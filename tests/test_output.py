@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 
 from bn.output import write_output
 
@@ -26,5 +27,5 @@ def test_write_output_spills_large_payload(tmp_path, monkeypatch):
     )
 
     envelope = json.loads(rendered)
-    artifact = tmp_path / "bridge-artifacts"
-    assert envelope["artifact_path"].startswith(str(artifact.parent))
+    artifact_root = tempfile.gettempdir()
+    assert envelope["artifact_path"].startswith(artifact_root)

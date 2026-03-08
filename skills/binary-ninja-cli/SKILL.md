@@ -77,6 +77,8 @@ If a struct edit is already identical, preview may report `changed: false` with 
 ## Practical Guidance
 
 - Prefer `bn` over MCP for shell-driven decompilation, search, bundles, and large outputs.
+- `bn decompile` does not always rewrite post-hoc struct-growth sites away from raw `__offset(...)` expressions, even after a manual analysis refresh.
+- Treat `bn types show ...` and `bn struct show ...` as the authoritative typed layouts when decompile output lags behind type recovery.
 - Use `--out` when output may be long or when you want a stable artifact.
 - Use `bn target list` again if target selection is ambiguous.
 - If multiple targets are open, be explicit and pass `--target <selector>`.

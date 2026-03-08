@@ -32,7 +32,7 @@ If the plugin code changes, reload Binary Ninja Python plugins or restart Binary
 - The plugin creates one fixed bridge socket and one fixed registry file.
 - The CLI discovers that bridge, connects to it, and forwards commands.
 - Read commands return structured data.
-- Large outputs can spill to artifacts with `--out`, and some large stdout responses auto-spill to the cache.
+- Large outputs can spill to artifacts with `--out`, and some large stdout responses auto-spill to a temp directory.
 - Mutations support `--preview` so you can inspect the effect before making a permanent change.
 
 This version assumes one Binary Ninja/plugin instance per machine, which keeps discovery simple.
@@ -118,6 +118,13 @@ bn strings --query follow
 bn imports
 bn data
 ```
+
+## Typing Caveat
+
+One local tooling caveat remains:
+
+- `bn decompile` does not always rewrite post-hoc struct-growth sites away from raw `__offset(...)` expressions, even after a manual analysis refresh.
+- For now, `bn types show Player`, `bn types show Game`, and `bn types show PathTemplate` are the authoritative typed layouts.
 
 ## Bundles And Python
 

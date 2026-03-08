@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import json
 import socket
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +15,12 @@ from .paths import bridge_registry_path
 
 class BridgeError(RuntimeError):
     pass
+
+
+TRANSIENT_SOCKET_ERRNOS = {
+    errno.ECONNREFUSED,
+    errno.ENOENT,
+}
 
 
 @dataclass(slots=True)
@@ -122,6 +130,7 @@ def send_request(
     target: str | None = None,
     instance_pid: int | None = None,
     timeout: float = 30.0,
+    connect_retries: int = 4,
 ) -> dict[str, Any]:
     instance = choose_instance(instance_pid=instance_pid, target=target)
     payload: dict[str, Any] = {
@@ -134,22 +143,31 @@ def send_request(
 
     encoded = (json.dumps(payload) + "\n").encode("utf-8")
 
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(timeout)
-            sock.connect(str(instance.socket_path))
-            sock.sendall(encoded)
-            sock.shutdown(socket.SHUT_WR)
-            chunks: list[bytes] = []
-            while True:
-                chunk = sock.recv(65536)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-    except OSError as exc:
+    chunks: list[bytes] = []
+    last_error: OSError | None = None
+    for attempt in range(connect_retries):
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(timeout)
+                sock.connect(str(instance.socket_path))
+                sock.sendall(encoded)
+                sock.shutdown(socket.SHUT_WR)
+                while True:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+            break
+        except OSError as exc:
+            last_error = exc
+            if exc.errno not in TRANSIENT_SOCKET_ERRNOS or attempt == connect_retries - 1:
+                break
+            time.sleep(0.05 * (attempt + 1))
+
+    if last_error is not None and not chunks:
         raise BridgeError(
-            f"Failed to contact Binary Ninja bridge pid {instance.pid} at {instance.socket_path}: {exc}"
-        ) from exc
+            f"Failed to contact Binary Ninja bridge pid {instance.pid} at {instance.socket_path}: {last_error}"
+        ) from last_error
 
     if not chunks:
         raise BridgeError("Binary Ninja bridge returned an empty response")

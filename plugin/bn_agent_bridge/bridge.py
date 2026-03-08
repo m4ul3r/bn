@@ -372,6 +372,7 @@ class BridgeHandler(socketserver.StreamRequestHandler):
 class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
     allow_reuse_address = True
+    request_queue_size = 64
 
     def __init__(self, socket_path: str, handler, bridge):
         self.bridge = bridge
@@ -697,9 +698,12 @@ class BinaryNinjaBridge:
     def _decompile(self, selector: str | None, identifier):
         bv = self._resolve_view(selector)
         func = self._find_function(bv, identifier)
+        text = self._function_text(bv, func, view="hlil")
+        warnings = self._render_warnings(text)
         return {
             "function": {"name": func.name, "address": hex(func.start)},
-            "text": self._function_text(bv, func, view="hlil"),
+            "text": text,
+            "warnings": warnings,
         }
 
     def _function_info(self, selector: str | None, identifier):
@@ -723,11 +727,13 @@ class BinaryNinjaBridge:
     def _il(self, selector: str | None, identifier, view: str, ssa: bool):
         bv = self._resolve_view(selector)
         func = self._find_function(bv, identifier)
+        text = self._function_text(bv, func, view=view, ssa=ssa)
         return {
             "function": {"name": func.name, "address": hex(func.start)},
             "view": view,
             "ssa": ssa,
-            "text": self._function_text(bv, func, view=view, ssa=ssa),
+            "text": text,
+            "warnings": self._render_warnings(text),
         }
 
     def _disasm(self, selector: str | None, identifier):
@@ -907,6 +913,7 @@ class BinaryNinjaBridge:
     def _bundle_function(self, selector: str | None, identifier, out_path: str | None):
         bv = self._resolve_view(selector)
         func = self._find_function(bv, identifier)
+        decompile = self._function_text(bv, func, view="hlil")
         bundle = {
             "target": self._target_info(selector),
             "function": {
@@ -915,9 +922,10 @@ class BinaryNinjaBridge:
                 "raw_name": getattr(func, "raw_name", func.name),
                 "type": str(func.type),
             },
-            "decompile": self._function_text(bv, func, view="hlil"),
+            "decompile": decompile,
+            "warnings": self._render_warnings(decompile),
             "il": {
-                "hlil": self._function_text(bv, func, view="hlil"),
+                "hlil": decompile,
                 "mlil": self._function_text(bv, func, view="mlil"),
             },
             "disassembly": self._disasm_text(bv, func),
@@ -965,6 +973,14 @@ class BinaryNinjaBridge:
         if artifact:
             result["artifact"] = artifact
         return result
+
+    def _render_warnings(self, text: str) -> list[str]:
+        warnings: list[str] = []
+        if "__offset(" in text:
+            warnings.append(
+                "Decompile still contains raw __offset(...) expressions; use `bn types show` or `bn struct show` as the authoritative layout until Binary Ninja refreshes the presentation."
+            )
+        return warnings
 
     def _guess_type_affected_functions(self, bv, type_name: str, limit: int = 10):
         matches = []

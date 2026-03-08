@@ -153,6 +153,57 @@ def test_send_request_wraps_socket_errors(tmp_path, monkeypatch):
         send_request("doctor")
 
 
+def test_send_request_retries_transient_connect_failures(tmp_path, monkeypatch):
+    from bn.transport import BridgeInstance
+
+    instance = BridgeInstance(
+        pid=999,
+        socket_path=tmp_path / "bridge.sock",
+        registry_path=tmp_path / "bridge.json",
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at=None,
+        meta={},
+    )
+    monkeypatch.setattr("bn.transport.choose_instance", lambda **_: instance)
+
+    class _FakeSocket:
+        attempts = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def connect(self, path):
+            type(self).attempts += 1
+            if type(self).attempts == 1:
+                raise ConnectionRefusedError(61, "Connection refused")
+
+        def sendall(self, payload):
+            self.payload = payload
+
+        def shutdown(self, how):
+            self.how = how
+
+        def recv(self, size):
+            if not hasattr(self, "_sent"):
+                self._sent = True
+                return json.dumps({"ok": True, "result": {"pong": True}}).encode("utf-8")
+            return b""
+
+    monkeypatch.setattr("bn.transport.socket.socket", lambda *args, **kwargs: _FakeSocket())
+
+    response = send_request("ping")
+
+    assert response["result"]["pong"] is True
+    assert _FakeSocket.attempts == 2
+
+
 def test_list_instances_trusts_live_socket_even_with_stale_pid(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     registry_path = bridge_registry_path()

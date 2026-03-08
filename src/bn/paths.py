@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import platform
+import tempfile
 from pathlib import Path
 
 
@@ -36,7 +37,9 @@ def bridge_registry_path() -> Path:
 
 
 def spill_root() -> Path:
-    return cache_home() / "spills"
+    root = Path(tempfile.gettempdir()) / "bn-spills"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 def plugin_source_dir() -> Path:
