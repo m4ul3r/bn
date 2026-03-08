@@ -51,6 +51,54 @@ def test_symbol_rename_builds_preview_payload(monkeypatch):
     assert captured["params"]["preview"] is True
 
 
+def test_symbol_rename_defaults_to_active_when_single_target_open(monkeypatch):
+    calls = []
+
+    def fake_send_request(op, *, params=None, target=None, instance_pid=None, timeout=30.0):
+        calls.append({"op": op, "params": params, "target": target})
+        if op == "list_targets":
+            return {
+                "ok": True,
+                "result": [
+                    {
+                        "target_id": "123:1:7",
+                        "selector": "SnailMail_unwrapped.exe.bndb",
+                    }
+                ],
+            }
+        if op == "rename_symbol":
+            return {"ok": True, "result": {"preview": True}}
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["symbol", "rename", "--preview", "sub_401000", "player_update"])
+
+    assert rc == 0
+    assert [call["op"] for call in calls] == ["list_targets", "rename_symbol"]
+    assert calls[1]["target"] == "active"
+
+
+def test_symbol_rename_requires_target_when_multiple_targets_are_open(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, instance_pid=None, timeout=30.0):
+        if op == "list_targets":
+            return {
+                "ok": True,
+                "result": [
+                    {"target_id": "123:1:7", "selector": "SnailMail_unwrapped.exe.bndb"},
+                    {"target_id": "123:2:8", "selector": "other.exe.bndb"},
+                ],
+            }
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["symbol", "rename", "sub_401000", "player_update"])
+
+    assert rc == 2
+    assert "requires --target when multiple targets are open" in capsys.readouterr().err
+
+
 def test_plugin_install_copy_mode(tmp_path):
     destination = tmp_path / "plugin-copy"
     rc = bn.cli.main(

@@ -48,7 +48,7 @@ bn function list
 bn decompile sub_401000 --target active
 ```
 
-If exactly one BinaryView is open, `--target active` works even when the UI focus is on a non-BinaryView pane.
+Read commands default to `--target active`. If exactly one BinaryView is open, target-specific commands can also omit `--target` entirely.
 
 ## Target Selection
 
@@ -144,11 +144,12 @@ Stdout and `result` are both returned.
 
 ## Mutation Commands
 
-Mutations require an explicit `--target`.
+Mutations can omit `--target` when exactly one BinaryView is open. If multiple targets are open, pass an explicit selector.
 
 Examples:
 
 ```bash
+bn symbol rename sub_401000 player_update --preview
 bn symbol rename --target active sub_401000 player_update --preview
 bn comment set --target active --address 0x401000 "interesting branch" --preview
 bn proto set --target active sub_401000 "int __cdecl player_update(Player* self)" --preview

@@ -62,17 +62,36 @@ def _render_result(
     sys.stdout.write(write_output(value, fmt=fmt, out_path=out_path, stem=stem))
 
 
+def _implicit_target(args: argparse.Namespace) -> str:
+    response = send_request(
+        "list_targets",
+        params={},
+        target=None,
+        instance_pid=getattr(args, "instance", None),
+    )
+    targets = list(response["result"])
+    if len(targets) == 1:
+        return "active"
+    if not targets:
+        raise BridgeError("No BinaryView targets are open in the GUI")
+    raise BridgeError("This command requires --target when multiple targets are open")
+
+
 def _call(
     args: argparse.Namespace,
     op: str,
     params: dict[str, Any] | None = None,
     *,
     require_target: bool,
+    allow_implicit_target: bool = False,
     stem: str,
 ) -> int:
     target = getattr(args, "target", None)
     if require_target and not target:
-        raise BridgeError("This command requires --target")
+        if allow_implicit_target:
+            target = _implicit_target(args)
+        else:
+            raise BridgeError("This command requires --target")
     response = send_request(
         op,
         params=params,
@@ -170,6 +189,7 @@ def _target_info(args: argparse.Namespace) -> int:
         "target_info",
         {"selector": args.target},
         require_target=True,
+        allow_implicit_target=True,
         stem="target-info",
     )
 
@@ -274,6 +294,7 @@ def _bundle_function(args: argparse.Namespace) -> int:
         "bundle_function",
         {"identifier": args.identifier, "out_path": str(args.out) if args.out else None},
         require_target=True,
+        allow_implicit_target=True,
         stem="function-bundle",
     )
 
@@ -289,6 +310,7 @@ def _bundle_corpus(args: argparse.Namespace) -> int:
             "out_path": str(args.out) if args.out else None,
         },
         require_target=True,
+        allow_implicit_target=True,
         stem="corpus-bundle",
     )
 
@@ -308,6 +330,7 @@ def _py_exec(args: argparse.Namespace) -> int:
         "py_exec",
         {"script": script, "out_path": str(args.out) if args.out else None},
         require_target=True,
+        allow_implicit_target=True,
         stem="py-exec",
     )
 
@@ -323,6 +346,7 @@ def _symbol_rename(args: argparse.Namespace) -> int:
             "preview": bool(args.preview),
         },
         require_target=True,
+        allow_implicit_target=True,
         stem="symbol-rename",
     )
 
@@ -338,6 +362,7 @@ def _comment_set(args: argparse.Namespace) -> int:
             "preview": bool(args.preview),
         },
         require_target=True,
+        allow_implicit_target=True,
         stem="comment-set",
     )
 
@@ -352,6 +377,7 @@ def _comment_delete(args: argparse.Namespace) -> int:
             "preview": bool(args.preview),
         },
         require_target=True,
+        allow_implicit_target=True,
         stem="comment-delete",
     )
 
@@ -366,6 +392,7 @@ def _proto_set(args: argparse.Namespace) -> int:
             "preview": bool(args.preview),
         },
         require_target=True,
+        allow_implicit_target=True,
         stem="prototype-set",
     )
 
@@ -381,6 +408,7 @@ def _local_rename(args: argparse.Namespace) -> int:
             "preview": bool(args.preview),
         },
         require_target=True,
+        allow_implicit_target=True,
         stem="local-rename",
     )
 
@@ -396,6 +424,7 @@ def _local_retype(args: argparse.Namespace) -> int:
             "preview": bool(args.preview),
         },
         require_target=True,
+        allow_implicit_target=True,
         stem="local-retype",
     )
 
@@ -413,6 +442,7 @@ def _struct_field_set(args: argparse.Namespace) -> int:
             "preview": bool(args.preview),
         },
         require_target=True,
+        allow_implicit_target=True,
         stem="struct-field-set",
     )
 
@@ -428,6 +458,7 @@ def _struct_field_rename(args: argparse.Namespace) -> int:
             "preview": bool(args.preview),
         },
         require_target=True,
+        allow_implicit_target=True,
         stem="struct-field-rename",
     )
 
@@ -442,6 +473,7 @@ def _struct_field_delete(args: argparse.Namespace) -> int:
             "preview": bool(args.preview),
         },
         require_target=True,
+        allow_implicit_target=True,
         stem="struct-field-delete",
     )
 
@@ -455,6 +487,7 @@ def _struct_replace(args: argparse.Namespace) -> int:
             "preview": bool(args.preview),
         },
         require_target=True,
+        allow_implicit_target=True,
         stem="struct-replace",
     )
 
@@ -469,6 +502,7 @@ def _patch_bytes(args: argparse.Namespace) -> int:
             "preview": bool(args.preview),
         },
         require_target=True,
+        allow_implicit_target=True,
         stem="patch-bytes",
     )
 
@@ -517,7 +551,7 @@ def build_parser() -> argparse.ArgumentParser:
     target_list.set_defaults(handler=_target_list)
     target_info = target_sub.add_parser("info", help="Show one target")
     _common_io_options(target_info)
-    _target_option(target_info, required=True)
+    _target_option(target_info, required=False)
     target_info.set_defaults(handler=_target_info)
 
     function = subparsers.add_parser("function", help="Function discovery helpers")
@@ -589,12 +623,12 @@ def build_parser() -> argparse.ArgumentParser:
     bundle_sub = bundle.add_subparsers(dest="bundle_command")
     bundle_function = bundle_sub.add_parser("function", help="Export a function bundle")
     _common_io_options(bundle_function)
-    _target_option(bundle_function, required=True)
+    _target_option(bundle_function, required=False)
     bundle_function.add_argument("identifier")
     bundle_function.set_defaults(handler=_bundle_function)
     bundle_corpus = bundle_sub.add_parser("corpus", help="Export a corpus bundle")
     _common_io_options(bundle_corpus)
-    _target_option(bundle_corpus, required=True)
+    _target_option(bundle_corpus, required=False)
     bundle_corpus.add_argument("--kind", choices=("functions", "types", "strings"), required=True)
     bundle_corpus.add_argument("--query")
     bundle_corpus.add_argument("--limit", type=int, default=500)
@@ -604,7 +638,7 @@ def build_parser() -> argparse.ArgumentParser:
     py_sub = py.add_subparsers(dest="py_command")
     py_exec = py_sub.add_parser("exec", help="Execute a Python snippet")
     _common_io_options(py_exec)
-    _target_option(py_exec, required=True)
+    _target_option(py_exec, required=False)
     source = py_exec.add_mutually_exclusive_group(required=True)
     source.add_argument("--script", type=Path, help="Read Python code from a file")
     source.add_argument("--code", help="Inline Python code")
@@ -615,7 +649,7 @@ def build_parser() -> argparse.ArgumentParser:
     symbol_sub = symbol.add_subparsers(dest="symbol_command")
     symbol_rename = symbol_sub.add_parser("rename", help="Rename a symbol")
     _common_io_options(symbol_rename)
-    _target_option(symbol_rename, required=True)
+    _target_option(symbol_rename, required=False)
     symbol_rename.add_argument("--kind", choices=("auto", "function", "data"), default="auto")
     symbol_rename.add_argument("--preview", action="store_true")
     symbol_rename.add_argument("identifier")
@@ -626,7 +660,7 @@ def build_parser() -> argparse.ArgumentParser:
     comment_sub = comment.add_subparsers(dest="comment_command")
     comment_set = comment_sub.add_parser("set", help="Set a comment")
     _common_io_options(comment_set)
-    _target_option(comment_set, required=True)
+    _target_option(comment_set, required=False)
     comment_set.add_argument("--preview", action="store_true")
     comment_set.add_argument("--address")
     comment_set.add_argument("--function")
@@ -634,7 +668,7 @@ def build_parser() -> argparse.ArgumentParser:
     comment_set.set_defaults(handler=_comment_set)
     comment_delete = comment_sub.add_parser("delete", help="Delete a comment")
     _common_io_options(comment_delete)
-    _target_option(comment_delete, required=True)
+    _target_option(comment_delete, required=False)
     comment_delete.add_argument("--preview", action="store_true")
     comment_delete.add_argument("--address")
     comment_delete.add_argument("--function")
@@ -644,7 +678,7 @@ def build_parser() -> argparse.ArgumentParser:
     proto_sub = proto.add_subparsers(dest="proto_command")
     proto_set = proto_sub.add_parser("set", help="Set a prototype")
     _common_io_options(proto_set)
-    _target_option(proto_set, required=True)
+    _target_option(proto_set, required=False)
     proto_set.add_argument("--preview", action="store_true")
     proto_set.add_argument("identifier")
     proto_set.add_argument("prototype")
@@ -654,7 +688,7 @@ def build_parser() -> argparse.ArgumentParser:
     local_sub = local.add_subparsers(dest="local_command")
     local_rename = local_sub.add_parser("rename", help="Rename a local")
     _common_io_options(local_rename)
-    _target_option(local_rename, required=True)
+    _target_option(local_rename, required=False)
     local_rename.add_argument("--preview", action="store_true")
     local_rename.add_argument("function")
     local_rename.add_argument("variable")
@@ -662,7 +696,7 @@ def build_parser() -> argparse.ArgumentParser:
     local_rename.set_defaults(handler=_local_rename)
     local_retype = local_sub.add_parser("retype", help="Retype a local")
     _common_io_options(local_retype)
-    _target_option(local_retype, required=True)
+    _target_option(local_retype, required=False)
     local_retype.add_argument("--preview", action="store_true")
     local_retype.add_argument("function")
     local_retype.add_argument("variable")
@@ -675,7 +709,7 @@ def build_parser() -> argparse.ArgumentParser:
     field_sub = field.add_subparsers(dest="struct_field_command")
     field_set = field_sub.add_parser("set", help="Set or replace a field")
     _common_io_options(field_set)
-    _target_option(field_set, required=True)
+    _target_option(field_set, required=False)
     field_set.add_argument("--preview", action="store_true")
     field_set.add_argument("--no-overwrite", action="store_true")
     field_set.add_argument("struct_name")
@@ -685,7 +719,7 @@ def build_parser() -> argparse.ArgumentParser:
     field_set.set_defaults(handler=_struct_field_set)
     field_rename = field_sub.add_parser("rename", help="Rename a field")
     _common_io_options(field_rename)
-    _target_option(field_rename, required=True)
+    _target_option(field_rename, required=False)
     field_rename.add_argument("--preview", action="store_true")
     field_rename.add_argument("struct_name")
     field_rename.add_argument("old_name")
@@ -693,14 +727,14 @@ def build_parser() -> argparse.ArgumentParser:
     field_rename.set_defaults(handler=_struct_field_rename)
     field_delete = field_sub.add_parser("delete", help="Delete a field")
     _common_io_options(field_delete)
-    _target_option(field_delete, required=True)
+    _target_option(field_delete, required=False)
     field_delete.add_argument("--preview", action="store_true")
     field_delete.add_argument("struct_name")
     field_delete.add_argument("field_name")
     field_delete.set_defaults(handler=_struct_field_delete)
     struct_replace = struct_sub.add_parser("replace", help="Whole-struct replacement escape hatch")
     _common_io_options(struct_replace)
-    _target_option(struct_replace, required=True)
+    _target_option(struct_replace, required=False)
     struct_replace.add_argument("--preview", action="store_true")
     struct_replace.add_argument("declaration")
     struct_replace.set_defaults(handler=_struct_replace)
@@ -709,7 +743,7 @@ def build_parser() -> argparse.ArgumentParser:
     patch_sub = patch.add_subparsers(dest="patch_command")
     patch_bytes = patch_sub.add_parser("bytes", help="Patch bytes at an address")
     _common_io_options(patch_bytes)
-    _target_option(patch_bytes, required=True)
+    _target_option(patch_bytes, required=False)
     patch_bytes.add_argument("--preview", action="store_true")
     patch_bytes.add_argument("address")
     patch_bytes.add_argument("data")
