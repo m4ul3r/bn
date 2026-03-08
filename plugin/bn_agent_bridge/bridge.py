@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import binaryninja as bn
-from binaryninja.mainthread import execute_on_main_thread_and_wait
+from binaryninja.mainthread import execute_on_main_thread_and_wait, is_main_thread
 from binaryninja.plugin import PluginCommand
 
 try:
@@ -59,6 +59,9 @@ def _json_response(*, ok: bool, result: Any = None, error: str | None = None) ->
 
 
 def _run_on_main_thread(func):
+    if is_main_thread():
+        return func()
+
     holder: dict[str, Any] = {}
 
     def wrapper():
@@ -112,28 +115,31 @@ def _active_binary_view():
     if ui is None:
         return None
 
-    def view_from_frame(frame):
-        if frame is None:
+    def resolve():
+        def view_from_frame(frame):
+            if frame is None:
+                return None
+            if hasattr(frame, "getCurrentBinaryView"):
+                return frame.getCurrentBinaryView()
+            if hasattr(frame, "getBinaryView"):
+                return frame.getBinaryView()
             return None
-        if hasattr(frame, "getCurrentBinaryView"):
-            return frame.getCurrentBinaryView()
-        if hasattr(frame, "getBinaryView"):
-            return frame.getBinaryView()
+
+        try:
+            context = ui.UIContext.activeContext()
+            if context is not None:
+                view = view_from_frame(context.getCurrentViewFrame())
+                if view is not None:
+                    return view
+
+            contexts = list(ui.UIContext.allContexts())
+            if len(contexts) == 1:
+                return view_from_frame(contexts[0].getCurrentViewFrame())
+        except Exception:
+            return None
         return None
 
-    try:
-        context = ui.UIContext.activeContext()
-        if context is not None:
-            view = view_from_frame(context.getCurrentViewFrame())
-            if view is not None:
-                return view
-
-        contexts = list(ui.UIContext.allContexts())
-        if len(contexts) == 1:
-            return view_from_frame(contexts[0].getCurrentViewFrame())
-    except Exception:
-        return None
-    return None
+    return _run_on_main_thread(resolve)
 
 
 def _collect_open_views() -> list[Any]:
@@ -141,53 +147,56 @@ def _collect_open_views() -> list[Any]:
         active = _active_binary_view()
         return [active] if active is not None else []
 
-    found: list[Any] = []
-    contexts = []
-    try:
-        contexts = list(ui.UIContext.allContexts())
-    except Exception:
-        pass
-    if not contexts:
-        active_context = ui.UIContext.activeContext()
-        if active_context is not None:
-            contexts = [active_context]
-
-    def collect_from_frame(frame):
-        if frame is None:
-            return
-        for attr in ("getCurrentBinaryView", "getBinaryView"):
-            try:
-                getter = getattr(frame, attr, None)
-                if callable(getter):
-                    value = getter()
-                    if value is not None:
-                        found.append(value)
-            except Exception:
-                continue
-
-    for context in contexts:
+    def collect():
+        found: list[Any] = []
+        contexts = []
         try:
-            collect_from_frame(context.getCurrentViewFrame())
+            contexts = list(ui.UIContext.allContexts())
         except Exception:
             pass
-        for attr in ("getViewFrames", "viewFrames", "allViewFrames", "frames"):
-            try:
-                getter = getattr(context, attr, None)
-                frames = getter() if callable(getter) else getter
-                if frames:
-                    for frame in list(frames):
-                        collect_from_frame(frame)
-            except Exception:
-                continue
+        if not contexts:
+            active_context = ui.UIContext.activeContext()
+            if active_context is not None:
+                contexts = [active_context]
 
-    unique: list[Any] = []
-    seen: set[int] = set()
-    for bv in found:
-        marker = id(bv)
-        if marker not in seen:
-            seen.add(marker)
-            unique.append(bv)
-    return unique
+        def collect_from_frame(frame):
+            if frame is None:
+                return
+            for attr in ("getCurrentBinaryView", "getBinaryView"):
+                try:
+                    getter = getattr(frame, attr, None)
+                    if callable(getter):
+                        value = getter()
+                        if value is not None:
+                            found.append(value)
+                except Exception:
+                    continue
+
+        for context in contexts:
+            try:
+                collect_from_frame(context.getCurrentViewFrame())
+            except Exception:
+                pass
+            for attr in ("getViewFrames", "viewFrames", "allViewFrames", "frames"):
+                try:
+                    getter = getattr(context, attr, None)
+                    frames = getter() if callable(getter) else getter
+                    if frames:
+                        for frame in list(frames):
+                            collect_from_frame(frame)
+                except Exception:
+                    continue
+
+        unique: list[Any] = []
+        seen: set[int] = set()
+        for bv in found:
+            marker = id(bv)
+            if marker not in seen:
+                seen.add(marker)
+                unique.append(bv)
+        return unique
+
+    return _run_on_main_thread(collect)
 
 
 @dataclass(slots=True)
@@ -416,7 +425,7 @@ class BinaryNinjaBridge:
         params = payload.get("params") or {}
         target = payload.get("target")
         try:
-            result = _run_on_main_thread(lambda: self._dispatch_on_main(op, params, target))
+            result = self._dispatch_on_main(op, params, target)
             return _json_response(ok=True, result=result)
         except Exception as exc:
             return _json_response(ok=False, error=f"{type(exc).__name__}: {exc}")
