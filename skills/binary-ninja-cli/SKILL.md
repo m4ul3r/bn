@@ -18,7 +18,7 @@ bn target list
 
 2. Pick a target:
 - If there is exactly one open BinaryView, target-scoped commands can omit `--target` entirely.
-- Read commands also default to `--target active`.
+- Do not repeat `--target active` in normal examples or routine usage.
 - Otherwise prefer the `selector` field from `bn target list`.
 - If multiple targets are open, pass an explicit `--target`.
 
@@ -78,6 +78,6 @@ If a struct edit is already identical, preview may report `changed: false` with 
 
 - Prefer `bn` over MCP for shell-driven decompilation, search, bundles, and large outputs.
 - Use `--out` when output may be long or when you want a stable artifact.
-- Use `bn target list` again if `active` is ambiguous.
+- Use `bn target list` again if target selection is ambiguous.
 - If multiple targets are open, be explicit and pass `--target <selector>`.
 - If `bn target list` is empty, the Binary Ninja plugin is not live. Check `bn plugin install`, then reload Binary Ninja plugins or restart Binary Ninja.

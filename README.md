@@ -45,10 +45,10 @@ Open a binary or `.bndb` in Binary Ninja, then run:
 bn doctor
 bn target list
 bn function list
-bn decompile sub_401000 --target active
+bn decompile sub_401000
 ```
 
-Read commands default to `--target active`. If exactly one BinaryView is open, target-specific commands can also omit `--target` entirely.
+If exactly one BinaryView is open, target-specific commands can omit `--target` entirely. If multiple targets are open, pass `--target <selector>` from `bn target list`.
 
 ## Target Selection
 
@@ -87,7 +87,7 @@ Examples:
 
 ```bash
 bn function list --format ndjson
-bn decompile sample_track_floor_height_at_position --target active --out /tmp/floor.json
+bn decompile sample_track_floor_height_at_position --out /tmp/floor.json
 ```
 
 If `--out` is set, the command writes the rendered result to that path and prints a compact JSON envelope with the artifact path, size, hash, and summary.
@@ -98,25 +98,25 @@ Common read-only commands:
 
 ```bash
 bn target list
-bn target info --target active
+bn target info
 
-bn function list --target active
-bn function search attachment --target active
-bn function info end_track_attachment_follow_state --target active
+bn function list
+bn function search attachment
+bn function info end_track_attachment_follow_state
 
-bn decompile end_track_attachment_follow_state --target active
-bn il end_track_attachment_follow_state --target active
-bn disasm end_track_attachment_follow_state --target active
-bn xrefs end_track_attachment_follow_state --target active
-bn xrefs field TrackRowCell.tile_type --target active
-bn comment get --address 0x401000 --target active
+bn decompile end_track_attachment_follow_state
+bn il end_track_attachment_follow_state
+bn disasm end_track_attachment_follow_state
+bn xrefs end_track_attachment_follow_state
+bn xrefs field TrackRowCell.tile_type
+bn comment get --address 0x401000
 
-bn types --target active --query Player
-bn types show Player --target active --format text
-bn struct show Player --target active --format text
-bn strings --target active --query follow
-bn imports --target active
-bn data --target active
+bn types --query Player
+bn types show Player --format text
+bn struct show Player --format text
+bn strings --query follow
+bn imports
+bn data
 ```
 
 ## Bundles And Python
@@ -124,15 +124,15 @@ bn data --target active
 Export a reusable function bundle:
 
 ```bash
-bn bundle function end_track_attachment_follow_state --target active --out /tmp/end_track_attachment_follow_state.json
+bn bundle function end_track_attachment_follow_state --out /tmp/end_track_attachment_follow_state.json
 ```
 
 Run Python inside the Binary Ninja process:
 
 ```bash
-bn py exec --target active --code "print(hex(bv.entry_point)); result = {'functions': len(list(bv.functions))}"
+bn py exec --code "print(hex(bv.entry_point)); result = {'functions': len(list(bv.functions))}"
 
-bn py exec --target active --stdin <<'PY'
+bn py exec --stdin <<'PY'
 print(hex(bv.entry_point))
 result = {"functions": len(list(bv.functions))}
 PY
@@ -155,14 +155,13 @@ Examples:
 
 ```bash
 bn symbol rename sub_401000 player_update --preview
-bn symbol rename --target active sub_401000 player_update --preview
-bn comment set --target active --address 0x401000 "interesting branch" --preview
-bn proto set --target active sub_401000 "int __cdecl player_update(Player* self)" --preview
-bn local rename --target active sub_401000 var_14 speed --preview
-bn local retype --target active sub_401000 var_14 float --preview
+bn comment set --address 0x401000 "interesting branch" --preview
+bn proto set sub_401000 "int __cdecl player_update(Player* self)" --preview
+bn local rename sub_401000 var_14 speed --preview
+bn local retype sub_401000 var_14 float --preview
 bn types declare "typedef struct Player { int hp; } Player;" --preview
-bn struct field set --target active Player 0x308 movement_flag_selector uint32_t --preview
-bn patch bytes --target active 0x401000 "90 90" --preview
+bn struct field set Player 0x308 movement_flag_selector uint32_t --preview
+bn patch bytes 0x401000 "90 90" --preview
 ```
 
 Preview mode applies the change, refreshes analysis, captures affected decompile diffs, and then reverts the mutation.
