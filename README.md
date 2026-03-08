@@ -108,6 +108,8 @@ bn decompile end_track_attachment_follow_state --target active
 bn il end_track_attachment_follow_state --target active
 bn disasm end_track_attachment_follow_state --target active
 bn xrefs end_track_attachment_follow_state --target active
+bn xrefs field TrackRowCell.tile_type --target active
+bn comment get --address 0x401000 --target active
 
 bn types --target active --query Player
 bn types show Player --target active --format text
@@ -166,6 +168,8 @@ bn patch bytes --target active 0x401000 "90 90" --preview
 Preview mode applies the change, refreshes analysis, captures affected decompile diffs, and then reverts the mutation.
 
 For declaration and struct mutations, preview results also include `affected_types` with before/after layouts and a unified diff. If a field edit is already identical, the result is marked with `changed: false` and a `No effective change detected` message.
+
+For the first few changed functions, `affected_functions` also includes short `before_excerpt` and `after_excerpt` snippets around the first changed HLIL lines.
 
 ## Batch Manifests
 

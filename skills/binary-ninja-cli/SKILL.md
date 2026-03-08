@@ -35,6 +35,8 @@ bn decompile sample_track_floor_height_at_position
 bn il sample_track_floor_height_at_position
 bn disasm sample_track_floor_height_at_position
 bn xrefs sample_track_floor_height_at_position
+bn xrefs field TrackRowCell.tile_type
+bn comment get --address 0x401000
 bn types --query Player
 bn types show Player --format text
 bn struct show Player --format text
@@ -67,6 +69,8 @@ For struct previews, inspect:
 - `results`
 - `affected_types`
 - `affected_functions`
+
+For the first few changed functions, `affected_functions` may also include `before_excerpt` and `after_excerpt` HLIL snippets around the first changed lines.
 
 If a struct edit is already identical, preview may report `changed: false` with `No effective change detected`.
 

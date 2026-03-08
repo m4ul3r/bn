@@ -448,6 +448,8 @@ class BinaryNinjaBridge:
             return self._disasm(target, params["identifier"])
         if op == "xrefs":
             return self._xrefs(target, params["identifier"])
+        if op == "field_xrefs":
+            return self._field_xrefs(target, str(params["field"]))
         if op == "types":
             return self._types(
                 target,
@@ -491,6 +493,8 @@ class BinaryNinjaBridge:
 
         if op == "rename_symbol":
             return self._mutation(target, bool(params.get("preview")), [params])
+        if op == "get_comment":
+            return self._get_comment(target, params.get("address"), params.get("function"))
         if op == "set_comment":
             return self._mutation(target, bool(params.get("preview")), [{"op": "set_comment", **params}])
         if op == "delete_comment":
@@ -733,6 +737,64 @@ class BinaryNinjaBridge:
             address = self._find_function(bv, identifier).start
         return self._xrefs_to_address(bv, address)
 
+    def _resolve_type_field(self, bv, field_spec: str):
+        type_name, sep, field_name = str(field_spec).rpartition(".")
+        if not sep or not type_name or not field_name:
+            raise RuntimeError("Field selector must be in the form Struct.field")
+
+        resolved_name, type_obj = self._find_type(bv, type_name)
+        members = getattr(type_obj, "members", None)
+        if members is None:
+            raise RuntimeError(f"Type is not a struct-like type: {resolved_name}")
+
+        for index, member in enumerate(list(members)):
+            if str(getattr(member, "name", "")) != field_name:
+                continue
+            return {
+                "type_name": resolved_name,
+                "field_name": field_name,
+                "offset": int(getattr(member, "offset", 0)),
+                "member_index": index,
+                "field_type": str(getattr(member, "type", "")),
+            }
+        raise RuntimeError(f"Field not found: {resolved_name}.{field_name}")
+
+    def _field_xrefs(self, selector: str | None, field_spec: str):
+        bv = self._resolve_view(selector)
+        field = self._resolve_type_field(bv, field_spec)
+
+        code_refs = []
+        for ref in bv.get_code_refs_for_type_field(field["type_name"], field["offset"]):
+            func = getattr(ref, "func", None)
+            address = int(getattr(ref, "address", 0))
+            code_refs.append(
+                {
+                    "function": func.name if func is not None else None,
+                    "address": hex(address),
+                    "size": int(getattr(ref, "size", 0)),
+                    "incoming_type": str(getattr(ref, "incomingType", "")) or None,
+                    "disasm": bv.get_disassembly(address) or "",
+                }
+            )
+
+        data_refs = []
+        for address in list(bv.get_data_refs_for_type_field(field["type_name"], field["offset"])):
+            symbol = bv.get_symbol_at(address)
+            type_obj = bv.get_type_at(address)
+            data_refs.append(
+                {
+                    "address": hex(address),
+                    "symbol": symbol.name if symbol is not None else None,
+                    "type": str(type_obj) if type_obj is not None else None,
+                }
+            )
+
+        return {
+            "field": field,
+            "code_refs": code_refs,
+            "data_refs": data_refs,
+        }
+
     def _types(self, selector: str | None, *, query, offset: int, limit: int):
         bv = self._resolve_view(selector)
         items = []
@@ -794,6 +856,29 @@ class BinaryNinjaBridge:
         for sym in list(bv.get_symbols_of_type(bn.SymbolType.ImportedFunctionSymbol)):
             items.append({"name": sym.name, "address": hex(sym.address)})
         return items
+
+    def _get_comment(self, selector: str | None, address, function):
+        bv = self._resolve_view(selector)
+        if function:
+            fn = self._find_function(bv, function)
+            comment = bv.get_comment_at(fn.start)
+            return {
+                "function": fn.name,
+                "address": hex(fn.start),
+                "comment": comment or "",
+                "has_comment": bool(comment),
+            }
+
+        if address is None:
+            raise RuntimeError("comment get requires --address or --function")
+
+        comment_address = _parse_address(address)
+        comment = bv.get_comment_at(comment_address)
+        return {
+            "address": hex(comment_address),
+            "comment": comment or "",
+            "has_comment": bool(comment),
+        }
 
     def _data(self, selector: str | None, *, offset: int, limit: int):
         bv = self._resolve_view(selector)
@@ -1031,8 +1116,33 @@ class BinaryNinjaBridge:
             }
         return snapshots
 
+    def _snippet_for_change(self, before_text: str, after_text: str, *, context_lines: int = 3, max_lines: int = 10):
+        before_lines = before_text.splitlines()
+        after_lines = after_text.splitlines()
+        line_count = max(len(before_lines), len(after_lines))
+
+        changed_line = None
+        for index in range(line_count):
+            before_line = before_lines[index] if index < len(before_lines) else None
+            after_line = after_lines[index] if index < len(after_lines) else None
+            if before_line != after_line:
+                changed_line = index
+                break
+
+        if changed_line is None:
+            return None
+
+        start = max(0, changed_line - context_lines)
+        end = min(line_count, start + max_lines)
+        return {
+            "start_line": start + 1,
+            "before_excerpt": "\n".join(before_lines[start:end]),
+            "after_excerpt": "\n".join(after_lines[start:end]),
+        }
+
     def _diff_snapshots(self, before: dict[int, Any], after: dict[int, Any]):
         diffs = []
+        snippets_added = 0
         for address in sorted(set(before) | set(after)):
             old = before.get(address, {"text": ""})
             new = after.get(address, {"text": ""})
@@ -1050,9 +1160,15 @@ class BinaryNinjaBridge:
                     "address": hex(address),
                     "before_name": old.get("name"),
                     "after_name": new.get("name"),
+                    "changed": old.get("text", "") != new.get("text", ""),
                     "diff": diff,
                 }
             )
+            if diffs[-1]["changed"] and snippets_added < 3:
+                snippet = self._snippet_for_change(old.get("text", ""), new.get("text", ""))
+                if snippet is not None:
+                    diffs[-1].update(snippet)
+                    snippets_added += 1
         return diffs
 
     def _find_variable(self, func, name: str):

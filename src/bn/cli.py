@@ -175,6 +175,56 @@ def _render_type_info_text(value: Any) -> str:
     return json.dumps(value, indent=2, sort_keys=True)
 
 
+def _render_field_xrefs_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return str(value)
+
+    field = value.get("field") or {}
+    lines = [
+        f"{field.get('type_name', '<unknown>')}.{field.get('field_name', '<unknown>')} @ +0x{int(field.get('offset', 0)):x}",
+        f"type: {field.get('field_type', '<unknown>')}",
+        "",
+        "code refs:",
+    ]
+    code_refs = list(value.get("code_refs") or [])
+    if code_refs:
+        for ref in code_refs:
+            details = [ref.get("address", "<unknown>")]
+            if ref.get("function"):
+                details.append(ref["function"])
+            if ref.get("incoming_type"):
+                details.append(f"type={ref['incoming_type']}")
+            if ref.get("disasm"):
+                details.append(ref["disasm"])
+            lines.append("- " + " | ".join(details))
+    else:
+        lines.append("- none")
+
+    lines.extend(["", "data refs:"])
+    data_refs = list(value.get("data_refs") or [])
+    if data_refs:
+        for ref in data_refs:
+            details = [ref.get("address", "<unknown>")]
+            if ref.get("symbol"):
+                details.append(ref["symbol"])
+            if ref.get("type"):
+                details.append(f"type={ref['type']}")
+            lines.append("- " + " | ".join(details))
+    else:
+        lines.append("- none")
+
+    return "\n".join(lines)
+
+
+def _render_comment_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return str(value)
+    comment = value.get("comment")
+    if isinstance(comment, str):
+        return comment
+    return json.dumps(value, indent=2, sort_keys=True)
+
+
 def _doctor(args: argparse.Namespace) -> int:
     instances = []
     for instance in list_instances():
@@ -327,6 +377,19 @@ def _disasm(args: argparse.Namespace) -> int:
 
 
 def _xrefs(args: argparse.Namespace) -> int:
+    if args.identifier == "field":
+        if len(args.extra) != 1:
+            raise BridgeError("Usage: bn xrefs field <Struct.field>")
+        return _call(
+            args,
+            "field_xrefs",
+            {"field": args.extra[0]},
+            require_target=True,
+            text_renderer=_render_field_xrefs_text,
+            stem="field-xrefs",
+        )
+    if not args.identifier:
+        raise BridgeError("xrefs requires an identifier")
     return _call(
         args,
         "xrefs",
@@ -485,6 +548,21 @@ def _comment_set(args: argparse.Namespace) -> int:
         require_target=True,
         allow_implicit_target=True,
         stem="comment-set",
+    )
+
+
+def _comment_get(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "get_comment",
+        {
+            "address": args.address,
+            "function": args.function,
+        },
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_comment_text,
+        stem="comment-get",
     )
 
 
@@ -728,10 +806,11 @@ def build_parser() -> argparse.ArgumentParser:
     disasm.add_argument("identifier")
     disasm.set_defaults(handler=_disasm)
 
-    xrefs = subparsers.add_parser("xrefs", help="List xrefs to an address or function")
+    xrefs = subparsers.add_parser("xrefs", help="List xrefs to an address or function, or `field <Struct.field>`")
     _common_io_options(xrefs)
     _target_option(xrefs, required=False, default="active")
-    xrefs.add_argument("identifier")
+    xrefs.add_argument("identifier", nargs="?")
+    xrefs.add_argument("extra", nargs="*")
     xrefs.set_defaults(handler=_xrefs)
 
     types = subparsers.add_parser("types", help="List or search types")
@@ -812,6 +891,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     comment = subparsers.add_parser("comment", help="Set or delete comments")
     comment_sub = comment.add_subparsers(dest="comment_command")
+    comment_get = comment_sub.add_parser("get", help="Get a comment")
+    _common_io_options(comment_get)
+    _target_option(comment_get, required=False)
+    comment_get.add_argument("--address")
+    comment_get.add_argument("--function")
+    comment_get.set_defaults(handler=_comment_get)
     comment_set = comment_sub.add_parser("set", help="Set a comment")
     _common_io_options(comment_set)
     _target_option(comment_set, required=False)

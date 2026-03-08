@@ -200,6 +200,64 @@ def test_types_declare_defaults_to_active_when_single_target_open(monkeypatch):
     assert "typedef struct Player" in calls[1]["params"]["declaration"]
 
 
+def test_xrefs_field_routes_to_field_xrefs(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, instance_pid=None, timeout=30.0):
+        captured["op"] = op
+        captured["params"] = params
+        captured["target"] = target
+        return {
+            "ok": True,
+            "result": {
+                "field": {
+                    "type_name": "TrackRowCell",
+                    "field_name": "tile_type",
+                    "offset": 8,
+                    "field_type": "uint32_t",
+                },
+                "code_refs": [{"address": "0x401000", "function": "sub_401000", "incoming_type": "TrackRowCell*", "disasm": "mov eax, [ecx+8]"}],
+                "data_refs": [],
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["xrefs", "field", "--format", "text", "TrackRowCell.tile_type"])
+
+    assert rc == 0
+    assert captured["op"] == "field_xrefs"
+    assert captured["params"]["field"] == "TrackRowCell.tile_type"
+    assert captured["target"] == "active"
+    output = capsys.readouterr().out
+    assert "TrackRowCell.tile_type" in output
+    assert "code refs:" in output
+
+
+def test_comment_get_defaults_to_active_when_single_target_open(monkeypatch, capsys):
+    calls = []
+
+    def fake_send_request(op, *, params=None, target=None, instance_pid=None, timeout=30.0):
+        calls.append({"op": op, "params": params, "target": target})
+        if op == "list_targets":
+            return {
+                "ok": True,
+                "result": [{"target_id": "123:1:7", "selector": "SnailMail_unwrapped.exe.bndb"}],
+            }
+        if op == "get_comment":
+            return {"ok": True, "result": {"address": "0x401000", "comment": "interesting branch", "has_comment": True}}
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["comment", "get", "--format", "text", "--address", "0x401000"])
+
+    assert rc == 0
+    assert [call["op"] for call in calls] == ["list_targets", "get_comment"]
+    assert calls[1]["target"] == "active"
+    assert capsys.readouterr().out == "interesting branch\n"
+
+
 def test_py_exec_accepts_inline_code(monkeypatch):
     captured = {}
 
