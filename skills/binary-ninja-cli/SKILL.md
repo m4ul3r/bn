@@ -30,11 +30,14 @@ bn target list
 ```bash
 bn function list
 bn function search attachment
+bn function info sample_track_floor_height_at_position
 bn decompile sample_track_floor_height_at_position
 bn il sample_track_floor_height_at_position
 bn disasm sample_track_floor_height_at_position
 bn xrefs sample_track_floor_height_at_position
 bn types --query Player
+bn types show Player --format text
+bn struct show Player --format text
 bn strings --query follow
 bn bundle function sample_track_floor_height_at_position --out /tmp/floor.json
 ```
@@ -54,6 +57,7 @@ Use `--stdin` for larger snippets. Use `--script <file>` only for real files.
 Prefer preview first:
 
 ```bash
+bn types declare "typedef struct Player { int hp; } Player;" --preview
 bn struct field set Player 0x308 movement_flag_selector uint32_t --preview
 bn symbol rename sub_401000 player_update --preview
 bn proto set sub_401000 "int __cdecl player_update(Player* self)" --preview

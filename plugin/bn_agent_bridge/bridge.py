@@ -438,6 +438,8 @@ class BinaryNinjaBridge:
                 params.get("offset", 0),
                 params.get("limit", 100),
             )
+        if op == "function_info":
+            return self._function_info(target, params["identifier"])
         if op == "decompile":
             return self._decompile(target, params["identifier"])
         if op == "il":
@@ -452,6 +454,12 @@ class BinaryNinjaBridge:
                 query=params.get("query"),
                 offset=int(params.get("offset", 0)),
                 limit=int(params.get("limit", 100)),
+            )
+        if op == "type_info":
+            return self._type_info(
+                target,
+                str(params["type_name"]),
+                require_struct=bool(params.get("require_struct")),
             )
         if op == "strings":
             return self._strings(
@@ -501,6 +509,8 @@ class BinaryNinjaBridge:
             return self._mutation(target, bool(params.get("preview")), [{"op": "struct_field_delete", **params}])
         if op == "struct_replace":
             return self._mutation(target, bool(params.get("preview")), [{"op": "struct_replace", **params}])
+        if op == "types_declare":
+            return self._mutation(target, bool(params.get("preview")), [{"op": "types_declare", **params}])
         if op == "patch_bytes":
             return self._mutation(target, bool(params.get("preview")), [{"op": "patch_bytes", **params}])
         if op == "batch_apply":
@@ -679,6 +689,24 @@ class BinaryNinjaBridge:
             "text": self._function_text(bv, func, view="hlil"),
         }
 
+    def _function_info(self, selector: str | None, identifier):
+        bv = self._resolve_view(selector)
+        func = self._find_function(bv, identifier)
+        variables = self._list_locals(func)
+        parameters = [item for item in variables if item["is_parameter"]]
+        locals_only = [item for item in variables if not item["is_parameter"]]
+        return {
+            "function": {
+                "name": func.name,
+                "address": hex(func.start),
+                "raw_name": getattr(func, "raw_name", func.name),
+            },
+            "prototype": str(func.type),
+            "parameters": parameters,
+            "locals": locals_only,
+            "stack_vars": locals_only,
+        }
+
     def _il(self, selector: str | None, identifier, view: str, ssa: bool):
         bv = self._resolve_view(selector)
         func = self._find_function(bv, identifier)
@@ -710,15 +738,38 @@ class BinaryNinjaBridge:
         items = []
         needle = str(query).lower() if query else None
         for name, type_obj in list(bv.types.items()):
-            entry = {
-                "name": str(name),
-                "kind": str(getattr(type_obj, "type_class", "unknown")),
-                "decl": str(type_obj),
-            }
+            entry = self._type_entry(name, type_obj)
             if needle and needle not in entry["name"].lower() and needle not in entry["decl"].lower():
                 continue
             items.append(entry)
         return items[offset : offset + limit]
+
+    def _find_type(self, bv, type_name: str):
+        type_obj = bv.get_type_by_name(type_name)
+        if type_obj is not None:
+            return type_name, type_obj
+
+        needle = str(type_name).lower()
+        for name, candidate in list(bv.types.items()):
+            if str(name).lower() == needle:
+                return str(name), candidate
+        raise RuntimeError(f"Type not found: {type_name}")
+
+    def _type_entry(self, type_name, type_obj):
+        return {
+            "name": str(type_name),
+            "kind": str(getattr(type_obj, "type_class", "unknown")),
+            "decl": str(type_obj),
+            "layout": self._render_type_layout(type_obj),
+        }
+
+    def _type_info(self, selector: str | None, type_name: str, *, require_struct: bool = False):
+        bv = self._resolve_view(selector)
+        resolved_name, type_obj = self._find_type(bv, type_name)
+        members = getattr(type_obj, "members", None)
+        if require_struct and members is None:
+            raise RuntimeError(f"Type is not a struct-like type: {resolved_name}")
+        return self._type_entry(resolved_name, type_obj)
 
     def _strings(self, selector: str | None, *, query, offset: int, limit: int):
         bv = self._resolve_view(selector)
@@ -832,6 +883,21 @@ class BinaryNinjaBridge:
                     break
         return matches
 
+    def _parse_declared_types(self, bv, declaration: str):
+        parse_result = bv.parse_types_from_string(declaration)
+        named_types = list(getattr(parse_result, "types", {}).items())
+        if not named_types:
+            raise RuntimeError("No named types found in declaration")
+        return named_types
+
+    def _operation_type_names(self, bv, op: dict[str, Any]) -> list[str]:
+        kind = op.get("op") or "rename_symbol"
+        if kind.startswith("struct_") and op.get("struct_name"):
+            return [str(op["struct_name"])]
+        if kind in {"struct_replace", "types_declare"}:
+            return [str(name) for name, _ in self._parse_declared_types(bv, str(op["declaration"]))]
+        return []
+
     def _guess_affected_functions(self, bv, operations: list[dict[str, Any]]):
         affected = []
         seen = set()
@@ -851,8 +917,9 @@ class BinaryNinjaBridge:
                         functions = self._functions_containing(bv, _parse_address(op["address"]))
                 elif kind == "patch_bytes":
                     functions = self._functions_containing(bv, _parse_address(op["address"]))
-                elif kind.startswith("struct_"):
-                    functions = self._guess_type_affected_functions(bv, str(op["struct_name"]))
+                elif kind.startswith("struct_") or kind == "types_declare":
+                    for type_name in self._operation_type_names(bv, op):
+                        functions.extend(self._guess_type_affected_functions(bv, type_name))
             except Exception:
                 functions = []
 
@@ -865,17 +932,14 @@ class BinaryNinjaBridge:
                     affected.append(fn)
         return affected
 
-    def _affected_type_names(self, operations: list[dict[str, Any]]) -> list[str]:
+    def _affected_type_names(self, bv, operations: list[dict[str, Any]]) -> list[str]:
         names: list[str] = []
         seen: set[str] = set()
         for op in operations:
-            type_name = op.get("struct_name")
-            if not type_name:
-                continue
-            text = str(type_name)
-            if text not in seen:
-                seen.add(text)
-                names.append(text)
+            for type_name in self._operation_type_names(bv, op):
+                if type_name not in seen:
+                    seen.add(type_name)
+                    names.append(type_name)
         return names
 
     def _render_type_layout(self, type_obj) -> str:
@@ -903,7 +967,7 @@ class BinaryNinjaBridge:
 
     def _capture_type_snapshots(self, bv, operations: list[dict[str, Any]]):
         snapshots: dict[str, dict[str, Any]] = {}
-        for type_name in self._affected_type_names(operations):
+        for type_name in self._affected_type_names(bv, operations):
             type_obj = bv.get_type_by_name(type_name)
             if type_obj is None:
                 continue
@@ -1020,6 +1084,8 @@ class BinaryNinjaBridge:
             return self._op_struct_field_delete(bv, op)
         if kind == "struct_replace":
             return self._op_struct_replace(bv, op)
+        if kind == "types_declare":
+            return self._op_types_declare(bv, op)
         if kind == "patch_bytes":
             return self._op_patch_bytes(bv, op)
         raise ValueError(f"Unsupported batch operation: {kind}")
@@ -1173,8 +1239,20 @@ class BinaryNinjaBridge:
         }
 
     def _op_struct_replace(self, bv, op: dict[str, Any]):
-        bv.define_user_type(None, str(op["declaration"]))
-        return {"op": "struct_replace"}
+        named_types = self._parse_declared_types(bv, str(op["declaration"]))
+        defined_types = {}
+        for name, type_obj in named_types:
+            bv.define_user_type(name, type_obj)
+            defined_types[str(name)] = str(type_obj)
+        return {"op": "struct_replace", "defined_types": defined_types}
+
+    def _op_types_declare(self, bv, op: dict[str, Any]):
+        named_types = self._parse_declared_types(bv, str(op["declaration"]))
+        defined_types = {}
+        for name, type_obj in named_types:
+            bv.define_user_type(name, type_obj)
+            defined_types[str(name)] = str(type_obj)
+        return {"op": "types_declare", "defined_types": defined_types, "count": len(defined_types)}
 
     def _op_patch_bytes(self, bv, op: dict[str, Any]):
         address = _parse_address(op["address"])

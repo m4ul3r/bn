@@ -77,6 +77,20 @@ def _implicit_target(args: argparse.Namespace) -> str:
     raise BridgeError("This command requires --target when multiple targets are open")
 
 
+def _resolve_target(
+    args: argparse.Namespace,
+    *,
+    require_target: bool,
+    allow_implicit_target: bool = False,
+) -> str | None:
+    target = getattr(args, "target", None)
+    if require_target and not target:
+        if allow_implicit_target:
+            return _implicit_target(args)
+        raise BridgeError("This command requires --target")
+    return target
+
+
 def _call(
     args: argparse.Namespace,
     op: str,
@@ -84,27 +98,81 @@ def _call(
     *,
     require_target: bool,
     allow_implicit_target: bool = False,
+    text_renderer: Callable[[Any], str] | None = None,
     stem: str,
 ) -> int:
-    target = getattr(args, "target", None)
-    if require_target and not target:
-        if allow_implicit_target:
-            target = _implicit_target(args)
-        else:
-            raise BridgeError("This command requires --target")
+    target = _resolve_target(
+        args,
+        require_target=require_target,
+        allow_implicit_target=allow_implicit_target,
+    )
     response = send_request(
         op,
         params=params,
         target=target,
         instance_pid=getattr(args, "instance", None),
     )
+    result = response["result"]
+    if text_renderer is not None and args.format in {"text", "md"}:
+        result = text_renderer(result)
     _render_result(
-        response["result"],
+        result,
         fmt=args.format,
         out_path=args.out,
         stem=stem,
     )
     return 0
+
+
+def _text_field(field: str) -> Callable[[Any], str]:
+    def render(value: Any) -> str:
+        if isinstance(value, dict):
+            text = value.get(field)
+            if isinstance(text, str):
+                return text
+        return str(value)
+
+    return render
+
+
+def _render_function_info_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return str(value)
+
+    function = value.get("function") or {}
+    lines = [
+        f"{function.get('name', '<unknown>')} @ {function.get('address', '<unknown>')}",
+        str(value.get("prototype", "")),
+        "",
+        "parameters:",
+    ]
+    parameters = list(value.get("parameters") or [])
+    if parameters:
+        for item in parameters:
+            lines.append(f"- {item['type']} {item['name']} (storage={item['storage']})")
+    else:
+        lines.append("- none")
+
+    lines.extend(["", "locals:"])
+    locals_only = list(value.get("locals") or [])
+    if locals_only:
+        for item in locals_only:
+            lines.append(f"- {item['type']} {item['name']} (storage={item['storage']})")
+    else:
+        lines.append("- none")
+    return "\n".join(lines)
+
+
+def _render_type_info_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return str(value)
+    layout = value.get("layout")
+    if isinstance(layout, str) and layout:
+        return layout
+    decl = value.get("decl")
+    if isinstance(decl, str) and decl:
+        return decl
+    return json.dumps(value, indent=2, sort_keys=True)
 
 
 def _doctor(args: argparse.Namespace) -> int:
@@ -214,12 +282,24 @@ def _function_search(args: argparse.Namespace) -> int:
     )
 
 
+def _function_info(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "function_info",
+        {"identifier": args.identifier},
+        require_target=True,
+        text_renderer=_render_function_info_text,
+        stem="function-info",
+    )
+
+
 def _decompile(args: argparse.Namespace) -> int:
     return _call(
         args,
         "decompile",
         {"identifier": args.identifier},
         require_target=True,
+        text_renderer=_text_field("text"),
         stem="decompile",
     )
 
@@ -230,6 +310,7 @@ def _il(args: argparse.Namespace) -> int:
         "il",
         {"identifier": args.identifier, "view": args.view, "ssa": bool(args.ssa)},
         require_target=True,
+        text_renderer=_text_field("text"),
         stem="il",
     )
 
@@ -240,6 +321,7 @@ def _disasm(args: argparse.Namespace) -> int:
         "disasm",
         {"identifier": args.identifier},
         require_target=True,
+        text_renderer=_text_field("text"),
         stem="disasm",
     )
 
@@ -261,6 +343,45 @@ def _types(args: argparse.Namespace) -> int:
         {"query": args.query, "offset": args.offset, "limit": args.limit},
         require_target=True,
         stem="types",
+    )
+
+
+def _types_show(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "type_info",
+        {
+            "type_name": args.type_name,
+            "require_struct": bool(getattr(args, "require_struct", False)),
+        },
+        require_target=True,
+        text_renderer=_render_type_info_text,
+        stem="type-show",
+    )
+
+
+def _types_declare(args: argparse.Namespace) -> int:
+    if args.file is not None:
+        if not args.file.exists():
+            raise BridgeError(f"Declaration file not found: {args.file}")
+        declaration = args.file.read_text(encoding="utf-8")
+    elif args.stdin:
+        declaration = sys.stdin.read()
+    elif args.declaration:
+        declaration = args.declaration
+    else:
+        raise BridgeError("Provide a declaration string, --file, or --stdin")
+
+    return _call(
+        args,
+        "types_declare",
+        {
+            "declaration": declaration,
+            "preview": bool(args.preview),
+        },
+        require_target=True,
+        allow_implicit_target=True,
+        stem="types-declare",
     )
 
 
@@ -447,6 +568,20 @@ def _struct_field_set(args: argparse.Namespace) -> int:
     )
 
 
+def _struct_show(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "type_info",
+        {
+            "type_name": args.struct_name,
+            "require_struct": True,
+        },
+        require_target=True,
+        text_renderer=_render_type_info_text,
+        stem="struct-show",
+    )
+
+
 def _struct_field_rename(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -567,6 +702,11 @@ def build_parser() -> argparse.ArgumentParser:
     _add_paged_args(function_search)
     function_search.add_argument("query")
     function_search.set_defaults(handler=_function_search)
+    function_info = function_sub.add_parser("info", help="Show function prototype and variables")
+    _common_io_options(function_info)
+    _target_option(function_info, required=False, default="active")
+    function_info.add_argument("identifier")
+    function_info.set_defaults(handler=_function_info)
 
     decompile = subparsers.add_parser("decompile", help="Decompile a function")
     _common_io_options(decompile)
@@ -600,6 +740,20 @@ def build_parser() -> argparse.ArgumentParser:
     _add_paged_args(types)
     types.add_argument("--query")
     types.set_defaults(handler=_types)
+    types_sub = types.add_subparsers(dest="types_command")
+    types_show = types_sub.add_parser("show", help="Show one type")
+    _common_io_options(types_show)
+    _target_option(types_show, required=False, default="active")
+    types_show.add_argument("type_name")
+    types_show.set_defaults(handler=_types_show)
+    types_declare = types_sub.add_parser("declare", help="Import C declarations as user types")
+    _common_io_options(types_declare)
+    _target_option(types_declare, required=False)
+    types_declare.add_argument("--preview", action="store_true")
+    types_declare.add_argument("--file", type=Path, help="Read declarations from a file")
+    types_declare.add_argument("--stdin", action="store_true", help="Read declarations from stdin")
+    types_declare.add_argument("declaration", nargs="?")
+    types_declare.set_defaults(handler=_types_declare)
 
     strings = subparsers.add_parser("strings", help="List or search strings")
     _common_io_options(strings)
@@ -705,6 +859,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     struct = subparsers.add_parser("struct", help="Field-first structure editing")
     struct_sub = struct.add_subparsers(dest="struct_command")
+    struct_show = struct_sub.add_parser("show", help="Show one struct layout")
+    _common_io_options(struct_show)
+    _target_option(struct_show, required=False, default="active")
+    struct_show.add_argument("struct_name")
+    struct_show.set_defaults(handler=_struct_show)
     field = struct_sub.add_parser("field", help="Operate on struct fields")
     field_sub = field.add_subparsers(dest="struct_field_command")
     field_set = field_sub.add_parser("set", help="Set or replace a field")

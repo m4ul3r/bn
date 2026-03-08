@@ -102,6 +102,7 @@ bn target info --target active
 
 bn function list --target active
 bn function search attachment --target active
+bn function info end_track_attachment_follow_state --target active
 
 bn decompile end_track_attachment_follow_state --target active
 bn il end_track_attachment_follow_state --target active
@@ -109,6 +110,8 @@ bn disasm end_track_attachment_follow_state --target active
 bn xrefs end_track_attachment_follow_state --target active
 
 bn types --target active --query Player
+bn types show Player --target active --format text
+bn struct show Player --target active --format text
 bn strings --target active --query follow
 bn imports --target active
 bn data --target active
@@ -155,13 +158,14 @@ bn comment set --target active --address 0x401000 "interesting branch" --preview
 bn proto set --target active sub_401000 "int __cdecl player_update(Player* self)" --preview
 bn local rename --target active sub_401000 var_14 speed --preview
 bn local retype --target active sub_401000 var_14 float --preview
+bn types declare "typedef struct Player { int hp; } Player;" --preview
 bn struct field set --target active Player 0x308 movement_flag_selector uint32_t --preview
 bn patch bytes --target active 0x401000 "90 90" --preview
 ```
 
 Preview mode applies the change, refreshes analysis, captures affected decompile diffs, and then reverts the mutation.
 
-For struct mutations, preview results also include `affected_types` with before/after layouts and a unified diff. If a field edit is already identical, the result is marked with `changed: false` and a `No effective change detected` message.
+For declaration and struct mutations, preview results also include `affected_types` with before/after layouts and a unified diff. If a field edit is already identical, the result is marked with `changed: false` and a `No effective change detected` message.
 
 ## Batch Manifests
 
