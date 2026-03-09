@@ -149,6 +149,21 @@ result = {"functions": len(list(bv.functions))}
 PY
 ```
 
+For multiline snippets, prefer `--stdin` or `--script`. `--code` receives one shell argument, so `"\n"` inside ordinary double quotes stays a literal backslash-`n` pair instead of becoming a newline.
+
+```bash
+bn py exec --stdin --target SnailMail_unwrapped.exe.bndb <<'PY'
+out = []
+for f in bv.functions:
+    if 0x416000 <= f.start < 0x41C000:
+        out.append((f.start, f.symbol.short_name))
+out.sort()
+print("\n".join(f"{addr:#x} {name}" for addr, name in out))
+PY
+
+bn py exec --code $'print(hex(bv.entry_point))\nresult = {"functions": len(list(bv.functions))}'
+```
+
 The `py exec` environment includes:
 
 - `bn`
