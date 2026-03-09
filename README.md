@@ -9,13 +9,6 @@
 - Apply mutations with `--preview`, capture decompile diffs, and verify the live post-state before reporting success.
 - Emit structured `json` or `ndjson` output, auto-spill large results to files, and return token counts so agents can budget context intelligently.
 
-It splits into two parts:
-
-- a normal Python CLI that you can run from your shell or agent tool harness
-- a Binary Ninja GUI plugin that owns all Binary Ninja API access
-
-The CLI talks to the GUI plugin over a local Unix socket. Because the Binary Ninja side runs as a GUI plugin, it works with a personal license and does not require a commercial headless license.
-
 ## Install
 
 Recommended setup: install the CLI, the Binary Ninja companion plugin, and the bundled Codex skill.
@@ -34,7 +27,7 @@ bn plugin install
 
 That links [`plugin/bn_agent_bridge`](/Users/banteg/dev/banteg/bn/plugin/bn_agent_bridge) into your Binary Ninja plugins directory.
 
-Install the bundled Codex skill as part of the default agent setup:
+Install the bundled Codex skill:
 
 ```bash
 bn skill install
@@ -46,12 +39,12 @@ If the plugin code changes, reload Binary Ninja Python plugins or restart Binary
 
 ## How It Works
 
+- `bn` has two parts:
+  - a normal Python CLI that you can run from your shell or agent tool harness
+  - a Binary Ninja GUI plugin that owns all Binary Ninja API access
 - The plugin creates one fixed bridge socket and one fixed registry file.
-- The CLI discovers that bridge, connects to it, and forwards commands.
-- Read commands return structured data.
-- Large outputs can spill to artifacts with `--out`, and some large stdout responses auto-spill to a temp directory with token-count metadata.
-- Mutations support `--preview` so you can inspect the effect before making a permanent change.
-- Mutations verify live Binary Ninja post-state before they report success.
+- The CLI discovers that bridge, connects to it, and forwards commands into the live GUI session.
+- Because the Binary Ninja side runs as a GUI plugin, it works with a personal license and does not require a commercial headless license.
 
 ## Quick Start
 
@@ -190,7 +183,7 @@ Stdout and `result` are both returned. If `result` is not JSON-serializable, `bn
 
 ## Mutation Commands
 
-Mutations can omit `--target` when exactly one BinaryView is open. If multiple targets are open, pass an explicit selector.
+Mutations follow the same target-selection rules as other target-specific commands.
 
 Examples:
 
