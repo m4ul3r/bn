@@ -9,36 +9,39 @@ Use this skill when the user wants reverse-engineering work against an already-o
 
 ## Workflow
 
-1. Check bridge state first:
+1. Start with target discovery:
 
 ```bash
-bn doctor
 bn target list
+bn doctor
 ```
+
+Use `bn doctor` when bridge state is unclear or `bn target list` does not show what you expect.
 
 2. Pick a target:
 - If there is exactly one open BinaryView, target-scoped commands can omit `--target` entirely.
-- Do not repeat `--target active` in normal examples or routine usage.
-- Otherwise prefer the `selector` field from `bn target list`.
-- If multiple targets are open, pass an explicit `--target`.
+- If multiple targets are open, pass `--target <selector>` from `bn target list`.
+- Use `--target active` only when you explicitly mean the GUI-selected target.
 
-3. Use `bn` directly when it is on PATH.
-- If running from this repo without the global tool installed, use `uv run bn`.
-
-4. Pick the right output mode:
-- Interactive read commands default to `text`.
+3. Pick the right output mode:
+- Read commands default to `text`.
 - Mutation, preview, setup, and export commands default to `json`.
-- Add `--format json` when you need stable fields for tooling or follow-on automation.
+- Other options: `--format json`, `--format ndjson`, `--out <path>`.
+
+`--out` writes rendered output to the path and usually returns a compact JSON envelope. `bn bundle function` writes the artifact from inside the bridge and returns the envelope.
 
 ## High-Value Read Commands
 
 ```bash
+bn target list
+bn target info
 bn function list
+bn function list --min-address 0x401000 --max-address 0x40ffff
 bn function search attachment
+bn function search --regex 'attach|detach|follow'
 bn function info sample_track_floor_height_at_position
 bn proto get sample_track_floor_height_at_position
 bn local list sample_track_floor_height_at_position
-bn refresh
 bn decompile sample_track_floor_height_at_position
 bn il sample_track_floor_height_at_position
 bn disasm sample_track_floor_height_at_position
@@ -48,10 +51,21 @@ bn comment get --address 0x401000
 bn types --query Player
 bn types show Player
 bn struct show Player
-bn types declare --file /path/to/win32_min.h --preview
 bn strings --query follow
+bn imports
+```
+
+`bn function search` is case-insensitive substring matching by default. Add `--regex` when you need regular expressions. `bn function list` and `bn function search` both accept `--min-address` and `--max-address`.
+
+## Bundles
+
+Use bundles when you want a reusable artifact instead of pasting long output into context:
+
+```bash
 bn bundle function sample_track_floor_height_at_position --out /tmp/floor.json
 ```
+
+With `--out`, the CLI returns a JSON envelope for the written artifact instead of dumping the whole bundle to stdout.
 
 ## Python Escape Hatch
 
@@ -88,6 +102,12 @@ If you really need inline multiline code without a heredoc, use ANSI-C quoting i
 bn py exec --code $'print(hex(bv.entry_point))\nresult = {"functions": len(list(bv.functions))}'
 ```
 
+The `py exec` environment includes:
+- `bn`
+- `binaryninja`
+- `bv`
+- `result`
+
 `py exec` always returns `stdout` and `result`. If `result` is not JSON-serializable, the CLI returns `repr(result)` plus a warning instead of silently flattening it.
 
 ## Mutation Workflow
@@ -103,6 +123,8 @@ bn proto get sub_401000
 bn local list sub_401000
 bn proto set sub_401000 "int __cdecl player_update(Player* self)" --preview
 ```
+
+Preview mode applies the change, refreshes analysis, captures affected decompile diffs, and then reverts the mutation.
 
 For struct previews, inspect:
 - `results`
@@ -125,6 +147,8 @@ Key result statuses:
 - `unsupported`
 - `verification_failed`
 
+When verification fails, JSON output also includes the requested and observed state for the failed operation.
+
 If you need to force BN to recalculate presentation after a type change, run:
 
 ```bash
@@ -140,7 +164,4 @@ bn refresh
 - Treat `bn decompile` as the HLIL-text convenience lane; typed layouts live in `bn types show ...` and `bn struct show ...`.
 - Treat `bn types show ...` and `bn struct show ...` as the authoritative typed layouts when decompile output lags behind type recovery.
 - Keep writes sequential when you care about trustworthy preview diffs. Read-side concurrency is much safer than write-side concurrency.
-- Use `--out` when output may be long or when you want a stable artifact.
-- Use `bn target list` again if target selection is ambiguous.
-- If multiple targets are open, be explicit and pass `--target <selector>`.
-- If `bn target list` is empty, the Binary Ninja plugin is not live. Check `bn plugin install`, then reload Binary Ninja plugins or restart Binary Ninja.
+- If `bn target list` is empty, make sure Binary Ninja is open with a binary or `.bndb` loaded. If it is, check `bn plugin install`, then reload Binary Ninja plugins or restart Binary Ninja.
