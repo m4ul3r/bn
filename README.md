@@ -1,15 +1,24 @@
 # bn
 
-`bn` is an agent-friendly Binary Ninja CLI.
+`bn` is a coding agent-first CLI for Binary Ninja. It gives a shell session or tool-calling agent stable commands, structured output, and access to the same live Binary Ninja database you already have open in the GUI.
+
+## Headline Features
+
+- Query live Binary Ninja state from the shell: targets, functions, decompile text, IL, disassembly, xrefs, types, strings, imports, and reusable bundles.
+- Execute Python inside the Binary Ninja process instead of maintaining a separate headless workflow.
+- Apply mutations with `--preview`, capture decompile diffs, and verify the live post-state before reporting success.
+- Emit structured `json` or `ndjson` output, auto-spill large results to files, and return token counts so agents can budget context intelligently.
 
 It splits into two parts:
 
-- a normal Python CLI that you can run from your shell
+- a normal Python CLI that you can run from your shell or agent tool harness
 - a Binary Ninja GUI plugin that owns all Binary Ninja API access
 
-The CLI talks to the GUI plugin over a local Unix socket. This avoids the headless `binaryninja` limitations in this environment and makes it easy to spill large results to files instead of truncating them in a tool harness.
+The CLI talks to the GUI plugin over a local Unix socket. Because the Binary Ninja side runs as a GUI plugin, it works with a personal license and does not require a commercial headless license.
 
 ## Install
+
+Recommended setup: install the CLI, the Binary Ninja companion plugin, and the bundled Codex skill.
 
 Install the CLI on your PATH:
 
@@ -25,7 +34,7 @@ bn plugin install
 
 That links [`plugin/bn_agent_bridge`](/Users/banteg/dev/banteg/bn/plugin/bn_agent_bridge) into your Binary Ninja plugins directory.
 
-Install the bundled Codex skill:
+Install the bundled Codex skill as part of the default agent setup:
 
 ```bash
 bn skill install
@@ -40,11 +49,9 @@ If the plugin code changes, reload Binary Ninja Python plugins or restart Binary
 - The plugin creates one fixed bridge socket and one fixed registry file.
 - The CLI discovers that bridge, connects to it, and forwards commands.
 - Read commands return structured data.
-- Large outputs can spill to artifacts with `--out`, and some large stdout responses auto-spill to a temp directory.
+- Large outputs can spill to artifacts with `--out`, and some large stdout responses auto-spill to a temp directory with token-count metadata.
 - Mutations support `--preview` so you can inspect the effect before making a permanent change.
 - Mutations verify live Binary Ninja post-state before they report success.
-
-This version assumes one Binary Ninja/plugin instance per machine, which keeps discovery simple.
 
 ## Quick Start
 
@@ -102,7 +109,7 @@ bn function list --format ndjson
 bn decompile sample_track_floor_height_at_position --out /tmp/floor.json
 ```
 
-If `--out` is set, the command writes the rendered result to that path and prints a compact JSON envelope with the artifact path, byte size, token count, tokenizer, hash, and summary.
+If `--out` is set, the command writes the rendered result to that path and prints a compact JSON envelope with the artifact path, byte size, token count, tokenizer, hash, and summary. Agents can use that envelope to decide whether to read the full artifact, keep a summary, or defer loading it into context.
 
 The only exception is `bn bundle function`, which writes the bundle artifact from inside the bridge and prints the envelope back to the CLI.
 
