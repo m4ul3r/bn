@@ -137,6 +137,11 @@ def _send_request_to_instance(
             time.sleep(0.05 * (attempt + 1))
 
     if last_error is not None and not chunks:
+        if isinstance(last_error, TimeoutError):
+            raise BridgeError(
+                f"Timed out waiting for Binary Ninja bridge pid {instance.pid} at {instance.socket_path} "
+                f"after {timeout:.1f}s"
+            ) from last_error
         raise BridgeError(
             f"Failed to contact Binary Ninja bridge pid {instance.pid} at {instance.socket_path}: {last_error}"
         ) from last_error

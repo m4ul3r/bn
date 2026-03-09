@@ -456,6 +456,39 @@ def test_search_functions_rejects_invalid_regex(monkeypatch):
         instance._search_functions("active", "(", regex=True)
 
 
+def test_bridge_handler_swallows_broken_pipe(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    warnings = []
+
+    class _BrokenWriter:
+        def write(self, data):
+            raise BrokenPipeError(32, "Broken pipe")
+
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.wfile = _BrokenWriter()
+    monkeypatch.setattr(bridge.bn, "log_warn", lambda message: warnings.append(message))
+
+    handler._write_response(b"{}", op="xrefs", request_id="req-123")
+
+    assert warnings == [
+        "BN Agent Bridge client disconnected before response could be delivered (op=xrefs, id=req-123)"
+    ]
+
+
+def test_bridge_handler_reraises_unrelated_write_errors(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+
+    class _FailingWriter:
+        def write(self, data):
+            raise OSError(5, "Input/output error")
+
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.wfile = _FailingWriter()
+
+    with pytest.raises(OSError, match="Input/output error"):
+        handler._write_response(b"{}", op="xrefs")
+
+
 def test_py_exec_non_serializable_result_falls_back_to_repr(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
