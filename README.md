@@ -140,10 +140,12 @@ bn bundle function end_track_attachment_follow_state --out /tmp/end_track_attach
 
 Run Python inside the Binary Ninja process. This is a first-class workflow for one-off inspection and BN-native scripting, not just a fallback:
 
-```bash
-bn py exec --code "print(hex(bv.entry_point)); result = {'functions': len(list(bv.functions))}"
+If exactly one BinaryView is open, you can omit `--target`. If multiple targets are open, pass `--target <selector>` from `bn target list`.
 
-bn py exec --stdin <<'PY'
+```bash
+bn py exec --target <selector> --code "print(hex(bv.entry_point)); result = {'functions': len(list(bv.functions))}"
+
+bn py exec --target <selector> --stdin <<'PY'
 print(hex(bv.entry_point))
 result = {"functions": len(list(bv.functions))}
 PY
@@ -152,7 +154,7 @@ PY
 For multiline snippets, prefer `--stdin` or `--script`. `--code` receives one shell argument, so `"\n"` inside ordinary double quotes stays a literal backslash-`n` pair instead of becoming a newline.
 
 ```bash
-bn py exec --stdin --target SnailMail_unwrapped.exe.bndb <<'PY'
+bn py exec --target <selector> --stdin <<'PY'
 out = []
 for f in bv.functions:
     if 0x416000 <= f.start < 0x41C000:
@@ -161,7 +163,7 @@ out.sort()
 print("\n".join(f"{addr:#x} {name}" for addr, name in out))
 PY
 
-bn py exec --code $'print(hex(bv.entry_point))\nresult = {"functions": len(list(bv.functions))}'
+bn py exec --target <selector> --code $'print(hex(bv.entry_point))\nresult = {"functions": len(list(bv.functions))}'
 ```
 
 The `py exec` environment includes:
