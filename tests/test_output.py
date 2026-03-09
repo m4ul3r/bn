@@ -27,13 +27,14 @@ def test_write_output_renders_small_payload_without_spill(tmp_path, monkeypatch)
 
 def test_write_output_spills_large_payload(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    payload = {"data": [f"item-{index:04d}" for index in range(1000)]}
 
     rendered = write_output(
-        {"data": "x" * 100_000},
+        payload,
         fmt="json",
         out_path=None,
         stem="large",
-        spill_threshold=256,
+        spill_token_limit=256,
     )
 
     envelope = json.loads(rendered)
@@ -46,17 +47,34 @@ def test_write_output_spills_large_payload(tmp_path, monkeypatch):
 
 def test_write_output_spills_text_payload_with_txt_suffix(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    payload = "\n".join(f"line {index} with distinctive content" for index in range(1000))
 
     rendered = write_output(
-        "x" * 100_000,
+        payload,
         fmt="text",
         out_path=None,
         stem="large-text",
-        spill_threshold=256,
+        spill_token_limit=256,
     )
 
     envelope = json.loads(rendered)
     assert envelope["artifact_path"].endswith(".txt")
+
+
+def test_write_output_uses_token_limit_not_byte_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    payload = "x" * 1000
+    token_limit = _token_count(payload + "\n") + 1
+
+    rendered = write_output(
+        payload,
+        fmt="text",
+        out_path=None,
+        stem="byte-heavy",
+        spill_token_limit=token_limit,
+    )
+
+    assert rendered == payload + "\n"
 
 
 def test_write_output_reports_exact_tokens_for_explicit_out_path(tmp_path, monkeypatch):
