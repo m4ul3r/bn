@@ -13,6 +13,8 @@ from .output import write_output
 from .paths import plugin_install_dir, plugin_source_dir
 from .transport import BridgeError, list_instances, send_request
 
+FAILED_MUTATION_STATUSES = {"unsupported", "verification_failed"}
+
 
 def _package_version() -> str:
     try:
@@ -85,6 +87,17 @@ def _resolve_target(
     return target
 
 
+def _mutation_exit_code(result: Any) -> int:
+    if not isinstance(result, dict):
+        return 0
+    results = list(result.get("results") or [])
+    if any(isinstance(item, dict) and item.get("status") in FAILED_MUTATION_STATUSES for item in results):
+        return 3
+    if result.get("success") is False:
+        return 3
+    return 0
+
+
 def _call(
     args: argparse.Namespace,
     op: str,
@@ -97,6 +110,7 @@ def _call(
     page_offset: int = 0,
     page_label: str | None = None,
     stem: str,
+    result_exit_code: Callable[[Any], int] | None = None,
 ) -> int:
     request_params = dict(params or {})
     effective_page_limit = None
@@ -115,6 +129,7 @@ def _call(
         target=target,
     )
     result = response["result"]
+    exit_code = result_exit_code(result) if result_exit_code is not None else 0
     if effective_page_limit is not None and isinstance(result, list) and len(result) > effective_page_limit:
         result = result[:effective_page_limit]
         label = page_label or op
@@ -131,7 +146,7 @@ def _call(
         out_path=args.out,
         stem=stem,
     )
-    return 0
+    return exit_code
 
 
 def _render_fallback_text(value: Any) -> str:
@@ -238,6 +253,15 @@ def _render_comment_text(value: Any) -> str:
     comment = value.get("comment")
     if isinstance(comment, str):
         return comment
+    return _render_fallback_text(value)
+
+
+def _render_refresh_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    target = value.get("target")
+    if isinstance(target, dict):
+        return f"refreshed: true\n\n{_render_target_summary(target)}"
     return _render_fallback_text(value)
 
 
@@ -471,17 +495,30 @@ def _render_mutation_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
 
-    lines = [f"preview: {bool(value.get('preview'))}", "", "results:"]
+    lines = [
+        f"preview: {bool(value.get('preview'))}",
+        f"success: {bool(value.get('success', True))}",
+        f"committed: {bool(value.get('committed', False))}",
+    ]
+    if value.get("message"):
+        lines.append(f"message: {value['message']}")
+    lines.extend(["", "results:"])
     results = list(value.get("results") or [])
     if results:
         for item in results:
             if isinstance(item, dict):
                 summary = _format_operation_result(item)
+                if item.get("status"):
+                    summary += f" [status={item['status']}]"
                 if "changed" in item:
                     summary += f" [changed={bool(item['changed'])}]"
                 if item.get("message"):
                     summary += f" ({item['message']})"
                 lines.append("- " + summary)
+                if item.get("requested"):
+                    lines.append("  requested: " + json.dumps(item["requested"], sort_keys=True))
+                if item.get("observed"):
+                    lines.append("  observed: " + json.dumps(item["observed"], sort_keys=True))
             else:
                 lines.append("- " + _render_fallback_text(item))
     else:
@@ -642,6 +679,18 @@ def _target_info(args: argparse.Namespace) -> int:
     )
 
 
+def _refresh(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "refresh",
+        {},
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_refresh_text,
+        stem="refresh",
+    )
+
+
 def _function_list(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -789,6 +838,7 @@ def _types_declare(args: argparse.Namespace) -> int:
         allow_implicit_target=True,
         text_renderer=_render_mutation_text,
         stem="types-declare",
+        result_exit_code=_mutation_exit_code,
     )
 
 
@@ -893,6 +943,7 @@ def _symbol_rename(args: argparse.Namespace) -> int:
         allow_implicit_target=True,
         text_renderer=_render_mutation_text,
         stem="symbol-rename",
+        result_exit_code=_mutation_exit_code,
     )
 
 
@@ -910,6 +961,7 @@ def _comment_set(args: argparse.Namespace) -> int:
         allow_implicit_target=True,
         text_renderer=_render_mutation_text,
         stem="comment-set",
+        result_exit_code=_mutation_exit_code,
     )
 
 
@@ -941,6 +993,7 @@ def _comment_delete(args: argparse.Namespace) -> int:
         allow_implicit_target=True,
         text_renderer=_render_mutation_text,
         stem="comment-delete",
+        result_exit_code=_mutation_exit_code,
     )
 
 
@@ -957,6 +1010,7 @@ def _proto_set(args: argparse.Namespace) -> int:
         allow_implicit_target=True,
         text_renderer=_render_mutation_text,
         stem="prototype-set",
+        result_exit_code=_mutation_exit_code,
     )
 
 
@@ -974,6 +1028,7 @@ def _local_rename(args: argparse.Namespace) -> int:
         allow_implicit_target=True,
         text_renderer=_render_mutation_text,
         stem="local-rename",
+        result_exit_code=_mutation_exit_code,
     )
 
 
@@ -991,6 +1046,7 @@ def _local_retype(args: argparse.Namespace) -> int:
         allow_implicit_target=True,
         text_renderer=_render_mutation_text,
         stem="local-retype",
+        result_exit_code=_mutation_exit_code,
     )
 
 
@@ -1010,6 +1066,7 @@ def _struct_field_set(args: argparse.Namespace) -> int:
         allow_implicit_target=True,
         text_renderer=_render_mutation_text,
         stem="struct-field-set",
+        result_exit_code=_mutation_exit_code,
     )
 
 
@@ -1041,6 +1098,7 @@ def _struct_field_rename(args: argparse.Namespace) -> int:
         allow_implicit_target=True,
         text_renderer=_render_mutation_text,
         stem="struct-field-rename",
+        result_exit_code=_mutation_exit_code,
     )
 
 
@@ -1057,6 +1115,7 @@ def _struct_field_delete(args: argparse.Namespace) -> int:
         allow_implicit_target=True,
         text_renderer=_render_mutation_text,
         stem="struct-field-delete",
+        result_exit_code=_mutation_exit_code,
     )
 
 
@@ -1072,6 +1131,7 @@ def _struct_replace(args: argparse.Namespace) -> int:
         allow_implicit_target=True,
         text_renderer=_render_mutation_text,
         stem="struct-replace",
+        result_exit_code=_mutation_exit_code,
     )
 
 
@@ -1088,6 +1148,7 @@ def _patch_bytes(args: argparse.Namespace) -> int:
         allow_implicit_target=True,
         text_renderer=_render_mutation_text,
         stem="patch-bytes",
+        result_exit_code=_mutation_exit_code,
     )
 
 
@@ -1102,6 +1163,7 @@ def _batch_apply(args: argparse.Namespace) -> int:
         require_target=False,
         text_renderer=_render_mutation_text,
         stem="batch-apply",
+        result_exit_code=_mutation_exit_code,
     )
 
 
@@ -1138,6 +1200,11 @@ def build_parser() -> argparse.ArgumentParser:
     _common_io_options(target_info)
     _target_option(target_info, required=False)
     target_info.set_defaults(handler=_target_info)
+
+    refresh = subparsers.add_parser("refresh", help="Refresh analysis for the selected target")
+    _common_io_options(refresh)
+    _target_option(refresh, required=False)
+    refresh.set_defaults(handler=_refresh)
 
     function = subparsers.add_parser("function", help="Function discovery helpers")
     function_sub = function.add_subparsers(dest="function_command")

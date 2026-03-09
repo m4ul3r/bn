@@ -50,6 +50,95 @@ def _json_response(*, ok: bool, result: Any = None, error: str | None = None) ->
     return {"ok": ok, "result": result, "error": error}
 
 
+class OperationFailure(RuntimeError):
+    def __init__(
+        self,
+        status: str,
+        message: str,
+        *,
+        requested: dict[str, Any] | None = None,
+        observed: dict[str, Any] | None = None,
+    ):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+        self.requested = requested or {}
+        self.observed = observed or {}
+
+
+class _ReadWriteLock:
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._readers = 0
+        self._writer = False
+
+    @contextlib.contextmanager
+    def read(self):
+        with self._condition:
+            while self._writer:
+                self._condition.wait()
+            self._readers += 1
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._readers -= 1
+                if self._readers == 0:
+                    self._condition.notify_all()
+
+    @contextlib.contextmanager
+    def write(self):
+        with self._condition:
+            while self._writer or self._readers:
+                self._condition.wait()
+            self._writer = True
+        try:
+            yield
+        finally:
+            with self._condition:
+                self._writer = False
+                self._condition.notify_all()
+
+
+READ_LOCKED_OPS = {
+    "function_info",
+    "list_functions",
+    "search_functions",
+    "decompile",
+    "il",
+    "disasm",
+    "xrefs",
+    "field_xrefs",
+    "types",
+    "type_info",
+    "strings",
+    "imports",
+    "data",
+    "bundle_function",
+    "bundle_corpus",
+    "get_comment",
+}
+
+
+WRITE_LOCKED_OPS = {
+    "py_exec",
+    "rename_symbol",
+    "set_comment",
+    "delete_comment",
+    "set_prototype",
+    "local_rename",
+    "local_retype",
+    "struct_field_set",
+    "struct_field_rename",
+    "struct_field_delete",
+    "struct_replace",
+    "types_declare",
+    "patch_bytes",
+    "batch_apply",
+    "refresh",
+}
+
+
 def _run_on_main_thread(func):
     if is_main_thread():
         return func()
@@ -364,6 +453,7 @@ class BinaryNinjaBridge:
         self.registry_path = _registry_path()
         self._server: ThreadedUnixServer | None = None
         self._thread: threading.Thread | None = None
+        self._target_lock = _ReadWriteLock()
 
     def start(self):  # pragma: no cover - requires GUI runtime
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
@@ -404,7 +494,13 @@ class BinaryNinjaBridge:
         params = payload.get("params") or {}
         target = payload.get("target")
         try:
-            result = self._dispatch_on_main(op, params, target)
+            lock = contextlib.nullcontext()
+            if op in WRITE_LOCKED_OPS:
+                lock = self._target_lock.write()
+            elif op in READ_LOCKED_OPS:
+                lock = self._target_lock.read()
+            with lock:
+                result = self._dispatch_on_main(op, params, target)
             return _json_response(ok=True, result=result)
         except Exception as exc:
             return _json_response(ok=False, error=f"{type(exc).__name__}: {exc}")
@@ -416,6 +512,8 @@ class BinaryNinjaBridge:
             return self.targets.refresh()
         if op == "target_info":
             return self._target_info(params.get("selector") or target)
+        if op == "refresh":
+            return self._refresh(target)
 
         if op == "list_functions":
             return self._list_functions(target, params.get("offset", 0), params.get("limit", 100))
@@ -544,6 +642,14 @@ class BinaryNinjaBridge:
             "entry_point": hex(getattr(bv, "entry_point", 0)),
         }
 
+    def _refresh(self, selector: str | None):
+        bv = self._resolve_view(selector)
+        bv.update_analysis_and_wait()
+        return {
+            "refreshed": True,
+            "target": self._target_info(selector),
+        }
+
     def _resolve_view(self, selector: str | None):
         return self.targets.resolve(selector)
 
@@ -557,12 +663,18 @@ class BinaryNinjaBridge:
             pass
 
         text = str(identifier)
-        for fn in list(bv.functions):
-            if fn.name == text:
-                return fn
-        for fn in list(bv.functions):
-            if fn.name.lower() == text.lower():
-                return fn
+        exact = self._find_functions_by_name(bv, text, case_sensitive=True)
+        if len(exact) == 1:
+            return exact[0]
+        if len(exact) > 1:
+            raise RuntimeError(f"Ambiguous function identifier: {identifier}")
+
+        folded = self._find_functions_by_name(bv, text, case_sensitive=False)
+        if len(folded) == 1:
+            return folded[0]
+        if len(folded) > 1:
+            raise RuntimeError(f"Ambiguous function identifier: {identifier}")
+
         symbol = bv.get_symbol_by_raw_name(text)
         if symbol is not None:
             fn = bv.get_function_at(symbol.address)
@@ -570,12 +682,166 @@ class BinaryNinjaBridge:
                 return fn
         raise RuntimeError(f"Function not found: {identifier}")
 
+    def _find_functions_by_name(self, bv, text: str, *, case_sensitive: bool) -> list[Any]:
+        matches = []
+        needle = text if case_sensitive else text.lower()
+        seen: set[int] = set()
+        for fn in list(bv.functions):
+            names = [str(fn.name), str(getattr(fn, "raw_name", fn.name))]
+            haystacks = names if case_sensitive else [name.lower() for name in names]
+            if needle not in haystacks:
+                continue
+            marker = int(fn.start)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            matches.append(fn)
+        return matches
+
+    def _find_symbols_by_name(self, bv, text: str, *, case_sensitive: bool) -> list[Any]:
+        matches = []
+        seen: set[tuple[int, str]] = set()
+
+        if case_sensitive:
+            candidates = list(bv.get_symbols_by_name(text))
+            raw_match = bv.get_symbol_by_raw_name(text)
+            if raw_match is not None:
+                candidates.append(raw_match)
+        else:
+            folded = text.lower()
+            candidates = []
+            for symbol in list(bv.get_symbols()):
+                names = [str(getattr(symbol, "name", "")), str(getattr(symbol, "raw_name", ""))]
+                if folded in {name.lower() for name in names if name}:
+                    candidates.append(symbol)
+
+        for symbol in candidates:
+            marker = (int(symbol.address), str(symbol.type))
+            if marker in seen:
+                continue
+            seen.add(marker)
+            matches.append(symbol)
+        return matches
+
+    def _resolve_rename_target(self, bv, identifier: Any, kind: str) -> dict[str, Any]:
+        requested = {
+            "kind": kind,
+            "identifier": str(identifier),
+        }
+
+        try:
+            address = _parse_address(identifier)
+        except Exception:
+            address = None
+
+        if address is not None:
+            fn = bv.get_function_at(address)
+            symbol = bv.get_symbol_at(address)
+            if kind == "function":
+                if fn is None:
+                    raise OperationFailure("unsupported", f"Function not found: {identifier}", requested=requested)
+                return {
+                    "kind": "function",
+                    "address": int(fn.start),
+                    "before_name": str(fn.name),
+                }
+            if kind == "data":
+                return {
+                    "kind": "data",
+                    "address": int(address),
+                    "before_name": str(symbol.name) if symbol is not None else None,
+                }
+            if fn is not None:
+                return {
+                    "kind": "function",
+                    "address": int(fn.start),
+                    "before_name": str(fn.name),
+                }
+            return {
+                "kind": "data",
+                "address": int(address),
+                "before_name": str(symbol.name) if symbol is not None else None,
+            }
+
+        if kind in {"auto", "function"}:
+            exact_functions = self._find_functions_by_name(bv, str(identifier), case_sensitive=True)
+            if len(exact_functions) == 1:
+                fn = exact_functions[0]
+                return {
+                    "kind": "function",
+                    "address": int(fn.start),
+                    "before_name": str(fn.name),
+                }
+            if len(exact_functions) > 1:
+                raise OperationFailure("unsupported", f"Ambiguous function identifier: {identifier}", requested=requested)
+
+            folded_functions = self._find_functions_by_name(bv, str(identifier), case_sensitive=False)
+            if len(folded_functions) == 1:
+                fn = folded_functions[0]
+                return {
+                    "kind": "function",
+                    "address": int(fn.start),
+                    "before_name": str(fn.name),
+                }
+            if len(folded_functions) > 1:
+                raise OperationFailure("unsupported", f"Ambiguous function identifier: {identifier}", requested=requested)
+
+        if kind == "function":
+            raise OperationFailure("unsupported", f"Function not found: {identifier}", requested=requested)
+
+        exact_symbols = [
+            symbol
+            for symbol in self._find_symbols_by_name(bv, str(identifier), case_sensitive=True)
+            if symbol.type != bn.SymbolType.FunctionSymbol
+        ]
+        if len(exact_symbols) == 1:
+            symbol = exact_symbols[0]
+            return {
+                "kind": "data",
+                "address": int(symbol.address),
+                "before_name": str(symbol.name),
+            }
+        if len(exact_symbols) > 1:
+            raise OperationFailure("unsupported", f"Ambiguous symbol identifier: {identifier}", requested=requested)
+
+        folded_symbols = [
+            symbol
+            for symbol in self._find_symbols_by_name(bv, str(identifier), case_sensitive=False)
+            if symbol.type != bn.SymbolType.FunctionSymbol
+        ]
+        if len(folded_symbols) == 1:
+            symbol = folded_symbols[0]
+            return {
+                "kind": "data",
+                "address": int(symbol.address),
+                "before_name": str(symbol.name),
+            }
+        if len(folded_symbols) > 1:
+            raise OperationFailure("unsupported", f"Ambiguous symbol identifier: {identifier}", requested=requested)
+
+        raise OperationFailure("unsupported", f"Symbol not found: {identifier}", requested=requested)
+
     def _functions_containing(self, bv, address: int):
         try:
             return list(bv.get_functions_containing(address))
         except Exception:
             fn = bv.get_function_at(address)
             return [fn] if fn is not None else []
+
+    def _find_variable_by_storage(self, func, storage: int, *, is_parameter: bool | None = None):
+        collections = []
+        if is_parameter is True:
+            collections = [(func.parameter_vars, True)]
+        elif is_parameter is False:
+            collections = [(func.stack_layout, False)]
+        else:
+            collections = [(func.parameter_vars, True), (func.stack_layout, False)]
+
+        for collection, marker in collections:
+            for var in list(collection):
+                if int(var.storage) == int(storage):
+                    return var, marker
+        raise RuntimeError(f"Variable not found at storage {storage}")
 
     def _function_text(self, bv, func, *, view: str = "hlil", ssa: bool = False) -> str:
         il_name = {"hlil": "hlil", "mlil": "mlil", "llil": "llil"}.get(view, "hlil")
@@ -1106,6 +1372,15 @@ class BinaryNinjaBridge:
                 item["changed"] = bool(change["changed"])
                 if not change["changed"]:
                     item["message"] = change["message"]
+                    if item.get("status") == "verified":
+                        item["status"] = "noop"
+            defined_types = dict(item.get("defined_types") or {})
+            if defined_types:
+                changed_types = {name: bool(type_changes.get(name, {}).get("changed")) for name in defined_types}
+                item["changed_types"] = changed_types
+                if item.get("status") == "verified" and not any(changed_types.values()):
+                    item["status"] = "noop"
+                    item["message"] = "No effective change detected"
             annotated.append(item)
         return annotated
 
@@ -1181,33 +1456,384 @@ class BinaryNinjaBridge:
                     return var
         raise RuntimeError(f"Variable not found: {name}")
 
+    def _operation_requested(self, op: dict[str, Any]) -> dict[str, Any]:
+        return {key: value for key, value in op.items() if key != "preview"}
+
+    def _operation_failure_result(self, op: dict[str, Any], exc: OperationFailure) -> dict[str, Any]:
+        result = {
+            "op": str(op.get("op") or "rename_symbol"),
+            "status": exc.status,
+            "message": exc.message,
+            "requested": exc.requested or self._operation_requested(op),
+        }
+        if exc.observed:
+            result["observed"] = exc.observed
+        return result
+
+    def _mark_unverified_results(self, results: list[dict[str, Any]], message: str) -> list[dict[str, Any]]:
+        annotated = []
+        for result in results:
+            item = dict(result)
+            item["status"] = "unsupported"
+            item["message"] = message
+            annotated.append(item)
+        return annotated
+
+    def _has_failed_results(self, results: list[dict[str, Any]]) -> bool:
+        return any(item.get("status") in {"unsupported", "verification_failed"} for item in results)
+
+    def _find_member(self, type_obj, *, offset: int | None = None, name: str | None = None):
+        members = getattr(type_obj, "members", None)
+        if members is None:
+            return None
+        for member in list(members):
+            member_offset = int(getattr(member, "offset", 0))
+            member_name = str(getattr(member, "name", ""))
+            if offset is not None and member_offset != int(offset):
+                continue
+            if name is not None and member_name != name:
+                continue
+            return member
+        return None
+
+    def _verify_operation(self, bv, result: dict[str, Any]) -> dict[str, Any]:
+        op = result.get("op")
+        try:
+            if op == "rename_symbol":
+                return self._verify_rename_symbol(bv, result)
+            if op == "set_comment":
+                return self._verify_set_comment(bv, result)
+            if op == "delete_comment":
+                return self._verify_delete_comment(bv, result)
+            if op == "set_prototype":
+                return self._verify_set_prototype(bv, result)
+            if op == "local_rename":
+                return self._verify_local_rename(bv, result)
+            if op == "local_retype":
+                return self._verify_local_retype(bv, result)
+            if op == "struct_field_set":
+                return self._verify_struct_field_set(bv, result)
+            if op == "struct_field_rename":
+                return self._verify_struct_field_rename(bv, result)
+            if op == "struct_field_delete":
+                return self._verify_struct_field_delete(bv, result)
+            if op == "struct_replace":
+                return self._verify_declared_types(bv, result)
+            if op == "types_declare":
+                return self._verify_declared_types(bv, result)
+            if op == "patch_bytes":
+                return self._verify_patch_bytes(bv, result)
+            raise OperationFailure("unsupported", f"Unsupported verification path: {op}", requested=result.get("requested"))
+        except OperationFailure as exc:
+            item = dict(result)
+            item["status"] = exc.status
+            item["message"] = exc.message
+            if exc.requested:
+                item["requested"] = exc.requested
+            if exc.observed:
+                item["observed"] = exc.observed
+            return item
+        except Exception as exc:
+            item = dict(result)
+            item["status"] = "verification_failed"
+            item["message"] = f"{type(exc).__name__}: {exc}"
+            if item.get("requested") is None:
+                item["requested"] = {}
+            return item
+
+    def _verify_rename_symbol(self, bv, result: dict[str, Any]) -> dict[str, Any]:
+        item = dict(result)
+        address = _parse_address(item["address"])
+        requested_name = str(item["new_name"])
+        before_name = item.get("before_name")
+        observed_name = None
+        if item.get("kind") == "function":
+            fn = bv.get_function_at(address)
+            if fn is None:
+                raise OperationFailure(
+                    "verification_failed",
+                    f"Function missing after rename at {item['address']}",
+                    requested=item.get("requested"),
+                    observed={"address": item["address"], "name": None},
+                )
+            observed_name = str(fn.name)
+        else:
+            symbol = bv.get_symbol_at(address)
+            observed_name = str(symbol.name) if symbol is not None else None
+        item["observed"] = {"address": item["address"], "name": observed_name}
+        if observed_name != requested_name:
+            raise OperationFailure(
+                "verification_failed",
+                f"Live rename verification failed at {item['address']}",
+                requested=item.get("requested"),
+                observed=item["observed"],
+            )
+        item["status"] = "noop" if before_name == requested_name else "verified"
+        return item
+
+    def _verify_set_comment(self, bv, result: dict[str, Any]) -> dict[str, Any]:
+        item = dict(result)
+        address = _parse_address(item["address"])
+        expected = str(item["requested"]["comment"])
+        observed = bv.get_comment_at(address) or ""
+        item["observed"] = {"address": item["address"], "comment": observed}
+        if observed != expected:
+            raise OperationFailure(
+                "verification_failed",
+                f"Live comment verification failed at {item['address']}",
+                requested=item.get("requested"),
+                observed=item["observed"],
+            )
+        item["status"] = "noop" if item.get("before_comment", "") == expected else "verified"
+        return item
+
+    def _verify_delete_comment(self, bv, result: dict[str, Any]) -> dict[str, Any]:
+        item = dict(result)
+        address = _parse_address(item["address"])
+        observed = bv.get_comment_at(address) or ""
+        item["observed"] = {"address": item["address"], "comment": observed}
+        if observed:
+            raise OperationFailure(
+                "verification_failed",
+                f"Live comment deletion verification failed at {item['address']}",
+                requested=item.get("requested"),
+                observed=item["observed"],
+            )
+        item["status"] = "noop" if not item.get("before_comment") else "verified"
+        return item
+
+    def _verify_set_prototype(self, bv, result: dict[str, Any]) -> dict[str, Any]:
+        item = dict(result)
+        address = _parse_address(item["address"])
+        fn = bv.get_function_at(address)
+        if fn is None:
+            raise OperationFailure(
+                "verification_failed",
+                f"Function missing after prototype change at {item['address']}",
+                requested=item.get("requested"),
+                observed={"address": item["address"], "prototype": None},
+            )
+        observed = str(fn.type)
+        item["observed"] = {"address": item["address"], "prototype": observed}
+        if observed != item["expected_prototype"]:
+            raise OperationFailure(
+                "verification_failed",
+                f"Live prototype verification failed at {item['address']}",
+                requested=item.get("requested"),
+                observed=item["observed"],
+            )
+        item["status"] = "noop" if item.get("before_prototype") == item["expected_prototype"] else "verified"
+        return item
+
+    def _verify_local_rename(self, bv, result: dict[str, Any]) -> dict[str, Any]:
+        item = dict(result)
+        address = _parse_address(item["address"])
+        fn = bv.get_function_at(address)
+        if fn is None:
+            raise OperationFailure(
+                "verification_failed",
+                f"Function missing after local rename at {item['address']}",
+                requested=item.get("requested"),
+                observed={"address": item["address"], "variable": None},
+            )
+        var, _ = self._find_variable_by_storage(
+            fn,
+            int(item["storage"]),
+            is_parameter=bool(item["is_parameter"]),
+        )
+        observed_name = str(var.name)
+        item["observed"] = {"address": item["address"], "variable": observed_name, "storage": int(item["storage"])}
+        if observed_name != item["new_name"]:
+            raise OperationFailure(
+                "verification_failed",
+                f"Live local rename verification failed at {item['address']}",
+                requested=item.get("requested"),
+                observed=item["observed"],
+            )
+        item["status"] = "noop" if item.get("before_name") == item["new_name"] else "verified"
+        return item
+
+    def _verify_local_retype(self, bv, result: dict[str, Any]) -> dict[str, Any]:
+        item = dict(result)
+        address = _parse_address(item["address"])
+        fn = bv.get_function_at(address)
+        if fn is None:
+            raise OperationFailure(
+                "verification_failed",
+                f"Function missing after local retype at {item['address']}",
+                requested=item.get("requested"),
+                observed={"address": item["address"], "type": None},
+            )
+        var, _ = self._find_variable_by_storage(
+            fn,
+            int(item["storage"]),
+            is_parameter=bool(item["is_parameter"]),
+        )
+        observed_type = str(var.type)
+        item["observed"] = {"address": item["address"], "variable": str(var.name), "type": observed_type}
+        if observed_type != item["expected_type"]:
+            raise OperationFailure(
+                "verification_failed",
+                f"Live local retype verification failed at {item['address']}",
+                requested=item.get("requested"),
+                observed=item["observed"],
+            )
+        item["status"] = "noop" if item.get("before_type") == item["expected_type"] else "verified"
+        return item
+
+    def _verify_struct_field_set(self, bv, result: dict[str, Any]) -> dict[str, Any]:
+        item = dict(result)
+        type_obj = bv.get_type_by_name(item["struct_name"])
+        if type_obj is None:
+            raise OperationFailure(
+                "verification_failed",
+                f"Struct missing after field set: {item['struct_name']}",
+                requested=item.get("requested"),
+                observed={"type_name": item["struct_name"]},
+            )
+        member = self._find_member(type_obj, offset=int(item["member_offset"]), name=item["field_name"])
+        observed = {
+            "type_name": item["struct_name"],
+            "offset": item["offset"],
+            "field_name": getattr(member, "name", None),
+            "field_type": str(getattr(member, "type", "")) if member is not None else None,
+        }
+        item["observed"] = observed
+        if member is None or observed["field_type"] != item["field_type"]:
+            raise OperationFailure(
+                "verification_failed",
+                f"Live struct field verification failed for {item['struct_name']} at {item['offset']}",
+                requested=item.get("requested"),
+                observed=observed,
+            )
+        previous = item.get("before_member")
+        if previous and previous.get("field_name") == item["field_name"] and previous.get("field_type") == item["field_type"]:
+            item["status"] = "noop"
+        else:
+            item["status"] = "verified"
+        return item
+
+    def _verify_struct_field_rename(self, bv, result: dict[str, Any]) -> dict[str, Any]:
+        item = dict(result)
+        type_obj = bv.get_type_by_name(item["struct_name"])
+        if type_obj is None:
+            raise OperationFailure(
+                "verification_failed",
+                f"Struct missing after field rename: {item['struct_name']}",
+                requested=item.get("requested"),
+                observed={"type_name": item["struct_name"]},
+            )
+        member = self._find_member(type_obj, name=item["new_name"])
+        old_member = self._find_member(type_obj, name=item["old_name"])
+        observed = {
+            "type_name": item["struct_name"],
+            "new_name": getattr(member, "name", None),
+            "old_name_present": old_member is not None,
+        }
+        item["observed"] = observed
+        if member is None or old_member is not None:
+            raise OperationFailure(
+                "verification_failed",
+                f"Live struct field rename verification failed for {item['struct_name']}",
+                requested=item.get("requested"),
+                observed=observed,
+            )
+        item["status"] = "noop" if item["old_name"] == item["new_name"] else "verified"
+        return item
+
+    def _verify_struct_field_delete(self, bv, result: dict[str, Any]) -> dict[str, Any]:
+        item = dict(result)
+        type_obj = bv.get_type_by_name(item["struct_name"])
+        if type_obj is None:
+            raise OperationFailure(
+                "verification_failed",
+                f"Struct missing after field delete: {item['struct_name']}",
+                requested=item.get("requested"),
+                observed={"type_name": item["struct_name"]},
+            )
+        member = self._find_member(type_obj, name=item["field_name"])
+        item["observed"] = {"type_name": item["struct_name"], "field_present": member is not None}
+        if member is not None:
+            raise OperationFailure(
+                "verification_failed",
+                f"Live struct field delete verification failed for {item['struct_name']}",
+                requested=item.get("requested"),
+                observed=item["observed"],
+            )
+        item["status"] = "verified"
+        return item
+
+    def _verify_declared_types(self, bv, result: dict[str, Any]) -> dict[str, Any]:
+        item = dict(result)
+        observed_types: dict[str, str | None] = {}
+        for name, expected in dict(item.get("defined_types") or {}).items():
+            type_obj = bv.get_type_by_name(name)
+            observed_types[name] = str(type_obj) if type_obj is not None else None
+            if observed_types[name] != expected:
+                raise OperationFailure(
+                    "verification_failed",
+                    f"Live type verification failed for {name}",
+                    requested=item.get("requested"),
+                    observed={"defined_types": observed_types},
+                )
+        item["observed"] = {"defined_types": observed_types}
+        before = dict(item.get("before_defined_types") or {})
+        item["status"] = "noop" if before and all(before.get(name) == expected for name, expected in item["defined_types"].items()) else "verified"
+        return item
+
+    def _verify_patch_bytes(self, bv, result: dict[str, Any]) -> dict[str, Any]:
+        item = dict(result)
+        address = _parse_address(item["address"])
+        expected = bytes.fromhex(item["patched"])
+        observed_bytes = bv.read(address, len(expected)) or b""
+        observed_hex = observed_bytes.hex()
+        item["observed"] = {"address": item["address"], "patched": observed_hex}
+        if observed_hex != item["patched"]:
+            raise OperationFailure(
+                "verification_failed",
+                f"Live patch verification failed at {item['address']}",
+                requested=item.get("requested"),
+                observed=item["observed"],
+            )
+        item["status"] = "noop" if item.get("original") == item["patched"] else "verified"
+        return item
+
     def _apply_operation(self, bv, op: dict[str, Any]):
         kind = op.get("op") or "rename_symbol"
-        if kind == "rename_symbol":
-            return self._op_rename_symbol(bv, op)
-        if kind == "set_comment":
-            return self._op_set_comment(bv, op)
-        if kind == "delete_comment":
-            return self._op_delete_comment(bv, op)
-        if kind == "set_prototype":
-            return self._op_set_prototype(bv, op)
-        if kind == "local_rename":
-            return self._op_local_rename(bv, op)
-        if kind == "local_retype":
-            return self._op_local_retype(bv, op)
-        if kind == "struct_field_set":
-            return self._op_struct_field_set(bv, op)
-        if kind == "struct_field_rename":
-            return self._op_struct_field_rename(bv, op)
-        if kind == "struct_field_delete":
-            return self._op_struct_field_delete(bv, op)
-        if kind == "struct_replace":
-            return self._op_struct_replace(bv, op)
-        if kind == "types_declare":
-            return self._op_types_declare(bv, op)
-        if kind == "patch_bytes":
-            return self._op_patch_bytes(bv, op)
-        raise ValueError(f"Unsupported batch operation: {kind}")
+        try:
+            if kind == "rename_symbol":
+                return self._op_rename_symbol(bv, op)
+            if kind == "set_comment":
+                return self._op_set_comment(bv, op)
+            if kind == "delete_comment":
+                return self._op_delete_comment(bv, op)
+            if kind == "set_prototype":
+                return self._op_set_prototype(bv, op)
+            if kind == "local_rename":
+                return self._op_local_rename(bv, op)
+            if kind == "local_retype":
+                return self._op_local_retype(bv, op)
+            if kind == "struct_field_set":
+                return self._op_struct_field_set(bv, op)
+            if kind == "struct_field_rename":
+                return self._op_struct_field_rename(bv, op)
+            if kind == "struct_field_delete":
+                return self._op_struct_field_delete(bv, op)
+            if kind == "struct_replace":
+                return self._op_struct_replace(bv, op)
+            if kind == "types_declare":
+                return self._op_types_declare(bv, op)
+            if kind == "patch_bytes":
+                return self._op_patch_bytes(bv, op)
+            raise OperationFailure("unsupported", f"Unsupported batch operation: {kind}", requested=self._operation_requested(op))
+        except OperationFailure:
+            raise
+        except Exception as exc:
+            raise OperationFailure(
+                "unsupported",
+                f"{type(exc).__name__}: {exc}",
+                requested=self._operation_requested(op),
+            ) from exc
 
     def _mutation(self, selector: str | None, preview: bool, operations: list[dict[str, Any]]):
         if not operations:
@@ -1222,18 +1848,46 @@ class BinaryNinjaBridge:
         try:
             for op in operations:
                 results.append(self._apply_operation(bv, op))
+        except OperationFailure as exc:
+            with contextlib.suppress(Exception):
+                bv.revert_undo_actions(state)
+            return {
+                "preview": preview,
+                "success": False,
+                "committed": False,
+                "message": "Rolled back before post-state verification because an operation failed to apply.",
+                "results": self._mark_unverified_results(results, "Rolled back before post-state verification.")
+                + [self._operation_failure_result(operations[len(results)], exc)],
+                "affected_functions": [],
+                "affected_types": [],
+            }
+
+        try:
             bv.update_analysis_and_wait()
             after = self._capture_function_snapshots(bv, affected)
             type_after = self._capture_type_snapshots(bv, operations)
             diffs = self._diff_snapshots(before, after)
             type_diffs = self._diff_type_snapshots(type_before, type_after)
-            if preview:
+            verified_results = [self._verify_operation(bv, result) for result in results]
+            annotated_results = self._annotate_operation_results(verified_results, type_diffs)
+            failed = self._has_failed_results(annotated_results)
+            if preview or failed:
                 bv.revert_undo_actions(state)
             else:
                 bv.commit_undo_actions(state)
+            message = None
+            if preview:
+                message = "Preview verified and reverted."
+            elif failed:
+                message = "Rolled back because live-session verification failed."
+            else:
+                message = "Applied and verified in the live Binary Ninja session."
             return {
                 "preview": preview,
-                "results": self._annotate_operation_results(results, type_diffs),
+                "success": not failed,
+                "committed": bool((not preview) and (not failed)),
+                "message": message,
+                "results": annotated_results,
                 "affected_functions": diffs,
                 "affected_types": type_diffs,
             }
@@ -1246,55 +1900,133 @@ class BinaryNinjaBridge:
         kind = str(op.get("kind", "auto"))
         identifier = op["identifier"]
         new_name = str(op["new_name"])
-        if kind in {"auto", "function"}:
-            try:
-                fn = self._find_function(bv, identifier)
-            except Exception:
-                fn = None
-            if fn is not None:
+        target = self._resolve_rename_target(bv, identifier, kind)
+        requested = self._operation_requested(op)
+        if target["kind"] == "function":
+            fn = bv.get_function_at(target["address"])
+            if fn is None:
+                raise OperationFailure("unsupported", f"Function not found: {identifier}", requested=requested)
+            if target["before_name"] != new_name:
                 fn.name = new_name
-                return {"op": "rename_symbol", "kind": "function", "address": hex(fn.start), "new_name": new_name}
-            if kind == "function":
-                raise RuntimeError(f"Function not found: {identifier}")
-        address = _parse_address(identifier)
-        bv.define_user_symbol(bn.Symbol(bn.SymbolType.DataSymbol, address, new_name))
-        return {"op": "rename_symbol", "kind": "data", "address": hex(address), "new_name": new_name}
+            return {
+                "op": "rename_symbol",
+                "kind": "function",
+                "address": hex(target["address"]),
+                "before_name": target["before_name"],
+                "new_name": new_name,
+                "requested": requested,
+            }
+        address = int(target["address"])
+        if target["before_name"] != new_name:
+            bv.define_user_symbol(bn.Symbol(bn.SymbolType.DataSymbol, address, new_name))
+        return {
+            "op": "rename_symbol",
+            "kind": "data",
+            "address": hex(address),
+            "before_name": target["before_name"],
+            "new_name": new_name,
+            "requested": requested,
+        }
 
     def _op_set_comment(self, bv, op: dict[str, Any]):
         comment = str(op["comment"])
         if op.get("function"):
             fn = self._find_function(bv, op["function"])
-            bv.set_comment_at(fn.start, comment)
-            return {"op": "set_comment", "address": hex(fn.start), "function": fn.name}
+            before_comment = bv.get_comment_at(fn.start) or ""
+            if before_comment != comment:
+                bv.set_comment_at(fn.start, comment)
+            return {
+                "op": "set_comment",
+                "address": hex(fn.start),
+                "function": fn.name,
+                "before_comment": before_comment,
+                "requested": self._operation_requested(op),
+            }
         address = _parse_address(op["address"])
-        bv.set_comment_at(address, comment)
-        return {"op": "set_comment", "address": hex(address)}
+        before_comment = bv.get_comment_at(address) or ""
+        if before_comment != comment:
+            bv.set_comment_at(address, comment)
+        return {
+            "op": "set_comment",
+            "address": hex(address),
+            "before_comment": before_comment,
+            "requested": self._operation_requested(op),
+        }
 
     def _op_delete_comment(self, bv, op: dict[str, Any]):
         if op.get("function"):
             fn = self._find_function(bv, op["function"])
-            bv.set_comment_at(fn.start, None)
-            return {"op": "delete_comment", "address": hex(fn.start), "function": fn.name}
+            before_comment = bv.get_comment_at(fn.start) or ""
+            if before_comment:
+                bv.set_comment_at(fn.start, None)
+            return {
+                "op": "delete_comment",
+                "address": hex(fn.start),
+                "function": fn.name,
+                "before_comment": before_comment,
+                "requested": self._operation_requested(op),
+            }
         address = _parse_address(op["address"])
-        bv.set_comment_at(address, None)
-        return {"op": "delete_comment", "address": hex(address)}
+        before_comment = bv.get_comment_at(address) or ""
+        if before_comment:
+            bv.set_comment_at(address, None)
+        return {
+            "op": "delete_comment",
+            "address": hex(address),
+            "before_comment": before_comment,
+            "requested": self._operation_requested(op),
+        }
 
     def _op_set_prototype(self, bv, op: dict[str, Any]):
         fn = self._find_function(bv, op["identifier"])
-        fn.set_user_type(str(op["prototype"]))
-        return {"op": "set_prototype", "function": fn.name, "address": hex(fn.start)}
+        expected_type, _ = bv.parse_type_string(str(op["prototype"]))
+        before_prototype = str(fn.type)
+        if before_prototype != str(expected_type):
+            fn.set_user_type(expected_type)
+        return {
+            "op": "set_prototype",
+            "function": fn.name,
+            "address": hex(fn.start),
+            "before_prototype": before_prototype,
+            "expected_prototype": str(expected_type),
+            "requested": self._operation_requested(op),
+        }
 
     def _op_local_rename(self, bv, op: dict[str, Any]):
         fn = self._find_function(bv, op["function"])
         var = self._find_variable(fn, str(op["variable"]))
-        fn.create_user_var(var, var.type, str(op["new_name"]))
-        return {"op": "local_rename", "function": fn.name, "variable": str(op["variable"])}
+        new_name = str(op["new_name"])
+        if str(var.name) != new_name:
+            fn.create_user_var(var, var.type, new_name)
+        return {
+            "op": "local_rename",
+            "function": fn.name,
+            "address": hex(fn.start),
+            "variable": str(op["variable"]),
+            "storage": int(var.storage),
+            "is_parameter": var in list(fn.parameter_vars),
+            "before_name": str(var.name),
+            "new_name": new_name,
+            "requested": self._operation_requested(op),
+        }
 
     def _op_local_retype(self, bv, op: dict[str, Any]):
         fn = self._find_function(bv, op["function"])
         var = self._find_variable(fn, str(op["variable"]))
-        fn.create_user_var(var, str(op["new_type"]), var.name)
-        return {"op": "local_retype", "function": fn.name, "variable": str(op["variable"])}
+        expected_type, _ = bv.parse_type_string(str(op["new_type"]))
+        if str(var.type) != str(expected_type):
+            fn.create_user_var(var, expected_type, var.name)
+        return {
+            "op": "local_retype",
+            "function": fn.name,
+            "address": hex(fn.start),
+            "variable": str(op["variable"]),
+            "storage": int(var.storage),
+            "is_parameter": var in list(fn.parameter_vars),
+            "before_type": str(var.type),
+            "expected_type": str(expected_type),
+            "requested": self._operation_requested(op),
+        }
 
     def _struct_builder(self, bv, struct_name: str):
         type_obj = bv.get_type_by_name(struct_name)
@@ -1311,6 +2043,16 @@ class BinaryNinjaBridge:
         field_type, _ = bv.parse_type_string(str(op["field_type"]))
         offset = _parse_address(op["offset"])
         overwrite = bool(op.get("overwrite_existing", True))
+        before_type = bv.get_type_by_name(struct_name)
+        before_member = None
+        if before_type is not None:
+            member = self._find_member(before_type, offset=offset)
+            if member is not None:
+                before_member = {
+                    "field_name": str(getattr(member, "name", "")),
+                    "field_type": str(getattr(member, "type", "")),
+                    "offset": hex(int(getattr(member, "offset", offset))),
+                }
         builder.add_member_at_offset(str(op["field_name"]), field_type, offset, overwrite)
         try:
             builder.width = max(int(builder.width), int(offset) + int(field_type.width))
@@ -1323,6 +2065,9 @@ class BinaryNinjaBridge:
             "offset": hex(offset),
             "field_name": str(op["field_name"]),
             "field_type": str(field_type),
+            "member_offset": int(offset),
+            "before_member": before_member,
+            "requested": self._operation_requested(op),
         }
 
     def _op_struct_field_rename(self, bv, op: dict[str, Any]):
@@ -1341,6 +2086,7 @@ class BinaryNinjaBridge:
             "struct_name": struct_name,
             "old_name": str(op["old_name"]),
             "new_name": str(op["new_name"]),
+            "requested": self._operation_requested(op),
         }
 
     def _op_struct_field_delete(self, bv, op: dict[str, Any]):
@@ -1355,23 +2101,41 @@ class BinaryNinjaBridge:
             "op": "struct_field_delete",
             "struct_name": struct_name,
             "field_name": str(op["field_name"]),
+            "requested": self._operation_requested(op),
         }
 
     def _op_struct_replace(self, bv, op: dict[str, Any]):
         named_types = self._parse_declared_types(bv, str(op["declaration"]))
         defined_types = {}
+        before_defined_types = {}
         for name, type_obj in named_types:
+            existing = bv.get_type_by_name(name)
+            before_defined_types[str(name)] = str(existing) if existing is not None else None
             bv.define_user_type(name, type_obj)
             defined_types[str(name)] = str(type_obj)
-        return {"op": "struct_replace", "defined_types": defined_types}
+        return {
+            "op": "struct_replace",
+            "defined_types": defined_types,
+            "before_defined_types": before_defined_types,
+            "requested": self._operation_requested(op),
+        }
 
     def _op_types_declare(self, bv, op: dict[str, Any]):
         named_types = self._parse_declared_types(bv, str(op["declaration"]))
         defined_types = {}
+        before_defined_types = {}
         for name, type_obj in named_types:
+            existing = bv.get_type_by_name(name)
+            before_defined_types[str(name)] = str(existing) if existing is not None else None
             bv.define_user_type(name, type_obj)
             defined_types[str(name)] = str(type_obj)
-        return {"op": "types_declare", "defined_types": defined_types, "count": len(defined_types)}
+        return {
+            "op": "types_declare",
+            "defined_types": defined_types,
+            "before_defined_types": before_defined_types,
+            "count": len(defined_types),
+            "requested": self._operation_requested(op),
+        }
 
     def _op_patch_bytes(self, bv, op: dict[str, Any]):
         address = _parse_address(op["address"])
@@ -1385,6 +2149,7 @@ class BinaryNinjaBridge:
             "address": hex(address),
             "original": original.hex() if original else None,
             "patched": data.hex(),
+            "requested": self._operation_requested(op),
         }
 
 

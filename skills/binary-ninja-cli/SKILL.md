@@ -31,6 +31,7 @@ bn target list
 bn function list
 bn function search attachment
 bn function info sample_track_floor_height_at_position
+bn refresh
 bn decompile sample_track_floor_height_at_position
 bn il sample_track_floor_height_at_position
 bn disasm sample_track_floor_height_at_position
@@ -74,11 +75,26 @@ For the first few changed functions, `affected_functions` may also include `befo
 
 If a struct edit is already identical, preview may report `changed: false` with `No effective change detected`.
 
+Non-preview writes are live-verified by default. If the requested state does not read back from Binary Ninja, the command exits nonzero and the whole mutation or batch is reverted.
+
+Key result statuses:
+- `verified`
+- `noop`
+- `unsupported`
+- `verification_failed`
+
+If you need to force BN to recalculate presentation after a type change, run:
+
+```bash
+bn refresh
+```
+
 ## Practical Guidance
 
 - Prefer `bn` over MCP for shell-driven decompilation, search, bundles, and large outputs.
 - `bn decompile` does not always rewrite post-hoc struct-growth sites away from raw `__offset(...)` expressions, even after a manual analysis refresh.
 - Treat `bn types show ...` and `bn struct show ...` as the authoritative typed layouts when decompile output lags behind type recovery.
+- Keep writes sequential when you care about trustworthy preview diffs. Read-side concurrency is much safer than write-side concurrency.
 - Use `--out` when output may be long or when you want a stable artifact.
 - Use `bn target list` again if target selection is ambiguous.
 - If multiple targets are open, be explicit and pass `--target <selector>`.

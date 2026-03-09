@@ -34,6 +34,7 @@ If the plugin code changes, reload Binary Ninja Python plugins or restart Binary
 - Read commands return structured data.
 - Large outputs can spill to artifacts with `--out`, and some large stdout responses auto-spill to a temp directory.
 - Mutations support `--preview` so you can inspect the effect before making a permanent change.
+- Mutations verify live Binary Ninja post-state before they report success.
 
 This version assumes one Binary Ninja/plugin instance per machine, which keeps discovery simple.
 
@@ -44,6 +45,7 @@ Open a binary or `.bndb` in Binary Ninja, then run:
 ```bash
 bn doctor
 bn target list
+bn refresh
 bn function list
 bn decompile sub_401000
 ```
@@ -103,6 +105,7 @@ bn target info
 bn function list
 bn function search attachment
 bn function info end_track_attachment_follow_state
+bn refresh
 
 bn decompile end_track_attachment_follow_state
 bn il end_track_attachment_follow_state
@@ -173,9 +176,20 @@ bn patch bytes 0x401000 "90 90" --preview
 
 Preview mode applies the change, refreshes analysis, captures affected decompile diffs, and then reverts the mutation.
 
+Non-preview writes only report success after reading the live BN session back and verifying that the requested post-state actually landed. If verification fails, the CLI returns a nonzero exit code and reverts the whole mutation or batch.
+
 For declaration and struct mutations, preview results also include `affected_types` with before/after layouts and a unified diff. If a field edit is already identical, the result is marked with `changed: false` and a `No effective change detected` message.
 
 For the first few changed functions, `affected_functions` also includes short `before_excerpt` and `after_excerpt` snippets around the first changed HLIL lines.
+
+Mutation results now distinguish:
+
+- `verified`
+- `noop`
+- `unsupported`
+- `verification_failed`
+
+When verification fails, JSON output also includes `requested` and `observed` state for the failed op.
 
 ## Batch Manifests
 
@@ -207,6 +221,8 @@ Apply it with:
 bn batch apply manifest.json
 ```
 
+Batch apply verifies the live session by default. If any op fails to apply or fails post-state verification, the entire batch is reverted.
+
 ## Troubleshooting
 
 Check bridge state:
@@ -223,6 +239,14 @@ If `bn target list` is empty:
 - reload Binary Ninja plugins or restart Binary Ninja after plugin changes
 
 If `active` is ambiguous, pass `--target <selector>` from `bn target list`.
+
+If decompile text still looks stale after a type change, run:
+
+```bash
+bn refresh
+```
+
+That forces an analysis refresh, but it still may not fully eliminate Binary Ninja's stale `__offset(...)` presentation in every case.
 
 ## Development
 

@@ -200,6 +200,45 @@ def test_target_list_text_format_renders_summary(monkeypatch, capsys):
     assert '"selector"' not in output
 
 
+def test_refresh_defaults_to_active_when_single_target_open(monkeypatch, capsys):
+    calls = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        calls.append({"op": op, "params": params, "target": target})
+        if op == "list_targets":
+            return {
+                "ok": True,
+                "result": [{"target_id": "123:1:7", "selector": "SnailMail_unwrapped.exe.bndb"}],
+            }
+        if op == "refresh":
+            return {
+                "ok": True,
+                "result": {
+                    "refreshed": True,
+                    "target": {
+                        "selector": "SnailMail_unwrapped.exe.bndb",
+                        "target_id": "123:1:7",
+                        "view_id": "1",
+                        "view_name": "PE",
+                        "filename": "/tmp/SnailMail_unwrapped.exe.bndb",
+                        "active": True,
+                    },
+                },
+            }
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["refresh", "--format", "text"])
+
+    assert rc == 0
+    assert [call["op"] for call in calls] == ["list_targets", "refresh"]
+    assert calls[1]["target"] == "active"
+    output = capsys.readouterr().out
+    assert "refreshed: true" in output
+    assert "SnailMail_unwrapped.exe.bndb" in output
+
+
 def test_types_show_uses_type_info_and_text_renderer(monkeypatch, capsys):
     captured = {}
 
@@ -457,6 +496,82 @@ def test_symbol_rename_text_format_renders_mutation_summary(monkeypatch, capsys)
     assert "rename_symbol function 0x401000 -> player_update" in output
     assert "0x401000 sub_401000 -> player_update [changed=True]" in output
     assert '"results"' not in output
+
+
+def test_symbol_rename_verification_failure_returns_nonzero(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        assert op == "rename_symbol"
+        return {
+            "ok": True,
+            "result": {
+                "preview": False,
+                "success": False,
+                "committed": False,
+                "message": "Rolled back because live-session verification failed.",
+                "results": [
+                    {
+                        "op": "rename_symbol",
+                        "kind": "function",
+                        "address": "0x401000",
+                        "new_name": "player_update",
+                        "status": "verification_failed",
+                        "message": "Live rename verification failed at 0x401000",
+                        "requested": {
+                            "identifier": "sub_401000",
+                            "kind": "function",
+                            "new_name": "player_update",
+                        },
+                        "observed": {
+                            "address": "0x401000",
+                            "name": "sub_401000",
+                        },
+                    }
+                ],
+                "affected_functions": [],
+                "affected_types": [],
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["symbol", "rename", "--format", "text", "--target", "active", "sub_401000", "player_update"])
+
+    assert rc == 3
+    output = capsys.readouterr().out
+    assert "success: False" in output
+    assert "status=verification_failed" in output
+    assert 'requested: {"identifier": "sub_401000"' in output
+    assert 'observed: {"address": "0x401000", "name": "sub_401000"}' in output
+
+
+def test_symbol_rename_noop_still_succeeds(monkeypatch):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        assert op == "rename_symbol"
+        return {
+            "ok": True,
+            "result": {
+                "preview": False,
+                "success": True,
+                "committed": True,
+                "results": [
+                    {
+                        "op": "rename_symbol",
+                        "kind": "function",
+                        "address": "0x401000",
+                        "new_name": "player_update",
+                        "status": "noop",
+                    }
+                ],
+                "affected_functions": [],
+                "affected_types": [],
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["symbol", "rename", "--target", "active", "player_update", "player_update"])
+
+    assert rc == 0
 
 
 def test_decompile_text_format_unwraps_text_field(monkeypatch, capsys):
