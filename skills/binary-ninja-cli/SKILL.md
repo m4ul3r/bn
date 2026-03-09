@@ -25,6 +25,11 @@ bn target list
 3. Use `bn` directly when it is on PATH.
 - If running from this repo without the global tool installed, use `uv run bn`.
 
+4. Pick the right output mode:
+- Interactive read commands default to `text`.
+- Mutation, preview, setup, and export commands default to `json`.
+- Add `--format json` when you need stable fields for tooling or follow-on automation.
+
 ## High-Value Read Commands
 
 ```bash
@@ -41,8 +46,8 @@ bn xrefs sample_track_floor_height_at_position
 bn xrefs field TrackRowCell.tile_type
 bn comment get --address 0x401000
 bn types --query Player
-bn types show Player --format text
-bn struct show Player --format text
+bn types show Player
+bn struct show Player
 bn types declare --file /path/to/win32_min.h --preview
 bn strings --query follow
 bn bundle function sample_track_floor_height_at_position --out /tmp/floor.json
@@ -104,6 +109,7 @@ bn refresh
 ## Practical Guidance
 
 - Prefer `bn` over MCP for shell-driven decompilation, search, bundles, and large outputs.
+- Read commands are shell-first now; use `--format json` only when you need stable fields.
 - Prefer stable `local_id` values from `bn local list` or `bn function info` when renaming or retyping locals.
 - `bn decompile` does not always rewrite post-hoc struct-growth sites away from raw `__offset(...)` expressions, even after a manual analysis refresh.
 - Treat `bn decompile` as the HLIL-text convenience lane; typed layouts live in `bn types show ...` and `bn struct show ...`.

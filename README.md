@@ -85,6 +85,7 @@ Every command supports:
 - `--out <path>`
 
 Interactive read commands default to `text`. Mutation, setup, and export commands default to `json`.
+Add `--format json` when you need stable fields for automation or piping into structured tooling.
 
 Examples:
 
