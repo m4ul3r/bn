@@ -128,13 +128,6 @@ bn strings --query follow
 bn imports
 ```
 
-## Typing Caveat
-
-One local tooling caveat remains:
-
-- `bn decompile` does not always rewrite post-hoc struct-growth sites away from raw `__offset(...)` expressions, even after a manual analysis refresh.
-- For now, `bn types show Player`, `bn types show Game`, and `bn types show PathTemplate` are the authoritative typed layouts.
-
 ## Bundles And Python
 
 `bn decompile` is the HLIL-text convenience lane. It is useful for quick function reading, but typed layouts remain authoritative in `bn types show` and `bn struct show`.
