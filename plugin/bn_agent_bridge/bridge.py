@@ -27,7 +27,7 @@ from .version import VERSION, build_id_for_file
 
 try:
     import binaryninjaui as ui
-except ImportError:  # pragma: no cover - GUI plugin only
+except Exception:  # ImportError or UIPluginInHeadlessError
     ui = None
 
 
@@ -123,6 +123,8 @@ WRITE_LOCKED_OPS = {
     "types_declare",
     "batch_apply",
     "refresh",
+    "load_binary",
+    "close_binary",
 }
 
 
@@ -186,33 +188,36 @@ def _write_json_artifact(path_text: str | None, payload: Any) -> dict[str, Any] 
 
 
 def _active_binary_view():
-    if ui is None:
-        return None
+    if ui is not None:
+        def resolve():
+            try:
+                context = ui.UIContext.activeContext()
+                if context is not None:
+                    frame = context.getCurrentViewFrame()
+                    view = frame.getCurrentBinaryView() if frame is not None else None
+                    if view is not None:
+                        return view
 
-    def resolve():
-        try:
-            context = ui.UIContext.activeContext()
-            if context is not None:
-                frame = context.getCurrentViewFrame()
-                view = frame.getCurrentBinaryView() if frame is not None else None
-                if view is not None:
-                    return view
-
-            contexts = list(ui.UIContext.allContexts())
-            if len(contexts) == 1:
-                frame = contexts[0].getCurrentViewFrame()
-                return frame.getCurrentBinaryView() if frame is not None else None
-        except Exception:
+                contexts = list(ui.UIContext.allContexts())
+                if len(contexts) == 1:
+                    frame = contexts[0].getCurrentViewFrame()
+                    return frame.getCurrentBinaryView() if frame is not None else None
+            except Exception:
+                return None
             return None
-        return None
 
-    return _run_on_main_thread(resolve)
+        return _run_on_main_thread(resolve)
+
+    with _headless_views_lock:
+        if len(_headless_views) == 1:
+            return _headless_views[0]
+    return None
 
 
 def _collect_open_views() -> list[Any]:
     if ui is None:
-        active = _active_binary_view()
-        return [active] if active is not None else []
+        with _headless_views_lock:
+            return list(_headless_views)
 
     def collect():
         found: list[Any] = []
@@ -393,7 +398,7 @@ class TargetManager:
     def resolve(self, selector: str | None):
         targets = self.refresh()
         if not targets:
-            raise RuntimeError("No BinaryView targets are open in the GUI")
+            raise RuntimeError("No BinaryView targets are open")
 
         if selector in (None, "", "active"):
             active = self._default_view()
@@ -529,6 +534,11 @@ class BinaryNinjaBridge:
         if op == "refresh":
             return self._refresh(target)
 
+        if op == "load_binary":
+            return self._load_binary(str(params["path"]))
+        if op == "close_binary":
+            return self._close_binary(params.get("path"))
+
         if op == "list_functions":
             return self._list_functions(
                 target,
@@ -633,6 +643,59 @@ class BinaryNinjaBridge:
             "socket_path": str(self.socket_path),
             "targets": self.targets.refresh(),
         }
+
+    def _load_binary(self, path: str):
+        import binaryninja
+
+        resolved = Path(path).expanduser().resolve()
+        if not resolved.exists():
+            raise RuntimeError(f"File not found: {resolved}")
+
+        bv = binaryninja.load(str(resolved))
+        if bv is None:
+            raise RuntimeError(f"Failed to open binary: {resolved}")
+
+        bv.update_analysis_and_wait()
+
+        with _headless_views_lock:
+            _headless_views.append(bv)
+
+        return {
+            "loaded": True,
+            "path": str(resolved),
+            "targets": self.targets.refresh(),
+        }
+
+    def _close_binary(self, path: str | None = None):
+        with _headless_views_lock:
+            if not _headless_views:
+                raise RuntimeError("No binaries are currently loaded")
+
+            if path is None:
+                closed = []
+                for bv in _headless_views:
+                    closed.append(str(getattr(bv.file, "filename", "")))
+                    bv.file.close()
+                _headless_views.clear()
+                return {"closed": closed}
+
+            resolved = str(Path(path).expanduser().resolve())
+            to_remove = []
+            for i, bv in enumerate(_headless_views):
+                filename = str(getattr(bv.file, "filename", ""))
+                if filename == resolved or str(Path(filename).resolve()) == resolved:
+                    to_remove.append(i)
+
+            if not to_remove:
+                raise RuntimeError(f"No loaded binary matches path: {path}")
+
+            closed = []
+            for i in reversed(to_remove):
+                bv = _headless_views.pop(i)
+                closed.append(str(getattr(bv.file, "filename", "")))
+                bv.file.close()
+
+        return {"closed": closed}
 
     def _target_info(self, selector: str | None):
         bv = self.targets.resolve(selector)
@@ -932,12 +995,95 @@ class BinaryNinjaBridge:
             seen.add(marker)
             yield var, False
 
+    def _format_hlil_tree(self, ins, indent=0, *, _else_prefix=False):
+        """Recursively format HLIL tree with proper indentation."""
+        lines = []
+        pad = "    " * indent
+        op = ins.operation.name
+
+        def _addr(i):
+            a = getattr(i, "address", None)
+            return f"{int(a):08x}" if a is not None else "        "
+
+        NO_ADDR = "        "
+
+        if op == "HLIL_NOP":
+            pass
+
+        elif op == "HLIL_BLOCK":
+            for stmt in ins:
+                lines.extend(self._format_hlil_tree(stmt, indent))
+
+        elif op == "HLIL_IF":
+            if _else_prefix:
+                lines.append(f"{_addr(ins)}        {pad}}} else if ({ins.condition})")
+            else:
+                lines.append(f"{_addr(ins)}        {pad}if ({ins.condition})")
+            lines.append(f"{NO_ADDR}        {pad}{{")
+            lines.extend(self._format_hlil_tree(ins.true, indent + 1))
+            false_branch = ins.false
+            false_op = false_branch.operation.name
+            if false_op == "HLIL_NOP":
+                lines.append(f"{NO_ADDR}        {pad}}}")
+            elif false_op == "HLIL_IF":
+                lines.extend(self._format_hlil_tree(false_branch, indent, _else_prefix=True))
+            else:
+                lines.append(f"{NO_ADDR}        {pad}}} else {{")
+                lines.extend(self._format_hlil_tree(false_branch, indent + 1))
+                lines.append(f"{NO_ADDR}        {pad}}}")
+
+        elif op in ("HLIL_WHILE", "HLIL_WHILE_SSA"):
+            lines.append(f"{_addr(ins)}        {pad}while ({ins.condition})")
+            lines.append(f"{NO_ADDR}        {pad}{{")
+            lines.extend(self._format_hlil_tree(ins.body, indent + 1))
+            lines.append(f"{NO_ADDR}        {pad}}}")
+
+        elif op in ("HLIL_DO_WHILE", "HLIL_DO_WHILE_SSA"):
+            lines.append(f"{_addr(ins)}        {pad}do")
+            lines.append(f"{NO_ADDR}        {pad}{{")
+            lines.extend(self._format_hlil_tree(ins.body, indent + 1))
+            lines.append(f"{NO_ADDR}        {pad}}} while ({ins.condition})")
+
+        elif op in ("HLIL_FOR", "HLIL_FOR_SSA"):
+            lines.append(f"{_addr(ins)}        {pad}for ({ins.init}; {ins.condition}; {ins.update})")
+            lines.append(f"{NO_ADDR}        {pad}{{")
+            lines.extend(self._format_hlil_tree(ins.body, indent + 1))
+            lines.append(f"{NO_ADDR}        {pad}}}")
+
+        elif op == "HLIL_SWITCH":
+            lines.append(f"{_addr(ins)}        {pad}switch ({ins.condition})")
+            lines.append(f"{NO_ADDR}        {pad}{{")
+            for case in ins.cases:
+                lines.extend(self._format_hlil_tree(case, indent + 1))
+            default = getattr(ins, "default", None)
+            if default is not None and default.operation.name != "HLIL_NOP":
+                lines.append(f"{NO_ADDR}        {pad}    default:")
+                lines.extend(self._format_hlil_tree(default, indent + 2))
+            lines.append(f"{NO_ADDR}        {pad}}}")
+
+        elif op == "HLIL_CASE":
+            for val in ins.values:
+                lines.append(f"{_addr(ins)}        {pad}case {val}:")
+            lines.extend(self._format_hlil_tree(ins.body, indent + 1))
+
+        else:
+            lines.append(f"{_addr(ins)}        {pad}{ins}")
+
+        return lines
+
     def _function_text(self, bv, func, *, view: str = "hlil", ssa: bool = False) -> str:
         il_name = {"hlil": "hlil", "mlil": "mlil", "llil": "llil"}.get(view, "hlil")
         try:
             il = getattr(func, il_name)
             if ssa and hasattr(il, "ssa_form") and il.ssa_form is not None:
                 il = il.ssa_form
+            if il_name == "hlil" and hasattr(il, "root"):
+                try:
+                    lines = self._format_hlil_tree(il.root)
+                    if lines:
+                        return "\n".join(lines)
+                except Exception:
+                    pass
             lines = []
             for ins in il.instructions:
                 address = getattr(ins, "address", func.start)
@@ -1521,10 +1667,24 @@ class BinaryNinjaBridge:
                 items.append({"name": fn.name, "address": hex(fn.start), "raw_name": getattr(fn, "raw_name", fn.name)})
         return items
 
+    def _function_signature(self, func) -> str:
+        """Build a C-style function signature from Binary Ninja metadata."""
+        func_type = getattr(func, "type", None)
+        if func_type is None:
+            return func.name
+        return_type = getattr(func_type, "return_value", getattr(func, "return_type", None))
+        ret = str(return_type) if return_type is not None else "void"
+        params = []
+        for var in list(func.parameter_vars):
+            params.append(f"{var.type} {var.name}")
+        return f"{ret} {func.name}({', '.join(params)})"
+
     def _decompile(self, selector: str | None, identifier):
         bv = self._resolve_view(selector)
         func = self._find_function(bv, identifier)
-        text = self._function_text(bv, func, view="hlil")
+        sig = self._function_signature(func)
+        body = self._function_text(bv, func, view="hlil")
+        text = f"{int(func.start):08x}        {sig}\n{body}"
         warnings = self._render_warnings(text)
         return {
             "function": {"name": func.name, "address": hex(func.start)},
@@ -2805,6 +2965,8 @@ class BinaryNinjaBridge:
         }
 
 _bridge: BinaryNinjaBridge | None = None
+_headless_views: list[Any] = []
+_headless_views_lock = threading.Lock()
 
 
 def _start_bridge_command(_):  # pragma: no cover - GUI runtime
@@ -2814,12 +2976,47 @@ def _start_bridge_command(_):  # pragma: no cover - GUI runtime
 def start_bridge():  # pragma: no cover - GUI runtime
     global _bridge
     if ui is None:
-        bn.log_warn("BN Agent Bridge requires the Binary Ninja GUI")
         return
     if _bridge is not None:
         return
     _bridge = BinaryNinjaBridge()
     _bridge.start()
+
+
+def start_headless(binaries: list[str] | None = None):
+    """Start the bridge in headless mode (no GUI required).
+
+    Opens any binary file paths provided, starts the socket server,
+    and blocks the calling thread forever.
+    """
+    global _bridge
+    if _bridge is not None:
+        return
+
+    if binaries:
+        import binaryninja
+
+        for path in binaries:
+            resolved = Path(path).expanduser().resolve()
+            bv = binaryninja.load(str(resolved))
+            if bv is None:
+                bn.log_warn(f"Failed to open binary: {resolved}")
+                continue
+            bv.update_analysis_and_wait()
+            with _headless_views_lock:
+                _headless_views.append(bv)
+            bn.log_info(f"Loaded {resolved}")
+
+    _bridge = BinaryNinjaBridge()
+    _bridge.start()
+    bn.log_info("BN Agent Bridge running in headless mode")
+
+    try:
+        threading.Event().wait()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        _stop_bridge()
 
 
 def _stop_bridge():  # pragma: no cover - GUI runtime

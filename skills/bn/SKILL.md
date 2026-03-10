@@ -1,11 +1,11 @@
 ---
 name: bn
-description: Use the local bn CLI for Binary Ninja reversing work when a Binary Ninja GUI session is already open. Prefer this skill for decompilation, function search, callsite recovery, IL/disassembly, xrefs, type inspection, struct field edits, previewed mutations, and inline Python execution through the bn bridge.
+description: Use the local bn CLI for Binary Ninja reversing work through the bn bridge. Works with both a live GUI session and headless mode. Prefer this skill for decompilation, function search, callsite recovery, IL/disassembly, xrefs, type inspection, struct field edits, previewed mutations, and inline Python execution.
 ---
 
 # bn
 
-Use this skill when the user wants reverse-engineering work against an already-open Binary Ninja database and the local `bn` CLI is available.
+Use this skill when the user wants reverse-engineering work against a Binary Ninja database and the local `bn` CLI is available. The bridge can run in GUI mode (attached to an open Binary Ninja window) or headless mode (no GUI required).
 
 ## Workflow
 
@@ -29,6 +29,23 @@ Use `bn doctor` when bridge state is unclear or `bn target list` does not show w
 - Other options: `--format json`, `--format ndjson`, `--out <path>`.
 
 Outputs above `10_000` `o200k_base` tokens auto-spill to disk. When that happens, stdout is empty and stderr carries the spill metadata as plain text, so do not chain `bn ... | rg ...` and expect to search the real output. Use `--out <path>` when you want the full body written to a known file.
+
+## Headless Mode
+
+When no GUI is available, start the bridge headless:
+
+```bash
+python -m bn_agent_bridge /path/to/binary.bndb
+```
+
+Or start with no binaries and load them over the socket:
+
+```bash
+python -m bn_agent_bridge &
+bn load /path/to/binary.bndb
+```
+
+Close binaries with `bn close [path]` (omit path to close all). All other commands work identically in headless and GUI modes.
 
 ## High-Value Read Commands
 
@@ -138,6 +155,45 @@ The `py exec` environment includes:`bn`, `binaryninja`, `bv`, `result`.
 
 `py exec` always returns `stdout` and `result`. If `result` is not JSON-serializable, the CLI returns `repr(result)` plus a warning instead of silently flattening it.
 
+## Additional Read Commands
+
+```bash
+bn il sub_401000 --view mlil              # MLIL instead of default HLIL
+bn il sub_401000 --view llil --ssa        # LLIL in SSA form
+bn local retype func_name var_name "uint32_t*"  # retype a local variable
+bn comment delete --address 0x401000      # remove a comment
+bn struct field rename Player 0x308 new_name    # rename a field
+bn struct field delete Player 0x308             # delete a field
+```
+
+## Batch Apply
+
+For bulk mutations (renames, retypes, comments), use `bn batch apply` with a JSON manifest. This is significantly faster than individual commands.
+
+Manifest format:
+
+```json
+{
+  "target": "active",
+  "ops": [
+    {"op": "rename_symbol", "identifier": "sub_401000", "new_name": "player_update"},
+    {"op": "rename_symbol", "identifier": "sub_402000", "new_name": "player_init"},
+    {"op": "rename_symbol", "identifier": "sub_403000", "new_name": "player_destroy"}
+  ]
+}
+```
+
+```bash
+bn batch apply /tmp/manifest.json            # apply live
+bn batch apply /tmp/manifest.json --preview  # preview diffs first
+```
+
+Key details:
+- The manifest MUST be a dict with an `"ops"` key (not a bare list)
+- Include `"target"` in the manifest or it will fail with "Unknown target selector: None"
+- All ops are verified and the entire batch is reverted if any op fails
+- Supports `--preview` to see diffs without committing
+
 ## Mutation Workflow
 
 Prefer preview first:
@@ -188,3 +244,57 @@ If you need to force BN to recalculate presentation after a type change, run:
 ```bash
 bn refresh
 ```
+
+## Saving and Loading Databases
+
+**Always save work as `.bndb`** before closing a target. Annotations (renames, types, comments) are lost if a raw binary is closed without saving.
+
+Save via Python:
+
+```bash
+bn py exec --code "bv.create_database(bv.file.filename + '.bndb')"
+```
+
+**Loading behavior**: `bn load foo.so` does NOT auto-detect a sibling `foo.so.bndb`. It re-analyzes from scratch, discarding all prior annotations. Always load the `.bndb` path explicitly:
+
+```bash
+# Wrong — ignores existing .bndb, re-analyzes from scratch
+bn load /path/to/foo.so
+
+# Correct — loads saved annotations
+bn load /path/to/foo.so.bndb
+```
+
+Before loading a binary, check if a `.bndb` already exists and prefer it.
+
+## Load Timeout
+
+`bn load` has a ~30-second default timeout. Large binaries may exceed this — the command exits with a timeout error but analysis continues in the background. Check back with:
+
+```bash
+bn target list
+```
+
+If the target appears, it loaded successfully despite the timeout.
+
+## Known Quirks
+
+- **`bn local rename` and `bn comment set` return null status**: The operations succeed but the JSON response shows `null` for status instead of `verified`. Verify by re-decompiling.
+- **`types declare` verification failures**: `bn types declare` may fail with `verification_failed` and roll back, even for correct declarations. Workaround: define structs directly via `bn py exec` using `bntypes.StructureBuilder`:
+
+```bash
+bn py exec --stdin <<'PY'
+from binaryninja import types as bntypes
+s = bntypes.StructureBuilder.create()
+s.append(bntypes.Type.pointer(bv.arch, bntypes.Type.void()), "vtable")
+s.append(bntypes.Type.array(bntypes.Type.int(1, sign=False), 0x20), "pad_04")
+s.append(bntypes.Type.int(4, sign=False), "m_bLoad")
+s.append(bntypes.Type.pointer(bv.arch, bntypes.Type.int(1, sign=False)), "m_fileBuf")
+s.append(bntypes.Type.int(4, sign=False), "m_fileBufSize")
+bv.define_user_type("MyStruct", bntypes.Type.structure_type(s))
+print("defined MyStruct")
+PY
+```
+
+- **Stale bridge**: If `bn doctor` reports `stale: loaded plugin code does not match installed plugin file`, restart Binary Ninja (GUI or headless) to pick up the updated bridge code. Commands will behave unpredictably with stale code.
+- **No targets = no `py exec`**: `bn py exec` requires at least one open BinaryView. If `bn load` timed out and the target isn't ready yet, `py exec` will fail with "No BinaryView targets are open".

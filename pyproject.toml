@@ -13,6 +13,7 @@ dependencies = [
 
 [project.scripts]
 bn = "bn.cli:main"
+bn-agent = "bn.headless:main"
 
 [dependency-groups]
 dev = [

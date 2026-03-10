@@ -14,11 +14,11 @@ def repo_root() -> Path:
     return Path(__file__).resolve().parents[2]
 
 
-def codex_home() -> Path:
-    env = os.environ.get("CODEX_HOME")
+def claude_home() -> Path:
+    env = os.environ.get("CLAUDE_HOME")
     if env:
         return Path(env).expanduser()
-    return Path.home() / ".codex"
+    return Path.home() / ".claude"
 
 
 def cache_home() -> Path:
@@ -78,8 +78,8 @@ def plugin_install_dir() -> Path:
     return binary_ninja_plugin_dir() / PLUGIN_NAME
 
 
-def codex_skills_dir() -> Path:
-    return codex_home() / "skills"
+def claude_skills_dir() -> Path:
+    return claude_home() / "skills"
 
 
 def skill_source_dir() -> Path:
@@ -87,4 +87,4 @@ def skill_source_dir() -> Path:
 
 
 def skill_install_dir() -> Path:
-    return codex_skills_dir() / SKILL_NAME
+    return claude_skills_dir() / SKILL_NAME
