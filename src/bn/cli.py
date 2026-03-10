@@ -988,6 +988,19 @@ def _close(args: argparse.Namespace) -> int:
     )
 
 
+def _save(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {}
+    if getattr(args, "path", None):
+        params["path"] = str(Path(args.path).expanduser().resolve())
+    return _call(
+        args,
+        "save_database",
+        params,
+        require_target=False,
+        stem="save",
+    )
+
+
 def _target_list(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1578,6 +1591,12 @@ def build_parser() -> argparse.ArgumentParser:
     _common_io_options(close, default_format="json")
     close.add_argument("path", nargs="?", help="Path to close (omit to close all)")
     close.set_defaults(handler=_close)
+
+    save = subparsers.add_parser("save", help="Save the current analysis database (.bndb)")
+    _common_io_options(save, default_format="json")
+    _target_option(save, required=False)
+    save.add_argument("path", nargs="?", help="Output path (defaults to <filename>.bndb)")
+    save.set_defaults(handler=_save)
 
     target = subparsers.add_parser("target", help="Inspect Binary Ninja targets")
     target_sub = target.add_subparsers(dest="target_command")

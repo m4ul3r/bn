@@ -125,6 +125,7 @@ WRITE_LOCKED_OPS = {
     "refresh",
     "load_binary",
     "close_binary",
+    "save_database",
 }
 
 
@@ -538,6 +539,8 @@ class BinaryNinjaBridge:
             return self._load_binary(str(params["path"]))
         if op == "close_binary":
             return self._close_binary(params.get("path"))
+        if op == "save_database":
+            return self._save_database(target, params.get("path"))
 
         if op == "list_functions":
             return self._list_functions(
@@ -696,6 +699,18 @@ class BinaryNinjaBridge:
                 bv.file.close()
 
         return {"closed": closed}
+
+    def _save_database(self, target: str | None, path: str | None = None):
+        bv = self.targets.resolve(target)
+        filename = getattr(bv.file, "filename", "")
+        if path:
+            out = str(Path(path).expanduser().resolve())
+        elif filename.endswith(".bndb"):
+            out = filename
+        else:
+            out = filename + ".bndb"
+        bv.create_database(out)
+        return {"saved": True, "path": out}
 
     def _target_info(self, selector: str | None):
         bv = self.targets.resolve(selector)
