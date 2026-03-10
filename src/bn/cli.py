@@ -90,7 +90,7 @@ def _implicit_target(args: argparse.Namespace) -> str:
     if len(targets) == 1:
         return "active"
     if not targets:
-        raise BridgeError("No BinaryView targets are open in the GUI")
+        raise BridgeError("No BinaryView targets are open")
     raise BridgeError("This command requires --target when multiple targets are open")
 
 
@@ -771,6 +771,29 @@ def _skill_install(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "load_binary",
+        {"path": str(Path(args.path).expanduser().resolve())},
+        require_target=False,
+        stem="load",
+    )
+
+
+def _close(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {}
+    if args.path:
+        params["path"] = str(Path(args.path).expanduser().resolve())
+    return _call(
+        args,
+        "close_binary",
+        params,
+        require_target=False,
+        stem="close",
+    )
+
+
 def _target_list(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1289,14 +1312,24 @@ def build_parser() -> argparse.ArgumentParser:
     _common_io_options(plugin_install, default_format="json")
     plugin_install.set_defaults(handler=_plugin_install)
 
-    skill = subparsers.add_parser("skill", help="Install the bundled Codex skill")
+    skill = subparsers.add_parser("skill", help="Install the bundled Claude Code skill")
     skill_sub = skill.add_subparsers(dest="skill_command")
-    skill_install = skill_sub.add_parser("install", help="Install the bundled Codex skill")
+    skill_install = skill_sub.add_parser("install", help="Install the bundled Claude Code skill")
     skill_install.add_argument("--dest", type=Path, help="Custom install destination")
     skill_install.add_argument("--mode", choices=("symlink", "copy"), default="symlink")
     skill_install.add_argument("--force", action="store_true")
     _common_io_options(skill_install, default_format="json")
     skill_install.set_defaults(handler=_skill_install)
+
+    load = subparsers.add_parser("load", help="Load a binary into headless bridge")
+    _common_io_options(load, default_format="json")
+    load.add_argument("path", help="Path to binary or BNDB file")
+    load.set_defaults(handler=_load)
+
+    close = subparsers.add_parser("close", help="Close a loaded binary")
+    _common_io_options(close, default_format="json")
+    close.add_argument("path", nargs="?", help="Path to close (omit to close all)")
+    close.set_defaults(handler=_close)
 
     target = subparsers.add_parser("target", help="Inspect Binary Ninja targets")
     target_sub = target.add_subparsers(dest="target_command")

@@ -1,4 +1,6 @@
-from .bridge import start_bridge
+from .bridge import start_bridge, start_headless, ui
 
-
-start_bridge()
+# Auto-start only when loaded as a Binary Ninja GUI plugin.
+# Headless callers use start_headless() directly.
+if ui is not None:
+    start_bridge()

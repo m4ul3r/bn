@@ -11,7 +11,7 @@
 
 ## Install
 
-Recommended setup: install the CLI, the Binary Ninja companion plugin, and the bundled Codex skill.
+Recommended setup: install the CLI, the Binary Ninja companion plugin, and the bundled Claude Code skill.
 
 Install the CLI on your PATH:
 
@@ -27,13 +27,13 @@ bn plugin install
 
 That links [`plugin/bn_agent_bridge`](/Users/banteg/dev/banteg/bn/plugin/bn_agent_bridge) into your Binary Ninja plugins directory.
 
-Install the bundled Codex skill:
+Install the bundled Claude Code skill:
 
 ```bash
 bn skill install
 ```
 
-That symlinks [`skills/bn`](/Users/banteg/dev/banteg/bn/skills/bn) into `$CODEX_HOME/skills/bn` by default. Use `--mode copy` if you want a standalone copy instead. Restart Codex to pick up a new or renamed skill.
+That symlinks [`skills/bn`](/Users/banteg/dev/banteg/bn/skills/bn) into `~/.claude/skills/bn` by default. Use `--mode copy` if you want a standalone copy instead. Restart Claude Code to pick up a new or renamed skill.
 
 If the plugin code changes, reload Binary Ninja Python plugins or restart Binary Ninja.
 
@@ -41,12 +41,14 @@ If the plugin code changes, reload Binary Ninja Python plugins or restart Binary
 
 - `bn` has two parts:
   - a normal Python CLI that you can run from your shell or agent tool harness
-  - a Binary Ninja GUI plugin that owns all Binary Ninja API access
-- The plugin creates one fixed bridge socket and one fixed registry file.
-- The CLI discovers that bridge, connects to it, and forwards commands into the live GUI session.
-- Because the Binary Ninja side runs as a GUI plugin, it works with a personal license and does not require a commercial headless license.
+  - a Binary Ninja bridge that owns all Binary Ninja API access
+- The bridge runs either as a GUI plugin or as a standalone headless process.
+- It creates one fixed bridge socket and one fixed registry file.
+- The CLI discovers that bridge, connects to it, and forwards commands.
+- In GUI mode, the bridge runs as a plugin and works with a personal license.
+- In headless mode, the bridge runs standalone and requires the `binaryninja` Python package on `sys.path` (commercial headless license or the headless API).
 
-## Quick Start
+## Quick Start (GUI)
 
 Open a binary or `.bndb` in Binary Ninja, then run:
 
@@ -57,6 +59,25 @@ bn refresh
 bn function list
 bn decompile sub_401000
 ```
+
+## Quick Start (Headless)
+
+Start the bridge with one or more binaries:
+
+```bash
+python -m bn_agent_bridge /path/to/binary.bndb
+```
+
+Or start the bridge empty and load binaries over the socket:
+
+```bash
+python -m bn_agent_bridge &
+bn load /path/to/binary.bndb
+bn function list
+bn close
+```
+
+All commands work identically in both modes. `bn load` and `bn close` are available for dynamic binary management (useful in headless, but also work with the GUI bridge).
 
 If exactly one BinaryView is open, target-specific commands can omit `--target` entirely. If multiple targets are open, pass `--target <selector>` from `bn target list`.
 
