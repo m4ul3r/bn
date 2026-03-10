@@ -13,7 +13,7 @@ import tiktoken
 from .paths import spill_root
 
 
-DEFAULT_SPILL_TOKEN_LIMIT = 20_000
+DEFAULT_SPILL_TOKEN_LIMIT = 10_000
 # `tiktoken` does not currently resolve the dotted `gpt-5.4` alias directly.
 GPT_5_4_TOKENIZER = "o200k_base"
 

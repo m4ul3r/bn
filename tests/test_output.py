@@ -6,6 +6,7 @@ from pathlib import Path
 
 import tiktoken
 
+from bn.output import DEFAULT_SPILL_TOKEN_LIMIT
 from bn.output import write_output
 
 
@@ -14,6 +15,10 @@ TOKENIZER = "o200k_base"
 
 def _token_count(text: str) -> int:
     return len(tiktoken.get_encoding(TOKENIZER).encode(text))
+
+
+def test_default_spill_token_limit_is_10k():
+    assert DEFAULT_SPILL_TOKEN_LIMIT == 10_000
 
 
 def test_write_output_renders_small_payload_without_spill(tmp_path, monkeypatch):
