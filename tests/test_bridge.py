@@ -121,7 +121,7 @@ class _FakeReg:
         self.name = name
 
 
-class _FakeHLILInstruction:
+class _FakeHLILInstructionNode:
     def __init__(self, text: str, *, condition=None, parent=None, expr_index: int = 0, instr_index: int = 0):
         self.text = text
         self.condition = condition
@@ -131,6 +131,31 @@ class _FakeHLILInstruction:
 
     def __str__(self):
         return self.text
+
+
+_FAKE_HLIL_TYPES: dict[str, type[_FakeHLILInstructionNode]] = {}
+
+
+def _FakeHLILInstruction(
+    text: str,
+    *,
+    class_name: str,
+    condition=None,
+    parent=None,
+    expr_index: int = 0,
+    instr_index: int = 0,
+):
+    cls = _FAKE_HLIL_TYPES.get(class_name)
+    if cls is None:
+        cls = type(class_name, (_FakeHLILInstructionNode,), {})
+        _FAKE_HLIL_TYPES[class_name] = cls
+    return cls(
+        text,
+        condition=condition,
+        parent=parent,
+        expr_index=expr_index,
+        instr_index=instr_index,
+    )
 
 
 class _FakeLLILInstruction:
@@ -669,28 +694,57 @@ def test_search_functions_rejects_invalid_regex(monkeypatch):
         instance._search_functions("active", "(", regex=True)
 
 
-def test_callsites_returns_exact_caller_static_and_context(monkeypatch):
+def test_callsites_returns_local_hlil_assignment_and_pre_branch_condition(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     branch = _FakeHLILInstruction(
-        "if ((eax_3 & 0x3f) != 0)",
-        condition="(eax_3 & 0x3f) != 0",
-        expr_index=1,
-        instr_index=1,
+        "if (result == 2)",
+        class_name="HighLevelILIf",
+        condition="result == 2",
+        expr_index=40,
+        instr_index=40,
     )
-    statement = _FakeHLILInstruction(
+    first_statement = _FakeHLILInstruction(
+        "edx_1:eax_1 = sx.q(crt_rand())",
+        class_name="HighLevelILVarInit",
+        expr_index=32,
+        instr_index=32,
+    )
+    first_sx = _FakeHLILInstruction(
+        "sx.q(crt_rand())",
+        class_name="HighLevelILSx",
+        parent=first_statement,
+        expr_index=31,
+        instr_index=31,
+    )
+    first_call = _FakeHLILInstruction(
+        "crt_rand()",
+        class_name="HighLevelILCall",
+        parent=first_sx,
+        expr_index=30,
+        instr_index=30,
+    )
+    second_statement = _FakeHLILInstruction(
         "eax_3, edx_2 = crt_rand()",
+        class_name="HighLevelILVarInit",
         parent=branch,
-        expr_index=2,
-        instr_index=2,
+        expr_index=42,
+        instr_index=42,
+    )
+    second_call = _FakeHLILInstruction(
+        "crt_rand()",
+        class_name="HighLevelILCall",
+        parent=second_statement,
+        expr_index=41,
+        instr_index=41,
     )
     callee = _FakeFunction(0x461746, "crt_rand")
     fn = _FakeFunction(0x412470, "bonus_pick_random_type")
     fn.basic_blocks = [_FakeBasicBlock(0x41249C, 0x4124D8)]
     fn.low_level_il = [
         [
-            _FakeLLILInstruction(0x4124A0, _FakeConstPtr(0x461746), hlils=[statement]),
-            _FakeLLILInstruction(0x4124D1, _FakeConstPtr(0x461746)),
+            _FakeLLILInstruction(0x4124A0, _FakeConstPtr(0x461746), hlils=[first_call]),
+            _FakeLLILInstruction(0x4124D1, _FakeConstPtr(0x461746), hlils=[second_call]),
         ]
     ]
     bv = _FakeBV(
@@ -724,11 +778,103 @@ def test_callsites_returns_exact_caller_static_and_context(monkeypatch):
     assert [row["caller_static"] for row in rows] == ["0x4124a5", "0x4124d6"]
     assert rows[0]["call_addr"] == "0x4124a0"
     assert rows[0]["instruction_length"] == 5
-    assert rows[0]["hlil_statement"] == "eax_3, edx_2 = crt_rand()"
-    assert rows[0]["branch_context"] == "(eax_3 & 0x3f) != 0"
+    assert rows[0]["call_index"] == 0
+    assert rows[0]["within_query"] == "bonus_pick_random_type"
+    assert rows[0]["hlil_statement"] == "edx_1:eax_1 = sx.q(crt_rand())"
+    assert rows[0]["pre_branch_condition"] is None
+    assert rows[1]["call_index"] == 1
+    assert rows[1]["hlil_statement"] == "eax_3, edx_2 = crt_rand()"
+    assert rows[1]["pre_branch_condition"] == "result == 2"
     assert [item["address"] for item in rows[0]["previous_instructions"]] == ["0x41249c", "0x41249e"]
     assert rows[0]["call_instruction"]["text"] == "call crt_rand"
     assert [item["address"] for item in rows[0]["next_instructions"][:1]] == ["0x4124a5"]
+
+
+def test_callsites_prefers_local_expression_over_broad_enclosing_hlil(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    branch = _FakeHLILInstruction(
+        "if (config_fx_toggle != 0)",
+        class_name="HighLevelILIf",
+        condition="config_fx_toggle != 0",
+        expr_index=100,
+        instr_index=100,
+    )
+    broad_statement = _FakeHLILInstruction(
+        "if (config_fx_toggle != 0)\nlong expression blob\nreturn",
+        class_name="HighLevelILVarInit",
+        parent=branch,
+        expr_index=99,
+        instr_index=99,
+    )
+    add_expr = _FakeHLILInstruction(
+        "float.t(crt_rand() & 0xf) * 0.01 + 0.84",
+        class_name="HighLevelILAdd",
+        parent=broad_statement,
+        expr_index=35,
+        instr_index=9,
+    )
+    mul_expr = _FakeHLILInstruction(
+        "float.t(crt_rand() & 0xf) * 0.01",
+        class_name="HighLevelILMul",
+        parent=add_expr,
+        expr_index=34,
+        instr_index=9,
+    )
+    cast_expr = _FakeHLILInstruction(
+        "float.t(crt_rand() & 0xf)",
+        class_name="HighLevelILIntToFloat",
+        parent=mul_expr,
+        expr_index=33,
+        instr_index=9,
+    )
+    and_expr = _FakeHLILInstruction(
+        "crt_rand() & 0xf",
+        class_name="HighLevelILAnd",
+        parent=cast_expr,
+        expr_index=32,
+        instr_index=9,
+    )
+    call_expr = _FakeHLILInstruction(
+        "crt_rand()",
+        class_name="HighLevelILCall",
+        parent=and_expr,
+        expr_index=31,
+        instr_index=9,
+    )
+    callee = _FakeFunction(0x461746, "crt_rand")
+    fn = _FakeFunction(0x427700, "fx_queue_add_random")
+    fn.basic_blocks = [_FakeBasicBlock(0x427753, 0x427768)]
+    fn.low_level_il = [[_FakeLLILInstruction(0x42775B, _FakeConstPtr(0x461746), hlils=[broad_statement, call_expr])]]
+    bv = _FakeBV(
+        functions=[callee, fn],
+        instruction_lengths={
+            0x427753: 5,
+            0x427758: 3,
+            0x42775B: 5,
+            0x427760: 3,
+        },
+        disassembly={
+            0x427753: "call helper",
+            0x427758: "add esp, 0x4",
+            0x42775B: "call crt_rand",
+            0x427760: "and eax, 0xf",
+        },
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    rows = instance._callsites(
+        "active",
+        "crt_rand",
+        within_identifiers=["fx_queue_add_random"],
+        context=2,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["hlil_statement"] == "float.t(crt_rand() & 0xf) * 0.01 + 0.84"
+    assert rows[0]["pre_branch_condition"] == "config_fx_toggle != 0"
+    assert rows[0]["call_index"] == 0
+    assert rows[0]["within_query"] == "fx_queue_add_random"
 
 
 def test_callsites_within_file_scope_preserves_file_order_and_dedupes(monkeypatch):
@@ -757,6 +903,8 @@ def test_callsites_within_file_scope_preserves_file_order_and_dedupes(monkeypatc
 
     assert [row["containing_function"]["name"] for row in rows] == ["beta", "alpha"]
     assert [row["caller_static"] for row in rows] == ["0x402025", "0x401015"]
+    assert [row["within_query"] for row in rows] == ["beta", "alpha"]
+    assert [row["call_index"] for row in rows] == [0, 0]
 
 
 def test_callsites_ignores_indirect_calls_and_returns_null_context_when_unmapped(monkeypatch):
@@ -788,7 +936,84 @@ def test_callsites_ignores_indirect_calls_and_returns_null_context_when_unmapped
     assert len(rows) == 1
     assert rows[0]["call_addr"] == "0x500015"
     assert rows[0]["hlil_statement"] is None
-    assert rows[0]["branch_context"] is None
+    assert rows[0]["pre_branch_condition"] is None
+
+
+def test_callsites_returns_null_for_coarse_only_hlil(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    callee = _FakeFunction(0x461746, "crt_rand")
+    broad_statement = _FakeHLILInstruction(
+        "if (x)\nwhole function blob\nreturn",
+        class_name="HighLevelILVarInit",
+        expr_index=10,
+        instr_index=10,
+    )
+    fn = _FakeFunction(0x600000, "coarse")
+    fn.basic_blocks = [_FakeBasicBlock(0x600010, 0x600016)]
+    fn.low_level_il = [[_FakeLLILInstruction(0x600010, _FakeConstPtr(0x461746), hlils=[broad_statement])]]
+    bv = _FakeBV(
+        functions=[callee, fn],
+        instruction_lengths={0x600010: 5},
+        disassembly={0x600010: "call crt_rand"},
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    rows = instance._callsites(
+        "active",
+        "crt_rand",
+        within_identifiers=["coarse"],
+        context=1,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["hlil_statement"] is None
+    assert rows[0]["pre_branch_condition"] is None
+
+
+def test_callsites_filters_placeholder_pre_branch_condition(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    branch = _FakeHLILInstruction(
+        "do while (not(cond:0_1))",
+        class_name="HighLevelILDoWhile",
+        condition="not(cond:0_1)",
+        expr_index=50,
+        instr_index=50,
+    )
+    statement = _FakeHLILInstruction(
+        "eax_1 = crt_rand()",
+        class_name="HighLevelILVarInit",
+        parent=branch,
+        expr_index=51,
+        instr_index=51,
+    )
+    call = _FakeHLILInstruction(
+        "crt_rand()",
+        class_name="HighLevelILCall",
+        parent=statement,
+        expr_index=52,
+        instr_index=52,
+    )
+    callee = _FakeFunction(0x461746, "crt_rand")
+    fn = _FakeFunction(0x700000, "placeholder_cond")
+    fn.basic_blocks = [_FakeBasicBlock(0x700010, 0x700016)]
+    fn.low_level_il = [[_FakeLLILInstruction(0x700010, _FakeConstPtr(0x461746), hlils=[call])]]
+    bv = _FakeBV(
+        functions=[callee, fn],
+        instruction_lengths={0x700010: 5},
+        disassembly={0x700010: "call crt_rand"},
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    rows = instance._callsites(
+        "active",
+        "crt_rand",
+        within_identifiers=["placeholder_cond"],
+        context=1,
+    )
+
+    assert rows[0]["pre_branch_condition"] is None
 
 
 def test_bridge_handler_swallows_broken_pipe(monkeypatch):

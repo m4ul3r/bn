@@ -548,6 +548,7 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
         containing = row.get("containing_function") if isinstance(row.get("containing_function"), dict) else {}
         call_addr = row.get("call_addr", "<unknown>")
         caller_static = row.get("caller_static", "<unknown>")
+        call_index = row.get("call_index")
         primary = (
             f"caller_static {caller_static} | call {call_addr}"
             if prefer_caller_static
@@ -561,10 +562,14 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
             ),
             f"callee: {callee.get('name', '<unknown>')} @ {callee.get('address', '<unknown>')}",
         ]
+        if call_index is not None:
+            lines.append(f"call-index: {call_index}")
+        if row.get("within_query"):
+            lines.append(f"within-query: {row['within_query']}")
         if row.get("hlil_statement"):
             lines.append(f"hlil: {row['hlil_statement']}")
-        if row.get("branch_context"):
-            lines.append(f"branch: {row['branch_context']}")
+        if row.get("pre_branch_condition"):
+            lines.append(f"pre-branch: {row['pre_branch_condition']}")
 
         call_instruction = row.get("call_instruction") if isinstance(row.get("call_instruction"), dict) else {}
         previous = list(row.get("previous_instructions") or [])

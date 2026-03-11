@@ -148,6 +148,15 @@ bn imports
 
 `bn callsites` is the direct-call lane for exact return-address recovery. It reports both the native `call_addr` and the post-call `caller_static`, where `caller_static = call_addr + instruction_length`. Scope it with `--within <function>` or `--within-file <path>`; the file format is one function identifier per non-empty line, with `#` comments ignored.
 
+Each callsite row also includes:
+
+- `call_index`: zero-based ordinal for matching callsites in the containing function, ordered by `call_addr`
+- `within_query`: the original unresolved scope token from `--within` or `--within-file`
+- `hlil_statement`: the smallest recoverable HLIL expression or statement containing the call, or `null` when Binary Ninja only exposes a coarse enclosing region
+- `pre_branch_condition`: the nearest enclosing pre-call HLIL condition when it can be recovered confidently, otherwise `null`
+
+`hlil_statement` is intentionally local-or-null. If the best available HLIL mapping expands to a broad whole-function or multi-statement blob, `bn callsites` suppresses it instead of returning noisy context.
+
 ## Bundles And Python
 
 `bn decompile` is the HLIL-text convenience lane. It is useful for quick function reading, but typed layouts remain authoritative in `bn types show` and `bn struct show`.

@@ -541,6 +541,8 @@ def test_callsites_routes_within_scope_and_renders_text(monkeypatch, capsys):
                         "name": "bonus_pick_random_type",
                         "address": "0x412470",
                     },
+                    "within_query": "bonus_pick_random_type",
+                    "call_index": 0,
                     "call_addr": "0x4124a0",
                     "instruction_length": 5,
                     "caller_static": "0x4124a5",
@@ -552,7 +554,7 @@ def test_callsites_routes_within_scope_and_renders_text(monkeypatch, capsys):
                         {"address": "0x4124a5", "text": "cmp eax, 0xd"},
                     ],
                     "hlil_statement": "edx_1:eax_1 = sx.q(crt_rand())",
-                    "branch_context": "mods.dp.d(edx_1:eax_1, 0xa2) + 1 s<= 0xd",
+                    "pre_branch_condition": "result == 2",
                 }
             ],
         }
@@ -583,8 +585,10 @@ def test_callsites_routes_within_scope_and_renders_text(monkeypatch, capsys):
     output = capsys.readouterr().out
     assert output.startswith("caller_static 0x4124a5 | call 0x4124a0")
     assert "within: bonus_pick_random_type @ 0x412470" in output
+    assert "call-index: 0" in output
+    assert "within-query: bonus_pick_random_type" in output
     assert "hlil: edx_1:eax_1 = sx.q(crt_rand())" in output
-    assert "branch: mods.dp.d(edx_1:eax_1, 0xa2) + 1 s<= 0xd" in output
+    assert "pre-branch: result == 2" in output
     assert "> 0x4124a0  call crt_rand" in output
 
 
@@ -621,6 +625,40 @@ def test_callsites_within_file_ignores_comments_and_blank_lines(monkeypatch, tmp
         "bonus_pick_random_type",
         "fx_queue_add_random",
     ]
+
+
+def test_callsites_text_omits_null_hlil_and_pre_branch(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        assert op == "callsites"
+        return {
+            "ok": True,
+            "result": [
+                {
+                    "callee": {"name": "crt_rand", "address": "0x461746"},
+                    "containing_function": {"name": "fx_queue_add_random", "address": "0x427700"},
+                    "within_query": "fx_queue_add_random",
+                    "call_index": 3,
+                    "call_addr": "0x427806",
+                    "instruction_length": 5,
+                    "caller_static": "0x42780b",
+                    "call_instruction": {"address": "0x427806", "text": "call crt_rand"},
+                    "previous_instructions": [],
+                    "next_instructions": [],
+                    "hlil_statement": None,
+                    "pre_branch_condition": None,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["callsites", "--format", "text", "--target", "active", "--within", "fx_queue_add_random", "crt_rand"])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "call-index: 3" in output
+    assert "hlil:" not in output
+    assert "pre-branch:" not in output
 
 
 def test_comment_get_defaults_to_active_when_single_target_open(monkeypatch, capsys):

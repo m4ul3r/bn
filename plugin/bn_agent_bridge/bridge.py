@@ -711,7 +711,7 @@ class BinaryNinjaBridge:
             matches.append(fn)
         return matches
 
-    def _resolve_scope_functions(self, bv, identifiers: list[Any]) -> list[Any]:
+    def _resolve_scope_functions(self, bv, identifiers: list[Any]) -> list[tuple[str, Any]]:
         if not identifiers:
             raise OperationFailure("invalid_scope", "callsites requires at least one scoped function")
 
@@ -723,7 +723,7 @@ class BinaryNinjaBridge:
             if marker in seen:
                 continue
             seen.add(marker)
-            resolved.append(fn)
+            resolved.append((str(identifier), fn))
         return resolved
 
     def _find_symbols_by_name(self, bv, text: str, *, case_sensitive: bool) -> list[Any]:
@@ -1176,45 +1176,164 @@ class BinaryNinjaBridge:
                 return parent
         return None
 
-    def _hlil_statement_text(self, insn) -> str | None:
-        candidates = self._hlil_candidates_for_llil(insn)
-        if not candidates:
+    def _hlil_marker(self, instruction) -> tuple[str, int]:
+        expr_index = getattr(instruction, "expr_index", None)
+        return (
+            type(instruction).__name__,
+            int(expr_index) if expr_index is not None else id(instruction),
+        )
+
+    def _hlil_type_name(self, instruction) -> str:
+        return type(instruction).__name__
+
+    def _hlil_text_is_local(self, text: str) -> bool:
+        stripped = text.strip()
+        if not stripped:
+            return False
+        if len(stripped) > 240:
+            return False
+        if stripped.count("\n") > 1:
+            return False
+        return True
+
+    def _hlil_condition_is_meaningful(self, text: str) -> bool:
+        stripped = text.strip()
+        if not stripped:
+            return False
+        if "\n" in stripped:
+            return False
+        if re.search(r"\bcond:\d", stripped):
+            return False
+        return True
+
+    def _is_hlil_assignment_like(self, instruction) -> bool:
+        return self._hlil_type_name(instruction) in {
+            "HighLevelILAssign",
+            "HighLevelILVarAssign",
+            "HighLevelILVarInit",
+            "HighLevelILAssignMem",
+            "HighLevelILAssignUnpack",
+            "HighLevelILVarDeclare",
+        }
+
+    def _is_hlil_control_flow(self, instruction) -> bool:
+        return self._hlil_type_name(instruction) in {
+            "HighLevelILIf",
+            "HighLevelILWhile",
+            "HighLevelILDoWhile",
+            "HighLevelILFor",
+            "HighLevelILSwitch",
+            "HighLevelILCase",
+        }
+
+    def _is_hlil_hard_boundary(self, instruction) -> bool:
+        if self._is_hlil_assignment_like(instruction) or self._is_hlil_control_flow(instruction):
+            return True
+        return self._hlil_type_name(instruction) in {
+            "HighLevelILRet",
+            "HighLevelILBlock",
+            "HighLevelILCall",
+            "HighLevelILTailcall",
+        }
+
+    def _is_hlil_trivial_wrapper(self, instruction) -> bool:
+        return self._hlil_type_name(instruction) in {
+            "HighLevelILCall",
+            "HighLevelILSx",
+            "HighLevelILZx",
+            "HighLevelILLowPart",
+            "HighLevelILIntToFloat",
+            "HighLevelILFloatToInt",
+            "HighLevelILBoolToInt",
+            "HighLevelILFloatConv",
+            "HighLevelILAddressOf",
+            "HighLevelILAddressOfField",
+            "HighLevelILArrayIndex",
+        }
+
+    def _hlil_call_roots(self, insn) -> list[Any]:
+        roots = []
+        seen: set[tuple[str, int]] = set()
+        for candidate in self._hlil_candidates_for_llil(insn):
+            current = candidate
+            while current is not None:
+                if self._hlil_type_name(current) == "HighLevelILCall":
+                    marker = self._hlil_marker(current)
+                    if marker not in seen:
+                        seen.add(marker)
+                        roots.append(current)
+                    break
+                current = self._il_parent(current)
+        return roots
+
+    def _select_local_hlil_node(self, insn) -> Any | None:
+        roots = self._hlil_call_roots(insn)
+        if not roots:
             return None
 
-        current = candidates[0]
+        for root in roots:
+            current = root
+            best_expression = None
+            assignment_candidate = None
+            seen: set[tuple[str, int]] = set()
+            while current is not None:
+                marker = self._hlil_marker(current)
+                if marker in seen:
+                    break
+                seen.add(marker)
+
+                parent = self._il_parent(current)
+                if parent is None:
+                    break
+                if self._is_hlil_control_flow(parent):
+                    break
+                if self._is_hlil_assignment_like(parent):
+                    text = str(parent)
+                    if self._hlil_text_is_local(text):
+                        assignment_candidate = parent
+                    break
+                if self._is_hlil_hard_boundary(parent):
+                    break
+
+                parent_text = str(parent)
+                if not self._is_hlil_trivial_wrapper(parent) and self._hlil_text_is_local(parent_text):
+                    best_expression = parent
+                current = parent
+
+            if best_expression is not None:
+                return best_expression
+            if assignment_candidate is not None:
+                return assignment_candidate
+        return None
+
+    def _hlil_statement_text(self, insn) -> str | None:
+        node = self._select_local_hlil_node(insn)
+        if node is None:
+            return None
+        text = str(node)
+        return text if self._hlil_text_is_local(text) else None
+
+    def _hlil_pre_branch_condition(self, insn) -> str | None:
+        current = self._select_local_hlil_node(insn)
+        if current is None:
+            return None
+
         seen: set[tuple[str, int]] = set()
         while current is not None:
-            expr_index = getattr(current, "expr_index", None)
-            instr_index = getattr(current, "instr_index", None)
-            marker = (type(current).__name__, int(expr_index) if expr_index is not None else id(current))
+            marker = self._hlil_marker(current)
             if marker in seen:
                 break
             seen.add(marker)
-            if expr_index is not None and instr_index is not None and int(expr_index) == int(instr_index):
-                return str(current)
             parent = self._il_parent(current)
             if parent is None:
-                return str(current)
-            current = parent
-        return str(candidates[0])
-
-    def _hlil_branch_context(self, insn) -> str | None:
-        candidates = self._hlil_candidates_for_llil(insn)
-        if not candidates:
-            return None
-
-        current = candidates[0]
-        seen: set[tuple[str, int]] = set()
-        while current is not None:
-            expr_index = getattr(current, "expr_index", None)
-            marker = (type(current).__name__, int(expr_index) if expr_index is not None else id(current))
-            if marker in seen:
                 break
-            seen.add(marker)
-            condition = getattr(current, "condition", None)
-            if condition is not None:
-                return str(condition)
-            current = self._il_parent(current)
+            if self._is_hlil_control_flow(parent):
+                condition = getattr(parent, "condition", None)
+                if condition is None:
+                    return None
+                text = str(condition).strip()
+                return text if self._hlil_condition_is_meaningful(text) else None
+            current = parent
         return None
 
     def _callsites_within_function(self, bv, callee, func, *, context: int) -> list[dict[str, Any]]:
@@ -1274,7 +1393,7 @@ class BinaryNinjaBridge:
                     "previous_instructions": previous,
                     "next_instructions": next_instructions,
                     "hlil_statement": self._hlil_statement_text(insn),
-                    "branch_context": self._hlil_branch_context(insn),
+                    "pre_branch_condition": self._hlil_pre_branch_condition(insn),
                 }
             )
         rows.sort(key=lambda item: int(item["call_addr"], 16))
@@ -1296,8 +1415,12 @@ class BinaryNinjaBridge:
         scope_functions = self._resolve_scope_functions(bv, within_identifiers)
 
         rows = []
-        for func in scope_functions:
-            rows.extend(self._callsites_within_function(bv, callee, func, context=context))
+        for within_query, func in scope_functions:
+            function_rows = self._callsites_within_function(bv, callee, func, context=context)
+            for call_index, row in enumerate(function_rows):
+                row["call_index"] = call_index
+                row["within_query"] = str(within_query)
+            rows.extend(function_rows)
         return rows
 
     def _xrefs_to_address(self, bv, address: int) -> dict[str, Any]:
