@@ -136,15 +136,14 @@ def _target_option(
     parser: argparse.ArgumentParser,
     *,
     required: bool,
-    default: str | None = None,
 ) -> None:
     kwargs: dict[str, Any] = {
-        "help": "Target selector from `bn target list` (`selector`, `target_id`, basename, filename, or view id) or `active`",
+        "help": (
+            "Target selector from `bn target list` (`selector`, `target_id`, basename, filename, or view id); "
+            "omit only when exactly one target is open, or use `active` to follow the GUI-selected target explicitly"
+        ),
         "required": required,
     }
-    if default is not None:
-        kwargs["default"] = default
-        kwargs["required"] = False
     parser.add_argument("--target", **kwargs)
 
 
@@ -971,6 +970,7 @@ def _function_list(args: argparse.Namespace) -> int:
         "list_functions",
         params,
         require_target=True,
+        allow_implicit_target=True,
         text_renderer=_render_name_address_list_text,
         page_label="function list",
         stem="functions",
@@ -991,6 +991,7 @@ def _function_search(args: argparse.Namespace) -> int:
         "search_functions",
         params,
         require_target=True,
+        allow_implicit_target=True,
         text_renderer=_render_name_address_list_text,
         page_label="function search",
         stem="function-search",
@@ -1003,6 +1004,7 @@ def _function_info(args: argparse.Namespace) -> int:
         "function_info",
         {"identifier": args.identifier},
         require_target=True,
+        allow_implicit_target=True,
         text_renderer=_render_function_info_text,
         stem="function-info",
     )
@@ -1014,6 +1016,7 @@ def _decompile(args: argparse.Namespace) -> int:
         "decompile",
         {"identifier": args.identifier},
         require_target=True,
+        allow_implicit_target=True,
         text_renderer=_text_field("text"),
         stem="decompile",
     )
@@ -1025,6 +1028,7 @@ def _il(args: argparse.Namespace) -> int:
         "il",
         {"identifier": args.identifier, "view": args.view, "ssa": bool(args.ssa)},
         require_target=True,
+        allow_implicit_target=True,
         text_renderer=_text_field("text"),
         stem="il",
     )
@@ -1036,6 +1040,7 @@ def _disasm(args: argparse.Namespace) -> int:
         "disasm",
         {"identifier": args.identifier},
         require_target=True,
+        allow_implicit_target=True,
         text_renderer=_text_field("text"),
         stem="disasm",
     )
@@ -1050,6 +1055,7 @@ def _xrefs(args: argparse.Namespace) -> int:
             "field_xrefs",
             {"field": args.extra[0]},
             require_target=True,
+            allow_implicit_target=True,
             text_renderer=_render_field_xrefs_text,
             stem="field-xrefs",
         )
@@ -1060,6 +1066,7 @@ def _xrefs(args: argparse.Namespace) -> int:
         "xrefs",
         {"identifier": args.identifier},
         require_target=True,
+        allow_implicit_target=True,
         text_renderer=_render_xrefs_text,
         stem="xrefs",
     )
@@ -1095,6 +1102,7 @@ def _callsites(args: argparse.Namespace) -> int:
             "caller_static": bool(args.caller_static),
         },
         require_target=True,
+        allow_implicit_target=True,
         text_renderer=lambda value: _render_callsites_text(
             value,
             prefer_caller_static=bool(args.caller_static),
@@ -1109,6 +1117,7 @@ def _types(args: argparse.Namespace) -> int:
         "types",
         {"query": args.query, "offset": args.offset, "limit": args.limit},
         require_target=True,
+        allow_implicit_target=True,
         text_renderer=_render_type_list_text,
         page_limit=args.limit,
         page_offset=args.offset,
@@ -1126,6 +1135,7 @@ def _types_show(args: argparse.Namespace) -> int:
             "require_struct": bool(getattr(args, "require_struct", False)),
         },
         require_target=True,
+        allow_implicit_target=True,
         text_renderer=_render_type_info_text,
         stem="type-show",
     )
@@ -1167,6 +1177,7 @@ def _strings(args: argparse.Namespace) -> int:
         "strings",
         {"query": args.query, "offset": args.offset, "limit": args.limit},
         require_target=True,
+        allow_implicit_target=True,
         text_renderer=_render_strings_text,
         page_limit=args.limit,
         page_offset=args.offset,
@@ -1181,6 +1192,7 @@ def _imports(args: argparse.Namespace) -> int:
         "imports",
         {},
         require_target=True,
+        allow_implicit_target=True,
         text_renderer=_render_name_address_list_text,
         stem="imports",
     )
@@ -1310,6 +1322,7 @@ def _proto_get(args: argparse.Namespace) -> int:
         "get_prototype",
         {"identifier": args.identifier},
         require_target=True,
+        allow_implicit_target=True,
         text_renderer=_render_proto_text,
         stem="prototype-get",
     )
@@ -1321,6 +1334,7 @@ def _local_list(args: argparse.Namespace) -> int:
         "list_locals",
         {"identifier": args.function},
         require_target=True,
+        allow_implicit_target=True,
         text_renderer=_render_local_list_text,
         stem="local-list",
     )
@@ -1391,6 +1405,7 @@ def _struct_show(args: argparse.Namespace) -> int:
             "require_struct": True,
         },
         require_target=True,
+        allow_implicit_target=True,
         text_renderer=_render_type_info_text,
         stem="struct-show",
     )
@@ -1509,12 +1524,12 @@ def build_parser() -> argparse.ArgumentParser:
     function_sub = function.add_subparsers(dest="function_command")
     function_list = function_sub.add_parser("list", help="List functions")
     _common_io_options(function_list)
-    _target_option(function_list, required=False, default="active")
+    _target_option(function_list, required=False)
     _add_function_address_args(function_list)
     function_list.set_defaults(handler=_function_list)
     function_search = function_sub.add_parser("search", help="Search functions by substring or regex")
     _common_io_options(function_search)
-    _target_option(function_search, required=False, default="active")
+    _target_option(function_search, required=False)
     _add_function_address_args(function_search)
     function_search.add_argument(
         "--regex",
@@ -1525,19 +1540,19 @@ def build_parser() -> argparse.ArgumentParser:
     function_search.set_defaults(handler=_function_search)
     function_info = function_sub.add_parser("info", help="Show function prototype and variables")
     _common_io_options(function_info)
-    _target_option(function_info, required=False, default="active")
+    _target_option(function_info, required=False)
     function_info.add_argument("identifier")
     function_info.set_defaults(handler=_function_info)
 
     decompile = subparsers.add_parser("decompile", help="Render HLIL-style decompile text for a function")
     _common_io_options(decompile)
-    _target_option(decompile, required=False, default="active")
+    _target_option(decompile, required=False)
     decompile.add_argument("identifier")
     decompile.set_defaults(handler=_decompile)
 
     il = subparsers.add_parser("il", help="Dump IL for a function")
     _common_io_options(il)
-    _target_option(il, required=False, default="active")
+    _target_option(il, required=False)
     il.add_argument("identifier")
     il.add_argument("--view", choices=("hlil", "mlil", "llil"), default="hlil")
     il.add_argument("--ssa", action="store_true")
@@ -1545,20 +1560,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     disasm = subparsers.add_parser("disasm", help="Disassemble a function")
     _common_io_options(disasm)
-    _target_option(disasm, required=False, default="active")
+    _target_option(disasm, required=False)
     disasm.add_argument("identifier")
     disasm.set_defaults(handler=_disasm)
 
     xrefs = subparsers.add_parser("xrefs", help="List xrefs to an address or function, or `field <Struct.field>`")
     _common_io_options(xrefs)
-    _target_option(xrefs, required=False, default="active")
+    _target_option(xrefs, required=False)
     xrefs.add_argument("identifier", nargs="?")
     xrefs.add_argument("extra", nargs="*")
     xrefs.set_defaults(handler=_xrefs)
 
     callsites = subparsers.add_parser("callsites", help="Find direct native callsites and exact caller_static addresses")
     _common_io_options(callsites)
-    _target_option(callsites, required=False, default="active")
+    _target_option(callsites, required=False)
     callsites.add_argument("callee")
     scope = callsites.add_mutually_exclusive_group(required=True)
     scope.add_argument("--within", help="Containing function to search for callsites")
@@ -1578,14 +1593,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     types = subparsers.add_parser("types", help="List or search types")
     _common_io_options(types)
-    _target_option(types, required=False, default="active")
+    _target_option(types, required=False)
     _add_paged_args(types)
     types.add_argument("--query")
     types.set_defaults(handler=_types)
     types_sub = types.add_subparsers(dest="types_command")
     types_show = types_sub.add_parser("show", help="Show one type")
     _common_io_options(types_show)
-    _target_option(types_show, required=False, default="active")
+    _target_option(types_show, required=False)
     types_show.add_argument("type_name")
     types_show.set_defaults(handler=_types_show)
     types_declare = types_sub.add_parser("declare", help="Import C declarations as user types")
@@ -1599,14 +1614,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     strings = subparsers.add_parser("strings", help="List or search strings")
     _common_io_options(strings)
-    _target_option(strings, required=False, default="active")
+    _target_option(strings, required=False)
     _add_paged_args(strings)
     strings.add_argument("--query")
     strings.set_defaults(handler=_strings)
 
     imports = subparsers.add_parser("imports", help="List imports")
     _common_io_options(imports)
-    _target_option(imports, required=False, default="active")
+    _target_option(imports, required=False)
     imports.set_defaults(handler=_imports)
 
     bundle = subparsers.add_parser("bundle", help="Export reusable bundles")
@@ -1667,7 +1682,7 @@ def build_parser() -> argparse.ArgumentParser:
     proto_sub = proto.add_subparsers(dest="proto_command")
     proto_get = proto_sub.add_parser("get", help="Show the current prototype")
     _common_io_options(proto_get)
-    _target_option(proto_get, required=False, default="active")
+    _target_option(proto_get, required=False)
     proto_get.add_argument("identifier")
     proto_get.set_defaults(handler=_proto_get)
     proto_set = proto_sub.add_parser("set", help="Set a prototype")
@@ -1682,7 +1697,7 @@ def build_parser() -> argparse.ArgumentParser:
     local_sub = local.add_subparsers(dest="local_command")
     local_list = local_sub.add_parser("list", help="List locals with stable IDs")
     _common_io_options(local_list)
-    _target_option(local_list, required=False, default="active")
+    _target_option(local_list, required=False)
     local_list.add_argument("function")
     local_list.set_defaults(handler=_local_list)
     local_rename = local_sub.add_parser("rename", help="Rename a local")
@@ -1706,7 +1721,7 @@ def build_parser() -> argparse.ArgumentParser:
     struct_sub = struct.add_subparsers(dest="struct_command")
     struct_show = struct_sub.add_parser("show", help="Show one struct layout")
     _common_io_options(struct_show)
-    _target_option(struct_show, required=False, default="active")
+    _target_option(struct_show, required=False)
     struct_show.add_argument("struct_name")
     struct_show.set_defaults(handler=_struct_show)
     field = struct_sub.add_parser("field", help="Operate on struct fields")

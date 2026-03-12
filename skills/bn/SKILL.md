@@ -20,7 +20,7 @@ Use `bn doctor` when bridge state is unclear or `bn target list` does not show w
 
 2. Pick a target:
 - If there is exactly one open BinaryView, target-scoped commands can omit `--target` entirely.
-- If multiple targets are open, pass `--target <selector>` from `bn target list`.
+- If multiple targets are open, commands that omit `--target` fail; pass `--target <selector>` from `bn target list`.
 - Use `--target active` only when you explicitly mean the GUI-selected target.
 
 3. Pick the right output mode:

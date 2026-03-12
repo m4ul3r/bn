@@ -7,25 +7,50 @@ import bn.cli
 import pytest
 
 
-def test_function_list_defaults_to_active_target(monkeypatch, capsys):
-    captured = {}
+def test_function_list_uses_implicit_target_when_single_target_is_open(monkeypatch, capsys):
+    calls = []
 
     def fake_send_request(op, *, params=None, target=None, timeout=30.0):
-        captured["op"] = op
-        captured["params"] = params
-        captured["target"] = target
-        return {"ok": True, "result": [{"name": "sub_401000", "address": "0x401000"}]}
+        calls.append({"op": op, "params": params, "target": target})
+        if op == "list_targets":
+            return {
+                "ok": True,
+                "result": [{"target_id": "123:1:7", "selector": "SnailMail_unwrapped.exe.bndb"}],
+            }
+        if op == "list_functions":
+            return {"ok": True, "result": [{"name": "sub_401000", "address": "0x401000"}]}
+        raise AssertionError(f"unexpected op: {op}")
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
     rc = bn.cli.main(["function", "list"])
     assert rc == 0
-    assert captured["op"] == "list_functions"
-    assert captured["params"] == {}
-    assert captured["target"] == "active"
+    assert [call["op"] for call in calls] == ["list_targets", "list_functions"]
+    assert calls[1]["params"] == {}
+    assert calls[1]["target"] == "active"
     output = capsys.readouterr().out
     assert output == "0x401000  sub_401000\n"
     assert '"name"' not in output
+
+
+def test_function_list_requires_target_when_multiple_targets_are_open(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        if op == "list_targets":
+            return {
+                "ok": True,
+                "result": [
+                    {"target_id": "123:1:7", "selector": "SnailMail_unwrapped.exe.bndb"},
+                    {"target_id": "123:2:8", "selector": "other.exe.bndb"},
+                ],
+            }
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["function", "list"])
+
+    assert rc == 2
+    assert "requires --target when multiple targets are open" in capsys.readouterr().err
 
 
 def test_function_list_returns_full_result_set(monkeypatch, capsys):
@@ -42,7 +67,7 @@ def test_function_list_returns_full_result_set(monkeypatch, capsys):
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
-    rc = bn.cli.main(["function", "list", "--format", "json"])
+    rc = bn.cli.main(["function", "list", "--target", "active", "--format", "json"])
 
     assert rc == 0
     assert captured["op"] == "list_functions"
@@ -86,7 +111,7 @@ def test_function_list_warns_when_output_auto_spills(monkeypatch, capsys):
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
     monkeypatch.setattr(bn.cli, "write_output_result", fake_write_output_result)
 
-    rc = bn.cli.main(["function", "list"])
+    rc = bn.cli.main(["function", "list", "--target", "active"])
 
     assert rc == 0
     stdout, stderr = capsys.readouterr()
@@ -109,7 +134,18 @@ def test_function_list_forwards_address_filters(monkeypatch, capsys):
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
-    rc = bn.cli.main(["function", "list", "--min-address", "0x401000", "--max-address", "0x402000"])
+    rc = bn.cli.main(
+        [
+            "function",
+            "list",
+            "--target",
+            "active",
+            "--min-address",
+            "0x401000",
+            "--max-address",
+            "0x402000",
+        ]
+    )
 
     assert rc == 0
     assert captured["op"] == "list_functions"
@@ -129,7 +165,7 @@ def test_function_search_can_request_regex_matching(monkeypatch, capsys):
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
-    rc = bn.cli.main(["function", "search", "--regex", "attach|detach"])
+    rc = bn.cli.main(["function", "search", "--target", "active", "--regex", "attach|detach"])
 
     assert rc == 0
     assert captured["op"] == "search_functions"
@@ -144,7 +180,9 @@ def test_parser_defaults_reads_to_text_and_mutations_to_json():
     parser = bn.cli.build_parser()
 
     assert parser.parse_args(["function", "list"]).format == "text"
+    assert parser.parse_args(["function", "list"]).target is None
     assert parser.parse_args(["callsites", "crt_rand", "--within", "bonus_pick_random_type"]).format == "text"
+    assert parser.parse_args(["decompile", "sub_401000"]).target is None
     assert parser.parse_args(["decompile", "sub_401000"]).format == "text"
     assert parser.parse_args(["plugin", "install"]).format == "json"
     assert parser.parse_args(["skill", "install"]).format == "json"
@@ -205,7 +243,7 @@ def test_function_info_uses_active_target_and_text_renderer(monkeypatch, capsys)
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
-    rc = bn.cli.main(["function", "info", "--format", "text", "sub_401000"])
+    rc = bn.cli.main(["function", "info", "--format", "text", "--target", "active", "sub_401000"])
 
     assert rc == 0
     assert captured["op"] == "function_info"
@@ -246,7 +284,7 @@ def test_symbol_rename_builds_preview_payload(monkeypatch):
     assert captured["params"]["preview"] is True
 
 
-def test_symbol_rename_defaults_to_active_when_single_target_open(monkeypatch):
+def test_symbol_rename_uses_implicit_target_when_single_target_is_open(monkeypatch):
     calls = []
 
     def fake_send_request(op, *, params=None, target=None, timeout=30.0):
@@ -355,7 +393,7 @@ def test_target_list_text_format_renders_summary(monkeypatch, capsys):
     assert '"selector"' not in output
 
 
-def test_refresh_defaults_to_active_when_single_target_open(monkeypatch, capsys):
+def test_refresh_uses_implicit_target_when_single_target_is_open(monkeypatch, capsys):
     calls = []
 
     def fake_send_request(op, *, params=None, target=None, timeout=30.0):
@@ -413,7 +451,7 @@ def test_types_show_uses_type_info_and_text_renderer(monkeypatch, capsys):
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
-    rc = bn.cli.main(["types", "show", "--format", "text", "Player"])
+    rc = bn.cli.main(["types", "show", "--format", "text", "--target", "active", "Player"])
 
     assert rc == 0
     assert captured["op"] == "type_info"
@@ -424,7 +462,7 @@ def test_types_show_uses_type_info_and_text_renderer(monkeypatch, capsys):
     assert '"decl"' not in output
 
 
-def test_types_declare_defaults_to_active_when_single_target_open(monkeypatch):
+def test_types_declare_uses_implicit_target_when_single_target_is_open(monkeypatch):
     calls = []
 
     def fake_send_request(op, *, params=None, target=None, timeout=30.0):
@@ -491,7 +529,7 @@ def test_xrefs_field_routes_to_field_xrefs(monkeypatch, capsys):
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
-    rc = bn.cli.main(["xrefs", "field", "--format", "text", "TrackRowCell.tile_type"])
+    rc = bn.cli.main(["xrefs", "field", "--format", "text", "--target", "active", "TrackRowCell.tile_type"])
 
     assert rc == 0
     assert captured["op"] == "field_xrefs"
@@ -516,7 +554,7 @@ def test_xrefs_text_format_renders_summary(monkeypatch, capsys):
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
-    rc = bn.cli.main(["xrefs", "--format", "text", "sub_401000"])
+    rc = bn.cli.main(["xrefs", "--format", "text", "--target", "active", "sub_401000"])
 
     assert rc == 0
     output = capsys.readouterr().out
@@ -661,7 +699,7 @@ def test_callsites_text_omits_null_hlil_and_pre_branch(monkeypatch, capsys):
     assert "pre-branch:" not in output
 
 
-def test_comment_get_defaults_to_active_when_single_target_open(monkeypatch, capsys):
+def test_comment_get_uses_implicit_target_when_single_target_is_open(monkeypatch, capsys):
     calls = []
 
     def fake_send_request(op, *, params=None, target=None, timeout=30.0):
@@ -729,7 +767,7 @@ def test_strings_text_format_renders_rows(monkeypatch, capsys):
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
-    rc = bn.cli.main(["strings", "--format", "text", "--query", "follow"])
+    rc = bn.cli.main(["strings", "--format", "text", "--target", "active", "--query", "follow"])
 
     assert rc == 0
     output = capsys.readouterr().out
@@ -775,7 +813,7 @@ def test_proto_get_renders_prototype_text(monkeypatch, capsys):
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
-    rc = bn.cli.main(["proto", "get", "--format", "text", "sub_401000"])
+    rc = bn.cli.main(["proto", "get", "--format", "text", "--target", "active", "sub_401000"])
 
     assert rc == 0
     assert capsys.readouterr().out == "int32_t sub_401000(int32_t arg1)\n"
@@ -805,7 +843,7 @@ def test_local_list_renders_ids(monkeypatch, capsys):
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
-    rc = bn.cli.main(["local", "list", "--format", "text", "sub_401000"])
+    rc = bn.cli.main(["local", "list", "--format", "text", "--target", "active", "sub_401000"])
 
     assert rc == 0
     output = capsys.readouterr().out
@@ -1161,7 +1199,7 @@ def test_decompile_text_format_unwraps_text_field(monkeypatch, capsys):
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
-    rc = bn.cli.main(["decompile", "--format", "text", "sub_401000"])
+    rc = bn.cli.main(["decompile", "--format", "text", "--target", "active", "sub_401000"])
 
     assert rc == 0
     assert capsys.readouterr().out == "return 7;\n"

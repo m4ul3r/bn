@@ -70,18 +70,20 @@ bn target list
 
 Targets can be selected with:
 
-- `active`
 - the `selector` field from `bn target list`
 - the full `target_id`
 - the BinaryView basename
 - the full filename
 - the view id
+- `active` when you explicitly want the GUI-selected target
 
 In normal use, prefer the `selector` field. For a single open database, this is usually just the `.bndb` basename:
 
 ```bash
 bn decompile update_player_movement_flags --target SnailMail_unwrapped.exe.bndb
 ```
+
+Omitting `--target` only works when exactly one target is open. If multiple targets are open, the CLI rejects the command instead of silently falling back to `active`.
 
 ## Output Behavior
 
@@ -302,7 +304,7 @@ If `bn target list` is empty:
 - make sure the plugin is installed with `bn plugin install`
 - reload Binary Ninja plugins or restart Binary Ninja after plugin changes
 
-If `active` is ambiguous, pass `--target <selector>` from `bn target list`.
+If multiple targets are open, omitted `--target` is rejected. Pass `--target <selector>` from `bn target list`, or use `--target active` only when you intentionally want the GUI-selected target.
 
 If decompile text still looks stale after a type change, run:
 
