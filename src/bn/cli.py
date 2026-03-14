@@ -193,6 +193,28 @@ def _render_result(
     sys.stdout.write(result.rendered)
 
 
+def _render_target_choice(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+
+    label = str(value.get("selector") or value.get("target_id") or "<unknown>")
+    if value.get("active"):
+        label += " [active]"
+
+    target_id = value.get("target_id")
+    if target_id not in (None, "", value.get("selector")):
+        label += f" (target_id: {target_id})"
+    return label
+
+
+def _render_target_choices(value: Any) -> str:
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "none"
+    return "\n".join(f"- {_render_target_choice(item)}" for item in value)
+
+
 def _implicit_target(args: argparse.Namespace) -> str:
     response = send_request(
         "list_targets",
@@ -204,7 +226,10 @@ def _implicit_target(args: argparse.Namespace) -> str:
         return "active"
     if not targets:
         raise BridgeError("No BinaryView targets are open in the GUI")
-    raise BridgeError("This command requires --target when multiple targets are open")
+    raise BridgeError(
+        "This command requires --target when multiple targets are open.\n"
+        f"Open targets:\n{_render_target_choices(targets)}"
+    )
 
 
 def _resolve_target(

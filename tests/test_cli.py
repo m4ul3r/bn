@@ -39,8 +39,12 @@ def test_function_list_requires_target_when_multiple_targets_are_open(monkeypatc
             return {
                 "ok": True,
                 "result": [
-                    {"target_id": "123:1:7", "selector": "SnailMail_unwrapped.exe.bndb"},
-                    {"target_id": "123:2:8", "selector": "other.exe.bndb"},
+                    {
+                        "target_id": "123:1:7",
+                        "selector": "SnailMail_unwrapped.exe.bndb",
+                        "active": True,
+                    },
+                    {"target_id": "123:2:8", "selector": "other.exe.bndb", "active": False},
                 ],
             }
         raise AssertionError(f"unexpected op: {op}")
@@ -50,7 +54,12 @@ def test_function_list_requires_target_when_multiple_targets_are_open(monkeypatc
     rc = bn.cli.main(["function", "list"])
 
     assert rc == 2
-    assert "requires --target when multiple targets are open" in capsys.readouterr().err
+    assert capsys.readouterr().err == (
+        "This command requires --target when multiple targets are open.\n"
+        "Open targets:\n"
+        "- SnailMail_unwrapped.exe.bndb [active] (target_id: 123:1:7)\n"
+        "- other.exe.bndb (target_id: 123:2:8)\n"
+    )
 
 
 def test_function_list_returns_full_result_set(monkeypatch, capsys):
@@ -326,8 +335,12 @@ def test_symbol_rename_requires_target_when_multiple_targets_are_open(monkeypatc
             return {
                 "ok": True,
                 "result": [
-                    {"target_id": "123:1:7", "selector": "SnailMail_unwrapped.exe.bndb"},
-                    {"target_id": "123:2:8", "selector": "other.exe.bndb"},
+                    {
+                        "target_id": "123:1:7",
+                        "selector": "SnailMail_unwrapped.exe.bndb",
+                        "active": True,
+                    },
+                    {"target_id": "123:2:8", "selector": "other.exe.bndb", "active": False},
                 ],
             }
         raise AssertionError(f"unexpected op: {op}")
@@ -337,7 +350,12 @@ def test_symbol_rename_requires_target_when_multiple_targets_are_open(monkeypatc
     rc = bn.cli.main(["symbol", "rename", "sub_401000", "player_update"])
 
     assert rc == 2
-    assert "requires --target when multiple targets are open" in capsys.readouterr().err
+    assert capsys.readouterr().err == (
+        "This command requires --target when multiple targets are open.\n"
+        "Open targets:\n"
+        "- SnailMail_unwrapped.exe.bndb [active] (target_id: 123:1:7)\n"
+        "- other.exe.bndb (target_id: 123:2:8)\n"
+    )
 
 
 def test_plugin_install_copy_mode(tmp_path):
