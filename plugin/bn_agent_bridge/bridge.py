@@ -465,6 +465,35 @@ class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamSer
         super().__init__(socket_path, handler)
 
 
+_TYPE_CLASS_NAMES: dict[int, str] = {
+    0: "void",
+    1: "bool",
+    2: "int",
+    3: "float",
+    4: "struct",
+    5: "enum",
+    6: "pointer",
+    7: "array",
+    8: "function",
+    9: "varargs",
+    10: "value",
+    11: "named_type_ref",
+    12: "wide_char",
+}
+
+_STRING_TYPE_NAMES: dict[int, str] = {
+    0: "ascii",
+    1: "utf16",
+    2: "utf32",
+}
+
+_SOURCE_TYPE_SHORT: dict[str, str] = {
+    "RegisterVariableSourceType": "reg",
+    "StackVariableSourceType": "stack",
+    "FlagVariableSourceType": "flag",
+}
+
+
 class BinaryNinjaBridge:
     def __init__(self):
         self.targets = TargetManager()
@@ -547,6 +576,8 @@ class BinaryNinjaBridge:
                 target,
                 min_address=params.get("min_address"),
                 max_address=params.get("max_address"),
+                offset=int(params.get("offset", 0)),
+                limit=int(params["limit"]) if "limit" in params else None,
             )
         if op == "search_functions":
             return self._search_functions(
@@ -555,6 +586,8 @@ class BinaryNinjaBridge:
                 regex=bool(params.get("regex", False)),
                 min_address=params.get("min_address"),
                 max_address=params.get("max_address"),
+                offset=int(params.get("offset", 0)),
+                limit=int(params["limit"]) if "limit" in params else None,
             )
         if op == "callsites":
             return self._callsites(
@@ -570,7 +603,7 @@ class BinaryNinjaBridge:
         if op == "list_locals":
             return self._list_locals_for_function(target, params["identifier"])
         if op == "decompile":
-            return self._decompile(target, params["identifier"])
+            return self._decompile(target, params["identifier"], addresses=bool(params.get("addresses")))
         if op == "il":
             return self._il(target, params["identifier"], str(params.get("view", "hlil")), bool(params.get("ssa")))
         if op == "disasm":
@@ -967,11 +1000,12 @@ class BinaryNinjaBridge:
         index = int(getattr(var, "index", 0))
         identifier = self._variable_identifier(var)
         source_name = self._variable_source_name(var)
+        short_source = _SOURCE_TYPE_SHORT.get(source_name, source_name)
         return ":".join(
             [
                 hex(int(func.start)),
                 role,
-                source_name,
+                short_source,
                 str(storage),
                 str(index),
                 str(identifier if identifier is not None else "none"),
@@ -1010,83 +1044,90 @@ class BinaryNinjaBridge:
             seen.add(marker)
             yield var, False
 
-    def _format_hlil_tree(self, ins, indent=0, *, _else_prefix=False):
+    def _format_hlil_tree(self, ins, indent=0, *, _else_prefix=False, addresses: bool = True):
         """Recursively format HLIL tree with proper indentation."""
         lines = []
         pad = "    " * indent
         op = ins.operation.name
 
-        def _addr(i):
-            a = getattr(i, "address", None)
-            return f"{int(a):08x}" if a is not None else "        "
+        BODY_INDENT = "    "
+        if addresses:
+            def _prefix(i):
+                a = getattr(i, "address", None)
+                return f"{int(a):08x}        " if a is not None else "                "
 
-        NO_ADDR = "        "
+            NO_PREFIX = "                "
+        else:
+            def _prefix(i):
+                return BODY_INDENT
+
+            NO_PREFIX = BODY_INDENT
 
         if op == "HLIL_NOP":
             pass
 
         elif op == "HLIL_BLOCK":
             for stmt in ins:
-                lines.extend(self._format_hlil_tree(stmt, indent))
+                lines.extend(self._format_hlil_tree(stmt, indent, addresses=addresses))
 
         elif op == "HLIL_IF":
             if _else_prefix:
-                lines.append(f"{_addr(ins)}        {pad}}} else if ({ins.condition})")
+                lines.append(f"{_prefix(ins)}{pad}}} else if ({ins.condition})")
             else:
-                lines.append(f"{_addr(ins)}        {pad}if ({ins.condition})")
-            lines.append(f"{NO_ADDR}        {pad}{{")
-            lines.extend(self._format_hlil_tree(ins.true, indent + 1))
+                lines.append(f"{_prefix(ins)}{pad}if ({ins.condition})")
+            lines.append(f"{NO_PREFIX}{pad}{{")
+            lines.extend(self._format_hlil_tree(ins.true, indent + 1, addresses=addresses))
             false_branch = ins.false
             false_op = false_branch.operation.name
             if false_op == "HLIL_NOP":
-                lines.append(f"{NO_ADDR}        {pad}}}")
+                lines.append(f"{NO_PREFIX}{pad}}}")
             elif false_op == "HLIL_IF":
-                lines.extend(self._format_hlil_tree(false_branch, indent, _else_prefix=True))
+                lines.extend(self._format_hlil_tree(false_branch, indent, _else_prefix=True, addresses=addresses))
             else:
-                lines.append(f"{NO_ADDR}        {pad}}} else {{")
-                lines.extend(self._format_hlil_tree(false_branch, indent + 1))
-                lines.append(f"{NO_ADDR}        {pad}}}")
+                lines.append(f"{NO_PREFIX}{pad}}} else {{")
+                lines.extend(self._format_hlil_tree(false_branch, indent + 1, addresses=addresses))
+                lines.append(f"{NO_PREFIX}{pad}}}")
 
         elif op in ("HLIL_WHILE", "HLIL_WHILE_SSA"):
-            lines.append(f"{_addr(ins)}        {pad}while ({ins.condition})")
-            lines.append(f"{NO_ADDR}        {pad}{{")
-            lines.extend(self._format_hlil_tree(ins.body, indent + 1))
-            lines.append(f"{NO_ADDR}        {pad}}}")
+            lines.append(f"{_prefix(ins)}{pad}while ({ins.condition})")
+            lines.append(f"{NO_PREFIX}{pad}{{")
+            lines.extend(self._format_hlil_tree(ins.body, indent + 1, addresses=addresses))
+            lines.append(f"{NO_PREFIX}{pad}}}")
 
         elif op in ("HLIL_DO_WHILE", "HLIL_DO_WHILE_SSA"):
-            lines.append(f"{_addr(ins)}        {pad}do")
-            lines.append(f"{NO_ADDR}        {pad}{{")
-            lines.extend(self._format_hlil_tree(ins.body, indent + 1))
-            lines.append(f"{NO_ADDR}        {pad}}} while ({ins.condition})")
+            lines.append(f"{_prefix(ins)}{pad}do")
+            lines.append(f"{NO_PREFIX}{pad}{{")
+            lines.extend(self._format_hlil_tree(ins.body, indent + 1, addresses=addresses))
+            lines.append(f"{NO_PREFIX}{pad}}} while ({ins.condition})")
 
         elif op in ("HLIL_FOR", "HLIL_FOR_SSA"):
-            lines.append(f"{_addr(ins)}        {pad}for ({ins.init}; {ins.condition}; {ins.update})")
-            lines.append(f"{NO_ADDR}        {pad}{{")
-            lines.extend(self._format_hlil_tree(ins.body, indent + 1))
-            lines.append(f"{NO_ADDR}        {pad}}}")
+            lines.append(f"{_prefix(ins)}{pad}for ({ins.init}; {ins.condition}; {ins.update})")
+            lines.append(f"{NO_PREFIX}{pad}{{")
+            lines.extend(self._format_hlil_tree(ins.body, indent + 1, addresses=addresses))
+            lines.append(f"{NO_PREFIX}{pad}}}")
 
         elif op == "HLIL_SWITCH":
-            lines.append(f"{_addr(ins)}        {pad}switch ({ins.condition})")
-            lines.append(f"{NO_ADDR}        {pad}{{")
+            lines.append(f"{_prefix(ins)}{pad}switch ({ins.condition})")
+            lines.append(f"{NO_PREFIX}{pad}{{")
             for case in ins.cases:
-                lines.extend(self._format_hlil_tree(case, indent + 1))
+                lines.extend(self._format_hlil_tree(case, indent + 1, addresses=addresses))
             default = getattr(ins, "default", None)
             if default is not None and default.operation.name != "HLIL_NOP":
-                lines.append(f"{NO_ADDR}        {pad}    default:")
-                lines.extend(self._format_hlil_tree(default, indent + 2))
-            lines.append(f"{NO_ADDR}        {pad}}}")
+                lines.append(f"{NO_PREFIX}{pad}    default:")
+                lines.extend(self._format_hlil_tree(default, indent + 2, addresses=addresses))
+            lines.append(f"{NO_PREFIX}{pad}}}")
 
         elif op == "HLIL_CASE":
             for val in ins.values:
-                lines.append(f"{_addr(ins)}        {pad}case {val}:")
-            lines.extend(self._format_hlil_tree(ins.body, indent + 1))
+                lines.append(f"{_prefix(ins)}{pad}case {val}:")
+            lines.extend(self._format_hlil_tree(ins.body, indent + 1, addresses=addresses))
 
         else:
-            lines.append(f"{_addr(ins)}        {pad}{ins}")
+            lines.append(f"{_prefix(ins)}{pad}{ins}")
 
         return lines
 
-    def _function_text(self, bv, func, *, view: str = "hlil", ssa: bool = False) -> str:
+    def _function_text(self, bv, func, *, view: str = "hlil", ssa: bool = False, addresses: bool = True) -> str:
         il_name = {"hlil": "hlil", "mlil": "mlil", "llil": "llil"}.get(view, "hlil")
         try:
             il = getattr(func, il_name)
@@ -1094,23 +1135,27 @@ class BinaryNinjaBridge:
                 il = il.ssa_form
             if il_name == "hlil" and hasattr(il, "root"):
                 try:
-                    lines = self._format_hlil_tree(il.root)
+                    lines = self._format_hlil_tree(il.root, addresses=addresses)
                     if lines:
                         return "\n".join(lines)
                 except Exception:
                     pass
             lines = []
             for ins in il.instructions:
-                address = getattr(ins, "address", func.start)
-                lines.append(f"{int(address):08x}        {ins}")
+                if addresses:
+                    address = getattr(ins, "address", func.start)
+                    lines.append(f"{int(address):08x}        {ins}")
+                else:
+                    lines.append(f"    {ins}")
             if lines:
                 return "\n".join(lines)
         except Exception:
             pass
         return str(func)
 
-    def _instruction_length(self, bv, address: int) -> int:
-        arch = getattr(bv, "arch", None)
+    def _instruction_length(self, bv, address: int, *, arch=None) -> int:
+        if arch is None:
+            arch = getattr(bv, "arch", None)
         try:
             max_length = int(getattr(arch, "max_instr_length", 16) or 16)
         except Exception:
@@ -1134,33 +1179,48 @@ class BinaryNinjaBridge:
             pass
         return 1
 
-    def _disasm_entry(self, bv, address: int) -> dict[str, Any]:
+    def _disasm_entry(self, bv, address: int, *, arch=None) -> dict[str, Any]:
+        text = ""
+        if arch is not None:
+            try:
+                max_length = int(getattr(arch, "max_instr_length", 16) or 16)
+                data = bv.read(address, max_length)
+                tokens, _length = arch.get_instruction_text(data, address)
+                if tokens:
+                    text = "".join(str(t) for t in tokens)
+            except Exception:
+                pass
+        if not text:
+            text = bv.get_disassembly(address) or ""
         return {
             "address": hex(int(address)),
-            "text": bv.get_disassembly(address) or "",
+            "text": text,
         }
 
     def _structured_disasm_entries(self, bv, func) -> list[dict[str, Any]]:
+        arch = getattr(func, "arch", None)
         entries = []
         for block in list(func.basic_blocks):
             addr = int(block.start)
             end = int(block.end)
             while addr < end:
-                entry = self._disasm_entry(bv, addr)
+                entry = self._disasm_entry(bv, addr, arch=arch)
                 if entry["text"]:
                     entry["_address_int"] = addr
                     entries.append(entry)
-                addr += max(1, self._instruction_length(bv, addr))
+                addr += max(1, self._instruction_length(bv, addr, arch=arch))
         entries.sort(key=lambda item: int(item["_address_int"]))
         return entries
 
     def _disasm_text(self, bv, func) -> str:
+        arch = getattr(func, "arch", None)
         lines = []
         for block in list(func.basic_blocks):
             addr = block.start
             while addr < block.end:
-                length = max(1, self._instruction_length(bv, int(addr)))
-                disasm = bv.get_disassembly(addr) or ""
+                length = max(1, self._instruction_length(bv, int(addr), arch=arch))
+                entry = self._disasm_entry(bv, addr, arch=arch)
+                disasm = entry["text"]
                 raw = bv.read(addr, length)
                 hex_bytes = raw.hex(" ") if raw else ""
                 lines.append(f"{addr:08x}  {hex_bytes:<16} {disasm}")
@@ -1195,10 +1255,27 @@ class BinaryNinjaBridge:
 
     def _find_variable_selector(self, func, selector: str) -> tuple[Any, bool]:
         locals_by_id: dict[str, tuple[Any, bool]] = {}
+        legacy_by_id: dict[str, tuple[Any, bool]] = {}
         for var, is_parameter in self._iter_canonical_variables(func):
-            locals_by_id[self._local_id(func, var, is_parameter=is_parameter)] = (var, is_parameter)
+            local_id = self._local_id(func, var, is_parameter=is_parameter)
+            locals_by_id[local_id] = (var, is_parameter)
+            # Build legacy (long-form) ID for backward compat
+            role = "param" if is_parameter else "local"
+            source_name = self._variable_source_name(var)
+            storage = int(getattr(var, "storage", 0))
+            index = int(getattr(var, "index", 0))
+            identifier = self._variable_identifier(var)
+            legacy_id = ":".join([
+                hex(int(func.start)), role, source_name,
+                str(storage), str(index),
+                str(identifier if identifier is not None else "none"),
+            ])
+            if legacy_id != local_id:
+                legacy_by_id[legacy_id] = (var, is_parameter)
         if selector in locals_by_id:
             return locals_by_id[selector]
+        if selector in legacy_by_id:
+            return legacy_by_id[selector]
 
         matches = self._find_variables_by_name(func, selector)
         if len(matches) == 1:
@@ -1236,6 +1313,7 @@ class BinaryNinjaBridge:
         }
 
     def _comment_map(self, bv, func) -> dict[str, str]:
+        arch = getattr(func, "arch", None)
         comments: dict[str, str] = {}
         for block in list(func.basic_blocks):
             addr = block.start
@@ -1243,7 +1321,7 @@ class BinaryNinjaBridge:
                 text = bv.get_comment_at(addr)
                 if text:
                     comments[hex(addr)] = text
-                addr += max(1, self._instruction_length(bv, int(addr)))
+                addr += max(1, self._instruction_length(bv, int(addr), arch=arch))
         return comments
 
     def _il_op_name(self, item) -> str:
@@ -1498,6 +1576,7 @@ class BinaryNinjaBridge:
         return None
 
     def _callsites_within_function(self, bv, callee, func, *, context: int) -> list[dict[str, Any]]:
+        func_arch = getattr(func, "arch", None)
         disasm_entries = self._structured_disasm_entries(bv, func)
         index_by_addr = {
             int(item["_address_int"]): index for index, item in enumerate(disasm_entries)
@@ -1513,7 +1592,7 @@ class BinaryNinjaBridge:
                 continue
 
             call_addr = int(getattr(insn, "address", 0))
-            instruction_length = self._instruction_length(bv, call_addr)
+            instruction_length = self._instruction_length(bv, call_addr, arch=func_arch)
             caller_static = call_addr + instruction_length
             disasm_index = index_by_addr.get(call_addr)
             if disasm_index is None:
@@ -1643,12 +1722,18 @@ class BinaryNinjaBridge:
         *,
         min_address: Any = None,
         max_address: Any = None,
+        offset: int = 0,
+        limit: int | None = None,
     ):
         bv = self._resolve_view(selector)
         items = [
             {"name": fn.name, "address": hex(fn.start), "raw_name": getattr(fn, "raw_name", fn.name)}
             for fn in self._filtered_functions(bv, min_address=min_address, max_address=max_address)
         ]
+        if offset:
+            items = items[offset:]
+        if limit is not None:
+            items = items[:limit]
         return items
 
     def _search_functions(
@@ -1659,6 +1744,8 @@ class BinaryNinjaBridge:
         regex: bool = False,
         min_address: Any = None,
         max_address: Any = None,
+        offset: int = 0,
+        limit: int | None = None,
     ):
         bv = self._resolve_view(selector)
         items = []
@@ -1680,6 +1767,10 @@ class BinaryNinjaBridge:
         for fn in self._filtered_functions(bv, min_address=min_address, max_address=max_address):
             if matches(fn.name):
                 items.append({"name": fn.name, "address": hex(fn.start), "raw_name": getattr(fn, "raw_name", fn.name)})
+        if offset:
+            items = items[offset:]
+        if limit is not None:
+            items = items[:limit]
         return items
 
     def _function_signature(self, func) -> str:
@@ -1694,16 +1785,37 @@ class BinaryNinjaBridge:
             params.append(f"{var.type} {var.name}")
         return f"{ret} {func.name}({', '.join(params)})"
 
-    def _decompile(self, selector: str | None, identifier):
+    def _decompile(self, selector: str | None, identifier, *, addresses: bool = False):
         bv = self._resolve_view(selector)
         func = self._find_function(bv, identifier)
         sig = self._function_signature(func)
-        body = self._function_text(bv, func, view="hlil")
-        text = f"{int(func.start):08x}        {sig}\n{body}"
+        body = self._function_text(bv, func, view="hlil", addresses=addresses)
+        comments = self._comment_map(bv, func)
+        if addresses:
+            text = f"{int(func.start):08x}        {sig}\n{body}"
+        else:
+            text = f"{sig}\n{{\n{body}\n}}"
+        if comments:
+            output_lines = []
+            for line in text.split("\n"):
+                output_lines.append(line)
+                # Match address prefix (8 hex digits at start of line)
+                stripped = line.lstrip()
+                if len(stripped) >= 8:
+                    addr_part = stripped[:8]
+                    try:
+                        addr_val = int(addr_part, 16)
+                        addr_hex = hex(addr_val)
+                        if addr_hex in comments:
+                            output_lines.append(f"{' ' * len(line[:len(line) - len(stripped)])}{'':8s}        // {comments[addr_hex]}")
+                    except ValueError:
+                        pass
+            text = "\n".join(output_lines)
         warnings = self._render_warnings(text)
         return {
             "function": {"name": func.name, "address": hex(func.start)},
             "text": text,
+            "comments": comments,
             "warnings": warnings,
         }
 
@@ -1895,9 +2007,16 @@ class BinaryNinjaBridge:
         raise RuntimeError(f"Type not found: {type_name}")
 
     def _type_entry(self, type_name, type_obj):
+        type_class = getattr(type_obj, "type_class", None)
+        kind = "unknown"
+        if type_class is not None:
+            try:
+                kind = _TYPE_CLASS_NAMES.get(int(type_class), str(type_class))
+            except (TypeError, ValueError):
+                kind = str(type_class)
         return {
             "name": str(type_name),
-            "kind": str(getattr(type_obj, "type_class", "unknown")),
+            "kind": kind,
             "decl": str(type_obj),
             "layout": self._render_type_layout(type_obj),
         }
@@ -1922,10 +2041,15 @@ class BinaryNinjaBridge:
         needle = str(query).lower() if query else None
         for item in list(getattr(bv, "strings", [])):
             value = str(getattr(item, "value", ""))
+            raw_type = getattr(item, "type", "")
+            try:
+                string_type = _STRING_TYPE_NAMES.get(int(raw_type), str(raw_type))
+            except (TypeError, ValueError):
+                string_type = str(raw_type)
             entry = {
                 "address": hex(int(getattr(item, "start", 0))),
                 "length": int(getattr(item, "length", 0)),
-                "type": str(getattr(item, "type", "")),
+                "type": string_type,
                 "value": value,
             }
             if needle and needle not in value.lower():
@@ -1938,11 +2062,14 @@ class BinaryNinjaBridge:
         bv = self._resolve_view(selector)
         items = []
         for sym in list(bv.get_symbols_of_type(bn.SymbolType.ImportedFunctionSymbol)):
+            name = str(getattr(sym, "short_name", None) or getattr(sym, "full_name", None) or sym.name)
+            raw_name = str(getattr(sym, "raw_name", sym.name))
             items.append(
                 {
-                    "name": sym.name,
+                    "name": name,
                     "address": hex(sym.address),
                     "library": str(getattr(sym, "namespace", "") or ""),
+                    "raw_name": raw_name,
                 }
             )
         items.sort(key=lambda item: (item["library"], item["name"], int(item["address"], 16)))
@@ -2873,21 +3000,22 @@ class BinaryNinjaBridge:
         }
 
     def _struct_builder(self, bv, struct_name: str):
-        type_obj = bv.get_type_by_name(struct_name)
-        if type_obj is None:
+        try:
+            resolved_name, type_obj = self._find_type(bv, struct_name)
+        except RuntimeError:
             raise RuntimeError(f"Struct not found: {struct_name}")
-        return type_obj.mutable_copy()
+        return resolved_name, type_obj.mutable_copy()
 
     def _commit_struct_builder(self, bv, struct_name: str, builder):
         bv.define_user_type(struct_name, builder)
 
     def _op_struct_field_set(self, bv, op: dict[str, Any]):
         struct_name = str(op["struct_name"])
-        builder = self._struct_builder(bv, struct_name)
+        resolved_name, builder = self._struct_builder(bv, struct_name)
         field_type, _ = bv.parse_type_string(str(op["field_type"]))
         offset = _parse_address(op["offset"])
         overwrite = bool(op.get("overwrite_existing", True))
-        before_type = bv.get_type_by_name(struct_name)
+        before_type = bv.get_type_by_name(resolved_name)
         before_member = None
         if before_type is not None:
             member = self._find_member(before_type, offset=offset)
@@ -2902,10 +3030,10 @@ class BinaryNinjaBridge:
             builder.width = max(int(builder.width), int(offset) + int(field_type.width))
         except Exception:
             pass
-        self._commit_struct_builder(bv, struct_name, builder)
+        self._commit_struct_builder(bv, resolved_name, builder)
         return {
             "op": "struct_field_set",
-            "struct_name": struct_name,
+            "struct_name": resolved_name,
             "offset": hex(offset),
             "field_name": str(op["field_name"]),
             "field_type": str(field_type),
@@ -2916,7 +3044,7 @@ class BinaryNinjaBridge:
 
     def _op_struct_field_rename(self, bv, op: dict[str, Any]):
         struct_name = str(op["struct_name"])
-        builder = self._struct_builder(bv, struct_name)
+        resolved_name, builder = self._struct_builder(bv, struct_name)
         index = builder.index_by_name(str(op["old_name"]))
         if index is None:
             raise RuntimeError(f"Field not found: {op['old_name']}")
@@ -2924,10 +3052,10 @@ class BinaryNinjaBridge:
         if member is None:
             raise RuntimeError(f"Field not found: {op['old_name']}")
         builder.replace(index, member.type, str(op["new_name"]), True)
-        self._commit_struct_builder(bv, struct_name, builder)
+        self._commit_struct_builder(bv, resolved_name, builder)
         return {
             "op": "struct_field_rename",
-            "struct_name": struct_name,
+            "struct_name": resolved_name,
             "old_name": str(op["old_name"]),
             "new_name": str(op["new_name"]),
             "requested": self._operation_requested(op),
@@ -2935,15 +3063,15 @@ class BinaryNinjaBridge:
 
     def _op_struct_field_delete(self, bv, op: dict[str, Any]):
         struct_name = str(op["struct_name"])
-        builder = self._struct_builder(bv, struct_name)
+        resolved_name, builder = self._struct_builder(bv, struct_name)
         index = builder.index_by_name(str(op["field_name"]))
         if index is None:
             raise RuntimeError(f"Field not found: {op['field_name']}")
         builder.remove(index)
-        self._commit_struct_builder(bv, struct_name, builder)
+        self._commit_struct_builder(bv, resolved_name, builder)
         return {
             "op": "struct_field_delete",
-            "struct_name": struct_name,
+            "struct_name": resolved_name,
             "field_name": str(op["field_name"]),
             "requested": self._operation_requested(op),
         }

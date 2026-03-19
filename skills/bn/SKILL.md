@@ -62,6 +62,7 @@ bn callsites crt_rand --within-file /tmp/rng-functions.txt --format ndjson
 bn proto get sample_track_floor_height_at_position
 bn local list sample_track_floor_height_at_position
 bn decompile sample_track_floor_height_at_position
+bn decompile sample_track_floor_height_at_position --addresses
 bn il sample_track_floor_height_at_position
 bn disasm sample_track_floor_height_at_position
 bn xrefs sample_track_floor_height_at_position
@@ -75,6 +76,8 @@ bn imports
 ```
 
 `bn function search` is case-insensitive substring matching by default. Add `--regex` when you need regular expressions. `bn function list` and `bn function search` both accept `--min-address` and `--max-address`.
+
+`bn decompile` omits address prefixes by default for cleaner output. Add `--addresses` when you need per-line addresses (e.g., for `bn comment set --address`).
 
 ## Caller-Static Mapping
 

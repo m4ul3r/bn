@@ -459,7 +459,7 @@ def _render_comment_text(value: Any) -> str:
         return _render_fallback_text(value)
     comment = value.get("comment")
     if isinstance(comment, str):
-        return comment
+        return comment if comment else "(no comment)"
     return _render_fallback_text(value)
 
 
@@ -576,7 +576,7 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value:
-        return "none"
+        return "no callsites found"
 
     blocks = []
     for row in value:
@@ -715,31 +715,36 @@ def _render_doctor_text(value: Any) -> str:
 
 def _format_operation_result(item: dict[str, Any]) -> str:
     op = item.get("op", "<unknown>")
+    requested = item.get("requested") or {}
+
+    def _get(key: str, default: str = "<unknown>") -> str:
+        return item.get(key) or requested.get(key, default)
+
     if op == "rename_symbol":
-        return f"rename_symbol {item.get('kind', 'auto')} {item.get('address', '<unknown>')} -> {item.get('new_name', '<unknown>')}"
+        return f"rename_symbol {_get('kind', 'auto')} {_get('address')} -> {_get('new_name')}"
     if op == "set_comment":
-        target = item.get("function") or item.get("address", "<unknown>")
+        target = item.get("function") or requested.get("function") or _get("address")
         return f"set_comment {target}"
     if op == "delete_comment":
-        target = item.get("function") or item.get("address", "<unknown>")
+        target = item.get("function") or requested.get("function") or _get("address")
         return f"delete_comment {target}"
     if op == "set_prototype":
-        return f"set_prototype {item.get('function', '<unknown>')} @ {item.get('address', '<unknown>')}"
+        return f"set_prototype {_get('function')} @ {_get('address')}"
     if op in {"local_rename", "local_retype"}:
-        target = item.get("local_id") or item.get("variable", "<unknown>")
-        return f"{op} {item.get('function', '<unknown>')}::{target}"
+        target = item.get("local_id") or item.get("variable") or requested.get("variable", "<unknown>")
+        return f"{op} {_get('function')}::{target}"
     if op == "struct_field_set":
         return (
-            f"struct_field_set {item.get('struct_name', '<unknown>')} "
-            f"{item.get('offset', '<unknown>')} {item.get('field_name', '<unknown>')} {item.get('field_type', '<unknown>')}"
+            f"struct_field_set {_get('struct_name')} "
+            f"{_get('offset')} {_get('field_name')} {_get('field_type')}"
         )
     if op == "struct_field_rename":
         return (
-            f"struct_field_rename {item.get('struct_name', '<unknown>')} "
-            f"{item.get('old_name', '<unknown>')} -> {item.get('new_name', '<unknown>')}"
+            f"struct_field_rename {_get('struct_name')} "
+            f"{_get('old_name')} -> {_get('new_name')}"
         )
     if op == "struct_field_delete":
-        return f"struct_field_delete {item.get('struct_name', '<unknown>')}::{item.get('field_name', '<unknown>')}"
+        return f"struct_field_delete {_get('struct_name')}::{_get('field_name')}"
     if op == "types_declare":
         return (
             f"types_declare {item.get('count', 0)} types"
@@ -1042,6 +1047,8 @@ def _function_list(args: argparse.Namespace) -> int:
         params["min_address"] = args.min_address
     if args.max_address is not None:
         params["max_address"] = args.max_address
+    if args.offset:
+        params["offset"] = args.offset
     return _call(
         args,
         "list_functions",
@@ -1049,13 +1056,15 @@ def _function_list(args: argparse.Namespace) -> int:
         require_target=True,
         allow_implicit_target=True,
         text_renderer=_render_name_address_list_text,
+        page_limit=args.limit,
+        page_offset=args.offset,
         page_label="function list",
         stem="functions",
     )
 
 
 def _function_search(args: argparse.Namespace) -> int:
-    params = {
+    params: dict[str, Any] = {
         "query": args.query,
         "regex": bool(args.regex),
     }
@@ -1063,6 +1072,8 @@ def _function_search(args: argparse.Namespace) -> int:
         params["min_address"] = args.min_address
     if args.max_address is not None:
         params["max_address"] = args.max_address
+    if args.offset:
+        params["offset"] = args.offset
     return _call(
         args,
         "search_functions",
@@ -1070,6 +1081,8 @@ def _function_search(args: argparse.Namespace) -> int:
         require_target=True,
         allow_implicit_target=True,
         text_renderer=_render_name_address_list_text,
+        page_limit=args.limit,
+        page_offset=args.offset,
         page_label="function search",
         stem="function-search",
     )
@@ -1091,7 +1104,7 @@ def _decompile(args: argparse.Namespace) -> int:
     return _call(
         args,
         "decompile",
-        {"identifier": args.identifier},
+        {"identifier": args.identifier, "addresses": args.addresses},
         require_target=True,
         allow_implicit_target=True,
         text_renderer=_text_field("text"),
@@ -1124,24 +1137,24 @@ def _disasm(args: argparse.Namespace) -> int:
 
 
 def _xrefs(args: argparse.Namespace) -> int:
-    if args.identifier == "field":
-        if len(args.extra) != 1:
-            raise BridgeError("Usage: bn xrefs field <Struct.field>")
+    field_spec = getattr(args, "field_spec", None)
+    identifier = getattr(args, "identifier", None)
+    if field_spec:
         return _call(
             args,
             "field_xrefs",
-            {"field": args.extra[0]},
+            {"field": field_spec},
             require_target=True,
             allow_implicit_target=True,
             text_renderer=_render_field_xrefs_text,
             stem="field-xrefs",
         )
-    if not args.identifier:
-        raise BridgeError("xrefs requires an identifier")
+    if not identifier:
+        raise BridgeError("xrefs requires an identifier or --field")
     return _call(
         args,
         "xrefs",
-        {"identifier": args.identifier},
+        {"identifier": identifier},
         require_target=True,
         allow_implicit_target=True,
         text_renderer=_render_xrefs_text,
@@ -1619,11 +1632,13 @@ def build_parser() -> argparse.ArgumentParser:
     _common_io_options(function_list)
     _target_option(function_list, required=False)
     _add_function_address_args(function_list)
+    _add_paged_args(function_list)
     function_list.set_defaults(handler=_function_list)
     function_search = function_sub.add_parser("search", help="Search functions by substring or regex")
     _common_io_options(function_search)
     _target_option(function_search, required=False)
     _add_function_address_args(function_search)
+    _add_paged_args(function_search)
     function_search.add_argument(
         "--regex",
         action="store_true",
@@ -1641,6 +1656,7 @@ def build_parser() -> argparse.ArgumentParser:
     _common_io_options(decompile)
     _target_option(decompile, required=False)
     decompile.add_argument("identifier")
+    decompile.add_argument("--addresses", action="store_true", default=False, help="Show address prefixes on each line")
     decompile.set_defaults(handler=_decompile)
 
     il = subparsers.add_parser("il", help="Dump IL for a function")
@@ -1657,11 +1673,11 @@ def build_parser() -> argparse.ArgumentParser:
     disasm.add_argument("identifier")
     disasm.set_defaults(handler=_disasm)
 
-    xrefs = subparsers.add_parser("xrefs", help="List xrefs to an address or function, or `field <Struct.field>`")
+    xrefs = subparsers.add_parser("xrefs", help="List xrefs to an address or function; use --field for struct field xrefs")
     _common_io_options(xrefs)
     _target_option(xrefs, required=False)
     xrefs.add_argument("identifier", nargs="?")
-    xrefs.add_argument("extra", nargs="*")
+    xrefs.add_argument("--field", dest="field_spec", help="Struct field xref spec (e.g., TrackRowCell.tile_type)")
     xrefs.set_defaults(handler=_xrefs)
 
     callsites = subparsers.add_parser("callsites", help="Find direct native callsites and exact caller_static addresses")

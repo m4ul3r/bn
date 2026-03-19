@@ -596,8 +596,8 @@ def test_list_locals_skips_stack_aliases_for_parameters(monkeypatch):
 
     assert len(locals_list) == 2
     assert [item["local_id"] for item in locals_list] == [
-        "0x401000:param:StackVariableSourceType:4:0:1001",
-        "0x401000:local:StackVariableSourceType:-4:0:2001",
+        "0x401000:param:stack:4:0:1001",
+        "0x401000:local:stack:-4:0:2001",
     ]
 
 

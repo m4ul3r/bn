@@ -26,7 +26,7 @@ def test_function_list_uses_implicit_target_when_single_target_is_open(monkeypat
     rc = bn.cli.main(["function", "list"])
     assert rc == 0
     assert [call["op"] for call in calls] == ["list_targets", "list_functions"]
-    assert calls[1]["params"] == {}
+    assert calls[1]["params"] == {"limit": 101}
     assert calls[1]["target"] == "active"
     output = capsys.readouterr().out
     assert output == "0x401000  sub_401000\n"
@@ -76,11 +76,11 @@ def test_function_list_returns_full_result_set(monkeypatch, capsys):
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
-    rc = bn.cli.main(["function", "list", "--target", "active", "--format", "json"])
+    rc = bn.cli.main(["function", "list", "--target", "active", "--format", "json", "--limit", "200"])
 
     assert rc == 0
     assert captured["op"] == "list_functions"
-    assert captured["params"] == {}
+    assert captured["params"] == {"limit": 201}
     stdout, stderr = capsys.readouterr()
     payload = json.loads(stdout)
     assert len(payload) == 150
@@ -189,7 +189,7 @@ def test_function_search_can_request_regex_matching(monkeypatch, capsys):
     assert captured["params"]["query"] == "attach|detach"
     assert captured["params"]["regex"] is True
     assert "offset" not in captured["params"]
-    assert "limit" not in captured["params"]
+    assert captured["params"]["limit"] == 101
     assert capsys.readouterr().out == "0x401000  load_attachment\n"
 
 
@@ -209,14 +209,17 @@ def test_parser_defaults_reads_to_text_and_mutations_to_json():
     assert parser.parse_args(["types", "declare", "typedef struct Player { int hp; } Player;"]).format == "json"
 
 
-def test_function_commands_do_not_accept_paging_flags():
+def test_function_commands_accept_paging_flags():
     parser = bn.cli.build_parser()
 
-    with pytest.raises(SystemExit):
-        parser.parse_args(["function", "list", "--limit", "10"])
+    args = parser.parse_args(["function", "list", "--limit", "10"])
+    assert args.limit == 10
+    assert args.offset == 0
 
-    with pytest.raises(SystemExit):
-        parser.parse_args(["function", "search", "--offset", "10", "attach"])
+    args = parser.parse_args(["function", "search", "--offset", "10", "--limit", "50", "attach"])
+    assert args.offset == 10
+    assert args.limit == 50
+    assert args.query == "attach"
 
 
 def test_callsites_requires_exactly_one_scope_flag():
@@ -253,8 +256,8 @@ def test_function_info_uses_active_target_and_text_renderer(monkeypatch, capsys)
                 "return_type": "int32_t",
                 "calling_convention": "__cdecl",
                 "size": 24,
-                "parameters": [{"name": "arg1", "type": "int32_t", "storage": 0, "is_parameter": True, "local_id": "0x401000:param:StackVariableSourceType:0:0:1"}],
-                "locals": [{"name": "var_4", "type": "int32_t", "storage": -4, "is_parameter": False, "local_id": "0x401000:local:StackVariableSourceType:-4:1:2"}],
+                "parameters": [{"name": "arg1", "type": "int32_t", "storage": 0, "is_parameter": True, "local_id": "0x401000:param:stack:0:0:1"}],
+                "locals": [{"name": "var_4", "type": "int32_t", "storage": -4, "is_parameter": False, "local_id": "0x401000:local:stack:-4:1:2"}],
             },
         }
 
@@ -270,7 +273,7 @@ def test_function_info_uses_active_target_and_text_renderer(monkeypatch, capsys)
     assert "calling convention: __cdecl" in output
     assert "parameters:" in output
     assert "locals:" in output
-    assert "id=0x401000:param:StackVariableSourceType:0:0:1" in output
+    assert "id=0x401000:param:stack:0:0:1" in output
 
 
 def test_symbol_rename_builds_preview_payload(monkeypatch):
@@ -555,7 +558,7 @@ def test_xrefs_field_routes_to_field_xrefs(monkeypatch, capsys):
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
-    rc = bn.cli.main(["xrefs", "field", "--format", "text", "--target", "active", "TrackRowCell.tile_type"])
+    rc = bn.cli.main(["xrefs", "--field", "TrackRowCell.tile_type", "--format", "text", "--target", "active"])
 
     assert rc == 0
     assert captured["op"] == "field_xrefs"
@@ -861,7 +864,7 @@ def test_local_list_renders_ids(monkeypatch, capsys):
                         "index": 0,
                         "identifier": 1,
                         "is_parameter": True,
-                        "local_id": "0x401000:param:StackVariableSourceType:4:0:1",
+                        "local_id": "0x401000:param:stack:4:0:1",
                     }
                 ],
             },
@@ -874,7 +877,7 @@ def test_local_list_renders_ids(monkeypatch, capsys):
     assert rc == 0
     output = capsys.readouterr().out
     assert "locals:" in output
-    assert "id=0x401000:param:StackVariableSourceType:4:0:1" in output
+    assert "id=0x401000:param:stack:4:0:1" in output
 
 
 def test_bundle_function_out_path_is_bridge_owned(monkeypatch, tmp_path, capsys):
@@ -1229,3 +1232,87 @@ def test_decompile_text_format_unwraps_text_field(monkeypatch, capsys):
 
     assert rc == 0
     assert capsys.readouterr().out == "return 7;\n"
+
+
+def test_comment_get_empty_comment_shows_placeholder(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        assert op == "get_comment"
+        return {"ok": True, "result": {"address": "0x401000", "comment": "", "has_comment": False}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["comment", "get", "--format", "text", "--target", "active", "--address", "0x401000"])
+
+    assert rc == 0
+    assert capsys.readouterr().out == "(no comment)\n"
+
+
+def test_callsites_empty_result_shows_descriptive_message(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        assert op == "callsites"
+        return {"ok": True, "result": []}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["callsites", "--format", "text", "--target", "active", "--within", "main", "sub_401000"])
+
+    assert rc == 0
+    assert capsys.readouterr().out == "no callsites found\n"
+
+
+def test_format_operation_result_falls_back_to_requested():
+    item = {
+        "op": "struct_field_set",
+        "status": "unsupported",
+        "message": "Struct not found",
+        "requested": {
+            "struct_name": "Player",
+            "offset": "0x8",
+            "field_name": "health",
+            "field_type": "int32_t",
+        },
+    }
+    result = bn.cli._format_operation_result(item)
+    assert "Player" in result
+    assert "0x8" in result
+    assert "health" in result
+    assert "int32_t" in result
+    assert "<unknown>" not in result
+
+
+def test_function_list_pagination_truncates_and_warns(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["params"] = params
+        return {
+            "ok": True,
+            "result": [{"name": f"sub_{i:06x}", "address": hex(i)} for i in range(21)],
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["function", "list", "--target", "active", "--limit", "20"])
+
+    assert rc == 0
+    assert captured["params"]["limit"] == 21
+    stdout, stderr = capsys.readouterr()
+    assert stdout.count("\n") == 20
+    assert "truncated to 20 items" in stderr
+    assert "--offset 20" in stderr
+
+
+def test_function_search_pagination_forwards_offset(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+        captured["params"] = params
+        return {"ok": True, "result": [{"name": "sub_401000", "address": "0x401000"}]}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["function", "search", "--target", "active", "--offset", "50", "--limit", "25", "sub"])
+
+    assert rc == 0
+    assert captured["params"]["offset"] == 50
+    assert captured["params"]["limit"] == 26
