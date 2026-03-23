@@ -99,7 +99,8 @@ class TestMultiInstance:
             info_b = _session_start()
             try:
                 result = _bn("session", "list", "--format", "json")
-                sessions = json.loads(result.stdout)
+                data = json.loads(result.stdout)
+                sessions = data["instances"]
                 ids = {s["instance_id"] for s in sessions}
                 assert info_a["instance_id"] in ids
                 assert info_b["instance_id"] in ids

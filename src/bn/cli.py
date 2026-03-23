@@ -1062,17 +1062,37 @@ def _session_stop(args: argparse.Namespace) -> int:
     return 0
 
 
+def _rss_mb(pid: int) -> float | None:
+    """Read resident set size in MB from /proc/<pid>/status."""
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / 1024.0
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
 def _session_list(args: argparse.Namespace) -> int:
     instances = list_instances()
-    result = [
-        {
+    entries = []
+    total_rss = 0.0
+    for inst in instances:
+        rss = _rss_mb(inst.pid)
+        entry: dict[str, Any] = {
             "instance_id": inst.instance_id,
             "pid": inst.pid,
             "socket_path": str(inst.socket_path),
             "started_at": inst.started_at,
+            "rss_mb": round(rss, 1) if rss is not None else None,
         }
-        for inst in instances
-    ]
+        entries.append(entry)
+        if rss is not None:
+            total_rss += rss
+    result: dict[str, Any] = {
+        "instances": entries,
+        "total_rss_mb": round(total_rss, 1),
+    }
     _render_result(result, fmt=args.format, out_path=args.out, stem="session-list")
     return 0
 

@@ -1383,9 +1383,11 @@ def test_session_list_shows_instances(monkeypatch, capsys):
     assert rc == 0
     stdout = capsys.readouterr().out
     parsed = json.loads(stdout)
-    assert len(parsed) == 2
-    assert parsed[0]["instance_id"] == "aaaa1111"
-    assert parsed[1]["instance_id"] == "bbbb2222"
+    assert len(parsed["instances"]) == 2
+    assert parsed["instances"][0]["instance_id"] == "aaaa1111"
+    assert parsed["instances"][1]["instance_id"] == "bbbb2222"
+    assert "rss_mb" in parsed["instances"][0]
+    assert "total_rss_mb" in parsed
 
 
 def test_session_stop_sends_shutdown(monkeypatch, capsys):
