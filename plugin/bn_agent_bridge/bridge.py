@@ -22,7 +22,7 @@ import binaryninja as bn
 from binaryninja.mainthread import execute_on_main_thread_and_wait, is_main_thread
 from binaryninja.plugin import PluginCommand
 
-from .paths import PLUGIN_NAME, bridge_registry_path, bridge_socket_path
+from .paths import PLUGIN_NAME, bridge_registry_path, bridge_socket_path, instances_dir
 from .version import VERSION, build_id_for_file
 
 try:
@@ -495,13 +495,15 @@ _SOURCE_TYPE_SHORT: dict[str, str] = {
 
 
 class BinaryNinjaBridge:
-    def __init__(self):
+    def __init__(self, instance_id: str | None = None):
+        self.instance_id = instance_id
         self.targets = TargetManager()
-        self.socket_path = bridge_socket_path()
-        self.registry_path = bridge_registry_path()
+        self.socket_path = bridge_socket_path(instance_id)
+        self.registry_path = bridge_registry_path(instance_id)
         self._server: ThreadedUnixServer | None = None
         self._thread: threading.Thread | None = None
         self._target_lock = _ReadWriteLock()
+        self._shutdown_event = threading.Event()
 
     def start(self):  # pragma: no cover - requires GUI runtime
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
@@ -536,6 +538,8 @@ class BinaryNinjaBridge:
             "plugin_build_id": PLUGIN_BUILD_ID,
             "started_at": datetime.now(timezone.utc).isoformat(),
         }
+        if self.instance_id is not None:
+            payload["instance_id"] = self.instance_id
         self.registry_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def dispatch(self, payload: dict[str, Any]) -> dict[str, Any]:  # pragma: no cover - GUI runtime
@@ -563,6 +567,9 @@ class BinaryNinjaBridge:
             return self._target_info(params.get("selector") or target)
         if op == "refresh":
             return self._refresh(target)
+        if op == "shutdown":
+            self._shutdown_event.set()
+            return {"shutting_down": True}
 
         if op == "load_binary":
             return self._load_binary(str(params["path"]))
@@ -3126,15 +3133,19 @@ def start_bridge():  # pragma: no cover - GUI runtime
     _bridge.start()
 
 
-def start_headless(binaries: list[str] | None = None):
+def start_headless(binaries: list[str] | None = None, instance_id: str | None = None):
     """Start the bridge in headless mode (no GUI required).
 
     Opens any binary file paths provided, starts the socket server,
-    and blocks the calling thread forever.
+    and blocks the calling thread until shutdown is requested.
     """
     global _bridge
     if _bridge is not None:
         return
+
+    if instance_id is None:
+        import secrets
+        instance_id = secrets.token_hex(4)
 
     if binaries:
         import binaryninja
@@ -3150,12 +3161,15 @@ def start_headless(binaries: list[str] | None = None):
                 _headless_views.append(bv)
             bn.log_info(f"Loaded {resolved}")
 
-    _bridge = BinaryNinjaBridge()
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+
+    _bridge = BinaryNinjaBridge(instance_id=instance_id)
     _bridge.start()
-    bn.log_info("BN Agent Bridge running in headless mode")
+    bn.log_info(f"BN Agent Bridge running in headless mode (instance {instance_id})")
 
     try:
-        threading.Event().wait()
+        _bridge._shutdown_event.wait()
     except KeyboardInterrupt:
         pass
     finally:

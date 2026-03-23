@@ -40,12 +40,20 @@ def cache_home() -> Path:
     return home / ".cache" / "bn"
 
 
-def bridge_registry_path() -> Path:
-    return cache_home() / f"{PLUGIN_NAME}.json"
+def instances_dir() -> Path:
+    return cache_home() / "instances"
 
 
-def bridge_socket_path() -> Path:
-    return cache_home() / f"{PLUGIN_NAME}.sock"
+def bridge_registry_path(instance_id: str | None = None) -> Path:
+    if instance_id is None:
+        return cache_home() / f"{PLUGIN_NAME}.json"
+    return instances_dir() / f"{instance_id}.json"
+
+
+def bridge_socket_path(instance_id: str | None = None) -> Path:
+    if instance_id is None:
+        return cache_home() / f"{PLUGIN_NAME}.sock"
+    return instances_dir() / f"{instance_id}.sock"
 
 
 def spill_root() -> Path:

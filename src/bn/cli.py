@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 from .output import write_output_result
 from .paths import plugin_install_dir, plugin_source_dir, skill_install_dir, skill_source_dir
-from .transport import BridgeError, _send_request_to_instance, list_instances, send_request
+from .transport import BridgeError, _send_request_to_instance, list_instances, send_request, spawn_instance
 from .version import VERSION, build_id_for_file
 
 FAILED_MUTATION_STATUSES = {"unsupported", "verification_failed"}
@@ -220,6 +220,7 @@ def _implicit_target(args: argparse.Namespace) -> str:
         "list_targets",
         params={},
         target=None,
+        instance_id=getattr(args, "instance", None),
     )
     targets = list(response["result"])
     if len(targets) == 1:
@@ -287,6 +288,7 @@ def _call(
         op,
         params=request_params,
         target=target,
+        instance_id=getattr(args, "instance", None),
     )
     result = response["result"]
     exit_code = result_exit_code(result) if result_exit_code is not None else 0
@@ -1006,6 +1008,75 @@ def _save(args: argparse.Namespace) -> int:
     )
 
 
+def _session_start(args: argparse.Namespace) -> int:
+    instance_id = getattr(args, "instance_id", None)
+    instance = spawn_instance(instance_id)
+
+    binaries = getattr(args, "binaries", None) or []
+    loaded = []
+    for binary in binaries:
+        resolved = str(Path(binary).expanduser().resolve())
+        try:
+            resp = send_request(
+                "load_binary",
+                params={"path": resolved},
+                instance_id=instance.instance_id,
+            )
+            loaded.append(resp["result"])
+        except BridgeError as exc:
+            loaded.append({"path": resolved, "error": str(exc)})
+
+    result: dict[str, Any] = {
+        "instance_id": instance.instance_id,
+        "pid": instance.pid,
+        "socket_path": str(instance.socket_path),
+    }
+    if loaded:
+        result["loaded"] = loaded
+
+    _render_result(result, fmt=args.format, out_path=args.out, stem="session-start")
+    return 0
+
+
+def _session_stop(args: argparse.Namespace) -> int:
+    import signal
+
+    target_id = args.instance
+    try:
+        resp = send_request("shutdown", instance_id=target_id)
+        result = {"instance_id": target_id, "stopped": True}
+    except BridgeError:
+        # Fallback: find instance and SIGTERM
+        for inst in list_instances():
+            if inst.instance_id == target_id:
+                try:
+                    os.kill(inst.pid, signal.SIGTERM)
+                except OSError:
+                    pass
+                result = {"instance_id": target_id, "stopped": True, "method": "sigterm"}
+                break
+        else:
+            raise BridgeError(f"No bridge instance found with id: {target_id}")
+
+    _render_result(result, fmt=args.format, out_path=args.out, stem="session-stop")
+    return 0
+
+
+def _session_list(args: argparse.Namespace) -> int:
+    instances = list_instances()
+    result = [
+        {
+            "instance_id": inst.instance_id,
+            "pid": inst.pid,
+            "socket_path": str(inst.socket_path),
+            "started_at": inst.started_at,
+        }
+        for inst in instances
+    ]
+    _render_result(result, fmt=args.format, out_path=args.out, stem="session-list")
+    return 0
+
+
 def _target_list(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1570,6 +1641,11 @@ def _add_function_address_args(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = BnArgumentParser(prog="bn", description="Agent-friendly Binary Ninja CLI")
     parser.set_defaults(handler=None)
+    parser.add_argument(
+        "--instance",
+        default=os.environ.get("BN_INSTANCE"),
+        help="Target a specific bridge instance by ID (env: BN_INSTANCE)",
+    )
 
     subparsers = parser.add_subparsers(dest="command")
 
@@ -1610,6 +1686,21 @@ def build_parser() -> argparse.ArgumentParser:
     _target_option(save, required=False)
     save.add_argument("path", nargs="?", help="Output path (defaults to <filename>.bndb)")
     save.set_defaults(handler=_save)
+
+    session = subparsers.add_parser("session", help="Manage bridge sessions")
+    session_sub = session.add_subparsers(dest="session_command")
+    session_start = session_sub.add_parser("start", help="Start a new headless bridge session")
+    session_start.add_argument("binaries", nargs="*", help="Binary file paths to preload")
+    session_start.add_argument("--instance-id", help="Use a specific instance ID (default: random)")
+    _common_io_options(session_start, default_format="json")
+    session_start.set_defaults(handler=_session_start)
+    session_stop = session_sub.add_parser("stop", help="Stop a running bridge session")
+    session_stop.add_argument("instance", help="Instance ID to stop")
+    _common_io_options(session_stop, default_format="json")
+    session_stop.set_defaults(handler=_session_stop)
+    session_list = session_sub.add_parser("list", help="List running bridge sessions")
+    _common_io_options(session_list, default_format="json")
+    session_list.set_defaults(handler=_session_list)
 
     target = subparsers.add_parser("target", help="Inspect Binary Ninja targets")
     target_sub = target.add_subparsers(dest="target_command")

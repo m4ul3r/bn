@@ -10,7 +10,7 @@ import pytest
 def test_function_list_uses_implicit_target_when_single_target_is_open(monkeypatch, capsys):
     calls = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         calls.append({"op": op, "params": params, "target": target})
         if op == "list_targets":
             return {
@@ -34,7 +34,7 @@ def test_function_list_uses_implicit_target_when_single_target_is_open(monkeypat
 
 
 def test_function_list_requires_target_when_multiple_targets_are_open(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         if op == "list_targets":
             return {
                 "ok": True,
@@ -65,7 +65,7 @@ def test_function_list_requires_target_when_multiple_targets_are_open(monkeypatc
 def test_function_list_returns_full_result_set(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         captured["op"] = op
         captured["params"] = params
         captured["target"] = target
@@ -90,7 +90,7 @@ def test_function_list_returns_full_result_set(monkeypatch, capsys):
 def test_function_list_warns_when_output_auto_spills(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         captured["op"] = op
         return {
             "ok": True,
@@ -143,7 +143,7 @@ def test_function_list_warns_when_output_auto_spills(monkeypatch, capsys):
 def test_function_list_forwards_address_filters(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         captured["op"] = op
         captured["params"] = params
         captured["target"] = target
@@ -174,7 +174,7 @@ def test_function_list_forwards_address_filters(monkeypatch, capsys):
 def test_function_search_can_request_regex_matching(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         captured["op"] = op
         captured["params"] = params
         captured["target"] = target
@@ -244,7 +244,7 @@ def test_callsites_requires_exactly_one_scope_flag():
 def test_function_info_uses_active_target_and_text_renderer(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         captured["op"] = op
         captured["params"] = params
         captured["target"] = target
@@ -279,7 +279,7 @@ def test_function_info_uses_active_target_and_text_renderer(monkeypatch, capsys)
 def test_symbol_rename_builds_preview_payload(monkeypatch):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         captured["op"] = op
         captured["params"] = params
         captured["target"] = target
@@ -307,7 +307,7 @@ def test_symbol_rename_builds_preview_payload(monkeypatch):
 def test_symbol_rename_uses_implicit_target_when_single_target_is_open(monkeypatch):
     calls = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         calls.append({"op": op, "params": params, "target": target})
         if op == "list_targets":
             return {
@@ -333,7 +333,7 @@ def test_symbol_rename_uses_implicit_target_when_single_target_is_open(monkeypat
 
 
 def test_symbol_rename_requires_target_when_multiple_targets_are_open(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         if op == "list_targets":
             return {
                 "ok": True,
@@ -395,7 +395,7 @@ def test_skill_install_copy_mode(tmp_path):
 
 
 def test_target_list_text_format_renders_summary(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         assert op == "list_targets"
         return {
             "ok": True,
@@ -425,7 +425,7 @@ def test_target_list_text_format_renders_summary(monkeypatch, capsys):
 def test_refresh_uses_implicit_target_when_single_target_is_open(monkeypatch, capsys):
     calls = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         calls.append({"op": op, "params": params, "target": target})
         if op == "list_targets":
             return {
@@ -464,7 +464,7 @@ def test_refresh_uses_implicit_target_when_single_target_is_open(monkeypatch, ca
 def test_types_show_uses_type_info_and_text_renderer(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         captured["op"] = op
         captured["params"] = params
         captured["target"] = target
@@ -494,7 +494,7 @@ def test_types_show_uses_type_info_and_text_renderer(monkeypatch, capsys):
 def test_types_declare_uses_implicit_target_when_single_target_is_open(monkeypatch):
     calls = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         calls.append({"op": op, "params": params, "target": target})
         if op == "list_targets":
             return {
@@ -520,7 +520,7 @@ def test_types_declare_passes_source_path_for_file_input(monkeypatch, tmp_path):
     declaration_file = tmp_path / "win32_min.h"
     declaration_file.write_text("typedef struct Player { int hp; } Player;", encoding="utf-8")
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         captured["op"] = op
         captured["params"] = params
         captured["target"] = target
@@ -538,7 +538,7 @@ def test_types_declare_passes_source_path_for_file_input(monkeypatch, tmp_path):
 def test_xrefs_field_routes_to_field_xrefs(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         captured["op"] = op
         captured["params"] = params
         captured["target"] = target
@@ -570,7 +570,7 @@ def test_xrefs_field_routes_to_field_xrefs(monkeypatch, capsys):
 
 
 def test_xrefs_text_format_renders_summary(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         assert op == "xrefs"
         return {
             "ok": True,
@@ -595,7 +595,7 @@ def test_xrefs_text_format_renders_summary(monkeypatch, capsys):
 def test_callsites_routes_within_scope_and_renders_text(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         captured["op"] = op
         captured["params"] = params
         captured["target"] = target
@@ -667,7 +667,7 @@ def test_callsites_within_file_ignores_comments_and_blank_lines(monkeypatch, tmp
         encoding="utf-8",
     )
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         captured["op"] = op
         captured["params"] = params
         captured["target"] = target
@@ -695,7 +695,7 @@ def test_callsites_within_file_ignores_comments_and_blank_lines(monkeypatch, tmp
 
 
 def test_callsites_text_omits_null_hlil_and_pre_branch(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         assert op == "callsites"
         return {
             "ok": True,
@@ -731,7 +731,7 @@ def test_callsites_text_omits_null_hlil_and_pre_branch(monkeypatch, capsys):
 def test_comment_get_uses_implicit_target_when_single_target_is_open(monkeypatch, capsys):
     calls = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         calls.append({"op": op, "params": params, "target": target})
         if op == "list_targets":
             return {
@@ -755,7 +755,7 @@ def test_comment_get_uses_implicit_target_when_single_target_is_open(monkeypatch
 def test_py_exec_accepts_inline_code(monkeypatch):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         captured["op"] = op
         captured["params"] = params
         captured["target"] = target
@@ -780,7 +780,7 @@ def test_py_exec_missing_script_mentions_code(capsys):
 
 
 def test_strings_text_format_renders_rows(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         assert op == "strings"
         return {
             "ok": True,
@@ -805,7 +805,7 @@ def test_strings_text_format_renders_rows(monkeypatch, capsys):
 
 
 def test_py_exec_text_format_renders_stdout_and_result(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         assert op == "py_exec"
         return {
             "ok": True,
@@ -828,7 +828,7 @@ def test_py_exec_text_format_renders_stdout_and_result(monkeypatch, capsys):
 
 
 def test_proto_get_renders_prototype_text(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         assert op == "get_prototype"
         return {
             "ok": True,
@@ -849,7 +849,7 @@ def test_proto_get_renders_prototype_text(monkeypatch, capsys):
 
 
 def test_local_list_renders_ids(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         assert op == "list_locals"
         return {
             "ok": True,
@@ -884,7 +884,7 @@ def test_bundle_function_out_path_is_bridge_owned(monkeypatch, tmp_path, capsys)
     captured = {}
     out_path = tmp_path / "bundle.json"
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         if op == "list_targets":
             return {
                 "ok": True,
@@ -957,7 +957,7 @@ def test_help_full_prints_recursive_root_help(capsys):
 
     assert exc_info.value.code == 0
     stdout, stderr = capsys.readouterr()
-    assert "usage: bn\n" in stdout
+    assert "usage: bn" in stdout
     assert "usage: bn struct {show,field} ..." in stdout
     assert "usage: bn struct field set" in stdout
     assert "-h, --help" not in stdout
@@ -1089,7 +1089,7 @@ def test_doctor_text_marks_healthy_instance_ok(monkeypatch, tmp_path, capsys):
 
 
 def test_symbol_rename_text_format_renders_mutation_summary(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         assert op == "rename_symbol"
         return {
             "ok": True,
@@ -1141,7 +1141,7 @@ def test_symbol_rename_text_format_renders_mutation_summary(monkeypatch, capsys)
 
 
 def test_symbol_rename_verification_failure_returns_nonzero(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         assert op == "rename_symbol"
         return {
             "ok": True,
@@ -1187,7 +1187,7 @@ def test_symbol_rename_verification_failure_returns_nonzero(monkeypatch, capsys)
 
 
 def test_symbol_rename_noop_still_succeeds(monkeypatch):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         assert op == "rename_symbol"
         return {
             "ok": True,
@@ -1217,7 +1217,7 @@ def test_symbol_rename_noop_still_succeeds(monkeypatch):
 
 
 def test_decompile_text_format_unwraps_text_field(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         return {
             "ok": True,
             "result": {
@@ -1235,7 +1235,7 @@ def test_decompile_text_format_unwraps_text_field(monkeypatch, capsys):
 
 
 def test_comment_get_empty_comment_shows_placeholder(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         assert op == "get_comment"
         return {"ok": True, "result": {"address": "0x401000", "comment": "", "has_comment": False}}
 
@@ -1248,7 +1248,7 @@ def test_comment_get_empty_comment_shows_placeholder(monkeypatch, capsys):
 
 
 def test_callsites_empty_result_shows_descriptive_message(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         assert op == "callsites"
         return {"ok": True, "result": []}
 
@@ -1283,7 +1283,7 @@ def test_format_operation_result_falls_back_to_requested():
 def test_function_list_pagination_truncates_and_warns(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         captured["params"] = params
         return {
             "ok": True,
@@ -1305,7 +1305,7 @@ def test_function_list_pagination_truncates_and_warns(monkeypatch, capsys):
 def test_function_search_pagination_forwards_offset(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         captured["params"] = params
         return {"ok": True, "result": [{"name": "sub_401000", "address": "0x401000"}]}
 
@@ -1316,3 +1316,114 @@ def test_function_search_pagination_forwards_offset(monkeypatch, capsys):
     assert rc == 0
     assert captured["params"]["offset"] == 50
     assert captured["params"]["limit"] == 26
+
+
+def test_instance_flag_passed_to_send_request(monkeypatch, capsys):
+    captured_instance_ids = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        captured_instance_ids.append(instance_id)
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "test.bndb"}]}
+        return {"ok": True, "result": []}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    bn.cli.main(["--instance", "abc123", "function", "list"])
+
+    assert "abc123" in captured_instance_ids
+
+
+def test_instance_flag_from_env(monkeypatch, capsys):
+    captured_instance_ids = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        captured_instance_ids.append(instance_id)
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "test.bndb"}]}
+        return {"ok": True, "result": []}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setenv("BN_INSTANCE", "env_inst")
+
+    bn.cli.main(["function", "list"])
+
+    assert "env_inst" in captured_instance_ids
+
+
+def test_session_list_shows_instances(monkeypatch, capsys):
+    from bn.transport import BridgeInstance
+
+    fake_instances = [
+        BridgeInstance(
+            pid=111,
+            socket_path=__import__("pathlib").Path("/tmp/a.sock"),
+            registry_path=__import__("pathlib").Path("/tmp/a.json"),
+            plugin_name="bn_agent_bridge",
+            plugin_version="0.1.0",
+            started_at="2026-01-01T00:00:00Z",
+            meta={},
+            instance_id="aaaa1111",
+        ),
+        BridgeInstance(
+            pid=222,
+            socket_path=__import__("pathlib").Path("/tmp/b.sock"),
+            registry_path=__import__("pathlib").Path("/tmp/b.json"),
+            plugin_name="bn_agent_bridge",
+            plugin_version="0.1.0",
+            started_at="2026-01-01T00:01:00Z",
+            meta={},
+            instance_id="bbbb2222",
+        ),
+    ]
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: fake_instances)
+
+    rc = bn.cli.main(["session", "list"])
+
+    assert rc == 0
+    stdout = capsys.readouterr().out
+    parsed = json.loads(stdout)
+    assert len(parsed) == 2
+    assert parsed[0]["instance_id"] == "aaaa1111"
+    assert parsed[1]["instance_id"] == "bbbb2222"
+
+
+def test_session_stop_sends_shutdown(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        assert op == "shutdown"
+        assert instance_id == "abc123"
+        return {"ok": True, "result": {"shutting_down": True}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["session", "stop", "abc123"])
+
+    assert rc == 0
+    stdout = capsys.readouterr().out
+    parsed = json.loads(stdout)
+    assert parsed["stopped"] is True
+    assert parsed["instance_id"] == "abc123"
+
+
+def test_session_start_spawns_instance(monkeypatch, capsys):
+    from bn.transport import BridgeInstance
+
+    fake_inst = BridgeInstance(
+        pid=999,
+        socket_path=__import__("pathlib").Path("/tmp/test.sock"),
+        registry_path=__import__("pathlib").Path("/tmp/test.json"),
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at="2026-01-01T00:00:00Z",
+        meta={},
+        instance_id="test1234",
+    )
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: fake_inst)
+
+    rc = bn.cli.main(["session", "start"])
+
+    assert rc == 0
+    stdout = capsys.readouterr().out
+    parsed = json.loads(stdout)
+    assert parsed["instance_id"] == "test1234"
+    assert parsed["pid"] == 999

@@ -32,18 +32,20 @@ Outputs above `10_000` `o200k_base` tokens auto-spill to disk. When that happens
 
 ## Headless Mode
 
-When no GUI is available, start the bridge headless:
+When no GUI is available, use `bn session start` to launch a headless bridge:
 
 ```bash
-python -m bn_agent_bridge /path/to/binary.bndb
+bn session start /path/to/binary.bndb
 ```
 
-Or start with no binaries and load them over the socket:
+Or start with no binaries and load them later:
 
 ```bash
-python -m bn_agent_bridge &
+bn session start
 bn load /path/to/binary.bndb
 ```
+
+If no bridge is running, `bn` auto-starts one on first use — no manual setup needed.
 
 Close binaries with `bn close [path]` (omit path to close all). All other commands work identically in headless and GUI modes.
 
@@ -252,10 +254,9 @@ bn refresh
 
 **Always save work as `.bndb`** before closing a target. Annotations (renames, types, comments) are lost if a raw binary is closed without saving.
 
-Save via Python:
-
 ```bash
-bn py exec --code "bv.create_database(bv.file.filename + '.bndb')"
+bn save                          # saves to <filename>.bndb
+bn save /path/to/output.bndb    # saves to explicit path
 ```
 
 **Loading behavior**: `bn load foo.so` does NOT auto-detect a sibling `foo.so.bndb`. It re-analyzes from scratch, discarding all prior annotations. Always load the `.bndb` path explicitly:
@@ -279,6 +280,35 @@ bn target list
 ```
 
 If the target appears, it loaded successfully despite the timeout.
+
+## Multi-Instance / Parallel Agents
+
+When multiple agents need to analyze different binaries concurrently, each agent should start its own dedicated bridge session to avoid conflicts:
+
+```bash
+# Start a session (optionally preload a binary)
+bn session start /path/to/binary.bndb
+# → {"instance_id": "a3f1bc09", "pid": 12345, "socket_path": "..."}
+
+# Route all subsequent commands to that session
+bn --instance a3f1bc09 target list
+bn --instance a3f1bc09 decompile main
+bn --instance a3f1bc09 save
+
+# Or set the env var once
+export BN_INSTANCE=a3f1bc09
+bn decompile main
+
+# Stop when done
+bn session stop a3f1bc09
+```
+
+Session management commands:
+- `bn session start [binary...]` — start a new headless bridge, return instance ID
+- `bn session list` — show all running bridge instances
+- `bn session stop <id>` — shut down a specific instance
+
+If no bridge is running and no `--instance` is specified, `bn` auto-starts a headless bridge. For parallel workflows, prefer explicit `bn session start` so each agent controls its own session lifecycle.
 
 ## Known Quirks
 

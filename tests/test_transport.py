@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import socket
@@ -10,8 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from bn.paths import bridge_registry_path
-from bn.transport import choose_instance, list_instances, send_request
+from bn.paths import bridge_registry_path, instances_dir
+from bn.transport import BridgeError, choose_instance, list_instances, send_request
 
 
 class _Handler(socketserver.StreamRequestHandler):
@@ -116,7 +117,7 @@ def test_send_request_wraps_socket_errors(tmp_path, monkeypatch):
         started_at=None,
         meta={},
     )
-    monkeypatch.setattr("bn.transport.choose_instance", lambda: instance)
+    monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None: instance)
 
     with pytest.raises(BridgeError, match="Failed to contact Binary Ninja bridge pid 999"):
         send_request("doctor")
@@ -134,7 +135,7 @@ def test_send_request_retries_transient_connect_failures(tmp_path, monkeypatch):
         started_at=None,
         meta={},
     )
-    monkeypatch.setattr("bn.transport.choose_instance", lambda: instance)
+    monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None: instance)
 
     class _FakeSocket:
         attempts = 0
@@ -151,7 +152,7 @@ def test_send_request_retries_transient_connect_failures(tmp_path, monkeypatch):
         def connect(self, path):
             type(self).attempts += 1
             if type(self).attempts == 1:
-                raise ConnectionRefusedError(61, "Connection refused")
+                raise ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused")
 
         def sendall(self, payload):
             self.payload = payload
@@ -185,7 +186,7 @@ def test_send_request_reports_timeout_waiting_for_response(tmp_path, monkeypatch
         started_at=None,
         meta={},
     )
-    monkeypatch.setattr("bn.transport.choose_instance", lambda: instance)
+    monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None: instance)
 
     class _FakeSocket:
         def __enter__(self):
@@ -279,3 +280,104 @@ def test_list_instances_reads_fixed_registry_path(tmp_path, monkeypatch):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def _create_live_instance(tmp_path, instance_id, *, subdir="instances"):
+    """Helper: start a mock server and write a registry file, return server."""
+    inst_dir = tmp_path / subdir
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    socket_path = Path("/tmp") / f"bn-inst-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
+    server = _Server(str(socket_path), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    registry_path = inst_dir / f"{instance_id}.json"
+    registry_path.write_text(
+        json.dumps({
+            "pid": os.getpid(),
+            "socket_path": str(socket_path),
+            "plugin_name": "bn_agent_bridge",
+            "plugin_version": "0.1.0",
+            "instance_id": instance_id,
+        }),
+        encoding="utf-8",
+    )
+    return server
+
+
+def test_list_instances_discovers_instance_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    srv_a = _create_live_instance(tmp_path, "aaaa1111")
+    srv_b = _create_live_instance(tmp_path, "bbbb2222")
+    try:
+        instances = list_instances()
+        ids = {inst.instance_id for inst in instances}
+        assert "aaaa1111" in ids
+        assert "bbbb2222" in ids
+        assert len(instances) >= 2
+    finally:
+        srv_a.shutdown()
+        srv_a.server_close()
+        srv_b.shutdown()
+        srv_b.server_close()
+
+
+def test_choose_instance_by_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    srv_a = _create_live_instance(tmp_path, "aaaa1111")
+    srv_b = _create_live_instance(tmp_path, "bbbb2222")
+    try:
+        inst = choose_instance("bbbb2222", auto_start=False)
+        assert inst.instance_id == "bbbb2222"
+
+        inst = choose_instance("aaaa1111", auto_start=False)
+        assert inst.instance_id == "aaaa1111"
+    finally:
+        srv_a.shutdown()
+        srv_a.server_close()
+        srv_b.shutdown()
+        srv_b.server_close()
+
+
+def test_choose_instance_no_match_raises(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    srv = _create_live_instance(tmp_path, "aaaa1111")
+    try:
+        with pytest.raises(BridgeError, match="No bridge instance found with id: missing"):
+            choose_instance("missing", auto_start=False)
+    finally:
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_list_instances_prunes_stale_in_instances_dir(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+
+    stale_socket = Path("/tmp") / f"bn-stale-inst-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
+    stale_server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale_server.bind(str(stale_socket))
+    stale_server.listen(1)
+    stale_server.close()
+
+    registry_path = inst_dir / "deadbeef.json"
+    registry_path.write_text(
+        json.dumps({
+            "pid": os.getpid(),
+            "socket_path": str(stale_socket),
+            "plugin_name": "bn_agent_bridge",
+            "plugin_version": "0.1.0",
+            "instance_id": "deadbeef",
+        }),
+        encoding="utf-8",
+    )
+
+    instances = list_instances()
+    assert not any(inst.instance_id == "deadbeef" for inst in instances)
+    assert not registry_path.exists()
+
+
+def test_choose_instance_no_auto_start_raises(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    with pytest.raises(BridgeError, match="No running Binary Ninja bridge instances found"):
+        choose_instance(auto_start=False)

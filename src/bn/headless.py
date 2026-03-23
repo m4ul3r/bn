@@ -40,6 +40,11 @@ def main(argv: list[str] | None = None) -> int:
         nargs="*",
         help="Binary file paths to open at startup",
     )
+    parser.add_argument(
+        "--instance-id",
+        help="Instance ID for this bridge session (default: random)",
+        default=None,
+    )
     args = parser.parse_args(argv)
 
     # Make the binaryninja package importable.
@@ -55,5 +60,9 @@ def main(argv: list[str] | None = None) -> int:
 
     from bn_agent_bridge.bridge import start_headless
 
-    start_headless(args.binaries)
+    start_headless(args.binaries, instance_id=args.instance_id)
     return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

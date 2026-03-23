@@ -10,3 +10,6 @@ wheels/
 .venv
 .pytest_cache/
 *.sock
+
+# Test fixtures (compiled binaries and databases)
+tests/fixtures/

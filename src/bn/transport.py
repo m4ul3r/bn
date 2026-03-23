@@ -3,14 +3,18 @@ from __future__ import annotations
 import contextlib
 import errno
 import json
+import os
+import secrets
 import socket
+import subprocess
+import sys
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .paths import bridge_registry_path
+from .paths import bridge_registry_path, bridge_socket_path, instances_dir
 
 
 class BridgeError(RuntimeError):
@@ -32,6 +36,7 @@ class BridgeInstance:
     plugin_version: str
     started_at: str | None
     meta: dict[str, Any]
+    instance_id: str | None = None
 
 
 def _purge_stale_registry(registry_path: Path) -> None:
@@ -73,26 +78,43 @@ def _load_instance(path: Path) -> BridgeInstance | None:
         plugin_version=str(payload.get("plugin_version", "0")),
         started_at=payload.get("started_at"),
         meta=payload,
+        instance_id=payload.get("instance_id"),
     )
 
 
 def list_instances() -> list[BridgeInstance]:
-    fixed_registry = bridge_registry_path()
-    if not fixed_registry.exists():
-        return []
-
     instances: list[BridgeInstance] = []
-    instance = _load_instance(fixed_registry)
-    if instance is not None:
-        instances.append(instance)
+
+    # Legacy fixed registry (GUI mode or old headless)
+    fixed_registry = bridge_registry_path()
+    if fixed_registry.exists():
+        instance = _load_instance(fixed_registry)
+        if instance is not None:
+            instances.append(instance)
+
+    # Per-instance registries
+    inst_dir = instances_dir()
+    if inst_dir.is_dir():
+        for reg_file in sorted(inst_dir.glob("*.json")):
+            instance = _load_instance(reg_file)
+            if instance is not None:
+                instances.append(instance)
+
     return instances
 
 
-def choose_instance() -> BridgeInstance:
+def choose_instance(instance_id: str | None = None, *, auto_start: bool = True) -> BridgeInstance:
     instances = list_instances()
-    if not instances:
-        raise BridgeError("No running Binary Ninja bridge instances found")
-    return instances[0]
+    if instance_id is not None:
+        for inst in instances:
+            if inst.instance_id == instance_id:
+                return inst
+        raise BridgeError(f"No bridge instance found with id: {instance_id}")
+    if instances:
+        return instances[0]
+    if auto_start:
+        return spawn_instance()
+    raise BridgeError("No running Binary Ninja bridge instances found")
 
 
 def _send_request_to_instance(
@@ -164,6 +186,57 @@ def _send_request_to_instance(
     raise BridgeError(str(error))
 
 
+def _find_bn_agent() -> list[str]:
+    """Return the command to invoke bn-agent."""
+    # Prefer the bn-agent script in the same directory as sys.executable
+    exe_dir = Path(sys.executable).parent
+    bn_agent = exe_dir / "bn-agent"
+    if bn_agent.exists():
+        return [str(bn_agent)]
+    return [sys.executable, "-m", "bn.headless"]
+
+
+def spawn_instance(
+    instance_id: str | None = None,
+    *,
+    timeout: float = 15.0,
+    poll_interval: float = 0.2,
+) -> BridgeInstance:
+    """Spawn a new bn-agent headless process and wait for it to register."""
+    if instance_id is None:
+        instance_id = secrets.token_hex(4)
+
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = inst_dir / f"{instance_id}.log"
+    log_file = open(log_path, "w")  # noqa: SIM115
+
+    cmd = _find_bn_agent() + ["--instance-id", instance_id]
+    proc = subprocess.Popen(
+        cmd,
+        start_new_session=True,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+    log_file.close()
+
+    reg_path = bridge_registry_path(instance_id)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if reg_path.exists():
+            inst = _load_instance(reg_path)
+            if inst is not None:
+                return inst
+        time.sleep(poll_interval)
+
+    raise BridgeError(
+        f"Auto-started bn-agent (pid {proc.pid}, instance {instance_id}) "
+        f"did not register within {timeout:.0f}s. Check {log_path}"
+    )
+
+
 def send_request(
     op: str,
     *,
@@ -171,8 +244,9 @@ def send_request(
     target: str | None = None,
     timeout: float = 30.0,
     connect_retries: int = 4,
+    instance_id: str | None = None,
 ) -> dict[str, Any]:
-    instance = choose_instance()
+    instance = choose_instance(instance_id)
     return _send_request_to_instance(
         instance,
         op,
