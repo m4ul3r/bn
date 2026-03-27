@@ -101,7 +101,7 @@ def _send_request_to_instance(
     *,
     params: dict[str, Any] | None = None,
     target: str | None = None,
-    timeout: float = 30.0,
+    timeout: float | None = None,
     connect_retries: int = 4,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
@@ -119,7 +119,8 @@ def _send_request_to_instance(
     for attempt in range(connect_retries):
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(timeout)
+                if timeout is not None:
+                    sock.settimeout(timeout)
                 sock.connect(str(instance.socket_path))
                 sock.sendall(encoded)
                 with contextlib.suppress(OSError):
@@ -138,9 +139,10 @@ def _send_request_to_instance(
 
     if last_error is not None and not chunks:
         if isinstance(last_error, TimeoutError):
+            timeout_suffix = f" after {timeout:.1f}s" if timeout is not None else ""
             raise BridgeError(
-                f"Timed out waiting for Binary Ninja bridge pid {instance.pid} at {instance.socket_path} "
-                f"after {timeout:.1f}s"
+                f"Timed out waiting for Binary Ninja bridge pid {instance.pid} at {instance.socket_path}"
+                f"{timeout_suffix}"
             ) from last_error
         raise BridgeError(
             f"Failed to contact Binary Ninja bridge pid {instance.pid} at {instance.socket_path}: {last_error}"
@@ -169,7 +171,7 @@ def send_request(
     *,
     params: dict[str, Any] | None = None,
     target: str | None = None,
-    timeout: float = 30.0,
+    timeout: float | None = None,
     connect_retries: int = 4,
 ) -> dict[str, Any]:
     instance = choose_instance()

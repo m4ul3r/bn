@@ -173,6 +173,56 @@ def test_send_request_retries_transient_connect_failures(tmp_path, monkeypatch):
     assert _FakeSocket.attempts == 2
 
 
+def test_send_request_uses_blocking_socket_by_default(tmp_path, monkeypatch):
+    from bn.transport import BridgeInstance
+
+    instance = BridgeInstance(
+        pid=999,
+        socket_path=tmp_path / "bridge.sock",
+        registry_path=tmp_path / "bridge.json",
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at=None,
+        meta={},
+    )
+    monkeypatch.setattr("bn.transport.choose_instance", lambda: instance)
+
+    class _FakeSocket:
+        timeout_calls = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def settimeout(self, timeout):
+            type(self).timeout_calls += 1
+            self.timeout = timeout
+
+        def connect(self, path):
+            self.path = path
+
+        def sendall(self, payload):
+            self.payload = payload
+
+        def shutdown(self, how):
+            self.how = how
+
+        def recv(self, size):
+            if not hasattr(self, "_sent"):
+                self._sent = True
+                return json.dumps({"ok": True, "result": {"pong": True}}).encode("utf-8")
+            return b""
+
+    monkeypatch.setattr("bn.transport.socket.socket", lambda *args, **kwargs: _FakeSocket())
+
+    response = send_request("ping")
+
+    assert response["result"]["pong"] is True
+    assert _FakeSocket.timeout_calls == 0
+
+
 def test_send_request_reports_timeout_waiting_for_response(tmp_path, monkeypatch):
     from bn.transport import BridgeError, BridgeInstance
 
