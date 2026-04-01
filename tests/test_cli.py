@@ -271,9 +271,11 @@ def test_function_info_uses_active_target_and_text_renderer(monkeypatch, capsys)
     output = capsys.readouterr().out
     assert "sub_401000 @ 0x401000" in output
     assert "calling convention: __cdecl" in output
-    assert "parameters:" in output
-    assert "locals:" in output
-    assert "id=0x401000:param:stack:0:0:1" in output
+    assert "size: 24" in output
+    assert "xrefs: 0" in output
+    assert "locals: 1 variables" in output
+    # compact mode should NOT show full parameter/local details
+    assert "id=0x401000:param:stack:0:0:1" not in output
 
 
 def test_symbol_rename_builds_preview_payload(monkeypatch):

@@ -232,6 +232,9 @@ class _FakeBV:
     def get_disassembly(self, address: int):
         return self._disassembly.get(int(address), "")
 
+    def get_code_refs(self, address: int):
+        return []
+
     def read(self, address: int, length: int):
         return b"\x90" * length
 

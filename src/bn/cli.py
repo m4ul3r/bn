@@ -464,7 +464,7 @@ def _text_field(field: str) -> Callable[[Any], str]:
     return render
 
 
-def _render_function_info_text(value: Any) -> str:
+def _render_function_info_text(value: Any, verbose: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
 
@@ -472,26 +472,30 @@ def _render_function_info_text(value: Any) -> str:
     lines = [
         f"{function.get('name', '<unknown>')} @ {function.get('address', '<unknown>')}",
         str(value.get("prototype", "")),
-        f"return: {value.get('return_type', '<unknown>')}",
         f"calling convention: {value.get('calling_convention', '<unknown>')}",
         f"size: {value.get('size', '<unknown>')}",
-        "",
-        "parameters:",
+        f"xrefs: {value.get('xref_count', 0)}",
     ]
-    parameters = list(value.get("parameters") or [])
-    if parameters:
-        for item in parameters:
-            lines.append(_format_local_entry(item))
-    else:
-        lines.append("- none")
 
-    lines.extend(["", "locals:"])
     locals_only = list(value.get("locals") or [])
     if locals_only:
-        for item in locals_only:
-            lines.append(_format_local_entry(item))
-    else:
-        lines.append("- none")
+        lines.append(f"locals: {len(locals_only)} variables")
+
+    if verbose:
+        parameters = list(value.get("parameters") or [])
+        if parameters:
+            lines.append("")
+            lines.append("parameters:")
+            for item in parameters:
+                lines.append(_format_local_entry(item))
+        lines.append("")
+        if locals_only:
+            lines.append("locals:")
+            for item in locals_only:
+                lines.append(_format_local_entry(item))
+        else:
+            lines.append("locals: none")
+
     return "\n".join(lines)
 
 
@@ -752,18 +756,23 @@ def _render_name_address_list_text(value: Any) -> str:
     return "\n".join(lines)
 
 
-def _render_xrefs_text(value: Any) -> str:
+def _render_xrefs_text(value: Any, limit: int | None = None) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
 
+    code_refs = list(value.get("code_refs") or [])
+    data_refs = list(value.get("data_refs") or [])
+    total_code = len(code_refs)
+    total_data = len(data_refs)
+
     lines = [
-        f"xrefs to {value.get('address', '<unknown>')}",
+        f"xrefs to {value.get('address', '<unknown>')} ({total_code} code, {total_data} data)",
         "",
         "code refs:",
     ]
-    code_refs = list(value.get("code_refs") or [])
     if code_refs:
-        for ref in code_refs:
+        shown = code_refs[:limit] if limit else code_refs
+        for ref in shown:
             if not isinstance(ref, dict):
                 lines.append("- " + _render_fallback_text(ref))
                 continue
@@ -771,13 +780,15 @@ def _render_xrefs_text(value: Any) -> str:
             if ref.get("function"):
                 details.append(str(ref["function"]))
             lines.append("- " + " | ".join(details))
+        if limit and total_code > limit:
+            lines.append(f"  ... {total_code - limit} more (use --limit or --format json)")
     else:
         lines.append("- none")
 
     lines.extend(["", "data refs:"])
-    data_refs = list(value.get("data_refs") or [])
     if data_refs:
-        for ref in data_refs:
+        shown = data_refs[:limit] if limit else data_refs
+        for ref in shown:
             if not isinstance(ref, dict):
                 lines.append("- " + _render_fallback_text(ref))
                 continue
@@ -785,6 +796,8 @@ def _render_xrefs_text(value: Any) -> str:
             if ref.get("function"):
                 details.append(str(ref["function"]))
             lines.append("- " + " | ".join(details))
+        if limit and total_data > limit:
+            lines.append(f"  ... {total_data - limit} more (use --limit or --format json)")
     else:
         lines.append("- none")
     return "\n".join(lines)
@@ -1068,6 +1081,19 @@ def _render_py_exec_text(value: Any) -> str:
     if not parts:
         return ""
     return "\n\n".join(parts)
+
+
+def _parse_line_range(value: str) -> tuple[int, int]:
+    parts = value.split(":")
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(f"expected START:END, got {value!r}")
+    try:
+        start, end = int(parts[0]), int(parts[1])
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected START:END with integers, got {value!r}")
+    if start < 1 or end < start:
+        raise argparse.ArgumentTypeError(f"invalid range: {start}:{end}")
+    return (start, end)
 
 
 @command("doctor", help="Validate bridge discovery and installation")
@@ -1443,15 +1469,18 @@ def _function_search(args: argparse.Namespace) -> int:
 
 
 @command("function", "info", help="Show function prototype and variables", target=True,
-         args=[arg("identifier")])
+         args=[arg("identifier"),
+               arg("--verbose", "-v", action="store_true", default=False,
+                   help="Show full parameter and local variable details")])
 def _function_info(args: argparse.Namespace) -> int:
+    verbose = getattr(args, "verbose", False)
     return _call(
         args,
         "function_info",
         {"identifier": args.identifier},
         require_target=True,
         allow_implicit_target=True,
-        text_renderer=_render_function_info_text,
+        text_renderer=lambda v: _render_function_info_text(v, verbose=verbose),
         stem="function-info",
     )
 
@@ -1461,15 +1490,30 @@ def _function_info(args: argparse.Namespace) -> int:
              arg("identifier"),
              arg("--addresses", action="store_true", default=False,
                  help="Show address prefixes on each line"),
+             arg("--lines", type=_parse_line_range, default=None, metavar="START:END",
+                 help="Show only lines START through END (1-indexed, inclusive)"),
          ])
 def _decompile(args: argparse.Namespace) -> int:
+    lines_range = getattr(args, "lines", None)
+
+    def _render_decompile_text(value: Any) -> str:
+        text = _text_field("text")(value)
+        if lines_range is None:
+            return text
+        all_lines = text.splitlines()
+        total = len(all_lines)
+        start, end = lines_range
+        sliced = all_lines[start - 1 : end]
+        header = f"// lines {start}-{min(end, total)} of {total}"
+        return header + "\n" + "\n".join(sliced)
+
     return _call(
         args,
         "decompile",
         {"identifier": args.identifier, "addresses": args.addresses},
         require_target=True,
         allow_implicit_target=True,
-        text_renderer=_text_field("text"),
+        text_renderer=_render_decompile_text,
         stem="decompile",
     )
 
@@ -1512,10 +1556,13 @@ def _disasm(args: argparse.Namespace) -> int:
              arg("identifier", nargs="?"),
              arg("--field", dest="field_spec",
                  help="Struct field xref spec (e.g., TrackRowCell.tile_type)"),
+             arg("--limit", type=int, default=None,
+                 help="Max number of code refs to show"),
          ])
 def _xrefs(args: argparse.Namespace) -> int:
     field_spec = getattr(args, "field_spec", None)
     identifier = getattr(args, "identifier", None)
+    limit = getattr(args, "limit", None)
     if field_spec:
         return _call(
             args,
@@ -1534,7 +1581,7 @@ def _xrefs(args: argparse.Namespace) -> int:
         {"identifier": identifier},
         require_target=True,
         allow_implicit_target=True,
-        text_renderer=_render_xrefs_text,
+        text_renderer=lambda v: _render_xrefs_text(v, limit=limit),
         stem="xrefs",
     )
 

@@ -1833,6 +1833,7 @@ class BinaryNinjaBridge:
         variables = self._list_locals(func)
         parameters = [item for item in variables if item["is_parameter"]]
         locals_only = [item for item in variables if not item["is_parameter"]]
+        code_ref_count = len(list(bv.get_code_refs(func.start)))
         return {
             "function": {
                 "name": func.name,
@@ -1842,6 +1843,7 @@ class BinaryNinjaBridge:
             **metadata,
             "parameters": parameters,
             "locals": locals_only,
+            "xref_count": code_ref_count,
         }
 
     def _get_prototype(self, selector: str | None, identifier):
