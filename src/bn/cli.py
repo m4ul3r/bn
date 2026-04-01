@@ -147,6 +147,122 @@ def _target_option(
     parser.add_argument("--target", **kwargs)
 
 
+# ---------------------------------------------------------------------------
+# Declarative command registration
+# ---------------------------------------------------------------------------
+
+_COMMANDS: list[dict[str, Any]] = []
+
+_GROUP_HELP: dict[tuple[str, ...], str] = {
+    ("plugin",): "Install the Binary Ninja companion plugin",
+    ("skill",): "Install the bundled Claude Code skill",
+    ("session",): "Manage bridge sessions",
+    ("target",): "Inspect Binary Ninja targets",
+    ("function",): "Function discovery helpers",
+    ("bundle",): "Export reusable bundles",
+    ("py",): "Execute Python inside Binary Ninja",
+    ("symbol",): "Rename functions or data",
+    ("comment",): "Set or delete comments",
+    ("proto",): "Inspect or set a user prototype",
+    ("local",): "Inspect, rename, or retype locals",
+    ("struct",): "Field-first structure editing",
+    ("struct", "field"): "Operate on struct fields",
+    ("batch",): "Apply a batch manifest",
+}
+
+
+def arg(*flags: str, **kwargs: Any) -> tuple[tuple[str, ...], dict[str, Any]]:
+    """Define an argument spec for :func:`command`."""
+    return (flags, kwargs)
+
+
+def mutex(required: bool, *args: tuple[tuple[str, ...], dict[str, Any]]) -> tuple[bool, list[tuple[tuple[str, ...], dict[str, Any]]]]:
+    """Define a mutually exclusive argument group for :func:`command`."""
+    return (required, list(args))
+
+
+def command(
+    *path: str,
+    help: str = "",
+    fmt: str = "text",
+    target: bool = False,
+    paged: bool = False,
+    address_filter: bool = False,
+    args: list[tuple[tuple[str, ...], dict[str, Any]]] | None = None,
+    mutex_groups: list[tuple[bool, list[tuple[tuple[str, ...], dict[str, Any]]]]] | None = None,
+) -> Callable:
+    """Register a CLI command declaratively."""
+
+    def decorator(fn: Callable[[argparse.Namespace], int]) -> Callable[[argparse.Namespace], int]:
+        _COMMANDS.append({
+            "path": path,
+            "handler": fn,
+            "help": help,
+            "fmt": fmt,
+            "target": target,
+            "paged": paged,
+            "address_filter": address_filter,
+            "args": args or [],
+            "mutex_groups": mutex_groups or [],
+        })
+        return fn
+
+    return decorator
+
+
+def _build_from_commands(root: BnArgumentParser) -> None:
+    """Populate *root* with subcommands from the ``_COMMANDS`` registry."""
+    subparser_actions: dict[tuple[str, ...], argparse._SubParsersAction] = {}
+    node_parsers: dict[tuple[str, ...], argparse.ArgumentParser] = {(): root}
+
+    def _get_subparsers(parent: tuple[str, ...]) -> argparse._SubParsersAction:
+        if parent not in subparser_actions:
+            dest = "_".join(parent) + "_command" if parent else "command"
+            subparser_actions[parent] = node_parsers[parent].add_subparsers(dest=dest)
+        return subparser_actions[parent]
+
+    def _ensure_intermediate(path: tuple[str, ...]) -> argparse.ArgumentParser:
+        if path in node_parsers:
+            return node_parsers[path]
+        if len(path) > 1:
+            _ensure_intermediate(path[:-1])
+        sub = _get_subparsers(path[:-1])
+        parser = sub.add_parser(path[-1], help=_GROUP_HELP.get(path, ""))
+        node_parsers[path] = parser
+        return parser
+
+    for spec in sorted(_COMMANDS, key=lambda s: len(s["path"])):
+        path = spec["path"]
+        parent = path[:-1]
+
+        if parent:
+            _ensure_intermediate(parent)
+
+        if path in node_parsers:
+            cmd = node_parsers[path]
+        else:
+            cmd = _get_subparsers(parent).add_parser(path[-1], help=spec["help"])
+            node_parsers[path] = cmd
+
+        _common_io_options(cmd, default_format=spec["fmt"])
+        if spec["target"]:
+            _target_option(cmd, required=False)
+        if spec["address_filter"]:
+            _add_function_address_args(cmd)
+        if spec["paged"]:
+            _add_paged_args(cmd)
+
+        for flags, kwargs in spec["args"]:
+            cmd.add_argument(*flags, **kwargs)
+
+        for required, group_args in spec["mutex_groups"]:
+            group = cmd.add_mutually_exclusive_group(required=required)
+            for flags, kwargs in group_args:
+                group.add_argument(*flags, **kwargs)
+
+        cmd.set_defaults(handler=spec["handler"])
+
+
 def _render_result(
     value: Any,
     *,
@@ -854,6 +970,7 @@ def _render_py_exec_text(value: Any) -> str:
     return "\n\n".join(parts)
 
 
+@command("doctor", help="Validate bridge discovery and installation")
 def _doctor(args: argparse.Namespace) -> int:
     install_dir = plugin_install_dir()
     source_dir = plugin_source_dir()
@@ -913,6 +1030,12 @@ def _doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+@command("plugin", "install", help="Install the GUI plugin", fmt="json",
+         args=[
+             arg("--dest", type=Path, help="Custom install destination"),
+             arg("--mode", choices=("symlink", "copy"), default="symlink"),
+             arg("--force", action="store_true"),
+         ])
 def _plugin_install(args: argparse.Namespace) -> int:
     source = plugin_source_dir()
     dest = args.dest or plugin_install_dir()
@@ -952,6 +1075,12 @@ def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
         os.symlink(source, dest, target_is_directory=True)
 
 
+@command("skill", "install", help="Install the bundled Claude Code skill", fmt="json",
+         args=[
+             arg("--dest", type=Path, help="Custom install destination"),
+             arg("--mode", choices=("symlink", "copy"), default="symlink"),
+             arg("--force", action="store_true"),
+         ])
 def _skill_install(args: argparse.Namespace) -> int:
     source = skill_source_dir()
     dest = args.dest or skill_install_dir()
@@ -972,6 +1101,8 @@ def _skill_install(args: argparse.Namespace) -> int:
     return 0
 
 
+@command("load", help="Load a binary into headless bridge", fmt="json",
+         args=[arg("path", help="Path to binary or BNDB file")])
 def _load(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -982,6 +1113,8 @@ def _load(args: argparse.Namespace) -> int:
     )
 
 
+@command("close", help="Close a loaded binary", fmt="json",
+         args=[arg("path", nargs="?", help="Path to close (omit to close all)")])
 def _close(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
     if args.path:
@@ -995,6 +1128,8 @@ def _close(args: argparse.Namespace) -> int:
     )
 
 
+@command("save", help="Save the current analysis database (.bndb)", fmt="json", target=True,
+         args=[arg("path", nargs="?", help="Output path (defaults to <filename>.bndb)")])
 def _save(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
     if getattr(args, "path", None):
@@ -1008,6 +1143,11 @@ def _save(args: argparse.Namespace) -> int:
     )
 
 
+@command("session", "start", help="Start a new headless bridge session", fmt="json",
+         args=[
+             arg("binaries", nargs="*", help="Binary file paths to preload"),
+             arg("--instance-id", help="Use a specific instance ID (default: random)"),
+         ])
 def _session_start(args: argparse.Namespace) -> int:
     instance_id = getattr(args, "instance_id", None)
     instance = spawn_instance(instance_id)
@@ -1038,6 +1178,8 @@ def _session_start(args: argparse.Namespace) -> int:
     return 0
 
 
+@command("session", "stop", help="Stop a running bridge session", fmt="json",
+         args=[arg("instance", help="Instance ID to stop")])
 def _session_stop(args: argparse.Namespace) -> int:
     import signal
 
@@ -1073,6 +1215,7 @@ def _rss_mb(pid: int) -> float | None:
     return None
 
 
+@command("session", "list", help="List running bridge sessions", fmt="json")
 def _session_list(args: argparse.Namespace) -> int:
     instances = list_instances()
     entries = []
@@ -1097,6 +1240,7 @@ def _session_list(args: argparse.Namespace) -> int:
     return 0
 
 
+@command("target", "list", help="List open BinaryView targets")
 def _target_list(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1108,6 +1252,7 @@ def _target_list(args: argparse.Namespace) -> int:
     )
 
 
+@command("target", "info", help="Show one target", target=True)
 def _target_info(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1120,6 +1265,7 @@ def _target_info(args: argparse.Namespace) -> int:
     )
 
 
+@command("refresh", help="Refresh analysis for the selected target", target=True)
 def _refresh(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1132,6 +1278,7 @@ def _refresh(args: argparse.Namespace) -> int:
     )
 
 
+@command("function", "list", help="List functions", target=True, paged=True, address_filter=True)
 def _function_list(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
     if args.min_address is not None:
@@ -1154,6 +1301,13 @@ def _function_list(args: argparse.Namespace) -> int:
     )
 
 
+@command("function", "search", help="Search functions by substring or regex",
+         target=True, paged=True, address_filter=True,
+         args=[
+             arg("--regex", action="store_true",
+                 help="Interpret query as a case-insensitive regular expression"),
+             arg("query"),
+         ])
 def _function_search(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {
         "query": args.query,
@@ -1179,6 +1333,8 @@ def _function_search(args: argparse.Namespace) -> int:
     )
 
 
+@command("function", "info", help="Show function prototype and variables", target=True,
+         args=[arg("identifier")])
 def _function_info(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1191,6 +1347,12 @@ def _function_info(args: argparse.Namespace) -> int:
     )
 
 
+@command("decompile", help="Render HLIL-style decompile text for a function", target=True,
+         args=[
+             arg("identifier"),
+             arg("--addresses", action="store_true", default=False,
+                 help="Show address prefixes on each line"),
+         ])
 def _decompile(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1203,6 +1365,12 @@ def _decompile(args: argparse.Namespace) -> int:
     )
 
 
+@command("il", help="Dump IL for a function", target=True,
+         args=[
+             arg("identifier"),
+             arg("--view", choices=("hlil", "mlil", "llil"), default="hlil"),
+             arg("--ssa", action="store_true"),
+         ])
 def _il(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1215,6 +1383,8 @@ def _il(args: argparse.Namespace) -> int:
     )
 
 
+@command("disasm", help="Disassemble a function", target=True,
+         args=[arg("identifier")])
 def _disasm(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1227,6 +1397,13 @@ def _disasm(args: argparse.Namespace) -> int:
     )
 
 
+@command("xrefs", help="List xrefs to an address or function; use --field for struct field xrefs",
+         target=True,
+         args=[
+             arg("identifier", nargs="?"),
+             arg("--field", dest="field_spec",
+                 help="Struct field xref spec (e.g., TrackRowCell.tile_type)"),
+         ])
 def _xrefs(args: argparse.Namespace) -> int:
     field_spec = getattr(args, "field_spec", None)
     identifier = getattr(args, "identifier", None)
@@ -1263,6 +1440,21 @@ def _load_within_identifiers(path: Path) -> list[str]:
     return identifiers
 
 
+@command("callsites", help="Find direct native callsites and exact caller_static addresses",
+         target=True,
+         args=[
+             arg("callee"),
+             arg("--context", type=int, default=3,
+                 help="Number of previous and next instructions to include around each callsite"),
+             arg("--caller-static", action="store_true",
+                 help="Prefer caller_static-first text output for return-address mapping workflows"),
+         ],
+         mutex_groups=[
+             mutex(True,
+                   arg("--within", help="Containing function to search for callsites"),
+                   arg("--within-file", type=Path,
+                       help="Text file with one containing-function identifier per line")),
+         ])
 def _callsites(args: argparse.Namespace) -> int:
     if args.within is not None:
         within_identifiers = [args.within]
@@ -1292,6 +1484,8 @@ def _callsites(args: argparse.Namespace) -> int:
     )
 
 
+@command("types", help="List or search types", target=True, paged=True,
+         args=[arg("--query")])
 def _types(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1307,6 +1501,8 @@ def _types(args: argparse.Namespace) -> int:
     )
 
 
+@command("types", "show", help="Show one type", target=True,
+         args=[arg("type_name")])
 def _types_show(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1322,6 +1518,13 @@ def _types_show(args: argparse.Namespace) -> int:
     )
 
 
+@command("types", "declare", help="Import C declarations as user types", fmt="json", target=True,
+         args=[
+             arg("--preview", action="store_true"),
+             arg("--file", type=Path, help="Read declarations from a file"),
+             arg("--stdin", action="store_true", help="Read declarations from stdin"),
+             arg("declaration", nargs="?"),
+         ])
 def _types_declare(args: argparse.Namespace) -> int:
     source_path = None
     if args.file is not None:
@@ -1352,6 +1555,8 @@ def _types_declare(args: argparse.Namespace) -> int:
     )
 
 
+@command("strings", help="List or search strings", target=True, paged=True,
+         args=[arg("--query")])
 def _strings(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1367,6 +1572,7 @@ def _strings(args: argparse.Namespace) -> int:
     )
 
 
+@command("imports", help="List imports", target=True)
 def _imports(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1379,6 +1585,8 @@ def _imports(args: argparse.Namespace) -> int:
     )
 
 
+@command("bundle", "function", help="Export a function bundle", fmt="json", target=True,
+         args=[arg("identifier")])
 def _bundle_function(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1391,6 +1599,13 @@ def _bundle_function(args: argparse.Namespace) -> int:
     )
 
 
+@command("py", "exec", help="Execute a Python snippet", target=True,
+         mutex_groups=[
+             mutex(True,
+                   arg("--script", type=Path, help="Read Python code from a file"),
+                   arg("--code", help="Inline Python code"),
+                   arg("--stdin", action="store_true")),
+         ])
 def _py_exec(args: argparse.Namespace) -> int:
     if getattr(args, "code", None) is not None:
         script = args.code
@@ -1412,6 +1627,13 @@ def _py_exec(args: argparse.Namespace) -> int:
     )
 
 
+@command("symbol", "rename", help="Rename a symbol", fmt="json", target=True,
+         args=[
+             arg("--kind", choices=("auto", "function", "data"), default="auto"),
+             arg("--preview", action="store_true"),
+             arg("identifier"),
+             arg("new_name"),
+         ])
 def _symbol_rename(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1430,6 +1652,13 @@ def _symbol_rename(args: argparse.Namespace) -> int:
     )
 
 
+@command("comment", "set", help="Set a comment", fmt="json", target=True,
+         args=[
+             arg("--preview", action="store_true"),
+             arg("--address"),
+             arg("--function"),
+             arg("comment"),
+         ])
 def _comment_set(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1448,6 +1677,8 @@ def _comment_set(args: argparse.Namespace) -> int:
     )
 
 
+@command("comment", "get", help="Get a comment", target=True,
+         args=[arg("--address"), arg("--function")])
 def _comment_get(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1463,6 +1694,12 @@ def _comment_get(args: argparse.Namespace) -> int:
     )
 
 
+@command("comment", "delete", help="Delete a comment", fmt="json", target=True,
+         args=[
+             arg("--preview", action="store_true"),
+             arg("--address"),
+             arg("--function"),
+         ])
 def _comment_delete(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1480,6 +1717,12 @@ def _comment_delete(args: argparse.Namespace) -> int:
     )
 
 
+@command("proto", "set", help="Set a prototype", fmt="json", target=True,
+         args=[
+             arg("--preview", action="store_true"),
+             arg("identifier"),
+             arg("prototype"),
+         ])
 def _proto_set(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1497,6 +1740,8 @@ def _proto_set(args: argparse.Namespace) -> int:
     )
 
 
+@command("proto", "get", help="Show the current prototype", target=True,
+         args=[arg("identifier")])
 def _proto_get(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1509,6 +1754,8 @@ def _proto_get(args: argparse.Namespace) -> int:
     )
 
 
+@command("local", "list", help="List locals with stable IDs", target=True,
+         args=[arg("function")])
 def _local_list(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1521,6 +1768,13 @@ def _local_list(args: argparse.Namespace) -> int:
     )
 
 
+@command("local", "rename", help="Rename a local", fmt="json", target=True,
+         args=[
+             arg("--preview", action="store_true"),
+             arg("function"),
+             arg("variable", help="Stable local_id or legacy variable name"),
+             arg("new_name"),
+         ])
 def _local_rename(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1539,6 +1793,13 @@ def _local_rename(args: argparse.Namespace) -> int:
     )
 
 
+@command("local", "retype", help="Retype a local", fmt="json", target=True,
+         args=[
+             arg("--preview", action="store_true"),
+             arg("function"),
+             arg("variable", help="Stable local_id or legacy variable name"),
+             arg("new_type"),
+         ])
 def _local_retype(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1557,6 +1818,15 @@ def _local_retype(args: argparse.Namespace) -> int:
     )
 
 
+@command("struct", "field", "set", help="Set or replace a field", fmt="json", target=True,
+         args=[
+             arg("--preview", action="store_true"),
+             arg("--no-overwrite", action="store_true"),
+             arg("struct_name"),
+             arg("offset"),
+             arg("field_name"),
+             arg("field_type"),
+         ])
 def _struct_field_set(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1577,6 +1847,8 @@ def _struct_field_set(args: argparse.Namespace) -> int:
     )
 
 
+@command("struct", "show", help="Show one struct layout", target=True,
+         args=[arg("struct_name")])
 def _struct_show(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1592,6 +1864,13 @@ def _struct_show(args: argparse.Namespace) -> int:
     )
 
 
+@command("struct", "field", "rename", help="Rename a field", fmt="json", target=True,
+         args=[
+             arg("--preview", action="store_true"),
+             arg("struct_name"),
+             arg("old_name"),
+             arg("new_name"),
+         ])
 def _struct_field_rename(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1610,6 +1889,12 @@ def _struct_field_rename(args: argparse.Namespace) -> int:
     )
 
 
+@command("struct", "field", "delete", help="Delete a field", fmt="json", target=True,
+         args=[
+             arg("--preview", action="store_true"),
+             arg("struct_name"),
+             arg("field_name"),
+         ])
 def _struct_field_delete(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -1627,6 +1912,11 @@ def _struct_field_delete(args: argparse.Namespace) -> int:
     )
 
 
+@command("batch", "apply", help="Apply a JSON manifest", fmt="json",
+         args=[
+             arg("--preview", action="store_true"),
+             arg("manifest", type=Path),
+         ])
 def _batch_apply(args: argparse.Namespace) -> int:
     manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
     if args.preview:
@@ -1666,319 +1956,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("BN_INSTANCE"),
         help="Target a specific bridge instance by ID (env: BN_INSTANCE)",
     )
-
-    subparsers = parser.add_subparsers(dest="command")
-
-    doctor = subparsers.add_parser("doctor", help="Validate bridge discovery and installation")
-    _common_io_options(doctor)
-    doctor.set_defaults(handler=_doctor)
-
-    plugin = subparsers.add_parser("plugin", help="Install the Binary Ninja companion plugin")
-    plugin_sub = plugin.add_subparsers(dest="plugin_command")
-    plugin_install = plugin_sub.add_parser("install", help="Install the GUI plugin")
-    plugin_install.add_argument("--dest", type=Path, help="Custom install destination")
-    plugin_install.add_argument("--mode", choices=("symlink", "copy"), default="symlink")
-    plugin_install.add_argument("--force", action="store_true")
-    _common_io_options(plugin_install, default_format="json")
-    plugin_install.set_defaults(handler=_plugin_install)
-
-    skill = subparsers.add_parser("skill", help="Install the bundled Claude Code skill")
-    skill_sub = skill.add_subparsers(dest="skill_command")
-    skill_install = skill_sub.add_parser("install", help="Install the bundled Claude Code skill")
-    skill_install.add_argument("--dest", type=Path, help="Custom install destination")
-    skill_install.add_argument("--mode", choices=("symlink", "copy"), default="symlink")
-    skill_install.add_argument("--force", action="store_true")
-    _common_io_options(skill_install, default_format="json")
-    skill_install.set_defaults(handler=_skill_install)
-
-    load = subparsers.add_parser("load", help="Load a binary into headless bridge")
-    _common_io_options(load, default_format="json")
-    load.add_argument("path", help="Path to binary or BNDB file")
-    load.set_defaults(handler=_load)
-
-    close = subparsers.add_parser("close", help="Close a loaded binary")
-    _common_io_options(close, default_format="json")
-    close.add_argument("path", nargs="?", help="Path to close (omit to close all)")
-    close.set_defaults(handler=_close)
-
-    save = subparsers.add_parser("save", help="Save the current analysis database (.bndb)")
-    _common_io_options(save, default_format="json")
-    _target_option(save, required=False)
-    save.add_argument("path", nargs="?", help="Output path (defaults to <filename>.bndb)")
-    save.set_defaults(handler=_save)
-
-    session = subparsers.add_parser("session", help="Manage bridge sessions")
-    session_sub = session.add_subparsers(dest="session_command")
-    session_start = session_sub.add_parser("start", help="Start a new headless bridge session")
-    session_start.add_argument("binaries", nargs="*", help="Binary file paths to preload")
-    session_start.add_argument("--instance-id", help="Use a specific instance ID (default: random)")
-    _common_io_options(session_start, default_format="json")
-    session_start.set_defaults(handler=_session_start)
-    session_stop = session_sub.add_parser("stop", help="Stop a running bridge session")
-    session_stop.add_argument("instance", help="Instance ID to stop")
-    _common_io_options(session_stop, default_format="json")
-    session_stop.set_defaults(handler=_session_stop)
-    session_list = session_sub.add_parser("list", help="List running bridge sessions")
-    _common_io_options(session_list, default_format="json")
-    session_list.set_defaults(handler=_session_list)
-
-    target = subparsers.add_parser("target", help="Inspect Binary Ninja targets")
-    target_sub = target.add_subparsers(dest="target_command")
-    target_list = target_sub.add_parser("list", help="List open BinaryView targets")
-    _common_io_options(target_list)
-    target_list.set_defaults(handler=_target_list)
-    target_info = target_sub.add_parser("info", help="Show one target")
-    _common_io_options(target_info)
-    _target_option(target_info, required=False)
-    target_info.set_defaults(handler=_target_info)
-
-    refresh = subparsers.add_parser("refresh", help="Refresh analysis for the selected target")
-    _common_io_options(refresh)
-    _target_option(refresh, required=False)
-    refresh.set_defaults(handler=_refresh)
-
-    function = subparsers.add_parser("function", help="Function discovery helpers")
-    function_sub = function.add_subparsers(dest="function_command")
-    function_list = function_sub.add_parser("list", help="List functions")
-    _common_io_options(function_list)
-    _target_option(function_list, required=False)
-    _add_function_address_args(function_list)
-    _add_paged_args(function_list)
-    function_list.set_defaults(handler=_function_list)
-    function_search = function_sub.add_parser("search", help="Search functions by substring or regex")
-    _common_io_options(function_search)
-    _target_option(function_search, required=False)
-    _add_function_address_args(function_search)
-    _add_paged_args(function_search)
-    function_search.add_argument(
-        "--regex",
-        action="store_true",
-        help="Interpret query as a case-insensitive regular expression",
-    )
-    function_search.add_argument("query")
-    function_search.set_defaults(handler=_function_search)
-    function_info = function_sub.add_parser("info", help="Show function prototype and variables")
-    _common_io_options(function_info)
-    _target_option(function_info, required=False)
-    function_info.add_argument("identifier")
-    function_info.set_defaults(handler=_function_info)
-
-    decompile = subparsers.add_parser("decompile", help="Render HLIL-style decompile text for a function")
-    _common_io_options(decompile)
-    _target_option(decompile, required=False)
-    decompile.add_argument("identifier")
-    decompile.add_argument("--addresses", action="store_true", default=False, help="Show address prefixes on each line")
-    decompile.set_defaults(handler=_decompile)
-
-    il = subparsers.add_parser("il", help="Dump IL for a function")
-    _common_io_options(il)
-    _target_option(il, required=False)
-    il.add_argument("identifier")
-    il.add_argument("--view", choices=("hlil", "mlil", "llil"), default="hlil")
-    il.add_argument("--ssa", action="store_true")
-    il.set_defaults(handler=_il)
-
-    disasm = subparsers.add_parser("disasm", help="Disassemble a function")
-    _common_io_options(disasm)
-    _target_option(disasm, required=False)
-    disasm.add_argument("identifier")
-    disasm.set_defaults(handler=_disasm)
-
-    xrefs = subparsers.add_parser("xrefs", help="List xrefs to an address or function; use --field for struct field xrefs")
-    _common_io_options(xrefs)
-    _target_option(xrefs, required=False)
-    xrefs.add_argument("identifier", nargs="?")
-    xrefs.add_argument("--field", dest="field_spec", help="Struct field xref spec (e.g., TrackRowCell.tile_type)")
-    xrefs.set_defaults(handler=_xrefs)
-
-    callsites = subparsers.add_parser("callsites", help="Find direct native callsites and exact caller_static addresses")
-    _common_io_options(callsites)
-    _target_option(callsites, required=False)
-    callsites.add_argument("callee")
-    scope = callsites.add_mutually_exclusive_group(required=True)
-    scope.add_argument("--within", help="Containing function to search for callsites")
-    scope.add_argument("--within-file", type=Path, help="Text file with one containing-function identifier per line")
-    callsites.add_argument(
-        "--context",
-        type=int,
-        default=3,
-        help="Number of previous and next instructions to include around each callsite",
-    )
-    callsites.add_argument(
-        "--caller-static",
-        action="store_true",
-        help="Prefer caller_static-first text output for return-address mapping workflows",
-    )
-    callsites.set_defaults(handler=_callsites)
-
-    types = subparsers.add_parser("types", help="List or search types")
-    _common_io_options(types)
-    _target_option(types, required=False)
-    _add_paged_args(types)
-    types.add_argument("--query")
-    types.set_defaults(handler=_types)
-    types_sub = types.add_subparsers(dest="types_command")
-    types_show = types_sub.add_parser("show", help="Show one type")
-    _common_io_options(types_show)
-    _target_option(types_show, required=False)
-    types_show.add_argument("type_name")
-    types_show.set_defaults(handler=_types_show)
-    types_declare = types_sub.add_parser("declare", help="Import C declarations as user types")
-    _common_io_options(types_declare, default_format="json")
-    _target_option(types_declare, required=False)
-    types_declare.add_argument("--preview", action="store_true")
-    types_declare.add_argument("--file", type=Path, help="Read declarations from a file")
-    types_declare.add_argument("--stdin", action="store_true", help="Read declarations from stdin")
-    types_declare.add_argument("declaration", nargs="?")
-    types_declare.set_defaults(handler=_types_declare)
-
-    strings = subparsers.add_parser("strings", help="List or search strings")
-    _common_io_options(strings)
-    _target_option(strings, required=False)
-    _add_paged_args(strings)
-    strings.add_argument("--query")
-    strings.set_defaults(handler=_strings)
-
-    imports = subparsers.add_parser("imports", help="List imports")
-    _common_io_options(imports)
-    _target_option(imports, required=False)
-    imports.set_defaults(handler=_imports)
-
-    bundle = subparsers.add_parser("bundle", help="Export reusable bundles")
-    bundle_sub = bundle.add_subparsers(dest="bundle_command")
-    bundle_function = bundle_sub.add_parser("function", help="Export a function bundle")
-    _common_io_options(bundle_function, default_format="json")
-    _target_option(bundle_function, required=False)
-    bundle_function.add_argument("identifier")
-    bundle_function.set_defaults(handler=_bundle_function)
-
-    py = subparsers.add_parser("py", help="Execute Python inside Binary Ninja")
-    py_sub = py.add_subparsers(dest="py_command")
-    py_exec = py_sub.add_parser("exec", help="Execute a Python snippet")
-    _common_io_options(py_exec)
-    _target_option(py_exec, required=False)
-    source = py_exec.add_mutually_exclusive_group(required=True)
-    source.add_argument("--script", type=Path, help="Read Python code from a file")
-    source.add_argument("--code", help="Inline Python code")
-    source.add_argument("--stdin", action="store_true")
-    py_exec.set_defaults(handler=_py_exec)
-
-    symbol = subparsers.add_parser("symbol", help="Rename functions or data")
-    symbol_sub = symbol.add_subparsers(dest="symbol_command")
-    symbol_rename = symbol_sub.add_parser("rename", help="Rename a symbol")
-    _common_io_options(symbol_rename, default_format="json")
-    _target_option(symbol_rename, required=False)
-    symbol_rename.add_argument("--kind", choices=("auto", "function", "data"), default="auto")
-    symbol_rename.add_argument("--preview", action="store_true")
-    symbol_rename.add_argument("identifier")
-    symbol_rename.add_argument("new_name")
-    symbol_rename.set_defaults(handler=_symbol_rename)
-
-    comment = subparsers.add_parser("comment", help="Set or delete comments")
-    comment_sub = comment.add_subparsers(dest="comment_command")
-    comment_get = comment_sub.add_parser("get", help="Get a comment")
-    _common_io_options(comment_get)
-    _target_option(comment_get, required=False)
-    comment_get.add_argument("--address")
-    comment_get.add_argument("--function")
-    comment_get.set_defaults(handler=_comment_get)
-    comment_set = comment_sub.add_parser("set", help="Set a comment")
-    _common_io_options(comment_set, default_format="json")
-    _target_option(comment_set, required=False)
-    comment_set.add_argument("--preview", action="store_true")
-    comment_set.add_argument("--address")
-    comment_set.add_argument("--function")
-    comment_set.add_argument("comment")
-    comment_set.set_defaults(handler=_comment_set)
-    comment_delete = comment_sub.add_parser("delete", help="Delete a comment")
-    _common_io_options(comment_delete, default_format="json")
-    _target_option(comment_delete, required=False)
-    comment_delete.add_argument("--preview", action="store_true")
-    comment_delete.add_argument("--address")
-    comment_delete.add_argument("--function")
-    comment_delete.set_defaults(handler=_comment_delete)
-
-    proto = subparsers.add_parser("proto", help="Inspect or set a user prototype")
-    proto_sub = proto.add_subparsers(dest="proto_command")
-    proto_get = proto_sub.add_parser("get", help="Show the current prototype")
-    _common_io_options(proto_get)
-    _target_option(proto_get, required=False)
-    proto_get.add_argument("identifier")
-    proto_get.set_defaults(handler=_proto_get)
-    proto_set = proto_sub.add_parser("set", help="Set a prototype")
-    _common_io_options(proto_set, default_format="json")
-    _target_option(proto_set, required=False)
-    proto_set.add_argument("--preview", action="store_true")
-    proto_set.add_argument("identifier")
-    proto_set.add_argument("prototype")
-    proto_set.set_defaults(handler=_proto_set)
-
-    local = subparsers.add_parser("local", help="Inspect, rename, or retype locals")
-    local_sub = local.add_subparsers(dest="local_command")
-    local_list = local_sub.add_parser("list", help="List locals with stable IDs")
-    _common_io_options(local_list)
-    _target_option(local_list, required=False)
-    local_list.add_argument("function")
-    local_list.set_defaults(handler=_local_list)
-    local_rename = local_sub.add_parser("rename", help="Rename a local")
-    _common_io_options(local_rename, default_format="json")
-    _target_option(local_rename, required=False)
-    local_rename.add_argument("--preview", action="store_true")
-    local_rename.add_argument("function")
-    local_rename.add_argument("variable", help="Stable local_id or legacy variable name")
-    local_rename.add_argument("new_name")
-    local_rename.set_defaults(handler=_local_rename)
-    local_retype = local_sub.add_parser("retype", help="Retype a local")
-    _common_io_options(local_retype, default_format="json")
-    _target_option(local_retype, required=False)
-    local_retype.add_argument("--preview", action="store_true")
-    local_retype.add_argument("function")
-    local_retype.add_argument("variable", help="Stable local_id or legacy variable name")
-    local_retype.add_argument("new_type")
-    local_retype.set_defaults(handler=_local_retype)
-
-    struct = subparsers.add_parser("struct", help="Field-first structure editing")
-    struct_sub = struct.add_subparsers(dest="struct_command")
-    struct_show = struct_sub.add_parser("show", help="Show one struct layout")
-    _common_io_options(struct_show)
-    _target_option(struct_show, required=False)
-    struct_show.add_argument("struct_name")
-    struct_show.set_defaults(handler=_struct_show)
-    field = struct_sub.add_parser("field", help="Operate on struct fields")
-    field_sub = field.add_subparsers(dest="struct_field_command")
-    field_set = field_sub.add_parser("set", help="Set or replace a field")
-    _common_io_options(field_set, default_format="json")
-    _target_option(field_set, required=False)
-    field_set.add_argument("--preview", action="store_true")
-    field_set.add_argument("--no-overwrite", action="store_true")
-    field_set.add_argument("struct_name")
-    field_set.add_argument("offset")
-    field_set.add_argument("field_name")
-    field_set.add_argument("field_type")
-    field_set.set_defaults(handler=_struct_field_set)
-    field_rename = field_sub.add_parser("rename", help="Rename a field")
-    _common_io_options(field_rename, default_format="json")
-    _target_option(field_rename, required=False)
-    field_rename.add_argument("--preview", action="store_true")
-    field_rename.add_argument("struct_name")
-    field_rename.add_argument("old_name")
-    field_rename.add_argument("new_name")
-    field_rename.set_defaults(handler=_struct_field_rename)
-    field_delete = field_sub.add_parser("delete", help="Delete a field")
-    _common_io_options(field_delete, default_format="json")
-    _target_option(field_delete, required=False)
-    field_delete.add_argument("--preview", action="store_true")
-    field_delete.add_argument("struct_name")
-    field_delete.add_argument("field_name")
-    field_delete.set_defaults(handler=_struct_field_delete)
-    batch = subparsers.add_parser("batch", help="Apply a batch manifest")
-    batch_sub = batch.add_subparsers(dest="batch_command")
-    batch_apply = batch_sub.add_parser("apply", help="Apply a JSON manifest")
-    _common_io_options(batch_apply, default_format="json")
-    batch_apply.add_argument("--preview", action="store_true")
-    batch_apply.add_argument("manifest", type=Path)
-    batch_apply.set_defaults(handler=_batch_apply)
-
+    _build_from_commands(parser)
     return parser
 
 
