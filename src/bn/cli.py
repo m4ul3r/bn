@@ -144,7 +144,7 @@ def _target_option(
         ),
         "required": required,
     }
-    parser.add_argument("--target", **kwargs)
+    parser.add_argument("-t", "--target", **kwargs)
 
 
 def _render_result(
@@ -573,8 +573,10 @@ def _render_session_list_text(value: Any) -> str:
 
 
 def _render_target_summary(value: dict[str, Any]) -> str:
+    view_id = value.get("view_id")
     label = value.get("selector") or value.get("target_id") or "<unknown>"
-    lines = [str(label)]
+    prefix = f"[{view_id}] " if view_id is not None else ""
+    lines = [f"{prefix}{label}"]
     if value.get("active"):
         lines[0] += " [active]"
 
@@ -589,7 +591,7 @@ def _render_target_summary(value: dict[str, Any]) -> str:
     ]
     for key, item in details:
         if item not in (None, ""):
-            lines.append(f"{key}: {item}")
+            lines.append(f"\t{key}: {item}")
     return "\n".join(lines)
 
 

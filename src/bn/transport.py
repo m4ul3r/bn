@@ -205,6 +205,10 @@ def spawn_instance(
     poll_interval: float = 0.2,
 ) -> BridgeInstance:
     """Spawn a new bn-agent headless process and wait for it to register."""
+    existing = list_instances()
+    if existing:
+        return existing[0]
+
     if instance_id is None:
         instance_id = secrets.token_hex(4)
 
