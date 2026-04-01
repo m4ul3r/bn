@@ -1378,7 +1378,7 @@ def test_session_list_shows_instances(monkeypatch, capsys):
     ]
     monkeypatch.setattr(bn.cli, "list_instances", lambda: fake_instances)
 
-    rc = bn.cli.main(["session", "list"])
+    rc = bn.cli.main(["session", "list", "--format", "json"])
 
     assert rc == 0
     stdout = capsys.readouterr().out
@@ -1398,7 +1398,7 @@ def test_session_stop_sends_shutdown(monkeypatch, capsys):
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
-    rc = bn.cli.main(["session", "stop", "abc123"])
+    rc = bn.cli.main(["session", "stop", "abc123", "--format", "json"])
 
     assert rc == 0
     stdout = capsys.readouterr().out
@@ -1422,7 +1422,7 @@ def test_session_start_spawns_instance(monkeypatch, capsys):
     )
     monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: fake_inst)
 
-    rc = bn.cli.main(["session", "start"])
+    rc = bn.cli.main(["session", "start", "--format", "json"])
 
     assert rc == 0
     stdout = capsys.readouterr().out

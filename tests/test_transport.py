@@ -186,7 +186,7 @@ def test_send_request_uses_blocking_socket_by_default(tmp_path, monkeypatch):
         started_at=None,
         meta={},
     )
-    monkeypatch.setattr("bn.transport.choose_instance", lambda: instance)
+    monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None, **kw: instance)
 
     class _FakeSocket:
         timeout_calls = 0

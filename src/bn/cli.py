@@ -144,7 +144,7 @@ def _target_option(
         ),
         "required": required,
     }
-    parser.add_argument("--target", **kwargs)
+    parser.add_argument("-t", "--target", **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -590,9 +590,109 @@ def _render_refresh_text(value: Any) -> str:
     return _render_fallback_text(value)
 
 
+def _render_load_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    lines = [f"loaded: {value.get('path', '<unknown>')}"]
+    targets = list(value.get("targets") or [])
+    if targets:
+        lines.append("")
+        lines.append("targets:")
+        for t in targets:
+            if isinstance(t, dict):
+                lines.append("- " + (t.get("selector") or t.get("basename") or "<unknown>"))
+            else:
+                lines.append("- " + _render_fallback_text(t))
+    return "\n".join(lines)
+
+
+def _render_close_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    closed = list(value.get("closed") or [])
+    if not closed:
+        return "no binaries closed"
+    if len(closed) == 1:
+        return f"closed: {closed[0]}"
+    lines = ["closed:"]
+    for path in closed:
+        lines.append(f"- {path}")
+    return "\n".join(lines)
+
+
+def _render_save_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    return f"saved: {value.get('path', '<unknown>')}"
+
+
+def _render_session_start_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    lines = [
+        f"instance: {value.get('instance_id', '<unknown>')}",
+        f"pid: {value.get('pid', '<unknown>')}",
+        f"socket: {value.get('socket_path', '<unknown>')}",
+    ]
+    loaded = list(value.get("loaded") or [])
+    if loaded:
+        lines.append("")
+        lines.append("loaded:")
+        for item in loaded:
+            if isinstance(item, dict):
+                error = item.get("error")
+                if error:
+                    lines.append(f"- {item.get('path', '<unknown>')} [error: {error}]")
+                else:
+                    lines.append(f"- {item.get('path', '<unknown>')}")
+            else:
+                lines.append(f"- {_render_fallback_text(item)}")
+    return "\n".join(lines)
+
+
+def _render_session_stop_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    line = f"stopped: {value.get('instance_id', '<unknown>')}"
+    method = value.get("method")
+    if method:
+        line += f" ({method})"
+    return line
+
+
+def _render_session_list_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    instances = list(value.get("instances") or [])
+    if not instances:
+        return "no sessions"
+    lines = []
+    for item in instances:
+        if not isinstance(item, dict):
+            lines.append(_render_fallback_text(item))
+            continue
+        parts = [str(item.get("instance_id", "<unknown>"))]
+        parts.append(f"pid={item.get('pid', '<unknown>')}")
+        rss = item.get("rss_mb")
+        if rss is not None:
+            parts.append(f"rss={rss}MB")
+        if item.get("started_at"):
+            parts.append(f"started={item['started_at']}")
+        lines.append("  ".join(parts))
+        if item.get("socket_path"):
+            lines.append(f"  socket: {item['socket_path']}")
+    total_rss = value.get("total_rss_mb")
+    if total_rss is not None and instances:
+        lines.append("")
+        lines.append(f"total rss: {total_rss}MB")
+    return "\n".join(lines)
+
+
 def _render_target_summary(value: dict[str, Any]) -> str:
+    view_id = value.get("view_id")
     label = value.get("selector") or value.get("target_id") or "<unknown>"
-    lines = [str(label)]
+    prefix = f"[{view_id}] " if view_id is not None else ""
+    lines = [f"{prefix}{label}"]
     if value.get("active"):
         lines[0] += " [active]"
 
@@ -607,7 +707,7 @@ def _render_target_summary(value: dict[str, Any]) -> str:
     ]
     for key, item in details:
         if item not in (None, ""):
-            lines.append(f"{key}: {item}")
+            lines.append(f"\t{key}: {item}")
     return "\n".join(lines)
 
 
@@ -1101,7 +1201,7 @@ def _skill_install(args: argparse.Namespace) -> int:
     return 0
 
 
-@command("load", help="Load a binary into headless bridge", fmt="json",
+@command("load", help="Load a binary into headless bridge",
          args=[arg("path", help="Path to binary or BNDB file")])
 def _load(args: argparse.Namespace) -> int:
     return _call(
@@ -1109,11 +1209,12 @@ def _load(args: argparse.Namespace) -> int:
         "load_binary",
         {"path": str(Path(args.path).expanduser().resolve())},
         require_target=False,
+        text_renderer=_render_load_text,
         stem="load",
     )
 
 
-@command("close", help="Close a loaded binary", fmt="json",
+@command("close", help="Close a loaded binary",
          args=[arg("path", nargs="?", help="Path to close (omit to close all)")])
 def _close(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
@@ -1124,11 +1225,12 @@ def _close(args: argparse.Namespace) -> int:
         "close_binary",
         params,
         require_target=False,
+        text_renderer=_render_close_text,
         stem="close",
     )
 
 
-@command("save", help="Save the current analysis database (.bndb)", fmt="json", target=True,
+@command("save", help="Save the current analysis database (.bndb)", target=True,
          args=[arg("path", nargs="?", help="Output path (defaults to <filename>.bndb)")])
 def _save(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
@@ -1139,11 +1241,12 @@ def _save(args: argparse.Namespace) -> int:
         "save_database",
         params,
         require_target=False,
+        text_renderer=_render_save_text,
         stem="save",
     )
 
 
-@command("session", "start", help="Start a new headless bridge session", fmt="json",
+@command("session", "start", help="Start a new headless bridge session",
          args=[
              arg("binaries", nargs="*", help="Binary file paths to preload"),
              arg("--instance-id", help="Use a specific instance ID (default: random)"),
@@ -1174,11 +1277,13 @@ def _session_start(args: argparse.Namespace) -> int:
     if loaded:
         result["loaded"] = loaded
 
+    if args.format == "text":
+        result = _render_session_start_text(result)
     _render_result(result, fmt=args.format, out_path=args.out, stem="session-start")
     return 0
 
 
-@command("session", "stop", help="Stop a running bridge session", fmt="json",
+@command("session", "stop", help="Stop a running bridge session",
          args=[arg("instance", help="Instance ID to stop")])
 def _session_stop(args: argparse.Namespace) -> int:
     import signal
@@ -1200,6 +1305,8 @@ def _session_stop(args: argparse.Namespace) -> int:
         else:
             raise BridgeError(f"No bridge instance found with id: {target_id}")
 
+    if args.format == "text":
+        result = _render_session_stop_text(result)
     _render_result(result, fmt=args.format, out_path=args.out, stem="session-stop")
     return 0
 
@@ -1215,7 +1322,7 @@ def _rss_mb(pid: int) -> float | None:
     return None
 
 
-@command("session", "list", help="List running bridge sessions", fmt="json")
+@command("session", "list", help="List running bridge sessions")
 def _session_list(args: argparse.Namespace) -> int:
     instances = list_instances()
     entries = []
@@ -1236,6 +1343,8 @@ def _session_list(args: argparse.Namespace) -> int:
         "instances": entries,
         "total_rss_mb": round(total_rss, 1),
     }
+    if args.format == "text":
+        result = _render_session_list_text(result)
     _render_result(result, fmt=args.format, out_path=args.out, stem="session-list")
     return 0
 

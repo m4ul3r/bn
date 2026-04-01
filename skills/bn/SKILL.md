@@ -13,15 +13,14 @@ Use this skill when the user wants reverse-engineering work against a Binary Nin
 
 ```bash
 bn target list
-bn doctor
 ```
 
-Use `bn doctor` when bridge state is unclear or `bn target list` does not show what you expect.
+This shows all open BinaryView targets. If no bridge is running, `bn` auto-starts one.
 
 2. Pick a target:
-- If there is exactly one open BinaryView, target-scoped commands can omit `--target` entirely.
-- If multiple targets are open, commands that omit `--target` fail; pass `--target <selector>` from `bn target list`.
-- Use `--target active` only when you explicitly mean the GUI-selected target.
+- If there is exactly one open BinaryView, target-scoped commands can omit `-t` entirely.
+- If multiple targets are open, commands that omit `-t` fail; pass `-t <selector>` from `bn target list`. The `[N]` prefix in the output is the view_id — use `-t 1`, `-t 2`, etc. as a shorthand.
+- Use `-t active` only when you explicitly mean the GUI-selected target.
 
 3. Pick the right output mode:
 - Read commands default to `text`.
@@ -32,20 +31,18 @@ Outputs above `10_000` `o200k_base` tokens auto-spill to disk. When that happens
 
 ## Headless Mode
 
-When no GUI is available, use `bn session start` to launch a headless bridge:
+When no GUI is available, `bn` auto-starts a headless bridge on first use — no manual setup needed. Just run commands directly:
+
+```bash
+bn load /path/to/binary.bndb
+bn target list
+```
+
+To preload binaries at startup, use `bn session start`:
 
 ```bash
 bn session start /path/to/binary.bndb
 ```
-
-Or start with no binaries and load them later:
-
-```bash
-bn session start
-bn load /path/to/binary.bndb
-```
-
-If no bridge is running, `bn` auto-starts one on first use — no manual setup needed.
 
 Close binaries with `bn close [path]` (omit path to close all). All other commands work identically in headless and GUI modes.
 
@@ -281,34 +278,24 @@ bn target list
 
 If the target appears, it loaded successfully despite the timeout.
 
-## Multi-Instance / Parallel Agents
+## Session Management
 
-When multiple agents need to analyze different binaries concurrently, each agent should start its own dedicated bridge session to avoid conflicts:
+`bn` uses a single bridge instance. If one is already running, all commands route to it automatically. Load multiple binaries into the same instance and use `-t <view_id>` to switch between them.
 
 ```bash
-# Start a session (optionally preload a binary)
-bn session start /path/to/binary.bndb
-# → {"instance_id": "a3f1bc09", "pid": 12345, "socket_path": "..."}
-
-# Route all subsequent commands to that session
-bn --instance a3f1bc09 target list
-bn --instance a3f1bc09 decompile main
-bn --instance a3f1bc09 save
-
-# Or set the env var once
-export BN_INSTANCE=a3f1bc09
-bn decompile main
-
-# Stop when done
-bn session stop a3f1bc09
+bn session list              # show the running bridge instance
+bn session stop <id>         # shut down the instance
 ```
 
-Session management commands:
-- `bn session start [binary...]` — start a new headless bridge, return instance ID
-- `bn session list` — show all running bridge instances
-- `bn session stop <id>` — shut down a specific instance
+## Troubleshooting
 
-If no bridge is running and no `--instance` is specified, `bn` auto-starts a headless bridge. For parallel workflows, prefer explicit `bn session start` so each agent controls its own session lifecycle.
+Run `bn doctor` only when something is wrong — commands fail unexpectedly, targets don't appear, or the bridge seems unresponsive:
+
+```bash
+bn doctor
+```
+
+It checks CLI version, plugin staleness, and instance connectivity. Do not run it as part of normal workflow.
 
 ## Known Quirks
 
