@@ -106,6 +106,7 @@ READ_LOCKED_OPS = {
     "imports",
     "bundle_function",
     "get_comment",
+    "list_comments",
 }
 
 
@@ -650,6 +651,13 @@ class BinaryNinjaBridge:
             return self._mutation(target, bool(params.get("preview")), [params])
         if op == "get_comment":
             return self._get_comment(target, params.get("address"), params.get("function"))
+        if op == "list_comments":
+            return self._list_comments(
+                target,
+                query=params.get("query"),
+                offset=int(params.get("offset", 0)),
+                limit=int(params["limit"]) if "limit" in params else None,
+            )
         if op == "set_comment":
             return self._mutation(target, bool(params.get("preview")), [{"op": "set_comment", **params}])
         if op == "delete_comment":
@@ -2106,6 +2114,36 @@ class BinaryNinjaBridge:
             "comment": comment or "",
             "has_comment": bool(comment),
         }
+
+    def _list_comments(
+        self,
+        selector: str | None,
+        *,
+        query: str | None = None,
+        offset: int = 0,
+        limit: int | None = None,
+    ):
+        bv = self._resolve_view(selector)
+        needle = query.lower() if query else None
+        items = []
+        for addr in sorted(bv.address_comments):
+            text = bv.address_comments[addr]
+            if not text:
+                continue
+            if needle and needle not in text.lower():
+                continue
+            funcs = bv.get_functions_containing(addr)
+            func_name = funcs[0].name if funcs else None
+            items.append({
+                "address": hex(addr),
+                "function": func_name,
+                "comment": text,
+            })
+        if offset:
+            items = items[offset:]
+        if limit is not None:
+            items = items[:limit]
+        return items
 
     def _bundle_function(self, selector: str | None, identifier, out_path: str | None):
         bv = self._resolve_view(selector)

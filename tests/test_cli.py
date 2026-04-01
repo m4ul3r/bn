@@ -392,8 +392,10 @@ def test_skill_install_copy_mode(tmp_path):
         ]
     )
     assert rc == 0
-    assert (destination / "SKILL.md").exists()
-    assert (destination / "agents" / "openai.yaml").exists()
+    assert (destination / "bn" / "SKILL.md").exists()
+    assert (destination / "bn" / "agents" / "openai.yaml").exists()
+    assert (destination / "bn-re" / "SKILL.md").exists()
+    assert (destination / "bn-vr" / "SKILL.md").exists()
 
 
 def test_target_list_text_format_renders_summary(monkeypatch, capsys):

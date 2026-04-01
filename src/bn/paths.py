@@ -7,7 +7,6 @@ from pathlib import Path
 
 
 PLUGIN_NAME = "bn_agent_bridge"
-SKILL_NAME = "bn"
 
 
 def repo_root() -> Path:
@@ -90,9 +89,3 @@ def claude_skills_dir() -> Path:
     return claude_home() / "skills"
 
 
-def skill_source_dir() -> Path:
-    return repo_root() / "skills" / SKILL_NAME
-
-
-def skill_install_dir() -> Path:
-    return claude_skills_dir() / SKILL_NAME

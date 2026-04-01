@@ -20,3 +20,11 @@ Add a `last_accessed` timestamp to `TargetRecord`, updated on every request that
 **Open questions:**
 - Is this useful enough on its own, or only if paired with auto-close of idle targets?
 - Auto-closing idle targets is risky (could surprise users who step away) -- probably not worth it
+
+## bn-re and bn-vr methodology skills
+
+Add two methodology skills on top of the `bn` tool skill. Full plan: [bn-re-bn-vr-skills-plan.md](bn-re-bn-vr-skills-plan.md)
+
+- **bn-re**: Static reverse engineering methodology (approaching unknowns, function triage, type recovery, call graph analysis, struct reconstruction)
+- **bn-vr**: Vulnerability research methodology (attack surface, dangerous imports, input-to-sink tracing, common vuln patterns, systematic audit)
+- Update `bn skill install` to install all three skills in one command

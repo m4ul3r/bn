@@ -7,6 +7,8 @@ description: Use the local bn CLI for Binary Ninja reversing work through the bn
 
 Use this skill when the user wants reverse-engineering work against a Binary Ninja database and the local `bn` CLI is available. The bridge can run in GUI mode (attached to an open Binary Ninja window) or headless mode (no GUI required).
 
+> **Methodology skills**: For structured RE workflows, see `bn-re`. For vulnerability research, see `bn-vr`.
+
 ## Workflow
 
 1. Start with target discovery:
@@ -66,6 +68,8 @@ bn il sample_track_floor_height_at_position
 bn disasm sample_track_floor_height_at_position
 bn xrefs sample_track_floor_height_at_position
 bn xrefs field TrackRowCell.tile_type
+bn comment list
+bn comment list --query TODO
 bn comment get --address 0x401000
 bn types --query Player
 bn types show Player

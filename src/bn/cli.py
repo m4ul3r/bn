@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .output import write_output_result
-from .paths import plugin_install_dir, plugin_source_dir, skill_install_dir, skill_source_dir
+from .paths import claude_skills_dir, plugin_install_dir, plugin_source_dir, repo_root
 from .transport import BridgeError, _send_request_to_instance, list_instances, send_request, spawn_instance
 from .version import VERSION, build_id_for_file
 
@@ -583,6 +583,23 @@ def _render_comment_text(value: Any) -> str:
     if isinstance(comment, str):
         return comment if comment else "(no comment)"
     return _render_fallback_text(value)
+
+
+def _render_comment_list_text(value: Any) -> str:
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "none"
+    lines = []
+    for item in value:
+        if not isinstance(item, dict):
+            lines.append(_render_fallback_text(item))
+            continue
+        address = item.get("address", "<unknown>")
+        func = item.get("function") or "<global>"
+        comment = item.get("comment", "")
+        lines.append(f"{address}  {func}  {comment}")
+    return "\n".join(lines)
 
 
 def _render_refresh_text(value: Any) -> str:
@@ -1201,24 +1218,27 @@ def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
         os.symlink(source, dest, target_is_directory=True)
 
 
-@command("skill", "install", help="Install the bundled Claude Code skill", fmt="json",
+@command("skill", "install", help="Install the bundled Claude Code skills", fmt="json",
          args=[
              arg("--dest", type=Path, help="Custom install destination"),
              arg("--mode", choices=("symlink", "copy"), default="symlink"),
              arg("--force", action="store_true"),
          ])
 def _skill_install(args: argparse.Namespace) -> int:
-    source = skill_source_dir()
-    dest = args.dest or skill_install_dir()
-    _install_tree(source, dest, mode=args.mode, force=args.force)
+    skills_root = repo_root() / "skills"
+    results = []
+    for source in sorted(skills_root.iterdir()):
+        if not source.is_dir() or not (source / "SKILL.md").exists():
+            continue
+        dest = (args.dest / source.name) if args.dest else (claude_skills_dir() / source.name)
+        _install_tree(source, dest, mode=args.mode, force=args.force)
+        results.append({"skill": source.name, "source": str(source), "destination": str(dest)})
 
     _render_result(
         {
             "installed": True,
             "mode": args.mode,
-            "skill": source.name,
-            "source": str(source),
-            "destination": str(dest),
+            "skills": results,
         },
         fmt=args.format,
         out_path=args.out,
@@ -1805,6 +1825,23 @@ def _symbol_rename(args: argparse.Namespace) -> int:
         text_renderer=_render_mutation_text,
         stem="symbol-rename",
         result_exit_code=_mutation_exit_code,
+    )
+
+
+@command("comment", "list", help="List comments", target=True, paged=True,
+         args=[arg("--query", help="Filter comments by substring")])
+def _comment_list(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "list_comments",
+        {"query": args.query, "offset": args.offset, "limit": args.limit},
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_comment_list_text,
+        page_limit=args.limit,
+        page_offset=args.offset,
+        page_label="comments",
+        stem="comments",
     )
 
 
