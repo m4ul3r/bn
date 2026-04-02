@@ -30,8 +30,15 @@ Start by mapping what the binary does and where untrusted data enters:
 
 3. **Interesting strings** — format strings, SQL fragments, shell commands, and paths hint at injection surfaces:
    ```bash
-   bn strings --query "%s\|%x\|%n\|SELECT\|INSERT\|/bin/"
+   bn strings --query "%s\|%x\|%n\|SELECT\|INSERT\|/bin/" --no-crt --min-length 4
    ```
+   Use `--no-crt` to suppress locale/CRT noise and `--min-length` to skip short fragments. Use `--section .rodata` to restrict to read-only data.
+
+4. **Memory layout** — understand which regions are writable, executable, or both:
+   ```bash
+   bn sections
+   ```
+   Look for writable+executable sections (W+X) — these are high-value targets for code injection. Check section sizes and ranges to understand the binary's memory layout.
 
 ## Input Tracing: Sources to Sinks
 

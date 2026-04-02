@@ -18,6 +18,8 @@ def _load_bridge(monkeypatch):
         FunctionSymbol = "SymbolType.FunctionSymbol"
         DataSymbol = "SymbolType.DataSymbol"
         ImportedFunctionSymbol = "SymbolType.ImportedFunctionSymbol"
+        ImportedDataSymbol = "SymbolType.ImportedDataSymbol"
+        ImportAddressSymbol = "SymbolType.ImportAddressSymbol"
 
     class Symbol:
         def __init__(self, symbol_type, address, name):
@@ -187,14 +189,41 @@ class _FakeVariable:
         self.source_type = types.SimpleNamespace(name=source_type)
 
 
+class _FakeStringRef:
+    def __init__(self, start: int, length: int, value: str, string_type: int = 0):
+        self.start = start
+        self.length = length
+        self.value = value
+        self.type = string_type
+
+
+class _FakeSection:
+    def __init__(self, name: str, start: int, end: int, semantics: int = 0):
+        self.name = name
+        self.start = start
+        self.end = end
+        self.semantics = semantics
+
+
+class _FakeSegment:
+    def __init__(self, *, readable: bool = True, writable: bool = False, executable: bool = False):
+        self.readable = readable
+        self.writable = writable
+        self.executable = executable
+
+
 class _FakeBV:
-    def __init__(self, *, functions=None, symbols=None, types_=None, arch=None, disassembly=None, instruction_lengths=None):
+    def __init__(self, *, functions=None, symbols=None, types_=None, arch=None, disassembly=None, instruction_lengths=None,
+                 strings=None, sections=None, segments=None):
         self.functions = list(functions or [])
         self._symbols = list(symbols or [])
         self.types = dict(types_ or {})
         self.arch = arch or _FakeArch(instruction_lengths)
         self._disassembly = dict(disassembly or {})
         self._instruction_lengths = dict(instruction_lengths or {})
+        self.strings = list(strings or [])
+        self.sections = dict(sections or {})
+        self._segments = dict(segments or {})
 
     def get_function_at(self, address: int):
         for fn in self.functions:
@@ -234,6 +263,19 @@ class _FakeBV:
 
     def get_code_refs(self, address: int):
         return []
+
+    def get_symbols_of_type(self, sym_type):
+        return [s for s in self._symbols if getattr(s, "type", None) == sym_type]
+
+    def get_sections_at(self, address: int):
+        result = []
+        for sec in self.sections.values():
+            if sec.start <= address < sec.end:
+                result.append(sec)
+        return result
+
+    def get_segment_at(self, address: int):
+        return self._segments.get(address)
 
     def read(self, address: int, length: int):
         return b"\x90" * length
@@ -1213,3 +1255,246 @@ def test_collect_open_views_uses_tabs_api(monkeypatch):
 
     assert len(views) == 3
     assert set(id(view) for view in views) == {id(view_a), id(view_b), id(view_c)}
+
+
+# --- I2: strings filtering ---
+
+
+def test_strings_min_length_excludes_short_strings(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(strings=[
+        _FakeStringRef(0x1000, 2, "ab"),
+        _FakeStringRef(0x2000, 5, "hello"),
+        _FakeStringRef(0x3000, 10, "helloworld"),
+    ])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._strings(None, query=None, offset=0, limit=100, min_length=4)
+
+    assert len(result) == 2
+    assert result[0]["value"] == "hello"
+    assert result[1]["value"] == "helloworld"
+
+
+def test_strings_section_filter_keeps_only_matching_section(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        strings=[
+            _FakeStringRef(0x1000, 4, "code"),
+            _FakeStringRef(0x5000, 6, "rodata"),
+        ],
+        sections={
+            ".text": _FakeSection(".text", 0x1000, 0x2000),
+            ".rodata": _FakeSection(".rodata", 0x5000, 0x6000),
+        },
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._strings(None, query=None, offset=0, limit=100, section=".rodata")
+
+    assert len(result) == 1
+    assert result[0]["value"] == "rodata"
+
+
+def test_strings_no_crt_excludes_locale_and_text_section(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        strings=[
+            _FakeStringRef(0x1000, 2, "en"),           # locale code
+            _FakeStringRef(0x2000, 5, "en-US"),         # locale code
+            _FakeStringRef(0x3000, 3, "Mon"),           # day abbreviation
+            _FakeStringRef(0x4000, 5, "UTF-8"),         # encoding name
+            _FakeStringRef(0x5000, 6, "player"),        # real string
+            _FakeStringRef(0x6000, 4, "data"),          # in .text section
+        ],
+        sections={
+            ".text": _FakeSection(".text", 0x6000, 0x7000),
+        },
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._strings(None, query=None, offset=0, limit=100, no_crt=True)
+
+    assert len(result) == 1
+    assert result[0]["value"] == "player"
+
+
+def test_strings_filters_combine(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        strings=[
+            _FakeStringRef(0x5000, 2, "ab"),            # too short
+            _FakeStringRef(0x5001, 6, "player"),        # passes all
+            _FakeStringRef(0x1000, 6, "system"),        # wrong section
+            _FakeStringRef(0x5002, 5, "en-US"),         # CRT locale
+        ],
+        sections={
+            ".text": _FakeSection(".text", 0x1000, 0x2000),
+            ".rodata": _FakeSection(".rodata", 0x5000, 0x6000),
+        },
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._strings(None, query=None, offset=0, limit=100,
+                               min_length=4, section=".rodata", no_crt=True)
+
+    assert len(result) == 1
+    assert result[0]["value"] == "player"
+
+
+# --- I5: sections ---
+
+
+def test_sections_returns_all_sections_with_permissions(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        sections={
+            ".text": _FakeSection(".text", 0x1000, 0x5000, semantics=1),
+            ".data": _FakeSection(".data", 0x5000, 0x6000, semantics=3),
+            ".rodata": _FakeSection(".rodata", 0x6000, 0x7000, semantics=2),
+        },
+        segments={
+            0x1000: _FakeSegment(readable=True, writable=False, executable=True),
+            0x5000: _FakeSegment(readable=True, writable=True, executable=False),
+            0x6000: _FakeSegment(readable=True, writable=False, executable=False),
+        },
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._sections(None)
+
+    assert len(result) == 3
+    text_sec = result[0]
+    assert text_sec["name"] == ".text"
+    assert text_sec["start"] == "0x1000"
+    assert text_sec["end"] == "0x5000"
+    assert text_sec["length"] == 0x4000
+    assert text_sec["semantics"] == "ReadOnlyCode"
+    assert text_sec["readable"] is True
+    assert text_sec["writable"] is False
+    assert text_sec["executable"] is True
+
+    data_sec = result[1]
+    assert data_sec["name"] == ".data"
+    assert data_sec["semantics"] == "ReadWriteData"
+    assert data_sec["writable"] is True
+
+    rodata_sec = result[2]
+    assert rodata_sec["name"] == ".rodata"
+    assert rodata_sec["semantics"] == "ReadOnlyData"
+    assert rodata_sec["executable"] is False
+
+
+def test_sections_query_filters_by_name(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        sections={
+            ".text": _FakeSection(".text", 0x1000, 0x5000),
+            ".rodata": _FakeSection(".rodata", 0x5000, 0x6000),
+            ".data": _FakeSection(".data", 0x6000, 0x7000),
+        },
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._sections(None, query="data")
+
+    assert len(result) == 2
+    names = [s["name"] for s in result]
+    assert ".rodata" in names
+    assert ".data" in names
+
+
+def test_sections_null_segment_omits_rwx(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        sections={".bss": _FakeSection(".bss", 0x9000, 0xa000)},
+        segments={0x1000: _FakeSegment(readable=True, writable=False, executable=True)},
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._sections(None)
+
+    assert len(result) == 1
+    assert "readable" not in result[0]
+
+
+def test_sections_without_segments_omits_rwx(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _BareView:
+        def __init__(self):
+            self.sections = {".text": _FakeSection(".text", 0x1000, 0x2000)}
+
+    bv = _BareView()
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._sections(None)
+
+    assert len(result) == 1
+    assert "readable" not in result[0]
+    assert "writable" not in result[0]
+    assert "executable" not in result[0]
+
+
+# --- I8: enhanced imports ---
+
+
+def test_imports_includes_function_data_and_address_symbols(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+
+    func_sym = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x1000, "printf")
+    func_sym.short_name = "printf"
+    func_sym.namespace = "libc"
+
+    data_sym = fake_bn.Symbol(fake_bn.SymbolType.ImportedDataSymbol, 0x2000, "__stdout")
+    data_sym.short_name = "__stdout"
+    data_sym.namespace = "libc"
+
+    addr_sym = fake_bn.Symbol(fake_bn.SymbolType.ImportAddressSymbol, 0x3000, "iat_entry")
+    addr_sym.short_name = "iat_entry"
+    addr_sym.namespace = ""
+
+    bv = _FakeBV(symbols=[func_sym, data_sym, addr_sym])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._imports(None)
+
+    assert len(result) == 3
+    kinds = {item["name"]: item["kind"] for item in result}
+    assert kinds["printf"] == "function"
+    assert kinds["__stdout"] == "data"
+    assert kinds["iat_entry"] == "address"
+
+
+def test_imports_sorts_by_library_kind_name(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+
+    sym_b = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x2000, "zebra")
+    sym_b.short_name = "zebra"
+    sym_b.namespace = "libz"
+
+    sym_a = fake_bn.Symbol(fake_bn.SymbolType.ImportedDataSymbol, 0x1000, "alpha")
+    sym_a.short_name = "alpha"
+    sym_a.namespace = "liba"
+
+    bv = _FakeBV(symbols=[sym_b, sym_a])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._imports(None)
+
+    assert result[0]["name"] == "alpha"
+    assert result[0]["library"] == "liba"
+    assert result[1]["name"] == "zebra"
+    assert result[1]["library"] == "libz"

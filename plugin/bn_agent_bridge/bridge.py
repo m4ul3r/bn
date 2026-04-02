@@ -107,6 +107,7 @@ READ_LOCKED_OPS = {
     "bundle_function",
     "get_comment",
     "list_comments",
+    "sections",
 }
 
 
@@ -639,9 +640,14 @@ class BinaryNinjaBridge:
                 query=params.get("query"),
                 offset=int(params.get("offset", 0)),
                 limit=int(params.get("limit", 100)),
+                min_length=int(params["min_length"]) if params.get("min_length") is not None else None,
+                section=params.get("section"),
+                no_crt=bool(params.get("no_crt", False)),
             )
         if op == "imports":
             return self._imports(target)
+        if op == "sections":
+            return self._sections(target, query=params.get("query"))
         if op == "bundle_function":
             return self._bundle_function(target, params["identifier"], params.get("out_path"))
         if op == "py_exec":
@@ -2052,44 +2058,134 @@ class BinaryNinjaBridge:
             raise RuntimeError(f"Type is not a struct-like type: {resolved_name}")
         return self._type_entry(resolved_name, type_obj)
 
-    def _strings(self, selector: str | None, *, query, offset: int, limit: int):
+    _NO_CRT_PATTERNS = re.compile(
+        r"^(?:"
+        r"[A-Za-z]$"                                      # single letters
+        r"|[a-z]{2}(?:-[A-Z]{2})?$"                        # locale codes: en, en-US
+        r"|[A-Z]{2,3}$"                                    # short uppercase tokens
+        r"|(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)$"                # day abbreviations
+        r"|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$"  # month abbreviations
+        r"|(?:Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)$"
+        r"|(?:January|February|March|April|June|July|August|September|October|November|December)$"
+        r"|(?:AM|PM|am|pm)$"
+        r"|(?:UTF-?(?:7|8|16|32)|(?:us-)?ascii|iso-\d{4}.*|euc-\w+|big5|gb\d+|shift_jis|windows-\d+|cp\d+)$"
+        r")",
+        re.IGNORECASE,
+    )
+
+    def _strings(self, selector: str | None, *, query, offset: int, limit: int,
+                 min_length: int | None = None, section: str | None = None,
+                 no_crt: bool = False):
         bv = self._resolve_view(selector)
         items = []
         needle = str(query).lower() if query else None
         for item in list(getattr(bv, "strings", [])):
             value = str(getattr(item, "value", ""))
+            length = int(getattr(item, "length", 0))
+            address = int(getattr(item, "start", 0))
             raw_type = getattr(item, "type", "")
             try:
                 string_type = _STRING_TYPE_NAMES.get(int(raw_type), str(raw_type))
             except (TypeError, ValueError):
                 string_type = str(raw_type)
+
+            if needle and needle not in value.lower():
+                continue
+            if min_length is not None and length < min_length:
+                continue
+            if section:
+                secs = bv.get_sections_at(address) if hasattr(bv, "get_sections_at") else []
+                if not any(getattr(s, "name", "") == section for s in secs):
+                    continue
+            if no_crt:
+                if self._NO_CRT_PATTERNS.match(value):
+                    continue
+                secs = bv.get_sections_at(address) if hasattr(bv, "get_sections_at") else []
+                if any(getattr(s, "name", "") == ".text" for s in secs):
+                    continue
+
             entry = {
-                "address": hex(int(getattr(item, "start", 0))),
-                "length": int(getattr(item, "length", 0)),
+                "address": hex(address),
+                "length": length,
                 "type": string_type,
                 "value": value,
             }
-            if needle and needle not in value.lower():
-                continue
             items.append(entry)
         items.sort(key=lambda item: (int(item["address"], 16), item["value"]))
         return items[offset : offset + limit]
 
+    _IMPORT_SYMBOL_TYPES: list[tuple[str, str]] = [
+        ("ImportedFunctionSymbol", "function"),
+        ("ImportedDataSymbol", "data"),
+        ("ImportAddressSymbol", "address"),
+    ]
+
     def _imports(self, selector: str | None):
         bv = self._resolve_view(selector)
         items = []
-        for sym in list(bv.get_symbols_of_type(bn.SymbolType.ImportedFunctionSymbol)):
-            name = str(getattr(sym, "short_name", None) or getattr(sym, "full_name", None) or sym.name)
-            raw_name = str(getattr(sym, "raw_name", sym.name))
-            items.append(
-                {
-                    "name": name,
-                    "address": hex(sym.address),
-                    "library": str(getattr(sym, "namespace", "") or ""),
-                    "raw_name": raw_name,
-                }
-            )
-        items.sort(key=lambda item: (item["library"], item["name"], int(item["address"], 16)))
+        for attr_name, kind in self._IMPORT_SYMBOL_TYPES:
+            sym_type = getattr(bn.SymbolType, attr_name, None)
+            if sym_type is None:
+                continue
+            for sym in list(bv.get_symbols_of_type(sym_type)):
+                name = str(getattr(sym, "short_name", None) or getattr(sym, "full_name", None) or sym.name)
+                raw_name = str(getattr(sym, "raw_name", sym.name))
+                items.append(
+                    {
+                        "name": name,
+                        "address": hex(sym.address),
+                        "library": str(getattr(sym, "namespace", "") or ""),
+                        "raw_name": raw_name,
+                        "kind": kind,
+                    }
+                )
+        items.sort(key=lambda item: (item["library"], item["kind"], item["name"], int(item["address"], 16)))
+        return items
+
+    _SECTION_SEMANTICS_NAMES: dict[int, str] = {
+        0: "DefaultSection",
+        1: "ReadOnlyCode",
+        2: "ReadOnlyData",
+        3: "ReadWriteData",
+        4: "ExternalSection",
+    }
+
+    def _sections(self, selector: str | None, *, query: str | None = None):
+        bv = self._resolve_view(selector)
+        items = []
+        sections = getattr(bv, "sections", {})
+        needle = str(query).lower() if query else None
+        for name, sec in sections.items():
+            if needle and needle not in name.lower():
+                continue
+            start = int(getattr(sec, "start", 0))
+            end = int(getattr(sec, "end", 0))
+            length = end - start
+
+            raw_semantics = getattr(sec, "semantics", 0)
+            try:
+                semantics_int = int(raw_semantics)
+            except (TypeError, ValueError):
+                semantics_int = 0
+            semantics = self._SECTION_SEMANTICS_NAMES.get(semantics_int, str(raw_semantics))
+
+            entry: dict[str, Any] = {
+                "name": name,
+                "start": hex(start),
+                "end": hex(end),
+                "length": length,
+                "semantics": semantics,
+            }
+
+            if hasattr(bv, "get_segment_at"):
+                seg = bv.get_segment_at(start)
+                if seg is not None:
+                    entry["readable"] = bool(getattr(seg, "readable", None))
+                    entry["writable"] = bool(getattr(seg, "writable", None))
+                    entry["executable"] = bool(getattr(seg, "executable", None))
+
+            items.append(entry)
+        items.sort(key=lambda item: int(item["start"], 16))
         return items
 
     def _get_comment(self, selector: str | None, address, function):

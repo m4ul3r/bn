@@ -1433,3 +1433,116 @@ def test_session_start_spawns_instance(monkeypatch, capsys):
     parsed = json.loads(stdout)
     assert parsed["instance_id"] == "test1234"
     assert parsed["pid"] == 999
+
+
+# --- I2: strings filtering CLI args ---
+
+
+def test_strings_passes_min_length_to_bridge(monkeypatch, capsys):
+    captured_params = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        if op == "strings":
+            captured_params.update(params)
+            return {"ok": True, "result": []}
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["strings", "--target", "active", "--min-length", "5"])
+
+    assert rc == 0
+    assert captured_params["min_length"] == 5
+
+
+def test_strings_passes_section_and_no_crt_to_bridge(monkeypatch, capsys):
+    captured_params = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        if op == "strings":
+            captured_params.update(params)
+            return {"ok": True, "result": []}
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["strings", "--target", "active", "--section", ".rodata", "--no-crt"])
+
+    assert rc == 0
+    assert captured_params["section"] == ".rodata"
+    assert captured_params["no_crt"] is True
+
+
+# --- I5: sections CLI ---
+
+
+def test_sections_text_format_renders_rows(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        assert op == "sections"
+        return {
+            "ok": True,
+            "result": [
+                {
+                    "name": ".text",
+                    "start": "0x1000",
+                    "end": "0x5000",
+                    "length": 16384,
+                    "semantics": "ReadOnlyCode",
+                    "readable": True,
+                    "writable": False,
+                    "executable": True,
+                }
+            ],
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["sections", "--format", "text", "--target", "active"])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert ".text" in output
+    assert "0x1000" in output
+    assert "r-x" in output
+
+
+def test_sections_passes_query_to_bridge(monkeypatch, capsys):
+    captured_params = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        if op == "sections":
+            captured_params.update(params)
+            return {"ok": True, "result": []}
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["sections", "--target", "active", "--query", "data"])
+
+    assert rc == 0
+    assert captured_params["query"] == "data"
+
+
+# --- I8: enhanced imports CLI ---
+
+
+def test_imports_text_shows_kind_for_non_function(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        assert op == "imports"
+        return {
+            "ok": True,
+            "result": [
+                {"name": "printf", "address": "0x1000", "library": "libc", "raw_name": "printf", "kind": "function"},
+                {"name": "__stdout", "address": "0x2000", "library": "libc", "raw_name": "__stdout", "kind": "data"},
+            ],
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["imports", "--format", "text", "--target", "active"])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "printf" in output
+    assert "(data)" in output
+    assert "(function)" not in output  # function kind is not shown

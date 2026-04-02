@@ -763,6 +763,9 @@ def _render_name_address_list_text(value: Any) -> str:
         address = item.get("address", "<unknown>")
         name = item.get("name") or item.get("function") or "<unknown>"
         line = f"{address}  {name}"
+        kind = item.get("kind")
+        if kind and kind != "function":
+            line += f" ({kind})"
         library = item.get("library")
         if library:
             line += f" [{library}]"
@@ -913,6 +916,30 @@ def _render_strings_text(value: Any) -> str:
         string_type = item.get("type", "")
         rendered = json.dumps(item.get("value", ""), ensure_ascii=True)
         lines.append(f"{address}  len={length}  {string_type}  {rendered}".rstrip())
+    return "\n".join(lines)
+
+
+def _render_sections_text(value: Any) -> str:
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "none"
+
+    lines = []
+    for item in value:
+        if not isinstance(item, dict):
+            lines.append(_render_fallback_text(item))
+            continue
+        name = item.get("name", "<unknown>")
+        start = item.get("start", "?")
+        end = item.get("end", "?")
+        length = item.get("length", "?")
+        semantics = item.get("semantics", "")
+        perms = ""
+        if "readable" in item:
+            perms = ("r" if item["readable"] else "-") + ("w" if item.get("writable") else "-") + ("x" if item.get("executable") else "-")
+        line = f"{start}-{end}  {length:>8}  {perms:>3}  {semantics:<20}  {name}"
+        lines.append(line.rstrip())
     return "\n".join(lines)
 
 
@@ -1732,12 +1759,27 @@ def _types_declare(args: argparse.Namespace) -> int:
 
 
 @command("strings", help="List or search strings", target=True, paged=True,
-         args=[arg("--query")])
+         args=[
+             arg("--query"),
+             arg("--min-length", type=int, default=None,
+                 help="Exclude strings shorter than N characters"),
+             arg("--section",
+                 help="Only include strings in this section (e.g. .rodata, .rdata)"),
+             arg("--no-crt", action="store_true", default=False,
+                 help="Heuristic filter: exclude likely CRT/locale strings (platform-biased, best-effort)"),
+         ])
 def _strings(args: argparse.Namespace) -> int:
     return _call(
         args,
         "strings",
-        {"query": args.query, "offset": args.offset, "limit": args.limit},
+        {
+            "query": args.query,
+            "offset": args.offset,
+            "limit": args.limit,
+            "min_length": args.min_length,
+            "section": args.section,
+            "no_crt": args.no_crt,
+        },
         require_target=True,
         allow_implicit_target=True,
         text_renderer=_render_strings_text,
@@ -1758,6 +1800,20 @@ def _imports(args: argparse.Namespace) -> int:
         allow_implicit_target=True,
         text_renderer=_render_name_address_list_text,
         stem="imports",
+    )
+
+
+@command("sections", help="List binary sections with address ranges and permissions", target=True,
+         args=[arg("--query", help="Filter sections by name substring")])
+def _sections(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "sections",
+        {"query": args.query},
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_sections_text,
+        stem="sections",
     )
 
 

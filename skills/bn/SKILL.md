@@ -75,12 +75,22 @@ bn types --query Player
 bn types show Player
 bn struct show Player
 bn strings --query follow
+bn strings --min-length 5 --section .rodata
+bn strings --no-crt
 bn imports
+bn sections
+bn sections --query data
 ```
 
 `bn function search` is case-insensitive substring matching by default. Add `--regex` when you need regular expressions. `bn function list` and `bn function search` both accept `--min-address` and `--max-address`.
 
 `bn decompile` omits address prefixes by default for cleaner output. Add `--addresses` when you need per-line addresses (e.g., for `bn comment set --address`).
+
+`bn strings` supports `--min-length N` to exclude short strings, `--section NAME` to restrict to a specific section (e.g., `.rodata`, `.rdata`), and `--no-crt` to heuristically exclude CRT/locale noise (single chars, locale codes, day/month names, encoding names, strings in `.text`). `--no-crt` is a best-effort heuristic, not a semantic filter.
+
+`bn sections` lists binary sections with address ranges, sizes, semantics, and segment-derived RWX permission flags. Use `--query` to filter by section name substring.
+
+`bn imports` includes function, data, and address import symbols. Data and address imports are tagged with `(data)` or `(address)` in text output and include a `"kind"` field in JSON.
 
 ## Caller-Static Mapping
 
