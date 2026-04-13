@@ -1498,3 +1498,201 @@ def test_imports_sorts_by_library_kind_name(monkeypatch):
     assert result[0]["library"] == "liba"
     assert result[1]["name"] == "zebra"
     assert result[1]["library"] == "libz"
+
+
+# ---------------------------------------------------------------------------
+# Verification: local rename with SSA-style variable reconstruction
+# ---------------------------------------------------------------------------
+
+
+def test_verify_local_rename_passes_when_auto_name_persists_but_user_name_on_alt_var(monkeypatch):
+    """After analysis BN may reconstruct variable objects at the same storage
+    offset.  If the primary variable still reports its auto name but a second
+    variable at the same offset carries the user-assigned name, verification
+    should succeed.
+    """
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    # Two variables at the same storage offset — simulates post-analysis state
+    # where BN keeps both the auto-named and user-named entries.
+    auto_var = _FakeVariable(name="var_48", storage=-72, var_type="int32_t", identifier=3001)
+    user_var = _FakeVariable(name="wIndex", storage=-72, var_type="int32_t", identifier=3001)
+
+    fn = _FakeFunction(0x401000, "process_usb")
+    fn.stack_layout = [auto_var, user_var]
+
+    bv = _FakeBV(functions=[fn])
+
+    # Build a result dict as _op_local_rename would produce.
+    result = {
+        "op": "local_rename",
+        "function": "process_usb",
+        "address": "0x401000",
+        "variable": "var_48",
+        "local_id": "0x401000:local:stack:-72:0:3001",
+        "storage": -72,
+        "identifier": 3001,
+        "source_type": "StackVariableSourceType",
+        "is_parameter": False,
+        "before_name": "var_48",
+        "new_name": "wIndex",
+        "requested": {"variable": "var_48", "new_name": "wIndex"},
+    }
+
+    verified = instance._verify_operation(bv, result)
+    assert verified["status"] == "verified"
+    assert verified["observed"]["variable"] == "wIndex"
+
+
+def test_verify_local_rename_uses_identifier_lookup(monkeypatch):
+    """Verification should prefer identifier-based lookup over raw storage
+    matching so it finds the correct variable after analysis rebuilds the
+    stack layout."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    # Variable at same storage but different identifier — should NOT be matched.
+    other_var = _FakeVariable(name="var_48", storage=-72, var_type="int32_t", identifier=9999)
+    renamed_var = _FakeVariable(name="wIndex", storage=-72, var_type="int32_t", identifier=3001)
+
+    fn = _FakeFunction(0x401000, "process_usb")
+    fn.stack_layout = [other_var, renamed_var]
+
+    bv = _FakeBV(functions=[fn])
+
+    result = {
+        "op": "local_rename",
+        "function": "process_usb",
+        "address": "0x401000",
+        "variable": "var_48",
+        "local_id": "0x401000:local:stack:-72:0:3001",
+        "storage": -72,
+        "identifier": 3001,
+        "source_type": "StackVariableSourceType",
+        "is_parameter": False,
+        "before_name": "var_48",
+        "new_name": "wIndex",
+        "requested": {"variable": "var_48", "new_name": "wIndex"},
+    }
+
+    verified = instance._verify_operation(bv, result)
+    assert verified["status"] == "verified"
+    assert verified["observed"]["variable"] == "wIndex"
+
+
+def test_verify_local_rename_fails_when_name_truly_missing(monkeypatch):
+    """If no variable at the storage offset has the expected name, verification
+    should still fail."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    wrong_var = _FakeVariable(name="var_48", storage=-72, var_type="int32_t", identifier=3001)
+
+    fn = _FakeFunction(0x401000, "process_usb")
+    fn.stack_layout = [wrong_var]
+
+    bv = _FakeBV(functions=[fn])
+
+    result = {
+        "op": "local_rename",
+        "function": "process_usb",
+        "address": "0x401000",
+        "variable": "var_48",
+        "local_id": "0x401000:local:stack:-72:0:3001",
+        "storage": -72,
+        "identifier": 3001,
+        "source_type": "StackVariableSourceType",
+        "is_parameter": False,
+        "before_name": "var_48",
+        "new_name": "wIndex",
+        "requested": {"variable": "var_48", "new_name": "wIndex"},
+    }
+
+    verified = instance._verify_operation(bv, result)
+    assert verified["status"] == "verification_failed"
+
+
+# ---------------------------------------------------------------------------
+# Verification: prototype with implicit calling convention
+# ---------------------------------------------------------------------------
+
+
+def test_verify_prototype_passes_with_implicit_calling_convention(monkeypatch):
+    """BN analysis may add __convention("cdecl") to the function type after
+    set_user_type.  Verification should normalise calling conventions before
+    comparing."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _ConventionFunction(_FakeFunction):
+        def __init__(self):
+            # After set_user_type + analysis, BN reports the type WITH
+            # the implicit convention annotation.
+            super().__init__(
+                0x43F200,
+                "parse_config",
+                'int32_t __convention("cdecl")(char const* path)',
+            )
+
+        def set_user_type(self, value):
+            # Store with convention added by analysis.
+            self.type = 'int32_t __convention("cdecl")(char const* path)'
+
+    class _ConventionBV(_FakeBV):
+        def parse_type_string(self, declaration):
+            # parse_type_string returns WITHOUT convention.
+            return _FakeType("int32_t(char const* path)", type_class="FunctionTypeClass"), None
+
+    fn = _ConventionFunction()
+    bv = _ConventionBV(functions=[fn])
+
+    result = instance._op_set_prototype(
+        bv,
+        {
+            "op": "set_prototype",
+            "identifier": "parse_config",
+            "prototype": "int32_t parse_config(char const* path)",
+        },
+    )
+
+    # expected_prototype comes from str(parse_type_string(...)): no convention
+    assert result["expected_prototype"] == "int32_t(char const* path)"
+    # observed will be the fn.type string WITH __convention("cdecl")
+    verified = instance._verify_operation(bv, result)
+    assert verified["status"] == "verified"
+    assert '__convention("cdecl")' in verified["observed"]["prototype"]
+
+
+def test_verify_prototype_still_fails_on_real_mismatch(monkeypatch):
+    """When the actual return type or params differ, verification must still
+    fail even after convention normalisation."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _MismatchFunction(_FakeFunction):
+        def __init__(self):
+            super().__init__(0x43F200, "parse_config", "void*(int32_t x)")
+
+        def set_user_type(self, value):
+            # Analysis "corrected" the type to something different.
+            self.type = "void*(int32_t x)"
+
+    class _MismatchBV(_FakeBV):
+        def parse_type_string(self, declaration):
+            return _FakeType("int32_t(char const* path)", type_class="FunctionTypeClass"), None
+
+    fn = _MismatchFunction()
+    bv = _MismatchBV(functions=[fn])
+
+    result = instance._op_set_prototype(
+        bv,
+        {
+            "op": "set_prototype",
+            "identifier": "parse_config",
+            "prototype": "int32_t parse_config(char const* path)",
+        },
+    )
+
+    verified = instance._verify_operation(bv, result)
+    assert verified["status"] == "verification_failed"

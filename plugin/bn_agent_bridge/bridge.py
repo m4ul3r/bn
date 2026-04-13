@@ -153,6 +153,14 @@ def _run_on_main_thread(func):
     return holder.get("result")
 
 
+_CONVENTION_RE = re.compile(r'\s*__convention\("[^"]*"\)\s*')
+
+
+def _normalize_prototype(proto: str) -> str:
+    """Strip ``__convention("...")`` annotations and normalize whitespace for comparison."""
+    return " ".join(_CONVENTION_RE.sub("", proto).split())
+
+
 def _parse_address(value: Any) -> int:
     if isinstance(value, int):
         return value
@@ -2719,14 +2727,19 @@ class BinaryNinjaBridge:
             )
         observed = str(fn.type)
         item["observed"] = {"address": item["address"], "prototype": observed}
-        if observed != item["expected_prototype"]:
-            raise OperationFailure(
-                "verification_failed",
-                f"Live prototype verification failed at {item['address']}",
-                requested=item.get("requested"),
-                observed=item["observed"],
-            )
-        item["status"] = "noop" if item.get("before_prototype") == item["expected_prototype"] else "verified"
+        expected = item["expected_prototype"]
+        if observed != expected:
+            # BN analysis may add an implicit calling convention (e.g.
+            # __convention("cdecl")) that wasn't present in the parsed
+            # expected type.  Normalize both before rejecting.
+            if _normalize_prototype(observed) != _normalize_prototype(expected):
+                raise OperationFailure(
+                    "verification_failed",
+                    f"Live prototype verification failed at {item['address']}",
+                    requested=item.get("requested"),
+                    observed=item["observed"],
+                )
+        item["status"] = "noop" if item.get("before_prototype") == expected else "verified"
         return item
 
     def _verify_local_rename(self, bv, result: dict[str, Any]) -> dict[str, Any]:
@@ -2740,21 +2753,48 @@ class BinaryNinjaBridge:
                 requested=item.get("requested"),
                 observed={"address": item["address"], "variable": None},
             )
-        var, _ = self._find_variable_by_storage(
-            fn,
-            int(item["storage"]),
-            is_parameter=bool(item["is_parameter"]),
-        )
+        # After analysis, variable objects may be reconstructed.  Try
+        # identifier-based lookup first (stable across analysis passes),
+        # then fall back to storage.  Check all variables at the storage
+        # offset because BN may keep both auto and user-named entries.
+        expected_name = item["new_name"]
+        storage = int(item["storage"])
+        identifier = item.get("identifier")
+        var = None
+        if identifier is not None:
+            for v, _ in self._iter_canonical_variables(fn):
+                if self._variable_identifier(v) == identifier:
+                    var = v
+                    break
+        if var is None:
+            var, _ = self._find_variable_by_storage(
+                fn, storage, is_parameter=bool(item["is_parameter"]),
+            )
         observed_name = str(var.name)
-        item["observed"] = {"address": item["address"], "variable": observed_name, "storage": int(item["storage"])}
-        if observed_name != item["new_name"]:
+        # If the primary variable still shows the auto name, scan the
+        # raw variable lists (bypassing dedup) because BN may keep both
+        # auto-named and user-named entries at the same storage offset
+        # after analysis.
+        if observed_name != expected_name:
+            is_param = bool(item["is_parameter"])
+            collections = [fn.parameter_vars] if is_param else [fn.stack_layout]
+            for collection in collections:
+                for v in list(collection):
+                    if int(getattr(v, "storage", -1)) == storage and str(v.name) == expected_name:
+                        observed_name = expected_name
+                        var = v
+                        break
+                if observed_name == expected_name:
+                    break
+        item["observed"] = {"address": item["address"], "variable": observed_name, "storage": storage}
+        if observed_name != expected_name:
             raise OperationFailure(
                 "verification_failed",
                 f"Live local rename verification failed at {item['address']}",
                 requested=item.get("requested"),
                 observed=item["observed"],
             )
-        item["status"] = "noop" if item.get("before_name") == item["new_name"] else "verified"
+        item["status"] = "noop" if item.get("before_name") == expected_name else "verified"
         return item
 
     def _verify_local_retype(self, bv, result: dict[str, Any]) -> dict[str, Any]:
