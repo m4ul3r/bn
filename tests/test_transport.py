@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from bn.paths import bridge_registry_path, instances_dir
-from bn.transport import BridgeError, choose_instance, list_instances, send_request
+from bn.transport import BridgeError, choose_instance, list_instances, send_request, spawn_instance
 
 
 class _Handler(socketserver.StreamRequestHandler):
@@ -388,6 +388,58 @@ def test_choose_instance_by_id(tmp_path, monkeypatch):
         srv_b.server_close()
 
 
+def test_choose_instance_by_default_selects_fixed_registry(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    pid = os.getpid()
+    socket_path = Path("/tmp") / f"bn-default-{pid}-{uuid.uuid4().hex[:8]}.sock"
+    server = _Server(str(socket_path), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    registry_path = bridge_registry_path()
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_path.write_text(
+        json.dumps(
+            {
+                "pid": pid,
+                "socket_path": str(socket_path),
+                "plugin_name": "bn_agent_bridge",
+                "plugin_version": "0.1.0",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    srv = _create_live_instance(tmp_path, "aaaa1111")
+    try:
+        inst = choose_instance("default", auto_start=False)
+        assert inst.instance_id is None
+        assert inst.registry_path == registry_path
+    finally:
+        server.shutdown()
+        server.server_close()
+        srv.shutdown()
+        srv.server_close()
+
+
+def test_choose_instance_requires_id_when_multiple_instances_exist(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    srv_a = _create_live_instance(tmp_path, "aaaa1111")
+    srv_b = _create_live_instance(tmp_path, "bbbb2222")
+    try:
+        with pytest.raises(BridgeError, match="Multiple Binary Ninja bridge instances are running") as exc:
+            choose_instance(auto_start=False)
+        message = str(exc.value)
+        assert "--instance <id>" in message
+        assert "aaaa1111" in message
+        assert "bbbb2222" in message
+    finally:
+        srv_a.shutdown()
+        srv_a.server_close()
+        srv_b.shutdown()
+        srv_b.server_close()
+
+
 def test_choose_instance_no_match_raises(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     srv = _create_live_instance(tmp_path, "aaaa1111")
@@ -431,3 +483,68 @@ def test_choose_instance_no_auto_start_raises(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     with pytest.raises(BridgeError, match="No running Binary Ninja bridge instances found"):
         choose_instance(auto_start=False)
+
+
+def test_spawn_instance_rejects_duplicate_id(monkeypatch, tmp_path):
+    from bn.transport import BridgeInstance
+
+    existing = BridgeInstance(
+        pid=123,
+        socket_path=tmp_path / "existing.sock",
+        registry_path=tmp_path / "existing.json",
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at=None,
+        meta={},
+        instance_id="aaaa1111",
+    )
+    monkeypatch.setattr("bn.transport.list_instances", lambda: [existing])
+
+    with pytest.raises(BridgeError, match="Bridge instance already exists with id: aaaa1111"):
+        spawn_instance("aaaa1111")
+
+
+def test_spawn_instance_starts_new_instance_when_other_instances_exist(monkeypatch, tmp_path):
+    from bn.transport import BridgeInstance
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    existing = BridgeInstance(
+        pid=123,
+        socket_path=tmp_path / "existing.sock",
+        registry_path=tmp_path / "existing.json",
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at=None,
+        meta={},
+        instance_id="aaaa1111",
+    )
+    created = BridgeInstance(
+        pid=456,
+        socket_path=tmp_path / "new.sock",
+        registry_path=bridge_registry_path("newid"),
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at=None,
+        meta={},
+        instance_id="newid",
+    )
+    bridge_registry_path("newid").parent.mkdir(parents=True, exist_ok=True)
+    bridge_registry_path("newid").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr("bn.transport.list_instances", lambda: [existing])
+    monkeypatch.setattr("bn.transport._find_bn_agent", lambda: ["bn-agent"])
+    monkeypatch.setattr("bn.transport._load_instance", lambda path: created)
+
+    popen_calls = []
+
+    class _FakePopen:
+        pid = 456
+
+        def __init__(self, cmd, **kwargs):
+            popen_calls.append({"cmd": cmd, **kwargs})
+
+    monkeypatch.setattr("bn.transport.subprocess.Popen", _FakePopen)
+
+    inst = spawn_instance("newid")
+
+    assert inst.instance_id == "newid"
+    assert popen_calls[0]["cmd"] == ["bn-agent", "--instance-id", "newid"]

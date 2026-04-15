@@ -29,7 +29,7 @@ This shows all open BinaryView targets. If no bridge is running, `bn` auto-start
 - Mutation, preview, setup, and export commands default to `json`.
 - Other options: `--format json`, `--format ndjson`, `--out <path>`.
 
-Outputs above `10_000` `o200k_base` tokens auto-spill to disk. When that happens, stdout is empty and stderr carries the spill metadata as plain text, so do not chain `bn ... | rg ...` and expect to search the real output. Use `--out <path>` when you want the full body written to a known file.
+Outputs above `10_000` `o200k_base` tokens auto-spill to disk. When that happens, stdout contains a compact text envelope (`spilled: true`, `path: ...`, `tokens: ...`) and stderr carries a short warning, so do not chain `bn ... | rg ...` and expect to search the real output. Use `--out <path>` when you want the full body written to a known file.
 
 ## Headless Mode
 

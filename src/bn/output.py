@@ -77,9 +77,11 @@ def _artifact_payload(
     encoded: bytes,
     token_count: int,
     value: Any,
+    spilled: bool,
 ) -> dict[str, Any]:
     return {
         "ok": True,
+        "spilled": spilled,
         "artifact_path": str(artifact_path),
         "format": fmt,
         "bytes": len(encoded),
@@ -90,8 +92,38 @@ def _artifact_payload(
     }
 
 
-def _artifact_envelope(payload: dict[str, Any]) -> str:
-    return json.dumps(payload, indent=2, sort_keys=True) + "\n"
+def _format_envelope_value(value: Any) -> str:
+    if isinstance(value, list | tuple):
+        return ",".join(str(item) for item in value)
+    if isinstance(value, dict):
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), default=_json_default)
+    return str(value)
+
+
+def render_artifact_envelope(payload: dict[str, Any]) -> str:
+    lines = []
+    if "ok" in payload:
+        lines.append(f"ok: {str(bool(payload.get('ok'))).lower()}")
+    if "spilled" in payload:
+        lines.append(f"spilled: {str(bool(payload.get('spilled'))).lower()}")
+    if "artifact_path" in payload:
+        lines.append(f"path: {payload['artifact_path']}")
+    for key in ("format", "bytes", "tokens", "tokenizer", "sha256"):
+        if key in payload:
+            lines.append(f"{key}: {payload[key]}")
+    summary = payload.get("summary")
+    if isinstance(summary, dict):
+        summary_parts = []
+        kind = summary.get("kind")
+        if kind is not None:
+            summary_parts.append(f"kind={_format_envelope_value(kind)}")
+        for key in sorted(summary):
+            if key == "kind":
+                continue
+            summary_parts.append(f"{key}={_format_envelope_value(summary[key])}")
+        if summary_parts:
+            lines.append(f"summary: {' '.join(summary_parts)}")
+    return "\n".join(lines) + "\n"
 
 
 def write_output_result(
@@ -115,9 +147,10 @@ def write_output_result(
             encoded=encoded,
             token_count=token_count,
             value=value,
+            spilled=False,
         )
         return OutputWriteResult(
-            rendered=_artifact_envelope(artifact),
+            rendered=render_artifact_envelope(artifact),
             artifact=artifact,
             spilled=False,
         )
@@ -134,9 +167,10 @@ def write_output_result(
         encoded=encoded,
         token_count=token_count,
         value=value,
+        spilled=True,
     )
     return OutputWriteResult(
-        rendered=_artifact_envelope(artifact),
+        rendered=render_artifact_envelope(artifact),
         artifact=artifact,
         spilled=True,
     )

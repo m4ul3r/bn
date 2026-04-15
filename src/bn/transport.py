@@ -39,6 +39,21 @@ class BridgeInstance:
     instance_id: str | None = None
 
 
+def instance_selector(instance: BridgeInstance) -> str:
+    return instance.instance_id or "default"
+
+
+def _format_instance_choices(instances: list[BridgeInstance]) -> str:
+    lines = []
+    for inst in instances:
+        selector = instance_selector(inst)
+        details = [f"pid={inst.pid}", f"socket={inst.socket_path}"]
+        if inst.started_at:
+            details.append(f"started={inst.started_at}")
+        lines.append(f"- {selector} ({', '.join(details)})")
+    return "\n".join(lines)
+
+
 def _purge_stale_registry(registry_path: Path) -> None:
     with contextlib.suppress(OSError):
         registry_path.unlink()
@@ -107,11 +122,17 @@ def choose_instance(instance_id: str | None = None, *, auto_start: bool = True) 
     instances = list_instances()
     if instance_id is not None:
         for inst in instances:
-            if inst.instance_id == instance_id:
+            if inst.instance_id == instance_id or instance_selector(inst) == instance_id:
                 return inst
         raise BridgeError(f"No bridge instance found with id: {instance_id}")
-    if instances:
+    if len(instances) == 1:
         return instances[0]
+    if instances:
+        raise BridgeError(
+            "Multiple Binary Ninja bridge instances are running; pass --instance <id> "
+            "or set BN_INSTANCE.\n"
+            f"Instances:\n{_format_instance_choices(instances)}"
+        )
     if auto_start:
         return spawn_instance()
     raise BridgeError("No running Binary Ninja bridge instances found")
@@ -206,11 +227,17 @@ def spawn_instance(
 ) -> BridgeInstance:
     """Spawn a new bn-agent headless process and wait for it to register."""
     existing = list_instances()
-    if existing:
-        return existing[0]
-
     if instance_id is None:
-        instance_id = secrets.token_hex(4)
+        existing_selectors = {instance_selector(inst) for inst in existing}
+        while True:
+            candidate = secrets.token_hex(4)
+            if candidate not in existing_selectors:
+                instance_id = candidate
+                break
+    elif instance_id == "default":
+        raise BridgeError("Instance id 'default' is reserved for the fixed GUI bridge")
+    elif any(inst.instance_id == instance_id or instance_selector(inst) == instance_id for inst in existing):
+        raise BridgeError(f"Bridge instance already exists with id: {instance_id}")
 
     inst_dir = instances_dir()
     inst_dir.mkdir(parents=True, exist_ok=True)

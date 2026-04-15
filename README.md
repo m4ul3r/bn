@@ -127,11 +127,25 @@ bn function search --regex 'attach|detach'
 bn decompile sample_track_floor_height_at_position --out /tmp/floor.json
 ```
 
-If `--out` is set, the command writes the rendered result to that path and prints a compact JSON envelope with the artifact path, byte size, token count, tokenizer, hash, and summary. Agents can use that envelope to decide whether to read the full artifact, keep a summary, or defer loading it into context.
+If `--out` is set, the command writes the rendered result to that path and prints a compact text envelope with the artifact path, byte size, token count, tokenizer, hash, and summary. Agents can use that envelope to decide whether to read the full artifact, keep a summary, or defer loading it into context.
+
+Example artifact envelope:
+
+```text
+ok: true
+spilled: false
+path: /tmp/floor.json
+format: json
+bytes: 1234
+tokens: 456
+tokenizer: o200k_base
+sha256: deadbeef...
+summary: kind=object count=3
+```
 
 The only exception is `bn bundle function`, which writes the bundle artifact from inside the bridge and prints the envelope back to the CLI.
 
-`bn function list` and `bn function search` return the full matching set for the selected target or address range. Large results auto-spill to an artifact instead of forcing manual pagination. Spill is token-based and currently triggers above 10,000 tokens. When that happens, stdout stays empty and stderr carries the spill metadata as plain text, including the artifact path and size counts.
+`bn function list` and `bn function search` return the full matching set for the selected target or address range. Large results auto-spill to an artifact instead of forcing manual pagination. Spill is token-based and currently triggers above 10,000 tokens. When that happens, stdout contains the compact artifact envelope and stderr carries a short warning with the artifact path.
 
 ## Extraction Commands
 

@@ -17,6 +17,14 @@ def _token_count(text: str) -> int:
     return len(tiktoken.get_encoding(TOKENIZER).encode(text))
 
 
+def _parse_envelope(text: str) -> dict[str, str]:
+    result = {}
+    for line in text.splitlines():
+        key, value = line.split(":", 1)
+        result[key] = value.strip()
+    return result
+
+
 def test_default_spill_token_limit_is_10k():
     assert DEFAULT_SPILL_TOKEN_LIMIT == 10_000
 
@@ -42,12 +50,13 @@ def test_write_output_spills_large_payload(tmp_path, monkeypatch):
         spill_token_limit=256,
     )
 
-    envelope = json.loads(rendered)
+    envelope = _parse_envelope(rendered)
     artifact_root = tempfile.gettempdir()
-    assert envelope["artifact_path"].startswith(artifact_root)
-    artifact_text = Path(envelope["artifact_path"]).read_text()
+    assert envelope["path"].startswith(artifact_root)
+    assert envelope["spilled"] == "true"
+    artifact_text = Path(envelope["path"]).read_text()
     assert envelope["tokenizer"] == TOKENIZER
-    assert envelope["tokens"] == _token_count(artifact_text)
+    assert int(envelope["tokens"]) == _token_count(artifact_text)
 
 
 def test_write_output_spills_text_payload_with_txt_suffix(tmp_path, monkeypatch):
@@ -62,8 +71,9 @@ def test_write_output_spills_text_payload_with_txt_suffix(tmp_path, monkeypatch)
         spill_token_limit=256,
     )
 
-    envelope = json.loads(rendered)
-    assert envelope["artifact_path"].endswith(".txt")
+    envelope = _parse_envelope(rendered)
+    assert envelope["path"].endswith(".txt")
+    assert envelope["spilled"] == "true"
 
 
 def test_write_output_uses_token_limit_not_byte_limit(tmp_path, monkeypatch):
@@ -93,8 +103,9 @@ def test_write_output_reports_exact_tokens_for_explicit_out_path(tmp_path, monke
         stem="explicit-out",
     )
 
-    envelope = json.loads(rendered)
+    envelope = _parse_envelope(rendered)
     artifact_text = out_path.read_text()
-    assert envelope["artifact_path"] == str(out_path)
+    assert envelope["path"] == str(out_path)
+    assert envelope["spilled"] == "false"
     assert envelope["tokenizer"] == TOKENIZER
-    assert envelope["tokens"] == _token_count(artifact_text)
+    assert int(envelope["tokens"]) == _token_count(artifact_text)

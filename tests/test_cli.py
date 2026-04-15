@@ -106,13 +106,24 @@ def test_function_list_warns_when_output_auto_spills(monkeypatch, capsys):
         captured["out_path"] = out_path
         captured["stem"] = stem
         return types.SimpleNamespace(
-            rendered='{"artifact_path":"/tmp/functions.txt","bytes":1234,"format":"text","ok":true,"tokenizer":"o200k_base","tokens":23456}\n',
+            rendered=(
+                "ok: true\n"
+                "spilled: true\n"
+                "path: /tmp/functions.txt\n"
+                "format: text\n"
+                "bytes: 1234\n"
+                "tokens: 23456\n"
+                "tokenizer: o200k_base\n"
+                "sha256: deadbeef\n"
+                "summary: kind=string chars=42\n"
+            ),
             spilled=True,
             artifact={
                 "artifact_path": "/tmp/functions.txt",
                 "bytes": 1234,
                 "format": "text",
                 "sha256": "deadbeef",
+                "spilled": True,
                 "summary": {"kind": "string", "chars": 42},
                 "tokenizer": "o200k_base",
                 "tokens": 23456,
@@ -126,18 +137,9 @@ def test_function_list_warns_when_output_auto_spills(monkeypatch, capsys):
 
     assert rc == 0
     stdout, stderr = capsys.readouterr()
-    assert stdout == ""
+    assert stdout.startswith("ok: true\nspilled: true\npath: /tmp/functions.txt\n")
     assert captured["value"] == "0x401000  sub_401000\n0x402000  sub_402000"
-    assert "warning: function list output spilled" in stderr
-    assert "path: /tmp/functions.txt" in stderr
-    assert "format: text" in stderr
-    assert "bytes: 1234" in stderr
-    assert "tokens: 23456" in stderr
-    assert "tokenizer: o200k_base" in stderr
-    assert "sha256: deadbeef" in stderr
-    assert "summary: kind=string, chars=42" in stderr
-    assert "items: 2" in stderr
-    assert "lines: 2" in stderr
+    assert stderr == "warning: function list output spilled to /tmp/functions.txt\n"
 
 
 def test_function_list_forwards_address_filters(monkeypatch, capsys):
@@ -916,8 +918,9 @@ def test_bundle_function_out_path_is_bridge_owned(monkeypatch, tmp_path, capsys)
     assert captured["op"] == "bundle_function"
     assert captured["params"]["out_path"] == str(out_path)
     assert not out_path.exists()
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["artifact_path"] == str(out_path)
+    output = capsys.readouterr().out
+    assert f"path: {out_path}" in output
+    assert "spilled: false" in output
 
 
 def test_removed_experimental_commands_are_not_present():
@@ -1388,6 +1391,7 @@ def test_session_list_shows_instances(monkeypatch, capsys):
     stdout = capsys.readouterr().out
     parsed = json.loads(stdout)
     assert len(parsed["instances"]) == 2
+    assert parsed["instances"][0]["selector"] == "aaaa1111"
     assert parsed["instances"][0]["instance_id"] == "aaaa1111"
     assert parsed["instances"][1]["instance_id"] == "bbbb2222"
     assert "rss_mb" in parsed["instances"][0]

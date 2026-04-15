@@ -8,9 +8,16 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
-from .output import write_output_result
+from .output import render_artifact_envelope, write_output_result
 from .paths import claude_skills_dir, plugin_install_dir, plugin_source_dir, repo_root
-from .transport import BridgeError, _send_request_to_instance, list_instances, send_request, spawn_instance
+from .transport import (
+    BridgeError,
+    _send_request_to_instance,
+    instance_selector,
+    list_instances,
+    send_request,
+    spawn_instance,
+)
 from .version import VERSION, build_id_for_file
 
 FAILED_MUTATION_STATUSES = {"unsupported", "verification_failed"}
@@ -272,39 +279,19 @@ def _render_result(
     spill_label: str | None = None,
     spill_context: Any = None,
 ) -> None:
+    if out_path is None and isinstance(value, dict) and isinstance(value.get("artifact_path"), str):
+        artifact = dict(value)
+        artifact.setdefault("ok", True)
+        artifact.setdefault("spilled", False)
+        sys.stdout.write(render_artifact_envelope(artifact))
+        return
+
     result = write_output_result(value, fmt=fmt, out_path=out_path, stem=stem)
     if result.spilled and result.artifact:
         label = spill_label or stem.replace("_", " ")
         artifact = result.artifact
-        lines = [
-            f"warning: {label} output spilled",
-            f"path: {artifact['artifact_path']}",
-            f"format: {artifact['format']}",
-            f"bytes: {artifact['bytes']}",
-            f"tokens: {artifact['tokens']}",
-            f"tokenizer: {artifact['tokenizer']}",
-        ]
-        if isinstance(artifact.get("sha256"), str):
-            lines.append(f"sha256: {artifact['sha256']}")
-        summary = artifact.get("summary")
-        if isinstance(summary, dict):
-            summary_parts = []
-            kind = summary.get("kind")
-            if kind is not None:
-                summary_parts.append(f"kind={kind}")
-            for key in sorted(summary):
-                if key == "kind":
-                    continue
-                summary_parts.append(
-                    f"{key}={json.dumps(summary[key], sort_keys=True, default=str)}"
-                )
-            if summary_parts:
-                lines.append(f"summary: {', '.join(summary_parts)}")
-        if isinstance(spill_context, list):
-            lines.append(f"items: {len(spill_context)}")
-        if isinstance(value, str):
-            lines.append(f"lines: {len(value.splitlines())}")
-        print("\n".join(lines), file=sys.stderr)
+        sys.stdout.write(result.rendered)
+        print(f"warning: {label} output spilled to {artifact['artifact_path']}", file=sys.stderr)
         return
     sys.stdout.write(result.rendered)
 
@@ -692,7 +679,7 @@ def _render_session_list_text(value: Any) -> str:
         if not isinstance(item, dict):
             lines.append(_render_fallback_text(item))
             continue
-        parts = [str(item.get("instance_id", "<unknown>"))]
+        parts = [str(item.get("selector") or item.get("instance_id") or "<unknown>")]
         parts.append(f"pid={item.get('pid', '<unknown>')}")
         rss = item.get("rss_mb")
         if rss is not None:
@@ -1368,7 +1355,7 @@ def _session_stop(args: argparse.Namespace) -> int:
     except BridgeError:
         # Fallback: find instance and SIGTERM
         for inst in list_instances():
-            if inst.instance_id == target_id:
+            if inst.instance_id == target_id or instance_selector(inst) == target_id:
                 try:
                     os.kill(inst.pid, signal.SIGTERM)
                 except OSError:
@@ -1403,6 +1390,7 @@ def _session_list(args: argparse.Namespace) -> int:
     for inst in instances:
         rss = _rss_mb(inst.pid)
         entry: dict[str, Any] = {
+            "selector": instance_selector(inst),
             "instance_id": inst.instance_id,
             "pid": inst.pid,
             "socket_path": str(inst.socket_path),
