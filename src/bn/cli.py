@@ -139,6 +139,14 @@ def _common_io_options(
     parser.add_argument("--out", type=Path, help="Write output to a file instead of stdout")
 
 
+def _instance_option(parser: argparse.ArgumentParser, *, is_root: bool = False) -> None:
+    parser.add_argument(
+        "--instance",
+        default=os.environ.get("BN_INSTANCE") if is_root else argparse.SUPPRESS,
+        help="Target a specific bridge instance by ID (env: BN_INSTANCE)",
+    )
+
+
 def _target_option(
     parser: argparse.ArgumentParser,
     *,
@@ -252,6 +260,7 @@ def _build_from_commands(root: BnArgumentParser) -> None:
             node_parsers[path] = cmd
 
         _common_io_options(cmd, default_format=spec["fmt"])
+        _instance_option(cmd)
         if spec["target"]:
             _target_option(cmd, required=False)
         if spec["address_filter"]:
@@ -2188,11 +2197,7 @@ def _add_function_address_args(parser: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     parser = BnArgumentParser(prog="bn", description="Agent-friendly Binary Ninja CLI")
     parser.set_defaults(handler=None)
-    parser.add_argument(
-        "--instance",
-        default=os.environ.get("BN_INSTANCE"),
-        help="Target a specific bridge instance by ID (env: BN_INSTANCE)",
-    )
+    _instance_option(parser, is_root=True)
     _build_from_commands(parser)
     return parser
 

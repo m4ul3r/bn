@@ -1341,6 +1341,22 @@ def test_instance_flag_passed_to_send_request(monkeypatch, capsys):
     assert "abc123" in captured_instance_ids
 
 
+def test_instance_flag_on_subcommand(monkeypatch, capsys):
+    captured_instance_ids = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        captured_instance_ids.append(instance_id)
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "test.bndb"}]}
+        return {"ok": True, "result": []}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    bn.cli.main(["function", "list", "--instance", "abc123"])
+
+    assert "abc123" in captured_instance_ids
+
+
 def test_instance_flag_from_env(monkeypatch, capsys):
     captured_instance_ids = []
 
