@@ -433,20 +433,9 @@ def _render_fallback_text(value: Any) -> str:
 
 
 def _format_local_entry(item: dict[str, Any]) -> str:
-    role = "param" if item.get("is_parameter") else "local"
-    details = [f"storage={item.get('storage', '?')}"]
-    if item.get("source_type"):
-        details.append(f"source={item['source_type']}")
-    if item.get("index") is not None:
-        details.append(f"index={item['index']}")
-    if item.get("identifier") is not None:
-        details.append(f"identifier={item['identifier']}")
-    if item.get("local_id"):
-        details.append(f"id={item['local_id']}")
-    return (
-        f"- {item.get('type', '<unknown>')} {item.get('name', '<unknown>')} "
-        f"[{role}; {'; '.join(details)}]"
-    )
+    name = str(item.get("name", "<unknown>"))
+    type_str = str(item.get("type", "<unknown>"))
+    return f"  {name:<20} {type_str}"
 
 
 def _text_field(field: str) -> Callable[[Any], str]:
@@ -508,14 +497,24 @@ def _render_local_list_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     function = value.get("function") or {}
-    lines = [f"{function.get('name', '<unknown>')} @ {function.get('address', '<unknown>')}", ""]
-    locals_only = list(value.get("locals") or [])
-    if not locals_only:
-        lines.append("locals: none")
-        return "\n".join(lines)
-    lines.append("locals:")
-    for item in locals_only:
-        lines.append(_format_local_entry(item))
+    all_items = list(value.get("locals") or [])
+    params = [item for item in all_items if item.get("is_parameter")]
+    locals_only = [item for item in all_items if not item.get("is_parameter")]
+
+    header = f"{function.get('name', '<unknown>')} @ {function.get('address', '<unknown>')}"
+    header += f" ({len(params)} params, {len(locals_only)} locals)"
+    lines = [header]
+
+    if params:
+        lines.extend(["", "params:"])
+        for item in params:
+            lines.append(_format_local_entry(item))
+    if locals_only:
+        lines.extend(["", "locals:"])
+        for item in locals_only:
+            lines.append(_format_local_entry(item))
+    if not params and not locals_only:
+        lines.extend(["", "no locals"])
     return "\n".join(lines)
 
 
@@ -629,11 +628,30 @@ def _render_close_text(value: Any) -> str:
     closed = list(value.get("closed") or [])
     if not closed:
         return "no binaries closed"
-    if len(closed) == 1:
-        return f"closed: {closed[0]}"
-    lines = ["closed:"]
-    for path in closed:
-        lines.append(f"- {path}")
+
+    def _row(entry: Any) -> tuple[str, bool]:
+        if isinstance(entry, dict):
+            return str(entry.get("path", "")), bool(entry.get("unsaved"))
+        return str(entry), False
+
+    rows = [_row(e) for e in closed]
+    unsaved_any = any(unsaved for _, unsaved in rows)
+
+    if len(rows) == 1:
+        path, unsaved = rows[0]
+        lines = [f"closed: {path}"]
+    else:
+        lines = ["closed:"]
+        for path, unsaved in rows:
+            marker = "  [unsaved changes discarded]" if unsaved else ""
+            lines.append(f"- {path}{marker}")
+
+    if unsaved_any:
+        lines.append("")
+        lines.append(
+            "warning: unsaved mutations were discarded. "
+            "use `bn save` before `bn close` to persist them."
+        )
     return "\n".join(lines)
 
 
@@ -772,6 +790,29 @@ def _render_name_address_list_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+def _group_refs_by_caller(refs: list[Any]) -> list[dict[str, Any]]:
+    groups: dict[tuple[str | None, str | None], dict[str, Any]] = {}
+    order: list[tuple[str | None, str | None]] = []
+    for ref in refs:
+        if not isinstance(ref, dict):
+            continue
+        caller = ref.get("caller_function") if isinstance(ref.get("caller_function"), dict) else None
+        key: tuple[str | None, str | None]
+        if caller is not None:
+            key = (caller.get("address"), caller.get("name"))
+        else:
+            key = (None, ref.get("function"))
+        if key not in groups:
+            groups[key] = {
+                "caller_address": key[0],
+                "caller_name": key[1],
+                "sites": [],
+            }
+            order.append(key)
+        groups[key]["sites"].append(str(ref.get("address", "<unknown>")))
+    return [groups[k] for k in order]
+
+
 def _render_xrefs_text(value: Any, limit: int | None = None) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -781,41 +822,32 @@ def _render_xrefs_text(value: Any, limit: int | None = None) -> str:
     total_code = len(code_refs)
     total_data = len(data_refs)
 
-    lines = [
-        f"xrefs to {value.get('address', '<unknown>')} ({total_code} code, {total_data} data)",
-        "",
-        "code refs:",
-    ]
-    if code_refs:
-        shown = code_refs[:limit] if limit else code_refs
-        for ref in shown:
-            if not isinstance(ref, dict):
-                lines.append("- " + _render_fallback_text(ref))
-                continue
-            details = [str(ref.get("address", "<unknown>"))]
-            if ref.get("function"):
-                details.append(str(ref["function"]))
-            lines.append("- " + " | ".join(details))
-        if limit and total_code > limit:
-            lines.append(f"  ... {total_code - limit} more (use --limit or --format json)")
-    else:
-        lines.append("- none")
+    def _render_group(refs: list[Any], total: int, label: str) -> list[str]:
+        groups = _group_refs_by_caller(refs)
+        if not groups:
+            return [f"{label}:", "- none"]
+        site_word = "site" if total == 1 else "sites"
+        fn_word = "function" if len(groups) == 1 else "functions"
+        header = f"{label}: {total} {site_word} across {len(groups)} {fn_word}"
+        shown = groups[:limit] if limit else groups
+        rendered = [header]
+        for group in shown:
+            caller_addr = group["caller_address"] or "<unknown>"
+            caller_name = group["caller_name"] or "<unknown>"
+            sites = group["sites"]
+            if len(sites) == 1:
+                suffix = f"(1 site: {sites[0]})"
+            else:
+                suffix = f"({len(sites)} sites: {', '.join(sites)})"
+            rendered.append(f"  {caller_addr}  {caller_name}  {suffix}")
+        if limit and len(groups) > limit:
+            rendered.append(f"  ... {len(groups) - limit} more functions (use --limit or --format json)")
+        return rendered
 
-    lines.extend(["", "data refs:"])
-    if data_refs:
-        shown = data_refs[:limit] if limit else data_refs
-        for ref in shown:
-            if not isinstance(ref, dict):
-                lines.append("- " + _render_fallback_text(ref))
-                continue
-            details = [str(ref.get("address", "<unknown>"))]
-            if ref.get("function"):
-                details.append(str(ref["function"]))
-            lines.append("- " + " | ".join(details))
-        if limit and total_data > limit:
-            lines.append(f"  ... {total_data - limit} more (use --limit or --format json)")
-    else:
-        lines.append("- none")
+    lines = [f"xrefs to {value.get('address', '<unknown>')} ({total_code} code, {total_data} data)", ""]
+    lines.extend(_render_group(code_refs, total_code, "code refs"))
+    lines.append("")
+    lines.extend(_render_group(data_refs, total_data, "data refs"))
     return "\n".join(lines)
 
 
@@ -909,9 +941,16 @@ def _render_strings_text(value: Any) -> str:
             continue
         address = item.get("address", "<unknown>")
         length = item.get("length", "?")
+        chars = item.get("chars")
         string_type = item.get("type", "")
         rendered = json.dumps(item.get("value", ""), ensure_ascii=True)
-        lines.append(f"{address}  len={length}  {string_type}  {rendered}".rstrip())
+        if chars is not None and isinstance(length, int) and chars != length:
+            size = f"chars={chars} bytes={length}"
+        elif chars is not None:
+            size = f"chars={chars}"
+        else:
+            size = f"len={length}"
+        lines.append(f"{address}  {size}  {string_type}  {rendered}".rstrip())
     return "\n".join(lines)
 
 
@@ -1650,20 +1689,27 @@ def _load_within_identifiers(path: Path) -> list[str]:
                  help="Prefer caller_static-first text output for return-address mapping workflows"),
          ],
          mutex_groups=[
-             mutex(True,
+             mutex(False,
                    arg("--within", help="Containing function to search for callsites"),
                    arg("--within-file", type=Path,
-                       help="Text file with one containing-function identifier per line")),
+                       help="Text file with one containing-function identifier per line (hex addresses accepted)")),
          ])
 def _callsites(args: argparse.Namespace) -> int:
     if args.within is not None:
         within_identifiers = [args.within]
-    else:
-        if args.within_file is None or not args.within_file.exists():
+    elif args.within_file is not None:
+        if not args.within_file.exists():
             raise BridgeError(f"Scope file not found: {args.within_file}")
         within_identifiers = _load_within_identifiers(args.within_file)
         if not within_identifiers:
             raise BridgeError(f"Scope file did not contain any function identifiers: {args.within_file}")
+    else:
+        raise BridgeError(
+            "bn callsites needs a scope. Options:\n"
+            f"  single caller:  bn callsites {args.callee} --within <function>\n"
+            f"  many callers:   bn callsites {args.callee} --within-file <path>\n"
+            f"  list callers:   bn xrefs {args.callee}"
+        )
 
     return _call(
         args,

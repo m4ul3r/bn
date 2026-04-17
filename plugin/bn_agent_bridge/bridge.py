@@ -38,6 +38,23 @@ def _json_response(*, ok: bool, result: Any = None, error: str | None = None) ->
     return {"ok": ok, "result": result, "error": error}
 
 
+def _format_ambiguous_function_error(identifier: Any, matches: list[Any]) -> str:
+    lines = [f"Ambiguous function identifier: {identifier} matches {len(matches)} functions:"]
+    for fn in sorted(matches, key=lambda f: int(f.start)):
+        lines.append(f"  {int(fn.start):#010x}  {str(fn.name)}")
+    lines.append("retry with one of the addresses above (e.g. `bn function info 0x…`)")
+    return "\n".join(lines)
+
+
+def _format_ambiguous_symbol_error(identifier: Any, matches: list[Any]) -> str:
+    lines = [f"Ambiguous symbol identifier: {identifier} matches {len(matches)} symbols:"]
+    for sym in sorted(matches, key=lambda s: int(s.address)):
+        kind = getattr(getattr(sym, "type", None), "name", "") or str(getattr(sym, "type", ""))
+        lines.append(f"  {int(sym.address):#010x}  {str(sym.name)}  [{kind}]")
+    lines.append("retry with one of the addresses above")
+    return "\n".join(lines)
+
+
 class OperationFailure(RuntimeError):
     def __init__(
         self,
@@ -732,6 +749,12 @@ class BinaryNinjaBridge:
         }
 
     def _close_binary(self, path: str | None = None):
+        def _snapshot(bv) -> dict[str, Any]:
+            return {
+                "path": str(getattr(bv.file, "filename", "")),
+                "unsaved": bool(getattr(bv.file, "modified", False)),
+            }
+
         with _headless_views_lock:
             if not _headless_views:
                 raise RuntimeError("No binaries are currently loaded")
@@ -739,7 +762,7 @@ class BinaryNinjaBridge:
             if path is None:
                 closed = []
                 for bv in _headless_views:
-                    closed.append(str(getattr(bv.file, "filename", "")))
+                    closed.append(_snapshot(bv))
                     bv.file.close()
                 _headless_views.clear()
                 return {"closed": closed}
@@ -757,7 +780,7 @@ class BinaryNinjaBridge:
             closed = []
             for i in reversed(to_remove):
                 bv = _headless_views.pop(i)
-                closed.append(str(getattr(bv.file, "filename", "")))
+                closed.append(_snapshot(bv))
                 bv.file.close()
 
         return {"closed": closed}
@@ -820,13 +843,13 @@ class BinaryNinjaBridge:
         if len(exact) == 1:
             return exact[0]
         if len(exact) > 1:
-            raise RuntimeError(f"Ambiguous function identifier: {identifier}")
+            raise RuntimeError(_format_ambiguous_function_error(identifier, exact))
 
         folded = self._find_functions_by_name(bv, text, case_sensitive=False)
         if len(folded) == 1:
             return folded[0]
         if len(folded) > 1:
-            raise RuntimeError(f"Ambiguous function identifier: {identifier}")
+            raise RuntimeError(_format_ambiguous_function_error(identifier, folded))
 
         symbol = bv.get_symbol_by_raw_name(text)
         if symbol is not None:
@@ -941,7 +964,11 @@ class BinaryNinjaBridge:
                     "before_name": str(fn.name),
                 }
             if len(exact_functions) > 1:
-                raise OperationFailure("unsupported", f"Ambiguous function identifier: {identifier}", requested=requested)
+                raise OperationFailure(
+                    "unsupported",
+                    _format_ambiguous_function_error(identifier, exact_functions),
+                    requested=requested,
+                )
 
             folded_functions = self._find_functions_by_name(bv, str(identifier), case_sensitive=False)
             if len(folded_functions) == 1:
@@ -952,7 +979,11 @@ class BinaryNinjaBridge:
                     "before_name": str(fn.name),
                 }
             if len(folded_functions) > 1:
-                raise OperationFailure("unsupported", f"Ambiguous function identifier: {identifier}", requested=requested)
+                raise OperationFailure(
+                    "unsupported",
+                    _format_ambiguous_function_error(identifier, folded_functions),
+                    requested=requested,
+                )
 
         if kind == "function":
             raise OperationFailure("unsupported", f"Function not found: {identifier}", requested=requested)
@@ -970,7 +1001,11 @@ class BinaryNinjaBridge:
                 "before_name": str(symbol.name),
             }
         if len(exact_symbols) > 1:
-            raise OperationFailure("unsupported", f"Ambiguous symbol identifier: {identifier}", requested=requested)
+            raise OperationFailure(
+                "unsupported",
+                _format_ambiguous_symbol_error(identifier, exact_symbols),
+                requested=requested,
+            )
 
         folded_symbols = [
             symbol
@@ -985,7 +1020,11 @@ class BinaryNinjaBridge:
                 "before_name": str(symbol.name),
             }
         if len(folded_symbols) > 1:
-            raise OperationFailure("unsupported", f"Ambiguous symbol identifier: {identifier}", requested=requested)
+            raise OperationFailure(
+                "unsupported",
+                _format_ambiguous_symbol_error(identifier, folded_symbols),
+                requested=requested,
+            )
 
         raise OperationFailure("unsupported", f"Symbol not found: {identifier}", requested=requested)
 
@@ -1310,7 +1349,14 @@ class BinaryNinjaBridge:
         if len(matches) == 1:
             return matches[0]
         if len(matches) > 1:
-            raise RuntimeError(f"Ambiguous variable selector: {selector}")
+            lines = [f"Ambiguous variable selector: {selector} matches {len(matches)} variables:"]
+            for var, is_parameter in matches:
+                role = "param" if is_parameter else "local"
+                source_name = self._variable_source_name(var)
+                storage = int(getattr(var, "storage", 0))
+                lines.append(f"  {str(getattr(var, 'name', '<unknown>'))}  [{role}; storage={storage}; source={source_name}]")
+            lines.append("retry with the full local_id from `bn local list --format json`")
+            raise RuntimeError("\n".join(lines))
         raise RuntimeError(f"Variable not found: {selector}")
 
     def _function_size(self, func) -> int | None:
@@ -1696,18 +1742,32 @@ class BinaryNinjaBridge:
         code_refs = []
         data_refs = []
         for ref in sorted(list(bv.get_code_refs(address)), key=lambda item: int(item.address)):
+            fn = getattr(ref, "function", None)
+            caller = (
+                {"address": hex(int(fn.start)), "name": str(fn.name)}
+                if fn is not None
+                else None
+            )
             code_refs.append(
                 {
-                    "function": ref.function.name if getattr(ref, "function", None) else None,
+                    "function": fn.name if fn is not None else None,
                     "address": hex(ref.address),
+                    "caller_function": caller,
                 }
             )
         for ref_addr in sorted(list(bv.get_data_refs(address))):
             functions = self._functions_containing(bv, ref_addr)
+            fn = functions[0] if functions else None
+            caller = (
+                {"address": hex(int(fn.start)), "name": str(fn.name)}
+                if fn is not None
+                else None
+            )
             data_refs.append(
                 {
-                    "function": functions[0].name if functions else None,
+                    "function": fn.name if fn is not None else None,
                     "address": hex(ref_addr),
+                    "caller_function": caller,
                 }
             )
         return {"address": hex(address), "code_refs": code_refs, "data_refs": data_refs}
@@ -2108,6 +2168,8 @@ class BinaryNinjaBridge:
             if no_crt:
                 if self._NO_CRT_PATTERNS.match(value):
                     continue
+                if len(value) >= 2 and len(set(value)) == 1:
+                    continue
                 secs = bv.get_sections_at(address) if hasattr(bv, "get_sections_at") else []
                 if any(getattr(s, "name", "") == ".text" for s in secs):
                     continue
@@ -2115,6 +2177,7 @@ class BinaryNinjaBridge:
             entry = {
                 "address": hex(address),
                 "length": length,
+                "chars": len(value),
                 "type": string_type,
                 "value": value,
             }

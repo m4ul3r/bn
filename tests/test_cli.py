@@ -224,12 +224,10 @@ def test_function_commands_accept_paging_flags():
     assert args.query == "attach"
 
 
-def test_callsites_requires_exactly_one_scope_flag():
+def test_callsites_both_scope_flags_still_rejected():
     parser = bn.cli.build_parser()
 
-    with pytest.raises(SystemExit):
-        parser.parse_args(["callsites", "crt_rand"])
-
+    # Passing both scope flags is still a mutex violation handled by argparse.
     with pytest.raises(SystemExit):
         parser.parse_args(
             [
@@ -241,6 +239,23 @@ def test_callsites_requires_exactly_one_scope_flag():
                 "functions.txt",
             ]
         )
+
+
+def test_callsites_missing_scope_raises_actionable_error(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        raise AssertionError("bridge should not be called when scope is missing")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["callsites", "crt_rand", "--target", "active"])
+
+    # BridgeError surfaces as a nonzero exit with a human-facing message.
+    assert rc != 0
+    combined = capsys.readouterr()
+    text = combined.err + combined.out
+    assert "--within" in text
+    assert "--within-file" in text
+    assert "bn xrefs crt_rand" in text
 
 
 def test_function_info_uses_active_target_and_text_renderer(monkeypatch, capsys):
@@ -582,8 +597,20 @@ def test_xrefs_text_format_renders_summary(monkeypatch, capsys):
             "ok": True,
             "result": {
                 "address": "0x401000",
-                "code_refs": [{"address": "0x402000", "function": "sub_402000"}],
-                "data_refs": [{"address": "0x403000", "function": "sub_403000"}],
+                "code_refs": [
+                    {
+                        "address": "0x402000",
+                        "function": "sub_402000",
+                        "caller_function": {"address": "0x401f00", "name": "sub_402000"},
+                    }
+                ],
+                "data_refs": [
+                    {
+                        "address": "0x403000",
+                        "function": "sub_403000",
+                        "caller_function": {"address": "0x402f00", "name": "sub_403000"},
+                    }
+                ],
             },
         }
 
@@ -594,8 +621,10 @@ def test_xrefs_text_format_renders_summary(monkeypatch, capsys):
     assert rc == 0
     output = capsys.readouterr().out
     assert "xrefs to 0x401000" in output
-    assert "- 0x402000 | sub_402000" in output
-    assert "- 0x403000 | sub_403000" in output
+    assert "code refs: 1 site across 1 function" in output
+    assert "0x401f00  sub_402000  (1 site: 0x402000)" in output
+    assert "data refs: 1 site across 1 function" in output
+    assert "0x402f00  sub_403000  (1 site: 0x403000)" in output
 
 
 def test_callsites_routes_within_scope_and_renders_text(monkeypatch, capsys):
@@ -854,9 +883,58 @@ def test_proto_get_renders_prototype_text(monkeypatch, capsys):
     assert capsys.readouterr().out == "int32_t sub_401000(int32_t arg1)\n"
 
 
-def test_local_list_renders_ids(monkeypatch, capsys):
+def test_local_list_text_is_slim(monkeypatch, capsys):
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         assert op == "list_locals"
+        return {
+            "ok": True,
+            "result": {
+                "function": {"name": "sub_401000", "address": "0x401000"},
+                "locals": [
+                    {
+                        "name": "arg1",
+                        "type": "int32_t",
+                        "storage": 4,
+                        "source_type": "StackVariableSourceType",
+                        "index": 0,
+                        "identifier": 1,
+                        "is_parameter": True,
+                        "local_id": "0x401000:param:stack:4:0:1",
+                    },
+                    {
+                        "name": "var_c",
+                        "type": "char*",
+                        "storage": -12,
+                        "source_type": "StackVariableSourceType",
+                        "index": 0,
+                        "identifier": 2,
+                        "is_parameter": False,
+                        "local_id": "0x401000:local:stack:-12:0:2",
+                    },
+                ],
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["local", "list", "--format", "text", "--target", "active", "sub_401000"])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "(1 params, 1 locals)" in output
+    assert "params:" in output
+    assert "locals:" in output
+    assert "arg1" in output and "int32_t" in output
+    assert "var_c" in output and "char*" in output
+    # internal IDs must not leak into text mode
+    assert "0x401000:param:stack:4:0:1" not in output
+    assert "storage=" not in output
+    assert "source=" not in output
+    assert "identifier=" not in output
+
+
+def test_local_list_json_retains_ids(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         return {
             "ok": True,
             "result": {
@@ -877,13 +955,11 @@ def test_local_list_renders_ids(monkeypatch, capsys):
         }
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
-
-    rc = bn.cli.main(["local", "list", "--format", "text", "--target", "active", "sub_401000"])
-
+    rc = bn.cli.main(["local", "list", "--format", "json", "--target", "active", "sub_401000"])
     assert rc == 0
-    output = capsys.readouterr().out
-    assert "locals:" in output
-    assert "id=0x401000:param:stack:4:0:1" in output
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["locals"][0]["local_id"] == "0x401000:param:stack:4:0:1"
+    assert payload["locals"][0]["identifier"] == 1
 
 
 def test_bundle_function_out_path_is_bridge_owned(monkeypatch, tmp_path, capsys):
@@ -1566,3 +1642,45 @@ def test_imports_text_shows_kind_for_non_function(monkeypatch, capsys):
     assert "printf" in output
     assert "(data)" in output
     assert "(function)" not in output  # function kind is not shown
+
+
+def test_close_warns_on_unsaved_changes(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        assert op == "close_binary"
+        return {
+            "ok": True,
+            "result": {
+                "closed": [{"path": "/tmp/foo.bndb", "unsaved": True}],
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["close", "--format", "text"])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "closed: /tmp/foo.bndb" in output
+    assert "unsaved" in output.lower()
+    assert "bn save" in output
+
+
+def test_close_silent_when_clean(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        assert op == "close_binary"
+        return {
+            "ok": True,
+            "result": {
+                "closed": [{"path": "/tmp/foo.bndb", "unsaved": False}],
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["close", "--format", "text"])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "closed: /tmp/foo.bndb" in output
+    assert "warning" not in output.lower()
+    assert "unsaved" not in output.lower()
