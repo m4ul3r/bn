@@ -10,7 +10,14 @@ from typing import Any, Callable
 
 from . import session_state
 from .output import render_artifact_envelope, write_output_result
-from .paths import claude_skills_dir, plugin_install_dir, plugin_source_dir, repo_root
+from .paths import (
+    claude_skills_dir,
+    codex_home,
+    codex_skills_dir,
+    plugin_install_dir,
+    plugin_source_dir,
+    repo_root,
+)
 from .transport import (
     BridgeError,
     _send_request_to_instance,
@@ -174,7 +181,7 @@ _COMMANDS: list[dict[str, Any]] = []
 
 _GROUP_HELP: dict[tuple[str, ...], str] = {
     ("plugin",): "Install the Binary Ninja companion plugin",
-    ("skill",): "Install the bundled Claude Code skill",
+    ("skill",): "Install the bundled agent skills",
     ("session",): "Manage bridge sessions",
     ("instance",): "Pin or clear the active bridge instance",
     ("target",): "Inspect Binary Ninja targets",
@@ -1171,6 +1178,27 @@ def _render_py_exec_text(value: Any) -> str:
     return "\n\n".join(parts)
 
 
+def _render_skill_install_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+
+    installed = value.get("installed_destinations")
+    skipped = value.get("skipped_destinations")
+    lines = []
+
+    if isinstance(installed, list) and installed:
+        lines.append(f"Installed skills ({value.get('mode', 'unknown')}):")
+        lines.extend(f"- {dest}" for dest in installed)
+    else:
+        lines.append("Skills already installed.")
+
+    if isinstance(skipped, list) and skipped:
+        lines.append("Skipped existing destinations:")
+        lines.extend(f"- {dest}" for dest in skipped)
+
+    return "\n".join(lines) + "\n"
+
+
 def _parse_line_range(value: str) -> tuple[int, int]:
     parts = value.split(":")
     if len(parts) != 2:
@@ -1289,7 +1317,14 @@ def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
         os.symlink(source, dest, target_is_directory=True)
 
 
-@command("skill", "install", help="Install the bundled Claude Code skills", fmt="json",
+def _check_install_destination(dest: Path, *, force: bool) -> None:
+    if force:
+        return
+    if dest.exists() or dest.is_symlink():
+        raise BridgeError(f"Destination already exists: {dest}")
+
+
+@command("skill", "install", help="Install the bundled agent skills", fmt="text",
          args=[
              arg("--dest", type=Path, help="Custom install destination"),
              arg("--mode", choices=("symlink", "copy"), default="symlink"),
@@ -1297,25 +1332,57 @@ def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
          ])
 def _skill_install(args: argparse.Namespace) -> int:
     skills_root = repo_root() / "skills"
+    explicit_dest = args.dest is not None
+    target_roots = [args.dest] if explicit_dest else _default_skill_install_roots()
+    install_plan = []
     results = []
     for source in sorted(skills_root.iterdir()):
         if not source.is_dir() or not (source / "SKILL.md").exists():
             continue
-        dest = (args.dest / source.name) if args.dest else (claude_skills_dir() / source.name)
-        _install_tree(source, dest, mode=args.mode, force=args.force)
-        results.append({"skill": source.name, "source": str(source), "destination": str(dest)})
+        destinations = []
+        for target_root in target_roots:
+            dest = target_root / source.name
+            install_plan.append((source, dest))
+            destinations.append(str(dest))
+        results.append(
+            {
+                "skill": source.name,
+                "source": str(source),
+                "destination": destinations[0],
+                "destinations": destinations,
+            }
+        )
 
-    _render_result(
-        {
-            "installed": True,
-            "mode": args.mode,
-            "skills": results,
-        },
-        fmt=args.format,
-        out_path=args.out,
-        stem="skill-install",
-    )
+    pending_installs = []
+    skipped_destinations = []
+    for source, dest in install_plan:
+        if not explicit_dest and not args.force and (dest.exists() or dest.is_symlink()):
+            skipped_destinations.append(str(dest))
+            continue
+        _check_install_destination(dest, force=args.force)
+        pending_installs.append((source, dest))
+
+    for source, dest in pending_installs:
+        _install_tree(source, dest, mode=args.mode, force=args.force)
+
+    result = {
+        "installed": True,
+        "mode": args.mode,
+        "installed_destinations": [str(dest) for _, dest in pending_installs],
+        "skipped_destinations": skipped_destinations,
+        "skills": results,
+    }
+    if args.format == "text":
+        result = _render_skill_install_text(result)
+    _render_result(result, fmt=args.format, out_path=args.out, stem="skill-install")
     return 0
+
+
+def _default_skill_install_roots() -> list[Path]:
+    roots = [claude_skills_dir()]
+    if codex_home().is_dir():
+        roots.append(codex_skills_dir())
+    return roots
 
 
 @command("load", help="Load a binary into headless bridge",

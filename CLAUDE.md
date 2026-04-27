@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 uv tool install -e .          # Install CLI on PATH
 bn plugin install              # Symlink bridge into BN plugins dir
-bn skill install               # Symlink Claude Code skills into ~/.claude/skills/
+bn skill install               # Symlink skills into ~/.claude/skills/ and, when present, ~/.codex/skills/
 
 uv run bn --help               # Run CLI from repo without installing
 ```

@@ -11,7 +11,7 @@
 
 ## Install
 
-Recommended setup: install the CLI, the Binary Ninja companion plugin, and the bundled Claude Code skill.
+Recommended setup: install the CLI, the Binary Ninja companion plugin, and the bundled agent skills.
 
 Install the CLI on your PATH:
 
@@ -27,13 +27,13 @@ bn plugin install
 
 That links [`plugin/bn_agent_bridge`](/Users/banteg/dev/banteg/bn/plugin/bn_agent_bridge) into your Binary Ninja plugins directory.
 
-Install the bundled Claude Code skill:
+Install the bundled Claude Code/Codex skills:
 
 ```bash
 bn skill install
 ```
 
-That symlinks [`skills/bn`](/Users/banteg/dev/banteg/bn/skills/bn) into `~/.claude/skills/bn` by default. Use `--mode copy` if you want a standalone copy instead. Restart Claude Code to pick up a new or renamed skill.
+That symlinks the bundled skills into `~/.claude/skills/` by default. If `~/.codex/` exists, it also installs them into `~/.codex/skills/`. Use `--mode copy` if you want standalone copies instead. Restart your agent to pick up a new or renamed skill.
 
 If the plugin code changes, reload Binary Ninja Python plugins or restart Binary Ninja.
 

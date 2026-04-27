@@ -21,6 +21,13 @@ def claude_home() -> Path:
     return Path.home() / ".claude"
 
 
+def codex_home() -> Path:
+    env = os.environ.get("CODEX_HOME")
+    if env:
+        return Path(env).expanduser()
+    return Path.home() / ".codex"
+
+
 def cache_home() -> Path:
     env = os.environ.get("BN_CACHE_DIR")
     if env:
@@ -112,4 +119,7 @@ def plugin_install_dir() -> Path:
 def claude_skills_dir() -> Path:
     return claude_home() / "skills"
 
+
+def codex_skills_dir() -> Path:
+    return codex_home() / "skills"
 

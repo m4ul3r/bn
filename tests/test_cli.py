@@ -204,7 +204,7 @@ def test_parser_defaults_reads_to_text_and_mutations_to_json():
     assert parser.parse_args(["decompile", "sub_401000"]).target is None
     assert parser.parse_args(["decompile", "sub_401000"]).format == "text"
     assert parser.parse_args(["plugin", "install"]).format == "json"
-    assert parser.parse_args(["skill", "install"]).format == "json"
+    assert parser.parse_args(["skill", "install"]).format == "text"
     assert parser.parse_args(["skill", "install"]).mode == "symlink"
     assert parser.parse_args(["bundle", "function", "sub_401000"]).format == "json"
     assert parser.parse_args(["symbol", "rename", "sub_401000", "player_update"]).format == "json"
@@ -449,6 +449,97 @@ def test_skill_install_copy_mode(tmp_path):
     assert (destination / "bn" / "agents" / "openai.yaml").exists()
     assert (destination / "bn-re" / "SKILL.md").exists()
     assert (destination / "bn-vr" / "SKILL.md").exists()
+
+
+def test_skill_install_defaults_to_claude_only_without_codex_home(tmp_path, monkeypatch):
+    claude_root = tmp_path / "claude" / "skills"
+    codex_home = tmp_path / "codex"
+    codex_root = codex_home / "skills"
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: claude_root)
+    monkeypatch.setattr(bn.cli, "codex_home", lambda: codex_home)
+    monkeypatch.setattr(bn.cli, "codex_skills_dir", lambda: codex_root)
+
+    rc = bn.cli.main(["skill", "install", "--mode", "copy"])
+
+    assert rc == 0
+    assert (claude_root / "bn" / "SKILL.md").exists()
+    assert not codex_root.exists()
+
+
+def test_skill_install_defaults_to_claude_and_codex_when_codex_home_exists(tmp_path, monkeypatch):
+    claude_root = tmp_path / "claude" / "skills"
+    codex_home = tmp_path / "codex"
+    codex_root = codex_home / "skills"
+    codex_home.mkdir()
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: claude_root)
+    monkeypatch.setattr(bn.cli, "codex_home", lambda: codex_home)
+    monkeypatch.setattr(bn.cli, "codex_skills_dir", lambda: codex_root)
+
+    rc = bn.cli.main(["skill", "install", "--mode", "copy"])
+
+    assert rc == 0
+    assert (claude_root / "bn" / "SKILL.md").exists()
+    assert (codex_root / "bn" / "SKILL.md").exists()
+    assert (codex_root / "bn-re" / "SKILL.md").exists()
+    assert (codex_root / "bn-vr" / "SKILL.md").exists()
+
+
+def test_skill_install_defaults_skip_existing_destinations(tmp_path, monkeypatch):
+    claude_root = tmp_path / "claude" / "skills"
+    codex_home = tmp_path / "codex"
+    codex_root = codex_home / "skills"
+    codex_home.mkdir()
+    (claude_root / "bn").mkdir(parents=True)
+    (claude_root / "bn-re").mkdir()
+    (claude_root / "bn-vr").mkdir()
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: claude_root)
+    monkeypatch.setattr(bn.cli, "codex_home", lambda: codex_home)
+    monkeypatch.setattr(bn.cli, "codex_skills_dir", lambda: codex_root)
+
+    rc = bn.cli.main(["skill", "install", "--mode", "copy"])
+
+    assert rc == 0
+    assert (codex_root / "bn" / "SKILL.md").exists()
+    assert (codex_root / "bn-re" / "SKILL.md").exists()
+    assert (codex_root / "bn-vr" / "SKILL.md").exists()
+
+
+def test_skill_install_default_output_is_text(tmp_path, monkeypatch, capsys):
+    claude_root = tmp_path / "claude" / "skills"
+    codex_home = tmp_path / "codex"
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: claude_root)
+    monkeypatch.setattr(bn.cli, "codex_home", lambda: codex_home)
+
+    rc = bn.cli.main(["skill", "install", "--mode", "copy"])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert output.startswith("Installed skills (copy):\n")
+    assert "- " + str(claude_root / "bn") in output
+    assert '"installed"' not in output
+
+
+def test_skill_install_json_output_remains_available(tmp_path, monkeypatch, capsys):
+    claude_root = tmp_path / "claude" / "skills"
+    codex_home = tmp_path / "codex"
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: claude_root)
+    monkeypatch.setattr(bn.cli, "codex_home", lambda: codex_home)
+
+    rc = bn.cli.main(["skill", "install", "--mode", "copy", "--format", "json"])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert '"installed": true' in output
+    assert '"installed_destinations"' in output
+
+
+def test_skill_install_custom_dest_still_fails_when_destination_exists(tmp_path):
+    destination = tmp_path / "skill-copy"
+    (destination / "bn").mkdir(parents=True)
+
+    rc = bn.cli.main(["skill", "install", "--mode", "copy", "--dest", str(destination)])
+
+    assert rc == 2
 
 
 def test_target_list_text_format_renders_summary(monkeypatch, capsys):
