@@ -211,6 +211,42 @@ def test_parser_defaults_reads_to_text_and_mutations_to_json():
     assert parser.parse_args(["types", "declare", "typedef struct Player { int hp; } Player;"]).format == "json"
 
 
+def test_target_flag_accepted_before_subcommand():
+    parser = bn.cli.build_parser()
+
+    # Names with dots, names that collide with subcommand strings, and
+    # interleaving with --instance must all parse with -t before the subcommand.
+    cases = [
+        (["-t", "pam_qnx.so.2", "function", "list"], "pam_qnx.so.2", None),
+        (["--target", "pam_qnx.so.2", "function", "list"], "pam_qnx.so.2", None),
+        (["-t", "session", "function", "list"], "session", None),
+        (["-t", "function", "function", "list"], "function", None),
+        (["--instance", "X", "-t", "pam_qnx.so.2", "function", "list"], "pam_qnx.so.2", "X"),
+        (["-t", "pam_qnx.so.2", "--instance", "X", "function", "list"], "pam_qnx.so.2", "X"),
+    ]
+    for argv, expected_target, expected_instance in cases:
+        args = parser.parse_args(argv)
+        assert args.target == expected_target, argv
+        assert args.instance == expected_instance, argv
+
+
+def test_target_flag_after_subcommand_still_works():
+    parser = bn.cli.build_parser()
+
+    # The pre-existing form (target after subcommand) must keep working.
+    args = parser.parse_args(["function", "list", "-t", "pam_qnx.so.2"])
+    assert args.target == "pam_qnx.so.2"
+
+
+def test_target_flag_root_does_not_clobber_subparser_value():
+    parser = bn.cli.build_parser()
+
+    # Root-level -t followed by a subparser-level -t: the later one wins
+    # (argparse default), and neither None nor SUPPRESS leaks through.
+    args = parser.parse_args(["-t", "first", "function", "list", "-t", "second"])
+    assert args.target == "second"
+
+
 def test_function_commands_accept_paging_flags():
     parser = bn.cli.build_parser()
 
@@ -1684,3 +1720,308 @@ def test_close_silent_when_clean(monkeypatch, capsys):
     assert "closed: /tmp/foo.bndb" in output
     assert "warning" not in output.lower()
     assert "unsaved" not in output.lower()
+
+
+# --- Sticky instance/target ---
+
+
+@pytest.fixture
+def tmp_session(tmp_path, monkeypatch):
+    """Isolate session-state file per test by redirecting BN_CACHE_DIR and cwd."""
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+def _fake_bridge_instance(instance_id="abc123", pid=111):
+    from pathlib import Path as _Path
+
+    from bn.transport import BridgeInstance
+
+    return BridgeInstance(
+        pid=pid,
+        socket_path=_Path(f"/tmp/{instance_id}.sock"),
+        registry_path=_Path(f"/tmp/{instance_id}.json"),
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at="2026-01-01T00:00:00Z",
+        meta={},
+        instance_id=instance_id,
+    )
+
+
+def test_instance_use_writes_state(tmp_session, monkeypatch, capsys):
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [_fake_bridge_instance("abc123")])
+
+    rc = bn.cli.main(["instance", "use", "abc123"])
+
+    assert rc == 0
+    state = bn.session_state.read()
+    assert state["instance_id"] == "abc123"
+    assert capsys.readouterr().out.strip() == "instance: abc123"
+
+
+def test_instance_use_rejects_unknown_id(tmp_session, monkeypatch, capsys):
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [_fake_bridge_instance("abc123")])
+
+    rc = bn.cli.main(["instance", "use", "not-running"])
+
+    assert rc == 2
+    assert "No running bridge instance" in capsys.readouterr().err
+    assert bn.session_state.read() == {}
+
+
+def test_instance_clear_removes_state(tmp_session, monkeypatch, capsys):
+    bn.session_state.update(instance_id="abc123")
+    assert bn.session_state.read()["instance_id"] == "abc123"
+
+    rc = bn.cli.main(["instance", "clear"])
+
+    assert rc == 0
+    assert "instance_id" not in bn.session_state.read()
+    assert capsys.readouterr().out.strip() == "cleared"
+
+
+def test_target_use_writes_state_without_bridge_call(tmp_session, monkeypatch, capsys):
+    def fail(*_a, **_kw):
+        raise AssertionError("target use must not call the bridge")
+
+    monkeypatch.setattr(bn.cli, "send_request", fail)
+
+    rc = bn.cli.main(["target", "use", "pam_qnx.so.2"])
+
+    assert rc == 0
+    assert bn.session_state.read()["target"] == "pam_qnx.so.2"
+    assert "target: pam_qnx.so.2" in capsys.readouterr().out
+
+
+def test_target_clear_removes_state(tmp_session, capsys):
+    bn.session_state.update(target="pam_qnx.so.2")
+
+    rc = bn.cli.main(["target", "clear"])
+
+    assert rc == 0
+    assert "target" not in bn.session_state.read()
+    assert capsys.readouterr().out.strip() == "cleared"
+
+
+def test_sticky_instance_fills_when_flag_absent(tmp_session, monkeypatch):
+    bn.session_state.update(instance_id="sticky_inst")
+
+    captured = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        captured.append(instance_id)
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": "1", "selector": "x"}]}
+        return {"ok": True, "result": []}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    bn.cli.main(["function", "list"])
+
+    assert "sticky_inst" in captured
+
+
+def test_cli_instance_flag_overrides_sticky(tmp_session, monkeypatch):
+    bn.session_state.update(instance_id="sticky_inst")
+
+    captured = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        captured.append(instance_id)
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": "1", "selector": "x"}]}
+        return {"ok": True, "result": []}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    bn.cli.main(["--instance", "explicit", "function", "list"])
+
+    assert "explicit" in captured
+    assert "sticky_inst" not in captured
+
+
+def test_env_var_overrides_sticky_instance(tmp_session, monkeypatch):
+    bn.session_state.update(instance_id="sticky_inst")
+    monkeypatch.setenv("BN_INSTANCE", "env_inst")
+
+    captured = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        captured.append(instance_id)
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": "1", "selector": "x"}]}
+        return {"ok": True, "result": []}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    bn.cli.main(["function", "list"])
+
+    assert "env_inst" in captured
+    assert "sticky_inst" not in captured
+
+
+def test_sticky_target_fills_when_flag_absent(tmp_session, monkeypatch):
+    bn.session_state.update(target="pam_qnx.so.2")
+
+    captured = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        captured.append(target)
+        return {"ok": True, "result": []}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    bn.cli.main(["function", "list"])
+
+    assert "pam_qnx.so.2" in captured
+
+
+def test_cli_target_flag_overrides_sticky(tmp_session, monkeypatch):
+    bn.session_state.update(target="sticky_tgt")
+
+    captured = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        captured.append(target)
+        return {"ok": True, "result": []}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    bn.cli.main(["function", "list", "-t", "explicit_tgt"])
+
+    assert "explicit_tgt" in captured
+    assert "sticky_tgt" not in captured
+
+
+def test_session_state_survives_subdir_navigation(tmp_session, monkeypatch):
+    # Mark tmp_session as a project root via .git, then descend into subdirs.
+    (tmp_session / ".git").mkdir()
+    bn.session_state.update(target="pam_qnx.so.2")
+
+    sub = tmp_session / "src" / "deep"
+    sub.mkdir(parents=True)
+    monkeypatch.chdir(sub)
+
+    assert bn.session_state.read()["target"] == "pam_qnx.so.2"
+
+
+def test_malformed_session_state_treated_as_empty(tmp_session):
+    from bn.paths import session_state_path, sessions_dir
+
+    sessions_dir().mkdir(parents=True, exist_ok=True)
+    session_state_path().write_text("{not json")
+
+    assert bn.session_state.read() == {}
+
+
+def test_session_list_marks_sticky(tmp_session, monkeypatch, capsys):
+    monkeypatch.setattr(
+        bn.cli, "list_instances",
+        lambda: [_fake_bridge_instance("aaaa1111"), _fake_bridge_instance("bbbb2222", pid=222)],
+    )
+    bn.session_state.update(instance_id="aaaa1111")
+
+    rc = bn.cli.main(["session", "list", "--format", "json"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    by_id = {entry["instance_id"]: entry for entry in parsed["instances"]}
+    assert by_id["aaaa1111"].get("sticky") is True
+    assert "sticky" not in by_id["bbbb2222"]
+
+
+def test_target_list_marks_sticky(tmp_session, monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        return {
+            "ok": True,
+            "result": [
+                {"target_id": "1", "selector": "foo.so", "filename": "/p/foo.so"},
+                {"target_id": "2", "selector": "bar.so", "filename": "/p/bar.so"},
+            ],
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    bn.session_state.update(target="foo.so")
+
+    rc = bn.cli.main(["target", "list", "--format", "json"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    by_sel = {entry["selector"]: entry for entry in parsed}
+    assert by_sel["foo.so"].get("sticky") is True
+    assert "sticky" not in by_sel["bar.so"]
+
+
+def test_stale_sticky_instance_emits_hint(tmp_session, monkeypatch, capsys):
+    bn.session_state.update(instance_id="dead_inst")
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        from bn.transport import BridgeError as _BE
+        raise _BE(f"No bridge instance found with id: {instance_id}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["function", "list"])
+    err = capsys.readouterr().err
+
+    assert rc == 2
+    assert "No bridge instance found with id: dead_inst" in err
+    assert "bn instance clear" in err
+
+
+def test_sticky_hint_on_failed_contact(tmp_session, monkeypatch, capsys):
+    """Bridge stopped mid-flight surfaces a transport error, not a registry miss."""
+    bn.session_state.update(instance_id="dying_inst")
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        from bn.transport import BridgeError as _BE
+        raise _BE(
+            "Failed to contact Binary Ninja bridge pid 17881 at /tmp/x.sock: "
+            "[Errno 104] Connection reset by peer"
+        )
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["target", "list"])
+    err = capsys.readouterr().err
+
+    assert rc == 2
+    assert "Failed to contact" in err
+    assert "bn instance clear" in err
+
+
+def test_sticky_hint_on_bridge_timeout(tmp_session, monkeypatch, capsys):
+    bn.session_state.update(instance_id="slow_inst")
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        from bn.transport import BridgeError as _BE
+        raise _BE(
+            "Timed out waiting for Binary Ninja bridge pid 9999 at /tmp/x.sock after 30.0s"
+        )
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["target", "list"])
+    err = capsys.readouterr().err
+
+    assert rc == 2
+    assert "Timed out" in err
+    assert "bn instance clear" in err
+
+
+def test_sticky_hint_skipped_for_unrelated_errors(tmp_session, monkeypatch, capsys):
+    """Bridge-side analysis errors must not get the sticky-clear hint."""
+    bn.session_state.update(instance_id="alive_inst")
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        from bn.transport import BridgeError as _BE
+        raise _BE("Function not found: nonexistent_symbol")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["function", "info", "nonexistent_symbol"])
+    err = capsys.readouterr().err
+
+    assert rc == 2
+    assert "Function not found" in err
+    assert "bn instance clear" not in err

@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
+from . import session_state
 from .output import render_artifact_envelope, write_output_result
 from .paths import claude_skills_dir, plugin_install_dir, plugin_source_dir, repo_root
 from .transport import (
@@ -151,6 +152,7 @@ def _target_option(
     parser: argparse.ArgumentParser,
     *,
     required: bool,
+    is_root: bool = False,
 ) -> None:
     kwargs: dict[str, Any] = {
         "help": (
@@ -159,6 +161,8 @@ def _target_option(
         ),
         "required": required,
     }
+    if not is_root:
+        kwargs["default"] = argparse.SUPPRESS
     parser.add_argument("-t", "--target", **kwargs)
 
 
@@ -172,6 +176,7 @@ _GROUP_HELP: dict[tuple[str, ...], str] = {
     ("plugin",): "Install the Binary Ninja companion plugin",
     ("skill",): "Install the bundled Claude Code skill",
     ("session",): "Manage bridge sessions",
+    ("instance",): "Pin or clear the active bridge instance",
     ("target",): "Inspect Binary Ninja targets",
     ("function",): "Function discovery helpers",
     ("bundle",): "Export reusable bundles",
@@ -706,8 +711,10 @@ def _render_session_list_text(value: Any) -> str:
         if not isinstance(item, dict):
             lines.append(_render_fallback_text(item))
             continue
-        parts = [str(item.get("selector") or item.get("instance_id") or "<unknown>")]
-        parts.append(f"pid={item.get('pid', '<unknown>')}")
+        head = str(item.get("selector") or item.get("instance_id") or "<unknown>")
+        if item.get("sticky"):
+            head += " [sticky]"
+        parts = [head, f"pid={item.get('pid', '<unknown>')}"]
         rss = item.get("rss_mb")
         if rss is not None:
             parts.append(f"rss={rss}MB")
@@ -730,6 +737,8 @@ def _render_target_summary(value: dict[str, Any]) -> str:
     lines = [f"{prefix}{label}"]
     if value.get("active"):
         lines[0] += " [active]"
+    if value.get("sticky"):
+        lines[0] += " [sticky]"
 
     details = [
         ("target", value.get("target_id")),
@@ -1433,18 +1442,22 @@ def _rss_mb(pid: int) -> float | None:
 @command("session", "list", help="List running bridge sessions")
 def _session_list(args: argparse.Namespace) -> int:
     instances = list_instances()
+    sticky_id = session_state.read().get("instance_id")
     entries = []
     total_rss = 0.0
     for inst in instances:
         rss = _rss_mb(inst.pid)
+        selector = instance_selector(inst)
         entry: dict[str, Any] = {
-            "selector": instance_selector(inst),
+            "selector": selector,
             "instance_id": inst.instance_id,
             "pid": inst.pid,
             "socket_path": str(inst.socket_path),
             "started_at": inst.started_at,
             "rss_mb": round(rss, 1) if rss is not None else None,
         }
+        if sticky_id and (inst.instance_id == sticky_id or selector == sticky_id):
+            entry["sticky"] = True
         entries.append(entry)
         if rss is not None:
             total_rss += rss
@@ -1458,16 +1471,91 @@ def _session_list(args: argparse.Namespace) -> int:
     return 0
 
 
+@command("instance", "use", help="Pin a bridge instance for subsequent calls", fmt="text",
+         args=[arg("instance_id", help="Instance ID to pin (see `bn session list`)")])
+def _instance_use(args: argparse.Namespace) -> int:
+    instance_id = args.instance_id
+    instances = list_instances()
+    matches = [
+        inst for inst in instances
+        if inst.instance_id == instance_id or instance_selector(inst) == instance_id
+    ]
+    if not matches:
+        raise BridgeError(f"No running bridge instance with id: {instance_id}")
+    resolved = matches[0].instance_id
+    session_state.update(instance_id=resolved)
+    result = {"instance_id": resolved, "set": True}
+    if args.format == "text":
+        result = f"instance: {resolved}"
+    _render_result(result, fmt=args.format, out_path=args.out, stem="instance-use")
+    return 0
+
+
+@command("instance", "clear", help="Clear the pinned bridge instance", fmt="text")
+def _instance_clear(args: argparse.Namespace) -> int:
+    session_state.update(instance_id=None)
+    result = {"instance_id": None, "set": False}
+    if args.format == "text":
+        result = "cleared"
+    _render_result(result, fmt=args.format, out_path=args.out, stem="instance-clear")
+    return 0
+
+
 @command("target", "list", help="List open BinaryView targets")
 def _target_list(args: argparse.Namespace) -> int:
-    return _call(
-        args,
+    response = send_request(
         "list_targets",
-        {},
-        require_target=False,
-        text_renderer=_render_target_list_text,
-        stem="targets",
+        params={},
+        instance_id=getattr(args, "instance", None),
     )
+    result = response["result"]
+    sticky = session_state.read().get("target")
+    if sticky and isinstance(result, list):
+        for item in result:
+            if isinstance(item, dict) and _target_matches(item, sticky):
+                item["sticky"] = True
+    if args.format == "text":
+        result = _render_target_list_text(result)
+    _render_result(result, fmt=args.format, out_path=args.out, stem="targets")
+    return 0
+
+
+def _target_matches(item: dict[str, Any], selector: str) -> bool:
+    """True when *selector* names this target via any of its identifiers."""
+    if selector == item.get("selector"):
+        return True
+    if selector == str(item.get("target_id", "")):
+        return True
+    if selector == str(item.get("view_id", "")):
+        return True
+    filename = item.get("filename")
+    if isinstance(filename, str):
+        if selector == filename:
+            return True
+        if selector == os.path.basename(filename):
+            return True
+    return False
+
+
+@command("target", "use", help="Pin a target selector for subsequent calls", fmt="text",
+         args=[arg("selector", help="Target selector to pin (see `bn target list`)")])
+def _target_use(args: argparse.Namespace) -> int:
+    session_state.update(target=args.selector)
+    result = {"target": args.selector, "set": True}
+    if args.format == "text":
+        result = f"target: {args.selector}"
+    _render_result(result, fmt=args.format, out_path=args.out, stem="target-use")
+    return 0
+
+
+@command("target", "clear", help="Clear the pinned target", fmt="text")
+def _target_clear(args: argparse.Namespace) -> int:
+    session_state.update(target=None)
+    result = {"target": None, "set": False}
+    if args.format == "text":
+        result = "cleared"
+    _render_result(result, fmt=args.format, out_path=args.out, stem="target-clear")
+    return 0
 
 
 @command("target", "info", help="Show one target", target=True)
@@ -2244,8 +2332,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser = BnArgumentParser(prog="bn", description="Agent-friendly Binary Ninja CLI")
     parser.set_defaults(handler=None)
     _instance_option(parser, is_root=True)
+    _target_option(parser, required=False, is_root=True)
     _build_from_commands(parser)
     return parser
+
+
+def _apply_sticky_defaults(args: argparse.Namespace) -> None:
+    """Fill unset --instance / --target from per-project sticky state."""
+    state = session_state.read()
+    if not getattr(args, "instance", None):
+        sticky_instance = state.get("instance_id")
+        if sticky_instance:
+            args.instance = sticky_instance
+            args._sticky_instance = True
+    if not getattr(args, "target", None):
+        sticky_target = state.get("target")
+        if sticky_target:
+            args.target = sticky_target
+            args._sticky_target = True
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2257,8 +2361,23 @@ def main(argv: list[str] | None = None) -> int:
         selected_parser.print_help()
         return 1
 
+    _apply_sticky_defaults(args)
+
     try:
         return handler(args)
     except BridgeError as exc:
-        print(str(exc), file=sys.stderr)
+        msg = str(exc)
+        if getattr(args, "_sticky_instance", False) and _looks_like_dead_bridge(msg):
+            msg += "\n\nThis came from sticky state. Clear it with `bn instance clear`."
+        print(msg, file=sys.stderr)
         return 2
+
+
+def _looks_like_dead_bridge(msg: str) -> bool:
+    """True when *msg* points at a missing or unreachable bridge instance."""
+    markers = (
+        "No bridge instance found with id",
+        "Failed to contact Binary Ninja bridge",
+        "Timed out waiting for Binary Ninja bridge",
+    )
+    return any(marker in msg for marker in markers)

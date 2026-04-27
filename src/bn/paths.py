@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import platform
 import tempfile
@@ -41,6 +42,29 @@ def cache_home() -> Path:
 
 def instances_dir() -> Path:
     return cache_home() / "instances"
+
+
+def sessions_dir() -> Path:
+    return cache_home() / "sessions"
+
+
+def project_root(start: Path | None = None) -> Path:
+    """Walk up from *start* (default: cwd) looking for a `.git` ancestor.
+
+    Falls back to the resolved start directory when no marker is found, so
+    sticky state still has a stable key in non-git checkouts.
+    """
+    cwd = (start or Path.cwd()).resolve()
+    for candidate in (cwd, *cwd.parents):
+        if (candidate / ".git").exists():
+            return candidate
+    return cwd
+
+
+def session_state_path(start: Path | None = None) -> Path:
+    root = project_root(start)
+    digest = hashlib.sha256(str(root).encode("utf-8")).hexdigest()[:16]
+    return sessions_dir() / f"{digest}.json"
 
 
 def bridge_registry_path(instance_id: str | None = None) -> Path:
