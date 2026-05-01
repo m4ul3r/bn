@@ -622,6 +622,8 @@ def _render_load_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     lines = [f"loaded: {value.get('path', '<unknown>')}"]
+    for note in value.get("notes") or []:
+        lines.append(f"note: {note}")
     targets = list(value.get("targets") or [])
     if targets:
         lines.append("")
@@ -692,6 +694,8 @@ def _render_session_start_text(value: Any) -> str:
                     lines.append(f"- {item.get('path', '<unknown>')} [error: {error}]")
                 else:
                     lines.append(f"- {item.get('path', '<unknown>')}")
+                for note in item.get("notes") or []:
+                    lines.append(f"  note: {note}")
             else:
                 lines.append(f"- {_render_fallback_text(item)}")
     return "\n".join(lines)
@@ -1080,74 +1084,82 @@ def _format_operation_result(item: dict[str, Any]) -> str:
     return _render_fallback_text(item)
 
 
+def _format_op_summary(item: dict[str, Any]) -> str:
+    summary = _format_operation_result(item)
+    if item.get("status"):
+        summary += f" [{item['status']}]"
+    if item.get("changed") is False and item.get("status") not in (None, "noop"):
+        summary += " [no change]"
+    if item.get("message"):
+        summary += f" ({item['message']})"
+    return summary
+
+
 def _render_mutation_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
 
-    lines = [
-        f"preview: {bool(value.get('preview'))}",
-        f"success: {bool(value.get('success', True))}",
-        f"committed: {bool(value.get('committed', False))}",
-    ]
-    if value.get("message"):
-        lines.append(f"message: {value['message']}")
-    lines.extend(["", "results:"])
-    results = list(value.get("results") or [])
-    if results:
-        for item in results:
-            if isinstance(item, dict):
-                summary = _format_operation_result(item)
-                if item.get("status"):
-                    summary += f" [status={item['status']}]"
-                if "changed" in item:
-                    summary += f" [changed={bool(item['changed'])}]"
-                if item.get("message"):
-                    summary += f" ({item['message']})"
-                lines.append("- " + summary)
-                if item.get("requested"):
-                    lines.append("  requested: " + json.dumps(item["requested"], sort_keys=True))
-                if item.get("observed"):
-                    lines.append("  observed: " + json.dumps(item["observed"], sort_keys=True))
-            else:
-                lines.append("- " + _render_fallback_text(item))
-    else:
-        lines.append("- none")
+    preview = bool(value.get("preview"))
+    success = bool(value.get("success", True))
+    committed = bool(value.get("committed", False))
+    results = [r for r in (value.get("results") or []) if isinstance(r, dict)]
+    failed = [r for r in results if r.get("status") in FAILED_MUTATION_STATUSES]
 
-    lines.extend(["", "affected functions:"])
-    affected_functions = list(value.get("affected_functions") or [])
-    if affected_functions:
-        for item in affected_functions:
-            if not isinstance(item, dict):
-                lines.append("- " + _render_fallback_text(item))
-                continue
+    lines: list[str] = []
+
+    if not success or failed:
+        if not committed:
+            lines.append("rolled back: live verification failed")
+        if value.get("message"):
+            lines.append(value["message"])
+        for item in failed:
+            lines.append("failed: " + _format_op_summary(item))
+            if item.get("requested"):
+                lines.append("  requested: " + json.dumps(item["requested"], sort_keys=True))
+            if item.get("observed"):
+                lines.append("  observed: " + json.dumps(item["observed"], sort_keys=True))
+        lines.append("")
+    elif preview:
+        lines.append("preview: change applied + reverted")
+        if value.get("message"):
+            lines.append(value["message"])
+        lines.append("")
+
+    if results:
+        if len(results) == 1 and success and not failed and not preview:
+            lines.append(_format_op_summary(results[0]))
+        else:
+            lines.append(f"results ({len(results)}):")
+            for item in results:
+                lines.append("- " + _format_op_summary(item))
+
+    affected_functions = [a for a in (value.get("affected_functions") or []) if isinstance(a, dict)]
+    changed_functions = [a for a in affected_functions if a.get("changed")]
+    if changed_functions:
+        lines.extend(["", f"affected functions ({len(changed_functions)}):"])
+        for item in changed_functions:
             before_name = item.get("before_name") or item.get("after_name") or "<unknown>"
             after_name = item.get("after_name") or before_name
             summary = f"{item.get('address', '<unknown>')} {before_name}"
             if after_name != before_name:
                 summary += f" -> {after_name}"
-            summary += f" [changed={bool(item.get('changed'))}]"
             lines.append("- " + summary)
-            if item.get("diff"):
+            if preview and item.get("diff"):
                 lines.append(str(item["diff"]))
-    else:
-        lines.append("- none")
 
-    lines.extend(["", "affected types:"])
-    affected_types = list(value.get("affected_types") or [])
-    if affected_types:
-        for item in affected_types:
-            if not isinstance(item, dict):
-                lines.append("- " + _render_fallback_text(item))
-                continue
-            summary = f"{item.get('type_name', '<unknown>')} [changed={bool(item.get('changed'))}]"
+    affected_types = [a for a in (value.get("affected_types") or []) if isinstance(a, dict)]
+    changed_types = [a for a in affected_types if a.get("changed")]
+    if changed_types:
+        lines.extend(["", f"affected types ({len(changed_types)}):"])
+        for item in changed_types:
+            summary = item.get("type_name", "<unknown>")
             if item.get("message"):
                 summary += f" ({item['message']})"
             lines.append("- " + summary)
-            if item.get("layout_diff"):
+            if preview and item.get("layout_diff"):
                 lines.append(str(item["layout_diff"]))
-    else:
-        lines.append("- none")
-    return "\n".join(lines)
+
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _render_py_exec_text(value: Any) -> str:
@@ -1386,12 +1398,19 @@ def _default_skill_install_roots() -> list[Path]:
 
 
 @command("load", help="Load a binary into headless bridge",
-         args=[arg("path", help="Path to binary or BNDB file")])
+         args=[
+             arg("path", help="Path to binary or BNDB file"),
+             arg("--no-bndb", action="store_true",
+                 help="Don't auto-prefer a sibling .bndb file"),
+         ])
 def _load(args: argparse.Namespace) -> int:
     return _call(
         args,
         "load_binary",
-        {"path": str(Path(args.path).expanduser().resolve())},
+        {
+            "path": str(Path(args.path).expanduser().resolve()),
+            "prefer_bndb": not args.no_bndb,
+        },
         require_target=False,
         text_renderer=_render_load_text,
         stem="load",
@@ -1434,19 +1453,22 @@ def _save(args: argparse.Namespace) -> int:
          args=[
              arg("binaries", nargs="*", help="Binary file paths to preload"),
              arg("--instance-id", help="Use a specific instance ID (default: random)"),
+             arg("--no-bndb", action="store_true",
+                 help="Don't auto-prefer a sibling .bndb file"),
          ])
 def _session_start(args: argparse.Namespace) -> int:
     instance_id = getattr(args, "instance_id", None)
     instance = spawn_instance(instance_id)
 
     binaries = getattr(args, "binaries", None) or []
+    prefer_bndb = not args.no_bndb
     loaded = []
     for binary in binaries:
         resolved = str(Path(binary).expanduser().resolve())
         try:
             resp = send_request(
                 "load_binary",
-                params={"path": resolved},
+                params={"path": resolved, "prefer_bndb": prefer_bndb},
                 instance_id=instance.instance_id,
             )
             loaded.append(resp["result"])
@@ -1919,7 +1941,7 @@ def _types_show(args: argparse.Namespace) -> int:
     )
 
 
-@command("types", "declare", help="Import C declarations as user types", fmt="json", target=True,
+@command("types", "declare", help="Import C declarations as user types", target=True,
          args=[
              arg("--preview", action="store_true"),
              arg("--file", type=Path, help="Read declarations from a file"),
@@ -2057,7 +2079,7 @@ def _py_exec(args: argparse.Namespace) -> int:
     )
 
 
-@command("symbol", "rename", help="Rename a symbol", fmt="json", target=True,
+@command("symbol", "rename", help="Rename a symbol", target=True,
          args=[
              arg("--kind", choices=("auto", "function", "data"), default="auto"),
              arg("--preview", action="store_true"),
@@ -2099,7 +2121,7 @@ def _comment_list(args: argparse.Namespace) -> int:
     )
 
 
-@command("comment", "set", help="Set a comment", fmt="json", target=True,
+@command("comment", "set", help="Set a comment", target=True,
          args=[
              arg("--preview", action="store_true"),
              arg("--address"),
@@ -2141,7 +2163,7 @@ def _comment_get(args: argparse.Namespace) -> int:
     )
 
 
-@command("comment", "delete", help="Delete a comment", fmt="json", target=True,
+@command("comment", "delete", help="Delete a comment", target=True,
          args=[
              arg("--preview", action="store_true"),
              arg("--address"),
@@ -2164,7 +2186,7 @@ def _comment_delete(args: argparse.Namespace) -> int:
     )
 
 
-@command("proto", "set", help="Set a prototype", fmt="json", target=True,
+@command("proto", "set", help="Set a prototype", target=True,
          args=[
              arg("--preview", action="store_true"),
              arg("identifier"),
@@ -2215,7 +2237,7 @@ def _local_list(args: argparse.Namespace) -> int:
     )
 
 
-@command("local", "rename", help="Rename a local", fmt="json", target=True,
+@command("local", "rename", help="Rename a local", target=True,
          args=[
              arg("--preview", action="store_true"),
              arg("function"),
@@ -2240,7 +2262,7 @@ def _local_rename(args: argparse.Namespace) -> int:
     )
 
 
-@command("local", "retype", help="Retype a local", fmt="json", target=True,
+@command("local", "retype", help="Retype a local", target=True,
          args=[
              arg("--preview", action="store_true"),
              arg("function"),
@@ -2265,7 +2287,7 @@ def _local_retype(args: argparse.Namespace) -> int:
     )
 
 
-@command("struct", "field", "set", help="Set or replace a field", fmt="json", target=True,
+@command("struct", "field", "set", help="Set or replace a field", target=True,
          args=[
              arg("--preview", action="store_true"),
              arg("--no-overwrite", action="store_true"),
@@ -2311,7 +2333,7 @@ def _struct_show(args: argparse.Namespace) -> int:
     )
 
 
-@command("struct", "field", "rename", help="Rename a field", fmt="json", target=True,
+@command("struct", "field", "rename", help="Rename a field", target=True,
          args=[
              arg("--preview", action="store_true"),
              arg("struct_name"),
@@ -2336,7 +2358,7 @@ def _struct_field_rename(args: argparse.Namespace) -> int:
     )
 
 
-@command("struct", "field", "delete", help="Delete a field", fmt="json", target=True,
+@command("struct", "field", "delete", help="Delete a field", target=True,
          args=[
              arg("--preview", action="store_true"),
              arg("struct_name"),
@@ -2359,7 +2381,7 @@ def _struct_field_delete(args: argparse.Namespace) -> int:
     )
 
 
-@command("batch", "apply", help="Apply a JSON manifest", fmt="json",
+@command("batch", "apply", help="Apply a JSON manifest",
          args=[
              arg("--preview", action="store_true"),
              arg("manifest", type=Path),

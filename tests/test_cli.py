@@ -195,20 +195,31 @@ def test_function_search_can_request_regex_matching(monkeypatch, capsys):
     assert capsys.readouterr().out == "0x401000  load_attachment\n"
 
 
-def test_parser_defaults_reads_to_text_and_mutations_to_json():
+def test_parser_default_formats():
     parser = bn.cli.build_parser()
 
+    # Read commands default to text.
     assert parser.parse_args(["function", "list"]).format == "text"
     assert parser.parse_args(["function", "list"]).target is None
     assert parser.parse_args(["callsites", "crt_rand", "--within", "bonus_pick_random_type"]).format == "text"
     assert parser.parse_args(["decompile", "sub_401000"]).target is None
     assert parser.parse_args(["decompile", "sub_401000"]).format == "text"
+
+    # Setup-style commands keep JSON for structured envelopes; skill install is human-friendly.
     assert parser.parse_args(["plugin", "install"]).format == "json"
     assert parser.parse_args(["skill", "install"]).format == "text"
     assert parser.parse_args(["skill", "install"]).mode == "symlink"
     assert parser.parse_args(["bundle", "function", "sub_401000"]).format == "json"
-    assert parser.parse_args(["symbol", "rename", "sub_401000", "player_update"]).format == "json"
-    assert parser.parse_args(["types", "declare", "typedef struct Player { int hp; } Player;"]).format == "json"
+
+    # Mutations now default to text — the rendered summary is enough for an agent
+    # and JSON is one --format json away when needed.
+    assert parser.parse_args(["symbol", "rename", "sub_401000", "player_update"]).format == "text"
+    assert parser.parse_args(["types", "declare", "typedef struct Player { int hp; } Player;"]).format == "text"
+    assert parser.parse_args(["comment", "set", "--address", "0x401000", "msg"]).format == "text"
+    assert parser.parse_args(["proto", "set", "sub_401000", "void()"]).format == "text"
+    assert parser.parse_args(["local", "rename", "fn", "var", "new"]).format == "text"
+    assert parser.parse_args(["struct", "field", "set", "S", "0", "f", "uint32_t"]).format == "text"
+    assert parser.parse_args(["batch", "apply", "manifest.json"]).format == "text"
 
 
 def test_target_flag_accepted_before_subcommand():
@@ -1344,9 +1355,9 @@ def test_symbol_rename_text_format_renders_mutation_summary(monkeypatch, capsys)
 
     assert rc == 0
     output = capsys.readouterr().out
-    assert "preview: True" in output
+    assert "preview: change applied + reverted" in output
     assert "rename_symbol function 0x401000 -> player_update" in output
-    assert "0x401000 sub_401000 -> player_update [changed=True]" in output
+    assert "0x401000 sub_401000 -> player_update" in output
     assert '"results"' not in output
 
 
@@ -1390,8 +1401,9 @@ def test_symbol_rename_verification_failure_returns_nonzero(monkeypatch, capsys)
 
     assert rc == 3
     output = capsys.readouterr().out
-    assert "success: False" in output
-    assert "status=verification_failed" in output
+    assert "rolled back" in output
+    assert "failed: rename_symbol" in output
+    assert "[verification_failed]" in output
     assert 'requested: {"identifier": "sub_401000"' in output
     assert 'observed: {"address": "0x401000", "name": "sub_401000"}' in output
 
@@ -2116,3 +2128,103 @@ def test_sticky_hint_skipped_for_unrelated_errors(tmp_session, monkeypatch, caps
     assert rc == 2
     assert "Function not found" in err
     assert "bn instance clear" not in err
+
+
+# --- bn load --no-bndb plumbing ---
+
+
+def test_load_defaults_to_prefer_bndb(monkeypatch, tmp_path):
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        assert op == "load_binary"
+        captured.update(params)
+        return {"ok": True, "result": {"loaded": True, "path": str(raw), "notes": [], "targets": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["load", str(raw)])
+
+    assert rc == 0
+    assert captured["prefer_bndb"] is True
+
+
+def test_load_no_bndb_flag_disables_prefer_bndb(monkeypatch, tmp_path):
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        assert op == "load_binary"
+        captured.update(params)
+        return {"ok": True, "result": {"loaded": True, "path": str(raw), "notes": [], "targets": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["load", "--no-bndb", str(raw)])
+
+    assert rc == 0
+    assert captured["prefer_bndb"] is False
+
+
+def test_load_text_renders_notes(monkeypatch, tmp_path, capsys):
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+    bndb = tmp_path / "foo.so.bndb"
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        return {
+            "ok": True,
+            "result": {
+                "loaded": True,
+                "path": str(bndb),
+                "requested_path": str(raw),
+                "notes": [f"loaded {bndb} instead of {raw} (use --no-bndb to skip)"],
+                "targets": [],
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["load", str(raw)])
+
+    assert rc == 0
+    stdout = capsys.readouterr().out
+    assert f"loaded: {bndb}" in stdout
+    assert "note: loaded" in stdout
+    assert "--no-bndb" in stdout
+
+
+def test_session_start_no_bndb_propagates_to_each_load(monkeypatch, tmp_path):
+    from bn.transport import BridgeInstance
+    import pathlib
+
+    a = tmp_path / "a"
+    a.write_bytes(b"")
+    b = tmp_path / "b"
+    b.write_bytes(b"")
+
+    fake_inst = BridgeInstance(
+        pid=999,
+        socket_path=pathlib.Path("/tmp/test.sock"),
+        registry_path=pathlib.Path("/tmp/test.json"),
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at="2026-01-01T00:00:00Z",
+        meta={},
+        instance_id="test1234",
+    )
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: fake_inst)
+
+    captured = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        captured.append(dict(params or {}))
+        return {"ok": True, "result": {"loaded": True, "path": params["path"], "notes": [], "targets": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["session", "start", "--no-bndb", str(a), str(b)])
+
+    assert rc == 0
+    assert len(captured) == 2
+    assert all(item["prefer_bndb"] is False for item in captured)
+    assert {item["path"] for item in captured} == {str(a), str(b)}
