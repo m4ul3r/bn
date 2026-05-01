@@ -1,4 +1,4 @@
 interface:
   display_name: "bn"
-  short_description: "Use bn for Binary Ninja reversing tasks"
-  default_prompt: "Use $bn to do Binary Ninja reversing work through the local bn CLI."
+  short_description: "Binary Ninja CLI: decompile, xrefs, callsites, types, previewed mutations, BN Python (live GUI or headless)"
+  default_prompt: "Use $bn to drive Binary Ninja through the local bn CLI; prefer built-in commands, preview mutations, and use bn py exec only when needed."

@@ -1,192 +1,245 @@
 ---
 name: bn
-description: Use the local bn CLI for Binary Ninja reversing work through the bn bridge. Works with both a live GUI session and headless mode. Prefer this skill for decompilation, function search, callsite recovery, IL/disassembly, xrefs, type inspection, struct field edits, previewed mutations, and inline Python execution.
+description: Use the local bn CLI for Binary Ninja reversing through the bn bridge, in a live GUI session or headless mode. Triggers include decompilation, function search, xrefs, callsites and exact caller_static mapping, IL/disassembly, type recovery, struct field edits, previewed mutations, stable local IDs, batch apply, BNDB save/load, and inline BN Python.
 ---
 
 # bn
 
-Use this skill when the user wants reverse-engineering work against a Binary Ninja database and the local `bn` CLI is available. The bridge can run in GUI mode (attached to an open Binary Ninja window) or headless mode (no GUI required).
+Use this skill when the user wants reverse-engineering work against a Binary Ninja database and the local `bn` CLI is available. The bridge runs as a GUI plugin (attached to an open Binary Ninja window) or as a headless process. The CLI auto-spawns a headless instance on first use if none is running.
 
-> **Methodology skills**: For structured RE workflows, see `bn-re`. For vulnerability research, see `bn-vr`.
+> **Methodology skills:** for structured RE workflows see `bn-re`; for vulnerability research see `bn-vr`. Both delegate command syntax back here.
 
-## Workflow
+## 1. Workflow & target selection
 
-1. Start with target discovery:
+1. Discover targets:
 
-```bash
-bn target list
-```
+   ```bash
+   bn target list
+   ```
 
-This shows all open BinaryView targets. If no bridge is running, `bn` auto-starts one.
+   The `[N]` prefix is the view id; you can pass `-t N`. If no bridge is running, any command auto-starts one.
 
 2. Pick a target:
-- If there is exactly one open BinaryView, target-scoped commands can omit `-t` entirely.
-- If multiple targets are open, commands that omit `-t` fail; pass `-t <selector>` from `bn target list`. The `[N]` prefix in the output is the view_id — use `-t 1`, `-t 2`, etc. as a shorthand.
-- Use `-t active` only when you explicitly mean the GUI-selected target.
+   - Single open BinaryView: omit `-t`.
+   - Multiple open: pass `-t <selector>` from `bn target list`. Selectors match against `selector`, `target_id`, `view_id`, full filename, or basename.
+   - `-t` works **before or after** the subcommand. Use the pre-subcommand form to disambiguate selectors that collide with subcommand names like `session` or `pam_qnx.so.2`:
 
-3. Pick the right output mode:
-- Read commands default to `text`.
-- Mutation, preview, setup, and export commands default to `json`.
-- Other options: `--format json`, `--format ndjson`, `--out <path>`.
+     ```bash
+     bn -t pam_qnx.so.2 decompile main
+     bn decompile main -t pam_qnx.so.2
+     ```
 
-Outputs above `10_000` `o200k_base` tokens auto-spill to disk. When that happens, stdout contains a compact text envelope (`spilled: true`, `path: ...`, `tokens: ...`) and stderr carries a short warning, so do not chain `bn ... | rg ...` and expect to search the real output. Use `--out <path>` when you want the full body written to a known file.
+   - Use `-t active` only when you explicitly want to follow the GUI selection.
 
-## Headless Mode
+3. (Optional) Pin sticky defaults — useful when you'll run many commands against the same instance/target:
 
-When no GUI is available, `bn` auto-starts a headless bridge on first use — no manual setup needed. Just run commands directly:
+   ```bash
+   bn instance use <id>          # pin --instance for this project
+   bn target use <selector>       # pin -t for this project
+   bn instance clear              # clear pinned instance
+   bn target clear                # clear pinned target
+   ```
+
+   Resolution order:
+   - **Instance:** CLI `--instance` > env `BN_INSTANCE` > sticky > auto-pick / auto-spawn.
+   - **Target:** CLI `-t/--target` > sticky > single-open auto-pick. **`BN_TARGET` does not exist** — target selection is the CLI flag or `bn target use`, nothing else.
+
+   State lives at `~/.cache/bn/sessions/<sha256(project_root)[:16]>.json`. Project root walks up to the nearest `.git` (cwd as fallback). `bn session list` and `bn target list` mark matching entries with `[sticky]`. When a sticky instance points at a dead bridge, errors append `Clear it with bn instance clear`.
+
+## 2. Sessions & headless
+
+The bridge runs as a GUI plugin or as a headless process; both speak the same protocol.
 
 ```bash
-bn load /path/to/binary.bndb
-bn target list
+bn load /path/to/binary.bndb           # auto-spawns a headless bridge if none is running
+bn session start /path/to/binary [--instance-id <id>]
+bn session list                         # running instances + RSS + sticky marker
+bn session stop <id>                    # shut one down
+bn close [<path>]                       # close one (omit path → close all)
 ```
 
-To preload binaries at startup, use `bn session start`:
+`bn close` reports each closed view as `{path, unsaved}`. If a view had unsaved mutations, stdout warns — run `bn save` *first* if you care about annotations:
 
 ```bash
-bn session start /path/to/binary.bndb
+bn save                                  # saves to <filename>.bndb
+bn save /path/to/output.bndb             # explicit path
 ```
 
-Close binaries with `bn close [path]` (omit path to close all). All other commands work identically in headless and GUI modes.
-
-## High-Value Read Commands
+`bn load <raw>` and `bn session start <raw> [...]` auto-prefer a sibling `<raw>.bndb` when one exists, so saved annotations come back without you having to retype the `.bndb` suffix. The CLI prints which file was actually opened:
 
 ```bash
-bn target list
+$ bn load /path/to/foo.so
+loaded: /path/to/foo.so.bndb
+note: loaded /path/to/foo.so.bndb instead of /path/to/foo.so (use --no-bndb to skip)
+```
+
+Pass `--no-bndb` to force loading the raw binary even when a sibling `.bndb` exists. Passing a path that already ends in `.bndb` skips the lookup. The same `--no-bndb` flag works on `bn session start`.
+
+`bn load` blocks until analysis completes (the bridge runs `update_analysis_and_wait()` and the CLI socket has no timeout). Plan for it on large binaries.
+
+`--instance` is accepted on every subcommand (env `BN_INSTANCE`).
+
+## 3. Output & context
+
+Defaults:
+
+- Read commands → `--format text`.
+- Mutation, preview, setup, and export commands → `--format json`.
+- `--format ndjson` is available where it makes sense.
+- `--out <path>` writes the full body to disk and returns an envelope on stdout.
+
+**Spill envelopes.** When output exceeds **10 000 `o200k_base` tokens**, the body is written to disk and stdout carries a compact envelope; stderr carries a one-line warning. Envelope keys:
+
+- `ok` — request status.
+- `spilled` — `true` when the body was written to disk because of the threshold; `false` when `--out` was used.
+- `path` (text envelope) / `artifact_path` (JSON) — location on disk: `<tempdir>/bn-spills/YYYYMMDD/<stem>-HHMMSS.<json|ndjson|txt>`.
+- `format` — `json`, `ndjson`, or `text`.
+- `bytes`, `tokens`, `tokenizer` (`o200k_base`), `sha256` — size + integrity.
+- `summary` — shape hint with `kind` and `count` / `chars` / `keys`.
+
+Don't pipe `bn ... | rg ...` and expect `rg` to see real content when output spills — read the artifact path instead.
+
+Slicing knobs to avoid spilling in the first place:
+
+```bash
+bn decompile <fn> --lines 40:80         # 1-indexed inclusive; prints "// lines 40-80 of N"
+bn xrefs <fn-or-addr> --limit 20        # cap text output
+bn function info <fn>                    # compact by default
+bn function info <fn> --verbose          # full params + locals
+```
+
+Pagination: `--limit` / `--offset` on list commands.
+
+## 4. Read flow
+
+```bash
 bn target info
-bn function list
-bn function list --min-address 0x401000 --max-address 0x40ffff
+bn function list [--min-address 0x401000 --max-address 0x40ffff]
 bn function search attachment
 bn function search --regex 'attach|detach|follow'
-bn function info sample_track_floor_height_at_position
-bn callsites crt_rand --within bonus_pick_random_type
-bn callsites crt_rand --within-file /tmp/rng-functions.txt --format ndjson
-bn proto get sample_track_floor_height_at_position
-bn local list sample_track_floor_height_at_position
-bn decompile sample_track_floor_height_at_position
-bn decompile sample_track_floor_height_at_position --addresses
-bn il sample_track_floor_height_at_position
-bn disasm sample_track_floor_height_at_position
-bn xrefs sample_track_floor_height_at_position
-bn xrefs field TrackRowCell.tile_type
-bn comment list
-bn comment list --query TODO
-bn comment get --address 0x401000
-bn types --query Player
-bn types show Player
-bn struct show Player
-bn strings --query follow
-bn strings --min-length 5 --section .rodata
-bn strings --no-crt
+bn function info <fn> [--verbose]
+bn decompile <fn> [--addresses] [--lines 40:80]
+bn il <fn> [--view {hlil|mlil|llil}] [--ssa]
+bn disasm <fn>
+bn xrefs <fn-or-addr> [--limit 20]
+bn xrefs --field <Struct.field>
+bn callsites <callee> --within <fn>
+bn callsites <callee> --within-file <path>
+bn proto get <fn>
+bn local list <fn>
+bn types [--query <q>]
+bn types show <name>
+bn struct show <name>
+bn strings [--query <q>] [--min-length 5] [--section .rodata] [--no-crt]
 bn imports
-bn sections
-bn sections --query data
+bn sections [--query <q>]
+bn comment list [--query <q>]
+bn comment get   --address 0x... | --function <fn>
 ```
 
-`bn function search` is case-insensitive substring matching by default. Add `--regex` when you need regular expressions. `bn function list` and `bn function search` both accept `--min-address` and `--max-address`.
+Notes:
 
-`bn decompile` omits address prefixes by default for cleaner output. Add `--addresses` when you need per-line addresses (e.g., for `bn comment set --address`).
+- `bn function search` is case-insensitive substring; add `--regex` for regular expressions. `function list` and `function search` both accept `--min-address` / `--max-address`.
+- `bn xrefs` accepts a function name *or* a hex/decimal address. Text groups refs by caller (`code refs: 12 sites across 4 functions`); JSON adds `caller_function: {address, name}` so an `xrefs → --within-file` pipeline survives duplicate symbol names. Use `bn xrefs` for inbound references; reach for `bn callsites` when you need exact return-address recovery and local context.
+- `bn decompile` omits address prefixes by default. Add `--addresses` when you need them (e.g. for `bn comment set --address`).
+- `bn imports` JSON tags each entry with `kind` (`function`, `data`, `address`) and includes `library` + `raw_name`. Text marks data/address imports with `(data)` / `(address)`.
+- `bn sections` exposes start/end, length, semantics, and segment-derived `r/w/x` permission flags.
+- `bn strings`: `--no-crt` is a heuristic — drops single-character repetitions and strings sitting in `.text`. Combine with `--min-length` and `--section`.
 
-`bn strings` supports `--min-length N` to exclude short strings, `--section NAME` to restrict to a specific section (e.g., `.rodata`, `.rdata`), and `--no-crt` to heuristically exclude CRT/locale noise (single chars, locale codes, day/month names, encoding names, strings in `.text`). `--no-crt` is a best-effort heuristic, not a semantic filter.
+## 5. Caller-static mapping
 
-`bn sections` lists binary sections with address ranges, sizes, semantics, and segment-derived RWX permission flags. Use `--query` to filter by section name substring.
+Prefer `bn callsites` over ad-hoc `py exec` whenever the task is "find the exact native return-address callers" or any direct-call mapping workflow.
 
-`bn imports` includes function, data, and address import symbols. Data and address imports are tagged with `(data)` or `(address)` in text output and include a `"kind"` field in JSON.
+`bn callsites` reports:
 
-## Caller-Static Mapping
-
-Prefer `bn callsites` over ad hoc `py exec` when the task is "find exact native RNG return-address callers" or any similar direct-call mapping workflow.
-
-`bn callsites` reports both:
-- `call_addr`: the native `call ...` instruction address
-- `caller_static`: the exact post-call return address
-
-The key rule is:
-- `caller_static = call_addr + instruction_length`
-
-Use it like this:
+- `call_addr` — the native `call ...` instruction address.
+- `caller_static` — the post-call return address (`call_addr + instruction_length`).
+- `call_index` within the containing function, `within_query`, previous/next instructions, a local-or-null `hlil_statement`, and a best-effort `pre_branch_condition`.
 
 ```bash
 bn callsites crt_rand --within bonus_pick_random_type --caller-static
-bn callsites crt_rand --within fx_queue_add_random --caller-static
+bn callsites crt_rand --within fx_queue_add_random   --caller-static
 bn callsites crt_rand --within-file /tmp/rng-functions.txt --format json
 ```
 
-The `--within-file` format is one function identifier per non-empty line. Lines beginning with `#` are ignored.
+`--within-file` accepts one identifier (name or hex address) per non-empty line; lines beginning with `#` are ignored.
 
-For close-together callsites, `bn callsites` also returns:
-- previous instructions
-- next instructions
-- `call_index` within the containing function
-- `within_query` with the original unresolved scope token
-- a local-or-null HLIL statement
-- a best-effort `pre_branch_condition`
+`hlil_statement` is intentionally local-or-null — when Binary Ninja only exposes a coarse enclosing region, expect `null` instead of a noisy whole-function blob. `pre_branch_condition` is the nearest enclosing pre-call HLIL condition when it can be recovered confidently; `null` is normal.
 
-`hlil_statement` is intentionally local-or-null. If Binary Ninja only exposes a coarse enclosing region instead of the smallest call-containing expression or statement, expect `hlil_statement: null` rather than a noisy whole-function blob.
+If you call `bn callsites <callee>` without `--within` / `--within-file`, the CLI prints a 3-option help block (`single caller`, `many callers`, `list callers`) instead of erroring.
 
-`pre_branch_condition` means the nearest enclosing pre-call HLIL condition when it can be recovered confidently. It is not a generic "related branch" field, so `null` is normal when the condition cannot be derived cleanly.
+## 6. Mutation flow
 
-Use `bn xrefs` when you only need inbound references. Use `bn callsites` when you need exact return-address recovery and local context around the call.
+The mutation surface is built around a four-step safety loop: **preview → live-verify → read back → save**.
 
-## Bundles
-
-Use bundles when you want a reusable artifact instead of pasting long output into context:
+### Step 1 — preview first
 
 ```bash
-bn bundle function sample_track_floor_height_at_position --out /tmp/floor.json
+bn types declare "typedef struct Player { int hp; } Player;" --preview
+bn types declare --file /path/to/win32_min.h --preview
+bn struct field set Player 0x308 movement_flag_selector uint32_t --preview
+bn symbol rename sub_401000 player_update --preview
+bn proto set sub_401000 "int __cdecl player_update(Player* self)" --preview
+bn comment set --address 0x401000 "explain this" --preview
 ```
 
-With `--out`, the CLI returns a JSON envelope for the written artifact instead of dumping the whole bundle to stdout.
+Preview applies → refreshes analysis → captures decompile diffs → reverts. Inspect:
 
-## Python Escape Hatch
+- `results` — per-op outcome and observed state.
+- `affected_types` — type-level layout diffs.
+- `affected_functions` — for the first few changed functions, also includes `before_excerpt` / `after_excerpt` HLIL snippets near the first change.
 
-Use inline Python as a normal lane for one-off Binary Ninja inspection that is awkward to express as a built-in command:
+A no-op edit reports `changed: false` ("No effective change detected").
+
+### Step 2 — live writes are verified
+
+Per-op statuses:
+
+- `verified` — change applied and read back as requested.
+- `noop` — already in the requested state.
+- `unsupported` — operation not supported on this object.
+- `verification_failed` — readback disagrees; the whole mutation/batch is reverted, and JSON also returns the requested vs observed state.
+
+### Step 3 — read back
 
 ```bash
-bn py exec --code "print(hex(bv.entry_point)); result = {'functions': len(list(bv.functions))}"
+bn proto get <fn>
+bn struct show <name>
+bn types show <name>
+bn decompile <fn>
+bn refresh                                # if BN still shows stale presentation
 ```
 
-Use `--stdin` with a quoted heredoc for multiline Python snippets:
-
-Shell details matter here:
-- Quote the heredoc delimiter as `<<'PY'` so the shell does not expand `$vars`, backticks, or backslashes before Binary Ninja sees the Python.
-- Keep the closing `PY` on its own line with no indentation or trailing spaces.
-- Use `--script <file>` only for real files you want to keep on disk.
-- Use `--code` for true one-liners only.
-- If you are counting or collecting BN iterators such as `f.hlil.instructions`, materialize them explicitly with `list(...)` or a generator consumption pattern instead of assuming random-access behavior.
-
-Use this pattern for larger inspection snippets:
+### Locals — prefer `local_id` over names
 
 ```bash
-bn py exec --stdin <<'PY'
-out = []
-for f in bv.functions:
-    if 0x416000 <= f.start < 0x41C000:
-        out.append((f.start, f.symbol.short_name))
-out.sort()
-print("\n".join(f"{addr:#x} {name}" for addr, name in out))
-PY
+bn local list <fn>
+bn local rename <fn> <local_id|name> <new_name>
+bn local retype <fn> <local_id|name> <new_type>
 ```
 
-The `py exec` environment includes:`bn`, `binaryninja`, `bv`, `result`.
+`bn local list` text output splits params and locals into compact `name  type` rows. JSON entries carry `name`, `type`, `storage`, `index`, `identifier`, `source_type`, `is_parameter`, and **`local_id`** — a stable handle that survives re-analysis. Reach for `local_id` whenever Binary Ninja might rebuild the variable list.
 
-`py exec` always returns `stdout` and `result`. If `result` is not JSON-serializable, the CLI returns `repr(result)` plus a warning instead of silently flattening it.
-
-## Additional Read Commands
+### Comments
 
 ```bash
-bn il sub_401000 --view mlil              # MLIL instead of default HLIL
-bn il sub_401000 --view llil --ssa        # LLIL in SSA form
-bn local retype func_name var_name "uint32_t*"  # retype a local variable
-bn comment delete --address 0x401000      # remove a comment
-bn struct field rename Player 0x308 new_name    # rename a field
-bn struct field delete Player 0x308             # delete a field
+bn comment set --address 0x401000 "explain this"
+bn comment set --function player_update "explain this"
+bn comment delete --address 0x401000
+bn comment delete --function player_update
 ```
 
-## Batch Apply
+### Struct field edits
 
-For bulk mutations (renames, retypes, comments), use `bn batch apply` with a JSON manifest. This is significantly faster than individual commands.
+```bash
+bn struct field set Player 0x308 flags uint32_t [--no-overwrite]
+bn struct field rename Player old_name new_name
+bn struct field delete Player <field_name>     # NOTE: takes the field name, not an offset
+```
 
-Manifest format:
+### Bulk mutations — batch manifest
+
+For large rename/retype/comment runs, use `bn batch apply` with a JSON manifest. Significantly faster than firing individual commands.
 
 ```json
 {
@@ -200,108 +253,64 @@ Manifest format:
 ```
 
 ```bash
-bn batch apply /tmp/manifest.json            # apply live
-bn batch apply /tmp/manifest.json --preview  # preview diffs first
+bn batch apply /tmp/manifest.json
+bn batch apply /tmp/manifest.json --preview
 ```
 
-Key details:
-- The manifest MUST be a dict with an `"ops"` key (not a bare list)
-- Include `"target"` in the manifest or it will fail with "Unknown target selector: None"
-- All ops are verified and the entire batch is reverted if any op fails
-- Supports `--preview` to see diffs without committing
+Rules:
 
-## Mutation Workflow
+- The manifest must be a dict with an `"ops"` key (not a bare list).
+- Include `"target"` in the manifest or it fails with `Unknown target selector: None`.
+- All ops are verified — a single failure reverts the entire batch.
+- `--preview` shows diffs without committing.
 
-Prefer preview first:
+### Step 4 — save before close
+
+Annotations live in the `.bndb`. Always save before closing — `bn close` warns when unsaved mutations are about to be discarded (see §2).
+
+## 7. Bundles
+
+Use bundles when you want a reusable artifact instead of pasting long output into context:
 
 ```bash
-bn types declare "typedef struct Player { int hp; } Player;" --preview
-bn types declare --file /path/to/win32_min.h --preview
-bn struct field set Player 0x308 movement_flag_selector uint32_t --preview
-bn symbol rename sub_401000 player_update --preview
-bn proto get sub_401000
-bn local list sub_401000
-bn proto set sub_401000 "int __cdecl player_update(Player* self)" --preview
+bn bundle function sample_track_floor_height_at_position --out /tmp/floor.json
 ```
 
-Preview mode applies the change, refreshes analysis, captures affected decompile diffs, and then reverts the mutation.
+With `--out`, the CLI returns a JSON envelope for the written artifact instead of dumping the bundle to stdout.
 
-For struct previews, inspect:`results`, `affected_types`, `affected_functions`.
+## 8. Python escape hatch
 
-For the first few changed functions, `affected_functions` may also include `before_excerpt` and `after_excerpt` HLIL snippets around the first changed lines.
-
-If a struct edit is already identical, preview may report `changed: false` with `No effective change detected`.
-
-`bn types declare` uses Binary Ninja's source parser when available. With `--file`, it forwards the real source path so relative includes work like GUI header import.
-
-If a declaration only introduces functions or extern variables and no named types, `types declare` now reports a no-op instead of failing with `No named types found in declaration`.
-
-Non-preview writes are live-verified by default. If the requested state does not read back from Binary Ninja, the command exits nonzero and the whole mutation or batch is reverted.
-
-After any live type or prototype mutation, do an explicit readback:
+Reach for `bn py exec` only when built-in commands are awkward — arbitrary BinaryView introspection or operations the bridge does not expose. Built-ins are preferred because they are verified, cache-friendly, and integrate with the preview/verify loop.
 
 ```bash
-bn proto get sub_401000
-bn struct show Player
-bn types show Player
-bn decompile sub_401000
+bn py exec --code "print(hex(bv.entry_point)); result = {'functions': len(list(bv.functions))}"
 ```
 
-Key result statuses:
-- `verified`
-- `noop`
-- `unsupported`
-- `verification_failed`
-
-When verification fails, JSON output also includes the requested and observed state for the failed operation.
-
-If you need to force BN to recalculate presentation after a type change, run:
+Multiline snippets via stdin with a quoted heredoc:
 
 ```bash
-bn refresh
+bn py exec --stdin <<'PY'
+out = []
+for f in bv.functions:
+    if 0x416000 <= f.start < 0x41C000:
+        out.append((f.start, f.symbol.short_name))
+out.sort()
+print("\n".join(f"{addr:#x} {name}" for addr, name in out))
+PY
 ```
 
-## Saving and Loading Databases
+Shell rules:
 
-**Always save work as `.bndb`** before closing a target. Annotations (renames, types, comments) are lost if a raw binary is closed without saving.
+- Quote the delimiter as `<<'PY'` so the shell does not expand `$vars`, backticks, or backslashes before Binary Ninja sees the Python.
+- Keep the closing `PY` on its own line with no indentation or trailing whitespace.
+- `--script <file>` for code on disk; `--code` for true one-liners.
+- Materialize Binary Ninja iterators (`f.hlil.instructions`, etc.) with `list(...)` instead of assuming random-access behavior.
 
-```bash
-bn save                          # saves to <filename>.bndb
-bn save /path/to/output.bndb    # saves to explicit path
-```
+The exec environment includes `bn`, `binaryninja`, `bv`, and `result`.
 
-**Loading behavior**: `bn load foo.so` does NOT auto-detect a sibling `foo.so.bndb`. It re-analyzes from scratch, discarding all prior annotations. Always load the `.bndb` path explicitly:
+`py exec` always returns `stdout` and `result`. `result` is JSON-serialized when possible; if not, the CLI returns `repr(result)` and a non-fatal entry in `warnings`. If your script writes a JSON artifact, it is surfaced under `artifact`.
 
-```bash
-# Wrong — ignores existing .bndb, re-analyzes from scratch
-bn load /path/to/foo.so
-
-# Correct — loads saved annotations
-bn load /path/to/foo.so.bndb
-```
-
-Before loading a binary, check if a `.bndb` already exists and prefer it.
-
-## Load Timeout
-
-`bn load` has a ~30-second default timeout. Large binaries may exceed this — the command exits with a timeout error but analysis continues in the background. Check back with:
-
-```bash
-bn target list
-```
-
-If the target appears, it loaded successfully despite the timeout.
-
-## Session Management
-
-`bn` uses a single bridge instance. If one is already running, all commands route to it automatically. Load multiple binaries into the same instance and use `-t <view_id>` to switch between them.
-
-```bash
-bn session list              # show the running bridge instance
-bn session stop <id>         # shut down the instance
-```
-
-## Troubleshooting
+## 9. Troubleshooting
 
 Run `bn doctor` only when something is wrong — commands fail unexpectedly, targets don't appear, or the bridge seems unresponsive:
 
@@ -309,26 +318,30 @@ Run `bn doctor` only when something is wrong — commands fail unexpectedly, tar
 bn doctor
 ```
 
-It checks CLI version, plugin staleness, and instance connectivity. Do not run it as part of normal workflow.
+It checks CLI version, plugin staleness (`stale_plugin_version`, `stale_plugin_code`), and instance connectivity. Don't run it as part of normal workflow.
 
-## Known Quirks
+## 10. Known quirks
 
-- **`bn local rename` and `bn comment set` return null status**: The operations succeed but the JSON response shows `null` for status instead of `verified`. Verify by re-decompiling.
-- **`types declare` verification failures**: `bn types declare` may fail with `verification_failed` and roll back, even for correct declarations. Workaround: define structs directly via `bn py exec` using `bntypes.StructureBuilder`:
+- **`types declare` verification failures.** The source-parser path handles most declarations, but a stubborn one may roll back with `verification_failed`. Workaround: define the struct directly via `bn py exec` using `StructureBuilder`, then re-run `bn types show`:
 
-```bash
-bn py exec --stdin <<'PY'
-from binaryninja import types as bntypes
-s = bntypes.StructureBuilder.create()
-s.append(bntypes.Type.pointer(bv.arch, bntypes.Type.void()), "vtable")
-s.append(bntypes.Type.array(bntypes.Type.int(1, sign=False), 0x20), "pad_04")
-s.append(bntypes.Type.int(4, sign=False), "m_bLoad")
-s.append(bntypes.Type.pointer(bv.arch, bntypes.Type.int(1, sign=False)), "m_fileBuf")
-s.append(bntypes.Type.int(4, sign=False), "m_fileBufSize")
-bv.define_user_type("MyStruct", bntypes.Type.structure_type(s))
-print("defined MyStruct")
-PY
-```
+  ```bash
+  bn py exec --stdin <<'PY'
+  from binaryninja import types as bntypes
+  s = bntypes.StructureBuilder.create()
+  s.append(bntypes.Type.pointer(bv.arch, bntypes.Type.void()), "vtable")
+  s.append(bntypes.Type.array(bntypes.Type.int(1, sign=False), 0x20), "pad_04")
+  s.append(bntypes.Type.int(4, sign=False), "m_bLoad")
+  s.append(bntypes.Type.pointer(bv.arch, bntypes.Type.int(1, sign=False)), "m_fileBuf")
+  s.append(bntypes.Type.int(4, sign=False), "m_fileBufSize")
+  bv.define_user_type("MyStruct", bntypes.Type.structure_type(s))
+  print("defined MyStruct")
+  PY
+  ```
 
-- **Stale bridge**: If `bn doctor` reports `stale: loaded plugin code does not match installed plugin file`, restart Binary Ninja (GUI or headless) to pick up the updated bridge code. Commands will behave unpredictably with stale code.
-- **No targets = no `py exec`**: `bn py exec` requires at least one open BinaryView. If `bn load` timed out and the target isn't ready yet, `py exec` will fail with "No BinaryView targets are open".
+- **Stale bridge.** If `bn doctor` reports `stale: loaded plugin code does not match installed plugin file`, restart Binary Ninja (GUI or headless) to pick up the updated bridge. Commands behave unpredictably with stale code.
+
+- **No targets ⇒ no `py exec`.** `bn py exec` requires at least one open BinaryView. If `bn load` is still running or the target isn't ready yet, `py exec` errors with "No BinaryView targets are open".
+
+## 11. Skill install
+
+`bn skill install` is idempotent. It links/copies the bundled skills into `~/.claude/skills/` and, when `~/.codex/` exists, also into `~/.codex/skills/`. Honors `CLAUDE_HOME` / `CODEX_HOME`. Use `--mode copy` for standalone copies, `--dest <path>` for a single explicit destination, and `--force` to overwrite. Restart your agent to pick up renamed or newly added skills.
