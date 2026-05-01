@@ -599,7 +599,10 @@ class BinaryNinjaBridge:
             return {"shutting_down": True}
 
         if op == "load_binary":
-            return self._load_binary(str(params["path"]))
+            return self._load_binary(
+                str(params["path"]),
+                prefer_bndb=bool(params.get("prefer_bndb", True)),
+            )
         if op == "close_binary":
             return self._close_binary(params.get("path"))
         if op == "save_database":
@@ -726,16 +729,26 @@ class BinaryNinjaBridge:
             "targets": self.targets.refresh(),
         }
 
-    def _load_binary(self, path: str):
+    def _load_binary(self, path: str, *, prefer_bndb: bool = True):
         import binaryninja
 
         resolved = Path(path).expanduser().resolve()
         if not resolved.exists():
             raise RuntimeError(f"File not found: {resolved}")
 
-        bv = binaryninja.load(str(resolved))
+        load_path = resolved
+        notes: list[str] = []
+        if prefer_bndb and resolved.suffix != ".bndb":
+            sibling = Path(str(resolved) + ".bndb")
+            if sibling.exists():
+                load_path = sibling
+                notes.append(
+                    f"loaded {sibling} instead of {resolved} (use --no-bndb to skip)"
+                )
+
+        bv = binaryninja.load(str(load_path))
         if bv is None:
-            raise RuntimeError(f"Failed to open binary: {resolved}")
+            raise RuntimeError(f"Failed to open binary: {load_path}")
 
         bv.update_analysis_and_wait()
 
@@ -744,7 +757,9 @@ class BinaryNinjaBridge:
 
         return {
             "loaded": True,
-            "path": str(resolved),
+            "path": str(load_path),
+            "requested_path": str(resolved),
+            "notes": notes,
             "targets": self.targets.refresh(),
         }
 

@@ -1696,3 +1696,87 @@ def test_verify_prototype_still_fails_on_real_mismatch(monkeypatch):
 
     verified = instance._verify_operation(bv, result)
     assert verified["status"] == "verification_failed"
+
+
+class _LoadBV:
+    def __init__(self):
+        self.analysis_updated = False
+
+    def update_analysis_and_wait(self):
+        self.analysis_updated = True
+
+
+def _setup_load_test(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+    bridge._headless_views.clear()
+
+    binaryninja = sys.modules["binaryninja"]
+    loaded_paths: list[str] = []
+
+    def fake_load(path):
+        loaded_paths.append(path)
+        return _LoadBV()
+
+    binaryninja.load = fake_load
+    return bridge, instance, loaded_paths
+
+
+def test_load_binary_prefers_sibling_bndb(monkeypatch, tmp_path):
+    bridge, instance, loaded_paths = _setup_load_test(monkeypatch)
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+    bndb = tmp_path / "foo.so.bndb"
+    bndb.write_bytes(b"")
+
+    result = instance._load_binary(str(raw))
+
+    assert loaded_paths == [str(bndb)]
+    assert result["path"] == str(bndb)
+    assert result["requested_path"] == str(raw)
+    assert result["notes"]
+    assert "foo.so.bndb" in result["notes"][0]
+    assert "--no-bndb" in result["notes"][0]
+    bridge._headless_views.clear()
+
+
+def test_load_binary_no_bndb_opt_out(monkeypatch, tmp_path):
+    bridge, instance, loaded_paths = _setup_load_test(monkeypatch)
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+    bndb = tmp_path / "foo.so.bndb"
+    bndb.write_bytes(b"")
+
+    result = instance._load_binary(str(raw), prefer_bndb=False)
+
+    assert loaded_paths == [str(raw)]
+    assert result["path"] == str(raw)
+    assert result["notes"] == []
+    bridge._headless_views.clear()
+
+
+def test_load_binary_no_sibling(monkeypatch, tmp_path):
+    bridge, instance, loaded_paths = _setup_load_test(monkeypatch)
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+
+    result = instance._load_binary(str(raw))
+
+    assert loaded_paths == [str(raw)]
+    assert result["path"] == str(raw)
+    assert result["notes"] == []
+    bridge._headless_views.clear()
+
+
+def test_load_binary_already_bndb_skips_lookup(monkeypatch, tmp_path):
+    bridge, instance, loaded_paths = _setup_load_test(monkeypatch)
+    bndb = tmp_path / "foo.so.bndb"
+    bndb.write_bytes(b"")
+
+    result = instance._load_binary(str(bndb))
+
+    assert loaded_paths == [str(bndb)]
+    assert result["path"] == str(bndb)
+    assert result["notes"] == []
+    bridge._headless_views.clear()
