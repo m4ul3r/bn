@@ -1769,6 +1769,86 @@ def test_load_binary_no_sibling(monkeypatch, tmp_path):
     bridge._headless_views.clear()
 
 
+class _FakeFileBV:
+    def __init__(self, filename: str, session_id: str = "0", view_name: str = "ELF"):
+        self.file = types.SimpleNamespace(session_id=session_id, filename=filename)
+        self.view_type = types.SimpleNamespace(name=view_name)
+
+
+def _register_views(bridge, *bvs):
+    bridge._headless_views.clear()
+    bridge._headless_views.extend(bvs)
+
+
+def test_selector_uses_basename_when_unique(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    bv_a = _FakeFileBV("/proj/alpha.bndb", session_id="11")
+    bv_b = _FakeFileBV("/proj/beta.bndb", session_id="22")
+    _register_views(bridge, bv_a, bv_b)
+
+    targets = bridge.TargetManager().refresh()
+    selectors = {t["filename"]: t["selector"] for t in targets}
+
+    assert selectors["/proj/alpha.bndb"] == "alpha.bndb"
+    assert selectors["/proj/beta.bndb"] == "beta.bndb"
+    bridge._headless_views.clear()
+
+
+def test_selector_disambiguates_with_parent_dir(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    bv1 = _FakeFileBV("/work/01_arithmetic_lock/target.bndb", session_id="1")
+    bv2 = _FakeFileBV("/work/02_bytecode_vm/target.bndb", session_id="2")
+    bv3 = _FakeFileBV("/work/03_layered_seal/target.bndb", session_id="3")
+    _register_views(bridge, bv1, bv2, bv3)
+
+    targets = bridge.TargetManager().refresh()
+    selectors = {t["filename"]: t["selector"] for t in targets}
+
+    assert selectors["/work/01_arithmetic_lock/target.bndb"] == "01_arithmetic_lock/target.bndb"
+    assert selectors["/work/02_bytecode_vm/target.bndb"] == "02_bytecode_vm/target.bndb"
+    assert selectors["/work/03_layered_seal/target.bndb"] == "03_layered_seal/target.bndb"
+    bridge._headless_views.clear()
+
+
+def test_selector_falls_back_to_target_id_for_identical_paths(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    bv1 = _FakeFileBV("/work/dup/target.bndb", session_id="1")
+    bv2 = _FakeFileBV("/work/dup/target.bndb", session_id="2")
+    _register_views(bridge, bv1, bv2)
+
+    targets = bridge.TargetManager().refresh()
+
+    assert targets[0]["selector"] == targets[0]["target_id"]
+    assert targets[1]["selector"] == targets[1]["target_id"]
+    assert targets[0]["selector"] != targets[1]["selector"]
+    bridge._headless_views.clear()
+
+
+def test_resolve_accepts_path_suffix_selector(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    bv1 = _FakeFileBV("/work/01_arithmetic_lock/target.bndb", session_id="1")
+    bv2 = _FakeFileBV("/work/02_bytecode_vm/target.bndb", session_id="2")
+    _register_views(bridge, bv1, bv2)
+
+    manager = bridge.TargetManager()
+    resolved = manager.resolve("02_bytecode_vm/target.bndb")
+
+    assert resolved is bv2
+    bridge._headless_views.clear()
+
+
+def test_resolve_raises_on_ambiguous_basename(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    bv1 = _FakeFileBV("/work/01_arithmetic_lock/target.bndb", session_id="1")
+    bv2 = _FakeFileBV("/work/02_bytecode_vm/target.bndb", session_id="2")
+    _register_views(bridge, bv1, bv2)
+
+    manager = bridge.TargetManager()
+    with pytest.raises(RuntimeError, match="Ambiguous target selector"):
+        manager.resolve("target.bndb")
+    bridge._headless_views.clear()
+
+
 def test_load_binary_already_bndb_skips_lookup(monkeypatch, tmp_path):
     bridge, instance, loaded_paths = _setup_load_test(monkeypatch)
     bndb = tmp_path / "foo.so.bndb"

@@ -302,6 +302,12 @@ def _collect_open_views() -> list[Any]:
     return _run_on_main_thread(collect)
 
 
+def _path_components(path: str) -> tuple[str, ...]:
+    if not path:
+        return ()
+    return tuple(p for p in path.split(os.sep) if p)
+
+
 @dataclass(slots=True)
 class TargetRecord:
     view_id: str
@@ -332,10 +338,26 @@ class TargetManager:
                 continue
         return type(bv).__name__
 
-    def _preferred_selector(self, record: TargetRecord, basename_counts: dict[str, int]) -> str:
-        if record.basename and basename_counts.get(record.basename, 0) == 1:
-            return record.basename
-        return record.target_id()
+    def _compute_selectors(self, records: dict[str, TargetRecord]) -> dict[str, str]:
+        components = {vid: _path_components(r.filename) for vid, r in records.items()}
+        selectors: dict[str, str] = {}
+        for vid, record in records.items():
+            my_parts = components[vid]
+            if not my_parts:
+                selectors[vid] = record.target_id()
+                continue
+            chosen: str | None = None
+            for depth in range(1, len(my_parts) + 1):
+                suffix = my_parts[-depth:]
+                if not any(
+                    other_parts[-depth:] == suffix
+                    for other_vid, other_parts in components.items()
+                    if other_vid != vid and len(other_parts) >= depth
+                ):
+                    chosen = os.sep.join(suffix)
+                    break
+            selectors[vid] = chosen or record.target_id()
+        return selectors
 
     def _matches_record(self, record: TargetRecord, selector: str | None) -> bool:
         if selector is None:
@@ -343,12 +365,19 @@ class TargetManager:
         candidate = str(selector).strip()
         if candidate in ("", "active"):
             return False
-        return candidate in (
+        if candidate in (
             record.target_id(),
             record.view_id,
             record.filename,
             record.basename,
-        )
+        ):
+            return True
+        suffix = _path_components(candidate)
+        if suffix:
+            parts = _path_components(record.filename)
+            if len(parts) >= len(suffix) and parts[-len(suffix):] == suffix:
+                return True
+        return False
 
     def _default_view(self):
         active = _active_binary_view()
@@ -398,10 +427,7 @@ class TargetManager:
             active = focused
             if active is None and len(self._records) == 1:
                 active = next(iter(self._records.values())).ref()
-            basename_counts: dict[str, int] = {}
-            for record in self._records.values():
-                if record.basename:
-                    basename_counts[record.basename] = basename_counts.get(record.basename, 0) + 1
+            selectors = self._compute_selectors(self._records)
 
             result = []
             for view_id in sorted(self._records, key=lambda item: int(item)):
@@ -416,7 +442,7 @@ class TargetManager:
                         "session_id": record.session_id,
                         "filename": record.filename,
                         "basename": record.basename,
-                        "selector": self._preferred_selector(record, basename_counts),
+                        "selector": selectors[view_id],
                         "view_name": record.view_name,
                         "active": bool(view is active),
                     }
@@ -435,12 +461,27 @@ class TargetManager:
             return active
 
         with self._lock:
+            matches: list[tuple[TargetRecord, Any]] = []
             for record in self._records.values():
-                if self._matches_record(record, selector):
-                    view = record.ref()
-                    if view is not None:
-                        return view
-        raise RuntimeError(f"Unknown target selector: {selector}")
+                if not self._matches_record(record, selector):
+                    continue
+                view = record.ref()
+                if view is None:
+                    continue
+                matches.append((record, view))
+
+        if not matches:
+            raise RuntimeError(f"Unknown target selector: {selector}")
+        if len(matches) > 1:
+            selectors_by_view = {t["view_id"]: t["selector"] for t in targets}
+            candidates = ", ".join(
+                selectors_by_view.get(record.view_id, record.target_id())
+                for record, _ in matches
+            )
+            raise RuntimeError(
+                f"Ambiguous target selector: {selector!r} matches {len(matches)} targets ({candidates})"
+            )
+        return matches[0][1]
 
 
 class BridgeHandler(socketserver.StreamRequestHandler):
