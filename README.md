@@ -25,7 +25,7 @@ Install the Binary Ninja companion plugin:
 bn plugin install
 ```
 
-That links [`plugin/bn_agent_bridge`](/Users/banteg/dev/banteg/bn/plugin/bn_agent_bridge) into your Binary Ninja plugins directory.
+That links [`plugin/bn_agent_bridge`](plugin/bn_agent_bridge) into your Binary Ninja plugins directory.
 
 Install the bundled Claude Code/Codex skills:
 
@@ -43,8 +43,8 @@ If the plugin code changes, reload Binary Ninja Python plugins or restart Binary
   - a normal Python CLI that you can run from your shell or agent tool harness
   - a Binary Ninja bridge that owns all Binary Ninja API access
 - The bridge runs either as a GUI plugin or as a standalone headless process.
-- It creates one fixed bridge socket and one fixed registry file.
-- The CLI discovers that bridge, connects to it, and forwards commands.
+- The GUI plugin uses a single fixed bridge socket and registry file. Headless bridges each get their own socket and registry under `~/.cache/bn/instances/`, so you can run multiple in parallel.
+- The CLI discovers a bridge, connects to it, and forwards commands. With multiple bridges open, pick one with `--instance` or pin it with `bn instance use`.
 - In GUI mode, the bridge runs as a plugin and works with a personal license.
 - In headless mode, the bridge runs standalone and requires the `binaryninja` Python package on `sys.path` (commercial headless license or the headless API).
 
@@ -62,24 +62,27 @@ bn decompile sub_401000
 
 ## Quick Start (Headless)
 
-Start the bridge with one or more binaries:
+Start a managed headless session and optionally preload binaries:
 
 ```bash
-python -m bn_agent_bridge /path/to/binary.bndb
-```
-
-Or start the bridge empty and load binaries over the socket:
-
-```bash
-python -m bn_agent_bridge &
-bn load /path/to/binary.bndb
+bn session start /path/to/binary.bndb
 bn function list
-bn close
+bn session list
+bn session stop <instance>
 ```
 
-All commands work identically in both modes. `bn load` and `bn close` are available for dynamic binary management (useful in headless, but also work with the GUI bridge).
+`bn session start` spawns a `bn-agent` process, registers it under `~/.cache/bn/instances/<id>.{json,sock}`, and prints the instance ID. Use `bn session list` to see what's running and `bn session stop <id>` to shut one down. You can also start a bridge directly with `python -m bn_agent_bridge /path/to/binary.bndb` if you want to manage the process yourself.
 
-If exactly one BinaryView is open, target-specific commands can omit `--target` entirely. If multiple targets are open, pass `--target <selector>` from `bn target list`.
+You can run several sessions in parallel. With more than one instance up, either pass `--instance <id>` per call or pin one for the shell with:
+
+```bash
+bn instance use <id>      # remembered per project root
+bn instance clear
+```
+
+`bn load` and `bn close` are available for dynamic binary management (useful in headless, but also work with the GUI bridge). All commands work identically in GUI and headless mode.
+
+If exactly one BinaryView is open, target-specific commands can omit `--target` entirely. If multiple targets are open, pass `--target <selector>` from `bn target list`, or pin one with `bn target use <selector>` (and `bn target clear` to undo).
 
 ## Target Selection
 

@@ -37,31 +37,43 @@ CLI (no BN dependency) → Unix socket → Bridge (owns all BN API access)
 
 The bridge runs either as a **GUI plugin** (auto-starts when BN loads) or as a **headless process** (`bn-agent` / `python -m bn_agent_bridge`). The CLI discovers the bridge via a registry file + socket probe, auto-spawning headless if needed.
 
-### Key Files
+### CLI Layout (`src/bn/`)
 
-- `src/bn/cli.py` — All CLI commands, argument parsing, output formatting (~2.2k LOC)
-- `src/bn/transport.py` — Socket communication, bridge discovery, auto-spawn
-- `src/bn/output.py` — Token-aware rendering, artifact spillover (>10k tokens → disk)
-- `plugin/bn_agent_bridge/bridge.py` — Core bridge: target manager, all operation handlers, mutation engine (~3.2k LOC)
-- `plugin/bn_agent_bridge/paths.py` / `version.py` — Symlinks to `src/bn/` shared modules
+`cli.py` is the entry point and shared infrastructure only — argparse plumbing, the `@command` decorator + `_COMMANDS` registry, target/instance resolution, the `_call` request wrapper, and `main()`. It does **not** define command handlers or text rendering anymore.
 
-### Declarative Command Registration
+- `commands/` — handler modules grouped by concern: `binary.py` (load/close/save/refresh/target info), `function.py` (list/search/info/decompile/il/disasm/xrefs/callsites), `types.py`, `mutation.py`, `misc.py` (strings/imports/sections/bundle/py exec/batch). Importing the package via `commands/__init__.py` triggers `@command` decorators that populate `_COMMANDS`.
+- `formatters.py` — all text-mode rendering (`_render_*`, `_format_operation_result`). Add new text output here, not in `cli.py`.
+- `transport.py` — socket I/O, bridge discovery, multi-instance registry, auto-spawn.
+- `output.py` — token-aware rendering and artifact spillover (>10k tokens → disk).
+- `session_state.py` — sticky per-project pins (`instance_id`, `target`) read by `bn instance use` / `bn target use`.
+- `paths.py` — all on-disk locations (cache, instances, sessions, spills, plugin/skills install dirs).
+- `headless.py` — `bn-agent` entry point.
 
-Commands are registered via `@command()` decorator in `cli.py`. The decorator declares help text, output format, whether a target is needed, pagination, address filtering, and argument specs. A single `build_parser()` function walks `_COMMANDS` to construct the argparse tree — no manual parser wiring.
+`plugin/bn_agent_bridge/paths.py` and `version.py` are symlinks to `src/bn/`, so the bridge and CLI agree on filesystem layout and version without duplication.
 
-To add a new command: decorate a handler function with `@command(...)`, add the corresponding operation in `bridge.py`'s `dispatch()`, and write tests.
+### Adding a New Command
 
-### Target Management
+1. Add a handler in the appropriate `src/bn/commands/*.py` module, decorated with `@command(...)` (declares help, output format, target requirement, pagination, address filter, args).
+2. Add the matching operation in `plugin/bn_agent_bridge/bridge.py`'s `dispatch()` and decide whether it belongs in `READ_LOCKED_OPS` or `WRITE_LOCKED_OPS`.
+3. Add tests in `tests/` (mirror the source layout).
 
-The bridge tracks open BinaryViews via `TargetManager` using weak references. When only one target is open, CLI commands can omit `--target`. Multiple open targets require an explicit selector.
+`build_parser()` in `cli.py` walks `_COMMANDS` to construct the full argparse tree — no manual parser wiring needed.
+
+### Bridge (`plugin/bn_agent_bridge/bridge.py`)
+
+Single ~3.5k-LOC module containing the `TargetManager` (weak-reffed `BinaryView`s, selector resolution), op handlers, and the mutation engine. Read ops dispatch under a shared lock; write ops under an exclusive lock (`READ_LOCKED_OPS` / `WRITE_LOCKED_OPS`).
+
+### Target Selection
+
+When only one target is open, target-required commands can omit `--target`. Multiple open targets require an explicit selector or a sticky pin via `bn target use`.
+
+### Multi-Instance Bridges
+
+The CLI supports several headless bridges concurrently. Each instance gets its own files under `~/.cache/bn/instances/<id>.{json,sock}`; the GUI plugin uses the legacy fixed pair (`~/.cache/bn/bn_agent_bridge.{json,sock}`). Sticky per-project state (selected instance, selected target) lives under `~/.cache/bn/sessions/<sha>.json`, keyed by the project's git root so parallel agents in different repos don't collide.
 
 ### Mutation Verification
 
 All mutations support `--preview` (apply → capture diffs → revert) and live verification (readback confirms requested state landed). Statuses: `verified`, `noop`, `unsupported`, `verification_failed`. Failed batches are fully reverted.
-
-### Read/Write Locking
-
-Bridge operations are categorized as `READ_LOCKED_OPS` (concurrent) or `WRITE_LOCKED_OPS` (exclusive). This is enforced in `bridge.py`'s dispatch path.
 
 ### JSON Protocol
 
@@ -71,7 +83,7 @@ Response: `{"ok": true, "result": ...}` or `{"ok": false, "error": "..."}`
 ## Conventions
 
 - Command handlers are named `_<group>_<subcommand>()` (e.g., `_function_list`)
-- Exit codes: 0 = success, 1 = handler/mutation error, 2 = BridgeError, 3 = verification failed
+- Exit codes: 0 = success, 1 = handler/mutation error, 2 = `BridgeError`, 3 = verification failed
 - `BridgeError` for user-facing errors, `OperationFailure` for bridge-side mutation failures with structured fields
 - Read commands default to `--format text`, mutations default to `--format json`
 - Type hints everywhere, `from __future__ import annotations` in all modules
