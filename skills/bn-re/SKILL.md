@@ -51,6 +51,56 @@ Not all functions matter equally. Prioritize:
   bn callsites recv --within <function>
   ```
 
+## Hidden Code Surfaces
+
+Binary Ninja's auto-analysis follows direct calls. Two important categories of code don't sit on that graph and will be invisible until you go looking for them.
+
+### Pre-main code (`.init_array`, constructors)
+
+Functions tagged with `__attribute__((constructor))`, C++ static initializers, and any code the linker registers in `.init_array` run *before* `main`. They commonly stage globals, derive keys, or wire up dispatch tables — exactly the kind of setup that breaks an analysis built only from `main`'s call graph.
+
+To find them:
+
+1. Look for `.init_array` in `bn sections` (it's a `ReadOnlyData` section near `.dynamic`).
+2. Walk the array — each entry is one function pointer:
+
+   ```bash
+   bn py exec --stdin <<'PY'
+   import struct
+   start = 0x403c48      # .init_array start address from `bn sections`
+   size  = 16            # .init_array size from `bn sections`
+   for ptr in struct.unpack(f'<{size // 8}Q', bv.read(start, size)):
+       print(hex(ptr))
+   PY
+   ```
+
+3. Skip the toolchain stub `frame_dummy` — it's the first slot on most GCC builds and rarely interesting.
+4. Decompile each remaining entry. Anything that writes to BSS / `.data` / `.bss` is staging state for `main` to read; rename it `stage1_<purpose>` (or similar) so the relationship is visible from later analysis.
+
+ELF entry-flow review when nothing in `main` makes sense: `entry_point → __libc_start_main → main`, *but* `_start` and `__libc_start_main` invoke the `.init_array` callbacks before `main`. If a global "appears from nowhere" in `main`, the producer is almost certainly an `.init_array` entry.
+
+### Data-only function references
+
+If the binary has a dispatch table (an array of function pointers — common in VMs, FSAs, vtables, callback registries), Binary Ninja often *won't* identify the targets as functions because there's no direct `call` to them, only a data reference from the table.
+
+Symptoms: `bn decompile <addr>` errors with `Function not found`; the bytes at `<addr>` look like a function prologue (`endbr64`, `push rbp`, …) on disasm, but it's marked as data.
+
+Force-create the function and re-analyze:
+
+```bash
+bn py exec --stdin <<'PY'
+target = 0x4014d0
+if not bv.get_function_at(target):
+    bv.create_user_function(target)
+    bv.update_analysis_and_wait()
+print("created" if bv.get_function_at(target) else "still missing")
+PY
+```
+
+After that, the normal `bn decompile` / `bn xrefs` flow works on the new function.
+
+When this comes up most: VM opcode handler tables, FSA predicate tables, COM-style vtables, plugin registries. If you've recovered a struct of `(tag, fn_ptr)` rows and one of the `fn_ptr` targets is missing, this is almost always why.
+
 ## Iterative Type Recovery
 
 Type recovery is incremental. Don't try to get everything right at once.
