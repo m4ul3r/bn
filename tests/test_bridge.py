@@ -214,7 +214,7 @@ class _FakeSegment:
 
 class _FakeBV:
     def __init__(self, *, functions=None, symbols=None, types_=None, arch=None, disassembly=None, instruction_lengths=None,
-                 strings=None, sections=None, segments=None):
+                 strings=None, sections=None, segments=None, memory=None):
         self.functions = list(functions or [])
         self._symbols = list(symbols or [])
         self.types = dict(types_ or {})
@@ -224,6 +224,8 @@ class _FakeBV:
         self.strings = list(strings or [])
         self.sections = dict(sections or {})
         self._segments = dict(segments or {})
+        # Map of {base_address: bytes} describing contiguous mapped regions.
+        self._memory = dict(memory or {})
 
     def get_function_at(self, address: int):
         for fn in self.functions:
@@ -278,6 +280,14 @@ class _FakeBV:
         return self._segments.get(address)
 
     def read(self, address: int, length: int):
+        if self._memory:
+            # Binary Ninja's bv.read returns only the contiguous mapped bytes
+            # starting at *address*, or b"" if the address is unmapped.
+            for base, blob in self._memory.items():
+                if base <= address < base + len(blob):
+                    start = address - base
+                    return blob[start:start + length]
+            return b""
         return b"\x90" * length
 
 
@@ -604,6 +614,64 @@ def test_resolve_type_field_accepts_offset_and_suggests_near_match(monkeypatch):
 
     with pytest.raises(RuntimeError, match=r"Did you mean: visible_life_stock"):
         instance._resolve_type_field(bv, "Player.visible_life_stok")
+
+
+def test_find_function_suggests_close_match_when_not_found(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        functions=[
+            _FakeFunction(0x401000, "player_update"),
+            _FakeFunction(0x402000, "player_render"),
+        ]
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        instance._find_function(bv, "player_updaet")
+
+    message = str(exc_info.value)
+    assert message.startswith("Function not found: player_updaet")
+    assert "Did you mean: player_update" in message
+
+
+def test_find_function_not_found_without_close_match(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[_FakeFunction(0x401000, "player_update")])
+
+    with pytest.raises(RuntimeError) as exc_info:
+        instance._find_function(bv, "zzzzzzzz")
+
+    assert str(exc_info.value) == "Function not found: zzzzzzzz"
+
+
+def test_find_type_suggests_close_match_when_not_found(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        types_={
+            "Player": _FakeType("struct Player"),
+            "Enemy": _FakeType("struct Enemy"),
+        }
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        instance._find_type(bv, "Playr")
+
+    message = str(exc_info.value)
+    assert message.startswith("Type not found: Playr")
+    assert "Did you mean: Player" in message
+
+
+def test_find_type_not_found_without_close_match(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(types_={"Player": _FakeType("struct Player")})
+
+    with pytest.raises(RuntimeError) as exc_info:
+        instance._find_type(bv, "zzzzzzzz")
+
+    assert str(exc_info.value) == "Type not found: zzzzzzzz"
 
 
 def test_list_locals_returns_stable_ids(monkeypatch):
@@ -1500,6 +1568,179 @@ def test_imports_sorts_by_library_kind_name(monkeypatch):
     assert result[1]["library"] == "libz"
 
 
+# --- read: raw bytes at an address ---
+
+
+def test_read_returns_hex_and_ascii_for_mapped_address(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(memory={0x1000: b"\x48\x65\x6c\x6c\x6f\x00\x90\xff"})
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._read(None, "0x1000", 8)
+
+    assert result["address"] == "0x1000"
+    assert result["length"] == 8
+    assert result["hex"] == "48656c6c6f0090ff"
+    assert result["ascii"] == "Hello..."
+    assert "short_read" not in result
+    assert "note" not in result
+
+
+def test_read_accepts_decimal_address(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(memory={0x1000: b"\x41\x42\x43\x44"})
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._read(None, "4096", 4)
+
+    assert result["address"] == "0x1000"
+    assert result["hex"] == "41424344"
+    assert result["ascii"] == "ABCD"
+
+
+def test_read_unmapped_address_raises_naming_the_address(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(memory={0x1000: b"\x41\x42\x43\x44"})
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(RuntimeError, match="0xdead.*not mapped"):
+        instance._read(None, "0xdead", 16)
+
+
+def test_read_short_read_returns_mapped_bytes_with_note(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(memory={0x1000: b"\x01\x02\x03\x04"})
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._read(None, "0x1000", 16)
+
+    assert result["length"] == 4
+    assert result["hex"] == "01020304"
+    assert result["short_read"] is True
+    assert result["requested_length"] == 16
+    assert "short read" in result["note"]
+    assert "0x1000" in result["note"]
+
+
+# --- function create: create+analyze a missed function ---
+
+
+class _FakeFunctionCreateBV(_FakeMutationBV):
+    def __init__(self, *, functions=None, segments=None, memory=None):
+        super().__init__()
+        self.functions = list(functions or [])
+        self._segments = dict(segments or {})
+        self._memory = dict(memory or {})
+        self.added: list[int] = []
+
+    def add_function(self, addr: int):
+        self.events.append(("add_function", addr))
+        self.added.append(int(addr))
+        fn = _FakeFunction(int(addr), f"sub_{addr:x}")
+        self.functions.append(fn)
+        return fn
+
+    def is_offset_executable(self, addr: int) -> bool:
+        seg = self.get_segment_at(int(addr))
+        return bool(seg is not None and seg.executable)
+
+
+def test_function_create_at_executable_address_returns_verified(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFunctionCreateBV(
+        segments={0x1000: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x55\x48\x89\xe5"},
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_create(None, "0x1000", False)
+
+    assert result["success"] is True
+    assert result["committed"] is True
+    assert bv.added == [0x1000]
+    assert "refresh" in bv.events
+    assert ("commit", "state") in bv.events
+    res = result["results"][0]
+    assert res["op"] == "function_create"
+    assert res["status"] == "verified"
+    assert res["address"] == "0x1000"
+    assert res["function"] == "sub_1000"
+    assert result["affected_functions"][0]["after_name"] == "sub_1000"
+
+
+def test_function_create_preview_reverts_without_committing(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFunctionCreateBV(
+        segments={0x1000: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x55\x48\x89\xe5"},
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_create(None, "0x1000", True)
+
+    assert result["success"] is True
+    assert result["committed"] is False
+    assert result["results"][0]["status"] == "verified"
+    assert ("revert", "state") in bv.events
+    assert ("commit", "state") not in bv.events
+
+
+def test_function_create_existing_function_is_noop(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFunctionCreateBV(
+        functions=[_FakeFunction(0x1000, "player_update")],
+        segments={0x1000: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x55\x48\x89\xe5"},
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_create(None, "0x1000", False)
+
+    assert result["success"] is True
+    assert result["committed"] is False
+    assert bv.added == []
+    res = result["results"][0]
+    assert res["status"] == "noop"
+    assert res["function"] == "player_update"
+
+
+def test_function_create_unmapped_address_is_rejected(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFunctionCreateBV(
+        segments={0x1000: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x55\x48\x89\xe5"},
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(RuntimeError, match="0xdead.*not mapped"):
+        instance._function_create(None, "0xdead", False)
+
+    assert bv.added == []
+
+
+def test_function_create_non_executable_address_is_rejected(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFunctionCreateBV(
+        segments={0x5000: _FakeSegment(readable=True, writable=True, executable=False)},
+        memory={0x5000: b"\x01\x02\x03\x04"},
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(RuntimeError, match="0x5000.*not inside an executable segment"):
+        instance._function_create(None, "0x5000", False)
+
+    assert bv.added == []
+
+
 # ---------------------------------------------------------------------------
 # Verification: local rename with SSA-style variable reconstruction
 # ---------------------------------------------------------------------------
@@ -1847,6 +2088,50 @@ def test_resolve_raises_on_ambiguous_basename(monkeypatch):
     with pytest.raises(RuntimeError, match="Ambiguous target selector"):
         manager.resolve("target.bndb")
     bridge._headless_views.clear()
+
+
+def test_resolve_unknown_selector_lists_open_targets(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    bv1 = _FakeFileBV("/work/01_arithmetic_lock/target.bndb", session_id="1")
+    bv2 = _FakeFileBV("/work/02_bytecode_vm/target.bndb", session_id="2")
+    _register_views(bridge, bv1, bv2)
+
+    manager = bridge.TargetManager()
+    with pytest.raises(RuntimeError) as exc_info:
+        manager.resolve("does_not_exist")
+
+    message = str(exc_info.value)
+    assert message.startswith("Unknown target selector: does_not_exist")
+    assert "Open targets:" in message
+    assert "01_arithmetic_lock/target.bndb" in message
+    assert "02_bytecode_vm/target.bndb" in message
+    assert "view_id=" in message
+    assert "target_id=" in message
+    assert "view_id / target_id are stable across `bn save`" in message
+    bridge._headless_views.clear()
+
+
+def test_serialize_error_keeps_user_facing_messages_clean(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+
+    runtime = RuntimeError("Function not found: foo")
+    assert bridge._serialize_error(runtime) == "Function not found: foo"
+
+    failure = bridge.OperationFailure("unsupported", "Symbol not found: bar")
+    assert bridge._serialize_error(failure) == "Symbol not found: bar"
+
+    value_error = ValueError("Unknown operation: bogus")
+    assert bridge._serialize_error(value_error) == "Unknown operation: bogus"
+
+
+def test_serialize_error_prefixes_unexpected_exceptions(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+
+    assert bridge._serialize_error(KeyError("offset")) == "internal error: KeyError: 'offset'"
+    assert (
+        bridge._serialize_error(AttributeError("'NoneType' has no attribute 'name'"))
+        == "internal error: AttributeError: 'NoneType' has no attribute 'name'"
+    )
 
 
 def test_load_binary_already_bndb_skips_lookup(monkeypatch, tmp_path):

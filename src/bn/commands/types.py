@@ -49,7 +49,8 @@ def _types_show(args: argparse.Namespace) -> int:
 
 @command("types", "declare", help="Import C declarations as user types", target=True,
          args=[
-             arg("--preview", action="store_true"),
+             arg("--preview", action="store_true",
+                 help="Apply, capture diffs, then revert without committing"),
              arg("--file", type=Path, help="Read declarations from a file"),
              arg("--stdin", action="store_true", help="Read declarations from stdin"),
              arg("declaration", nargs="?"),
@@ -103,7 +104,8 @@ def _struct_show(args: argparse.Namespace) -> int:
 
 @command("struct", "field", "set", help="Set or replace a field", target=True,
          args=[
-             arg("--preview", action="store_true"),
+             arg("--preview", action="store_true",
+                 help="Apply, capture diffs, then revert without committing"),
              arg("--no-overwrite", action="store_true"),
              arg("struct_name"),
              arg("offset"),
@@ -132,7 +134,8 @@ def _struct_field_set(args: argparse.Namespace) -> int:
 
 @command("struct", "field", "rename", help="Rename a field", target=True,
          args=[
-             arg("--preview", action="store_true"),
+             arg("--preview", action="store_true",
+                 help="Apply, capture diffs, then revert without committing"),
              arg("struct_name"),
              arg("old_name"),
              arg("new_name"),
@@ -157,7 +160,8 @@ def _struct_field_rename(args: argparse.Namespace) -> int:
 
 @command("struct", "field", "delete", help="Delete a field", target=True,
          args=[
-             arg("--preview", action="store_true"),
+             arg("--preview", action="store_true",
+                 help="Apply, capture diffs, then revert without committing"),
              arg("struct_name"),
              arg("field_name"),
          ])

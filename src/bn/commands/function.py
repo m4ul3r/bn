@@ -4,11 +4,12 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-from ..cli import _call, _parse_line_range, arg, command, mutex
+from ..cli import _call, _mutation_exit_code, _parse_line_range, arg, command, mutex
 from ..formatters import (
     _render_callsites_text,
     _render_field_xrefs_text,
     _render_function_info_text,
+    _render_mutation_text,
     _render_name_address_list_text,
     _render_xrefs_text,
     _text_field,
@@ -72,7 +73,7 @@ def _function_search(args: argparse.Namespace) -> int:
 
 
 @command("function", "info", help="Show function prototype and variables", target=True,
-         args=[arg("identifier"),
+         args=[arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
                arg("--verbose", "-v", action="store_true", default=False,
                    help="Show full parameter and local variable details")])
 def _function_info(args: argparse.Namespace) -> int:
@@ -88,9 +89,33 @@ def _function_info(args: argparse.Namespace) -> int:
     )
 
 
+@command("function", "create",
+         help="Create and analyze a function at an address auto-analysis missed",
+         target=True, fmt="json",
+         args=[
+             arg("--preview", action="store_true",
+                 help="Create, verify, then revert without committing"),
+             arg("address", help="Address of the function entry point (hex or decimal)"),
+         ])
+def _function_create(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "function_create",
+        {
+            "address": args.address,
+            "preview": bool(args.preview),
+        },
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_mutation_text,
+        stem="function-create",
+        result_exit_code=_mutation_exit_code,
+    )
+
+
 @command("decompile", help="Render HLIL-style decompile text for a function", target=True,
          args=[
-             arg("identifier"),
+             arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
              arg("--addresses", action="store_true", default=False,
                  help="Show address prefixes on each line"),
              arg("--lines", type=_parse_line_range, default=None, metavar="START:END",
@@ -123,9 +148,11 @@ def _decompile(args: argparse.Namespace) -> int:
 
 @command("il", help="Dump IL for a function", target=True,
          args=[
-             arg("identifier"),
-             arg("--view", choices=("hlil", "mlil", "llil"), default="hlil"),
-             arg("--ssa", action="store_true"),
+             arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
+             arg("--view", choices=("hlil", "mlil", "llil"), default="hlil",
+                 help="IL level to dump: hlil (default), mlil, or llil"),
+             arg("--ssa", action="store_true",
+                 help="Emit the SSA form of the selected IL view"),
          ])
 def _il(args: argparse.Namespace) -> int:
     return _call(
@@ -140,7 +167,7 @@ def _il(args: argparse.Namespace) -> int:
 
 
 @command("disasm", help="Disassemble a function", target=True,
-         args=[arg("identifier")])
+         args=[arg("identifier", help="Function name or entry address (hex 0x.. or decimal)")])
 def _disasm(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -156,7 +183,8 @@ def _disasm(args: argparse.Namespace) -> int:
 @command("xrefs", help="List xrefs to an address or function; use --field for struct field xrefs",
          target=True,
          args=[
-             arg("identifier", nargs="?"),
+             arg("identifier", nargs="?",
+                 help="Function name or address (hex 0x.. or decimal) to find inbound refs to"),
              arg("--field", dest="field_spec",
                  help="Struct field xref spec (e.g., TrackRowCell.tile_type)"),
              arg("--limit", type=int, default=None,
@@ -202,7 +230,7 @@ def _load_within_identifiers(path: Path) -> list[str]:
 @command("callsites", help="Find direct native callsites and exact caller_static addresses",
          target=True,
          args=[
-             arg("callee"),
+             arg("callee", help="Callee function name or address whose callsites to locate"),
              arg("--context", type=int, default=3,
                  help="Number of previous and next instructions to include around each callsite"),
              arg("--caller-static", action="store_true",

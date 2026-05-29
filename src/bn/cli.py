@@ -137,6 +137,22 @@ class BnArgumentParser(argparse.ArgumentParser):
             file = sys.stdout
         self._print_message(self.format_full_help(), file)
 
+    def parse_args(  # type: ignore[override]
+        self,
+        args: Any = None,
+        namespace: Any = None,
+    ) -> argparse.Namespace:
+        parsed, extras = self.parse_known_args(args, namespace)
+        if extras:
+            # Route unrecognized arguments to the most-specific subcommand parser
+            # so the usage/error text reflects the command the user actually ran,
+            # not the bare root parser. Each subparser records itself as `_parser`.
+            selected_parser = getattr(parsed, "_parser", self)
+            selected_parser.error(
+                f"unrecognized arguments: {' '.join(extras)}"
+            )
+        return parsed
+
 
 def _package_version() -> str:
     return VERSION
@@ -320,10 +336,29 @@ def _render_result(
     if result.spilled and result.artifact:
         label = spill_label or stem.replace("_", " ")
         artifact = result.artifact
+        artifact_path = artifact["artifact_path"]
         sys.stdout.write(result.rendered)
-        print(f"warning: {label} output spilled to {artifact['artifact_path']}", file=sys.stderr)
+        hint = _spill_next_step_hint(stem, spill_context, artifact_path)
+        print(
+            f"warning: {label} output spilled to {artifact_path}; {hint}",
+            file=sys.stderr,
+        )
         return
     sys.stdout.write(result.rendered)
+
+
+def _spill_next_step_hint(stem: str, spill_context: Any, artifact_path: str) -> str:
+    """Build a command-keyed next-step slicing hint for spilled output.
+
+    Mirrors the pagination truncation warning: decompile output is line-sliced,
+    list/array output is paginated, and anything else points at the artifact.
+    """
+
+    if stem == "decompile":
+        return "rerun with --lines START:END to fetch a slice instead"
+    if isinstance(spill_context, list):
+        return "rerun with --limit/--offset to page through the results"
+    return f"read the artifact at {artifact_path} to inspect the full output"
 
 
 def _implicit_target(args: argparse.Namespace) -> str:
@@ -423,6 +458,20 @@ def _call(
         spill_context=spill_context,
     )
     return exit_code
+
+
+def _int_or_hex(value: str) -> int:
+    """Parse a count/size accepting decimal or ``0x``/``0o``/``0b`` literals.
+
+    RE work is hex-native (strides, ``memcpy`` sizes), so size args should take
+    the same hex forms as address args rather than forcing decimal-only ``int``.
+    """
+    try:
+        return int(value, 0)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected a decimal or hex (0x..) integer, got {value!r}"
+        )
 
 
 def _parse_line_range(value: str) -> tuple[int, int]:
@@ -810,8 +859,18 @@ def _target_clear(args: argparse.Namespace) -> int:
 
 
 def _add_paged_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--offset", type=int, default=0)
-    parser.add_argument("--limit", type=int, default=100)
+    parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Index of the first item to return (default: 0)",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=100,
+        help="Maximum number of items to return (default: 100)",
+    )
 
 
 def _add_function_address_args(parser: argparse.ArgumentParser) -> None:
@@ -830,7 +889,14 @@ def build_parser() -> argparse.ArgumentParser:
     # Deferred until call time to keep cli.py importable on its own.
     from . import commands  # noqa: F401
 
-    parser = BnArgumentParser(prog="bn", description="Agent-friendly Binary Ninja CLI")
+    parser = BnArgumentParser(
+        prog="bn",
+        description="Agent-friendly Binary Ninja CLI",
+        epilog=(
+            "Output over ~10k o200k_base tokens spills to disk; the command prints an "
+            "envelope with the artifact path. Read that file directly -- do not pipe to grep."
+        ),
+    )
     parser.set_defaults(handler=None)
     _instance_option(parser, is_root=True)
     _target_option(parser, required=False, is_root=True)

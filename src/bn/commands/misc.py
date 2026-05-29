@@ -5,11 +5,12 @@ import json
 import sys
 from pathlib import Path
 
-from ..cli import _call, _mutation_exit_code, arg, command, mutex
+from ..cli import _call, _int_or_hex, _mutation_exit_code, arg, command, mutex
 from ..formatters import (
     _render_mutation_text,
     _render_name_address_list_text,
     _render_py_exec_text,
+    _render_read_text,
     _render_sections_text,
     _render_strings_text,
 )
@@ -89,6 +90,49 @@ def _bundle_function(args: argparse.Namespace) -> int:
     )
 
 
+@command("read", help="Read raw bytes at an address", target=True,
+         args=[
+             arg("--address", required=True,
+                 help="Address to read from (hex 0x.. or decimal)"),
+             arg("--length", required=True, type=_int_or_hex,
+                 help="Number of bytes to read (decimal or hex 0x..)"),
+             arg("--encoding", choices=("hex", "bytes"), default="hex",
+                 help="Byte payload encoding: hex hexdump (default) or raw bytes"),
+         ])
+def _read(args: argparse.Namespace) -> int:
+    if args.encoding == "bytes":
+        return _read_raw_bytes(args)
+    return _call(
+        args,
+        "read",
+        {"address": args.address, "length": args.length},
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_read_text,
+        stem="read",
+    )
+
+
+def _read_raw_bytes(args: argparse.Namespace) -> int:
+    from .. import cli
+
+    target = cli._resolve_target(args, require_target=True, allow_implicit_target=True)
+    response = cli.send_request(
+        "read",
+        params={"address": args.address, "length": args.length},
+        target=target,
+        instance_id=getattr(args, "instance", None),
+    )
+    result = response["result"]
+    data = bytes.fromhex(result["hex"])
+    if args.out:
+        args.out.write_bytes(data)
+    else:
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+    return 0
+
+
 @command("py", "exec", help="Execute a Python snippet", target=True,
          mutex_groups=[
              mutex(True,
@@ -119,8 +163,10 @@ def _py_exec(args: argparse.Namespace) -> int:
 
 @command("batch", "apply", help="Apply a JSON manifest",
          args=[
-             arg("--preview", action="store_true"),
-             arg("manifest", type=Path),
+             arg("--preview", action="store_true",
+                 help="Apply the whole batch, capture diffs, then revert without committing"),
+             arg("manifest", type=Path,
+                 help="Path to a JSON manifest: a dict with a top-level 'ops' list and a 'target'"),
          ])
 def _batch_apply(args: argparse.Namespace) -> int:
     manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
