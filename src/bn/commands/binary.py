@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-from ..cli import _call, arg, command
+from ..cli import _call, _pick, arg, command
 from ..formatters import (
     _render_close_text,
     _render_load_text,
@@ -51,11 +51,16 @@ def _close(args: argparse.Namespace) -> int:
 
 
 @command("save", help="Save the current analysis database (.bndb)", target=True,
-         args=[arg("path", nargs="?", help="Output path (defaults to <filename>.bndb)")])
+         args=[
+             arg("path", nargs="?", help="Output path (defaults to <filename>.bndb)"),
+             arg("--path", dest="path_flag", default=None,
+                 help="Output path (alias for the positional)"),
+         ])
 def _save(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
-    if getattr(args, "path", None):
-        params["path"] = str(Path(args.path).expanduser().resolve())
+    out_path = _pick(args.path, getattr(args, "path_flag", None), "save path", required=False)
+    if out_path:
+        params["path"] = str(Path(out_path).expanduser().resolve())
     return _call(
         args,
         "save_database",

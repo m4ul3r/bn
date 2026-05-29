@@ -2112,6 +2112,94 @@ def test_read_bytes_encoding_writes_raw_bytes(monkeypatch, capsys):
     assert capsys.readouterr().out == "ABCD"
 
 
+def test_read_accepts_positional_address(monkeypatch):
+    captured_params = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        assert op == "read"
+        captured_params.update(params)
+        return {"ok": True, "result": {"address": "0x1000", "length": 8, "hex": "00" * 8, "ascii": "." * 8}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    # Positional address matches the convention used by decompile/disasm/il/xrefs.
+    rc = bn.cli.main(["read", "--target", "active", "0x1000", "--length", "8"])
+
+    assert rc == 0
+    assert captured_params == {"address": "0x1000", "length": 8}
+
+
+def test_read_length_accepts_hex(monkeypatch):
+    captured_params = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        captured_params.update(params)
+        return {"ok": True, "result": {"address": "0x1000", "length": 194, "hex": "", "ascii": ""}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["read", "--target", "active", "0x1000", "--length", "0xc2"])
+
+    assert rc == 0
+    assert captured_params["length"] == 194
+
+
+def test_read_conflicting_address_errors(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        raise AssertionError("send_request should not run when addresses conflict")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["read", "--target", "active", "0x1000", "--address", "0x2000", "--length", "8"])
+
+    assert rc == 2
+    assert "given twice with different values" in capsys.readouterr().err
+
+
+def test_read_missing_address_errors(monkeypatch, capsys):
+    monkeypatch.setattr(bn.cli, "send_request", lambda *a, **k: None)
+
+    rc = bn.cli.main(["read", "--target", "active", "--length", "8"])
+
+    assert rc == 2
+    assert "read address is required" in capsys.readouterr().err
+
+
+def test_save_accepts_path_flag(monkeypatch, tmp_path):
+    captured_params = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        assert op == "save_database"
+        captured_params.update(params or {})
+        return {"ok": True, "result": {"path": params.get("path"), "saved": True}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    out = tmp_path / "out.bndb"
+    rc = bn.cli.main(["save", "--target", "active", "--path", str(out)])
+
+    assert rc == 0
+    assert captured_params["path"] == str(out.expanduser().resolve())
+
+
+def test_rename_alias_maps_to_symbol_rename(monkeypatch):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        captured["op"] = op
+        captured["params"] = params
+        return {"ok": True, "result": {"preview": True}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["rename", "--target", "123:1:7", "--preview", "sub_401000", "player_update"])
+
+    assert rc == 0
+    assert captured["op"] == "rename_symbol"
+    assert captured["params"]["identifier"] == "sub_401000"
+    assert captured["params"]["new_name"] == "player_update"
+
+
 def test_close_warns_on_unsaved_changes(monkeypatch, capsys):
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
         assert op == "close_binary"

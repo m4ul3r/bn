@@ -474,6 +474,23 @@ def _int_or_hex(value: str) -> int:
         )
 
 
+def _pick(positional: Any, flag: Any, label: str, *, required: bool = True) -> Any:
+    """Resolve a value supplied either positionally or via a flag alias.
+
+    Lets address/path args be passed uniformly (``bn read 0x.. `` or
+    ``bn read --address 0x..``). Both-but-equal is fine; both-but-different
+    raises, and absence raises only when ``required``.
+    """
+    if positional is not None and flag is not None and positional != flag:
+        raise BridgeError(
+            f"{label} given twice with different values ({positional!r} vs {flag!r})"
+        )
+    value = positional if positional is not None else flag
+    if value is None and required:
+        raise BridgeError(f"{label} is required")
+    return value
+
+
 def _parse_line_range(value: str) -> tuple[int, int]:
     parts = value.split(":")
     if len(parts) != 2:

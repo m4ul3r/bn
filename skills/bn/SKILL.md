@@ -64,7 +64,8 @@ bn close [<path>]                       # close one (omit path → close all)
 
 ```bash
 bn save                                  # saves to <filename>.bndb
-bn save /path/to/output.bndb             # explicit path
+bn save /path/to/output.bndb             # explicit path (positional)
+bn save --path /path/to/output.bndb      # --path is an accepted alias for the positional
 ```
 
 > **Selector rebind after save.** `bn save` / `bn save <path>` rebinds the in-memory view's filename, so its basename / filename selector changes (e.g. `foo` becomes `foo.bndb`). A `-t foo` that worked before the save can stop resolving afterward. Post-save commands should target the **stable** `view_id` / `target_id` (the `[N]` prefix from `bn target list`), not the basename, to avoid `Unknown target selector` after a save.
@@ -131,7 +132,7 @@ bn callsites <callee> --within <fn>
 bn callsites <callee> --within-file <path>
 bn proto get <fn>
 bn local list <fn>
-bn read --address 0x... --length N [--encoding {hex|bytes}]
+bn read 0x... --length N [--encoding {hex|bytes}]   # address is positional; --address 0x... is an accepted alias
 bn function create <address> [--preview]
 bn types [--query <q>]
 bn types show <name>
@@ -152,7 +153,7 @@ Notes:
 - `bn imports` JSON tags each entry with `kind` (`function`, `data`, `address`) and includes `library` + `raw_name`. Text marks data/address imports with `(data)` / `(address)`.
 - `bn sections` exposes start/end, length, semantics, and segment-derived `r/w/x` permission flags.
 - `bn strings`: `--no-crt` is a heuristic — drops single-character repetitions and strings sitting in `.text`. Combine with `--min-length` and `--section`.
-- `bn read --address <addr> --length <N>` returns raw bytes from the mapped view — the parallel-safe alternative to a `py exec` `bv.read(...)` (it runs under the shared read lock). Text mode prints an offset/hex/ASCII hexdump; JSON returns `{address, length, hex, ascii}`. A read that runs past mapped memory comes back **short** with `short_read: true`, `requested_length`, and a `note` (it does **not** error). An entirely unmapped address *does* error (`Address 0x... is not mapped`). Add `--encoding bytes` to stream the raw bytes to stdout (or to `--out <path>`) instead of a hexdump — useful for piping a blob into another tool or saving it to disk.
+- `bn read --address <addr> --length <N>` returns raw bytes from the mapped view — the parallel-safe alternative to a `py exec` `bv.read(...)` (it runs under the shared read lock). Text mode prints an offset/hex/ASCII hexdump; JSON returns `{address, length, hex, ascii}`. A read that runs past mapped memory comes back **short** with `short_read: true`, `requested_length`, and a `note` (it does **not** error). An entirely unmapped address *does* error (`Address 0x... is not mapped`). Add `--encoding bytes` to stream the raw bytes to stdout (or to `--out <path>`) instead of a hexdump — useful for piping a blob into another tool or saving it to disk. Note that `--encoding bytes` emits only the raw stream, so the `short_read`/`note` marker is **not** visible in that mode — use the default hex mode (or JSON) when you need to know whether a read ran short.
 - `bn function create <address> [--preview]` forces Binary Ninja to create and analyze a function at `<address>` when auto-analysis missed it. **When to reach for it:** a code entry point that BN never disassembled because it is reachable only through a **data pointer** (a vtable slot, a function-pointer table, a handler/dispatch array) and has no direct `call`. Point `bn read` / `bn xrefs` at the pointer table to recover the target address, then `bn function create` it so `decompile` / `xrefs` / `callsites` work on it. It is a verified mutation, so it honors the same `--preview` (create → verify → revert) and live-verify loop as the other mutations: it returns `noop` if a function already starts there, errors if the address is unmapped or not inside an executable segment, and rolls back with `verification_failed` if analysis produces no function. Save afterward (§6 step 4) to persist the new function.
 
 ## 5. Caller-static mapping
@@ -187,7 +188,7 @@ The mutation surface is built around a four-step safety loop: **preview → live
 bn types declare "typedef struct Player { int hp; } Player;" --preview
 bn types declare --file /path/to/win32_min.h --preview
 bn struct field set Player 0x308 movement_flag_selector uint32_t --preview
-bn symbol rename sub_401000 player_update --preview
+bn symbol rename sub_401000 player_update --preview   # `bn rename sub_401000 player_update` is a top-level alias (locals: `bn local rename`; struct fields: `bn struct field rename`)
 bn proto set sub_401000 "int __cdecl player_update(Player* self)" --preview
 bn comment set --address 0x401000 "explain this" --preview
 bn function create 0x401000 --preview

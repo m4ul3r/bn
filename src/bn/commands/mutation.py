@@ -12,15 +12,21 @@ from ..formatters import (
 )
 
 
-@command("symbol", "rename", help="Rename a symbol", target=True,
-         args=[
-             arg("--kind", choices=("auto", "function", "data"), default="auto",
-                 help="Symbol kind to rename: auto-detect (default), function, or data"),
-             arg("--preview", action="store_true",
-                 help="Apply, capture diffs, then revert without committing"),
-             arg("identifier", help="Current symbol name or address (hex 0x.. or decimal)"),
-             arg("new_name", help="New symbol name"),
-         ])
+_RENAME_ARGS = [
+    arg("--kind", choices=("auto", "function", "data"), default="auto",
+        help="Symbol kind to rename: auto-detect (default), function, or data"),
+    arg("--preview", action="store_true",
+        help="Apply, capture diffs, then revert without committing"),
+    arg("identifier", help="Current symbol name or address (hex 0x.. or decimal)"),
+    arg("new_name", help="New symbol name"),
+]
+
+
+@command("rename",
+         help="Rename a function or data symbol (alias for `symbol rename`; "
+              "use `local rename` / `struct field rename` for locals and fields)",
+         target=True, args=_RENAME_ARGS)
+@command("symbol", "rename", help="Rename a symbol", target=True, args=_RENAME_ARGS)
 def _symbol_rename(args: argparse.Namespace) -> int:
     return _call(
         args,
