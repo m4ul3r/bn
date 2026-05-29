@@ -1229,6 +1229,37 @@ class BinaryNinjaBridge:
             seen.add(marker)
             yield var, False
 
+        # Register/flag locals that HLIL renders (e.g. rsi_1, rdx_3, loop
+        # counters, the success flag) are real, nameable Variables that live in
+        # neither parameter_vars nor stack_layout, so without this they are
+        # invisible to `local list` and unresolvable by `local rename`/`retype`
+        # (-> "Variable not found", which rolls back the whole batch). Surface
+        # the HLIL-visible ones; func.vars would also drag in dataflow
+        # temporaries (temp0, cond intermediates) that never appear in output.
+        for var in self._iter_hlil_variables(func):
+            marker = self._variable_marker(var)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            yield var, False
+
+    def _iter_hlil_variables(self, func):
+        """HLIL-rendered variables, or empty when HLIL is unavailable.
+
+        Large or non-decompilable functions may have no HLIL; fall back to the
+        parameter/stack set rather than failing the whole listing.
+        """
+        try:
+            hlil = func.hlil
+        except Exception:
+            return []
+        if hlil is None:
+            return []
+        try:
+            return list(hlil.vars)
+        except Exception:
+            return []
+
     def _format_hlil_tree(self, ins, indent=0, *, _else_prefix=False, addresses: bool = True):
         """Recursively format HLIL tree with proper indentation."""
         lines = []

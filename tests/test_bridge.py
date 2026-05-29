@@ -714,6 +714,59 @@ def test_list_locals_skips_stack_aliases_for_parameters(monkeypatch):
     ]
 
 
+def test_list_locals_surfaces_hlil_register_and_flag_vars(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401230, "keychecker_step", "int32_t keychecker_step(void* arg1, char arg2)")
+    arg1 = _FakeVariable(name="arg1", storage=105, var_type="void*", identifier=5001,
+                         source_type="RegisterVariableSourceType")
+    arg2 = _FakeVariable(name="arg2", storage=104, var_type="char", identifier=5002,
+                         source_type="RegisterVariableSourceType")
+    ret = _FakeVariable(name="__return_addr", storage=0, var_type="void*", identifier=6001,
+                        source_type="StackVariableSourceType")
+    fn.parameter_vars = [arg1, arg2]
+    fn.stack_layout = [ret]
+    # Register/flag locals only visible through HLIL; arg1/arg2 reappear here
+    # (same Variable identity) and must dedupe against the parameter entries.
+    rsi_1 = _FakeVariable(name="rsi_1", storage=104, var_type="char", identifier=5011, index=11,
+                          source_type="RegisterVariableSourceType")
+    rdx_3 = _FakeVariable(name="rdx_3", storage=100, var_type="int32_t", identifier=5032, index=32,
+                          source_type="RegisterVariableSourceType")
+    cond = _FakeVariable(name="cond:0", storage=2147483648, var_type="bool", identifier=7000, index=15,
+                         source_type="FlagVariableSourceType")
+    fn.hlil = types.SimpleNamespace(vars=[arg1, arg2, rsi_1, rdx_3, cond])
+
+    locals_list = instance._list_locals(fn)
+    by_name = {item["name"]: item for item in locals_list}
+
+    # params + stack + the 3 HLIL-only vars, with no duplicate arg1/arg2
+    assert [item["name"] for item in locals_list].count("arg1") == 1
+    assert [item["name"] for item in locals_list].count("arg2") == 1
+    assert {"rsi_1", "rdx_3", "cond:0"} <= set(by_name)
+    assert by_name["rsi_1"]["local_id"] == "0x401230:local:reg:104:11:5011"
+    assert by_name["cond:0"]["local_id"] == "0x401230:local:flag:2147483648:15:7000"
+
+    # The point of the fix: a register var is now resolvable for rename/retype,
+    # by both its local_id and its name.
+    found, is_param = instance._find_variable_selector(fn, by_name["rsi_1"]["local_id"])
+    assert found is rsi_1 and is_param is False
+    found_by_name, _ = instance._find_variable_selector(fn, "rdx_3")
+    assert found_by_name is rdx_3
+
+
+def test_list_locals_without_hlil_falls_back_to_param_and_stack(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    # _FakeFunction has no `.hlil` attribute -> graceful fallback, no crash.
+    fn = _FakeFunction(0x401000, "f", "int32_t f(int32_t arg1)")
+    fn.parameter_vars = [_FakeVariable(name="arg1", storage=4, var_type="int32_t", identifier=1001)]
+    fn.stack_layout = [_FakeVariable(name="var_4", storage=-4, var_type="int32_t", identifier=2001)]
+
+    locals_list = instance._list_locals(fn)
+
+    assert [item["name"] for item in locals_list] == ["arg1", "var_4"]
+
+
 def test_find_variable_selector_prefers_local_id(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
