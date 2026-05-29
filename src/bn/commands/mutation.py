@@ -12,13 +12,21 @@ from ..formatters import (
 )
 
 
-@command("symbol", "rename", help="Rename a symbol", target=True,
-         args=[
-             arg("--kind", choices=("auto", "function", "data"), default="auto"),
-             arg("--preview", action="store_true"),
-             arg("identifier"),
-             arg("new_name"),
-         ])
+_RENAME_ARGS = [
+    arg("--kind", choices=("auto", "function", "data"), default="auto",
+        help="Symbol kind to rename: auto-detect (default), function, or data"),
+    arg("--preview", action="store_true",
+        help="Apply, capture diffs, then revert without committing"),
+    arg("identifier", help="Current symbol name or address (hex 0x.. or decimal)"),
+    arg("new_name", help="New symbol name"),
+]
+
+
+@command("rename",
+         help="Rename a function or data symbol (alias for `symbol rename`; "
+              "use `local rename` / `struct field rename` for locals and fields)",
+         target=True, args=_RENAME_ARGS)
+@command("symbol", "rename", help="Rename a symbol", target=True, args=_RENAME_ARGS)
 def _symbol_rename(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -56,7 +64,8 @@ def _comment_list(args: argparse.Namespace) -> int:
 
 @command("comment", "set", help="Set a comment", target=True,
          args=[
-             arg("--preview", action="store_true"),
+             arg("--preview", action="store_true",
+                 help="Apply, capture diffs, then revert without committing"),
              arg("--address"),
              arg("--function"),
              arg("comment"),
@@ -98,7 +107,8 @@ def _comment_get(args: argparse.Namespace) -> int:
 
 @command("comment", "delete", help="Delete a comment", target=True,
          args=[
-             arg("--preview", action="store_true"),
+             arg("--preview", action="store_true",
+                 help="Apply, capture diffs, then revert without committing"),
              arg("--address"),
              arg("--function"),
          ])
@@ -121,9 +131,10 @@ def _comment_delete(args: argparse.Namespace) -> int:
 
 @command("proto", "set", help="Set a prototype", target=True,
          args=[
-             arg("--preview", action="store_true"),
-             arg("identifier"),
-             arg("prototype"),
+             arg("--preview", action="store_true",
+                 help="Apply, capture diffs, then revert without committing"),
+             arg("identifier", help="Function name or address (hex 0x.. or decimal)"),
+             arg("prototype", help="Full C prototype string, e.g. \"int __cdecl f(Player* self)\""),
          ])
 def _proto_set(args: argparse.Namespace) -> int:
     return _call(
@@ -143,7 +154,7 @@ def _proto_set(args: argparse.Namespace) -> int:
 
 
 @command("proto", "get", help="Show the current prototype", target=True,
-         args=[arg("identifier")])
+         args=[arg("identifier", help="Function name or address (hex 0x.. or decimal)")])
 def _proto_get(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -172,7 +183,8 @@ def _local_list(args: argparse.Namespace) -> int:
 
 @command("local", "rename", help="Rename a local", target=True,
          args=[
-             arg("--preview", action="store_true"),
+             arg("--preview", action="store_true",
+                 help="Apply, capture diffs, then revert without committing"),
              arg("function"),
              arg("variable", help="Stable local_id or legacy variable name"),
              arg("new_name"),
@@ -197,7 +209,8 @@ def _local_rename(args: argparse.Namespace) -> int:
 
 @command("local", "retype", help="Retype a local", target=True,
          args=[
-             arg("--preview", action="store_true"),
+             arg("--preview", action="store_true",
+                 help="Apply, capture diffs, then revert without committing"),
              arg("function"),
              arg("variable", help="Stable local_id or legacy variable name"),
              arg("new_type"),

@@ -588,6 +588,45 @@ def _render_sections_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+def _render_read_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+
+    hex_str = value.get("hex")
+    if not isinstance(hex_str, str):
+        return _render_fallback_text(value)
+
+    try:
+        data = bytes.fromhex(hex_str)
+    except ValueError:
+        return _render_fallback_text(value)
+
+    address = value.get("address", "0x0")
+    try:
+        base = int(str(address), 16) if str(address).lower().startswith("0x") else int(address)
+    except (TypeError, ValueError):
+        base = 0
+
+    lines: list[str] = []
+    width = 16
+    for offset in range(0, len(data), width):
+        chunk = data[offset:offset + width]
+        hex_bytes = " ".join(f"{b:02x}" for b in chunk)
+        hex_bytes = f"{hex_bytes:<{width * 3 - 1}}"
+        ascii_chunk = "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in chunk)
+        lines.append(f"{base + offset:08x}: {hex_bytes}  {ascii_chunk}")
+
+    if not lines:
+        lines.append(f"{base:08x}: (no bytes)")
+
+    note = value.get("note")
+    if isinstance(note, str) and note:
+        lines.append("")
+        lines.append(f"note: {note}")
+
+    return "\n".join(lines)
+
+
 def _render_doctor_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -640,6 +679,10 @@ def _format_operation_result(item: dict[str, Any]) -> str:
     def _get(key: str, default: str = "<unknown>") -> str:
         return item.get(key) or requested.get(key, default)
 
+    if op == "function_create":
+        name = item.get("function")
+        suffix = f" ({name})" if name else ""
+        return f"function_create {_get('address')}{suffix}"
     if op == "rename_symbol":
         return f"rename_symbol {_get('kind', 'auto')} {_get('address')} -> {_get('new_name')}"
     if op == "set_comment":

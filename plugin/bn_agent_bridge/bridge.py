@@ -55,6 +55,42 @@ def _format_ambiguous_symbol_error(identifier: Any, matches: list[Any]) -> str:
     return "\n".join(lines)
 
 
+def _format_unknown_target_error(selector: Any, targets: list[dict[str, Any]]) -> str:
+    lines = [f"Unknown target selector: {selector}"]
+    if not targets:
+        lines.append("No BinaryView targets are open.")
+        return "\n".join(lines)
+    lines.append("Open targets:")
+    for target in targets:
+        marker = "*" if target.get("active") else " "
+        lines.append(
+            f"  {marker} {target.get('selector', '')}"
+            f"  view_id={target.get('view_id', '')}"
+            f"  target_id={target.get('target_id', '')}"
+            f"  {target.get('filename', '')}"
+        )
+    lines.append("note: view_id / target_id are stable across `bn save`")
+    return "\n".join(lines)
+
+
+def _serialize_error(exc: BaseException) -> str:
+    """Render an exception for the user-facing error field.
+
+    User-facing errors (``OperationFailure`` and the plain ``RuntimeError`` /
+    ``ValueError`` instances raised throughout the bridge to report bad input or
+    missing targets) carry an already-actionable message, so we emit ``str(exc)``
+    verbatim. Anything outside that whitelist is treated as an unexpected bug and
+    prefixed with ``internal error:`` plus its class name so callers can tell the
+    difference without us leaking raw Python class names into normal errors.
+    """
+
+    # OperationFailure subclasses RuntimeError, so it is already covered by the
+    # tuple below; it is listed explicitly to document the intent.
+    if isinstance(exc, USER_FACING_ERRORS):
+        return str(exc)
+    return f"internal error: {type(exc).__name__}: {exc}"
+
+
 class OperationFailure(RuntimeError):
     def __init__(
         self,
@@ -69,6 +105,13 @@ class OperationFailure(RuntimeError):
         self.message = message
         self.requested = requested or {}
         self.observed = observed or {}
+
+
+# Exception classes whose messages are already user-facing and actionable.
+# OperationFailure is a RuntimeError subclass; RuntimeError covers the bulk of
+# "Function not found"/"Type not found"/"Unknown target selector" style errors,
+# and ValueError covers argument-validation errors like "Unknown operation".
+USER_FACING_ERRORS: tuple[type[BaseException], ...] = (OperationFailure, RuntimeError, ValueError)
 
 
 class _ReadWriteLock:
@@ -125,11 +168,13 @@ READ_LOCKED_OPS = {
     "get_comment",
     "list_comments",
     "sections",
+    "read",
 }
 
 
 WRITE_LOCKED_OPS = {
     "py_exec",
+    "function_create",
     "rename_symbol",
     "set_comment",
     "delete_comment",
@@ -471,7 +516,7 @@ class TargetManager:
                 matches.append((record, view))
 
         if not matches:
-            raise RuntimeError(f"Unknown target selector: {selector}")
+            raise RuntimeError(_format_unknown_target_error(selector, targets))
         if len(matches) > 1:
             selectors_by_view = {t["view_id"]: t["selector"] for t in targets}
             candidates = ", ".join(
@@ -624,7 +669,7 @@ class BinaryNinjaBridge:
                 result = self._dispatch_on_main(op, params, target)
             return _json_response(ok=True, result=result)
         except Exception as exc:
-            return _json_response(ok=False, error=f"{type(exc).__name__}: {exc}")
+            return _json_response(ok=False, error=_serialize_error(exc))
 
     def _dispatch_on_main(self, op: str, params: dict[str, Any], target: str | None):
         if op == "doctor":
@@ -717,6 +762,10 @@ class BinaryNinjaBridge:
             return self._imports(target)
         if op == "sections":
             return self._sections(target, query=params.get("query"))
+        if op == "read":
+            return self._read(target, params["address"], int(params["length"]))
+        if op == "function_create":
+            return self._function_create(target, params["address"], bool(params.get("preview")))
         if op == "bundle_function":
             return self._bundle_function(target, params["identifier"], params.get("out_path"))
         if op == "py_exec":
@@ -912,6 +961,18 @@ class BinaryNinjaBridge:
             fn = bv.get_function_at(symbol.address)
             if fn is not None:
                 return fn
+
+        available: list[str] = []
+        for fn in list(bv.functions):
+            available.append(str(fn.name))
+            raw = str(getattr(fn, "raw_name", fn.name))
+            if raw != str(fn.name):
+                available.append(raw)
+        suggestions = difflib.get_close_matches(text, available, n=5, cutoff=0.5)
+        if suggestions:
+            raise RuntimeError(
+                f"Function not found: {identifier}. Did you mean: {', '.join(suggestions)}"
+            )
         raise RuntimeError(f"Function not found: {identifier}")
 
     def _find_functions_by_name(self, bv, text: str, *, case_sensitive: bool) -> list[Any]:
@@ -1167,6 +1228,37 @@ class BinaryNinjaBridge:
                 continue
             seen.add(marker)
             yield var, False
+
+        # Register/flag locals that HLIL renders (e.g. rsi_1, rdx_3, loop
+        # counters, the success flag) are real, nameable Variables that live in
+        # neither parameter_vars nor stack_layout, so without this they are
+        # invisible to `local list` and unresolvable by `local rename`/`retype`
+        # (-> "Variable not found", which rolls back the whole batch). Surface
+        # the HLIL-visible ones; func.vars would also drag in dataflow
+        # temporaries (temp0, cond intermediates) that never appear in output.
+        for var in self._iter_hlil_variables(func):
+            marker = self._variable_marker(var)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            yield var, False
+
+    def _iter_hlil_variables(self, func):
+        """HLIL-rendered variables, or empty when HLIL is unavailable.
+
+        Large or non-decompilable functions may have no HLIL; fall back to the
+        parameter/stack set rather than failing the whole listing.
+        """
+        try:
+            hlil = func.hlil
+        except Exception:
+            return []
+        if hlil is None:
+            return []
+        try:
+            return list(hlil.vars)
+        except Exception:
+            return []
 
     def _format_hlil_tree(self, ins, indent=0, *, _else_prefix=False, addresses: bool = True):
         """Recursively format HLIL tree with proper indentation."""
@@ -2148,9 +2240,17 @@ class BinaryNinjaBridge:
             return type_name, type_obj
 
         needle = str(type_name).lower()
+        available: list[str] = []
         for name, candidate in list(bv.types.items()):
             if str(name).lower() == needle:
                 return str(name), candidate
+            available.append(str(name))
+
+        suggestions = difflib.get_close_matches(str(type_name), available, n=5, cutoff=0.5)
+        if suggestions:
+            raise RuntimeError(
+                f"Type not found: {type_name}. Did you mean: {', '.join(suggestions)}"
+            )
         raise RuntimeError(f"Type not found: {type_name}")
 
     def _type_entry(self, type_name, type_obj):
@@ -2314,6 +2414,147 @@ class BinaryNinjaBridge:
             items.append(entry)
         items.sort(key=lambda item: int(item["start"], 16))
         return items
+
+    @staticmethod
+    def _ascii_render(data: bytes) -> str:
+        return "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in data)
+
+    def _read(self, selector: str | None, address, length: int):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address)
+        if length < 0:
+            raise RuntimeError(f"read length must be non-negative, got {length}")
+
+        data = bytes(bv.read(addr, length))
+        if length > 0 and not data:
+            raise RuntimeError(f"Address 0x{addr:x} is not mapped (no bytes available)")
+
+        result: dict[str, Any] = {
+            "address": hex(addr),
+            "length": len(data),
+            "hex": data.hex(),
+            "ascii": self._ascii_render(data),
+        }
+        if len(data) < length:
+            result["requested_length"] = length
+            result["short_read"] = True
+            result["note"] = (
+                f"short read: requested {length} bytes, only {len(data)} mapped from 0x{addr:x}"
+            )
+        return result
+
+    def _is_executable_address(self, bv, addr: int) -> bool:
+        is_offset_executable = getattr(bv, "is_offset_executable", None)
+        if callable(is_offset_executable):
+            return bool(is_offset_executable(addr))
+        get_segment_at = getattr(bv, "get_segment_at", None)
+        if callable(get_segment_at):
+            seg = get_segment_at(addr)
+            if seg is not None:
+                return bool(getattr(seg, "executable", False))
+        return False
+
+    def _function_create(self, selector: str | None, address, preview: bool):
+        bv = self._resolve_view(selector)
+        addr = _parse_address(address)
+        requested = {"op": "function_create", "address": hex(addr)}
+
+        existing = bv.get_function_at(addr)
+        if existing is not None:
+            return {
+                "preview": preview,
+                "success": True,
+                "committed": False,
+                "message": "A function already starts at this address.",
+                "results": [
+                    {
+                        "op": "function_create",
+                        "status": "noop",
+                        "address": hex(addr),
+                        "function": str(existing.name),
+                        "message": "A function already starts at this address.",
+                        "requested": requested,
+                    }
+                ],
+                "affected_functions": [],
+                "affected_types": [],
+            }
+
+        # Refuse to create junk functions: the address must be mapped and live
+        # inside an executable region. Auto-analysis skips exactly these handler
+        # entry points (reachable only via data/function-pointer tables), so we
+        # still create them on request -- but only where code can actually run.
+        if len(bytes(bv.read(addr, 1))) == 0:
+            raise RuntimeError(
+                f"Cannot create function: address 0x{addr:x} is not mapped"
+            )
+        if not self._is_executable_address(bv, addr):
+            raise RuntimeError(
+                f"Cannot create function: address 0x{addr:x} is not inside an executable segment"
+            )
+
+        state = bv.begin_undo_actions()
+        try:
+            bv.add_function(addr)
+            bv.update_analysis_and_wait()
+            created = bv.get_function_at(addr)
+            if created is None:
+                with contextlib.suppress(Exception):
+                    bv.revert_undo_actions(state)
+                return {
+                    "preview": preview,
+                    "success": False,
+                    "committed": False,
+                    "message": "Rolled back because no function was created at the address.",
+                    "results": [
+                        {
+                            "op": "function_create",
+                            "status": "verification_failed",
+                            "address": hex(addr),
+                            "message": f"No function starts at 0x{addr:x} after analysis.",
+                            "requested": requested,
+                            "observed": {"address": hex(addr), "function": None},
+                        }
+                    ],
+                    "affected_functions": [],
+                    "affected_types": [],
+                }
+
+            function_name = str(created.name)
+            if preview:
+                bv.revert_undo_actions(state)
+                message = "Preview verified and reverted."
+            else:
+                bv.commit_undo_actions(state)
+                message = "Function created and verified in the live Binary Ninja session."
+            return {
+                "preview": preview,
+                "success": True,
+                "committed": bool(not preview),
+                "message": message,
+                "results": [
+                    {
+                        "op": "function_create",
+                        "status": "verified",
+                        "address": hex(addr),
+                        "function": function_name,
+                        "requested": requested,
+                    }
+                ],
+                "affected_functions": [
+                    {
+                        "address": hex(addr),
+                        "before_name": None,
+                        "after_name": function_name,
+                        "changed": True,
+                    }
+                ],
+                "affected_types": [],
+            }
+        except Exception:
+            with contextlib.suppress(Exception):
+                bv.revert_undo_actions(state)
+            raise
 
     def _get_comment(self, selector: str | None, address, function):
         bv = self._resolve_view(selector)

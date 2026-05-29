@@ -46,6 +46,8 @@ Use this skill when the user wants reverse-engineering work against a Binary Nin
 
    State lives at `~/.cache/bn/sessions/<sha256(project_root)[:16]>.json`. Project root walks up to the nearest `.git` (cwd as fallback). `bn session list` and `bn target list` mark matching entries with `[sticky]`. When a sticky instance points at a dead bridge, errors append `Clear it with bn instance clear`.
 
+   > **HARD rule for parallel / fan-out agents.** Sticky pins are **one shared file per git repo** — every agent rooted in the same repo reads and writes the same `instance_id` / `target`. If multiple agents run concurrently against that repo, one agent's `bn instance use` / `bn target use` / `bn instance clear` / `bn target clear` silently changes the target for *all* of them, causing cross-talk and commands hitting the wrong binary. Parallel/fan-out agents **MUST** pass `-t/--target` and `--instance` explicitly on **every** command and **MUST NOT** call `instance use` / `target use` / `instance clear` / `target clear`. Prefer one dedicated headless instance per agent: `bn session start <binary> --instance-id <unique-id>`, then thread that `--instance <unique-id>` (and an explicit `-t`) through every subsequent call.
+
 ## 2. Sessions & headless
 
 The bridge runs as a GUI plugin or as a headless process; both speak the same protocol.
@@ -62,8 +64,11 @@ bn close [<path>]                       # close one (omit path → close all)
 
 ```bash
 bn save                                  # saves to <filename>.bndb
-bn save /path/to/output.bndb             # explicit path
+bn save /path/to/output.bndb             # explicit path (positional)
+bn save --path /path/to/output.bndb      # --path is an accepted alias for the positional
 ```
+
+> **Selector rebind after save.** `bn save` / `bn save <path>` rebinds the in-memory view's filename, so its basename / filename selector changes (e.g. `foo` becomes `foo.bndb`). A `-t foo` that worked before the save can stop resolving afterward. Post-save commands should target the **stable** `view_id` / `target_id` (the `[N]` prefix from `bn target list`), not the basename, to avoid `Unknown target selector` after a save.
 
 `bn load <raw>` and `bn session start <raw> [...]` auto-prefer a sibling `<raw>.bndb` when one exists, so saved annotations come back without you having to retype the `.bndb` suffix. The CLI prints which file was actually opened:
 
@@ -127,6 +132,8 @@ bn callsites <callee> --within <fn>
 bn callsites <callee> --within-file <path>
 bn proto get <fn>
 bn local list <fn>
+bn read 0x... --length N [--encoding {hex|bytes}]   # address is positional; --address 0x... is an accepted alias
+bn function create <address> [--preview]
 bn types [--query <q>]
 bn types show <name>
 bn struct show <name>
@@ -142,9 +149,12 @@ Notes:
 - `bn function search` is case-insensitive substring; add `--regex` for regular expressions. `function list` and `function search` both accept `--min-address` / `--max-address`.
 - `bn xrefs` accepts a function name *or* a hex/decimal address. Text groups refs by caller (`code refs: 12 sites across 4 functions`); JSON adds `caller_function: {address, name}` so an `xrefs → --within-file` pipeline survives duplicate symbol names. Use `bn xrefs` for inbound references; reach for `bn callsites` when you need exact return-address recovery and local context.
 - `bn decompile` omits address prefixes by default. Add `--addresses` when you need them (e.g. for `bn comment set --address`).
+- **Width-sensitive reads — trust `bn disasm`, not HLIL.** HLIL can hide the real access width. A byte compare (`cmp al, ...`) renders as a full-width equality, and a `zx.d` on a dereference does **not** imply a 4-byte load (it can be a 1-byte load zero-extended to 4). When the exact comparison width or memory-read size matters (off-by-one, OOB, signedness bugs), treat `bn disasm <fn>` as authoritative and confirm the operand size there before reasoning about the bug.
 - `bn imports` JSON tags each entry with `kind` (`function`, `data`, `address`) and includes `library` + `raw_name`. Text marks data/address imports with `(data)` / `(address)`.
 - `bn sections` exposes start/end, length, semantics, and segment-derived `r/w/x` permission flags.
 - `bn strings`: `--no-crt` is a heuristic — drops single-character repetitions and strings sitting in `.text`. Combine with `--min-length` and `--section`.
+- `bn read --address <addr> --length <N>` returns raw bytes from the mapped view — the parallel-safe alternative to a `py exec` `bv.read(...)` (it runs under the shared read lock). Text mode prints an offset/hex/ASCII hexdump; JSON returns `{address, length, hex, ascii}`. A read that runs past mapped memory comes back **short** with `short_read: true`, `requested_length`, and a `note` (it does **not** error). An entirely unmapped address *does* error (`Address 0x... is not mapped`). Add `--encoding bytes` to stream the raw bytes to stdout (or to `--out <path>`) instead of a hexdump — useful for piping a blob into another tool or saving it to disk. Note that `--encoding bytes` emits only the raw stream, so the `short_read`/`note` marker is **not** visible in that mode — use the default hex mode (or JSON) when you need to know whether a read ran short.
+- `bn function create <address> [--preview]` forces Binary Ninja to create and analyze a function at `<address>` when auto-analysis missed it. **When to reach for it:** a code entry point that BN never disassembled because it is reachable only through a **data pointer** (a vtable slot, a function-pointer table, a handler/dispatch array) and has no direct `call`. Point `bn read` / `bn xrefs` at the pointer table to recover the target address, then `bn function create` it so `decompile` / `xrefs` / `callsites` work on it. It is a verified mutation, so it honors the same `--preview` (create → verify → revert) and live-verify loop as the other mutations: it returns `noop` if a function already starts there, errors if the address is unmapped or not inside an executable segment, and rolls back with `verification_failed` if analysis produces no function. Save afterward (§6 step 4) to persist the new function.
 
 ## 5. Caller-static mapping
 
@@ -178,9 +188,10 @@ The mutation surface is built around a four-step safety loop: **preview → live
 bn types declare "typedef struct Player { int hp; } Player;" --preview
 bn types declare --file /path/to/win32_min.h --preview
 bn struct field set Player 0x308 movement_flag_selector uint32_t --preview
-bn symbol rename sub_401000 player_update --preview
+bn symbol rename sub_401000 player_update --preview   # `bn rename sub_401000 player_update` is a top-level alias (locals: `bn local rename`; struct fields: `bn struct field rename`)
 bn proto set sub_401000 "int __cdecl player_update(Player* self)" --preview
 bn comment set --address 0x401000 "explain this" --preview
+bn function create 0x401000 --preview
 ```
 
 Preview applies → refreshes analysis → captures decompile diffs → reverts. Inspect:
@@ -219,6 +230,8 @@ bn local retype <fn> <local_id|name> <new_type>
 ```
 
 `bn local list` text output splits params and locals into compact `name  type` rows. JSON entries carry `name`, `type`, `storage`, `index`, `identifier`, `source_type`, `is_parameter`, and **`local_id`** — a stable handle that survives re-analysis. Reach for `local_id` whenever Binary Ninja might rebuild the variable list.
+
+`bn local list` includes the register/flag locals HLIL actually renders (`rsi_1`, `rdx_3`, loop counters, the success flag), so they can be renamed and retyped like stack vars. Their **auto-generated names drift** across re-analysis — a `proto set` or `local retype` can re-render `rcx` as `result` — while the `local_id` is invariant. So for these especially, capture the `local_id` from `bn local list --format json` and pass **that** (not the on-screen name) to `local rename` / `local retype`; a name you saw earlier may no longer resolve after an intervening re-analysis.
 
 ### Comments
 
@@ -309,6 +322,8 @@ Shell rules:
 The exec environment includes `bn`, `binaryninja`, `bv`, and `result`.
 
 `py exec` always returns `stdout` and `result`. `result` is JSON-serialized when possible; if not, the CLI returns `repr(result)` and a non-fatal entry in `warnings`. If your script writes a JSON artifact, it is surfaced under `artifact`.
+
+> **Exclusive write lock + unsandboxed.** `py exec` runs under the bridge's **exclusive write lock**, so a long-running snippet blocks **every** other op (reads and writes) on a shared bridge until it returns — don't park slow scripts on a bridge other agents are using. It also runs **unsandboxed** with full `bv` / `binaryninja` access (it can mutate or write to disk). Keep snippets short on shared bridges, and for raw byte reads prefer the dedicated `bn read` (read-locked, parallel-safe) instead of a `py exec` that calls `bv.read(...)`.
 
 ## 9. Troubleshooting
 
