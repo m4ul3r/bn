@@ -118,21 +118,32 @@ class FSSAFunc:
 class FMLIL:
     def __init__(self, ssa):
         self.ssa_form = ssa
+        self.instructions = ssa.instructions
+
+
+class FSym:
+    def __init__(self, type_name):
+        self.type = type("T", (), {"name": type_name})()
 
 
 class FFunc:
-    def __init__(self, name, start, ssa, params=()):
+    def __init__(self, name, start, ssa, params=(), symbol_type="FunctionSymbol", is_thunk=False):
         self.name = name
         self.start = start
         self.mlil = FMLIL(ssa)
         self.parameter_vars = list(params)
+        self.symbol = FSym(symbol_type)
+        self.is_thunk = is_thunk
 
 
 class FBV:
-    def __init__(self, addr_names):
+    def __init__(self, addr_names, funcs=None):
         self._names = addr_names
+        self._funcs = funcs or {}
 
     def get_function_at(self, addr):
+        if addr in self._funcs:
+            return self._funcs[addr]
         name = self._names.get(addr)
         if name is None:
             return None
@@ -284,6 +295,57 @@ def test_forward_unresolved_source_raises(models):
     engine = te.TaintEngine(FBV({}), models)
     with pytest.raises(te.TaintError):
         engine.forward(func, [te.parse_locator("arg:read:1")])
+
+
+def test_forward_interprocedural_descends_into_callee(models):
+    # copy_it(src, dst): rax#1 = src[0]; memcpy(dst, src, rax#1)  -> sink inside callee
+    src = FVar("src"); dst = FVar("dst"); rax = FVar("rax")
+    src1 = FSSA(src, 1); rax1 = FSSA(rax, 1)
+    copy_ssa = FSSAFunc([
+        FInstr(0, 0x2004, "MLIL_SET_VAR_SSA", "rax#1 = src#1[0]", reads=[src1], writes=[rax1]),
+        FInstr(1, 0x2010, "MLIL_CALL_SSA", "0x1080(dst#1, src#1, rax#1)",
+               reads=[rax1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x1080", constant=0x1080),
+               params=[FExpr("MLIL_VAR_SSA", "dst#1", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "src#1", reads=[src1]),
+                       FExpr("MLIL_VAR_SSA", "rax#1", reads=[rax1])]),
+    ])
+    copy_it = FFunc("copy_it", 0x2000, copy_ssa, params=[src, dst])
+
+    # handler(fd): read(fd, &buf, 64); copy_it(&buf, &out)
+    buf = FVar("buf", typ="char[0x40]"); out = FVar("out", typ="char[0x10]")
+    fd = FVar("fd"); p0 = FVar("p0"); p1 = FVar("p1")
+    rsi1 = FSSA(p0, 1); rsi2 = FSSA(p1, 1)
+    handler_ssa = FSSAFunc([
+        FInstr(0, 0x3000, "MLIL_SET_VAR_SSA", "rsi#1 = &buf", writes=[rsi1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+        FInstr(1, 0x3008, "MLIL_CALL_SSA", "0x1050(rdi#1, rsi#1, 0x40)",
+               reads=[rsi1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x1050", constant=0x1050),
+               params=[FExpr("MLIL_VAR_SSA", "rdi#1", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "rsi#1", reads=[rsi1]),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+        FInstr(2, 0x3010, "MLIL_SET_VAR_SSA", "rsi_2#1 = &out", writes=[rsi2],
+               src=FExpr("MLIL_ADDRESS_OF", "&out", src=out)),
+        FInstr(3, 0x3018, "MLIL_CALL_SSA", "0x2000(&buf, &out)",
+               reads=[rsi1, rsi2], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_VAR_SSA", "rsi#1", reads=[rsi1]),
+                       FExpr("MLIL_VAR_SSA", "rsi_2#1", reads=[rsi2])]),
+    ])
+    handler = FFunc("handler", 0x3000, handler_ssa, params=[fd])
+
+    bv = FBV({0x1050: "read", 0x1080: "memcpy"}, funcs={0x2000: copy_it})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(handler, [te.parse_locator("arg:read:1")])
+
+    # the sink lives in copy_it but must bubble up as a handler finding
+    assert len(result["reached_sinks"]) == 1
+    sink = result["reached_sinks"][0]["sink"]
+    assert sink["callee"] == "memcpy" and sink["class"] == "overflow_len"
+    # path must cross the call boundary into copy_it
+    assert any("calls copy_it" in (s.get("reason") or "") for s in result["reached_sinks"][0]["path"])
+    assert result["stats"]["functions_visited"] == 2
 
 
 # --------------------------------------------------------------------------

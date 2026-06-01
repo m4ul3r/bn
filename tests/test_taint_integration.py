@@ -125,5 +125,12 @@ def test_corpus_target(expected_path, tmp_path):
                 assert indirect, f"{stem}: expected an indirect callee, got {callees}"
                 # honest degradation: every indirect callee carries a resolution verdict
                 assert all("resolution" in c for c in indirect)
+            if case.get("expect_direct_callee"):
+                want = case["expect_direct_callee"]
+                names = [
+                    (c.get("target") or {}).get("name") for c in callees if c.get("kind") == "direct"
+                ]
+                assert any(n and want in n for n in names), \
+                    f"{stem}: expected direct callee {want}, got {names}"
     finally:
         _session_stop(inst)

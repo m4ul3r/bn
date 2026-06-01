@@ -3168,7 +3168,7 @@ class BinaryNinjaBridge:
                 locators = [_taint.parse_locator(s) for s in (params.get("sources") or [])]
                 if not locators:
                     raise _taint.TaintError("forward taint needs at least one --source")
-                return engine.forward(func, locators)
+                return engine.forward(func, locators, max_depth=int(params.get("max_depth", 8)))
             if direction == "backward":
                 locators = [_taint.parse_locator(s) for s in (params.get("sinks") or [])]
                 if not locators:

@@ -1,0 +1,11 @@
+{
+  "description": "tainted buffer crosses a call boundary; sink (memcpy length) is inside the callee",
+  "lang": "c",
+  "forward": [
+    {"function": "handler", "source": "arg:read:1",
+     "sinks": [{"callee": "memcpy", "class": "overflow_len", "arg": 2}]}
+  ],
+  "callgraph": [
+    {"function": "handler", "expect_direct_callee": "copy_it"}
+  ]
+}

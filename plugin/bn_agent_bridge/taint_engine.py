@@ -33,8 +33,9 @@ except Exception:  # pragma: no cover - defensive
 _BUILTIN_MODELS = Path(__file__).resolve().parent / "taint_models.json"
 
 SOUNDNESS = (
-    "may-analysis (intraprocedural, MVP); coarse memory + unmodeled/indirect "
-    "calls are surfaced as assumptions/leaves; NOT a proof of reachability"
+    "may-analysis (interprocedural, summary-based, depth-bounded); coarse memory "
+    "and unresolved indirect/external calls are surfaced as assumptions/leaves; "
+    "NOT a proof of reachability"
 )
 
 
@@ -280,14 +281,80 @@ class TaintEngine:
 
     # -- forward ----------------------------------------------------------
 
-    def forward(self, func: Any, sources: list[dict[str, Any]], *, sink_filter: set[str] | None = None) -> dict[str, Any]:
+    def forward(self, func: Any, sources: list[dict[str, Any]], *,
+                sink_filter: set[str] | None = None, max_depth: int = 8) -> dict[str, Any]:
+        # Per-call analysis state (reset each public call):
+        self._cache: dict[tuple, Any] = {}          # (func_start, frozenset(params)) -> summary
+        self._funcs_visited: set[int] = set()
+        self._max_depth_seen = 0
+        self._truncated = False
+
+        sub = self._run_forward(func, sources, depth=0, max_depth=max_depth, top=True)
+        return {
+            "direction": "forward",
+            "function": {"name": str(func.name), "address": hex(int(func.start))},
+            "sources": [self._describe_locator(s) for s in sources],
+            "reached_sinks": sub["findings"],
+            "leaves": sub["leaves"],
+            "assumptions": sub["assumptions"],
+            "stats": {
+                "functions_visited": len(self._funcs_visited),
+                "max_depth": self._max_depth_seen,
+                "sinks": len(sub["findings"]),
+                "truncated": self._truncated,
+            },
+            "soundness": SOUNDNESS,
+        }
+
+    def _is_internal(self, fn: Any) -> bool:
+        """True if a call target is an in-binary function worth descending into
+        (not a PLT/import thunk, which we model instead)."""
+        if fn is None or getattr(fn, "is_thunk", False):
+            return False
+        sym = getattr(fn, "symbol", None)
+        stype = str(getattr(getattr(sym, "type", None), "name", "") or "")
+        if stype in {"ImportedFunctionSymbol", "LibraryFunctionSymbol",
+                     "ImportAddressSymbol", "ExternalSymbol"}:
+            return False
+        try:
+            return len(list(fn.mlil.instructions)) > 0
+        except Exception:
+            return False
+
+    def _summarize(self, callee: Any, param_set: frozenset, depth: int, max_depth: int) -> dict[str, Any]:
+        """Analyze *callee* with the given tainted parameter indices, caching the
+        result per (callee, tainted-param-set) so it is computed once."""
+        key = (int(callee.start), param_set)
+        if key in self._cache:
+            cached = self._cache[key]
+            if cached is None:  # in-progress -> recursion cycle
+                return {"reached_return": True, "out_params": set(), "findings": [], "leaves": [],
+                        "assumptions": [f"recursion cycle at {callee.name}; return conservatively tainted"]}
+            return cached
+        self._cache[key] = None  # mark in-progress (cycle guard)
+        locators = [{"kind": "param", "index": i} for i in sorted(param_set)]
+        try:
+            sub = self._run_forward(callee, locators, depth, max_depth, top=False)
+        except TaintError as exc:
+            sub = {"reached_return": True, "out_params": set(), "findings": [], "leaves": [],
+                   "assumptions": [f"could not analyze {callee.name}: {exc}; return conservatively tainted"]}
+        self._cache[key] = sub
+        return sub
+
+    def _run_forward(self, func: Any, locators: list[dict[str, Any]], depth: int,
+                     max_depth: int, *, top: bool) -> dict[str, Any]:
         ssaf = self._ssa_func(func)
         instrs = self._instrs(ssaf)
+        self._funcs_visited.add(int(getattr(func, "start", 0)))
+        self._max_depth_seen = max(self._max_depth_seen, depth)
 
         tainted: set[tuple] = set()
         why: dict[tuple, dict[str, Any]] = {}
         assumptions: list[str] = []
         leaves: list[dict[str, Any]] = []
+        findings: list[dict[str, Any]] = []
+        recorded_sinks: set[tuple] = set()
+        reached_return = False
 
         def add_assumption(msg: str) -> None:
             if msg not in assumptions:
@@ -297,24 +364,20 @@ class TaintEngine:
             if node in tainted:
                 return False
             tainted.add(node)
-            why[node] = {
-                "label": label,
-                "instr": ins,
-                "reason": reason,
-                "parents": list(parents),
-            }
+            why[node] = {"label": label, "instr": ins, "reason": reason, "parents": list(parents)}
             return True
 
-        # -- seed from the source locators --
-        seeded = self._seed_forward(func, ssaf, instrs, sources, taint_node, add_assumption)
+        seeded = self._seed_forward(func, ssaf, instrs, locators, taint_node, add_assumption)
         if not seeded:
-            raise TaintError("no taint sources resolved; check --source locator")
+            if top:
+                raise TaintError("no taint sources resolved; check --source locator")
+            return {"reached_return": False, "out_params": set(), "findings": [],
+                    "leaves": [], "assumptions": []}
 
         def read_taint(ins: Any) -> list[tuple]:
             hit = []
             for r in ssa_reads(ins):
-                k = var_key(r)
-                ver = getattr(r, "version", None)
+                k = var_key(r); ver = getattr(r, "version", None)
                 if (k, ver) in tainted:
                     hit.append((k, ver))
                 elif (k, None) in tainted:
@@ -322,13 +385,12 @@ class TaintEngine:
             return hit
 
         def arg_taint(expr: Any) -> list[tuple]:
-            # An argument carries taint either as a tainted scalar value (e.g. a
-            # length register) or as a pointer to a tainted buffer (e.g.
-            # system(char*), f(buf)). Check both so pointer-arg sinks/leaves fire.
+            # An argument carries taint either as a tainted scalar value (a length
+            # register) or as a pointer to a tainted buffer (system(char*),
+            # f(buf), helper(buf)). Check both so pointer args fire too.
             hit = []
             for r in expr_reads(expr):
-                k = var_key(r)
-                ver = getattr(r, "version", None)
+                k = var_key(r); ver = getattr(r, "version", None)
                 if (k, ver) in tainted:
                     hit.append((k, ver))
                 elif (k, None) in tainted:
@@ -339,13 +401,23 @@ class TaintEngine:
                     hit.append((var_key(pv), None))
             return hit
 
-        findings: list[dict[str, Any]] = []
-        recorded_sinks: set[tuple] = set()
+        def cons_return(ins: Any, reason: str) -> bool:
+            done = False
+            for w in ssa_writes(ins):
+                node = (var_key(w), getattr(w, "version", None))
+                if taint_node(node, var_label(w), ins, reason, []):
+                    done = True
+            return done
 
         for _ in range(self.max_iters):
             changed = False
             for ins in instrs:
                 opn = op_name(ins)
+
+                if opn == "MLIL_RET":
+                    if read_taint(ins):
+                        reached_return = True
+                    continue
 
                 if self._is_call(ins):
                     target = const_target(getattr(ins, "dest", None))
@@ -353,7 +425,7 @@ class TaintEngine:
                     mkey, model = lookup_model(self.models, name)
                     params = self._call_params(ins)
 
-                    # sink detection
+                    # 1) model-driven sink detection
                     if model and model.get("sink") is not None:
                         sink = model["sink"]
                         for argidx in sink.get("tainted_args", []) or []:
@@ -363,46 +435,79 @@ class TaintEngine:
                                     sig = (int(getattr(ins, "address", 0)), argidx)
                                     if sig not in recorded_sinks:
                                         recorded_sinks.add(sig)
-                                        findings.append(self._make_finding(
-                                            ins, mkey or name, argidx, sink, ht, why))
+                                        findings.append(self._make_finding(ins, mkey or name, argidx, sink, ht, why))
 
-                    # propagation via model
-                    propagated_any = False
+                    # 2) model-driven propagation
                     if model and model.get("propagates"):
                         for rule in model["propagates"]:
-                            src_tok, dst_tok = rule.get("from"), rule.get("to")
-                            if self._token_tainted(ssaf, ins, params, src_tok, tainted):
-                                if self._apply_to_token(ssaf, ins, params, dst_tok, taint_node, name or "?"):
-                                    propagated_any = True
+                            if self._token_tainted(ssaf, ins, params, rule.get("from"), tainted):
+                                if self._apply_to_token(ssaf, ins, params, rule.get("to"), taint_node, name or "?"):
                                     changed = True
-                    elif model is None and self._is_call(ins):
-                        # no model: decide by whether it's external or internal
-                        any_arg = any(arg_taint(p) for p in params)
-                        if any_arg:
-                            if target is None:
-                                # indirect call reached by taint -> leaf, do not drop
-                                leaf = {
-                                    "kind": "indirect_call_unresolved",
-                                    "address": hex(int(getattr(ins, "address", 0))),
-                                    "dest_expr": str(getattr(ins, "dest", "")),
-                                    "il_text": str(ins),
-                                    "detail": "tainted value flows into an indirect call whose target VSA could not pin",
-                                }
-                                if leaf not in leaves:
-                                    leaves.append(leaf)
-                                add_assumption(
-                                    f"indirect call at {leaf['address']} reached by taint; target unresolved (MVP)")
-                            elif self.unknown_call_policy != "stop":
-                                # conservatively taint the return value of the un-descended call
-                                for w in ssa_writes(ins):
-                                    node = (var_key(w), getattr(w, "version", None))
-                                    if taint_node(node, var_label(w), ins,
-                                                  f"conservative: return of un-analyzed call {name or hex(target)}",
-                                                  []):
-                                        changed = True
-                                add_assumption(
-                                    f"call to {name or hex(target)} not analyzed interprocedurally (MVP); "
-                                    "return conservatively tainted")
+                        continue
+
+                    if model is not None:
+                        continue  # modeled (e.g. source-only); body intentionally not descended
+
+                    # 3) no model: tainted argument positions at this callsite
+                    tainted_args = {i: arg_taint(p) for i, p in enumerate(params) if arg_taint(p)}
+                    if not tainted_args:
+                        continue
+
+                    if target is None:
+                        leaf = {
+                            "kind": "indirect_call_unresolved",
+                            "address": hex(int(getattr(ins, "address", 0))),
+                            "dest_expr": str(getattr(ins, "dest", "")),
+                            "il_text": str(ins),
+                            "detail": "tainted value flows into an indirect call whose target VSA could not pin",
+                        }
+                        if leaf not in leaves:
+                            leaves.append(leaf)
+                        add_assumption(f"indirect call at {leaf['address']} reached by taint; target unresolved")
+                        continue
+
+                    callee_fn = self.bv.get_function_at(target) if hasattr(self.bv, "get_function_at") else None
+                    if self._is_internal(callee_fn):
+                        n_params = len(list(getattr(callee_fn, "parameter_vars", []) or []))
+                        valid = frozenset(i for i in tainted_args if i < n_params)
+                        if not valid:
+                            if cons_return(ins, f"return of variadic/over-arg call {callee_fn.name} (conservative)"):
+                                changed = True
+                            add_assumption(f"tainted args to {callee_fn.name} fall beyond its parameters; conservative")
+                            continue
+                        if depth + 1 > max_depth:
+                            self._truncated = True
+                            if cons_return(ins, f"max-depth: return of {callee_fn.name} (conservative)"):
+                                changed = True
+                            add_assumption(
+                                f"max interprocedural depth {max_depth} reached at {callee_fn.name}; not descended")
+                            continue
+                        # 4) interprocedural: descend with a cached summary, bubble findings up
+                        sub = self._summarize(callee_fn, valid, depth + 1, max_depth)
+                        first_hit = tainted_args[sorted(valid)[0]][0]
+                        prefix = self._reconstruct_path(first_hit, why)
+                        prefix.append(_instr_dict(
+                            ins, reason=f"calls {callee_fn.name} with tainted arg(s) {sorted(valid)}",
+                            tainted=[var_label_of(first_hit)]))
+                        for f in sub["findings"]:
+                            findings.append({"sink": f["sink"], "path": prefix + f["path"]})
+                        for lf in sub["leaves"]:
+                            if lf not in leaves:
+                                leaves.append(lf)
+                        for a in sub["assumptions"]:
+                            add_assumption(a)
+                        if sub["reached_return"]:
+                            for w in ssa_writes(ins):
+                                node = (var_key(w), getattr(w, "version", None))
+                                if taint_node(node, var_label(w), ins,
+                                              f"return of {callee_fn.name} propagates taint", [first_hit]):
+                                    changed = True
+                    else:
+                        # external with no model
+                        if self.unknown_call_policy != "stop":
+                            if cons_return(ins, f"return of unmodeled external {name or hex(target)} (conservative)"):
+                                changed = True
+                            add_assumption(f"external {name or hex(target)} has no model; return conservatively tainted")
                     continue
 
                 # generic value flow: any tainted value-read taints all writes
@@ -424,20 +529,8 @@ class TaintEngine:
             if not changed:
                 break
 
-        return {
-            "direction": "forward",
-            "function": {"name": str(func.name), "address": hex(int(func.start))},
-            "sources": [self._describe_locator(s) for s in sources],
-            "reached_sinks": findings,
-            "leaves": leaves,
-            "assumptions": assumptions,
-            "stats": {
-                "instructions": len(instrs),
-                "tainted_values": len(tainted),
-                "sinks": len(findings),
-            },
-            "soundness": SOUNDNESS,
-        }
+        return {"reached_return": reached_return, "out_params": set(),
+                "findings": findings, "leaves": leaves, "assumptions": assumptions}
 
     def _reason_for(self, opn: str) -> str:
         if "PHI" in opn:

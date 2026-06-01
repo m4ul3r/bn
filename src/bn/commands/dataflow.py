@@ -88,6 +88,8 @@ _LOCATOR_HELP = (
                  help="Function to analyze (name or address)"),
              arg("--source", dest="sources", action="append", default=None, metavar="LOCATOR",
                  help=f"Taint source (repeatable). {_LOCATOR_HELP}"),
+             arg("--max-depth", dest="max_depth", type=int, default=8,
+                 help="Max interprocedural recursion depth into callees (default: 8)"),
              arg("--unknown-call", choices=("conservative", "stop"), default="conservative",
                  help="How to treat un-analyzed/external calls reached by taint (default: conservative)"),
          ])
@@ -101,6 +103,7 @@ def _taint_forward(args: argparse.Namespace) -> int:
             "direction": "forward",
             "function": args.function,
             "sources": list(args.sources),
+            "max_depth": int(args.max_depth),
             "unknown_call": args.unknown_call,
         },
         require_target=True,

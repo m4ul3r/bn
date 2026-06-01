@@ -200,11 +200,13 @@ Choose an approach based on the binary:
 `bn taint` automates the propagation step over Binary Ninja's MLIL-SSA: it
 follows def-use chains through assignments, arithmetic, phi joins, and a
 built-in function-model DB (`recv`/`read`/`fgets`/`getenv` sources;
-`memcpy`/`strcpy`/`sprintf`/`system`/… sinks). It is **intraprocedural** today —
-honest about its limits: every coarse-memory step, every un-analyzed/external
-call, and every unresolved indirect call is reported under `assumptions` /
-`leaves`, and the result always carries a `soundness` disclaimer. It is a
-may-analysis, not a proof.
+`memcpy`/`strcpy`/`sprintf`/`system`/… sinks). It is **interprocedural** — it
+descends into in-binary callees (depth-bounded by `--max-depth`, cached per
+function) so a sink inside a helper is reported against the entry function with
+the full cross-boundary path. It stays honest about its limits: every
+coarse-memory step, every unmodeled external call, and every unresolved indirect
+call is reported under `assumptions` / `leaves`, and the result always carries a
+`soundness` disclaimer. It is a may-analysis, not a proof.
 
 **Forward — from a source to whatever sinks it reaches:**
 ```bash

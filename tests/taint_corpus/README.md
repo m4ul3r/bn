@@ -14,6 +14,7 @@ brittle across compilers/optimisation.
 | `sanitized.c`          | constant memcpy length (negative — no false positive)  |
 | `command_injection.c`  | tainted buffer -> system() pointer arg (external model)|
 | `indirect_call.c`      | tainted data into a function-pointer call (leaf, not dropped) |
+| `interproc.c`          | tainted buffer crosses a call boundary; sink lives in the callee (interprocedural descent) |
 | `vtable.cpp`           | C++ virtual dispatch shows as an indirect callee (honest degradation) |
 
 ## `EXPECTED.json` schema
