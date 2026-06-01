@@ -95,6 +95,21 @@ def test_taint_forward_forwards_sources(monkeypatch, capsys):
     assert call["params"]["unknown_call"] == "conservative"
 
 
+def test_taint_forward_reads_and_forwards_resolve_map(monkeypatch, capsys, tmp_path):
+    rmap = tmp_path / "rmap.json"
+    rmap.write_text(json.dumps({"0x4011f0": ["0x401176", "0x401195"]}))
+    fake, calls = _fake({"taint": {"direction": "forward", "function": {"name": "p", "address": "0x1"},
+                                   "sources": [], "reached_sinks": [], "leaves": [],
+                                   "assumptions": [], "soundness": "x"}})
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    rc = bn.cli.main(["taint", "forward", "-f", "dispatch", "--source", "param:1",
+                      "--resolve-map", str(rmap), "--max-depth", "4", "--target", "active"])
+    assert rc == 0
+    call = [c for c in calls if c["op"] == "taint"][0]
+    assert call["params"]["resolve_map"] == {"0x4011f0": ["0x401176", "0x401195"]}
+    assert call["params"]["max_depth"] == 4
+
+
 def test_taint_backward_forwards_sinks(monkeypatch, capsys):
     fake, calls = _fake({"taint": {"direction": "backward", "function": {"name": "p", "address": "0x1"},
                                    "sinks": [], "slices": [], "leaves": [], "assumptions": [], "soundness": "x"}})

@@ -235,11 +235,19 @@ bn dataflow values <fn> --at <addr>            # value-set (possible values)
 bn function structured-il <fn>                 # per-instruction op + vars_read/written
 ```
 
+Indirect calls reached by taint are resolved automatically when value-set
+analysis can pin the target(s) (e.g. const function-pointer tables), and taint
+follows into each resolved target; only genuinely unresolved ones become
+`leaves`. You can force resolution with `--resolve-map FILE`
+(`{"0x4011f0": ["0x401176", "0x401195"]}`).
+
 **When taint stops (the known-hard cases), fall back to the manual chain.** If a
 flow hits a `leaves` entry — an `indirect_call_unresolved` (function pointer /
-vtable) or an un-modeled external — resolve it by hand and continue:
+vtable VSA could not pin) or an un-modeled external — resolve it by hand and
+continue:
 - Try `bn dataflow callgraph <fn>` / `bn dataflow values <fn> --at <call-addr>`
-  to pin an indirect target; if it resolves, re-run taint inside that callee.
+  to pin an indirect target; feed it back via `--resolve-map`, or re-run taint
+  inside that callee.
 - For interprocedural flows, taint each function in turn and stitch the path:
   `bn taint backward -f <callee> --sink arg:<sink>:<n>` then map the callee's
   tainted parameter back to the caller's argument with

@@ -62,8 +62,22 @@ class FOp:
         self.name = name
 
 
+class FPVS:
+    def __init__(self, type_name, mapping=None, values=None, value=None):
+        self.type = FOp(type_name)
+        if mapping is not None:
+            self.mapping = mapping
+        if values is not None:
+            self.values = values
+        if value is not None:
+            self.value = value
+
+    def __repr__(self):
+        return f"<pvs {self.type.name}>"
+
+
 class FExpr:
-    def __init__(self, opname, text, reads=(), src=None, constant=None):
+    def __init__(self, opname, text, reads=(), src=None, constant=None, possible_values=None):
         self.operation = FOp(opname)
         self._text = text
         self.vars_read = list(reads)
@@ -71,6 +85,8 @@ class FExpr:
             self.src = src
         if constant is not None:
             self.constant = constant
+        if possible_values is not None:
+            self.possible_values = possible_values
 
     def __str__(self):
         return self._text
@@ -295,6 +311,77 @@ def test_forward_unresolved_source_raises(models):
     engine = te.TaintEngine(FBV({}), models)
     with pytest.raises(te.TaintError):
         engine.forward(func, [te.parse_locator("arg:read:1")])
+
+
+def _dispatch_table_program():
+    """dispatch(buf) -> table[?](buf) indirect; targets run_sys(p)=system(p) and
+    run_cpy(p)=strcpy(b,p). Returns (handler-equivalent dispatch func, bv)."""
+    # run_sys @ 0x500: system(p)
+    p_s = FVar("p"); ps0 = FSSA(p_s, 0)
+    run_sys = FFunc("run_sys", 0x500, FSSAFunc([
+        FInstr(0, 0x504, "MLIL_CALL_SSA", "0x900(p#0)", reads=[ps0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_VAR_SSA", "p#0", reads=[ps0])]),
+    ]), params=[p_s])
+    # run_cpy @ 0x600: strcpy(b, p)
+    p_c = FVar("p2"); pc0 = FSSA(p_c, 0)
+    run_cpy = FFunc("run_cpy", 0x600, FSSAFunc([
+        FInstr(0, 0x604, "MLIL_CALL_SSA", "0x910(b, p2#0)", reads=[pc0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x910", constant=0x910),
+               params=[FExpr("MLIL_VAR_SSA", "b", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "p2#0", reads=[pc0])]),
+    ]), params=[p_c])
+    # dispatch @ 0x700: indirect call resolved by VSA to {0x500, 0x600}
+    buf = FVar("buf"); buf0 = FSSA(buf, 0)
+    pvs = FPVS("LookupTableValue", mapping={0: 0x500, 1: 0x600})
+    dispatch = FFunc("dispatch", 0x700, FSSAFunc([
+        FInstr(0, 0x70c, "MLIL_CALL_SSA", "fp(buf#0)", reads=[buf0], writes=[],
+               dest=FExpr("MLIL_VAR_SSA", "fp#1", reads=[], possible_values=pvs),
+               params=[FExpr("MLIL_VAR_SSA", "buf#0", reads=[buf0])]),
+    ]), params=[buf])
+    bv = FBV({0x900: "system", 0x910: "strcpy"},
+             funcs={0x500: run_sys, 0x600: run_cpy})
+    return dispatch, bv
+
+
+def test_forward_resolves_indirect_via_value_set(models):
+    dispatch, bv = _dispatch_table_program()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(dispatch, [te.parse_locator("param:0")])
+    classes = {s["sink"]["class"] for s in result["reached_sinks"]}
+    assert "command_injection" in classes  # via run_sys
+    assert "overflow_unbounded" in classes  # via run_cpy
+    assert any("resolved via value-set" in a for a in result["assumptions"])
+    # no unresolved leaf since VSA pinned the targets
+    assert not any(l["kind"] == "indirect_call_unresolved" for l in result["leaves"])
+
+
+def test_forward_resolve_map_overrides_unresolved(models):
+    # an indirect call with no VSA info, resolved by an agent-supplied map
+    buf = FVar("buf"); buf0 = FSSA(buf, 0)
+    p_s = FVar("p"); ps0 = FSSA(p_s, 0)
+    run_sys = FFunc("run_sys", 0x500, FSSAFunc([
+        FInstr(0, 0x504, "MLIL_CALL_SSA", "0x900(p#0)", reads=[ps0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_VAR_SSA", "p#0", reads=[ps0])]),
+    ]), params=[p_s])
+    dispatch = FFunc("dispatch", 0x700, FSSAFunc([
+        FInstr(0, 0x70c, "MLIL_CALL_SSA", "fp(buf#0)", reads=[buf0], writes=[],
+               dest=FExpr("MLIL_VAR_SSA", "fp#1", reads=[]),  # no possible_values
+               params=[FExpr("MLIL_VAR_SSA", "buf#0", reads=[buf0])]),
+    ]), params=[buf])
+    bv = FBV({0x900: "system"}, funcs={0x500: run_sys})
+
+    # without a map -> unresolved leaf
+    e1 = te.TaintEngine(bv, models)
+    r1 = e1.forward(dispatch, [te.parse_locator("param:0")])
+    assert any(l["kind"] == "indirect_call_unresolved" for l in r1["leaves"])
+
+    # with an agent-supplied map -> resolved into run_sys -> system
+    e2 = te.TaintEngine(bv, models, resolve_map={"0x70c": ["0x500"]})
+    r2 = e2.forward(dispatch, [te.parse_locator("param:0")])
+    assert any(s["sink"]["class"] == "command_injection" for s in r2["reached_sinks"])
+    assert any("resolved via agent-map" in a for a in r2["assumptions"])
 
 
 def test_forward_interprocedural_descends_into_callee(models):

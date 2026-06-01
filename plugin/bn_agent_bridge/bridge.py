@@ -3044,12 +3044,28 @@ class BinaryNinjaBridge:
                     addrs.append(int(value))
                 except Exception:
                     pass
-        elif type_name in {"InSetOfValues", "LookupTableValue"}:
+        elif type_name == "InSetOfValues":
             for v in (getattr(pvs, "values", None) or []):
                 try:
                     addrs.append(int(v))
                 except Exception:
                     pass
+        elif type_name == "LookupTableValue":
+            mapping = getattr(pvs, "mapping", None)
+            if isinstance(mapping, dict):
+                for v in mapping.values():
+                    try:
+                        addrs.append(int(v))
+                    except Exception:
+                        pass
+            else:
+                for entry in (getattr(pvs, "table", None) or []):
+                    target = getattr(entry, "to", None)
+                    if target is not None:
+                        try:
+                            addrs.append(int(target))
+                        except Exception:
+                            pass
         targets = []
         for addr in addrs:
             fn = bv.get_function_at(addr) if hasattr(bv, "get_function_at") else None
@@ -3162,6 +3178,7 @@ class BinaryNinjaBridge:
             models,
             find_variable=_find_variable,
             unknown_call_policy=str(params.get("unknown_call", "conservative")),
+            resolve_map=params.get("resolve_map") or {},
         )
         try:
             if direction == "forward":

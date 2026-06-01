@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+from pathlib import Path
 from typing import Any
 
 from ..cli import _call, arg, command
@@ -90,22 +92,31 @@ _LOCATOR_HELP = (
                  help=f"Taint source (repeatable). {_LOCATOR_HELP}"),
              arg("--max-depth", dest="max_depth", type=int, default=8,
                  help="Max interprocedural recursion depth into callees (default: 8)"),
+             arg("--resolve-map", dest="resolve_map", default=None, metavar="FILE",
+                 help="JSON file mapping indirect call addresses to target lists: "
+                      '{"0x4011f0": ["0x401176", "0x401195"]}'),
              arg("--unknown-call", choices=("conservative", "stop"), default="conservative",
                  help="How to treat un-analyzed/external calls reached by taint (default: conservative)"),
          ])
 def _taint_forward(args: argparse.Namespace) -> int:
     if not args.sources:
         raise BridgeError("taint forward requires at least one --source")
+    params: dict[str, Any] = {
+        "direction": "forward",
+        "function": args.function,
+        "sources": list(args.sources),
+        "max_depth": int(args.max_depth),
+        "unknown_call": args.unknown_call,
+    }
+    if args.resolve_map:
+        try:
+            params["resolve_map"] = json.loads(Path(args.resolve_map).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise BridgeError(f"could not read --resolve-map {args.resolve_map}: {exc}")
     return _call(
         args,
         "taint",
-        {
-            "direction": "forward",
-            "function": args.function,
-            "sources": list(args.sources),
-            "max_depth": int(args.max_depth),
-            "unknown_call": args.unknown_call,
-        },
+        params,
         require_target=True,
         allow_implicit_target=True,
         text_renderer=_render_taint_text,

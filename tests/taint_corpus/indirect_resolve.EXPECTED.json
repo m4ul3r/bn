@@ -1,0 +1,14 @@
+{
+  "description": "function-pointer-table indirect call resolved by value-set; taint follows into both targets",
+  "lang": "c",
+  "forward": [
+    {"function": "handler", "source": "arg:read:1",
+     "sinks": [
+       {"callee": "system", "class": "command_injection", "arg": 0},
+       {"callee": "strcpy", "class": "overflow_unbounded", "arg": 1}
+     ]}
+  ],
+  "callgraph": [
+    {"function": "dispatch", "expect_indirect": true}
+  ]
+}
