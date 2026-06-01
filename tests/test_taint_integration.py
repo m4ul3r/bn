@@ -107,6 +107,10 @@ def test_corpus_target(expected_path, tmp_path):
             kinds = {sl["origin"]["kind"] for sl in result["slices"]}
             assert kinds & set(case["origin_kinds"]), \
                 f"{stem}: backward origin {kinds} not in {case['origin_kinds']}"
+            if case.get("expect_crossed"):
+                crossed = [c for sl in result["slices"] for c in (sl.get("crossed_functions") or [])]
+                assert case["expect_crossed"] in crossed, \
+                    f"{stem}: backward did not cross into caller; crossed={crossed}"
 
         for case in spec.get("negative", []):
             addr = _resolve_addr(inst, case["function"])

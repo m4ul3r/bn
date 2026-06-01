@@ -18,6 +18,7 @@ brittle across compilers/optimisation.
 | `interproc.c`          | tainted buffer crosses a call boundary; sink lives in the callee (interprocedural descent) |
 | `outparam.c`           | helper fills an output buffer through a pointer param; taint flows back to the caller |
 | `multihop.c`           | input -> snprintf propagator -> system (command injection); mirrors DVRF socket_cmd |
+| `bw_interproc.c`       | backward slice from a memcpy-length parameter crosses into the caller to reach the recv source |
 | `vtable.cpp`           | C++ virtual dispatch shows as an indirect callee (honest degradation) |
 
 ## `EXPECTED.json` schema

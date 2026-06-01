@@ -855,76 +855,152 @@ class TaintEngine:
 
     # -- backward ---------------------------------------------------------
 
-    def backward(self, func: Any, sinks: list[dict[str, Any]]) -> dict[str, Any]:
-        ssaf = self._ssa_func(func)
-        instrs = self._instrs(ssaf)
+    def backward(self, func: Any, sinks: list[dict[str, Any]], *, max_depth: int = 8) -> dict[str, Any]:
+        self._bw_leaves: list[dict[str, Any]] = []
+        self._bw_assumptions: list[str] = []
         slices: list[dict[str, Any]] = []
-        assumptions: list[str] = []
-        leaves: list[dict[str, Any]] = []
 
         for sink in sinks:
-            seeds = self._seed_backward(func, ssaf, instrs, sink)
-            for seed_var, sink_ins in seeds:
-                steps: list[dict[str, Any]] = []
-                origin = {"kind": "unresolved"}
-                visited: set = set()
-
-                def walk(v, depth):
-                    nonlocal origin
-                    if depth > self.max_depth:
-                        return
-                    key = (var_key(v), getattr(v, "version", None))
-                    if key in visited:
-                        return
-                    visited.add(key)
-                    try:
-                        d = ssaf.get_ssa_var_definition(v)
-                    except Exception:
-                        d = None
-                    if d is None:
-                        origin = {"kind": "parameter_or_entry", "var": var_label(v)}
-                        return
-                    if self._is_call(d):
-                        target = const_target(getattr(d, "dest", None))
-                        name = self._callee_name(target)
-                        mkey, model = lookup_model(self.models, name)
-                        steps.append(_instr_dict(d, reason=f"defined by call to {name or 'indirect'}"))
-                        if model and model.get("sources"):
-                            origin = {"kind": "source", "callee": mkey or name}
-                        elif target is None:
-                            origin = {"kind": "indirect_call", "var": var_label(v)}
-                            leaf = {"kind": "indirect_call_unresolved",
-                                    "address": hex(int(getattr(d, "address", 0))),
-                                    "il_text": str(d)}
-                            if leaf not in leaves:
-                                leaves.append(leaf)
-                        else:
-                            origin = {"kind": "call", "callee": name}
-                        return
-                    steps.append(_instr_dict(d, reason="definition"))
-                    for r in ssa_reads(d):
-                        walk(r, depth + 1)
-
-                walk(seed_var, 0)
-                steps.reverse()
-                slices.append({
-                    "sink": {
-                        "callee": sink.get("callee"),
-                        "address": hex(int(getattr(sink_ins, "address", 0))),
-                        "seed": var_label(seed_var),
-                    },
-                    "origin": origin,
-                    "slice": steps,
-                })
+            ssaf = self._ssa_func(func)
+            instrs = self._instrs(ssaf)
+            for seed_var, sink_ins in self._seed_backward(func, ssaf, instrs, sink):
+                for sl in self._backward_slice(func, seed_var, 0, max_depth, set()):
+                    slices.append({
+                        "sink": {
+                            "callee": sink.get("callee"),
+                            "address": hex(int(getattr(sink_ins, "address", 0))),
+                            "seed": var_label(seed_var),
+                        },
+                        "origin": sl["origin"],
+                        "crossed_functions": sl["crossed"],
+                        "slice": sl["steps"],
+                    })
         return {
             "direction": "backward",
             "function": {"name": str(func.name), "address": hex(int(func.start))},
             "sinks": [self._describe_locator(s) for s in sinks],
             "slices": slices,
-            "leaves": leaves,
-            "assumptions": assumptions,
+            "leaves": self._bw_leaves,
+            "assumptions": self._bw_assumptions,
             "soundness": SOUNDNESS,
         }
+
+    def _bw_assume(self, msg: str) -> None:
+        if msg not in self._bw_assumptions:
+            self._bw_assumptions.append(msg)
+
+    def _backward_slice(self, func: Any, seed_var: Any, depth: int, max_depth: int,
+                        visited_funcs: set) -> list[dict[str, Any]]:
+        """Backward def-chain slice within *func*, continuing into callers when it
+        bottoms out at a parameter. Returns one slice per origin path."""
+        ssaf = self._ssa_func(func)
+        steps: list[dict[str, Any]] = []
+        visited_vars: set = set()
+        origin = {"kind": "unresolved"}
+        terminal_params: dict[int, Any] = {}
+
+        def walk(v, d):
+            nonlocal origin
+            if d > self.max_depth:
+                return
+            key = (var_key(v), getattr(v, "version", None))
+            if key in visited_vars:
+                return
+            visited_vars.add(key)
+            try:
+                defn = ssaf.get_ssa_var_definition(v)
+            except Exception:
+                defn = None
+            if defn is None:
+                pidx = self._param_index_of(func, v)
+                if pidx is not None:
+                    terminal_params[pidx] = v
+                    if origin["kind"] == "unresolved":
+                        origin = {"kind": "parameter", "index": pidx, "var": var_label(v)}
+                elif origin["kind"] == "unresolved":
+                    origin = {"kind": "entry", "var": var_label(v)}
+                return
+            if self._is_call(defn):
+                target = const_target(getattr(defn, "dest", None))
+                name = self._callee_name(target)
+                mkey, model = lookup_model(self.models, name)
+                steps.append(_instr_dict(defn, reason=f"defined by call to {name or 'indirect'}"))
+                if model and model.get("sources"):
+                    origin = {"kind": "source", "callee": mkey or name}
+                elif target is None:
+                    origin = {"kind": "indirect_call", "var": var_label(v)}
+                    leaf = {"kind": "indirect_call_unresolved",
+                            "address": hex(int(getattr(defn, "address", 0))), "il_text": str(defn)}
+                    if leaf not in self._bw_leaves:
+                        self._bw_leaves.append(leaf)
+                else:
+                    origin = {"kind": "call", "callee": name}
+                return
+            steps.append(_instr_dict(defn, reason="definition"))
+            for r in ssa_reads(defn):
+                walk(r, d + 1)
+
+        walk(seed_var, 0)
+        base_steps = list(reversed(steps))
+
+        # continue into callers only when the value's origin here is a parameter
+        if (origin["kind"] == "parameter" and depth < max_depth
+                and int(getattr(func, "start", 0)) not in visited_funcs):
+            cont = self._continue_into_callers(
+                func, terminal_params, depth, max_depth,
+                visited_funcs | {int(getattr(func, "start", 0))}, base_steps)
+            if cont:
+                return cont
+        return [{"steps": base_steps, "origin": origin, "crossed": []}]
+
+    def _continue_into_callers(self, func, terminal_params, depth, max_depth,
+                               visited_funcs, base_steps) -> list[dict[str, Any]]:
+        caller_sites = list(getattr(func, "caller_sites", None) or [])
+        if not caller_sites:
+            return []
+        MAX_CALLERS = 16
+        results: list[dict[str, Any]] = []
+        for pidx, pvar in terminal_params.items():
+            followed = False
+            for site in caller_sites[:MAX_CALLERS]:
+                caller = getattr(site, "function", None)
+                if caller is None:
+                    continue
+                addr = int(getattr(site, "address", 0))
+                try:
+                    c_instrs = self._instrs(self._ssa_func(caller))
+                except TaintError:
+                    continue
+                call_ins = next((i for i in c_instrs
+                                 if self._is_call(i) and int(getattr(i, "address", 0)) == addr), None)
+                if call_ins is None:
+                    continue
+                cparams = self._call_params(call_ins)
+                if pidx >= len(cparams):
+                    continue
+                seeds = expr_reads(cparams[pidx])
+                if not seeds:
+                    # arg has no SSA value reads (e.g. &localbuf); can't follow scalar slice
+                    self._bw_assume(
+                        f"arg {pidx} at {hex(addr)} in {caller.name} is not a trackable scalar; "
+                        "caller slice not followed")
+                    continue
+                boundary = _instr_dict(call_ins, reason=f"passed as arg {pidx} to {func.name}")
+                for sv in seeds:
+                    for sub in self._backward_slice(caller, sv, depth + 1, max_depth, visited_funcs):
+                        results.append({
+                            "steps": sub["steps"] + [boundary] + base_steps,
+                            "origin": sub["origin"],
+                            "crossed": [str(func.name)] + sub["crossed"],
+                        })
+                        followed = True
+            if len(caller_sites) > MAX_CALLERS:
+                self._bw_assume(f"{func.name} has {len(caller_sites)} callers; followed first {MAX_CALLERS}")
+            if not followed:
+                results.append({"steps": base_steps,
+                                "origin": {"kind": "parameter", "index": pidx, "var": var_label(pvar)},
+                                "crossed": []})
+        return results
 
     def _seed_backward(self, func, ssaf, instrs, sink) -> list[tuple]:
         kind = sink.get("kind")

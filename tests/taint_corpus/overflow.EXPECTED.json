@@ -7,6 +7,6 @@
   ],
   "backward": [
     {"function": "process", "sink": "arg:memcpy:2",
-     "origin_kinds": ["parameter_or_entry", "source", "call"]}
+     "origin_kinds": ["entry", "parameter", "source", "call"]}
   ]
 }

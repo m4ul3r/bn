@@ -3190,7 +3190,7 @@ class BinaryNinjaBridge:
                 locators = [_taint.parse_locator(s) for s in (params.get("sinks") or [])]
                 if not locators:
                     raise _taint.TaintError("backward taint needs at least one --sink")
-                return engine.backward(func, locators)
+                return engine.backward(func, locators, max_depth=int(params.get("max_depth", 8)))
         except _taint.TaintError as exc:
             raise OperationFailure("unsupported", str(exc)) from exc
         raise OperationFailure("unsupported", f"unknown taint direction: {direction}")

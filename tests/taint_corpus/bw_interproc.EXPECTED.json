@@ -1,0 +1,9 @@
+{
+  "description": "backward slice from a memcpy length parameter continues into the caller and reaches the recv source",
+  "lang": "c",
+  "backward": [
+    {"function": "use_len", "sink": "arg:memcpy:2",
+     "origin_kinds": ["source", "call", "parameter", "entry"],
+     "expect_crossed": "use_len"}
+  ]
+}

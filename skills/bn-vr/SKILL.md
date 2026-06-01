@@ -225,6 +225,10 @@ Reports each reached sink with its bug class (`overflow_len`,
 bn taint backward -f <handler> --sink arg:memcpy:2   # where does the length come from?
 bn taint backward -f <handler> --sink arg:strcpy:1
 ```
+When a slice bottoms out at a parameter, it continues up into callers
+(`caller_sites`, depth-bounded by `--max-depth`), mapping the parameter back to
+each call's argument — so a length checked in a helper is traced to the `recv`
+that produced it. Each result lists the `crosses:` chain and an `origin`.
 
 **Source/sink locator grammar:** `param:<n>` · `var:<selector>` ·
 `ret:<callee>` · `arg:<callee>:<n>` (the buffer arg `n` points at).

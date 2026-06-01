@@ -131,6 +131,8 @@ def _taint_forward(args: argparse.Namespace) -> int:
                  help="Function to analyze (name or address)"),
              arg("--sink", dest="sinks", action="append", default=None, metavar="LOCATOR",
                  help=f"Sink to slice from (repeatable). {_LOCATOR_HELP}"),
+             arg("--max-depth", dest="max_depth", type=int, default=8,
+                 help="Max interprocedural depth to follow slices up into callers (default: 8)"),
          ])
 def _taint_backward(args: argparse.Namespace) -> int:
     if not args.sinks:
@@ -142,6 +144,7 @@ def _taint_backward(args: argparse.Namespace) -> int:
             "direction": "backward",
             "function": args.function,
             "sinks": list(args.sinks),
+            "max_depth": int(args.max_depth),
         },
         require_target=True,
         allow_implicit_target=True,

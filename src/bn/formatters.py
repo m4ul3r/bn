@@ -1020,6 +1020,9 @@ def _render_taint_text(value: Any) -> str:
             lines.append(f"  origin: {origin.get('kind')}" + (
                 f" {origin.get('callee') or origin.get('var') or ''}".rstrip()
             ))
+            crossed = sl.get("crossed_functions") or []
+            if crossed:
+                lines.append(f"  crosses: {' <- '.join(crossed)}")
             for step in sl.get("slice") or []:
                 if isinstance(step, dict):
                     lines.append(f"  {step.get('address')}  {step.get('op')}  {step.get('il_text', '')}".rstrip())
