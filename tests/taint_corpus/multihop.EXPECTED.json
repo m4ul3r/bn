@@ -1,0 +1,8 @@
+{
+  "description": "input -> snprintf propagator -> system (command injection); validated against DVRF socket_cmd",
+  "lang": "c",
+  "forward": [
+    {"function": "handle", "source": "arg:read:1",
+     "sinks": [{"callee": "system", "class": "command_injection", "arg": 0}]}
+  ]
+}

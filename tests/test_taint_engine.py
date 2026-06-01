@@ -384,6 +384,44 @@ def test_forward_resolve_map_overrides_unresolved(models):
     assert any("resolved via agent-map" in a for a in r2["assumptions"])
 
 
+def test_forward_propagated_path_links_back_to_source(models):
+    # handle(fd): read(&str); snprintf(cmd, sz, "echo %s", str); system(cmd)
+    # the system finding's path must include the read source, not start at snprintf.
+    s = FVar("str"); c = FVar("cmd"); rs = FVar("rs"); rc = FVar("rc"); fd = FVar("fd")
+    rs1 = FSSA(rs, 1); rc1 = FSSA(rc, 1)
+    ssa = FSSAFunc([
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "rs#1 = &str", writes=[rs1],
+               src=FExpr("MLIL_ADDRESS_OF", "&str", src=s)),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "0x910(rdi, rs#1, 0xc8)", reads=[rs1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x910", constant=0x910),
+               params=[FExpr("MLIL_VAR_SSA", "rdi", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "rs#1", reads=[rs1]),
+                       FExpr("MLIL_CONST", "0xc8", constant=0xc8)]),
+        FInstr(2, 0x18, "MLIL_SET_VAR_SSA", "rc#1 = &cmd", writes=[rc1],
+               src=FExpr("MLIL_ADDRESS_OF", "&cmd", src=c)),
+        FInstr(3, 0x1c, "MLIL_CALL_SSA", "0x920(rc#1, 0x100, \"echo %s\", rs#1)", reads=[rc1, rs1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x920", constant=0x920),
+               params=[FExpr("MLIL_VAR_SSA", "rc#1", reads=[rc1]),
+                       FExpr("MLIL_CONST", "0x100", constant=0x100),
+                       FExpr("MLIL_CONST_PTR", "echo %s", constant=0x4050),
+                       FExpr("MLIL_VAR_SSA", "rs#1", reads=[rs1])]),
+        FInstr(4, 0x20, "MLIL_CALL_SSA", "0x930(rc#1)", reads=[rc1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x930", constant=0x930),
+               params=[FExpr("MLIL_VAR_SSA", "rc#1", reads=[rc1])]),
+    ])
+    func = FFunc("handle", 0x10, ssa, params=[fd])
+    bv = FBV({0x910: "read", 0x920: "snprintf", 0x930: "system"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:read:1")])
+    assert len(result["reached_sinks"]) == 1
+    path = result["reached_sinks"][0]["path"]
+    reasons = " | ".join(s.get("reason", "") for s in path)
+    assert "source: read" in reasons          # provenance reaches the source
+    assert "snprintf" in reasons               # through the propagator
+    # benign/socket noise must not appear for a clean modeled flow
+    assert result["assumptions"] == []
+
+
 def test_forward_outparam_propagates_to_caller(models):
     # fill(src, dst): strcpy(dst, src) -> dst is a tainted out-parameter
     src = FVar("src", ident=10); dst = FVar("dst", ident=11)

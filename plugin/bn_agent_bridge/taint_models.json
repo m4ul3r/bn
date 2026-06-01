@@ -55,6 +55,15 @@
     "malloc":       {"sink": {"tainted_args": [0], "class": "alloc_size", "detail": "attacker-controlled allocation size to malloc"}},
     "calloc":       {"sink": {"tainted_args": [0, 1], "class": "alloc_size", "detail": "attacker-controlled allocation size to calloc"}},
     "realloc":      {"sink": {"tainted_args": [1], "class": "alloc_size", "detail": "attacker-controlled allocation size to realloc"}},
-    "alloca":       {"sink": {"tainted_args": [0], "class": "alloc_size", "detail": "attacker-controlled alloca size (stack)"}}
+    "alloca":       {"sink": {"tainted_args": [0], "class": "alloc_size", "detail": "attacker-controlled alloca size (stack)"}},
+
+    "_comment_benign": "Empty models mark functions that neither source, propagate, nor sink taint, so a tainted argument does not trigger the conservative 'unmodeled external' fallback. They cut noise without hiding real flows.",
+    "socket": {}, "bind": {}, "listen": {}, "accept": {}, "connect": {},
+    "setsockopt": {}, "getsockopt": {}, "getsockname": {}, "getpeername": {},
+    "close": {}, "shutdown": {}, "write": {}, "send": {}, "sendto": {},
+    "htons": {}, "htonl": {}, "ntohs": {}, "ntohl": {}, "inet_addr": {},
+    "exit": {}, "abort": {}, "perror": {}, "fflush": {}, "fclose": {}, "puts": {},
+    "strcmp": {}, "strncmp": {}, "strcasecmp": {}, "strncasecmp": {},
+    "bzero": {}, "__builtin_memset": {}, "srand": {}, "rand": {}, "time": {}
   }
 }

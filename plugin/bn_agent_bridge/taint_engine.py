@@ -557,8 +557,9 @@ class TaintEngine:
                     if model and model.get("propagates"):
                         for rule in model["propagates"]:
                             to = rule.get("to")
-                            if self._token_tainted(ssaf, ins, params, rule.get("from"), tainted):
-                                if self._apply_to_token(ssaf, ins, params, to, taint_node, name or "?"):
+                            hit = self._token_hit_node(ssaf, params, rule.get("from"), tainted)
+                            if hit is not None:
+                                if self._apply_to_token(ssaf, ins, params, to, taint_node, name or "?", parents=[hit]):
                                     changed = True
                                 # out-param: the propagate writes through an arg that
                                 # is one of THIS function's parameters -> caller out-param
@@ -630,8 +631,9 @@ class TaintEngine:
                                                 findings.append(self._make_finding(ins, mk or nm, argidx, md["sink"], ht, why))
                             if md.get("propagates"):
                                 for rule in md["propagates"]:
-                                    if self._token_tainted(ssaf, ins, params, rule.get("from"), tainted):
-                                        if self._apply_to_token(ssaf, ins, params, rule.get("to"), taint_node, nm or "?"):
+                                    hit = self._token_hit_node(ssaf, params, rule.get("from"), tainted)
+                                    if hit is not None:
+                                        if self._apply_to_token(ssaf, ins, params, rule.get("to"), taint_node, nm or "?", parents=[hit]):
                                             changed = True
                             resolved_names.append(nm or hex(taddr))
                         elif self._is_internal(cfn):
@@ -713,38 +715,44 @@ class TaintEngine:
                 return f"{txt} of tainted operand"
         return "assignment/copy of tainted value"
 
-    def _token_tainted(self, ssaf: Any, ins: Any, params: list[Any], tok: str | None, tainted: set) -> bool:
-        if not tok:
-            return False
-        if tok.startswith("*arg:") or tok.startswith("arg:"):
-            pointee = tok.startswith("*arg:")
-            idx = int(tok.split("arg:", 1)[1])
-            if idx >= len(params):
-                return False
-            if pointee:
-                pv = self._pointee_var(ssaf, params[idx])
-                if pv is not None and (var_key(pv), None) in tainted:
-                    return True
-                # a tainted pointer argument (e.g. a tainted buffer pointer passed
-                # in as a parameter) implies its pointee is tainted in our model
-                for r in expr_reads(params[idx]):
-                    if (var_key(r), getattr(r, "version", None)) in tainted or (var_key(r), None) in tainted:
-                        return True
-                return False
-            for r in expr_reads(params[idx]):
-                if (var_key(r), getattr(r, "version", None)) in tainted or (var_key(r), None) in tainted:
-                    return True
-            return False
-        return False
+    def _token_hit_node(self, ssaf: Any, params: list[Any], tok: str | None, tainted: set):
+        """The tainted node satisfying an arg/pointee token, or None. Returning
+        the node (not just a bool) lets propagation record provenance so a
+        propagated buffer's path links back to the original source."""
+        if not tok or not (tok.startswith("*arg:") or tok.startswith("arg:")):
+            return None
+        pointee = tok.startswith("*arg:")
+        idx = int(tok.split("arg:", 1)[1])
+        if idx >= len(params):
+            return None
+        expr = params[idx]
+        if pointee:
+            pv = self._pointee_var(ssaf, expr)
+            if pv is not None and (var_key(pv), None) in tainted:
+                return (var_key(pv), None)
+        # a tainted scalar/pointer arg (incl. a tainted pointer parameter whose
+        # pointee is tainted in our coarse model) satisfies the token
+        for r in expr_reads(expr):
+            ver = getattr(r, "version", None)
+            if (var_key(r), ver) in tainted:
+                return (var_key(r), ver)
+            if (var_key(r), None) in tainted:
+                return (var_key(r), None)
+        return None
 
-    def _apply_to_token(self, ssaf: Any, ins: Any, params: list[Any], tok: str | None, taint_node, callee: str) -> bool:
+    def _token_tainted(self, ssaf: Any, ins: Any, params: list[Any], tok: str | None, tainted: set) -> bool:
+        return self._token_hit_node(ssaf, params, tok, tainted) is not None
+
+    def _apply_to_token(self, ssaf: Any, ins: Any, params: list[Any], tok: str | None,
+                        taint_node, callee: str, parents: list | None = None) -> bool:
+        parents = parents or []
         if not tok:
             return False
         if tok == "ret" or tok == "*ret":
             done = False
             for w in ssa_writes(ins):
                 node = (var_key(w), getattr(w, "version", None))
-                if taint_node(node, var_label(w), ins, f"return of {callee} (model propagate)", []):
+                if taint_node(node, var_label(w), ins, f"return of {callee} (model propagate)", parents):
                     done = True
             return done
         if tok.startswith("*arg:") or tok.startswith("arg:"):
@@ -756,12 +764,12 @@ class TaintEngine:
                 pv = self._pointee_var(ssaf, params[idx])
                 if pv is not None:
                     return taint_node((var_key(pv), None), var_label(pv), ins,
-                                      f"buffer written by {callee} (model propagate)", [])
+                                      f"buffer written by {callee} (model propagate)", parents)
                 return False
             done = False
             for r in expr_reads(params[idx]):
                 node = (var_key(r), getattr(r, "version", None))
-                if taint_node(node, var_label(r), ins, f"output of {callee} (model propagate)", []):
+                if taint_node(node, var_label(r), ins, f"output of {callee} (model propagate)", parents):
                     done = True
             return done
         return False

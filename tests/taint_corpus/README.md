@@ -17,6 +17,7 @@ brittle across compilers/optimisation.
 | `indirect_resolve.c`   | const function-pointer table resolved by value-set; taint follows into both targets |
 | `interproc.c`          | tainted buffer crosses a call boundary; sink lives in the callee (interprocedural descent) |
 | `outparam.c`           | helper fills an output buffer through a pointer param; taint flows back to the caller |
+| `multihop.c`           | input -> snprintf propagator -> system (command injection); mirrors DVRF socket_cmd |
 | `vtable.cpp`           | C++ virtual dispatch shows as an indirect callee (honest degradation) |
 
 ## `EXPECTED.json` schema
@@ -30,6 +31,22 @@ brittle across compilers/optimisation.
   "callgraph":[{"function","expect_indirect": true}]
 }
 ```
+
+## Real-world validation runs (done; not checked in)
+
+The engine has been exercised on real targets beyond the synthetic corpus:
+
+- **DVRF firmware services** (`socket_bof.c`, `socket_cmd.c` from
+  github.com/praetorian-inc/DVRF, compiled natively). Forward taint from
+  `arg:read:1` correctly found `read -> sprintf` (overflow) and the multi-hop
+  `read -> snprintf -> system` (command injection) with a full provenance path.
+  `multihop.c` above is the regression distilled from this.
+- **Statically-linked stripped MIPS busybox** (busybox.net prebuilt). Surfaced a
+  real gap: with no symbols, the symbol-keyed model DB does not fire, so sinks
+  go unrecognized. Workarounds: apply BN signature libraries, rename identified
+  libc functions (then models match by name), or supply address-keyed targets
+  via `--resolve-map` for indirect dispatch. The value-set indirect resolution
+  and structured primitives still work on stripped code.
 
 ## Tier 3 — firmware-style targets (opt-in, not checked in)
 
