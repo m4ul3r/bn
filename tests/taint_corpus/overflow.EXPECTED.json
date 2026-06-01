@@ -1,0 +1,12 @@
+{
+  "description": "read() taints a stack buffer; a byte from it becomes a memcpy length -> overflow",
+  "lang": "c",
+  "forward": [
+    {"function": "process", "source": "arg:read:1",
+     "sinks": [{"callee": "memcpy", "class": "overflow_len", "arg": 2}]}
+  ],
+  "backward": [
+    {"function": "process", "sink": "arg:memcpy:2",
+     "origin_kinds": ["parameter_or_entry", "source", "call"]}
+  ]
+}

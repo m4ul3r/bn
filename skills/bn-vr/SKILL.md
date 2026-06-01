@@ -195,32 +195,59 @@ Choose an approach based on the binary:
 1. Start pattern-based to find low-hanging fruit
 2. Switch to function-by-function for high-value code (parsers, auth, crypto)
 
-## Manual Taint Analysis
+## Taint Analysis (`bn taint`)
 
-When you need to rigorously track whether attacker-controlled data reaches a dangerous operation:
+`bn taint` automates the propagation step over Binary Ninja's MLIL-SSA: it
+follows def-use chains through assignments, arithmetic, phi joins, and a
+built-in function-model DB (`recv`/`read`/`fgets`/`getenv` sources;
+`memcpy`/`strcpy`/`sprintf`/`system`/… sinks). It is **intraprocedural** today —
+honest about its limits: every coarse-memory step, every un-analyzed/external
+call, and every unresolved indirect call is reported under `assumptions` /
+`leaves`, and the result always carries a `soundness` disclaimer. It is a
+may-analysis, not a proof.
 
-1. **Mark sources** — identify which function parameters or return values carry untrusted data:
-   ```bash
-   bn decompile <input_handler>
-   ```
+**Forward — from a source to whatever sinks it reaches:**
+```bash
+# the buffer that recv()'s 2nd arg fills is the source:
+bn taint forward -f <handler> --source arg:recv:1
+# a function parameter is tainted on entry:
+bn taint forward -f <handler> --source param:0
+```
+Reports each reached sink with its bug class (`overflow_len`,
+`command_injection`, `format_string`, …) and the full SSA path.
 
-2. **Propagate taint** — trace through assignments, copies, and function calls:
-   - Direct assignment: `dest = tainted_src` -> `dest` is tainted
-   - Copy: `memcpy(dest, tainted_src, len)` -> `dest` is tainted
-   - Function call: if a tainted value is passed as an argument, check whether the callee propagates it to its return value or to other outputs. Use `bn trace` to follow a sink argument back through SSA to its origin:
-     ```bash
-     bn trace <sink_function> <call_address> --arg N                    # intra: one function
-     bn trace <sink_function> <call_address> --arg N --interprocedural  # IP: follow across calls
-     ```
-   ```bash
-   bn callsites <function> --within <caller>
-   bn decompile <callee>
-   ```
+**Backward — slice a sink's argument back to its origin:**
+```bash
+bn taint backward -f <handler> --sink arg:memcpy:2   # where does the length come from?
+bn taint backward -f <handler> --sink arg:strcpy:1
+```
 
-3. **Check sinks** — when tainted data reaches a dangerous function, assess exploitability:
-   - Can the attacker control enough of the input to trigger the bug?
-   - Are there length checks, sanitization, or canaries in the path?
-   - What is the memory layout at the target (stack vs heap, adjacent allocations)?
+**Source/sink locator grammar:** `param:<n>` · `var:<selector>` ·
+`ret:<callee>` · `arg:<callee>:<n>` (the buffer arg `n` points at).
+
+**Underlying primitives** (useful on their own, and for auditing a taint result):
+```bash
+bn dataflow defuse <fn> --var <name#version>   # SSA def site + all uses
+bn dataflow callgraph <fn> --direction callees # resolved callees; indirect via value-set
+bn dataflow values <fn> --at <addr>            # value-set (possible values)
+bn function structured-il <fn>                 # per-instruction op + vars_read/written
+```
+
+**When taint stops (the known-hard cases), fall back to the manual chain.** If a
+flow hits a `leaves` entry — an `indirect_call_unresolved` (function pointer /
+vtable) or an un-modeled external — resolve it by hand and continue:
+- Try `bn dataflow callgraph <fn>` / `bn dataflow values <fn> --at <call-addr>`
+  to pin an indirect target; if it resolves, re-run taint inside that callee.
+- For interprocedural flows, taint each function in turn and stitch the path:
+  `bn taint backward -f <callee> --sink arg:<sink>:<n>` then map the callee's
+  tainted parameter back to the caller's argument with
+  `bn callsites <callee> --within <caller>` + `bn decompile <caller>`.
+- For an un-modeled external, add a model to the override file
+  (`~/.cache/bn/taint_models.json`, or `$BN_TAINT_MODELS`) and re-run.
+
+Then assess exploitability as before: can the attacker control enough of the
+input, are there length/sanitization checks in the path, and what is the memory
+layout at the target?
 
 ## Reporting Findings
 

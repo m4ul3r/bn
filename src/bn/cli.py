@@ -203,6 +203,8 @@ _GROUP_HELP: dict[tuple[str, ...], str] = {
     ("instance",): "Pin or clear the active bridge instance",
     ("target",): "Inspect Binary Ninja targets",
     ("function",): "Function discovery helpers",
+    ("dataflow",): "Structured data-flow primitives (def-use, value-set, call graph)",
+    ("taint",): "Taint analysis (forward source->sink, backward sink slicing)",
     ("evidence",): "Evidence-oriented reversing helpers",
     ("bundle",): "Export reusable bundles",
     ("py",): "Execute Python inside Binary Ninja",

@@ -25,6 +25,7 @@ from binaryninja import SSAVariable
 from binaryninja.mainthread import execute_on_main_thread_and_wait, is_main_thread
 from binaryninja.plugin import PluginCommand
 
+from . import taint_engine as _taint
 from .paths import PLUGIN_NAME, bridge_registry_path, bridge_socket_path, instances_dir
 from .version import VERSION, build_id_for_file
 
@@ -178,6 +179,11 @@ READ_LOCKED_OPS = {
     "callsites",
     "decompile",
     "il",
+    "structured_il",
+    "defuse",
+    "resolved_calls",
+    "possible_values",
+    "taint",
     "disasm",
     "function_evidence",
     "xrefs",
@@ -844,6 +850,26 @@ class BinaryNinjaBridge:
             )
         if op == "il":
             return self._il(target, params["identifier"], str(params.get("view", "hlil")), bool(params.get("ssa")))
+        if op == "structured_il":
+            return self._structured_il(
+                target,
+                params["identifier"],
+                view=str(params.get("view", "mlil")),
+                ssa=bool(params.get("ssa", True)),
+            )
+        if op == "defuse":
+            return self._defuse(target, params["identifier"], str(params["var"]))
+        if op == "resolved_calls":
+            return self._resolved_calls(
+                target,
+                params["identifier"],
+                direction=str(params.get("direction", "both")),
+                resolve_indirect=bool(params.get("resolve_indirect", True)),
+            )
+        if op == "possible_values":
+            return self._possible_values(target, params["identifier"], params["at"])
+        if op == "taint":
+            return self._taint(target, params)
         if op == "disasm":
             return self._disasm(target, params["identifier"])
         if op == "function_evidence":
@@ -2840,6 +2866,317 @@ class BinaryNinjaBridge:
             "function": {"name": func.name, "address": hex(func.start)},
             "text": self._disasm_text(bv, func),
         }
+
+    # ------------------------------------------------------------------
+    # Structured data-flow primitives (def-use / value-set / call graph)
+    # ------------------------------------------------------------------
+
+    def _il_function_for(self, func, view: str, ssa: bool):
+        attr = {"hlil": "hlil", "mlil": "mlil", "llil": "llil"}.get(view, "mlil")
+        il = getattr(func, attr, None)
+        if il is None:
+            raise OperationFailure("unsupported", f"function has no {view.upper()}")
+        if ssa:
+            ssa_form = getattr(il, "ssa_form", None)
+            if ssa_form is not None:
+                il = ssa_form
+        return il
+
+    def _ssa_var_entry(self, v) -> dict[str, Any]:
+        """Serialize an SSAVariable or plain Variable consistently.
+
+        SSA vars expose ``.var`` (-> Variable) and ``.version``; AddressOf
+        targets surface as plain Variables (no version) in ``vars_read``.
+        """
+        base = getattr(v, "var", v)
+        version = getattr(v, "version", None)
+        name = str(getattr(base, "name", base))
+        entry: dict[str, Any] = {
+            "name": name,
+            "version": int(version) if version is not None else None,
+            "ssa": f"{name}#{version}" if version is not None else name,
+            "type": str(getattr(base, "type", "")) or None,
+            "identifier": self._variable_identifier(base),
+        }
+        return entry
+
+    def _collect_ssa_vars(self, il) -> dict[tuple[str, int], Any]:
+        found: dict[tuple[str, int], Any] = {}
+        try:
+            items = list(il.instructions)
+        except Exception:
+            items = []
+        for ins in items:
+            for v in list(getattr(ins, "vars_read", None) or []) + list(getattr(ins, "vars_written", None) or []):
+                version = getattr(v, "version", None)
+                if version is None:
+                    continue
+                base = getattr(v, "var", v)
+                found[(str(getattr(base, "name", base)), int(version))] = v
+        return found
+
+    def _resolve_ssa_variable(self, func, il, selector: str):
+        index = self._collect_ssa_vars(il)
+        name, sep, version = str(selector).partition("#")
+        if sep and version:
+            key = (name, int(version))
+            if key in index:
+                return index[key], None
+            raise OperationFailure("unsupported", f"SSA variable not found: {selector}")
+        # bare name: return the lowest-version instance plus the list of versions
+        versions = sorted(v for (n, v) in index if n == name)
+        if not versions:
+            raise OperationFailure("unsupported", f"SSA variable not found: {selector}")
+        return index[(name, versions[0])], versions
+
+    def _structured_il(self, selector, identifier, *, view: str = "mlil", ssa: bool = True):
+        bv = self._resolve_view(selector)
+        func = self._find_function(bv, identifier)
+        il = self._il_function_for(func, view, ssa)
+        instructions = []
+        try:
+            items = list(il.instructions)
+        except Exception:
+            items = []
+        for ins in items:
+            opn = self._il_op_name(ins)
+            instructions.append({
+                "il_index": int(getattr(ins, "instr_index", -1)),
+                "address": hex(int(getattr(ins, "address", func.start))),
+                "op": opn,
+                "text": str(ins),
+                "vars_read": [self._ssa_var_entry(v) for v in (getattr(ins, "vars_read", None) or [])],
+                "vars_written": [self._ssa_var_entry(v) for v in (getattr(ins, "vars_written", None) or [])],
+                "operands_summary": [str(o) for o in (getattr(ins, "operands", None) or [])],
+                "is_call": "CALL" in opn,
+            })
+        return {
+            "function": {"name": func.name, "address": hex(func.start)},
+            "view": view,
+            "ssa": ssa,
+            "instructions": instructions,
+        }
+
+    def _defuse(self, selector, identifier, var_selector: str):
+        bv = self._resolve_view(selector)
+        func = self._find_function(bv, identifier)
+        il = self._il_function_for(func, "mlil", True)
+        ssa_var, other_versions = self._resolve_ssa_variable(func, il, var_selector)
+
+        try:
+            definition = il.get_ssa_var_definition(ssa_var)
+        except Exception:
+            definition = None
+        try:
+            uses = list(il.get_ssa_var_uses(ssa_var) or [])
+        except Exception:
+            uses = []
+
+        def _ref(ins):
+            if ins is None:
+                return None
+            return {
+                "il_index": int(getattr(ins, "instr_index", -1)),
+                "address": hex(int(getattr(ins, "address", func.start))),
+                "op": self._il_op_name(ins),
+                "text": str(ins),
+            }
+
+        is_phi = definition is not None and "PHI" in self._il_op_name(definition)
+        phi_sources = []
+        if is_phi:
+            for s in (getattr(definition, "src", None) or []):
+                phi_sources.append(self._ssa_var_entry(s))
+
+        return {
+            "function": {"name": func.name, "address": hex(func.start)},
+            "variable": self._ssa_var_entry(ssa_var),
+            "definition": _ref(definition),
+            "uses": [_ref(u) for u in uses],
+            "is_phi": is_phi,
+            "phi_sources": phi_sources,
+            "other_versions": other_versions or [],
+        }
+
+    def _serialize_pvs(self, pvs) -> dict[str, Any] | None:
+        if pvs is None:
+            return None
+        out: dict[str, Any] = {"raw": str(pvs)}
+        t = getattr(pvs, "type", None)
+        out["type"] = getattr(t, "name", None) or (str(t) if t is not None else None)
+
+        def _coerce(v):
+            try:
+                return int(v)
+            except Exception:
+                return str(v)
+
+        value = getattr(pvs, "value", None)
+        if value is not None:
+            out["value"] = _coerce(value)
+        values = getattr(pvs, "values", None)
+        if values:
+            try:
+                out["values"] = sorted(_coerce(v) for v in values)
+            except Exception:
+                out["values"] = [_coerce(v) for v in values]
+        ranges = getattr(pvs, "ranges", None)
+        if ranges:
+            out["ranges"] = [
+                {
+                    "start": _coerce(getattr(r, "start", 0)),
+                    "end": _coerce(getattr(r, "end", 0)),
+                    "step": _coerce(getattr(r, "step", 1)),
+                }
+                for r in ranges
+            ]
+        return out
+
+    def _pvs_targets(self, bv, pvs) -> list[dict[str, Any]]:
+        if pvs is None:
+            return []
+        type_name = getattr(getattr(pvs, "type", None), "name", "") or ""
+        addrs: list[int] = []
+        if type_name in {"ConstantValue", "ConstantPointerValue", "ImportedAddressValue", "ExternalPointerValue"}:
+            value = getattr(pvs, "value", None)
+            if value is not None:
+                try:
+                    addrs.append(int(value))
+                except Exception:
+                    pass
+        elif type_name in {"InSetOfValues", "LookupTableValue"}:
+            for v in (getattr(pvs, "values", None) or []):
+                try:
+                    addrs.append(int(v))
+                except Exception:
+                    pass
+        targets = []
+        for addr in addrs:
+            fn = bv.get_function_at(addr) if hasattr(bv, "get_function_at") else None
+            name = None
+            if fn is not None:
+                name = str(getattr(fn, "name", None))
+            else:
+                sym = bv.get_symbol_at(addr) if hasattr(bv, "get_symbol_at") else None
+                name = str(getattr(sym, "name", None)) if sym is not None else None
+            targets.append({"address": hex(addr), "name": name})
+        return targets
+
+    def _resolved_calls(self, selector, identifier, *, direction: str = "both", resolve_indirect: bool = True):
+        bv = self._resolve_view(selector)
+        func = self._find_function(bv, identifier)
+        result: dict[str, Any] = {"function": {"name": func.name, "address": hex(func.start)}}
+
+        if direction in ("callees", "both"):
+            il = self._il_function_for(func, "mlil", True)
+            callees = []
+            try:
+                items = list(il.instructions)
+            except Exception:
+                items = []
+            for ins in items:
+                opn = self._il_op_name(ins)
+                if "CALL" not in opn and "TAILCALL" not in opn:
+                    continue
+                target = _taint.const_target(getattr(ins, "dest", None))
+                row = {
+                    "call_addr": hex(int(getattr(ins, "address", func.start))),
+                    "il_index": int(getattr(ins, "instr_index", -1)),
+                }
+                if target is not None:
+                    fn = bv.get_function_at(target)
+                    name = str(fn.name) if fn is not None else None
+                    if name is None:
+                        sym = bv.get_symbol_at(target) if hasattr(bv, "get_symbol_at") else None
+                        name = str(sym.name) if sym is not None else None
+                    row.update({"kind": "direct", "target": {"address": hex(target), "name": name}})
+                else:
+                    row.update({"kind": "indirect", "dest_expr": str(getattr(ins, "dest", ""))})
+                    if resolve_indirect:
+                        pvs = getattr(getattr(ins, "dest", None), "possible_values", None)
+                        resolved = self._pvs_targets(bv, pvs)
+                        row["resolved"] = resolved
+                        type_name = getattr(getattr(pvs, "type", None), "name", "") or "none"
+                        row["resolution"] = "possible_values" if resolved else "unresolved"
+                        row["resolution_detail"] = type_name
+                callees.append(row)
+            result["callees"] = callees
+
+        if direction in ("callers", "both"):
+            callers = []
+            seen: set[int] = set()
+            for site in (list(getattr(func, "caller_sites", None) or [])):
+                addr = int(getattr(site, "address", 0))
+                fn = getattr(site, "function", None)
+                if fn is None:
+                    functions = self._functions_containing(bv, addr)
+                    fn = functions[0] if functions else None
+                caller = (
+                    {"address": hex(int(fn.start)), "name": str(fn.name)} if fn is not None else None
+                )
+                callers.append({"call_addr": hex(addr), "caller": caller})
+            if not callers:
+                for fn in (list(getattr(func, "callers", None) or [])):
+                    marker = int(getattr(fn, "start", 0))
+                    if marker in seen:
+                        continue
+                    seen.add(marker)
+                    callers.append({"caller": {"address": hex(marker), "name": str(fn.name)}})
+            result["callers"] = callers
+
+        return result
+
+    def _possible_values(self, selector, identifier, at):
+        bv = self._resolve_view(selector)
+        func = self._find_function(bv, identifier)
+        address = _parse_address(at)
+        il = self._il_function_for(func, "mlil", True)
+        target_ins = None
+        try:
+            for ins in list(il.instructions):
+                if int(getattr(ins, "address", -1)) == address:
+                    target_ins = ins
+                    break
+        except Exception:
+            target_ins = None
+        pvs = getattr(target_ins, "possible_values", None) if target_ins is not None else None
+        return {
+            "function": {"name": func.name, "address": hex(func.start)},
+            "at": hex(address),
+            "expression": str(target_ins) if target_ins is not None else None,
+            "possible_values": self._serialize_pvs(pvs),
+        }
+
+    def _taint(self, selector, params: dict[str, Any]):
+        bv = self._resolve_view(selector)
+        direction = str(params.get("direction", "forward"))
+        func = self._find_function(bv, params["function"])
+        models = _taint.load_models()
+
+        def _find_variable(fn, sel):
+            var, _is_param = self._find_variable_selector(fn, sel)
+            return var
+
+        engine = _taint.TaintEngine(
+            bv,
+            models,
+            find_variable=_find_variable,
+            unknown_call_policy=str(params.get("unknown_call", "conservative")),
+        )
+        try:
+            if direction == "forward":
+                locators = [_taint.parse_locator(s) for s in (params.get("sources") or [])]
+                if not locators:
+                    raise _taint.TaintError("forward taint needs at least one --source")
+                return engine.forward(func, locators)
+            if direction == "backward":
+                locators = [_taint.parse_locator(s) for s in (params.get("sinks") or [])]
+                if not locators:
+                    raise _taint.TaintError("backward taint needs at least one --sink")
+                return engine.backward(func, locators)
+        except _taint.TaintError as exc:
+            raise OperationFailure("unsupported", str(exc)) from exc
+        raise OperationFailure("unsupported", f"unknown taint direction: {direction}")
 
     def _call_destination_value(self, insn) -> int | None:
         return self._llil_constant_value(getattr(insn, "dest", None))

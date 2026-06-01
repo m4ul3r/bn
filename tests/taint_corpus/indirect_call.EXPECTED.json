@@ -1,0 +1,11 @@
+{
+  "description": "tainted data reaching an indirect call must be reported as a leaf, not dropped",
+  "lang": "c",
+  "forward": [
+    {"function": "invoke", "source": "arg:read:1",
+     "leaves": [{"kind": "indirect_call_unresolved"}]}
+  ],
+  "callgraph": [
+    {"function": "invoke", "expect_indirect": true}
+  ]
+}

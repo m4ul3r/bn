@@ -16,6 +16,7 @@ from ..formatters import (
     _render_name_address_list_text,
     _render_message_lens_text,
     _render_pointer_table_text,
+    _render_structured_il_text,
     _render_trace_text,
     _render_xrefs_text,
     _slice_text_lines,
@@ -214,6 +215,28 @@ def _il(args: argparse.Namespace) -> int:
         allow_implicit_target=True,
         text_renderer=lambda value: _slice_text_lines(base(value), lines_range),
         stem="il",
+    )
+
+
+@command("function", "structured-il",
+         help="Per-instruction structured IL (op, vars_read/written) for data-flow tooling",
+         target=True,
+         args=[
+             arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
+             arg("--view", choices=("hlil", "mlil"), default="mlil",
+                 help="IL level (default: mlil)"),
+             arg("--no-ssa", dest="ssa", action="store_false", default=True,
+                 help="Emit non-SSA form (default: SSA)"),
+         ])
+def _function_structured_il(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "structured_il",
+        {"identifier": args.identifier, "view": args.view, "ssa": bool(args.ssa)},
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_structured_il_text,
+        stem="structured-il",
     )
 
 

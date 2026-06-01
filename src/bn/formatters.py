@@ -872,6 +872,194 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
     return "\n\n".join(blocks)
 
 
+def _render_structured_il_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    fn = value.get("function") or {}
+    form = "ssa" if value.get("ssa") else "non-ssa"
+    lines = [f"{fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}  ({value.get('view', 'mlil')} {form})"]
+    for ins in list(value.get("instructions") or []):
+        reads = ",".join(v.get("ssa", v.get("name", "?")) for v in (ins.get("vars_read") or []))
+        writes = ",".join(v.get("ssa", v.get("name", "?")) for v in (ins.get("vars_written") or []))
+        head = f"  [{ins.get('il_index')}] {ins.get('address')}  {ins.get('op')}  {ins.get('text', '')}".rstrip()
+        lines.append(head)
+        if reads or writes:
+            lines.append(f"        r:[{reads}]  w:[{writes}]")
+    return "\n".join(lines)
+
+
+def _render_defuse_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    fn = value.get("function") or {}
+    var = value.get("variable") or {}
+    lines = [
+        f"{fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}",
+        f"variable: {var.get('ssa', var.get('name', '?'))}  ({var.get('type', '?')})",
+    ]
+    definition = value.get("definition")
+    if definition:
+        lines.append(f"def: {definition.get('address')}  {definition.get('op')}  {definition.get('text', '')}".rstrip())
+    else:
+        lines.append("def: <none (parameter/entry/aliased)>")
+    if value.get("is_phi"):
+        srcs = ", ".join(s.get("ssa", s.get("name", "?")) for s in (value.get("phi_sources") or []))
+        lines.append(f"phi sources: {srcs}")
+    uses = list(value.get("uses") or [])
+    lines.append(f"uses ({len(uses)}):")
+    for u in uses:
+        lines.append(f"  {u.get('address')}  {u.get('op')}  {u.get('text', '')}".rstrip())
+    others = value.get("other_versions") or []
+    if others:
+        lines.append(f"other versions of {var.get('name', '?')}: {others}")
+    return "\n".join(lines)
+
+
+def _render_callgraph_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    fn = value.get("function") or {}
+    lines = [f"{fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}"]
+    if "callees" in value:
+        callees = list(value.get("callees") or [])
+        lines.append(f"callees ({len(callees)}):")
+        for c in callees:
+            if c.get("kind") == "direct":
+                tgt = c.get("target") or {}
+                lines.append(f"  {c.get('call_addr')}  direct -> {tgt.get('name', '<unknown>')} @ {tgt.get('address')}")
+            else:
+                resolved = c.get("resolved") or []
+                if resolved:
+                    tgts = ", ".join(f"{r.get('name', '?')}@{r.get('address')}" for r in resolved)
+                    suffix = f"resolved: {tgts}"
+                else:
+                    suffix = f"UNRESOLVED ({c.get('resolution_detail', 'indirect')})"
+                lines.append(f"  {c.get('call_addr')}  indirect [{c.get('dest_expr', '')}]  {suffix}")
+    if "callers" in value:
+        callers = list(value.get("callers") or [])
+        lines.append(f"callers ({len(callers)}):")
+        for c in callers:
+            caller = c.get("caller") or {}
+            site = f"{c.get('call_addr')}  " if c.get("call_addr") else ""
+            lines.append(f"  {site}{caller.get('name', '<unknown>')} @ {caller.get('address', '?')}")
+    return "\n".join(lines)
+
+
+def _render_values_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    fn = value.get("function") or {}
+    lines = [f"{fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}"]
+    lines.append(f"at {value.get('at')}: {value.get('expression', '<no instruction at address>')}")
+    pvs = value.get("possible_values")
+    if not pvs:
+        lines.append("possible values: <unavailable>")
+        return "\n".join(lines)
+    summary = pvs.get("type", "?")
+    if "value" in pvs:
+        summary += f"  value={pvs['value']:#x}" if isinstance(pvs["value"], int) else f"  value={pvs['value']}"
+    if pvs.get("values"):
+        summary += f"  values={pvs['values']}"
+    if pvs.get("ranges"):
+        summary += f"  ranges={pvs['ranges']}"
+    lines.append(f"possible values: {summary}")
+    lines.append(f"  raw: {pvs.get('raw', '')}")
+    return "\n".join(lines)
+
+
+def _render_taint_path(steps: list[Any]) -> list[str]:
+    out = []
+    last = len(steps) - 1
+    for i, step in enumerate(steps):
+        if not isinstance(step, dict):
+            continue
+        marker = ">" if i == last else " "
+        reason = step.get("reason")
+        line = f"  {marker} {step.get('address')}  {step.get('op')}  {step.get('il_text', '')}".rstrip()
+        out.append(line)
+        if reason:
+            out.append(f"        <- {reason}")
+    return out
+
+
+def _render_taint_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    fn = value.get("function") or {}
+    direction = value.get("direction", "forward")
+    lines = [f"{direction} taint in {fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}"]
+
+    if direction == "forward":
+        srcs = value.get("sources") or []
+        lines.append("sources: " + (", ".join(_describe_loc(s) for s in srcs) or "<none>"))
+        findings = list(value.get("reached_sinks") or [])
+        lines.append("")
+        if not findings:
+            lines.append("no sinks reached by tainted data")
+        else:
+            lines.append(f"reached {len(findings)} sink(s):")
+            for f in findings:
+                sink = f.get("sink") or {}
+                lines.append("")
+                lines.append(
+                    f"[{sink.get('class', '?')}] {sink.get('callee', '?')} @ {sink.get('address')} "
+                    f"(arg {sink.get('tainted_arg_index')}) -- {sink.get('detail', '')}".rstrip()
+                )
+                lines.extend(_render_taint_path(f.get("path") or []))
+    else:
+        sinks = value.get("sinks") or []
+        lines.append("sinks: " + (", ".join(_describe_loc(s) for s in sinks) or "<none>"))
+        slices = list(value.get("slices") or [])
+        for sl in slices:
+            sink = sl.get("sink") or {}
+            origin = sl.get("origin") or {}
+            lines.append("")
+            lines.append(
+                f"slice for {sink.get('callee', '?')} @ {sink.get('address')} (seed {sink.get('seed', '?')}):"
+            )
+            lines.append(f"  origin: {origin.get('kind')}" + (
+                f" {origin.get('callee') or origin.get('var') or ''}".rstrip()
+            ))
+            for step in sl.get("slice") or []:
+                if isinstance(step, dict):
+                    lines.append(f"  {step.get('address')}  {step.get('op')}  {step.get('il_text', '')}".rstrip())
+
+    leaves = list(value.get("leaves") or [])
+    if leaves:
+        lines.append("")
+        lines.append(f"UNRESOLVED LEAVES ({len(leaves)}):")
+        for leaf in leaves:
+            lines.append(
+                f"  {leaf.get('kind')} @ {leaf.get('address')}  [{leaf.get('dest_expr', leaf.get('il_text', ''))}]"
+                + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
+            )
+    assumptions = list(value.get("assumptions") or [])
+    if assumptions:
+        lines.append("")
+        lines.append("ASSUMPTIONS:")
+        for a in assumptions:
+            lines.append(f"  - {a}")
+    if value.get("soundness"):
+        lines.append("")
+        lines.append(f"soundness: {value['soundness']}")
+    return "\n".join(lines)
+
+
+def _describe_loc(loc: Any) -> str:
+    if not isinstance(loc, dict):
+        return str(loc)
+    kind = loc.get("kind")
+    if kind == "param":
+        return f"param:{loc.get('index')}"
+    if kind == "var":
+        return f"var:{loc.get('selector')}"
+    if kind == "ret":
+        return f"ret:{loc.get('callee')}"
+    if kind == "arg":
+        return f"arg:{loc.get('callee')}:{loc.get('index')}"
+    return str(kind)
+
+
 def _render_type_list_text(value: Any) -> str:
     if not isinstance(value, list):
         return _render_fallback_text(value)

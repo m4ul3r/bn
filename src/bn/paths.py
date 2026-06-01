@@ -94,6 +94,20 @@ def spill_root() -> Path:
     return root
 
 
+def taint_models_path() -> Path:
+    """User-override file for taint function-models, merged over the builtin DB.
+
+    The builtin models ship beside the bridge (``taint_models.json``); this
+    optional file lets a user or agent add/override source/propagate/sink
+    semantics without editing the plugin. Honoured by the taint engine when it
+    exists; missing is fine.
+    """
+    env = os.environ.get("BN_TAINT_MODELS")
+    if env:
+        return Path(env).expanduser()
+    return cache_home() / "taint_models.json"
+
+
 def plugin_source_dir() -> Path:
     return repo_root() / "plugin" / PLUGIN_NAME
 

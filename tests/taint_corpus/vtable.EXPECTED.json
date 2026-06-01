@@ -1,0 +1,7 @@
+{
+  "description": "C++ virtual dispatch surfaces as an indirect callee (honest degradation; devirtualization is Phase 3)",
+  "lang": "cpp",
+  "callgraph": [
+    {"function": "dispatch", "expect_indirect": true}
+  ]
+}

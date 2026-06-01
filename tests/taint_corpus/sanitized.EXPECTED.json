@@ -1,0 +1,8 @@
+{
+  "description": "constant memcpy length must NOT be reported as a tainted-length sink",
+  "lang": "c",
+  "negative": [
+    {"function": "safe_copy", "source": "arg:read:1",
+     "forbid_sink_classes": ["overflow_len"]}
+  ]
+}
