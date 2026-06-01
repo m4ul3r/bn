@@ -271,6 +271,26 @@ class TaintEngine:
                 return self._pointee_var(ssaf, getattr(d, "src", None), depth + 1)
         return None
 
+    def _pointee_tainted(self, ssaf: Any, expr: Any, tainted: set):
+        """If *expr* is a pointer to a variable that has ANY tainted SSA version,
+        return a representative tainted node, else None.
+
+        Version-agnostic on purpose: a buffer/struct slot is written under one
+        SSA/memory version (e.g. an MLIL_SET_VAR_ALIASED store -> var#85) but a
+        later ``&var`` references the whole variable (version None). Matching only
+        the exact version would miss the pointer carrying that taint.
+        """
+        pv = self._pointee_var(ssaf, expr)
+        if pv is None:
+            return None
+        k = var_key(pv)
+        if (k, None) in tainted:
+            return (k, None)
+        for node in tainted:
+            if node[0] == k:
+                return node
+        return None
+
     # -- memory-SSA load/store correlation (Phase 3C) ---------------------
     # BN's memory SSA is a single global chain (a load's `src_memory` def is the
     # most-recent store, not necessarily an aliasing one), so we walk the version
@@ -627,9 +647,9 @@ class TaintEngine:
                 elif (k, None) in tainted:
                     hit.append((k, None))
             if not hit:
-                pv = self._pointee_var(ssaf, expr)
-                if pv is not None and (var_key(pv), None) in tainted:
-                    hit.append((var_key(pv), None))
+                node = self._pointee_tainted(ssaf, expr, tainted)
+                if node is not None:
+                    hit.append(node)
             return hit
 
         def cons_return(ins: Any, reason: str) -> bool:
@@ -856,9 +876,9 @@ class TaintEngine:
             return None
         expr = params[idx]
         if pointee:
-            pv = self._pointee_var(ssaf, expr)
-            if pv is not None and (var_key(pv), None) in tainted:
-                return (var_key(pv), None)
+            node = self._pointee_tainted(ssaf, expr, tainted)
+            if node is not None:
+                return node
         # a tainted scalar/pointer arg (incl. a tainted pointer parameter whose
         # pointee is tainted in our coarse model) satisfies the token
         for r in expr_reads(expr):

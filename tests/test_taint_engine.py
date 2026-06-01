@@ -533,6 +533,35 @@ def test_forward_interprocedural_descends_into_callee(models):
 # backward taint
 # --------------------------------------------------------------------------
 
+def test_forward_version_agnostic_pointee_via_aliased_store(models):
+    # handler: d#5 = src; f(&d).  f(p): system(p).
+    # The aliased store taints d at a specific version; &d references the whole
+    # var (version None). The callsite must still see the arg as tainted
+    # (version-agnostic pointee match) and descend, reaching the sink.
+    src = FVar("src", ident=51); d = FVar("d", ident=50); p = FVar("p", ident=52)
+    src0 = FSSA(src, 0); d5 = FSSA(d, 5); p1 = FSSA(p, 1)
+    pp = FVar("pp", ident=60); pp0 = FSSA(pp, 0)
+    sink_fn = FFunc("f", 0x800, FSSAFunc([
+        FInstr(0, 0x804, "MLIL_CALL_SSA", "0x900(pp#0)", reads=[pp0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_VAR_SSA", "pp#0", reads=[pp0])]),
+    ]), params=[pp])
+    handler = FFunc("handler", 0x900, FSSAFunc([
+        FInstr(0, 0x904, "MLIL_SET_VAR_ALIASED", "d#5 = src#0", reads=[src0], writes=[d5]),
+        FInstr(1, 0x908, "MLIL_SET_VAR_SSA", "p#1 = &d", writes=[p1],
+               src=FExpr("MLIL_ADDRESS_OF", "&d", src=d)),
+        FInstr(2, 0x90c, "MLIL_CALL_SSA", "0x800(p#1)", reads=[p1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x800", constant=0x800),
+               params=[FExpr("MLIL_VAR_SSA", "p#1", reads=[p1])]),
+    ]), params=[src])
+    bv = FBV({0x800: "f", 0x900: "system"}, funcs={0x800: sink_fn})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(handler, [te.parse_locator("param:0")])
+    assert any(s["sink"]["class"] == "command_injection" for s in result["reached_sinks"])
+    assert any("calls f" in (st.get("reason") or "")
+               for s in result["reached_sinks"] for st in s["path"])
+
+
 def test_forward_memory_ssa_store_to_load(models):
     # g(tval): [p] = tval; x = [p]; memcpy(d, s, x)
     # mem-SSA correlation must taint x (load reads the tainted store's bytes).
