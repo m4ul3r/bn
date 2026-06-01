@@ -1,0 +1,8 @@
+{
+  "description": "helper fills an output buffer through a pointer param; taint flows back to the caller and reaches system()",
+  "lang": "c",
+  "forward": [
+    {"function": "handler", "source": "arg:read:1",
+     "sinks": [{"callee": "system", "class": "command_injection", "arg": 0}]}
+  ]
+}

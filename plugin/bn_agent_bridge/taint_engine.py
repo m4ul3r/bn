@@ -270,6 +270,40 @@ class TaintEngine:
                 return self._pointee_var(ssaf, getattr(d, "src", None), depth + 1)
         return None
 
+    def _param_index_of(self, func: Any, v: Any) -> int | None:
+        """Index of the function parameter that *v* (an SSAVariable/Variable) is,
+        or None. Matches by identifier first, then storage+name."""
+        base = getattr(v, "var", v)
+        bid = getattr(base, "identifier", None)
+        bstore = getattr(base, "storage", None)
+        bname = str(getattr(base, "name", base))
+        for i, p in enumerate(list(getattr(func, "parameter_vars", []) or [])):
+            if bid is not None and getattr(p, "identifier", None) == bid:
+                return i
+            if bstore is not None and getattr(p, "storage", None) == bstore and str(getattr(p, "name", p)) == bname:
+                return i
+        return None
+
+    def _resolve_to_param_index(self, func: Any, ssaf: Any, expr: Any, depth: int = 0) -> int | None:
+        """Trace a pointer-arg expression back to one of *func*'s parameters
+        (so we can tell that writing through it taints a caller out-parameter)."""
+        if expr is None or depth > 6:
+            return None
+        cands = expr_reads(expr) or ([expr] if is_ssa_var(expr) else [])
+        for r in cands:
+            idx = self._param_index_of(func, r)
+            if idx is not None:
+                return idx
+            try:
+                d = ssaf.get_ssa_var_definition(r)
+            except Exception:
+                d = None
+            if d is not None:
+                res = self._resolve_to_param_index(func, ssaf, getattr(d, "src", None), depth + 1)
+                if res is not None:
+                    return res
+        return None
+
     def _find_callsites(self, instrs: list[Any], callee: str) -> list[Any]:
         hits = []
         for ins in instrs:
@@ -342,7 +376,7 @@ class TaintEngine:
         if key in self._cache:
             cached = self._cache[key]
             if cached is None:  # in-progress -> recursion cycle
-                return {"reached_return": True, "out_params": set(), "findings": [], "leaves": [],
+                return {"reached_return": True, "out_params": frozenset(), "findings": [], "leaves": [],
                         "assumptions": [f"recursion cycle at {callee.name}; return conservatively tainted"]}
             return cached
         self._cache[key] = None  # mark in-progress (cycle guard)
@@ -350,7 +384,7 @@ class TaintEngine:
         try:
             sub = self._run_forward(callee, locators, depth, max_depth, top=False)
         except TaintError as exc:
-            sub = {"reached_return": True, "out_params": set(), "findings": [], "leaves": [],
+            sub = {"reached_return": True, "out_params": frozenset(), "findings": [], "leaves": [],
                    "assumptions": [f"could not analyze {callee.name}: {exc}; return conservatively tainted"]}
         self._cache[key] = sub
         return sub
@@ -362,7 +396,8 @@ class TaintEngine:
         propagates taint to its return."""
         n_params = len(list(getattr(callee_fn, "parameter_vars", []) or []))
         valid = frozenset(i for i in tainted_args if i < n_params)
-        out: dict[str, Any] = {"findings": [], "reached_return": False, "leaves": [], "assumptions": []}
+        out: dict[str, Any] = {"findings": [], "reached_return": False, "leaves": [],
+                               "assumptions": [], "out_params": frozenset()}
         if not valid:
             out["reached_return"] = True
             out["assumptions"].append(f"tainted args to {callee_fn.name} fall beyond its parameters; conservative")
@@ -385,6 +420,7 @@ class TaintEngine:
         out["leaves"] = list(sub["leaves"])
         out["assumptions"] = list(sub["assumptions"])
         out["reached_return"] = sub["reached_return"]
+        out["out_params"] = sub.get("out_params", frozenset())
         return out
 
     def _call_targets_from_pvs(self, pvs: Any) -> list[int]:
@@ -433,6 +469,7 @@ class TaintEngine:
         findings: list[dict[str, Any]] = []
         recorded_sinks: set[tuple] = set()
         processed_calls: set[tuple] = set()  # (call_addr, tainted-arg-set) already descended
+        out_params: set[int] = set()         # this func's params whose pointee got tainted
         reached_return = False
 
         def add_assumption(msg: str) -> None:
@@ -519,9 +556,19 @@ class TaintEngine:
                     # 2) model-driven propagation
                     if model and model.get("propagates"):
                         for rule in model["propagates"]:
+                            to = rule.get("to")
                             if self._token_tainted(ssaf, ins, params, rule.get("from"), tainted):
-                                if self._apply_to_token(ssaf, ins, params, rule.get("to"), taint_node, name or "?"):
+                                if self._apply_to_token(ssaf, ins, params, to, taint_node, name or "?"):
                                     changed = True
+                                # out-param: the propagate writes through an arg that
+                                # is one of THIS function's parameters -> caller out-param
+                                if to and to.startswith("*arg:"):
+                                    k = int(to.split("arg:", 1)[1])
+                                    if k < len(params):
+                                        pidx = self._resolve_to_param_index(func, ssaf, params[k])
+                                        if pidx is not None and pidx not in out_params:
+                                            out_params.add(pidx)
+                                            changed = True
                         continue
 
                     if model is not None:
@@ -564,6 +611,7 @@ class TaintEngine:
                         continue
 
                     ret_tainted = False
+                    descend_outparams: set[int] = set()
                     resolved_names: list[str] = []
                     for taddr in candidates:
                         cfn = self.bv.get_function_at(taddr) if hasattr(self.bv, "get_function_at") else None
@@ -595,6 +643,7 @@ class TaintEngine:
                             for a in d["assumptions"]:
                                 add_assumption(a)
                             ret_tainted = ret_tainted or d["reached_return"]
+                            descend_outparams |= set(d.get("out_params") or ())
                             resolved_names.append(str(cfn.name))
                         else:
                             if self.unknown_call_policy != "stop":
@@ -604,6 +653,18 @@ class TaintEngine:
 
                     if ret_tainted and cons_return(ins, "return of resolved call propagates taint"):
                         changed = True
+                    # callee wrote tainted data through pointer arg(s) -> taint the
+                    # caller's buffer, and bubble up if that buffer is our own param
+                    for j in descend_outparams:
+                        if j < len(params):
+                            pv = self._pointee_var(ssaf, params[j])
+                            if pv is not None and taint_node((var_key(pv), None), var_label(pv), ins,
+                                                             f"out-param {j} written by callee", []):
+                                changed = True
+                            pidx = self._resolve_to_param_index(func, ssaf, params[j])
+                            if pidx is not None and pidx not in out_params:
+                                out_params.add(pidx)
+                                changed = True
                     if via:
                         add_assumption(
                             f"indirect call at {hex(int(getattr(ins, 'address', 0)))} resolved via {via} to: "
@@ -620,16 +681,23 @@ class TaintEngine:
                             changed = True
                     # store-through-pointer: taint the pointee buffer (coarse)
                     if "STORE" in opn and not ssa_writes(ins):
-                        pv = self._pointee_var(ssaf, getattr(ins, "dest", None))
+                        dest = getattr(ins, "dest", None)
+                        pv = self._pointee_var(ssaf, dest)
                         if pv is not None:
                             node = (var_key(pv), None)
                             if taint_node(node, var_label(pv), ins, "store into tainted buffer (memory_approx)", reads):
                                 changed = True
                                 add_assumption("memory aliasing modeled coarsely via pointer-base/AddressOf (memory_approx)")
+                        else:
+                            # tainted store through a pointer parameter -> out-param
+                            pidx = self._resolve_to_param_index(func, ssaf, dest)
+                            if pidx is not None and pidx not in out_params:
+                                out_params.add(pidx)
+                                changed = True
             if not changed:
                 break
 
-        return {"reached_return": reached_return, "out_params": set(),
+        return {"reached_return": reached_return, "out_params": frozenset(out_params),
                 "findings": findings, "leaves": leaves, "assumptions": assumptions}
 
     def _reason_for(self, opn: str) -> str:
@@ -655,7 +723,14 @@ class TaintEngine:
                 return False
             if pointee:
                 pv = self._pointee_var(ssaf, params[idx])
-                return pv is not None and (var_key(pv), None) in tainted
+                if pv is not None and (var_key(pv), None) in tainted:
+                    return True
+                # a tainted pointer argument (e.g. a tainted buffer pointer passed
+                # in as a parameter) implies its pointee is tainted in our model
+                for r in expr_reads(params[idx]):
+                    if (var_key(r), getattr(r, "version", None)) in tainted or (var_key(r), None) in tainted:
+                        return True
+                return False
             for r in expr_reads(params[idx]):
                 if (var_key(r), getattr(r, "version", None)) in tainted or (var_key(r), None) in tainted:
                     return True

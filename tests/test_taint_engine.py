@@ -384,6 +384,48 @@ def test_forward_resolve_map_overrides_unresolved(models):
     assert any("resolved via agent-map" in a for a in r2["assumptions"])
 
 
+def test_forward_outparam_propagates_to_caller(models):
+    # fill(src, dst): strcpy(dst, src) -> dst is a tainted out-parameter
+    src = FVar("src", ident=10); dst = FVar("dst", ident=11)
+    src0 = FSSA(src, 0); dst0 = FSSA(dst, 0)
+    fill = FFunc("fill", 0x800, FSSAFunc([
+        FInstr(0, 0x804, "MLIL_CALL_SSA", "0x920(dst#0, src#0)", reads=[dst0, src0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x920", constant=0x920),
+               params=[FExpr("MLIL_VAR_SSA", "dst#0", reads=[dst0]),
+                       FExpr("MLIL_VAR_SSA", "src#0", reads=[src0])]),
+    ]), params=[src, dst])
+
+    # handler(fd): read(&buf); fill(&buf, &out); system(out)
+    buf = FVar("buf"); out = FVar("out"); fd = FVar("fd")
+    rb = FVar("rb"); ro = FVar("ro")
+    rb1 = FSSA(rb, 1); ro1 = FSSA(ro, 1); out0 = FSSA(out, 0)
+    handler = FFunc("handler", 0x900, FSSAFunc([
+        FInstr(0, 0x904, "MLIL_SET_VAR_SSA", "rb#1 = &buf", writes=[rb1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+        FInstr(1, 0x908, "MLIL_CALL_SSA", "0x910(rdi#1, rb#1, 0x40)", reads=[rb1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x910", constant=0x910),
+               params=[FExpr("MLIL_VAR_SSA", "rdi#1", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "rb#1", reads=[rb1]),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+        FInstr(2, 0x90c, "MLIL_SET_VAR_SSA", "ro#1 = &out", writes=[ro1],
+               src=FExpr("MLIL_ADDRESS_OF", "&out", src=out)),
+        FInstr(3, 0x910, "MLIL_CALL_SSA", "0x800(rb#1, ro#1)", reads=[rb1, ro1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x800", constant=0x800),
+               params=[FExpr("MLIL_VAR_SSA", "rb#1", reads=[rb1]),
+                       FExpr("MLIL_VAR_SSA", "ro#1", reads=[ro1])]),
+        FInstr(4, 0x918, "MLIL_CALL_SSA", "0x930(out#0)", reads=[out0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x930", constant=0x930),
+               params=[FExpr("MLIL_VAR_SSA", "out#0", reads=[out0])]),
+    ]), params=[fd])
+
+    bv = FBV({0x910: "read", 0x920: "strcpy", 0x930: "system"}, funcs={0x800: fill})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(handler, [te.parse_locator("arg:read:1")])
+    classes = {s["sink"]["class"] for s in result["reached_sinks"]}
+    # system is reachable ONLY if fill's out-parameter tainted `out`
+    assert "command_injection" in classes
+
+
 def test_forward_interprocedural_descends_into_callee(models):
     # copy_it(src, dst): rax#1 = src[0]; memcpy(dst, src, rax#1)  -> sink inside callee
     src = FVar("src"); dst = FVar("dst"); rax = FVar("rax")

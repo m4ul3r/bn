@@ -16,6 +16,7 @@ brittle across compilers/optimisation.
 | `indirect_call.c`      | tainted data into a function-pointer call (leaf, not dropped) |
 | `indirect_resolve.c`   | const function-pointer table resolved by value-set; taint follows into both targets |
 | `interproc.c`          | tainted buffer crosses a call boundary; sink lives in the callee (interprocedural descent) |
+| `outparam.c`           | helper fills an output buffer through a pointer param; taint flows back to the caller |
 | `vtable.cpp`           | C++ virtual dispatch shows as an indirect callee (honest degradation) |
 
 ## `EXPECTED.json` schema
