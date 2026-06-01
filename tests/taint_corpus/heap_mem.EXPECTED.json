@@ -1,0 +1,8 @@
+{
+  "description": "tainted value stored to a heap buffer and loaded back reaches a memcpy length (memory-SSA store/load correlation)",
+  "lang": "c",
+  "forward": [
+    {"function": "handle", "source": "arg:read:1",
+     "sinks": [{"callee": "memcpy", "class": "overflow_len", "arg": 2}]}
+  ]
+}

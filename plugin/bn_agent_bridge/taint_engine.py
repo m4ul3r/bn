@@ -33,9 +33,10 @@ except Exception:  # pragma: no cover - defensive
 _BUILTIN_MODELS = Path(__file__).resolve().parent / "taint_models.json"
 
 SOUNDNESS = (
-    "may-analysis (interprocedural, summary-based, depth-bounded); coarse memory "
-    "and unresolved indirect/external calls are surfaced as assumptions/leaves; "
-    "NOT a proof of reachability"
+    "may-analysis (interprocedural, summary-based, depth-bounded); memory is "
+    "tracked via SSA store/load correlation where addresses match and coarsely "
+    "otherwise; unresolved indirect/external calls are surfaced as assumptions/"
+    "leaves; NOT a proof of reachability"
 )
 
 
@@ -269,6 +270,120 @@ class TaintEngine:
             if d is not None:
                 return self._pointee_var(ssaf, getattr(d, "src", None), depth + 1)
         return None
+
+    # -- memory-SSA load/store correlation (Phase 3C) ---------------------
+    # BN's memory SSA is a single global chain (a load's `src_memory` def is the
+    # most-recent store, not necessarily an aliasing one), so we walk the version
+    # chain ourselves and compare addresses. Used additively: it only ADDS taint
+    # when a matching store wrote a tainted value, never removes coarse taint, so
+    # it stays sound for a may-analysis while recovering heap/pointer flows the
+    # AddressOf-only rule misses.
+
+    def _int_const(self, expr: Any) -> int | None:
+        if expr is None or "CONST" not in op_name(expr):
+            return None
+        c = getattr(expr, "constant", None)
+        if c is None:
+            return None
+        try:
+            return int(c)
+        except Exception:
+            return None
+
+    def _addr_base_offset(self, ssaf: Any, expr: Any, depth: int = 0):
+        """Resolve an address expression to (base_var_key, offset), following SSA
+        copies to a common root so a store and a load through different temp vars
+        that ultimately hold the same pointer compare equal. None if unresolved."""
+        if expr is None or depth > 8:
+            return None
+        op = op_name(expr)
+        if "ADDRESS_OF" in op:
+            v = getattr(expr, "src", None) or getattr(expr, "var", None)
+            return (var_key(v), 0) if v is not None else None
+        if op in ("MLIL_ADD", "MLIL_SUB"):
+            left = getattr(expr, "left", None)
+            right = getattr(expr, "right", None)
+            rc = self._int_const(right)
+            base = self._addr_base_offset(ssaf, left, depth + 1)
+            if base is not None and rc is not None:
+                return (base[0], base[1] + (rc if op == "MLIL_ADD" else -rc))
+            if op == "MLIL_ADD":
+                lc = self._int_const(left)
+                base2 = self._addr_base_offset(ssaf, right, depth + 1)
+                if base2 is not None and lc is not None:
+                    return (base2[0], base2[1] + lc)
+            return None
+        if is_ssa_var(expr):
+            try:
+                d = ssaf.get_ssa_var_definition(expr)
+            except Exception:
+                d = None
+            if d is not None and op_name(d) == "MLIL_SET_VAR_SSA":
+                sub = self._addr_base_offset(ssaf, getattr(d, "src", None), depth + 1)
+                if sub is not None:
+                    return sub
+            return (var_key(expr), 0)
+        reads = expr_reads(expr)
+        if len(reads) == 1:
+            return self._addr_base_offset(ssaf, reads[0], depth + 1)
+        return None
+
+    def _mem_phi_sources(self, defn: Any) -> list[int]:
+        src = getattr(defn, "src_memory", None)
+        if isinstance(src, (list, tuple)):
+            try:
+                return [int(x) for x in src]
+            except Exception:
+                return []
+        out = []
+        for x in (getattr(defn, "src", None) or []):
+            try:
+                out.append(int(getattr(x, "version", x)))
+            except Exception:
+                pass
+        return out
+
+    def _walk_mem(self, ssaf, mv, la, tainted, seen, depth):
+        if mv is None or depth > 64:
+            return None
+        try:
+            mv = int(mv)
+        except Exception:
+            return None
+        if mv in seen:
+            return None
+        seen.add(mv)
+        try:
+            defn = ssaf.get_ssa_memory_definition(mv)
+        except Exception:
+            defn = None
+        if defn is None:
+            return None
+        op = op_name(defn)
+        if "STORE" in op:
+            sa = self._addr_base_offset(ssaf, getattr(defn, "dest", None))
+            if sa is not None and sa == la:
+                for r in expr_reads(getattr(defn, "src", None)):
+                    if (var_key(r), getattr(r, "version", None)) in tainted or (var_key(r), None) in tainted:
+                        return (var_key(r), getattr(r, "version", None))
+                return None  # matching store wrote untainted data -> not tainted via memory
+            return self._walk_mem(ssaf, getattr(defn, "src_memory", None), la, tainted, seen, depth + 1)
+        if "MEM_PHI" in op:
+            for sv in self._mem_phi_sources(defn):
+                res = self._walk_mem(ssaf, sv, la, tainted, seen, depth + 1)
+                if res is not None:
+                    return res
+            return None
+        return None  # opaque writer (call/intrinsic): handled by models, not here
+
+    def _load_tainted_via_memory(self, ssaf, load_expr, tainted):
+        """If a load reads bytes that a tainted store wrote (matched by address
+        along the memory-version chain), return the source node; else None."""
+        la = self._addr_base_offset(ssaf, getattr(load_expr, "src", None))
+        mv = getattr(load_expr, "src_memory", None)
+        if la is None or mv is None:
+            return None
+        return self._walk_mem(ssaf, mv, la, tainted, set(), 0)
 
     def _param_index_of(self, func: Any, v: Any) -> int | None:
         """Index of the function parameter that *v* (an SSAVariable/Variable) is,
@@ -672,6 +787,20 @@ class TaintEngine:
                             f"indirect call at {hex(int(getattr(ins, 'address', 0)))} resolved via {via} to: "
                             f"{', '.join(resolved_names)}")
                     continue
+
+                # memory-SSA: a load that reads bytes a tainted store wrote (heap/
+                # pointer aliasing the AddressOf rule misses). Additive + sound.
+                if opn == "MLIL_SET_VAR_SSA":
+                    src_expr = getattr(ins, "src", None)
+                    if src_expr is not None and "LOAD" in op_name(src_expr):
+                        msrc = self._load_tainted_via_memory(ssaf, src_expr, tainted)
+                        if msrc is not None:
+                            for w in ssa_writes(ins):
+                                node = (var_key(w), getattr(w, "version", None))
+                                if taint_node(node, var_label(w), ins,
+                                              "loads value stored through a tainted pointer (mem-SSA)", [msrc]):
+                                    changed = True
+                            add_assumption("heap/pointer load resolved via memory-SSA store correlation")
 
                 # generic value flow: any tainted value-read taints all writes
                 reads = read_taint(ins)

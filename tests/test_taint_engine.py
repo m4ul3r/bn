@@ -77,7 +77,7 @@ class FPVS:
 
 
 class FExpr:
-    def __init__(self, opname, text, reads=(), src=None, constant=None, possible_values=None):
+    def __init__(self, opname, text, reads=(), src=None, constant=None, possible_values=None, src_memory=None):
         self.operation = FOp(opname)
         self._text = text
         self.vars_read = list(reads)
@@ -87,6 +87,8 @@ class FExpr:
             self.constant = constant
         if possible_values is not None:
             self.possible_values = possible_values
+        if src_memory is not None:
+            self.src_memory = src_memory
 
     def __str__(self):
         return self._text
@@ -113,8 +115,12 @@ class FInstr:
 
 
 class FSSAFunc:
-    def __init__(self, instrs):
+    def __init__(self, instrs, mem_defs=None):
         self.instructions = instrs
+        self._mem_defs = mem_defs or {}
+
+    def get_ssa_memory_definition(self, version):
+        return self._mem_defs.get(int(version))
 
     def _match(self, ssa_var, collection_attr):
         for ins in self.instructions:
@@ -526,6 +532,60 @@ def test_forward_interprocedural_descends_into_callee(models):
 # --------------------------------------------------------------------------
 # backward taint
 # --------------------------------------------------------------------------
+
+def test_forward_memory_ssa_store_to_load(models):
+    # g(tval): [p] = tval; x = [p]; memcpy(d, s, x)
+    # mem-SSA correlation must taint x (load reads the tainted store's bytes).
+    tv = FVar("tval", ident=30); p = FVar("p", ident=31); x = FVar("x", ident=32)
+    tv0 = FSSA(tv, 0); p1 = FSSA(p, 1); x1 = FSSA(x, 1)
+    store = FInstr(0, 0x10, "MLIL_STORE_SSA", "[p#1] = tval#0", reads=[p1, tv0], writes=[],
+                   dest=FExpr("MLIL_VAR_SSA", "p#1", reads=[p1]),
+                   src=FExpr("MLIL_VAR_SSA", "tval#0", reads=[tv0]))
+    store.src_memory = 0
+    store.dest_memory = 1
+    load = FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "x#1 = [p#1]", reads=[p1], writes=[x1],
+                  src=FExpr("MLIL_LOAD_SSA", "[p#1]", reads=[p1],
+                            src=FExpr("MLIL_VAR_SSA", "p#1", reads=[p1]), src_memory=1))
+    sink = FInstr(2, 0x18, "MLIL_CALL_SSA", "0x90(d, s, x#1)", reads=[x1], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", "0x90", constant=0x90),
+                  params=[FExpr("MLIL_VAR_SSA", "d", reads=[]),
+                          FExpr("MLIL_VAR_SSA", "s", reads=[]),
+                          FExpr("MLIL_VAR_SSA", "x#1", reads=[x1])])
+    ssa = FSSAFunc([store, load, sink], mem_defs={1: store})
+    func = FFunc("g", 0x10, ssa, params=[tv])   # param 0 = tval
+    bv = FBV({0x90: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert any(s["sink"]["class"] == "overflow_len" for s in result["reached_sinks"])
+    reasons = [st.get("reason", "") for s in result["reached_sinks"] for st in s["path"]]
+    assert any("mem-SSA" in r for r in reasons)
+
+
+def test_forward_memory_ssa_untainted_store_no_false_positive(models):
+    # same shape but the store writes a constant -> load must NOT be tainted
+    p = FVar("p", ident=31); x = FVar("x", ident=32)
+    p1 = FSSA(p, 1); x1 = FSSA(x, 1)
+    store = FInstr(0, 0x10, "MLIL_STORE_SSA", "[p#1] = 0x78", reads=[p1], writes=[],
+                   dest=FExpr("MLIL_VAR_SSA", "p#1", reads=[p1]),
+                   src=FExpr("MLIL_CONST", "0x78", constant=0x78))
+    store.src_memory = 0
+    store.dest_memory = 1
+    load = FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "x#1 = [p#1]", reads=[p1], writes=[x1],
+                  src=FExpr("MLIL_LOAD_SSA", "[p#1]", reads=[p1],
+                            src=FExpr("MLIL_VAR_SSA", "p#1", reads=[p1]), src_memory=1))
+    sink = FInstr(2, 0x18, "MLIL_CALL_SSA", "0x90(d, s, x#1)", reads=[x1], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", "0x90", constant=0x90),
+                  params=[FExpr("MLIL_VAR_SSA", "d", reads=[]),
+                          FExpr("MLIL_VAR_SSA", "s", reads=[]),
+                          FExpr("MLIL_VAR_SSA", "x#1", reads=[x1])])
+    ssa = FSSAFunc([store, load, sink], mem_defs={1: store})
+    func = FFunc("g", 0x10, ssa, params=[FVar("unused", ident=99)])
+    bv = FBV({0x90: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    # seed an unrelated param; the const store must not produce a tainted load
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert result["reached_sinks"] == []
+
 
 def test_backward_follows_into_caller(models):
     # use_len(dst, src, n): memcpy(dst, src, n) -- n is a parameter.
