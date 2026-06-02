@@ -380,6 +380,59 @@ def test_optional_sink_on_with_class(models):
     assert result2["reached_sinks"] == []
 
 
+def _sprintf_vararg_func():
+    # build(fd): read(fd,&buf,0x40); sprintf(&cmd,"echo %s",&buf); system(&cmd)
+    # The format string is an UNTAINTED const ptr; the only taint into cmd is the
+    # vararg &buf, so a command_injection at system proves vararg->dest propagation.
+    buf = FVar("buf", typ="char[0x40]"); cmd = FVar("cmd", typ="char[0x80]")
+    rsi = FVar("rsi"); rdi = FVar("rdi"); rax = FVar("rax"); rc = FVar("rc")
+    rsi1 = FSSA(rsi, 1); rdi1 = FSSA(rdi, 1); rax2 = FSSA(rax, 2); rc1 = FSSA(rc, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "rsi#1 = &buf", writes=[rsi1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "read(rdi#1, rsi#1, 0x40)", reads=[rdi1, rsi1], writes=[rax2],
+               dest=FExpr("MLIL_CONST_PTR", "0x401070", constant=0x401070),
+               params=[FExpr("MLIL_VAR_SSA", "rdi#1", reads=[rdi1]),
+                       FExpr("MLIL_VAR_SSA", "rsi#1", reads=[rsi1]),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+        FInstr(2, 0x18, "MLIL_SET_VAR_SSA", "rc#1 = &cmd", writes=[rc1],
+               src=FExpr("MLIL_ADDRESS_OF", "&cmd", src=cmd)),
+        FInstr(3, 0x1c, "MLIL_CALL_SSA", "sprintf(rc#1, \"echo %s\", &buf)", reads=[rc1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401080", constant=0x401080),
+               params=[FExpr("MLIL_VAR_SSA", "rc#1", reads=[rc1]),
+                       FExpr("MLIL_CONST_PTR", "echo %s", constant=0x4050),
+                       FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)]),
+        FInstr(4, 0x20, "MLIL_CALL_SSA", "system(rc#1)", reads=[rc1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401090", constant=0x401090),
+               params=[FExpr("MLIL_VAR_SSA", "rc#1", reads=[rc1])]),
+    ]
+    bv = FBV({0x401070: "read", 0x401080: "sprintf", 0x401090: "system"})
+    return FFunc("build", 0x10, FSSAFunc(instrs), params=[FVar("fd")]), bv
+
+
+def test_forward_vararg_taints_dest_buffer(models):
+    func, bv = _sprintf_vararg_func()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:read:1")])
+    classes = {s["sink"]["class"] for s in result["reached_sinks"]}
+    # cmd only became tainted via the vararg -> *arg:0 propagation
+    assert "command_injection" in classes
+    # the tainted vararg is itself flagged at sprintf (unbounded family)
+    assert any(s["sink"]["callee"] == "sprintf" and s["sink"]["tainted_arg_index"] == 2
+               for s in result["reached_sinks"])
+
+
+def test_forward_vararg_no_double_report(models):
+    func, bv = _sprintf_vararg_func()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:read:1")])
+    # the sprintf vararg sink at arg2 must be recorded exactly once despite the
+    # fixpoint revisiting the call across iterations.
+    sprintf_arg2 = [s for s in result["reached_sinks"]
+                    if s["sink"]["callee"] == "sprintf" and s["sink"]["tainted_arg_index"] == 2]
+    assert len(sprintf_arg2) == 1
+
+
 def test_forward_indirect_call_is_a_leaf_not_dropped(models):
     fp = FVar("fp"); arg = FVar("arg"); rr = FVar("rr")
     arg0 = FSSA(arg, 0); fp1 = FSSA(fp, 1); rr1 = FSSA(rr, 1)

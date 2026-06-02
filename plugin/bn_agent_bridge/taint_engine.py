@@ -701,6 +701,33 @@ class TaintEngine:
                         k = int(to.split("arg:", 1)[1])
                         if k < len(params):
                             propagated.add(k)
+            # variadic propagation: every tainted vararg (from first_index on) flows
+            # into the dest buffer and is itself reportable. Uses the actual call
+            # params, so no format-string parsing is needed; arg_taint already covers
+            # both a tainted scalar (%d) and a pointer to a tainted buffer (%s).
+            va = model.get("varargs")
+            if va is not None:
+                base = int(va.get("first_index", 0))
+                vto = va.get("to")
+                vsink = model.get("sink") if va.get("sink") else None
+                for i in range(max(base, 0), len(params)):
+                    ht = arg_taint(params[i])
+                    if not ht:
+                        continue
+                    if vto:
+                        if self._apply_to_token(ssaf, ins, params, vto, taint_node, name or "?", parents=[ht[0]]):
+                            changed = True
+                        if vto.startswith("*arg:"):
+                            k = int(vto.split("arg:", 1)[1])
+                            if k < len(params):
+                                propagated.add(k)
+                    if vsink is not None:
+                        # record under the real param index i so this shares the
+                        # recorded_sinks / top-level dedup with any static sink.
+                        sig = (addr, i) if site_taddr is None else (addr, i, site_taddr)
+                        if sig not in recorded_sinks:
+                            recorded_sinks.add(sig)
+                            findings.append(self._make_finding(ins, mkey or name, i, vsink, ht, why))
             return changed, propagated
 
         for _ in range(self.max_iters):
