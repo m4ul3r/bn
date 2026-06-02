@@ -433,6 +433,55 @@ def test_forward_vararg_no_double_report(models):
     assert len(sprintf_arg2) == 1
 
 
+def test_var_label_of_global():
+    assert te.var_label_of((("global", 0x404060), None)) == "glob_0x404060"
+    assert te.var_label_of((("global", 0x404060), 2)) == "glob_0x404060#2"
+
+
+def test_global_addr_rejects_readonly():
+    class BVWritable:
+        def is_offset_writable(self, a):
+            return a >= 0x404000  # .bss/.data writable; .rodata below is not
+
+    eng = te.TaintEngine(BVWritable(), te.load_models())
+    ro = FExpr("MLIL_CONST_PTR", "0x402000", constant=0x402000)   # rodata
+    rw = FExpr("MLIL_CONST_PTR", "0x404060", constant=0x404060)   # .bss
+    assert eng._global_addr(None, ro) is None
+    assert eng._global_addr(None, rw) == 0x404060
+
+
+def test_forward_global_buffer_source_to_sink(models):
+    # g(fd): read(fd, &glob, 0x40); len = glob[0]; memcpy(d, glob, len)
+    # glob is referenced by an absolute address (MLIL_CONST_PTR) — the case
+    # _pointee_var misses. Seeding the global + loading back out of it + the memcpy
+    # length sink must all fire.
+    GLOB = 0x404060
+    rdi = FVar("rdi"); length = FVar("len")
+    rdi1 = FSSA(rdi, 1); len1 = FSSA(length, 1)
+
+    def glob_ptr():
+        return FExpr("MLIL_CONST_PTR", hex(GLOB), constant=GLOB)
+
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "read(rdi#1, 0x404060, 0x40)", reads=[rdi1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401070", constant=0x401070),
+               params=[FExpr("MLIL_VAR_SSA", "rdi#1", reads=[rdi1]), glob_ptr(),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+        FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "len#1 = [0x404060]", writes=[len1],
+               src=FExpr("MLIL_LOAD_SSA", "[0x404060]", src=glob_ptr())),
+        FInstr(2, 0x18, "MLIL_CALL_SSA", "memcpy(d, 0x404060, len#1)", reads=[len1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401080", constant=0x401080),
+               params=[FExpr("MLIL_VAR_SSA", "&d", reads=[]), glob_ptr(),
+                       FExpr("MLIL_VAR_SSA", "len#1", reads=[len1])]),
+    ]
+    bv = FBV({0x401070: "read", 0x401080: "memcpy"})
+    func = FFunc("g", 0x10, FSSAFunc(instrs), params=[FVar("fd")])
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:read:1")])
+    assert any(s["sink"]["callee"] == "memcpy" and s["sink"]["class"] == "overflow_len"
+               and s["sink"]["tainted_arg_index"] == 2 for s in result["reached_sinks"])
+
+
 def test_forward_indirect_call_is_a_leaf_not_dropped(models):
     fp = FVar("fp"); arg = FVar("arg"); rr = FVar("rr")
     arg0 = FSSA(arg, 0); fp1 = FSSA(fp, 1); rr1 = FSSA(rr, 1)

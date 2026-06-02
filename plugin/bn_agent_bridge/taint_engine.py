@@ -272,24 +272,102 @@ class TaintEngine:
         return None
 
     def _pointee_tainted(self, ssaf: Any, expr: Any, tainted: set):
-        """If *expr* is a pointer to a variable that has ANY tainted SSA version,
-        return a representative tainted node, else None.
+        """If *expr* is a pointer to a buffer (stack Variable or global) that has
+        ANY tainted version, return a representative tainted node, else None.
 
         Version-agnostic on purpose: a buffer/struct slot is written under one
         SSA/memory version (e.g. an MLIL_SET_VAR_ALIASED store -> var#85) but a
         later ``&var`` references the whole variable (version None). Matching only
         the exact version would miss the pointer carrying that taint.
         """
-        pv = self._pointee_var(ssaf, expr)
-        if pv is None:
+        bt = self._buffer_target(ssaf, expr)
+        if bt is None:
             return None
-        k = var_key(pv)
+        k = bt[0]
         if (k, None) in tainted:
             return (k, None)
         for node in tainted:
             if node[0] == k:
                 return node
         return None
+
+    # -- global/static buffers as taint locations -------------------------
+    # A global buffer is referenced by an absolute address (MLIL_CONST_PTR), which
+    # _pointee_var (stack-only) misses. We make it a single coarse taint location
+    # keyed ("global", base_addr). Precise offset/aliasing is deliberately out of
+    # scope (motiongraph's territory); we over-approximate the whole buffer.
+
+    def _buffer_target(self, ssaf: Any, expr: Any):
+        """Resolve a pointer expr to ``(key, label)`` for the buffer it points at:
+        a stack Variable (preferred — keeps its name) or a writable global. None if
+        neither. The key is what taint nodes are keyed on; label is for provenance."""
+        pv = self._pointee_var(ssaf, expr)
+        if pv is not None:
+            return (var_key(pv), var_label(pv))
+        ga = self._global_addr(ssaf, expr)
+        if ga is not None:
+            return (("global", ga), f"glob_{hex(ga)}")
+        return None
+
+    def _global_addr(self, ssaf: Any, expr: Any, depth: int = 0) -> int | None:
+        """The base address of a writable global/static buffer *expr* points at, or
+        None. Follows an SSA copy chain to a constant pointer."""
+        if expr is None or depth > 6:
+            return None
+        if "CONST_PTR" in op_name(expr):
+            c = getattr(expr, "constant", None)
+            if c is None:
+                v = getattr(expr, "value", None)
+                c = getattr(v, "value", v)
+            try:
+                addr = int(c)
+            except Exception:
+                return None
+            return self._canon_global(addr)
+        if is_ssa_var(expr):
+            try:
+                d = ssaf.get_ssa_var_definition(expr)
+            except Exception:
+                d = None
+            if d is not None:
+                return self._global_addr(ssaf, getattr(d, "src", None), depth + 1)
+            return None
+        reads = expr_reads(expr)
+        if len(reads) == 1:
+            try:
+                d = ssaf.get_ssa_var_definition(reads[0])
+            except Exception:
+                d = None
+            if d is not None:
+                return self._global_addr(ssaf, getattr(d, "src", None), depth + 1)
+        return None
+
+    def _canon_global(self, addr: int) -> int | None:
+        """Canonicalize a global address to its data-variable base (so different
+        offsets into one buffer share a taint location) and require it be writable,
+        so rodata strings / code pointers are not treated as buffers. Permissive
+        when the BinaryView lacks these APIs (the unit-test fakes)."""
+        getdv = getattr(self.bv, "get_data_var_at", None)
+        if getdv is not None:
+            try:
+                dv = getdv(addr)
+            except Exception:
+                dv = None
+            if dv is None:
+                return None  # not a known data variable -> not a global buffer
+            base = getattr(dv, "address", None)
+            base = int(base) if base is not None else addr
+            return base if self._is_writable(base) else None
+        return addr if self._is_writable(addr) else None
+
+    def _is_writable(self, addr: int) -> bool:
+        fn = getattr(self.bv, "is_offset_writable", None)
+        if fn is None:
+            return True  # no introspection API (unit fakes) -> permissive
+        try:
+            return bool(fn(addr))
+        except Exception:
+            return False
 
     # -- memory-SSA load/store correlation (Phase 3C) ---------------------
     # BN's memory SSA is a single global chain (a load's `src_memory` def is the
@@ -877,13 +955,23 @@ class TaintEngine:
                     src_expr = getattr(ins, "src", None)
                     if src_expr is not None and "LOAD" in op_name(src_expr):
                         msrc = self._load_tainted_via_memory(ssaf, src_expr, tainted)
+                        reason = "loads value stored through a tainted pointer (mem-SSA)"
+                        assume = "heap/pointer load resolved via memory-SSA store correlation"
+                        if msrc is None:
+                            # read()-filled globals are written by an opaque call, so
+                            # mem-SSA can't correlate; match the load's absolute address
+                            # against the coarse global taint location instead.
+                            ga = self._global_addr(ssaf, getattr(src_expr, "src", None))
+                            if ga is not None and (("global", ga), None) in tainted:
+                                msrc = (("global", ga), None)
+                                reason = "loads from a tainted global buffer (global_approx)"
+                                assume = "global buffer modeled coarsely as one taint location (global_approx)"
                         if msrc is not None:
                             for w in ssa_writes(ins):
                                 node = (var_key(w), getattr(w, "version", None))
-                                if taint_node(node, var_label(w), ins,
-                                              "loads value stored through a tainted pointer (mem-SSA)", [msrc]):
+                                if taint_node(node, var_label(w), ins, reason, [msrc]):
                                     changed = True
-                            add_assumption("heap/pointer load resolved via memory-SSA store correlation")
+                            add_assumption(assume)
 
                 # generic value flow: any tainted value-read taints all writes
                 reads = read_taint(ins)
@@ -973,9 +1061,10 @@ class TaintEngine:
             if idx >= len(params):
                 return False
             if pointee:
-                pv = self._pointee_var(ssaf, params[idx])
-                if pv is not None:
-                    return taint_node((var_key(pv), None), var_label(pv), ins,
+                bt = self._buffer_target(ssaf, params[idx])
+                if bt is not None:
+                    key, label = bt
+                    return taint_node((key, None), label, ins,
                                       f"buffer written by {callee} (model propagate)", parents)
                 return False
             done = False
@@ -1020,9 +1109,10 @@ class TaintEngine:
                         idx = int(src["index"])
                         params = self._call_params(c)
                         if idx < len(params):
-                            pv = self._pointee_var(ssaf, params[idx])
-                            if pv is not None:
-                                if taint_node((var_key(pv), None), str(getattr(pv, "name", pv)), c,
+                            bt = self._buffer_target(ssaf, params[idx])
+                            if bt is not None:
+                                key, label = bt
+                                if taint_node((key, None), label, c,
                                               f"source: {callee} fills arg{idx} buffer", []):
                                     seeded = True
                             else:
@@ -1263,7 +1353,12 @@ class TaintEngine:
 
 def var_label_of(node: tuple) -> str:
     key, version = node
-    name = key[1] if key[0] == "name" else f"var#{key[1]}"
+    if key[0] == "global":
+        name = f"glob_{hex(key[1])}"
+    elif key[0] == "name":
+        name = key[1]
+    else:
+        name = f"var#{key[1]}"
     return f"{name}#{version}" if version is not None else str(name)
 
 
