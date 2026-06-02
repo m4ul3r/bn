@@ -123,7 +123,7 @@ bn function list [--min-address 0x401000 --max-address 0x40ffff]
 bn function search attachment
 bn function search --regex 'attach|detach|follow'
 bn function info <fn> [--verbose]
-bn decompile <fn> [--addresses] [--lines 40:80]
+bn decompile <fn> [--addresses] [--lines 40:80] [--force-analysis]
 bn il <fn> [--view {hlil|mlil|llil}] [--ssa]
 bn disasm <fn>
 bn xrefs <fn-or-addr> [--limit 20]
@@ -149,6 +149,7 @@ Notes:
 - `bn function search` is case-insensitive substring; add `--regex` for regular expressions. `function list` and `function search` both accept `--min-address` / `--max-address`.
 - `bn xrefs` accepts a function name *or* a hex/decimal address. Text groups refs by caller (`code refs: 12 sites across 4 functions`); JSON adds `caller_function: {address, name}` so an `xrefs → --within-file` pipeline survives duplicate symbol names. Use `bn xrefs` for inbound references; reach for `bn callsites` when you need exact return-address recovery and local context.
 - `bn decompile` renders Binary Ninja's **Pseudo C** (the same text the GUI shows), comments inline. It omits the address gutter by default — add `--addresses` when you need it (e.g. for `bn comment set --address`). For the underlying IL instead, use `bn il --view {hlil|mlil|llil}`.
+- **Skipped (oversize) functions.** Binary Ninja skips analysis on functions that exceed its size/time limits and renders only a stub ("…taking too long to analyze… Loading…"). `bn decompile` detects this (`func.analysis_skipped`) and appends a `warning:` (and sets `analysis_skipped: true` in JSON) so you never mistake a stub for a real body. Pass `--force-analysis` to override the skip and reanalyze just that function before decompiling — it returns the full body and sets `analysis_forced: true`. It can be slow on very large functions and takes the **write lock** (it mutates analysis state), so avoid it on a bridge other agents are actively reading.
 - **Width-sensitive reads — trust `bn disasm`, not the decompiler.** Pseudo C and HLIL share the same analysis and can hide the real access width. A byte compare (`cmp al, ...`) renders as a full-width equality, and a `zx.d` on a dereference does **not** imply a 4-byte load (it can be a 1-byte load zero-extended to 4). When the exact comparison width or memory-read size matters (off-by-one, OOB, signedness bugs), treat `bn disasm <fn>` as authoritative and confirm the operand size there before reasoning about the bug.
 - `bn imports` JSON tags each entry with `kind` (`function`, `data`, `address`) and includes `library` + `raw_name`. Text marks data/address imports with `(data)` / `(address)`.
 - `bn sections` exposes start/end, length, semantics, and segment-derived `r/w/x` permission flags.

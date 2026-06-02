@@ -120,25 +120,35 @@ def _function_create(args: argparse.Namespace) -> int:
                  help="Show address prefixes on each line"),
              arg("--lines", type=_parse_line_range, default=None, metavar="START:END",
                  help="Show only lines START through END (1-indexed, inclusive)"),
+             arg("--force-analysis", action="store_true", default=False,
+                 help="If Binary Ninja skipped this function (e.g. too large), override the skip "
+                      "and reanalyze it before decompiling (may be slow; takes the write lock)"),
          ])
 def _decompile(args: argparse.Namespace) -> int:
     lines_range = getattr(args, "lines", None)
 
     def _render_decompile_text(value: Any) -> str:
         text = _text_field("text")(value)
-        if lines_range is None:
-            return text
-        all_lines = text.splitlines()
-        total = len(all_lines)
-        start, end = lines_range
-        sliced = all_lines[start - 1 : end]
-        header = f"// lines {start}-{min(end, total)} of {total}"
-        return header + "\n" + "\n".join(sliced)
+        if lines_range is not None:
+            all_lines = text.splitlines()
+            total = len(all_lines)
+            start, end = lines_range
+            sliced = all_lines[start - 1 : end]
+            header = f"// lines {start}-{min(end, total)} of {total}"
+            text = header + "\n" + "\n".join(sliced)
+        warnings = value.get("warnings") if isinstance(value, dict) else None
+        if warnings:
+            text = text + "\n\n" + "\n".join(f"warning: {warning}" for warning in warnings)
+        return text
 
     return _call(
         args,
         "decompile",
-        {"identifier": args.identifier, "addresses": args.addresses},
+        {
+            "identifier": args.identifier,
+            "addresses": args.addresses,
+            "force_analysis": args.force_analysis,
+        },
         require_target=True,
         allow_implicit_target=True,
         text_renderer=_render_decompile_text,

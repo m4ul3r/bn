@@ -81,6 +81,12 @@ class _FakeFunction:
         self.return_type = "int32_t"
         self.basic_blocks = []
         self.low_level_il = []
+        self.analysis_skipped = False
+        self.analysis_skip_reason = "NoSkipReason"
+        self.reanalyzed = False
+
+    def reanalyze(self, *args, **kwargs):
+        self.reanalyzed = True
 
 
 class _FakeBasicBlock:
@@ -232,6 +238,9 @@ class _FakeBV:
             if int(fn.start) == int(address):
                 return fn
         return None
+
+    def update_analysis_and_wait(self):
+        self.analysis_updated = True
 
     def get_symbols_by_name(self, name: str):
         return [symbol for symbol in self._symbols if getattr(symbol, "name", None) == name]
@@ -936,6 +945,82 @@ def test_decompile_falls_back_to_hlil_when_pseudo_c_unavailable(monkeypatch):
     result = instance._decompile("active", "player_update")
 
     assert result["text"] == "int32_t player_update()\n{\n    return 1;\n}"
+
+
+def test_decompile_warns_on_skipped_analysis(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "big_fn")
+    fn.analysis_skipped = True
+    fn.analysis_skip_reason = "ExceedFunctionSize"
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance, "_comment_map", lambda bv, func: {})
+    # Body has no telltale text -> warning must fire on the analysis_skipped flag alone.
+    _install_fake_pseudo_c(
+        monkeypatch, bridge, fn,
+        [[(0x401000, "int32_t big_fn()")], [(0x401000, "{")], [(0x401000, "}")]],
+    )
+
+    result = instance._decompile("active", "big_fn")
+
+    assert result["analysis_skipped"] is True
+    assert result["analysis_forced"] is False
+    assert fn.reanalyzed is False  # warn-only must NOT reanalyze
+    assert any("big_fn" in w and "ExceedFunctionSize" in w and "--force-analysis" in w for w in result["warnings"])
+
+
+def test_decompile_warns_on_placeholder_text_when_flag_clear(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "big_fn")  # analysis_skipped defaults False
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance, "_comment_map", lambda bv, func: {})
+    _install_fake_pseudo_c(
+        monkeypatch, bridge, fn,
+        [
+            [(0x401000, "int32_t big_fn()")],
+            [(0x401000, "{")],
+            [(0x401000, "    // This function is taking too long to analyze")],
+            [(0x401000, "}")],
+        ],
+    )
+
+    result = instance._decompile("active", "big_fn")
+
+    assert result["analysis_skipped"] is False
+    assert any("incomplete stub" in w for w in result["warnings"])
+
+
+def test_decompile_force_analysis_reanalyzes_and_clears_warning(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "big_fn")
+    fn.analysis_skipped = True
+    fn.analysis_skip_reason = "ExceedFunctionSize"
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance, "_comment_map", lambda bv, func: {})
+    _install_fake_pseudo_c(
+        monkeypatch, bridge, fn,
+        [
+            [(0x401000, "int32_t big_fn()")],
+            [(0x401000, "{")],
+            [(0x401004, "    return 1;")],
+            [(0x401008, "}")],
+        ],
+    )
+
+    result = instance._decompile("active", "big_fn", force_analysis=True)
+
+    assert fn.reanalyzed is True                       # reanalysis was triggered
+    assert getattr(bv, "analysis_updated", False) is True
+    assert fn.analysis_skipped is False               # skip override cleared
+    assert result["analysis_forced"] is True
+    assert result["analysis_skipped"] is False
+    assert result["text"] == "int32_t big_fn()\n{\n    return 1;\n}"
+    assert not any("stub" in w.lower() or "skipped analysis" in w for w in result["warnings"])
 
 
 def test_list_functions_is_sorted_by_address(monkeypatch):

@@ -663,6 +663,10 @@ class BinaryNinjaBridge:
             lock = contextlib.nullcontext()
             if op in WRITE_LOCKED_OPS:
                 lock = self._target_lock.write()
+            elif op == "decompile" and params.get("force_analysis"):
+                # --force-analysis reanalyzes the function, mutating the view, so
+                # it needs the exclusive lock even though decompile is a read op.
+                lock = self._target_lock.write()
             elif op in READ_LOCKED_OPS:
                 lock = self._target_lock.read()
             with lock:
@@ -726,7 +730,12 @@ class BinaryNinjaBridge:
         if op == "list_locals":
             return self._list_locals_for_function(target, params["identifier"])
         if op == "decompile":
-            return self._decompile(target, params["identifier"], addresses=bool(params.get("addresses")))
+            return self._decompile(
+                target,
+                params["identifier"],
+                addresses=bool(params.get("addresses")),
+                force_analysis=bool(params.get("force_analysis")),
+            )
         if op == "il":
             return self._il(target, params["identifier"], str(params.get("view", "hlil")), bool(params.get("ssa")))
         if op == "disasm":
@@ -2089,16 +2098,74 @@ class BinaryNinjaBridge:
             return f"{int(func.start):08x}        {sig}\n{body}"
         return f"{sig}\n{{\n{body}\n}}"
 
-    def _decompile(self, selector: str | None, identifier, *, addresses: bool = False):
+    def _analysis_stub_warning(self, func, text: str, *, forced: bool = False) -> str | None:
+        """Warn when a decompile body is a Binary Ninja analysis stub, not a real body.
+
+        BN skips analysis for oversized functions and renders a placeholder
+        instead of a body. The authoritative signal is ``func.analysis_skipped``;
+        a distinctive-phrase text match is kept as a fallback.
+        """
+        skipped = bool(getattr(func, "analysis_skipped", False))
+        placeholder = "taking too long to analyze" in text
+        if not (skipped or placeholder):
+            return None
+        reason = None
+        try:
+            raw = func.analysis_skip_reason
+            # BN's AnalysisSkipReason is an IntEnum; on Python 3.11+ str() yields
+            # the bare number, so prefer the member name.
+            reason = getattr(raw, "name", None) or str(raw)
+        except Exception:
+            reason = None
+        detail = f" (skip reason: {reason})" if reason else ""
+        if forced:
+            return (
+                f"{func.name}: Binary Ninja could not complete analysis even after --force-analysis{detail}; "
+                f"this decompile is still an incomplete stub, not the real function body."
+            )
+        return (
+            f"Binary Ninja skipped analysis for {func.name}{detail}; this decompile is an incomplete stub, "
+            f"not the real function body. Re-run with --force-analysis to analyze it (may be slow on large functions)."
+        )
+
+    def _force_function_analysis(self, bv, func):
+        """Override a skipped function's analysis and reanalyze it in place.
+
+        Mutates the BinaryView (skip override + reanalysis), so callers must hold
+        the exclusive write lock. Returns the (possibly rebuilt) function object.
+        """
+        start = int(func.start)
+        try:
+            func.analysis_skipped = False  # setter installs NeverSkipFunctionAnalysis
+        except Exception:
+            pass
+        try:
+            func.reanalyze()
+        except Exception:
+            pass
+        bv.update_analysis_and_wait()
+        return bv.get_function_at(start) or func
+
+    def _decompile(self, selector: str | None, identifier, *, addresses: bool = False, force_analysis: bool = False):
         bv = self._resolve_view(selector)
         func = self._find_function(bv, identifier)
+        forced = False
+        if force_analysis and bool(getattr(func, "analysis_skipped", False)):
+            func = self._force_function_analysis(bv, func)
+            forced = True
         text = self._decompile_text(bv, func, addresses=addresses)
+        warnings = self._render_warnings(text)
+        stub = self._analysis_stub_warning(func, text, forced=forced)
+        if stub:
+            warnings.append(stub)
         comments = self._comment_map(bv, func)
         return {
             "function": {"name": func.name, "address": hex(func.start)},
             "text": text,
             "comments": comments,
-            "warnings": self._render_warnings(text),
+            "warnings": warnings,
+            "analysis_skipped": bool(getattr(func, "analysis_skipped", False)),
+            "analysis_forced": forced,
         }
 
     def _function_info(self, selector: str | None, identifier):
@@ -2658,6 +2725,10 @@ class BinaryNinjaBridge:
         bv = self._resolve_view(selector)
         func = self._find_function(bv, identifier)
         decompile = self._decompile_text(bv, func)
+        bundle_warnings = self._render_warnings(decompile)
+        stub = self._analysis_stub_warning(func, decompile)
+        if stub:
+            bundle_warnings.append(stub)
         bundle = {
             "target": self._target_info(selector),
             "function": {
@@ -2667,7 +2738,7 @@ class BinaryNinjaBridge:
                 "type": str(func.type),
             },
             "decompile": decompile,
-            "warnings": self._render_warnings(decompile),
+            "warnings": bundle_warnings,
             "il": {
                 "hlil": self._function_text(bv, func, view="hlil"),
                 "mlil": self._function_text(bv, func, view="mlil"),
