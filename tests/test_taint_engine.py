@@ -257,6 +257,27 @@ def test_lookup_model_strips_decorations():
     assert name is None and model is None
 
 
+def test_chk_models_present_and_shaped():
+    models = te.load_models()
+    # FORTIFY variants resolve via the underscore-stripped key, NOT by collapsing
+    # to the base function (which has different argument positions).
+    name, model = te.lookup_model(models, "__memcpy_chk")
+    assert name == "memcpy_chk"
+    assert model["sink"]["tainted_args"] == [2]
+    assert model["sink"]["class"] == "fortified_overflow"
+    assert model["propagates"] == [{"from": "*arg:1", "to": "*arg:0"}]
+    # decorated/PLT forms also resolve
+    assert te.lookup_model(models, "__strcpy_chk@plt")[0] == "strcpy_chk"
+    assert models["strcpy_chk"]["sink"]["tainted_args"] == [1]
+    assert models["strcpy_chk"]["propagates"] == [{"from": "*arg:1", "to": "*arg:0"}]
+    # memset_chk's arg1 is the fill byte (int c), so it must NOT propagate
+    assert "propagates" not in models["memset_chk"]
+    assert models["memset_chk"]["sink"]["tainted_args"] == [2]
+    # fortified source variants seed the destination buffer + return value
+    assert {"to": "*arg:1"} in models["read_chk"]["sources"]
+    assert {"to": "*arg:0"} in models["fgets_chk"]["sources"]
+
+
 @pytest.mark.parametrize("spec,expected", [
     ("param:0", {"kind": "param", "index": 0}),
     ("var:buf", {"kind": "var", "selector": "buf"}),
