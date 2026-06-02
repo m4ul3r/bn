@@ -1,0 +1,8 @@
+{
+  "description": "local typed-struct descriptor populated from input and passed by address; field stores must taint the struct so the callee's field read reaches the memcpy",
+  "lang": "c",
+  "forward": [
+    {"function": "handle", "source": "arg:read:1",
+     "sinks": [{"callee": "memcpy", "class": "overflow_len", "arg": 2}]}
+  ]
+}

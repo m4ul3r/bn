@@ -95,7 +95,8 @@ class FExpr:
 
 
 class FInstr:
-    def __init__(self, index, addr, opname, text, reads=(), writes=(), params=None, dest=None, src=None):
+    def __init__(self, index, addr, opname, text, reads=(), writes=(), params=None,
+                 dest=None, src=None, prev=None, offset=None):
         self.instr_index = index
         self.address = addr
         self.operation = FOp(opname)
@@ -109,6 +110,10 @@ class FInstr:
             self.dest = dest
         if src is not None:
             self.src = src
+        if prev is not None:
+            self.prev = prev
+        if offset is not None:
+            self.offset = offset
 
     def __str__(self):
         return self._text
@@ -560,6 +565,36 @@ def test_forward_version_agnostic_pointee_via_aliased_store(models):
     assert any(s["sink"]["class"] == "command_injection" for s in result["reached_sinks"])
     assert any("calls f" in (st.get("reason") or "")
                for s in result["reached_sinks"] for st in s["path"])
+
+
+def test_forward_struct_field_store_taints_descriptor(models):
+    # handle(fd): d.len = src (SET_VAR_ALIASED_FIELD, no vars_written); f(&d).
+    # f(p): system(p). The field store must taint d.dest so &d descends.
+    src = FVar("src", ident=70); d = FVar("d", ident=71); p = FVar("p", ident=72)
+    src0 = FSSA(src, 0); d1 = FSSA(d, 1); d2 = FSSA(d, 2); p1 = FSSA(p, 1)
+    pp = FVar("pp", ident=73); pp0 = FSSA(pp, 0)
+    sink_fn = FFunc("f", 0x800, FSSAFunc([
+        FInstr(0, 0x804, "MLIL_CALL_SSA", "0x900(pp#0)", reads=[pp0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_VAR_SSA", "pp#0", reads=[pp0])]),
+    ]), params=[pp])
+    handler = FFunc("handle", 0x900, FSSAFunc([
+        # field store exposes NO vars_written; only .dest/.prev/.src/.offset
+        FInstr(0, 0x904, "MLIL_SET_VAR_ALIASED_FIELD", "d.len @ mem = src#0",
+               reads=[d1, src0], writes=[], dest=d2, prev=d1, offset=8,
+               src=FExpr("MLIL_VAR_SSA", "src#0", reads=[src0])),
+        FInstr(1, 0x908, "MLIL_SET_VAR_SSA", "p#1 = &d", writes=[p1],
+               src=FExpr("MLIL_ADDRESS_OF", "&d", src=d)),
+        FInstr(2, 0x90c, "MLIL_CALL_SSA", "0x800(p#1)", reads=[p1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x800", constant=0x800),
+               params=[FExpr("MLIL_VAR_SSA", "p#1", reads=[p1])]),
+    ]), params=[src])
+    bv = FBV({0x800: "f", 0x900: "system"}, funcs={0x800: sink_fn})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(handler, [te.parse_locator("param:0")])
+    assert any(s["sink"]["class"] == "command_injection" for s in result["reached_sinks"])
+    reasons = [st.get("reason", "") for s in result["reached_sinks"] for st in s["path"]]
+    assert any("struct field" in r for r in reasons)
 
 
 def test_forward_memory_ssa_store_to_load(models):

@@ -206,7 +206,9 @@ function) so a sink inside a helper is reported against the entry function with
 the full cross-boundary path, and it carries taint back through output-pointer
 parameters (a helper that fills `*dst` taints the caller's buffer). Heap/pointer
 flows (`*p = tainted; x = *p`) are recovered via memory-SSA store/load
-correlation, not just stack buffers. It stays honest about its limits: every
+correlation, not just stack buffers, and locally-built descriptor structs
+populated from input and passed by address (a common protocol-stack pattern)
+are tracked through their field stores. It stays honest about its limits: every
 coarse-memory step, every unmodeled external call, and every unresolved indirect
 call is reported under `assumptions` / `leaves`, and the result always carries a
 `soundness` disclaimer. It is a may-analysis, not a proof.

@@ -808,6 +808,31 @@ class TaintEngine:
                             f"{', '.join(resolved_names)}")
                     continue
 
+                # typed-struct field store: MLIL_SET_VAR_FIELD / _ALIASED_FIELD write
+                # a struct variable but expose NO vars_written (only .dest/.prev/.src),
+                # so the generic rule misses them. Taint .dest (the new struct version)
+                # when the stored value -- or any prior version of the struct -- is
+                # tainted, keeping the whole descriptor tainted across field writes.
+                if opn in ("MLIL_SET_VAR_ALIASED_FIELD", "MLIL_SET_VAR_FIELD"):
+                    dest = getattr(ins, "dest", None)
+                    if dest is not None and is_ssa_var(dest):
+                        hits = arg_taint(getattr(ins, "src", None))
+                        if not hits:
+                            prev = getattr(ins, "prev", None)
+                            if prev is not None:
+                                pk = var_key(prev)
+                                for n in tainted:
+                                    if n[0] == pk:
+                                        hits = [n]
+                                        break
+                        if hits:
+                            node = (var_key(dest), getattr(dest, "version", None))
+                            off = getattr(ins, "offset", 0)
+                            if taint_node(node, var_label(dest), ins,
+                                          f"tainted store into struct field +{off}", hits):
+                                changed = True
+                    continue
+
                 # memory-SSA: a load that reads bytes a tainted store wrote (heap/
                 # pointer aliasing the AddressOf rule misses). Additive + sound.
                 if opn == "MLIL_SET_VAR_SSA":
