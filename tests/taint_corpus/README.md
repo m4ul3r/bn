@@ -21,18 +21,26 @@ brittle across compilers/optimisation.
 | `bw_interproc.c`       | backward slice from a memcpy-length parameter crosses into the caller to reach the recv source |
 | `heap_mem.c`           | tainted value stored to a heap buffer and loaded back reaches a memcpy length (memory-SSA correlation); parallel const store must not taint |
 | `vtable.cpp`           | C++ virtual dispatch shows as an indirect callee (honest degradation) |
+| `fortified.c`          | FORTIFY build: read -> `__memcpy_chk` length sink (`fortified_overflow`); needs `cflags` |
+| `vararg_sprintf.c`     | a tainted *later* vararg into sprintf taints the dest buffer -> system (full vararg propagation, not just the first) |
+| `global_buf.c`         | read() fills a global/static buffer, loaded back into a memcpy length (global buffer tracking) |
+| `file_write.c`         | tainted data into fwrite: flagged only with `--sink-class file_write`, silent by default (positive + negative) |
 
 ## `EXPECTED.json` schema
 
 ```jsonc
 {
   "lang": "c" | "cpp",
-  "forward":  [{"function","source","sinks":[{"callee","class","arg"}],"leaves":[{"kind"}]}],
+  "cflags": ["-O2", "-D_FORTIFY_SOURCE=2"],   // optional: extra compiler flags (e.g. to emit __*_chk)
+  "forward":  [{"function","source","sink_classes":[...],"sinks":[{"callee","class","arg"}],"leaves":[{"kind"}]}],
   "backward": [{"function","sink","origin_kinds":[...]}],
-  "negative": [{"function","source","forbid_sink_classes":[...]}],
+  "negative": [{"function","source","sink_classes":[...],"forbid_sink_classes":[...]}],
   "callgraph":[{"function","expect_indirect": true}]
 }
 ```
+
+`sink_classes` (optional, forward/negative) is passed through as `--sink-class`
+to enable opt-in sink classes (e.g. `file_write`).
 
 ## Real-world validation runs (done; not checked in)
 

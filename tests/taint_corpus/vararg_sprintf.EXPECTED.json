@@ -1,0 +1,8 @@
+{
+  "description": "a tainted later vararg into sprintf taints the dest buffer, reaching system (vararg propagation beyond the first vararg)",
+  "lang": "c",
+  "forward": [
+    {"function": "handle", "source": "arg:read:1",
+     "sinks": [{"callee": "system", "class": "command_injection", "arg": 0}]}
+  ]
+}

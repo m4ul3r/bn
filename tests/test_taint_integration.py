@@ -46,12 +46,15 @@ def _session_stop(inst: str) -> None:
     _bn("session", "stop", inst, timeout=30.0)
 
 
-def _compile(src: Path, out: Path) -> None:
+def _compile(src: Path, out: Path, extra_cflags: list[str] | None = None) -> None:
     if src.suffix == ".cpp":
         cc = ["g++"]
     else:
         cc = ["gcc"]
-    cmd = [*cc, "-O0", "-g", "-fno-stack-protector", "-no-pie", str(src), "-o", str(out)]
+    # extra_cflags lands after the defaults so a target can opt into e.g.
+    # -O2 -D_FORTIFY_SOURCE=2 (needed to emit __*_chk calls); a later -O wins.
+    cmd = [*cc, "-O0", "-g", "-fno-stack-protector", "-no-pie",
+           *(extra_cflags or []), str(src), "-o", str(out)]
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=120.0)
     assert res.returncode == 0, f"compile failed for {src.name}: {res.stderr}"
 
@@ -80,13 +83,16 @@ def test_corpus_target(expected_path, tmp_path):
     stem = expected_path.name[: -len(".EXPECTED.json")]
     src = CORPUS / (stem + (".cpp" if spec.get("lang") == "cpp" else ".c"))
     binary = tmp_path / stem
-    _compile(src, binary)
+    _compile(src, binary, spec.get("cflags"))
 
     inst = _session_start(binary)
     try:
         for case in spec.get("forward", []):
             addr = _resolve_addr(inst, case["function"])
-            result = _bn_json(inst, "taint", "forward", "-f", addr, "--source", case["source"])
+            fwd = ["taint", "forward", "-f", addr, "--source", case["source"]]
+            for sc in case.get("sink_classes", []) or []:
+                fwd += ["--sink-class", sc]
+            result = _bn_json(inst, *fwd)
             got = result["reached_sinks"]
             for want in case.get("sinks", []):
                 assert any(
@@ -114,7 +120,10 @@ def test_corpus_target(expected_path, tmp_path):
 
         for case in spec.get("negative", []):
             addr = _resolve_addr(inst, case["function"])
-            result = _bn_json(inst, "taint", "forward", "-f", addr, "--source", case["source"])
+            fwd = ["taint", "forward", "-f", addr, "--source", case["source"]]
+            for sc in case.get("sink_classes", []) or []:
+                fwd += ["--sink-class", sc]
+            result = _bn_json(inst, *fwd)
             forbidden = set(case.get("forbid_sink_classes", []))
             classes = {s["sink"]["class"] for s in result["reached_sinks"]}
             assert not (classes & forbidden), \

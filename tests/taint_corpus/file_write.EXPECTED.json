@@ -1,0 +1,11 @@
+{
+  "description": "tainted buffer written to a file via fwrite; flagged only when the opt-in file_write sink class is enabled, silent by default",
+  "lang": "c",
+  "forward": [
+    {"function": "persist", "source": "arg:read:1", "sink_classes": ["file_write"],
+     "sinks": [{"callee": "fwrite", "class": "file_write", "arg": 0}]}
+  ],
+  "negative": [
+    {"function": "persist", "source": "arg:read:1", "forbid_sink_classes": ["file_write"]}
+  ]
+}

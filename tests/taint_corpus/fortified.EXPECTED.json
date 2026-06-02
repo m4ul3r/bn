@@ -1,0 +1,9 @@
+{
+  "description": "FORTIFY build: read taints a stack buffer; a byte becomes a __memcpy_chk length -> fortified_overflow",
+  "lang": "c",
+  "cflags": ["-O2", "-D_FORTIFY_SOURCE=2"],
+  "forward": [
+    {"function": "process", "source": "arg:read:1",
+     "sinks": [{"callee": "memcpy_chk", "class": "fortified_overflow", "arg": 2}]}
+  ]
+}

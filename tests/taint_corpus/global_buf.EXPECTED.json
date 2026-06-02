@@ -1,0 +1,8 @@
+{
+  "description": "read() fills a global/static buffer; a byte from it becomes a memcpy length -> overflow_len (global buffer tracking)",
+  "lang": "c",
+  "forward": [
+    {"function": "g_handle", "source": "arg:read:1",
+     "sinks": [{"callee": "memcpy", "class": "overflow_len", "arg": 2}]}
+  ]
+}
