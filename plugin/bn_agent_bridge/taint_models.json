@@ -80,10 +80,17 @@
     "strncat_chk":  {"propagates": [{"from": "*arg:1", "to": "*arg:0"}],
                      "sink": {"tainted_args": [2], "class": "fortified_overflow", "detail": "attacker-controlled length to __strncat_chk (fortified; aborts at runtime)"}},
 
+    "_comment_optional_sinks": "Opt-in sinks: a sink with 'optional': true fires only when its 'class' is passed via --sink-class (engine: enabled_sink_classes). Off by default so 'tainted data written out' does not spam normal runs; useful when auditing persistence / file corruption / exfiltration. They are still non-empty models, so they suppress the conservative 'unmodeled external' fallback exactly like the benign {} entries they replace.",
+    "fwrite":   {"sink": {"tainted_args": [0, 1, 2], "class": "file_write", "optional": true, "detail": "tainted data (arg0) or size/count (args1-2) written via fwrite"}},
+    "fputs":    {"sink": {"tainted_args": [0], "class": "file_write", "optional": true, "detail": "tainted string written via fputs"}},
+    "write":    {"sink": {"tainted_args": [1, 2], "class": "file_write", "optional": true, "detail": "tainted data (arg1) or length (arg2) written via write()"}},
+    "send":     {"sink": {"tainted_args": [1, 2], "class": "net_write", "optional": true, "detail": "tainted data (arg1) or length (arg2) sent via send()"}},
+    "sendto":   {"sink": {"tainted_args": [1, 2], "class": "net_write", "optional": true, "detail": "tainted data (arg1) or length (arg2) sent via sendto()"}},
+
     "_comment_benign": "Empty models mark functions that neither source, propagate, nor sink taint, so a tainted argument does not trigger the conservative 'unmodeled external' fallback. They cut noise without hiding real flows.",
     "socket": {}, "bind": {}, "listen": {}, "accept": {}, "connect": {},
     "setsockopt": {}, "getsockopt": {}, "getsockname": {}, "getpeername": {},
-    "close": {}, "shutdown": {}, "write": {}, "send": {}, "sendto": {},
+    "close": {}, "shutdown": {},
     "htons": {}, "htonl": {}, "ntohs": {}, "ntohl": {}, "inet_addr": {},
     "exit": {}, "abort": {}, "perror": {}, "fflush": {}, "fclose": {}, "puts": {},
     "strcmp": {}, "strncmp": {}, "strcasecmp": {}, "strncasecmp": {},

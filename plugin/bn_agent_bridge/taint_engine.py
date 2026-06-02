@@ -454,8 +454,11 @@ class TaintEngine:
     # -- forward ----------------------------------------------------------
 
     def forward(self, func: Any, sources: list[dict[str, Any]], *,
-                sink_filter: set[str] | None = None, max_depth: int = 8) -> dict[str, Any]:
+                enabled_sink_classes: set[str] | None = None, max_depth: int = 8) -> dict[str, Any]:
         # Per-call analysis state (reset each public call):
+        # optional-sink classes the caller opted into (e.g. file_write); a sink
+        # marked "optional" in the model DB fires only if its class is in here.
+        self._enabled_sink_classes: set[str] = set(enabled_sink_classes or ())
         self._cache: dict[tuple, Any] = {}          # (func_start, frozenset(params)) -> summary
         self._funcs_visited: set[int] = set()
         self._max_depth_seen = 0
@@ -675,6 +678,10 @@ class TaintEngine:
             propagated: set[int] = set()
             addr = int(getattr(ins, "address", 0))
             sink = model.get("sink")
+            # opt-in sinks (e.g. file_write) stay silent unless their class was
+            # enabled for this run; still a "modeled" call, so no fallback noise.
+            if sink is not None and sink.get("optional") and sink.get("class") not in self._enabled_sink_classes:
+                sink = None
             if sink is not None:
                 for argidx in sink.get("tainted_args", []) or []:
                     if argidx < len(params):

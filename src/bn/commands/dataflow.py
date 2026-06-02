@@ -97,6 +97,11 @@ _LOCATOR_HELP = (
                       '{"0x4011f0": ["0x401176", "0x401195"]}'),
              arg("--unknown-call", choices=("conservative", "stop"), default="conservative",
                  help="How to treat un-analyzed/external calls reached by taint (default: conservative)"),
+             arg("--sink-class", dest="sink_classes", action="append", default=None,
+                 choices=("file_write", "net_write"), metavar="CLASS",
+                 help="Enable an opt-in sink class (repeatable). Off by default: "
+                      "file_write (fwrite/write/fputs), net_write (send/sendto). "
+                      "Use when auditing persistence / file-corruption / exfiltration paths."),
          ])
 def _taint_forward(args: argparse.Namespace) -> int:
     if not args.sources:
@@ -107,6 +112,7 @@ def _taint_forward(args: argparse.Namespace) -> int:
         "sources": list(args.sources),
         "max_depth": int(args.max_depth),
         "unknown_call": args.unknown_call,
+        "enabled_sink_classes": list(args.sink_classes or []),
     }
     if args.resolve_map:
         try:

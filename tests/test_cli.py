@@ -3328,6 +3328,49 @@ def test_session_start_no_bndb_propagates_to_each_load(monkeypatch, tmp_path):
     assert {item["path"] for item in captured} == {str(a), str(b)}
 
 
+def test_taint_forward_passes_enabled_sink_classes(monkeypatch):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "a.bndb"}]}
+        captured["op"] = op
+        captured["params"] = params
+        return {"ok": True, "result": {"direction": "forward",
+                                       "function": {"name": "handler", "address": "0x10"},
+                                       "sources": [], "reached_sinks": [], "leaves": [],
+                                       "assumptions": [], "soundness": "may"}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["taint", "forward", "-f", "handler", "--source", "arg:read:1",
+                      "--sink-class", "file_write", "--sink-class", "net_write",
+                      "--format", "json"])
+    assert rc == 0
+    assert captured["op"] == "taint"
+    assert captured["params"]["enabled_sink_classes"] == ["file_write", "net_write"]
+
+
+def test_taint_forward_sink_classes_default_empty(monkeypatch):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "a.bndb"}]}
+        captured["params"] = params
+        return {"ok": True, "result": {"direction": "forward",
+                                       "function": {"name": "handler", "address": "0x10"},
+                                       "sources": [], "reached_sinks": [], "leaves": [],
+                                       "assumptions": [], "soundness": "may"}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["taint", "forward", "-f", "handler", "--source", "arg:read:1",
+                      "--format", "json"])
+    assert rc == 0
+    assert captured["params"]["enabled_sink_classes"] == []
+
+
 def test_trace_routes_and_renders_text(monkeypatch, capsys):
     captured = {}
 

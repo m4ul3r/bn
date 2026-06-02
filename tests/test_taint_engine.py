@@ -329,6 +329,57 @@ def test_forward_no_flow_no_false_positive(models):
     assert result["reached_sinks"] == []
 
 
+def _fwrite_func():
+    # dump(fd): read(fd, &buf, 0x40); fwrite(&buf, 1, 0x40, fp)
+    buf = FVar("buf", typ="char[0x40]")
+    rsi = FVar("rsi"); rdi = FVar("rdi"); rax = FVar("rax"); fp = FVar("fp")
+    rsi1 = FSSA(rsi, 1); rdi1 = FSSA(rdi, 1); rax2 = FSSA(rax, 2); fp1 = FSSA(fp, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "rsi#1 = &buf", writes=[rsi1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "rax#2 = read(rdi#1, rsi#1, 0x40)",
+               reads=[rdi1, rsi1], writes=[rax2],
+               dest=FExpr("MLIL_CONST_PTR", "0x401070", constant=0x401070),
+               params=[FExpr("MLIL_VAR_SSA", "rdi#1", reads=[rdi1]),
+                       FExpr("MLIL_VAR_SSA", "rsi#1", reads=[rsi1]),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+        FInstr(2, 0x18, "MLIL_CALL_SSA", "fwrite(&buf, 1, 0x40, fp#1)", reads=[fp1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401090", constant=0x401090),
+               params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       FExpr("MLIL_CONST", "1", constant=1),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40),
+                       FExpr("MLIL_VAR_SSA", "fp#1", reads=[fp1])]),
+    ]
+    bv = FBV({0x401070: "read", 0x401090: "fwrite"})
+    return FFunc("dump", 0x10, FSSAFunc(instrs), params=[FVar("fd")]), bv
+
+
+def test_optional_sink_off_by_default(models):
+    func, bv = _fwrite_func()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:read:1")])
+    # fwrite is modeled but its sink is opt-in -> no finding, and (crucially) no
+    # conservative-unmodeled-external assumption (the model suppresses that).
+    assert result["reached_sinks"] == []
+    assert not any("conservatively tainted" in a for a in result["assumptions"])
+
+
+def test_optional_sink_on_with_class(models):
+    func, bv = _fwrite_func()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:read:1")],
+                            enabled_sink_classes={"file_write"})
+    sinks = result["reached_sinks"]
+    assert len(sinks) == 1
+    assert sinks[0]["sink"]["callee"] == "fwrite"
+    assert sinks[0]["sink"]["class"] == "file_write"
+    assert sinks[0]["sink"]["tainted_arg_index"] == 0
+    # enabling an unrelated class leaves fwrite silent
+    result2 = engine.forward(func, [te.parse_locator("arg:read:1")],
+                             enabled_sink_classes={"net_write"})
+    assert result2["reached_sinks"] == []
+
+
 def test_forward_indirect_call_is_a_leaf_not_dropped(models):
     fp = FVar("fp"); arg = FVar("arg"); rr = FVar("rr")
     arg0 = FSSA(arg, 0); fp1 = FSSA(fp, 1); rr1 = FSSA(rr, 1)
