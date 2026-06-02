@@ -800,6 +800,144 @@ def test_function_info_includes_metadata(monkeypatch):
     assert result["size"] is None
 
 
+def _install_fake_pseudo_c(monkeypatch, bridge, func, batches):
+    """Install a fake `binaryninja.lineardisassembly` whose cursor yields `batches`.
+
+    `batches` is a list of line-batches; each line is an (address, text) pair,
+    mirroring how a LinearViewCursor returns LinearDisassemblyLine objects.
+    """
+
+    class _FakeContents:
+        def __init__(self, address, text):
+            self.address = address
+            self._text = text
+
+        def __str__(self):
+            return self._text
+
+    class _FakeLine:
+        def __init__(self, address, text):
+            self.contents = _FakeContents(address, text)
+
+    class _FakeViewObject:
+        def __init__(self, batches):
+            self.batches = [[_FakeLine(a, t) for (a, t) in batch] for batch in batches]
+
+    class _FakeCursor:
+        def __init__(self, view_obj):
+            self._batches = view_obj.batches
+            self._i = 0
+
+        def seek_to_begin(self):
+            self._i = 0
+
+        @property
+        def lines(self):
+            return self._batches[self._i] if self._i < len(self._batches) else []
+
+        def next(self):
+            self._i += 1
+            return self._i < len(self._batches)
+
+    class _FakeLinearViewObject:
+        @staticmethod
+        def single_function_language_representation(fn, settings=None, language="Pseudo C"):
+            assert fn is func
+            assert language == "Pseudo C"
+            return _FakeViewObject(batches)
+
+    fake_mod = types.ModuleType("binaryninja.lineardisassembly")
+    fake_mod.LinearViewObject = _FakeLinearViewObject
+    fake_mod.LinearViewCursor = _FakeCursor
+    monkeypatch.setattr(bridge.bn, "lineardisassembly", fake_mod, raising=False)
+
+    class _FakeDisassemblySettings:
+        def set_option(self, option, state=True):
+            return None
+
+    class _FakeDisassemblyOption:
+        ShowAddress = 0
+        ShowTypeCasts = 10
+        WaitForIL = 66
+        DisableLineFormatting = 68
+
+    monkeypatch.setattr(bridge.bn, "DisassemblySettings", _FakeDisassemblySettings, raising=False)
+    monkeypatch.setattr(bridge.bn, "DisassemblyOption", _FakeDisassemblyOption, raising=False)
+
+
+def test_decompile_renders_pseudo_c(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "player_update")
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance, "_comment_map", lambda bv, func: {})
+    _install_fake_pseudo_c(
+        monkeypatch,
+        bridge,
+        fn,
+        [
+            # BN indents the signature line by 2 spaces; we left-justify it.
+            [(0x401000, "  int32_t player_update(int32_t arg1)")],
+            [(0x401000, "{")],
+            [(0x401004, "    return arg1 + 1;")],
+            [(0x401008, "}")],
+        ],
+    )
+
+    result = instance._decompile("active", "player_update")
+
+    assert result["function"] == {"name": "player_update", "address": "0x401000"}
+    assert result["text"] == (
+        "int32_t player_update(int32_t arg1)\n{\n    return arg1 + 1;\n}"
+    )
+
+
+def test_decompile_pseudo_c_with_address_gutter(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "player_update")
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance, "_comment_map", lambda bv, func: {})
+    _install_fake_pseudo_c(
+        monkeypatch,
+        bridge,
+        fn,
+        [
+            [(0x401000, "")],  # leading blank separator -> trimmed, no orphan address
+            [(0x401000, "  int32_t player_update(int32_t arg1)")],  # 2-space indent stripped
+            [(0x401000, "")],  # internal blank -> empty line, not "00401000"
+            [(0x401004, "    return arg1 + 1;")],
+            [(0x401004, "")],  # trailing blank separator -> trimmed
+        ],
+    )
+
+    result = instance._decompile("active", "player_update", addresses=True)
+
+    assert result["text"] == (
+        "00401000        int32_t player_update(int32_t arg1)\n"
+        "\n"
+        "00401004            return arg1 + 1;"
+    )
+
+
+def test_decompile_falls_back_to_hlil_when_pseudo_c_unavailable(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "player_update", "int32_t player_update()")
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance, "_comment_map", lambda bv, func: {})
+    # No fake lineardisassembly module installed -> _pseudo_c_text raises and we
+    # fall back to wrapped HLIL produced by _function_text.
+    monkeypatch.setattr(instance, "_function_text", lambda bv, func, **kw: "    return 1;")
+
+    result = instance._decompile("active", "player_update")
+
+    assert result["text"] == "int32_t player_update()\n{\n    return 1;\n}"
+
+
 def test_list_functions_is_sorted_by_address(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

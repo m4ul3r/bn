@@ -113,7 +113,7 @@ def _function_create(args: argparse.Namespace) -> int:
     )
 
 
-@command("decompile", help="Render HLIL-style decompile text for a function", target=True,
+@command("decompile", help="Render Binary Ninja Pseudo C for a function", target=True,
          args=[
              arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
              arg("--addresses", action="store_true", default=False,

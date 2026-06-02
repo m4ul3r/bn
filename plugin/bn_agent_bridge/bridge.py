@@ -2022,38 +2022,83 @@ class BinaryNinjaBridge:
             params.append(f"{var.type} {var.name}")
         return f"{ret} {func.name}({', '.join(params)})"
 
+    def _pseudo_c_text(self, func, *, addresses: bool = False) -> str:
+        """Render Binary Ninja's Pseudo C for one function (GUI-equivalent).
+
+        Walks the language-representation linear view a batch of lines at a
+        time. Each line carries its own address, so the optional gutter matches
+        what Binary Ninja shows in its UI. Comments are rendered inline by BN.
+        """
+        settings = bn.DisassemblySettings()
+        # Suppress BN's built-in address column so `--addresses` controls the
+        # gutter (and its format) on our side rather than doubling it. Keep the
+        # explicit type casts (e.g. `*(uint8_t*)x`) that make the access width
+        # legible — they are off in a default DisassemblySettings.
+        settings.set_option(bn.DisassemblyOption.ShowAddress, False)
+        settings.set_option(bn.DisassemblyOption.ShowTypeCasts, True)
+        settings.set_option(bn.DisassemblyOption.WaitForIL, True)
+        # Keep long statements (and string literals) on one line instead of
+        # wrapping them into adjacent fragments — one statement per line is
+        # easier to read, slice (--lines), and grep without splitting strings.
+        settings.set_option(bn.DisassemblyOption.DisableLineFormatting, True)
+        view_obj = bn.lineardisassembly.LinearViewObject.single_function_language_representation(func, settings)
+        cursor = bn.lineardisassembly.LinearViewCursor(view_obj)
+        cursor.seek_to_begin()
+        out: list[str] = []
+        seen_content = False
+        while True:
+            for line in cursor.lines:
+                text = str(line.contents)
+                if not text.strip():
+                    # Blank separator line: keep the spacing but never emit a
+                    # lone address in the gutter (decide blankness on content,
+                    # not on the prefixed string).
+                    out.append("")
+                    continue
+                if not seen_content:
+                    # BN indents the function-header (signature) line by two
+                    # spaces; the braces and body don't share that indent, so
+                    # left-justify the header to line up with them.
+                    text = text.lstrip()
+                    seen_content = True
+                if addresses:
+                    addr = getattr(line.contents, "address", None)
+                    prefix = f"{int(addr):08x}        " if addr is not None else " " * 16
+                    out.append(f"{prefix}{text}")
+                else:
+                    out.append(text)
+            if not cursor.next():
+                break
+        while out and not out[0]:
+            out.pop(0)
+        while out and not out[-1]:
+            out.pop()
+        return "\n".join(out)
+
+    def _decompile_text(self, bv, func, *, addresses: bool = False) -> str:
+        """Pseudo C for a function, degrading to wrapped HLIL if it is unavailable."""
+        try:
+            text = self._pseudo_c_text(func, addresses=addresses)
+        except Exception:
+            text = ""
+        if text.strip():
+            return text
+        sig = self._function_signature(func)
+        body = self._function_text(bv, func, view="hlil", addresses=addresses)
+        if addresses:
+            return f"{int(func.start):08x}        {sig}\n{body}"
+        return f"{sig}\n{{\n{body}\n}}"
+
     def _decompile(self, selector: str | None, identifier, *, addresses: bool = False):
         bv = self._resolve_view(selector)
         func = self._find_function(bv, identifier)
-        sig = self._function_signature(func)
-        body = self._function_text(bv, func, view="hlil", addresses=addresses)
+        text = self._decompile_text(bv, func, addresses=addresses)
         comments = self._comment_map(bv, func)
-        if addresses:
-            text = f"{int(func.start):08x}        {sig}\n{body}"
-        else:
-            text = f"{sig}\n{{\n{body}\n}}"
-        if comments:
-            output_lines = []
-            for line in text.split("\n"):
-                output_lines.append(line)
-                # Match address prefix (8 hex digits at start of line)
-                stripped = line.lstrip()
-                if len(stripped) >= 8:
-                    addr_part = stripped[:8]
-                    try:
-                        addr_val = int(addr_part, 16)
-                        addr_hex = hex(addr_val)
-                        if addr_hex in comments:
-                            output_lines.append(f"{' ' * len(line[:len(line) - len(stripped)])}{'':8s}        // {comments[addr_hex]}")
-                    except ValueError:
-                        pass
-            text = "\n".join(output_lines)
-        warnings = self._render_warnings(text)
         return {
             "function": {"name": func.name, "address": hex(func.start)},
             "text": text,
             "comments": comments,
-            "warnings": warnings,
+            "warnings": self._render_warnings(text),
         }
 
     def _function_info(self, selector: str | None, identifier):
@@ -2612,7 +2657,7 @@ class BinaryNinjaBridge:
     def _bundle_function(self, selector: str | None, identifier, out_path: str | None):
         bv = self._resolve_view(selector)
         func = self._find_function(bv, identifier)
-        decompile = self._function_text(bv, func, view="hlil")
+        decompile = self._decompile_text(bv, func)
         bundle = {
             "target": self._target_info(selector),
             "function": {
@@ -2624,7 +2669,7 @@ class BinaryNinjaBridge:
             "decompile": decompile,
             "warnings": self._render_warnings(decompile),
             "il": {
-                "hlil": decompile,
+                "hlil": self._function_text(bv, func, view="hlil"),
                 "mlil": self._function_text(bv, func, view="mlil"),
             },
             "disassembly": self._disasm_text(bv, func),
