@@ -660,6 +660,42 @@ class TaintEngine:
                     done = True
             return done
 
+        def apply_model(ins, params, model, mkey, name, *, site_taddr=None):
+            """Apply a function model's sink-detection + taint propagation at a call
+            site. Shared by the direct-call and resolved-indirect-external branches.
+
+            Returns ``(changed, propagated_argidx)`` where ``propagated_argidx`` is
+            the set of ``*arg:N`` indices the model propagated *into* — the caller
+            uses it to bubble those up as out-params. This helper does NOT bubble
+            out-params itself (so the resolved-external branch keeps its historical
+            behavior of not creating out-params). ``site_taddr`` selects the dedup
+            signature: ``(addr, argidx)`` for direct calls, ``(addr, argidx, taddr)``
+            per resolved target so distinct indirect targets each record once."""
+            changed = False
+            propagated: set[int] = set()
+            addr = int(getattr(ins, "address", 0))
+            sink = model.get("sink")
+            if sink is not None:
+                for argidx in sink.get("tainted_args", []) or []:
+                    if argidx < len(params):
+                        ht = arg_taint(params[argidx])
+                        if ht:
+                            sig = (addr, argidx) if site_taddr is None else (addr, argidx, site_taddr)
+                            if sig not in recorded_sinks:
+                                recorded_sinks.add(sig)
+                                findings.append(self._make_finding(ins, mkey or name, argidx, sink, ht, why))
+            for rule in model.get("propagates") or []:
+                to = rule.get("to")
+                hit = self._token_hit_node(ssaf, params, rule.get("from"), tainted)
+                if hit is not None:
+                    if self._apply_to_token(ssaf, ins, params, to, taint_node, name or "?", parents=[hit]):
+                        changed = True
+                    if to and to.startswith("*arg:"):
+                        k = int(to.split("arg:", 1)[1])
+                        if k < len(params):
+                            propagated.add(k)
+            return changed, propagated
+
         for _ in range(self.max_iters):
             changed = False
             for ins in instrs:
@@ -676,39 +712,19 @@ class TaintEngine:
                     mkey, model = lookup_model(self.models, name)
                     params = self._call_params(ins)
 
-                    # 1) model-driven sink detection
-                    if model and model.get("sink") is not None:
-                        sink = model["sink"]
-                        for argidx in sink.get("tainted_args", []) or []:
-                            if argidx < len(params):
-                                ht = arg_taint(params[argidx])
-                                if ht:
-                                    sig = (int(getattr(ins, "address", 0)), argidx)
-                                    if sig not in recorded_sinks:
-                                        recorded_sinks.add(sig)
-                                        findings.append(self._make_finding(ins, mkey or name, argidx, sink, ht, why))
-
-                    # 2) model-driven propagation
-                    if model and model.get("propagates"):
-                        for rule in model["propagates"]:
-                            to = rule.get("to")
-                            hit = self._token_hit_node(ssaf, params, rule.get("from"), tainted)
-                            if hit is not None:
-                                if self._apply_to_token(ssaf, ins, params, to, taint_node, name or "?", parents=[hit]):
-                                    changed = True
-                                # out-param: the propagate writes through an arg that
-                                # is one of THIS function's parameters -> caller out-param
-                                if to and to.startswith("*arg:"):
-                                    k = int(to.split("arg:", 1)[1])
-                                    if k < len(params):
-                                        pidx = self._resolve_to_param_index(func, ssaf, params[k])
-                                        if pidx is not None and pidx not in out_params:
-                                            out_params.add(pidx)
-                                            changed = True
-                        continue
-
+                    # 1+2) model-driven sink detection + propagation (shared helper)
                     if model is not None:
-                        continue  # modeled (e.g. source-only); body intentionally not descended
+                        mchanged, propagated = apply_model(ins, params, model, mkey, name)
+                        if mchanged:
+                            changed = True
+                        # out-param: a propagate that writes through one of THIS
+                        # function's parameters taints a caller out-param.
+                        for k in propagated:
+                            pidx = self._resolve_to_param_index(func, ssaf, params[k])
+                            if pidx is not None and pidx not in out_params:
+                                out_params.add(pidx)
+                                changed = True
+                        continue  # modeled (sink/propagate/source-only); body not descended
 
                     # 3) no model: resolve the target(s) and descend.
                     tainted_args = {i: arg_taint(p) for i, p in enumerate(params) if arg_taint(p)}
@@ -755,21 +771,9 @@ class TaintEngine:
                         mk, md = lookup_model(self.models, nm)
                         if md is not None:
                             # resolved target is a modeled external
-                            if md.get("sink") is not None:
-                                for argidx in md["sink"].get("tainted_args", []) or []:
-                                    if argidx < len(params):
-                                        ht = arg_taint(params[argidx])
-                                        if ht:
-                                            sig = (int(getattr(ins, "address", 0)), argidx, taddr)
-                                            if sig not in recorded_sinks:
-                                                recorded_sinks.add(sig)
-                                                findings.append(self._make_finding(ins, mk or nm, argidx, md["sink"], ht, why))
-                            if md.get("propagates"):
-                                for rule in md["propagates"]:
-                                    hit = self._token_hit_node(ssaf, params, rule.get("from"), tainted)
-                                    if hit is not None:
-                                        if self._apply_to_token(ssaf, ins, params, rule.get("to"), taint_node, nm or "?", parents=[hit]):
-                                            changed = True
+                            mchanged, _ = apply_model(ins, params, md, mk, nm, site_taddr=taddr)
+                            if mchanged:
+                                changed = True
                             resolved_names.append(nm or hex(taddr))
                         elif self._is_internal(cfn):
                             d = self._descend(ins, cfn, tainted_args, why, depth, max_depth, via=via)
