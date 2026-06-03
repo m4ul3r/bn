@@ -1547,6 +1547,38 @@ def test_xrefs_suppress_disasm_for_data_targets(monkeypatch):
     assert result["code_refs"][0]["context"]["disasm"] == "ldr r0, =message"
 
 
+def test_xrefs_resolve_multiline_strings_and_mark_truncation(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    caller = _FakeFunction(0x401000, "usage")
+    caller.basic_blocks = [_FakeBasicBlock(0x401000, 0x401100)]
+    message = "Usage: %s [OPTION]... PATTERNS [FILE]...\n" + ("A" * 120)
+    bv = _FakeBV(
+        functions=[caller],
+        code_refs={0x427840: [_FakeCodeRef(0x40EA7C, caller)]},
+        disassembly={0x40EA7C: "lea rsi, [rel 0x427840]"},
+        sections={
+            ".text": _FakeSection(".text", 0x401000, 0x402000),
+            ".rodata": _FakeSection(".rodata", 0x427000, 0x428000),
+        },
+        segments={
+            0x40EA7C: _FakeSegment(readable=True, executable=True),
+            0x427840: _FakeSegment(readable=True),
+        },
+        memory={0x427840: message.encode() + b"\x00"},
+    )
+
+    result = instance._xrefs_to_address(bv, 0x427840)
+
+    target = result["target_context"]
+    assert target["kind"] == "string"
+    assert target["string"]["value"] == message[:96]
+    assert "\n" in target["string"]["value"]
+    assert target["string"]["truncated"] is True
+    assert target["disasm"] is None
+    assert result["code_refs"][0]["context"]["disasm"] == "lea rsi, [rel 0x427840]"
+
+
 def test_function_evidence_resolves_pointer_constant_arguments(monkeypatch):
     # ILX #2: append(&var, 0x2a4f4) should annotate the constant with "4" [.rodata].
     bridge = _load_bridge(monkeypatch)

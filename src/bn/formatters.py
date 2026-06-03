@@ -12,6 +12,13 @@ def _render_fallback_text(value: Any) -> str:
     return json.dumps(value, indent=2, sort_keys=True)
 
 
+def _render_string_literal(value: Any, *, truncated: bool = False) -> str:
+    text = json.dumps(value, ensure_ascii=True)
+    if truncated:
+        text += " [truncated]"
+    return text
+
+
 def _format_local_entry(item: dict[str, Any]) -> str:
     name = str(item.get("name", "<unknown>"))
     type_str = str(item.get("type", "<unknown>"))
@@ -489,7 +496,9 @@ def _context_suffix(context: Any) -> str:
     if isinstance(string, dict) and string.get("value"):
         enc = string.get("encoding")
         label = "string" if enc in (None, "ascii") else f"string({enc})"
-        parts.append(f"{label}={json.dumps(string['value'], ensure_ascii=True)}")
+        parts.append(
+            f"{label}={_render_string_literal(string['value'], truncated=bool(string.get('truncated')))}"
+        )
     disasm = context.get("disasm")
     if isinstance(disasm, str) and disasm:
         parts.append(f"disasm={disasm}")
@@ -567,7 +576,15 @@ def _render_target_line(target: Any) -> str:
         elif isinstance(string, dict) and string.get("value"):
             enc = string.get("encoding")
             base = json.dumps(string["value"], ensure_ascii=True)
-            annot = [a for a in (section_name, (enc if enc and enc != "ascii" else None)) if a]
+            annot = [
+                a
+                for a in (
+                    section_name,
+                    (enc if enc and enc != "ascii" else None),
+                    ("truncated" if string.get("truncated") else None),
+                )
+                if a
+            ]
             if annot:
                 base += f" [{', '.join(annot)}]"
         else:
@@ -644,6 +661,8 @@ def _render_resolved_arg(resolved: Any) -> str:
         encoding = resolved.get("encoding")
         if encoding:
             value += f"({encoding})"
+        if resolved.get("truncated"):
+            value += " [truncated]"
         return f" -> {value}{suffix}"
     if resolved.get("symbol"):
         return f" -> {resolved['symbol']}{suffix}"

@@ -1312,8 +1312,10 @@ class BinaryNinjaBridge:
         """Best-effort printable string at *address*, even when BN never
         atomized one there (e.g. single chars packed for std::string::append).
 
-        Tries a NUL-terminated ASCII run first, then UTF-16LE. Returns None for
-        non-string bytes so it can be used as a cheap "is this a string?" probe.
+        Tries a NUL-terminated ASCII run first, then UTF-16LE. Common escaped
+        text controls are allowed. Long strings are capped and marked
+        truncated so evidence output stays compact. Returns None for non-string
+        bytes so it can be used as a cheap "is this a string?" probe.
         """
         try:
             data = bytes(bv.read(int(address), max_chars * 2 + 2))
@@ -1321,27 +1323,70 @@ class BinaryNinjaBridge:
             return None
         if not data:
             return None
-        nul = data.find(b"\x00")
-        ascii_run = data if nul == -1 else data[:nul]
-        if 1 <= len(ascii_run) <= max_chars and all(32 <= b < 127 for b in ascii_run):
+
+        allowed_ascii = set(range(32, 127)) | {9, 10, 13}
+        ascii_chars: list[str] = []
+        for byte in data:
+            if byte == 0:
+                if ascii_chars:
+                    return {
+                        "value": "".join(ascii_chars),
+                        "encoding": "ascii",
+                        "truncated": False,
+                    }
+                break
+            if byte not in allowed_ascii:
+                ascii_chars = []
+                break
+            if len(ascii_chars) >= max_chars:
+                return {
+                    "value": "".join(ascii_chars),
+                    "encoding": "ascii",
+                    "truncated": True,
+                }
+            ascii_chars.append(chr(byte))
+        else:
+            if ascii_chars:
+                return {
+                    "value": "".join(ascii_chars),
+                    "encoding": "ascii",
+                    "truncated": True,
+                }
+
+        if ascii_chars:
             return {
-                "value": ascii_run.decode("ascii"),
+                "value": "".join(ascii_chars),
                 "encoding": "ascii",
-                "truncated": nul == -1 and len(data) >= max_chars * 2 + 2,
+                "truncated": True,
             }
+
         chars: list[str] = []
         index = 0
+        terminated = False
+        allowed_wide = allowed_ascii
         while index + 1 < len(data) and len(chars) < max_chars:
             lo, hi = data[index], data[index + 1]
             if lo == 0 and hi == 0:
+                terminated = True
                 break
-            if hi != 0 or not (32 <= lo < 127):
+            if hi != 0 or lo not in allowed_wide:
                 chars = []
                 break
             chars.append(chr(lo))
             index += 2
+        if (
+            len(chars) >= max_chars
+            and index + 1 < len(data)
+            and data[index] == 0
+            and data[index + 1] == 0
+        ):
+            terminated = True
         if len(chars) >= 2:
-            return {"value": "".join(chars), "encoding": "utf-16le", "truncated": False}
+            return {
+                "value": "".join(chars),
+                "encoding": "utf-16le",
+                "truncated": not terminated and len(chars) >= max_chars,
+            }
         return None
 
     def _address_context(self, bv, address: int, *, include_disasm: bool = False, arch=None,
@@ -2610,6 +2655,8 @@ class BinaryNinjaBridge:
             resolved["string"] = string.get("value")
             if string.get("encoding") and string.get("encoding") != "ascii":
                 resolved["encoding"] = string["encoding"]
+            if string.get("truncated"):
+                resolved["truncated"] = True
         symbol = context.get("symbol")
         if symbol and symbol.get("name"):
             resolved["symbol"] = symbol["name"]

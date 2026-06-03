@@ -984,6 +984,11 @@ def test_evidence_xrefs_routes_and_renders_context(monkeypatch, capsys):
                 "target_context": {
                     "sections": [{"name": ".rodata"}],
                     "symbol": {"name": "common.HeadUnitInfo", "type": "DataSymbol"},
+                    "string": {
+                        "value": "Usage: %s [OPTION]...\n",
+                        "encoding": "ascii",
+                        "truncated": True,
+                    },
                 },
                 "code_refs": [
                     {
@@ -1010,6 +1015,7 @@ def test_evidence_xrefs_routes_and_renders_context(monkeypatch, capsys):
     assert captured["params"]["identifier"] == "0x175b20"
     output = capsys.readouterr().out
     assert "target | section=.rodata | symbol=common.HeadUnitInfo[DataSymbol]" in output
+    assert 'string="Usage: %s [OPTION]...\\n" [truncated]' in output
     assert "0x586c0  code  sub_586a2" in output
     assert "seg=r-x" in output
 
@@ -1151,6 +1157,24 @@ def test_render_target_line_shows_symbol_and_string_for_mapped_targets():
     line = formatters._render_target_line(rodata_string)
     assert '"N19androidauto_service17AndroidAutoClientE"' in line
     assert "[.rodata]" in line
+
+    truncated_string = {
+        "raw": "0x427840",
+        "normalized": "0x427840",
+        "function": None,
+        "status": "mapped",
+        "context": {
+            "string": {
+                "value": "Usage: %s [OPTION]...\n" + ("A" * 16),
+                "encoding": "ascii",
+                "truncated": True,
+            },
+            "sections": [{"name": ".rodata"}],
+        },
+    }
+    line = formatters._render_target_line(truncated_string)
+    assert '"Usage: %s [OPTION]...\\nAAAAAAAAAAAAAAAA"' in line
+    assert "[.rodata, truncated]" in line
 
 
 def test_evidence_table_renders_interior_function_targets(monkeypatch, capsys):
