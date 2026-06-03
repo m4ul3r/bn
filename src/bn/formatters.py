@@ -461,6 +461,249 @@ def _render_xrefs_text(value: Any, limit: int | None = None) -> str:
     return "\n".join(lines)
 
 
+def _context_suffix(context: Any) -> str:
+    if not isinstance(context, dict):
+        return ""
+    parts = []
+    sections = context.get("sections")
+    if isinstance(sections, list) and sections:
+        names = [str(item.get("name", "")) for item in sections if isinstance(item, dict) and item.get("name")]
+        if names:
+            parts.append("section=" + ",".join(names))
+    segment = context.get("segment")
+    if isinstance(segment, dict):
+        perms = (
+            ("r" if segment.get("readable") else "-")
+            + ("w" if segment.get("writable") else "-")
+            + ("x" if segment.get("executable") else "-")
+        )
+        parts.append(f"seg={perms}")
+    symbol = context.get("symbol")
+    if isinstance(symbol, dict) and symbol.get("name"):
+        sym_type = symbol.get("type")
+        if sym_type:
+            parts.append(f"symbol={symbol['name']}[{sym_type}]")
+        else:
+            parts.append(f"symbol={symbol['name']}")
+    disasm = context.get("disasm")
+    if isinstance(disasm, str) and disasm:
+        parts.append(f"disasm={disasm}")
+    return " | " + " | ".join(parts) if parts else ""
+
+
+def _render_evidence_xrefs_text(value: Any, limit: int | None = None) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    lines = [f"xrefs to {value.get('address', '<unknown>')}"]
+    target_context = value.get("target_context")
+    suffix = _context_suffix(target_context)
+    if suffix:
+        lines.append(f"target{suffix}")
+
+    for label in ("code_refs", "data_refs"):
+        refs = list(value.get(label) or [])
+        if limit:
+            refs = refs[:limit]
+        lines.append("")
+        lines.append(f"{label.replace('_', ' ')}:")
+        if not refs:
+            lines.append("- none")
+            continue
+        for ref in refs:
+            if not isinstance(ref, dict):
+                lines.append("- " + _render_fallback_text(ref))
+                continue
+            address = ref.get("address", "<unknown>")
+            function = ref.get("function") or "<unknown>"
+            kind = ref.get("kind") or label.removesuffix("_refs")
+            lines.append(
+                f"- {address}  {kind}  {function}{_context_suffix(ref.get('context'))}"
+            )
+    return "\n".join(lines)
+
+
+def _render_target_line(target: Any) -> str:
+    if not isinstance(target, dict):
+        return "<unknown>"
+    if target.get("status") == "unmapped":
+        raw = target.get("raw") or "<unknown>"
+        return f"{raw} [unmapped/non-pointer]"
+    if target.get("status") == "null":
+        return "0x0 [null]"
+    raw = target.get("raw")
+    normalized = target.get("normalized")
+    fn = target.get("function")
+    if isinstance(fn, dict) and fn.get("name"):
+        fn_address = fn.get("address", normalized or raw or "<unknown>")
+        base = f"{fn.get('name')} @ {fn_address}"
+        if fn.get("exact_start") is False:
+            offset = fn.get("offset")
+            if offset:
+                base += str(offset) if str(offset).startswith("-") else f"+{offset}"
+            actual = normalized or raw
+            if actual and actual != fn_address:
+                base += f" (target {actual}, not start)"
+            else:
+                base += " (not start)"
+    else:
+        base = str(normalized or raw or "<unknown>")
+    if raw and normalized and raw != normalized:
+        base += f" (raw {raw})"
+    if target.get("thumb_adjusted"):
+        base += " [thumb-adjusted]"
+    if target.get("plausible") is False:
+        base += " [low-confidence]"
+    return base
+
+
+def _render_function_evidence_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    function = value.get("function") if isinstance(value.get("function"), dict) else {}
+    lines = [
+        f"{function.get('name', '<unknown>')} @ {function.get('address', '<unknown>')}",
+        f"prototype: {value.get('prototype', '<unknown>')}",
+        f"calling convention: {value.get('calling_convention', '<unknown>')}",
+    ]
+    thunk = value.get("thunk") if isinstance(value.get("thunk"), dict) else {}
+    if thunk.get("is_candidate"):
+        lines.append(f"thunk: candidate ({thunk.get('reason', 'no reason recorded')})")
+        if thunk.get("target"):
+            lines.append(f"  target: {_render_target_line(thunk['target'])}")
+    else:
+        lines.append("thunk: no")
+
+    calls = list(value.get("calls") or [])
+    lines.append("")
+    lines.append(f"calls: {len(calls)}")
+    if not calls:
+        return "\n".join(lines)
+
+    for call in calls:
+        if not isinstance(call, dict):
+            lines.append("- " + _render_fallback_text(call))
+            continue
+        call_addr = call.get("address", "<unknown>")
+        operation = call.get("operation", "<unknown>")
+        direct = "direct" if call.get("direct") else "indirect"
+        lines.append(f"- {call_addr}  {operation}  {direct}")
+        target = call.get("target")
+        if target:
+            lines.append(f"  target: {_render_target_line(target)}")
+        if call.get("call_instruction"):
+            instr = call["call_instruction"]
+            if isinstance(instr, dict):
+                lines.append(f"  instruction: {instr.get('address', call_addr)}  {instr.get('text', '')}".rstrip())
+        if call.get("hlil_statement"):
+            lines.append(f"  hlil: {call['hlil_statement']}")
+        if call.get("mlil"):
+            lines.append(f"  mlil: {call['mlil']}")
+        if call.get("llil"):
+            lines.append(f"  llil: {call['llil']}")
+        args = [arg for arg in list(call.get("arguments") or []) if isinstance(arg, dict)]
+        if args:
+            lines.append("  arguments:")
+            for arg in args:
+                lines.append(
+                    f"    {arg.get('source', '?')}[{arg.get('index', '?')}]: {arg.get('text', '')}"
+                )
+    return "\n".join(lines)
+
+
+def _render_pointer_table_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    lines = [
+        f"pointer table @ {value.get('address', '<unknown>')}",
+        f"pointer-size: {value.get('pointer_size', '<unknown>')}  stride: {value.get('stride', '<unknown>')}",
+    ]
+    suffix = _context_suffix(value.get("context"))
+    if suffix:
+        lines.append(f"context{suffix}")
+    for warning in list(value.get("warnings") or []):
+        lines.append(f"warning: {warning}")
+    lines.append("")
+    for item in list(value.get("entries") or []):
+        if not isinstance(item, dict):
+            lines.append(_render_fallback_text(item))
+            continue
+        prefix = f"[{item.get('index', '?'):>2}] {item.get('entry_address', '<unknown>')}"
+        if not item.get("readable", True):
+            lines.append(f"{prefix}  <unreadable>")
+            continue
+        plausibility = "" if item.get("plausible", True) else "  [implausible]"
+        lines.append(f"{prefix}  {item.get('value', '<unknown>')} -> {_render_target_line(item.get('target'))}{plausibility}")
+    return "\n".join(lines)
+
+
+def _render_message_lens_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    lines = [f"message lens: {value.get('query', '<unknown>')} ({value.get('count', 0)} matches)"]
+    for match in list(value.get("matches") or []):
+        if not isinstance(match, dict):
+            lines.append(_render_fallback_text(match))
+            continue
+        type_string = match.get("type_string") if isinstance(match.get("type_string"), dict) else {}
+        lines.append("")
+        lines.append(f"{type_string.get('address', '<unknown>')}  {json.dumps(type_string.get('value', ''), ensure_ascii=True)}")
+        suffix = _context_suffix(type_string.get("context"))
+        if suffix:
+            lines.append(f"  context{suffix}")
+        xrefs = match.get("xrefs") if isinstance(match.get("xrefs"), dict) else {}
+        code_count = len(list(xrefs.get("code_refs") or []))
+        data_count = len(list(xrefs.get("data_refs") or []))
+        lines.append(f"  xrefs: {code_count} code, {data_count} data")
+        for ref in list(xrefs.get("code_refs") or [])[:3]:
+            if isinstance(ref, dict):
+                lines.append(f"    code {ref.get('address', '<unknown>')}  {ref.get('function') or '<unknown>'}{_context_suffix(ref.get('context'))}")
+        for ref in list(xrefs.get("data_refs") or [])[:3]:
+            if isinstance(ref, dict):
+                lines.append(f"    data {ref.get('address', '<unknown>')}{_context_suffix(ref.get('context'))}")
+        table_windows = list(match.get("metadata_table_windows") or [])
+        if table_windows:
+            lines.append(f"  metadata table windows: {len(table_windows)}")
+            for table in table_windows[:2]:
+                if isinstance(table, dict):
+                    lines.append(f"    table @ {table.get('address', '<unknown>')}")
+                    for warning in list(table.get("warnings") or [])[:2]:
+                        lines.append(f"      warning: {warning}")
+    return "\n".join(lines)
+
+
+def _render_init_arrays_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    sections = list(value.get("sections") or [])
+    if not sections:
+        return "init arrays: none"
+    lines = [f"init arrays: {len(sections)} section(s), pointer-size={value.get('pointer_size', '<unknown>')}"]
+    for section in sections:
+        if not isinstance(section, dict):
+            lines.append(_render_fallback_text(section))
+            continue
+        lines.append("")
+        lines.append(
+            f"{section.get('name', '<unknown>')} "
+            f"{section.get('start', '<unknown>')}-{section.get('end', '<unknown>')} "
+            f"entries={section.get('total_entries', '?')}"
+        )
+        if section.get("truncated"):
+            lines.append(f"  showing first {section.get('shown_entries', '?')} entries")
+        table = section.get("table") if isinstance(section.get("table"), dict) else {}
+        for warning in list(table.get("warnings") or []):
+            lines.append(f"  warning: {warning}")
+        for item in list(table.get("entries") or []):
+            if not isinstance(item, dict):
+                continue
+            prefix = f"  [{item.get('index', '?'):>2}] {item.get('entry_address', '<unknown>')}"
+            if not item.get("readable", True):
+                lines.append(f"{prefix}  <unreadable>")
+                continue
+            lines.append(f"{prefix}  {item.get('value', '<unknown>')} -> {_render_target_line(item.get('target'))}")
+    return "\n".join(lines)
+
+
 def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) -> str:
     if not isinstance(value, list):
         return _render_fallback_text(value)

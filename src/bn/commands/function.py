@@ -7,10 +7,15 @@ from typing import Any
 from ..cli import _call, _mutation_exit_code, _parse_line_range, arg, command, mutex
 from ..formatters import (
     _render_callsites_text,
+    _render_evidence_xrefs_text,
     _render_field_xrefs_text,
+    _render_function_evidence_text,
+    _render_init_arrays_text,
     _render_function_info_text,
     _render_mutation_text,
     _render_name_address_list_text,
+    _render_message_lens_text,
+    _render_pointer_table_text,
     _render_xrefs_text,
     _text_field,
 )
@@ -285,4 +290,119 @@ def _callsites(args: argparse.Namespace) -> int:
             prefer_caller_static=bool(args.caller_static),
         ),
         stem="callsites",
+    )
+
+
+@command("evidence", "function",
+         help="Summarize generic function evidence: thunk candidates, calls, IL, and argument hints",
+         target=True,
+         args=[
+             arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
+             arg("--context", type=int, default=2,
+                 help="Number of previous and next disassembly instructions to include around calls"),
+         ])
+def _evidence_function(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "function_evidence",
+        {
+            "identifier": args.identifier,
+            "context": args.context,
+        },
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_function_evidence_text,
+        stem="function-evidence",
+    )
+
+
+@command("evidence", "xrefs",
+         help="List xrefs with section/segment/symbol/disassembly context",
+         target=True,
+         args=[
+             arg("identifier", help="Function name or address (hex 0x.. or decimal) to find inbound refs to"),
+             arg("--limit", type=int, default=None,
+                 help="Max number of refs per code/data bucket to show in text output"),
+         ])
+def _evidence_xrefs(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "xrefs",
+        {"identifier": args.identifier},
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=lambda value: _render_evidence_xrefs_text(value, limit=args.limit),
+        stem="evidence-xrefs",
+    )
+
+
+@command("evidence", "table",
+         help="Interpret memory at an address as a pointer table or vtable-like table",
+         target=True,
+         args=[
+             arg("address", help="Table start address (hex 0x.. or decimal)"),
+             arg("--entries", type=int, default=16,
+                 help="Number of pointer entries to read"),
+             arg("--stride", default=None,
+                 help="Byte stride between entries (default: target pointer size)"),
+         ])
+def _evidence_table(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "pointer_table",
+        {
+            "address": args.address,
+            "entries": args.entries,
+            "stride": args.stride,
+        },
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_pointer_table_text,
+        stem="pointer-table",
+    )
+
+
+@command("evidence", "message",
+         help="Summarize message/type-name strings, xrefs, and nearby metadata tables",
+         target=True,
+         paged=False,
+         args=[
+             arg("query", help="Message/type-name string substring to locate"),
+             arg("--limit", type=int, default=20,
+                 help="Maximum matching strings to summarize"),
+             arg("--table-entries", type=int, default=6,
+                 help="Pointer entries to show around metadata data refs"),
+         ])
+def _evidence_message(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "message_lens",
+        {
+            "query": args.query,
+            "limit": args.limit,
+            "table_entries": args.table_entries,
+        },
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_message_lens_text,
+        stem="message-lens",
+    )
+
+
+@command("evidence", "init",
+         help="Summarize constructor/destructor pointer sections such as .init_array and .ctors",
+         target=True,
+         args=[
+             arg("--limit", type=int, default=64,
+                 help="Maximum entries to show per constructor/destructor section"),
+         ])
+def _evidence_init(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "init_arrays",
+        {"limit": args.limit},
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_init_arrays_text,
+        stem="init-arrays",
     )

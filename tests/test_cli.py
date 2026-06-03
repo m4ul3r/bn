@@ -970,6 +970,292 @@ def test_xrefs_text_format_renders_summary(monkeypatch, capsys):
     assert "0x402f00  sub_403000  (1 site: 0x403000)" in output
 
 
+def test_evidence_xrefs_routes_and_renders_context(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        captured["op"] = op
+        captured["params"] = params
+        captured["target"] = target
+        return {
+            "ok": True,
+            "result": {
+                "address": "0x175b20",
+                "target_context": {
+                    "sections": [{"name": ".rodata"}],
+                    "symbol": {"name": "common.HeadUnitInfo", "type": "DataSymbol"},
+                },
+                "code_refs": [
+                    {
+                        "address": "0x586c0",
+                        "function": "sub_586a2",
+                        "kind": "code",
+                        "context": {
+                            "sections": [{"name": ".text"}],
+                            "segment": {"readable": True, "writable": False, "executable": True},
+                            "disasm": "adr r1, common.HeadUnitInfo",
+                        },
+                    }
+                ],
+                "data_refs": [],
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["evidence", "xrefs", "--format", "text", "--target", "active", "0x175b20"])
+
+    assert rc == 0
+    assert captured["op"] == "xrefs"
+    assert captured["params"]["identifier"] == "0x175b20"
+    output = capsys.readouterr().out
+    assert "target | section=.rodata | symbol=common.HeadUnitInfo[DataSymbol]" in output
+    assert "0x586c0  code  sub_586a2" in output
+    assert "seg=r-x" in output
+
+
+def test_evidence_function_routes_and_renders_calls(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        captured["op"] = op
+        captured["params"] = params
+        return {
+            "ok": True,
+            "result": {
+                "function": {"name": "build_response", "address": "0x412470"},
+                "prototype": "int32_t build_response(void*)",
+                "calling_convention": "__cdecl",
+                "thunk": {"is_candidate": False},
+                "calls": [
+                    {
+                        "address": "0x4124a0",
+                        "operation": "LLIL_CALL",
+                        "direct": True,
+                        "target": {
+                            "raw": "0x461746",
+                            "normalized": "0x461746",
+                            "function": {"name": "send_message", "address": "0x461746"},
+                        },
+                        "llil": "call(0x461746)",
+                        "hlil_statement": "send_message(6, &response)",
+                        "arguments": [
+                            {"source": "hlil", "index": 0, "text": "6"},
+                        ],
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["evidence", "function", "--target", "active", "--context", "1", "build_response"])
+
+    assert rc == 0
+    assert captured["op"] == "function_evidence"
+    assert captured["params"] == {"identifier": "build_response", "context": 1}
+    output = capsys.readouterr().out
+    assert "build_response @ 0x412470" in output
+    assert "target: send_message @ 0x461746" in output
+    assert "hlil[0]: 6" in output
+
+
+def test_evidence_table_routes_and_renders_targets(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        captured["op"] = op
+        captured["params"] = params
+        return {
+            "ok": True,
+            "result": {
+                "address": "0x64ea0",
+                "pointer_size": 4,
+                "stride": 4,
+                "warnings": [
+                    "table start is in an executable segment; this may be code, not a pointer table"
+                ],
+                "entries": [
+                    {
+                        "index": 0,
+                        "entry_address": "0x64ea0",
+                        "value": "0x46971",
+                        "readable": True,
+                        "plausible": True,
+                        "target": {
+                            "raw": "0x46971",
+                            "normalized": "0x46970",
+                            "thumb_adjusted": True,
+                            "function": {"name": "sub_46970", "address": "0x46970"},
+                        },
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["evidence", "table", "--target", "active", "--entries", "1", "0x64ea0"])
+
+    assert rc == 0
+    assert captured["op"] == "pointer_table"
+    assert captured["params"]["address"] == "0x64ea0"
+    assert captured["params"]["entries"] == 1
+    output = capsys.readouterr().out
+    assert "pointer table @ 0x64ea0" in output
+    assert "warning: table start is in an executable segment" in output
+    assert "sub_46970 @ 0x46970 (raw 0x46971) [thumb-adjusted]" in output
+
+
+def test_evidence_table_renders_interior_function_targets(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        assert op == "pointer_table"
+        return {
+            "ok": True,
+            "result": {
+                "address": "0x402000",
+                "pointer_size": 8,
+                "stride": 8,
+                "warnings": ["1 entries resolve inside functions but not at function starts"],
+                "entries": [
+                    {
+                        "index": 0,
+                        "entry_address": "0x402000",
+                        "value": "0x401001",
+                        "readable": True,
+                        "plausible": True,
+                        "target": {
+                            "raw": "0x401001",
+                            "normalized": "0x401001",
+                            "thumb_adjusted": False,
+                            "function": {
+                                "name": "target",
+                                "address": "0x401000",
+                                "exact_start": False,
+                                "offset": "0x1",
+                            },
+                        },
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["evidence", "table", "--target", "active", "--entries", "1", "0x402000"])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "warning: 1 entries resolve inside functions but not at function starts" in output
+    assert "target @ 0x401000+0x1 (target 0x401001, not start)" in output
+    assert "[thumb-adjusted]" not in output
+
+
+def test_evidence_message_routes_and_renders_lens(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        captured["op"] = op
+        captured["params"] = params
+        return {
+            "ok": True,
+            "result": {
+                "query": "HeadUnitInfo",
+                "count": 1,
+                "matches": [
+                    {
+                        "type_string": {
+                            "address": "0x175b20",
+                            "value": "common.HeadUnitInfo",
+                            "context": {"sections": [{"name": ".rodata"}]},
+                        },
+                        "xrefs": {
+                            "code_refs": [{"address": "0x586c0", "function": "sub_586a2"}],
+                            "data_refs": [{"address": "0x175bd8"}],
+                        },
+                        "metadata_table_windows": [{"address": "0x175bd0"}],
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(
+        [
+            "evidence",
+            "message",
+            "--target",
+            "active",
+            "--limit",
+            "5",
+            "--table-entries",
+            "4",
+            "HeadUnitInfo",
+        ]
+    )
+
+    assert rc == 0
+    assert captured["op"] == "message_lens"
+    assert captured["params"] == {"query": "HeadUnitInfo", "limit": 5, "table_entries": 4}
+    output = capsys.readouterr().out
+    assert "message lens: HeadUnitInfo (1 matches)" in output
+    assert "0x175b20  \"common.HeadUnitInfo\"" in output
+    assert "metadata table windows: 1" in output
+
+
+def test_evidence_init_routes_and_renders_sections(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        captured["op"] = op
+        captured["params"] = params
+        return {
+            "ok": True,
+            "result": {
+                "pointer_size": 4,
+                "sections": [
+                    {
+                        "name": ".init_array",
+                        "start": "0x5000",
+                        "end": "0x5008",
+                        "total_entries": 2,
+                        "shown_entries": 2,
+                        "truncated": False,
+                        "table": {
+                            "entries": [
+                                {
+                                    "index": 0,
+                                    "entry_address": "0x5000",
+                                    "value": "0x401001",
+                                    "readable": True,
+                                    "target": {
+                                        "raw": "0x401001",
+                                        "normalized": "0x401000",
+                                        "thumb_adjusted": True,
+                                        "function": {"name": "global_ctor", "address": "0x401000"},
+                                    },
+                                }
+                            ]
+                        },
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["evidence", "init", "--target", "active", "--limit", "4"])
+
+    assert rc == 0
+    assert captured["op"] == "init_arrays"
+    assert captured["params"] == {"limit": 4}
+    output = capsys.readouterr().out
+    assert "init arrays: 1 section(s), pointer-size=4" in output
+    assert ".init_array 0x5000-0x5008 entries=2" in output
+    assert "global_ctor @ 0x401000 (raw 0x401001) [thumb-adjusted]" in output
+
+
 def test_callsites_routes_within_scope_and_renders_text(monkeypatch, capsys):
     captured = {}
 
@@ -1911,6 +2197,58 @@ def test_strings_passes_section_and_no_crt_to_bridge(monkeypatch, capsys):
     assert rc == 0
     assert captured_params["section"] == ".rodata"
     assert captured_params["no_crt"] is True
+
+
+def test_strings_passes_regex_to_bridge(monkeypatch, capsys):
+    captured_params = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        if op == "strings":
+            captured_params.update(params)
+            return {"ok": True, "result": []}
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["strings", "--target", "active", "--query", "foo|bar", "--regex"])
+
+    assert rc == 0
+    assert captured_params["query"] == "foo|bar"
+    assert captured_params["regex"] is True
+
+
+def test_strings_query_value_can_look_like_flag(monkeypatch, capsys):
+    captured_queries = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        if op == "strings":
+            captured_queries.append(params["query"])
+            return {"ok": True, "result": []}
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["strings", "--target", "active", "--query", "-h"])
+    assert rc == 0
+
+    rc = bn.cli.main(["strings", "--target", "active", "--query", "--"])
+
+    assert rc == 0
+    assert captured_queries == ["-h", "--"]
+
+
+def test_strings_query_does_not_swallow_known_sibling_flags(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        raise AssertionError("parse failure should happen before bridge call")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    with pytest.raises(SystemExit) as exc_info:
+        bn.cli.main(["strings", "--target", "active", "--query", "--regex"])
+
+    assert exc_info.value.code == 2
+    _, stderr = capsys.readouterr()
+    assert "argument --query: expected one argument" in stderr
 
 
 # --- I5: sections CLI ---

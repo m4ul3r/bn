@@ -20,6 +20,8 @@ from ..transport import BridgeError
 @command("strings", help="List or search strings", target=True, paged=True,
          args=[
              arg("--query"),
+             arg("--regex", action="store_true", default=False,
+                 help="Interpret --query as a case-insensitive regular expression"),
              arg("--min-length", type=int, default=None,
                  help="Exclude strings shorter than N characters"),
              arg("--section",
@@ -38,6 +40,7 @@ def _strings(args: argparse.Namespace) -> int:
             "min_length": args.min_length,
             "section": args.section,
             "no_crt": args.no_crt,
+            "regex": bool(args.regex),
         },
         require_target=True,
         allow_implicit_target=True,

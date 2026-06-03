@@ -101,9 +101,14 @@ class _FakeInstructionInfo:
 
 
 class _FakeArch:
-    def __init__(self, lengths=None):
+    def __init__(self, lengths=None, *, name: str = "x86", address_size: int = 4):
+        self.name = name
+        self.address_size = address_size
         self.max_instr_length = 16
         self.lengths = dict(lengths or {})
+
+    def __str__(self):
+        return self.name
 
     def get_instruction_info(self, data, address):
         return _FakeInstructionInfo(self.lengths.get(int(address), 1))
@@ -203,6 +208,12 @@ class _FakeStringRef:
         self.type = string_type
 
 
+class _FakeCodeRef:
+    def __init__(self, address: int, function=None):
+        self.address = address
+        self.function = function
+
+
 class _FakeSection:
     def __init__(self, name: str, start: int, end: int, semantics: int = 0):
         self.name = name
@@ -220,7 +231,7 @@ class _FakeSegment:
 
 class _FakeBV:
     def __init__(self, *, functions=None, symbols=None, types_=None, arch=None, disassembly=None, instruction_lengths=None,
-                 strings=None, sections=None, segments=None, memory=None):
+                 strings=None, sections=None, segments=None, memory=None, code_refs=None, data_refs=None):
         self.functions = list(functions or [])
         self._symbols = list(symbols or [])
         self.types = dict(types_ or {})
@@ -232,6 +243,8 @@ class _FakeBV:
         self._segments = dict(segments or {})
         # Map of {base_address: bytes} describing contiguous mapped regions.
         self._memory = dict(memory or {})
+        self._code_refs = dict(code_refs or {})
+        self._data_refs = dict(data_refs or {})
 
     def get_function_at(self, address: int):
         for fn in self.functions:
@@ -273,7 +286,10 @@ class _FakeBV:
         return self._disassembly.get(int(address), "")
 
     def get_code_refs(self, address: int):
-        return []
+        return list(self._code_refs.get(int(address), []))
+
+    def get_data_refs(self, address: int):
+        return list(self._data_refs.get(int(address), []))
 
     def get_symbols_of_type(self, sym_type):
         return [s for s in self._symbols if getattr(s, "type", None) == sym_type]
@@ -1405,6 +1421,229 @@ def test_callsites_filters_placeholder_pre_branch_condition(monkeypatch):
     assert rows[0]["pre_branch_condition"] is None
 
 
+def test_xrefs_include_address_context(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    caller = _FakeFunction(0x401000, "caller")
+    target = _FakeFunction(0x402000, "target")
+    bv = _FakeBV(
+        functions=[caller, target],
+        symbols=[bridge.bn.Symbol(bridge.bn.SymbolType.DataSymbol, 0x5000, "type_name")],
+        code_refs={0x5000: [_FakeCodeRef(0x401010, caller)]},
+        data_refs={0x5000: [0x6000]},
+        disassembly={0x401010: "ldr r0, =type_name"},
+        sections={
+            ".text": _FakeSection(".text", 0x400000, 0x410000),
+            ".rodata": _FakeSection(".rodata", 0x5000, 0x7000),
+        },
+        segments={
+            0x401010: _FakeSegment(readable=True, executable=True),
+            0x5000: _FakeSegment(readable=True),
+            0x6000: _FakeSegment(readable=True, writable=True),
+        },
+    )
+
+    result = instance._xrefs_to_address(bv, 0x5000)
+
+    assert result["target_context"]["symbol"]["name"] == "type_name"
+    assert result["code_refs"][0]["context"]["disasm"] == "ldr r0, =type_name"
+    assert result["code_refs"][0]["context"]["sections"][0]["name"] == ".text"
+    assert result["data_refs"][0]["context"]["sections"][0]["name"] == ".rodata"
+
+
+def test_function_evidence_reports_calls_arguments_and_thunk_candidate(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    callee = _FakeFunction(0x461746, "send_message")
+    caller = _FakeFunction(0x412470, "build_response")
+    call_expr = _FakeHLILInstruction(
+        "send_message(6, &response)",
+        class_name="HighLevelILCall",
+        expr_index=30,
+        instr_index=30,
+    )
+    call_expr.params = [6, "&response"]
+    call_insn = _FakeLLILInstruction(0x4124A0, _FakeConstPtr(0x461746), hlils=[call_expr])
+    call_insn.params = [_FakeReg("r0"), _FakeConstPtr(6), _FakeReg("r2")]
+    caller.basic_blocks = [_FakeBasicBlock(0x41249C, 0x4124A8)]
+    caller.low_level_il = [[call_insn]]
+    thunk = _FakeFunction(0x500000, "j_send_message")
+    thunk.basic_blocks = [_FakeBasicBlock(0x500000, 0x500004)]
+    thunk.low_level_il = [[_FakeLLILInstruction(0x500000, _FakeConstPtr(0x461746), operation="LLIL_JUMP")]]
+    bv = _FakeBV(
+        functions=[callee, caller, thunk],
+        instruction_lengths={0x41249C: 2, 0x41249E: 2, 0x4124A0: 4, 0x4124A4: 4},
+        disassembly={
+            0x41249C: "mov r1, #6",
+            0x41249E: "mov r2, response",
+            0x4124A0: "bl send_message",
+            0x4124A4: "pop {pc}",
+            0x500000: "b send_message",
+        },
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_evidence("active", "build_response", context=1)
+    call = result["calls"][0]
+
+    assert call["direct"] is True
+    assert call["target"]["function"]["name"] == "send_message"
+    assert {arg["source"] for arg in call["arguments"]} == {"llil", "hlil"}
+    assert call["previous_instructions"][0]["text"] == "mov r2, response"
+
+    thunk_result = instance._function_evidence("active", "j_send_message", context=0)
+    assert thunk_result["thunk"]["is_candidate"] is True
+    assert thunk_result["thunk"]["target"]["function"]["name"] == "send_message"
+
+
+def test_pointer_table_normalizes_thumb_function_pointers(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    target = _FakeFunction(0x401000, "handler")
+    table = (0x401001).to_bytes(4, "little") + (0x402000).to_bytes(4, "little")
+
+    class _ThumbTolerantBV(_FakeBV):
+        def get_function_at(self, address: int):
+            if int(address) == 0x401001:
+                return target
+            return super().get_function_at(address)
+
+    bv = _ThumbTolerantBV(functions=[target], arch=_FakeArch(name="armv7"), memory={0x3000: table})
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._pointer_table("active", "0x3000", entries=2)
+
+    assert result["entries"][0]["value"] == "0x401001"
+    assert result["entries"][0]["target"]["normalized"] == "0x401000"
+    assert result["entries"][0]["target"]["thumb_adjusted"] is True
+    assert result["entries"][0]["target"]["function"]["name"] == "handler"
+    assert result["entries"][0]["target"]["function"]["exact_start"] is True
+    assert result["entries"][0]["target"]["context"]["address"] == "0x401000"
+    assert result["entries"][1]["target"]["function"] is None
+    assert result["entries"][1]["target"]["plausible"] is False
+
+
+def test_pointer_table_does_not_thumb_normalize_non_arm_pointers(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    target = _FakeFunction(0x401000, "handler")
+    table = (0x401001).to_bytes(4, "little")
+
+    class _OddTolerantBV(_FakeBV):
+        def get_function_at(self, address: int):
+            if int(address) == 0x401001:
+                return target
+            return super().get_function_at(address)
+
+    bv = _OddTolerantBV(functions=[target], arch=_FakeArch(name="x86"), memory={0x3000: table})
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._pointer_table("active", "0x3000", entries=1)
+    target_info = result["entries"][0]["target"]
+
+    assert target_info["raw"] == "0x401001"
+    assert target_info["normalized"] == "0x401001"
+    assert target_info["thumb_adjusted"] is False
+    assert target_info["function"]["name"] == "handler"
+    assert target_info["function"]["exact_start"] is False
+    assert target_info["function"]["offset"] == "0x1"
+    assert target_info["context"]["address"] == "0x401001"
+    assert any("inside functions" in warning for warning in result["warnings"])
+
+
+def test_function_evidence_marks_plt_stubs_as_thunk_candidates(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    plt = _FakeFunction(0x404020, "puts@plt")
+    plt.basic_blocks = [_FakeBasicBlock(0x404020, 0x404026)]
+    plt.low_level_il = [[_FakeLLILInstruction(0x404020, _FakeReg("rax"), operation="LLIL_JUMP")]]
+    bv = _FakeBV(
+        functions=[plt],
+        sections={".plt.got": _FakeSection(".plt.got", 0x404020, 0x404100)},
+        disassembly={0x404020: "jmp qword ptr [rip+0x2000]"},
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_evidence("active", "puts@plt", context=0)
+
+    assert result["thunk"]["is_candidate"] is True
+    assert "PLT" in result["thunk"]["reason"]
+
+
+def test_pointer_table_warns_when_start_looks_like_code_not_table(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    memory = {0x64EA0: b"\xfb\x6b\xdb\xb2\x00\x2b\x00\xf0"}
+    bv = _FakeBV(
+        sections={".text": _FakeSection(".text", 0x64000, 0x65000)},
+        segments={0x64EA0: _FakeSegment(readable=True, executable=True)},
+        memory=memory,
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._pointer_table("active", "0x64ea0", entries=2)
+
+    assert all(entry["plausible"] is False for entry in result["entries"])
+    assert any("executable segment" in warning for warning in result["warnings"])
+    assert any("low confidence" in warning for warning in result["warnings"])
+
+
+def test_message_lens_summarizes_type_string_xrefs_and_metadata_window(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    builder = _FakeFunction(0x586A2, "build_type_name")
+    memory = {0x6000: (0x586A3).to_bytes(4, "little") + (0x7000).to_bytes(4, "little")}
+    bv = _FakeBV(
+        functions=[builder],
+        arch=_FakeArch(name="armv7"),
+        strings=[_FakeStringRef(0x175B20, 19, "common.HeadUnitInfo")],
+        code_refs={0x175B20: [_FakeCodeRef(0x586C0, builder)]},
+        data_refs={0x175B20: [0x6008]},
+        disassembly={0x586C0: "adr r1, common.HeadUnitInfo"},
+        memory=memory,
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._message_lens("active", "HeadUnitInfo", limit=5, table_entries=2)
+
+    assert result["count"] == 1
+    match = result["matches"][0]
+    assert match["type_string"]["value"] == "common.HeadUnitInfo"
+    assert match["xrefs"]["code_refs"][0]["function"] == "build_type_name"
+    assert match["metadata_table_windows"][0]["address"] == "0x6000"
+    assert match["metadata_table_windows"][0]["entries"][0]["target"]["thumb_adjusted"] is True
+
+
+def test_message_lens_metadata_window_stops_at_obvious_non_pointer(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    builder = _FakeFunction(0x586A2, "build_type_name")
+    # First pointer resolves to code, then ASCII bytes "N6co" as little-endian
+    # integer. The lens should include the bad entry as evidence and stop.
+    memory = {
+        0x6000: (
+            (0x586A3).to_bytes(4, "little")
+            + int.from_bytes(b"N6co", "little").to_bytes(4, "little")
+            + int.from_bytes(b"mmon", "little").to_bytes(4, "little")
+        )
+    }
+    bv = _FakeBV(
+        functions=[builder],
+        arch=_FakeArch(name="armv7"),
+        strings=[_FakeStringRef(0x175BE4, 23, "N6common12HeadUnitInfoE")],
+        data_refs={0x175BE4: [0x6008]},
+        memory=memory,
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._message_lens("active", "HeadUnitInfo", limit=5, table_entries=8)
+    table = result["matches"][0]["metadata_table_windows"][0]
+
+    assert len(table["entries"]) == 2
+    assert table["entries"][1]["target"]["status"] == "unmapped"
+    assert any("stopped after" in warning for warning in table["warnings"])
+
+
 def test_bridge_handler_swallows_broken_pipe(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     warnings = []
@@ -1690,6 +1929,32 @@ def test_strings_filters_combine(monkeypatch):
     assert result[0]["value"] == "player"
 
 
+def test_strings_regex_search_matches_or_patterns(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        strings=[
+            _FakeStringRef(0x5000, 7, "Vehicle"),
+            _FakeStringRef(0x5010, 12, "HeadUnitInfo"),
+            _FakeStringRef(0x5020, 4, "skip"),
+        ]
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._strings(None, query="vehicle|headunit", offset=0, limit=100, regex=True)
+
+    assert [item["value"] for item in result] == ["Vehicle", "HeadUnitInfo"]
+
+
+def test_strings_invalid_regex_is_actionable(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: _FakeBV())
+
+    with pytest.raises(bridge.OperationFailure, match="Invalid string regex"):
+        instance._strings(None, query="(", offset=0, limit=100, regex=True)
+
+
 # --- I5: sections ---
 
 
@@ -1732,6 +1997,32 @@ def test_sections_returns_all_sections_with_permissions(monkeypatch):
     assert rodata_sec["name"] == ".rodata"
     assert rodata_sec["semantics"] == "ReadOnlyData"
     assert rodata_sec["executable"] is False
+
+
+def test_init_arrays_summarizes_constructor_pointer_sections(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    ctor = _FakeFunction(0x401000, "global_ctor")
+    table = (0x401001).to_bytes(4, "little") + (0x402000).to_bytes(4, "little")
+    bv = _FakeBV(
+        functions=[ctor],
+        arch=_FakeArch(name="armv7"),
+        sections={
+            ".init_array": _FakeSection(".init_array", 0x5000, 0x5008),
+            ".data": _FakeSection(".data", 0x6000, 0x6010),
+        },
+        memory={0x5000: table},
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._init_arrays("active", limit=4)
+
+    assert result["pointer_size"] == 4
+    assert len(result["sections"]) == 1
+    section = result["sections"][0]
+    assert section["name"] == ".init_array"
+    assert section["total_entries"] == 2
+    assert section["table"]["entries"][0]["target"]["function"]["name"] == "global_ctor"
 
 
 def test_sections_query_filters_by_name(monkeypatch):

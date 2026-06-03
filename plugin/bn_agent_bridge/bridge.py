@@ -158,8 +158,12 @@ READ_LOCKED_OPS = {
     "decompile",
     "il",
     "disasm",
+    "function_evidence",
     "xrefs",
     "field_xrefs",
+    "pointer_table",
+    "message_lens",
+    "init_arrays",
     "types",
     "type_info",
     "strings",
@@ -740,10 +744,35 @@ class BinaryNinjaBridge:
             return self._il(target, params["identifier"], str(params.get("view", "hlil")), bool(params.get("ssa")))
         if op == "disasm":
             return self._disasm(target, params["identifier"])
+        if op == "function_evidence":
+            return self._function_evidence(
+                target,
+                params["identifier"],
+                context=int(params.get("context", 2)),
+            )
         if op == "xrefs":
             return self._xrefs(target, params["identifier"])
         if op == "field_xrefs":
             return self._field_xrefs(target, str(params["field"]))
+        if op == "pointer_table":
+            return self._pointer_table(
+                target,
+                params["address"],
+                entries=int(params.get("entries", 16)),
+                stride=params.get("stride"),
+            )
+        if op == "message_lens":
+            return self._message_lens(
+                target,
+                str(params["query"]),
+                limit=int(params.get("limit", 20)),
+                table_entries=int(params.get("table_entries", 6)),
+            )
+        if op == "init_arrays":
+            return self._init_arrays(
+                target,
+                limit=int(params.get("limit", 64)),
+            )
         if op == "types":
             return self._types(
                 target,
@@ -766,6 +795,7 @@ class BinaryNinjaBridge:
                 min_length=int(params["min_length"]) if params.get("min_length") is not None else None,
                 section=params.get("section"),
                 no_crt=bool(params.get("no_crt", False)),
+                regex=bool(params.get("regex", False)),
             )
         if op == "imports":
             return self._imports(target)
@@ -1160,6 +1190,184 @@ class BinaryNinjaBridge:
         except Exception:
             fn = bv.get_function_at(address)
             return [fn] if fn is not None else []
+
+    def _sections_at(self, bv, address: int) -> list[dict[str, Any]]:
+        try:
+            sections = list(bv.get_sections_at(address))
+        except Exception:
+            sections = []
+            for name, sec in getattr(bv, "sections", {}).items():
+                try:
+                    if int(sec.start) <= address < int(sec.end):
+                        sections.append(sec)
+                except Exception:
+                    continue
+
+        result = []
+        for sec in sections:
+            try:
+                start = int(getattr(sec, "start", 0))
+                end = int(getattr(sec, "end", 0))
+            except Exception:
+                start = end = 0
+            result.append(
+                {
+                    "name": str(getattr(sec, "name", "")),
+                    "start": hex(start),
+                    "end": hex(end),
+                }
+            )
+        return result
+
+    def _segment_at(self, bv, address: int) -> dict[str, Any] | None:
+        try:
+            seg = bv.get_segment_at(address)
+        except Exception:
+            seg = None
+        if seg is None:
+            return None
+        entry: dict[str, Any] = {
+            "readable": bool(getattr(seg, "readable", False)),
+            "writable": bool(getattr(seg, "writable", False)),
+            "executable": bool(getattr(seg, "executable", False)),
+        }
+        for attr in ("start", "end"):
+            value = getattr(seg, attr, None)
+            if value is not None:
+                try:
+                    entry[attr] = hex(int(value))
+                except Exception:
+                    pass
+        return entry
+
+    def _symbol_at(self, bv, address: int) -> dict[str, Any] | None:
+        try:
+            symbol = bv.get_symbol_at(address)
+        except Exception:
+            symbol = None
+        if symbol is None:
+            return None
+        raw_type = getattr(symbol, "type", None)
+        kind = getattr(raw_type, "name", None) or str(raw_type)
+        return {
+            "name": str(getattr(symbol, "name", "")),
+            "raw_name": str(getattr(symbol, "raw_name", getattr(symbol, "name", ""))),
+            "type": kind,
+        }
+
+    def _function_entry_for_address(self, bv, address: int) -> dict[str, Any] | None:
+        try:
+            fn = bv.get_function_at(address)
+        except Exception:
+            fn = None
+        if fn is None:
+            functions = self._functions_containing(bv, address)
+            fn = functions[0] if functions else None
+        if fn is None:
+            return None
+        function_start = int(fn.start)
+        entry = {
+            "name": str(fn.name),
+            "address": hex(function_start),
+            "exact_start": function_start == int(address),
+        }
+        if function_start != int(address):
+            delta = int(address) - function_start
+            entry["offset"] = f"-{hex(abs(delta))}" if delta < 0 else hex(delta)
+        return entry
+
+    def _address_context(self, bv, address: int, *, include_disasm: bool = False) -> dict[str, Any]:
+        context: dict[str, Any] = {
+            "address": hex(int(address)),
+            "sections": self._sections_at(bv, address),
+            "segment": self._segment_at(bv, address),
+            "symbol": self._symbol_at(bv, address),
+            "function": self._function_entry_for_address(bv, address),
+        }
+        if include_disasm:
+            try:
+                context["disasm"] = bv.get_disassembly(address) or ""
+            except Exception:
+                context["disasm"] = ""
+        return context
+
+    def _pointer_size(self, bv) -> int:
+        for obj in (bv, getattr(bv, "arch", None)):
+            value = getattr(obj, "address_size", None)
+            if value is None:
+                continue
+            try:
+                size = int(value)
+                if size > 0:
+                    return size
+            except Exception:
+                pass
+        return 4
+
+    def _byteorder(self, bv) -> str:
+        for obj in (bv, getattr(bv, "arch", None)):
+            value = getattr(obj, "endianness", None)
+            text = str(value)
+            if "Big" in text or "big" in text:
+                return "big"
+        return "little"
+
+    def _supports_thumb_pointer_tags(self, bv) -> bool:
+        if self._pointer_size(bv) != 4:
+            return False
+        names = []
+        arch = getattr(bv, "arch", None)
+        for obj in (arch, getattr(bv, "platform", None)):
+            if obj is None:
+                continue
+            for attr in ("name", "raw_name"):
+                value = getattr(obj, attr, None)
+                if value:
+                    names.append(str(value).lower())
+            names.append(str(obj).lower())
+        joined = " ".join(names)
+        if "aarch64" in joined or "arm64" in joined:
+            return False
+        return "thumb" in joined or "arm" in joined
+
+    def _read_pointer_value(self, bv, address: int, *, size: int | None = None) -> int | None:
+        pointer_size = size or self._pointer_size(bv)
+        try:
+            data = bytes(bv.read(address, pointer_size))
+        except Exception:
+            return None
+        if len(data) != pointer_size:
+            return None
+        return int.from_bytes(data, self._byteorder(bv), signed=False)
+
+    def _normalize_code_pointer(self, bv, value: int) -> dict[str, Any]:
+        raw = int(value)
+        normalized = raw
+        thumb_adjusted = False
+        if raw & 1 and self._supports_thumb_pointer_tags(bv):
+            candidate = raw & ~1
+            candidate_function = self._function_entry_for_address(bv, candidate)
+            if candidate_function is not None:
+                normalized = candidate
+                thumb_adjusted = True
+                function = candidate_function
+            else:
+                function = self._function_entry_for_address(bv, normalized)
+        else:
+            function = self._function_entry_for_address(bv, normalized)
+        context = self._address_context(bv, normalized, include_disasm=bool(function))
+        segment = context.get("segment")
+        status = "function" if function is not None else "mapped" if segment is not None else "null" if raw == 0 else "unmapped"
+        plausible = status in {"function", "mapped", "null"}
+        return {
+            "raw": hex(raw),
+            "normalized": hex(normalized),
+            "thumb_adjusted": thumb_adjusted,
+            "function": function,
+            "status": status,
+            "plausible": plausible,
+            "context": context,
+        }
 
     def _find_variable_by_storage(self, func, storage: int, *, is_parameter: bool | None = None):
         collections = []
@@ -1898,21 +2106,29 @@ class BinaryNinjaBridge:
     def _xrefs_to_address(self, bv, address: int) -> dict[str, Any]:
         code_refs = []
         data_refs = []
-        for ref in sorted(list(bv.get_code_refs(address)), key=lambda item: int(item.address)):
+        get_code_refs = getattr(bv, "get_code_refs", None)
+        raw_code_refs = list(get_code_refs(address)) if callable(get_code_refs) else []
+        for ref in sorted(raw_code_refs, key=lambda item: int(item.address)):
             fn = getattr(ref, "function", None)
             caller = (
                 {"address": hex(int(fn.start)), "name": str(fn.name)}
                 if fn is not None
                 else None
             )
+            ref_addr = int(ref.address)
             code_refs.append(
                 {
                     "function": fn.name if fn is not None else None,
-                    "address": hex(ref.address),
+                    "address": hex(ref_addr),
                     "caller_function": caller,
+                    "kind": "code",
+                    "context": self._address_context(bv, ref_addr, include_disasm=True),
                 }
             )
-        for ref_addr in sorted(list(bv.get_data_refs(address))):
+        get_data_refs = getattr(bv, "get_data_refs", None)
+        raw_data_refs = list(get_data_refs(address)) if callable(get_data_refs) else []
+        for ref_addr in sorted(raw_data_refs):
+            ref_addr = int(ref_addr)
             functions = self._functions_containing(bv, ref_addr)
             fn = functions[0] if functions else None
             caller = (
@@ -1925,9 +2141,16 @@ class BinaryNinjaBridge:
                     "function": fn.name if fn is not None else None,
                     "address": hex(ref_addr),
                     "caller_function": caller,
+                    "kind": "data",
+                    "context": self._address_context(bv, ref_addr),
                 }
             )
-        return {"address": hex(address), "code_refs": code_refs, "data_refs": data_refs}
+        return {
+            "address": hex(address),
+            "target_context": self._address_context(bv, address, include_disasm=True),
+            "code_refs": code_refs,
+            "data_refs": data_refs,
+        }
 
     def _parse_function_address_bounds(
         self,
@@ -2233,6 +2456,338 @@ class BinaryNinjaBridge:
             "text": self._disasm_text(bv, func),
         }
 
+    def _call_destination_value(self, insn) -> int | None:
+        return self._llil_constant_value(getattr(insn, "dest", None))
+
+    def _target_entry_for_call(self, bv, value: int | None) -> dict[str, Any] | None:
+        if value is None:
+            return None
+        return self._normalize_code_pointer(bv, value)
+
+    def _il_argument_texts(self, node) -> list[str]:
+        for attr in ("params", "parameters"):
+            params = getattr(node, attr, None)
+            if params is None:
+                continue
+            try:
+                return [str(item) for item in list(params)]
+            except Exception:
+                return [str(params)]
+        return []
+
+    def _call_argument_evidence(self, insn) -> list[dict[str, Any]]:
+        evidence = []
+        seen: set[tuple[str, int, str]] = set()
+
+        def add(source: str, args: list[str]) -> None:
+            for index, text in enumerate(args):
+                marker = (source, index, text)
+                if marker in seen:
+                    continue
+                seen.add(marker)
+                evidence.append({"source": source, "index": index, "text": text})
+
+        for source, node in (
+            ("llil", insn),
+            ("mlil", getattr(insn, "mapped_medium_level_il", None)),
+        ):
+            if node is not None:
+                add(source, self._il_argument_texts(node))
+
+        for call in self._hlil_call_roots(insn):
+            add("hlil", self._il_argument_texts(call))
+        return evidence
+
+    def _function_call_evidence(self, bv, func, *, context: int) -> list[dict[str, Any]]:
+        disasm_entries = self._structured_disasm_entries(bv, func)
+        index_by_addr = {
+            int(item["_address_int"]): index for index, item in enumerate(disasm_entries)
+        }
+        calls = []
+        for insn in self._iter_llil_instructions(func):
+            op_name = self._il_op_name(insn)
+            if op_name not in {
+                "LLIL_CALL",
+                "LLIL_CALL_STACK_ADJUST",
+                "LLIL_TAILCALL",
+            }:
+                continue
+            call_addr = int(getattr(insn, "address", 0))
+            disasm_index = index_by_addr.get(call_addr)
+            previous: list[dict[str, Any]] = []
+            next_instructions: list[dict[str, Any]] = []
+            call_instruction = self._disasm_entry(bv, call_addr, arch=getattr(func, "arch", None))
+            if disasm_index is not None:
+                previous = [
+                    {"address": item["address"], "text": item["text"]}
+                    for item in disasm_entries[max(0, disasm_index - context) : disasm_index]
+                ]
+                next_instructions = [
+                    {"address": item["address"], "text": item["text"]}
+                    for item in disasm_entries[disasm_index + 1 : disasm_index + 1 + context]
+                ]
+                call_instruction = {
+                    "address": disasm_entries[disasm_index]["address"],
+                    "text": disasm_entries[disasm_index]["text"],
+                }
+
+            mlil = getattr(insn, "mapped_medium_level_il", None)
+            dest_value = self._call_destination_value(insn)
+            target = self._target_entry_for_call(bv, dest_value)
+            calls.append(
+                {
+                    "address": hex(call_addr),
+                    "operation": op_name,
+                    "direct": dest_value is not None,
+                    "target": target,
+                    "llil": str(insn),
+                    "mlil": str(mlil) if mlil is not None else None,
+                    "hlil_statement": self._hlil_statement_text(insn),
+                    "pre_branch_condition": self._hlil_pre_branch_condition(insn),
+                    "arguments": self._call_argument_evidence(insn),
+                    "call_instruction": call_instruction,
+                    "previous_instructions": previous,
+                    "next_instructions": next_instructions,
+                }
+            )
+        return calls
+
+    def _function_thunk_summary(self, bv, func) -> dict[str, Any]:
+        sections = self._sections_at(bv, int(func.start))
+        if any("plt" in str(section.get("name", "")).lower() for section in sections):
+            return {
+                "is_candidate": True,
+                "reason": "function starts in a PLT/import trampoline section",
+                "target": None,
+                "sections": sections,
+            }
+
+        llil = [
+            insn
+            for insn in self._iter_llil_instructions(func)
+            if self._il_op_name(insn) not in {"LLIL_NOP", "LLIL_UNDEF"}
+        ]
+        result: dict[str, Any] = {
+            "is_candidate": False,
+            "reason": None,
+            "target": None,
+            "sections": sections,
+        }
+        if not llil or len(llil) > 3:
+            return result
+        for insn in llil:
+            op_name = self._il_op_name(insn)
+            if op_name not in {"LLIL_JUMP", "LLIL_TAILCALL", "LLIL_CALL", "LLIL_CALL_STACK_ADJUST"}:
+                continue
+            target = self._target_entry_for_call(bv, self._call_destination_value(insn))
+            if target is None:
+                continue
+            result.update(
+                {
+                    "is_candidate": True,
+                    "reason": f"small function with {op_name.lower()} to another address",
+                    "target": target,
+                }
+            )
+            return result
+
+        try:
+            text = self._decompile_text(bv, func)
+        except Exception:
+            text = ""
+        if "/* tailcall */" in text and len(llil) <= 3:
+            result.update(
+                {
+                    "is_candidate": True,
+                    "reason": "small function rendered as a pseudo-C tailcall",
+                }
+            )
+        return result
+
+    def _function_evidence(self, selector: str | None, identifier, *, context: int = 2):
+        if context < 0:
+            raise OperationFailure("invalid_context", f"Invalid evidence context size: {context}")
+        bv = self._resolve_view(selector)
+        func = self._find_function(bv, identifier)
+        text = self._decompile_text(bv, func)
+        return {
+            "function": {
+                "name": func.name,
+                "address": hex(func.start),
+                "raw_name": getattr(func, "raw_name", func.name),
+            },
+            **self._function_metadata(func),
+            "thunk": self._function_thunk_summary(bv, func),
+            "calls": self._function_call_evidence(bv, func, context=context),
+            "warnings": self._render_warnings(text),
+        }
+
+    def _pointer_table_for_view(
+        self,
+        bv,
+        start: int,
+        *,
+        entries: int,
+        stride_size: int,
+        stop_after_invalid: int | None = None,
+    ) -> dict[str, Any]:
+        pointer_size = self._pointer_size(bv)
+        rows = []
+        warnings = []
+        invalid_run = 0
+        for index in range(entries):
+            entry_address = start + index * stride_size
+            value = self._read_pointer_value(bv, entry_address, size=pointer_size)
+            if value is None:
+                rows.append(
+                    {
+                        "index": index,
+                        "entry_address": hex(entry_address),
+                        "value": None,
+                        "readable": False,
+                    }
+                )
+                invalid_run += 1
+                if stop_after_invalid is not None and invalid_run >= stop_after_invalid:
+                    warnings.append(
+                        f"stopped after {invalid_run} unreadable/implausible entries at {hex(entry_address)}"
+                    )
+                    break
+                continue
+            target = self._normalize_code_pointer(bv, value)
+            if target["plausible"] or target["status"] == "null":
+                invalid_run = 0
+            else:
+                invalid_run += 1
+            rows.append(
+                {
+                    "index": index,
+                    "entry_address": hex(entry_address),
+                    "value": hex(value),
+                    "readable": True,
+                    "plausible": bool(target["plausible"]),
+                    "target": target,
+                }
+            )
+            if stop_after_invalid is not None and invalid_run >= stop_after_invalid:
+                warnings.append(
+                    f"stopped after {invalid_run} unreadable/implausible entries at {hex(entry_address)}"
+                )
+                break
+
+        table_context = self._address_context(bv, start)
+        segment = table_context.get("segment")
+        section_names = [
+            str(section.get("name", "")).lower()
+            for section in list(table_context.get("sections") or [])
+            if isinstance(section, dict)
+        ]
+        code_like_section = any(
+            name in {".text", "__text"} or name.startswith(".plt")
+            for name in section_names
+        )
+        data_like_section = any(
+            marker in name
+            for name in section_names
+            for marker in ("data", "rodata", "got", "rdata", "bss", "init_array", "fini_array", "ctors", "dtors")
+        )
+        if isinstance(segment, dict) and segment.get("executable") and (code_like_section or not data_like_section):
+            warnings.append("table start is in an executable segment; this may be code, not a pointer table")
+        non_null_rows = [
+            row for row in rows
+            if row.get("readable") and row.get("value") not in {None, "0x0"}
+        ]
+        plausible_rows = [row for row in non_null_rows if row.get("plausible")]
+        if non_null_rows and not plausible_rows:
+            warnings.append("no non-null entries resolve to mapped addresses; low confidence pointer table")
+        elif non_null_rows and len(plausible_rows) < len(non_null_rows):
+            warnings.append(
+                f"{len(non_null_rows) - len(plausible_rows)} non-null entries do not resolve to mapped addresses"
+            )
+        interior_function_rows = [
+            row for row in non_null_rows
+            if isinstance(row.get("target"), dict)
+            and isinstance(row["target"].get("function"), dict)
+            and row["target"]["function"].get("exact_start") is False
+        ]
+        if interior_function_rows:
+            warnings.append(
+                f"{len(interior_function_rows)} entries resolve inside functions but not at function starts"
+            )
+        return {
+            "address": hex(start),
+            "pointer_size": pointer_size,
+            "stride": stride_size,
+            "context": table_context,
+            "entries": rows,
+            "warnings": warnings,
+        }
+
+    def _pointer_table(self, selector: str | None, address, *, entries: int = 16, stride=None):
+        if entries < 0:
+            raise OperationFailure("invalid_entries", f"Invalid table entry count: {entries}")
+        bv = self._resolve_view(selector)
+        start = _parse_address(address)
+        pointer_size = self._pointer_size(bv)
+        stride_size = _parse_address(stride) if stride not in (None, "") else pointer_size
+        if stride_size <= 0:
+            raise OperationFailure("invalid_stride", f"Invalid table stride: {stride_size}")
+        return self._pointer_table_for_view(
+            bv,
+            start,
+            entries=entries,
+            stride_size=stride_size,
+        )
+
+    def _message_lens(self, selector: str | None, query: str, *, limit: int = 20, table_entries: int = 6):
+        if limit < 0:
+            raise OperationFailure("invalid_limit", f"Invalid message lens limit: {limit}")
+        bv = self._resolve_view(selector)
+        needle = query.lower()
+        matches = []
+        for item in list(getattr(bv, "strings", [])):
+            value = str(getattr(item, "value", ""))
+            if needle and needle not in value.lower():
+                continue
+            address = int(getattr(item, "start", 0))
+            xrefs = self._xrefs_to_address(bv, address)
+            metadata_tables = []
+            for ref in list(xrefs.get("data_refs") or [])[:3]:
+                try:
+                    ref_addr = _parse_address(ref["address"])
+                except Exception:
+                    continue
+                start = max(0, ref_addr - self._pointer_size(bv) * 2)
+                metadata_tables.append(
+                    self._pointer_table_for_view(
+                        bv,
+                        start,
+                        entries=table_entries,
+                        stride_size=self._pointer_size(bv),
+                        stop_after_invalid=1,
+                    )
+                )
+
+            matches.append(
+                {
+                    "type_string": {
+                        "address": hex(address),
+                        "value": value,
+                        "length": int(getattr(item, "length", len(value))),
+                        "context": self._address_context(bv, address),
+                    },
+                    "xrefs": xrefs,
+                    "metadata_table_windows": metadata_tables,
+                }
+            )
+            if len(matches) >= limit:
+                break
+        return {
+            "query": query,
+            "matches": matches,
+            "count": len(matches),
+        }
+
     def _xrefs(self, selector: str | None, identifier):
         bv = self._resolve_view(selector)
         try:
@@ -2411,10 +2966,18 @@ class BinaryNinjaBridge:
 
     def _strings(self, selector: str | None, *, query, offset: int, limit: int,
                  min_length: int | None = None, section: str | None = None,
-                 no_crt: bool = False):
+                 no_crt: bool = False, regex: bool = False):
         bv = self._resolve_view(selector)
         items = []
-        needle = str(query).lower() if query else None
+        needle = str(query) if query else None
+        pattern = None
+        if needle and regex:
+            try:
+                pattern = re.compile(needle, re.IGNORECASE)
+            except re.error as exc:
+                raise OperationFailure("invalid_regex", f"Invalid string regex: {exc}") from exc
+        elif needle:
+            needle = needle.lower()
         for item in list(getattr(bv, "strings", [])):
             value = str(getattr(item, "value", ""))
             length = int(getattr(item, "length", 0))
@@ -2425,7 +2988,10 @@ class BinaryNinjaBridge:
             except (TypeError, ValueError):
                 string_type = str(raw_type)
 
-            if needle and needle not in value.lower():
+            if pattern is not None:
+                if not pattern.search(value):
+                    continue
+            elif needle and needle not in value.lower():
                 continue
             if min_length is not None and length < min_length:
                 continue
@@ -2452,6 +3018,53 @@ class BinaryNinjaBridge:
             items.append(entry)
         items.sort(key=lambda item: (int(item["address"], 16), item["value"]))
         return items[offset : offset + limit]
+
+    _INIT_SECTION_HINTS = (
+        "init_array",
+        "preinit_array",
+        "fini_array",
+        ".ctors",
+        ".dtors",
+        "__mod_init_func",
+        "__mod_term_func",
+    )
+
+    def _init_arrays(self, selector: str | None, *, limit: int = 64):
+        if limit < 0:
+            raise OperationFailure("invalid_limit", f"Invalid init-array limit: {limit}")
+        bv = self._resolve_view(selector)
+        pointer_size = self._pointer_size(bv)
+        sections = []
+        for name, sec in getattr(bv, "sections", {}).items():
+            lowered = str(name).lower()
+            if not any(hint in lowered for hint in self._INIT_SECTION_HINTS):
+                continue
+            start = int(getattr(sec, "start", 0))
+            end = int(getattr(sec, "end", 0))
+            total_entries = max(0, (end - start) // pointer_size)
+            shown_entries = min(total_entries, limit)
+            table = self._pointer_table_for_view(
+                bv,
+                start,
+                entries=shown_entries,
+                stride_size=pointer_size,
+            )
+            sections.append(
+                {
+                    "name": str(name),
+                    "start": hex(start),
+                    "end": hex(end),
+                    "total_entries": total_entries,
+                    "shown_entries": shown_entries,
+                    "truncated": total_entries > shown_entries,
+                    "table": table,
+                }
+            )
+        sections.sort(key=lambda item: int(item["start"], 16))
+        return {
+            "pointer_size": pointer_size,
+            "sections": sections,
+        }
 
     _IMPORT_SYMBOL_TYPES: list[tuple[str, str]] = [
         ("ImportedFunctionSymbol", "function"),

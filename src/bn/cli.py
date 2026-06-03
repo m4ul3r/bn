@@ -211,6 +211,7 @@ _GROUP_HELP: dict[tuple[str, ...], str] = {
     ("instance",): "Pin or clear the active bridge instance",
     ("target",): "Inspect Binary Ninja targets",
     ("function",): "Function discovery helpers",
+    ("evidence",): "Evidence-oriented reversing helpers",
     ("bundle",): "Export reusable bundles",
     ("py",): "Execute Python inside Binary Ninja",
     ("symbol",): "Rename functions or data",
@@ -921,6 +922,64 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _selected_parser_for_argv(
+    parser: argparse.ArgumentParser,
+    argv: list[str],
+) -> argparse.ArgumentParser:
+    selected = parser
+    for item in argv:
+        if item == "--":
+            break
+        if item.startswith("-"):
+            continue
+        subparser_action = next(
+            (action for action in selected._actions if isinstance(action, argparse._SubParsersAction)),
+            None,
+        )
+        if subparser_action is None or item not in subparser_action.choices:
+            continue
+        selected = subparser_action.choices[item]
+    return selected
+
+
+def _known_option_strings(parser: argparse.ArgumentParser) -> set[str]:
+    options: set[str] = set()
+    for action in parser._actions:
+        options.update(action.option_strings)
+    return options
+
+
+def _protect_flag_like_option_values(
+    parser: argparse.ArgumentParser,
+    argv: list[str],
+) -> list[str]:
+    """Let explicit data options accept values that look like flags.
+
+    Argparse treats ``bn strings --query -h`` as a help flag instead of a query
+    value. When the user has explicitly supplied an option that takes arbitrary
+    data, preserve the next token as that option's value by rewriting to the
+    ``--opt=value`` spelling before parsing.
+    """
+    protected_options = {"--query"}
+    selected_parser = _selected_parser_for_argv(parser, argv)
+    known_options = _known_option_strings(selected_parser)
+    help_options = {"-h", "--help", "--help-full"}
+    out: list[str] = []
+    index = 0
+    while index < len(argv):
+        item = argv[index]
+        if item in protected_options and index + 1 < len(argv):
+            value = argv[index + 1]
+            value_option = value.split("=", 1)[0]
+            if value.startswith("-") and (value_option not in known_options or value_option in help_options):
+                out.append(f"{item}={value}")
+                index += 2
+                continue
+        out.append(item)
+        index += 1
+    return out
+
+
 def _apply_sticky_defaults(args: argparse.Namespace) -> None:
     """Fill unset --instance / --target from per-project sticky state."""
     state = session_state.read()
@@ -938,7 +997,8 @@ def _apply_sticky_defaults(args: argparse.Namespace) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    parse_argv = sys.argv[1:] if argv is None else list(argv)
+    args = parser.parse_args(_protect_flag_like_option_values(parser, parse_argv))
     handler: Callable[[argparse.Namespace], int] | None = getattr(args, "handler", None)
     if handler is None:
         selected_parser = getattr(args, "_parser", parser)
