@@ -282,8 +282,21 @@ class _FakeBV:
     def get_instruction_length(self, address: int):
         return self._instruction_lengths.get(int(address), 1)
 
-    def get_disassembly(self, address: int):
+    def get_disassembly(self, address: int, arch=None):
         return self._disassembly.get(int(address), "")
+
+    def get_functions_containing(self, address: int):
+        result = []
+        for fn in self.functions:
+            start = int(fn.start)
+            end = start
+            for block in getattr(fn, "basic_blocks", []) or []:
+                end = max(end, int(block.end))
+            if end == start:
+                end = start + 1
+            if start <= int(address) < end:
+                result.append(fn)
+        return result
 
     def get_code_refs(self, address: int):
         return list(self._code_refs.get(int(address), []))
@@ -1488,12 +1501,117 @@ def test_function_evidence_reports_calls_arguments_and_thunk_candidate(monkeypat
 
     assert call["direct"] is True
     assert call["target"]["function"]["name"] == "send_message"
-    assert {arg["source"] for arg in call["arguments"]} == {"llil", "hlil"}
+    # primary args come from the single matched HLIL call; no merged/source-tagged noise
+    assert call["argument_source"] == "hlil"
+    assert [arg["text"] for arg in call["arguments"]] == ["6", "&response"]
+    # other IL layers are quarantined as candidates, JSON-only
+    assert any(c["source"] == "llil" for c in call["argument_candidates"])
     assert call["previous_instructions"][0]["text"] == "mov r2, response"
 
     thunk_result = instance._function_evidence("active", "j_send_message", context=0)
     assert thunk_result["thunk"]["is_candidate"] is True
     assert thunk_result["thunk"]["target"]["function"]["name"] == "send_message"
+
+
+def test_xrefs_suppress_disasm_for_data_targets(monkeypatch):
+    # ILX #1: a .rodata string target must not be disassembled into garbage,
+    # even though firmware ELFs map .rodata into the r-x load segment.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    caller = _FakeFunction(0x1A000, "caller")
+    caller.basic_blocks = [_FakeBasicBlock(0x1A000, 0x1A100)]
+    message = "basic_string::_M_construct null not valid"
+    bv = _FakeBV(
+        functions=[caller],
+        code_refs={0x2A07C: [_FakeCodeRef(0x1A050, caller)]},
+        disassembly={0x1A050: "ldr r0, =message"},
+        sections={
+            ".text": _FakeSection(".text", 0x10000, 0x20000),
+            ".rodata": _FakeSection(".rodata", 0x2A000, 0x2B000),
+        },
+        segments={
+            0x1A050: _FakeSegment(readable=True, executable=True),
+            0x2A07C: _FakeSegment(readable=True, executable=True),  # rodata shares the r-x segment
+        },
+        memory={0x2A07C: message.encode() + b"\x00"},
+    )
+
+    result = instance._xrefs_to_address(bv, 0x2A07C)
+
+    target = result["target_context"]
+    assert target["kind"] == "string"
+    assert target["string"]["value"] == message
+    assert target["disasm"] is None
+    assert target["notes"]
+    # the referencing instruction is genuine code, so its disasm is kept
+    assert result["code_refs"][0]["context"]["disasm"] == "ldr r0, =message"
+
+
+def test_function_evidence_resolves_pointer_constant_arguments(monkeypatch):
+    # ILX #2: append(&var, 0x2a4f4) should annotate the constant with "4" [.rodata].
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    callee = _FakeFunction(0x154F4, "append")
+    caller = _FakeFunction(0x1A36C, "createBTService")
+    call_expr = _FakeHLILInstruction(
+        "append(&var_38, 0x2a4f4)", class_name="HighLevelILCall", expr_index=10, instr_index=10
+    )
+    call_expr.params = ["&var_38", "0x2a4f4"]
+    call_insn = _FakeLLILInstruction(0x1A38E, _FakeConstPtr(0x154F4), hlils=[call_expr])
+    caller.basic_blocks = [_FakeBasicBlock(0x1A38E, 0x1A392)]
+    caller.low_level_il = [[call_insn]]
+    bv = _FakeBV(
+        functions=[callee, caller],
+        instruction_lengths={0x1A38E: 4},
+        disassembly={0x1A38E: "blx append"},
+        sections={".rodata": _FakeSection(".rodata", 0x2A000, 0x2B000)},
+        segments={0x2A4F4: _FakeSegment(readable=True)},
+        memory={0x2A4F4: b"4\x00"},
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_evidence("active", "createBTService", context=0)
+    call = result["calls"][0]
+    constant = next(arg for arg in call["arguments"] if arg["text"] == "0x2a4f4")
+    assert constant["resolved"]["string"] == "4"
+    assert constant["resolved"]["section"] == ".rodata"
+
+
+def test_function_evidence_does_not_merge_unrelated_hlil_call_args(monkeypatch):
+    # ILX #3: one LLIL call mapping to two HLIL calls must not borrow the other's args.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    callee = _FakeFunction(0x16520, "getopt_long")
+    caller = _FakeFunction(0x17140, "main")
+    real = _FakeHLILInstruction(
+        'getopt_long(argc, argv, "hb:d:")', class_name="HighLevelILCall", expr_index=5, instr_index=5
+    )
+    real.params = ["argc", "argv", '"hb:d:"']
+    real.address = 0x17188
+    unrelated = _FakeHLILInstruction(
+        '__android_log_print(4, "aa accessory", x)',
+        class_name="HighLevelILCall",
+        expr_index=9,
+        instr_index=9,
+    )
+    unrelated.params = ["4", '"aa accessory"', "x"]
+    unrelated.address = 0x172A0
+    call_insn = _FakeLLILInstruction(0x17188, _FakeConstPtr(0x16520), hlils=[real, unrelated])
+    caller.basic_blocks = [_FakeBasicBlock(0x17140, 0x17200)]
+    caller.low_level_il = [[call_insn]]
+    bv = _FakeBV(
+        functions=[callee, caller],
+        instruction_lengths={0x17188: 4},
+        disassembly={0x17188: "blx getopt_long"},
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_evidence("active", "main", context=0)
+    call = result["calls"][0]
+    assert call["argument_source"] == "hlil"
+    assert [arg["text"] for arg in call["arguments"]] == ["argc", "argv", '"hb:d:"']
+    assert all("aa accessory" not in arg["text"] for arg in call["arguments"])
+    assert any(c["text"] == '"aa accessory"' for c in call["argument_candidates"])
 
 
 def test_pointer_table_normalizes_thumb_function_pointers(monkeypatch):

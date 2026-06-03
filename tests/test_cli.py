@@ -1039,8 +1039,17 @@ def test_evidence_function_routes_and_renders_calls(monkeypatch, capsys):
                         },
                         "llil": "call(0x461746)",
                         "hlil_statement": "send_message(6, &response)",
+                        "argument_source": "hlil",
                         "arguments": [
-                            {"source": "hlil", "index": 0, "text": "6"},
+                            {"index": 0, "text": "6"},
+                            {
+                                "index": 1,
+                                "text": "0x2a4f4",
+                                "resolved": {"string": "4", "section": ".rodata"},
+                            },
+                        ],
+                        "argument_candidates": [
+                            {"source": "mlil", "index": 0, "text": "r0"},
                         ],
                     }
                 ],
@@ -1057,7 +1066,10 @@ def test_evidence_function_routes_and_renders_calls(monkeypatch, capsys):
     output = capsys.readouterr().out
     assert "build_response @ 0x412470" in output
     assert "target: send_message @ 0x461746" in output
-    assert "hlil[0]: 6" in output
+    assert "arguments: (hlil)" in output
+    assert '0x2a4f4 -> "4" [.rodata]' in output
+    # uncertain extras are JSON-only; not shown in text
+    assert "r0" not in output
 
 
 def test_evidence_table_routes_and_renders_targets(monkeypatch, capsys):
@@ -1105,6 +1117,40 @@ def test_evidence_table_routes_and_renders_targets(monkeypatch, capsys):
     assert "pointer table @ 0x64ea0" in output
     assert "warning: table start is in an executable segment" in output
     assert "sub_46970 @ 0x46970 (raw 0x46971) [thumb-adjusted]" in output
+
+
+def test_render_target_line_shows_symbol_and_string_for_mapped_targets():
+    # ILX #4: mapped non-function targets should surface symbol/string + section,
+    # not just bare hex.
+    from bn import formatters
+
+    vtable = {
+        "raw": "0x3f418",
+        "normalized": "0x3f418",
+        "function": None,
+        "status": "mapped",
+        "context": {
+            "symbol": {"name": "_ZTVN17service_framework7IPCBoolE", "type": "ExternalSymbol"},
+            "sections": [{"name": ".extern"}],
+        },
+    }
+    line = formatters._render_target_line(vtable)
+    assert "_ZTVN17service_framework7IPCBoolE @ 0x3f418" in line
+    assert "[.extern, ExternalSymbol]" in line
+
+    rodata_string = {
+        "raw": "0x2a407",
+        "normalized": "0x2a407",
+        "function": None,
+        "status": "mapped",
+        "context": {
+            "string": {"value": "N19androidauto_service17AndroidAutoClientE", "encoding": "ascii"},
+            "sections": [{"name": ".rodata"}],
+        },
+    }
+    line = formatters._render_target_line(rodata_string)
+    assert '"N19androidauto_service17AndroidAutoClientE"' in line
+    assert "[.rodata]" in line
 
 
 def test_evidence_table_renders_interior_function_targets(monkeypatch, capsys):

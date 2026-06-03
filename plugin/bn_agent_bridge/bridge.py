@@ -1276,20 +1276,121 @@ class BinaryNinjaBridge:
             entry["offset"] = f"-{hex(abs(delta))}" if delta < 0 else hex(delta)
         return entry
 
-    def _address_context(self, bv, address: int, *, include_disasm: bool = False) -> dict[str, Any]:
+    def _raw_sections_at(self, bv, address: int) -> list[Any]:
+        try:
+            return list(bv.get_sections_at(address))
+        except Exception:
+            result = []
+            for _name, sec in getattr(bv, "sections", {}).items():
+                try:
+                    if int(sec.start) <= address < int(sec.end):
+                        result.append(sec)
+                except Exception:
+                    continue
+            return result
+
+    def _section_semantics_name(self, sec) -> str:
+        sem = getattr(sec, "semantics", None)
+        return getattr(sem, "name", None) or str(sem)
+
+    def _address_is_code(self, bv, address: int) -> bool:
+        """True only when the address is real code.
+
+        Keys on function membership and section *semantics* (ReadOnlyCode), not
+        the segment's executable bit — firmware ELFs routinely map .rodata into
+        the same r-x load segment as .text, so an executable segment is not
+        evidence that an address is an instruction.
+        """
+        if self._functions_containing(bv, address):
+            return True
+        for sec in self._raw_sections_at(bv, address):
+            if "Code" in self._section_semantics_name(sec):
+                return True
+        return False
+
+    def _resolve_data_string(self, bv, address: int, *, max_chars: int = 96) -> dict[str, Any] | None:
+        """Best-effort printable string at *address*, even when BN never
+        atomized one there (e.g. single chars packed for std::string::append).
+
+        Tries a NUL-terminated ASCII run first, then UTF-16LE. Returns None for
+        non-string bytes so it can be used as a cheap "is this a string?" probe.
+        """
+        try:
+            data = bytes(bv.read(int(address), max_chars * 2 + 2))
+        except Exception:
+            return None
+        if not data:
+            return None
+        nul = data.find(b"\x00")
+        ascii_run = data if nul == -1 else data[:nul]
+        if 1 <= len(ascii_run) <= max_chars and all(32 <= b < 127 for b in ascii_run):
+            return {
+                "value": ascii_run.decode("ascii"),
+                "encoding": "ascii",
+                "truncated": nul == -1 and len(data) >= max_chars * 2 + 2,
+            }
+        chars: list[str] = []
+        index = 0
+        while index + 1 < len(data) and len(chars) < max_chars:
+            lo, hi = data[index], data[index + 1]
+            if lo == 0 and hi == 0:
+                break
+            if hi != 0 or not (32 <= lo < 127):
+                chars = []
+                break
+            chars.append(chr(lo))
+            index += 2
+        if len(chars) >= 2:
+            return {"value": "".join(chars), "encoding": "utf-16le", "truncated": False}
+        return None
+
+    def _address_context(self, bv, address: int, *, include_disasm: bool = False, arch=None,
+                         assume_code: bool = False) -> dict[str, Any]:
+        address = int(address)
+        sections = self._sections_at(bv, address)
+        segment = self._segment_at(bv, address)
+        symbol = self._symbol_at(bv, address)
+        function = self._function_entry_for_address(bv, address)
         context: dict[str, Any] = {
-            "address": hex(int(address)),
-            "sections": self._sections_at(bv, address),
-            "segment": self._segment_at(bv, address),
-            "symbol": self._symbol_at(bv, address),
-            "function": self._function_entry_for_address(bv, address),
+            "address": hex(address),
+            "sections": sections,
+            "segment": segment,
+            "symbol": symbol,
+            "function": function,
         }
+        section_name = sections[0]["name"].lower() if sections else ""
+        symbol_type = (symbol or {}).get("type") or ""
+        if address == 0:
+            kind = "null"
+        elif segment is None and not sections:
+            kind = "unmapped"
+        elif assume_code or function is not None or self._address_is_code(bv, address):
+            kind = "code"
+        elif symbol_type == "ExternalSymbol" or "extern" in section_name:
+            kind = "extern"
+        else:
+            resolved = self._resolve_data_string(bv, address)
+            if resolved is not None:
+                context["string"] = resolved
+                kind = "string"
+            else:
+                kind = "data"
+        context["kind"] = kind
         if include_disasm:
-            try:
-                context["disasm"] = bv.get_disassembly(address) or ""
-            except Exception:
-                context["disasm"] = ""
+            if kind == "code":
+                context["disasm"] = self._safe_disassembly(bv, address, arch)
+            else:
+                context["disasm"] = None
+                context["notes"] = [f"target is {kind}; disassembly suppressed"]
         return context
+
+    def _safe_disassembly(self, bv, address: int, arch=None) -> str:
+        for args in ((address, arch) if arch is not None else (), (address,)):
+            try:
+                return bv.get_disassembly(*args) or ""
+            except Exception:
+                continue
+        return ""
 
     def _pointer_size(self, bv) -> int:
         for obj in (bv, getattr(bv, "arch", None)):
@@ -2116,13 +2217,16 @@ class BinaryNinjaBridge:
                 else None
             )
             ref_addr = int(ref.address)
+            ref_arch = getattr(ref, "arch", None) or getattr(fn, "arch", None)
             code_refs.append(
                 {
                     "function": fn.name if fn is not None else None,
                     "address": hex(ref_addr),
                     "caller_function": caller,
                     "kind": "code",
-                    "context": self._address_context(bv, ref_addr, include_disasm=True),
+                    "context": self._address_context(
+                        bv, ref_addr, include_disasm=True, arch=ref_arch, assume_code=True
+                    ),
                 }
             )
         get_data_refs = getattr(bv, "get_data_refs", None)
@@ -2475,28 +2579,102 @@ class BinaryNinjaBridge:
                 return [str(params)]
         return []
 
-    def _call_argument_evidence(self, insn) -> list[dict[str, Any]]:
-        evidence = []
-        seen: set[tuple[str, int, str]] = set()
+    @staticmethod
+    def _safe_int(value) -> int | None:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
-        def add(source: str, args: list[str]) -> None:
-            for index, text in enumerate(args):
-                marker = (source, index, text)
+    _ARG_CONSTANT_RE = re.compile(r"0x[0-9a-fA-F]+")
+
+    def _resolve_argument_value(self, bv, text: str) -> dict[str, Any] | None:
+        """Annotate a pointer-constant argument with what it points at.
+
+        Generic: fixes std::string::append literals, log format strings, RTTI
+        names, and service identifiers in one place. Returns None for arguments
+        that are not a bare hex pointer or that resolve to nothing useful.
+        """
+        match = self._ARG_CONSTANT_RE.fullmatch(text.strip())
+        if match is None:
+            return None
+        address = self._safe_int(int(match.group(0), 16))
+        if not address:
+            return None
+        context = self._address_context(bv, address)
+        resolved: dict[str, Any] = {"address": hex(address), "kind": context.get("kind")}
+        string = context.get("string")
+        if string:
+            resolved["string"] = string.get("value")
+            if string.get("encoding") and string.get("encoding") != "ascii":
+                resolved["encoding"] = string["encoding"]
+        symbol = context.get("symbol")
+        if symbol and symbol.get("name"):
+            resolved["symbol"] = symbol["name"]
+        function = context.get("function")
+        if function and function.get("name"):
+            resolved["function"] = function["name"]
+        sections = context.get("sections")
+        if sections:
+            resolved["section"] = sections[0].get("name")
+        if not any(key in resolved for key in ("string", "symbol", "function")):
+            return None
+        return resolved
+
+    def _call_arguments(self, bv, insn, call_addr: int) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+        """Pick one primary argument source and quarantine uncertain extras.
+
+        One LLIL call can map to several HLIL call expressions (BN folds adjacent
+        statements); blindly merging their params attributes another call's
+        arguments to this one. Prefer the single HLIL call whose address matches
+        this call site; if that is ambiguous fall back to MLIL, then LLIL. Other
+        candidates are returned separately (JSON-only, not shown in text).
+        """
+        roots = self._hlil_call_roots(insn)
+        chosen = None
+        matched = [r for r in roots if self._safe_int(getattr(r, "address", None)) == int(call_addr)]
+        if len(matched) == 1:
+            chosen = matched[0]
+        elif len(roots) == 1:
+            chosen = roots[0]
+
+        mlil = getattr(insn, "mapped_medium_level_il", None)
+        if chosen is not None:
+            source, texts = "hlil", self._il_argument_texts(chosen)
+        elif mlil is not None:
+            source, texts = "mlil", self._il_argument_texts(mlil)
+        else:
+            source, texts = "llil", self._il_argument_texts(insn)
+
+        primary: list[dict[str, Any]] = []
+        for index, text in enumerate(texts):
+            entry: dict[str, Any] = {"index": index, "text": text}
+            resolved = self._resolve_argument_value(bv, text)
+            if resolved is not None:
+                entry["resolved"] = resolved
+            primary.append(entry)
+
+        candidates: list[dict[str, Any]] = []
+        seen: set[tuple[str, int, str]] = {(source, e["index"], e["text"]) for e in primary}
+
+        def add_candidates(candidate_source: str, candidate_texts: list[str]) -> None:
+            for index, text in enumerate(candidate_texts):
+                marker = (candidate_source, index, text)
                 if marker in seen:
                     continue
                 seen.add(marker)
-                evidence.append({"source": source, "index": index, "text": text})
+                candidates.append({"source": candidate_source, "index": index, "text": text})
 
-        for source, node in (
-            ("llil", insn),
-            ("mlil", getattr(insn, "mapped_medium_level_il", None)),
-        ):
-            if node is not None:
-                add(source, self._il_argument_texts(node))
-
-        for call in self._hlil_call_roots(insn):
-            add("hlil", self._il_argument_texts(call))
-        return evidence
+        add_candidates("llil", self._il_argument_texts(insn))
+        if mlil is not None:
+            add_candidates("mlil", self._il_argument_texts(mlil))
+        for root in roots:
+            if root is chosen:
+                continue
+            add_candidates("hlil", self._il_argument_texts(root))
+        return source, primary, candidates
 
     def _function_call_evidence(self, bv, func, *, context: int) -> list[dict[str, Any]]:
         disasm_entries = self._structured_disasm_entries(bv, func)
@@ -2534,6 +2712,7 @@ class BinaryNinjaBridge:
             mlil = getattr(insn, "mapped_medium_level_il", None)
             dest_value = self._call_destination_value(insn)
             target = self._target_entry_for_call(bv, dest_value)
+            arg_source, arguments, argument_candidates = self._call_arguments(bv, insn, call_addr)
             calls.append(
                 {
                     "address": hex(call_addr),
@@ -2544,7 +2723,9 @@ class BinaryNinjaBridge:
                     "mlil": str(mlil) if mlil is not None else None,
                     "hlil_statement": self._hlil_statement_text(insn),
                     "pre_branch_condition": self._hlil_pre_branch_condition(insn),
-                    "arguments": self._call_argument_evidence(insn),
+                    "argument_source": arg_source,
+                    "arguments": arguments,
+                    "argument_candidates": argument_candidates,
                     "call_instruction": call_instruction,
                     "previous_instructions": previous,
                     "next_instructions": next_instructions,

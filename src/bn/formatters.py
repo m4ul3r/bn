@@ -485,6 +485,11 @@ def _context_suffix(context: Any) -> str:
             parts.append(f"symbol={symbol['name']}[{sym_type}]")
         else:
             parts.append(f"symbol={symbol['name']}")
+    string = context.get("string")
+    if isinstance(string, dict) and string.get("value"):
+        enc = string.get("encoding")
+        label = "string" if enc in (None, "ascii") else f"string({enc})"
+        parts.append(f"{label}={json.dumps(string['value'], ensure_ascii=True)}")
     disasm = context.get("disasm")
     if isinstance(disasm, str) and disasm:
         parts.append(f"disasm={disasm}")
@@ -546,7 +551,27 @@ def _render_target_line(target: Any) -> str:
             else:
                 base += " (not start)"
     else:
-        base = str(normalized or raw or "<unknown>")
+        addr = normalized or raw or "<unknown>"
+        context = target.get("context") if isinstance(target.get("context"), dict) else {}
+        symbol = context.get("symbol")
+        string = context.get("string")
+        sections = context.get("sections")
+        section_name = None
+        if isinstance(sections, list) and sections and isinstance(sections[0], dict):
+            section_name = sections[0].get("name")
+        if isinstance(symbol, dict) and symbol.get("name"):
+            base = f"{symbol['name']} @ {addr}"
+            annot = [a for a in (section_name, symbol.get("type")) if a]
+            if annot:
+                base += f" [{', '.join(annot)}]"
+        elif isinstance(string, dict) and string.get("value"):
+            enc = string.get("encoding")
+            base = json.dumps(string["value"], ensure_ascii=True)
+            annot = [a for a in (section_name, (enc if enc and enc != "ascii" else None)) if a]
+            if annot:
+                base += f" [{', '.join(annot)}]"
+        else:
+            base = str(addr)
     if raw and normalized and raw != normalized:
         base += f" (raw {raw})"
     if target.get("thumb_adjusted"):
@@ -602,12 +627,29 @@ def _render_function_evidence_text(value: Any) -> str:
             lines.append(f"  llil: {call['llil']}")
         args = [arg for arg in list(call.get("arguments") or []) if isinstance(arg, dict)]
         if args:
-            lines.append("  arguments:")
+            source = call.get("argument_source")
+            lines.append("  arguments:" + (f" ({source})" if source else ""))
             for arg in args:
-                lines.append(
-                    f"    {arg.get('source', '?')}[{arg.get('index', '?')}]: {arg.get('text', '')}"
-                )
+                lines.append(f"    {arg.get('text', '')}{_render_resolved_arg(arg.get('resolved'))}")
     return "\n".join(lines)
+
+
+def _render_resolved_arg(resolved: Any) -> str:
+    if not isinstance(resolved, dict):
+        return ""
+    section = resolved.get("section")
+    suffix = f" [{section}]" if section else ""
+    if resolved.get("string") is not None:
+        value = json.dumps(resolved["string"], ensure_ascii=True)
+        encoding = resolved.get("encoding")
+        if encoding:
+            value += f"({encoding})"
+        return f" -> {value}{suffix}"
+    if resolved.get("symbol"):
+        return f" -> {resolved['symbol']}{suffix}"
+    if resolved.get("function"):
+        return f" -> {resolved['function']}{suffix}"
+    return ""
 
 
 def _render_pointer_table_text(value: Any) -> str:
