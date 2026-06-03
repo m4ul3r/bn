@@ -30,9 +30,9 @@ Start by mapping what the binary does and where untrusted data enters:
 
 3. **Interesting strings** — format strings, SQL fragments, shell commands, and paths hint at injection surfaces:
    ```bash
-   bn strings --query "%s\|%x\|%n\|SELECT\|INSERT\|/bin/" --no-crt --min-length 4
+   bn strings --regex --query '%s|%x|%n|SELECT|INSERT|/bin/' --no-crt --min-length 4
    ```
-   Use `--no-crt` to suppress locale/CRT noise and `--min-length` to skip short fragments. Use `--section .rodata` to restrict to read-only data.
+   `--regex` makes `--query` a case-insensitive regex so the `|` actually means OR — without it `--query` is a literal substring and `\|` matches nothing. Use `--no-crt` to suppress locale/CRT noise and `--min-length` to skip short fragments; `--section .rodata` restricts to read-only data.
 
 4. **Memory layout** — understand which regions are writable, executable, or both:
    ```bash
@@ -67,6 +67,15 @@ Data often passes through several functions before reaching a sink. Follow it st
 2. Trace each argument back through the caller's locals and parameters
 3. Use `bn xrefs` on the caller to find *its* callers
 4. Repeat until you reach an input source or lose the trail
+
+### When the trail is indirect or the args are unclear
+Plain `bn xrefs`/`decompile` thin out when dispatch is indirect or the decompiler's argument story is incomplete (common in C++/IPC services). Three evidence helpers (syntax in the bn skill, §4) pick up the trail:
+
+- `bn evidence xrefs <sink-or-string>` — like `bn xrefs` but each ref carries section/segment/symbol + the referencing disassembly, so you can tell a real code caller from a vtable/RTTI/descriptor slot, and spot a sink that's reachable **only** through a vtable (no direct call).
+- `bn evidence function <caller>` — shows the raw ABI arguments (registers + LLIL/MLIL/HLIL) next to the pseudo-C at each call, including the vtable offset for an indirect/virtual call. Use it to recover a sink's real arguments without dropping to disasm, and to see through `j_*`/PLT thunks to the true callee.
+- `bn evidence message <TypeName>` — for protobuf/IPC message handlers, maps a message type-name string to its serializer/handler pointers, giving you the receive→parse→dispatch entry points to trace forward from.
+
+Reminder: HLIL can hide the real access/operand width — confirm the size in `bn disasm` before concluding on a truncation/off-by-one (see the width note in the bn skill, §4).
 
 ## Common Vulnerability Patterns
 

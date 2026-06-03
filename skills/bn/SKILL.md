@@ -1,6 +1,6 @@
 ---
 name: bn
-description: Use the local bn CLI for Binary Ninja reversing through the bn bridge, in a live GUI session or headless mode. Triggers include decompilation, function search, xrefs, callsites and exact caller_static mapping, IL/disassembly, type recovery, struct field edits, previewed mutations, stable local IDs, batch apply, BNDB save/load, and inline BN Python.
+description: Use the local bn CLI for Binary Ninja reversing through the bn bridge, in a live GUI session or headless mode. Triggers include decompilation, function search, xrefs, callsites and exact caller_static mapping, IL/disassembly, type recovery, struct field edits, previewed mutations, stable local IDs, batch apply, BNDB save/load, evidence helpers (vtable/pointer-table and .init_array walking, protobuf/RTTI type lensing, raw-ABI call evidence), and inline BN Python.
 ---
 
 # bn
@@ -130,6 +130,11 @@ bn xrefs <fn-or-addr> [--limit 20]
 bn xrefs --field <Struct.field>
 bn callsites <callee> --within <fn>
 bn callsites <callee> --within-file <path>
+bn evidence function <fn> [--context 2]              # per-call ABI args (LLIL/MLIL/HLIL + raw disasm) + thunk detection
+bn evidence xrefs <fn-or-addr> [--limit N]           # inbound refs annotated with section/segment/symbol/disasm
+bn evidence table <addr> [--entries N] [--stride N]  # interpret memory as a pointer/vtable table (Thumb-normalized)
+bn evidence message <type-string> [--limit N]        # protobuf/RTTI type-name -> xrefs -> nearby metadata table windows
+bn evidence init [--limit N]                         # .init_array/.ctors constructor-pointer summary
 bn proto get <fn>
 bn local list <fn>
 bn read 0x... --length N [--encoding {hex|bytes}]   # address is positional; --address 0x... is an accepted alias
@@ -137,7 +142,7 @@ bn function create <address> [--preview]
 bn types [--query <q>]
 bn types show <name>
 bn struct show <name>
-bn strings [--query <q>] [--min-length 5] [--section .rodata] [--no-crt]
+bn strings [--query <q>] [--regex] [--min-length 5] [--section .rodata] [--no-crt]
 bn imports
 bn sections [--query <q>]
 bn comment list [--query <q>]
@@ -153,7 +158,8 @@ Notes:
 - **Width-sensitive reads — trust `bn disasm`, not the decompiler.** Pseudo C and HLIL share the same analysis and can hide the real access width. A byte compare (`cmp al, ...`) renders as a full-width equality, and a `zx.d` on a dereference does **not** imply a 4-byte load (it can be a 1-byte load zero-extended to 4). When the exact comparison width or memory-read size matters (off-by-one, OOB, signedness bugs), treat `bn disasm <fn>` as authoritative and confirm the operand size there before reasoning about the bug.
 - `bn imports` JSON tags each entry with `kind` (`function`, `data`, `address`) and includes `library` + `raw_name`. Text marks data/address imports with `(data)` / `(address)`.
 - `bn sections` exposes start/end, length, semantics, and segment-derived `r/w/x` permission flags.
-- `bn strings`: `--no-crt` is a heuristic — drops single-character repetitions and strings sitting in `.text`. Combine with `--min-length` and `--section`.
+- `bn strings`: `--no-crt` is a heuristic — drops single-character repetitions and strings sitting in `.text`. Combine with `--min-length` and `--section`. Add `--regex` to treat `--query` as a case-insensitive regex (use it for OR patterns like `'%s|%n|/bin/'` — plain `--query` is literal substring, so `\|` does **not** mean OR). A `--query` value that looks like a flag (e.g. `-h`) is preserved as the query, but a known sibling flag right after `--query` (e.g. `--regex`) still errors — put flags before `--query` or use `--query=<value>`.
+- `bn evidence ...` is a read-locked family that surfaces the **raw material** behind a call/table/type so you don't have to hand-roll `py exec` — built for stripped C++/firmware. `evidence function <fn>` pairs each call's raw disasm with LLIL/MLIL/HLIL argument evidence and flags thunks (including PLT/import trampolines); `evidence xrefs` annotates each ref with section/segment/symbol + the referencing disassembly; `evidence table <addr>` reads a pointer/vtable table, is **ARM/Thumb-aware** (clears the T bit and resolves the even entry, marked `[thumb-adjusted]`), and tags each slot with `status` (`function`/`mapped`/`null`/`unmapped`) + `plausible` plus low-confidence `warnings` when the address doesn't look like a table; `evidence message <type-string>` is a protobuf/RTTI lens (type-name → xrefs → nearby metadata windows, e.g. the serializer slot); `evidence init` summarizes `.init_array`/`.ctors` constructor pointers. Large results spill to disk like other read ops.
 - `bn read --address <addr> --length <N>` returns raw bytes from the mapped view — the parallel-safe alternative to a `py exec` `bv.read(...)` (it runs under the shared read lock). Text mode prints an offset/hex/ASCII hexdump; JSON returns `{address, length, hex, ascii}`. A read that runs past mapped memory comes back **short** with `short_read: true`, `requested_length`, and a `note` (it does **not** error). An entirely unmapped address *does* error (`Address 0x... is not mapped`). Add `--encoding bytes` to stream the raw bytes to stdout (or to `--out <path>`) instead of a hexdump — useful for piping a blob into another tool or saving it to disk. Note that `--encoding bytes` emits only the raw stream, so the `short_read`/`note` marker is **not** visible in that mode — use the default hex mode (or JSON) when you need to know whether a read ran short.
 - `bn function create <address> [--preview]` forces Binary Ninja to create and analyze a function at `<address>` when auto-analysis missed it. **When to reach for it:** a code entry point that BN never disassembled because it is reachable only through a **data pointer** (a vtable slot, a function-pointer table, a handler/dispatch array) and has no direct `call`. Point `bn read` / `bn xrefs` at the pointer table to recover the target address, then `bn function create` it so `decompile` / `xrefs` / `callsites` work on it. It is a verified mutation, so it honors the same `--preview` (create → verify → revert) and live-verify loop as the other mutations: it returns `noop` if a function already starts there, errors if the address is unmapped or not inside an executable segment, and rolls back with `verification_failed` if analysis produces no function. Save afterward (§6 step 4) to persist the new function.
 

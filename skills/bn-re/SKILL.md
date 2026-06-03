@@ -61,21 +61,9 @@ Functions tagged with `__attribute__((constructor))`, C++ static initializers, a
 
 To find them:
 
-1. Look for `.init_array` in `bn sections` (it's a `ReadOnlyData` section near `.dynamic`).
-2. Walk the array — each entry is one function pointer:
-
-   ```bash
-   bn py exec --stdin <<'PY'
-   import struct
-   start = 0x403c48      # .init_array start address from `bn sections`
-   size  = 16            # .init_array size from `bn sections`
-   for ptr in struct.unpack(f'<{size // 8}Q', bv.read(start, size)):
-       print(hex(ptr))
-   PY
-   ```
-
-3. Skip the toolchain stub `frame_dummy` — it's the first slot on most GCC builds and rarely interesting.
-4. Decompile each remaining entry. Anything that writes to BSS / `.data` / `.bss` is staging state for `main` to read; rename it `stage1_<purpose>` (or similar) so the relationship is visible from later analysis.
+1. `bn evidence init` finds every constructor/destructor section (`.init_array`, `.ctors`, `.fini_array`, …), walks each one, and resolves every slot to its function. It's **arch-aware** (uses the view's pointer size + endianness) and **ARM/Thumb-aware** (clears the T bit so an odd `0x…1` pointer resolves to the even function entry, marked `[thumb-adjusted]`) — don't hand-roll `bv.read` + `struct.unpack('<…Q')`, which hardcodes 8-byte little-endian and is silently wrong off x86-64. See the command in the bn skill, §4.
+2. Skip the toolchain stub `frame_dummy` — it's the first slot on most GCC builds and rarely interesting.
+3. Decompile each remaining entry. Anything that writes to BSS / `.data` / `.bss` is staging state for `main` to read; rename it `stage1_<purpose>` (or similar) so the relationship is visible from later analysis.
 
 ELF entry-flow review when nothing in `main` makes sense: `entry_point → __libc_start_main → main`, *but* `_start` and `__libc_start_main` invoke the `.init_array` callbacks before `main`. If a global "appears from nowhere" in `main`, the producer is almost certainly an `.init_array` entry.
 
@@ -83,23 +71,24 @@ ELF entry-flow review when nothing in `main` makes sense: `entry_point → __lib
 
 If the binary has a dispatch table (an array of function pointers — common in VMs, FSAs, vtables, callback registries), Binary Ninja often *won't* identify the targets as functions because there's no direct `call` to them, only a data reference from the table.
 
-Symptoms: `bn decompile <addr>` errors with `Function not found`; the bytes at `<addr>` look like a function prologue (`endbr64`, `push rbp`, …) on disasm, but it's marked as data.
+Symptoms: `bn decompile <addr>` errors with `Function not found`; the bytes at `<addr>` look like a function prologue (`endbr64`, `push rbp`, `push {…,lr}` / `stp x29,x30` on ARM) on disasm, but it's marked as data.
 
-Force-create the function and re-analyze:
+Recover and create the targets:
 
-```bash
-bn py exec --stdin <<'PY'
-target = 0x4014d0
-if not bv.get_function_at(target):
-    bv.create_user_function(target)
-    bv.update_analysis_and_wait()
-print("created" if bv.get_function_at(target) else "still missing")
-PY
-```
+1. `bn evidence table <table-addr> --entries N` reads the dispatch/vtable table and resolves each slot to a function — Thumb-normalized, with a `status`/`plausible` tag per entry and a warning when the address doesn't look like a table (so you can tell a real table from misread code). Slots that come back `status: mapped`/`unmapped` with no function are the ones BN missed.
+2. `bn function create <target> --preview` creates and verifies a function at each missing slot (a previewed, revertible mutation — see the bn skill, §4 and §6). Save afterward to persist it.
 
 After that, the normal `bn decompile` / `bn xrefs` flow works on the new function.
 
 When this comes up most: VM opcode handler tables, FSA predicate tables, COM-style vtables, plugin registries. If you've recovered a struct of `(tag, fn_ptr)` rows and one of the `fn_ptr` targets is missing, this is almost always why.
+
+### Stripped C++ / generated code (RTTI, vtables, protobuf)
+
+Stripped C++ firmware leaks structure through RTTI type-name strings and vtables even when symbols are gone. To turn a type name into code:
+
+- `bn evidence message <TypeName>` locates the type-name string (e.g. a mangled `N…E` typeinfo name or a `pkg.Message` proto string), lists its xrefs, and dumps the nearby metadata windows — the typeinfo table and the serializer/handler pointer slots sitting next to it. This is how you get from "I see the string `common.HeadUnitInfo`" to "its serializer is `sub_…`" without reading raw bytes by hand.
+- `bn evidence table <vtable-addr>` lists a class vtable's methods (Thumb-normalized), so you can tell construction from dispatch from generated boilerplate.
+- `bn evidence function <fn>` flags thunks (a `j_*` veneer or PLT/import trampoline → its target) and, for each call, shows the raw ABI argument evidence beside the pseudo-C — including the vtable offset for an indirect/virtual call (`(*(*this + 0xNN))(...)`). Reach for it when the decompiler's argument story is incomplete and you'd otherwise drop to MLIL/disassembly.
 
 ## Iterative Type Recovery
 
