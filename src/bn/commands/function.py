@@ -49,12 +49,15 @@ def _function_list(args: argparse.Namespace) -> int:
 @command("function", "search", help="Search functions by substring or regex",
          target=True, paged=True, address_filter=True,
          args=[
-             arg("--regex", action="store_true",
-                 help="Interpret query as a case-insensitive regular expression"),
-             arg("--exact", action="store_true", default=False,
-                 help="Match function names exactly (case-insensitive); avoids substring "
-                      "false positives in C++ mangled names"),
              arg("query"),
+         ],
+         mutex_groups=[
+             mutex(False,
+                   arg("--regex", action="store_true",
+                       help="Interpret query as a case-insensitive regular expression"),
+                   arg("--exact", action="store_true", default=False,
+                       help="Match function names exactly (case-insensitive); avoids substring "
+                            "false positives in C++ mangled names")),
          ])
 def _function_search(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {

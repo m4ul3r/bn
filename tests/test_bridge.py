@@ -3197,7 +3197,7 @@ def test_imports_summary_aggregates_counts(monkeypatch):
     result = instance._imports(None, summary=True)
 
     assert result["total_symbols"] == 4
-    assert result["libraries"] == {"libc": 3, "libfoo": 1}
+    assert result["namespaces"] == {"libc": 3, "libfoo": 1}
     assert result["by_kind"] == {"function": 3, "data": 1}
 
 
@@ -3210,7 +3210,7 @@ def test_imports_summary_empty(monkeypatch):
     result = instance._imports(None, summary=True)
 
     assert result["total_symbols"] == 0
-    assert result["libraries"] == {}
+    assert result["namespaces"] == {}
     assert result["by_kind"] == {}
 
 

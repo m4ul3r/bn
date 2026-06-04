@@ -55,7 +55,7 @@ def _strings(args: argparse.Namespace) -> int:
 
 @command("imports", help="List imports", target=True,
          args=[arg("--summary", action="store_true", default=False,
-                   help="Show aggregate counts by library and kind instead of the full list")])
+                   help="Show aggregate counts by namespace and kind instead of the full list")])
 def _imports(args: argparse.Namespace) -> int:
     summary_mode = bool(args.summary)
     return _call(

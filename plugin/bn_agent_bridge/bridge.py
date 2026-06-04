@@ -3815,16 +3815,20 @@ class BinaryNinjaBridge:
         return items
 
     def _imports_build_summary(self, items: list[dict]) -> dict[str, Any]:
-        libraries: dict[str, int] = {}
+        # Each item's "library" field actually holds the BN symbol namespace
+        # (BNINTERNALNAMESPACE/BNEXTERNALNAMESPACE on standard ELF; real per-library
+        # names only on binaries that carry them), so the summary reports it as
+        # "namespaces" to avoid implying a per-shared-object breakdown.
+        namespaces: dict[str, int] = {}
         by_kind: dict[str, int] = {}
         for item in items:
-            lib = str(item.get("library", "")) or "(none)"
-            libraries[lib] = libraries.get(lib, 0) + 1
+            ns = str(item.get("library", "")) or "(none)"
+            namespaces[ns] = namespaces.get(ns, 0) + 1
             kind = str(item.get("kind", "unknown"))
             by_kind[kind] = by_kind.get(kind, 0) + 1
         return {
             "total_symbols": len(items),
-            "libraries": dict(sorted(libraries.items(), key=lambda x: -x[1])),
+            "namespaces": dict(sorted(namespaces.items(), key=lambda x: -x[1])),
             "by_kind": dict(sorted(by_kind.items(), key=lambda x: -x[1])),
         }
 

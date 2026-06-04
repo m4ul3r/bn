@@ -3198,3 +3198,84 @@ def test_trace_json_renders_structure(monkeypatch, capsys):
     parsed = _json.loads(output)
     assert parsed["function"] == "f"
     assert len(parsed["trace"]) == 2
+
+
+# --- imports --summary CLI routing/rendering ---
+
+
+def test_imports_summary_routes_and_renders_text(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        captured["op"] = op
+        captured["params"] = params
+        return {
+            "ok": True,
+            "result": {
+                "total_symbols": 4,
+                "namespaces": {"libc": 3, "libfoo": 1},
+                "by_kind": {"function": 3, "data": 1},
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["imports", "--summary", "--format", "text", "--target", "active"])
+
+    assert rc == 0
+    assert captured["op"] == "imports"
+    assert captured["params"]["summary"] is True
+    output = capsys.readouterr().out
+    assert "total imports: 4" in output
+    assert "by namespace:" in output
+    assert "libc" in output
+    assert "by kind:" in output
+
+
+def test_imports_without_summary_routes_false(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        captured["params"] = params
+        return {"ok": True, "result": []}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["imports", "--target", "active"])
+
+    assert rc == 0
+    assert captured["params"]["summary"] is False
+
+
+# --- function search --exact CLI routing + mutual exclusion ---
+
+
+def test_function_search_exact_routes(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        captured["op"] = op
+        captured["params"] = params
+        return {"ok": True, "result": [{"name": "system", "address": "0x401000"}]}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["function", "search", "--target", "active", "--exact", "system"])
+
+    assert rc == 0
+    assert captured["op"] == "search_functions"
+    assert captured["params"]["query"] == "system"
+    assert captured["params"]["exact"] is True
+    assert captured["params"]["regex"] is False
+
+
+def test_function_search_regex_and_exact_are_mutually_exclusive(monkeypatch):
+    # argparse must reject both flags together (exit code 2), before any request.
+    def fail_send_request(*a, **k):
+        raise AssertionError("send_request should not be called when args are invalid")
+
+    monkeypatch.setattr(bn.cli, "send_request", fail_send_request)
+
+    with pytest.raises(SystemExit) as exc:
+        bn.cli.main(["function", "search", "--target", "active", "--regex", "--exact", "system"])
+    assert exc.value.code == 2

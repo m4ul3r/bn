@@ -857,12 +857,12 @@ def _render_imports_summary_text(value: Any) -> str:
     lines = [
         f"total imports: {total}",
         "",
-        "by library:",
+        "by namespace:",
     ]
-    for lib, count in sorted(
-        value.get("libraries", {}).items(), key=lambda x: -x[1]
+    for ns, count in sorted(
+        value.get("namespaces", {}).items(), key=lambda x: -x[1]
     ):
-        lines.append(f"  {count:>5}  {lib if lib else '(unnamed)'}")
+        lines.append(f"  {count:>5}  {ns if ns else '(unnamed)'}")
     lines.append("")
     lines.append("by kind:")
     for kind, count in sorted(
