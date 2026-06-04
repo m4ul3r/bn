@@ -439,6 +439,11 @@ def _render_xrefs_text(value: Any, limit: int | None = None) -> str:
     total_code = len(code_refs)
     total_data = len(data_refs)
 
+    import_label = ""
+    if value.get("import_resolved"):
+        scanned = " (scanned)" if value.get("code_refs_scanned") else ""
+        import_label = f"import: {value.get('import_name', '<unknown>')}{scanned}"
+
     def _render_group(refs: list[Any], total: int, label: str) -> list[str]:
         groups = _group_refs_by_caller(refs)
         if not groups:
@@ -462,6 +467,9 @@ def _render_xrefs_text(value: Any, limit: int | None = None) -> str:
         return rendered
 
     lines = [f"xrefs to {value.get('address', '<unknown>')} ({total_code} code, {total_data} data)", ""]
+    if import_label:
+        lines.insert(0, import_label)
+        lines.insert(1, "")
     lines.extend(_render_group(code_refs, total_code, "code refs"))
     lines.append("")
     lines.extend(_render_group(data_refs, total_data, "data refs"))
@@ -839,6 +847,28 @@ def _render_type_list_text(value: Any) -> str:
         if decl:
             line += f" | {decl}"
         lines.append(line)
+    return "\n".join(lines)
+
+
+def _render_imports_summary_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    total = value.get("total_symbols", 0)
+    lines = [
+        f"total imports: {total}",
+        "",
+        "by library:",
+    ]
+    for lib, count in sorted(
+        value.get("libraries", {}).items(), key=lambda x: -x[1]
+    ):
+        lines.append(f"  {count:>5}  {lib if lib else '(unnamed)'}")
+    lines.append("")
+    lines.append("by kind:")
+    for kind, count in sorted(
+        value.get("by_kind", {}).items(), key=lambda x: -x[1]
+    ):
+        lines.append(f"  {count:>5}  {kind}")
     return "\n".join(lines)
 
 

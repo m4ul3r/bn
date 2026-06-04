@@ -7,6 +7,7 @@ from pathlib import Path
 
 from ..cli import _call, _int_or_hex, _mutation_exit_code, _pick, arg, command, mutex
 from ..formatters import (
+    _render_imports_summary_text,
     _render_mutation_text,
     _render_name_address_list_text,
     _render_py_exec_text,
@@ -52,16 +53,19 @@ def _strings(args: argparse.Namespace) -> int:
     )
 
 
-@command("imports", help="List imports", target=True)
+@command("imports", help="List imports", target=True,
+         args=[arg("--summary", action="store_true", default=False,
+                   help="Show aggregate counts by library and kind instead of the full list")])
 def _imports(args: argparse.Namespace) -> int:
+    summary_mode = bool(args.summary)
     return _call(
         args,
         "imports",
-        {},
+        {"summary": summary_mode},
         require_target=True,
         allow_implicit_target=True,
-        text_renderer=_render_name_address_list_text,
-        stem="imports",
+        text_renderer=_render_imports_summary_text if summary_mode else _render_name_address_list_text,
+        stem="imports-summary" if summary_mode else "imports",
     )
 
 

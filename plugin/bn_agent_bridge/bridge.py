@@ -717,6 +717,7 @@ class BinaryNinjaBridge:
                 target,
                 str(params.get("query", "")),
                 regex=bool(params.get("regex", False)),
+                exact=bool(params.get("exact", False)),
                 min_address=params.get("min_address"),
                 max_address=params.get("max_address"),
                 offset=int(params.get("offset", 0)),
@@ -811,7 +812,7 @@ class BinaryNinjaBridge:
                 regex=bool(params.get("regex", False)),
             )
         if op == "imports":
-            return self._imports(target)
+            return self._imports(target, summary=bool(params.get("summary", False)))
         if op == "sections":
             return self._sections(target, query=params.get("query"))
         if op == "read":
@@ -2373,6 +2374,7 @@ class BinaryNinjaBridge:
         query: str,
         *,
         regex: bool = False,
+        exact: bool = False,
         min_address: Any = None,
         max_address: Any = None,
         offset: int = 0,
@@ -2388,6 +2390,12 @@ class BinaryNinjaBridge:
 
             def matches(name: str) -> bool:
                 return bool(pattern.search(name))
+
+        elif exact:
+            needle = query.lower()
+
+            def matches(name: str) -> bool:
+                return name.lower() == needle
 
         else:
             needle = query.lower()
@@ -3418,8 +3426,93 @@ class BinaryNinjaBridge:
         try:
             address = _parse_address(identifier)
         except Exception:
-            address = self._find_function(bv, identifier).start
+            try:
+                address = self._find_function(bv, identifier).start
+            except RuntimeError:
+                return self._xrefs_import_symbol(bv, identifier)
         return self._xrefs_to_address(bv, address)
+
+    def _find_import_symbol(self, bv, name: str):
+        needle = name.lower()
+        for attr_name, kind in self._IMPORT_SYMBOL_TYPES:
+            sym_type = getattr(bn.SymbolType, attr_name, None)
+            if sym_type is None:
+                continue
+            for sym in list(bv.get_symbols_of_type(sym_type)):
+                sym_name = str(
+                    getattr(sym, "short_name", None)
+                    or getattr(sym, "full_name", None)
+                    or sym.name
+                )
+                if sym_name.lower() == needle:
+                    return sym
+        return None
+
+    def _xrefs_import_symbol(self, bv, identifier: str) -> dict[str, Any]:
+        sym = self._find_import_symbol(bv, identifier)
+        if sym is None:
+            available: list[str] = []
+            for attr_name, kind in self._IMPORT_SYMBOL_TYPES:
+                sym_type = getattr(bn.SymbolType, attr_name, None)
+                if sym_type is None:
+                    continue
+                for s in list(bv.get_symbols_of_type(sym_type)):
+                    n = str(
+                        getattr(s, "short_name", None)
+                        or getattr(s, "full_name", None)
+                        or s.name
+                    )
+                    available.append(n)
+            suggestions = difflib.get_close_matches(identifier, sorted(set(available)), n=5, cutoff=0.5)
+            msg = f"Function not found: {identifier}."
+            if suggestions:
+                msg += f" Did you mean: {', '.join(suggestions)}"
+            msg += " Not found as an import symbol either. Use 'bn imports' to see available imports."
+            raise RuntimeError(msg)
+
+        sym_address = int(sym.address)
+        result = self._xrefs_to_address(bv, sym_address)
+        result["import_resolved"] = True
+        result["import_name"] = str(identifier)
+
+        if not result.get("code_refs"):
+            manual = self._scan_for_calls_to(bv, sym_address)
+            if manual:
+                result["code_refs"] = manual
+                result["code_refs_scanned"] = True
+
+        return result
+
+    def _scan_for_calls_to(self, bv, target_address: int) -> list[dict[str, Any]]:
+        code_refs = []
+        seen: set[int] = set()
+        for fn in list(bv.functions):
+            for insn in self._iter_llil_instructions(fn):
+                op_name = self._il_op_name(insn)
+                if op_name not in {"LLIL_CALL", "LLIL_CALL_STACK_ADJUST", "LLIL_TAILCALL"}:
+                    continue
+                dest_value = self._llil_constant_value(getattr(insn, "dest", None))
+                if dest_value != target_address:
+                    continue
+                ref_addr = int(getattr(insn, "address", 0))
+                if ref_addr in seen:
+                    continue
+                seen.add(ref_addr)
+                fn_arch = getattr(fn, "arch", None)
+                code_refs.append({
+                    "function": str(fn.name),
+                    "address": hex(ref_addr),
+                    "caller_function": {
+                        "address": hex(int(fn.start)),
+                        "name": str(fn.name),
+                    },
+                    "kind": "code",
+                    "context": self._address_context(
+                        bv, ref_addr, include_disasm=True, arch=fn_arch, assume_code=True
+                    ),
+                })
+        code_refs.sort(key=lambda item: int(item["address"], 16))
+        return code_refs
 
     def _resolve_type_field(self, bv, field_spec: str):
         type_name, sep, field_name = str(field_spec).rpartition(".")
@@ -3697,7 +3790,7 @@ class BinaryNinjaBridge:
         ("ImportAddressSymbol", "address"),
     ]
 
-    def _imports(self, selector: str | None):
+    def _imports(self, selector: str | None, *, summary: bool = False):
         bv = self._resolve_view(selector)
         items = []
         for attr_name, kind in self._IMPORT_SYMBOL_TYPES:
@@ -3716,8 +3809,24 @@ class BinaryNinjaBridge:
                         "kind": kind,
                     }
                 )
+        if summary:
+            return self._imports_build_summary(items)
         items.sort(key=lambda item: (item["library"], item["kind"], item["name"], int(item["address"], 16)))
         return items
+
+    def _imports_build_summary(self, items: list[dict]) -> dict[str, Any]:
+        libraries: dict[str, int] = {}
+        by_kind: dict[str, int] = {}
+        for item in items:
+            lib = str(item.get("library", "")) or "(none)"
+            libraries[lib] = libraries.get(lib, 0) + 1
+            kind = str(item.get("kind", "unknown"))
+            by_kind[kind] = by_kind.get(kind, 0) + 1
+        return {
+            "total_symbols": len(items),
+            "libraries": dict(sorted(libraries.items(), key=lambda x: -x[1])),
+            "by_kind": dict(sorted(by_kind.items(), key=lambda x: -x[1])),
+        }
 
     _SECTION_SEMANTICS_NAMES: dict[int, str] = {
         0: "DefaultSection",

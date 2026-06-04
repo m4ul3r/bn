@@ -51,12 +51,16 @@ def _function_list(args: argparse.Namespace) -> int:
          args=[
              arg("--regex", action="store_true",
                  help="Interpret query as a case-insensitive regular expression"),
+             arg("--exact", action="store_true", default=False,
+                 help="Match function names exactly (case-insensitive); avoids substring "
+                      "false positives in C++ mangled names"),
              arg("query"),
          ])
 def _function_search(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {
         "query": args.query,
         "regex": bool(args.regex),
+        "exact": bool(args.exact),
     }
     if args.min_address is not None:
         params["min_address"] = args.min_address

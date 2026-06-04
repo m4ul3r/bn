@@ -3165,3 +3165,186 @@ def test_backward_slice_ip_rejects_llil(monkeypatch):
     with pytest.raises(bridge.OperationFailure, match="SSA form does not support"):
         instance._backward_slice("active", "test_func", "0x10010", arg_index=0,
                                  view="llil", interprocedural=True)
+
+
+# --- imports --summary ---
+
+
+def test_imports_summary_aggregates_counts(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+
+    sym_a = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x1000, "printf")
+    sym_a.short_name = "printf"
+    sym_a.namespace = "libc"
+
+    sym_b = fake_bn.Symbol(fake_bn.SymbolType.ImportedDataSymbol, 0x2000, "__stdout")
+    sym_b.short_name = "__stdout"
+    sym_b.namespace = "libc"
+
+    sym_c = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x3000, "read")
+    sym_c.short_name = "read"
+    sym_c.namespace = "libc"
+
+    sym_d = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x4000, "foobar")
+    sym_d.short_name = "foobar"
+    sym_d.namespace = "libfoo"
+
+    bv = _FakeBV(symbols=[sym_a, sym_b, sym_c, sym_d])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._imports(None, summary=True)
+
+    assert result["total_symbols"] == 4
+    assert result["libraries"] == {"libc": 3, "libfoo": 1}
+    assert result["by_kind"] == {"function": 3, "data": 1}
+
+
+def test_imports_summary_empty(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._imports(None, summary=True)
+
+    assert result["total_symbols"] == 0
+    assert result["libraries"] == {}
+    assert result["by_kind"] == {}
+
+
+# --- xrefs import symbol resolution ---
+
+
+def test_xrefs_falls_back_to_import_symbol_when_function_not_found(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+
+    malloc_sym = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x20000, "malloc")
+    malloc_sym.short_name = "malloc"
+    malloc_sym.namespace = "libc"
+
+    bv = _FakeBV(
+        functions=[_FakeFunction(0x10000, "main")],
+        symbols=[malloc_sym],
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._xrefs(None, "malloc")
+
+    assert result["import_resolved"] is True
+    assert result["import_name"] == "malloc"
+    assert result["address"] == "0x20000"
+
+
+def test_xrefs_import_symbol_raises_for_unknown_symbol(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[_FakeFunction(0x10000, "main")])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(RuntimeError, match="Function not found: nonexistent"):
+        instance._xrefs(None, "nonexistent")
+
+
+def test_scan_for_calls_to_finds_llil_calls(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    func_sym = sys.modules["binaryninja"].Symbol(
+        sys.modules["binaryninja"].SymbolType.FunctionSymbol, 0x10000, "my_func"
+    )
+    func_sym.short_name = "my_func"
+
+    insn_call = _FakeLLILInstruction(0x10010, _FakeConstPtr(0x20000))
+    insn_tailcall = _FakeLLILInstruction(
+        0x10020, _FakeConstPtr(0x20000), operation="LLIL_TAILCALL"
+    )
+    insn_other = _FakeLLILInstruction(0x10030, _FakeConstPtr(0x30000))
+
+    fn = _FakeFunction(0x10000, "my_func")
+    fn.low_level_il = [[insn_call, insn_tailcall, insn_other]]
+
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._scan_for_calls_to(bv, 0x20000)
+
+    assert len(result) == 2
+    addresses = [int(r["address"], 16) for r in result]
+    assert 0x10010 in addresses
+    assert 0x10020 in addresses
+    assert 0x10030 not in addresses
+
+
+def test_scan_for_calls_to_deduplicates_same_address(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    insn = _FakeLLILInstruction(0x10010, _FakeConstPtr(0x20000))
+    fn = _FakeFunction(0x10000, "my_func")
+    fn.low_level_il = [[insn, insn]]
+
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._scan_for_calls_to(bv, 0x20000)
+
+    assert len(result) == 1
+
+
+# --- function search --exact ---
+
+
+def test_search_functions_exact_match(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        functions=[
+            _FakeFunction(0x401000, "system"),
+            _FakeFunction(0x402000, "QAudioSystemPlugin"),
+            _FakeFunction(0x403000, "sprintf"),
+        ]
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._search_functions("active", "system", exact=True)
+
+    assert len(result) == 1
+    assert result[0]["name"] == "system"
+    assert result[0]["address"] == "0x401000"
+
+
+def test_search_functions_exact_case_insensitive(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        functions=[
+            _FakeFunction(0x401000, "System"),
+            _FakeFunction(0x402000, "QSystemPlugin"),
+        ]
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._search_functions("active", "system", exact=True)
+
+    assert len(result) == 1
+    assert result[0]["name"] == "System"
+
+
+def test_search_functions_exact_no_match(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        functions=[
+            _FakeFunction(0x401000, "system_ex"),
+            _FakeFunction(0x402000, "_system"),
+        ]
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._search_functions("active", "system", exact=True)
+
+    assert len(result) == 0
