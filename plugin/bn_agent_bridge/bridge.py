@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 import binaryninja as bn
+from binaryninja import SSAVariable
 from binaryninja.mainthread import execute_on_main_thread_and_wait, is_main_thread
 from binaryninja.plugin import PluginCommand
 
@@ -164,6 +165,7 @@ READ_LOCKED_OPS = {
     "pointer_table",
     "message_lens",
     "init_arrays",
+    "backward_slice",
     "types",
     "type_info",
     "strings",
@@ -772,6 +774,17 @@ class BinaryNinjaBridge:
             return self._init_arrays(
                 target,
                 limit=int(params.get("limit", 64)),
+            )
+        if op == "backward_slice":
+            return self._backward_slice(
+                target,
+                str(params["identifier"]),
+                str(params["address"]),
+                arg_index=int(params.get("arg_index", 0)),
+                view=str(params.get("view", "mlil")),
+                max_depth=int(params.get("max_depth", 50)),
+                interprocedural=bool(params.get("interprocedural", False)),
+                ip_depth=int(params.get("ip_depth", 2)),
             )
         if op == "types":
             return self._types(
@@ -3014,6 +3027,397 @@ class BinaryNinjaBridge:
             "query": query,
             "matches": matches,
             "count": len(matches),
+        }
+
+    def _iter_il_instructions(self, il_func):
+        if il_func is None:
+            return []
+        instructions = []
+        try:
+            blocks = list(il_func)
+        except Exception:
+            blocks = list(getattr(il_func, "basic_blocks", []) or [])
+        for block in blocks:
+            try:
+                instructions.extend(list(block))
+            except Exception:
+                continue
+        return instructions
+
+    @staticmethod
+    def _ssa_vars_from(vars_list: list) -> list[SSAVariable]:
+        return [v for v in vars_list if isinstance(v, SSAVariable)]
+
+    def _build_backward_trace(
+        self,
+        bv,
+        ssa_func,
+        initial_vars: list,
+        max_depth: int,
+        *,
+        interprocedural: bool = False,
+        ip_depth: int = 2,
+        view: str = "mlil",
+        _call_depth: int = 0,
+    ) -> list[dict[str, Any]]:
+        """Recursively walk SSA use-def chains backward, optionally crossing call boundaries."""
+        if _call_depth > 10:
+            return []  # Safety: prevent runaway recursion
+        trace: list[dict[str, Any]] = []
+        worklist: list[Any] = list(initial_vars)
+        visited: set[Any] = set()
+
+        while worklist and len(trace) < max_depth:
+            ssa_var = worklist.pop(0)
+            if not isinstance(ssa_var, SSAVariable):
+                trace.append({
+                    "ssa_var": str(ssa_var),
+                    "depth": len(trace),
+                    "terminates": True,
+                    "reason": "function_parameter_or_global",
+                })
+                continue
+            if ssa_var in visited:
+                continue
+            visited.add(ssa_var)
+
+            try:
+                def_insn = ssa_func.get_ssa_var_definition(ssa_var)
+            except AttributeError:
+                if interprocedural:
+                    continue
+                raise OperationFailure(
+                    "no_ssa_trace",
+                    f"{view} SSA form does not support get_ssa_var_definition (MLIL or HLIL required)",
+                )
+            entry: dict[str, Any] = {
+                "ssa_var": str(ssa_var),
+                "depth": len(trace),
+            }
+
+            if def_insn is None:
+                entry["terminates"] = True
+                entry["reason"] = "function_parameter_or_global"
+                trace.append(entry)
+                continue
+
+            entry["address"] = hex(int(getattr(def_insn, "address", 0)))
+            entry["il_text"] = str(def_insn)
+            entry["operation"] = self._il_op_name(def_insn)
+
+            def_op = entry["operation"]
+            if "CALL" in def_op or "JUMP" in def_op:
+                if interprocedural and ip_depth > 0:
+                    callee = self._resolve_callee(bv, def_insn)
+                    if callee is not None:
+                        callee_mlil = getattr(callee, "medium_level_il", None)
+                        if callee_mlil is not None and callee_mlil.ssa_form is not None:
+                            if hasattr(callee_mlil.ssa_form, "get_ssa_var_definition"):
+                                callee_ret_vars = self._find_return_vars(callee_mlil.ssa_form, bv)
+                                if callee_ret_vars:
+                                    entry["cross_function"] = True
+                                    entry["callee"] = callee.name
+                                    entry["terminates"] = False
+                                    entry["reason"] = "cross_function"
+                                    trace.append(entry)
+                                    callee_trace = self._build_backward_trace(
+                                        bv, callee_mlil.ssa_form, callee_ret_vars,
+                                        max_depth - len(trace),
+                                        interprocedural=True,
+                                        ip_depth=ip_depth - 1,
+                                        view=view,
+                                        _call_depth=_call_depth + 1,
+                                    )
+                                    for ct in callee_trace:
+                                        ct.setdefault("function_context", callee.name)
+                                    trace.extend(callee_trace)
+                                    continue
+                entry["terminates"] = True
+                entry["reason"] = "call_or_jump_boundary"
+                trace.append(entry)
+                continue
+
+            if "LOAD" in def_op:
+                entry["terminates"] = True
+                entry["reason"] = "memory_load"
+                trace.append(entry)
+                for rv in self._ssa_vars_from(getattr(def_insn, "vars_read", []) or []):
+                    if rv not in visited:
+                        worklist.append(rv)
+                continue
+
+            entry["terminates"] = False
+            entry["reason"] = None
+            trace.append(entry)
+
+            for rv in self._ssa_vars_from(getattr(def_insn, "vars_read", []) or []):
+                if rv not in visited:
+                    worklist.append(rv)
+
+        return trace
+
+    def _resolve_callee(self, bv, call_insn):
+        """Resolve a call instruction's callee to a BN function, or None.
+
+        Follows thunks/veneers (single-instruction tailcalls) to their real
+        target so interprocedural tracing works through PLT stubs and GCC thunks.
+        """
+        dest = getattr(call_insn, "dest", None)
+        if dest is None:
+            return None
+
+        fn = None
+        # Try direct numeric address first
+        try:
+            addr = int(dest)
+        except (ValueError, TypeError):
+            addr = getattr(dest, "constant", None)
+        if addr is not None and addr != 0:
+            fn = bv.get_function_at(int(addr))
+            if fn is None:
+                fn = bv.get_function_at(int(addr) & ~1)
+
+        # Try name-based resolution for imports (MediumLevelILImport).
+        # This is the primary path for PLT stubs where .constant gives a GOT
+        # slot address rather than the function entry point.
+        if fn is None:
+            name = getattr(dest, "name", None)
+            if name:
+                for sym in list(bv.get_symbols_by_name(name, bv.sections)):
+                    fn = bv.get_function_at(sym.address)
+                    if fn is not None:
+                        break
+                if fn is None:
+                    sym = bv.get_symbol_by_raw_name(name)
+                    if sym is not None:
+                        fn = bv.get_function_at(sym.address)
+
+        if fn is None:
+            return None
+        # Follow thunk/veneer: if the function is a single tailcall, resolve its target
+        return self._resolve_thunk(bv, fn) or fn
+
+    def _resolve_thunk(self, bv, fn):
+        """If fn is a single-instruction tailcall thunk, return its real target."""
+        mlil = getattr(fn, "medium_level_il", None)
+        if mlil is None:
+            return None
+        ssa = mlil.ssa_form
+        if ssa is None:
+            return None
+        instructions = []
+        for block in getattr(ssa, "basic_blocks", []) or []:
+            instructions.extend(list(block))
+        if len(instructions) != 1:
+            return None
+        insn = instructions[0]
+        if "TAILCALL" not in self._il_op_name(insn):
+            return None
+        dest = getattr(insn, "dest", None)
+        if dest is None:
+            return None
+        addr = self._extract_dest_address(bv, dest)
+        if addr is None:
+            return None
+        target = bv.get_function_at(addr)
+        if target is None:
+            target = bv.get_function_at(addr & ~1)
+        if target is not None and target.start != fn.start:
+            return self._resolve_thunk(bv, target) or target
+        return None
+
+    @staticmethod
+    def _extract_dest_address(bv, dest):
+        """Extract a numeric address from a call/tailcall destination expression.
+
+        Handles:
+        - raw int
+        - MLIL_CONST_PTR with .constant
+        - MLIL_IMPORT with a resolvable name
+
+        For MLIL_IMPORT, name lookup is tried BEFORE .constant because
+        .constant returns the GOT slot address, not the function entry point.
+        """
+        try:
+            return int(dest)
+        except (ValueError, TypeError):
+            pass
+        # For MLIL_IMPORT, resolve by symbol name first (the .constant is
+        # the GOT slot, not the function address).
+        name = getattr(dest, "name", None) or str(dest)
+        if name:
+            for sym in list(bv.get_symbols_by_name(name, bv.sections)):
+                fn = bv.get_function_at(sym.address)
+                if fn is not None:
+                    return int(fn.start)
+            sym = bv.get_symbol_by_raw_name(name)
+            if sym is not None:
+                fn = bv.get_function_at(sym.address)
+                if fn is not None:
+                    return int(fn.start)
+        # For MLIL_CONST_PTR and other constant-bearing expressions,
+        # fall back to .constant.
+        addr = getattr(dest, "constant", None)
+        if addr is not None:
+            return int(addr)
+        return None
+
+    def _find_return_vars(self, ssa_func, bv=None, _visited=None) -> list[SSAVariable]:
+        """Find SSA variables that feed into RET instructions in a function.
+
+        For functions that only contain a TAILCALL (PLT stubs, thunks), follows
+        the tailcall to the real implementation and returns its return vars.
+        """
+        ret_vars: list[SSAVariable] = []
+        has_ret = False
+        for block in getattr(ssa_func, "basic_blocks", []) or []:
+            for insn in block:
+                op_name = self._il_op_name(insn)
+                if op_name == "MLIL_RET":
+                    has_ret = True
+                    found = self._ssa_vars_from(getattr(insn, "vars_read", []) or [])
+                    if not found:
+                        src = getattr(insn, "src", []) or []
+                        for s in src:
+                            var = getattr(s, "var", None)
+                            if var is not None and isinstance(var, SSAVariable):
+                                found.append(var)
+                    if not found:
+                        dest = getattr(insn, "dest", None)
+                        if dest is not None:
+                            found = self._ssa_vars_from([dest] if not isinstance(dest, list) else dest)
+                    if not found:
+                        non_ssa = getattr(insn, "non_ssa_form", None)
+                        if non_ssa is not None:
+                            found = self._ssa_vars_from(getattr(non_ssa, "vars_read", []) or [])
+                    ret_vars.extend(found)
+        # No MLIL_RET found — try to follow TAILCALL to real implementation
+        if not has_ret and bv is not None:
+            if _visited is None:
+                _visited = set()
+            fn_key = id(ssa_func)
+            if fn_key in _visited:
+                return ret_vars  # Cycle detected
+            _visited.add(fn_key)
+            for block in getattr(ssa_func, "basic_blocks", []) or []:
+                for insn in block:
+                    if "TAILCALL" not in self._il_op_name(insn):
+                        continue
+                    dest = getattr(insn, "dest", None)
+                    if dest is None:
+                        break
+                    fn_source = getattr(ssa_func, "source_function", None)
+                    source_start = getattr(fn_source, "start", None)
+                    addr = self._extract_dest_address(bv, dest)
+                    if addr is not None:
+                        if source_start is not None and (addr == source_start or addr & ~1 == source_start):
+                            break  # Self-loop (PLT stub → itself)
+                        target = bv.get_function_at(addr)
+                        if target is None:
+                            target = bv.get_function_at(addr & ~1)
+                        if target is not None and source_start is not None and target.start == source_start:
+                            break  # Self-loop via different resolution path
+                        if target is not None:
+                            callee_mlil = getattr(target, "medium_level_il", None)
+                            if callee_mlil and callee_mlil.ssa_form:
+                                return self._find_return_vars(callee_mlil.ssa_form, bv, _visited)
+                    break  # Only try the first instruction
+        return ret_vars
+
+    def _backward_slice(
+        self,
+        selector: str | None,
+        identifier: str,
+        address: str,
+        *,
+        arg_index: int = 0,
+        view: str = "mlil",
+        max_depth: int = 50,
+        interprocedural: bool = False,
+        ip_depth: int = 2,
+    ) -> dict[str, Any]:
+        if max_depth < 1:
+            raise OperationFailure("invalid_max_depth", f"Invalid max_depth: {max_depth}")
+        bv = self._resolve_view(selector)
+        func = self._find_function(bv, identifier)
+        target_addr = _parse_address(address)
+
+        il_name = {"mlil": "medium_level_il", "llil": "low_level_il", "hlil": "high_level_il"}.get(view)
+        if il_name is None:
+            raise OperationFailure("invalid_view", f"Unsupported IL view: {view}")
+
+        il_func = getattr(func, il_name, None)
+        if il_func is None:
+            raise OperationFailure("no_il", f"Function {func.name} has no {view}")
+        ssa_func = il_func.ssa_form
+        if ssa_func is None:
+            raise OperationFailure("no_ssa", f"Function {func.name} has no {view} SSA form")
+
+        if not hasattr(ssa_func, "get_ssa_var_definition"):
+            raise OperationFailure(
+                "no_ssa_trace",
+                f"{view} SSA form does not support get_ssa_var_definition (MLIL or HLIL required)",
+            )
+
+        ssa_instructions = self._iter_il_instructions(ssa_func)
+        call_insn = None
+        for insn in ssa_instructions:
+            insn_addr = int(getattr(insn, "address", 0))
+            if insn_addr == target_addr:
+                op_name = self._il_op_name(insn)
+                if "CALL" in op_name or "TAILCALL" in op_name:
+                    call_insn = insn
+                    break
+
+        if call_insn is None:
+            for insn in ssa_instructions:
+                if int(getattr(insn, "address", 0)) == target_addr:
+                    op_name = self._il_op_name(insn)
+                    if "CALL" in op_name or "TAILCALL" in op_name:
+                        call_insn = insn
+                        break
+            if call_insn is None:
+                hint = ""
+                if view != "mlil":
+                    hint = " (try --view mlil, which has the broadest call coverage)"
+                raise OperationFailure(
+                    "instruction_not_found",
+                    f"No call instruction at {address} in {func.name}{hint}",
+                )
+
+        params = list(getattr(call_insn, "params", []) or [])
+        if not params:
+            raise OperationFailure(
+                "no_params",
+                f"Call at {address} has no exposed parameters in {view}",
+            )
+        if arg_index < 0 or arg_index >= len(params):
+            raise OperationFailure(
+                "invalid_arg_index",
+                f"Argument index {arg_index} out of range (0..{len(params) - 1})",
+            )
+
+        param_expr = params[arg_index]
+        initial_vars: list[Any] = self._ssa_vars_from(getattr(param_expr, "vars_read", []) or [])
+
+        trace = self._build_backward_trace(
+            bv, ssa_func, initial_vars, max_depth,
+            interprocedural=interprocedural,
+            ip_depth=ip_depth,
+            view=view,
+        )
+
+        return {
+            "function": func.name,
+            "function_address": hex(func.start),
+            "target_address": hex(target_addr),
+            "arg_index": arg_index,
+            "view": view,
+            "interprocedural": interprocedural,
+            "ip_depth": ip_depth if interprocedural else 0,
+            "truncated": len(trace) >= max_depth,
+            "step_count": len(trace),
+            "trace": trace,
         }
 
     def _xrefs(self, selector: str | None, identifier):

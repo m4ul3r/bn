@@ -16,6 +16,7 @@ from ..formatters import (
     _render_name_address_list_text,
     _render_message_lens_text,
     _render_pointer_table_text,
+    _render_trace_text,
     _render_xrefs_text,
     _text_field,
 )
@@ -405,4 +406,41 @@ def _evidence_init(args: argparse.Namespace) -> int:
         allow_implicit_target=True,
         text_renderer=_render_init_arrays_text,
         stem="init-arrays",
+    )
+
+
+@command("trace",
+         help="Backward slice: trace a call argument through SSA use-def chains to its origin",
+         target=True,
+         args=[
+             arg("identifier", help="Function name or entry address containing the call"),
+             arg("address", help="Address of the call instruction to trace from (hex 0x.. or decimal)"),
+             arg("--arg", type=int, default=0,
+                 help="Zero-based argument index to trace (default: 0)"),
+             arg("--view", default="mlil", choices=("mlil", "llil", "hlil"),
+                 help="IL view for SSA walking (default: mlil)"),
+             arg("--max-depth", type=int, default=50,
+                 help="Maximum trace steps before truncation (default: 50)"),
+             arg("--interprocedural", action="store_true", default=False,
+                 help="Follow return values across call boundaries into callees"),
+             arg("--ip-depth", type=int, default=2,
+                 help="Max call depth for interprocedural tracing (default: 2)"),
+         ])
+def _trace(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "backward_slice",
+        {
+            "identifier": args.identifier,
+            "address": args.address,
+            "arg_index": args.arg,
+            "view": args.view,
+            "max_depth": args.max_depth,
+            "interprocedural": args.interprocedural,
+            "ip_depth": args.ip_depth,
+        },
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_trace_text,
+        stem="trace",
     )

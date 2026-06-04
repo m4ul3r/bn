@@ -138,7 +138,14 @@ Understanding relationships between functions reveals architecture:
   ```
   This gives you the exact call site with surrounding HLIL context.
 
-- **Build a mental call tree** — for key functions, trace both up and down 2-3 levels. This reveals the flow: entry -> dispatch -> handler -> utility.
+- **Trace argument origins** — when you need to know where a specific call argument comes from (function parameter, global, heap allocation, previous call return):
+  ```bash
+  bn trace <caller> <call_address> --arg N
+  bn trace <caller> <call_address> --arg N --interprocedural
+  ```
+  Each step shows the SSA variable, its defining instruction, and whether the chain terminates at a function parameter, memory load, or call boundary. Add `--interprocedural` to follow return values across internal call boundaries (works best on static/kernel binaries).
+
+- **Build a mental call tree** — for key functions, trace both up and down 2-3 layers. This reveals the flow: entry -> dispatch -> handler -> utility.
 
 ## Naming Conventions
 

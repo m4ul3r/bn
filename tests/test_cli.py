@@ -3053,3 +3053,148 @@ def test_session_start_no_bndb_propagates_to_each_load(monkeypatch, tmp_path):
     assert len(captured) == 2
     assert all(item["prefer_bndb"] is False for item in captured)
     assert {item["path"] for item in captured} == {str(a), str(b)}
+
+
+def test_trace_routes_and_renders_text(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        captured["op"] = op
+        captured["params"] = params
+        captured["target"] = target
+        return {
+            "ok": True,
+            "result": {
+                "function": "test_func",
+                "function_address": "0x10000",
+                "target_address": "0x10010",
+                "arg_index": 0,
+                "view": "mlil",
+                "truncated": False,
+                "step_count": 2,
+                "trace": [
+                    {
+                        "ssa_var": "r0#1",
+                        "depth": 0,
+                        "address": "0x10010",
+                        "il_text": "MLIL_CALL_SSA @ 0x10010",
+                        "operation": "MLIL_SET_VAR_SSA",
+                        "terminates": False,
+                        "reason": None,
+                    },
+                    {
+                        "ssa_var": "r1#2",
+                        "depth": 1,
+                        "address": None,
+                        "il_text": None,
+                        "operation": "undefined",
+                        "terminates": True,
+                        "reason": "function_parameter_or_global",
+                    },
+                ],
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main([
+        "trace",
+        "--format", "text",
+        "--target", "active",
+        "--arg", "0",
+        "test_func",
+        "0x10010",
+    ])
+
+    assert rc == 0
+    assert captured["op"] == "backward_slice"
+    assert captured["target"] == "active"
+    assert captured["params"]["identifier"] == "test_func"
+    assert captured["params"]["address"] == "0x10010"
+    assert captured["params"]["arg_index"] == 0
+    output = capsys.readouterr().out
+    assert "backward trace of arg[0]" in output
+    assert "test_func" in output
+    assert "r0#1" in output or "0x10010" in output
+    assert "r1#2" in output
+    assert "function parameter" in output
+
+
+def test_trace_defaults_to_arg_0(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        captured["params"] = params or {}
+        return {"ok": True, "result": {"function": "f", "trace": [], "step_count": 0, "truncated": False}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["trace", "f", "0x10010", "--target", "active"])
+    assert rc == 0
+    assert captured["params"]["arg_index"] == 0
+
+
+def test_trace_respects_view_and_max_depth(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        captured["params"] = dict(params or {})
+        return {"ok": True, "result": {"function": "f", "trace": [], "step_count": 0, "truncated": False}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main([
+        "trace", "f", "0x10010",
+        "--target", "active",
+        "--view", "llil",
+        "--max-depth", "10",
+    ])
+    assert rc == 0
+    assert captured["params"]["view"] == "llil"
+    assert captured["params"]["max_depth"] == 10
+
+
+def test_trace_text_renderer_empty_trace(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        return {"ok": True, "result": {"function": "f", "trace": [], "step_count": 0, "truncated": False}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["trace", "f", "0x10010", "--target", "active"])
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "constant or immediate" in output or "no SSA trace" in output
+
+
+def test_trace_json_renders_structure(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        return {
+            "ok": True,
+            "result": {
+                "function": "f",
+                "function_address": "0x10000",
+                "target_address": "0x10010",
+                "arg_index": 0,
+                "view": "mlil",
+                "truncated": False,
+                "step_count": 2,
+                "trace": [
+                    {"ssa_var": "x#1", "depth": 0, "terminates": False},
+                    {"ssa_var": "y#2", "depth": 1, "terminates": True, "reason": "function_parameter_or_global"},
+                ],
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["trace", "f", "0x10010", "--target", "active", "--format", "json"])
+    assert rc == 0
+    output = capsys.readouterr().out
+    import json as _json
+    parsed = _json.loads(output)
+    assert parsed["function"] == "f"
+    assert len(parsed["trace"]) == 2

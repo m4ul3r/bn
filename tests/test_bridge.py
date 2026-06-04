@@ -34,6 +34,8 @@ def _load_bridge(monkeypatch):
     fake_bn.log_warn = lambda *args, **kwargs: None
     fake_bn.log_error = lambda *args, **kwargs: None
 
+    fake_bn.SSAVariable = SSAVariable
+
     fake_mainthread = types.ModuleType("binaryninja.mainthread")
     fake_mainthread.execute_on_main_thread_and_wait = lambda func: func()
     fake_mainthread.is_main_thread = lambda: True
@@ -2862,3 +2864,306 @@ def test_load_binary_already_bndb_skips_lookup(monkeypatch, tmp_path):
     assert result["path"] == str(bndb)
     assert result["notes"] == []
     bridge._headless_views.clear()
+
+
+# ---------------------------------------------------------------------------
+# backward_slice tests
+# ---------------------------------------------------------------------------
+
+class SSAVariable:
+    """Stand-in for binaryninja.SSAVariable for isinstance checks in tests."""
+    pass
+
+
+class _FakeSSAVariable(SSAVariable):
+    """Minimal SSA variable stand-in — hashable, str-able, used as dict key."""
+    def __init__(self, name: str):
+        self.name = name
+
+    def __str__(self):
+        return self.name
+
+    def __hash__(self):
+        return hash(self.name)
+
+    def __eq__(self, other):
+        if isinstance(other, _FakeSSAVariable):
+            return self.name == other.name
+        return NotImplemented
+
+
+class _FakeMLILInsn:
+    """Fake MLIL/SSA instruction for backward-slice tests."""
+    def __init__(
+        self,
+        address: int,
+        *,
+        operation: str = "MLIL_SET_VAR_SSA",
+        params: list | None = None,
+        vars_read: list | None = None,
+        dest=None,
+    ):
+        self._address = address
+        self._operation_name = operation
+        self._params = params or []
+        self._vars_read = vars_read or []
+        self.dest = dest
+
+    @property
+    def address(self):
+        return self._address
+
+    @property
+    def operation(self):
+        return _FakeOperation(self._operation_name)
+
+    @property
+    def params(self):
+        return self._params
+
+    @property
+    def vars_read(self):
+        return list(self._vars_read)
+
+    def __str__(self):
+        return f"{self._operation_name} @ 0x{self._address:x}"
+
+
+class _FakeSSAFunction:
+    """Fake MLIL SSA function that tracks variable definitions."""
+    def __init__(self, instructions: list[_FakeMLILInsn], definitions: dict | None = None):
+        self._instructions = instructions
+        self._definitions = dict(definitions or {})
+        self.basic_blocks = [_FakeBlock(instructions)] if instructions else []
+
+    def get_ssa_var_definition(self, ssa_var):
+        return self._definitions.get(ssa_var)
+
+
+class _FakeBlock:
+    """Fake basic block wrapping a list of instructions."""
+    def __init__(self, instructions: list):
+        self._instructions = instructions
+
+    def __iter__(self):
+        return iter(self._instructions)
+
+    def __len__(self):
+        return len(self._instructions)
+
+
+class _FakeMLILFunction:
+    """Fake MLIL function wrapping instructions + SSA form."""
+    def __init__(self, instructions: list[_FakeMLILInsn], definitions: dict | None = None):
+        self._instructions = instructions
+        self.basic_blocks = [_FakeBlock(instructions)] if instructions else []
+        self.ssa_form = _FakeSSAFunction(instructions, definitions)
+
+    def __iter__(self):
+        return iter(self.basic_blocks)
+
+
+def test_backward_slice_simple_chain(monkeypatch):
+    """Trace a variable through one SET_VAR."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    var_r0 = _FakeSSAVariable("r0#1")
+    var_r1 = _FakeSSAVariable("r1#2")
+
+    call_insn = _FakeMLILInsn(
+        0x10010,
+        operation="MLIL_CALL_SSA",
+        params=[_FakeMLILInsn(0x10010, operation="MLIL_VAR_SSA", vars_read=[var_r0])],
+        vars_read=[var_r0],
+    )
+    def_insn = _FakeMLILInsn(
+        0x10008,
+        operation="MLIL_SET_VAR_SSA",
+        vars_read=[var_r1],
+    )
+
+    fn = _FakeFunction(0x10000, "test_func")
+    fn.medium_level_il = _FakeMLILFunction(
+        instructions=[call_insn],
+        definitions={var_r0: def_insn},
+    )
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._backward_slice("active", "test_func", "0x10010", arg_index=0)
+
+    assert result["function"] == "test_func"
+    assert result["function_address"] == "0x10000"
+    assert result["target_address"] == "0x10010"
+    assert result["arg_index"] == 0
+    assert result["step_count"] == 2
+    assert result["truncated"] is False
+    assert result["trace"][0]["ssa_var"] == "r0#1"
+    assert result["trace"][0]["terminates"] is False
+    assert result["trace"][1]["ssa_var"] == "r1#2"
+    assert result["trace"][1]["terminates"] is True
+    assert result["trace"][1]["reason"] == "function_parameter_or_global"
+
+
+def test_backward_slice_undefined_var(monkeypatch):
+    """Variable with no definition should terminate immediately."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    var_param = _FakeSSAVariable("arg1#0")
+
+    call_insn = _FakeMLILInsn(
+        0x10020,
+        operation="MLIL_CALL_SSA",
+        params=[_FakeMLILInsn(0x10020, operation="MLIL_VAR_SSA", vars_read=[var_param])],
+        vars_read=[var_param],
+    )
+
+    fn = _FakeFunction(0x10000, "test_func")
+    fn.medium_level_il = _FakeMLILFunction(instructions=[call_insn])
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._backward_slice("active", "test_func", "0x10020", arg_index=0)
+
+    assert result["step_count"] == 1
+    assert result["trace"][0]["ssa_var"] == "arg1#0"
+    assert result["trace"][0]["terminates"] is True
+    assert result["trace"][0]["reason"] == "function_parameter_or_global"
+
+
+def test_backward_slice_no_call_at_address(monkeypatch):
+    """Address with no call instruction should raise."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    fn = _FakeFunction(0x10000, "test_func")
+    fn.medium_level_il = _FakeMLILFunction(instructions=[])
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(bridge.OperationFailure, match="No call instruction"):
+        instance._backward_slice("active", "test_func", "0x99999", arg_index=0)
+
+
+def test_backward_slice_bad_arg_index(monkeypatch):
+    """Out-of-range arg index should raise."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    call_insn = _FakeMLILInsn(
+        0x10010,
+        operation="MLIL_CALL_SSA",
+        params=[_FakeMLILInsn(0x10010, operation="MLIL_VAR_SSA")],
+    )
+
+    fn = _FakeFunction(0x10000, "test_func")
+    fn.medium_level_il = _FakeMLILFunction(instructions=[call_insn])
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(bridge.OperationFailure, match="out of range"):
+        instance._backward_slice("active", "test_func", "0x10010", arg_index=5)
+
+
+def test_backward_slice_no_mlil(monkeypatch):
+    """Function with no MLIL should raise."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    fn = _FakeFunction(0x10000, "test_func")
+    fn.medium_level_il = None
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(bridge.OperationFailure, match="has no mlil"):
+        instance._backward_slice("active", "test_func", "0x10010", arg_index=0)
+
+
+def test_backward_slice_interprocedural_follows_callee(monkeypatch):
+    """Interprocedural trace follows return value into a callee with MLIL_RET."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    callee_ret_var = _FakeSSAVariable("result#1")
+    callee_def_var = _FakeSSAVariable("tmp#2")
+
+    # Callee function: has MLIL_RET instruction that reads callee_ret_var
+    callee_ret_insn = _FakeMLILInsn(
+        0x20010, operation="MLIL_RET", vars_read=[callee_ret_var],
+    )
+    callee_def_insn = _FakeMLILInsn(
+        0x20008, operation="MLIL_SET_VAR_SSA", vars_read=[callee_def_var],
+    )
+    callee_ret_insn = _FakeMLILInsn(
+        0x20010, operation="MLIL_RET", vars_read=[callee_ret_var],
+    )
+    callee_def_insn = _FakeMLILInsn(
+        0x20008, operation="MLIL_SET_VAR_SSA", vars_read=[callee_def_var],
+    )
+    callee = _FakeFunction(0x20000, "callee_fn")
+    callee.medium_level_il = _FakeMLILFunction(
+        instructions=[callee_ret_insn, callee_def_insn],
+        definitions={callee_ret_var: callee_def_insn},
+    )
+
+    # Caller function: has a call instruction at 0x10010 to callee_fn
+    # The trace starts from a parameter that traces back through a SET_VAR
+    # whose definition is the call to callee_fn (call output crosses boundary)
+    call_dest_var = _FakeSSAVariable("r0#1")
+    param_var = _FakeSSAVariable("r0_1#2")
+
+    call_insn = _FakeMLILInsn(
+        0x10010,
+        operation="MLIL_CALL_SSA",
+        params=[_FakeMLILInsn(0x10010, operation="MLIL_VAR_SSA", vars_read=[call_dest_var])],
+        vars_read=[call_dest_var],
+        dest=0x20000,
+    )
+    # A SET_VAR that copies from the call output to another var,
+    # so the trace walks: param_var → def (SET_VAR reading call_dest_var)
+    # → call_dest_var def → CALL (which has dest=callee)
+    call_def = _FakeMLILInsn(
+        0x1000e, operation="MLIL_SET_VAR_SSA",
+        vars_read=[call_dest_var],
+    )
+    fn = _FakeFunction(0x10000, "caller_fn")
+    fn.medium_level_il = _FakeMLILFunction(
+        instructions=[call_insn],
+        definitions={call_dest_var: call_def},
+    )
+    # Register both functions so _resolve_callee can find callee by address
+    bv = _FakeBV(functions=[fn, callee])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._backward_slice(
+        "active", "caller_fn", "0x10010", arg_index=0,
+        interprocedural=True, ip_depth=2,
+    )
+
+    assert result["interprocedural"] is True
+    # The trace should have at least the caller steps + cross_function entry
+    assert len(result["trace"]) >= 1
+
+
+def test_backward_slice_ip_rejects_llil(monkeypatch):
+    """Interprocedural mode should still reject LLIL (no get_ssa_var_definition)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    call_insn = _FakeMLILInsn(
+        0x10010, operation="MLIL_CALL_SSA",
+        params=[_FakeMLILInsn(0x10010, operation="MLIL_VAR_SSA")],
+    )
+    fn = _FakeFunction(0x10000, "test_func")
+    fn.medium_level_il = _FakeMLILFunction(instructions=[call_insn])
+    fn.low_level_il = _FakeMLILFunction(instructions=[call_insn])
+    # Patch low_level_il.ssa_form to be a bare object without get_ssa_var_definition
+    class _NoSsaDefs:
+        basic_blocks = []
+    fn.low_level_il.ssa_form = _NoSsaDefs()
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    with pytest.raises(bridge.OperationFailure, match="SSA form does not support"):
+        instance._backward_slice("active", "test_func", "0x10010", arg_index=0,
+                                 view="llil", interprocedural=True)

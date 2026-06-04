@@ -1146,3 +1146,69 @@ def _render_skill_install_text(value: Any) -> str:
         lines.extend(f"- {dest}" for dest in skipped)
 
     return "\n".join(lines) + "\n"
+
+
+_TRACE_REASON_LABELS: dict[str, str] = {
+    "function_parameter_or_global": "function parameter",
+    "memory_load": "memory load",
+    "call_or_jump_boundary": "call boundary",
+}
+
+
+def _render_trace_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    fn_name = value.get("function", "<unknown>")
+    fn_addr = value.get("function_address", "<unknown>")
+    target_addr = value.get("target_address", "<unknown>")
+    arg_index = value.get("arg_index", 0)
+    trace = list(value.get("trace") or [])
+
+    header = (
+        f"backward trace of arg[{arg_index}] in {fn_name} @ {target_addr}"
+    )
+    info = f"  {fn_name} @ {fn_addr}  •  {len(trace)} steps"
+    if value.get("truncated"):
+        info += "  •  truncated"
+
+    if not trace:
+        return f"{header}\n{info}\n\n  constant or immediate — no SSA trace"
+
+    lines = [header, info, ""]
+    current_fn: str | None = None
+    for step in trace:
+        if not isinstance(step, dict):
+            lines.append(f"  {step}")
+            continue
+
+        fn_ctx = step.get("function_context")
+        cross_fn = step.get("cross_function")
+        ssa_var = step.get("ssa_var", "")
+        addr = step.get("address")
+        il_text = step.get("il_text") or ""
+        reason = step.get("reason") or ""
+        terminates = bool(step.get("terminates"))
+
+        if cross_fn:
+            callee = step.get("callee", "")
+            lines.append(f"  ── enters {callee} ──")
+            current_fn = callee
+            continue
+
+        if fn_ctx and fn_ctx != current_fn:
+            lines.append(f"  ── in {fn_ctx} ──")
+            current_fn = fn_ctx
+
+        if terminates:
+            label = _TRACE_REASON_LABELS.get(reason, reason.replace("_", " "))
+            line = f"  {ssa_var}  —  {label}"
+            if il_text:
+                line += f"  @ {addr}  {il_text}" if addr else f"  {il_text}"
+            lines.append(line)
+        else:
+            if addr:
+                lines.append(f"  {addr}  {il_text}")
+            else:
+                lines.append(f"  {il_text}")
+
+    return "\n".join(lines)

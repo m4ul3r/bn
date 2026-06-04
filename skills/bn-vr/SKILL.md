@@ -68,6 +68,25 @@ Data often passes through several functions before reaching a sink. Follow it st
 3. Use `bn xrefs` on the caller to find *its* callers
 4. Repeat until you reach an input source or lose the trail
 
+### Sink-to-source tracing with `bn trace`
+
+When you find a dangerous call (e.g. `memcpy(dst, src, len)`) and need to know where a specific argument originates, use `bn trace` to walk the SSA use-def chain backward:
+
+```bash
+bn trace <containing_function> <call_address> --arg N
+```
+
+This works within a single function (intraprocedural). For example, tracing which buffer flows into a `memcpy` destination reveals whether it's a stack local, a heap allocation, or a function parameter — letting you assess attacker control without reading every line of decompilation.
+
+Add `--interprocedural` to cross call boundaries when the traced value is another function's return value:
+
+```bash
+bn trace handler 0x1234 --arg 0 --interprocedural        # follow through callee return
+bn trace handler 0x1234 --arg 0 --interprocedural --ip-depth 3  # deeper recursion
+```
+
+This works best on self-contained code (static binaries, kernel modules). For shared library PLT/import calls, the callee has no MLIL body so IP mode correctly falls back to intraprocedural behavior. Use `--format json` to get structured step-by-step SSA variable information.
+
 ### When the trail is indirect or the args are unclear
 Plain `bn xrefs`/`decompile` thin out when dispatch is indirect or the decompiler's argument story is incomplete (common in C++/IPC services). Three evidence helpers (syntax in the bn skill, §4) pick up the trail:
 
@@ -143,7 +162,11 @@ When you need to rigorously track whether attacker-controlled data reaches a dan
 2. **Propagate taint** — trace through assignments, copies, and function calls:
    - Direct assignment: `dest = tainted_src` -> `dest` is tainted
    - Copy: `memcpy(dest, tainted_src, len)` -> `dest` is tainted
-   - Function call: if a tainted value is passed as an argument, check whether the callee propagates it to its return value or to other outputs
+   - Function call: if a tainted value is passed as an argument, check whether the callee propagates it to its return value or to other outputs. Use `bn trace` to follow a sink argument back through SSA to its origin:
+     ```bash
+     bn trace <sink_function> <call_address> --arg N                    # intra: one function
+     bn trace <sink_function> <call_address> --arg N --interprocedural  # IP: follow across calls
+     ```
    ```bash
    bn callsites <function> --within <caller>
    bn decompile <callee>
