@@ -3146,11 +3146,11 @@ def test_trace_respects_view_and_max_depth(monkeypatch, capsys):
     rc = bn.cli.main([
         "trace", "f", "0x10010",
         "--target", "active",
-        "--view", "llil",
+        "--view", "hlil",
         "--max-depth", "10",
     ])
     assert rc == 0
-    assert captured["params"]["view"] == "llil"
+    assert captured["params"]["view"] == "hlil"
     assert captured["params"]["max_depth"] == 10
 
 

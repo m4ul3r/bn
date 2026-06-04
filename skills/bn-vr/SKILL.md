@@ -78,14 +78,16 @@ bn trace <containing_function> <call_address> --arg N
 
 This works within a single function (intraprocedural). For example, tracing which buffer flows into a `memcpy` destination reveals whether it's a stack local, a heap allocation, or a function parameter — letting you assess attacker control without reading every line of decompilation.
 
-Add `--interprocedural` to cross call boundaries when the traced value is another function's return value:
+Add `--interprocedural` to cross call boundaries when the traced value is another function's **return value**:
 
 ```bash
 bn trace handler 0x1234 --arg 0 --interprocedural        # follow through callee return
 bn trace handler 0x1234 --arg 0 --interprocedural --ip-depth 3  # deeper recursion
 ```
 
-This works best on self-contained code (static binaries, kernel modules). For shared library PLT/import calls, the callee has no MLIL body so IP mode correctly falls back to intraprocedural behavior. Use `--format json` to get structured step-by-step SSA variable information.
+Scope of `--interprocedural`: it follows a value *into* a callee only when that value is the callee's return value, then traces the callee's return-value origins and stops at the callee's own parameters. It does **not** map a callee's parameters back to the caller's argument expressions, and it does **not** walk *up* the caller chain. So for "this arg is the return of `foo()` — where does `foo` get it?" IP mode answers directly; for "this arg came from my own caller" or "trace up through every caller," step up manually with `bn xrefs` on the containing function and re-run `bn trace` in each caller.
+
+The walk requires MLIL SSA, so use `--view mlil` (the default; `--view hlil` exists but often can't locate calls nested in assignment statements). IP mode works best on self-contained code (static binaries, kernel modules); for shared-library PLT/import calls the callee has no MLIL body, so IP mode correctly falls back to intraprocedural behavior. Use `--format json` to get structured step-by-step SSA variable information.
 
 ### When the trail is indirect or the args are unclear
 Plain `bn xrefs`/`decompile` thin out when dispatch is indirect or the decompiler's argument story is incomplete (common in C++/IPC services). Three evidence helpers (syntax in the bn skill, §4) pick up the trail:

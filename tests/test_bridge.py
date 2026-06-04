@@ -3082,20 +3082,13 @@ def test_backward_slice_no_mlil(monkeypatch):
 
 
 def test_backward_slice_interprocedural_follows_callee(monkeypatch):
-    """Interprocedural trace follows return value into a callee with MLIL_RET."""
+    """Interprocedural trace crosses into a callee when the traced arg is a call return value."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
 
+    # Callee: returns callee_ret_var, which is a copy of a parameter (callee_def_var).
     callee_ret_var = _FakeSSAVariable("result#1")
     callee_def_var = _FakeSSAVariable("tmp#2")
-
-    # Callee function: has MLIL_RET instruction that reads callee_ret_var
-    callee_ret_insn = _FakeMLILInsn(
-        0x20010, operation="MLIL_RET", vars_read=[callee_ret_var],
-    )
-    callee_def_insn = _FakeMLILInsn(
-        0x20008, operation="MLIL_SET_VAR_SSA", vars_read=[callee_def_var],
-    )
     callee_ret_insn = _FakeMLILInsn(
         0x20010, operation="MLIL_RET", vars_read=[callee_ret_var],
     )
@@ -3108,33 +3101,28 @@ def test_backward_slice_interprocedural_follows_callee(monkeypatch):
         definitions={callee_ret_var: callee_def_insn},
     )
 
-    # Caller function: has a call instruction at 0x10010 to callee_fn
-    # The trace starts from a parameter that traces back through a SET_VAR
-    # whose definition is the call to callee_fn (call output crosses boundary)
-    call_dest_var = _FakeSSAVariable("r0#1")
-    param_var = _FakeSSAVariable("r0_1#2")
-
-    call_insn = _FakeMLILInsn(
+    # Caller: arg 0 of the traced call (0x10010) is `ret_var`, and `ret_var` is
+    # defined by an *inner* call to callee_fn (0x1000c). The slice must therefore
+    # cross the call boundary into callee_fn.
+    ret_var = _FakeSSAVariable("r0#3")
+    # dest is a const-ptr expression (like real MLIL), so _resolve_callee exercises
+    # the int(dest)->TypeError->`.constant` fallback rather than the raw-int fast path.
+    inner_call_insn = _FakeMLILInsn(
+        0x1000c, operation="MLIL_CALL_SSA", dest=_FakeConstPtr(0x20000),
+    )
+    target_call_insn = _FakeMLILInsn(
         0x10010,
         operation="MLIL_CALL_SSA",
-        params=[_FakeMLILInsn(0x10010, operation="MLIL_VAR_SSA", vars_read=[call_dest_var])],
-        vars_read=[call_dest_var],
-        dest=0x20000,
+        params=[_FakeMLILInsn(0x10010, operation="MLIL_VAR_SSA", vars_read=[ret_var])],
+        vars_read=[ret_var],
     )
-    # A SET_VAR that copies from the call output to another var,
-    # so the trace walks: param_var → def (SET_VAR reading call_dest_var)
-    # → call_dest_var def → CALL (which has dest=callee)
-    call_def = _FakeMLILInsn(
-        0x1000e, operation="MLIL_SET_VAR_SSA",
-        vars_read=[call_dest_var],
+    caller = _FakeFunction(0x10000, "caller_fn")
+    caller.medium_level_il = _FakeMLILFunction(
+        instructions=[inner_call_insn, target_call_insn],
+        definitions={ret_var: inner_call_insn},
     )
-    fn = _FakeFunction(0x10000, "caller_fn")
-    fn.medium_level_il = _FakeMLILFunction(
-        instructions=[call_insn],
-        definitions={call_dest_var: call_def},
-    )
-    # Register both functions so _resolve_callee can find callee by address
-    bv = _FakeBV(functions=[fn, callee])
+    # Register both functions so _resolve_callee can find callee by address.
+    bv = _FakeBV(functions=[caller, callee])
     monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
 
     result = instance._backward_slice(
@@ -3143,8 +3131,18 @@ def test_backward_slice_interprocedural_follows_callee(monkeypatch):
     )
 
     assert result["interprocedural"] is True
-    # The trace should have at least the caller steps + cross_function entry
-    assert len(result["trace"]) >= 1
+    trace = result["trace"]
+    # Exactly one boundary crossing, into callee_fn.
+    cross = [s for s in trace if s.get("cross_function")]
+    assert len(cross) == 1, f"expected one cross-function step, got {trace}"
+    assert cross[0]["callee"] == "callee_fn"
+    assert cross[0]["reason"] == "cross_function"
+    assert cross[0]["terminates"] is False
+    # Recursion actually entered the callee body (steps tagged with its context)...
+    assert any(s.get("function_context") == "callee_fn" for s in trace)
+    # ...and bottomed out at the callee's parameter.
+    assert trace[-1]["terminates"] is True
+    assert trace[-1]["reason"] == "function_parameter_or_global"
 
 
 def test_backward_slice_ip_rejects_llil(monkeypatch):

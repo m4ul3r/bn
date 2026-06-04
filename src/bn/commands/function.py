@@ -417,8 +417,9 @@ def _evidence_init(args: argparse.Namespace) -> int:
              arg("address", help="Address of the call instruction to trace from (hex 0x.. or decimal)"),
              arg("--arg", type=int, default=0,
                  help="Zero-based argument index to trace (default: 0)"),
-             arg("--view", default="mlil", choices=("mlil", "llil", "hlil"),
-                 help="IL view for SSA walking (default: mlil)"),
+             arg("--view", default="mlil", choices=("mlil", "hlil"),
+                 help="IL view for SSA walking (default: mlil, broadest call coverage; "
+                      "hlil misses calls whose return value is assigned)"),
              arg("--max-depth", type=int, default=50,
                  help="Maximum trace steps before truncation (default: 50)"),
              arg("--interprocedural", action="store_true", default=False,

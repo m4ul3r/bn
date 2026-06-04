@@ -3183,7 +3183,7 @@ class BinaryNinjaBridge:
         if fn is None:
             name = getattr(dest, "name", None)
             if name:
-                for sym in list(bv.get_symbols_by_name(name, bv.sections)):
+                for sym in list(bv.get_symbols_by_name(name)):
                     fn = bv.get_function_at(sym.address)
                     if fn is not None:
                         break
@@ -3246,7 +3246,7 @@ class BinaryNinjaBridge:
         # the GOT slot, not the function address).
         name = getattr(dest, "name", None) or str(dest)
         if name:
-            for sym in list(bv.get_symbols_by_name(name, bv.sections)):
+            for sym in list(bv.get_symbols_by_name(name)):
                 fn = bv.get_function_at(sym.address)
                 if fn is not None:
                     return int(fn.start)
@@ -3362,28 +3362,21 @@ class BinaryNinjaBridge:
         ssa_instructions = self._iter_il_instructions(ssa_func)
         call_insn = None
         for insn in ssa_instructions:
-            insn_addr = int(getattr(insn, "address", 0))
-            if insn_addr == target_addr:
-                op_name = self._il_op_name(insn)
-                if "CALL" in op_name or "TAILCALL" in op_name:
-                    call_insn = insn
-                    break
+            if int(getattr(insn, "address", 0)) != target_addr:
+                continue
+            # "CALL" also matches TAILCALL/SYSCALL op names.
+            if "CALL" in self._il_op_name(insn):
+                call_insn = insn
+                break
 
         if call_insn is None:
-            for insn in ssa_instructions:
-                if int(getattr(insn, "address", 0)) == target_addr:
-                    op_name = self._il_op_name(insn)
-                    if "CALL" in op_name or "TAILCALL" in op_name:
-                        call_insn = insn
-                        break
-            if call_insn is None:
-                hint = ""
-                if view != "mlil":
-                    hint = " (try --view mlil, which has the broadest call coverage)"
-                raise OperationFailure(
-                    "instruction_not_found",
-                    f"No call instruction at {address} in {func.name}{hint}",
-                )
+            hint = ""
+            if view != "mlil":
+                hint = " (try --view mlil, which has the broadest call coverage)"
+            raise OperationFailure(
+                "instruction_not_found",
+                f"No call instruction at {address} in {func.name}{hint}",
+            )
 
         params = list(getattr(call_insn, "params", []) or [])
         if not params:
