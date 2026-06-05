@@ -917,9 +917,9 @@ class BinaryNinjaBridge:
         quick_effective = quick and load_path.suffix != ".bndb"
         if quick_effective:
             notes.append(
-                "loaded without analysis (--quick): sections/imports/strings/symbols "
-                "are ready; run `bn refresh` for full function analysis, or "
-                "`bn decompile <fn> --force-analysis` for a single function"
+                "loaded without analysis (--quick): sections/imports/symbols are ready; "
+                "strings and the full function set need `bn refresh` (or "
+                "`bn decompile <fn> --force-analysis` for a single function)"
             )
         else:
             bv.update_analysis_and_wait()

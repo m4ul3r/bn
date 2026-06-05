@@ -20,8 +20,8 @@ from ..formatters import (
              arg("--no-bndb", action="store_true",
                  help="Don't auto-prefer a sibling .bndb file"),
              arg("--quick", "--no-analysis", action="store_true",
-                 help="Load without full analysis (fast, ~1s): sections/imports/strings/symbols "
-                      "are ready immediately; run `bn refresh` for full function analysis"),
+                 help="Load without full analysis (fast, ~1s): sections/imports/symbols are ready "
+                      "immediately; strings and the full function set need `bn refresh`"),
          ])
 def _load(args: argparse.Namespace) -> int:
     return _call(
