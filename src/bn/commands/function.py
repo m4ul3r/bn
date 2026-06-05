@@ -24,7 +24,11 @@ from ..formatters import (
 from ..transport import BridgeError
 
 
-@command("function", "list", help="List functions", target=True, paged=True, address_filter=True)
+@command("function", "list", help="List functions", target=True, paged=True, address_filter=True,
+         args=[
+             arg("--count", action="store_true", default=False,
+                 help="Show total function count instead of listing"),
+         ])
 def _function_list(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
     if args.min_address is not None:
@@ -33,6 +37,17 @@ def _function_list(args: argparse.Namespace) -> int:
         params["max_address"] = args.max_address
     if args.offset:
         params["offset"] = args.offset
+    if args.count:
+        params["count_only"] = True
+        return _call(
+            args,
+            "list_functions",
+            params,
+            require_target=True,
+            allow_implicit_target=True,
+            text_renderer=lambda value: f"Total functions: {value.get('count', 0)}",
+            stem="function-count",
+        )
     return _call(
         args,
         "list_functions",

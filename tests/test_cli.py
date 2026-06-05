@@ -2799,6 +2799,76 @@ def test_close_silent_when_clean(monkeypatch, capsys):
     assert "unsaved" not in output.lower()
 
 
+def test_close_forwards_explicit_target_selector(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        assert op == "close_binary"
+        captured["target"] = target
+        return {"ok": True, "result": {"closed": [{"path": "/tmp/foo", "unsaved": False}]}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    rc = bn.cli.main(["close", "-t", "foo", "--format", "text"])
+
+    assert rc == 0
+    assert captured["target"] == "foo"
+
+
+def test_close_all_flag_sets_param(monkeypatch, capsys):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        captured["params"] = params
+        captured["target"] = target
+        return {"ok": True, "result": {"closed": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    rc = bn.cli.main(["close", "--all", "--format", "text"])
+
+    assert rc == 0
+    assert captured["params"].get("all") is True
+
+
+def test_close_ignores_sticky_target_pin(monkeypatch, capsys):
+    # A sticky pin must NOT turn a bare `close` (documented close-all) into
+    # close-one, and a stale pin must not make cleanup fail.
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        captured["target"] = target
+        return {"ok": True, "result": {"closed": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {"target": "stale_pin"})
+
+    rc = bn.cli.main(["close", "--format", "text"])
+
+    assert rc == 0
+    assert captured["target"] is None  # pin ignored -> close-all
+
+
+def test_function_list_count_prints_total(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "x"}]}
+        if op == "list_functions":
+            assert params.get("count_only") is True
+            return {"ok": True, "result": {"count": 4242}}
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    rc = bn.cli.main(["function", "list", "--count"])
+
+    assert rc == 0
+    assert "Total functions: 4242" in capsys.readouterr().out
+
+
 # --- Sticky instance/target ---
 
 

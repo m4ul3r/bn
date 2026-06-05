@@ -34,12 +34,23 @@ def _load(args: argparse.Namespace) -> int:
     )
 
 
-@command("close", help="Close a loaded binary",
-         args=[arg("path", nargs="?", help="Path to close (omit to close all)")])
+@command("close", help="Close a loaded binary", target=True,
+         args=[
+             arg("path", nargs="?", help="Path to close (omit to close all)"),
+             arg("--all", action="store_true", help="Close all loaded binaries"),
+         ])
 def _close(args: argparse.Namespace) -> int:
+    # Only honor an explicit -t/--target. A sticky pin must not turn a bare
+    # `close` (documented as close-all) into close-one, and a stale pin must
+    # not make cleanup fail -- close needs to stay robust. `_call` resolves
+    # `args.target` into the request target, so drop any sticky-injected value.
+    if getattr(args, "_sticky_target", False):
+        args.target = None
     params: dict[str, Any] = {}
     if args.path:
         params["path"] = str(Path(args.path).expanduser().resolve())
+    if args.all:
+        params["all"] = True
     return _call(
         args,
         "close_binary",

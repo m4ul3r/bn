@@ -2875,6 +2875,90 @@ def test_resolve_accepts_path_suffix_selector(monkeypatch):
     bridge._headless_views.clear()
 
 
+class _ClosableBV:
+    def __init__(self, filename: str, session_id: str = "0"):
+        self.closed = False
+        self.file = types.SimpleNamespace(
+            session_id=session_id,
+            filename=filename,
+            modified=False,
+            close=lambda: setattr(self, "closed", True),
+        )
+        self.view_type = types.SimpleNamespace(name="ELF")
+
+
+def test_close_binary_by_target_selector_does_not_deadlock(monkeypatch):
+    # Regression: _close_binary used to resolve() the selector *while holding*
+    # the non-reentrant _headless_views_lock, and resolve() re-acquires it ->
+    # permanent deadlock. Run it on a watchdog thread so a regression fails the
+    # test instead of hanging the suite.
+    import threading
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv_a = _ClosableBV("/proj/alpha.so", session_id="11")
+    bv_b = _ClosableBV("/proj/beta.so", session_id="22")
+    _register_views(bridge, bv_a, bv_b)
+
+    out: dict = {}
+
+    def go():
+        out["result"] = instance._close_binary(target="alpha.so")
+
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    t.join(timeout=5)
+
+    assert not t.is_alive(), "close by target deadlocked (resolve under views lock)"
+    assert bv_a.closed and not bv_b.closed
+    assert bv_a not in bridge._headless_views and bv_b in bridge._headless_views
+    bridge._headless_views.clear()
+
+
+def test_close_binary_all_flag_closes_everything(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv_a = _ClosableBV("/proj/alpha.so")
+    bv_b = _ClosableBV("/proj/beta.so")
+    _register_views(bridge, bv_a, bv_b)
+
+    result = instance._close_binary(all_=True)
+
+    assert len(result["closed"]) == 2
+    assert bv_a.closed and bv_b.closed
+    assert bridge._headless_views == []
+
+
+def test_close_binary_by_path_still_matches(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv_a = _ClosableBV("/proj/alpha.so")
+    bv_b = _ClosableBV("/proj/beta.so")
+    _register_views(bridge, bv_a, bv_b)
+
+    result = instance._close_binary(path="/proj/beta.so")
+
+    assert [c["path"] for c in result["closed"]] == ["/proj/beta.so"]
+    assert bv_b.closed and not bv_a.closed
+    assert bv_b not in bridge._headless_views and bv_a in bridge._headless_views
+    bridge._headless_views.clear()
+
+
+def test_list_functions_count_only_returns_count(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[
+        _FakeFunction(0x1000, "a"),
+        _FakeFunction(0x2000, "b"),
+        _FakeFunction(0x3000, "c"),
+    ])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    assert instance._list_functions(None, count_only=True) == {"count": 3}
+    # count must match the full listing length
+    assert len(instance._list_functions(None)) == 3
+
+
 def test_resolve_raises_on_ambiguous_basename(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     bv1 = _FakeFileBV("/work/01_arithmetic_lock/target.bndb", session_id="1")

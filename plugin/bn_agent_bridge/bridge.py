@@ -713,7 +713,7 @@ class BinaryNinjaBridge:
                 prefer_bndb=bool(params.get("prefer_bndb", True)),
             )
         if op == "close_binary":
-            return self._close_binary(params.get("path"))
+            return self._close_binary(params.get("path"), target, params.get("all"))
         if op == "save_database":
             return self._save_database(target, params.get("path"))
 
@@ -724,6 +724,7 @@ class BinaryNinjaBridge:
                 max_address=params.get("max_address"),
                 offset=int(params.get("offset", 0)),
                 limit=int(params["limit"]) if "limit" in params else None,
+                count_only=bool(params.get("count_only", False)),
             )
         if op == "search_functions":
             return self._search_functions(
@@ -919,18 +920,31 @@ class BinaryNinjaBridge:
             "targets": self.targets.refresh(),
         }
 
-    def _close_binary(self, path: str | None = None):
+    def _close_binary(self, path: str | None = None, target: str | None = None, all_: bool = False):
         def _snapshot(bv) -> dict[str, Any]:
             return {
                 "path": str(getattr(bv.file, "filename", "")),
                 "unsaved": bool(getattr(bv.file, "modified", False)),
             }
 
+        # Resolve a target selector *before* taking _headless_views_lock:
+        # resolve() -> refresh() -> _collect_open_views() re-acquires that lock,
+        # which is non-reentrant, so resolving while holding it deadlocks.
+        target_bv = self.targets.resolve(target) if target is not None else None
+
         with _headless_views_lock:
             if not _headless_views:
                 raise RuntimeError("No binaries are currently loaded")
 
-            if path is None:
+            # Target-based close takes priority over path
+            if target_bv is not None:
+                closed = [_snapshot(target_bv)]
+                target_bv.file.close()
+                _headless_views[:] = [v for v in _headless_views if v is not target_bv]
+                return {"closed": closed}
+
+            # --all closes everything
+            if all_ or path is None:
                 closed = []
                 for bv in _headless_views:
                     closed.append(_snapshot(bv))
@@ -2384,11 +2398,15 @@ class BinaryNinjaBridge:
         max_address: Any = None,
         offset: int = 0,
         limit: int | None = None,
+        count_only: bool = False,
     ):
         bv = self._resolve_view(selector)
+        functions = list(self._filtered_functions(bv, min_address=min_address, max_address=max_address))
+        if count_only:
+            return {"count": len(functions)}
         items = [
             {"name": fn.name, "address": hex(fn.start), "raw_name": getattr(fn, "raw_name", fn.name)}
-            for fn in self._filtered_functions(bv, min_address=min_address, max_address=max_address)
+            for fn in functions
         ]
         if offset:
             items = items[offset:]
