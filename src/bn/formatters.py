@@ -215,7 +215,8 @@ def _render_refresh_text(value: Any) -> str:
 def _render_load_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    lines = [f"loaded: {value.get('path', '<unknown>')}"]
+    suffix = "  [not analyzed]" if value.get("analyzed") is False else ""
+    lines = [f"loaded: {value.get('path', '<unknown>')}{suffix}"]
     for note in value.get("notes") or []:
         lines.append(f"note: {note}")
     targets = list(value.get("targets") or [])
@@ -287,7 +288,8 @@ def _render_session_start_text(value: Any) -> str:
                 if error:
                     lines.append(f"- {item.get('path', '<unknown>')} [error: {error}]")
                 else:
-                    lines.append(f"- {item.get('path', '<unknown>')}")
+                    mark = "  [not analyzed]" if item.get("analyzed") is False else ""
+                    lines.append(f"- {item.get('path', '<unknown>')}{mark}")
                 for note in item.get("notes") or []:
                     lines.append(f"  note: {note}")
             else:

@@ -45,6 +45,13 @@ def main(argv: list[str] | None = None) -> int:
         help="Instance ID for this bridge session (default: random)",
         default=None,
     )
+    parser.add_argument(
+        "--quick",
+        "--no-analysis",
+        dest="quick",
+        action="store_true",
+        help="Preload binaries without full analysis (fast); run `bn refresh` for full analysis",
+    )
     args = parser.parse_args(argv)
 
     # Make the binaryninja package importable.
@@ -60,7 +67,7 @@ def main(argv: list[str] | None = None) -> int:
 
     from bn_agent_bridge.bridge import start_headless
 
-    start_headless(args.binaries, instance_id=args.instance_id)
+    start_headless(args.binaries, instance_id=args.instance_id, quick=args.quick)
     return 0
 
 

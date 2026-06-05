@@ -2753,7 +2753,7 @@ def _setup_load_test(monkeypatch):
     binaryninja = sys.modules["binaryninja"]
     loaded_paths: list[str] = []
 
-    def fake_load(path):
+    def fake_load(path, update_analysis=True):
         loaded_paths.append(path)
         return _LoadBV()
 
@@ -2804,6 +2804,44 @@ def test_load_binary_no_sibling(monkeypatch, tmp_path):
     assert loaded_paths == [str(raw)]
     assert result["path"] == str(raw)
     assert result["notes"] == []
+    bridge._headless_views.clear()
+
+
+def test_load_binary_quick_skips_analysis(monkeypatch, tmp_path):
+    bridge, instance, loaded_paths = _setup_load_test(monkeypatch)
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+
+    result = instance._load_binary(str(raw), quick=True)
+
+    assert result["analyzed"] is False
+    assert any("--quick" in note for note in result["notes"])
+    assert bridge._headless_views[-1].analysis_updated is False  # heavy phase skipped
+    bridge._headless_views.clear()
+
+
+def test_load_binary_full_runs_analysis(monkeypatch, tmp_path):
+    bridge, instance, loaded_paths = _setup_load_test(monkeypatch)
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+
+    result = instance._load_binary(str(raw))
+
+    assert result["analyzed"] is True
+    assert bridge._headless_views[-1].analysis_updated is True
+    bridge._headless_views.clear()
+
+
+def test_load_binary_quick_is_noop_for_bndb(monkeypatch, tmp_path):
+    bridge, instance, loaded_paths = _setup_load_test(monkeypatch)
+    bndb = tmp_path / "foo.so.bndb"
+    bndb.write_bytes(b"")
+
+    result = instance._load_binary(str(bndb), quick=True)
+
+    # A .bndb already carries its saved analysis: --quick is a no-op there.
+    assert result["analyzed"] is True
+    assert bridge._headless_views[-1].analysis_updated is True
     bridge._headless_views.clear()
 
 

@@ -3211,6 +3211,52 @@ def test_load_no_bndb_flag_disables_prefer_bndb(monkeypatch, tmp_path):
     assert captured["prefer_bndb"] is False
 
 
+def _load_capture(monkeypatch, raw, analyzed):
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        assert op == "load_binary"
+        captured.update(params)
+        return {"ok": True, "result": {
+            "loaded": True, "path": str(raw), "analyzed": analyzed,
+            "notes": ([] if analyzed else ["loaded without analysis (--quick): run `bn refresh`"]),
+            "targets": [],
+        }}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    return captured
+
+
+def test_load_quick_flag_sets_quick_param(monkeypatch, tmp_path):
+    raw = tmp_path / "foo.so"; raw.write_bytes(b"")
+    captured = _load_capture(monkeypatch, raw, analyzed=False)
+    assert bn.cli.main(["load", "--quick", str(raw)]) == 0
+    assert captured["quick"] is True
+
+
+def test_load_no_analysis_alias_sets_quick_param(monkeypatch, tmp_path):
+    raw = tmp_path / "foo.so"; raw.write_bytes(b"")
+    captured = _load_capture(monkeypatch, raw, analyzed=False)
+    assert bn.cli.main(["load", "--no-analysis", str(raw)]) == 0
+    assert captured["quick"] is True
+
+
+def test_load_default_is_not_quick(monkeypatch, tmp_path):
+    raw = tmp_path / "foo.so"; raw.write_bytes(b"")
+    captured = _load_capture(monkeypatch, raw, analyzed=True)
+    assert bn.cli.main(["load", str(raw)]) == 0
+    assert captured["quick"] is False
+
+
+def test_load_quick_output_marks_not_analyzed(monkeypatch, tmp_path, capsys):
+    raw = tmp_path / "foo.so"; raw.write_bytes(b"")
+    _load_capture(monkeypatch, raw, analyzed=False)
+    assert bn.cli.main(["load", "--quick", str(raw)]) == 0
+    out = capsys.readouterr().out
+    assert "[not analyzed]" in out
+    assert "bn refresh" in out
+
+
 def test_load_text_renders_notes(monkeypatch, tmp_path, capsys):
     raw = tmp_path / "foo.so"
     raw.write_bytes(b"")

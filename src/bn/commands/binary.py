@@ -19,6 +19,9 @@ from ..formatters import (
              arg("path", help="Path to binary or BNDB file"),
              arg("--no-bndb", action="store_true",
                  help="Don't auto-prefer a sibling .bndb file"),
+             arg("--quick", "--no-analysis", action="store_true",
+                 help="Load without full analysis (fast, ~1s): sections/imports/strings/symbols "
+                      "are ready immediately; run `bn refresh` for full function analysis"),
          ])
 def _load(args: argparse.Namespace) -> int:
     return _call(
@@ -27,6 +30,7 @@ def _load(args: argparse.Namespace) -> int:
         {
             "path": str(Path(args.path).expanduser().resolve()),
             "prefer_bndb": not args.no_bndb,
+            "quick": bool(args.quick),
         },
         require_target=False,
         text_renderer=_render_load_text,

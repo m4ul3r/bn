@@ -686,6 +686,8 @@ def _default_skill_install_roots() -> list[Path]:
              arg("--instance-id", help="Use a specific instance ID (default: random)"),
              arg("--no-bndb", action="store_true",
                  help="Don't auto-prefer a sibling .bndb file"),
+             arg("--quick", "--no-analysis", action="store_true",
+                 help="Preload without full analysis (fast); run `bn refresh` for full analysis"),
          ])
 def _session_start(args: argparse.Namespace) -> int:
     instance_id = getattr(args, "instance_id", None)
@@ -693,13 +695,14 @@ def _session_start(args: argparse.Namespace) -> int:
 
     binaries = getattr(args, "binaries", None) or []
     prefer_bndb = not args.no_bndb
+    quick = bool(getattr(args, "quick", False))
     loaded = []
     for binary in binaries:
         resolved = str(Path(binary).expanduser().resolve())
         try:
             resp = send_request(
                 "load_binary",
-                params={"path": resolved, "prefer_bndb": prefer_bndb},
+                params={"path": resolved, "prefer_bndb": prefer_bndb, "quick": quick},
                 instance_id=instance.instance_id,
             )
             loaded.append(resp["result"])

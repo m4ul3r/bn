@@ -711,6 +711,7 @@ class BinaryNinjaBridge:
             return self._load_binary(
                 str(params["path"]),
                 prefer_bndb=bool(params.get("prefer_bndb", True)),
+                quick=bool(params.get("quick", False)),
             )
         if op == "close_binary":
             return self._close_binary(params.get("path"), target, params.get("all"))
@@ -886,7 +887,7 @@ class BinaryNinjaBridge:
             "targets": self.targets.refresh(),
         }
 
-    def _load_binary(self, path: str, *, prefer_bndb: bool = True):
+    def _load_binary(self, path: str, *, prefer_bndb: bool = True, quick: bool = False):
         import binaryninja
 
         resolved = Path(path).expanduser().resolve()
@@ -903,11 +904,25 @@ class BinaryNinjaBridge:
                     f"loaded {sibling} instead of {resolved} (use --no-bndb to skip)"
                 )
 
-        bv = binaryninja.load(str(load_path))
+        # Always open without auto-analysis, then analyze explicitly unless
+        # --quick. Quick load skips update_analysis_and_wait() entirely -- the
+        # expensive, occasionally-crashing/OOMing phase -- so sections, symbols,
+        # imports and strings are usable in ~1s while the function set stays
+        # minimal until `bn refresh` promotes it to full analysis. A .bndb
+        # already carries its saved analysis, so --quick is a no-op there.
+        bv = binaryninja.load(str(load_path), update_analysis=False)
         if bv is None:
             raise RuntimeError(f"Failed to open binary: {load_path}")
 
-        bv.update_analysis_and_wait()
+        quick_effective = quick and load_path.suffix != ".bndb"
+        if quick_effective:
+            notes.append(
+                "loaded without analysis (--quick): sections/imports/strings/symbols "
+                "are ready; run `bn refresh` for full function analysis, or "
+                "`bn decompile <fn> --force-analysis` for a single function"
+            )
+        else:
+            bv.update_analysis_and_wait()
 
         with _headless_views_lock:
             _headless_views.append(bv)
@@ -916,6 +931,7 @@ class BinaryNinjaBridge:
             "loaded": True,
             "path": str(load_path),
             "requested_path": str(resolved),
+            "analyzed": not quick_effective,
             "notes": notes,
             "targets": self.targets.refresh(),
         }
@@ -5206,11 +5222,16 @@ def start_bridge():  # pragma: no cover - GUI runtime
     _bridge.start()
 
 
-def start_headless(binaries: list[str] | None = None, instance_id: str | None = None):
+def start_headless(
+    binaries: list[str] | None = None,
+    instance_id: str | None = None,
+    quick: bool = False,
+):
     """Start the bridge in headless mode (no GUI required).
 
     Opens any binary file paths provided, starts the socket server,
-    and blocks the calling thread until shutdown is requested.
+    and blocks the calling thread until shutdown is requested. With ``quick``,
+    preloaded binaries skip ``update_analysis_and_wait()`` (see ``--quick``).
     """
     global _bridge
     if _bridge is not None:
@@ -5240,14 +5261,15 @@ def start_headless(binaries: list[str] | None = None, instance_id: str | None = 
 
         for path in binaries:
             resolved = Path(path).expanduser().resolve()
-            bv = binaryninja.load(str(resolved))
+            bv = binaryninja.load(str(resolved), update_analysis=False)
             if bv is None:
                 bn.log_warn(f"Failed to open binary: {resolved}")
                 continue
-            bv.update_analysis_and_wait()
+            if not quick:
+                bv.update_analysis_and_wait()
             with _headless_views_lock:
                 _headless_views.append(bv)
-            bn.log_info(f"Loaded {resolved}")
+            bn.log_info(f"Loaded {resolved}{' (no analysis)' if quick else ''}")
 
     try:
         _bridge._shutdown_event.wait()
