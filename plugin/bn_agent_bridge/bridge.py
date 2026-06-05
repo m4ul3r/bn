@@ -3818,8 +3818,24 @@ class BinaryNinjaBridge:
         ("ImportAddressSymbol", "address"),
     ]
 
+    # BN tags standard-ELF import symbols with these namespace sentinels rather
+    # than a real shared-object name (the dynamic linker only resolves the actual
+    # provider at runtime). Treat them as "no known library".
+    _BN_SENTINEL_NAMESPACES: frozenset[str] = frozenset(
+        {"", "BNINTERNALNAMESPACE", "BNEXTERNALNAMESPACE"}
+    )
+
+    @staticmethod
+    def _needed_libraries(bv) -> list[str]:
+        """DT_NEEDED shared objects this binary links against, if BN exposes them."""
+        try:
+            return sorted({str(lib) for lib in (getattr(bv, "libraries", None) or [])})
+        except Exception:
+            return []
+
     def _imports(self, selector: str | None, *, summary: bool = False):
         bv = self._resolve_view(selector)
+        needed_libraries = self._needed_libraries(bv)
         items = []
         for attr_name, kind in self._IMPORT_SYMBOL_TYPES:
             sym_type = getattr(bn.SymbolType, attr_name, None)
@@ -3828,34 +3844,42 @@ class BinaryNinjaBridge:
             for sym in list(bv.get_symbols_of_type(sym_type)):
                 name = str(getattr(sym, "short_name", None) or getattr(sym, "full_name", None) or sym.name)
                 raw_name = str(getattr(sym, "raw_name", sym.name))
+                namespace = str(getattr(sym, "namespace", "") or "")
+                # Only surface `library` when it's a real per-library namespace;
+                # BN's sentinels become None so agents don't read them as a
+                # dependency. `namespace` keeps the raw value under an honest name.
+                library = namespace if namespace not in self._BN_SENTINEL_NAMESPACES else None
                 items.append(
                     {
                         "name": name,
                         "address": hex(sym.address),
-                        "library": str(getattr(sym, "namespace", "") or ""),
+                        "library": library,
+                        "namespace": namespace,
                         "raw_name": raw_name,
                         "kind": kind,
                     }
                 )
         if summary:
-            return self._imports_build_summary(items)
-        items.sort(key=lambda item: (item["library"], item["kind"], item["name"], int(item["address"], 16)))
+            return self._imports_build_summary(items, needed_libraries)
+        items.sort(key=lambda item: (item["library"] or "", item["kind"], item["name"], int(item["address"], 16)))
         return items
 
-    def _imports_build_summary(self, items: list[dict]) -> dict[str, Any]:
-        # Each item's "library" field actually holds the BN symbol namespace
-        # (BNINTERNALNAMESPACE/BNEXTERNALNAMESPACE on standard ELF; real per-library
-        # names only on binaries that carry them), so the summary reports it as
-        # "namespaces" to avoid implying a per-shared-object breakdown.
+    def _imports_build_summary(
+        self, items: list[dict], needed_libraries: list[str] | None = None
+    ) -> dict[str, Any]:
+        # "namespaces" groups BN's symbol namespace (sentinels on standard ELF),
+        # not a per-shared-object breakdown. The real dependency list is
+        # "needed_libraries" (DT_NEEDED), which is what agents actually want.
         namespaces: dict[str, int] = {}
         by_kind: dict[str, int] = {}
         for item in items:
-            ns = str(item.get("library", "")) or "(none)"
+            ns = str(item.get("namespace", "") or "") or "(none)"
             namespaces[ns] = namespaces.get(ns, 0) + 1
             kind = str(item.get("kind", "unknown"))
             by_kind[kind] = by_kind.get(kind, 0) + 1
         return {
             "total_symbols": len(items),
+            "needed_libraries": needed_libraries or [],
             "namespaces": dict(sorted(namespaces.items(), key=lambda x: -x[1])),
             "by_kind": dict(sorted(by_kind.items(), key=lambda x: -x[1])),
         }

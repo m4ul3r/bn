@@ -36,6 +36,25 @@ def _text_field(field: str) -> Callable[[Any], str]:
     return render
 
 
+def _slice_text_lines(
+    text: str, lines_range: tuple[int, int] | None, *, marker: str = "//"
+) -> str:
+    """Return only lines START..END (1-indexed, inclusive) with a count header.
+
+    Shared by `decompile`, `il`, and `disasm` so every line-oriented view slices
+    the same way. Slicing happens before the spill check, so `--lines` also keeps
+    large functions inline.
+    """
+    if lines_range is None:
+        return text
+    all_lines = text.splitlines()
+    total = len(all_lines)
+    start, end = lines_range
+    sliced = all_lines[start - 1 : end]
+    header = f"{marker} lines {start}-{min(end, total)} of {total}"
+    return header + "\n" + "\n".join(sliced)
+
+
 def _render_function_info_text(value: Any, verbose: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -857,11 +876,15 @@ def _render_imports_summary_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     total = value.get("total_symbols", 0)
-    lines = [
-        f"total imports: {total}",
-        "",
-        "by namespace:",
-    ]
+    lines = [f"total imports: {total}"]
+    needed = value.get("needed_libraries") or []
+    if needed:
+        lines.append("")
+        lines.append("needed libraries (DT_NEEDED):")
+        for lib in needed:
+            lines.append(f"  {lib}")
+    lines.append("")
+    lines.append("by namespace:")
     for ns, count in sorted(
         value.get("namespaces", {}).items(), key=lambda x: -x[1]
     ):

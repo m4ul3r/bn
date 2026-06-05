@@ -2324,6 +2324,47 @@ def test_imports_sorts_by_library_kind_name(monkeypatch):
     assert result[1]["library"] == "libz"
 
 
+def test_imports_bn_sentinel_namespace_is_not_surfaced_as_library(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+
+    sym = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x1000, "memcpy")
+    sym.short_name = "memcpy"
+    sym.namespace = "BNINTERNALNAMESPACE"
+
+    bv = _FakeBV(symbols=[sym])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._imports(None)
+
+    # The meaningless sentinel must not masquerade as a real library...
+    assert result[0]["library"] is None
+    # ...but stays available under an honestly-named field.
+    assert result[0]["namespace"] == "BNINTERNALNAMESPACE"
+
+
+def test_imports_summary_includes_needed_libraries(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+
+    sym = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x1000, "memcpy")
+    sym.short_name = "memcpy"
+    sym.namespace = "BNEXTERNALNAMESPACE"
+
+    bv = _FakeBV(symbols=[sym])
+    bv.libraries = ["libssl.so.1.1", "libc.so.6"]
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._imports(None, summary=True)
+
+    # DT_NEEDED is the real dependency signal, sorted and de-duped.
+    assert result["needed_libraries"] == ["libc.so.6", "libssl.so.1.1"]
+    # namespace grouping still reflects the raw BN namespace.
+    assert result["namespaces"] == {"BNEXTERNALNAMESPACE": 1}
+
+
 # --- read: raw bytes at an address ---
 
 

@@ -2337,6 +2337,49 @@ def test_batch_apply_invalid_json_clean_error(monkeypatch, capsys, tmp_path):
     assert "Traceback" not in err
 
 
+def test_il_lines_slices_output_with_header(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        if op == "il":
+            return {"ok": True, "result": {"text": "line1\nline2\nline3\nline4\nline5"}}
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["il", "main", "--target", "active", "--lines", "2:4"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "// lines 2-4 of 5" in out
+    assert "line2" in out and "line3" in out and "line4" in out
+    assert "line1" not in out
+    assert "line5" not in out
+
+
+def test_disasm_lines_slices_output_with_header(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        if op == "disasm":
+            return {"ok": True, "result": {"text": "aaa\nbbb\nccc\nddd"}}
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["disasm", "0x1000", "--target", "active", "--lines", "1:2"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "// lines 1-2 of 4" in out
+    assert "aaa" in out and "bbb" in out
+    assert "ccc" not in out and "ddd" not in out
+
+
+def test_lines_range_rejects_zero_index_with_helpful_error(monkeypatch, capsys):
+    # argparse type errors exit via SystemExit(2)
+    with pytest.raises(SystemExit):
+        bn.cli.main(["disasm", "0x1000", "--target", "active", "--lines", "0:3"])
+    err = capsys.readouterr().err
+    assert "1-indexed" in err
+
+
 # --- I2: strings filtering CLI args ---
 
 

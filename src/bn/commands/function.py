@@ -18,6 +18,7 @@ from ..formatters import (
     _render_pointer_table_text,
     _render_trace_text,
     _render_xrefs_text,
+    _slice_text_lines,
     _text_field,
 )
 from ..transport import BridgeError
@@ -141,14 +142,7 @@ def _decompile(args: argparse.Namespace) -> int:
     lines_range = getattr(args, "lines", None)
 
     def _render_decompile_text(value: Any) -> str:
-        text = _text_field("text")(value)
-        if lines_range is not None:
-            all_lines = text.splitlines()
-            total = len(all_lines)
-            start, end = lines_range
-            sliced = all_lines[start - 1 : end]
-            header = f"// lines {start}-{min(end, total)} of {total}"
-            text = header + "\n" + "\n".join(sliced)
+        text = _slice_text_lines(_text_field("text")(value), lines_range)
         warnings = value.get("warnings") if isinstance(value, dict) else None
         if warnings:
             text = text + "\n\n" + "\n".join(f"warning: {warning}" for warning in warnings)
@@ -176,29 +170,39 @@ def _decompile(args: argparse.Namespace) -> int:
                  help="IL level to dump: hlil (default), mlil, or llil"),
              arg("--ssa", action="store_true",
                  help="Emit the SSA form of the selected IL view"),
+             arg("--lines", type=_parse_line_range, default=None, metavar="START:END",
+                 help="Show only lines START through END (1-indexed, inclusive)"),
          ])
 def _il(args: argparse.Namespace) -> int:
+    lines_range = getattr(args, "lines", None)
+    base = _text_field("text")
     return _call(
         args,
         "il",
         {"identifier": args.identifier, "view": args.view, "ssa": bool(args.ssa)},
         require_target=True,
         allow_implicit_target=True,
-        text_renderer=_text_field("text"),
+        text_renderer=lambda value: _slice_text_lines(base(value), lines_range),
         stem="il",
     )
 
 
 @command("disasm", help="Disassemble a function", target=True,
-         args=[arg("identifier", help="Function name or entry address (hex 0x.. or decimal)")])
+         args=[
+             arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
+             arg("--lines", type=_parse_line_range, default=None, metavar="START:END",
+                 help="Show only lines START through END (1-indexed, inclusive)"),
+         ])
 def _disasm(args: argparse.Namespace) -> int:
+    lines_range = getattr(args, "lines", None)
+    base = _text_field("text")
     return _call(
         args,
         "disasm",
         {"identifier": args.identifier},
         require_target=True,
         allow_implicit_target=True,
-        text_renderer=_text_field("text"),
+        text_renderer=lambda value: _slice_text_lines(base(value), lines_range),
         stem="disasm",
     )
 

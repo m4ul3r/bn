@@ -501,7 +501,9 @@ def _parse_line_range(value: str) -> tuple[int, int]:
     except ValueError:
         raise argparse.ArgumentTypeError(f"expected START:END with integers, got {value!r}")
     if start < 1 or end < start:
-        raise argparse.ArgumentTypeError(f"invalid range: {start}:{end}")
+        raise argparse.ArgumentTypeError(
+            f"invalid range {start}:{end}; --lines is 1-indexed (START >= 1, END >= START)"
+        )
     return (start, end)
 
 
