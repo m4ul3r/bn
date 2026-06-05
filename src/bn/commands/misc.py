@@ -179,7 +179,14 @@ def _py_exec(args: argparse.Namespace) -> int:
                  help="Path to a JSON manifest: a dict with a top-level 'ops' list and a 'target'"),
          ])
 def _batch_apply(args: argparse.Namespace) -> int:
-    manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+    if not args.manifest.exists():
+        raise BridgeError(f"Manifest file not found: {args.manifest}")
+    try:
+        manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise BridgeError(f"Invalid JSON in manifest {args.manifest}: {exc}") from None
+    except OSError as exc:
+        raise BridgeError(f"Could not read manifest {args.manifest}: {exc}") from None
     if args.preview:
         manifest["preview"] = True
     return _call(

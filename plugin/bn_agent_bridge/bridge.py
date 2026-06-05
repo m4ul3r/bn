@@ -233,9 +233,14 @@ def _parse_address(value: Any) -> int:
     if isinstance(value, int):
         return value
     text = str(value).strip()
-    if text.lower().startswith("0x"):
-        return int(text, 16)
-    return int(text, 10)
+    try:
+        if text.lower().startswith("0x"):
+            return int(text, 16)
+        return int(text, 10)
+    except ValueError:
+        raise ValueError(
+            f"{value!r} is not a valid address; expected a decimal or 0x-prefixed hex value"
+        ) from None
 
 
 def _artifact_summary(value: Any) -> dict[str, Any]:
@@ -996,13 +1001,28 @@ class BinaryNinjaBridge:
         return self.targets.resolve(selector)
 
     def _find_function(self, bv, identifier):
+        # A 0x-prefixed identifier is unambiguously an address attempt (function
+        # names never start with 0x), so a parse failure or a miss should report
+        # the address problem rather than silently degrading to a name search
+        # that ends in a misleading "Function not found".
+        looks_like_address = str(identifier).strip().lower().startswith("0x")
+        addr = None
         try:
             addr = _parse_address(identifier)
-            fn = bv.get_function_at(addr)
+        except ValueError:
+            if looks_like_address:
+                raise RuntimeError(
+                    f"Invalid address {identifier!r}: expected a 0x-prefixed hex or decimal value"
+                ) from None
+        if addr is not None:
+            try:
+                fn = bv.get_function_at(addr)
+            except Exception:
+                fn = None
             if fn is not None:
                 return fn
-        except Exception:
-            pass
+            if looks_like_address:
+                raise RuntimeError(f"No function found at address {hex(addr)}")
 
         text = str(identifier)
         exact = self._find_functions_by_name(bv, text, case_sensitive=True)

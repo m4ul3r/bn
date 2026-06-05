@@ -273,6 +273,9 @@ def _render_session_start_text(value: Any) -> str:
                     lines.append(f"  note: {note}")
             else:
                 lines.append(f"- {_render_fallback_text(item)}")
+    if value.get("stopped"):
+        lines.append("")
+        lines.append("session stopped: no binaries loaded successfully")
     return "\n".join(lines)
 
 

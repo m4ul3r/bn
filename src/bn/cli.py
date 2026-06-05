@@ -704,6 +704,9 @@ def _session_start(args: argparse.Namespace) -> int:
         except BridgeError as exc:
             loaded.append({"path": resolved, "error": str(exc)})
 
+    failures = [item for item in loaded if isinstance(item, dict) and item.get("error")]
+    successes = [item for item in loaded if isinstance(item, dict) and not item.get("error")]
+
     result: dict[str, Any] = {
         "instance_id": instance.instance_id,
         "pid": instance.pid,
@@ -712,10 +715,20 @@ def _session_start(args: argparse.Namespace) -> int:
     if loaded:
         result["loaded"] = loaded
 
+    # If the caller asked to preload binaries but none loaded, the freshly
+    # spawned bridge is an empty zombie they'd have to hunt down and stop. Shut
+    # it down and exit non-zero so the failure is visible to scripts.
+    if binaries and not successes:
+        try:
+            send_request("shutdown", instance_id=instance.instance_id)
+        except BridgeError:
+            pass
+        result["stopped"] = True
+
     if args.format == "text":
         result = _render_session_start_text(result)
     _render_result(result, fmt=args.format, out_path=args.out, stem="session-start")
-    return 0
+    return 1 if failures else 0
 
 
 @command("session", "stop", help="Stop a running bridge session",

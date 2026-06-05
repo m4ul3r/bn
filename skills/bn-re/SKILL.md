@@ -42,7 +42,7 @@ Not all functions matter equally. Prioritize:
   Many inbound xrefs = widely used. Few xrefs + large body = likely a top-level handler.
 - **String references** — functions containing interesting strings (error messages, protocol keywords, file paths) are high-value targets:
   ```bash
-  bn strings --query "error\|fail\|password\|key\|flag"
+  bn strings --regex --query "error|fail|password|key|flag"
   ```
   Then use `bn xrefs` on the string address to find which functions reference it.
 - **Import callers** — trace backward from interesting imports:

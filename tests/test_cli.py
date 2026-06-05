@@ -2231,6 +2231,112 @@ def test_session_start_spawns_instance(monkeypatch, capsys):
     assert parsed["pid"] == 999
 
 
+def test_session_start_all_loads_fail_stops_bridge_and_exits_nonzero(monkeypatch, capsys):
+    from bn.transport import BridgeError, BridgeInstance
+
+    fake_inst = BridgeInstance(
+        pid=999,
+        socket_path=__import__("pathlib").Path("/tmp/test.sock"),
+        registry_path=__import__("pathlib").Path("/tmp/test.json"),
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at="2026-01-01T00:00:00Z",
+        meta={},
+        instance_id="ghost9",
+    )
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: fake_inst)
+
+    ops = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        ops.append(op)
+        if op == "load_binary":
+            raise BridgeError(f"File not found: {params['path']}")
+        if op == "shutdown":
+            return {"ok": True, "result": {"shutting_down": True}}
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["session", "start", "/tmp/nonexistent.so", "--format", "json"])
+
+    # Non-zero exit, and the empty zombie bridge is shut down rather than leaked.
+    assert rc == 1
+    assert "shutdown" in ops
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["stopped"] is True
+
+
+def test_session_start_partial_failure_keeps_bridge_but_exits_nonzero(monkeypatch, capsys):
+    from bn.transport import BridgeError, BridgeInstance
+
+    fake_inst = BridgeInstance(
+        pid=999,
+        socket_path=__import__("pathlib").Path("/tmp/test.sock"),
+        registry_path=__import__("pathlib").Path("/tmp/test.json"),
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at="2026-01-01T00:00:00Z",
+        meta={},
+        instance_id="half",
+    )
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: fake_inst)
+
+    ops = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        ops.append(op)
+        if op == "load_binary":
+            if "good" in params["path"]:
+                return {"ok": True, "result": {"path": params["path"], "loaded": True}}
+            raise BridgeError(f"File not found: {params['path']}")
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["session", "start", "/tmp/good.so", "/tmp/bad.so", "--format", "json"])
+
+    # One binary loaded, so the bridge stays up, but the failure still surfaces.
+    assert rc == 1
+    assert "shutdown" not in ops
+    parsed = json.loads(capsys.readouterr().out)
+    assert "stopped" not in parsed
+
+
+def test_batch_apply_missing_manifest_clean_error(monkeypatch, capsys, tmp_path):
+    from bn.transport import BridgeError
+
+    def fail_send_request(*args, **kwargs):
+        raise AssertionError("bridge should not be contacted for a missing manifest")
+
+    monkeypatch.setattr(bn.cli, "send_request", fail_send_request)
+
+    missing = tmp_path / "no" / "such" / "manifest.json"
+    rc = bn.cli.main(["batch", "apply", str(missing)])
+
+    assert rc == 2  # BridgeError exit code
+    err = capsys.readouterr().err
+    assert "Manifest file not found" in err
+    assert "Traceback" not in err
+
+
+def test_batch_apply_invalid_json_clean_error(monkeypatch, capsys, tmp_path):
+    bad = tmp_path / "manifest.json"
+    bad.write_text("{not valid json", encoding="utf-8")
+
+    monkeypatch.setattr(
+        bn.cli, "send_request",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("bridge should not be contacted")),
+    )
+
+    rc = bn.cli.main(["batch", "apply", str(bad)])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "Invalid JSON in manifest" in err
+    assert "Traceback" not in err
+
+
 # --- I2: strings filtering CLI args ---
 
 

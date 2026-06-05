@@ -685,6 +685,43 @@ def test_find_function_not_found_without_close_match(monkeypatch):
     assert str(exc_info.value) == "Function not found: zzzzzzzz"
 
 
+def test_parse_address_reports_friendly_error_for_garbage(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+
+    with pytest.raises(ValueError) as exc_info:
+        bridge._parse_address("not_an_address")
+
+    message = str(exc_info.value)
+    assert "not a valid address" in message
+    # The raw int() ValueError must not leak through.
+    assert "invalid literal for int" not in message
+
+
+def test_find_function_invalid_hex_reports_address_not_missing_function(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[_FakeFunction(0x401000, "player_update")])
+
+    with pytest.raises(RuntimeError) as exc_info:
+        instance._find_function(bv, "0xGGGG")
+
+    message = str(exc_info.value)
+    assert "Invalid address" in message
+    assert "0xGGGG" in message
+    assert "Function not found" not in message
+
+
+def test_find_function_valid_address_with_no_function(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[_FakeFunction(0x401000, "player_update")])
+
+    with pytest.raises(RuntimeError) as exc_info:
+        instance._find_function(bv, "0x999999")
+
+    assert str(exc_info.value) == "No function found at address 0x999999"
+
+
 def test_find_type_suggests_close_match_when_not_found(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
