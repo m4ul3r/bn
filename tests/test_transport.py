@@ -102,7 +102,8 @@ def test_list_instances_prunes_stale_registry_and_socket(tmp_path, monkeypatch):
 
     assert instances == []
     assert not registry_path.exists()
-    assert stale_socket_path.exists()
+    # The dead socket file is swept too (a SIGKILL/crash leaves it behind).
+    assert not stale_socket_path.exists()
 
 
 def test_send_request_wraps_socket_errors(tmp_path, monkeypatch):
@@ -121,6 +122,127 @@ def test_send_request_wraps_socket_errors(tmp_path, monkeypatch):
 
     with pytest.raises(BridgeError, match="Failed to contact Binary Ninja bridge pid 999"):
         send_request("doctor")
+
+
+def test_purge_keeps_log_sibling_for_diagnostics(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+
+    registry_path = inst_dir / "ghost.json"
+    socket_path = inst_dir / "ghost.sock"
+    log_path = inst_dir / "ghost.log"
+
+    # Bind+close leaves the socket file on disk but refuses connections,
+    # mimicking a process that died without unlinking it.
+    dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    dead.bind(str(socket_path))
+    dead.listen(1)
+    dead.close()
+
+    log_path.write_text("native crash output\n", encoding="utf-8")
+    registry_path.write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "socket_path": str(socket_path),
+                "instance_id": "ghost",
+                "plugin_name": "bn_agent_bridge",
+                "plugin_version": "0.1.0",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    instances = list_instances()
+
+    assert instances == []
+    assert not registry_path.exists()
+    assert not socket_path.exists()  # orphan socket swept
+    assert log_path.exists()  # log preserved for diagnosis
+    assert log_path.read_text(encoding="utf-8") == "native crash output\n"
+
+
+def _empty_reply_socket():
+    class _FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, path):
+            pass
+
+        def sendall(self, payload):
+            pass
+
+        def shutdown(self, how):
+            pass
+
+        def recv(self, size):
+            return b""
+
+    return _FakeSocket()
+
+
+def test_send_request_empty_response_reports_dead_process(tmp_path, monkeypatch):
+    from bn.transport import BridgeInstance
+
+    log_path = tmp_path / "ghost.log"
+    log_path.write_text("segfault\n", encoding="utf-8")
+    instance = BridgeInstance(
+        pid=4242,
+        socket_path=tmp_path / "bridge.sock",
+        registry_path=tmp_path / "ghost.json",
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at=None,
+        meta={},
+        instance_id="ghost",
+    )
+    monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None, **kw: instance)
+    monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
+    monkeypatch.setattr("bn.transport.socket.socket", lambda *a, **k: _empty_reply_socket())
+
+    with pytest.raises(BridgeError) as excinfo:
+        send_request("decompile")
+
+    msg = str(excinfo.value)
+    assert "empty response" in msg
+    assert "op 'decompile'" in msg
+    assert "pid 4242" in msg
+    assert "ghost" in msg
+    assert "no longer running" in msg
+    assert str(log_path) in msg
+
+
+def test_send_request_empty_response_reports_live_process(tmp_path, monkeypatch):
+    from bn.transport import BridgeInstance
+
+    instance = BridgeInstance(
+        pid=4242,
+        socket_path=tmp_path / "bridge.sock",
+        registry_path=tmp_path / "ghost.json",
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at=None,
+        meta={},
+        instance_id="ghost",
+    )
+    monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None, **kw: instance)
+    monkeypatch.setattr("bn.transport._process_alive", lambda pid: True)
+    monkeypatch.setattr("bn.transport.socket.socket", lambda *a, **k: _empty_reply_socket())
+
+    with pytest.raises(BridgeError) as excinfo:
+        send_request("decompile")
+
+    msg = str(excinfo.value)
+    assert "still running" in msg
+    assert "pid 4242" in msg
 
 
 def test_send_request_retries_transient_connect_failures(tmp_path, monkeypatch):

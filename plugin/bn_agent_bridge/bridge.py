@@ -647,6 +647,14 @@ class BinaryNinjaBridge:
         if self.registry_path.exists():
             with contextlib.suppress(OSError):
                 self.registry_path.unlink()
+        # On a clean shutdown there's no crash to diagnose, so drop the log
+        # file too rather than leave it as clutter in the instances dir. A
+        # crash skips stop() entirely (SIGKILL/segfault), so crash logs are
+        # preserved for `bn`'s empty-response diagnostic to point at.
+        log_path = self.registry_path.with_suffix(".log")
+        if log_path.exists():
+            with contextlib.suppress(OSError):
+                log_path.unlink()
 
     def _write_registry(self):
         payload = {
@@ -5150,6 +5158,21 @@ def start_headless(binaries: list[str] | None = None, instance_id: str | None = 
         import secrets
         instance_id = secrets.token_hex(4)
 
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+
+    _bridge = BinaryNinjaBridge(instance_id=instance_id)
+    _bridge.start()
+    bn.log_info(f"BN Agent Bridge running in headless mode (instance {instance_id})")
+
+    # Open any preloaded binaries *after* the socket is live and the registry
+    # is written, so the instance is immediately discoverable (`bn session
+    # list`, `bn target list`, etc.) while the potentially multi-minute
+    # update_analysis_and_wait() runs. Each view is appended only once its
+    # analysis finishes, so clients never observe a half-analyzed target -- it
+    # simply appears in the target list when ready. Crucially, if analysis
+    # crashes here the instance has already registered, so it surfaces as a
+    # dead instance instead of an invisible orphan process.
     if binaries:
         import binaryninja
 
@@ -5163,13 +5186,6 @@ def start_headless(binaries: list[str] | None = None, instance_id: str | None = 
             with _headless_views_lock:
                 _headless_views.append(bv)
             bn.log_info(f"Loaded {resolved}")
-
-    inst_dir = instances_dir()
-    inst_dir.mkdir(parents=True, exist_ok=True)
-
-    _bridge = BinaryNinjaBridge(instance_id=instance_id)
-    _bridge.start()
-    bn.log_info(f"BN Agent Bridge running in headless mode (instance {instance_id})")
 
     try:
         _bridge._shutdown_event.wait()

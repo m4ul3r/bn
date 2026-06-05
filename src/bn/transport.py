@@ -54,9 +54,64 @@ def _format_instance_choices(instances: list[BridgeInstance]) -> str:
     return "\n".join(lines)
 
 
-def _purge_stale_registry(registry_path: Path) -> None:
+def _process_alive(pid: int) -> bool:
+    """Best-effort check that ``pid`` still names a running process."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _empty_response_error(instance: BridgeInstance, op: str | None) -> BridgeError:
+    """Explain a connection that accepted the request but replied with nothing.
+
+    This is the symptom of the bridge process dying mid-request -- the dispatch
+    layer catches every Python exception, so an empty reply means the *process*
+    went away (segfault or OOM during native analysis), not a handler error.
+    Surface the pid, liveness, and log path instead of a bare one-liner.
+    """
+    op_label = f"op '{op}'" if op else "the request"
+    log_path = instance.registry_path.with_suffix(".log")
+    parts = [
+        f"Binary Ninja bridge returned an empty response for {op_label} "
+        f"(instance {instance_selector(instance)}, pid {instance.pid})."
+    ]
+    if _process_alive(instance.pid):
+        parts.append(
+            "The process is still running but closed the connection without "
+            "replying -- a worker thread likely hit a native fault."
+        )
+    else:
+        parts.append(
+            "The process is no longer running -- it most likely crashed or was "
+            "OOM-killed (large or complex binaries can exhaust memory during "
+            "update_analysis_and_wait)."
+        )
+    if log_path.exists():
+        parts.append(f"Check {log_path} for any crash output.")
+    parts.append("Reload the target with `bn load`, or start a fresh bridge with `bn session start`.")
+    return BridgeError(" ".join(parts))
+
+
+def _purge_stale_registry(registry_path: Path, socket_path: Path | None = None) -> None:
+    """Drop a registry whose owning process is gone, plus its orphaned socket.
+
+    A SIGKILL or native crash leaves the unix socket file on disk (only a clean
+    ``stop()`` unlinks it), so the registry is removed *and* the dead socket is
+    swept here. The sibling ``.log`` is intentionally left behind: an instance
+    is only purged after its socket goes dead -- frequently a crash -- and the
+    log is the one breadcrumb worth keeping for the empty-response diagnostic.
+    """
     with contextlib.suppress(OSError):
         registry_path.unlink()
+    if socket_path is not None:
+        with contextlib.suppress(OSError):
+            socket_path.unlink()
 
 
 def _socket_is_live(socket_path: Path, timeout: float = 0.2) -> bool:
@@ -78,11 +133,11 @@ def _load_instance(path: Path) -> BridgeInstance | None:
         return None
 
     if not socket_path.exists():
-        _purge_stale_registry(path)
+        _purge_stale_registry(path, socket_path)
         return None
 
     if not _socket_is_live(socket_path):
-        _purge_stale_registry(path)
+        _purge_stale_registry(path, socket_path)
         return None
 
     return BridgeInstance(
@@ -192,7 +247,7 @@ def _send_request_to_instance(
         ) from last_error
 
     if not chunks:
-        raise BridgeError("Binary Ninja bridge returned an empty response")
+        raise _empty_response_error(instance, op)
 
     try:
         response = json.loads(b"".join(chunks).decode("utf-8"))
