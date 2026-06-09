@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+import io
+import json
+import socket
 import sys
 import threading
 import time
 import types
+import weakref
 from pathlib import Path
 
 import pytest
@@ -1012,7 +1016,11 @@ def test_decompile_falls_back_to_hlil_when_pseudo_c_unavailable(monkeypatch):
 
     result = instance._decompile("active", "player_update")
 
-    assert result["text"] == "int32_t player_update()\n{\n    return 1;\n}"
+    # The pseudo-C failure is surfaced via an explicit marker line instead of
+    # silently presenting the HLIL fallback as a successful decompilation.
+    lines = result["text"].splitlines()
+    assert lines[0].startswith("// bn: decompilation failed (")
+    assert "\n".join(lines[1:]) == "int32_t player_update()\n{\n    return 1;\n}"
 
 
 def test_decompile_warns_on_skipped_analysis(monkeypatch):
@@ -1966,6 +1974,60 @@ def test_read_write_lock_allows_parallel_readers(monkeypatch):
     second.join(1)
 
     assert sorted(entered) == ["first", "second"]
+
+
+def test_read_write_lock_waiting_writer_blocks_new_readers(monkeypatch):
+    """A reader arriving while a writer is queued must not jump the queue,
+    otherwise a steady reader stream starves the writer forever."""
+    bridge = _load_bridge(monkeypatch)
+    lock = bridge._ReadWriteLock()
+    order: list[str] = []
+    first_reader_in = threading.Event()
+    first_reader_release = threading.Event()
+    writer_done = threading.Event()
+    second_reader_done = threading.Event()
+
+    def first_reader():
+        with lock.read():
+            first_reader_in.set()
+            first_reader_release.wait(2)
+
+    def writer():
+        with lock.write():
+            order.append("writer")
+        writer_done.set()
+
+    def second_reader():
+        with lock.read():
+            order.append("reader")
+        second_reader_done.set()
+
+    t_first = threading.Thread(target=first_reader)
+    t_first.start()
+    assert first_reader_in.wait(1)
+
+    t_writer = threading.Thread(target=writer)
+    t_writer.start()
+    # Wait until the writer is actually queued behind the active reader.
+    deadline = time.monotonic() + 2
+    while lock._writers_waiting == 0 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert lock._writers_waiting == 1
+
+    t_second = threading.Thread(target=second_reader)
+    t_second.start()
+    # The second reader must not enter while the writer is waiting.
+    time.sleep(0.05)
+    assert order == []
+
+    first_reader_release.set()
+    assert writer_done.wait(2)
+    assert second_reader_done.wait(2)
+    t_first.join(1)
+    t_writer.join(1)
+    t_second.join(1)
+
+    assert order == ["writer", "reader"]
 
 
 def test_collect_open_views_uses_tabs_api(monkeypatch):
@@ -3548,3 +3610,290 @@ def test_search_functions_exact_no_match(monkeypatch):
     result = instance._search_functions("active", "system", exact=True)
 
     assert len(result) == 0
+
+
+# ---------------------------------------------------------------------------
+# Protocol hardening: request size cap and non-dict payloads
+# ---------------------------------------------------------------------------
+
+
+class _RecordingWriter:
+    def __init__(self):
+        self.data = b""
+
+    def write(self, data):
+        self.data += data
+
+
+def test_bridge_handler_rejects_oversized_request(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    monkeypatch.setattr(bridge, "MAX_REQUEST_BYTES", 16)
+
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.rfile = io.BytesIO(b"x" * 64)  # no newline within the cap
+    writer = _RecordingWriter()
+    handler.wfile = writer
+
+    handler.handle()
+
+    response = json.loads(writer.data.decode("utf-8"))
+    assert response["ok"] is False
+    assert response["error"] == "request too large"
+
+
+def test_bridge_handler_allows_request_exactly_at_cap_with_newline(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    line = b'{"op": "noop"      }\n'
+    monkeypatch.setattr(bridge, "MAX_REQUEST_BYTES", len(line))
+
+    dispatched = []
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.rfile = io.BytesIO(line)
+    handler.server = types.SimpleNamespace(
+        bridge=types.SimpleNamespace(
+            dispatch=lambda payload: dispatched.append(payload) or {"ok": True, "result": None, "error": None}
+        )
+    )
+    writer = _RecordingWriter()
+    handler.wfile = writer
+
+    handler.handle()
+
+    assert dispatched == [{"op": "noop"}]
+    assert json.loads(writer.data.decode("utf-8"))["ok"] is True
+
+
+def test_bridge_handler_rejects_non_dict_json(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+
+    dispatched = []
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.rfile = io.BytesIO(b"[1, 2, 3]\n")
+    handler.server = types.SimpleNamespace(
+        bridge=types.SimpleNamespace(dispatch=lambda payload: dispatched.append(payload))
+    )
+    writer = _RecordingWriter()
+    handler.wfile = writer
+
+    handler.handle()
+
+    response = json.loads(writer.data.decode("utf-8"))
+    assert response["ok"] is False
+    assert "JSON object" in response["error"]
+    assert dispatched == []
+
+
+# ---------------------------------------------------------------------------
+# batch_apply: missing target must stay None, not become "None"
+# ---------------------------------------------------------------------------
+
+
+def test_batch_apply_passes_none_target_through(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    captured: dict = {}
+
+    def fake_mutation(selector, preview, operations):
+        captured["selector"] = selector
+        captured["preview"] = preview
+        captured["operations"] = operations
+        return {"success": True}
+
+    monkeypatch.setattr(instance, "_mutation", fake_mutation)
+
+    instance._dispatch_on_main("batch_apply", {"ops": [{"op": "rename_symbol"}]}, None)
+    # Both manifest target and request target are absent -> the single-open-
+    # target default must still apply, so the selector stays None (not "None").
+    assert captured["selector"] is None
+
+    instance._dispatch_on_main("batch_apply", {"ops": []}, "alpha.bndb")
+    assert captured["selector"] == "alpha.bndb"
+
+    instance._dispatch_on_main(
+        "batch_apply", {"ops": [], "target": "beta.bndb"}, "alpha.bndb"
+    )
+    assert captured["selector"] == "beta.bndb"
+
+
+# ---------------------------------------------------------------------------
+# TargetManager: _ids_by_object pruning and id() recycling
+# ---------------------------------------------------------------------------
+
+
+def test_target_manager_does_not_alias_recycled_object_ids(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    bv_a = _FakeFileBV("/proj/alpha.bndb", session_id="11")
+    _register_views(bridge, bv_a)
+    manager = bridge.TargetManager()
+    manager.refresh()
+
+    # Simulate CPython id() recycling: a stale map entry whose key collides
+    # with a brand-new view but whose ref points at a different object.
+    bv_b = _FakeFileBV("/proj/beta.bndb", session_id="22")
+    manager._ids_by_object[id(bv_b)] = (weakref.ref(bv_a), "999")
+    _register_views(bridge, bv_a, bv_b)
+
+    targets = manager.refresh()
+    by_file = {t["filename"]: t["view_id"] for t in targets}
+
+    # The new view must get a fresh id, not inherit the stale "999".
+    assert by_file["/proj/beta.bndb"] != "999"
+    assert by_file["/proj/alpha.bndb"] != by_file["/proj/beta.bndb"]
+    bridge._headless_views.clear()
+
+
+def test_target_manager_prunes_dead_id_entries_on_refresh(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    bv_a = _FakeFileBV("/proj/alpha.bndb", session_id="11")
+    _register_views(bridge, bv_a)
+    manager = bridge.TargetManager()
+
+    class _Doomed:
+        pass
+
+    doomed = _Doomed()
+    manager._ids_by_object[id(doomed)] = (weakref.ref(doomed), "777")
+    del doomed
+
+    manager.refresh()
+
+    assert all(vid != "777" for _, vid in manager._ids_by_object.values())
+    assert len(manager._ids_by_object) == 1
+    bridge._headless_views.clear()
+
+
+# ---------------------------------------------------------------------------
+# Verification: fallback must not accept an unrelated same-named variable
+# ---------------------------------------------------------------------------
+
+
+def test_verify_local_rename_rejects_unrelated_var_with_target_name(monkeypatch):
+    """Two variables share a storage slot. The OTHER one (different identifier)
+    already carries the requested name; the renamed variable still shows its
+    auto name, i.e. the rename did not land. Verification must fail instead of
+    crediting the neighbor's name."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    renamed = _FakeVariable(name="var_48", storage=-72, var_type="int32_t", identifier=3001)
+    other = _FakeVariable(name="wIndex", storage=-72, var_type="int32_t", identifier=9999)
+
+    fn = _FakeFunction(0x401000, "process_usb")
+    fn.stack_layout = [renamed, other]
+
+    bv = _FakeBV(functions=[fn])
+
+    result = {
+        "op": "local_rename",
+        "function": "process_usb",
+        "address": "0x401000",
+        "variable": "var_48",
+        "local_id": "0x401000:local:stack:-72:0:3001",
+        "storage": -72,
+        "identifier": 3001,
+        "source_type": "StackVariableSourceType",
+        "is_parameter": False,
+        "before_name": "var_48",
+        "new_name": "wIndex",
+        "requested": {"variable": "var_48", "new_name": "wIndex"},
+    }
+
+    verified = instance._verify_operation(bv, result)
+    assert verified["status"] == "verification_failed"
+
+
+# ---------------------------------------------------------------------------
+# xrefs: ambiguous function identifiers must not degrade to "not found"
+# ---------------------------------------------------------------------------
+
+
+def test_xrefs_reraises_ambiguous_function_identifier(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        functions=[
+            _FakeFunction(0x401000, "duplicate_name"),
+            _FakeFunction(0x402000, "duplicate_name"),
+        ]
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(RuntimeError, match="Ambiguous function identifier"):
+        instance._xrefs(None, "duplicate_name")
+
+
+# ---------------------------------------------------------------------------
+# Visible degradation markers for IL / pseudo-C rendering failures
+# ---------------------------------------------------------------------------
+
+
+def test_function_text_marks_il_failure_instead_of_silent_prototype(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    warnings: list[str] = []
+    monkeypatch.setattr(bridge.bn, "log_warn", lambda message: warnings.append(message))
+
+    fn = _FakeFunction(0x401000, "player_update")  # has no .hlil attribute
+
+    text = instance._function_text(None, fn, view="hlil")
+
+    assert text.startswith("// bn: IL rendering failed (")
+    assert "showing prototype only" in text.splitlines()[0]
+    assert warnings  # failure was logged, not swallowed
+
+
+# ---------------------------------------------------------------------------
+# Registry write atomicity
+# ---------------------------------------------------------------------------
+
+
+def test_write_registry_is_atomic_and_leaves_no_temp_files(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    instance.registry_path = tmp_path / "registry.json"
+
+    instance._write_registry()
+
+    data = json.loads(instance.registry_path.read_text(encoding="utf-8"))
+    assert data["socket_path"] == str(instance.socket_path)
+    assert data["plugin_name"]
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".tmp-")]
+    assert leftovers == []
+
+
+# ---------------------------------------------------------------------------
+# start(): never displace a live socket
+# ---------------------------------------------------------------------------
+
+
+def test_start_refuses_to_displace_live_socket(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    sock_path = tmp_path / "bridge.sock"
+
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))
+    server.listen(1)
+    instance.socket_path = sock_path
+    try:
+        with pytest.raises(RuntimeError, match="refusing to displace"):
+            instance.start()
+        # The live socket file must still be there for its owner.
+        assert sock_path.exists()
+    finally:
+        server.close()
+
+
+def test_socket_is_live_false_for_stale_socket_file(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    sock_path = tmp_path / "stale.sock"
+
+    # Bind then close: the filesystem entry remains but nothing is listening.
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(str(sock_path))
+    server.close()
+    instance.socket_path = sock_path
+
+    assert sock_path.exists()
+    assert instance._socket_is_live() is False

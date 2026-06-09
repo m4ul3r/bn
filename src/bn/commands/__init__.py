@@ -6,6 +6,7 @@ populating the central ``_COMMANDS`` registry in ``bn.cli``.
 
 from __future__ import annotations
 
+from . import admin  # noqa: F401
 from . import binary  # noqa: F401
 from . import function  # noqa: F401
 from . import misc  # noqa: F401

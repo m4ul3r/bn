@@ -2,12 +2,25 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import secrets
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from .paths import spill_root
+from .transport import BridgeError
+
+
+class OutputWriteError(BridgeError):
+    """Raised when an explicitly requested --out file cannot be written.
+
+    Subclasses ``BridgeError`` so ``cli.main()`` prints it as a clean one-line
+    message instead of a traceback (that is the only exception type the CLI
+    layer turns into clean output).
+    """
 
 
 DEFAULT_SPILL_TOKEN_LIMIT = 10_000
@@ -64,7 +77,10 @@ def _spill_path(stem: str, suffix: str) -> Path:
     now = datetime.now(timezone.utc)
     directory = spill_root() / now.strftime("%Y%m%d")
     directory.mkdir(parents=True, exist_ok=True)
-    return directory / f"{stem}-{now.strftime('%H%M%S')}{suffix}"
+    # pid + random component: parallel agents spilling in the same second
+    # must not clobber each other's artifacts.
+    unique = f"{os.getpid()}-{secrets.token_hex(2)}"
+    return directory / f"{stem}-{now.strftime('%H%M%S')}-{unique}{suffix}"
 
 
 def estimate_tokens(encoded: bytes) -> int:
@@ -140,8 +156,13 @@ def write_output_result(
     token_count = estimate_tokens(encoded)
 
     if out_path is not None:
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_bytes(encoded)
+        try:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_bytes(encoded)
+        except OSError as exc:
+            # The user explicitly asked for a file; silently falling back to
+            # stdout would be wrong. Fail with a clean message instead.
+            raise OutputWriteError(f"Failed to write --out file {out_path}: {exc}") from exc
         artifact = _artifact_payload(
             artifact_path=out_path,
             fmt=fmt,
@@ -160,8 +181,17 @@ def write_output_result(
         return OutputWriteResult(rendered=rendered)
 
     suffix = ".ndjson" if fmt == "ndjson" else ".txt" if fmt == "text" else ".json"
-    spill_path = _spill_path(stem, suffix)
-    spill_path.write_bytes(encoded)
+    try:
+        spill_path = _spill_path(stem, suffix)
+        spill_path.write_bytes(encoded)
+    except OSError as exc:
+        # The rendered output is already in memory; losing it over a failed
+        # spill write (disk full, permissions) would punish the user twice.
+        print(
+            f"warning: failed to write spill artifact ({exc}); printing full output",
+            file=sys.stderr,
+        )
+        return OutputWriteResult(rendered=rendered)
     artifact = _artifact_payload(
         artifact_path=spill_path,
         fmt=fmt,

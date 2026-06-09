@@ -142,6 +142,17 @@ def _function_create(args: argparse.Namespace) -> int:
     )
 
 
+def _require_text_format(args: argparse.Namespace, flag: str) -> None:
+    """Reject display-only flags outside text mode instead of ignoring them.
+
+    Flags like --lines and xrefs --limit only affect the text renderer; JSON
+    and ndjson output always carry the full payload, so silently accepting
+    them would misrepresent what the caller asked for.
+    """
+    if args.format != "text":
+        raise BridgeError(f"{flag} only applies to --format text")
+
+
 @command("decompile", help="Render Binary Ninja Pseudo C for a function", target=True,
          args=[
              arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
@@ -155,6 +166,8 @@ def _function_create(args: argparse.Namespace) -> int:
          ])
 def _decompile(args: argparse.Namespace) -> int:
     lines_range = getattr(args, "lines", None)
+    if lines_range is not None:
+        _require_text_format(args, "--lines")
 
     def _render_decompile_text(value: Any) -> str:
         text = _slice_text_lines(_text_field("text")(value), lines_range)
@@ -190,6 +203,8 @@ def _decompile(args: argparse.Namespace) -> int:
          ])
 def _il(args: argparse.Namespace) -> int:
     lines_range = getattr(args, "lines", None)
+    if lines_range is not None:
+        _require_text_format(args, "--lines")
     base = _text_field("text")
     return _call(
         args,
@@ -210,6 +225,8 @@ def _il(args: argparse.Namespace) -> int:
          ])
 def _disasm(args: argparse.Namespace) -> int:
     lines_range = getattr(args, "lines", None)
+    if lines_range is not None:
+        _require_text_format(args, "--lines")
     base = _text_field("text")
     return _call(
         args,
@@ -230,12 +247,19 @@ def _disasm(args: argparse.Namespace) -> int:
              arg("--field", dest="field_spec",
                  help="Struct field xref spec (e.g., TrackRowCell.tile_type)"),
              arg("--limit", type=int, default=None,
-                 help="Max number of code refs to show"),
+                 help="Max caller/data-ref groups to show (text output only)"),
          ])
 def _xrefs(args: argparse.Namespace) -> int:
     field_spec = getattr(args, "field_spec", None)
     identifier = getattr(args, "identifier", None)
     limit = getattr(args, "limit", None)
+    if limit is not None:
+        _require_text_format(args, "--limit")
+    if field_spec and identifier:
+        raise BridgeError(
+            "xrefs takes either an identifier or --field, not both "
+            f"(got {identifier!r} and --field {field_spec!r})"
+        )
     if field_spec:
         return _call(
             args,
@@ -352,6 +376,8 @@ def _evidence_function(args: argparse.Namespace) -> int:
                  help="Max number of refs per code/data bucket to show in text output"),
          ])
 def _evidence_xrefs(args: argparse.Namespace) -> int:
+    if args.limit is not None:
+        _require_text_format(args, "--limit")
     return _call(
         args,
         "xrefs",
@@ -392,7 +418,6 @@ def _evidence_table(args: argparse.Namespace) -> int:
 @command("evidence", "message",
          help="Summarize message/type-name strings, xrefs, and nearby metadata tables",
          target=True,
-         paged=False,
          args=[
              arg("query", help="Message/type-name string substring to locate"),
              arg("--limit", type=int, default=20,

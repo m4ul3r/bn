@@ -41,7 +41,7 @@ The bridge runs either as a **GUI plugin** (auto-starts when BN loads) or as a *
 
 `cli.py` is the entry point and shared infrastructure only — argparse plumbing, the `@command` decorator + `_COMMANDS` registry, target/instance resolution, the `_call` request wrapper, and `main()`. It does **not** define command handlers or text rendering anymore.
 
-- `commands/` — handler modules grouped by concern: `binary.py` (load/close/save/refresh/target info), `function.py` (list/search/info/decompile/il/disasm/xrefs/callsites), `types.py`, `mutation.py`, `misc.py` (strings/imports/sections/bundle/py exec/batch). Importing the package via `commands/__init__.py` triggers `@command` decorators that populate `_COMMANDS`.
+- `commands/` — handler modules grouped by concern: `binary.py` (load/close/save/refresh/target info), `function.py` (list/search/info/decompile/il/disasm/xrefs/callsites), `types.py`, `mutation.py`, `misc.py` (strings/imports/sections/bundle/py exec/batch), `admin.py` (doctor/plugin/skill install/session/instance/target pins). Importing the package via `commands/__init__.py` triggers `@command` decorators that populate `_COMMANDS`. Registering the same command path twice raises at import time.
 - `formatters.py` — all text-mode rendering (`_render_*`, `_format_operation_result`). Add new text output here, not in `cli.py`.
 - `transport.py` — socket I/O, bridge discovery, multi-instance registry, auto-spawn.
 - `output.py` — token-aware rendering and artifact spillover (>10k tokens → disk).
@@ -61,7 +61,7 @@ The bridge runs either as a **GUI plugin** (auto-starts when BN loads) or as a *
 
 ### Bridge (`plugin/bn_agent_bridge/bridge.py`)
 
-Single ~3.5k-LOC module containing the `TargetManager` (weak-reffed `BinaryView`s, selector resolution), op handlers, and the mutation engine. Read ops dispatch under a shared lock; write ops under an exclusive lock (`READ_LOCKED_OPS` / `WRITE_LOCKED_OPS`).
+Single ~5.5k-LOC module containing the `TargetManager` (weak-reffed `BinaryView`s, selector resolution), op handlers, and the mutation engine. Read ops dispatch under a shared lock (writer-priority `_ReadWriteLock`); write ops under an exclusive lock (`READ_LOCKED_OPS` / `WRITE_LOCKED_OPS`). Ops in neither set run unlocked — only do that for ops that touch no BN state (e.g. `shutdown`).
 
 ### Target Selection
 
@@ -83,7 +83,7 @@ Response: `{"ok": true, "result": ...}` or `{"ok": false, "error": "..."}`
 ## Conventions
 
 - Command handlers are named `_<group>_<subcommand>()` (e.g., `_function_list`)
-- Exit codes: 0 = success, 1 = handler/mutation error, 2 = `BridgeError`, 3 = verification failed
+- Exit codes: 0 = success, 1 = CLI-side handler error (e.g. partial `session start` failure), 2 = `BridgeError` (transport failures and bridge-side errors, including mutation apply failures), 3 = mutation status `verification_failed` or `unsupported`
 - `BridgeError` for user-facing errors, `OperationFailure` for bridge-side mutation failures with structured fields
 - Read commands default to `--format text`, mutations default to `--format json`
 - Type hints everywhere, `from __future__ import annotations` in all modules

@@ -84,6 +84,8 @@ Pass `--no-bndb` to force loading the raw binary even when a sibling `.bndb` exi
 
 `--instance` is accepted on every subcommand (env `BN_INSTANCE`).
 
+Requests time out after 600s by default so a wedged bridge can't hang the CLI; override with `BN_REQUEST_TIMEOUT=<seconds>` (`0` disables).
+
 ## 3. Output & context
 
 Defaults:
@@ -97,7 +99,7 @@ Defaults:
 
 - `ok` — request status.
 - `spilled` — `true` when the body was written to disk because of the threshold; `false` when `--out` was used.
-- `path` (text envelope) / `artifact_path` (JSON) — location on disk: `<tempdir>/bn-spills/YYYYMMDD/<stem>-HHMMSS.<json|ndjson|txt>`.
+- `path` (text envelope) / `artifact_path` (JSON) — location on disk: `<cache>/spills/YYYYMMDD/<stem>-HHMMSS-<pid>-<rand>.<json|ndjson|txt>` (cache dir defaults to `~/.cache/bn`, override with `BN_CACHE_DIR`).
 - `format` — `json`, `ndjson`, or `text`.
 - `bytes`, `tokens` (estimate), `tokenizer` (`estimate`), `sha256` — size + integrity.
 - `summary` — shape hint with `kind` and `count` / `chars` / `keys`.

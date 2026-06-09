@@ -333,6 +333,18 @@ def _find_bn_agent() -> list[str]:
     return [sys.executable, "-m", "bn.headless"]
 
 
+def _log_tail(log_path: Path, lines: int = 20) -> str:
+    """Return the last *lines* of the spawn log, formatted for an error message."""
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    tail = [line for line in text.splitlines() if line.strip()][-lines:]
+    if not tail:
+        return ""
+    return f"\nLast output from {log_path}:\n" + "\n".join(f"  {line}" for line in tail)
+
+
 def spawn_instance(
     instance_id: str | None = None,
     *,
@@ -376,11 +388,28 @@ def spawn_instance(
             inst = _load_instance(reg_path)
             if inst is not None:
                 return inst
+        exit_code = proc.poll()
+        if exit_code is not None:
+            raise BridgeError(
+                f"Auto-started bn-agent (pid {proc.pid}, instance {instance_id}) "
+                f"exited with code {exit_code} before registering."
+                f"{_log_tail(log_path)}"
+            )
         time.sleep(poll_interval)
+
+    # The child is still running but never registered. Kill it so a slow
+    # starter can't register later and show up as a surprise extra instance.
+    proc.terminate()
+    try:
+        proc.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=2.0)
 
     raise BridgeError(
         f"Auto-started bn-agent (pid {proc.pid}, instance {instance_id}) "
-        f"did not register within {timeout:.0f}s. Check {log_path}"
+        f"did not register within {timeout:.0f}s and was terminated. Check {log_path}"
     )
 
 

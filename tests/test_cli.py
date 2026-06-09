@@ -201,7 +201,8 @@ def test_scalar_spill_warning_points_at_artifact(monkeypatch, capsys):
     _, stderr = capsys.readouterr()
     assert stderr == (
         "warning: type info output spilled to /tmp/type-show.txt; "
-        "read the artifact at /tmp/type-show.txt to inspect the full output\n"
+        "rerun with --out <path> or read the artifact at /tmp/type-show.txt "
+        "to inspect the full output\n"
     )
 
 
@@ -274,15 +275,21 @@ def test_parser_default_formats():
     assert parser.parse_args(["skill", "install"]).mode == "symlink"
     assert parser.parse_args(["bundle", "function", "sub_401000"]).format == "json"
 
-    # Mutations now default to text — the rendered summary is enough for an agent
-    # and JSON is one --format json away when needed.
-    assert parser.parse_args(["symbol", "rename", "sub_401000", "player_update"]).format == "text"
-    assert parser.parse_args(["types", "declare", "typedef struct Player { int hp; } Player;"]).format == "text"
-    assert parser.parse_args(["comment", "set", "--address", "0x401000", "msg"]).format == "text"
-    assert parser.parse_args(["proto", "set", "sub_401000", "void()"]).format == "text"
-    assert parser.parse_args(["local", "rename", "fn", "var", "new"]).format == "text"
-    assert parser.parse_args(["struct", "field", "set", "S", "0", "f", "uint32_t"]).format == "text"
-    assert parser.parse_args(["batch", "apply", "manifest.json"]).format == "text"
+    # Mutations default to JSON per the documented convention; the text
+    # summary is one --format text away when needed.
+    assert parser.parse_args(["symbol", "rename", "sub_401000", "player_update"]).format == "json"
+    assert parser.parse_args(["rename", "sub_401000", "player_update"]).format == "json"
+    assert parser.parse_args(["types", "declare", "typedef struct Player { int hp; } Player;"]).format == "json"
+    assert parser.parse_args(["comment", "set", "--address", "0x401000", "msg"]).format == "json"
+    assert parser.parse_args(["comment", "delete", "--address", "0x401000"]).format == "json"
+    assert parser.parse_args(["proto", "set", "sub_401000", "void()"]).format == "json"
+    assert parser.parse_args(["local", "rename", "fn", "var", "new"]).format == "json"
+    assert parser.parse_args(["local", "retype", "fn", "var", "int"]).format == "json"
+    assert parser.parse_args(["struct", "field", "set", "S", "0", "f", "uint32_t"]).format == "json"
+    assert parser.parse_args(["struct", "field", "rename", "S", "old", "new"]).format == "json"
+    assert parser.parse_args(["struct", "field", "delete", "S", "f"]).format == "json"
+    assert parser.parse_args(["batch", "apply", "manifest.json"]).format == "json"
+    assert parser.parse_args(["function", "create", "0x401000"]).format == "json"
 
 
 def test_target_flag_accepted_before_subcommand():
@@ -849,6 +856,7 @@ def test_types_show_uses_type_info_and_text_renderer(monkeypatch, capsys):
     assert rc == 0
     assert captured["op"] == "type_info"
     assert captured["params"]["type_name"] == "Player"
+    assert captured["params"]["require_struct"] is False
     assert captured["target"] == "active"
     output = capsys.readouterr().out
     assert output.startswith("struct Player")
@@ -3544,3 +3552,162 @@ def test_function_search_regex_and_exact_are_mutually_exclusive(monkeypatch):
     with pytest.raises(SystemExit) as exc:
         bn.cli.main(["function", "search", "--target", "active", "--regex", "--exact", "system"])
     assert exc.value.code == 2
+
+
+# --- Review fixes: display-only flags, xrefs mutex, session stop, spill hints ---
+
+
+def _assert_no_bridge_call(monkeypatch):
+    def fail_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        raise AssertionError(f"bridge should not be called (got op {op!r})")
+
+    monkeypatch.setattr(bn.cli, "send_request", fail_send_request)
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["decompile", "sub_401000", "--format", "json", "--lines", "1:5"],
+        ["decompile", "sub_401000", "--format", "ndjson", "--lines", "1:5"],
+        ["il", "sub_401000", "--format", "json", "--lines", "1:5"],
+        ["disasm", "sub_401000", "--format", "json", "--lines", "1:5"],
+    ],
+)
+def test_lines_flag_rejected_outside_text_mode(monkeypatch, capsys, argv):
+    _assert_no_bridge_call(monkeypatch)
+
+    rc = bn.cli.main(argv + ["--target", "active"])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "--lines only applies to --format text" in err
+    assert "Traceback" not in err
+
+
+def test_xrefs_limit_rejected_outside_text_mode(monkeypatch, capsys):
+    _assert_no_bridge_call(monkeypatch)
+
+    rc = bn.cli.main(["xrefs", "sub_401000", "--target", "active", "--format", "json", "--limit", "3"])
+
+    assert rc == 2
+    assert "--limit only applies to --format text" in capsys.readouterr().err
+
+
+def test_evidence_xrefs_limit_rejected_outside_text_mode(monkeypatch, capsys):
+    _assert_no_bridge_call(monkeypatch)
+
+    rc = bn.cli.main(
+        ["evidence", "xrefs", "sub_401000", "--target", "active", "--format", "json", "--limit", "3"]
+    )
+
+    assert rc == 2
+    assert "--limit only applies to --format text" in capsys.readouterr().err
+
+
+def test_xrefs_identifier_and_field_are_mutually_exclusive(monkeypatch, capsys):
+    _assert_no_bridge_call(monkeypatch)
+
+    rc = bn.cli.main(["xrefs", "some_func", "--field", "T.x", "--target", "active"])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "not both" in err
+    assert "some_func" in err
+    assert "T.x" in err
+
+
+def test_session_stop_kill_failure_reports_error_and_exits_nonzero(monkeypatch, capsys):
+    from bn.transport import BridgeError
+
+    def fail_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        raise BridgeError("bridge unreachable")
+
+    monkeypatch.setattr(bn.cli, "send_request", fail_send_request)
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [_fake_bridge_instance("abc123")])
+
+    def fail_kill(pid, sig):
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr("os.kill", fail_kill)
+
+    rc = bn.cli.main(["session", "stop", "abc123"])
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert "failed to stop bridge instance abc123" in captured.err
+    assert "stopped" not in captured.out
+
+
+def test_session_stop_sigterm_fallback_reports_method(monkeypatch, capsys):
+    from bn.transport import BridgeError
+
+    def fail_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        raise BridgeError("bridge unreachable")
+
+    monkeypatch.setattr(bn.cli, "send_request", fail_send_request)
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [_fake_bridge_instance("abc123")])
+
+    kills = []
+    monkeypatch.setattr("os.kill", lambda pid, sig: kills.append((pid, sig)))
+
+    rc = bn.cli.main(["session", "stop", "abc123", "--format", "json"])
+
+    assert rc == 0
+    assert kills == [(111, __import__("signal").SIGTERM)]
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["stopped"] is True
+    assert parsed["method"] == "sigterm"
+
+
+def test_duplicate_command_path_registration_raises():
+    bn.cli.build_parser()  # ensure command modules populated the registry
+
+    with pytest.raises(ValueError, match="duplicate command path"):
+        bn.cli.command("xrefs")(lambda args: 0)
+
+
+def test_unpaged_list_spill_hint_points_at_out_flag(monkeypatch, capsys):
+    # imports returns a list but is not a paged command: the spill hint must
+    # not suggest --limit/--offset (those flags do not exist on `bn imports`).
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        return {"ok": True, "result": [{"name": "printf", "address": "0x1000"}]}
+
+    def fake_write_output_result(value, *, fmt, out_path, stem):
+        assert stem == "imports"
+        return _spill_artifact_namespace("/tmp/imports.txt")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli, "write_output_result", fake_write_output_result)
+
+    rc = bn.cli.main(["imports", "--target", "active"])
+
+    assert rc == 0
+    _, stderr = capsys.readouterr()
+    assert "--limit/--offset" not in stderr
+    assert (
+        "rerun with --out <path> or read the artifact at /tmp/imports.txt" in stderr
+    )
+
+
+def test_slice_text_lines_start_beyond_end_keeps_header_sane():
+    from bn import formatters
+
+    out = formatters._slice_text_lines("a\nb\nc", (10, 12))
+
+    assert out == "// lines 0 of 3 (start 10 is beyond the last line)"
+
+
+def test_read_bytes_malformed_response_clean_error(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        return {"ok": True, "result": {"length": 4}}  # no "hex" payload
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(
+        ["read", "0x1000", "--length", "4", "--encoding", "bytes", "--target", "active"]
+    )
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "malformed read response" in err
+    assert "Traceback" not in err

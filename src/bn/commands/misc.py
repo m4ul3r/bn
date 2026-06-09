@@ -134,7 +134,13 @@ def _read_raw_bytes(args: argparse.Namespace, address: str) -> int:
         instance_id=getattr(args, "instance", None),
     )
     result = response["result"]
-    data = bytes.fromhex(result["hex"])
+    hex_payload = result.get("hex") if isinstance(result, dict) else None
+    if not isinstance(hex_payload, str):
+        raise BridgeError("bridge returned malformed read response (missing 'hex' payload)")
+    try:
+        data = bytes.fromhex(hex_payload)
+    except ValueError:
+        raise BridgeError("bridge returned malformed read response (invalid hex payload)") from None
     if args.out:
         args.out.write_bytes(data)
     else:
@@ -171,7 +177,7 @@ def _py_exec(args: argparse.Namespace) -> int:
     )
 
 
-@command("batch", "apply", help="Apply a JSON manifest",
+@command("batch", "apply", help="Apply a JSON manifest", fmt="json",
          args=[
              arg("--preview", action="store_true",
                  help="Apply the whole batch, capture diffs, then revert without committing"),

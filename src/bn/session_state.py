@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import tempfile
@@ -21,15 +22,24 @@ def read() -> dict[str, Any]:
 
 
 def update(**fields: Any) -> dict[str, Any]:
-    """Merge *fields* into on-disk state. ``None`` removes a key."""
-    state = read()
-    for key, value in fields.items():
-        if value is None:
-            state.pop(key, None)
-        else:
-            state[key] = value
-    state["project_root"] = str(project_root())
-    _atomic_write(state)
+    """Merge *fields* into on-disk state. ``None`` removes a key.
+
+    The read -> merge -> write cycle runs under an exclusive flock on a lock
+    file next to the state file, so concurrent updates (e.g. ``bn instance
+    use`` and ``bn target use`` racing in the same project) can't lose writes.
+    """
+    sessions_dir().mkdir(parents=True, exist_ok=True)
+    lock_path = session_state_path().with_suffix(".lock")
+    with open(lock_path, "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        state = read()
+        for key, value in fields.items():
+            if value is None:
+                state.pop(key, None)
+            else:
+                state[key] = value
+        state["project_root"] = str(project_root())
+        _atomic_write(state)
     return state
 
 

@@ -50,6 +50,8 @@ def _slice_text_lines(
     all_lines = text.splitlines()
     total = len(all_lines)
     start, end = lines_range
+    if start > total:
+        return f"{marker} lines 0 of {total} (start {start} is beyond the last line)"
     sliced = all_lines[start - 1 : end]
     header = f"{marker} lines {start}-{min(end, total)} of {total}"
     return header + "\n" + "\n".join(sliced)
@@ -402,6 +404,23 @@ def _render_target_choices(value: Any) -> str:
     if not value:
         return "none"
     return "\n".join(f"- {_render_target_choice(item)}" for item in value)
+
+
+def _render_instance_use_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    return f"instance: {value.get('instance_id', '<unknown>')}"
+
+
+def _render_target_use_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    return f"target: {value.get('target', '<unknown>')}"
+
+
+def _render_pin_clear_text(value: Any) -> str:
+    """Render `instance clear` / `target clear` confirmations."""
+    return "cleared"
 
 
 def _render_name_address_list_text(value: Any) -> str:
@@ -1169,8 +1188,7 @@ def _render_py_exec_text(value: Any) -> str:
     result = value.get("result")
     if result is not None:
         body = result if isinstance(result, str) else json.dumps(result, indent=2, sort_keys=True)
-        prefix = "result:\n" if parts else "result:\n"
-        parts.append(prefix + body)
+        parts.append("result:\n" + body)
 
     warnings = list(value.get("warnings") or [])
     if warnings:

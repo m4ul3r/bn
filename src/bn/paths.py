@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import os
 import platform
-import tempfile
 from pathlib import Path
 
 
@@ -87,7 +86,10 @@ def bridge_socket_path(instance_id: str | None = None) -> Path:
 
 
 def spill_root() -> Path:
-    root = Path(tempfile.gettempdir()) / "bn-spills"
+    # Lives under the per-user cache (not a shared /tmp dir) so multi-user
+    # hosts don't hit permission collisions or leak decompiled artifacts
+    # world-readably. Honors BN_CACHE_DIR via cache_home().
+    root = cache_home() / "spills"
     root.mkdir(parents=True, exist_ok=True)
     return root
 

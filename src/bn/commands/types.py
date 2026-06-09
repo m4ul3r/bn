@@ -38,7 +38,9 @@ def _types_show(args: argparse.Namespace) -> int:
         "type_info",
         {
             "type_name": args.type_name,
-            "require_struct": bool(getattr(args, "require_struct", False)),
+            # The bridge accepts require_struct; `types show` never restricts
+            # to structs (that's `struct show`), so this is always False.
+            "require_struct": False,
         },
         require_target=True,
         allow_implicit_target=True,
@@ -47,7 +49,7 @@ def _types_show(args: argparse.Namespace) -> int:
     )
 
 
-@command("types", "declare", help="Import C declarations as user types", target=True,
+@command("types", "declare", help="Import C declarations as user types", target=True, fmt="json",
          args=[
              arg("--preview", action="store_true",
                  help="Apply, capture diffs, then revert without committing"),
@@ -102,7 +104,7 @@ def _struct_show(args: argparse.Namespace) -> int:
     )
 
 
-@command("struct", "field", "set", help="Set or replace a field", target=True,
+@command("struct", "field", "set", help="Set or replace a field", target=True, fmt="json",
          args=[
              arg("--preview", action="store_true",
                  help="Apply, capture diffs, then revert without committing"),
@@ -132,7 +134,7 @@ def _struct_field_set(args: argparse.Namespace) -> int:
     )
 
 
-@command("struct", "field", "rename", help="Rename a field", target=True,
+@command("struct", "field", "rename", help="Rename a field", target=True, fmt="json",
          args=[
              arg("--preview", action="store_true",
                  help="Apply, capture diffs, then revert without committing"),
@@ -158,7 +160,7 @@ def _struct_field_rename(args: argparse.Namespace) -> int:
     )
 
 
-@command("struct", "field", "delete", help="Delete a field", target=True,
+@command("struct", "field", "delete", help="Delete a field", target=True, fmt="json",
          args=[
              arg("--preview", action="store_true",
                  help="Apply, capture diffs, then revert without committing"),

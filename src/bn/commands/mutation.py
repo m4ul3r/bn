@@ -25,8 +25,8 @@ _RENAME_ARGS = [
 @command("rename",
          help="Rename a function or data symbol (alias for `symbol rename`; "
               "use `local rename` / `struct field rename` for locals and fields)",
-         target=True, args=_RENAME_ARGS)
-@command("symbol", "rename", help="Rename a symbol", target=True, args=_RENAME_ARGS)
+         target=True, fmt="json", args=_RENAME_ARGS)
+@command("symbol", "rename", help="Rename a symbol", target=True, fmt="json", args=_RENAME_ARGS)
 def _symbol_rename(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -62,7 +62,7 @@ def _comment_list(args: argparse.Namespace) -> int:
     )
 
 
-@command("comment", "set", help="Set a comment", target=True,
+@command("comment", "set", help="Set a comment", target=True, fmt="json",
          args=[
              arg("--preview", action="store_true",
                  help="Apply, capture diffs, then revert without committing"),
@@ -105,7 +105,7 @@ def _comment_get(args: argparse.Namespace) -> int:
     )
 
 
-@command("comment", "delete", help="Delete a comment", target=True,
+@command("comment", "delete", help="Delete a comment", target=True, fmt="json",
          args=[
              arg("--preview", action="store_true",
                  help="Apply, capture diffs, then revert without committing"),
@@ -129,7 +129,7 @@ def _comment_delete(args: argparse.Namespace) -> int:
     )
 
 
-@command("proto", "set", help="Set a prototype", target=True,
+@command("proto", "set", help="Set a prototype", target=True, fmt="json",
          args=[
              arg("--preview", action="store_true",
                  help="Apply, capture diffs, then revert without committing"),
@@ -181,7 +181,7 @@ def _local_list(args: argparse.Namespace) -> int:
     )
 
 
-@command("local", "rename", help="Rename a local", target=True,
+@command("local", "rename", help="Rename a local", target=True, fmt="json",
          args=[
              arg("--preview", action="store_true",
                  help="Apply, capture diffs, then revert without committing"),
@@ -207,7 +207,7 @@ def _local_rename(args: argparse.Namespace) -> int:
     )
 
 
-@command("local", "retype", help="Retype a local", target=True,
+@command("local", "retype", help="Retype a local", target=True, fmt="json",
          args=[
              arg("--preview", action="store_true",
                  help="Apply, capture diffs, then revert without committing"),

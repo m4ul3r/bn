@@ -1,0 +1,422 @@
+"""Administrative commands: doctor, installs, sessions, and sticky pins.
+
+Shared infrastructure (transport, paths, session state) is accessed through
+the ``bn.cli`` module at call time -- ``cli.send_request(...)`` rather than a
+``from ..cli import send_request`` -- so tests and scripts can monkeypatch
+``bn.cli`` as the single well-known location.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import signal
+import sys
+from pathlib import Path
+from typing import Any
+
+from .. import cli
+from ..cli import arg, command
+from ..formatters import (
+    _render_doctor_text,
+    _render_instance_use_text,
+    _render_pin_clear_text,
+    _render_session_list_text,
+    _render_session_start_text,
+    _render_session_stop_text,
+    _render_skill_install_text,
+    _render_target_list_text,
+    _render_target_use_text,
+)
+from ..transport import BridgeError
+
+
+@command("doctor", help="Validate bridge discovery and installation")
+def _doctor(args: argparse.Namespace) -> int:
+    install_dir = cli.plugin_install_dir()
+    source_dir = cli.plugin_source_dir()
+    install_bridge = install_dir / "bridge.py"
+    source_bridge = source_dir / "bridge.py"
+    install_build_id = cli.build_id_for_file(install_bridge)
+    source_build_id = cli.build_id_for_file(source_bridge)
+    instances = []
+    for instance in cli.list_instances():
+        ping: dict[str, Any]
+        try:
+            response = cli._send_request_to_instance(
+                instance,
+                "doctor",
+                params={},
+                target=None,
+            )
+            ping = response["result"]
+        except Exception as exc:
+            ping = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+        loaded_version = ping.get("plugin_version") if isinstance(ping, dict) else None
+        loaded_build_id = ping.get("plugin_build_id") if isinstance(ping, dict) else None
+        instances.append(
+            {
+                "pid": instance.pid,
+                "socket_path": str(instance.socket_path),
+                "plugin_version": instance.plugin_version,
+                "plugin_build_id": loaded_build_id,
+                "installed_plugin_build_id": install_build_id,
+                "source_plugin_build_id": source_build_id,
+                "stale_plugin_version": (
+                    bool(loaded_version)
+                    and str(loaded_version) != cli.VERSION
+                ),
+                "stale_plugin_code": (
+                    bool(loaded_build_id)
+                    and install_build_id is not None
+                    and loaded_build_id != install_build_id
+                ),
+                "started_at": instance.started_at,
+                "doctor": ping,
+            }
+        )
+
+    result = {
+        "cli_version": cli.VERSION,
+        "plugin_source_dir": str(source_dir),
+        "plugin_install_dir": str(install_dir),
+        "plugin_source_build_id": source_build_id,
+        "plugin_install_build_id": install_build_id,
+        "instances": instances,
+    }
+    if args.format == "text":
+        result = _render_doctor_text(result)
+    cli._render_result(result, fmt=args.format, out_path=args.out, stem="doctor")
+    return 0
+
+
+@command("plugin", "install", help="Install the GUI plugin", fmt="json",
+         args=[
+             arg("--dest", type=Path, help="Custom install destination"),
+             arg("--mode", choices=("symlink", "copy"), default="symlink"),
+             arg("--force", action="store_true"),
+         ])
+def _plugin_install(args: argparse.Namespace) -> int:
+    source = cli.plugin_source_dir()
+    dest = args.dest or cli.plugin_install_dir()
+    _install_tree(source, dest, mode=args.mode, force=args.force)
+
+    cli._render_result(
+        {
+            "installed": True,
+            "mode": args.mode,
+            "source": str(source),
+            "destination": str(dest),
+        },
+        fmt=args.format,
+        out_path=args.out,
+        stem="plugin-install",
+    )
+    return 0
+
+
+def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
+    if not source.exists():
+        raise BridgeError(f"Source directory is missing: {source}")
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    if dest.exists() or dest.is_symlink():
+        if not force:
+            raise BridgeError(f"Destination already exists: {dest}")
+        if dest.is_symlink() or dest.is_file():
+            dest.unlink()
+        else:
+            shutil.rmtree(dest)
+
+    if mode == "copy":
+        shutil.copytree(source, dest)
+    else:
+        os.symlink(source, dest, target_is_directory=True)
+
+
+def _check_install_destination(dest: Path, *, force: bool) -> None:
+    if force:
+        return
+    if dest.exists() or dest.is_symlink():
+        raise BridgeError(f"Destination already exists: {dest}")
+
+
+@command("skill", "install", help="Install the bundled agent skills", fmt="text",
+         args=[
+             arg("--dest", type=Path, help="Custom install destination"),
+             arg("--mode", choices=("symlink", "copy"), default="symlink"),
+             arg("--force", action="store_true"),
+         ])
+def _skill_install(args: argparse.Namespace) -> int:
+    skills_root = cli.repo_root() / "skills"
+    explicit_dest = args.dest is not None
+    target_roots = [args.dest] if explicit_dest else _default_skill_install_roots()
+    install_plan = []
+    results = []
+    for source in sorted(skills_root.iterdir()):
+        if not source.is_dir() or not (source / "SKILL.md").exists():
+            continue
+        destinations = []
+        for target_root in target_roots:
+            dest = target_root / source.name
+            install_plan.append((source, dest))
+            destinations.append(str(dest))
+        results.append(
+            {
+                "skill": source.name,
+                "source": str(source),
+                "destination": destinations[0],
+                "destinations": destinations,
+            }
+        )
+
+    pending_installs = []
+    skipped_destinations = []
+    for source, dest in install_plan:
+        if not explicit_dest and not args.force and (dest.exists() or dest.is_symlink()):
+            skipped_destinations.append(str(dest))
+            continue
+        _check_install_destination(dest, force=args.force)
+        pending_installs.append((source, dest))
+
+    for source, dest in pending_installs:
+        _install_tree(source, dest, mode=args.mode, force=args.force)
+
+    result = {
+        "installed": True,
+        "mode": args.mode,
+        "installed_destinations": [str(dest) for _, dest in pending_installs],
+        "skipped_destinations": skipped_destinations,
+        "skills": results,
+    }
+    if args.format == "text":
+        result = _render_skill_install_text(result)
+    cli._render_result(result, fmt=args.format, out_path=args.out, stem="skill-install")
+    return 0
+
+
+def _default_skill_install_roots() -> list[Path]:
+    roots = [cli.claude_skills_dir()]
+    if cli.codex_home().is_dir():
+        roots.append(cli.codex_skills_dir())
+    return roots
+
+
+@command("session", "start", help="Start a new headless bridge session",
+         args=[
+             arg("binaries", nargs="*", help="Binary file paths to preload"),
+             arg("--instance-id", help="Use a specific instance ID (default: random)"),
+             arg("--no-bndb", action="store_true",
+                 help="Don't auto-prefer a sibling .bndb file"),
+             arg("--quick", "--no-analysis", action="store_true",
+                 help="Preload without full analysis (fast); run `bn refresh` for full analysis"),
+         ])
+def _session_start(args: argparse.Namespace) -> int:
+    instance_id = getattr(args, "instance_id", None)
+    instance = cli.spawn_instance(instance_id)
+
+    binaries = getattr(args, "binaries", None) or []
+    prefer_bndb = not args.no_bndb
+    quick = bool(getattr(args, "quick", False))
+    loaded = []
+    for binary in binaries:
+        resolved = str(Path(binary).expanduser().resolve())
+        try:
+            resp = cli.send_request(
+                "load_binary",
+                params={"path": resolved, "prefer_bndb": prefer_bndb, "quick": quick},
+                instance_id=instance.instance_id,
+            )
+            loaded.append(resp["result"])
+        except BridgeError as exc:
+            loaded.append({"path": resolved, "error": str(exc)})
+
+    failures = [item for item in loaded if isinstance(item, dict) and item.get("error")]
+    successes = [item for item in loaded if isinstance(item, dict) and not item.get("error")]
+
+    result: dict[str, Any] = {
+        "instance_id": instance.instance_id,
+        "pid": instance.pid,
+        "socket_path": str(instance.socket_path),
+    }
+    if loaded:
+        result["loaded"] = loaded
+
+    # If the caller asked to preload binaries but none loaded, the freshly
+    # spawned bridge is an empty zombie they'd have to hunt down and stop. Shut
+    # it down and exit non-zero so the failure is visible to scripts.
+    if binaries and not successes:
+        try:
+            cli.send_request("shutdown", instance_id=instance.instance_id)
+        except BridgeError:
+            pass
+        result["stopped"] = True
+
+    if args.format == "text":
+        result = _render_session_start_text(result)
+    cli._render_result(result, fmt=args.format, out_path=args.out, stem="session-start")
+    return 1 if failures else 0
+
+
+@command("session", "stop", help="Stop a running bridge session",
+         args=[arg("instance", help="Instance ID to stop")])
+def _session_stop(args: argparse.Namespace) -> int:
+    target_id = args.instance
+    try:
+        cli.send_request("shutdown", instance_id=target_id)
+        result = {"instance_id": target_id, "stopped": True}
+    except BridgeError:
+        # Fallback: find instance and SIGTERM
+        for inst in cli.list_instances():
+            if inst.instance_id == target_id or cli.instance_selector(inst) == target_id:
+                try:
+                    os.kill(inst.pid, signal.SIGTERM)
+                except OSError as exc:
+                    print(
+                        f"error: failed to stop bridge instance {target_id} "
+                        f"(pid {inst.pid}): {exc}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                result = {"instance_id": target_id, "stopped": True, "method": "sigterm"}
+                break
+        else:
+            raise BridgeError(f"No bridge instance found with id: {target_id}")
+
+    if args.format == "text":
+        result = _render_session_stop_text(result)
+    cli._render_result(result, fmt=args.format, out_path=args.out, stem="session-stop")
+    return 0
+
+
+def _rss_mb(pid: int) -> float | None:
+    """Read resident set size in MB from /proc/<pid>/status."""
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / 1024.0
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+@command("session", "list", help="List running bridge sessions")
+def _session_list(args: argparse.Namespace) -> int:
+    instances = cli.list_instances()
+    sticky_id = cli.session_state.read().get("instance_id")
+    entries = []
+    total_rss = 0.0
+    for inst in instances:
+        rss = _rss_mb(inst.pid)
+        selector = cli.instance_selector(inst)
+        entry: dict[str, Any] = {
+            "selector": selector,
+            "instance_id": inst.instance_id,
+            "pid": inst.pid,
+            "socket_path": str(inst.socket_path),
+            "started_at": inst.started_at,
+            "rss_mb": round(rss, 1) if rss is not None else None,
+        }
+        if sticky_id and (inst.instance_id == sticky_id or selector == sticky_id):
+            entry["sticky"] = True
+        entries.append(entry)
+        if rss is not None:
+            total_rss += rss
+    result: dict[str, Any] = {
+        "instances": entries,
+        "total_rss_mb": round(total_rss, 1),
+    }
+    if args.format == "text":
+        result = _render_session_list_text(result)
+    cli._render_result(result, fmt=args.format, out_path=args.out, stem="session-list")
+    return 0
+
+
+@command("instance", "use", help="Pin a bridge instance for subsequent calls", fmt="text",
+         args=[arg("instance_id", help="Instance ID to pin (see `bn session list`)")])
+def _instance_use(args: argparse.Namespace) -> int:
+    instance_id = args.instance_id
+    instances = cli.list_instances()
+    matches = [
+        inst for inst in instances
+        if inst.instance_id == instance_id or cli.instance_selector(inst) == instance_id
+    ]
+    if not matches:
+        raise BridgeError(f"No running bridge instance with id: {instance_id}")
+    resolved = matches[0].instance_id
+    cli.session_state.update(instance_id=resolved)
+    result: Any = {"instance_id": resolved, "set": True}
+    if args.format == "text":
+        result = _render_instance_use_text(result)
+    cli._render_result(result, fmt=args.format, out_path=args.out, stem="instance-use")
+    return 0
+
+
+@command("instance", "clear", help="Clear the pinned bridge instance", fmt="text")
+def _instance_clear(args: argparse.Namespace) -> int:
+    cli.session_state.update(instance_id=None)
+    result: Any = {"instance_id": None, "set": False}
+    if args.format == "text":
+        result = _render_pin_clear_text(result)
+    cli._render_result(result, fmt=args.format, out_path=args.out, stem="instance-clear")
+    return 0
+
+
+@command("target", "list", help="List open BinaryView targets")
+def _target_list(args: argparse.Namespace) -> int:
+    response = cli.send_request(
+        "list_targets",
+        params={},
+        instance_id=getattr(args, "instance", None),
+    )
+    result = response["result"]
+    sticky = cli.session_state.read().get("target")
+    if sticky and isinstance(result, list):
+        for item in result:
+            if isinstance(item, dict) and _target_matches(item, sticky):
+                item["sticky"] = True
+    if args.format == "text":
+        result = _render_target_list_text(result)
+    cli._render_result(result, fmt=args.format, out_path=args.out, stem="targets")
+    return 0
+
+
+def _target_matches(item: dict[str, Any], selector: str) -> bool:
+    """True when *selector* names this target via any of its identifiers."""
+    if selector == item.get("selector"):
+        return True
+    if selector == str(item.get("target_id", "")):
+        return True
+    if selector == str(item.get("view_id", "")):
+        return True
+    filename = item.get("filename")
+    if isinstance(filename, str):
+        if selector == filename:
+            return True
+        if selector == os.path.basename(filename):
+            return True
+    return False
+
+
+@command("target", "use", help="Pin a target selector for subsequent calls", fmt="text",
+         args=[arg("selector", help="Target selector to pin (see `bn target list`)")])
+def _target_use(args: argparse.Namespace) -> int:
+    cli.session_state.update(target=args.selector)
+    result: Any = {"target": args.selector, "set": True}
+    if args.format == "text":
+        result = _render_target_use_text(result)
+    cli._render_result(result, fmt=args.format, out_path=args.out, stem="target-use")
+    return 0
+
+
+@command("target", "clear", help="Clear the pinned target", fmt="text")
+def _target_clear(args: argparse.Namespace) -> int:
+    cli.session_state.update(target=None)
+    result: Any = {"target": None, "set": False}
+    if args.format == "text":
+        result = _render_pin_clear_text(result)
+    cli._render_result(result, fmt=args.format, out_path=args.out, stem="target-clear")
+    return 0

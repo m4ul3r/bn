@@ -9,7 +9,9 @@ import io
 import json
 import os
 import re
+import socket
 import socketserver
+import tempfile
 import threading
 import traceback
 import weakref
@@ -33,6 +35,10 @@ except Exception:  # ImportError or UIPluginInHeadlessError
 
 
 PLUGIN_BUILD_ID = build_id_for_file(Path(__file__).resolve())
+
+# Upper bound on a single newline-terminated JSON request. Anything larger is
+# rejected with a clean error instead of being buffered without limit.
+MAX_REQUEST_BYTES = 32 * 1024 * 1024
 
 
 def _json_response(*, ok: bool, result: Any = None, error: str | None = None) -> dict[str, Any]:
@@ -120,11 +126,14 @@ class _ReadWriteLock:
         self._condition = threading.Condition()
         self._readers = 0
         self._writer = False
+        self._writers_waiting = 0
 
     @contextlib.contextmanager
     def read(self):
         with self._condition:
-            while self._writer:
+            # Also wait while writers are queued, otherwise a steady stream of
+            # readers starves a waiting writer forever.
+            while self._writer or self._writers_waiting:
                 self._condition.wait()
             self._readers += 1
         try:
@@ -138,8 +147,12 @@ class _ReadWriteLock:
     @contextlib.contextmanager
     def write(self):
         with self._condition:
-            while self._writer or self._readers:
-                self._condition.wait()
+            self._writers_waiting += 1
+            try:
+                while self._writer or self._readers:
+                    self._condition.wait()
+            finally:
+                self._writers_waiting -= 1
             self._writer = True
         try:
             yield
@@ -388,7 +401,10 @@ class TargetManager:
     def __init__(self):
         self._lock = threading.RLock()
         self._records: dict[str, TargetRecord] = {}
-        self._ids_by_object: dict[int, str] = {}
+        # id(bv) -> (weakref to that exact bv, stable view_id). The weakref is
+        # validated on lookup because CPython recycles addresses: a new view can
+        # otherwise inherit a dead view's stable view_id.
+        self._ids_by_object: dict[int, tuple[weakref.ref, str]] = {}
         self._next_id = 1
 
     def _view_name(self, bv) -> str:
@@ -467,14 +483,28 @@ class TargetManager:
         focused = _active_binary_view()
 
         with self._lock:
+            # Prune entries whose referent is gone so the map cannot grow
+            # without bound across many load/close cycles.
+            self._ids_by_object = {
+                key: (ref, vid)
+                for key, (ref, vid) in self._ids_by_object.items()
+                if ref() is not None
+            }
             alive: dict[str, TargetRecord] = {}
             for bv in views:
                 key = id(bv)
-                view_id = self._ids_by_object.get(key)
+                view_id = None
+                entry = self._ids_by_object.get(key)
+                if entry is not None:
+                    ref, candidate = entry
+                    # Only reuse the id if the stored ref still points at this
+                    # exact object; id() values get recycled by CPython.
+                    if ref() is bv:
+                        view_id = candidate
                 if view_id is None:
                     view_id = str(self._next_id)
                     self._next_id += 1
-                    self._ids_by_object[key] = view_id
+                    self._ids_by_object[key] = (weakref.ref(bv), view_id)
 
                 try:
                     session_id = str(bv.file.session_id)
@@ -577,19 +607,27 @@ class BridgeHandler(socketserver.StreamRequestHandler):
             bn.log_warn(f"BN Agent Bridge client disconnected before response could be delivered{suffix}")
 
     def handle(self):  # pragma: no cover - exercised from CLI
-        raw = self.rfile.readline()
+        raw = self.rfile.readline(MAX_REQUEST_BYTES)
         if not raw:
             return
         op = None
         request_id = None
-        try:
-            payload = json.loads(raw.decode("utf-8"))
-        except json.JSONDecodeError:
-            response = _json_response(ok=False, error="Invalid JSON request")
+        if len(raw) == MAX_REQUEST_BYTES and not raw.endswith(b"\n"):
+            response = _json_response(ok=False, error="request too large")
         else:
-            op = payload.get("op")
-            request_id = payload.get("id")
-            response = self.server.bridge.dispatch(payload)
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                response = _json_response(ok=False, error="Invalid JSON request")
+            else:
+                if not isinstance(payload, dict):
+                    response = _json_response(
+                        ok=False, error="Invalid request: expected a JSON object"
+                    )
+                else:
+                    op = payload.get("op")
+                    request_id = payload.get("id")
+                    response = self.server.bridge.dispatch(payload)
         encoded = json.dumps(response, sort_keys=True, default=str).encode("utf-8")
         self._write_response(encoded, op=op, request_id=request_id)
 
@@ -644,9 +682,30 @@ class BinaryNinjaBridge:
         self._target_lock = _ReadWriteLock()
         self._shutdown_event = threading.Event()
 
+    def _socket_is_live(self) -> bool:
+        """Whether something is currently accepting connections on our socket path."""
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        probe.settimeout(0.2)
+        try:
+            probe.connect(str(self.socket_path))
+        except OSError:
+            return False
+        finally:
+            with contextlib.suppress(OSError):
+                probe.close()
+        return True
+
     def start(self):  # pragma: no cover - requires GUI runtime
         self.socket_path.parent.mkdir(parents=True, exist_ok=True)
         if self.socket_path.exists():
+            # A stale socket file from a crashed bridge is safe to clear, but a
+            # live one belongs to another bridge instance; unlinking it would
+            # silently orphan that bridge on an unlinked inode.
+            if self._socket_is_live():
+                raise RuntimeError(
+                    f"Another bridge is already serving on {self.socket_path}; "
+                    "refusing to displace it"
+                )
             self.socket_path.unlink()
 
         self._server = ThreadedUnixServer(str(self.socket_path), BridgeHandler, self)
@@ -687,7 +746,17 @@ class BinaryNinjaBridge:
         }
         if self.instance_id is not None:
             payload["instance_id"] = self.instance_id
-        self.registry_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        # Write atomically (temp file + rename) so a concurrent reader never
+        # sees a half-written registry and concludes no instance exists.
+        self.registry_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=self.registry_path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, indent=2))
+            os.replace(tmp, self.registry_path)
+        except Exception:
+            Path(tmp).unlink(missing_ok=True)
+            raise
 
     def dispatch(self, payload: dict[str, Any]) -> dict[str, Any]:  # pragma: no cover - GUI runtime
         op = payload.get("op")
@@ -886,7 +955,10 @@ class BinaryNinjaBridge:
         if op == "batch_apply":
             manifest = dict(params)
             preview = bool(manifest.get("preview"))
-            target = str(manifest.get("target") or target)
+            # Keep None as None so the single-open-target default still applies;
+            # str(None) would become the bogus selector "None".
+            chosen = manifest.get("target") or target
+            target = str(chosen) if chosen is not None else None
             operations = list(manifest.get("ops") or [])
             return self._mutation(target, preview, operations)
 
@@ -1811,8 +1883,17 @@ class BinaryNinjaBridge:
                     lines.append(f"    {ins}")
             if lines:
                 return "\n".join(lines)
-        except Exception:
-            pass
+        except Exception as exc:
+            # Degrade to the prototype, but say so: a silent prototype-only
+            # body with ok:true reads like a successful (empty) render.
+            bn.log_warn(
+                f"BN Agent Bridge: {view} rendering failed for {getattr(func, 'name', func)}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return (
+                f"// bn: IL rendering failed ({type(exc).__name__}: {exc}); "
+                f"showing prototype only\n{func}"
+            )
         return str(func)
 
     def _instruction_length(self, bv, address: int, *, arch=None) -> int:
@@ -2552,17 +2633,28 @@ class BinaryNinjaBridge:
 
     def _decompile_text(self, bv, func, *, addresses: bool = False) -> str:
         """Pseudo C for a function, degrading to wrapped HLIL if it is unavailable."""
+        marker = ""
         try:
             text = self._pseudo_c_text(func, addresses=addresses)
-        except Exception:
+        except Exception as exc:
+            # Make the failure visible instead of silently returning the HLIL
+            # fallback (or worse, an empty body) with ok:true.
+            bn.log_warn(
+                f"BN Agent Bridge: pseudo-C decompilation failed for "
+                f"{getattr(func, 'name', func)}: {type(exc).__name__}: {exc}"
+            )
+            marker = (
+                f"// bn: decompilation failed ({type(exc).__name__}: {exc}); "
+                "showing HLIL fallback\n"
+            )
             text = ""
         if text.strip():
             return text
         sig = self._function_signature(func)
         body = self._function_text(bv, func, view="hlil", addresses=addresses)
         if addresses:
-            return f"{int(func.start):08x}        {sig}\n{body}"
-        return f"{sig}\n{{\n{body}\n}}"
+            return f"{marker}{int(func.start):08x}        {sig}\n{body}"
+        return f"{marker}{sig}\n{{\n{body}\n}}"
 
     def _analysis_stub_warning(self, func, text: str, *, forced: bool = False) -> str | None:
         """Warn when a decompile body is a Binary Ninja analysis stub, not a real body.
@@ -3501,9 +3593,23 @@ class BinaryNinjaBridge:
         except Exception:
             try:
                 address = self._find_function(bv, identifier).start
-            except RuntimeError:
+            except RuntimeError as exc:
+                # An ambiguous identifier is actionable as-is; replacing it
+                # with "not found / not an import symbol" would be misleading.
+                # Only fall back to import-symbol lookup for genuine misses.
+                if "Ambiguous" in str(exc):
+                    raise
                 return self._xrefs_import_symbol(bv, identifier)
         return self._xrefs_to_address(bv, address)
+
+    @staticmethod
+    def _import_symbol_name(sym) -> str:
+        """Preferred display name for an import symbol."""
+        return str(
+            getattr(sym, "short_name", None)
+            or getattr(sym, "full_name", None)
+            or sym.name
+        )
 
     def _find_import_symbol(self, bv, name: str):
         needle = name.lower()
@@ -3512,12 +3618,7 @@ class BinaryNinjaBridge:
             if sym_type is None:
                 continue
             for sym in list(bv.get_symbols_of_type(sym_type)):
-                sym_name = str(
-                    getattr(sym, "short_name", None)
-                    or getattr(sym, "full_name", None)
-                    or sym.name
-                )
-                if sym_name.lower() == needle:
+                if self._import_symbol_name(sym).lower() == needle:
                     return sym
         return None
 
@@ -3530,12 +3631,7 @@ class BinaryNinjaBridge:
                 if sym_type is None:
                     continue
                 for s in list(bv.get_symbols_of_type(sym_type)):
-                    n = str(
-                        getattr(s, "short_name", None)
-                        or getattr(s, "full_name", None)
-                        or s.name
-                    )
-                    available.append(n)
+                    available.append(self._import_symbol_name(s))
             suggestions = difflib.get_close_matches(identifier, sorted(set(available)), n=5, cutoff=0.5)
             msg = f"Function not found: {identifier}."
             if suggestions:
@@ -3887,7 +3983,7 @@ class BinaryNinjaBridge:
             if sym_type is None:
                 continue
             for sym in list(bv.get_symbols_of_type(sym_type)):
-                name = str(getattr(sym, "short_name", None) or getattr(sym, "full_name", None) or sym.name)
+                name = self._import_symbol_name(sym)
                 raw_name = str(getattr(sym, "raw_name", sym.name))
                 namespace = str(getattr(sym, "namespace", "") or "")
                 # Only surface `library` when it's a real per-library namespace;
@@ -4705,13 +4801,19 @@ class BinaryNinjaBridge:
         # If the primary variable still shows the auto name, scan the
         # raw variable lists (bypassing dedup) because BN may keep both
         # auto-named and user-named entries at the same storage offset
-        # after analysis.
+        # after analysis. The alternate entry must still be the *same*
+        # variable (matching identifier); an unrelated neighbor that
+        # happens to carry the requested name must not count as success.
         if observed_name != expected_name:
             is_param = bool(item["is_parameter"])
             collections = [fn.parameter_vars] if is_param else [fn.stack_layout]
             for collection in collections:
                 for v in list(collection):
-                    if int(getattr(v, "storage", -1)) == storage and str(v.name) == expected_name:
+                    if (
+                        int(getattr(v, "storage", -1)) == storage
+                        and str(v.name) == expected_name
+                        and (identifier is None or self._variable_identifier(v) == identifier)
+                    ):
                         observed_name = expected_name
                         var = v
                         break

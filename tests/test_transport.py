@@ -742,3 +742,65 @@ def test_spawn_instance_starts_new_instance_when_other_instances_exist(monkeypat
 
     assert inst.instance_id == "newid"
     assert popen_calls[0]["cmd"] == ["bn-agent", "--instance-id", "newid"]
+
+
+def test_spawn_instance_reports_exit_code_and_log_when_child_dies(monkeypatch, tmp_path):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr("bn.transport.list_instances", lambda: [])
+    monkeypatch.setattr("bn.transport._find_bn_agent", lambda: ["bn-agent"])
+
+    class _FakePopen:
+        pid = 456
+
+        def __init__(self, cmd, **kwargs):
+            # Write to the log file handle just like a crashing child would.
+            kwargs["stdout"].write(
+                "Traceback (most recent call last):\nImportError: no module named binaryninja\n"
+            )
+
+        def poll(self):
+            return 3
+
+    monkeypatch.setattr("bn.transport.subprocess.Popen", _FakePopen)
+
+    with pytest.raises(BridgeError) as excinfo:
+        spawn_instance("deadkid")
+
+    msg = str(excinfo.value)
+    assert "exited with code 3" in msg
+    assert "ImportError: no module named binaryninja" in msg
+    assert str(instances_dir() / "deadkid.log") in msg
+
+
+def test_spawn_instance_terminates_child_on_registration_timeout(monkeypatch, tmp_path):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr("bn.transport.list_instances", lambda: [])
+    monkeypatch.setattr("bn.transport._find_bn_agent", lambda: ["bn-agent"])
+
+    lifecycle: list[str] = []
+
+    class _FakePopen:
+        pid = 456
+
+        def __init__(self, cmd, **kwargs):
+            pass
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            lifecycle.append("terminate")
+
+        def wait(self, timeout=None):
+            lifecycle.append("wait")
+            return 0
+
+        def kill(self):  # pragma: no cover - only reached if wait() raised
+            lifecycle.append("kill")
+
+    monkeypatch.setattr("bn.transport.subprocess.Popen", _FakePopen)
+
+    with pytest.raises(BridgeError, match="did not register within .* and was terminated"):
+        spawn_instance("slowkid", timeout=0.05, poll_interval=0.01)
+
+    assert lifecycle[:2] == ["terminate", "wait"]
