@@ -4,17 +4,13 @@ import json
 import tempfile
 from pathlib import Path
 
-import tiktoken
-
 from bn.output import DEFAULT_SPILL_TOKEN_LIMIT
+from bn.output import estimate_tokens
 from bn.output import write_output
 
 
-TOKENIZER = "o200k_base"
-
-
 def _token_count(text: str) -> int:
-    return len(tiktoken.get_encoding(TOKENIZER).encode(text))
+    return estimate_tokens(text.encode("utf-8"))
 
 
 def _parse_envelope(text: str) -> dict[str, str]:
@@ -55,7 +51,7 @@ def test_write_output_spills_large_payload(tmp_path, monkeypatch):
     assert envelope["path"].startswith(artifact_root)
     assert envelope["spilled"] == "true"
     artifact_text = Path(envelope["path"]).read_text()
-    assert envelope["tokenizer"] == TOKENIZER
+    assert envelope["tokenizer"] == "estimate"
     assert int(envelope["tokens"]) == _token_count(artifact_text)
 
 
@@ -107,5 +103,5 @@ def test_write_output_reports_exact_tokens_for_explicit_out_path(tmp_path, monke
     artifact_text = out_path.read_text()
     assert envelope["path"] == str(out_path)
     assert envelope["spilled"] == "false"
-    assert envelope["tokenizer"] == TOKENIZER
+    assert envelope["tokenizer"] == "estimate"
     assert int(envelope["tokens"]) == _token_count(artifact_text)

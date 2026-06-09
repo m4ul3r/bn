@@ -93,13 +93,13 @@ Defaults:
 - `--format ndjson` is available where it makes sense.
 - `--out <path>` writes the full body to disk and returns an envelope on stdout.
 
-**Spill envelopes.** When output exceeds **10 000 `o200k_base` tokens**, the body is written to disk and stdout carries a compact envelope; stderr carries a one-line warning. Envelope keys:
+**Spill envelopes.** When output exceeds **10 000 estimated tokens** (~3 bytes/token heuristic), the body is written to disk and stdout carries a compact envelope; stderr carries a one-line warning. Envelope keys:
 
 - `ok` — request status.
 - `spilled` — `true` when the body was written to disk because of the threshold; `false` when `--out` was used.
 - `path` (text envelope) / `artifact_path` (JSON) — location on disk: `<tempdir>/bn-spills/YYYYMMDD/<stem>-HHMMSS.<json|ndjson|txt>`.
 - `format` — `json`, `ndjson`, or `text`.
-- `bytes`, `tokens`, `tokenizer` (`o200k_base`), `sha256` — size + integrity.
+- `bytes`, `tokens` (estimate), `tokenizer` (`estimate`), `sha256` — size + integrity.
 - `summary` — shape hint with `kind` and `count` / `chars` / `keys`.
 
 Don't pipe `bn ... | rg ...` and expect `rg` to see real content when output spills — read the artifact path instead.

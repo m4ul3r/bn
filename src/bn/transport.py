@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import fcntl
 import json
 import os
 import secrets
@@ -25,6 +26,28 @@ TRANSIENT_SOCKET_ERRNOS = {
     errno.ECONNREFUSED,
     errno.ENOENT,
 }
+
+# Hard ceiling on how long a request may sit with no bytes arriving before the
+# CLI gives up, so a wedged bridge (e.g. a py_exec stuck under the write lock)
+# can't hang every CLI invocation forever. Generous because legitimate ops
+# (load/refresh with update_analysis_and_wait) can run for minutes. Override
+# with BN_REQUEST_TIMEOUT=<seconds>; 0/none disables the timeout entirely.
+DEFAULT_REQUEST_TIMEOUT = 600.0
+
+
+def _resolve_timeout(timeout: float | None) -> float | None:
+    if timeout is not None:
+        return timeout
+    raw = os.environ.get("BN_REQUEST_TIMEOUT")
+    if raw is not None:
+        text = raw.strip().lower()
+        if text in ("", "0", "none", "off"):
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            pass
+    return DEFAULT_REQUEST_TIMEOUT
 
 
 @dataclass(slots=True)
@@ -173,6 +196,35 @@ def list_instances() -> list[BridgeInstance]:
     return instances
 
 
+def _multiple_instances_error(instances: list[BridgeInstance]) -> BridgeError:
+    return BridgeError(
+        "Multiple Binary Ninja bridge instances are running; pass --instance <id> "
+        "or set BN_INSTANCE.\n"
+        f"Instances:\n{_format_instance_choices(instances)}"
+    )
+
+
+def _auto_spawn_locked() -> BridgeInstance:
+    """Serialize auto-spawn across concurrent CLI processes.
+
+    Without this lock, two CLIs racing on an empty registry each spawn a
+    bridge, after which every bare command fails with "Multiple instances
+    are running" until a human cleans up. The registry is re-checked under
+    the lock because the previous holder may have spawned while we waited.
+    """
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = inst_dir / ".spawn.lock"
+    with open(lock_path, "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        instances = list_instances()
+        if len(instances) == 1:
+            return instances[0]
+        if instances:
+            raise _multiple_instances_error(instances)
+        return spawn_instance()
+
+
 def choose_instance(instance_id: str | None = None, *, auto_start: bool = True) -> BridgeInstance:
     instances = list_instances()
     if instance_id is not None:
@@ -183,13 +235,9 @@ def choose_instance(instance_id: str | None = None, *, auto_start: bool = True) 
     if len(instances) == 1:
         return instances[0]
     if instances:
-        raise BridgeError(
-            "Multiple Binary Ninja bridge instances are running; pass --instance <id> "
-            "or set BN_INSTANCE.\n"
-            f"Instances:\n{_format_instance_choices(instances)}"
-        )
+        raise _multiple_instances_error(instances)
     if auto_start:
-        return spawn_instance()
+        return _auto_spawn_locked()
     raise BridgeError("No running Binary Ninja bridge instances found")
 
 
@@ -211,6 +259,7 @@ def _send_request_to_instance(
         payload["target"] = target
 
     encoded = (json.dumps(payload) + "\n").encode("utf-8")
+    timeout = _resolve_timeout(timeout)
 
     chunks: list[bytes] = []
     last_error: OSError | None = None
@@ -228,6 +277,7 @@ def _send_request_to_instance(
                     if not chunk:
                         break
                     chunks.append(chunk)
+            last_error = None
             break
         except OSError as exc:
             last_error = exc
@@ -235,12 +285,21 @@ def _send_request_to_instance(
                 break
             time.sleep(0.05 * (attempt + 1))
 
-    if last_error is not None and not chunks:
+    if last_error is not None and chunks:
+        # Bytes arrived and then the connection failed: a timeout or reset
+        # mid-response. Don't fall through to json.loads on the truncated
+        # payload -- that misreports the failure as "invalid JSON".
+        raise BridgeError(
+            f"Connection to Binary Ninja bridge pid {instance.pid} failed mid-response for op '{op}' "
+            f"after {len(b''.join(chunks))} bytes ({type(last_error).__name__}: {last_error})"
+        ) from last_error
+    if last_error is not None:
         if isinstance(last_error, TimeoutError):
             timeout_suffix = f" after {timeout:.1f}s" if timeout is not None else ""
             raise BridgeError(
                 f"Timed out waiting for Binary Ninja bridge pid {instance.pid} at {instance.socket_path}"
-                f"{timeout_suffix}"
+                f"{timeout_suffix} (op '{op}'). The bridge may be busy with a long analysis; "
+                "raise or disable the limit with BN_REQUEST_TIMEOUT=<seconds|0>."
             ) from last_error
         raise BridgeError(
             f"Failed to contact Binary Ninja bridge pid {instance.pid} at {instance.socket_path}: {last_error}"

@@ -150,6 +150,13 @@ class _ReadWriteLock:
 
 
 READ_LOCKED_OPS = {
+    # These three read live BinaryViews (targets.refresh() dereferences each
+    # view's file/session), so they must exclude write-locked close_binary /
+    # load_binary. "shutdown" stays unlocked on purpose: it only sets an event
+    # and must work even while a write op is wedged.
+    "doctor",
+    "list_targets",
+    "target_info",
     "function_info",
     "get_prototype",
     "list_functions",
@@ -433,6 +440,14 @@ class TargetManager:
             parts = _path_components(record.filename)
             if len(parts) >= len(suffix) and parts[-len(suffix):] == suffix:
                 return True
+        return False
+
+    def matches_target(self, target_id: str, selector: str | None) -> bool:
+        """Whether ``selector`` names the record with ``target_id``. Locked."""
+        with self._lock:
+            for record in self._records.values():
+                if record.target_id() == target_id:
+                    return self._matches_record(record, selector)
         return False
 
     def _default_view(self):
@@ -1005,11 +1020,7 @@ class BinaryNinjaBridge:
             if item["active"] and selector in (None, "", "active"):
                 record = item
                 break
-            if selector and any(
-                self.targets._matches_record(target_record, selector)
-                for target_record in self.targets._records.values()
-                if target_record.target_id() == item["target_id"]
-            ):
+            if selector and self.targets.matches_target(item["target_id"], selector):
                 record = item
                 break
         return {
@@ -4048,13 +4059,18 @@ class BinaryNinjaBridge:
             bv.update_analysis_and_wait()
             created = bv.get_function_at(addr)
             if created is None:
-                with contextlib.suppress(Exception):
-                    bv.revert_undo_actions(state)
+                reverted = self._revert_undo_safely(bv, state)
                 return {
                     "preview": preview,
                     "success": False,
                     "committed": False,
-                    "message": "Rolled back because no function was created at the address.",
+                    "rolled_back": reverted,
+                    "message": (
+                        "Rolled back because no function was created at the address."
+                        if reverted
+                        else "No function was created at the address AND the rollback failed; "
+                        "the view may be left partially modified."
+                    ),
                     "results": [
                         {
                             "op": "function_create",
@@ -4100,9 +4116,11 @@ class BinaryNinjaBridge:
                 ],
                 "affected_types": [],
             }
-        except Exception:
-            with contextlib.suppress(Exception):
-                bv.revert_undo_actions(state)
+        except Exception as exc:
+            if not self._revert_undo_safely(bv, state):
+                raise RuntimeError(
+                    f"{exc} (additionally, rollback failed; the view may be left partially modified)"
+                ) from exc
             raise
 
     def _get_comment(self, selector: str | None, address, function):
@@ -4892,6 +4910,16 @@ class BinaryNinjaBridge:
                 requested=self._operation_requested(op),
             ) from exc
 
+    def _revert_undo_safely(self, bv, state) -> bool:
+        """Best-effort rollback. Returns False when the revert itself failed,
+        meaning partially-applied changes may still be live in the view."""
+        try:
+            bv.revert_undo_actions(state)
+            return True
+        except Exception as exc:
+            bn.log_error(f"BN Agent Bridge: rollback failed, view may be partially modified: {exc!r}")
+            return False
+
     def _mutation(self, selector: str | None, preview: bool, operations: list[dict[str, Any]]):
         if not operations:
             raise ValueError("Batch operation list is empty")
@@ -4906,14 +4934,23 @@ class BinaryNinjaBridge:
             for op in operations:
                 results.append(self._apply_operation(bv, op))
         except OperationFailure as exc:
-            with contextlib.suppress(Exception):
-                bv.revert_undo_actions(state)
+            reverted = self._revert_undo_safely(bv, state)
+            if reverted:
+                message = "Rolled back before post-state verification because an operation failed to apply."
+                result_note = "Rolled back before post-state verification."
+            else:
+                message = (
+                    "An operation failed to apply AND the rollback itself failed; "
+                    "the view may be left partially modified."
+                )
+                result_note = "Rollback failed; this operation may still be applied."
             return {
                 "preview": preview,
                 "success": False,
                 "committed": False,
-                "message": "Rolled back before post-state verification because an operation failed to apply.",
-                "results": self._mark_unverified_results(results, "Rolled back before post-state verification.")
+                "rolled_back": reverted,
+                "message": message,
+                "results": self._mark_unverified_results(results, result_note)
                 + [self._operation_failure_result(operations[len(results)], exc)],
                 "affected_functions": [],
                 "affected_types": [],
@@ -4948,9 +4985,11 @@ class BinaryNinjaBridge:
                 "affected_functions": diffs,
                 "affected_types": type_diffs,
             }
-        except Exception:
-            with contextlib.suppress(Exception):
-                bv.revert_undo_actions(state)
+        except Exception as exc:
+            if not self._revert_undo_safely(bv, state):
+                raise RuntimeError(
+                    f"{exc} (additionally, rollback failed; the view may be left partially modified)"
+                ) from exc
             raise
 
     def _op_rename_symbol(self, bv, op: dict[str, Any]):
@@ -5057,7 +5096,11 @@ class BinaryNinjaBridge:
         fn = self._find_function(bv, op["function"])
         var, is_parameter = self._find_variable_selector(fn, str(op["variable"]))
         new_name = str(op["new_name"])
-        if str(var.name) != new_name:
+        # Variable.name is a live property backed by the core: snapshot it
+        # before mutating, or before_name reads back the new name and
+        # verification misclassifies a real change as a noop.
+        before_name = str(var.name)
+        if before_name != new_name:
             fn.create_user_var(var, var.type, new_name)
         return {
             "op": "local_rename",
@@ -5069,7 +5112,7 @@ class BinaryNinjaBridge:
             "identifier": self._variable_identifier(var),
             "source_type": self._variable_source_name(var),
             "is_parameter": is_parameter,
-            "before_name": str(var.name),
+            "before_name": before_name,
             "new_name": new_name,
             "requested": self._operation_requested(op),
         }
@@ -5078,7 +5121,10 @@ class BinaryNinjaBridge:
         fn = self._find_function(bv, op["function"])
         var, is_parameter = self._find_variable_selector(fn, str(op["variable"]))
         expected_type, _ = bv.parse_type_string(str(op["new_type"]))
-        if str(var.type) != str(expected_type):
+        # Variable.type is a live property backed by the core: snapshot it
+        # before mutating (see _op_local_rename).
+        before_type = str(var.type)
+        if before_type != str(expected_type):
             fn.create_user_var(var, expected_type, var.name)
         return {
             "op": "local_retype",
@@ -5090,7 +5136,7 @@ class BinaryNinjaBridge:
             "identifier": self._variable_identifier(var),
             "source_type": self._variable_source_name(var),
             "is_parameter": is_parameter,
-            "before_type": str(var.type),
+            "before_type": before_type,
             "expected_type": str(expected_type),
             "requested": self._operation_requested(op),
         }

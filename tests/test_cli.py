@@ -113,7 +113,7 @@ def test_function_list_warns_when_output_auto_spills(monkeypatch, capsys):
                 "format: text\n"
                 "bytes: 1234\n"
                 "tokens: 23456\n"
-                "tokenizer: o200k_base\n"
+                "tokenizer: estimate\n"
                 "sha256: deadbeef\n"
                 "summary: kind=string chars=42\n"
             ),
@@ -125,7 +125,7 @@ def test_function_list_warns_when_output_auto_spills(monkeypatch, capsys):
                 "sha256": "deadbeef",
                 "spilled": True,
                 "summary": {"kind": "string", "chars": 42},
-                "tokenizer": "o200k_base",
+                "tokenizer": "estimate",
                 "tokens": 23456,
             },
         )
@@ -156,7 +156,7 @@ def _spill_artifact_namespace(path: str) -> types.SimpleNamespace:
             "sha256": "feedface",
             "spilled": True,
             "summary": {"kind": "string", "chars": 99},
-            "tokenizer": "o200k_base",
+            "tokenizer": "estimate",
             "tokens": 34567,
         },
     )

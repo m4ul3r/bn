@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import functools
 import hashlib
 import json
 from dataclasses import dataclass
@@ -8,14 +7,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import tiktoken
-
 from .paths import spill_root
 
 
 DEFAULT_SPILL_TOKEN_LIMIT = 10_000
-# `tiktoken` does not currently resolve the dotted `gpt-5.4` alias directly.
-GPT_5_4_TOKENIZER = "o200k_base"
+# Offline token estimate: ~3 bytes of UTF-8 per token. Deliberately
+# conservative for the decompiled-code/JSON output this tool produces (which
+# tokenizes denser than prose), so oversized output spills to disk a little
+# early rather than flooding the consuming agent's context. This replaces a
+# tiktoken dependency that downloaded the OpenAI BPE at runtime and crashed
+# every command on offline machines.
+TOKEN_ESTIMATE_BYTES_PER_TOKEN = 3
 
 
 @dataclass(frozen=True)
@@ -65,9 +67,8 @@ def _spill_path(stem: str, suffix: str) -> Path:
     return directory / f"{stem}-{now.strftime('%H%M%S')}{suffix}"
 
 
-@functools.cache
-def _token_encoding() -> tiktoken.Encoding:
-    return tiktoken.get_encoding(GPT_5_4_TOKENIZER)
+def estimate_tokens(encoded: bytes) -> int:
+    return -(-len(encoded) // TOKEN_ESTIMATE_BYTES_PER_TOKEN)
 
 
 def _artifact_payload(
@@ -86,7 +87,7 @@ def _artifact_payload(
         "format": fmt,
         "bytes": len(encoded),
         "tokens": token_count,
-        "tokenizer": GPT_5_4_TOKENIZER,
+        "tokenizer": "estimate",
         "sha256": hashlib.sha256(encoded).hexdigest(),
         "summary": _summary(value),
     }
@@ -136,7 +137,7 @@ def write_output_result(
 ) -> OutputWriteResult:
     rendered = render_value(value, fmt)
     encoded = rendered.encode("utf-8")
-    token_count = len(_token_encoding().encode(rendered))
+    token_count = estimate_tokens(encoded)
 
     if out_path is not None:
         out_path.parent.mkdir(parents=True, exist_ok=True)

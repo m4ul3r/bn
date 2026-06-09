@@ -296,22 +296,9 @@ def test_send_request_retries_transient_connect_failures(tmp_path, monkeypatch):
     assert _FakeSocket.attempts == 2
 
 
-def test_send_request_uses_blocking_socket_by_default(tmp_path, monkeypatch):
-    from bn.transport import BridgeInstance
-
-    instance = BridgeInstance(
-        pid=999,
-        socket_path=tmp_path / "bridge.sock",
-        registry_path=tmp_path / "bridge.json",
-        plugin_name="bn_agent_bridge",
-        plugin_version="0.1.0",
-        started_at=None,
-        meta={},
-    )
-    monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None, **kw: instance)
-
+def _make_timeout_probe_socket():
     class _FakeSocket:
-        timeout_calls = 0
+        timeouts: list[float] = []
 
         def __enter__(self):
             return self
@@ -320,7 +307,7 @@ def test_send_request_uses_blocking_socket_by_default(tmp_path, monkeypatch):
             return False
 
         def settimeout(self, timeout):
-            type(self).timeout_calls += 1
+            type(self).timeouts.append(timeout)
             self.timeout = timeout
 
         def connect(self, path):
@@ -338,12 +325,97 @@ def test_send_request_uses_blocking_socket_by_default(tmp_path, monkeypatch):
                 return json.dumps({"ok": True, "result": {"pong": True}}).encode("utf-8")
             return b""
 
-    monkeypatch.setattr("bn.transport.socket.socket", lambda *args, **kwargs: _FakeSocket())
+    return _FakeSocket
+
+
+def _make_instance(tmp_path):
+    from bn.transport import BridgeInstance
+
+    return BridgeInstance(
+        pid=999,
+        socket_path=tmp_path / "bridge.sock",
+        registry_path=tmp_path / "bridge.json",
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at=None,
+        meta={},
+    )
+
+
+def test_send_request_applies_default_timeout(tmp_path, monkeypatch):
+    from bn.transport import DEFAULT_REQUEST_TIMEOUT
+
+    monkeypatch.delenv("BN_REQUEST_TIMEOUT", raising=False)
+    instance = _make_instance(tmp_path)
+    monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None, **kw: instance)
+    fake_socket = _make_timeout_probe_socket()
+    monkeypatch.setattr("bn.transport.socket.socket", lambda *args, **kwargs: fake_socket())
 
     response = send_request("ping")
 
     assert response["result"]["pong"] is True
-    assert _FakeSocket.timeout_calls == 0
+    assert fake_socket.timeouts == [DEFAULT_REQUEST_TIMEOUT]
+
+
+def test_send_request_timeout_env_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "42.5")
+    instance = _make_instance(tmp_path)
+    monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None, **kw: instance)
+    fake_socket = _make_timeout_probe_socket()
+    monkeypatch.setattr("bn.transport.socket.socket", lambda *args, **kwargs: fake_socket())
+
+    send_request("ping")
+
+    assert fake_socket.timeouts == [42.5]
+
+
+def test_send_request_timeout_env_zero_disables(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "0")
+    instance = _make_instance(tmp_path)
+    monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None, **kw: instance)
+    fake_socket = _make_timeout_probe_socket()
+    monkeypatch.setattr("bn.transport.socket.socket", lambda *args, **kwargs: fake_socket())
+
+    send_request("ping")
+
+    assert fake_socket.timeouts == []
+
+
+def test_send_request_partial_response_reports_real_error(tmp_path, monkeypatch):
+    from bn.transport import BridgeError
+
+    instance = _make_instance(tmp_path)
+    monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None, **kw: instance)
+
+    class _FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def connect(self, path):
+            self.path = path
+
+        def sendall(self, payload):
+            self.payload = payload
+
+        def shutdown(self, how):
+            self.how = how
+
+        def recv(self, size):
+            if not hasattr(self, "_sent"):
+                self._sent = True
+                return b'{"ok": true, "resu'
+            raise socket.timeout("timed out")
+
+    monkeypatch.setattr("bn.transport.socket.socket", lambda *args, **kwargs: _FakeSocket())
+
+    with pytest.raises(BridgeError, match="failed mid-response for op 'ping' after 18 bytes"):
+        send_request("ping", timeout=5.0)
 
 
 def test_send_request_reports_timeout_waiting_for_response(tmp_path, monkeypatch):

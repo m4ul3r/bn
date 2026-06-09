@@ -141,7 +141,7 @@ path: /tmp/floor.json
 format: json
 bytes: 1234
 tokens: 456
-tokenizer: o200k_base
+tokenizer: estimate
 sha256: deadbeef...
 summary: kind=object count=3
 ```

@@ -929,7 +929,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="bn",
         description="Agent-friendly Binary Ninja CLI",
         epilog=(
-            "Output over ~10k o200k_base tokens spills to disk; the command prints an "
+            "Output over ~10k estimated tokens spills to disk; the command prints an "
             "envelope with the artifact path. Read that file directly -- do not pipe to grep."
         ),
     )
