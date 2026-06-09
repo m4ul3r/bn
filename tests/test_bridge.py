@@ -432,7 +432,7 @@ def test_mutation_reverts_on_verification_failure(monkeypatch):
     monkeypatch.setattr(
         instance,
         "_apply_operation",
-        lambda bv, op: {
+        lambda bv, op, restores=None: {
             "op": "rename_symbol",
             "kind": "function",
             "address": "0x401000",
@@ -456,6 +456,98 @@ def test_mutation_reverts_on_verification_failure(monkeypatch):
     assert result["committed"] is False
     assert ("revert", "state") in bv.events
     assert ("commit", "state") not in bv.events
+
+
+def test_run_local_restores_runs_reverse_and_reports_failure(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    order: list[int] = []
+
+    def mk(n, *, fail=False):
+        def _restore():
+            order.append(n)
+            if fail:
+                raise RuntimeError("boom")
+        return _restore
+
+    settled = []
+    bv = types.SimpleNamespace(update_analysis_and_wait=lambda: settled.append(True))
+
+    # A failing restore must not stop the others, and the result is False.
+    ok = instance._run_local_restores(bv, [mk(1), mk(2, fail=True), mk(3)])
+    assert order == [3, 2, 1]  # reverse of apply order
+    assert ok is False
+    assert settled == [True]  # view re-settled so the restore materializes
+
+    order.clear()
+    settled.clear()
+    assert instance._run_local_restores(bv, [mk(1), mk(2)]) is True
+    assert order == [2, 1]
+    assert settled == [True]
+
+    # Empty restore list is a no-op: no reanalysis triggered.
+    settled.clear()
+    assert instance._run_local_restores(bv, []) is True
+    assert settled == []
+
+
+def test_op_local_rename_registers_restore_that_undoes_the_rename(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    var = _FakeVariable(
+        name="r2_1", storage=2, var_type="uint32_t", identifier=123,
+        source_type="RegisterVariableSourceType",
+    )
+
+    class _RecordingFunc:
+        def __init__(self):
+            self.start = 0x1000
+            self.name = "f"
+            self.calls: list[tuple] = []
+
+        def create_user_var(self, v, type_obj, name):
+            self.calls.append((name, str(type_obj)))
+            v.name = name
+            v.type = type_obj
+
+    fn = _RecordingFunc()
+    bv = types.SimpleNamespace(get_function_at=lambda addr: fn)
+    monkeypatch.setattr(instance, "_find_function", lambda _bv, ident: fn)
+    monkeypatch.setattr(instance, "_find_variable_selector", lambda _f, sel: (var, False))
+    monkeypatch.setattr(instance, "_find_var_for_restore", lambda _f, identifier, storage, is_parameter: var)
+    monkeypatch.setattr(instance, "_local_id", lambda _f, _v, is_parameter: "lid")
+
+    restores: list = []
+    result = instance._op_local_rename(
+        bv, {"op": "local_rename", "function": "f", "variable": "r2_1", "new_name": "tbl_count"}, restores
+    )
+
+    # before_name is the OLD name, the rename applied, and a restore was registered.
+    assert result["before_name"] == "r2_1"
+    assert result["new_name"] == "tbl_count"
+    assert var.name == "tbl_count"
+    assert len(restores) == 1
+
+    # Replaying the restore puts the local back to its original name+type.
+    restores[0]()
+    assert var.name == "r2_1"
+    assert str(var.type) == "uint32_t"
+    assert fn.calls[-1] == ("r2_1", "uint32_t")
+
+
+def test_op_local_rename_noop_registers_no_restore(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    var = _FakeVariable(name="keep", storage=2, var_type="int32_t", identifier=1)
+    fn = types.SimpleNamespace(start=0x1000, name="f", create_user_var=lambda *a: None)
+    monkeypatch.setattr(instance, "_find_function", lambda _bv, ident: fn)
+    monkeypatch.setattr(instance, "_find_variable_selector", lambda _f, sel: (var, False))
+    monkeypatch.setattr(instance, "_local_id", lambda _f, _v, is_parameter: "lid")
+
+    restores: list = []
+    instance._op_local_rename(bv := object(), {"op": "local_rename", "function": "f", "variable": "keep", "new_name": "keep"}, restores)
+    assert restores == []  # renaming to the same name mutates nothing, so nothing to revert
 
 
 def test_refresh_updates_analysis_and_returns_target_info(monkeypatch):

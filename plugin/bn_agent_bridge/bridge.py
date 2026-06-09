@@ -4979,7 +4979,7 @@ class BinaryNinjaBridge:
         item["status"] = "noop" if before and all(before.get(name) == expected for name, expected in defined_types.items()) else "verified"
         return item
 
-    def _apply_operation(self, bv, op: dict[str, Any]):
+    def _apply_operation(self, bv, op: dict[str, Any], restores: list | None = None):
         kind = op.get("op") or "rename_symbol"
         try:
             if kind == "rename_symbol":
@@ -4991,9 +4991,9 @@ class BinaryNinjaBridge:
             if kind == "set_prototype":
                 return self._op_set_prototype(bv, op)
             if kind == "local_rename":
-                return self._op_local_rename(bv, op)
+                return self._op_local_rename(bv, op, restores)
             if kind == "local_retype":
-                return self._op_local_retype(bv, op)
+                return self._op_local_retype(bv, op, restores)
             if kind == "struct_field_set":
                 return self._op_struct_field_set(bv, op)
             if kind == "struct_field_rename":
@@ -5022,6 +5022,48 @@ class BinaryNinjaBridge:
             bn.log_error(f"BN Agent Bridge: rollback failed, view may be partially modified: {exc!r}")
             return False
 
+    def _find_var_for_restore(self, fn, identifier, storage, is_parameter):
+        """Re-resolve a local for restore the way verification does: identifier
+        first (stable across analysis passes and covers register vars, which
+        stack_layout omits), then storage. Returns None if it can't be found."""
+        if identifier is not None:
+            for var, _ in self._iter_canonical_variables(fn):
+                if self._variable_identifier(var) == identifier:
+                    return var
+        try:
+            var, _ = self._find_variable_by_storage(fn, int(storage), is_parameter=is_parameter)
+            return var
+        except RuntimeError:
+            return None
+
+    def _run_local_restores(self, bv, restores) -> bool:
+        """Explicitly undo local var rename/retype on revert. BN's undo buffer
+        does NOT journal Function.create_user_var(), so revert_undo_actions is a
+        silent no-op for locals -- without this, --preview and rollback-on-failure
+        would leave the renamed/retyped local permanently applied. Runs in reverse
+        apply order. Returns False if any restore failed."""
+        if not restores:
+            return True
+        ok = True
+        for restore in reversed(restores):
+            try:
+                restore()
+            except Exception as exc:
+                ok = False
+                bn.log_error(
+                    "BN Agent Bridge: failed to restore local var on revert "
+                    f"(create_user_var isn't journaled by BN undo): {exc!r}"
+                )
+        # create_user_var only materializes once analysis runs again (same as the
+        # forward apply path), so settle the view before returning -- otherwise the
+        # restore is queued but the old name/type is still showing.
+        try:
+            bv.update_analysis_and_wait()
+        except Exception as exc:
+            ok = False
+            bn.log_error(f"BN Agent Bridge: reanalysis after local restore failed: {exc!r}")
+        return ok
+
     def _mutation(self, selector: str | None, preview: bool, operations: list[dict[str, Any]]):
         if not operations:
             raise ValueError("Batch operation list is empty")
@@ -5032,11 +5074,14 @@ class BinaryNinjaBridge:
         type_before = self._capture_type_snapshots(bv, operations)
         state = bv.begin_undo_actions()
         results = []
+        # Explicit restores for local var ops, which BN's undo buffer can't
+        # revert (see _run_local_restores). Replayed on every revert path.
+        restores: list = []
         try:
             for op in operations:
-                results.append(self._apply_operation(bv, op))
+                results.append(self._apply_operation(bv, op, restores))
         except OperationFailure as exc:
-            reverted = self._revert_undo_safely(bv, state)
+            reverted = self._revert_undo_safely(bv, state) and self._run_local_restores(bv, restores)
             if reverted:
                 message = "Rolled back before post-state verification because an operation failed to apply."
                 result_note = "Rolled back before post-state verification."
@@ -5067,18 +5112,26 @@ class BinaryNinjaBridge:
             verified_results = [self._verify_operation(bv, result) for result in results]
             annotated_results = self._annotate_operation_results(verified_results, type_diffs)
             failed = self._has_failed_results(annotated_results)
+            restored = True
             if preview or failed:
                 bv.revert_undo_actions(state)
+                restored = self._run_local_restores(bv, restores)
             else:
                 bv.commit_undo_actions(state)
             message = None
             if preview:
-                message = "Preview verified and reverted."
+                message = "Preview verified and reverted." if restored else (
+                    "Preview verified, but reverting a local variable change failed; "
+                    "the view may be left modified."
+                )
             elif failed:
-                message = "Rolled back because live-session verification failed."
+                message = "Rolled back because live-session verification failed." if restored else (
+                    "Live-session verification failed AND reverting a local variable change failed; "
+                    "the view may be left modified."
+                )
             else:
                 message = "Applied and verified in the live Binary Ninja session."
-            return {
+            result = {
                 "preview": preview,
                 "success": not failed,
                 "committed": bool((not preview) and (not failed)),
@@ -5087,8 +5140,13 @@ class BinaryNinjaBridge:
                 "affected_functions": diffs,
                 "affected_types": type_diffs,
             }
+            if preview or failed:
+                result["rolled_back"] = restored
+            return result
         except Exception as exc:
-            if not self._revert_undo_safely(bv, state):
+            undo_ok = self._revert_undo_safely(bv, state)
+            restore_ok = self._run_local_restores(bv, restores)
+            if not (undo_ok and restore_ok):
                 raise RuntimeError(
                     f"{exc} (additionally, rollback failed; the view may be left partially modified)"
                 ) from exc
@@ -5194,7 +5252,28 @@ class BinaryNinjaBridge:
             "requested": self._operation_requested(op),
         }
 
-    def _op_local_rename(self, bv, op: dict[str, Any]):
+    def _register_local_restore(self, bv, restores, *, fn, var, name, type_obj, is_parameter):
+        """Capture how to put a local back to (name, type_obj) on revert.
+        Re-resolves the variable fresh at restore time by identifier/storage,
+        because the captured Variable's index can shift across reanalysis."""
+        if restores is None:
+            return
+        fn_start = int(fn.start)
+        identifier = self._variable_identifier(var)
+        storage = int(var.storage)
+
+        def _restore():
+            rfn = bv.get_function_at(fn_start)
+            if rfn is None:
+                raise RuntimeError(f"function {hex(fn_start)} missing on restore")
+            rvar = self._find_var_for_restore(rfn, identifier, storage, is_parameter)
+            if rvar is None:
+                raise RuntimeError(f"local at storage {storage} missing on restore in {hex(fn_start)}")
+            rfn.create_user_var(rvar, type_obj, name)
+
+        restores.append(_restore)
+
+    def _op_local_rename(self, bv, op: dict[str, Any], restores: list | None = None):
         fn = self._find_function(bv, op["function"])
         var, is_parameter = self._find_variable_selector(fn, str(op["variable"]))
         new_name = str(op["new_name"])
@@ -5203,6 +5282,11 @@ class BinaryNinjaBridge:
         # verification misclassifies a real change as a noop.
         before_name = str(var.name)
         if before_name != new_name:
+            # create_user_var isn't journaled by BN's undo buffer, so register
+            # an explicit restore for the preview/rollback paths.
+            self._register_local_restore(
+                bv, restores, fn=fn, var=var, name=before_name, type_obj=var.type, is_parameter=is_parameter
+            )
             fn.create_user_var(var, var.type, new_name)
         return {
             "op": "local_rename",
@@ -5219,14 +5303,20 @@ class BinaryNinjaBridge:
             "requested": self._operation_requested(op),
         }
 
-    def _op_local_retype(self, bv, op: dict[str, Any]):
+    def _op_local_retype(self, bv, op: dict[str, Any], restores: list | None = None):
         fn = self._find_function(bv, op["function"])
         var, is_parameter = self._find_variable_selector(fn, str(op["variable"]))
         expected_type, _ = bv.parse_type_string(str(op["new_type"]))
         # Variable.type is a live property backed by the core: snapshot it
         # before mutating (see _op_local_rename).
-        before_type = str(var.type)
+        before_type_obj = var.type
+        before_type = str(before_type_obj)
         if before_type != str(expected_type):
+            # create_user_var isn't journaled by BN's undo buffer, so register
+            # an explicit restore for the preview/rollback paths.
+            self._register_local_restore(
+                bv, restores, fn=fn, var=var, name=str(var.name), type_obj=before_type_obj, is_parameter=is_parameter
+            )
             fn.create_user_var(var, expected_type, var.name)
         return {
             "op": "local_retype",
