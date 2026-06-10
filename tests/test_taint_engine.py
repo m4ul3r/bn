@@ -885,3 +885,63 @@ def test_backward_slices_from_memcpy_length(process_func, models):
     assert sl["origin"]["kind"] == "entry"
     slice_addrs = [s["address"] for s in sl["slice"]]
     assert "0x4011bc" in slice_addrs  # len#2 = len#1 + 4 is on the slice
+
+
+def test_backward_param_seed_ascends_into_caller(models):
+    # use_len(dst, src, n): memcpy(dst, src, n). Backward from param:2 (n)
+    # seeds at n's earliest read and continues into the caller, reaching the
+    # recv source — the same ascent as an arg: sink that bottoms out at a param.
+    dst = FVar("dst", ident=20); src = FVar("src", ident=21); n = FVar("n", ident=22)
+    dst0 = FSSA(dst, 0); src0 = FSSA(src, 0); n0 = FSSA(n, 0)
+    USE_LEN_CALL = 0x920
+    use_len = FFunc("use_len", 0x800, FSSAFunc([
+        FInstr(0, 0x804, "MLIL_CALL_SSA", "0x940(dst#0, src#0, n#0)", reads=[dst0, src0, n0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x940", constant=0x940),
+               params=[FExpr("MLIL_VAR_SSA", "dst#0", reads=[dst0]),
+                       FExpr("MLIL_VAR_SSA", "src#0", reads=[src0]),
+                       FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])]),
+    ]), params=[dst, src, n])
+
+    fd = FVar("fd"); buf = FVar("buf"); nh = FVar("nh")
+    nh1 = FSSA(nh, 1); rb = FVar("rb"); rb1 = FSSA(rb, 1)
+    handler = FFunc("handler", 0x900, FSSAFunc([
+        FInstr(0, 0x904, "MLIL_SET_VAR_SSA", "rb#1 = &buf", writes=[rb1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+        FInstr(1, 0x910, "MLIL_CALL_SSA", "nh#1 = 0x930(fd, rb#1, 0x40, 0)", reads=[rb1], writes=[nh1],
+               dest=FExpr("MLIL_CONST_PTR", "0x930", constant=0x930),
+               params=[FExpr("MLIL_VAR_SSA", "fd", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "rb#1", reads=[rb1]),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40),
+                       FExpr("MLIL_CONST", "0", constant=0)]),
+        FInstr(2, USE_LEN_CALL, "MLIL_CALL_SSA", "0x800(out, rb#1, nh#1)", reads=[rb1, nh1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x800", constant=0x800),
+               params=[FExpr("MLIL_VAR_SSA", "out", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "rb#1", reads=[rb1]),
+                       FExpr("MLIL_VAR_SSA", "nh#1", reads=[nh1])]),
+    ]), params=[fd])
+    use_len.caller_sites = [FSite(handler, USE_LEN_CALL)]
+
+    bv = FBV({0x940: "memcpy", 0x930: "recv", 0x800: "use_len"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.backward(use_len, [te.parse_locator("param:2")])
+
+    assert result["slices"]
+    assert result["slices"][0]["sink"]["kind"] == "param"
+    origins = [(sl["origin"]["kind"], sl["origin"].get("callee")) for sl in result["slices"]]
+    assert ("source", "recv") in origins
+
+
+def test_backward_ret_sink_rejected_with_guidance(process_func, models):
+    bv = FBV({0x401070: "read", 0x401080: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    with pytest.raises(te.TaintError, match="forward-only"):
+        engine.backward(process_func, [te.parse_locator("ret:read")])
+
+
+def test_backward_walk_truncation_recorded(process_func, models):
+    # an engine-level def-chain cap of 1 cannot reach the end of the
+    # rdx_1#1 <- len#2 <- len#1 chain; the cut must surface in assumptions
+    bv = FBV({0x401070: "read", 0x401080: "memcpy"})
+    engine = te.TaintEngine(bv, models, max_depth=1)
+    result = engine.backward(process_func, [te.parse_locator("arg:memcpy:2")])
+    assert any("truncated" in a for a in result["assumptions"])

@@ -82,6 +82,10 @@ _LOCATOR_HELP = (
     "Locator: param:<n> | var:<selector> | ret:<callee> | arg:<callee>:<n>"
 )
 
+_SINK_LOCATOR_HELP = (
+    "Locator: param:<n> | var:<selector> | arg:<callee>:<n> (ret: is forward-only)"
+)
+
 
 @command("taint", "forward", help="Forward taint: trace untrusted data from sources to sinks",
          target=True,
@@ -136,9 +140,11 @@ def _taint_forward(args: argparse.Namespace) -> int:
              arg("--function", "-f", dest="function", required=True,
                  help="Function to analyze (name or address)"),
              arg("--sink", dest="sinks", action="append", default=None, metavar="LOCATOR",
-                 help=f"Sink to slice from (repeatable). {_LOCATOR_HELP}"),
+                 help=f"Sink to slice from (repeatable). {_SINK_LOCATOR_HELP}"),
              arg("--max-depth", dest="max_depth", type=int, default=8,
-                 help="Max interprocedural depth to follow slices up into callers (default: 8)"),
+                 help="Max interprocedural depth to follow slices up into callers (default: 8). "
+                      "The in-function def-chain walk caps at 64 steps; truncation is "
+                      "recorded under assumptions."),
          ])
 def _taint_backward(args: argparse.Namespace) -> int:
     if not args.sinks:

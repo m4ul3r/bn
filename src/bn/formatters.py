@@ -1015,7 +1015,7 @@ def _render_taint_text(value: Any) -> str:
             origin = sl.get("origin") or {}
             lines.append("")
             lines.append(
-                f"slice for {sink.get('callee', '?')} @ {sink.get('address')} (seed {sink.get('seed', '?')}):"
+                f"slice for {sink.get('callee') or sink.get('kind') or '?'} @ {sink.get('address')} (seed {sink.get('seed', '?')}):"
             )
             lines.append(f"  origin: {origin.get('kind')}" + (
                 f" {origin.get('callee') or origin.get('var') or ''}".rstrip()

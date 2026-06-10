@@ -241,7 +241,7 @@ for return-value provenance. Reach for `trace` when interrogating a concrete
 callsite, `taint backward` when hunting origins across the caller chain.
 
 **Source/sink locator grammar:** `param:<n>` · `var:<selector>` ·
-`ret:<callee>` · `arg:<callee>:<n>` (the buffer arg `n` points at).
+`ret:<callee>` (forward only) · `arg:<callee>:<n>` (the buffer arg `n` points at).
 
 **Underlying primitives** (useful on their own, and for auditing a taint result):
 ```bash

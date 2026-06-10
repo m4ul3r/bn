@@ -1169,6 +1169,7 @@ class TaintEngine:
                 for sl in self._backward_slice(func, seed_var, 0, max_depth, set()):
                     slices.append({
                         "sink": {
+                            "kind": sink.get("kind"),
                             "callee": sink.get("callee"),
                             "address": hex(int(getattr(sink_ins, "address", 0))),
                             "seed": var_label(seed_var),
@@ -1204,6 +1205,8 @@ class TaintEngine:
         def walk(v, d):
             nonlocal origin
             if d > self.max_depth:
+                self._bw_assume(
+                    f"def-chain walk truncated at {self.max_depth} steps (engine max_depth)")
                 return
             key = (var_key(v), getattr(v, "version", None))
             if key in visited_vars:
@@ -1325,6 +1328,26 @@ class TaintEngine:
                         break
                 if out:
                     break
+        elif kind == "param":
+            idx = int(sink["index"])
+            pv = self._param_var(func, idx)
+            if pv is None:
+                raise TaintError(f"parameter {idx} not found on {func.name}")
+            # seed from the earliest SSA read of the parameter (its entry value);
+            # the walk bottoms out at the parameter and continues into callers
+            for ins in instrs:
+                for r in ssa_reads(ins):
+                    if var_key(r) == var_key(pv):
+                        out.append((r, ins))
+                        break
+                if out:
+                    break
+        elif kind == "ret":
+            raise TaintError(
+                "ret:<callee> is a forward-only locator: in the caller a return "
+                "value has no def-chain to slice. Slice the variable that receives "
+                "it (var:<name>), or use 'bn trace <fn> <call_addr> --arg N' for "
+                "callee return-value provenance.")
         else:
             raise TaintError(f"unsupported backward sink kind: {kind}")
         if not out:
