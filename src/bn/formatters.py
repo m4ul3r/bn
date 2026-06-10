@@ -467,10 +467,30 @@ def _group_refs_by_caller(refs: list[Any]) -> list[dict[str, Any]]:
                 "caller_address": key[0],
                 "caller_name": key[1],
                 "sites": [],
+                # Keep the first ref's address-context so a ref with no
+                # containing function can still be labeled by its section or
+                # symbol instead of a bare "<unknown>".
+                "context": ref.get("context"),
             }
             order.append(key)
         groups[key]["sites"].append(str(ref.get("address", "<unknown>")))
     return [groups[k] for k in order]
+
+
+def _unknown_ref_label(context: Any) -> str:
+    """A concise fallback label (symbol name, else section name) for a ref that
+    has no containing function, so it isn't rendered as a bare "<unknown>"."""
+    if not isinstance(context, dict):
+        return ""
+    symbol = context.get("symbol")
+    if isinstance(symbol, dict) and symbol.get("name"):
+        return str(symbol["name"])
+    sections = context.get("sections")
+    if isinstance(sections, list):
+        for item in sections:
+            if isinstance(item, dict) and item.get("name"):
+                return str(item["name"])
+    return ""
 
 
 def _render_xrefs_text(value: Any, limit: int | None = None) -> str:
@@ -498,7 +518,11 @@ def _render_xrefs_text(value: Any, limit: int | None = None) -> str:
         rendered = [header]
         for group in shown:
             caller_addr = group["caller_address"] or "<unknown>"
-            caller_name = group["caller_name"] or "<unknown>"
+            caller_name = (
+                group["caller_name"]
+                or _unknown_ref_label(group.get("context"))
+                or "<unknown>"
+            )
             sites = group["sites"]
             if len(sites) == 1:
                 suffix = f"(1 site: {sites[0]})"
@@ -1449,7 +1473,8 @@ def _render_trace_text(value: Any) -> str:
     header = (
         f"backward trace of arg[{arg_index}] in {fn_name} @ {target_addr}"
     )
-    info = f"  {fn_name} @ {fn_addr}  •  {len(trace)} steps"
+    step_word = "step" if len(trace) == 1 else "steps"
+    info = f"  {fn_name} @ {fn_addr}  •  {len(trace)} {step_word}"
     if value.get("truncated"):
         info += "  •  truncated"
 

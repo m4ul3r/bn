@@ -3848,3 +3848,50 @@ def test_strings_with_filter_suppresses_section_hint(monkeypatch, capsys):
 
     _, stderr = capsys.readouterr()
     assert "tip:" not in stderr
+
+
+def test_trace_render_step_grammar_singular_and_plural():
+    from bn import formatters
+    base = {
+        "function": "f", "function_address": "0x1000", "target_address": "0x1010",
+        "arg_index": 0, "truncated": False,
+        "trace": [{"ssa_var": "x#1", "terminates": True, "reason": "undefined_or_global", "depth": 0}],
+    }
+    out1 = formatters._render_trace_text(base)
+    assert "1 step" in out1 and "1 steps" not in out1
+    two = dict(base, trace=base["trace"] + [
+        {"ssa_var": "y#1", "terminates": True, "reason": "undefined_or_global", "depth": 1}])
+    assert "2 steps" in formatters._render_trace_text(two)
+
+
+def test_unknown_ref_label_prefers_symbol_then_section():
+    from bn import formatters
+    assert formatters._unknown_ref_label({"symbol": {"name": "some_export"}}) == "some_export"
+    assert formatters._unknown_ref_label({"sections": [{"name": ".got"}]}) == ".got"
+    assert formatters._unknown_ref_label({"symbol": {"name": "s"}, "sections": [{"name": ".got"}]}) == "s"
+    assert formatters._unknown_ref_label({}) == ""
+    assert formatters._unknown_ref_label(None) == ""
+
+
+def test_xrefs_data_ref_labels_unknown_caller_by_section_or_symbol():
+    from bn import formatters
+    value = {
+        "address": "0x18d58", "code_refs": [],
+        "data_refs": [
+            {"address": "0x1a254", "caller_function": None, "function": None,
+             "context": {"sections": [{"name": ".got"}], "symbol": {"name": "some_export"}}},
+        ],
+    }
+    out = formatters._render_xrefs_text(value)
+    assert "some_export" in out          # symbol preferred over a bare <unknown>
+    assert "<unknown>  <unknown>" not in out
+
+
+def test_negative_ip_depth_rejected_with_exit_2():
+    parser = bn.cli.build_parser()
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(["trace", "f", "0x1000", "--target", "active", "--ip-depth", "-1"])
+    assert excinfo.value.code == 2
+    # ip-depth 0 (disable crossing) is allowed
+    ns = parser.parse_args(["trace", "f", "0x1000", "--target", "active", "--ip-depth", "0"])
+    assert ns.ip_depth == 0
