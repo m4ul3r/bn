@@ -3567,9 +3567,16 @@ class BinaryNinjaBridge:
         bv = self._resolve_view(selector)
         needle = query.lower()
         matches = []
+        total_matched = 0
         for item in list(getattr(bv, "strings", [])):
             value = str(getattr(item, "value", ""))
             if needle and needle not in value.lower():
+                continue
+            # Count every match so the reported total is honest, but only build
+            # the expensive per-match evidence (xrefs + pointer tables) for the
+            # first `limit` matches that are actually returned.
+            total_matched += 1
+            if len(matches) >= limit:
                 continue
             address = int(getattr(item, "start", 0))
             xrefs = self._xrefs_to_address(bv, address)
@@ -3602,12 +3609,12 @@ class BinaryNinjaBridge:
                     "metadata_table_windows": metadata_tables,
                 }
             )
-            if len(matches) >= limit:
-                break
         return {
             "query": query,
             "matches": matches,
             "count": len(matches),
+            "total": total_matched,
+            "truncated": total_matched > len(matches),
         }
 
     def _iter_il_instructions(self, il_func):

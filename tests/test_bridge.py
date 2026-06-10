@@ -1903,6 +1903,39 @@ def test_message_lens_summarizes_type_string_xrefs_and_metadata_window(monkeypat
     assert match["xrefs"]["code_refs"][0]["function"] == "build_type_name"
     assert match["metadata_table_windows"][0]["address"] == "0x6000"
     assert match["metadata_table_windows"][0]["entries"][0]["target"]["thumb_adjusted"] is True
+    # single match under the limit: honest total, not truncated
+    assert result["total"] == 1
+    assert result["truncated"] is False
+
+
+def test_message_lens_reports_true_total_and_flags_truncation(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    # 5 strings match the needle; with limit=2 only 2 rich matches come back,
+    # but the reported total must be the honest 5 with truncated=True (issue #13).
+    strings = [_FakeStringRef(0x1000 + i * 0x20, 9, f"Evt{i}_token") for i in range(5)]
+    bv = _FakeBV(arch=_FakeArch(name="armv7"), strings=strings)
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._message_lens("active", "token", limit=2)
+
+    assert result["count"] == 2          # only `limit` rich matches returned
+    assert len(result["matches"]) == 2
+    assert result["total"] == 5          # but the count reported is honest
+    assert result["truncated"] is True
+
+
+def test_message_lens_not_truncated_when_all_matches_fit(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    strings = [_FakeStringRef(0x1000 + i * 0x20, 9, f"Evt{i}_token") for i in range(3)]
+    bv = _FakeBV(arch=_FakeArch(name="armv7"), strings=strings)
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._message_lens("active", "token", limit=20)
+
+    assert result["count"] == result["total"] == 3
+    assert result["truncated"] is False
 
 
 def test_message_lens_metadata_window_stops_at_obvious_non_pointer(monkeypatch):

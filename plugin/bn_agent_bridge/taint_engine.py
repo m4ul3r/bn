@@ -839,7 +839,7 @@ class TaintEngine:
         note = f"calls {callee_fn.name} with tainted arg(s) {sorted(valid)}"
         if via:
             note = f"[{via}-resolved] " + note
-        prefix.append(_instr_dict(ins, reason=note, tainted=[var_label_of(first_hit)]))
+        prefix.append(_instr_dict(ins, reason=note, tainted=[node_label(first_hit, why)]))
         for f in sub["findings"]:
             out["findings"].append({"sink": f["sink"], "path": prefix + f["path"]})
         out["leaves"] = list(sub["leaves"])
@@ -1309,7 +1309,7 @@ class TaintEngine:
     def _make_finding(self, ins, callee, argidx, sink, hit_nodes, why) -> dict[str, Any]:
         path = self._reconstruct_path(hit_nodes[0], why)
         path.append(_instr_dict(ins, reason=f"tainted arg{argidx} reaches {callee}",
-                                tainted=[var_label_of(n) for n in hit_nodes]))
+                                tainted=[node_label(n, why) for n in hit_nodes]))
         return {
             "sink": {
                 "callee": callee,
@@ -1565,6 +1565,25 @@ def var_label_of(node: tuple) -> str:
     else:
         name = f"var#{key[1]}"
     return f"{name}#{version}" if version is not None else str(name)
+
+
+def node_label(node: tuple, why: dict | None = None) -> str:
+    """Human-readable label for a taint node.
+
+    Prefers the label captured when the node was first tainted (the live
+    variable's ``name#version``, e.g. ``r1#2``). Falls back to deriving one from
+    the node key, which can only yield ``var#<identifier>`` for id-keyed
+    variables because :func:`var_key` intentionally drops the (unstable) name in
+    favor of the stable identifier for set membership -- so the recorded label
+    is what keeps JSON/ndjson output as readable as the text renderer.
+    """
+    if why is not None:
+        record = why.get(node)
+        if record:
+            label = record.get("label")
+            if label:
+                return str(label)
+    return var_label_of(node)
 
 
 # --------------------------------------------------------------------------

@@ -438,6 +438,24 @@ def test_var_label_of_global():
     assert te.var_label_of((("global", 0x404060), 2)) == "glob_0x404060#2"
 
 
+def test_node_label_prefers_recorded_human_label():
+    # An id-keyed node carries no name in its key, so the key-only fallback can
+    # only render "var#<identifier>". The label captured when the node was
+    # tainted (the live register name) must win so JSON output reads like text.
+    node = (("id", 1729382256911319086), 2)
+    why = {node: {"label": "r1#2", "instr": None, "reason": "", "parents": []}}
+    assert te.node_label(node, why) == "r1#2"
+
+
+def test_node_label_falls_back_to_var_label_of_without_why():
+    node = (("id", 99), 2)
+    assert te.node_label(node, None) == "var#99#2"
+    assert te.node_label(node, {}) == "var#99#2"
+    # named/global keys are already readable via the fallback
+    assert te.node_label((("name", "buf"), 3), {}) == "buf#3"
+    assert te.node_label((("global", 0x404060), None), None) == "glob_0x404060"
+
+
 def test_global_addr_rejects_readonly():
     class BVWritable:
         def is_offset_writable(self, a):

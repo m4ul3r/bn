@@ -754,7 +754,13 @@ def _render_pointer_table_text(value: Any) -> str:
 def _render_message_lens_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    lines = [f"message lens: {value.get('query', '<unknown>')} ({value.get('count', 0)} matches)"]
+    shown = value.get("count", 0)
+    total = value.get("total", shown)
+    header = f"message lens: {value.get('query', '<unknown>')} ({total} matches"
+    if value.get("truncated"):
+        header += f"; showing first {shown}, increase --limit for the rest"
+    header += ")"
+    lines = [header]
     for match in list(value.get("matches") or []):
         if not isinstance(match, dict):
             lines.append(_render_fallback_text(match))
