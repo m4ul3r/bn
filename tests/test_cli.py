@@ -3504,6 +3504,15 @@ def test_trace_respects_view_and_max_depth(monkeypatch, capsys):
     assert captured["params"]["max_depth"] == 10
 
 
+def test_trace_rejects_negative_ip_depth():
+    parser = bn.cli.build_parser()
+
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(["trace", "f", "0x10010", "--target", "active", "--ip-depth", "-1"])
+
+    assert excinfo.value.code == 2
+
+
 def test_trace_text_renderer_empty_trace(monkeypatch, capsys):
     captured = {}
 
@@ -3516,6 +3525,38 @@ def test_trace_text_renderer_empty_trace(monkeypatch, capsys):
     assert rc == 0
     output = capsys.readouterr().out
     assert "constant or immediate" in output or "no SSA trace" in output
+
+
+def test_trace_text_renderer_singular_step(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {
+            "ok": True,
+            "result": {
+                "function": "f",
+                "function_address": "0x10000",
+                "target_address": "0x10010",
+                "arg_index": 0,
+                "truncated": False,
+                "trace": [
+                    {
+                        "ssa_var": "r0#1",
+                        "depth": 0,
+                        "address": "0x10010",
+                        "il_text": "MLIL_VAR_SSA @ 0x10010",
+                        "operation": "MLIL_VAR_SSA",
+                        "terminates": True,
+                        "reason": "function_parameter_or_global",
+                    }
+                ],
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["trace", "f", "0x10010", "--target", "active"])
+
+    assert rc == 0
+    assert "1 step" in capsys.readouterr().out
 
 
 def test_trace_json_renders_structure(monkeypatch, capsys):

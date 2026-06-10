@@ -1425,6 +1425,12 @@ _TRACE_REASON_LABELS: dict[str, str] = {
 }
 
 
+def _pluralize(count: int, singular: str, plural: str | None = None) -> str:
+    if count == 1:
+        return singular
+    return plural or f"{singular}s"
+
+
 def _render_trace_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -1437,7 +1443,8 @@ def _render_trace_text(value: Any) -> str:
     header = (
         f"backward trace of arg[{arg_index}] in {fn_name} @ {target_addr}"
     )
-    info = f"  {fn_name} @ {fn_addr}  •  {len(trace)} steps"
+    step_count = len(trace)
+    info = f"  {fn_name} @ {fn_addr}  •  {step_count} {_pluralize(step_count, 'step')}"
     if value.get("truncated"):
         info += "  •  truncated"
 
