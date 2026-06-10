@@ -726,6 +726,67 @@ def test_forward_interprocedural_descends_into_callee(models):
     assert result["stats"]["functions_visited"] == 2
 
 
+def test_forward_descends_through_plt_thunk_into_local(models):
+    # Same descend scenario, but the call is routed through a single-instruction
+    # PLT/veneer thunk (is_thunk=True) to a locally-defined function. Forward
+    # taint must follow the thunk and descend into the real implementation,
+    # reaching the sink -- not dead-end treating the thunk as an opaque
+    # external (#14).
+    src = FVar("src"); dst = FVar("dst"); rax = FVar("rax")
+    src1 = FSSA(src, 1); rax1 = FSSA(rax, 1)
+    copy_ssa = FSSAFunc([
+        FInstr(0, 0x2004, "MLIL_SET_VAR_SSA", "rax#1 = src#1[0]", reads=[src1], writes=[rax1]),
+        FInstr(1, 0x2010, "MLIL_CALL_SSA", "0x1080(dst#1, src#1, rax#1)",
+               reads=[rax1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x1080", constant=0x1080),
+               params=[FExpr("MLIL_VAR_SSA", "dst#1", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "src#1", reads=[src1]),
+                       FExpr("MLIL_VAR_SSA", "rax#1", reads=[rax1])]),
+    ])
+    copy_it = FFunc("copy_it", 0x2000, copy_ssa, params=[src, dst])
+
+    # j_copy_it: a single-tailcall thunk to copy_it. is_thunk=True so it is not
+    # itself a descendable body -- the engine must follow it to copy_it.
+    thunk = FFunc("j_copy_it", 0x2100, FSSAFunc([
+        FInstr(0, 0x2100, "MLIL_TAILCALL_SSA", "tailcall(0x2000)",
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000)),
+    ]), is_thunk=True)
+
+    buf = FVar("buf", typ="char[0x40]"); out = FVar("out", typ="char[0x10]")
+    fd = FVar("fd"); p0 = FVar("p0"); p1 = FVar("p1")
+    rsi1 = FSSA(p0, 1); rsi2 = FSSA(p1, 1)
+    handler_ssa = FSSAFunc([
+        FInstr(0, 0x3000, "MLIL_SET_VAR_SSA", "rsi#1 = &buf", writes=[rsi1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+        FInstr(1, 0x3008, "MLIL_CALL_SSA", "0x1050(rdi#1, rsi#1, 0x40)",
+               reads=[rsi1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x1050", constant=0x1050),
+               params=[FExpr("MLIL_VAR_SSA", "rdi#1", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "rsi#1", reads=[rsi1]),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+        FInstr(2, 0x3010, "MLIL_SET_VAR_SSA", "rsi_2#1 = &out", writes=[rsi2],
+               src=FExpr("MLIL_ADDRESS_OF", "&out", src=out)),
+        FInstr(3, 0x3018, "MLIL_CALL_SSA", "0x2100(&buf, &out)",
+               reads=[rsi1, rsi2], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x2100", constant=0x2100),
+               params=[FExpr("MLIL_VAR_SSA", "rsi#1", reads=[rsi1]),
+                       FExpr("MLIL_VAR_SSA", "rsi_2#1", reads=[rsi2])]),
+    ])
+    handler = FFunc("handler", 0x3000, handler_ssa, params=[fd])
+
+    bv = FBV({0x1050: "read", 0x1080: "memcpy"}, funcs={0x2000: copy_it, 0x2100: thunk})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(handler, [te.parse_locator("arg:read:1")])
+
+    # the sink lives in copy_it (reached only by following the thunk) and must
+    # bubble up as a handler finding, crossing the boundary into copy_it.
+    assert len(result["reached_sinks"]) == 1
+    sink = result["reached_sinks"][0]["sink"]
+    assert sink["callee"] == "memcpy" and sink["class"] == "overflow_len"
+    assert any("calls copy_it" in (s.get("reason") or "") for s in result["reached_sinks"][0]["path"])
+    assert result["stats"]["functions_visited"] == 2  # handler + copy_it; thunk body skipped
+
+
 # --------------------------------------------------------------------------
 # backward taint
 # --------------------------------------------------------------------------

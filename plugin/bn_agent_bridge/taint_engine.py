@@ -1063,14 +1063,26 @@ class TaintEngine:
                         cfn = self.bv.get_function_at(taddr) if hasattr(self.bv, "get_function_at") else None
                         nm = self._callee_name(taddr)
                         mk, md = lookup_model(self.models, nm)
+                        # A .plt/veneer thunk to a locally-defined function must be
+                        # descended into, not treated as an opaque external. When the
+                        # candidate is not already a descendable in-binary function
+                        # and is not a modeled import, follow a single-instruction
+                        # thunk to its real target and descend there if it lands
+                        # in-binary. Thunks to modeled/imported externals stay
+                        # external (handled by the model branch / conservative tail).
+                        descend_fn = cfn
+                        if md is None and cfn is not None and not self._is_internal(cfn):
+                            resolved = follow_thunk(self.bv, cfn)
+                            if resolved is not None and self._is_internal(resolved):
+                                descend_fn = resolved
                         if md is not None:
                             # resolved target is a modeled external
                             mchanged, _ = apply_model(ins, params, md, mk, nm, site_taddr=taddr)
                             if mchanged:
                                 changed = True
                             resolved_names.append(nm or hex(taddr))
-                        elif self._is_internal(cfn):
-                            d = self._descend(ins, cfn, tainted_args, why, depth, max_depth, via=via)
+                        elif self._is_internal(descend_fn):
+                            d = self._descend(ins, descend_fn, tainted_args, why, depth, max_depth, via=via)
                             findings.extend(d["findings"])
                             for lf in d["leaves"]:
                                 if lf not in leaves:
@@ -1079,7 +1091,7 @@ class TaintEngine:
                                 add_assumption(a)
                             ret_tainted = ret_tainted or d["reached_return"]
                             descend_outparams |= set(d.get("out_params") or ())
-                            resolved_names.append(str(cfn.name))
+                            resolved_names.append(str(descend_fn.name))
                         else:
                             if self.unknown_call_policy != "stop":
                                 ret_tainted = True
