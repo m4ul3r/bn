@@ -3331,7 +3331,7 @@ def test_session_start_no_bndb_propagates_to_each_load(monkeypatch, tmp_path):
 def test_taint_forward_passes_enabled_sink_classes(monkeypatch):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         if op == "list_targets":
             return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "a.bndb"}]}
         captured["op"] = op
@@ -3354,7 +3354,7 @@ def test_taint_forward_passes_enabled_sink_classes(monkeypatch):
 def test_taint_forward_sink_classes_default_empty(monkeypatch):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         if op == "list_targets":
             return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "a.bndb"}]}
         captured["params"] = params

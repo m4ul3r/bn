@@ -22,7 +22,7 @@ from bn.formatters import (
 def _fake(op_results):
     calls = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         calls.append({"op": op, "params": params, "target": target})
         if op == "list_targets":
             return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "sample"}]}

@@ -233,6 +233,13 @@ When a slice bottoms out at a parameter, it continues up into callers
 each call's argument — so a length checked in a helper is traced to the `recv`
 that produced it. Each result lists the `crosses:` chain and an `origin`.
 
+`bn taint backward` and `bn trace` (see "Sink-to-source tracing" above) are
+complementary backward slicers: `taint backward` seeds on a sink/var locator
+and ascends into *callers* to find where a value originates, while `bn trace`
+pins an exact call argument at a specific address and descends into *callees*
+for return-value provenance. Reach for `trace` when interrogating a concrete
+callsite, `taint backward` when hunting origins across the caller chain.
+
 **Source/sink locator grammar:** `param:<n>` · `var:<selector>` ·
 `ret:<callee>` · `arg:<callee>:<n>` (the buffer arg `n` points at).
 
