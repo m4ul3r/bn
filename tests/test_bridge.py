@@ -4390,3 +4390,20 @@ def test_load_quick_marks_view_full_load_does_not(monkeypatch, tmp_path):
     assert full_bv not in bridge._quick_loaded_views
 
     bridge._headless_views.clear()
+
+
+def test_apply_operation_missing_field_is_invalid_request(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+    # rename_symbol requires 'identifier' (and 'new_name'); omitting it is a
+    # malformed request, not an unsupported operation.
+    with pytest.raises(bridge.OperationFailure) as excinfo:
+        instance._apply_operation(bv, {"op": "rename_symbol"})
+    assert excinfo.value.status == "invalid_request"
+    assert "identifier" in str(excinfo.value)
+
+
+def test_invalid_request_counts_as_a_failed_mutation_status():
+    from bn.formatters import FAILED_MUTATION_STATUSES
+    assert "invalid_request" in FAILED_MUTATION_STATUSES

@@ -1017,6 +1017,31 @@ def test_backward_ret_sink_rejected_with_guidance(process_func, models):
         engine.backward(process_func, [te.parse_locator("ret:read")])
 
 
+def test_backward_arg_no_such_callee_names_the_callee(process_func, models):
+    bv = FBV({0x401070: "read", 0x401080: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    # the locator is well-formed; there is simply no call to strcpy here.
+    with pytest.raises(te.TaintError, match=r"no call to 'strcpy' found"):
+        engine.backward(process_func, [te.parse_locator("arg:strcpy:0")])
+
+
+def test_backward_arg_index_out_of_range_says_so(process_func, models):
+    bv = FBV({0x401070: "read", 0x401080: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    # memcpy is called with 3 args; index 9 is out of range, not a bad locator.
+    with pytest.raises(te.TaintError, match=r"out of range for memcpy"):
+        engine.backward(process_func, [te.parse_locator("arg:memcpy:9")])
+
+
+def test_backward_arg_with_no_variable_reads_says_so(process_func, models):
+    bv = FBV({0x401070: "read", 0x401080: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    # process_func passes &buf (an address expr, no SSA reads) as memcpy arg 1:
+    # there is nothing to slice, but the locator itself was fine.
+    with pytest.raises(te.TaintError, match=r"reads no variable in the recovered IL"):
+        engine.backward(process_func, [te.parse_locator("arg:memcpy:1")])
+
+
 def test_backward_walk_truncation_recorded(process_func, models):
     # an engine-level def-chain cap of 1 cannot reach the end of the
     # rdx_1#1 <- len#2 <- len#1 chain; the cut must surface in assumptions

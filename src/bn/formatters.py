@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any, Callable
 
-FAILED_MUTATION_STATUSES = {"unsupported", "verification_failed"}
+FAILED_MUTATION_STATUSES = {"unsupported", "verification_failed", "invalid_request"}
 
 
 def _render_fallback_text(value: Any) -> str:

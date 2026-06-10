@@ -200,7 +200,16 @@ def _py_exec(args: argparse.Namespace) -> int:
              arg("--preview", action="store_true",
                  help="Apply the whole batch, capture diffs, then revert without committing"),
              arg("manifest", type=Path,
-                 help="Path to a JSON manifest: a dict with a top-level 'ops' list and a 'target'"),
+                 help=(
+                     "Path to a JSON manifest: {\"target\": <selector>, \"ops\": [<op>, ...]}. "
+                     "Each op is an object with an \"op\" kind plus its fields, e.g. "
+                     "{\"op\": \"rename_symbol\", \"identifier\": \"sub_1000\", \"new_name\": \"parse\"} "
+                     "or {\"op\": \"set_comment\", \"address\": \"0x1000\", \"comment\": \"...\"}. "
+                     "Kinds: rename_symbol, set_comment, delete_comment, set_prototype, "
+                     "local_rename, local_retype, struct_field_set, struct_field_rename, "
+                     "struct_field_delete, types_declare. A missing required field is reported "
+                     "as status 'invalid_request' naming the field."
+                 )),
          ])
 def _batch_apply(args: argparse.Namespace) -> int:
     if not args.manifest.exists():

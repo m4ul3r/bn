@@ -1507,11 +1507,28 @@ class TaintEngine:
         if kind == "arg":
             callee = sink["callee"]
             idx = int(sink["index"])
-            for c in self._find_callsites(instrs, callee):
+            sites = self._find_callsites(instrs, callee)
+            if not sites:
+                raise TaintError(
+                    f"no call to {callee!r} found in {func.name}; check the --sink callee name")
+            saw_in_range = False
+            for c in sites:
                 params = self._call_params(c)
                 if idx < len(params):
+                    saw_in_range = True
                     for r in expr_reads(params[idx]):
                         out.append((r, c))
+            if not out:
+                # The locator was fine; the arg itself can't be sliced. Say so
+                # precisely instead of blaming the --sink locator.
+                if not saw_in_range:
+                    raise TaintError(
+                        f"--sink arg index {idx} is out of range for {callee}: its call "
+                        f"site(s) have fewer arguments in the recovered IL")
+                raise TaintError(
+                    f"--sink arg {idx} of {callee} reads no variable in the recovered IL "
+                    f"(it is a constant or address expression) -- there is no def-chain "
+                    f"to slice backward")
         elif kind == "var":
             v = self._resolve_var(func, sink["selector"])
             # seed from the latest SSA use of the variable in the function

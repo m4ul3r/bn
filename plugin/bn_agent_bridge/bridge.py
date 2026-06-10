@@ -5399,6 +5399,16 @@ class BinaryNinjaBridge:
             raise OperationFailure("unsupported", f"Unsupported batch operation: {kind}", requested=self._operation_requested(op))
         except OperationFailure:
             raise
+        except KeyError as exc:
+            # A missing required field is a malformed REQUEST, not an
+            # unsupported operation -- name the field instead of leaking a raw
+            # KeyError tagged "unsupported".
+            field = exc.args[0] if exc.args else "?"
+            raise OperationFailure(
+                "invalid_request",
+                f"batch operation {kind!r} is missing required field {field!r}",
+                requested=self._operation_requested(op),
+            ) from exc
         except Exception as exc:
             raise OperationFailure(
                 "unsupported",
