@@ -1059,6 +1059,12 @@ def _render_taint_text(value: Any) -> str:
             for step in sl.get("slice") or []:
                 if isinstance(step, dict):
                     lines.append(f"  {step.get('address')}  {step.get('op')}  {step.get('il_text', '')}".rstrip())
+        unseeded = [s for s in (value.get("sink_status") or []) if not s.get("seeded", True)]
+        if unseeded:
+            lines.append("")
+            lines.append(f"UNSEEDED SINKS ({len(unseeded)}):")
+            for s in unseeded:
+                lines.append(f"  {_describe_loc(s)} -- {s.get('note', 'could not seed')}")
 
     leaves = list(value.get("leaves") or [])
     if leaves:

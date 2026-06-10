@@ -1356,10 +1356,27 @@ class TaintEngine:
         self._bw_assumptions: list[str] = []
         slices: list[dict[str, Any]] = []
 
+        # Function-level resolution is sink-independent: a missing MLIL/SSA form
+        # means the whole function can't be analyzed, so it stays a hard error.
+        ssaf = self._ssa_func(func)
+        instrs = self._instrs(ssaf)
+
+        # Per-sink isolation: a sink that can't be seeded (callee not called
+        # here, arg is a constant, ...) records a status note and the analysis
+        # continues with the remaining sinks. Only an all-sinks-fail run is a
+        # hard error, preserving the original single-sink behavior.
+        sink_status: list[dict[str, Any]] = []
+        errors: list[tuple[dict[str, Any], str]] = []
         for sink in sinks:
-            ssaf = self._ssa_func(func)
-            instrs = self._instrs(ssaf)
-            for seed_var, sink_ins in self._seed_backward(func, ssaf, instrs, sink):
+            desc = self._describe_locator(sink)
+            try:
+                seeds = self._seed_backward(func, ssaf, instrs, sink)
+            except TaintError as exc:
+                errors.append((sink, str(exc)))
+                sink_status.append({**desc, "seeded": False, "note": str(exc)})
+                continue
+            n_before = len(slices)
+            for seed_var, sink_ins in seeds:
                 for sl in self._backward_slice(func, seed_var, 0, max_depth, set()):
                     slices.append({
                         "sink": {
@@ -1372,10 +1389,21 @@ class TaintEngine:
                         "crossed_functions": sl["crossed"],
                         "slice": sl["steps"],
                     })
+            sink_status.append({**desc, "seeded": True, "slices": len(slices) - n_before})
+
+        if sinks and len(errors) == len(sinks):
+            # Every sink failed to seed -> hard error (no partial results to keep).
+            if len(errors) == 1:
+                raise TaintError(errors[0][1])
+            raise TaintError(
+                "no backward seed resolved for any sink:\n  "
+                + "\n  ".join(f"{format_locator(s)}: {m}" for s, m in errors))
+
         return {
             "direction": "backward",
             "function": {"name": str(func.name), "address": hex(int(func.start))},
             "sinks": [self._describe_locator(s) for s in sinks],
+            "sink_status": sink_status,
             "slices": slices,
             "leaves": self._bw_leaves,
             "assumptions": self._bw_assumptions,
@@ -1507,6 +1535,13 @@ class TaintEngine:
         if kind == "arg":
             callee = sink["callee"]
             idx = int(sink["index"])
+            if idx < 0:
+                # Guards programmatic callers that build the sink dict directly;
+                # the CLI path is already rejected in parse_locator. A negative
+                # idx would pass ``idx < len(params)`` and seed params[-1].
+                raise TaintError(
+                    f"--sink arg index {idx} is invalid: argument indices are "
+                    f"0-based and must be >= 0")
             sites = self._find_callsites(instrs, callee)
             if not sites:
                 raise TaintError(
@@ -1632,7 +1667,7 @@ def parse_locator(spec: str) -> dict[str, Any]:
         raise TaintError("empty locator")
     head, _, rest = spec.partition(":")
     if head == "param":
-        return {"kind": "param", "index": int(rest)}
+        return {"kind": "param", "index": _locator_index(rest, "param")}
     if head == "var":
         if not rest:
             raise TaintError("var: locator needs a selector")
@@ -1645,5 +1680,35 @@ def parse_locator(spec: str) -> dict[str, Any]:
         callee, _, n = rest.partition(":")
         if not callee or not n:
             raise TaintError("arg: locator must be arg:<callee>:<n>")
-        return {"kind": "arg", "callee": callee, "index": int(n)}
+        return {"kind": "arg", "callee": callee, "index": _locator_index(n, f"arg:{callee}")}
     raise TaintError(f"unknown locator kind: {head!r} (use param:/var:/ret:/arg:)")
+
+
+def _locator_index(text: str, what: str) -> int:
+    """Parse a 0-based argument/parameter index, rejecting negatives.
+
+    A negative index would otherwise pass ``idx < len(params)`` and silently
+    seed ``params[-1]`` (the *last* argument) -- a confidently-wrong slice.
+    """
+    try:
+        n = int(text)
+    except (TypeError, ValueError):
+        raise TaintError(f"{what} index must be an integer, got {text!r}")
+    if n < 0:
+        raise TaintError(
+            f"{what} index must be >= 0 (argument indices are 0-based), got {n}")
+    return n
+
+
+def format_locator(loc: dict[str, Any]) -> str:
+    """Render a locator dict back to its ``kind:...`` string for diagnostics."""
+    kind = loc.get("kind")
+    if kind == "arg":
+        return f"arg:{loc.get('callee')}:{loc.get('index')}"
+    if kind == "param":
+        return f"param:{loc.get('index')}"
+    if kind == "var":
+        return f"var:{loc.get('selector')}"
+    if kind == "ret":
+        return f"ret:{loc.get('callee')}"
+    return str(kind)
