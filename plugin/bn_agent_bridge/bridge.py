@@ -5780,21 +5780,39 @@ class BinaryNinjaBridge:
             "requested": self._operation_requested(op),
         }
 
+    def _resolve_struct_field(self, builder, resolved_name: str, locator: Any) -> str:
+        """Resolve a struct-field locator (a field NAME, or an OFFSET like 0x8 /
+        8) to the field's name. `struct field set` takes an offset, so accept one
+        here too. Raises invalid_request (not a raw RuntimeError tagged
+        ``unsupported``) when nothing matches."""
+        text = str(locator)
+        if builder.index_by_name(text) is not None:
+            return text
+        try:
+            offset = int(text, 0)
+        except (TypeError, ValueError):
+            offset = None
+        if offset is not None:
+            for member in list(getattr(builder, "members", []) or []):
+                if int(getattr(member, "offset", -1)) == offset:
+                    return str(member.name)
+        raise OperationFailure(
+            "invalid_request",
+            f"no field named or at offset {text!r} in struct {resolved_name}",
+        )
+
     def _op_struct_field_rename(self, bv, op: dict[str, Any]):
         struct_name = str(op["struct_name"])
         resolved_name, builder = self._struct_builder(bv, struct_name)
-        index = builder.index_by_name(str(op["old_name"]))
-        if index is None:
-            raise RuntimeError(f"Field not found: {op['old_name']}")
-        member = builder[str(op["old_name"])]
-        if member is None:
-            raise RuntimeError(f"Field not found: {op['old_name']}")
+        field_name = self._resolve_struct_field(builder, resolved_name, op["old_name"])
+        index = builder.index_by_name(field_name)
+        member = builder[field_name]
         builder.replace(index, member.type, str(op["new_name"]), True)
         self._commit_struct_builder(bv, resolved_name, builder)
         return {
             "op": "struct_field_rename",
             "struct_name": resolved_name,
-            "old_name": str(op["old_name"]),
+            "old_name": field_name,
             "new_name": str(op["new_name"]),
             "requested": self._operation_requested(op),
         }
@@ -5802,15 +5820,14 @@ class BinaryNinjaBridge:
     def _op_struct_field_delete(self, bv, op: dict[str, Any]):
         struct_name = str(op["struct_name"])
         resolved_name, builder = self._struct_builder(bv, struct_name)
-        index = builder.index_by_name(str(op["field_name"]))
-        if index is None:
-            raise RuntimeError(f"Field not found: {op['field_name']}")
+        field_name = self._resolve_struct_field(builder, resolved_name, op["field_name"])
+        index = builder.index_by_name(field_name)
         builder.remove(index)
         self._commit_struct_builder(bv, resolved_name, builder)
         return {
             "op": "struct_field_delete",
             "struct_name": resolved_name,
-            "field_name": str(op["field_name"]),
+            "field_name": field_name,
             "requested": self._operation_requested(op),
         }
 

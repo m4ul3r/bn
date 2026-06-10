@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -699,6 +700,11 @@ def main(argv: list[str] | None = None) -> int:
         msg = str(exc)
         if getattr(args, "_sticky_instance", False) and _looks_like_dead_bridge(msg):
             msg += "\n\nThis came from sticky state. Clear it with `bn instance clear`."
+        # Under a machine-readable format, also emit the error as JSON on stdout
+        # so `bn ... --format json | jq` gets a parseable object instead of an
+        # empty stream; the human-readable line still goes to stderr.
+        if getattr(args, "format", None) in ("json", "ndjson"):
+            print(json.dumps({"ok": False, "error": msg}), file=sys.stdout)
         print(msg, file=sys.stderr)
         return 2
 

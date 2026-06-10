@@ -4407,3 +4407,73 @@ def test_apply_operation_missing_field_is_invalid_request(monkeypatch):
 def test_invalid_request_counts_as_a_failed_mutation_status():
     from bn.formatters import FAILED_MUTATION_STATUSES
     assert "invalid_request" in FAILED_MUTATION_STATUSES
+
+
+class _FakeStructMember:
+    def __init__(self, offset, name, type_text="int32_t"):
+        self.offset = offset
+        self.name = name
+        self.type = type_text
+
+
+class _FakeStructBuilder:
+    def __init__(self, members):
+        self.members = list(members)
+
+    def index_by_name(self, name):
+        for i, m in enumerate(self.members):
+            if m.name == name:
+                return i
+        return None
+
+    def __getitem__(self, name):
+        for m in self.members:
+            if m.name == name:
+                return m
+        return None
+
+    def replace(self, index, type_, name, overwrite):
+        self.members[index].name = name
+
+    def remove(self, index):
+        del self.members[index]
+
+
+def _struct_instance(monkeypatch, members):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    builder = _FakeStructBuilder(members)
+    monkeypatch.setattr(instance, "_struct_builder", lambda bv, name: ("S", builder))
+    monkeypatch.setattr(instance, "_commit_struct_builder", lambda *a, **k: None)
+    return bridge, instance, builder
+
+
+def test_struct_field_rename_accepts_offset(monkeypatch):
+    bridge, instance, builder = _struct_instance(
+        monkeypatch, [_FakeStructMember(0, "a"), _FakeStructMember(8, "b")])
+    res = instance._op_struct_field_rename(None, {"struct_name": "S", "old_name": "0x8", "new_name": "bb"})
+    assert res["old_name"] == "b"  # offset 0x8 resolved to field 'b'
+    assert builder.members[1].name == "bb"
+
+
+def test_struct_field_rename_still_accepts_name(monkeypatch):
+    bridge, instance, builder = _struct_instance(
+        monkeypatch, [_FakeStructMember(0, "a"), _FakeStructMember(8, "b")])
+    res = instance._op_struct_field_rename(None, {"struct_name": "S", "old_name": "a", "new_name": "aa"})
+    assert res["old_name"] == "a"
+    assert builder.members[0].name == "aa"
+
+
+def test_struct_field_delete_accepts_offset(monkeypatch):
+    bridge, instance, builder = _struct_instance(
+        monkeypatch, [_FakeStructMember(0, "a"), _FakeStructMember(8, "b")])
+    res = instance._op_struct_field_delete(None, {"struct_name": "S", "field_name": "0x8"})
+    assert res["field_name"] == "b"
+    assert [m.name for m in builder.members] == ["a"]
+
+
+def test_struct_field_unknown_locator_is_invalid_request(monkeypatch):
+    bridge, instance, builder = _struct_instance(monkeypatch, [_FakeStructMember(0, "a")])
+    with pytest.raises(bridge.OperationFailure) as excinfo:
+        instance._op_struct_field_rename(None, {"struct_name": "S", "old_name": "0x99", "new_name": "x"})
+    assert excinfo.value.status == "invalid_request"

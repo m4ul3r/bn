@@ -396,7 +396,8 @@ def _evidence_function(args: argparse.Namespace) -> int:
          args=[
              arg("identifier", help="Function name or address (hex 0x.. or decimal) to find inbound refs to"),
              arg("--limit", type=_positive_int, default=None,
-                 help="Max number of refs per code/data bucket to show in text output"),
+                 help="Max refs per code/data bucket to show; text-render cap only "
+                      "(not allowed with --format json, which returns every ref)"),
          ])
 def _evidence_xrefs(args: argparse.Namespace) -> int:
     if args.limit is not None:
@@ -444,7 +445,8 @@ def _evidence_table(args: argparse.Namespace) -> int:
          args=[
              arg("query", help="Message/type-name string substring to locate"),
              arg("--limit", type=_positive_int, default=20,
-                 help="Maximum matching strings to summarize"),
+                 help="Max matching strings to summarize; result cap in all formats "
+                      "(the reported total stays honest, with truncated=true when capped)"),
              arg("--table-entries", type=int, default=6,
                  help="Pointer entries to show around metadata data refs"),
          ])

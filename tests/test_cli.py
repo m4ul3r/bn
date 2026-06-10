@@ -3895,3 +3895,33 @@ def test_negative_ip_depth_rejected_with_exit_2():
     # ip-depth 0 (disable crossing) is allowed
     ns = parser.parse_args(["trace", "f", "0x1000", "--target", "active", "--ip-depth", "0"])
     assert ns.ip_depth == 0
+
+
+def test_json_format_error_emits_json_to_stdout(monkeypatch, capsys):
+    from bn.transport import BridgeError
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        raise BridgeError("Type not found: Foo")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["types", "show", "Foo", "--format", "json", "--target", "active"])
+    assert rc == 2
+    out, err = capsys.readouterr()
+    payload = json.loads(out)              # stdout is valid JSON under --format json
+    assert payload["ok"] is False
+    assert "Type not found" in payload["error"]
+    assert "Type not found" in err          # human-readable line still on stderr
+
+
+def test_text_format_error_stays_on_stderr(monkeypatch, capsys):
+    from bn.transport import BridgeError
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        raise BridgeError("Type not found: Foo")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["types", "show", "Foo", "--target", "active"])
+    assert rc == 2
+    out, err = capsys.readouterr()
+    assert out == ""                        # nothing on stdout in text mode
+    assert "Type not found" in err

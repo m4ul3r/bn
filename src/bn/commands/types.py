@@ -139,7 +139,7 @@ def _struct_field_set(args: argparse.Namespace) -> int:
              arg("--preview", action="store_true",
                  help="Apply, capture diffs, then revert without committing"),
              arg("struct_name"),
-             arg("old_name"),
+             arg("old_name", help="Field name or offset (e.g. count or 0x8)"),
              arg("new_name"),
          ])
 def _struct_field_rename(args: argparse.Namespace) -> int:
@@ -165,7 +165,7 @@ def _struct_field_rename(args: argparse.Namespace) -> int:
              arg("--preview", action="store_true",
                  help="Apply, capture diffs, then revert without committing"),
              arg("struct_name"),
-             arg("field_name"),
+             arg("field_name", help="Field name or offset (e.g. count or 0x8)"),
          ])
 def _struct_field_delete(args: argparse.Namespace) -> int:
     return _call(
