@@ -3392,7 +3392,9 @@ def test_backward_slice_simple_chain(monkeypatch):
     assert result["trace"][0]["terminates"] is False
     assert result["trace"][1]["ssa_var"] == "r1#2"
     assert result["trace"][1]["terminates"] is True
-    assert result["trace"][1]["reason"] == "function_parameter_or_global"
+    # No reaching def and no parameter info available -> neutral terminal,
+    # not a false "function parameter" claim.
+    assert result["trace"][1]["reason"] == "undefined_or_global"
 
 
 def test_backward_slice_undefined_var(monkeypatch):
@@ -3419,7 +3421,67 @@ def test_backward_slice_undefined_var(monkeypatch):
     assert result["step_count"] == 1
     assert result["trace"][0]["ssa_var"] == "arg1#0"
     assert result["trace"][0]["terminates"] is True
-    assert result["trace"][0]["reason"] == "function_parameter_or_global"
+    # The fake exposes no parameter_vars, so an undefined terminal is reported
+    # neutrally rather than asserted to be a parameter.
+    assert result["trace"][0]["reason"] == "undefined_or_global"
+
+
+def test_backward_slice_labels_true_parameter(monkeypatch):
+    """An undefined terminal that IS a formal parameter is labeled as such."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    var_param = _FakeSSAVariable("arg1#0")
+    call_insn = _FakeMLILInsn(
+        0x10020,
+        operation="MLIL_CALL_SSA",
+        params=[_FakeMLILInsn(0x10020, operation="MLIL_VAR_SSA", vars_read=[var_param])],
+        vars_read=[var_param],
+    )
+    fn = _FakeFunction(0x10000, "test_func")
+    fn.medium_level_il = _FakeMLILFunction(instructions=[call_insn])
+    # Wire parameter info so the undefined terminal resolves to a real parameter
+    # rather than the neutral "undefined" label.
+    fn.parameter_vars = [_FakeSSAVariable("arg1")]
+    fn.medium_level_il.ssa_form.source_function = fn
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._backward_slice("active", "test_func", "0x10020", arg_index=0)
+
+    assert result["trace"][0]["ssa_var"] == "arg1#0"
+    assert result["trace"][0]["terminates"] is True
+    assert result["trace"][0]["reason"] == "function_parameter"
+
+
+def test_backward_slice_depth_is_def_use_distance(monkeypatch):
+    """`depth` is the real graph distance from the seed: operands of one
+    definition are siblings sharing a depth, not a sequential append index."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    x = _FakeSSAVariable("x#3")
+    y = _FakeSSAVariable("y#1")
+    z = _FakeSSAVariable("z#2")
+    # x = y <op> z : one definition reading two operands.
+    def_x = _FakeMLILInsn(0x2000, operation="MLIL_SET_VAR_SSA", vars_read=[y, z], dest=x)
+    call_insn = _FakeMLILInsn(
+        0x2010,
+        operation="MLIL_CALL_SSA",
+        params=[_FakeMLILInsn(0x2010, operation="MLIL_VAR_SSA", vars_read=[x])],
+        vars_read=[x],
+    )
+    fn = _FakeFunction(0x2000, "f")
+    fn.medium_level_il = _FakeMLILFunction(instructions=[def_x, call_insn], definitions={x: def_x})
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    result = instance._backward_slice("active", "f", "0x2010", arg_index=0)
+    by_var = {s["ssa_var"]: s for s in result["trace"]}
+
+    assert by_var["x#3"]["depth"] == 0
+    assert by_var["y#1"]["depth"] == 1
+    assert by_var["z#2"]["depth"] == 1  # sibling of y#1, same depth (not 2)
 
 
 def test_backward_slice_no_call_at_address(monkeypatch):
@@ -3529,9 +3591,11 @@ def test_backward_slice_interprocedural_follows_callee(monkeypatch):
     assert cross[0]["terminates"] is False
     # Recursion actually entered the callee body (steps tagged with its context)...
     assert any(s.get("function_context") == "callee_fn" for s in trace)
-    # ...and bottomed out at the callee's parameter.
+    # ...and bottomed out at an undefined terminal in the callee (its
+    # parameter; the fake exposes no parameter_vars to confirm that, so it is
+    # reported neutrally).
     assert trace[-1]["terminates"] is True
-    assert trace[-1]["reason"] == "function_parameter_or_global"
+    assert trace[-1]["reason"] == "undefined_or_global"
 
 
 def test_backward_slice_ip_rejects_llil(monkeypatch):

@@ -1425,7 +1425,13 @@ def _render_skill_install_text(value: Any) -> str:
 
 
 _TRACE_REASON_LABELS: dict[str, str] = {
-    "function_parameter_or_global": "function parameter",
+    "function_parameter": "function parameter",
+    # A terminal with no reaching SSA definition that is NOT a confirmed
+    # parameter: an undefined local or a global. Don't claim "function
+    # parameter" — that misleads provenance/attacker-source slices.
+    "undefined_or_global": "undefined / no reaching definition",
+    # Legacy combined reason (still accepted on input): stay neutral.
+    "function_parameter_or_global": "function parameter, global, or undefined",
     "memory_load": "memory load",
     "call_or_jump_boundary": "call boundary",
 }

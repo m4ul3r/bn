@@ -3647,22 +3647,28 @@ class BinaryNinjaBridge:
         ip_depth: int = 2,
         view: str = "mlil",
         _call_depth: int = 0,
+        base_depth: int = 0,
     ) -> list[dict[str, Any]]:
         """Recursively walk SSA use-def chains backward, optionally crossing call boundaries."""
         if _call_depth > 10:
             return []  # Safety: prevent runaway recursion
         trace: list[dict[str, Any]] = []
-        worklist: list[Any] = list(initial_vars)
+        # Each worklist item carries its def-use distance from the seed so the
+        # reported "depth" is the real graph depth (operands of one definition
+        # share a depth) rather than a sequential append index. base_depth
+        # offsets a callee sub-walk so its depths continue from the call site.
+        worklist: list[tuple[Any, int]] = [(v, 0) for v in initial_vars]
         visited: set[Any] = set()
 
         while worklist and len(trace) < max_depth:
-            ssa_var = worklist.pop(0)
+            ssa_var, node_depth = worklist.pop(0)
+            depth = base_depth + node_depth
             if not isinstance(ssa_var, SSAVariable):
                 trace.append({
                     "ssa_var": str(ssa_var),
-                    "depth": len(trace),
+                    "depth": depth,
                     "terminates": True,
-                    "reason": "function_parameter_or_global",
+                    "reason": "undefined_or_global",
                 })
                 continue
             if ssa_var in visited:
@@ -3680,12 +3686,20 @@ class BinaryNinjaBridge:
                 )
             entry: dict[str, Any] = {
                 "ssa_var": str(ssa_var),
-                "depth": len(trace),
+                "depth": depth,
             }
 
             if def_insn is None:
+                # No reaching definition: a real parameter, or an undefined
+                # local / global. Only claim "function parameter" when it
+                # actually is one; otherwise stay neutral (don't mislead
+                # provenance slices).
                 entry["terminates"] = True
-                entry["reason"] = "function_parameter_or_global"
+                entry["reason"] = (
+                    "function_parameter"
+                    if self._is_parameter_ssa_var(ssa_func, ssa_var)
+                    else "undefined_or_global"
+                )
                 trace.append(entry)
                 continue
 
@@ -3715,6 +3729,7 @@ class BinaryNinjaBridge:
                                         ip_depth=ip_depth - 1,
                                         view=view,
                                         _call_depth=_call_depth + 1,
+                                        base_depth=depth + 1,
                                     )
                                     for ct in callee_trace:
                                         ct.setdefault("function_context", callee.name)
@@ -3731,7 +3746,7 @@ class BinaryNinjaBridge:
                 trace.append(entry)
                 for rv in self._ssa_vars_from(getattr(def_insn, "vars_read", []) or []):
                     if rv not in visited:
-                        worklist.append(rv)
+                        worklist.append((rv, node_depth + 1))
                 continue
 
             entry["terminates"] = False
@@ -3740,9 +3755,31 @@ class BinaryNinjaBridge:
 
             for rv in self._ssa_vars_from(getattr(def_insn, "vars_read", []) or []):
                 if rv not in visited:
-                    worklist.append(rv)
+                    worklist.append((rv, node_depth + 1))
 
         return trace
+
+    def _is_parameter_ssa_var(self, ssa_func, ssa_var) -> bool:
+        """True if *ssa_var* (an SSA variable with no reaching definition) is a
+        formal parameter of the function, vs. an undefined local or a global.
+
+        Matched against the source function's ``parameter_vars`` by identifier
+        first, then by base name. Returns False whenever parameter information
+        is unavailable, so the caller falls back to a neutral label rather than
+        guessing 'parameter'."""
+        source = getattr(ssa_func, "source_function", None)
+        params = list(getattr(source, "parameter_vars", []) or [])
+        if not params:
+            return False
+        base = getattr(ssa_var, "var", ssa_var)
+        ident = getattr(base, "identifier", None)
+        base_name = str(ssa_var).split("#")[0]
+        for param in params:
+            if ident is not None and getattr(param, "identifier", None) == ident:
+                return True
+            if base_name and str(getattr(param, "name", param)) == base_name:
+                return True
+        return False
 
     def _resolve_callee(self, bv, call_insn):
         """Resolve a call instruction's callee to a BN function, or None.
