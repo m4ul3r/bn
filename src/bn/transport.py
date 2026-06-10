@@ -225,13 +225,27 @@ def _auto_spawn_locked() -> BridgeInstance:
         return spawn_instance()
 
 
-def choose_instance(instance_id: str | None = None, *, auto_start: bool = True) -> BridgeInstance:
+def choose_instance(
+    instance_id: str | None = None,
+    *,
+    auto_start: bool = True,
+    spawn_missing_named: bool = False,
+) -> BridgeInstance:
     instances = list_instances()
     if instance_id is not None:
         for inst in instances:
             if inst.instance_id == instance_id or instance_selector(inst) == instance_id:
                 return inst
-        raise BridgeError(f"No bridge instance found with id: {instance_id}")
+        if spawn_missing_named:
+            # `bn load --instance <new-id>` brings the named bridge up itself,
+            # matching the "auto-spawn headless if needed" model. Only load opts
+            # in; other commands keep failing fast so a typo'd id can't silently
+            # spawn an empty process.
+            return spawn_instance(instance_id)
+        raise BridgeError(
+            f"No bridge instance found with id: {instance_id}. "
+            f"Start one with: bn session start --instance-id {instance_id}"
+        )
     if len(instances) == 1:
         return instances[0]
     if instances:
@@ -421,8 +435,9 @@ def send_request(
     timeout: float | None = None,
     connect_retries: int = 4,
     instance_id: str | None = None,
+    spawn_missing_named: bool = False,
 ) -> dict[str, Any]:
-    instance = choose_instance(instance_id)
+    instance = choose_instance(instance_id, spawn_missing_named=spawn_missing_named)
     return _send_request_to_instance(
         instance,
         op,

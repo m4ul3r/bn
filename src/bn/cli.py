@@ -430,6 +430,7 @@ def _call(
     stem: str,
     result_exit_code: Callable[[Any], int] | None = None,
     bridge_writes_output: bool = False,
+    spawn_missing_named: bool = False,
 ) -> int:
     request_params = dict(params or {})
     effective_page_limit = None
@@ -447,6 +448,7 @@ def _call(
         params=request_params,
         target=target,
         instance_id=getattr(args, "instance", None),
+        spawn_missing_named=spawn_missing_named,
     )
     result = response["result"]
     exit_code = result_exit_code(result) if result_exit_code is not None else 0

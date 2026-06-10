@@ -35,6 +35,9 @@ def _load(args: argparse.Namespace) -> int:
         require_target=False,
         text_renderer=_render_load_text,
         stem="load",
+        # `bn load --instance <new-id>` auto-spawns that named bridge instead of
+        # erroring, so a fresh isolated instance is one command, not two.
+        spawn_missing_named=True,
     )
 
 

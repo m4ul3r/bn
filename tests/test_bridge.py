@@ -1134,6 +1134,7 @@ def test_decompile_warns_on_skipped_analysis(monkeypatch):
 
     assert result["analysis_skipped"] is True
     assert result["analysis_forced"] is False
+    assert result["analysis_force_requested"] is False
     assert fn.reanalyzed is False  # warn-only must NOT reanalyze
     assert any("big_fn" in w and "ExceedFunctionSize" in w and "--force-analysis" in w for w in result["warnings"])
 
@@ -1186,6 +1187,7 @@ def test_decompile_force_analysis_reanalyzes_and_clears_warning(monkeypatch):
     assert getattr(bv, "analysis_updated", False) is True
     assert fn.analysis_skipped is False               # skip override cleared
     assert result["analysis_forced"] is True
+    assert result["analysis_force_requested"] is True
     assert result["analysis_skipped"] is False
     assert result["text"] == "int32_t big_fn()\n{\n    return 1;\n}"
     assert not any("stub" in w.lower() or "skipped analysis" in w for w in result["warnings"])
@@ -3989,3 +3991,305 @@ def test_socket_is_live_false_for_stale_socket_file(monkeypatch, tmp_path):
 
     assert sock_path.exists()
     assert instance._socket_is_live() is False
+
+
+# --- save_database: never report success when nothing was written -------------
+
+
+class _SaveBV:
+    """Minimal view for _save_database: records the path create_database got and
+    optionally writes a file / returns a chosen bool, mimicking Binary Ninja."""
+
+    def __init__(self, filename: str, *, result=True, write: bool = True):
+        self.file = types.SimpleNamespace(filename=filename)
+        self._result = result
+        self._write = write
+        self.created_with = None
+
+    def create_database(self, out: str):
+        self.created_with = out
+        if self._write:
+            Path(out).write_text("bndb")
+        return self._result
+
+
+def test_save_database_succeeds_when_file_is_written(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _SaveBV(str(tmp_path / "x.bin"), result=True, write=True)
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+
+    out = tmp_path / "x.bndb"
+    result = instance._save_database(None, str(out))
+
+    assert result == {"saved": True, "path": str(out.resolve())}
+    assert out.exists()
+    assert bv.created_with == str(out.resolve())
+
+
+def test_save_database_fails_when_create_database_returns_false(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    # Unwritable-dir style failure: BN returns False and writes nothing.
+    bv = _SaveBV(str(tmp_path / "x.bin"), result=False, write=False)
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+
+    out = tmp_path / "x.bndb"
+    with pytest.raises(RuntimeError, match="no file was written"):
+        instance._save_database(None, str(out))
+    assert not out.exists()
+
+
+def test_save_database_fails_when_file_missing_despite_truthy_return(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    # BN claims success but no file lands on disk -> still a hard failure.
+    bv = _SaveBV(str(tmp_path / "x.bin"), result=True, write=False)
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+
+    out = tmp_path / "x.bndb"
+    with pytest.raises(RuntimeError, match="no file was written"):
+        instance._save_database(None, str(out))
+
+
+def test_save_database_errors_before_calling_bn_when_parent_dir_missing(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _SaveBV(str(tmp_path / "x.bin"))
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+
+    missing = tmp_path / "nope" / "x.bndb"
+    with pytest.raises(RuntimeError, match="directory does not exist"):
+        instance._save_database(None, str(missing))
+    # Fails fast: create_database is never attempted.
+    assert bv.created_with is None
+
+
+# --- field_xrefs: resolve data-ref types without the nonexistent get_type_at --
+
+
+class _FieldRefBV:
+    """View for _field_xrefs. Deliberately has NO get_type_at(): the fix must
+    resolve data-ref types via get_data_var_at(), not the nonexistent method
+    that previously crashed the whole --field query."""
+
+    def __init__(self, *, code_refs, data_refs, symbols, data_vars, disassembly):
+        self._code_refs = code_refs
+        self._data_refs = data_refs
+        self._symbols = symbols
+        self._data_vars = data_vars
+        self._disasm = disassembly
+
+    def get_code_refs_for_type_field(self, type_name, offset):
+        return list(self._code_refs.get((type_name, offset), []))
+
+    def get_data_refs_for_type_field(self, type_name, offset):
+        return list(self._data_refs.get((type_name, offset), []))
+
+    def get_symbol_at(self, address):
+        return self._symbols.get(int(address))
+
+    def get_data_var_at(self, address):
+        return self._data_vars.get(int(address))
+
+    def get_disassembly(self, address, arch=None):
+        return self._disasm.get(int(address), "")
+
+
+def test_field_xrefs_resolves_data_var_type(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    caller = _FakeFunction(0x1000, "use_field")
+    code_ref = types.SimpleNamespace(func=caller, address=0x1010, size=4, incomingType="int32_t")
+    bv = _FieldRefBV(
+        code_refs={("Foo", 4): [code_ref]},
+        data_refs={("Foo", 4): [0x2000, 0x3000]},
+        symbols={0x2000: types.SimpleNamespace(name="g_foo")},
+        # 0x2000 has a data var (type resolves); 0x3000 has none (type -> None).
+        data_vars={0x2000: types.SimpleNamespace(type="struct Foo")},
+        disassembly={0x1010: "ldr r0, [r1, #4]"},
+    )
+
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(
+        instance,
+        "_resolve_type_field",
+        lambda view, spec: {"type_name": "Foo", "offset": 4, "field_name": "bar"},
+    )
+
+    # Must not raise (the old get_type_at call would AttributeError here).
+    result = instance._field_xrefs("active", "Foo.bar")
+
+    assert result["code_refs"][0]["function"] == "use_field"
+    assert result["code_refs"][0]["disasm"] == "ldr r0, [r1, #4]"
+    assert result["data_refs"] == [
+        {"address": "0x2000", "symbol": "g_foo", "type": "struct Foo"},
+        {"address": "0x3000", "symbol": None, "type": None},
+    ]
+
+
+# --- papercuts: pagination, clean errors, force-analysis echo -----------------
+
+
+def test_imports_pagination_slices_offset_and_limit(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    syms = []
+    for i in range(5):
+        s = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x1000 + i, f"fn{i}")
+        s.short_name = f"fn{i}"
+        s.namespace = "lib"
+        syms.append(s)
+    bv = _FakeBV(symbols=syms)
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    full = instance._imports(None)
+    assert [item["name"] for item in full] == ["fn0", "fn1", "fn2", "fn3", "fn4"]
+    page = instance._imports(None, offset=1, limit=2)
+    assert page == full[1:3]
+    # summary aggregates the whole set regardless of offset/limit.
+    summary = instance._imports(None, summary=True, offset=1, limit=2)
+    assert summary["total_symbols"] == 5
+
+
+def test_sections_pagination_slices_offset_and_limit(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    secs = {
+        ".a": _FakeSection(".a", 0x1000, 0x1100),
+        ".b": _FakeSection(".b", 0x2000, 0x2100),
+        ".c": _FakeSection(".c", 0x3000, 0x3100),
+    }
+    bv = _FakeBV(sections=secs)
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    full = instance._sections(None)
+    assert [s["name"] for s in full] == [".a", ".b", ".c"]
+    page = instance._sections(None, offset=1, limit=1)
+    assert [s["name"] for s in page] == [".b"]
+
+
+def test_py_exec_reports_script_error_with_type_prefix(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    # A NameError used to be tagged "internal error: NameError:" while a raised
+    # ValueError surfaced as a bare message. Both now read "TypeName: message".
+    with pytest.raises(RuntimeError, match=r"^NameError: name 'missing' is not defined$"):
+        instance._py_exec("active", "missing")
+    with pytest.raises(RuntimeError, match=r"^ValueError: boom$"):
+        instance._py_exec("active", "raise ValueError('boom')")
+
+
+def test_load_binary_corrupt_file_raises_clean_error(monkeypatch, tmp_path):
+    bridge, instance, _ = _setup_load_test(monkeypatch)
+    raw = tmp_path / "broken.bndb"
+    raw.write_bytes(b"not a real database")
+
+    def boom(path, update_analysis=True):
+        raise Exception("Unable to create new BinaryView")
+
+    sys.modules["binaryninja"].load = boom
+
+    # A corrupt/truncated file used to escape as "internal error: Exception: ...".
+    with pytest.raises(RuntimeError, match="may be corrupt"):
+        instance._load_binary(str(raw))
+    bridge._headless_views.clear()
+
+
+def test_decompile_force_requested_but_not_skipped_echoes_flag(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "small_fn")  # analysis_skipped defaults False
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance, "_comment_map", lambda bv, func: {})
+    _install_fake_pseudo_c(
+        monkeypatch, bridge, fn,
+        [[(0x401000, "int32_t small_fn()")], [(0x401000, "{")], [(0x401000, "}")]],
+    )
+
+    result = instance._decompile("active", "small_fn", force_analysis=True)
+
+    # Nothing was skipped, so no reanalysis ran ...
+    assert result["analysis_forced"] is False
+    assert fn.reanalyzed is False
+    # ... but the echo confirms --force-analysis was honored, not silently ignored.
+    assert result["analysis_force_requested"] is True
+
+
+# --- --quick honesty: don't return a misleading empty result on an unanalyzed view
+
+
+def test_strings_requires_refresh_when_quick_loaded(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(strings=[])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    # Quick-loaded: strings analysis hasn't run, so refuse rather than return [].
+    bridge._quick_loaded_views.add(bv)
+    with pytest.raises(RuntimeError, match="loaded with --quick"):
+        instance._strings(None, query=None, offset=0, limit=100)
+
+    # Once analysis lands, strings answers normally (here: genuinely empty).
+    bridge._quick_loaded_views.discard(bv)
+    assert instance._strings(None, query=None, offset=0, limit=100) == []
+
+
+def test_target_info_reports_quick_analysis_state(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+
+    bridge._quick_loaded_views.add(bv)
+    info = instance._target_info("active")
+    assert info["analyzed"] is False
+    assert info["analysis_state"] == "quick"
+
+    bridge._quick_loaded_views.discard(bv)
+    info2 = instance._target_info("active")
+    assert info2["analyzed"] is True
+    assert info2["analysis_state"] == "full"
+
+
+def test_refresh_clears_quick_state_and_enables_strings(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(strings=[])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+
+    bridge._quick_loaded_views.add(bv)
+    instance._refresh(None)  # runs analysis and clears the quick flag
+
+    assert bv not in bridge._quick_loaded_views
+    assert getattr(bv, "analysis_updated", False) is True
+    assert instance._strings(None, query=None, offset=0, limit=100) == []
+
+
+def test_load_quick_marks_view_full_load_does_not(monkeypatch, tmp_path):
+    bridge, instance, _ = _setup_load_test(monkeypatch)
+
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+    result = instance._load_binary(str(raw), quick=True)
+    assert result["analyzed"] is False
+    quick_bv = bridge._headless_views[-1]
+    assert quick_bv in bridge._quick_loaded_views
+
+    raw2 = tmp_path / "bar.so"
+    raw2.write_bytes(b"")
+    full = instance._load_binary(str(raw2), quick=False)
+    assert full["analyzed"] is True
+    full_bv = bridge._headless_views[-1]
+    assert full_bv not in bridge._quick_loaded_views
+
+    bridge._headless_views.clear()

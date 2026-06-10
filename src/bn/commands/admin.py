@@ -40,8 +40,22 @@ def _doctor(args: argparse.Namespace) -> int:
     source_bridge = source_dir / "bridge.py"
     install_build_id = cli.build_id_for_file(install_bridge)
     source_build_id = cli.build_id_for_file(source_bridge)
+    requested = getattr(args, "instance", None)
+    candidates = cli.list_instances()
+    if requested:
+        # Honor --instance: scope the report to the one bridge instead of dumping
+        # every running instance (a wall of text on a busy host).
+        candidates = [
+            inst for inst in candidates
+            if inst.instance_id == requested or cli.instance_selector(inst) == requested
+        ]
+        if not candidates:
+            raise BridgeError(
+                f"No bridge instance found with id: {requested}. "
+                "See `bn session list` for running instances."
+            )
     instances = []
-    for instance in cli.list_instances():
+    for instance in candidates:
         ping: dict[str, Any]
         try:
             response = cli._send_request_to_instance(
@@ -303,8 +317,8 @@ def _rss_mb(pid: int) -> float | None:
     return None
 
 
-@command("session", "list", help="List running bridge sessions")
-def _session_list(args: argparse.Namespace) -> int:
+def _running_instances_result() -> dict[str, Any]:
+    """Snapshot every running bridge instance (shared by session/instance list)."""
     instances = cli.list_instances()
     sticky_id = cli.session_state.read().get("instance_id")
     entries = []
@@ -325,13 +339,24 @@ def _session_list(args: argparse.Namespace) -> int:
         entries.append(entry)
         if rss is not None:
             total_rss += rss
-    result: dict[str, Any] = {
-        "instances": entries,
-        "total_rss_mb": round(total_rss, 1),
-    }
+    return {"instances": entries, "total_rss_mb": round(total_rss, 1)}
+
+
+@command("session", "list", help="List running bridge sessions")
+def _session_list(args: argparse.Namespace) -> int:
+    result: Any = _running_instances_result()
     if args.format == "text":
         result = _render_session_list_text(result)
     cli._render_result(result, fmt=args.format, out_path=args.out, stem="session-list")
+    return 0
+
+
+@command("instance", "list", help="List running bridge instances (alias for `session list`)")
+def _instance_list(args: argparse.Namespace) -> int:
+    result: Any = _running_instances_result()
+    if args.format == "text":
+        result = _render_session_list_text(result)
+    cli._render_result(result, fmt=args.format, out_path=args.out, stem="instance-list")
     return 0
 
 

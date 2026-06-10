@@ -911,9 +911,19 @@ class BinaryNinjaBridge:
                 regex=bool(params.get("regex", False)),
             )
         if op == "imports":
-            return self._imports(target, summary=bool(params.get("summary", False)))
+            return self._imports(
+                target,
+                summary=bool(params.get("summary", False)),
+                offset=int(params.get("offset", 0)),
+                limit=int(params["limit"]) if params.get("limit") is not None else None,
+            )
         if op == "sections":
-            return self._sections(target, query=params.get("query"))
+            return self._sections(
+                target,
+                query=params.get("query"),
+                offset=int(params.get("offset", 0)),
+                limit=int(params["limit"]) if params.get("limit") is not None else None,
+            )
         if op == "read":
             return self._read(target, params["address"], int(params["length"]))
         if op == "function_create":
@@ -997,7 +1007,16 @@ class BinaryNinjaBridge:
         # imports and strings are usable in ~1s while the function set stays
         # minimal until `bn refresh` promotes it to full analysis. A .bndb
         # already carries its saved analysis, so --quick is a no-op there.
-        bv = binaryninja.load(str(load_path), update_analysis=False)
+        try:
+            bv = binaryninja.load(str(load_path), update_analysis=False)
+        except Exception as exc:  # noqa: BLE001 - surface BN open failures cleanly
+            # BN raises a bare Exception ("Unable to create new BinaryView") on a
+            # corrupt/truncated .bndb; without this it reached the caller as
+            # "internal error: Exception: ...". Frame it as a user-facing error.
+            raise RuntimeError(
+                f"Unable to open {load_path}: {exc}. The file may be corrupt, "
+                "truncated, or an unsupported format."
+            ) from exc
         if bv is None:
             raise RuntimeError(f"Failed to open binary: {load_path}")
 
@@ -1008,8 +1027,10 @@ class BinaryNinjaBridge:
                 "strings and the full function set need `bn refresh` (or "
                 "`bn decompile <fn> --force-analysis` for a single function)"
             )
+            _quick_loaded_views.add(bv)
         else:
             bv.update_analysis_and_wait()
+            _quick_loaded_views.discard(bv)
 
         with _headless_views_lock:
             _headless_views.append(bv)
@@ -1082,7 +1103,25 @@ class BinaryNinjaBridge:
             out = filename
         else:
             out = filename + ".bndb"
-        bv.create_database(out)
+        out_path = Path(out)
+        if not out_path.parent.exists():
+            raise RuntimeError(
+                f"Cannot save database to {out}: directory does not exist: {out_path.parent}"
+            )
+        # create_database returns a bool: False means Binary Ninja could not write
+        # the file (e.g. an unwritable directory). The previous code discarded that
+        # return value and unconditionally reported success, silently losing the
+        # analysis. Treat a falsy result -- or a path that simply isn't there
+        # afterward -- as a hard failure so callers never get a false "saved".
+        try:
+            created = bv.create_database(out)
+        except Exception as exc:  # noqa: BLE001 - surface BN I/O errors cleanly
+            raise RuntimeError(f"Failed to save database to {out}: {exc}") from exc
+        if created is False or not out_path.exists():
+            raise RuntimeError(
+                f"Failed to save database to {out}: Binary Ninja reported no file was "
+                "written (check that the directory exists and is writable)"
+            )
         return {"saved": True, "path": out}
 
     def _target_info(self, selector: str | None):
@@ -1095,16 +1134,22 @@ class BinaryNinjaBridge:
             if selector and self.targets.matches_target(item["target_id"], selector):
                 record = item
                 break
+        quick = bv in _quick_loaded_views
         return {
             **(record or {}),
             "arch": str(getattr(bv, "arch", "")),
             "platform": str(getattr(bv, "platform", "")),
             "entry_point": hex(getattr(bv, "entry_point", 0)),
+            # Machine-readable analysis state so callers can tell a --quick view
+            # (strings/full function set pending `bn refresh`) from a real one.
+            "analyzed": not quick,
+            "analysis_state": "quick" if quick else "full",
         }
 
     def _refresh(self, selector: str | None):
         bv = self._resolve_view(selector)
         bv.update_analysis_and_wait()
+        _quick_loaded_views.discard(bv)
         return {
             "refreshed": True,
             "target": self._target_info(selector),
@@ -2723,6 +2768,11 @@ class BinaryNinjaBridge:
             "comments": comments,
             "warnings": warnings,
             "analysis_skipped": bool(getattr(func, "analysis_skipped", False)),
+            # `analysis_force_requested` echoes the --force-analysis flag; `analysis_forced`
+            # is True only when a reanalysis actually ran this call. On a second forced
+            # decompile the function is no longer skipped, so nothing reruns and
+            # analysis_forced is False -- the echo tells callers the flag wasn't ignored.
+            "analysis_force_requested": bool(force_analysis),
             "analysis_forced": forced,
         }
 
@@ -3761,7 +3811,11 @@ class BinaryNinjaBridge:
         data_refs = []
         for address in sorted(list(bv.get_data_refs_for_type_field(field["type_name"], field["offset"]))):
             symbol = bv.get_symbol_at(address)
-            type_obj = bv.get_type_at(address)
+            # BinaryView has no get_type_at(); the data variable defined at the
+            # address carries the type. The old call raised AttributeError and
+            # took the whole --field query down whenever a field had data refs.
+            data_var = bv.get_data_var_at(address)
+            type_obj = getattr(data_var, "type", None) if data_var is not None else None
             data_refs.append(
                 {
                     "address": hex(address),
@@ -3855,6 +3909,14 @@ class BinaryNinjaBridge:
                  min_length: int | None = None, section: str | None = None,
                  no_crt: bool = False, regex: bool = False):
         bv = self._resolve_view(selector)
+        if bv in _quick_loaded_views:
+            # In --quick mode string analysis hasn't run, so bv.strings is empty
+            # and `[]` would be indistinguishable from "this binary has none".
+            # Refuse with a directive instead of misleading the caller.
+            raise RuntimeError(
+                "Strings are not available: this target was loaded with --quick (no analysis). "
+                "Run `bn refresh` to build the full string set first."
+            )
         items = []
         needle = str(query) if query else None
         pattern = None
@@ -3974,7 +4036,8 @@ class BinaryNinjaBridge:
         except Exception:
             return []
 
-    def _imports(self, selector: str | None, *, summary: bool = False):
+    def _imports(self, selector: str | None, *, summary: bool = False,
+                 offset: int = 0, limit: int | None = None):
         bv = self._resolve_view(selector)
         needed_libraries = self._needed_libraries(bv)
         items = []
@@ -4001,9 +4064,13 @@ class BinaryNinjaBridge:
                     }
                 )
         if summary:
+            # Summary aggregates the whole import set; paging would distort the
+            # counts, so it always reflects every symbol regardless of offset/limit.
             return self._imports_build_summary(items, needed_libraries)
         items.sort(key=lambda item: (item["library"] or "", item["kind"], item["name"], int(item["address"], 16)))
-        return items
+        if limit is not None:
+            return items[offset : offset + limit]
+        return items[offset:] if offset else items
 
     def _imports_build_summary(
         self, items: list[dict], needed_libraries: list[str] | None = None
@@ -4033,7 +4100,8 @@ class BinaryNinjaBridge:
         4: "ExternalSection",
     }
 
-    def _sections(self, selector: str | None, *, query: str | None = None):
+    def _sections(self, selector: str | None, *, query: str | None = None,
+                  offset: int = 0, limit: int | None = None):
         bv = self._resolve_view(selector)
         items = []
         sections = getattr(bv, "sections", {})
@@ -4069,7 +4137,9 @@ class BinaryNinjaBridge:
 
             items.append(entry)
         items.sort(key=lambda item: int(item["start"], 16))
-        return items
+        if limit is not None:
+            return items[offset : offset + limit]
+        return items[offset:] if offset else items
 
     @staticmethod
     def _ascii_render(data: bytes) -> str:
@@ -4327,7 +4397,15 @@ class BinaryNinjaBridge:
             "result": None,
         }
         with contextlib.redirect_stdout(stdout):
-            exec(script, scope, scope)
+            try:
+                exec(script, scope, scope)
+            except Exception as exc:  # noqa: BLE001 - user script errors are user-facing
+                # Report every script failure the same way -- "TypeName: message".
+                # Previously a ValueError surfaced as a bare message while a
+                # NameError was tagged "internal error: NameError:", because only
+                # some builtins are whitelisted as user-facing. The user's own
+                # script raised this, so it is always a user-facing error.
+                raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
         result_value, warnings = self._normalize_py_result(scope.get("result"))
         result = {
             "stdout": stdout.getvalue(),
@@ -5444,6 +5522,10 @@ class BinaryNinjaBridge:
 _bridge: BinaryNinjaBridge | None = None
 _headless_views: list[Any] = []
 _headless_views_lock = threading.Lock()
+# Views loaded with --quick (analysis not run yet). Strings/full function set
+# are unavailable until `bn refresh`, so commands consult this to stay honest
+# instead of returning a misleading empty result. Weak so closed views drop out.
+_quick_loaded_views: "weakref.WeakSet[Any]" = weakref.WeakSet()
 
 
 def _start_bridge_command(_):  # pragma: no cover - GUI runtime

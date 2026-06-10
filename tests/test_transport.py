@@ -118,7 +118,7 @@ def test_send_request_wraps_socket_errors(tmp_path, monkeypatch):
         started_at=None,
         meta={},
     )
-    monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None: instance)
+    monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None, **kw: instance)
 
     with pytest.raises(BridgeError, match="Failed to contact Binary Ninja bridge pid 999"):
         send_request("doctor")
@@ -257,7 +257,7 @@ def test_send_request_retries_transient_connect_failures(tmp_path, monkeypatch):
         started_at=None,
         meta={},
     )
-    monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None: instance)
+    monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None, **kw: instance)
 
     class _FakeSocket:
         attempts = 0
@@ -430,7 +430,7 @@ def test_send_request_reports_timeout_waiting_for_response(tmp_path, monkeypatch
         started_at=None,
         meta={},
     )
-    monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None: instance)
+    monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None, **kw: instance)
 
     class _FakeSocket:
         def __enter__(self):
@@ -804,3 +804,25 @@ def test_spawn_instance_terminates_child_on_registration_timeout(monkeypatch, tm
         spawn_instance("slowkid", timeout=0.05, poll_interval=0.01)
 
     assert lifecycle[:2] == ["terminate", "wait"]
+
+
+def test_choose_instance_spawn_missing_named_spawns_new(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    spawned = {}
+    sentinel = object()
+
+    def fake_spawn(instance_id):
+        spawned["id"] = instance_id
+        return sentinel
+
+    monkeypatch.setattr("bn.transport.spawn_instance", fake_spawn)
+
+    # opt-in (the `bn load` path): a missing named id is spawned, not an error.
+    result = choose_instance("brandnew", spawn_missing_named=True)
+    assert result is sentinel
+    assert spawned["id"] == "brandnew"
+
+    # default: a missing named id still fails fast, and the error points the way.
+    with pytest.raises(BridgeError, match="session start --instance-id brandnew") as exc:
+        choose_instance("brandnew")
+    assert "No bridge instance found with id: brandnew" in str(exc.value)

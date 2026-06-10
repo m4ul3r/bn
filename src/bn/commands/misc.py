@@ -31,6 +31,15 @@ from ..transport import BridgeError
                  help="Heuristic filter: exclude likely CRT/locale strings (platform-biased, best-effort)"),
          ])
 def _strings(args: argparse.Namespace) -> int:
+    # An unfiltered dump pulls in .dynsym/.hash/.symtab byte noise that buries the
+    # real .rodata literals. Nudge toward narrowing -- only when no filter is set,
+    # so a targeted `--section`/`--query`/`--min-length` query stays quiet.
+    if args.section is None and args.query is None and args.min_length is None and not args.no_crt:
+        print(
+            "tip: an unfiltered string dump includes .dynsym/.hash/.symtab noise; "
+            "narrow with --section .rodata (or --query / --min-length) for signal.",
+            file=sys.stderr,
+        )
     return _call(
         args,
         "strings",
@@ -53,32 +62,41 @@ def _strings(args: argparse.Namespace) -> int:
     )
 
 
-@command("imports", help="List imports", target=True,
+@command("imports", help="List imports", target=True, paged=True,
          args=[arg("--summary", action="store_true", default=False,
                    help="Show aggregate counts by namespace and kind instead of the full list")])
 def _imports(args: argparse.Namespace) -> int:
     summary_mode = bool(args.summary)
+    # Summary is a single aggregate object, so it ignores paging; the full list
+    # (often 500+ entries on firmware libs) pages like strings/function list.
+    page_limit = None if summary_mode else args.limit
     return _call(
         args,
         "imports",
-        {"summary": summary_mode},
+        {"summary": summary_mode, "offset": args.offset},
         require_target=True,
         allow_implicit_target=True,
         text_renderer=_render_imports_summary_text if summary_mode else _render_name_address_list_text,
+        page_limit=page_limit,
+        page_offset=args.offset,
+        page_label="imports",
         stem="imports-summary" if summary_mode else "imports",
     )
 
 
 @command("sections", help="List binary sections with address ranges and permissions", target=True,
-         args=[arg("--query", help="Filter sections by name substring")])
+         paged=True, args=[arg("--query", help="Filter sections by name substring")])
 def _sections(args: argparse.Namespace) -> int:
     return _call(
         args,
         "sections",
-        {"query": args.query},
+        {"query": args.query, "offset": args.offset},
         require_target=True,
         allow_implicit_target=True,
         text_renderer=_render_sections_text,
+        page_limit=args.limit,
+        page_offset=args.offset,
+        page_label="sections",
         stem="sections",
     )
 

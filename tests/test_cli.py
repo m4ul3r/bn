@@ -10,7 +10,7 @@ import pytest
 def test_function_list_uses_implicit_target_when_single_target_is_open(monkeypatch, capsys):
     calls = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         calls.append({"op": op, "params": params, "target": target})
         if op == "list_targets":
             return {
@@ -34,7 +34,7 @@ def test_function_list_uses_implicit_target_when_single_target_is_open(monkeypat
 
 
 def test_function_list_requires_target_when_multiple_targets_are_open(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         if op == "list_targets":
             return {
                 "ok": True,
@@ -65,7 +65,7 @@ def test_function_list_requires_target_when_multiple_targets_are_open(monkeypatc
 def test_function_list_returns_full_result_set(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["op"] = op
         captured["params"] = params
         captured["target"] = target
@@ -90,7 +90,7 @@ def test_function_list_returns_full_result_set(monkeypatch, capsys):
 def test_function_list_warns_when_output_auto_spills(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["op"] = op
         return {
             "ok": True,
@@ -163,7 +163,7 @@ def _spill_artifact_namespace(path: str) -> types.SimpleNamespace:
 
 
 def test_decompile_spill_warning_suggests_line_slicing(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         return {"ok": True, "result": {"text": "long decompiled text"}}
 
     def fake_write_output_result(value, *, fmt, out_path, stem):
@@ -184,7 +184,7 @@ def test_decompile_spill_warning_suggests_line_slicing(monkeypatch, capsys):
 
 
 def test_scalar_spill_warning_points_at_artifact(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         # type_info returns a dict (non-list) payload that can spill.
         return {"ok": True, "result": {"name": "Player", "decl": "struct Player { ... }"}}
 
@@ -209,7 +209,7 @@ def test_scalar_spill_warning_points_at_artifact(monkeypatch, capsys):
 def test_function_list_forwards_address_filters(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["op"] = op
         captured["params"] = params
         captured["target"] = target
@@ -240,7 +240,7 @@ def test_function_list_forwards_address_filters(monkeypatch, capsys):
 def test_function_search_can_request_regex_matching(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["op"] = op
         captured["params"] = params
         captured["target"] = target
@@ -384,7 +384,7 @@ def test_unrecognized_argument_at_root_routes_to_root_usage(capsys):
 
 
 def test_callsites_missing_scope_raises_actionable_error(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         raise AssertionError("bridge should not be called when scope is missing")
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
@@ -403,7 +403,7 @@ def test_callsites_missing_scope_raises_actionable_error(monkeypatch, capsys):
 def test_function_info_uses_active_target_and_text_renderer(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["op"] = op
         captured["params"] = params
         captured["target"] = target
@@ -440,7 +440,7 @@ def test_function_info_uses_active_target_and_text_renderer(monkeypatch, capsys)
 def test_symbol_rename_builds_preview_payload(monkeypatch):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["op"] = op
         captured["params"] = params
         captured["target"] = target
@@ -468,7 +468,7 @@ def test_symbol_rename_builds_preview_payload(monkeypatch):
 def test_symbol_rename_uses_implicit_target_when_single_target_is_open(monkeypatch):
     calls = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         calls.append({"op": op, "params": params, "target": target})
         if op == "list_targets":
             return {
@@ -494,7 +494,7 @@ def test_symbol_rename_uses_implicit_target_when_single_target_is_open(monkeypat
 
 
 def test_symbol_rename_requires_target_when_multiple_targets_are_open(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         if op == "list_targets":
             return {
                 "ok": True,
@@ -525,7 +525,7 @@ def test_symbol_rename_requires_target_when_multiple_targets_are_open(monkeypatc
 def test_function_create_builds_payload_and_defaults_to_json(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["op"] = op
         captured["params"] = params
         captured["target"] = target
@@ -563,7 +563,7 @@ def test_function_create_builds_payload_and_defaults_to_json(monkeypatch, capsys
 
 
 def test_function_create_text_output_renders_verified_summary(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         return {
             "ok": True,
             "result": {
@@ -597,7 +597,7 @@ def test_function_create_text_output_renders_verified_summary(monkeypatch, capsy
 def test_function_create_forwards_preview_flag(monkeypatch):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["params"] = params
         return {"ok": True, "result": {"preview": True, "success": True, "committed": False, "results": []}}
 
@@ -610,7 +610,7 @@ def test_function_create_forwards_preview_flag(monkeypatch):
 
 
 def test_function_create_verification_failure_exits_three(monkeypatch):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         return {
             "ok": True,
             "result": {
@@ -766,7 +766,7 @@ def test_skill_install_custom_dest_still_fails_when_destination_exists(tmp_path)
 
 
 def test_target_list_text_format_renders_summary(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "list_targets"
         return {
             "ok": True,
@@ -796,7 +796,7 @@ def test_target_list_text_format_renders_summary(monkeypatch, capsys):
 def test_refresh_uses_implicit_target_when_single_target_is_open(monkeypatch, capsys):
     calls = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         calls.append({"op": op, "params": params, "target": target})
         if op == "list_targets":
             return {
@@ -835,7 +835,7 @@ def test_refresh_uses_implicit_target_when_single_target_is_open(monkeypatch, ca
 def test_types_show_uses_type_info_and_text_renderer(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["op"] = op
         captured["params"] = params
         captured["target"] = target
@@ -866,7 +866,7 @@ def test_types_show_uses_type_info_and_text_renderer(monkeypatch, capsys):
 def test_types_declare_uses_implicit_target_when_single_target_is_open(monkeypatch):
     calls = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         calls.append({"op": op, "params": params, "target": target})
         if op == "list_targets":
             return {
@@ -892,7 +892,7 @@ def test_types_declare_passes_source_path_for_file_input(monkeypatch, tmp_path):
     declaration_file = tmp_path / "win32_min.h"
     declaration_file.write_text("typedef struct Player { int hp; } Player;", encoding="utf-8")
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["op"] = op
         captured["params"] = params
         captured["target"] = target
@@ -910,7 +910,7 @@ def test_types_declare_passes_source_path_for_file_input(monkeypatch, tmp_path):
 def test_xrefs_field_routes_to_field_xrefs(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["op"] = op
         captured["params"] = params
         captured["target"] = target
@@ -942,7 +942,7 @@ def test_xrefs_field_routes_to_field_xrefs(monkeypatch, capsys):
 
 
 def test_xrefs_text_format_renders_summary(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "xrefs"
         return {
             "ok": True,
@@ -981,7 +981,7 @@ def test_xrefs_text_format_renders_summary(monkeypatch, capsys):
 def test_evidence_xrefs_routes_and_renders_context(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["op"] = op
         captured["params"] = params
         captured["target"] = target
@@ -1031,7 +1031,7 @@ def test_evidence_xrefs_routes_and_renders_context(monkeypatch, capsys):
 def test_evidence_function_routes_and_renders_calls(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["op"] = op
         captured["params"] = params
         return {
@@ -1089,7 +1089,7 @@ def test_evidence_function_routes_and_renders_calls(monkeypatch, capsys):
 def test_evidence_table_routes_and_renders_targets(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["op"] = op
         captured["params"] = params
         return {
@@ -1186,7 +1186,7 @@ def test_render_target_line_shows_symbol_and_string_for_mapped_targets():
 
 
 def test_evidence_table_renders_interior_function_targets(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "pointer_table"
         return {
             "ok": True,
@@ -1232,7 +1232,7 @@ def test_evidence_table_renders_interior_function_targets(monkeypatch, capsys):
 def test_evidence_message_routes_and_renders_lens(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["op"] = op
         captured["params"] = params
         return {
@@ -1285,7 +1285,7 @@ def test_evidence_message_routes_and_renders_lens(monkeypatch, capsys):
 def test_evidence_init_routes_and_renders_sections(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["op"] = op
         captured["params"] = params
         return {
@@ -1337,7 +1337,7 @@ def test_evidence_init_routes_and_renders_sections(monkeypatch, capsys):
 def test_callsites_routes_within_scope_and_renders_text(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["op"] = op
         captured["params"] = params
         captured["target"] = target
@@ -1409,7 +1409,7 @@ def test_callsites_within_file_ignores_comments_and_blank_lines(monkeypatch, tmp
         encoding="utf-8",
     )
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["op"] = op
         captured["params"] = params
         captured["target"] = target
@@ -1437,7 +1437,7 @@ def test_callsites_within_file_ignores_comments_and_blank_lines(monkeypatch, tmp
 
 
 def test_callsites_text_omits_null_hlil_and_pre_branch(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "callsites"
         return {
             "ok": True,
@@ -1473,7 +1473,7 @@ def test_callsites_text_omits_null_hlil_and_pre_branch(monkeypatch, capsys):
 def test_comment_get_uses_implicit_target_when_single_target_is_open(monkeypatch, capsys):
     calls = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         calls.append({"op": op, "params": params, "target": target})
         if op == "list_targets":
             return {
@@ -1497,7 +1497,7 @@ def test_comment_get_uses_implicit_target_when_single_target_is_open(monkeypatch
 def test_py_exec_accepts_inline_code(monkeypatch):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["op"] = op
         captured["params"] = params
         captured["target"] = target
@@ -1522,7 +1522,7 @@ def test_py_exec_missing_script_mentions_code(capsys):
 
 
 def test_strings_text_format_renders_rows(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "strings"
         return {
             "ok": True,
@@ -1547,7 +1547,7 @@ def test_strings_text_format_renders_rows(monkeypatch, capsys):
 
 
 def test_py_exec_text_format_renders_stdout_and_result(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "py_exec"
         return {
             "ok": True,
@@ -1570,7 +1570,7 @@ def test_py_exec_text_format_renders_stdout_and_result(monkeypatch, capsys):
 
 
 def test_proto_get_renders_prototype_text(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "get_prototype"
         return {
             "ok": True,
@@ -1591,7 +1591,7 @@ def test_proto_get_renders_prototype_text(monkeypatch, capsys):
 
 
 def test_local_list_text_is_slim(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "list_locals"
         return {
             "ok": True,
@@ -1641,7 +1641,7 @@ def test_local_list_text_is_slim(monkeypatch, capsys):
 
 
 def test_local_list_json_retains_ids(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         return {
             "ok": True,
             "result": {
@@ -1673,7 +1673,7 @@ def test_bundle_function_out_path_is_bridge_owned(monkeypatch, tmp_path, capsys)
     captured = {}
     out_path = tmp_path / "bundle.json"
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         if op == "list_targets":
             return {
                 "ok": True,
@@ -1879,7 +1879,7 @@ def test_doctor_text_marks_healthy_instance_ok(monkeypatch, tmp_path, capsys):
 
 
 def test_symbol_rename_text_format_renders_mutation_summary(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "rename_symbol"
         return {
             "ok": True,
@@ -1931,7 +1931,7 @@ def test_symbol_rename_text_format_renders_mutation_summary(monkeypatch, capsys)
 
 
 def test_symbol_rename_verification_failure_returns_nonzero(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "rename_symbol"
         return {
             "ok": True,
@@ -1978,7 +1978,7 @@ def test_symbol_rename_verification_failure_returns_nonzero(monkeypatch, capsys)
 
 
 def test_symbol_rename_noop_still_succeeds(monkeypatch):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "rename_symbol"
         return {
             "ok": True,
@@ -2008,7 +2008,7 @@ def test_symbol_rename_noop_still_succeeds(monkeypatch):
 
 
 def test_decompile_text_format_unwraps_text_field(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         return {
             "ok": True,
             "result": {
@@ -2026,7 +2026,7 @@ def test_decompile_text_format_unwraps_text_field(monkeypatch, capsys):
 
 
 def test_comment_get_empty_comment_shows_placeholder(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "get_comment"
         return {"ok": True, "result": {"address": "0x401000", "comment": "", "has_comment": False}}
 
@@ -2039,7 +2039,7 @@ def test_comment_get_empty_comment_shows_placeholder(monkeypatch, capsys):
 
 
 def test_callsites_empty_result_shows_descriptive_message(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "callsites"
         return {"ok": True, "result": []}
 
@@ -2074,7 +2074,7 @@ def test_format_operation_result_falls_back_to_requested():
 def test_function_list_pagination_truncates_and_warns(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["params"] = params
         return {
             "ok": True,
@@ -2096,7 +2096,7 @@ def test_function_list_pagination_truncates_and_warns(monkeypatch, capsys):
 def test_function_search_pagination_forwards_offset(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["params"] = params
         return {"ok": True, "result": [{"name": "sub_401000", "address": "0x401000"}]}
 
@@ -2112,7 +2112,7 @@ def test_function_search_pagination_forwards_offset(monkeypatch, capsys):
 def test_instance_flag_passed_to_send_request(monkeypatch, capsys):
     captured_instance_ids = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured_instance_ids.append(instance_id)
         if op == "list_targets":
             return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "test.bndb"}]}
@@ -2128,7 +2128,7 @@ def test_instance_flag_passed_to_send_request(monkeypatch, capsys):
 def test_instance_flag_on_subcommand(monkeypatch, capsys):
     captured_instance_ids = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured_instance_ids.append(instance_id)
         if op == "list_targets":
             return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "test.bndb"}]}
@@ -2144,7 +2144,7 @@ def test_instance_flag_on_subcommand(monkeypatch, capsys):
 def test_instance_flag_from_env(monkeypatch, capsys):
     captured_instance_ids = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured_instance_ids.append(instance_id)
         if op == "list_targets":
             return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "test.bndb"}]}
@@ -2199,7 +2199,7 @@ def test_session_list_shows_instances(monkeypatch, capsys):
 
 
 def test_session_stop_sends_shutdown(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "shutdown"
         assert instance_id == "abc123"
         return {"ok": True, "result": {"shutting_down": True}}
@@ -2256,7 +2256,7 @@ def test_session_start_all_loads_fail_stops_bridge_and_exits_nonzero(monkeypatch
 
     ops = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         ops.append(op)
         if op == "load_binary":
             raise BridgeError(f"File not found: {params['path']}")
@@ -2292,7 +2292,7 @@ def test_session_start_partial_failure_keeps_bridge_but_exits_nonzero(monkeypatc
 
     ops = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         ops.append(op)
         if op == "load_binary":
             if "good" in params["path"]:
@@ -2346,7 +2346,7 @@ def test_batch_apply_invalid_json_clean_error(monkeypatch, capsys, tmp_path):
 
 
 def test_il_lines_slices_output_with_header(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         if op == "il":
             return {"ok": True, "result": {"text": "line1\nline2\nline3\nline4\nline5"}}
         raise AssertionError(f"unexpected op: {op}")
@@ -2364,7 +2364,7 @@ def test_il_lines_slices_output_with_header(monkeypatch, capsys):
 
 
 def test_disasm_lines_slices_output_with_header(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         if op == "disasm":
             return {"ok": True, "result": {"text": "aaa\nbbb\nccc\nddd"}}
         raise AssertionError(f"unexpected op: {op}")
@@ -2394,7 +2394,7 @@ def test_lines_range_rejects_zero_index_with_helpful_error(monkeypatch, capsys):
 def test_strings_passes_min_length_to_bridge(monkeypatch, capsys):
     captured_params = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         if op == "strings":
             captured_params.update(params)
             return {"ok": True, "result": []}
@@ -2411,7 +2411,7 @@ def test_strings_passes_min_length_to_bridge(monkeypatch, capsys):
 def test_strings_passes_section_and_no_crt_to_bridge(monkeypatch, capsys):
     captured_params = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         if op == "strings":
             captured_params.update(params)
             return {"ok": True, "result": []}
@@ -2429,7 +2429,7 @@ def test_strings_passes_section_and_no_crt_to_bridge(monkeypatch, capsys):
 def test_strings_passes_regex_to_bridge(monkeypatch, capsys):
     captured_params = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         if op == "strings":
             captured_params.update(params)
             return {"ok": True, "result": []}
@@ -2447,7 +2447,7 @@ def test_strings_passes_regex_to_bridge(monkeypatch, capsys):
 def test_strings_query_value_can_look_like_flag(monkeypatch, capsys):
     captured_queries = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         if op == "strings":
             captured_queries.append(params["query"])
             return {"ok": True, "result": []}
@@ -2465,7 +2465,7 @@ def test_strings_query_value_can_look_like_flag(monkeypatch, capsys):
 
 
 def test_strings_query_does_not_swallow_known_sibling_flags(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         raise AssertionError("parse failure should happen before bridge call")
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
@@ -2482,7 +2482,7 @@ def test_strings_query_does_not_swallow_known_sibling_flags(monkeypatch, capsys)
 
 
 def test_sections_text_format_renders_rows(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "sections"
         return {
             "ok": True,
@@ -2514,7 +2514,7 @@ def test_sections_text_format_renders_rows(monkeypatch, capsys):
 def test_sections_passes_query_to_bridge(monkeypatch, capsys):
     captured_params = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         if op == "sections":
             captured_params.update(params)
             return {"ok": True, "result": []}
@@ -2532,7 +2532,7 @@ def test_sections_passes_query_to_bridge(monkeypatch, capsys):
 
 
 def test_imports_text_shows_kind_for_non_function(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "imports"
         return {
             "ok": True,
@@ -2559,7 +2559,7 @@ def test_imports_text_shows_kind_for_non_function(monkeypatch, capsys):
 def test_read_text_renders_hexdump(monkeypatch, capsys):
     captured_params = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "read"
         captured_params.update(params)
         return {
@@ -2584,7 +2584,7 @@ def test_read_text_renders_hexdump(monkeypatch, capsys):
 
 
 def test_read_json_returns_structured_payload(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "read"
         return {
             "ok": True,
@@ -2613,7 +2613,7 @@ def test_read_json_returns_structured_payload(monkeypatch, capsys):
 
 
 def test_read_unmapped_address_surfaces_bridge_error(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         if op == "read":
             raise bn.cli.BridgeError("Address 0xdead is not mapped (no bytes available)")
         raise AssertionError(f"unexpected op: {op}")
@@ -2629,7 +2629,7 @@ def test_read_unmapped_address_surfaces_bridge_error(monkeypatch, capsys):
 
 
 def test_read_short_read_text_includes_note(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "read"
         return {
             "ok": True,
@@ -2655,7 +2655,7 @@ def test_read_short_read_text_includes_note(monkeypatch, capsys):
 
 
 def test_read_bytes_encoding_writes_raw_bytes(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "read"
         return {
             "ok": True,
@@ -2680,7 +2680,7 @@ def test_read_bytes_encoding_writes_raw_bytes(monkeypatch, capsys):
 def test_read_accepts_positional_address(monkeypatch):
     captured_params = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "read"
         captured_params.update(params)
         return {"ok": True, "result": {"address": "0x1000", "length": 8, "hex": "00" * 8, "ascii": "." * 8}}
@@ -2697,7 +2697,7 @@ def test_read_accepts_positional_address(monkeypatch):
 def test_read_length_accepts_hex(monkeypatch):
     captured_params = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured_params.update(params)
         return {"ok": True, "result": {"address": "0x1000", "length": 194, "hex": "", "ascii": ""}}
 
@@ -2710,7 +2710,7 @@ def test_read_length_accepts_hex(monkeypatch):
 
 
 def test_read_conflicting_address_errors(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         raise AssertionError("send_request should not run when addresses conflict")
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
@@ -2733,7 +2733,7 @@ def test_read_missing_address_errors(monkeypatch, capsys):
 def test_save_accepts_path_flag(monkeypatch, tmp_path):
     captured_params = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "save_database"
         captured_params.update(params or {})
         return {"ok": True, "result": {"path": params.get("path"), "saved": True}}
@@ -2750,7 +2750,7 @@ def test_save_accepts_path_flag(monkeypatch, tmp_path):
 def test_rename_alias_maps_to_symbol_rename(monkeypatch):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["op"] = op
         captured["params"] = params
         return {"ok": True, "result": {"preview": True}}
@@ -2766,7 +2766,7 @@ def test_rename_alias_maps_to_symbol_rename(monkeypatch):
 
 
 def test_close_warns_on_unsaved_changes(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "close_binary"
         return {
             "ok": True,
@@ -2787,7 +2787,7 @@ def test_close_warns_on_unsaved_changes(monkeypatch, capsys):
 
 
 def test_close_silent_when_clean(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "close_binary"
         return {
             "ok": True,
@@ -2810,7 +2810,7 @@ def test_close_silent_when_clean(monkeypatch, capsys):
 def test_close_forwards_explicit_target_selector(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "close_binary"
         captured["target"] = target
         return {"ok": True, "result": {"closed": [{"path": "/tmp/foo", "unsaved": False}]}}
@@ -2827,7 +2827,7 @@ def test_close_forwards_explicit_target_selector(monkeypatch, capsys):
 def test_close_all_flag_sets_param(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["params"] = params
         captured["target"] = target
         return {"ok": True, "result": {"closed": []}}
@@ -2846,7 +2846,7 @@ def test_close_ignores_sticky_target_pin(monkeypatch, capsys):
     # close-one, and a stale pin must not make cleanup fail.
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["target"] = target
         return {"ok": True, "result": {"closed": []}}
 
@@ -2860,7 +2860,7 @@ def test_close_ignores_sticky_target_pin(monkeypatch, capsys):
 
 
 def test_function_list_count_prints_total(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         if op == "list_targets":
             return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "x"}]}
         if op == "list_functions":
@@ -2965,7 +2965,7 @@ def test_sticky_instance_fills_when_flag_absent(tmp_session, monkeypatch):
 
     captured = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured.append(instance_id)
         if op == "list_targets":
             return {"ok": True, "result": [{"target_id": "1", "selector": "x"}]}
@@ -2983,7 +2983,7 @@ def test_cli_instance_flag_overrides_sticky(tmp_session, monkeypatch):
 
     captured = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured.append(instance_id)
         if op == "list_targets":
             return {"ok": True, "result": [{"target_id": "1", "selector": "x"}]}
@@ -3003,7 +3003,7 @@ def test_env_var_overrides_sticky_instance(tmp_session, monkeypatch):
 
     captured = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured.append(instance_id)
         if op == "list_targets":
             return {"ok": True, "result": [{"target_id": "1", "selector": "x"}]}
@@ -3022,7 +3022,7 @@ def test_sticky_target_fills_when_flag_absent(tmp_session, monkeypatch):
 
     captured = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured.append(target)
         return {"ok": True, "result": []}
 
@@ -3038,7 +3038,7 @@ def test_cli_target_flag_overrides_sticky(tmp_session, monkeypatch):
 
     captured = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured.append(target)
         return {"ok": True, "result": []}
 
@@ -3087,7 +3087,7 @@ def test_session_list_marks_sticky(tmp_session, monkeypatch, capsys):
 
 
 def test_target_list_marks_sticky(tmp_session, monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         return {
             "ok": True,
             "result": [
@@ -3110,7 +3110,7 @@ def test_target_list_marks_sticky(tmp_session, monkeypatch, capsys):
 def test_stale_sticky_instance_emits_hint(tmp_session, monkeypatch, capsys):
     bn.session_state.update(instance_id="dead_inst")
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         from bn.transport import BridgeError as _BE
         raise _BE(f"No bridge instance found with id: {instance_id}")
 
@@ -3128,7 +3128,7 @@ def test_sticky_hint_on_failed_contact(tmp_session, monkeypatch, capsys):
     """Bridge stopped mid-flight surfaces a transport error, not a registry miss."""
     bn.session_state.update(instance_id="dying_inst")
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         from bn.transport import BridgeError as _BE
         raise _BE(
             "Failed to contact Binary Ninja bridge pid 17881 at /tmp/x.sock: "
@@ -3148,7 +3148,7 @@ def test_sticky_hint_on_failed_contact(tmp_session, monkeypatch, capsys):
 def test_sticky_hint_on_bridge_timeout(tmp_session, monkeypatch, capsys):
     bn.session_state.update(instance_id="slow_inst")
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         from bn.transport import BridgeError as _BE
         raise _BE(
             "Timed out waiting for Binary Ninja bridge pid 9999 at /tmp/x.sock after 30.0s"
@@ -3168,7 +3168,7 @@ def test_sticky_hint_skipped_for_unrelated_errors(tmp_session, monkeypatch, caps
     """Bridge-side analysis errors must not get the sticky-clear hint."""
     bn.session_state.update(instance_id="alive_inst")
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         from bn.transport import BridgeError as _BE
         raise _BE("Function not found: nonexistent_symbol")
 
@@ -3190,7 +3190,7 @@ def test_load_defaults_to_prefer_bndb(monkeypatch, tmp_path):
     raw.write_bytes(b"")
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "load_binary"
         captured.update(params)
         return {"ok": True, "result": {"loaded": True, "path": str(raw), "notes": [], "targets": []}}
@@ -3207,7 +3207,7 @@ def test_load_no_bndb_flag_disables_prefer_bndb(monkeypatch, tmp_path):
     raw.write_bytes(b"")
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "load_binary"
         captured.update(params)
         return {"ok": True, "result": {"loaded": True, "path": str(raw), "notes": [], "targets": []}}
@@ -3222,7 +3222,7 @@ def test_load_no_bndb_flag_disables_prefer_bndb(monkeypatch, tmp_path):
 def _load_capture(monkeypatch, raw, analyzed):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "load_binary"
         captured.update(params)
         return {"ok": True, "result": {
@@ -3270,7 +3270,7 @@ def test_load_text_renders_notes(monkeypatch, tmp_path, capsys):
     raw.write_bytes(b"")
     bndb = tmp_path / "foo.so.bndb"
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         return {
             "ok": True,
             "result": {
@@ -3315,7 +3315,7 @@ def test_session_start_no_bndb_propagates_to_each_load(monkeypatch, tmp_path):
 
     captured = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured.append(dict(params or {}))
         return {"ok": True, "result": {"loaded": True, "path": params["path"], "notes": [], "targets": []}}
 
@@ -3331,7 +3331,7 @@ def test_session_start_no_bndb_propagates_to_each_load(monkeypatch, tmp_path):
 def test_trace_routes_and_renders_text(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["op"] = op
         captured["params"] = params
         captured["target"] = target
@@ -3396,7 +3396,7 @@ def test_trace_routes_and_renders_text(monkeypatch, capsys):
 def test_trace_defaults_to_arg_0(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["params"] = params or {}
         return {"ok": True, "result": {"function": "f", "trace": [], "step_count": 0, "truncated": False}}
 
@@ -3410,7 +3410,7 @@ def test_trace_defaults_to_arg_0(monkeypatch, capsys):
 def test_trace_respects_view_and_max_depth(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["params"] = dict(params or {})
         return {"ok": True, "result": {"function": "f", "trace": [], "step_count": 0, "truncated": False}}
 
@@ -3430,7 +3430,7 @@ def test_trace_respects_view_and_max_depth(monkeypatch, capsys):
 def test_trace_text_renderer_empty_trace(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         return {"ok": True, "result": {"function": "f", "trace": [], "step_count": 0, "truncated": False}}
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
@@ -3444,7 +3444,7 @@ def test_trace_text_renderer_empty_trace(monkeypatch, capsys):
 def test_trace_json_renders_structure(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         return {
             "ok": True,
             "result": {
@@ -3479,7 +3479,7 @@ def test_trace_json_renders_structure(monkeypatch, capsys):
 def test_imports_summary_routes_and_renders_text(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["op"] = op
         captured["params"] = params
         return {
@@ -3508,7 +3508,7 @@ def test_imports_summary_routes_and_renders_text(monkeypatch, capsys):
 def test_imports_without_summary_routes_false(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["params"] = params
         return {"ok": True, "result": []}
 
@@ -3526,7 +3526,7 @@ def test_imports_without_summary_routes_false(monkeypatch, capsys):
 def test_function_search_exact_routes(monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["op"] = op
         captured["params"] = params
         return {"ok": True, "result": [{"name": "system", "address": "0x401000"}]}
@@ -3667,25 +3667,26 @@ def test_duplicate_command_path_registration_raises():
 
 
 def test_unpaged_list_spill_hint_points_at_out_flag(monkeypatch, capsys):
-    # imports returns a list but is not a paged command: the spill hint must
-    # not suggest --limit/--offset (those flags do not exist on `bn imports`).
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
-        return {"ok": True, "result": [{"name": "printf", "address": "0x1000"}]}
+    # callsites returns a list but is not a paged command: the spill hint must
+    # not suggest --limit/--offset (those flags do not exist on `bn callsites`).
+    # (imports/sections used to be the example here, but they are paged now.)
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": [{"call": "0x1000", "caller_static": "0x1004"}]}
 
     def fake_write_output_result(value, *, fmt, out_path, stem):
-        assert stem == "imports"
-        return _spill_artifact_namespace("/tmp/imports.txt")
+        assert stem == "callsites"
+        return _spill_artifact_namespace("/tmp/callsites.txt")
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
     monkeypatch.setattr(bn.cli, "write_output_result", fake_write_output_result)
 
-    rc = bn.cli.main(["imports", "--target", "active"])
+    rc = bn.cli.main(["callsites", "memcpy", "--within", "f", "--target", "active", "--format", "json"])
 
     assert rc == 0
     _, stderr = capsys.readouterr()
     assert "--limit/--offset" not in stderr
     assert (
-        "rerun with --out <path> or read the artifact at /tmp/imports.txt" in stderr
+        "rerun with --out <path> or read the artifact at /tmp/callsites.txt" in stderr
     )
 
 
@@ -3698,7 +3699,7 @@ def test_slice_text_lines_start_beyond_end_keeps_header_sane():
 
 
 def test_read_bytes_malformed_response_clean_error(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         return {"ok": True, "result": {"length": 4}}  # no "hex" payload
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
@@ -3711,3 +3712,62 @@ def test_read_bytes_malformed_response_clean_error(monkeypatch, capsys):
     err = capsys.readouterr().err
     assert "malformed read response" in err
     assert "Traceback" not in err
+
+
+def test_load_opts_into_spawn_missing_named(monkeypatch, tmp_path):
+    # `bn load --instance <new-id>` should auto-spawn that named bridge, so the
+    # load handler is the one command that opts into spawn_missing_named.
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        captured["op"] = op
+        captured["instance_id"] = instance_id
+        captured["spawn_missing_named"] = spawn_missing_named
+        return {"ok": True, "result": {"loaded": True, "path": str(raw), "notes": [], "targets": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["load", str(raw), "--instance", "brandnew"])
+
+    assert rc == 0
+    assert captured["op"] == "load_binary"
+    assert captured["instance_id"] == "brandnew"
+    assert captured["spawn_missing_named"] is True
+
+
+def test_non_load_command_does_not_spawn_missing_named(monkeypatch):
+    # Read commands must not silently spawn a process for a typo'd --instance.
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        captured["spawn_missing_named"] = spawn_missing_named
+        return {"ok": True, "result": []}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["sections", "--target", "active"])
+
+    assert rc == 0
+    assert captured["spawn_missing_named"] is False
+
+
+def test_strings_unfiltered_emits_section_hint(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": []}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    assert bn.cli.main(["strings", "--target", "active"]) == 0
+
+    _, stderr = capsys.readouterr()
+    assert "--section .rodata" in stderr
+
+
+def test_strings_with_filter_suppresses_section_hint(monkeypatch, capsys):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": []}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    assert bn.cli.main(["strings", "--section", ".rodata", "--target", "active"]) == 0
+
+    _, stderr = capsys.readouterr()
+    assert "tip:" not in stderr
