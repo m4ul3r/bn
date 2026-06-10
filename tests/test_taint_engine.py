@@ -945,3 +945,139 @@ def test_backward_walk_truncation_recorded(process_func, models):
     engine = te.TaintEngine(bv, models, max_depth=1)
     result = engine.backward(process_func, [te.parse_locator("arg:memcpy:2")])
     assert any("truncated" in a for a in result["assumptions"])
+
+
+# --------------------------------------------------------------------------
+# unified call-target / thunk resolver (issue #7, PR1)
+# --------------------------------------------------------------------------
+
+class FBVSym(FBV):
+    """FBV plus symbol-name resolution APIs (which the base FBV lacks)."""
+
+    def __init__(self, addr_names, funcs=None, sym_names=None):
+        super().__init__(addr_names, funcs)
+        self._sym_names = sym_names or {}  # name -> address
+
+    def get_symbols_by_name(self, name):
+        addr = self._sym_names.get(name)
+        return [type("S", (), {"address": addr})()] if addr is not None else []
+
+    def get_symbol_by_raw_name(self, name):
+        addr = self._sym_names.get(name)
+        return type("S", (), {"address": addr})() if addr is not None else None
+
+
+def _tailcall_thunk(name, start, target_addr):
+    return FFunc(name, start, FSSAFunc([
+        FInstr(0, start, "MLIL_TAILCALL_SSA", f"tailcall(0x{target_addr:x})",
+               dest=FExpr("MLIL_CONST_PTR", f"0x{target_addr:x}", constant=target_addr)),
+    ]))
+
+
+def _leaf_func(name, start):
+    return FFunc(name, start, FSSAFunc([FInstr(0, start, "MLIL_RET", "return", reads=[])]))
+
+
+# -- extract_dest_address ---------------------------------------------------
+
+def test_extract_dest_address_raw_int():
+    assert te.extract_dest_address(FBV({}), 0x401000) == 0x401000
+
+
+def test_extract_dest_address_const_ptr_without_symbol_apis():
+    # base FBV has no get_symbols_by_name; must fall back to .constant, not crash
+    dest = FExpr("MLIL_CONST_PTR", "0x401070", constant=0x401070)
+    assert te.extract_dest_address(FBV({}), dest) == 0x401070
+
+
+def test_extract_dest_address_import_name_before_constant():
+    # .constant is the GOT slot; the import name resolves to the real entry
+    dest = FExpr("MLIL_IMPORT", "memcpy", constant=0x600000)
+    dest.name = "memcpy"
+    bv = FBVSym({}, funcs={0x401050: _leaf_func("memcpy", 0x401050)},
+                sym_names={"memcpy": 0x401050})
+    assert te.extract_dest_address(bv, dest) == 0x401050
+
+
+def test_extract_dest_address_unresolvable_returns_none():
+    dest = FExpr("MLIL_VAR_SSA", "fp#1")  # no constant, no resolvable name
+    assert te.extract_dest_address(FBV({}), dest) is None
+
+
+# -- targets_from_pvs -------------------------------------------------------
+
+def test_targets_from_pvs_constant():
+    assert te.targets_from_pvs(FPVS("ConstantPointerValue", value=0x401000)) == [0x401000]
+
+
+def test_targets_from_pvs_in_set_sorted_unique():
+    assert te.targets_from_pvs(FPVS("InSetOfValues", values=[0x300, 0x100, 0x300, 0x200])) == [0x100, 0x200, 0x300]
+
+
+def test_targets_from_pvs_lookup_table_mapping():
+    assert te.targets_from_pvs(FPVS("LookupTableValue", mapping={0: 0x500, 1: 0x600})) == [0x500, 0x600]
+
+
+def test_targets_from_pvs_none():
+    assert te.targets_from_pvs(None) == []
+
+
+# -- follow_thunk -----------------------------------------------------------
+
+def test_follow_thunk_single_tailcall_resolves_target():
+    real = _leaf_func("real_impl", 0x401200)
+    thunk = _tailcall_thunk("j_real_impl", 0x401100, 0x401200)
+    bv = FBV({}, funcs={0x401200: real, 0x401100: thunk})
+    assert te.follow_thunk(bv, thunk) is real
+
+
+def test_follow_thunk_non_thunk_returns_none():
+    real = _leaf_func("real_impl", 0x401200)
+    bv = FBV({}, funcs={0x401200: real})
+    assert te.follow_thunk(bv, real) is None
+
+
+def test_follow_thunk_self_loop_returns_none():
+    # a PLT stub whose tailcall resolves back to itself must not recurse forever
+    selfish = _tailcall_thunk("plt_stub", 0x401100, 0x401100)
+    bv = FBV({}, funcs={0x401100: selfish})
+    assert te.follow_thunk(bv, selfish) is None
+
+
+# -- resolve_call_target ----------------------------------------------------
+
+def test_resolve_call_target_direct_const():
+    target = _leaf_func("read", 0x401070)
+    call = FInstr(0, 0x401000, "MLIL_CALL_SSA", "0x401070()",
+                  dest=FExpr("MLIL_CONST_PTR", "0x401070", constant=0x401070))
+    bv = FBV({}, funcs={0x401070: target})
+    rt = te.resolve_call_target(bv, call)
+    assert rt.function is target
+    assert rt.address == 0x401070
+
+
+def test_resolve_call_target_import_name():
+    target = _leaf_func("memcpy", 0x401050)
+    dest = FExpr("MLIL_IMPORT", "memcpy", constant=0x600000)
+    dest.name = "memcpy"
+    call = FInstr(0, 0x401000, "MLIL_CALL_SSA", "memcpy()", dest=dest)
+    bv = FBVSym({}, funcs={0x401050: target}, sym_names={"memcpy": 0x401050})
+    rt = te.resolve_call_target(bv, call)
+    assert rt.function is target
+
+
+def test_resolve_call_target_follows_thunk_when_requested():
+    real = _leaf_func("real_impl", 0x401200)
+    thunk = _tailcall_thunk("j_real_impl", 0x401100, 0x401200)
+    call = FInstr(0, 0x401000, "MLIL_CALL_SSA", "0x401100()",
+                  dest=FExpr("MLIL_CONST_PTR", "0x401100", constant=0x401100))
+    bv = FBV({}, funcs={0x401100: thunk, 0x401200: real})
+    assert te.resolve_call_target(bv, call, follow_thunks=False).function is thunk
+    assert te.resolve_call_target(bv, call, follow_thunks=True).function is real
+
+
+def test_resolve_call_target_unresolved_indirect():
+    call = FInstr(0, 0x70c, "MLIL_CALL_SSA", "fp()", dest=FExpr("MLIL_VAR_SSA", "fp#1"))
+    rt = te.resolve_call_target(FBV({}), call)
+    assert rt.address is None
+    assert rt.function is None

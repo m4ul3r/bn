@@ -22,6 +22,7 @@ API behaviour verified against /opt/binaryninja (see the design's spike):
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -166,6 +167,214 @@ def _instr_dict(ins: Any, reason: str | None = None, tainted: list[str] | None =
     if tainted is not None:
         out["tainted"] = tainted
     return out
+
+
+# --------------------------------------------------------------------------
+# unified call-target / thunk resolver
+# --------------------------------------------------------------------------
+# Canonical home (issue #7) for "what does this call target, through thunks?".
+# Faithful ports of the trace resolver that lived in bridge.py; the bridge now
+# delegates here. Kept import-free of binaryninja: all BN access is via
+# duck-typed methods on the passed objects, and symbol-table lookups are guarded
+# so the resolver degrades gracefully against the synthetic fakes the tests use.
+
+
+def _mlil_ssa(fn: Any) -> Any:
+    """MLIL SSA form of a function, tolerating the ``mlil`` vs ``medium_level_il``
+    attribute alias (real BN exposes both; the test fakes expose only ``mlil``)."""
+    mlil = getattr(fn, "mlil", None) or getattr(fn, "medium_level_il", None)
+    if mlil is None:
+        return None
+    return getattr(mlil, "ssa_form", None)
+
+
+def _ssa_instructions(ssaf: Any) -> list[Any]:
+    """All SSA instructions, preferring ``.instructions`` and falling back to
+    flattening ``.basic_blocks`` (both are valid on real BN)."""
+    try:
+        return list(ssaf.instructions)
+    except Exception:
+        out: list[Any] = []
+        for block in (getattr(ssaf, "basic_blocks", None) or []):
+            try:
+                out.extend(list(block))
+            except Exception:
+                continue
+        return out
+
+
+def _symbols_by_name(bv: Any, name: str) -> list[Any]:
+    fn = getattr(bv, "get_symbols_by_name", None)
+    if fn is None:
+        return []
+    try:
+        return list(fn(name) or [])
+    except Exception:
+        return []
+
+
+def _symbol_by_raw_name(bv: Any, name: str) -> Any:
+    fn = getattr(bv, "get_symbol_by_raw_name", None)
+    if fn is None:
+        return None
+    try:
+        return fn(name)
+    except Exception:
+        return None
+
+
+def extract_dest_address(bv: Any, dest: Any) -> int | None:
+    """Numeric address of a call/tailcall destination expression, or None.
+
+    Handles a raw int, MLIL_CONST_PTR (``.constant``), and MLIL_IMPORT. For
+    imports the symbol name is resolved *before* ``.constant`` because
+    ``.constant`` is the GOT slot, not the function entry point.
+    """
+    try:
+        return int(dest)
+    except (ValueError, TypeError):
+        pass
+    name = getattr(dest, "name", None) or str(dest)
+    if name:
+        for sym in _symbols_by_name(bv, name):
+            fn = bv.get_function_at(sym.address)
+            if fn is not None:
+                return int(fn.start)
+        sym = _symbol_by_raw_name(bv, name)
+        if sym is not None:
+            fn = bv.get_function_at(sym.address)
+            if fn is not None:
+                return int(fn.start)
+    addr = getattr(dest, "constant", None)
+    if addr is not None:
+        return int(addr)
+    return None
+
+
+def targets_from_pvs(pvs: Any) -> list[int]:
+    """Extract concrete call-target addresses from a PossibleValueSet.
+
+    Handles constants, in-set values, and lookup tables (function-pointer
+    tables expose ``.mapping`` {idx: addr} / ``.table``, not ``.values``).
+    """
+    if pvs is None:
+        return []
+    tname = str(getattr(getattr(pvs, "type", None), "name", "") or "")
+    out: list[int] = []
+
+    def _add(v):
+        try:
+            out.append(int(v))
+        except Exception:
+            pass
+
+    if tname in {"ConstantValue", "ConstantPointerValue", "ImportedAddressValue", "ExternalPointerValue"}:
+        _add(getattr(pvs, "value", None))
+    elif tname == "InSetOfValues":
+        for v in (getattr(pvs, "values", None) or []):
+            _add(v)
+    elif tname == "LookupTableValue":
+        mapping = getattr(pvs, "mapping", None)
+        if isinstance(mapping, dict):
+            for v in mapping.values():
+                _add(v)
+        else:
+            for entry in (getattr(pvs, "table", None) or []):
+                _add(getattr(entry, "to", None))
+    return sorted({a for a in out if a})
+
+
+def follow_thunk(bv: Any, fn: Any) -> Any | None:
+    """If *fn* is a single-instruction tailcall thunk, return its real target.
+
+    Recursively follows thunk chains (PLT stubs, GCC veneers) with self-loop
+    protection. Returns None when *fn* is not a thunk.
+    """
+    ssa = _mlil_ssa(fn)
+    if ssa is None:
+        return None
+    instructions = _ssa_instructions(ssa)
+    if len(instructions) != 1:
+        return None
+    insn = instructions[0]
+    if "TAILCALL" not in op_name(insn):
+        return None
+    dest = getattr(insn, "dest", None)
+    if dest is None:
+        return None
+    addr = extract_dest_address(bv, dest)
+    if addr is None:
+        return None
+    target = bv.get_function_at(addr)
+    if target is None:
+        target = bv.get_function_at(addr & ~1)
+    if target is not None and int(getattr(target, "start", -1)) != int(getattr(fn, "start", -2)):
+        return follow_thunk(bv, target) or target
+    return None
+
+
+@dataclass
+class ResolvedTarget:
+    """Result of resolving a call instruction's callee."""
+    address: int | None         # entry of the resolved function (post-thunk if followed)
+    function: Any | None        # bv function object, or None
+    via: str | None = None      # "direct" | "import" | "thunk" | None
+    thunk_chain: list[int] = field(default_factory=list)  # addresses traversed while following thunks
+
+
+def resolve_call_target(bv: Any, call_insn: Any, *, follow_thunks: bool = False) -> ResolvedTarget:
+    """Resolve a call instruction's callee to a function.
+
+    Mirrors the trace resolver: direct numeric/``.constant`` dest first, then
+    import-name resolution (the primary path for PLT stubs, where ``.constant``
+    is a GOT slot), then optional thunk following. Value-sets and agent-supplied
+    resolve-maps are deliberately *not* consulted here — those are forward-taint
+    concerns (see ``targets_from_pvs`` and the engine's resolve_map handling).
+    """
+    dest = getattr(call_insn, "dest", None)
+    if dest is None:
+        return ResolvedTarget(None, None)
+
+    fn = None
+    via: str | None = None
+    try:
+        addr = int(dest)
+    except (ValueError, TypeError):
+        addr = getattr(dest, "constant", None)
+    if addr is not None and addr != 0:
+        fn = bv.get_function_at(int(addr))
+        if fn is None:
+            fn = bv.get_function_at(int(addr) & ~1)
+        if fn is not None:
+            via = "direct"
+
+    if fn is None:
+        name = getattr(dest, "name", None)
+        if name:
+            for sym in _symbols_by_name(bv, name):
+                fn = bv.get_function_at(sym.address)
+                if fn is not None:
+                    via = "import"
+                    break
+            if fn is None:
+                sym = _symbol_by_raw_name(bv, name)
+                if sym is not None:
+                    fn = bv.get_function_at(sym.address)
+                    if fn is not None:
+                        via = "import"
+
+    if fn is None:
+        return ResolvedTarget(None, None)
+
+    thunk_chain: list[int] = []
+    if follow_thunks:
+        resolved = follow_thunk(bv, fn)
+        if resolved is not None and resolved is not fn:
+            thunk_chain = [int(getattr(fn, "start", 0))]
+            fn = resolved
+            via = "thunk"
+
+    return ResolvedTarget(int(getattr(fn, "start", 0)), fn, via, thunk_chain)
 
 
 # --------------------------------------------------------------------------
@@ -640,36 +849,9 @@ class TaintEngine:
         return out
 
     def _call_targets_from_pvs(self, pvs: Any) -> list[int]:
-        """Extract concrete call-target addresses from a PossibleValueSet.
-
-        Handles constants, in-set values, and lookup tables (function-pointer
-        tables expose ``.mapping`` {idx: addr} / ``.table``, not ``.values``).
-        """
-        if pvs is None:
-            return []
-        tname = str(getattr(getattr(pvs, "type", None), "name", "") or "")
-        out: list[int] = []
-
-        def _add(v):
-            try:
-                out.append(int(v))
-            except Exception:
-                pass
-
-        if tname in {"ConstantValue", "ConstantPointerValue", "ImportedAddressValue", "ExternalPointerValue"}:
-            _add(getattr(pvs, "value", None))
-        elif tname == "InSetOfValues":
-            for v in (getattr(pvs, "values", None) or []):
-                _add(v)
-        elif tname == "LookupTableValue":
-            mapping = getattr(pvs, "mapping", None)
-            if isinstance(mapping, dict):
-                for v in mapping.values():
-                    _add(v)
-            else:
-                for entry in (getattr(pvs, "table", None) or []):
-                    _add(getattr(entry, "to", None))
-        return sorted({a for a in out if a})
+        """Concrete call-target addresses from a PossibleValueSet (delegates to
+        the module-level :func:`targets_from_pvs`)."""
+        return targets_from_pvs(pvs)
 
     def _run_forward(self, func: Any, locators: list[dict[str, Any]], depth: int,
                      max_depth: int, *, top: bool) -> dict[str, Any]:

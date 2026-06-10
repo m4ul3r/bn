@@ -3740,108 +3740,22 @@ class BinaryNinjaBridge:
     def _resolve_callee(self, bv, call_insn):
         """Resolve a call instruction's callee to a BN function, or None.
 
-        Follows thunks/veneers (single-instruction tailcalls) to their real
-        target so interprocedural tracing works through PLT stubs and GCC thunks.
+        Thin wrapper over the canonical resolver in ``taint_engine``; follows
+        thunks/veneers (single-instruction tailcalls) to their real target so
+        interprocedural tracing works through PLT stubs and GCC thunks.
         """
-        dest = getattr(call_insn, "dest", None)
-        if dest is None:
-            return None
-
-        fn = None
-        # Try direct numeric address first
-        try:
-            addr = int(dest)
-        except (ValueError, TypeError):
-            addr = getattr(dest, "constant", None)
-        if addr is not None and addr != 0:
-            fn = bv.get_function_at(int(addr))
-            if fn is None:
-                fn = bv.get_function_at(int(addr) & ~1)
-
-        # Try name-based resolution for imports (MediumLevelILImport).
-        # This is the primary path for PLT stubs where .constant gives a GOT
-        # slot address rather than the function entry point.
-        if fn is None:
-            name = getattr(dest, "name", None)
-            if name:
-                for sym in list(bv.get_symbols_by_name(name)):
-                    fn = bv.get_function_at(sym.address)
-                    if fn is not None:
-                        break
-                if fn is None:
-                    sym = bv.get_symbol_by_raw_name(name)
-                    if sym is not None:
-                        fn = bv.get_function_at(sym.address)
-
-        if fn is None:
-            return None
-        # Follow thunk/veneer: if the function is a single tailcall, resolve its target
-        return self._resolve_thunk(bv, fn) or fn
+        return _taint.resolve_call_target(bv, call_insn, follow_thunks=True).function
 
     def _resolve_thunk(self, bv, fn):
-        """If fn is a single-instruction tailcall thunk, return its real target."""
-        mlil = getattr(fn, "medium_level_il", None)
-        if mlil is None:
-            return None
-        ssa = mlil.ssa_form
-        if ssa is None:
-            return None
-        instructions = []
-        for block in getattr(ssa, "basic_blocks", []) or []:
-            instructions.extend(list(block))
-        if len(instructions) != 1:
-            return None
-        insn = instructions[0]
-        if "TAILCALL" not in self._il_op_name(insn):
-            return None
-        dest = getattr(insn, "dest", None)
-        if dest is None:
-            return None
-        addr = self._extract_dest_address(bv, dest)
-        if addr is None:
-            return None
-        target = bv.get_function_at(addr)
-        if target is None:
-            target = bv.get_function_at(addr & ~1)
-        if target is not None and target.start != fn.start:
-            return self._resolve_thunk(bv, target) or target
-        return None
+        """If fn is a single-instruction tailcall thunk, return its real target
+        (delegates to ``taint_engine.follow_thunk``)."""
+        return _taint.follow_thunk(bv, fn)
 
     @staticmethod
     def _extract_dest_address(bv, dest):
-        """Extract a numeric address from a call/tailcall destination expression.
-
-        Handles:
-        - raw int
-        - MLIL_CONST_PTR with .constant
-        - MLIL_IMPORT with a resolvable name
-
-        For MLIL_IMPORT, name lookup is tried BEFORE .constant because
-        .constant returns the GOT slot address, not the function entry point.
-        """
-        try:
-            return int(dest)
-        except (ValueError, TypeError):
-            pass
-        # For MLIL_IMPORT, resolve by symbol name first (the .constant is
-        # the GOT slot, not the function address).
-        name = getattr(dest, "name", None) or str(dest)
-        if name:
-            for sym in list(bv.get_symbols_by_name(name)):
-                fn = bv.get_function_at(sym.address)
-                if fn is not None:
-                    return int(fn.start)
-            sym = bv.get_symbol_by_raw_name(name)
-            if sym is not None:
-                fn = bv.get_function_at(sym.address)
-                if fn is not None:
-                    return int(fn.start)
-        # For MLIL_CONST_PTR and other constant-bearing expressions,
-        # fall back to .constant.
-        addr = getattr(dest, "constant", None)
-        if addr is not None:
-            return int(addr)
-        return None
+        """Numeric address of a call/tailcall destination expression (delegates
+        to ``taint_engine.extract_dest_address``)."""
+        return _taint.extract_dest_address(bv, dest)
 
     def _find_return_vars(self, ssa_func, bv=None, _visited=None) -> list[SSAVariable]:
         """Find SSA variables that feed into RET instructions in a function.
