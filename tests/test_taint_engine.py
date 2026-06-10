@@ -1042,6 +1042,67 @@ def test_backward_arg_with_no_variable_reads_says_so(process_func, models):
         engine.backward(process_func, [te.parse_locator("arg:memcpy:1")])
 
 
+def test_parse_locator_rejects_negative_arg_index():
+    # arg:<callee>:-1 must be rejected, not silently seed params[-1].
+    with pytest.raises(te.TaintError, match=r"index must be >= 0"):
+        te.parse_locator("arg:memcpy:-1")
+
+
+def test_parse_locator_rejects_negative_param_index():
+    with pytest.raises(te.TaintError, match=r"index must be >= 0"):
+        te.parse_locator("param:-2")
+
+
+def test_parse_locator_rejects_non_integer_index():
+    with pytest.raises(te.TaintError, match=r"must be an integer"):
+        te.parse_locator("arg:memcpy:two")
+
+
+def test_backward_negative_index_guarded_for_direct_callers(process_func, models):
+    # A programmatic caller that skips parse_locator and builds the dict directly
+    # must still be rejected before the idx < len(params) check.
+    bv = FBV({0x401070: "read", 0x401080: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    with pytest.raises(te.TaintError, match=r"must be >= 0"):
+        engine.backward(process_func, [{"kind": "arg", "callee": "memcpy", "index": -1}])
+
+
+def test_backward_per_sink_isolation_keeps_resolvable_slices(process_func, models):
+    # memcpy is called here; strcpy is not. The un-seedable strcpy sink must not
+    # discard the valid memcpy slice — exit with partial results plus a note.
+    bv = FBV({0x401070: "read", 0x401080: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.backward(
+        process_func,
+        [te.parse_locator("arg:memcpy:2"), te.parse_locator("arg:strcpy:0")],
+    )
+    assert result["slices"], "the resolvable memcpy slice must survive"
+    assert all(sl["sink"]["callee"] == "memcpy" for sl in result["slices"])
+    status = {s.get("callee"): s for s in result["sink_status"]}
+    assert status["memcpy"]["seeded"] is True
+    assert status["strcpy"]["seeded"] is False
+    assert "no call to 'strcpy'" in status["strcpy"]["note"]
+
+
+def test_backward_all_sinks_unseedable_is_hard_error(process_func, models):
+    bv = FBV({0x401070: "read", 0x401080: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    with pytest.raises(te.TaintError, match=r"no backward seed resolved for any sink"):
+        engine.backward(
+            process_func,
+            [te.parse_locator("arg:strcpy:0"), te.parse_locator("arg:fread:0")],
+        )
+
+
+def test_backward_single_unseedable_sink_preserves_original_error(process_func, models):
+    # A single failing sink keeps the precise original message (not the
+    # multi-sink aggregate), preserving the established single-sink UX.
+    bv = FBV({0x401070: "read", 0x401080: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    with pytest.raises(te.TaintError, match=r"no call to 'strcpy' found"):
+        engine.backward(process_func, [te.parse_locator("arg:strcpy:0")])
+
+
 def test_backward_walk_truncation_recorded(process_func, models):
     # an engine-level def-chain cap of 1 cannot reach the end of the
     # rdx_1#1 <- len#2 <- len#1 chain; the cut must surface in assumptions
