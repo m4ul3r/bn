@@ -506,7 +506,10 @@ def _render_xrefs_text(value: Any, limit: int | None = None) -> str:
                 suffix = f"({len(sites)} sites: {', '.join(sites)})"
             rendered.append(f"  {caller_addr}  {caller_name}  {suffix}")
         if limit and len(groups) > limit:
-            rendered.append(f"  ... {len(groups) - limit} more functions (use --limit or --format json)")
+            rendered.append(
+                f"  ... {len(groups) - limit} more functions "
+                "(increase --limit or use --format json for all)"
+            )
         return rendered
 
     lines = [f"xrefs to {value.get('address', '<unknown>')} ({total_code} code, {total_data} data)", ""]

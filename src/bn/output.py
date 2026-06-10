@@ -143,6 +143,22 @@ def render_artifact_envelope(payload: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def render_envelope(payload: dict[str, Any], fmt: str) -> str:
+    """Render a spill/``--out`` artifact envelope honoring the requested format.
+
+    The envelope must itself be valid JSON under ``json``/``ndjson`` so that
+    ``bn <cmd> --format json | jq`` keeps working when output spills to disk or
+    is redirected with ``--out`` (the spilled/written file already holds the
+    real payload in the requested format). Only ``text`` gets the human-readable
+    ``key: value`` form.
+    """
+    if fmt == "json":
+        return json.dumps(payload, indent=2, sort_keys=True, default=_json_default) + "\n"
+    if fmt == "ndjson":
+        return json.dumps(payload, sort_keys=True, default=_json_default) + "\n"
+    return render_artifact_envelope(payload)
+
+
 def write_output_result(
     value: Any,
     *,
@@ -172,7 +188,7 @@ def write_output_result(
             spilled=False,
         )
         return OutputWriteResult(
-            rendered=render_artifact_envelope(artifact),
+            rendered=render_envelope(artifact, fmt),
             artifact=artifact,
             spilled=False,
         )
@@ -201,7 +217,7 @@ def write_output_result(
         spilled=True,
     )
     return OutputWriteResult(
-        rendered=render_artifact_envelope(artifact),
+        rendered=render_envelope(artifact, fmt),
         artifact=artifact,
         spilled=True,
     )

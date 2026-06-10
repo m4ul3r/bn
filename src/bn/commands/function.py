@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-from ..cli import _call, _mutation_exit_code, _parse_line_range, arg, command, mutex
+from ..cli import _call, _mutation_exit_code, _parse_line_range, _positive_int, arg, command, mutex
 from ..formatters import (
     _render_callsites_text,
     _render_evidence_xrefs_text,
@@ -269,7 +269,7 @@ def _disasm(args: argparse.Namespace) -> int:
                  help="Function name or address (hex 0x.. or decimal) to find inbound refs to"),
              arg("--field", dest="field_spec",
                  help="Struct field xref spec (e.g., TrackRowCell.tile_type)"),
-             arg("--limit", type=int, default=None,
+             arg("--limit", type=_positive_int, default=None,
                  help="Max caller/data-ref groups to show (text output only)"),
          ])
 def _xrefs(args: argparse.Namespace) -> int:
@@ -395,7 +395,7 @@ def _evidence_function(args: argparse.Namespace) -> int:
          target=True,
          args=[
              arg("identifier", help="Function name or address (hex 0x.. or decimal) to find inbound refs to"),
-             arg("--limit", type=int, default=None,
+             arg("--limit", type=_positive_int, default=None,
                  help="Max number of refs per code/data bucket to show in text output"),
          ])
 def _evidence_xrefs(args: argparse.Namespace) -> int:
@@ -443,7 +443,7 @@ def _evidence_table(args: argparse.Namespace) -> int:
          target=True,
          args=[
              arg("query", help="Message/type-name string substring to locate"),
-             arg("--limit", type=int, default=20,
+             arg("--limit", type=_positive_int, default=20,
                  help="Maximum matching strings to summarize"),
              arg("--table-entries", type=int, default=6,
                  help="Pointer entries to show around metadata data refs"),
@@ -468,7 +468,7 @@ def _evidence_message(args: argparse.Namespace) -> int:
          help="Summarize constructor/destructor pointer sections such as .init_array and .ctors",
          target=True,
          args=[
-             arg("--limit", type=int, default=64,
+             arg("--limit", type=_positive_int, default=64,
                  help="Maximum entries to show per constructor/destructor section"),
          ])
 def _evidence_init(args: argparse.Namespace) -> int:

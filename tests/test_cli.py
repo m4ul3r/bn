@@ -1702,8 +1702,42 @@ def test_bundle_function_out_path_is_bridge_owned(monkeypatch, tmp_path, capsys)
     assert captured["params"]["out_path"] == str(out_path)
     assert not out_path.exists()
     output = capsys.readouterr().out
-    assert f"path: {out_path}" in output
-    assert "spilled: false" in output
+    # bundle function defaults to --format json; the bridge-owned --out envelope
+    # printed to stdout must itself be valid JSON, not a text key:value block
+    # (issue #10).
+    payload = json.loads(output)
+    assert payload["artifact_path"] == str(out_path)
+    assert payload["spilled"] is False
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["function", "list", "--target", "active", "--limit", "-1"],
+        ["function", "list", "--target", "active", "--limit", "0"],
+        ["function", "list", "--target", "active", "--offset", "-1"],
+        ["types", "--target", "active", "--limit", "-2"],
+        ["xrefs", "sub_401000", "--target", "active", "--limit", "-1"],
+        ["callsites", "sub_401000", "--target", "active", "--limit", "0"],
+    ],
+)
+def test_negative_or_zero_pagination_args_rejected_with_exit_2(argv):
+    # Negative/zero --limit (and negative --offset) must be rejected at the arg
+    # layer with argparse's exit code 2, never leak into Python negative-slice
+    # semantics downstream (issue #9; #15 types --limit 0). Covers both the
+    # shared paged path (function list / types) and per-command renderer limits
+    # (xrefs / callsites).
+    parser = bn.cli.build_parser()
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(argv)
+    assert excinfo.value.code == 2
+
+
+def test_positive_pagination_args_still_accepted():
+    parser = bn.cli.build_parser()
+    ns = parser.parse_args(["function", "list", "--target", "active", "--limit", "5", "--offset", "0"])
+    assert ns.limit == 5
+    assert ns.offset == 0
 
 
 def test_removed_experimental_commands_are_not_present():

@@ -50,16 +50,18 @@ def test_write_output_spills_large_payload(tmp_path, monkeypatch):
         spill_token_limit=256,
     )
 
-    envelope = _parse_envelope(rendered)
+    # Under --format json the stdout envelope must itself be valid JSON (issue #10)
+    # so that `bn <cmd> --format json | jq` keeps working at spill scale.
+    envelope = json.loads(rendered)
     # Spills live under the (BN_CACHE_DIR-overridable) cache root, not /tmp.
-    assert envelope["path"].startswith(str(tmp_path / "spills"))
-    assert envelope["spilled"] == "true"
-    artifact_text = Path(envelope["path"]).read_text()
+    assert envelope["artifact_path"].startswith(str(tmp_path / "spills"))
+    assert envelope["spilled"] is True
+    artifact_text = Path(envelope["artifact_path"]).read_text()
     assert envelope["tokenizer"] == "estimate"
     assert int(envelope["tokens"]) == _token_count(artifact_text)
     # Filename carries pid + random component so parallel agents spilling in
     # the same second can't clobber each other.
-    name = Path(envelope["path"]).name
+    name = Path(envelope["artifact_path"]).name
     assert re.fullmatch(rf"large-\d{{6}}-{os.getpid()}-[0-9a-f]{{4}}\.json", name)
 
 
@@ -78,6 +80,37 @@ def test_write_output_spills_text_payload_with_txt_suffix(tmp_path, monkeypatch)
     envelope = _parse_envelope(rendered)
     assert envelope["path"].endswith(".txt")
     assert envelope["spilled"] == "true"
+
+
+def test_text_spill_envelope_stays_plaintext(tmp_path, monkeypatch):
+    # Only json/ndjson change to a machine-readable envelope; text keeps the
+    # human-readable key:value form (issue #10 must not regress text output).
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    payload = "\n".join(f"line {index} distinctive" for index in range(1000))
+
+    rendered = write_output(
+        payload, fmt="text", out_path=None, stem="t", spill_token_limit=256
+    )
+
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(rendered)
+    envelope = _parse_envelope(rendered)
+    assert envelope["spilled"] == "true"
+    assert envelope["path"].endswith(".txt")
+
+
+def test_ndjson_spill_envelope_is_one_json_line(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    payload = [{"i": index} for index in range(1000)]
+
+    rendered = write_output(
+        payload, fmt="ndjson", out_path=None, stem="nd", spill_token_limit=256
+    )
+
+    assert len(rendered.splitlines()) == 1
+    envelope = json.loads(rendered)
+    assert envelope["spilled"] is True
+    assert envelope["artifact_path"].endswith(".ndjson")
 
 
 def test_write_output_uses_token_limit_not_byte_limit(tmp_path, monkeypatch):
@@ -109,7 +142,7 @@ def test_write_output_spill_filenames_do_not_collide(tmp_path, monkeypatch):
             stem="same-stem",
             spill_token_limit=256,
         )
-        paths.add(_parse_envelope(rendered)["path"])
+        paths.add(json.loads(rendered)["artifact_path"])
 
     assert len(paths) == 3
 
@@ -174,9 +207,9 @@ def test_write_output_reports_exact_tokens_for_explicit_out_path(tmp_path, monke
         stem="explicit-out",
     )
 
-    envelope = _parse_envelope(rendered)
+    envelope = json.loads(rendered)
     artifact_text = out_path.read_text()
-    assert envelope["path"] == str(out_path)
-    assert envelope["spilled"] == "false"
+    assert envelope["artifact_path"] == str(out_path)
+    assert envelope["spilled"] is False
     assert envelope["tokenizer"] == "estimate"
     assert int(envelope["tokens"]) == _token_count(artifact_text)

@@ -12,7 +12,7 @@ from .formatters import (
     _format_operation_result,  # noqa: F401  -- re-exported for tests/scripts that monkeypatch bn.cli
     _render_target_choices,
 )
-from .output import render_artifact_envelope, write_output_result
+from .output import render_envelope, write_output_result
 
 # The names below are re-exported through this module on purpose: command
 # handlers in bn.commands access them as `cli.<name>` so tests (and scripts)
@@ -331,7 +331,7 @@ def _render_result(
         artifact = dict(value)
         artifact.setdefault("ok", True)
         artifact.setdefault("spilled", False)
-        sys.stdout.write(render_artifact_envelope(artifact))
+        sys.stdout.write(render_envelope(artifact, fmt))
         return
 
     result = write_output_result(value, fmt=fmt, out_path=out_path, stem=stem)
@@ -491,6 +491,36 @@ def _int_or_hex(value: str) -> int:
         )
 
 
+def _positive_int(value: str) -> int:
+    """Argparse type for count flags like ``--limit``: an integer >= 1.
+
+    Rejecting non-positive counts at the parse layer (argparse exit code 2)
+    stops a negative value from leaking into Python's negative-slice semantics
+    downstream -- which silently drops trailing items and inverts the
+    truncation math (a ``--limit -1`` would print "N more" counts that exceed
+    the stated total). Zero is rejected too: a count of nothing is always a
+    mistake, never "unlimited" (that is expressed by omitting the flag).
+    """
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    if parsed < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive integer (>= 1), got {parsed}")
+    return parsed
+
+
+def _non_negative_int(value: str) -> int:
+    """Argparse type for index flags like ``--offset``: an integer >= 0."""
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a non-negative integer, got {value!r}")
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"must be a non-negative integer (>= 0), got {parsed}")
+    return parsed
+
+
 def _pick(positional: Any, flag: Any, label: str, *, required: bool = True) -> Any:
     """Resolve a value supplied either positionally or via a flag alias.
 
@@ -526,13 +556,13 @@ def _parse_line_range(value: str) -> tuple[int, int]:
 def _add_paged_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--offset",
-        type=int,
+        type=_non_negative_int,
         default=0,
         help="Index of the first item to return (default: 0)",
     )
     parser.add_argument(
         "--limit",
-        type=int,
+        type=_positive_int,
         default=100,
         help="Maximum number of items to return (default: 100)",
     )
