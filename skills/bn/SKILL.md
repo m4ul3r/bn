@@ -121,7 +121,7 @@ Pagination: `--limit` / `--offset` on list commands.
 
 ```bash
 bn target info
-bn function list [--min-address 0x401000 --max-address 0x40ffff]
+bn function list [--count] [--min-address 0x401000 --max-address 0x40ffff]
 bn function search attachment
 bn function search --regex 'attach|detach|follow'
 bn function info <fn> [--verbose]
@@ -154,7 +154,7 @@ bn comment get   --address 0x... | --function <fn>
 
 Notes:
 
-- `bn function search` is case-insensitive substring; add `--regex` for regular expressions. `function list` and `function search` both accept `--min-address` / `--max-address`.
+- `bn function search` is case-insensitive substring; add `--regex` for regular expressions. `function list` and `function search` both accept `--min-address` / `--max-address`. `bn function list --count` returns just the total function count (fast binary sizing) instead of the listing.
 - `bn xrefs` accepts a function name *or* a hex/decimal address. Text groups refs by caller (`code refs: 12 sites across 4 functions`); JSON adds `caller_function: {address, name}` so an `xrefs → --within-file` pipeline survives duplicate symbol names. Use `bn xrefs` for inbound references; reach for `bn callsites` when you need exact return-address recovery and local context.
 - `bn decompile` renders Binary Ninja's **Pseudo C** (the same text the GUI shows), comments inline. It omits the address gutter by default — add `--addresses` when you need it (e.g. for `bn comment set --address`). For the underlying IL instead, use `bn il --view {hlil|mlil|llil}`.
 - **Skipped (oversize) functions.** Binary Ninja skips analysis on functions that exceed its size/time limits and renders only a stub ("…taking too long to analyze… Loading…"). `bn decompile` detects this (`func.analysis_skipped`) and appends a `warning:` (and sets `analysis_skipped: true` in JSON) so you never mistake a stub for a real body. Pass `--force-analysis` to override the skip and reanalyze just that function before decompiling — it returns the full body and sets `analysis_forced: true`. It can be slow on very large functions and takes the **write lock** (it mutates analysis state), so avoid it on a bridge other agents are actively reading.

@@ -11,6 +11,8 @@ Use this skill when the user wants to find vulnerabilities, audit for bugs, chec
 
 Start by mapping what the binary does and where untrusted data enters:
 
+> **No imports? (static / stripped firmware.)** If `bn imports` comes back empty or near-empty, the binary is statically linked and the import-first steps below won't bite — `bn xrefs strcpy` / `function search strcpy` return nothing when no function is *named* `strcpy`. Use the **Stripped / static lane** at the end of this section instead.
+
 1. **Dangerous imports** — scan for functions with known vulnerability history:
    ```bash
    bn imports
@@ -39,6 +41,47 @@ Start by mapping what the binary does and where untrusted data enters:
    bn sections
    ```
    Look for writable+executable sections (W+X) — these are high-value targets for code injection. Check section sizes and ranges to understand the binary's memory layout.
+
+### Stripped / static lane (no imports, no symbols)
+
+On stripped static firmware (busybox, embedded ARM/MIPS), `bn imports` is empty and `bn xrefs strcpy` / `function search strcpy` return nothing — there are no import names and no function names. Invert the workflow: enter from *data*, not from imported symbols.
+
+1. **Confirm the case.**
+   ```bash
+   bn target info               # static? stripped? arch (ARM/Thumb/MIPS)?
+   bn imports                   # empty / near-empty => statically linked
+   bn function list --count     # thousands of sub_XXXX names = stripped
+   ```
+   A few-thousand-function count with `sub_XXXX` names and an empty import table is the signature.
+
+2. **Enter from strings.** Strings are the surviving attack-surface map — config paths, format strings, command/applet names, protocol keywords. The first column of `bn strings` output is each string's address; pivot it to the code that uses it:
+   ```bash
+   bn strings --regex --query '/etc/|/bin/|%s|%n|password|http|telnet|login' --no-crt --min-length 4
+   bn xrefs <string-address>    # who references this string
+   bn decompile <referencing-fn>
+   ```
+   This `strings -> xrefs <addr> -> decompile` chain is the reliable spine when name/import search returns `none`.
+
+3. **Recover the libc-like sinks by shape.** You can't `bn xrefs strcpy` if strcpy has no name — so identify the unnamed helpers behaviorally, then name them, which restores the source->sink tracing below. As you read the functions strings led you to, watch for a helper called from a copy/format pattern:
+   - libc primitives (memcpy, strcpy, strlen, sprintf) are small, leaf/near-leaf, and called from *many* sites. Run `bn xrefs <sub_addr>` on a candidate — a high inbound count plus a tiny body is the tell.
+   - Decompile the candidate, recognize the idiom (byte-copy loop, copy-until-NUL, scan-for-zero), then `bn symbol rename <addr> memcpy --preview`, verify, and apply.
+   - Now `bn xrefs memcpy` works and the Pattern-based audit (below) is back in play.
+
+4. **Walk constructor and dispatch tables.** Static firmware hides entry points the direct-call graph won't show (see bn-re's "Hidden Code Surfaces"):
+   ```bash
+   bn evidence init             # .init_array / constructors (Thumb-normalized)
+   bn evidence table <addr>     # applet / dispatch / fuse_operations tables as fn pointers
+   ```
+
+5. **Confirm widths in disasm.** Stripped + ARM means the decompiler's width/sign story is frequently wrong — confirm field loads (`ldrb` vs `ldr`) in `bn disasm` before concluding off-by-one / truncation (see the width note in the bn skill, §4).
+
+**Worked example — busybox.** BusyBox is an applet multiplexer: `main` dispatches on `argv[0]`/`argv[1]` to applet handlers, so its real attack surface is the applet table plus the strings that name applets:
+```bash
+bn strings --regex --query 'httpd|telnetd|login|/etc/(passwd|shadow)' --no-crt
+bn xrefs <httpd-string-addr>            # -> the httpd applet handler
+bn evidence table <applet-table-addr>  # enumerate every applet entry point
+```
+Then audit each reachable applet (httpd request parsing, telnetd, login) with the source->sink tracing below — now that the sinks have names from step 3.
 
 ## Input Tracing: Sources to Sinks
 

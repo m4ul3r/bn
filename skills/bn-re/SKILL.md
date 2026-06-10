@@ -27,7 +27,7 @@ Start broad, then narrow:
    ```bash
    bn function list
    ```
-   Note the total count, address range, and whether symbols are stripped. A stripped binary with 2000 functions requires different tactics than a symbolicated one with 50.
+   Note the total count, address range, and whether symbols are stripped. A stripped binary with 2000 functions requires different tactics than a symbolicated one with 50. For *vulnerability* work on a stripped static target, see the "Stripped / static lane" in `bn-vr`, which inverts the import-first workflow (strings → string-xref → behavioral sink recovery).
 
 ## Function Triage
 
