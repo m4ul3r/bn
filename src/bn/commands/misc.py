@@ -209,7 +209,15 @@ def _py_exec(args: argparse.Namespace) -> int:
                  help="Apply the whole batch, capture diffs, then revert without committing"),
              arg("manifest", type=Path,
                  help=(
-                     "Path to a JSON manifest: {\"target\": <selector>, \"ops\": [<op>, ...]}. "
+                     "JSON manifest source: a file path, or \"-\" to read from stdin. "
+                     "A quoted heredoc on stdin is the recommended form -- the quoted "
+                     "delimiter makes the whole payload literal, so comments with quotes, "
+                     "apostrophes, $, or parens need no escaping:\n"
+                     "  bn batch apply - <<'BN_EOF'\n"
+                     "  {\"ops\": [{\"op\": \"set_comment\", \"address\": \"0x1000\", "
+                     "\"comment\": \"len isn't checked\"}]}\n"
+                     "  BN_EOF\n"
+                     "Manifest shape: {\"target\": <selector>, \"ops\": [<op>, ...]}. "
                      "Each op is an object with an \"op\" kind plus its fields, e.g. "
                      "{\"op\": \"rename_symbol\", \"identifier\": \"sub_1000\", \"new_name\": \"parse\"} "
                      "or {\"op\": \"set_comment\", \"address\": \"0x1000\", \"comment\": \"...\"}. "
@@ -220,28 +228,48 @@ def _py_exec(args: argparse.Namespace) -> int:
                  )),
          ])
 def _batch_apply(args: argparse.Namespace) -> int:
-    if not args.manifest.exists():
-        raise BridgeError(f"Manifest file not found: {args.manifest}")
+    # "-" reads the manifest from stdin (standard CLI convention), enabling the
+    # quoted-heredoc form that needs no escaping for free-text comments (#104). A
+    # literal file named "-" can still be passed as "./-".
+    from_stdin = str(args.manifest) == "-"
+    if from_stdin:
+        source = "<stdin>"
+        try:
+            raw = sys.stdin.read()
+        except OSError as exc:
+            raise BridgeError(f"Could not read manifest from stdin: {exc}") from None
+        if not raw.strip():
+            raise BridgeError(
+                'No manifest on stdin. Pipe a JSON object {"target": <selector>, '
+                '"ops": [<op>, ...]}, e.g. via a quoted heredoc: '
+                "bn batch apply - <<'BN_EOF' ... BN_EOF"
+            )
+    else:
+        source = f"file {args.manifest}"
+        if not args.manifest.exists():
+            raise BridgeError(f"Manifest file not found: {args.manifest}")
+        try:
+            raw = args.manifest.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise BridgeError(f"Could not read manifest {args.manifest}: {exc}") from None
     try:
-        manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+        manifest = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise BridgeError(f"Invalid JSON in manifest {args.manifest}: {exc}") from None
-    except OSError as exc:
-        raise BridgeError(f"Could not read manifest {args.manifest}: {exc}") from None
+        raise BridgeError(f"Invalid JSON in manifest ({source}): {exc}") from None
     # The manifest must be a JSON object {"target": <sel>, "ops": [...]}. A bare
     # array (an easy mistake) would otherwise crash client-side in _call's
     # dict(params) -- and `manifest["preview"]` below assumes a dict. Validate
     # shape here and raise a clean BridgeError (#48).
     if not isinstance(manifest, dict):
         raise BridgeError(
-            f"Manifest {args.manifest} must be a JSON object "
+            f"Manifest ({source}) must be a JSON object "
             f'{{"target": <selector>, "ops": [<op>, ...]}}, got a '
             f"{type(manifest).__name__}. (A bare list of ops should be wrapped as "
             f'{{"ops": [...]}}.)'
         )
     if not isinstance(manifest.get("ops"), list):
         raise BridgeError(
-            f'Manifest {args.manifest} must have an "ops" array (the list of '
+            f'Manifest ({source}) must have an "ops" array (the list of '
             f"operations to apply)."
         )
     if args.preview:

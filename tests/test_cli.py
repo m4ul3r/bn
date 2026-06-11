@@ -2568,6 +2568,112 @@ def test_batch_apply_manifest_without_ops_clean_error(monkeypatch, capsys, tmp_p
     assert "Traceback" not in err
 
 
+def test_batch_apply_reads_manifest_from_stdin(monkeypatch, capsys):
+    # "-" reads the manifest from stdin, enabling the quoted-heredoc form. A
+    # comment containing ', ", $, and parens must survive verbatim with no
+    # escaping (that is the whole point of a quoted heredoc) (#104).
+    import io
+
+    comment = "len isn't checked; $sp + (a) \"bad\""
+    manifest = (
+        '{"target": "active", "ops": ['
+        '{"op": "set_comment", "address": "0x1000", "comment": "' + comment.replace('"', '\\"') + '"}'
+        "]}"
+    )
+    monkeypatch.setattr("sys.stdin", io.StringIO(manifest))
+
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        captured["op"] = op
+        captured["params"] = params
+        return {"ok": True, "result": {"preview": False, "success": True, "results": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["batch", "apply", "-"])
+
+    assert rc == 0
+    assert captured["op"] == "batch_apply"
+    # The free-text comment reached the bridge byte-for-byte.
+    assert captured["params"]["ops"][0]["comment"] == comment
+
+
+def test_batch_apply_stdin_forwards_preview_flag(monkeypatch):
+    import io
+
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO('{"ops": [{"op": "set_comment", "address": "0x1000", "comment": "x"}]}'),
+    )
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        captured["params"] = params
+        return {"ok": True, "result": {"preview": True, "success": True, "committed": False, "results": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["batch", "apply", "--preview", "-"])
+
+    assert rc == 0
+    assert captured["params"]["preview"] is True
+
+
+def test_batch_apply_empty_stdin_clean_error(monkeypatch, capsys):
+    import io
+
+    monkeypatch.setattr("sys.stdin", io.StringIO("   \n"))
+    monkeypatch.setattr(
+        bn.cli, "send_request",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("bridge should not be contacted")),
+    )
+
+    rc = bn.cli.main(["batch", "apply", "-"])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "No manifest on stdin" in err
+    assert "Traceback" not in err
+
+
+def test_batch_apply_invalid_stdin_json_clean_error(monkeypatch, capsys):
+    import io
+
+    monkeypatch.setattr("sys.stdin", io.StringIO("{not valid json"))
+    monkeypatch.setattr(
+        bn.cli, "send_request",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("bridge should not be contacted")),
+    )
+
+    rc = bn.cli.main(["batch", "apply", "-"])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "Invalid JSON in manifest (<stdin>)" in err
+    assert "Traceback" not in err
+
+
+def test_batch_apply_stdin_bare_array_clean_error(monkeypatch, capsys):
+    import io
+
+    monkeypatch.setattr(
+        "sys.stdin",
+        io.StringIO('[{"op": "set_comment", "address": "0x1000", "comment": "x"}]'),
+    )
+    monkeypatch.setattr(
+        bn.cli, "send_request",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("bridge should not be contacted")),
+    )
+
+    rc = bn.cli.main(["batch", "apply", "-"])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "must be a JSON object" in err
+    assert "Traceback" not in err
+
+
 def test_il_lines_slices_output_with_header(monkeypatch, capsys):
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         if op == "il":

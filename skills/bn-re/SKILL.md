@@ -115,7 +115,18 @@ Correct prototypes propagate to all callers.
 When you see repeated field accesses at fixed offsets from a pointer, that pointer is a struct. See the **Struct Reconstruction** section below.
 
 ### Batch mutations
-When you have multiple renames or retypes queued up, use `bn batch apply` with a manifest instead of individual commands. This is faster and atomic.
+When you have multiple renames or retypes queued up, use `bn batch apply` with a manifest instead of individual commands. This is faster and atomic. Pipe the manifest on stdin with a quoted heredoc — no temp file, and free-text comments need no escaping:
+
+```bash
+bn batch apply - <<'BN_EOF'
+{"target": "active", "ops": [
+  {"op": "rename_symbol", "identifier": "sub_401000", "new_name": "parse_header"},
+  {"op": "set_comment", "address": "0x401040", "comment": "len isn't bounds-checked"}
+]}
+BN_EOF
+```
+
+A file path is also accepted (`bn batch apply /tmp/manifest.json`); `--preview` (before `-`) diffs without committing.
 
 ## Call Graph Analysis
 

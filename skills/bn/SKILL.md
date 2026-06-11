@@ -270,21 +270,21 @@ bn struct field delete Player <field_name>     # NOTE: takes the field name, not
 
 For large rename/retype/comment runs, use `bn batch apply` with a JSON manifest. Significantly faster than firing individual commands.
 
-```json
-{
-  "target": "active",
-  "ops": [
-    {"op": "rename_symbol", "identifier": "sub_401000", "new_name": "player_update"},
-    {"op": "rename_symbol", "identifier": "sub_402000", "new_name": "player_init"},
-    {"op": "rename_symbol", "identifier": "sub_403000", "new_name": "player_destroy"}
-  ]
-}
-```
+**Primary form — pipe the manifest on stdin with a quoted heredoc** (`-` means "read stdin"). The quoted delimiter (`<<'BN_EOF'`) makes the whole payload literal, so comments with quotes, apostrophes, `$`, backticks, or parens need no escaping — and there is no temp file to write or clean up:
 
 ```bash
-bn batch apply /tmp/manifest.json
-bn batch apply /tmp/manifest.json --preview
+bn batch apply - <<'BN_EOF'
+{"target": "active", "ops": [
+  {"op": "rename_symbol", "identifier": "sub_401000", "new_name": "player_update"},
+  {"op": "rename_symbol", "identifier": "sub_402000", "new_name": "player_init"},
+  {"op": "set_comment", "address": "0x401040", "comment": "len isn't checked; attacker-controlled (see $r0)"}
+]}
+BN_EOF
 ```
+
+Add `--preview` before the `-` to diff without committing: `bn batch apply --preview - <<'BN_EOF' ... BN_EOF`.
+
+The file-path form is also accepted (`bn batch apply /tmp/manifest.json`) — use it when the manifest already exists on disk.
 
 Rules:
 
@@ -292,6 +292,7 @@ Rules:
 - Include `"target"` in the manifest or it fails with `Unknown target selector: None`.
 - All ops are verified — a single failure reverts the entire batch.
 - `--preview` shows diffs without committing.
+- Use a unique heredoc sentinel (`BN_EOF`) so a line in a comment can't accidentally close the payload. Empty or malformed stdin yields a clean error, not a traceback.
 
 ### Step 4 — save before close
 
