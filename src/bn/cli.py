@@ -502,8 +502,9 @@ def _call(
         result = result[:effective_page_limit]
         label = page_label or op
         next_offset = page_offset + effective_page_limit
+        item_word = "item" if effective_page_limit == 1 else "items"
         print(
-            f"warning: {label} output truncated to {effective_page_limit} items; rerun with --offset {next_offset} or a larger --limit",
+            f"warning: {label} output truncated to {effective_page_limit} {item_word}; rerun with --offset {next_offset} or a larger --limit",
             file=sys.stderr,
         )
     spill_context = result
