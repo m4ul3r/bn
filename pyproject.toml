@@ -42,3 +42,4 @@ wheel-exclude = ["**/__pycache__", "**/*.pyc"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["plugin"]
