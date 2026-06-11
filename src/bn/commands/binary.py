@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from ..cli import _call, _pick, arg, command
+from ..transport import BridgeError
 from ..formatters import (
     _render_close_text,
     _render_load_text,
@@ -53,6 +54,15 @@ def _close(args: argparse.Namespace) -> int:
     # `args.target` into the request target, so drop any sticky-injected value.
     if getattr(args, "_sticky_target", False):
         args.target = None
+    # A named path and --all are mutually exclusive: the bridge gives --all
+    # priority, so `bn close <path> --all` would silently close EVERY target
+    # despite naming one file. Reject the combination instead of surprising the
+    # user in a multi-target session (#85).
+    if args.path and args.all:
+        raise BridgeError(
+            "Pass a path or --all, not both: a named path closes only that "
+            "target; --all (or a bare `bn close`) closes every loaded target."
+        )
     params: dict[str, Any] = {}
     if args.path:
         params["path"] = str(Path(args.path).expanduser().resolve())

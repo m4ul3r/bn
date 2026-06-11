@@ -3017,6 +3017,27 @@ def test_close_all_flag_sets_param(monkeypatch, capsys):
     assert captured["params"].get("all") is True
 
 
+def test_close_rejects_path_and_all_together(monkeypatch, capsys):
+    # `bn close <path> --all` is contradictory; the bridge would let --all win
+    # and close everything despite naming one file. The CLI rejects it before
+    # any request is sent (#85).
+    sent = {"called": False}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        sent["called"] = True
+        return {"ok": True, "result": {"closed": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    rc = bn.cli.main(["close", "/tmp/one-binary", "--all", "--format", "text"])
+
+    assert rc == 2  # BridgeError -> exit 2
+    assert sent["called"] is False  # never reached the bridge
+    err = capsys.readouterr().err
+    assert "not both" in err
+
+
 def test_close_ignores_sticky_target_pin(monkeypatch, capsys):
     # A sticky pin must NOT turn a bare `close` (documented close-all) into
     # close-one, and a stale pin must not make cleanup fail.

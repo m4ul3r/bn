@@ -3621,6 +3621,160 @@ def test_close_binary_by_path_still_matches(monkeypatch):
     bridge._headless_views.clear()
 
 
+def test_close_binary_rejects_path_and_all_together(monkeypatch):
+    # A named path + all=true is contradictory; the all-branch used to silently
+    # win and close everything. The bridge now rejects the combination so raw
+    # socket clients are protected too (#85).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv_a = _ClosableBV("/proj/alpha.so")
+    bv_b = _ClosableBV("/proj/beta.so")
+    _register_views(bridge, bv_a, bv_b)
+
+    with pytest.raises(RuntimeError, match="not both"):
+        instance._close_binary(path="/proj/alpha.so", all_=True)
+    assert not bv_a.closed and not bv_b.closed  # nothing destroyed
+    bridge._headless_views.clear()
+
+
+def test_close_binary_by_target_works_when_headless_views_empty(monkeypatch):
+    # A GUI-opened view resolves fine but is NOT tracked in _headless_views. The
+    # old "no binaries loaded" guard ran before the target branch, so every
+    # target-based close failed on a GUI bridge. Target close must succeed even
+    # with an empty _headless_views (#86 Problem B).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bridge._headless_views.clear()
+    gui_view = _ClosableBV("/proj/gui-opened.bndb")
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: gui_view)
+
+    result = instance._close_binary(target="gui-opened.bndb")
+
+    assert gui_view.closed
+    assert [c["path"] for c in result["closed"]] == ["/proj/gui-opened.bndb"]
+
+
+def test_collect_open_views_merges_headless_views_in_gui_mode(monkeypatch):
+    # `bn load` against a GUI bridge appends to _headless_views, but the UI walk
+    # only enumerates tabs/contexts -- so a headless-loaded view would be
+    # invisible to target list. _collect_open_views must merge them (#86 Problem A).
+    bridge = _load_bridge(monkeypatch)
+
+    ui_view = object()
+    headless_view = object()
+
+    class _Frame:
+        def getCurrentBinaryView(self):
+            return ui_view
+
+    class _Context:
+        def getCurrentViewFrame(self):
+            return _Frame()
+
+        def getTabs(self):
+            return []
+
+    fake_ui = types.SimpleNamespace(
+        UIContext=types.SimpleNamespace(
+            allContexts=lambda: [_Context()],
+            activeContext=lambda: None,
+        )
+    )
+    monkeypatch.setattr(bridge, "ui", fake_ui)
+    bridge._headless_views.clear()
+    bridge._headless_views.append(headless_view)
+
+    views = bridge._collect_open_views()
+
+    ids = {id(v) for v in views}
+    assert id(ui_view) in ids and id(headless_view) in ids  # both visible
+    # No duplicate if a view is in both the UI walk and _headless_views.
+    bridge._headless_views.append(ui_view)
+    views2 = bridge._collect_open_views()
+    assert sum(1 for v in views2 if v is ui_view) == 1
+    bridge._headless_views.clear()
+
+
+def test_preload_binary_marks_quick_views_for_honesty(monkeypatch, tmp_path):
+    # Headless `bn-agent --quick` preload must record the view in
+    # _quick_loaded_views so target_info/strings stay honest (#90).
+    bridge = _load_bridge(monkeypatch)
+    bridge._headless_views.clear()
+    bridge._quick_loaded_views.clear()
+    binaryninja = sys.modules["binaryninja"]
+    binaryninja.load = lambda path, update_analysis=True: _LoadBV()
+
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+    bv = bridge._preload_binary(str(raw), quick=True)
+
+    assert bv in bridge._quick_loaded_views          # marked quick
+    assert bv.analysis_updated is False              # heavy phase skipped
+    assert bv in bridge._headless_views
+
+    # target_info and strings now tell the truth about the quick view.
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+    info = instance._target_info("active")
+    assert info["analyzed"] is False and info["analysis_state"] == "quick"
+    with pytest.raises(RuntimeError, match="bn refresh"):
+        instance._strings("active", query=None, offset=0, limit=10)
+    bridge._headless_views.clear()
+    bridge._quick_loaded_views.clear()
+
+
+def test_preload_binary_full_analysis_not_marked_quick(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    bridge._headless_views.clear()
+    bridge._quick_loaded_views.clear()
+    binaryninja = sys.modules["binaryninja"]
+    binaryninja.load = lambda path, update_analysis=True: _LoadBV()
+
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+    bv = bridge._preload_binary(str(raw), quick=False)
+
+    assert bv not in bridge._quick_loaded_views
+    assert bv.analysis_updated is True
+    bridge._headless_views.clear()
+
+
+def test_dispatch_rejects_non_boolean_all(monkeypatch):
+    # Raw JSON params must be real booleans: "all": "false" is truthy under
+    # bool() and used to close every target. Reject it as invalid_request (#91).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv_a = _ClosableBV("/proj/alpha.so")
+    _register_views(bridge, bv_a)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._dispatch_on_main("close_binary", {"all": "false"}, None)
+    assert exc.value.status == "invalid_request"
+    assert not bv_a.closed  # nothing closed
+    bridge._headless_views.clear()
+
+
+def test_dispatch_rejects_non_boolean_quick(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._dispatch_on_main("load_binary", {"path": str(tmp_path / "x"), "quick": "false"}, None)
+    assert exc.value.status == "invalid_request"
+
+
+def test_validate_bool_accepts_real_booleans_and_default(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    assert bridge._validate_bool(None, label="quick", default=True) is True
+    assert bridge._validate_bool(None, label="quick", default=False) is False
+    assert bridge._validate_bool(True, label="quick", default=False) is True
+    assert bridge._validate_bool(False, label="all", default=True) is False
+    for bad in ("false", "true", 0, 1, "", "yes"):
+        with pytest.raises(bridge.OperationFailure):
+            bridge._validate_bool(bad, label="all", default=False)
+
+
 def test_list_functions_count_only_returns_count(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

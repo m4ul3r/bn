@@ -172,6 +172,26 @@ def _validate_count(value: Any, *, label: str, minimum: int, allow_none: bool = 
     return n
 
 
+def _validate_bool(value: Any, *, label: str, default: bool) -> bool:
+    """Require a known boolean param to be an actual JSON boolean.
+
+    The CLI always sends real booleans, but raw socket clients, ``py exec``
+    callers and batch manifests can send strings. Plain truthiness coercion is
+    destructive here: ``bool("false")`` is ``True``, so ``"all": "false"`` would
+    close every target and ``"quick": "false"`` would enable quick load. Reject
+    anything that isn't a JSON ``true``/``false`` with a clean invalid_request
+    (#91). ``None`` (param absent) takes *default*.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    raise OperationFailure(
+        "invalid_request",
+        f"{label} must be a JSON boolean (true or false), got {value!r}",
+    )
+
+
 class _ReadWriteLock:
     def __init__(self):
         self._condition = threading.Condition()
@@ -431,7 +451,19 @@ def _collect_open_views() -> list[Any]:
                 unique.append(bv)
         return unique
 
-    return _run_on_main_thread(collect)
+    views = _run_on_main_thread(collect)
+    # `bn load` against a GUI bridge appends to _headless_views, but the UI
+    # enumeration above only walks UI tabs/contexts -- so a headless-loaded view
+    # would be invisible to `target list` and unselectable despite a successful
+    # load (#86 Problem A). Merge in any tracked headless views the UI walk
+    # missed so every loaded target is visible and resolvable.
+    with _headless_views_lock:
+        seen_ids = {id(bv) for bv in views}
+        for bv in _headless_views:
+            if id(bv) not in seen_ids:
+                seen_ids.add(id(bv))
+                views.append(bv)
+    return views
 
 
 def _path_components(path: str) -> tuple[str, ...]:
@@ -828,7 +860,9 @@ class BinaryNinjaBridge:
             lock = contextlib.nullcontext()
             if op in WRITE_LOCKED_OPS:
                 lock = self._target_lock.write()
-            elif op == "decompile" and params.get("force_analysis"):
+            elif op == "decompile" and _validate_bool(
+                params.get("force_analysis"), label="force_analysis", default=False
+            ):
                 # --force-analysis reanalyzes the function, mutating the view, so
                 # it needs the exclusive lock even though decompile is a read op.
                 lock = self._target_lock.write()
@@ -856,11 +890,15 @@ class BinaryNinjaBridge:
         if op == "load_binary":
             return self._load_binary(
                 str(params["path"]),
-                prefer_bndb=bool(params.get("prefer_bndb", True)),
-                quick=bool(params.get("quick", False)),
+                prefer_bndb=_validate_bool(params.get("prefer_bndb"), label="prefer_bndb", default=True),
+                quick=_validate_bool(params.get("quick"), label="quick", default=False),
             )
         if op == "close_binary":
-            return self._close_binary(params.get("path"), target, params.get("all"))
+            return self._close_binary(
+                params.get("path"),
+                target,
+                _validate_bool(params.get("all"), label="all", default=False),
+            )
         if op == "save_database":
             return self._save_database(target, params.get("path"))
 
@@ -1133,28 +1171,45 @@ class BinaryNinjaBridge:
                 "unsaved": bool(getattr(bv.file, "modified", False)),
             }
 
+        # A named path and all=true are mutually exclusive. The CLI already
+        # rejects the combination, but a raw socket client could send both;
+        # without this guard the all-branch silently wins and closes everything
+        # despite a named path (#85).
+        if all_ and path is not None:
+            raise RuntimeError(
+                "Pass either a path or all=true, not both: a named path closes "
+                "only that target; all=true closes every loaded target."
+            )
+
         # Resolve a target selector *before* taking _headless_views_lock:
         # resolve() -> refresh() -> _collect_open_views() re-acquires that lock,
         # which is non-reentrant, so resolving while holding it deadlocks.
         target_bv = self.targets.resolve(target) if target is not None else None
 
+        # Target-based close takes priority and must succeed even when
+        # _headless_views is empty: GUI-opened views resolve fine but are not
+        # tracked in _headless_views, so the old "no binaries loaded" guard ran
+        # before this branch and made every target-based close fail on a GUI
+        # bridge (#86 Problem B). Close on the main thread (a no-op marshal when
+        # already there) so closing a GUI view is safe, and only prune
+        # _headless_views when the view is actually tracked there.
+        if target_bv is not None:
+            closed = [_snapshot(target_bv)]
+            _run_on_main_thread(lambda: target_bv.file.close())
+            with _headless_views_lock:
+                _headless_views[:] = [v for v in _headless_views if v is not target_bv]
+            return {"closed": closed}
+
         with _headless_views_lock:
             if not _headless_views:
                 raise RuntimeError("No binaries are currently loaded")
-
-            # Target-based close takes priority over path
-            if target_bv is not None:
-                closed = [_snapshot(target_bv)]
-                target_bv.file.close()
-                _headless_views[:] = [v for v in _headless_views if v is not target_bv]
-                return {"closed": closed}
 
             # --all closes everything
             if all_ or path is None:
                 closed = []
                 for bv in _headless_views:
                     closed.append(_snapshot(bv))
-                    bv.file.close()
+                    _run_on_main_thread(lambda v=bv: v.file.close())
                 _headless_views.clear()
                 return {"closed": closed}
 
@@ -1172,7 +1227,7 @@ class BinaryNinjaBridge:
             for i in reversed(to_remove):
                 bv = _headless_views.pop(i)
                 closed.append(_snapshot(bv))
-                bv.file.close()
+                _run_on_main_thread(lambda v=bv: v.file.close())
 
         return {"closed": closed}
 
@@ -6319,6 +6374,35 @@ _headless_views_lock = threading.Lock()
 _quick_loaded_views: "weakref.WeakSet[Any]" = weakref.WeakSet()
 
 
+def _preload_binary(path: str, quick: bool):
+    """Open one headless preload binary and register it.
+
+    Mirrors _load_binary's --quick bookkeeping so the preload path and the
+    runtime `bn load` path agree: a .bndb already carries its analysis (so
+    --quick is a no-op there), and a genuinely quick preload is recorded in
+    _quick_loaded_views so target_info/strings stay honest ("run bn refresh")
+    instead of reporting full analysis or a misleading empty string list (#90).
+    Returns the opened BinaryView, or None if the open failed.
+    """
+    import binaryninja
+
+    resolved = Path(path).expanduser().resolve()
+    bv = binaryninja.load(str(resolved), update_analysis=False)
+    if bv is None:
+        bn.log_warn(f"Failed to open binary: {resolved}")
+        return None
+    quick_effective = quick and resolved.suffix != ".bndb"
+    if quick_effective:
+        _quick_loaded_views.add(bv)
+    else:
+        bv.update_analysis_and_wait()
+        _quick_loaded_views.discard(bv)
+    with _headless_views_lock:
+        _headless_views.append(bv)
+    bn.log_info(f"Loaded {resolved}{' (no analysis)' if quick_effective else ''}")
+    return bv
+
+
 def _start_bridge_command(_):  # pragma: no cover - GUI runtime
     start_bridge()
 
@@ -6368,19 +6452,8 @@ def start_headless(
     # crashes here the instance has already registered, so it surfaces as a
     # dead instance instead of an invisible orphan process.
     if binaries:
-        import binaryninja
-
         for path in binaries:
-            resolved = Path(path).expanduser().resolve()
-            bv = binaryninja.load(str(resolved), update_analysis=False)
-            if bv is None:
-                bn.log_warn(f"Failed to open binary: {resolved}")
-                continue
-            if not quick:
-                bv.update_analysis_and_wait()
-            with _headless_views_lock:
-                _headless_views.append(bv)
-            bn.log_info(f"Loaded {resolved}{' (no analysis)' if quick else ''}")
+            _preload_binary(path, quick)
 
     try:
         _bridge._shutdown_event.wait()
