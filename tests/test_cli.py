@@ -1718,7 +1718,10 @@ def test_bundle_function_out_path_is_bridge_owned(monkeypatch, tmp_path, capsys)
         ["function", "list", "--target", "active", "--offset", "-1"],
         ["types", "--target", "active", "--limit", "-2"],
         ["xrefs", "sub_401000", "--target", "active", "--limit", "-1"],
-        ["callsites", "sub_401000", "--target", "active", "--limit", "0"],
+        # evidence message has its own per-command --limit (_positive_int);
+        # callsites declares no --limit, so the prior callsites row asserted
+        # nothing about the validator (it exited 2 via "unrecognized arguments").
+        ["evidence", "message", "token", "--target", "active", "--limit", "0"],
     ],
 )
 def test_negative_or_zero_pagination_args_rejected_with_exit_2(argv):
@@ -1726,7 +1729,7 @@ def test_negative_or_zero_pagination_args_rejected_with_exit_2(argv):
     # layer with argparse's exit code 2, never leak into Python negative-slice
     # semantics downstream (issue #9; #15 types --limit 0). Covers both the
     # shared paged path (function list / types) and per-command renderer limits
-    # (xrefs / callsites).
+    # (xrefs / evidence message).
     parser = bn.cli.build_parser()
     with pytest.raises(SystemExit) as excinfo:
         parser.parse_args(argv)
@@ -1738,6 +1741,66 @@ def test_positive_pagination_args_still_accepted():
     ns = parser.parse_args(["function", "list", "--target", "active", "--limit", "5", "--offset", "0"])
     assert ns.limit == 5
     assert ns.offset == 0
+
+
+def test_count_flags_accept_hex_literals():
+    # The count/index validators parse with int(value, 0), so --limit 0x10 must
+    # be accepted -- matching _int_or_hex's grammar for --length etc. (#32).
+    parser = bn.cli.build_parser()
+    ns = parser.parse_args(
+        ["function", "list", "--target", "active", "--limit", "0x10", "--offset", "0x4"])
+    assert ns.limit == 16
+    assert ns.offset == 4
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["taint", "forward", "-f", "h", "--source", "param:0", "--max-depth", "-1", "--target", "active"],
+        ["taint", "backward", "-f", "h", "--sink", "arg:memcpy:0", "--max-depth", "-1", "--target", "active"],
+        ["evidence", "message", "q", "--table-entries", "-1", "--target", "active"],
+    ],
+)
+def test_sibling_count_flags_reject_negative(argv):
+    # Count siblings beyond --limit/--offset must also reject negatives at the
+    # arg layer, not silently degrade analysis or empty a window (#28).
+    parser = bn.cli.build_parser()
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(argv)
+    assert excinfo.value.code == 2
+
+
+def test_taint_max_depth_zero_allowed():
+    # 0 is a meaningful "intraprocedural only" choice and must be accepted.
+    parser = bn.cli.build_parser()
+    ns = parser.parse_args(
+        ["taint", "forward", "-f", "h", "--source", "param:0", "--max-depth", "0", "--target", "active"])
+    assert ns.max_depth == 0
+
+
+def test_argparse_error_emits_json_envelope_under_format_json(capsys):
+    # An argparse usage/type error must emit a parseable {"ok": false, ...}
+    # object on stdout under --format json (not an empty stream), while the
+    # human-readable usage still goes to stderr at exit code 2 (#29).
+    import json as _json
+    with pytest.raises(SystemExit) as exc:
+        bn.cli.main(["function", "list", "--target", "active", "--limit", "-1", "--format", "json"])
+    assert exc.value.code == 2
+    out, err = capsys.readouterr()
+    payload = _json.loads(out)
+    assert payload["ok"] is False
+    assert "error" in payload and payload["error"]
+    assert err  # usage text still on stderr
+
+
+def test_argparse_error_text_format_keeps_stdout_empty(capsys):
+    # Default text format keeps the prior contract: usage on stderr, no stdout.
+    with pytest.raises(SystemExit) as exc:
+        bn.cli.main(["function", "list", "--target", "active", "--limit", "-1"])
+    assert exc.value.code == 2
+    out, err = capsys.readouterr()
+    assert out == ""
+    assert err
 
 
 def test_removed_experimental_commands_are_not_present():

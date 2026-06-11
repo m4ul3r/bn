@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 from pathlib import Path
@@ -13,7 +12,7 @@ from .formatters import (
     _format_operation_result,  # noqa: F401  -- re-exported for tests/scripts that monkeypatch bn.cli
     _render_target_choices,
 )
-from .output import render_envelope, write_output_result
+from .output import render_envelope, render_error, write_output_result
 
 # The names below are re-exported through this module on purpose: command
 # handlers in bn.commands access them as `cli.<name>` so tests (and scripts)
@@ -67,15 +66,59 @@ class _HelpFullAction(argparse.Action):
         parser.exit()
 
 
+# The --format value as written on the command line, captured by main() before
+# argparse runs so argparse's own usage/type errors can still honor
+# --format json|ndjson (argparse fails before args.format is ever assigned).
+# None when invoked outside main() (e.g. tests calling build_parser().parse_args
+# directly), in which case error() behaves exactly like stock argparse.
+_MACHINE_ERROR_FORMAT: str | None = None
+
+
+def _requested_output_format(argv: list[str]) -> str | None:
+    """The machine ``--format`` (json/ndjson) as written in *argv*, else None.
+
+    Read before parsing so argparse errors can emit a JSON envelope. Last
+    occurrence wins; stops at ``--`` (end of options).
+    """
+    fmt: str | None = None
+    i = 0
+    while i < len(argv):
+        item = argv[i]
+        if item == "--":
+            break
+        if item == "--format" and i + 1 < len(argv):
+            fmt = argv[i + 1]
+            i += 2
+            continue
+        if item.startswith("--format="):
+            fmt = item.split("=", 1)[1]
+        i += 1
+    return fmt if fmt in ("json", "ndjson") else None
+
+
 class BnArgumentParser(argparse.ArgumentParser):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.set_defaults(_parser=self)
+
         self.add_argument(
             "--help-full",
             action=_HelpFullAction,
             help="Show help for this command and all subcommands",
         )
+
+    def error(self, message: str) -> None:  # type: ignore[override]
+        # Argparse usage/type errors (bad --limit, unrecognized args, ...) print
+        # usage to stderr and exit 2 with an EMPTY stdout, which breaks
+        # `bn ... --format json | jq`. When a machine format was requested, emit
+        # the same {"ok": false, "error": ...} envelope on stdout first, then
+        # defer to argparse for the stderr usage text and the exit(2).
+        if _MACHINE_ERROR_FORMAT in ("json", "ndjson"):
+            self._print_message(
+                render_error(f"{self.prog}: error: {message}", _MACHINE_ERROR_FORMAT),
+                sys.stdout,
+            )
+        super().error(message)
 
     def _iter_full_help_parsers(self) -> list[argparse.ArgumentParser]:
         parsers: list[argparse.ArgumentParser] = [self]
@@ -492,34 +535,36 @@ def _int_or_hex(value: str) -> int:
         )
 
 
-def _positive_int(value: str) -> int:
-    """Argparse type for count flags like ``--limit``: an integer >= 1.
+def _int_at_least(minimum: int, label: str) -> Callable[[str], int]:
+    """Build an argparse type for a count/index flag: an integer >= *minimum*.
 
-    Rejecting non-positive counts at the parse layer (argparse exit code 2)
-    stops a negative value from leaking into Python's negative-slice semantics
-    downstream -- which silently drops trailing items and inverts the
-    truncation math (a ``--limit -1`` would print "N more" counts that exceed
-    the stated total). Zero is rejected too: a count of nothing is always a
-    mistake, never "unlimited" (that is expressed by omitting the flag).
+    Parses with ``int(value, 0)`` so count/size flags accept the same
+    ``0x``/``0o``/``0b`` forms as address/size args -- a user who writes
+    ``--limit 0x10`` should not be rejected when ``--length 0x40`` (wired to
+    ``_int_or_hex``) is fine. Rejecting out-of-range values at the parse layer
+    (argparse exit code 2) stops a negative value from leaking into Python's
+    negative-slice semantics downstream, which silently drops trailing items
+    and inverts the truncation math (a ``--limit -1`` would print "N more"
+    counts that exceed the stated total). For count flags the minimum is 1: a
+    count of nothing is always a mistake, never "unlimited" (that is expressed
+    by omitting the flag).
     """
-    try:
-        parsed = int(value)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
-    if parsed < 1:
-        raise argparse.ArgumentTypeError(f"must be a positive integer (>= 1), got {parsed}")
-    return parsed
+    def parse(value: str) -> int:
+        try:
+            parsed = int(value, 0)
+        except (TypeError, ValueError):
+            raise argparse.ArgumentTypeError(
+                f"expected a decimal or hex (0x..) integer, got {value!r}")
+        if parsed < minimum:
+            raise argparse.ArgumentTypeError(
+                f"{label} must be an integer >= {minimum}, got {parsed}")
+        return parsed
+    return parse
 
 
-def _non_negative_int(value: str) -> int:
-    """Argparse type for index flags like ``--offset``: an integer >= 0."""
-    try:
-        parsed = int(value)
-    except ValueError:
-        raise argparse.ArgumentTypeError(f"expected a non-negative integer, got {value!r}")
-    if parsed < 0:
-        raise argparse.ArgumentTypeError(f"must be a non-negative integer (>= 0), got {parsed}")
-    return parsed
+# Count flags (``--limit``) require >= 1; index flags (``--offset``) allow 0.
+_positive_int = _int_at_least(1, "count")
+_non_negative_int = _int_at_least(0, "index")
 
 
 def _pick(positional: Any, flag: Any, label: str, *, required: bool = True) -> Any:
@@ -683,8 +728,12 @@ def _apply_sticky_defaults(args: argparse.Namespace) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    global _MACHINE_ERROR_FORMAT
     parser = build_parser()
     parse_argv = sys.argv[1:] if argv is None else list(argv)
+    # Capture --format before parsing so argparse usage/type errors (which fire
+    # before args.format exists) can still emit a JSON error envelope.
+    _MACHINE_ERROR_FORMAT = _requested_output_format(parse_argv)
     args = parser.parse_args(_protect_flag_like_option_values(parser, parse_argv))
     handler: Callable[[argparse.Namespace], int] | None = getattr(args, "handler", None)
     if handler is None:
@@ -702,9 +751,10 @@ def main(argv: list[str] | None = None) -> int:
             msg += "\n\nThis came from sticky state. Clear it with `bn instance clear`."
         # Under a machine-readable format, also emit the error as JSON on stdout
         # so `bn ... --format json | jq` gets a parseable object instead of an
-        # empty stream; the human-readable line still goes to stderr.
+        # empty stream; the human-readable line still goes to stderr. Routed
+        # through render_error so the envelope matches successful JSON output.
         if getattr(args, "format", None) in ("json", "ndjson"):
-            print(json.dumps({"ok": False, "error": msg}), file=sys.stdout)
+            sys.stdout.write(render_error(msg, args.format))
         print(msg, file=sys.stderr)
         return 2
 

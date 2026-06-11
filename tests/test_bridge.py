@@ -1908,6 +1908,47 @@ def test_message_lens_summarizes_type_string_xrefs_and_metadata_window(monkeypat
     assert result["truncated"] is False
 
 
+def test_validate_count_enforces_minimum(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    # count flags require >= 1
+    with pytest.raises(bridge.OperationFailure) as e:
+        bridge._validate_count(0, label="limit", minimum=1)
+    assert e.value.status == "invalid_request"
+    with pytest.raises(bridge.OperationFailure):
+        bridge._validate_count(-3, label="limit", minimum=1)
+    # index flags allow 0 but reject negatives
+    assert bridge._validate_count(0, label="offset", minimum=0) == 0
+    with pytest.raises(bridge.OperationFailure):
+        bridge._validate_count(-1, label="offset", minimum=0)
+    # None handling and non-integer coercion
+    assert bridge._validate_count(None, label="limit", minimum=1, allow_none=True) is None
+    with pytest.raises(bridge.OperationFailure):
+        bridge._validate_count(None, label="limit", minimum=1)  # allow_none=False
+    with pytest.raises(bridge.OperationFailure):
+        bridge._validate_count("abc", label="limit", minimum=1)
+
+
+def test_bridge_ops_reject_out_of_range_count_params(monkeypatch):
+    # Non-CLI callers (py exec / raw socket) reach the op handlers directly, so
+    # the bridge must re-enforce the count/offset contract the CLI argparse
+    # layer applies -- a negative/zero limit must not silently drop the tail or
+    # return a degenerate empty-but-"truncated" result (#28).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    # validation happens before _resolve_view, so no fake view is needed
+    with pytest.raises(bridge.OperationFailure) as e:
+        instance._message_lens("active", "x", limit=0)
+    assert e.value.status == "invalid_request"
+    with pytest.raises(bridge.OperationFailure):
+        instance._list_functions("active", limit=-1)
+    with pytest.raises(bridge.OperationFailure):
+        instance._search_functions("active", "q", limit=-5)
+    with pytest.raises(bridge.OperationFailure):
+        instance._types("active", query=None, offset=0, limit=0)
+    with pytest.raises(bridge.OperationFailure):
+        instance._strings("active", query=None, offset=-1, limit=10)
+
+
 def test_message_lens_reports_true_total_and_flags_truncation(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

@@ -122,6 +122,28 @@ class OperationFailure(RuntimeError):
 USER_FACING_ERRORS: tuple[type[BaseException], ...] = (OperationFailure, RuntimeError, ValueError)
 
 
+def _validate_count(value: Any, *, label: str, minimum: int, allow_none: bool = False) -> int | None:
+    """Coerce a limit/offset param to int and enforce *minimum*.
+
+    The CLI argparse layer already rejects out-of-range count/limit/offset
+    flags, but non-CLI callers (``bn py exec``, a raw socket client) reach the
+    op handlers directly, so the bridge re-enforces the same contract: a
+    negative limit must not silently drop the tail via Python slice math, and a
+    zero limit must not return a degenerate empty-but-"truncated" result.
+    """
+    if value is None:
+        if allow_none:
+            return None
+        raise OperationFailure("invalid_request", f"{label} is required")
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise OperationFailure("invalid_request", f"{label} must be an integer, got {value!r}")
+    if n < minimum:
+        raise OperationFailure("invalid_request", f"{label} must be >= {minimum}, got {n}")
+    return n
+
+
 class _ReadWriteLock:
     def __init__(self):
         self._condition = threading.Condition()
@@ -2579,6 +2601,8 @@ class BinaryNinjaBridge:
         limit: int | None = None,
         count_only: bool = False,
     ):
+        offset = _validate_count(offset, label="offset", minimum=0)
+        limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
         bv = self._resolve_view(selector)
         functions = list(self._filtered_functions(bv, min_address=min_address, max_address=max_address))
         if count_only:
@@ -2605,6 +2629,8 @@ class BinaryNinjaBridge:
         offset: int = 0,
         limit: int | None = None,
     ):
+        offset = _validate_count(offset, label="offset", minimum=0)
+        limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
         bv = self._resolve_view(selector)
         items = []
         if regex:
@@ -3562,8 +3588,8 @@ class BinaryNinjaBridge:
         )
 
     def _message_lens(self, selector: str | None, query: str, *, limit: int = 20, table_entries: int = 6):
-        if limit < 0:
-            raise OperationFailure("invalid_limit", f"Invalid message lens limit: {limit}")
+        limit = _validate_count(limit, label="limit", minimum=1)
+        table_entries = _validate_count(table_entries, label="table_entries", minimum=0)
         bv = self._resolve_view(selector)
         needle = query.lower()
         matches = []
@@ -4147,6 +4173,8 @@ class BinaryNinjaBridge:
         }
 
     def _types(self, selector: str | None, *, query, offset: int, limit: int):
+        offset = _validate_count(offset, label="offset", minimum=0)
+        limit = _validate_count(limit, label="limit", minimum=1)
         bv = self._resolve_view(selector)
         items = []
         needle = str(query).lower() if query else None
@@ -4224,6 +4252,8 @@ class BinaryNinjaBridge:
     def _strings(self, selector: str | None, *, query, offset: int, limit: int,
                  min_length: int | None = None, section: str | None = None,
                  no_crt: bool = False, regex: bool = False):
+        offset = _validate_count(offset, label="offset", minimum=0)
+        limit = _validate_count(limit, label="limit", minimum=1)
         bv = self._resolve_view(selector)
         if bv in _quick_loaded_views:
             # In --quick mode string analysis hasn't run, so bv.strings is empty

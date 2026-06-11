@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from ..cli import _call, arg, command
+from ..cli import _call, _non_negative_int, arg, command
 from ..formatters import (
     _render_callgraph_text,
     _render_defuse_text,
@@ -94,8 +94,9 @@ _SINK_LOCATOR_HELP = (
                  help="Function to analyze (name or address)"),
              arg("--source", dest="sources", action="append", default=None, metavar="LOCATOR",
                  help=f"Taint source (repeatable). {_LOCATOR_HELP}"),
-             arg("--max-depth", dest="max_depth", type=int, default=8,
-                 help="Max interprocedural recursion depth into callees (default: 8)"),
+             arg("--max-depth", dest="max_depth", type=_non_negative_int, default=8,
+                 help="Max interprocedural recursion depth into callees (default: 8; "
+                      "0 = intraprocedural only)"),
              arg("--resolve-map", dest="resolve_map", default=None, metavar="FILE",
                  help="JSON file mapping indirect call addresses to target lists: "
                       '{"0x4011f0": ["0x401176", "0x401195"]}'),
@@ -141,10 +142,10 @@ def _taint_forward(args: argparse.Namespace) -> int:
                  help="Function to analyze (name or address)"),
              arg("--sink", dest="sinks", action="append", default=None, metavar="LOCATOR",
                  help=f"Sink to slice from (repeatable). {_SINK_LOCATOR_HELP}"),
-             arg("--max-depth", dest="max_depth", type=int, default=8,
-                 help="Max interprocedural depth to follow slices up into callers (default: 8). "
-                      "The in-function def-chain walk caps at 64 steps; truncation is "
-                      "recorded under assumptions."),
+             arg("--max-depth", dest="max_depth", type=_non_negative_int, default=8,
+                 help="Max interprocedural depth to follow slices up into callers (default: 8; "
+                      "0 = intraprocedural only). The in-function def-chain walk caps at 64 "
+                      "steps; truncation is recorded under assumptions."),
          ])
 def _taint_backward(args: argparse.Namespace) -> int:
     if not args.sinks:
