@@ -1021,6 +1021,136 @@ class TaintEngine:
         cache[key] = resolved
         return resolved
 
+    # Allocator name -> index of its SIZE argument. calloc is omitted on purpose:
+    # its size is n*elsize (a product), which the same-SSA-value proof below
+    # can't establish, so calloc'd buffers simply never downgrade (safe).
+    _ALLOC_SIZE_ARG = {
+        "malloc": 0, "xmalloc": 0, "g_malloc": 0, "g_malloc0": 0,
+        "valloc": 0, "pvalloc": 0, "alloca": 0, "__builtin_alloca": 0,
+        "realloc": 1, "reallocf": 1, "g_realloc": 1,
+    }
+
+    def _alloc_size_expr(self, ssaf: Any, ptr_expr: Any) -> Any | None:
+        """If *ptr_expr*'s buffer was produced by an allocator call in this
+        function, return the allocator's SIZE argument expression, else None."""
+        var = ptr_expr if is_ssa_var(ptr_expr) else None
+        if var is None:
+            reads = expr_reads(ptr_expr)
+            if len(reads) == 1:
+                var = reads[0]
+        if var is None:
+            return None
+        try:
+            d = ssaf.get_ssa_var_definition(var)
+        except Exception:
+            d = None
+        if d is None or "CALL" not in op_name(d):
+            return None
+        callee = self._callee_name(self._resolve_direct_target(d))
+        base = (callee or "").split("@", 1)[0].lstrip("_")
+        idx = self._ALLOC_SIZE_ARG.get(base)
+        if idx is None:
+            return None
+        aparams = self._call_params(d)
+        return aparams[idx] if idx < len(aparams) else None
+
+    def _as_single_ssa_var(self, expr: Any) -> Any | None:
+        """The lone SSA variable an expression reads, but ONLY when the
+        expression is a bare var read (MLIL_VAR_SSA / an SSAVariable) -- not
+        inline arithmetic. Returns None otherwise."""
+        if is_ssa_var(expr):
+            return expr
+        if op_name(expr) == "MLIL_VAR_SSA":
+            reads = expr_reads(expr)
+            if len(reads) == 1:
+                return reads[0]
+        return None
+
+    def _canonical_ssa_var(self, ssaf: Any, var: Any, depth: int = 0) -> Any:
+        """Follow PURE copy definitions (t = s) to the root SSA variable.
+
+        Compiled ARM routinely splits one length value across register copies
+        (r0_5 = r5_2 for malloc, r2_1 = r5_2 for memcpy), so two copies of the
+        same value have different var+version. Following only SET_VAR_SSA
+        definitions whose source is a single bare var read preserves the value
+        exactly, so comparing canonical roots is still a PROOF of equality --
+        arithmetic, PHI, and call defs all stop the walk (#46 item 1)."""
+        cur = var
+        seen: set[tuple[Any, Any]] = set()
+        for _ in range(8):
+            marker = (var_key(cur), getattr(cur, "version", None))
+            if marker in seen:
+                break
+            seen.add(marker)
+            try:
+                d = ssaf.get_ssa_var_definition(cur)
+            except Exception:
+                d = None
+            if d is None or op_name(d) != "MLIL_SET_VAR_SSA":
+                break
+            src = self._as_single_ssa_var(getattr(d, "src", None))
+            if src is None:
+                break
+            cur = src
+        return cur
+
+    def _same_ssa_value(self, ssaf: Any, a: Any, b: Any) -> bool:
+        """True only when *a* and *b* provably hold the same runtime value:
+        each must be a bare SSA var read, and their canonical (copy-chain) roots
+        must be the same var + version. Any other shape (inline arithmetic,
+        multiple reads, constants, differing roots) -> False, so a length is
+        only ever declared bounded when provably equal to the allocation size,
+        never by a heuristic (#46 item 1)."""
+        va = self._as_single_ssa_var(a)
+        vb = self._as_single_ssa_var(b)
+        if va is None or vb is None:
+            return False
+        ra = self._canonical_ssa_var(ssaf, va)
+        rb = self._canonical_ssa_var(ssaf, vb)
+        return (
+            var_key(ra) == var_key(rb)
+            and getattr(ra, "version", None) == getattr(rb, "version", None)
+        )
+
+    def _provably_bounded_length(self, ssaf: Any, params: list[Any], length_idx: int,
+                                 dest_idx: int = 0) -> bool:
+        """True when the copy length (params[length_idx]) is provably equal to
+        the size the destination buffer (params[dest_idx]) was allocated with in
+        this same function -- e.g. dst = malloc(n); memcpy(dst, src, n). Used to
+        downgrade an overflow_len label to a bounded one (#46 item 1)."""
+        if dest_idx >= len(params) or length_idx >= len(params):
+            return False
+        size_expr = self._alloc_size_expr(ssaf, params[dest_idx])
+        if size_expr is None:
+            return False
+        return self._same_ssa_value(ssaf, size_expr, params[length_idx])
+
+    def _local_definition_for(self, name: str | None) -> Any | None:
+        """An in-binary DEFINED function with this name, or None.
+
+        On the receive/deserialization surface a locally-defined exported
+        function is often invoked through a PLT/GOT stub to its re-imported
+        export, so the call resolves to the import side and forward taint can't
+        descend into the real body without a manual --resolve-map. When the same
+        name also has a DEFINED (non-imported) function symbol with a body in
+        this binary, bridge to it (#46 item 3). Conservative: returns a function
+        only when it's a real internal definition, never a thunk/import, so it
+        can't change thunk-following semantics."""
+        if not name or self.bv is None:
+            return None
+        for sym in _symbols_by_name(self.bv, name):
+            stype = str(getattr(getattr(sym, "type", None), "name", "") or "")
+            if "Imported" in stype or "External" in stype:
+                continue  # the import side, not the definition
+            try:
+                addr = int(getattr(sym, "address"))
+            except Exception:
+                continue
+            fn = function_at(self.bv, addr)
+            if self._is_internal(fn):
+                return fn
+        return None
+
     def _is_internal(self, fn: Any) -> bool:
         """True if a call target is an in-binary function worth descending into
         (not a PLT/import thunk, which we model instead)."""
@@ -1192,7 +1322,26 @@ class TaintEngine:
                             sig = (addr, argidx) if site_taddr is None else (addr, argidx, site_taddr)
                             if sig not in recorded_sinks:
                                 recorded_sinks.add(sig)
-                                findings.append(self._make_finding(ins, mkey or name, argidx, sink, ht, why))
+                                eff_sink = sink
+                                # Downgrade a tainted memcpy-family LENGTH from
+                                # overflow to bounded when the destination is
+                                # provably allocated with that same length in
+                                # this function (e.g. dst=malloc(n); memcpy(dst,
+                                # src,n)) -- the length is attacker-derived but
+                                # the copy cannot overflow (#46 item 1). Still
+                                # reported, just relabeled, so it's not noise in
+                                # the overflow set.
+                                if sink.get("class") == "overflow_len" and \
+                                        self._provably_bounded_length(ssaf, params, argidx):
+                                    eff_sink = {
+                                        **sink,
+                                        "class": "bounded_len",
+                                        "detail": (sink.get("detail") or "")
+                                        + " (attacker-derived length, but the destination is "
+                                        "allocated with the same size in this function -- "
+                                        "provably bounded, not an overflow)",
+                                    }
+                                findings.append(self._make_finding(ins, mkey or name, argidx, eff_sink, ht, why))
             for rule in model.get("propagates") or []:
                 to = rule.get("to")
                 frm = rule.get("from")
@@ -1372,6 +1521,20 @@ class TaintEngine:
                                 elif self._is_internal(resolved):
                                     descend_fn = resolved
                                     descend_internal = True
+                        # Re-imported export: the call routed through a PLT/GOT
+                        # stub to a symbol that is ALSO defined in this binary.
+                        # Bridge to the local definition so taint descends into
+                        # its body instead of stopping at a conservative external
+                        # leaf (#46 item 3). Only when unmodeled and not already
+                        # internal, and only to a real in-binary definition.
+                        if md is None and not descend_internal:
+                            local = self._local_definition_for(nm)
+                            if local is not None:
+                                descend_fn = local
+                                descend_internal = True
+                                add_assumption(
+                                    f"bridged re-imported export {nm} to its in-binary "
+                                    f"definition at {hex(int(getattr(local, 'start', 0)))}")
                         if md is not None:
                             # resolved target is a modeled external
                             mchanged, _ = apply_model(ins, params, md, mk, nm, site_taddr=taddr)

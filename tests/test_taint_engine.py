@@ -1760,3 +1760,163 @@ def test_resolve_direct_target_constant_direct_call_unchanged():
     call = FInstr(0, 0x401000, "MLIL_CALL_SSA", "helper()", dest=dest, params=[])
     engine = te.TaintEngine(bv, te.load_models())
     assert engine._resolve_direct_target(call) == 0x401070
+
+
+# ---------------------------------------------------------------------------
+# #46 item 1 — overflow_len downgraded to bounded_len when provably bounded
+# ---------------------------------------------------------------------------
+
+
+def _copy_func(malloc_size_var, length_var, *, param):
+    # dst = malloc(<malloc_size_var>); memcpy(dst, src, <length_var>)
+    dst = FVar("dst"); src = FVar("src")
+    dst1 = FSSA(dst, 1); src0 = FSSA(src, 0)
+    malloc_size = FExpr("MLIL_VAR_SSA", "size", reads=[malloc_size_var])
+    dst_param = FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1])
+    src_param = FExpr("MLIL_VAR_SSA", "src#0", reads=[src0])
+    len_param = FExpr("MLIL_VAR_SSA", "len", reads=[length_var])
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "dst#1 = malloc(size)",
+               reads=[malloc_size_var], writes=[dst1],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[malloc_size]),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "memcpy(dst#1, src#0, len)",
+               reads=[dst1, src0, length_var],
+               dest=FExpr("MLIL_CONST_PTR", "0x2010", constant=0x2010),
+               params=[dst_param, src_param, len_param]),
+    ]
+    return FFunc("copy", 0x10, FSSAFunc(instrs), params=[param])
+
+
+def test_forward_downgrades_overflow_when_dest_alloc_matches_length(models):
+    # dst = malloc(n); memcpy(dst, src, n) -- the tainted length equals the
+    # allocation size, so it cannot overflow; report it as bounded_len, not
+    # overflow_len (#46 item 1).
+    n = FVar("n"); n0 = FSSA(n, 0)
+    func = _copy_func(n0, n0, param=n)  # SAME SSA var feeds malloc and memcpy
+    bv = FBV({0x2000: "malloc", 0x2010: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    # malloc(tainted) also fires its own alloc-size sink; isolate the memcpy one.
+    memcpy_sinks = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(memcpy_sinks) == 1
+    assert memcpy_sinks[0]["class"] == "bounded_len"          # downgraded
+    assert "provably bounded" in memcpy_sinks[0]["detail"]
+
+
+def test_forward_keeps_overflow_when_alloc_size_differs_from_length(models):
+    # dst = malloc(m); memcpy(dst, src, n) with m != n -- NOT provably bounded,
+    # so the overflow_len label must stand (no false downgrade).
+    n = FVar("n"); m = FVar("m")
+    n0 = FSSA(n, 0); m0 = FSSA(m, 0)
+    func = _copy_func(m0, n0, param=n)              # malloc uses m, memcpy uses n
+    func.parameter_vars = [n, m]
+    bv = FBV({0x2000: "malloc", 0x2010: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    memcpy_sinks = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(memcpy_sinks) == 1
+    assert memcpy_sinks[0]["class"] == "overflow_len"          # NOT downgraded
+
+
+def test_same_ssa_value_only_matches_identical_var():
+    engine = te.TaintEngine(FBV({}), {})
+    ssaf = FSSAFunc([])  # no copy defs -> canonical root is the var itself
+    n = FVar("n")
+    a = FExpr("MLIL_VAR_SSA", "n#0", reads=[FSSA(n, 0)])
+    b = FExpr("MLIL_VAR_SSA", "n#0", reads=[FSSA(n, 0)])
+    c = FExpr("MLIL_VAR_SSA", "n#1", reads=[FSSA(n, 1)])  # different version
+    assert engine._same_ssa_value(ssaf, a, b) is True
+    assert engine._same_ssa_value(ssaf, a, c) is False
+    # inline arithmetic (more than a bare var read) is never "same value"
+    add = FExpr("MLIL_ADD", "n#0 + 1", reads=[FSSA(n, 0)])
+    assert engine._same_ssa_value(ssaf, add, a) is False
+
+
+def test_same_ssa_value_follows_pure_copy_chains():
+    # r0_5 = r5_2 (malloc size) and r2_1 = r5_2 (memcpy length): different
+    # var+version, but both are pure copies of r5_2 -> provably equal (#46 item 1).
+    engine = te.TaintEngine(FBV({}), {})
+    r5 = FVar("r5"); r0 = FVar("r0"); r2 = FVar("r2")
+    r5_2 = FSSA(r5, 2); r0_5 = FSSA(r0, 5); r2_1 = FSSA(r2, 1)
+    ssaf = FSSAFunc([
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "r0#5 = r5#2", writes=[r0_5],
+               src=FExpr("MLIL_VAR_SSA", "r5#2", reads=[r5_2])),
+        FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "r2#1 = r5#2", writes=[r2_1],
+               src=FExpr("MLIL_VAR_SSA", "r5#2", reads=[r5_2])),
+    ])
+    size = FExpr("MLIL_VAR_SSA", "r0#5", reads=[r0_5])
+    length = FExpr("MLIL_VAR_SSA", "r2#1", reads=[r2_1])
+    assert engine._same_ssa_value(ssaf, size, length) is True
+    # but a copy of a DIFFERENT root must NOT match
+    rX = FVar("rX"); rX_1 = FSSA(rX, 1); r9 = FVar("r9"); r9_3 = FSSA(r9, 3)
+    ssaf2 = FSSAFunc([
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "rX#1 = r9#3", writes=[rX_1],
+               src=FExpr("MLIL_VAR_SSA", "r9#3", reads=[r9_3])),
+    ])
+    other = FExpr("MLIL_VAR_SSA", "rX#1", reads=[rX_1])
+    assert engine._same_ssa_value(ssaf2, size, other) is False  # size root r5#2 != r9#3
+
+
+# ---------------------------------------------------------------------------
+# #46 item 3 — re-imported export bridged to its in-binary definition
+# ---------------------------------------------------------------------------
+
+
+class _ReimportBV:
+    def __init__(self, funcs, syms):
+        self._funcs = funcs
+        self._syms = syms
+
+    def get_function_at(self, addr):
+        return self._funcs.get(addr)
+
+    def get_symbol_at(self, addr):
+        return None
+
+    def get_symbols_by_name(self, name):
+        return self._syms.get(name, [])
+
+    def get_symbol_by_raw_name(self, name):
+        return None
+
+
+def test_forward_bridges_reimported_export_to_local_definition(models):
+    # handler(p) calls deserialize(p); deserialize is BOTH an import stub AND a
+    # defined in-binary function. Forward taint must bridge to the local
+    # definition and descend, not stop at a conservative external leaf (#46 item 3).
+    p = FVar("p"); p0 = FSSA(p, 0)
+    p_param = FExpr("MLIL_VAR_SSA", "p#0", reads=[p0])
+    caller = FFunc("handler", 0x100, FSSAFunc([
+        FInstr(0, 0x100, "MLIL_CALL_SSA", "deserialize(p#0)", reads=[p0],
+               dest=FExpr("MLIL_CONST_PTR", "0x3000", constant=0x3000),
+               params=[p_param]),
+    ]), params=[p])
+
+    import_stub = FFunc("deserialize", 0x3000, FSSAFunc([]),
+                        symbol_type="ImportedFunctionSymbol")
+    b = FVar("b")
+    local_def = FFunc("deserialize", 0x4000,
+                      FSSAFunc([FInstr(0, 0x4000, "MLIL_RET", "return", reads=[])]),
+                      params=[b], symbol_type="FunctionSymbol")
+
+    import types as _t
+    syms = {"deserialize": [
+        _t.SimpleNamespace(address=0x3000, type=_t.SimpleNamespace(name="ImportedFunctionSymbol")),
+        _t.SimpleNamespace(address=0x4000, type=_t.SimpleNamespace(name="FunctionSymbol")),
+    ]}
+    bv = _ReimportBV({0x3000: import_stub, 0x4000: local_def}, syms)
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(caller, [te.parse_locator("param:0")])
+
+    assert any("bridged re-imported export deserialize" in a for a in result.get("assumptions", []))
+
+
+def test_local_definition_for_skips_import_only(models):
+    # When a name has ONLY an import symbol (no in-binary definition), don't
+    # bridge -- there's nothing to descend into.
+    import types as _t
+    syms = {"recv": [_t.SimpleNamespace(address=0x3000, type=_t.SimpleNamespace(name="ImportedFunctionSymbol"))]}
+    bv = _ReimportBV({0x3000: FFunc("recv", 0x3000, FSSAFunc([]), symbol_type="ImportedFunctionSymbol")}, syms)
+    engine = te.TaintEngine(bv, models)
+    assert engine._local_definition_for("recv") is None
