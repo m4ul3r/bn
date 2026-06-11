@@ -16,6 +16,11 @@ import pytest
 
 
 def _load_bridge(monkeypatch):
+    # Loading the bridge from its file writes bytecode into
+    # plugin/bn_agent_bridge/__pycache__, which the wheel build then ships as
+    # data files (uv_build can't exclude inside data trees). Don't pollute the
+    # source tree so dev builds stay as clean as a release build (#83).
+    sys.dont_write_bytecode = True
     fake_bn = types.ModuleType("binaryninja")
 
     class SymbolType:

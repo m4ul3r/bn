@@ -23,7 +23,9 @@ _ENGINE_PATH = Path(__file__).resolve().parents[1] / "plugin" / "bn_agent_bridge
 def _load_engine():
     # Load as a top-level module so the wrapped `from .paths import ...` falls
     # back gracefully (no package context) — load_models still reads the
-    # builtin JSON beside the file.
+    # builtin JSON beside the file. Don't write bytecode into the plugin source
+    # tree (the wheel build ships it as data files; see _load_bridge / #83).
+    sys.dont_write_bytecode = True
     spec = importlib.util.spec_from_file_location("bn_taint_engine_under_test", _ENGINE_PATH)
     module = importlib.util.module_from_spec(spec)
     sys.modules.setdefault("bn_taint_engine_under_test", module)
