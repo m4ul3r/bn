@@ -220,6 +220,22 @@ def _batch_apply(args: argparse.Namespace) -> int:
         raise BridgeError(f"Invalid JSON in manifest {args.manifest}: {exc}") from None
     except OSError as exc:
         raise BridgeError(f"Could not read manifest {args.manifest}: {exc}") from None
+    # The manifest must be a JSON object {"target": <sel>, "ops": [...]}. A bare
+    # array (an easy mistake) would otherwise crash client-side in _call's
+    # dict(params) -- and `manifest["preview"]` below assumes a dict. Validate
+    # shape here and raise a clean BridgeError (#48).
+    if not isinstance(manifest, dict):
+        raise BridgeError(
+            f"Manifest {args.manifest} must be a JSON object "
+            f'{{"target": <selector>, "ops": [<op>, ...]}}, got a '
+            f"{type(manifest).__name__}. (A bare list of ops should be wrapped as "
+            f'{{"ops": [...]}}.)'
+        )
+    if not isinstance(manifest.get("ops"), list):
+        raise BridgeError(
+            f'Manifest {args.manifest} must have an "ops" array (the list of '
+            f"operations to apply)."
+        )
     if args.preview:
         manifest["preview"] = True
     return _call(

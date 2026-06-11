@@ -4412,6 +4412,39 @@ def test_apply_operation_set_comment_missing_comment_still_rejected(monkeypatch)
     assert "comment" in str(exc.value)
 
 
+def test_apply_operation_missing_op_key_is_invalid_request(monkeypatch):
+    # A manifest op without an `op` key must be invalid_request naming `op`, NOT
+    # silently dispatched as a rename_symbol (which risks a wrong mutation) (#48).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._apply_operation(None, {"identifier": "x", "new_name": "y"})
+    assert exc.value.status == "invalid_request"
+    assert "'op'" in str(exc.value)
+
+
+def test_operation_failure_result_missing_op_is_honest(monkeypatch):
+    # The per-op failure echo for an op missing `op` must not claim rename_symbol.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    exc = bridge.OperationFailure("invalid_request", "missing op")
+    result = instance._operation_failure_result({"identifier": "x"}, exc)
+    assert result["op"] == "<missing>"
+
+
+def test_apply_operation_non_object_op_is_invalid_request(monkeypatch):
+    # A non-object manifest op element (e.g. "ops": ["foo"]) must be a clean
+    # invalid_request, not an AttributeError (#48).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._apply_operation(None, "not_an_object")
+    assert exc.value.status == "invalid_request"
+    # the failure-result/echo helpers must tolerate the non-dict op too
+    assert instance._operation_requested("not_an_object") == {}
+    assert instance._operation_failure_result("not_an_object", exc.value)["op"] == "<non-object>"
+
+
 def test_sections_pagination_slices_offset_and_limit(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

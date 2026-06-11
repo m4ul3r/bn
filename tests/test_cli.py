@@ -2456,6 +2456,40 @@ def test_batch_apply_invalid_json_clean_error(monkeypatch, capsys, tmp_path):
     assert "Traceback" not in err
 
 
+def test_batch_apply_bare_array_manifest_clean_error(monkeypatch, capsys, tmp_path):
+    # A bare JSON array (an easy mistake) must be a clean BridgeError, not a
+    # client-side ValueError traceback in _call's dict(params) (#48).
+    bad = tmp_path / "manifest.json"
+    bad.write_text('[{"op": "set_comment", "address": "0x1000", "comment": "x"}]', encoding="utf-8")
+    monkeypatch.setattr(
+        bn.cli, "send_request",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("bridge should not be contacted")),
+    )
+
+    rc = bn.cli.main(["batch", "apply", str(bad)])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "must be a JSON object" in err
+    assert "Traceback" not in err
+
+
+def test_batch_apply_manifest_without_ops_clean_error(monkeypatch, capsys, tmp_path):
+    bad = tmp_path / "manifest.json"
+    bad.write_text('{"target": "x"}', encoding="utf-8")  # no "ops" array
+    monkeypatch.setattr(
+        bn.cli, "send_request",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("bridge should not be contacted")),
+    )
+
+    rc = bn.cli.main(["batch", "apply", str(bad)])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert '"ops" array' in err
+    assert "Traceback" not in err
+
+
 def test_il_lines_slices_output_with_header(monkeypatch, capsys):
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         if op == "il":

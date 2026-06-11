@@ -1010,7 +1010,7 @@ class BinaryNinjaBridge:
             return self._py_exec(target, str(params["script"]))
 
         if op == "rename_symbol":
-            return self._mutation(target, bool(params.get("preview")), [params])
+            return self._mutation(target, bool(params.get("preview")), [{"op": "rename_symbol", **params}])
         if op == "get_comment":
             return self._get_comment(target, params.get("address"), params.get("function"))
         if op == "list_comments":
@@ -4892,6 +4892,8 @@ class BinaryNinjaBridge:
         affected = []
         seen = set()
         for op in operations:
+            if not isinstance(op, dict):
+                continue  # a non-dict op is rejected cleanly in _apply_operation (#48)
             kind = op.get("op") or "rename_symbol"
             functions = []
             try:
@@ -4924,6 +4926,8 @@ class BinaryNinjaBridge:
         names: list[str] = []
         seen: set[str] = set()
         for op in operations:
+            if not isinstance(op, dict):
+                continue  # a non-dict op is rejected cleanly in _apply_operation (#48)
             for type_name in self._operation_type_names(bv, op):
                 if type_name not in seen:
                     seen.add(type_name)
@@ -5118,11 +5122,14 @@ class BinaryNinjaBridge:
         return diffs
 
     def _operation_requested(self, op: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(op, dict):
+            return {}
         return {key: value for key, value in op.items() if key != "preview"}
 
     def _operation_failure_result(self, op: dict[str, Any], exc: OperationFailure) -> dict[str, Any]:
+        op_label = str(op.get("op") or "<missing>") if isinstance(op, dict) else "<non-object>"
         result = {
-            "op": str(op.get("op") or "rename_symbol"),
+            "op": op_label,
             "status": exc.status,
             "message": exc.message,
             "requested": exc.requested or self._operation_requested(op),
@@ -5532,7 +5539,24 @@ class BinaryNinjaBridge:
         return item
 
     def _apply_operation(self, bv, op: dict[str, Any], restores: list | None = None):
-        kind = op.get("op") or "rename_symbol"
+        # A manifest op must be a JSON object; a non-object element (e.g.
+        # "ops": ["foo"]) gets a clean invalid_request, not an AttributeError (#48).
+        if not isinstance(op, dict):
+            raise OperationFailure(
+                "invalid_request",
+                f"each manifest operation must be a JSON object, got {type(op).__name__}",
+            )
+        # A missing `op` key must be its own invalid_request, NOT silently assumed
+        # to be a rename_symbol -- a typo'd/absent op kind would otherwise apply
+        # the wrong mutation (#48). Internal single-op callers always set `op`.
+        kind = op.get("op")
+        if not kind:
+            raise OperationFailure(
+                "invalid_request",
+                "operation is missing required field 'op' (the mutation kind, e.g. "
+                "'rename_symbol', 'set_comment', 'types_declare')",
+                requested=self._operation_requested(op),
+            )
         # Validate required request fields up front so a malformed request is
         # reported precisely (invalid_request, naming the field) and a KeyError
         # raised deeper -- e.g. by BN internals inside a handler -- is no longer
