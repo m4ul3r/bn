@@ -787,6 +787,32 @@ def test_forward_descends_through_plt_thunk_into_local(models):
     assert result["stats"]["functions_visited"] == 2  # handler + copy_it; thunk body skipped
 
 
+def test_forward_remodels_thunk_to_modeled_external_sink(models):
+    # A tainted length flows through j_memcpy -- a veneer whose own name is NOT
+    # in the model DB -- which tailcalls the modeled memcpy. Forward taint must
+    # re-run lookup_model on the post-thunk target and fire the memcpy sink, not
+    # fall through to the conservative "external, no model" tail (#27).
+    n = FVar("n", ident=40); n1 = FSSA(n, 1)
+    thunk = FFunc("j_memcpy", 0x2100, FSSAFunc([
+        FInstr(0, 0x2100, "MLIL_TAILCALL_SSA", "tailcall(0x1080)",
+               dest=FExpr("MLIL_CONST_PTR", "0x1080", constant=0x1080)),
+    ]), is_thunk=True)
+    handler = FFunc("handler", 0x3000, FSSAFunc([
+        FInstr(0, 0x3008, "MLIL_CALL_SSA", "0x2100(d, s, n#1)", reads=[n1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x2100", constant=0x2100),
+               params=[FExpr("MLIL_VAR_SSA", "d", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "s", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "n#1", reads=[n1])]),
+    ]), params=[n])
+    bv = FBV({0x1080: "memcpy"}, funcs={0x2100: thunk})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(handler, [te.parse_locator("param:0")])
+    assert len(result["reached_sinks"]) == 1
+    sink = result["reached_sinks"][0]["sink"]
+    assert sink["callee"] == "memcpy" and sink["class"] == "overflow_len"
+    assert sink["tainted_arg_index"] == 2
+
+
 # --------------------------------------------------------------------------
 # backward taint
 # --------------------------------------------------------------------------
@@ -1101,6 +1127,44 @@ def test_backward_single_unseedable_sink_preserves_original_error(process_func, 
     engine = te.TaintEngine(bv, models)
     with pytest.raises(te.TaintError, match=r"no call to 'strcpy' found"):
         engine.backward(process_func, [te.parse_locator("arg:strcpy:0")])
+
+
+def test_backward_seeds_through_thunk_to_sink(models):
+    # The function calls memcpy through a j_memcpy veneer. Backward seeding must
+    # follow the thunk so `--sink arg:memcpy:0` finds the callsite -- the
+    # backward dual of the forward thunk-follow (#35). Before the fix,
+    # _find_callsites name-matched only the pre-thunk name and seeded nothing.
+    a = FVar("a", ident=50); a1 = FSSA(a, 1)
+    thunk = _tailcall_thunk("j_memcpy", 0x2100, 0x1080)
+    caller = FFunc("caller", 0x3000, FSSAFunc([
+        FInstr(0, 0x3008, "MLIL_CALL_SSA", "0x2100(a#1, s, n)", reads=[a1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x2100", constant=0x2100),
+               params=[FExpr("MLIL_VAR_SSA", "a#1", reads=[a1]),
+                       FExpr("MLIL_VAR_SSA", "s", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "n", reads=[])]),
+    ]), params=[a])
+    bv = FBV({0x1080: "memcpy"}, funcs={0x2100: thunk})
+    engine = te.TaintEngine(bv, models)
+    result = engine.backward(caller, [te.parse_locator("arg:memcpy:0")])
+    status = {s.get("callee"): s for s in result["sink_status"]}
+    assert status["memcpy"]["seeded"] is True, "thunked memcpy callsite must seed"
+    assert result["slices"], "seeding through the thunk must produce a slice"
+
+
+def test_backward_direct_callsite_still_seeds_without_thunk(models):
+    # Guard: the non-thunk path is unchanged -- a direct memcpy call still seeds.
+    a = FVar("a", ident=51); a1 = FSSA(a, 1)
+    caller = FFunc("caller", 0x3000, FSSAFunc([
+        FInstr(0, 0x3008, "MLIL_CALL_SSA", "0x1080(a#1, s, n)", reads=[a1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x1080", constant=0x1080),
+               params=[FExpr("MLIL_VAR_SSA", "a#1", reads=[a1]),
+                       FExpr("MLIL_VAR_SSA", "s", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "n", reads=[])]),
+    ]), params=[a])
+    bv = FBV({0x1080: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.backward(caller, [te.parse_locator("arg:memcpy:0")])
+    assert {s.get("callee"): s for s in result["sink_status"]}["memcpy"]["seeded"] is True
 
 
 def test_backward_walk_truncation_recorded(process_func, models):
