@@ -4969,9 +4969,18 @@ class BinaryNinjaBridge:
             if defined_types:
                 changed_types = {name: bool(type_changes.get(name, {}).get("changed")) for name in defined_types}
                 item["changed_types"] = changed_types
-                if item.get("status") == "verified" and not any(changed_types.values()):
-                    item["status"] = "noop"
-                    item["message"] = "No effective change detected"
+                # The authoritative change signal is the before/after layout diff
+                # (changed_types), not the verify step's decl-string compare -- a
+                # redeclaration of an existing NAME renders the same `struct QA`
+                # decl before and after, so that compare wrongly reported `noop`
+                # on a real layout change (#57). Reclassify from changed_types for
+                # the success statuses only (never override a *_failed status).
+                if item.get("status") in ("verified", "noop"):
+                    if any(changed_types.values()):
+                        item["status"] = "verified"
+                    else:
+                        item["status"] = "noop"
+                        item["message"] = "No effective change detected"
             annotated.append(item)
         return annotated
 
@@ -5074,6 +5083,27 @@ class BinaryNinjaBridge:
 
     def _has_failed_results(self, results: list[dict[str, Any]]) -> bool:
         return any(item.get("status") in {"unsupported", "verification_failed"} for item in results)
+
+    def _first_overlapping_member(self, type_obj, offset: int, width: int):
+        """The first existing member whose byte range intersects the range a new
+        field of *width* bytes at *offset* would occupy, else None. Width 0/unknown
+        is treated as 1 byte so an exact start-offset collision is always caught.
+        Used to enforce struct field set --no-overwrite (#56)."""
+        members = getattr(type_obj, "members", None)
+        if members is None:
+            return None
+        new_start = int(offset)
+        new_end = new_start + max(int(width or 0), 1)
+        for member in list(members):
+            m_start = int(getattr(member, "offset", 0))
+            try:
+                m_width = int(getattr(getattr(member, "type", None), "width", 0) or 0)
+            except Exception:
+                m_width = 0
+            m_end = m_start + max(m_width, 1)
+            if new_start < m_end and m_start < new_end:
+                return member
+        return None
 
     def _find_member(self, type_obj, *, offset: int | None = None, name: str | None = None):
         members = getattr(type_obj, "members", None)
@@ -5870,6 +5900,32 @@ class BinaryNinjaBridge:
                     "field_type": str(getattr(member, "type", "")),
                     "offset": hex(int(getattr(member, "offset", offset))),
                 }
+        # --no-overwrite must REFUSE when the new field would clobber existing
+        # data, not add an overlapping member: BN's add_member_at_offset(...,
+        # overwrite=False) silently appends an overlapping member (worse than the
+        # overwrite path). Guard the whole BYTE RANGE the new field occupies, not
+        # just an exact start-offset collision -- an offset that lands *inside* a
+        # wider member (e.g. 0x4 within an int64_t at 0x0) overlaps just as much
+        # (#56).
+        if not overwrite and before_type is not None:
+            new_width = 0
+            try:
+                new_width = int(field_type.width)
+            except Exception:
+                new_width = 0
+            clash = self._first_overlapping_member(before_type, offset, new_width)
+            if clash is not None:
+                raise OperationFailure(
+                    "invalid_request",
+                    f"a {new_width or 1}-byte field at offset {hex(offset)} in struct "
+                    f"{resolved_name} would overlap existing member "
+                    f"{str(getattr(clash, 'name', ''))!r} "
+                    f"({str(getattr(clash, 'type', ''))}) at "
+                    f"{hex(int(getattr(clash, 'offset', offset)))}; --no-overwrite refuses "
+                    f"to clobber it. Re-run without --no-overwrite to replace it, or choose "
+                    f"a free range.",
+                    requested=self._operation_requested(op),
+                )
         builder.add_member_at_offset(str(op["field_name"]), field_type, offset, overwrite)
         try:
             builder.width = max(int(builder.width), int(offset) + int(field_type.width))

@@ -4600,6 +4600,118 @@ def test_struct_field_offset_rename_targets_right_field_on_duplicate_names(monke
     assert [(m.offset, m.name) for m in builder.members] == [(0, "dup"), (8, "renamed")]
 
 
+class _AddableStructBuilder:
+    def __init__(self):
+        self.width = 4
+        self.added = []
+
+    def add_member_at_offset(self, name, type_, offset, overwrite):
+        self.added.append((name, int(offset), overwrite))
+
+
+def _struct_set_instance(monkeypatch, occupied_offsets):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    builder = _AddableStructBuilder()
+    occupied_type = types.SimpleNamespace(
+        members=[_FakeStructMember(off, name) for off, name in occupied_offsets])
+
+    class _BV:
+        def parse_type_string(self, s):
+            return _FakeType("int32_t"), None
+
+        def get_type_by_name(self, n):
+            return occupied_type
+
+    monkeypatch.setattr(instance, "_struct_builder", lambda bv, name: ("S", builder))
+    monkeypatch.setattr(instance, "_commit_struct_builder", lambda *a, **k: None)
+    return bridge, instance, builder, _BV()
+
+
+def test_struct_field_set_no_overwrite_at_occupied_offset_refuses(monkeypatch):
+    # --no-overwrite at an occupied offset must REFUSE, not append an overlapping
+    # member (BN's add_member_at_offset(overwrite=False) silently overlaps) (#56).
+    bridge, instance, builder, bv = _struct_set_instance(monkeypatch, [(0, "x")])
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._op_struct_field_set(bv, {
+            "struct_name": "S", "offset": "0x0", "field_name": "dupfld",
+            "field_type": "int32_t", "overwrite_existing": False})
+    assert exc.value.status == "invalid_request"
+    assert "x" in str(exc.value)              # names the existing member
+    assert builder.added == []                # never reached add_member_at_offset
+
+
+def test_struct_field_set_no_overwrite_at_free_offset_adds(monkeypatch):
+    # The contrast case: --no-overwrite at a FREE offset still adds.
+    bridge, instance, builder, bv = _struct_set_instance(monkeypatch, [(0, "x")])
+    res = instance._op_struct_field_set(bv, {
+        "struct_name": "S", "offset": "0x8", "field_name": "newf",
+        "field_type": "int32_t", "overwrite_existing": False})
+    assert res["before_member"] is None       # 0x8 is free
+    assert builder.added and builder.added[0][0] == "newf"
+
+
+def test_struct_field_set_no_overwrite_refuses_interior_overlap(monkeypatch):
+    # An offset that lands INSIDE a wider member (0x4 within an 8-byte member at
+    # 0x0) overlaps just as much as an exact-start collision -- must refuse (#56).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    builder = _AddableStructBuilder()
+    big = types.SimpleNamespace(offset=0, name="big", type=types.SimpleNamespace(width=8))
+    occupied_type = types.SimpleNamespace(members=[big])
+
+    class _BV:
+        def parse_type_string(self, s):
+            return types.SimpleNamespace(width=4), None   # a 4-byte field
+
+        def get_type_by_name(self, n):
+            return occupied_type
+
+    monkeypatch.setattr(instance, "_struct_builder", lambda bv, name: ("S", builder))
+    monkeypatch.setattr(instance, "_commit_struct_builder", lambda *a, **k: None)
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._op_struct_field_set(_BV(), {
+            "struct_name": "S", "offset": "0x4", "field_name": "mid",
+            "field_type": "int32_t", "overwrite_existing": False})
+    assert exc.value.status == "invalid_request"
+    assert "big" in str(exc.value)            # names the spanned member
+    assert builder.added == []
+
+
+def test_struct_field_set_overwrite_at_occupied_offset_replaces(monkeypatch):
+    # The other contrast case: default overwrite at an occupied offset still
+    # applies (it replaces, not refuses).
+    bridge, instance, builder, bv = _struct_set_instance(monkeypatch, [(0, "x")])
+    res = instance._op_struct_field_set(bv, {
+        "struct_name": "S", "offset": "0x0", "field_name": "replfld",
+        "field_type": "int32_t", "overwrite_existing": True})
+    assert res["before_member"]["field_name"] == "x"
+    assert builder.added and builder.added[0] == ("replfld", 0, True)
+
+
+def test_annotate_types_declare_verified_when_layout_changed(monkeypatch):
+    # A redeclaration of an existing type NAME with a real layout change must be
+    # 'verified', not 'noop' -- the authoritative signal is the layout diff, not
+    # the decl-string compare that renders the same `struct QA` either way (#57).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    results = [{"op": "types_declare", "status": "noop", "defined_types": {"QA": "struct QA"}}]
+    type_diffs = [{"type_name": "QA", "changed": True, "message": "layout changed"}]
+    out = instance._annotate_operation_results(results, type_diffs)
+    assert out[0]["status"] == "verified"
+    assert out[0]["changed_types"] == {"QA": True}
+
+
+def test_annotate_types_declare_noop_when_unchanged(monkeypatch):
+    # A genuinely-identical redeclaration stays 'noop'.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    results = [{"op": "types_declare", "status": "verified", "defined_types": {"QA": "struct QA"}}]
+    type_diffs = [{"type_name": "QA", "changed": False, "message": "no change"}]
+    out = instance._annotate_operation_results(results, type_diffs)
+    assert out[0]["status"] == "noop"
+
+
 def test_struct_field_offset_grammar_matches_set(monkeypatch):
     # A zero-padded offset that `struct field set` accepts (_parse_address) must
     # also resolve in rename/delete; int(text, 0) rejected leading zeros (#25).
