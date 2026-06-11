@@ -1068,9 +1068,14 @@ def _render_taint_text(value: Any) -> str:
             lines.append(
                 f"slice for {sink.get('callee') or sink.get('kind') or '?'} @ {sink.get('address')} (seed {sink.get('seed', '?')}):"
             )
-            lines.append(f"  origin: {origin.get('kind')}" + (
-                f" {origin.get('callee') or origin.get('var') or ''}".rstrip()
-            ))
+            _ok = origin.get("kind")
+            if _ok == "constant" and origin.get("value") is not None:
+                _val = origin["value"]
+                _vs = f"{_val:#x}" if isinstance(_val, int) else str(_val)
+                _extra = _vs + (f" ({origin['var']})" if origin.get("var") else "")
+            else:
+                _extra = origin.get("callee") or origin.get("var") or ""
+            lines.append(f"  origin: {_ok} {_extra}".rstrip())
             crossed = sl.get("crossed_functions") or []
             if crossed:
                 lines.append(f"  crosses: {' <- '.join(crossed)}")

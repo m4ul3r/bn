@@ -22,6 +22,7 @@ API behaviour verified against /opt/binaryninja (see the design's spike):
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -104,6 +105,28 @@ def op_name(item: Any) -> str:
 
 def is_ssa_var(v: Any) -> bool:
     return hasattr(v, "version") and hasattr(v, "var")
+
+
+# printf-family conversion specifier: optional flags, width, precision, length
+# modifier, then a conversion char. `%%` is a literal (consumes nothing); a `*`
+# width or precision each consume one extra int arg.
+_FORMAT_SPEC_RE = re.compile(
+    r"%([-+ 0#]*)(\*|[0-9]+)?(?:\.(\*|[0-9]+))?(?:hh|h|ll|l|L|q|j|z|t)?([diouxXeEfFgGaAcspn%])")
+
+
+def _count_format_args(fmt: str) -> int:
+    """Number of varargs a printf-style *constant* format string consumes, so a
+    tainted vararg beyond it can be recognized as a provably-dead flow (#45)."""
+    n = 0
+    for m in _FORMAT_SPEC_RE.finditer(fmt):
+        if m.group(4) == "%":
+            continue
+        if m.group(2) == "*":
+            n += 1
+        if m.group(3) == "*":
+            n += 1
+        n += 1
+    return n
 
 
 def var_key(v: Any) -> tuple[str, Any]:
@@ -613,6 +636,59 @@ class TaintEngine:
         except Exception:
             return None
 
+    def _const_ptr_addr(self, ssaf: Any, expr: Any, depth: int = 0) -> int | None:
+        """Resolve a pointer expr to the constant address it points at, following
+        an SSA copy chain. Unlike :meth:`_global_addr` this does NOT require the
+        target be writable -- a rodata format string lives in read-only data."""
+        if expr is None or depth > 6:
+            return None
+        if "CONST" in op_name(expr):
+            return self._int_const(expr)
+        if is_ssa_var(expr):
+            try:
+                d = ssaf.get_ssa_var_definition(expr)
+            except Exception:
+                d = None
+            if d is not None:
+                return self._const_ptr_addr(ssaf, getattr(d, "src", None), depth + 1)
+            return None
+        reads = expr_reads(expr)
+        if len(reads) == 1:
+            try:
+                d = ssaf.get_ssa_var_definition(reads[0])
+            except Exception:
+                d = None
+            if d is not None:
+                return self._const_ptr_addr(ssaf, getattr(d, "src", None), depth + 1)
+        return None
+
+    def _const_format_string(self, ssaf: Any, expr: Any) -> str | None:
+        """If *expr* points at a NUL-terminated constant string in the binary,
+        return its text; else None (unknown/non-constant format -> stay
+        conservative and treat every vararg as live)."""
+        addr = self._const_ptr_addr(ssaf, expr)
+        if addr is None:
+            return None
+        getstr = getattr(self.bv, "get_ascii_string_at", None)
+        if getstr is not None:
+            try:
+                s = getstr(int(addr), 1)
+                val = getattr(s, "value", None)
+                if val is not None:
+                    return str(val)
+            except Exception:
+                pass
+        read = getattr(self.bv, "read", None)
+        if read is not None:
+            try:
+                raw = read(int(addr), 512)
+                if raw:
+                    nul = raw.find(b"\x00")
+                    return raw[: nul if nul >= 0 else len(raw)].decode("latin-1", "replace")
+            except Exception:
+                pass
+        return None
+
     def _addr_base_offset(self, ssaf: Any, expr: Any, depth: int = 0):
         """Resolve an address expression to (base_var_key, offset), following SSA
         copies to a common root so a store and a load through different temp vars
@@ -1026,7 +1102,19 @@ class TaintEngine:
                 base = int(va.get("first_index", 0))
                 vto = va.get("to")
                 vsink = model.get("sink") if va.get("sink") else None
-                for i in range(max(base, 0), len(params)):
+                upper = len(params)
+                # When the format string (the arg right before the varargs, for the
+                # printf family) is a compile-time constant, only the varargs its
+                # conversion specifiers actually consume can affect the output or
+                # the dest buffer. A tainted vararg past the last conversion is a
+                # provably-dead flow and must not be reported or propagated (#45).
+                # A non-constant / tainted format keeps the conservative all-args
+                # behavior (still a real sink).
+                if base >= 1 and (base - 1) < len(params):
+                    fmt = self._const_format_string(ssaf, params[base - 1])
+                    if fmt is not None:
+                        upper = min(upper, base + _count_format_args(fmt))
+                for i in range(max(base, 0), upper):
                     ht = arg_taint(params[i])
                     if not ht:
                         continue
@@ -1543,7 +1631,19 @@ class TaintEngine:
                     origin = {"kind": "call", "callee": name}
                 return
             steps.append(_instr_dict(defn, reason="definition"))
-            for r in ssa_reads(defn):
+            reads = ssa_reads(defn)
+            # A definition that reads no further SSA vars is a leaf: if its source
+            # is a compile-time constant, the slice bottoms out at that literal.
+            # Label it `constant` (as `trace` does) instead of leaving the default
+            # `unresolved` -- for an auditor those are opposite risk conclusions
+            # (#43). The narrow case the issue targets: a constant reached through
+            # one or more variable copies (var = 0; r2 = var), where the direct
+            # immediate is already handled at seeding time.
+            if not reads and origin["kind"] == "unresolved":
+                cval = self._int_const(getattr(defn, "src", None))
+                if cval is not None:
+                    origin = {"kind": "constant", "value": cval, "var": var_label(v)}
+            for r in reads:
                 walk(r, d + 1)
 
         walk(seed_var, 0)

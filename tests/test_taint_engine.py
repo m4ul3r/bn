@@ -433,6 +433,79 @@ def test_forward_vararg_no_double_report(models):
     assert len(sprintf_arg2) == 1
 
 
+class FBVStr(FBV):
+    """FBV that can also resolve a constant string by address (for format-string
+    aware vararg gating)."""
+    def __init__(self, addr_names, funcs=None, strings=None):
+        super().__init__(addr_names, funcs)
+        self._strings = strings or {}
+
+    def read(self, addr, length):
+        s = self._strings.get(int(addr))
+        return (s.encode("latin-1") + b"\x00") if s is not None else b""
+
+
+def _sprintf_unconsumed_vararg_func(fmt):
+    # f(x): sprintf(&buf, fmt, 1, 7, 0xe, x)  -- x is the tainted param.
+    # When fmt is a constant, only the varargs its conversions consume are live.
+    buf = FVar("buf", typ="char[0x80]"); x = FVar("x"); rc = FVar("rc")
+    x1 = FSSA(x, 1); rc1 = FSSA(rc, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "rc#1 = &buf", writes=[rc1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", f"sprintf(rc#1, {fmt!r}, 1, 7, 0xe, x#1)",
+               reads=[rc1, x1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401080", constant=0x401080),
+               params=[FExpr("MLIL_VAR_SSA", "rc#1", reads=[rc1]),
+                       FExpr("MLIL_CONST_PTR", fmt, constant=0x5000),
+                       FExpr("MLIL_CONST", "1", constant=1),
+                       FExpr("MLIL_CONST", "7", constant=7),
+                       FExpr("MLIL_CONST", "0xe", constant=0xe),
+                       FExpr("MLIL_VAR_SSA", "x#1", reads=[x1])]),
+    ]
+    bv = FBVStr({0x401080: "sprintf"}, strings={0x5000: fmt})
+    return FFunc("fmt_fn", 0x10, FSSAFunc(instrs), params=[x]), bv
+
+
+def test_forward_unconsumed_vararg_not_reported(models):
+    # "%i.%i.%i" consumes 3 args (1,7,0xe); the tainted 4th vararg is never read
+    # by the format -> provably dead -> must NOT be reported as a sprintf sink (#45).
+    func, bv = _sprintf_unconsumed_vararg_func("%i.%i.%i")
+    engine = te.TaintEngine(bv, te.load_models())
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    sprintf_sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "sprintf"]
+    assert sprintf_sinks == [], f"unconsumed tainted vararg wrongly reported: {sprintf_sinks}"
+
+
+def test_forward_consumed_vararg_still_reported():
+    # When the format DOES consume the tainted vararg, it stays a real sink: the
+    # gating is precise, not a blanket suppression.
+    func, bv = _sprintf_unconsumed_vararg_func("%i.%i.%i.%i")
+    engine = te.TaintEngine(bv, te.load_models())
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert any(s["sink"]["callee"] == "sprintf" and s["sink"]["tainted_arg_index"] == 5
+               for s in result["reached_sinks"]), result["reached_sinks"]
+
+
+def test_forward_nonconstant_format_keeps_all_varargs():
+    # If the format string is not a discoverable constant, stay conservative and
+    # still report the tainted vararg (no false negative).
+    func, bv = _sprintf_unconsumed_vararg_func("%i.%i.%i")
+    bv._strings = {}  # format no longer resolvable
+    engine = te.TaintEngine(bv, te.load_models())
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert any(s["sink"]["callee"] == "sprintf" and s["sink"]["tainted_arg_index"] == 5
+               for s in result["reached_sinks"]), result["reached_sinks"]
+
+
+def test_count_format_args_handles_literals_and_star():
+    assert te._count_format_args("%i.%i.%i") == 3
+    assert te._count_format_args("100%% done: %s") == 1   # %% is a literal
+    assert te._count_format_args("%*d") == 2               # * width consumes an arg
+    assert te._count_format_args("%.*f") == 2              # * precision consumes an arg
+    assert te._count_format_args("no conversions here") == 0
+
+
 def test_var_label_of_global():
     assert te.var_label_of((("global", 0x404060), None)) == "glob_0x404060"
     assert te.var_label_of((("global", 0x404060), 2)) == "glob_0x404060#2"
@@ -1174,6 +1247,56 @@ def test_backward_walk_truncation_recorded(process_func, models):
     engine = te.TaintEngine(bv, models, max_depth=1)
     result = engine.backward(process_func, [te.parse_locator("arg:memcpy:2")])
     assert any("truncated" in a for a in result["assumptions"])
+
+
+def test_backward_constant_through_copy_labeled_constant(models):
+    # size = 0 reaches memcpy's length arg through a variable copy:
+    #   var_2c#1 = 0 ; r2#4 = var_2c#1 ; memcpy(dst, src, r2#4)
+    # The slice must bottom out at `constant 0`, not the default `unresolved` --
+    # for an auditor those are opposite risk conclusions (#43).
+    v2c = FVar("var_2c"); r2 = FVar("r2")
+    v2c1 = FSSA(v2c, 1); r2_4 = FSSA(r2, 4)
+    instrs = [
+        FInstr(0, 0x100, "MLIL_SET_VAR_SSA", "var_2c#1 = 0", writes=[v2c1],
+               src=FExpr("MLIL_CONST", "0", constant=0)),
+        FInstr(1, 0x104, "MLIL_SET_VAR_SSA", "r2#4 = var_2c#1", reads=[v2c1], writes=[r2_4],
+               src=FExpr("MLIL_VAR_SSA", "var_2c#1", reads=[v2c1])),
+        FInstr(2, 0x108, "MLIL_CALL_SSA", "memcpy(dst, src, r2#4)", reads=[r2_4], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401080", constant=0x401080),
+               params=[FExpr("MLIL_VAR_SSA", "dst", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "src", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "r2#4", reads=[r2_4])]),
+    ]
+    bv = FBV({0x401080: "memcpy"})
+    func = FFunc("f", 0x100, FSSAFunc(instrs), params=[])
+    engine = te.TaintEngine(bv, models)
+    result = engine.backward(func, [te.parse_locator("arg:memcpy:2")])
+    origins = [sl["origin"] for sl in result["slices"]]
+    assert any(o.get("kind") == "constant" and o.get("value") == 0 for o in origins), origins
+
+
+def test_backward_copy_of_nonconstant_stays_unresolved(models):
+    # Guard the narrow #43 fix: a copy chain that does NOT bottom out at a literal
+    # must keep its existing classification (not be mislabeled `constant`).
+    a = FVar("a"); r2 = FVar("r2"); g = FVar("g")
+    a1 = FSSA(a, 1); r2_4 = FSSA(r2, 4); g1 = FSSA(g, 1)
+    instrs = [
+        FInstr(0, 0x100, "MLIL_SET_VAR_SSA", "a#1 = g#1", reads=[g1], writes=[a1],
+               src=FExpr("MLIL_VAR_SSA", "g#1", reads=[g1])),
+        FInstr(1, 0x104, "MLIL_SET_VAR_SSA", "r2#4 = a#1", reads=[a1], writes=[r2_4],
+               src=FExpr("MLIL_VAR_SSA", "a#1", reads=[a1])),
+        FInstr(2, 0x108, "MLIL_CALL_SSA", "memcpy(dst, src, r2#4)", reads=[r2_4], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401080", constant=0x401080),
+               params=[FExpr("MLIL_VAR_SSA", "dst", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "src", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "r2#4", reads=[r2_4])]),
+    ]
+    bv = FBV({0x401080: "memcpy"})
+    func = FFunc("f", 0x100, FSSAFunc(instrs), params=[])
+    engine = te.TaintEngine(bv, models)
+    result = engine.backward(func, [te.parse_locator("arg:memcpy:2")])
+    origins = [sl["origin"] for sl in result["slices"]]
+    assert all(o.get("kind") != "constant" for o in origins), origins
 
 
 # --------------------------------------------------------------------------
