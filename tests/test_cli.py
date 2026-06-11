@@ -1844,6 +1844,54 @@ def test_version_flag_prints_version(capsys):
     assert out.strip() == f"bn {VERSION}"
 
 
+def test_version_is_single_sourced_from_pyproject():
+    # The version literal lives only in pyproject.toml; version.py derives it,
+    # so CLI/bridge never drift and a bump touches one file (#82).
+    import tomllib
+    from pathlib import Path
+
+    import bn.version
+
+    repo_root = Path(bn.version.__file__).resolve().parents[2]
+    pyproject = tomllib.loads((repo_root / "pyproject.toml").read_text(encoding="utf-8"))
+    canonical = pyproject["project"]["version"]
+
+    assert canonical == "0.20.0"  # the reset target
+    assert bn.version.VERSION == canonical
+    # No stray literal: the old number must be gone from the version module.
+    assert "0.12.2" not in Path(bn.version.__file__).read_text(encoding="utf-8")
+
+
+def test_resolve_version_falls_back_to_dist_metadata(monkeypatch):
+    # When pyproject is unreachable (installed wheel), VERSION resolves from the
+    # installed distribution metadata rather than crashing (#82).
+    import tomllib
+
+    import bn.version
+
+    monkeypatch.setattr(
+        tomllib, "loads",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no pyproject here")),
+    )
+    # Editable install metadata reports the same canonical version.
+    assert bn.version._resolve_version() == bn.version.VERSION
+
+
+def test_bridge_plugin_json_carries_no_version_literal():
+    # plugin.json is BN-manager metadata that cannot import Python; it must not
+    # duplicate the version (single-source invariant, #82).
+    import json
+    from pathlib import Path
+
+    import bn.version
+
+    repo_root = Path(bn.version.__file__).resolve().parents[2]
+    manifest = json.loads(
+        (repo_root / "plugin" / "bn_agent_bridge" / "plugin.json").read_text(encoding="utf-8")
+    )
+    assert "version" not in manifest
+
+
 def test_max_depth_validator_says_depth_not_index(capsys):
     # Depth flags get a "depth" label, not the generic "index" (#49).
     with pytest.raises(SystemExit) as exc:

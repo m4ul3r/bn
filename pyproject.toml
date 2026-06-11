@@ -1,6 +1,10 @@
 [project]
 name = "bn"
-version = "0.12.2"
+# Canonical version literal for the whole project. src/bn/version.py derives
+# VERSION from this (the uv_build backend requires a static literal here and
+# cannot read it from a Python attribute), and the bridge's plugin.json carries
+# no version of its own, so this is the single place to bump (#82).
+version = "0.20.0"
 description = "Agent-friendly Binary Ninja CLI with a GUI companion bridge"
 readme = "README.md"
 authors = [
