@@ -447,8 +447,8 @@ def _evidence_table(args: argparse.Namespace) -> int:
              arg("--limit", type=_positive_int, default=20,
                  help="Max matching strings to summarize; result cap in all formats "
                       "(the reported total stays honest, with truncated=true when capped)"),
-             arg("--table-entries", type=int, default=6,
-                 help="Pointer entries to show around metadata data refs"),
+             arg("--table-entries", type=_non_negative_int, default=6,
+                 help="Pointer entries to show around metadata data refs (0 = none)"),
          ])
 def _evidence_message(args: argparse.Namespace) -> int:
     return _call(

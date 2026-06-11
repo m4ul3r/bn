@@ -152,11 +152,23 @@ def render_envelope(payload: dict[str, Any], fmt: str) -> str:
     real payload in the requested format). Only ``text`` gets the human-readable
     ``key: value`` form.
     """
-    if fmt == "json":
-        return json.dumps(payload, indent=2, sort_keys=True, default=_json_default) + "\n"
-    if fmt == "ndjson":
-        return json.dumps(payload, sort_keys=True, default=_json_default) + "\n"
+    if fmt in ("json", "ndjson"):
+        # payload is always a dict here, so render_value's json/ndjson branches
+        # produce byte-identical output -- share them rather than keep a second
+        # copy of the indent/sort_keys/default settings that could drift.
+        return render_value(payload, fmt)
     return render_artifact_envelope(payload)
+
+
+def render_error(message: str, fmt: str) -> str:
+    """Render an error as a machine-readable envelope under json/ndjson.
+
+    Routes through :func:`render_value` so error envelopes match successful
+    JSON output (``indent=2, sort_keys=True``) instead of a hand-rolled compact
+    ``json.dumps``. Lets ``bn ... --format json | jq`` parse an error object
+    rather than an empty stream.
+    """
+    return render_value({"ok": False, "error": message}, fmt)
 
 
 def write_output_result(
