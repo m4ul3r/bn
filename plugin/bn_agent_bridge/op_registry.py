@@ -40,6 +40,18 @@ class OpRegistry:
 
         return decorator
 
+    def clear(self) -> None:
+        """Drop all registered ops.
+
+        bridge.py is re-executed from scratch by the test harness's
+        ``_load_bridge`` (``spec.loader.exec_module``) on every call, which
+        re-runs the @op binder block against this same module-global registry.
+        Clearing first makes that re-execution idempotent (identical final
+        state) while keeping the duplicate-registration guard intact for
+        genuine double-registration within one module execution.
+        """
+        self._ops.clear()
+
     def spec(self, name: str) -> OpSpec | None:
         return self._ops.get(name)
 

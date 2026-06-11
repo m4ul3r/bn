@@ -86,3 +86,15 @@ def test_escalation_is_stored():
     def _e(bridge, params, target): return 1
 
     assert reg.spec("e").lock_escalation({"force": True}) is True
+
+
+def test_registry_covers_every_dispatch_op():
+    from bn_agent_bridge.op_registry import REGISTRY
+    expected = EXPECTED_READ | EXPECTED_WRITE | {"load_binary", "shutdown"}
+    assert REGISTRY.names() == expected
+
+
+def test_decompile_is_the_only_escalating_op():
+    from bn_agent_bridge.op_registry import REGISTRY
+    escalating = {n for n in REGISTRY.names() if REGISTRY.spec(n).lock_escalation is not None}
+    assert escalating == {"decompile"}

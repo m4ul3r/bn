@@ -26,6 +26,7 @@ from binaryninja.mainthread import execute_on_main_thread_and_wait, is_main_thre
 from binaryninja.plugin import PluginCommand
 
 from . import taint_engine as _taint
+from .op_registry import REGISTRY, op
 from .paths import PLUGIN_NAME, bridge_registry_path, bridge_socket_path, instances_dir
 from .version import VERSION, build_id_for_file
 
@@ -6446,6 +6447,382 @@ _headless_views_lock = threading.Lock()
 # are unavailable until `bn refresh`, so commands consult this to stay honest
 # instead of returning a misleading empty result. Weak so closed views drop out.
 _quick_loaded_views: "weakref.WeakSet[Any]" = weakref.WeakSet()
+
+
+# ---- op binders: each reproduces one former _dispatch_on_main if-arm verbatim
+# (self -> bridge). Registered at import; dispatch still uses the legacy if-chain
+# until Task 1.4 wires the registry in. ----
+# Clear first so re-executing this module (the test harness's _load_bridge re-runs
+# the whole file via exec_module against this same global registry) re-registers
+# the identical op set instead of tripping the duplicate-registration guard.
+REGISTRY.clear()
+
+
+@op("doctor", lock="read")
+def _bind_doctor(bridge, params, target):
+    return bridge._doctor()
+
+
+@op("list_targets", lock="read")
+def _bind_list_targets(bridge, params, target):
+    return bridge.targets.refresh()
+
+
+@op("target_info", lock="read")
+def _bind_target_info(bridge, params, target):
+    return bridge._target_info(params.get("selector") or target)
+
+
+@op("refresh", lock="write")
+def _bind_refresh(bridge, params, target):
+    return bridge._refresh(target)
+
+
+@op("shutdown", lock="none")
+def _bind_shutdown(bridge, params, target):
+    bridge._shutdown_event.set()
+    return {"shutting_down": True}
+
+
+@op("load_binary", lock="none")
+def _bind_load_binary(bridge, params, target):
+    return bridge._load_binary(
+        str(params["path"]),
+        prefer_bndb=_validate_bool(params.get("prefer_bndb"), label="prefer_bndb", default=True),
+        quick=_validate_bool(params.get("quick"), label="quick", default=False),
+    )
+
+
+@op("close_binary", lock="write")
+def _bind_close_binary(bridge, params, target):
+    return bridge._close_binary(
+        params.get("path"),
+        target,
+        _validate_bool(params.get("all"), label="all", default=False),
+    )
+
+
+@op("save_database", lock="write")
+def _bind_save_database(bridge, params, target):
+    return bridge._save_database(target, params.get("path"))
+
+
+@op("list_functions", lock="read")
+def _bind_list_functions(bridge, params, target):
+    return bridge._list_functions(
+        target,
+        min_address=params.get("min_address"),
+        max_address=params.get("max_address"),
+        offset=int(params.get("offset", 0)),
+        limit=int(params["limit"]) if "limit" in params else None,
+        count_only=bool(params.get("count_only", False)),
+    )
+
+
+@op("search_functions", lock="read")
+def _bind_search_functions(bridge, params, target):
+    return bridge._search_functions(
+        target,
+        str(params.get("query", "")),
+        regex=bool(params.get("regex", False)),
+        exact=bool(params.get("exact", False)),
+        min_address=params.get("min_address"),
+        max_address=params.get("max_address"),
+        offset=int(params.get("offset", 0)),
+        limit=int(params["limit"]) if "limit" in params else None,
+    )
+
+
+@op("callsites", lock="read")
+def _bind_callsites(bridge, params, target):
+    return bridge._callsites(
+        target,
+        str(params["callee"]),
+        within_identifiers=list(params.get("within_identifiers") or []),
+        context=int(params.get("context", 3)),
+    )
+
+
+@op("function_info", lock="read")
+def _bind_function_info(bridge, params, target):
+    return bridge._function_info(target, params["identifier"])
+
+
+@op("get_prototype", lock="read")
+def _bind_get_prototype(bridge, params, target):
+    return bridge._get_prototype(target, params["identifier"])
+
+
+@op("list_locals", lock="read")
+def _bind_list_locals(bridge, params, target):
+    return bridge._list_locals_for_function(target, params["identifier"])
+
+
+@op("decompile", lock="read",
+    escalation=lambda p: _validate_bool(p.get("force_analysis"), label="force_analysis", default=False))
+def _bind_decompile(bridge, params, target):
+    return bridge._decompile(
+        target,
+        params["identifier"],
+        addresses=bool(params.get("addresses")),
+        force_analysis=bool(params.get("force_analysis")),
+    )
+
+
+@op("il", lock="read")
+def _bind_il(bridge, params, target):
+    return bridge._il(target, params["identifier"], str(params.get("view", "hlil")), bool(params.get("ssa")))
+
+
+@op("structured_il", lock="read")
+def _bind_structured_il(bridge, params, target):
+    return bridge._structured_il(
+        target,
+        params["identifier"],
+        view=str(params.get("view", "mlil")),
+        ssa=bool(params.get("ssa", True)),
+    )
+
+
+@op("defuse", lock="read")
+def _bind_defuse(bridge, params, target):
+    return bridge._defuse(target, params["identifier"], str(params["var"]))
+
+
+@op("resolved_calls", lock="read")
+def _bind_resolved_calls(bridge, params, target):
+    return bridge._resolved_calls(
+        target,
+        params["identifier"],
+        direction=str(params.get("direction", "both")),
+        resolve_indirect=bool(params.get("resolve_indirect", True)),
+    )
+
+
+@op("possible_values", lock="read")
+def _bind_possible_values(bridge, params, target):
+    return bridge._possible_values(target, params["identifier"], params["at"])
+
+
+@op("taint", lock="read")
+def _bind_taint(bridge, params, target):
+    return bridge._taint(target, params)
+
+
+@op("disasm", lock="read")
+def _bind_disasm(bridge, params, target):
+    return bridge._disasm(target, params["identifier"])
+
+
+@op("function_evidence", lock="read")
+def _bind_function_evidence(bridge, params, target):
+    return bridge._function_evidence(
+        target,
+        params["identifier"],
+        context=int(params.get("context", 2)),
+    )
+
+
+@op("xrefs", lock="read")
+def _bind_xrefs(bridge, params, target):
+    return bridge._xrefs(target, params["identifier"])
+
+
+@op("field_xrefs", lock="read")
+def _bind_field_xrefs(bridge, params, target):
+    return bridge._field_xrefs(target, str(params["field"]))
+
+
+@op("pointer_table", lock="read")
+def _bind_pointer_table(bridge, params, target):
+    return bridge._pointer_table(
+        target,
+        params["address"],
+        entries=int(params.get("entries", 16)),
+        stride=params.get("stride"),
+    )
+
+
+@op("message_lens", lock="read")
+def _bind_message_lens(bridge, params, target):
+    return bridge._message_lens(
+        target,
+        str(params["query"]),
+        limit=int(params.get("limit", 20)),
+        table_entries=int(params.get("table_entries", 6)),
+    )
+
+
+@op("init_arrays", lock="read")
+def _bind_init_arrays(bridge, params, target):
+    return bridge._init_arrays(
+        target,
+        limit=int(params.get("limit", 64)),
+    )
+
+
+@op("backward_slice", lock="read")
+def _bind_backward_slice(bridge, params, target):
+    return bridge._backward_slice(
+        target,
+        str(params["identifier"]),
+        str(params["address"]),
+        arg_index=int(params.get("arg_index", 0)),
+        view=str(params.get("view", "mlil")),
+        max_depth=int(params.get("max_depth", 50)),
+        interprocedural=bool(params.get("interprocedural", False)),
+        ip_depth=int(params.get("ip_depth", 2)),
+    )
+
+
+@op("types", lock="read")
+def _bind_types(bridge, params, target):
+    return bridge._types(
+        target,
+        query=params.get("query"),
+        offset=int(params.get("offset", 0)),
+        limit=int(params.get("limit", 100)),
+    )
+
+
+@op("type_info", lock="read")
+def _bind_type_info(bridge, params, target):
+    return bridge._type_info(
+        target,
+        str(params["type_name"]),
+        require_struct=bool(params.get("require_struct")),
+    )
+
+
+@op("strings", lock="read")
+def _bind_strings(bridge, params, target):
+    return bridge._strings(
+        target,
+        query=params.get("query"),
+        offset=int(params.get("offset", 0)),
+        limit=int(params.get("limit", 100)),
+        min_length=int(params["min_length"]) if params.get("min_length") is not None else None,
+        section=params.get("section"),
+        no_crt=bool(params.get("no_crt", False)),
+        regex=bool(params.get("regex", False)),
+    )
+
+
+@op("imports", lock="read")
+def _bind_imports(bridge, params, target):
+    return bridge._imports(
+        target,
+        summary=bool(params.get("summary", False)),
+        offset=int(params.get("offset", 0)),
+        limit=int(params["limit"]) if params.get("limit") is not None else None,
+    )
+
+
+@op("sections", lock="read")
+def _bind_sections(bridge, params, target):
+    return bridge._sections(
+        target,
+        query=params.get("query"),
+        offset=int(params.get("offset", 0)),
+        limit=int(params["limit"]) if params.get("limit") is not None else None,
+    )
+
+
+@op("read", lock="read")
+def _bind_read(bridge, params, target):
+    return bridge._read(target, params["address"], int(params["length"]))
+
+
+@op("function_create", lock="write")
+def _bind_function_create(bridge, params, target):
+    return bridge._function_create(target, params["address"], bool(params.get("preview")))
+
+
+@op("bundle_function", lock="read")
+def _bind_bundle_function(bridge, params, target):
+    return bridge._bundle_function(target, params["identifier"], params.get("out_path"))
+
+
+@op("py_exec", lock="write")
+def _bind_py_exec(bridge, params, target):
+    return bridge._py_exec(target, str(params["script"]))
+
+
+@op("rename_symbol", lock="write")
+def _bind_rename_symbol(bridge, params, target):
+    return bridge._mutation(target, bool(params.get("preview")), [{"op": "rename_symbol", **params}])
+
+
+@op("get_comment", lock="read")
+def _bind_get_comment(bridge, params, target):
+    return bridge._get_comment(target, params.get("address"), params.get("function"))
+
+
+@op("list_comments", lock="read")
+def _bind_list_comments(bridge, params, target):
+    return bridge._list_comments(
+        target,
+        query=params.get("query"),
+        offset=int(params.get("offset", 0)),
+        limit=int(params["limit"]) if "limit" in params else None,
+    )
+
+
+@op("set_comment", lock="write")
+def _bind_set_comment(bridge, params, target):
+    return bridge._mutation(target, bool(params.get("preview")), [{"op": "set_comment", **params}])
+
+
+@op("delete_comment", lock="write")
+def _bind_delete_comment(bridge, params, target):
+    return bridge._mutation(target, bool(params.get("preview")), [{"op": "delete_comment", **params}])
+
+
+@op("set_prototype", lock="write")
+def _bind_set_prototype(bridge, params, target):
+    return bridge._mutation(target, bool(params.get("preview")), [{"op": "set_prototype", **params}])
+
+
+@op("local_rename", lock="write")
+def _bind_local_rename(bridge, params, target):
+    return bridge._mutation(target, bool(params.get("preview")), [{"op": "local_rename", **params}])
+
+
+@op("local_retype", lock="write")
+def _bind_local_retype(bridge, params, target):
+    return bridge._mutation(target, bool(params.get("preview")), [{"op": "local_retype", **params}])
+
+
+@op("struct_field_set", lock="write")
+def _bind_struct_field_set(bridge, params, target):
+    return bridge._mutation(target, bool(params.get("preview")), [{"op": "struct_field_set", **params}])
+
+
+@op("struct_field_rename", lock="write")
+def _bind_struct_field_rename(bridge, params, target):
+    return bridge._mutation(target, bool(params.get("preview")), [{"op": "struct_field_rename", **params}])
+
+
+@op("struct_field_delete", lock="write")
+def _bind_struct_field_delete(bridge, params, target):
+    return bridge._mutation(target, bool(params.get("preview")), [{"op": "struct_field_delete", **params}])
+
+
+@op("types_declare", lock="write")
+def _bind_types_declare(bridge, params, target):
+    return bridge._mutation(target, bool(params.get("preview")), [{"op": "types_declare", **params}])
+
+
+@op("batch_apply", lock="write")
+def _bind_batch_apply(bridge, params, target):
+    manifest = dict(params)
+    preview = bool(manifest.get("preview"))
+    # Keep None as None so the single-open-target default still applies;
+    # str(None) would become the bogus selector "None".
+    chosen = manifest.get("target") or target
+    target = str(chosen) if chosen is not None else None
+    operations = list(manifest.get("ops") or [])
+    return bridge._mutation(target, preview, operations)
 
 
 def _preload_binary(path: str, quick: bool):
