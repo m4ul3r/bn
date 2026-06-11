@@ -1325,6 +1325,36 @@ def test_backward_copy_of_nonconstant_stays_unresolved(models):
     assert all(o.get("kind") != "constant" for o in origins), origins
 
 
+def test_find_callsites_matches_address_form_locator(models):
+    # A call the IL renders only by address (PLT veneer / no recovered symbol):
+    # arg:0x12fa4:1 must seed the same callsite the name form would (#58).
+    a = FVar("a"); a1 = FSSA(a, 1)
+    instrs = [
+        FInstr(0, 0x100, "MLIL_SET_VAR_SSA", "a#1 = arg", writes=[a1]),
+        FInstr(1, 0x108, "MLIL_CALL_SSA", "0x12fa4(dst, a#1, 0x10)", reads=[a1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x12fa4", constant=0x12fa4),
+               params=[FExpr("MLIL_VAR_SSA", "dst", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "a#1", reads=[a1]),
+                       FExpr("MLIL_CONST", "0x10", constant=0x10)]),
+    ]
+    func = FFunc("f", 0x100, FSSAFunc(instrs), params=[])
+    bv = FBV({})  # 0x12fa4 has no symbol -> name match fails; address match must work
+    engine = te.TaintEngine(bv, models)
+    assert len(engine._find_callsites(instrs, "0x12fa4")) == 1
+    assert len(engine._find_callsites(instrs, "0x12fa5")) == 1   # THUMB-bit tolerant
+    assert engine._find_callsites(instrs, "0x9999") == []        # other address: no match
+    # end-to-end: backward arg:0x12fa4:1 seeds (no "no call found" error)
+    result = engine.backward(func, [te.parse_locator("arg:0x12fa4:1")])
+    assert result["sink_status"][0]["seeded"] is True
+
+
+def test_callee_as_addr_parsing():
+    assert te.TaintEngine._callee_as_addr("0x12fa4") == 0x12fa4
+    assert te.TaintEngine._callee_as_addr("4711") == 4711
+    assert te.TaintEngine._callee_as_addr("memcpy") is None
+    assert te.TaintEngine._callee_as_addr("Parameter::data") is None
+
+
 # --------------------------------------------------------------------------
 # unified call-target / thunk resolver (issue #7, PR1)
 # --------------------------------------------------------------------------

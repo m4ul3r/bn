@@ -827,25 +827,54 @@ class TaintEngine:
         matched, _ = lookup_model({callee: True}, name)
         return bool(matched)
 
+    @staticmethod
+    def _callee_as_addr(callee: str) -> int | None:
+        """An address-form callee locator (``0x12fa4`` or a bare decimal) as an
+        int, else None. Lets ``ret:<addr>`` / ``arg:<addr>:<n>`` name a callee by
+        the address the IL renders (PLT veneers, indirect calls with no recovered
+        symbol) instead of a symbol that may not exist (#58)."""
+        if not isinstance(callee, str):
+            return None
+        s = callee.strip()
+        try:
+            if s.lower().startswith("0x"):
+                return int(s, 16)
+            if s.isdigit():
+                return int(s, 10)
+        except Exception:
+            return None
+        return None
+
     def _find_callsites(self, instrs: list[Any], callee: str) -> list[Any]:
+        callee_addr = self._callee_as_addr(callee)
+
+        def addr_match(a: Any) -> bool:
+            # Compare THUMB-bit-masked so 0x12de0 matches a 0x12de1 entry.
+            return (callee_addr is not None and a is not None
+                    and (int(a) & ~1) == (callee_addr & ~1))
+
         hits = []
         for ins in instrs:
             if not self._is_call(ins):
                 continue
             target = const_target(getattr(ins, "dest", None))
             name = self._callee_name(target)
-            if self._name_matches_callee(name, callee):
+            # Match by symbol name, or by the address the call renders -- the same
+            # address xrefs/trace use -- so an address-form locator seeds the same
+            # callsites the name form does.
+            if self._name_matches_callee(name, callee) or addr_match(target):
                 hits.append(ins)
                 continue
             # Follow a thunk/veneer (j_memcpy -> memcpy) and match the resolved
-            # name, so backward seeding reaches a sink called through a stub --
-            # the same resolution forward taint and `bn trace` already perform.
-            # This is the backward dual of the forward thunk-follow above.
+            # name OR its resolved address, so backward/forward seeding reaches a
+            # sink called through a stub -- the same resolution forward taint and
+            # `bn trace` already perform.
             rt = resolve_call_target(self.bv, ins, follow_thunks=True)
-            if rt.via == "thunk" and rt.address is not None:
+            if rt.address is not None:
                 rname = self._callee_name(int(rt.address)) \
                     or (str(rt.function.name) if getattr(rt.function, "name", None) else None)
-                if self._name_matches_callee(rname, callee):
+                if (rt.via == "thunk" and self._name_matches_callee(rname, callee)) \
+                        or addr_match(rt.address):
                     hits.append(ins)
         return hits
 
