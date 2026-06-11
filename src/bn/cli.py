@@ -32,6 +32,8 @@ from .transport import (  # noqa: F401
     list_instances,
     send_request,
     spawn_instance,
+    validate_instance_id,
+    wait_for_teardown,
 )
 from .version import VERSION, build_id_for_file  # noqa: F401
 

@@ -5,6 +5,7 @@ import errno
 import fcntl
 import json
 import os
+import re
 import secrets
 import socket
 import subprocess
@@ -64,6 +65,33 @@ class BridgeInstance:
 
 def instance_selector(instance: BridgeInstance) -> str:
     return instance.instance_id or "default"
+
+
+# A bridge instance id is joined directly into filesystem paths
+# (instances_dir()/<id>.{json,sock,log}). Path semantics make an unvalidated id
+# a traversal primitive: "../evil" escapes instances_dir() and "/abs" replaces
+# it entirely, spawning a bridge whose files land outside the cache tree --
+# never listed by list_instances() (which only globs instances_dir()/*.json) and
+# impossible to stop normally (#84). Restrict ids to a strict basename grammar.
+_INSTANCE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def validate_instance_id(instance_id: str) -> str:
+    """Reject any instance id that isn't a safe path basename.
+
+    Accepts letters, digits, '_', '-', '.'; rejects empty strings, '.'/'..',
+    and anything containing a path separator or other character (which also
+    rules out absolute paths and traversal). Raises BridgeError before any
+    filesystem activity. Returns the id unchanged when valid.
+    """
+    if not isinstance(instance_id, str) or not instance_id:
+        raise BridgeError("Instance id must be a non-empty string")
+    if instance_id in (".", "..") or not _INSTANCE_ID_RE.match(instance_id):
+        raise BridgeError(
+            f"Invalid instance id: {instance_id!r}. Use only letters, digits, "
+            "'_', '-', and '.' (no path separators, no '.'/'..', no absolute paths)."
+        )
+    return instance_id
 
 
 def _format_instance_choices(instances: list[BridgeInstance]) -> str:
@@ -204,6 +232,26 @@ def _multiple_instances_error(instances: list[BridgeInstance]) -> BridgeError:
     )
 
 
+@contextlib.contextmanager
+def _spawn_lock():
+    """Exclusive flock serializing ALL spawns (auto and named) by this host.
+
+    A single process-wide lock file is intentional: flock is per-open-file, so
+    a named spawn and a concurrent auto-spawn must contend on the *same* file or
+    they could both pass the duplicate check and fork two children (#92). Held
+    only for the spawn-and-register window, never around a request.
+    """
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    lock_path = inst_dir / ".spawn.lock"
+    with open(lock_path, "w") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
 def _auto_spawn_locked() -> BridgeInstance:
     """Serialize auto-spawn across concurrent CLI processes.
 
@@ -212,17 +260,15 @@ def _auto_spawn_locked() -> BridgeInstance:
     are running" until a human cleans up. The registry is re-checked under
     the lock because the previous holder may have spawned while we waited.
     """
-    inst_dir = instances_dir()
-    inst_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = inst_dir / ".spawn.lock"
-    with open(lock_path, "w") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
+    with _spawn_lock():
         instances = list_instances()
         if len(instances) == 1:
             return instances[0]
         if instances:
             raise _multiple_instances_error(instances)
-        return spawn_instance()
+        # Already under the spawn lock -- call the unlocked core directly, or a
+        # second flock on the same file from this process would deadlock.
+        return _spawn_instance_unlocked()
 
 
 def choose_instance(
@@ -231,6 +277,8 @@ def choose_instance(
     auto_start: bool = True,
     spawn_missing_named: bool = False,
 ) -> BridgeInstance:
+    if instance_id is not None:
+        validate_instance_id(instance_id)
     instances = list_instances()
     if instance_id is not None:
         for inst in instances:
@@ -359,13 +407,43 @@ def _log_tail(log_path: Path, lines: int = 20) -> str:
     return f"\nLast output from {log_path}:\n" + "\n".join(f"  {line}" for line in tail)
 
 
+def _reap_child(proc: subprocess.Popen) -> None:
+    """Terminate a spawned child that won't be used, escalating to SIGKILL."""
+    proc.terminate()
+    try:
+        proc.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=2.0)
+
+
 def spawn_instance(
     instance_id: str | None = None,
     *,
     timeout: float = 15.0,
     poll_interval: float = 0.2,
 ) -> BridgeInstance:
-    """Spawn a new bn-agent headless process and wait for it to register."""
+    """Spawn a new bn-agent headless process and wait for it to register.
+
+    Serialized against all other spawns by a host-wide lock so two concurrent
+    named spawns of the same id can't both fork a child (#92 Problem A).
+    """
+    if instance_id is not None and instance_id != "default":
+        validate_instance_id(instance_id)
+    with _spawn_lock():
+        return _spawn_instance_unlocked(
+            instance_id, timeout=timeout, poll_interval=poll_interval
+        )
+
+
+def _spawn_instance_unlocked(
+    instance_id: str | None = None,
+    *,
+    timeout: float = 15.0,
+    poll_interval: float = 0.2,
+) -> BridgeInstance:
+    """Spawn-and-register core. MUST run under _spawn_lock()."""
     existing = list_instances()
     if instance_id is None:
         existing_selectors = {instance_selector(inst) for inst in existing}
@@ -401,6 +479,17 @@ def spawn_instance(
         if reg_path.exists():
             inst = _load_instance(reg_path)
             if inst is not None:
+                # Verify the registered process is the child WE spawned. A
+                # different live pid means a stale registry slipped past the
+                # liveness purge or another process raced us under this id;
+                # reap our orphan rather than return someone else's bridge (#92).
+                if inst.pid != proc.pid:
+                    _reap_child(proc)
+                    raise BridgeError(
+                        f"Bridge instance id {instance_id!r} is already owned by "
+                        f"another process (pid {inst.pid}); refusing to return a "
+                        "bridge this call did not start."
+                    )
                 return inst
         exit_code = proc.poll()
         if exit_code is not None:
@@ -413,18 +502,40 @@ def spawn_instance(
 
     # The child is still running but never registered. Kill it so a slow
     # starter can't register later and show up as a surprise extra instance.
-    proc.terminate()
-    try:
-        proc.wait(timeout=2.0)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            proc.wait(timeout=2.0)
+    _reap_child(proc)
 
     raise BridgeError(
         f"Auto-started bn-agent (pid {proc.pid}, instance {instance_id}) "
         f"did not register within {timeout:.0f}s and was terminated. Check {log_path}"
     )
+
+
+def wait_for_teardown(
+    instance: BridgeInstance,
+    *,
+    timeout: float = 5.0,
+    poll_interval: float = 0.05,
+) -> bool:
+    """Block until *instance* has fully torn down, or *timeout* elapses.
+
+    `bn session stop` used to return as soon as the shutdown ACK (or a SIGTERM)
+    was delivered, before the socket/registry were unlinked and the process
+    exited -- so `stop X && start X` could race the dying instance and fail as a
+    duplicate (#92 Problem B). Convergence here means the process is gone AND the
+    registry no longer resolves (`_load_instance` returns None, which also sweeps
+    a stale registry+socket left by a hard kill). Returns True on convergence.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        gone = (
+            not _process_alive(instance.pid)
+            and _load_instance(instance.registry_path) is None
+        )
+        if gone:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll_interval)
 
 
 def send_request(

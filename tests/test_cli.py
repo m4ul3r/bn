@@ -3113,6 +3113,24 @@ def test_instance_use_writes_state(tmp_session, monkeypatch, capsys):
     assert capsys.readouterr().out.strip() == "instance: abc123"
 
 
+def test_instance_use_default_pins_gui_bridge(tmp_session, monkeypatch, capsys):
+    # The fixed GUI bridge has instance_id=None and selector "default". Storing
+    # the raw None made session_state.update() DELETE the pin, so the pin
+    # silently vanished. `bn instance use default` must persist "default" so
+    # later bare commands resolve to the GUI bridge (#93).
+    gui = _fake_bridge_instance("gui")
+    object.__setattr__(gui, "instance_id", None)  # GUI bridge: id is None
+    named = _fake_bridge_instance("headless1")
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [gui, named])
+
+    rc = bn.cli.main(["instance", "use", "default"])
+
+    assert rc == 0
+    state = bn.session_state.read()
+    assert state.get("instance_id") == "default"  # pin persisted, not deleted
+    assert capsys.readouterr().out.strip() == "instance: default"
+
+
 def test_instance_use_rejects_unknown_id(tmp_session, monkeypatch, capsys):
     monkeypatch.setattr(bn.cli, "list_instances", lambda: [_fake_bridge_instance("abc123")])
 
@@ -3911,6 +3929,9 @@ def test_session_stop_sigterm_fallback_reports_method(monkeypatch, capsys):
 
     monkeypatch.setattr(bn.cli, "send_request", fail_send_request)
     monkeypatch.setattr(bn.cli, "list_instances", lambda: [_fake_bridge_instance("abc123")])
+    # Convergence polling is covered by its own transport test; here we only
+    # assert the SIGTERM dispatch + reported method, so simulate a clean teardown.
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: True)
 
     kills = []
     monkeypatch.setattr("os.kill", lambda pid, sig: kills.append((pid, sig)))

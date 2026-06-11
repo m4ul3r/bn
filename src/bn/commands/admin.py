@@ -9,6 +9,7 @@ the ``bn.cli`` module at call time -- ``cli.send_request(...)`` rather than a
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import shutil
 import signal
@@ -279,26 +280,56 @@ def _session_start(args: argparse.Namespace) -> int:
          args=[arg("instance", help="Instance ID to stop")])
 def _session_stop(args: argparse.Namespace) -> int:
     target_id = args.instance
+    # Resolve the instance up front so we can confirm teardown by pid + files
+    # after the shutdown, and SIGTERM it if the socket request fails.
+    inst = next(
+        (
+            i for i in cli.list_instances()
+            if i.instance_id == target_id or cli.instance_selector(i) == target_id
+        ),
+        None,
+    )
     try:
         cli.send_request("shutdown", instance_id=target_id)
-        result = {"instance_id": target_id, "stopped": True}
+        method = "shutdown"
     except BridgeError:
-        # Fallback: find instance and SIGTERM
-        for inst in cli.list_instances():
-            if inst.instance_id == target_id or cli.instance_selector(inst) == target_id:
-                try:
-                    os.kill(inst.pid, signal.SIGTERM)
-                except OSError as exc:
-                    print(
-                        f"error: failed to stop bridge instance {target_id} "
-                        f"(pid {inst.pid}): {exc}",
-                        file=sys.stderr,
-                    )
-                    return 1
-                result = {"instance_id": target_id, "stopped": True, "method": "sigterm"}
-                break
-        else:
+        # Fallback: SIGTERM the process directly.
+        if inst is None:
             raise BridgeError(f"No bridge instance found with id: {target_id}")
+        try:
+            os.kill(inst.pid, signal.SIGTERM)
+        except OSError as exc:
+            print(
+                f"error: failed to stop bridge instance {target_id} "
+                f"(pid {inst.pid}): {exc}",
+                file=sys.stderr,
+            )
+            return 1
+        method = "sigterm"
+
+    result: dict[str, Any] = {"instance_id": target_id, "stopped": True}
+    if method == "sigterm":
+        result["method"] = method
+
+    # Block until the socket/registry are gone and the process has exited, so a
+    # follow-on `bn session start --instance-id <same>` can't race the dying
+    # instance and fail as a duplicate (#92 Problem B). Escalate to SIGKILL if
+    # graceful teardown stalls, and report failure if it never converges.
+    if inst is not None:
+        if not cli.wait_for_teardown(inst, timeout=5.0):
+            with contextlib.suppress(OSError):
+                os.kill(inst.pid, signal.SIGKILL)
+            if not cli.wait_for_teardown(inst, timeout=2.0):
+                result["stopped"] = False
+                result["error"] = (
+                    f"bridge instance {target_id} (pid {inst.pid}) did not fully "
+                    "tear down; registry/socket may be stale."
+                )
+                if args.format == "text":
+                    result = _render_session_stop_text(result)
+                cli._render_result(result, fmt=args.format, out_path=args.out, stem="session-stop")
+                return 1
+            result["method"] = "sigkill"
 
     if args.format == "text":
         result = _render_session_stop_text(result)
@@ -371,7 +402,12 @@ def _instance_use(args: argparse.Namespace) -> int:
     ]
     if not matches:
         raise BridgeError(f"No running bridge instance with id: {instance_id}")
-    resolved = matches[0].instance_id
+    # Store the SELECTOR, not the raw instance_id. The fixed GUI bridge has
+    # instance_id=None; persisting None makes session_state.update() DELETE the
+    # pin (None means "remove the key"), so `bn instance use default` silently
+    # left no pin and bare commands kept failing with "Multiple instances".
+    # instance_selector() maps None -> "default", which resolution honors (#93).
+    resolved = cli.instance_selector(matches[0])
     cli.session_state.update(instance_id=resolved)
     result: Any = {"instance_id": resolved, "set": True}
     if args.format == "text":

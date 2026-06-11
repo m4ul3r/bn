@@ -12,7 +12,15 @@ from pathlib import Path
 import pytest
 
 from bn.paths import bridge_registry_path, instances_dir
-from bn.transport import BridgeError, choose_instance, list_instances, send_request, spawn_instance
+from bn.transport import (
+    BridgeError,
+    choose_instance,
+    list_instances,
+    send_request,
+    spawn_instance,
+    validate_instance_id,
+    wait_for_teardown,
+)
 
 
 class _Handler(socketserver.StreamRequestHandler):
@@ -826,3 +834,167 @@ def test_choose_instance_spawn_missing_named_spawns_new(tmp_path, monkeypatch):
     with pytest.raises(BridgeError, match="session start --instance-id brandnew") as exc:
         choose_instance("brandnew")
     assert "No bridge instance found with id: brandnew" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# #84 — instance-id validation (path traversal)
+# ---------------------------------------------------------------------------
+
+
+def test_validate_instance_id_accepts_safe_basenames():
+    for good in ("abc123", "goal-v1", "my_inst.2", "A.B-C_9", "default"):
+        assert validate_instance_id(good) == good
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "../evil",
+        "../../tmp/evil",
+        "/abs/path",
+        "a/b",
+        "a\\b",
+        ".",
+        "..",
+        "",
+        "has space",
+        "weird;id",
+    ],
+)
+def test_validate_instance_id_rejects_traversal_and_separators(bad):
+    with pytest.raises(BridgeError, match="Invalid instance id|non-empty"):
+        validate_instance_id(bad)
+
+
+def test_spawn_instance_rejects_traversal_id_before_any_fs(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    # Must raise before spawning anything; no files outside instances_dir().
+    popen_called = {"n": 0}
+    monkeypatch.setattr("subprocess.Popen", lambda *a, **k: popen_called.__setitem__("n", popen_called["n"] + 1))
+    with pytest.raises(BridgeError, match="Invalid instance id"):
+        spawn_instance("../../tmp/evil")
+    assert popen_called["n"] == 0
+    # No escaped registry/socket/log created anywhere under tmp_path's parent.
+    assert not (tmp_path.parent / "tmp" / "evil.json").exists()
+
+
+def test_choose_instance_rejects_traversal_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    with pytest.raises(BridgeError, match="Invalid instance id"):
+        choose_instance("../escape")
+
+
+# ---------------------------------------------------------------------------
+# #92 — spawn pid verification + stop-teardown convergence
+# ---------------------------------------------------------------------------
+
+
+class _FakeProc:
+    def __init__(self, pid, *, on_start=None):
+        self.pid = pid
+        self._terminated = False
+        if on_start is not None:
+            on_start()
+
+    def poll(self):
+        return None
+
+    def terminate(self):
+        self._terminated = True
+
+    def kill(self):
+        self._terminated = True
+
+    def wait(self, timeout=None):
+        return 0
+
+
+def test_spawn_rejects_registry_owned_by_other_pid(tmp_path, monkeypatch):
+    # The registry that appears is owned by a DIFFERENT pid than our child:
+    # spawn must reap our child and refuse, not return a stranger's bridge (#92).
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr("bn.transport._find_bn_agent", lambda: ["/bin/true"])
+
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    socket_path = Path("/tmp") / f"bn-pidtest-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
+    server = _Server(str(socket_path), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    other_pid = os.getpid()  # a live pid that is NOT our spawned child's pid
+    our_child_pid = 2_000_000_000  # implausible, definitely != other_pid
+
+    def write_registry():
+        (inst_dir / "racer.json").write_text(
+            json.dumps({
+                "pid": other_pid,
+                "socket_path": str(socket_path),
+                "plugin_name": "bn_agent_bridge",
+                "instance_id": "racer",
+            }),
+            encoding="utf-8",
+        )
+
+    # Construct the fake child LAZILY (when Popen is called inside spawn), so the
+    # racer registry is written DURING the spawn wait, not at test-setup time.
+    holder = {}
+
+    def fake_popen(*a, **k):
+        holder["proc"] = _FakeProc(our_child_pid, on_start=write_registry)
+        return holder["proc"]
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+
+    try:
+        with pytest.raises(BridgeError, match="already owned by another process"):
+            spawn_instance("racer")
+        assert holder["proc"]._terminated  # our orphan child was reaped
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_wait_for_teardown_converges_when_process_and_registry_gone(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    from bn.transport import BridgeInstance
+
+    inst = BridgeInstance(
+        pid=2_000_000_001,  # not a live pid
+        socket_path=tmp_path / "gone.sock",
+        registry_path=tmp_path / "gone.json",  # never created -> _load_instance None
+        plugin_name="bn_agent_bridge",
+        plugin_version="0",
+        started_at=None,
+        meta={},
+        instance_id="gone",
+    )
+    assert wait_for_teardown(inst, timeout=1.0) is True
+
+
+def test_wait_for_teardown_times_out_while_live(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    from bn.transport import BridgeInstance
+
+    socket_path = Path("/tmp") / f"bn-live-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
+    server = _Server(str(socket_path), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    reg = tmp_path / "live.json"
+    reg.write_text(
+        json.dumps({"pid": os.getpid(), "socket_path": str(socket_path), "instance_id": "live"}),
+        encoding="utf-8",
+    )
+    inst = BridgeInstance(
+        pid=os.getpid(),  # this test process is alive
+        socket_path=socket_path,
+        registry_path=reg,
+        plugin_name="bn_agent_bridge",
+        plugin_version="0",
+        started_at=None,
+        meta={},
+        instance_id="live",
+    )
+    try:
+        assert wait_for_teardown(inst, timeout=0.3) is False
+    finally:
+        server.shutdown()
+        server.server_close()
