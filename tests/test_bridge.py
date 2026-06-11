@@ -4353,6 +4353,65 @@ def test_imports_pagination_slices_offset_and_limit(monkeypatch):
     assert summary["total_symbols"] == 5
 
 
+def test_imports_rejects_negative_offset_and_limit(monkeypatch):
+    # Non-CLI callers (raw socket / py exec) must hit the same paging guard the
+    # sibling list ops enforce, not a silent negative-index slice (#68).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(symbols=[])
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    with pytest.raises(bridge.OperationFailure) as e1:
+        instance._imports(None, offset=-1)
+    assert e1.value.status == "invalid_request"
+    with pytest.raises(bridge.OperationFailure) as e2:
+        instance._imports(None, limit=-5)
+    assert e2.value.status == "invalid_request"
+    with pytest.raises(bridge.OperationFailure) as e3:
+        instance._imports(None, limit=0)   # zero limit is degenerate too
+    assert e3.value.status == "invalid_request"
+
+
+def test_apply_operation_comment_function_only_form_accepted(monkeypatch):
+    # The documented function-only comment form (no `address`) must pass
+    # required-field validation, not be rejected as missing `address` (#67).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance, "_op_set_comment", lambda bv, op: {"ok": "set"})
+    monkeypatch.setattr(instance, "_op_delete_comment", lambda bv, op: {"ok": "del"})
+    assert instance._apply_operation(
+        None, {"op": "set_comment", "function": "main", "comment": "hi"}) == {"ok": "set"}
+    assert instance._apply_operation(
+        None, {"op": "delete_comment", "function": "main"}) == {"ok": "del"}
+
+
+def test_apply_operation_comment_address_form_still_accepted(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance, "_op_set_comment", lambda bv, op: {"ok": "set"})
+    assert instance._apply_operation(
+        None, {"op": "set_comment", "address": "0x1000", "comment": "hi"}) == {"ok": "set"}
+
+
+def test_apply_operation_comment_requires_function_or_address(monkeypatch):
+    # Neither locator field present -> precise invalid_request naming both options.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._apply_operation(None, {"op": "set_comment", "comment": "hi"})
+    assert exc.value.status == "invalid_request"
+    assert "function" in str(exc.value) and "address" in str(exc.value)
+
+
+def test_apply_operation_set_comment_missing_comment_still_rejected(monkeypatch):
+    # The genuinely-required field is still enforced precisely.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._apply_operation(None, {"op": "set_comment", "function": "main"})
+    assert exc.value.status == "invalid_request"
+    assert "comment" in str(exc.value)
+
+
 def test_sections_pagination_slices_offset_and_limit(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

@@ -129,8 +129,8 @@ USER_FACING_ERRORS: tuple[type[BaseException], ...] = (OperationFailure, Runtime
 # Optional fields (read via op.get(...)) are intentionally omitted.
 REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "rename_symbol": ("identifier", "new_name"),
-    "set_comment": ("comment", "address"),
-    "delete_comment": ("address",),
+    "set_comment": ("comment",),
+    "delete_comment": (),
     "set_prototype": ("identifier", "prototype"),
     "local_rename": ("function", "variable", "new_name"),
     "local_retype": ("function", "variable", "new_type"),
@@ -138,6 +138,15 @@ REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "struct_field_rename": ("struct_name", "old_name", "new_name"),
     "struct_field_delete": ("struct_name", "field_name"),
     "types_declare": ("declaration",),
+}
+
+# Ops that accept one of several alternative locator fields. set_comment /
+# delete_comment target EITHER a function (`function`) OR an address (`address`):
+# listing `address` as unconditionally required wrongly rejected the documented
+# function-only form (#67). Each group requires at least one of its fields.
+REQUIRED_ONE_OF: dict[str, tuple[tuple[str, ...], ...]] = {
+    "set_comment": (("function", "address"),),
+    "delete_comment": (("function", "address"),),
 }
 
 
@@ -4432,6 +4441,11 @@ class BinaryNinjaBridge:
 
     def _imports(self, selector: str | None, *, summary: bool = False,
                  offset: int = 0, limit: int | None = None):
+        # Guard paging the same way the sibling list ops do, so a raw-socket /
+        # py exec caller passing a negative offset/limit gets a clean
+        # invalid_request instead of a silent Python negative-index slice (#68).
+        offset = _validate_count(offset, label="offset", minimum=0)
+        limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
         bv = self._resolve_view(selector)
         needed_libraries = self._needed_libraries(bv)
         items = []
@@ -5512,6 +5526,14 @@ class BinaryNinjaBridge:
                 raise OperationFailure(
                     "invalid_request",
                     f"operation {kind!r} is missing required field {field!r}",
+                    requested=self._operation_requested(op),
+                )
+        for group in REQUIRED_ONE_OF.get(kind, ()):
+            if not any(field in op for field in group):
+                raise OperationFailure(
+                    "invalid_request",
+                    f"operation {kind!r} requires one of "
+                    f"{' / '.join(repr(f) for f in group)}",
                     requested=self._operation_requested(op),
                 )
         try:
