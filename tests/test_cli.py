@@ -2190,6 +2190,20 @@ def test_function_list_pagination_truncates_and_warns(monkeypatch, capsys):
     assert "--offset 20" in stderr
 
 
+def test_pagination_truncation_warning_singular_grammar(monkeypatch, capsys):
+    # `--limit 1` must say "1 item", not "1 items" (#31 bundled grammar fix,
+    # same class as the trace "1 step" fix).
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": [{"name": f"sub_{i}", "address": hex(i)} for i in range(5)]}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["function", "list", "--target", "active", "--limit", "1"])
+    assert rc == 0
+    _, stderr = capsys.readouterr()
+    assert "truncated to 1 item;" in stderr
+    assert "1 items" not in stderr
+
+
 def test_function_search_pagination_forwards_offset(monkeypatch, capsys):
     captured = {}
 
@@ -3948,6 +3962,62 @@ def test_xrefs_data_ref_labels_unknown_caller_by_section_or_symbol():
     out = formatters._render_xrefs_text(value)
     assert "some_export" in out          # symbol preferred over a bare <unknown>
     assert "<unknown>  <unknown>" not in out
+
+
+def test_xrefs_distinct_functionless_refs_are_not_merged_under_one_label():
+    # Two function-less data refs with DIFFERENT symbols must render as two
+    # distinct, correctly-labeled lines -- not collapse into one group stamped
+    # with the first ref's symbol (which mislabeled the second site) (#24).
+    from bn import formatters
+    value = {
+        "address": "0x18d58", "code_refs": [],
+        "data_refs": [
+            {"address": "0xaaaa", "caller_function": None, "function": None,
+             "context": {"sections": [{"name": ".got"}], "symbol": {"name": "sym_a"}}},
+            {"address": "0xbbbb", "caller_function": None, "function": None,
+             "context": {"sections": [{"name": ".data"}], "symbol": {"name": "sym_b"}}},
+        ],
+    }
+    out = formatters._render_xrefs_text(value)
+    assert "data refs: 2 sites across 2 functions" in out
+    # each site is labeled with its OWN symbol, on a line with its OWN address
+    assert any("0xaaaa" in ln and "sym_a" in ln and "sym_b" not in ln for ln in out.splitlines())
+    assert any("0xbbbb" in ln and "sym_b" in ln and "sym_a" not in ln for ln in out.splitlines())
+
+
+def test_xrefs_same_label_functionless_refs_still_coalesce():
+    # Refs sharing a resolved label are still grouped (two sites, one line).
+    from bn import formatters
+    value = {
+        "address": "0x18d58", "code_refs": [],
+        "data_refs": [
+            {"address": "0xaaaa", "caller_function": None, "function": None,
+             "context": {"symbol": {"name": "sym_a"}}},
+            {"address": "0xbbbb", "caller_function": None, "function": None,
+             "context": {"symbol": {"name": "sym_a"}}},
+        ],
+    }
+    out = formatters._render_xrefs_text(value)
+    assert "data refs: 2 sites across 1 function" in out
+    assert any("0xaaaa" in ln and "0xbbbb" in ln for ln in out.splitlines())
+
+
+def test_evidence_xrefs_text_reports_truncation_total():
+    # Capping evidence xrefs must surface the true total + a "showing first N"
+    # marker, not silently drop refs (#31, the #13 honesty convention).
+    from bn import formatters
+    value = {
+        "address": "0x1000",
+        "code_refs": [{"address": hex(0x2000 + i), "kind": "code"} for i in range(14)],
+        "data_refs": [],
+    }
+    out = formatters._render_evidence_xrefs_text(value, limit=3)
+    assert "code refs: 14 total, showing first 3" in out
+    # only 3 ref lines rendered
+    assert sum(1 for ln in out.splitlines() if ln.startswith("- 0x")) == 3
+    # uncapped render shows the plain header (no truncation marker)
+    out_full = formatters._render_evidence_xrefs_text(value)
+    assert "code refs:" in out_full and "total, showing" not in out_full
 
 
 def test_negative_ip_depth_rejected_with_exit_2():

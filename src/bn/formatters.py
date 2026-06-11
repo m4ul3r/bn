@@ -451,25 +451,36 @@ def _render_name_address_list_text(value: Any) -> str:
 
 
 def _group_refs_by_caller(refs: list[Any]) -> list[dict[str, Any]]:
-    groups: dict[tuple[str | None, str | None], dict[str, Any]] = {}
-    order: list[tuple[str | None, str | None]] = []
+    groups: dict[tuple, dict[str, Any]] = {}
+    order: list[tuple] = []
     for ref in refs:
         if not isinstance(ref, dict):
             continue
         caller = ref.get("caller_function") if isinstance(ref.get("caller_function"), dict) else None
-        key: tuple[str | None, str | None]
+        key: tuple
         if caller is not None:
-            key = (caller.get("address"), caller.get("name"))
+            key = ("fn", caller.get("address"), caller.get("name"))
+            caller_address = caller.get("address")
+            caller_name = caller.get("name")
         else:
-            key = (None, ref.get("function"))
+            # No containing function: group by the ref's own resolved label
+            # (symbol, else section) so refs under DIFFERENT symbols/sections do
+            # not collapse into one group that gets stamped with the first
+            # ref's label (which mislabeled the others). A label-less ref is
+            # never coalesced -- it keys on its own address so each renders as a
+            # distinct "<unknown>" line with its own context.
+            label = _unknown_ref_label(ref.get("context")) or ref.get("function")
+            if label:
+                key = ("label", label)
+            else:
+                key = ("site", str(ref.get("address", "<unknown>")))
+            caller_address = None
+            caller_name = label or None
         if key not in groups:
             groups[key] = {
-                "caller_address": key[0],
-                "caller_name": key[1],
+                "caller_address": caller_address,
+                "caller_name": caller_name,
                 "sites": [],
-                # Keep the first ref's address-context so a ref with no
-                # containing function can still be labeled by its section or
-                # symbol instead of a bare "<unknown>".
                 "context": ref.get("context"),
             }
             order.append(key)
@@ -594,14 +605,21 @@ def _render_evidence_xrefs_text(value: Any, limit: int | None = None) -> str:
 
     for label in ("code_refs", "data_refs"):
         refs = list(value.get(label) or [])
-        if limit:
-            refs = refs[:limit]
+        total = len(refs)
+        shown = refs[:limit] if limit else refs
+        nice = label.replace("_", " ")
         lines.append("")
-        lines.append(f"{label.replace('_', ' ')}:")
-        if not refs:
+        # Report the true total and a truncation marker when capped, matching
+        # the honesty convention used by strings/function list/evidence message
+        # -- a bare cap with no "N more" would hide that refs exist (#31).
+        if limit and total > len(shown):
+            lines.append(f"{nice}: {total} total, showing first {len(shown)}")
+        else:
+            lines.append(f"{nice}:")
+        if not shown:
             lines.append("- none")
             continue
-        for ref in refs:
+        for ref in shown:
             if not isinstance(ref, dict):
                 lines.append("- " + _render_fallback_text(ref))
                 continue
