@@ -401,6 +401,11 @@ class TaintEngine:
         self.resolve_map = resolve_map or {}
         self.max_iters = max_iters
         self.max_depth = max_depth
+        # follow_thunk is deterministic for a given (bv, function) and the
+        # engine is created per request, so resolved thunks are cached for the
+        # engine's lifetime -- avoids re-materializing a veneer's MLIL on every
+        # candidate visit (forward) and every callsite scan (backward).
+        self._thunk_cache: dict[int, Any] = {}
 
     # -- shared resolution ------------------------------------------------
 
@@ -726,6 +731,15 @@ class TaintEngine:
                     return res
         return None
 
+    def _name_matches_callee(self, name: str | None, callee: str) -> bool:
+        """Match a (possibly decorated) callsite name against a --sink callee."""
+        if not name:
+            return False
+        if name == callee or name.split("@", 1)[0].lstrip("_") == callee.lstrip("_"):
+            return True
+        matched, _ = lookup_model({callee: True}, name)
+        return bool(matched)
+
     def _find_callsites(self, instrs: list[Any], callee: str) -> list[Any]:
         hits = []
         for ins in instrs:
@@ -733,9 +747,19 @@ class TaintEngine:
                 continue
             target = const_target(getattr(ins, "dest", None))
             name = self._callee_name(target)
-            matched, _ = lookup_model({callee: True}, name) if name else (None, None)
-            if (name and (name == callee or name.split("@", 1)[0].lstrip("_") == callee.lstrip("_"))) or matched:
+            if self._name_matches_callee(name, callee):
                 hits.append(ins)
+                continue
+            # Follow a thunk/veneer (j_memcpy -> memcpy) and match the resolved
+            # name, so backward seeding reaches a sink called through a stub --
+            # the same resolution forward taint and `bn trace` already perform.
+            # This is the backward dual of the forward thunk-follow above.
+            rt = resolve_call_target(self.bv, ins, follow_thunks=True)
+            if rt.via == "thunk" and rt.address is not None:
+                rname = self._callee_name(int(rt.address)) \
+                    or (str(rt.function.name) if getattr(rt.function, "name", None) else None)
+                if self._name_matches_callee(rname, callee):
+                    hits.append(ins)
         return hits
 
     # -- forward ----------------------------------------------------------
@@ -778,6 +802,18 @@ class TaintEngine:
             },
             "soundness": SOUNDNESS,
         }
+
+    def _follow_thunk_cached(self, fn: Any) -> Any | None:
+        """``follow_thunk`` memoized per resolved function start address."""
+        if fn is None:
+            return None
+        key = int(getattr(fn, "start", 0))
+        cache = self._thunk_cache
+        if key in cache:
+            return cache[key]
+        resolved = follow_thunk(self.bv, fn)
+        cache[key] = resolved
+        return resolved
 
     def _is_internal(self, fn: Any) -> bool:
         """True if a call target is an in-binary function worth descending into
@@ -1063,25 +1099,36 @@ class TaintEngine:
                         cfn = self.bv.get_function_at(taddr) if hasattr(self.bv, "get_function_at") else None
                         nm = self._callee_name(taddr)
                         mk, md = lookup_model(self.models, nm)
-                        # A .plt/veneer thunk to a locally-defined function must be
-                        # descended into, not treated as an opaque external. When the
-                        # candidate is not already a descendable in-binary function
-                        # and is not a modeled import, follow a single-instruction
-                        # thunk to its real target and descend there if it lands
-                        # in-binary. Thunks to modeled/imported externals stay
-                        # external (handled by the model branch / conservative tail).
+                        cfn_internal = self._is_internal(cfn)
+                        # A .plt/veneer thunk must be resolved to its real target,
+                        # then BOTH re-modeled and re-classified. When the candidate
+                        # is neither a descendable in-binary function nor a modeled
+                        # import, follow a single-instruction thunk to its real
+                        # target and re-run the model lookup + internal check on
+                        # THAT target. Without re-modeling, a decorated veneer whose
+                        # own name misses the model DB but that tail-calls a modeled
+                        # sink (j_memcpy -> memcpy) would fall through to the
+                        # conservative external tail and the sink be silently missed.
                         descend_fn = cfn
-                        if md is None and cfn is not None and not self._is_internal(cfn):
-                            resolved = follow_thunk(self.bv, cfn)
-                            if resolved is not None and self._is_internal(resolved):
-                                descend_fn = resolved
+                        descend_internal = cfn_internal
+                        if md is None and cfn is not None and not cfn_internal:
+                            resolved = self._follow_thunk_cached(cfn)
+                            if resolved is not None and resolved is not cfn:
+                                rnm = self._callee_name(int(getattr(resolved, "start", 0))) \
+                                    or (str(resolved.name) if getattr(resolved, "name", None) else None)
+                                rmk, rmd = lookup_model(self.models, rnm)
+                                if rmd is not None:
+                                    nm, mk, md = rnm, rmk, rmd
+                                elif self._is_internal(resolved):
+                                    descend_fn = resolved
+                                    descend_internal = True
                         if md is not None:
                             # resolved target is a modeled external
                             mchanged, _ = apply_model(ins, params, md, mk, nm, site_taddr=taddr)
                             if mchanged:
                                 changed = True
                             resolved_names.append(nm or hex(taddr))
-                        elif self._is_internal(descend_fn):
+                        elif descend_internal:
                             d = self._descend(ins, descend_fn, tainted_args, why, depth, max_depth, via=via)
                             findings.extend(d["findings"])
                             for lf in d["leaves"]:
