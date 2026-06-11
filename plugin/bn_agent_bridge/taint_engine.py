@@ -50,23 +50,62 @@ class TaintError(RuntimeError):
 # model database
 # --------------------------------------------------------------------------
 
+def _coerce_model_map(raw: Any, *, source: str) -> dict[str, Any]:
+    """Validate a parsed model DB and return its name->model map.
+
+    Accepts either ``{"models": {...}}`` or a bare ``{name: model}`` map; rejects
+    any other top-level shape so a malformed file can't silently merge to nothing
+    (a model whose value isn't a dict couldn't carry source/sink/propagate data).
+    """
+    if isinstance(raw, dict) and "models" in raw:
+        raw = raw.get("models")
+    if not isinstance(raw, dict):
+        raise TaintError(
+            f"{source} must be a JSON object of name->model (or {{\"models\": {{...}}}}); "
+            f"got {type(raw).__name__}"
+        )
+    for name, model in raw.items():
+        # `_comment*` keys are free-text documentation in the DB (their string
+        # values never match a symbol, so lookup_model ignores them); every real
+        # model name must map to an object that can carry source/sink/propagate.
+        if str(name).startswith("_comment"):
+            continue
+        if not isinstance(model, dict):
+            raise TaintError(
+                f"{source}: model {name!r} must be a JSON object, got {type(model).__name__}"
+            )
+    return raw
+
+
 def load_models(extra: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Return the merged function-model DB: builtin <- user override <- extra."""
+    """Return the merged function-model DB: builtin <- user override <- extra.
+
+    Model-load failures used to be swallowed, silently degrading into missing
+    source/sink/propagation models -- false negatives indistinguishable from
+    analysis limits (#97). Now a broken builtin DB (a packaging bug) and a broken
+    BN_TAINT_MODELS override (a user typo that should be loud, not silent) both
+    raise TaintError, which the taint command surfaces as a clean error.
+    """
     models: dict[str, Any] = {}
     try:
         raw = json.loads(_BUILTIN_MODELS.read_text(encoding="utf-8"))
-        models.update(raw.get("models") or {})
-    except Exception:  # pragma: no cover - builtin should always parse
-        pass
+    except Exception as exc:
+        raise TaintError(
+            f"builtin taint model DB at {_BUILTIN_MODELS} could not be loaded: {exc}. "
+            "This is a packaging bug -- reinstall the bridge."
+        ) from exc
+    models.update(_coerce_model_map(raw, source=f"builtin taint model DB ({_BUILTIN_MODELS})"))
     if taint_models_path is not None:
-        try:
-            override_path = taint_models_path()
-            if override_path.exists():
+        override_path = taint_models_path()
+        if override_path.exists():
+            try:
                 raw = json.loads(override_path.read_text(encoding="utf-8"))
-                # accept either {"models": {...}} or a bare {name: model} map
-                models.update(raw.get("models") if isinstance(raw, dict) and "models" in raw else raw)
-        except Exception:
-            pass
+            except Exception as exc:
+                raise TaintError(
+                    f"BN_TAINT_MODELS override at {override_path} could not be loaded: {exc}. "
+                    "Fix or remove the file (it overrides the builtin models)."
+                ) from exc
+            models.update(_coerce_model_map(raw, source=f"BN_TAINT_MODELS override ({override_path})"))
     if extra:
         models.update(extra)
     return models
@@ -167,6 +206,29 @@ def ssa_writes(ins: Any) -> list[Any]:
 
 def expr_reads(expr: Any) -> list[Any]:
     return [v for v in (getattr(expr, "vars_read", None) or []) if is_ssa_var(v)]
+
+
+def function_at(bv: Any, addr: int | None) -> Any | None:
+    """``get_function_at`` with ARM/Thumb low-bit normalization.
+
+    A code pointer on ARM carries the Thumb tag in its LSB, so an indirect/
+    value-set target address can be odd while the function lives at ``addr & ~1``.
+    The exact lookup is tried first (raw address preserved for diagnostics), then
+    the normalized one (#89). Returns None when neither resolves or *bv* lacks
+    ``get_function_at`` (the synthetic test fakes).
+    """
+    if addr is None or not hasattr(bv, "get_function_at"):
+        return None
+    try:
+        fn = bv.get_function_at(addr)
+    except Exception:
+        fn = None
+    if fn is None and (addr & 1):
+        try:
+            fn = bv.get_function_at(addr & ~1)
+        except Exception:
+            fn = None
+    return fn
 
 
 def const_target(expr: Any) -> int | None:
@@ -468,23 +530,35 @@ class TaintEngine:
     def _callee_name(self, addr: int | None) -> str | None:
         if addr is None or self.bv is None:
             return None
-        fn = None
-        try:
-            fn = self.bv.get_function_at(addr)
-        except Exception:
-            fn = None
+        # function_at normalizes the Thumb low bit so an odd code pointer still
+        # resolves to its function name (#89).
+        fn = function_at(self.bv, addr)
         if fn is not None and getattr(fn, "name", None):
             return str(fn.name)
-        try:
-            sym = self.bv.get_symbol_at(addr)
-        except Exception:
-            sym = None
-        if sym is not None and getattr(sym, "name", None):
-            return str(sym.name)
+        for cand in (addr, addr & ~1) if (addr & 1) else (addr,):
+            try:
+                sym = self.bv.get_symbol_at(cand)
+            except Exception:
+                sym = None
+            if sym is not None and getattr(sym, "name", None):
+                return str(sym.name)
         return None
 
     def _is_call(self, ins: Any) -> bool:
         return "CALL" in op_name(ins) or "TAILCALL" in op_name(ins)
+
+    def _resolve_direct_target(self, ins: Any) -> int | None:
+        """Resolved direct/import call-target address, or None for a genuinely
+        indirect call. Uses the shared resolver (follow_thunks=False, so thunk
+        semantics are unchanged -- the call loop still follows thunks itself),
+        which resolves MLIL_IMPORT and Thumb-tagged targets that const_target
+        misses (#89 Problem A). Falls back to the raw constant for the synthetic
+        test fakes / odd dests where no function can be confirmed."""
+        if self.bv is not None:
+            resolved = resolve_call_target(self.bv, ins, follow_thunks=False)
+            if resolved.address is not None:
+                return resolved.address
+        return const_target(getattr(ins, "dest", None))
 
     def _call_params(self, ins: Any) -> list[Any]:
         params = getattr(ins, "params", None)
@@ -1210,7 +1284,7 @@ class TaintEngine:
                     continue
 
                 if self._is_call(ins):
-                    target = const_target(getattr(ins, "dest", None))
+                    target = self._resolve_direct_target(ins)
                     name = self._callee_name(target)
                     mkey, model = lookup_model(self.models, name)
                     params = self._call_params(ins)
@@ -1269,7 +1343,10 @@ class TaintEngine:
                     descend_outparams: set[int] = set()
                     resolved_names: list[str] = []
                     for taddr in candidates:
-                        cfn = self.bv.get_function_at(taddr) if hasattr(self.bv, "get_function_at") else None
+                        # function_at normalizes the Thumb low bit: a value-set
+                        # target can be odd while the function lives at taddr&~1
+                        # (#89 Problem B).
+                        cfn = function_at(self.bv, taddr)
                         nm = self._callee_name(taddr)
                         mk, md = lookup_model(self.models, nm)
                         cfn_internal = self._is_internal(cfn)
@@ -1941,8 +2018,11 @@ def parse_locator(spec: str) -> dict[str, Any]:
             raise TaintError("ret: locator needs a callee")
         return {"kind": "ret", "callee": rest}
     if head == "arg":
-        callee, _, n = rest.partition(":")
-        if not callee or not n:
+        # Split at the LAST colon so a C++ qualified callee keeps its own colons:
+        # "arg:Ns::method:1" -> callee="Ns::method", n="1". partition(":") split at
+        # the FIRST colon and mis-parsed callee="Ns" (#98).
+        callee, sep, n = rest.rpartition(":")
+        if not sep or not callee or not n:
             raise TaintError("arg: locator must be arg:<callee>:<n>")
         return {"kind": "arg", "callee": callee, "index": _locator_index(n, f"arg:{callee}")}
     raise TaintError(f"unknown locator kind: {head!r} (use param:/var:/ret:/arg:)")

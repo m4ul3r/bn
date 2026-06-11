@@ -1638,3 +1638,123 @@ def test_resolve_call_target_unresolved_indirect():
     rt = te.resolve_call_target(FBV({}), call)
     assert rt.address is None
     assert rt.function is None
+
+
+# ---------------------------------------------------------------------------
+# #98 — arg: locator with C++ qualified callee names
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("spec,expected", [
+    ("arg:Namespace::method:1", {"kind": "arg", "callee": "Namespace::method", "index": 1}),
+    ("arg:a::b::c:0", {"kind": "arg", "callee": "a::b::c", "index": 0}),
+    ("arg:memcpy:1", {"kind": "arg", "callee": "memcpy", "index": 1}),  # plain still works
+])
+def test_parse_locator_arg_splits_at_last_colon(spec, expected):
+    assert te.parse_locator(spec) == expected
+
+
+def test_parse_locator_arg_requires_an_index():
+    # No trailing :<n> -> error, not a silent mis-parse.
+    with pytest.raises(te.TaintError, match=r"arg:<callee>:<n>"):
+        te.parse_locator("arg:memcpy")
+    with pytest.raises(te.TaintError, match=r"arg:<callee>:<n>"):
+        te.parse_locator("arg::1")  # empty callee
+
+
+# ---------------------------------------------------------------------------
+# #97 — model-load failures are loud, not silent
+# ---------------------------------------------------------------------------
+
+
+def test_load_models_raises_on_corrupt_builtin(monkeypatch, tmp_path):
+    bad = tmp_path / "builtin.json"
+    bad.write_text("{ this is not json", encoding="utf-8")
+    monkeypatch.setattr(te, "_BUILTIN_MODELS", bad)
+    with pytest.raises(te.TaintError, match="packaging bug"):
+        te.load_models()
+
+
+def test_load_models_raises_on_broken_override(monkeypatch, tmp_path):
+    bad = tmp_path / "override.json"
+    bad.write_text("{ broken", encoding="utf-8")
+    monkeypatch.setattr(te, "taint_models_path", lambda: bad)
+    with pytest.raises(te.TaintError, match="BN_TAINT_MODELS"):
+        te.load_models()
+
+
+def test_load_models_rejects_non_object_override(monkeypatch, tmp_path):
+    bad = tmp_path / "override.json"
+    bad.write_text('["a", "b"]', encoding="utf-8")
+    monkeypatch.setattr(te, "taint_models_path", lambda: bad)
+    with pytest.raises(te.TaintError, match="must be a JSON object"):
+        te.load_models()
+
+
+def test_load_models_rejects_non_dict_model_value(monkeypatch, tmp_path):
+    bad = tmp_path / "override.json"
+    bad.write_text('{"models": {"memcpy": "oops"}}', encoding="utf-8")
+    monkeypatch.setattr(te, "taint_models_path", lambda: bad)
+    with pytest.raises(te.TaintError, match="must be a JSON object"):
+        te.load_models()
+
+
+def test_load_models_accepts_valid_override_with_comment(monkeypatch, tmp_path):
+    ok = tmp_path / "override.json"
+    ok.write_text(
+        '{"my_custom_sink": {"sink": {"class": "x", "tainted_args": [0]}}, "_comment_x": "doc text"}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(te, "taint_models_path", lambda: ok)
+    models = te.load_models()
+    assert "my_custom_sink" in models           # override merged over builtin
+    assert "memcpy" in models                   # builtin still present
+    assert "_comment_x" not in [k for k in models if not k.startswith("_comment")]
+
+
+# ---------------------------------------------------------------------------
+# #89 — import + Thumb call-target resolution
+# ---------------------------------------------------------------------------
+
+
+def test_function_at_normalizes_thumb_low_bit():
+    target = type("F", (), {"name": "handler", "start": 0x8000})()
+    bv = FBV({}, funcs={0x8000: target})
+    # Even address resolves directly; odd (Thumb-tagged) falls back to addr & ~1.
+    assert te.function_at(bv, 0x8000) is target
+    assert te.function_at(bv, 0x8001) is target
+    assert te.function_at(bv, 0x9000) is None  # genuinely absent
+    assert te.function_at(object(), 0x8000) is None  # no get_function_at
+
+
+def test_resolve_direct_target_resolves_import_call():
+    # An MLIL_IMPORT dest exposes a symbol .name and a GOT-slot .constant; the
+    # resolver must resolve via the name to the function entry, not the GOT slot.
+    memcpy_fn = type("F", (), {"name": "memcpy", "start": 0x1100})()
+
+    class _ImportBV:
+        def get_function_at(self, addr):
+            return memcpy_fn if addr == 0x1100 else None
+
+        def get_symbols_by_name(self, name):
+            if name == "memcpy":
+                return [type("S", (), {"address": 0x1100})()]
+            return []
+
+        def get_symbol_by_raw_name(self, name):
+            return None
+
+    dest = FExpr("MLIL_IMPORT", "memcpy", constant=0x2000)  # 0x2000 = GOT slot
+    dest.name = "memcpy"
+    call = FInstr(0, 0x500, "MLIL_CALL_SSA", "memcpy(...)", dest=dest, params=[])
+    engine = te.TaintEngine(_ImportBV(), te.load_models())
+    assert engine._resolve_direct_target(call) == 0x1100  # entry, not GOT slot
+
+
+def test_resolve_direct_target_constant_direct_call_unchanged():
+    fn = type("F", (), {"name": "helper", "start": 0x401070})()
+    bv = FBV({}, funcs={0x401070: fn})
+    dest = FExpr("MLIL_CONST_PTR", "0x401070", constant=0x401070)
+    call = FInstr(0, 0x401000, "MLIL_CALL_SSA", "helper()", dest=dest, params=[])
+    engine = te.TaintEngine(bv, te.load_models())
+    assert engine._resolve_direct_target(call) == 0x401070

@@ -3207,12 +3207,17 @@ class BinaryNinjaBridge:
                             pass
         targets = []
         for addr in addrs:
-            fn = bv.get_function_at(addr) if hasattr(bv, "get_function_at") else None
+            # function_at normalizes the Thumb low bit so an odd value-set target
+            # resolves to its function (#89 Problem B). The raw address is kept
+            # in the reported "address".
+            fn = _taint.function_at(bv, addr)
             name = None
             if fn is not None:
                 name = str(getattr(fn, "name", None))
             else:
                 sym = bv.get_symbol_at(addr) if hasattr(bv, "get_symbol_at") else None
+                if sym is None and (addr & 1) and hasattr(bv, "get_symbol_at"):
+                    sym = bv.get_symbol_at(addr & ~1)
                 name = str(getattr(sym, "name", None)) if sym is not None else None
             targets.append({"address": hex(addr), "name": name})
         return targets
@@ -3233,13 +3238,17 @@ class BinaryNinjaBridge:
                 opn = self._il_op_name(ins)
                 if "CALL" not in opn and "TAILCALL" not in opn:
                     continue
-                target = _taint.const_target(getattr(ins, "dest", None))
+                # resolve_call_target (no thunk following) resolves MLIL_IMPORT
+                # calls and Thumb-tagged targets that const_target/exact-address
+                # lookup miss (#89). Constant direct calls resolve identically.
+                resolved = _taint.resolve_call_target(bv, ins, follow_thunks=False)
+                target = resolved.address
                 row = {
                     "call_addr": hex(int(getattr(ins, "address", func.start))),
                     "il_index": int(getattr(ins, "instr_index", -1)),
                 }
                 if target is not None:
-                    fn = bv.get_function_at(target)
+                    fn = resolved.function or (bv.get_function_at(target) if hasattr(bv, "get_function_at") else None)
                     name = str(fn.name) if fn is not None else None
                     if name is None:
                         sym = bv.get_symbol_at(target) if hasattr(bv, "get_symbol_at") else None
@@ -3335,7 +3344,12 @@ class BinaryNinjaBridge:
         bv = self._resolve_view(selector)
         direction = str(params.get("direction", "forward"))
         func = self._find_function(bv, params["function"])
-        models = _taint.load_models()
+        try:
+            models = _taint.load_models()
+        except _taint.TaintError as exc:
+            # A broken builtin DB or BN_TAINT_MODELS override is now loud instead
+            # of silently producing false negatives (#97).
+            raise OperationFailure("unsupported", str(exc)) from exc
 
         def _find_variable(fn, sel):
             var, _is_param = self._find_variable_selector(fn, sel)
