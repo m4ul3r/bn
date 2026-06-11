@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-from ..cli import _call, _mutation_exit_code, _non_negative_int, _parse_line_range, _positive_int, arg, command, mutex
+from ..cli import _call, _depth_int, _mutation_exit_code, _non_negative_int, _parse_line_range, _positive_int, arg, command, mutex
 from ..formatters import (
     _render_callsites_text,
     _render_evidence_xrefs_text,
@@ -418,7 +418,7 @@ def _evidence_xrefs(args: argparse.Namespace) -> int:
          target=True,
          args=[
              arg("address", help="Table start address (hex 0x.. or decimal)"),
-             arg("--entries", type=int, default=16,
+             arg("--entries", type=_positive_int, default=16,
                  help="Number of pointer entries to read"),
              arg("--stride", default=None,
                  help="Byte stride between entries (default: target pointer size)"),
@@ -496,11 +496,11 @@ def _evidence_init(args: argparse.Namespace) -> int:
              arg("--view", default="mlil", choices=("mlil", "hlil"),
                  help="IL view for SSA walking (default: mlil, broadest call coverage; "
                       "hlil misses calls whose return value is assigned)"),
-             arg("--max-depth", type=int, default=50,
+             arg("--max-depth", type=_depth_int, default=50,
                  help="Maximum trace steps before truncation (default: 50)"),
              arg("--interprocedural", action="store_true", default=False,
                  help="Follow return values across call boundaries into callees"),
-             arg("--ip-depth", type=_non_negative_int, default=2,
+             arg("--ip-depth", type=_depth_int, default=2,
                  help="Max call depth for interprocedural tracing (default: 2; 0 disables crossing)"),
          ])
 def _trace(args: argparse.Namespace) -> int:

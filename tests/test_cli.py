@@ -201,7 +201,7 @@ def test_scalar_spill_warning_points_at_artifact(monkeypatch, capsys):
     _, stderr = capsys.readouterr()
     assert stderr == (
         "warning: type info output spilled to /tmp/type-show.txt; "
-        "rerun with --out <path> or read the artifact at /tmp/type-show.txt "
+        "rerun with --out <path> to write it to a file, or read that artifact "
         "to inspect the full output\n"
     )
 
@@ -1791,6 +1791,37 @@ def test_argparse_error_emits_json_envelope_under_format_json(capsys):
     assert payload["ok"] is False
     assert "error" in payload and payload["error"]
     assert err  # usage text still on stderr
+
+
+def test_version_flag_prints_version(capsys):
+    # `bn --version` is a real affordance, not "unrecognized arguments" (#49).
+    from bn.version import VERSION
+    with pytest.raises(SystemExit) as exc:
+        bn.cli.main(["--version"])
+    assert exc.value.code == 0
+    out, _ = capsys.readouterr()
+    assert out.strip() == f"bn {VERSION}"
+
+
+def test_max_depth_validator_says_depth_not_index(capsys):
+    # Depth flags get a "depth" label, not the generic "index" (#49).
+    with pytest.raises(SystemExit) as exc:
+        bn.cli.main(["taint", "forward", "-f", "main", "--source", "param:0",
+                     "--max-depth", "-1", "--target", "active"])
+    assert exc.value.code == 2
+    _, err = capsys.readouterr()
+    assert "depth must be an integer >= 0" in err
+    assert "index must be" not in err
+
+
+def test_entries_validator_hex_aware_and_rejects_zero(capsys):
+    # evidence table --entries is wired to the shared count validator: hex is
+    # accepted and a degenerate 0/negative is rejected with the standard message (#59).
+    with pytest.raises(SystemExit) as exc0:
+        bn.cli.main(["evidence", "table", "0x1000", "--entries", "0", "--target", "active"])
+    assert exc0.value.code == 2
+    _, err0 = capsys.readouterr()
+    assert "count must be an integer >= 1" in err0
 
 
 def test_argparse_error_text_format_keeps_stdout_empty(capsys):
@@ -3898,9 +3929,10 @@ def test_unpaged_list_spill_hint_points_at_out_flag(monkeypatch, capsys):
     assert rc == 0
     _, stderr = capsys.readouterr()
     assert "--limit/--offset" not in stderr
-    assert (
-        "rerun with --out <path> or read the artifact at /tmp/callsites.txt" in stderr
-    )
+    # the path is named once (in "spilled to <path>"); the hint must not repeat it
+    assert "spilled to /tmp/callsites.txt" in stderr
+    assert stderr.count("/tmp/callsites.txt") == 1
+    assert "rerun with --out <path>" in stderr
 
 
 def test_slice_text_lines_start_beyond_end_keeps_header_sane():
@@ -4038,7 +4070,8 @@ def test_xrefs_distinct_functionless_refs_are_not_merged_under_one_label():
         ],
     }
     out = formatters._render_xrefs_text(value)
-    assert "data refs: 2 sites across 2 functions" in out
+    # function-less refs are "locations", not "functions" (#49)
+    assert "data refs: 2 sites across 2 locations" in out
     # each site is labeled with its OWN symbol, on a line with its OWN address
     assert any("0xaaaa" in ln and "sym_a" in ln and "sym_b" not in ln for ln in out.splitlines())
     assert any("0xbbbb" in ln and "sym_b" in ln and "sym_a" not in ln for ln in out.splitlines())
@@ -4057,7 +4090,7 @@ def test_xrefs_same_label_functionless_refs_still_coalesce():
         ],
     }
     out = formatters._render_xrefs_text(value)
-    assert "data refs: 2 sites across 1 function" in out
+    assert "data refs: 2 sites across 1 location" in out   # function-less -> location (#49)
     assert any("0xaaaa" in ln and "0xbbbb" in ln for ln in out.splitlines())
 
 

@@ -413,10 +413,9 @@ def _spill_next_step_hint(
         return "rerun with --lines START:END to fetch a slice instead"
     if paged and isinstance(spill_context, list):
         return "rerun with --limit/--offset to page through the results"
-    return (
-        f"rerun with --out <path> or read the artifact at {artifact_path} "
-        "to inspect the full output"
-    )
+    # The warning already names the artifact path ("spilled to <path>"); don't
+    # repeat it a second time in the hint (#49).
+    return "rerun with --out <path> to write it to a file, or read that artifact to inspect the full output"
 
 
 def _implicit_target(args: argparse.Namespace) -> str:
@@ -566,6 +565,9 @@ def _int_at_least(minimum: int, label: str) -> Callable[[str], int]:
 # Count flags (``--limit``) require >= 1; index flags (``--offset``) allow 0.
 _positive_int = _int_at_least(1, "count")
 _non_negative_int = _int_at_least(0, "index")
+# A depth-labeled non-negative validator so e.g. `--max-depth -1` reads
+# "depth must be an integer >= 0", not the generic "index ..." (#49).
+_depth_int = _int_at_least(0, "depth")
 
 
 def _pick(positional: Any, flag: Any, label: str, *, required: bool = True) -> Any:
@@ -639,6 +641,7 @@ def build_parser() -> argparse.ArgumentParser:
             "envelope with the artifact path. Read that file directly -- do not pipe to grep."
         ),
     )
+    parser.add_argument("--version", action="version", version=f"bn {VERSION}")
     parser.set_defaults(handler=None)
     _instance_option(parser, is_root=True)
     _target_option(parser, required=False, is_root=True)

@@ -523,8 +523,18 @@ def _render_xrefs_text(value: Any, limit: int | None = None) -> str:
         if not groups:
             return [f"{label}:", "- none"]
         site_word = "site" if total == 1 else "sites"
-        fn_word = "function" if len(groups) == 1 else "functions"
-        header = f"{label}: {total} {site_word} across {len(groups)} {fn_word}"
+        # The groups are distinct CALLERS, which may be functions OR function-less
+        # locations (a data ref whose caller_function is null). Only call them
+        # "functions" when every group really is one; otherwise use the neutral
+        # "locations" so a function-less bucket isn't miscounted as a function (#49).
+        # A function group carries a caller_address; a function-less one has None
+        # (its caller_name holds a fallback symbol/section label, so that field
+        # can't be the discriminator).
+        all_functions = all(group.get("caller_address") for group in groups)
+        grp_singular = "function" if all_functions else "location"
+        grp_plural = "functions" if all_functions else "locations"
+        grp_word = grp_singular if len(groups) == 1 else grp_plural
+        header = f"{label}: {total} {site_word} across {len(groups)} {grp_word}"
         shown = groups[:limit] if limit else groups
         rendered = [header]
         for group in shown:
@@ -542,7 +552,7 @@ def _render_xrefs_text(value: Any, limit: int | None = None) -> str:
             rendered.append(f"  {caller_addr}  {caller_name}  {suffix}")
         if limit and len(groups) > limit:
             rendered.append(
-                f"  ... {len(groups) - limit} more functions "
+                f"  ... {len(groups) - limit} more {grp_plural} "
                 "(increase --limit or use --format json for all)"
             )
         return rendered
