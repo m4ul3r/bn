@@ -1273,6 +1273,34 @@ def test_follow_thunk_self_loop_returns_none():
     assert te.follow_thunk(bv, selfish) is None
 
 
+def test_follow_thunk_two_step_cycle_terminates():
+    # A->B->A: the old recursive form only rejected a direct self-loop, so this
+    # multi-step cycle recursed without bound (issue #42). Must terminate.
+    a = _tailcall_thunk("a", 0x401100, 0x401200)
+    b = _tailcall_thunk("b", 0x401200, 0x401100)
+    bv = FBV({}, funcs={0x401100: a, 0x401200: b})
+    assert te.follow_thunk(bv, a) is b  # deepest target before the cycle closes
+
+
+def test_follow_thunk_long_cycle_terminates():
+    # A->B->C->A: a longer tailcall cycle must also terminate, not recurse.
+    a = _tailcall_thunk("a", 0x401100, 0x401200)
+    b = _tailcall_thunk("b", 0x401200, 0x401300)
+    c = _tailcall_thunk("c", 0x401300, 0x401100)
+    bv = FBV({}, funcs={0x401100: a, 0x401200: b, 0x401300: c})
+    assert te.follow_thunk(bv, a) is c
+
+
+def test_follow_thunk_multi_hop_chain_resolves_deepest():
+    # A->B->real (acyclic, len>1): must follow all the way to the leaf, not stop
+    # at the first hop. Guards against the cycle fix breaking real chains.
+    real = _leaf_func("real_impl", 0x401300)
+    a = _tailcall_thunk("a", 0x401100, 0x401200)
+    b = _tailcall_thunk("b", 0x401200, 0x401300)
+    bv = FBV({}, funcs={0x401100: a, 0x401200: b, 0x401300: real})
+    assert te.follow_thunk(bv, a) is real
+
+
 # -- resolve_call_target ----------------------------------------------------
 
 def test_resolve_call_target_direct_const():

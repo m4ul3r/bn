@@ -287,30 +287,41 @@ def targets_from_pvs(pvs: Any) -> list[int]:
 def follow_thunk(bv: Any, fn: Any) -> Any | None:
     """If *fn* is a single-instruction tailcall thunk, return its real target.
 
-    Recursively follows thunk chains (PLT stubs, GCC veneers) with self-loop
-    protection. Returns None when *fn* is not a thunk.
+    Follows thunk chains (PLT stubs, GCC veneers) iteratively, guarding against
+    cycles of *any* length via a visited-set of function starts. The old
+    recursive form only rejected a direct A->A self-loop, so a multi-step
+    tailcall cycle in the binary (A->B->A, or longer) recursed without bound and
+    raised ``RecursionError``. Returns the deepest resolved target, or None when
+    *fn* is not a thunk.
     """
-    ssa = _mlil_ssa(fn)
-    if ssa is None:
-        return None
-    instructions = _ssa_instructions(ssa)
-    if len(instructions) != 1:
-        return None
-    insn = instructions[0]
-    if "TAILCALL" not in op_name(insn):
-        return None
-    dest = getattr(insn, "dest", None)
-    if dest is None:
-        return None
-    addr = extract_dest_address(bv, dest)
-    if addr is None:
-        return None
-    target = bv.get_function_at(addr)
-    if target is None:
-        target = bv.get_function_at(addr & ~1)
-    if target is not None and int(getattr(target, "start", -1)) != int(getattr(fn, "start", -2)):
-        return follow_thunk(bv, target) or target
-    return None
+    seen: set[int] = {int(getattr(fn, "start", -1))}
+    cur = fn
+    result: Any | None = None
+    while True:
+        ssa = _mlil_ssa(cur)
+        if ssa is None:
+            break
+        instructions = _ssa_instructions(ssa)
+        if len(instructions) != 1:
+            break
+        insn = instructions[0]
+        if "TAILCALL" not in op_name(insn):
+            break
+        dest = getattr(insn, "dest", None)
+        if dest is None:
+            break
+        addr = extract_dest_address(bv, dest)
+        if addr is None:
+            break
+        target = bv.get_function_at(addr)
+        if target is None:
+            target = bv.get_function_at(addr & ~1)
+        if target is None or int(getattr(target, "start", -2)) in seen:
+            break
+        seen.add(int(getattr(target, "start", -1)))
+        result = target
+        cur = target
+    return result
 
 
 @dataclass
@@ -775,7 +786,16 @@ class TaintEngine:
         self._max_depth_seen = 0
         self._truncated = False
 
-        sub = self._run_forward(func, sources, depth=0, max_depth=max_depth, top=True)
+        try:
+            sub = self._run_forward(func, sources, depth=0, max_depth=max_depth, top=True)
+        except RecursionError:
+            # Defense in depth: should not happen now that thunk-following and the
+            # SSA/call walks are cycle-guarded, but a pathological binary must
+            # degrade to a bounded, honest result rather than crash the whole op.
+            self._truncated = True
+            sub = {"findings": [], "leaves": [], "assumptions": [
+                f"analysis of {func.name} truncated: Python recursion limit reached "
+                "while propagating taint (possible unresolved cycle); results incomplete"]}
         # collapse any duplicate sink reports (same callee/site/arg) that distinct
         # resolved targets or arg-set growth may have produced
         seen_sink: set[tuple] = set()
@@ -1423,19 +1443,31 @@ class TaintEngine:
                 sink_status.append({**desc, "seeded": False, "note": str(exc)})
                 continue
             n_before = len(slices)
-            for seed_var, sink_ins in seeds:
-                for sl in self._backward_slice(func, seed_var, 0, max_depth, set()):
-                    slices.append({
-                        "sink": {
-                            "kind": sink.get("kind"),
-                            "callee": sink.get("callee"),
-                            "address": hex(int(getattr(sink_ins, "address", 0))),
-                            "seed": var_label(seed_var),
-                        },
-                        "origin": sl["origin"],
-                        "crossed_functions": sl["crossed"],
-                        "slice": sl["steps"],
-                    })
+            try:
+                for seed_var, sink_ins in seeds:
+                    for sl in self._backward_slice(func, seed_var, 0, max_depth, set()):
+                        slices.append({
+                            "sink": {
+                                "kind": sink.get("kind"),
+                                "callee": sink.get("callee"),
+                                "address": hex(int(getattr(sink_ins, "address", 0))),
+                                "seed": var_label(seed_var),
+                            },
+                            "origin": sl["origin"],
+                            "crossed_functions": sl["crossed"],
+                            "slice": sl["steps"],
+                        })
+            except RecursionError:
+                # Per-sink isolation: a pathological cycle truncates this sink's
+                # slice (keeping any partial steps already collected) without
+                # taking down the other sinks or the whole op.
+                self._bw_assume(
+                    f"backward slice for {format_locator(sink)} truncated: "
+                    "Python recursion limit reached (possible unresolved cycle)")
+                sink_status.append({**desc, "seeded": True, "truncated": True,
+                                    "slices": len(slices) - n_before,
+                                    "note": "recursion limit reached while slicing; results incomplete"})
+                continue
             sink_status.append({**desc, "seeded": True, "slices": len(slices) - n_before})
 
         if sinks and len(errors) == len(sinks):
