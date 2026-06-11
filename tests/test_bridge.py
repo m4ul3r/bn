@@ -491,6 +491,196 @@ def test_run_local_restores_runs_reverse_and_reports_failure(monkeypatch):
     assert settled == []
 
 
+def _mutation_with_stubs(monkeypatch, bridge, instance, bv, *, apply, verify=None):
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance, "_guess_affected_functions", lambda bv, operations: [])
+    monkeypatch.setattr(instance, "_capture_function_snapshots", lambda bv, functions: {})
+    monkeypatch.setattr(instance, "_capture_type_snapshots", lambda bv, operations: {})
+    monkeypatch.setattr(instance, "_diff_snapshots", lambda before, after: [])
+    monkeypatch.setattr(instance, "_diff_type_snapshots", lambda before, after: [])
+    monkeypatch.setattr(instance, "_apply_operation", apply)
+    if verify is not None:
+        monkeypatch.setattr(instance, "_verify_operation", verify)
+
+
+def test_apply_failure_runs_restores_even_when_undo_revert_fails(monkeypatch):
+    """An apply failure must run the explicit non-journaled restores even when
+    the undo revert fails — `and` short-circuit would skip them and leave
+    local/prototype changes applied (#88)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+    calls = {"restores": 0}
+
+    def apply(bv_, op, restores=None):
+        if op.get("op") == "boom":
+            raise bridge.OperationFailure("unsupported", "nope", requested={})
+        restores.append(lambda: None)
+        return {"op": "local_rename", "requested": {}}
+
+    _mutation_with_stubs(monkeypatch, bridge, instance, bv, apply=apply)
+    monkeypatch.setattr(instance, "_revert_undo_safely", lambda bv_, state: False)
+
+    def run_restores(bv_, restores):
+        calls["restores"] += 1
+        assert len(restores) == 1
+        return True
+
+    monkeypatch.setattr(instance, "_run_local_restores", run_restores)
+
+    result = instance._mutation("active", False, [{"op": "local_rename"}, {"op": "boom"}])
+
+    assert calls["restores"] == 1  # restores ran despite the failed undo revert
+    assert result["success"] is False
+    assert result["rolled_back"] is False  # undo revert failed, so not fully reverted
+    assert "rollback itself failed" in result["message"]
+
+
+def test_preview_restore_failure_is_not_success(monkeypatch):
+    """A preview whose non-journaled restore failed left the view modified;
+    it must not report success:true / exit 0 to automation (#88)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+
+    def apply(bv_, op, restores=None):
+        restores.append(lambda: None)
+        return {"op": "local_rename", "requested": {}}
+
+    _mutation_with_stubs(
+        monkeypatch, bridge, instance, bv,
+        apply=apply,
+        verify=lambda bv_, result: {**result, "status": "verified"},
+    )
+    monkeypatch.setattr(instance, "_run_local_restores", lambda bv_, restores: False)
+
+    result = instance._mutation("active", True, [{"op": "local_rename"}])
+
+    assert result["preview"] is True
+    assert result["success"] is False
+    assert result["committed"] is False
+    assert result["rolled_back"] is False
+    assert "failed" in result["message"]
+    assert ("revert", "state") in bv.events
+    assert ("commit", "state") not in bv.events
+
+
+def test_preview_drift_restore_failure_is_not_success(monkeypatch):
+    """If reverting BN's propagation onto aliased siblings (the var-drift
+    restore) fails, the preview left the view modified and must report
+    success:false / rolled_back:false (#88)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+
+    def apply(bv_, op, restores=None):
+        return {"op": "local_rename", "requested": {}}
+
+    _mutation_with_stubs(
+        monkeypatch, bridge, instance, bv,
+        apply=apply,
+        verify=lambda bv_, result: {**result, "status": "verified"},
+    )
+    monkeypatch.setattr(instance, "_run_local_restores", lambda bv_, restores: True)
+    # Force a non-empty var snapshot and a failing drift restore.
+    monkeypatch.setattr(instance, "_capture_local_var_snapshots", lambda bv_, fns: {0x1: {1: ("a", "int")}})
+    monkeypatch.setattr(instance, "_restore_local_var_drift", lambda bv_, snap: False)
+
+    result = instance._mutation("active", True, [{"op": "local_rename"}])
+
+    assert result["preview"] is True
+    assert result["success"] is False
+    assert result["rolled_back"] is False
+
+
+def test_preview_with_successful_restore_still_succeeds(monkeypatch):
+    """The restored-success coupling must not regress the normal preview path."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+
+    def apply(bv_, op, restores=None):
+        restores.append(lambda: None)
+        return {"op": "local_rename", "requested": {}}
+
+    _mutation_with_stubs(
+        monkeypatch, bridge, instance, bv,
+        apply=apply,
+        verify=lambda bv_, result: {**result, "status": "verified"},
+    )
+    monkeypatch.setattr(instance, "_run_local_restores", lambda bv_, restores: True)
+
+    result = instance._mutation("active", True, [{"op": "local_rename"}])
+
+    assert result["preview"] is True
+    assert result["success"] is True
+    assert result["committed"] is False
+    assert result["rolled_back"] is True
+
+
+def test_capture_and_restore_local_var_drift_reverts_propagated_siblings(monkeypatch):
+    """BN's create_user_var propagates a user name onto aliased siblings (naming
+    a stack var also renames the aliased register). The drift snapshot/restore
+    must put EVERY changed local back, not just the targeted one (#88)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    target = _FakeVariable(name="var_8", storage=-8, var_type="int32_t", identifier=10)
+    sibling = _FakeVariable(name="r2", storage=2, var_type="int32_t", identifier=20,
+                            source_type="RegisterVariableSourceType")
+    fn = _FakeFunction(0x11744, "f")
+    fn.stack_layout = [target]
+    fn.hlil = types.SimpleNamespace(vars=[sibling])
+    settled: list[bool] = []
+
+    class _Func(_FakeFunction):
+        def create_user_var(self, var, type_obj, name):
+            var.name = name
+            var.type = type_obj
+
+    fn.__class__ = _Func
+    bv = _FakeBV(functions=[fn])
+    bv.update_analysis_and_wait = lambda: settled.append(True)
+
+    before = instance._capture_local_var_snapshots(bv, [fn])
+    assert before[0x11744][10] == ("var_8", "int32_t")
+    assert before[0x11744][20] == ("r2", "int32_t")
+
+    # Simulate apply + propagation: target renamed AND sibling auto-renamed.
+    target.name = "Q8"
+    sibling.name = "Q8_1"
+
+    ok = instance._restore_local_var_drift(bv, before)
+    assert ok is True
+    assert target.name == "var_8"   # targeted var restored
+    assert sibling.name == "r2"     # propagated sibling restored too
+    assert settled == [True]        # reanalyzed exactly once (something drifted)
+
+
+def test_restore_local_var_drift_noop_when_nothing_changed(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    var = _FakeVariable(name="keep", storage=-8, var_type="int32_t", identifier=10)
+    fn = _FakeFunction(0x11744, "f")
+    fn.stack_layout = [var]
+    settled: list[bool] = []
+    bv = _FakeBV(functions=[fn])
+    bv.update_analysis_and_wait = lambda: settled.append(True)
+
+    before = instance._capture_local_var_snapshots(bv, [fn])
+    assert instance._restore_local_var_drift(bv, before) is True
+    assert settled == []  # nothing drifted -> no reanalysis
+
+
+def test_restore_local_var_drift_reports_failure_on_missing_function(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    # Snapshot references a function the view can no longer resolve.
+    snapshots = {0xdead: {10: ("v", "int32_t")}}
+    bv = _FakeBV(functions=[])
+    assert instance._restore_local_var_drift(bv, snapshots) is False
+
+
 def test_op_local_rename_registers_restore_that_undoes_the_rename(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -2989,6 +3179,117 @@ def test_verify_local_rename_fails_when_name_truly_missing(monkeypatch):
     assert verified["status"] == "verification_failed"
 
 
+def _local_retype_result(**overrides):
+    result = {
+        "op": "local_retype",
+        "function": "process_usb",
+        "address": "0x401000",
+        "variable": "var_48",
+        "local_id": "0x401000:local:stack:-72:0:3001",
+        "storage": -72,
+        "identifier": 3001,
+        "source_type": "StackVariableSourceType",
+        "is_parameter": False,
+        "before_type": "int32_t",
+        "expected_type": "char*",
+        "requested": {"variable": "var_48", "new_type": "char*"},
+    }
+    result.update(overrides)
+    return result
+
+
+def test_verify_local_retype_uses_identifier_for_register_locals(monkeypatch):
+    """A retyped register/HLIL-visible local lives in neither parameter_vars
+    nor stack_layout, so storage-only resolution cannot see it and a change
+    that actually landed would fail verification and roll back (#87).
+    Identifier-based lookup over the canonical set must find it."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    reg_var = _FakeVariable(
+        name="r2_1", storage=2, var_type="char*", identifier=3001,
+        source_type="RegisterVariableSourceType",
+    )
+    fn = _FakeFunction(0x401000, "process_usb")
+    fn.hlil = types.SimpleNamespace(vars=[reg_var])
+    bv = _FakeBV(functions=[fn])
+
+    result = _local_retype_result(variable="r2_1", storage=2)
+    verified = instance._verify_operation(bv, result)
+    assert verified["status"] == "verified"
+    assert verified["observed"]["type"] == "char*"
+
+
+def test_verify_local_retype_rejects_same_storage_different_identifier(monkeypatch):
+    """A different variable at the same storage offset whose type happens to
+    match the expected type must not count as success — verification would be
+    reading the wrong variable (#87)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    # Neighbor listed FIRST so storage-only resolution would pick it.
+    neighbor = _FakeVariable(name="other", storage=-72, var_type="char*", identifier=9999)
+    actual = _FakeVariable(name="var_48", storage=-72, var_type="int32_t", identifier=3001)
+    fn = _FakeFunction(0x401000, "process_usb")
+    fn.stack_layout = [neighbor, actual]
+    bv = _FakeBV(functions=[fn])
+
+    verified = instance._verify_operation(bv, _local_retype_result())
+    assert verified["status"] == "verification_failed"
+    assert verified["observed"]["variable"] == "var_48"
+    assert verified["observed"]["type"] == "int32_t"
+
+
+def test_verify_local_retype_passes_when_new_type_on_alt_entry_same_identifier(monkeypatch):
+    """After analysis BN may keep both an auto and a user entry at the same
+    storage offset. If the primary entry still shows the old type but the
+    alternate entry (same identifier) carries the expected type, verification
+    should succeed — mirroring the rename path."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    stale = _FakeVariable(name="var_48", storage=-72, var_type="int32_t", identifier=3001)
+    fresh = _FakeVariable(name="var_48", storage=-72, var_type="char*", identifier=3001)
+    fn = _FakeFunction(0x401000, "process_usb")
+    fn.stack_layout = [stale, fresh]
+    bv = _FakeBV(functions=[fn])
+
+    verified = instance._verify_operation(bv, _local_retype_result())
+    assert verified["status"] == "verified"
+    assert verified["observed"]["type"] == "char*"
+
+
+def test_verify_local_retype_falls_back_to_storage_without_identifier(monkeypatch):
+    """When no identifier was recorded, storage resolution remains the only
+    handle and must still work."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    var = _FakeVariable(name="var_48", storage=-72, var_type="char*", identifier=3001)
+    fn = _FakeFunction(0x401000, "process_usb")
+    fn.stack_layout = [var]
+    bv = _FakeBV(functions=[fn])
+
+    verified = instance._verify_operation(bv, _local_retype_result(identifier=None))
+    assert verified["status"] == "verified"
+
+
+def test_verify_local_retype_fails_when_identifier_vanished(monkeypatch):
+    """If the recorded identifier no longer resolves, verification must report
+    failure rather than silently verifying a same-storage stranger."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    stranger = _FakeVariable(name="other", storage=-72, var_type="char*", identifier=9999)
+    fn = _FakeFunction(0x401000, "process_usb")
+    fn.stack_layout = [stranger]
+    bv = _FakeBV(functions=[fn])
+
+    verified = instance._verify_operation(bv, _local_retype_result())
+    assert verified["status"] == "verification_failed"
+    assert verified["observed"]["variable"] is None
+
+
 # ---------------------------------------------------------------------------
 # Verification: prototype with implicit calling convention
 # ---------------------------------------------------------------------------
@@ -5066,3 +5367,35 @@ def test_affected_type_names_tolerates_malformed_types_declare(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     assert instance._affected_type_names(None, [{"op": "types_declare"}]) == []
+
+
+def test_struct_snapshot_uses_find_type_resolved_name(monkeypatch):
+    """Struct ops resolve names case-insensitively via _find_type and commit
+    under the resolved name; the snapshot pipeline must snapshot under that
+    same name or affected_types silently loses the layout diff (#95)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    struct_type = _FakeType(
+        "struct MyStruct", width=8,
+        members=[_FakeMember(0, "field_0", "int64_t")],
+    )
+    bv = _FakeBV(types_={"MyStruct": struct_type})
+    ops = [{"op": "struct_field_set", "struct_name": "mystruct"}]
+
+    assert instance._affected_type_names(bv, ops) == ["MyStruct"]
+    snapshots = instance._capture_type_snapshots(bv, ops)
+    assert "MyStruct" in snapshots
+    assert snapshots["MyStruct"]["layout"]
+
+
+def test_struct_snapshot_tolerates_unresolvable_name(monkeypatch):
+    # _find_type raises on unknown names; the pre-apply snapshot pass must fall
+    # back to the raw name (and skip the snapshot) so _apply_operation can
+    # surface the precise error instead.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(types_={})
+    ops = [{"op": "struct_field_set", "struct_name": "NoSuchStruct"}]
+
+    assert instance._affected_type_names(bv, ops) == ["NoSuchStruct"]
+    assert instance._capture_type_snapshots(bv, ops) == {}

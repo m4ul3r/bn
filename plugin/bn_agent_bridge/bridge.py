@@ -726,6 +726,12 @@ _SOURCE_TYPE_SHORT: dict[str, str] = {
     "FlagVariableSourceType": "flag",
 }
 
+# Op kinds that mutate a function's local variables via create_user_var /
+# set_user_type, which BN may PROPAGATE onto aliased siblings. Batches with any
+# of these get a full per-function local snapshot so revert paths can undo the
+# propagation, not just the targeted variable (see _capture_local_var_snapshots).
+_VAR_DRIFT_OPS = {"local_rename", "local_retype", "set_prototype"}
+
 
 class BinaryNinjaBridge:
     def __init__(self, instance_id: str | None = None):
@@ -4896,7 +4902,19 @@ class BinaryNinjaBridge:
     def _operation_type_names(self, bv, op: dict[str, Any]) -> list[str]:
         kind = op.get("op") or "rename_symbol"
         if kind.startswith("struct_") and op.get("struct_name"):
-            return [str(op["struct_name"])]
+            # Struct ops resolve the name canonically (case-insensitively) via
+            # _find_type and commit under the RESOLVED name. Snapshot under
+            # that same name, or a request like "mystruct" against an actual
+            # "MyStruct" misses both pre- and post-snapshots and the layout
+            # diff silently drops out of affected_types. Fall back to the raw
+            # name when resolution fails: this pre-apply pass must not raise --
+            # _apply_operation surfaces the precise error.
+            raw_name = str(op["struct_name"])
+            try:
+                resolved_name, _ = self._find_type(bv, raw_name)
+            except Exception:
+                return [raw_name]
+            return [resolved_name]
         if kind == "types_declare":
             # Tolerate a malformed op here (the pre-apply snapshot pass): a
             # missing `declaration` must surface as the precise invalid_request
@@ -5411,21 +5429,64 @@ class BinaryNinjaBridge:
                 requested=item.get("requested"),
                 observed={"address": item["address"], "type": None},
             )
-        var, _ = self._find_variable_by_storage(
-            fn,
-            int(item["storage"]),
-            is_parameter=bool(item["is_parameter"]),
-        )
-        observed_type = str(var.type)
-        item["observed"] = {"address": item["address"], "variable": str(var.name), "type": observed_type}
-        if observed_type != item["expected_type"]:
+        # Mirror _verify_local_rename: identifier-based lookup first (stable
+        # across analysis passes, and it covers register/HLIL-visible locals
+        # that _find_variable_by_storage cannot see because that helper scans
+        # only parameter_vars/stack_layout). Fall back to storage ONLY when no
+        # identifier was recorded -- with an identifier in hand, a same-storage
+        # variable with a different identifier is a different variable, and
+        # types collide far more often than names (every other local is an
+        # int32_t), so a storage-only match could verify the wrong one.
+        expected_type = item["expected_type"]
+        storage = int(item["storage"])
+        identifier = item.get("identifier")
+        var = None
+        if identifier is not None:
+            for v, _ in self._iter_canonical_variables(fn):
+                if self._variable_identifier(v) == identifier:
+                    var = v
+                    break
+        else:
+            var, _ = self._find_variable_by_storage(
+                fn,
+                storage,
+                is_parameter=bool(item["is_parameter"]),
+            )
+        observed_type = None if var is None else str(var.type)
+        # If the primary variable still shows the old type, scan the raw
+        # variable lists (bypassing dedup) because BN may keep both auto and
+        # user entries at the same storage offset after analysis. The alternate
+        # entry must still be the *same* variable (matching identifier); an
+        # unrelated neighbor that happens to carry the expected type must not
+        # count as success (see _verify_local_rename).
+        if var is not None and observed_type != expected_type:
+            is_param = bool(item["is_parameter"])
+            collections = [fn.parameter_vars] if is_param else [fn.stack_layout]
+            for collection in collections:
+                for v in list(collection):
+                    if (
+                        int(getattr(v, "storage", -1)) == storage
+                        and str(v.type) == expected_type
+                        and (identifier is None or self._variable_identifier(v) == identifier)
+                    ):
+                        observed_type = expected_type
+                        var = v
+                        break
+                if observed_type == expected_type:
+                    break
+        item["observed"] = {
+            "address": item["address"],
+            "variable": None if var is None else str(var.name),
+            "type": observed_type,
+        }
+        if observed_type != expected_type:
             raise OperationFailure(
                 "verification_failed",
                 f"Live local retype verification failed at {item['address']}",
                 requested=item.get("requested"),
                 observed=item["observed"],
             )
-        item["status"] = "noop" if item.get("before_type") == item["expected_type"] else "verified"
+        item["status"] = "noop" if item.get("before_type") == expected_type else "verified"
         return item
 
     def _verify_struct_field_set(self, bv, result: dict[str, Any]) -> dict[str, Any]:
@@ -5655,6 +5716,78 @@ class BinaryNinjaBridge:
         except RuntimeError:
             return None
 
+    def _capture_local_var_snapshots(self, bv, functions) -> dict[int, dict[int, tuple[str, Any]]]:
+        """Snapshot every identifiable local's (name, type) per affected function.
+
+        BN's create_user_var/set_user_type PROPAGATE a user name/type onto
+        aliased variables -- naming a stack var also names the register that
+        copies it (e.g. naming var_8 also renames the aliased r2 to var_8_1).
+        Those propagated siblings are NOT the variable an op targeted, so the
+        per-op explicit restore (_run_local_restores) never reverts them, and a
+        --preview or a rolled-back batch would leave them modified. Snapshotting
+        the whole canonical set lets _restore_local_var_drift put every drifted
+        local back, not just the targeted one."""
+        snapshots: dict[int, dict[int, tuple[str, Any]]] = {}
+        for fn in functions:
+            entries: dict[int, tuple[str, Any]] = {}
+            try:
+                for var, _ in self._iter_canonical_variables(fn):
+                    identifier = self._variable_identifier(var)
+                    if identifier is None:
+                        continue  # can't re-resolve it after reanalysis
+                    entries[identifier] = (str(var.name), var.type)
+            except Exception as exc:
+                bn.log_error(f"BN Agent Bridge: local var snapshot failed for {hex(int(fn.start))}: {exc!r}")
+            snapshots[int(fn.start)] = entries
+        return snapshots
+
+    def _restore_local_var_drift(self, bv, snapshots) -> bool:
+        """Put any local whose (name, type) drifted from *snapshots* back, then
+        reanalyze. Covers BN's name/type propagation onto aliased siblings that
+        the targeted per-op restores miss (see _capture_local_var_snapshots).
+        Returns False if any restore raised."""
+        if not snapshots:
+            return True
+        ok = True
+        touched = False
+        for fn_start, entries in snapshots.items():
+            if not entries:
+                continue
+            rfn = bv.get_function_at(int(fn_start))
+            if rfn is None:
+                ok = False
+                bn.log_error(f"BN Agent Bridge: function {hex(int(fn_start))} missing on var-drift restore")
+                continue
+            try:
+                current = list(self._iter_canonical_variables(rfn))
+            except Exception as exc:
+                ok = False
+                bn.log_error(f"BN Agent Bridge: var-drift re-enumeration failed for {hex(int(fn_start))}: {exc!r}")
+                continue
+            for var, _ in current:
+                identifier = self._variable_identifier(var)
+                if identifier is None or identifier not in entries:
+                    continue
+                snap_name, snap_type = entries[identifier]
+                if str(var.name) == snap_name and str(var.type) == str(snap_type):
+                    continue
+                try:
+                    rfn.create_user_var(var, snap_type, snap_name)
+                    touched = True
+                except Exception as exc:
+                    ok = False
+                    bn.log_error(
+                        "BN Agent Bridge: failed to restore a propagated local "
+                        f"(identifier {identifier}) in {hex(int(fn_start))}: {exc!r}"
+                    )
+        if touched:
+            try:
+                bv.update_analysis_and_wait()
+            except Exception as exc:
+                ok = False
+                bn.log_error(f"BN Agent Bridge: reanalysis after var-drift restore failed: {exc!r}")
+        return ok
+
     def _run_local_restores(self, bv, restores) -> bool:
         """Explicitly undo changes BN's undo buffer does NOT journal -- local var
         rename/retype (Function.create_user_var) and function prototypes
@@ -5693,6 +5826,18 @@ class BinaryNinjaBridge:
         affected = self._guess_affected_functions(bv, operations)
         before = self._capture_function_snapshots(bv, affected)
         type_before = self._capture_type_snapshots(bv, operations)
+        # Snapshot affected-function locals up front when the batch mutates any
+        # (rename/retype/prototype), so the revert paths can undo BN's name/type
+        # propagation onto aliased siblings (see _capture_local_var_snapshots).
+        var_before = (
+            self._capture_local_var_snapshots(bv, affected)
+            if any(
+                isinstance(op, dict)
+                and (op.get("op") or "rename_symbol") in _VAR_DRIFT_OPS
+                for op in operations
+            )
+            else {}
+        )
         state = bv.begin_undo_actions()
         results = []
         # Explicit restores for local var ops, which BN's undo buffer can't
@@ -5702,7 +5847,13 @@ class BinaryNinjaBridge:
             for op in operations:
                 results.append(self._apply_operation(bv, op, restores))
         except OperationFailure as exc:
-            reverted = self._revert_undo_safely(bv, state) and self._run_local_restores(bv, restores)
+            # Run BOTH revert steps unconditionally: an `and` would short-circuit
+            # past the explicit restores when the undo revert fails, leaving
+            # non-journaled local/prototype changes applied.
+            undo_ok = self._revert_undo_safely(bv, state)
+            restore_ok = self._run_local_restores(bv, restores)
+            drift_ok = self._restore_local_var_drift(bv, var_before)
+            reverted = undo_ok and restore_ok and drift_ok
             if reverted:
                 message = "Rolled back before post-state verification because an operation failed to apply."
                 result_note = "Rolled back before post-state verification."
@@ -5736,7 +5887,10 @@ class BinaryNinjaBridge:
             restored = True
             if preview or failed:
                 bv.revert_undo_actions(state)
+                # Targeted/prototype restores first, then mop up BN's propagation
+                # onto aliased siblings; both must succeed for a clean revert.
                 restored = self._run_local_restores(bv, restores)
+                restored = self._restore_local_var_drift(bv, var_before) and restored
             else:
                 bv.commit_undo_actions(state)
             message = None
@@ -5752,9 +5906,13 @@ class BinaryNinjaBridge:
                 )
             else:
                 message = "Applied and verified in the live Binary Ninja session."
+            # A preview whose non-journaled restore failed left the view
+            # modified -- that is not a success, even if every operation
+            # verified. Automation keys off `success`; `restored` is only
+            # False on the preview/failed paths.
             result = {
                 "preview": preview,
-                "success": not failed,
+                "success": (not failed) and restored,
                 "committed": bool((not preview) and (not failed)),
                 "message": message,
                 "results": annotated_results,
@@ -5767,7 +5925,8 @@ class BinaryNinjaBridge:
         except Exception as exc:
             undo_ok = self._revert_undo_safely(bv, state)
             restore_ok = self._run_local_restores(bv, restores)
-            if not (undo_ok and restore_ok):
+            drift_ok = self._restore_local_var_drift(bv, var_before)
+            if not (undo_ok and restore_ok and drift_ok):
                 raise RuntimeError(
                     f"{exc} (additionally, rollback failed; the view may be left partially modified)"
                 ) from exc
