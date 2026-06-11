@@ -1699,11 +1699,29 @@ class BinaryNinjaBridge:
         context["kind"] = kind
         if include_disasm:
             if kind == "code":
-                context["disasm"] = self._safe_disassembly(bv, address, arch)
+                disasm_arch = arch
+                if disasm_arch is None:
+                    # Disassemble with the TARGET function's own arch, not the
+                    # BinaryView default: in a mixed ARM/THUMB binary the default
+                    # (ARM) misdecodes a THUMB2 target into a fabricated
+                    # instruction. The function-start xref target is the common
+                    # case here (#53).
+                    disasm_arch = getattr(self._function_object_at(bv, address), "arch", None)
+                context["disasm"] = self._safe_disassembly(bv, address, disasm_arch)
             else:
                 context["disasm"] = None
                 context["notes"] = [f"target is {kind}; disassembly suppressed"]
         return context
+
+    def _function_object_at(self, bv, address: int):
+        """The function whose body covers *address* (entry first), or None. Used
+        to disassemble with the right per-function arch in a mixed-ISA binary."""
+        getfn = getattr(bv, "get_function_at", None)
+        fn = getfn(int(address)) if callable(getfn) else None
+        if fn is not None:
+            return fn
+        containing = self._functions_containing(bv, int(address))
+        return containing[0] if containing else None
 
     def _safe_disassembly(self, bv, address: int, arch=None) -> str:
         for args in ((address, arch) if arch is not None else (), (address,)):

@@ -4945,6 +4945,57 @@ def test_render_type_layout_struct_unchanged(monkeypatch):
     assert "0x0004: char b" in out
 
 
+def _stub_code_context(monkeypatch, instance, function_entry):
+    monkeypatch.setattr(instance, "_sections_at", lambda bv, a: [{"name": ".text"}])
+    monkeypatch.setattr(instance, "_segment_at", lambda bv, a: {"name": "seg"})
+    monkeypatch.setattr(instance, "_symbol_at", lambda bv, a: None)
+    monkeypatch.setattr(instance, "_function_entry_for_address", lambda bv, a: function_entry)
+    monkeypatch.setattr(instance, "_address_is_code", lambda bv, a: True)
+
+
+def test_address_context_disasm_uses_target_function_arch(monkeypatch):
+    # target_context disasm must decode with the TARGET function's arch, not the
+    # bv default -- a THUMB2 target must not be ARM-misdecoded into garbage (#53).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    thumb_arch = object()
+    fn = types.SimpleNamespace(start=0x12e74, name="thumb_fn", arch=thumb_arch)
+
+    class _BV:
+        def get_function_at(self, a):
+            return fn if a == 0x12e74 else None
+
+    _stub_code_context(monkeypatch, instance, {"name": "thumb_fn"})
+    recorded = {}
+
+    def fake_safe(bv_, address, arch=None):
+        recorded["arch"] = arch
+        return "bx pc" if arch is thumb_arch else "udf #0xd478"
+
+    monkeypatch.setattr(instance, "_safe_disassembly", fake_safe)
+    ctx = instance._address_context(_BV(), 0x12e74, include_disasm=True)
+    assert recorded["arch"] is thumb_arch           # used the target function's arch
+    assert ctx["disasm"] == "bx pc"                 # not the ARM misdecode
+
+
+def test_address_context_disasm_respects_explicit_arch(monkeypatch):
+    # An explicitly-passed arch (the caller's arch for a code-ref site) is used
+    # as-is, not overridden by the function-at-address derivation.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    explicit = object()
+    _stub_code_context(monkeypatch, instance, None)
+    recorded = {}
+
+    def fake_safe(bv_, address, arch=None):
+        recorded["arch"] = arch
+        return "x"
+
+    monkeypatch.setattr(instance, "_safe_disassembly", fake_safe)
+    instance._address_context(object(), 0x1000, include_disasm=True, arch=explicit, assume_code=True)
+    assert recorded["arch"] is explicit
+
+
 def test_struct_field_offset_grammar_matches_set(monkeypatch):
     # A zero-padded offset that `struct field set` accepts (_parse_address) must
     # also resolve in rename/delete; int(text, 0) rejected leading zeros (#25).
