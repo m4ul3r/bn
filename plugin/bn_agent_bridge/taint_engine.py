@@ -1114,7 +1114,8 @@ class TaintEngine:
                                 findings.append(self._make_finding(ins, mkey or name, argidx, sink, ht, why))
             for rule in model.get("propagates") or []:
                 to = rule.get("to")
-                hit = self._token_hit_node(ssaf, params, rule.get("from"), tainted)
+                frm = rule.get("from")
+                hit = self._token_hit_node(ssaf, params, frm, tainted)
                 if hit is not None:
                     if self._apply_to_token(ssaf, ins, params, to, taint_node, name or "?", parents=[hit]):
                         changed = True
@@ -1122,6 +1123,32 @@ class TaintEngine:
                         k = int(to.split("arg:", 1)[1])
                         if k < len(params):
                             propagated.add(k)
+                    # Visibility for a tainted copy *source* (#44): the buffer a
+                    # source operand (arg N>=1) points at is copied into the
+                    # destination buffer (arg 0). The flow is propagated -- so a
+                    # downstream sink on the destination IS reachable forward --
+                    # but the copy itself is not a sink, so without this note a
+                    # source-seed that lands here would report a bare "no sinks
+                    # reached" even though backward/trace both reach it. Record the
+                    # src-side copy so the three tools agree. Deduped per site.
+                    if isinstance(frm, str) and frm.startswith("*arg:") and to == "*arg:0":
+                        try:
+                            src_i = int(frm.split("arg:", 1)[1])
+                        except Exception:
+                            src_i = None
+                        # Only when the source operand is NOT already a reported
+                        # sink of this model: that is exactly the memcpy/memmove
+                        # case #44 flags (source silently propagated, never
+                        # reported). strcpy/strcpy_s already flag their source arg
+                        # as a sink, so it shows up in reached_sinks and needs no
+                        # note -- and the "not flagged" wording would be false.
+                        sink_args = (model.get("sink") or {}).get("tainted_args") or []
+                        if src_i is not None and src_i >= 1 and src_i not in sink_args:
+                            add_assumption(
+                                f"tainted buffer copied into the destination of "
+                                f"{name or '?'} at {hex(int(getattr(ins, 'address', 0)))} "
+                                f"(arg{src_i} -> arg0); propagated to the destination, "
+                                f"not itself flagged as a sink")
             # variadic propagation: every tainted vararg (from first_index on) flows
             # into the dest buffer and is itself reportable. Uses the actual call
             # params, so no format-string parsing is needed; arg_taint already covers

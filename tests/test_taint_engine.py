@@ -493,6 +493,56 @@ def _sprintf_unconsumed_vararg_func(fmt):
     return FFunc("fmt_fn", 0x10, FSSAFunc(instrs), params=[x]), bv
 
 
+def test_forward_notes_tainted_memcpy_source(models):
+    # memcpy(dst, src, n) with src = the tainted parameter. The copy isn't a sink
+    # on its source operand, so reached_sinks stays empty -- but forward must NOTE
+    # the src-side copy so it agrees with backward/trace instead of silently
+    # reporting "no sinks reached" (#44).
+    src = FVar("src"); dst = FVar("dst")
+    src1 = FSSA(src, 1)
+    instrs = [
+        FInstr(0, 0x100, "MLIL_CALL_SSA", "memcpy(&dst, src#1, 0x20)", reads=[src1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401080", constant=0x401080),
+               params=[FExpr("MLIL_ADDRESS_OF", "&dst", src=dst),
+                       FExpr("MLIL_VAR_SSA", "src#1", reads=[src1]),
+                       FExpr("MLIL_CONST", "0x20", constant=0x20)]),
+    ]
+    func = FFunc("f", 0x100, FSSAFunc(instrs), params=[src])
+    bv = FBV({0x401080: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    # the copy's source is NOT fabricated into a sink ...
+    assert result["reached_sinks"] == [], result["reached_sinks"]
+    # ... but the src-side copy is surfaced so forward no longer silently misses it
+    assert any("copied into the destination" in a and "memcpy" in a
+               for a in result["assumptions"]), result["assumptions"]
+
+
+def test_forward_no_copy_note_when_source_is_already_a_sink(models):
+    # strcpy flags its SOURCE (arg 1) as a sink, so forward already reports it --
+    # the #44 copy note must NOT also fire there (it would be redundant and its
+    # "not itself flagged as a sink" wording would be false). The note is for the
+    # silent case (memcpy) only.
+    src = FVar("src"); dst = FVar("dst")
+    src1 = FSSA(src, 1)
+    instrs = [
+        FInstr(0, 0x100, "MLIL_CALL_SSA", "strcpy(&dst, src#1)", reads=[src1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401090", constant=0x401090),
+               params=[FExpr("MLIL_ADDRESS_OF", "&dst", src=dst),
+                       FExpr("MLIL_VAR_SSA", "src#1", reads=[src1])]),
+    ]
+    func = FFunc("f", 0x100, FSSAFunc(instrs), params=[src])
+    bv = FBV({0x401090: "strcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    # strcpy's tainted source IS a real sink (arg 1) ...
+    assert any(s["sink"]["callee"] == "strcpy" and s["sink"]["tainted_arg_index"] == 1
+               for s in result["reached_sinks"]), result["reached_sinks"]
+    # ... so no redundant copy note is emitted for it
+    assert not any("copied into the destination" in a for a in result["assumptions"]), \
+        result["assumptions"]
+
+
 def test_forward_unconsumed_vararg_not_reported(models):
     # "%i.%i.%i" consumes 3 args (1,7,0xe); the tainted 4th vararg is never read
     # by the format -> provably dead -> must NOT be reported as a sprintf sink (#45).
