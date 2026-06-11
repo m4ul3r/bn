@@ -639,6 +639,43 @@ def test_function_create_verification_failure_exits_three(monkeypatch):
     assert rc == 3
 
 
+def test_skills_source_dir_prefers_repo_then_falls_back_to_prefix(monkeypatch, tmp_path):
+    # #83: editable checkout uses repo skills/; a wheel install (no repo skills/)
+    # falls back to the install prefix where the data files land.
+    import sys as _sys
+
+    import bn.paths as paths
+
+    (tmp_path / "skills").mkdir()
+    monkeypatch.setattr(paths, "repo_root", lambda: tmp_path)
+    assert paths.skills_source_dir() == tmp_path / "skills"
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    monkeypatch.setattr(paths, "repo_root", lambda: empty)  # no skills/ here
+    assert paths.skills_source_dir() == paths.Path(_sys.prefix)
+
+
+def test_plugin_source_dir_prefers_repo_then_falls_back_to_installed_module(monkeypatch, tmp_path):
+    # #83: editable checkout uses repo plugin/<name>; a wheel install resolves
+    # the bridge packaged into site-packages via find_spec.
+    import bn.paths as paths
+
+    repo_plugin = tmp_path / "plugin" / paths.PLUGIN_NAME
+    repo_plugin.mkdir(parents=True)
+    monkeypatch.setattr(paths, "repo_root", lambda: tmp_path)
+    assert paths.plugin_source_dir() == repo_plugin
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    installed = tmp_path / "site" / paths.PLUGIN_NAME
+    installed.mkdir(parents=True)
+    fake_spec = types.SimpleNamespace(origin=str(installed / "__init__.py"))
+    monkeypatch.setattr(paths, "repo_root", lambda: empty)
+    monkeypatch.setattr(paths.importlib.util, "find_spec", lambda name: fake_spec)
+    assert paths.plugin_source_dir() == installed
+
+
 def test_plugin_install_copy_mode(tmp_path):
     destination = tmp_path / "plugin-copy"
     rc = bn.cli.main(

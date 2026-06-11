@@ -166,7 +166,7 @@ def _check_install_destination(dest: Path, *, force: bool) -> None:
              arg("--force", action="store_true"),
          ])
 def _skill_install(args: argparse.Namespace) -> int:
-    skills_root = cli.repo_root() / "skills"
+    skills_root = cli.skills_source_dir()
     explicit_dest = args.dest is not None
     target_roots = [args.dest] if explicit_dest else _default_skill_install_roots()
     install_plan = []

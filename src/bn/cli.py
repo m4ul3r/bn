@@ -24,6 +24,7 @@ from .paths import (  # noqa: F401
     plugin_install_dir,
     plugin_source_dir,
     repo_root,
+    skills_source_dir,
 )
 from .transport import (  # noqa: F401
     BridgeError,

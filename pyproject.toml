@@ -22,5 +22,19 @@ dev = [
 requires = ["uv_build>=0.9.18,<0.10.0"]
 build-backend = "uv_build"
 
+# The bridge plugin and agent skills live at the repo root (outside src/bn) so
+# Binary Ninja can load the plugin directly, but a wheel install needs them too,
+# or `bn plugin install`, `bn skill install`, and `python -m bn_agent_bridge`
+# all break (#83). Ship the bridge into purelib (so it installs into
+# site-packages and is importable as bn_agent_bridge -- the symlinked paths.py/
+# version.py are resolved to real files at build time) and the skills under the
+# install prefix. paths.py resolves these installed locations at runtime.
+[tool.uv.build-backend.data]
+purelib = "plugin"
+data = "skills"
+
+[tool.uv.build-backend]
+wheel-exclude = ["**/__pycache__", "**/*.pyc"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import os
 import platform
+import sys
 from pathlib import Path
 
 
@@ -109,7 +111,35 @@ def taint_models_path() -> Path:
 
 
 def plugin_source_dir() -> Path:
-    return repo_root() / "plugin" / PLUGIN_NAME
+    """Where ``bn plugin install`` copies/symlinks the bridge from.
+
+    Editable checkout: the plugin lives at the repo root. Wheel install:
+    repo_root() points into site-packages and that path doesn't exist, so fall
+    back to the bridge packaged into site-packages (importable as the
+    PLUGIN_NAME module). repo_root() can't be trusted in a wheel (#83)."""
+    repo_plugin = repo_root() / "plugin" / PLUGIN_NAME
+    if repo_plugin.exists():
+        return repo_plugin
+    try:
+        spec = importlib.util.find_spec(PLUGIN_NAME)
+    except Exception:
+        spec = None
+    if spec is not None and spec.origin:
+        return Path(spec.origin).resolve().parent
+    return repo_plugin  # nonexistent -> _install_tree raises a clean error
+
+
+def skills_source_dir() -> Path:
+    """Where ``bn skill install`` reads the bundled skills from.
+
+    Editable checkout: the repo's ``skills/`` dir. Wheel install: the skills are
+    shipped as install-prefix data files, so they land directly under
+    ``sys.prefix`` (the installer copies each skill dir there); the install
+    handler filters to dirs containing ``SKILL.md`` (#83)."""
+    repo_skills = repo_root() / "skills"
+    if repo_skills.exists():
+        return repo_skills
+    return Path(sys.prefix)
 
 
 def binary_ninja_plugin_dir() -> Path:
