@@ -4518,3 +4518,94 @@ def test_struct_field_unknown_locator_is_invalid_request(monkeypatch):
     with pytest.raises(bridge.OperationFailure) as excinfo:
         instance._op_struct_field_rename(None, {"struct_name": "S", "old_name": "0x99", "new_name": "x"})
     assert excinfo.value.status == "invalid_request"
+
+
+def test_struct_field_offset_delete_targets_right_field_on_duplicate_names(monkeypatch):
+    # Two members share the name 'dup' at offsets 0x0 and 0x8. Deleting by
+    # offset 0x8 must remove the SECOND one. A name round-trip would resolve via
+    # index_by_name's first match (0x0) and silently delete the wrong field (#25).
+    bridge, instance, builder = _struct_instance(
+        monkeypatch, [_FakeStructMember(0, "dup"), _FakeStructMember(8, "dup")])
+    res = instance._op_struct_field_delete(None, {"struct_name": "S", "field_name": "0x8"})
+    assert res["field_name"] == "dup"
+    assert [(m.offset, m.name) for m in builder.members] == [(0, "dup")]  # 0x8 gone, 0x0 kept
+
+
+def test_struct_field_offset_rename_targets_right_field_on_duplicate_names(monkeypatch):
+    bridge, instance, builder = _struct_instance(
+        monkeypatch, [_FakeStructMember(0, "dup"), _FakeStructMember(8, "dup")])
+    instance._op_struct_field_rename(None, {"struct_name": "S", "old_name": "0x8", "new_name": "renamed"})
+    # only the member at offset 0x8 is renamed; offset 0x0 is untouched
+    assert [(m.offset, m.name) for m in builder.members] == [(0, "dup"), (8, "renamed")]
+
+
+def test_struct_field_offset_grammar_matches_set(monkeypatch):
+    # A zero-padded offset that `struct field set` accepts (_parse_address) must
+    # also resolve in rename/delete; int(text, 0) rejected leading zeros (#25).
+    bridge, instance, builder = _struct_instance(
+        monkeypatch, [_FakeStructMember(0, "a"), _FakeStructMember(8, "b")])
+    res = instance._op_struct_field_rename(
+        None, {"struct_name": "S", "old_name": "0008", "new_name": "bb"})
+    assert res["old_name"] == "b"
+    assert builder.members[1].name == "bb"
+
+
+def test_single_mutation_missing_field_message_is_neutral(monkeypatch):
+    # A single mutation missing a field must NOT be described as a "batch
+    # operation" -- it names the op kind and field neutrally (#30).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+    with pytest.raises(bridge.OperationFailure) as e:
+        instance._apply_operation(bv, {"op": "local_rename", "function": "f", "variable": "v"})
+    assert e.value.status == "invalid_request"
+    assert "new_name" in str(e.value)
+    assert "batch" not in str(e.value).lower()
+
+
+def test_internal_keyerror_not_mislabeled_as_missing_field(monkeypatch):
+    # A KeyError raised deeper than request-field reads (e.g. BN internals) must
+    # NOT be reported as a missing request field now that fields are validated
+    # up front (#30).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+
+    def boom(b, o):
+        raise KeyError("some_internal_key")
+
+    monkeypatch.setattr(instance, "_op_rename_symbol", boom)
+    with pytest.raises(bridge.OperationFailure) as e:
+        instance._apply_operation(bv, {"op": "rename_symbol", "identifier": "x", "new_name": "y"})
+    assert "missing required field" not in str(e.value)
+    assert "KeyError" in str(e.value)
+
+
+def test_unsupported_op_kind_uses_neutral_wording(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+    with pytest.raises(bridge.OperationFailure) as e:
+        instance._apply_operation(bv, {"op": "nonsuch_op"})
+    assert e.value.status == "unsupported"
+    assert "batch" not in str(e.value).lower()
+
+
+def test_types_declare_missing_declaration_is_invalid_request(monkeypatch):
+    # types_declare missing 'declaration' must report invalid_request naming the
+    # field, not crash with a raw KeyError from the pre-apply snapshot pass (#30).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+    with pytest.raises(bridge.OperationFailure) as e:
+        instance._apply_operation(bv, {"op": "types_declare"})
+    assert e.value.status == "invalid_request"
+    assert "declaration" in str(e.value)
+
+
+def test_affected_type_names_tolerates_malformed_types_declare(monkeypatch):
+    # The pre-apply snapshot pass must not raise on a types_declare op missing
+    # 'declaration'; it skips it so _apply_operation can reject it cleanly.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    assert instance._affected_type_names(None, [{"op": "types_declare"}]) == []
