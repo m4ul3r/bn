@@ -1462,7 +1462,8 @@ def test_list_functions_is_sorted_by_address(monkeypatch):
 
     result = instance._list_functions("active")
 
-    assert [item["address"] for item in result] == ["0x401000", "0x402000"]
+    assert [item["address"] for item in result["functions"]] == ["0x401000", "0x402000"]
+    assert result["total"] == 2 and result["has_more"] is False
 
 
 def test_list_functions_can_filter_by_address_range(monkeypatch):
@@ -1479,7 +1480,8 @@ def test_list_functions_can_filter_by_address_range(monkeypatch):
 
     result = instance._list_functions("active", min_address="0x401800", max_address="0x402fff")
 
-    assert [item["address"] for item in result] == ["0x402000"]
+    assert [item["address"] for item in result["functions"]] == ["0x402000"]
+    assert result["total"] == 1
 
 
 def test_search_functions_supports_regex(monkeypatch):
@@ -1496,7 +1498,7 @@ def test_search_functions_supports_regex(monkeypatch):
 
     result = instance._search_functions("active", "attach|detach", regex=True)
 
-    assert [item["name"] for item in result] == ["load_attachment", "detach_player"]
+    assert [item["name"] for item in result["functions"]] == ["load_attachment", "detach_player"]
 
 
 def test_search_functions_rejects_invalid_regex(monkeypatch):
@@ -3833,8 +3835,9 @@ def test_list_functions_count_only_returns_count(monkeypatch):
     monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
 
     assert instance._list_functions(None, count_only=True) == {"count": 3}
-    # count must match the full listing length
-    assert len(instance._list_functions(None)) == 3
+    # count must match the full listing's reported total
+    listing = instance._list_functions(None)
+    assert listing["total"] == 3 and listing["returned"] == 3 and len(listing["functions"]) == 3
 
 
 def test_resolve_raises_on_ambiguous_basename(monkeypatch):
@@ -4416,9 +4419,9 @@ def test_search_functions_exact_match(monkeypatch):
 
     result = instance._search_functions("active", "system", exact=True)
 
-    assert len(result) == 1
-    assert result[0]["name"] == "system"
-    assert result[0]["address"] == "0x401000"
+    assert result["returned"] == 1 and result["total"] == 1
+    assert result["functions"][0]["name"] == "system"
+    assert result["functions"][0]["address"] == "0x401000"
 
 
 def test_search_functions_exact_case_insensitive(monkeypatch):
@@ -4434,8 +4437,8 @@ def test_search_functions_exact_case_insensitive(monkeypatch):
 
     result = instance._search_functions("active", "system", exact=True)
 
-    assert len(result) == 1
-    assert result[0]["name"] == "System"
+    assert result["returned"] == 1
+    assert result["functions"][0]["name"] == "System"
 
 
 def test_search_functions_exact_no_match(monkeypatch):
@@ -4451,7 +4454,7 @@ def test_search_functions_exact_no_match(monkeypatch):
 
     result = instance._search_functions("active", "system", exact=True)
 
-    assert len(result) == 0
+    assert result["functions"] == [] and result["total"] == 0
 
 
 # ---------------------------------------------------------------------------

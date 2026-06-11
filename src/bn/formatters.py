@@ -461,6 +461,33 @@ def _render_name_address_list_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+def _render_function_list_text(value: Any) -> str:
+    """Render a paged function listing (the {functions, total, ...} envelope),
+    with a footer stating the true total and remainder (#59)."""
+    if not isinstance(value, dict) or "functions" not in value:
+        return _render_name_address_list_text(value)  # back-compat / fallback
+    functions = value.get("functions") or []
+    body = _render_name_address_list_text(functions)
+    total = value.get("total")
+    returned = value.get("returned", len(functions) if isinstance(functions, list) else 0)
+    offset = value.get("offset", 0) or 0
+    if not isinstance(total, int):
+        return body
+    footer = None
+    if value.get("has_more"):
+        remaining = total - (offset + returned)
+        next_offset = offset + returned
+        footer = (
+            f"// showing {returned} of {total} ({remaining} more); "
+            f"rerun with --offset {next_offset} or a larger --limit"
+        )
+    elif offset or returned != total:
+        footer = f"// showing {returned} of {total}"
+    if footer is None:
+        return body
+    return footer if body == "none" else f"{body}\n\n{footer}"
+
+
 def _group_refs_by_caller(refs: list[Any]) -> list[dict[str, Any]]:
     groups: dict[tuple, dict[str, Any]] = {}
     order: list[tuple] = []

@@ -2745,11 +2745,29 @@ class BinaryNinjaBridge:
             {"name": fn.name, "address": hex(fn.start), "raw_name": getattr(fn, "raw_name", fn.name)}
             for fn in functions
         ]
-        if offset:
-            items = items[offset:]
+        return self._paged_function_result(items, offset=offset, limit=limit)
+
+    def _paged_function_result(self, items: list[dict[str, Any]], *, offset: int,
+                               limit: int | None) -> dict[str, Any]:
+        """Return a function-listing page WITH paging metadata.
+
+        The CLI can't compute the true total itself -- it fetches a bounded page
+        -- so the bridge, which has the full filtered set, returns total/offset/
+        limit/returned/has_more alongside the page. This lets `function list`
+        state the real total + remainder (text) and expose paging in JSON, the
+        same honesty convention as evidence xrefs (#59)."""
+        total = len(items)
+        page = items[offset:]
         if limit is not None:
-            items = items[:limit]
-        return items
+            page = page[:limit]
+        return {
+            "functions": page,
+            "total": total,
+            "offset": offset,
+            "limit": limit,
+            "returned": len(page),
+            "has_more": (offset + len(page)) < total,
+        }
 
     def _search_functions(
         self,
@@ -2791,11 +2809,7 @@ class BinaryNinjaBridge:
         for fn in self._filtered_functions(bv, min_address=min_address, max_address=max_address):
             if matches(fn.name):
                 items.append({"name": fn.name, "address": hex(fn.start), "raw_name": getattr(fn, "raw_name", fn.name)})
-        if offset:
-            items = items[offset:]
-        if limit is not None:
-            items = items[:limit]
-        return items
+        return self._paged_function_result(items, offset=offset, limit=limit)
 
     def _function_signature(self, func) -> str:
         """Build a C-style function signature from Binary Ninja metadata."""

@@ -13,6 +13,7 @@ from ..formatters import (
     _render_init_arrays_text,
     _render_function_info_text,
     _render_mutation_text,
+    _render_function_list_text,
     _render_name_address_list_text,
     _render_message_lens_text,
     _render_pointer_table_text,
@@ -49,16 +50,20 @@ def _function_list(args: argparse.Namespace) -> int:
             text_renderer=lambda value: f"Total functions: {value.get('count', 0)}",
             stem="function-count",
         )
+    # Bridge-authoritative paging: send the real limit/offset (not the generic
+    # +1 page_limit) so the bridge returns the page WITH the true total, which
+    # the renderer surfaces (#59). The bridge envelope is {functions, total, ...}.
+    if args.limit is not None:
+        params["limit"] = args.limit
     return _call(
         args,
         "list_functions",
         params,
         require_target=True,
         allow_implicit_target=True,
-        text_renderer=_render_name_address_list_text,
-        page_limit=args.limit,
-        page_offset=args.offset,
+        text_renderer=_render_function_list_text,
         page_label="function list",
+        paged_spill=True,
         stem="functions",
     )
 
@@ -88,16 +93,17 @@ def _function_search(args: argparse.Namespace) -> int:
         params["max_address"] = args.max_address
     if args.offset:
         params["offset"] = args.offset
+    if args.limit is not None:
+        params["limit"] = args.limit
     return _call(
         args,
         "search_functions",
         params,
         require_target=True,
         allow_implicit_target=True,
-        text_renderer=_render_name_address_list_text,
-        page_limit=args.limit,
-        page_offset=args.offset,
+        text_renderer=_render_function_list_text,
         page_label="function search",
+        paged_spill=True,
         stem="function-search",
     )
 

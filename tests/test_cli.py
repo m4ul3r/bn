@@ -18,7 +18,8 @@ def test_function_list_uses_implicit_target_when_single_target_is_open(monkeypat
                 "result": [{"target_id": "123:1:7", "selector": "SnailMail_unwrapped.exe.bndb"}],
             }
         if op == "list_functions":
-            return {"ok": True, "result": [{"name": "sub_401000", "address": "0x401000"}]}
+            return {"ok": True, "result": {"functions": [{"name": "sub_401000", "address": "0x401000"}],
+                                           "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False}}
         raise AssertionError(f"unexpected op: {op}")
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
@@ -26,7 +27,7 @@ def test_function_list_uses_implicit_target_when_single_target_is_open(monkeypat
     rc = bn.cli.main(["function", "list"])
     assert rc == 0
     assert [call["op"] for call in calls] == ["list_targets", "list_functions"]
-    assert calls[1]["params"] == {"limit": 101}
+    assert calls[1]["params"] == {"limit": 100}
     assert calls[1]["target"] == "active"
     output = capsys.readouterr().out
     assert output == "0x401000  sub_401000\n"
@@ -71,7 +72,8 @@ def test_function_list_returns_full_result_set(monkeypatch, capsys):
         captured["target"] = target
         return {
             "ok": True,
-            "result": [{"name": f"sub_{index:06x}", "address": hex(index)} for index in range(150)],
+            "result": {"functions": [{"name": f"sub_{index:06x}", "address": hex(index)} for index in range(150)],
+                       "total": 150, "offset": 0, "limit": 200, "returned": 150, "has_more": False},
         }
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
@@ -80,10 +82,11 @@ def test_function_list_returns_full_result_set(monkeypatch, capsys):
 
     assert rc == 0
     assert captured["op"] == "list_functions"
-    assert captured["params"] == {"limit": 201}
+    assert captured["params"] == {"limit": 200}
     stdout, stderr = capsys.readouterr()
     payload = json.loads(stdout)
-    assert len(payload) == 150
+    assert len(payload["functions"]) == 150
+    assert payload["total"] == 150 and payload["has_more"] is False
     assert stderr == ""
 
 
@@ -94,10 +97,10 @@ def test_function_list_warns_when_output_auto_spills(monkeypatch, capsys):
         captured["op"] = op
         return {
             "ok": True,
-            "result": [
+            "result": {"functions": [
                 {"name": "sub_401000", "address": "0x401000"},
                 {"name": "sub_402000", "address": "0x402000"},
-            ],
+            ], "total": 2, "offset": 0, "limit": 100, "returned": 2, "has_more": False},
         }
 
     def fake_write_output_result(value, *, fmt, out_path, stem):
@@ -244,7 +247,8 @@ def test_function_search_can_request_regex_matching(monkeypatch, capsys):
         captured["op"] = op
         captured["params"] = params
         captured["target"] = target
-        return {"ok": True, "result": [{"name": "load_attachment", "address": "0x401000"}]}
+        return {"ok": True, "result": {"functions": [{"name": "load_attachment", "address": "0x401000"}],
+                                       "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False}}
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
@@ -255,7 +259,7 @@ def test_function_search_can_request_regex_matching(monkeypatch, capsys):
     assert captured["params"]["query"] == "attach|detach"
     assert captured["params"]["regex"] is True
     assert "offset" not in captured["params"]
-    assert captured["params"]["limit"] == 101
+    assert captured["params"]["limit"] == 100
     assert capsys.readouterr().out == "0x401000  load_attachment\n"
 
 
@@ -2236,14 +2240,20 @@ def test_format_operation_result_falls_back_to_requested():
     assert "<unknown>" not in result
 
 
-def test_function_list_pagination_truncates_and_warns(monkeypatch, capsys):
+def test_function_list_pagination_states_true_total(monkeypatch, capsys):
+    # #59: the bridge returns the page WITH the true total; the footer states it
+    # (showing N of TOTAL (REMAINING more)) on stdout. The CLI sends the real
+    # limit (not limit+1).
     captured = {}
 
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["params"] = params
         return {
             "ok": True,
-            "result": [{"name": f"sub_{i:06x}", "address": hex(i)} for i in range(21)],
+            "result": {
+                "functions": [{"name": f"sub_{i:06x}", "address": hex(i)} for i in range(20)],
+                "total": 6350, "offset": 0, "limit": 20, "returned": 20, "has_more": True,
+            },
         }
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
@@ -2251,25 +2261,25 @@ def test_function_list_pagination_truncates_and_warns(monkeypatch, capsys):
     rc = bn.cli.main(["function", "list", "--target", "active", "--limit", "20"])
 
     assert rc == 0
-    assert captured["params"]["limit"] == 21
-    stdout, stderr = capsys.readouterr()
-    assert stdout.count("\n") == 20
-    assert "truncated to 20 items" in stderr
-    assert "--offset 20" in stderr
+    assert captured["params"]["limit"] == 20            # real limit, not +1
+    stdout, _ = capsys.readouterr()
+    assert "// showing 20 of 6350 (6330 more)" in stdout   # true total + remainder
+    assert "--offset 20" in stdout
 
 
-def test_pagination_truncation_warning_singular_grammar(monkeypatch, capsys):
-    # `--limit 1` must say "1 item", not "1 items" (#31 bundled grammar fix,
-    # same class as the trace "1 step" fix).
+def test_function_list_json_carries_paging_metadata(monkeypatch, capsys):
+    # #59: machine consumers get total/has_more in JSON, not only a stderr note.
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        return {"ok": True, "result": [{"name": f"sub_{i}", "address": hex(i)} for i in range(5)]}
+        return {"ok": True, "result": {
+            "functions": [{"name": "sub_0", "address": "0x0"}],
+            "total": 6350, "offset": 0, "limit": 1, "returned": 1, "has_more": True,
+        }}
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
-    rc = bn.cli.main(["function", "list", "--target", "active", "--limit", "1"])
+    rc = bn.cli.main(["function", "list", "--target", "active", "--limit", "1", "--format", "json"])
     assert rc == 0
-    _, stderr = capsys.readouterr()
-    assert "truncated to 1 item;" in stderr
-    assert "1 items" not in stderr
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["total"] == 6350 and payload["has_more"] is True and payload["returned"] == 1
 
 
 def test_function_search_pagination_forwards_offset(monkeypatch, capsys):
@@ -2285,7 +2295,7 @@ def test_function_search_pagination_forwards_offset(monkeypatch, capsys):
 
     assert rc == 0
     assert captured["params"]["offset"] == 50
-    assert captured["params"]["limit"] == 26
+    assert captured["params"]["limit"] == 25
 
 
 def test_instance_flag_passed_to_send_request(monkeypatch, capsys):

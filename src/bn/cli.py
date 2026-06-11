@@ -414,7 +414,10 @@ def _spill_next_step_hint(
 
     if stem in ("decompile", "il", "disasm"):
         return "rerun with --lines START:END to fetch a slice instead"
-    if paged and isinstance(spill_context, list):
+    # `paged` is only set for commands that actually expose --limit/--offset, so
+    # it alone gates the paging hint (function list/search now page bridge-side
+    # and return a dict envelope rather than a bare list, #59).
+    if paged:
         return "rerun with --limit/--offset to page through the results"
     # The warning already names the artifact path ("spilled to <path>"); don't
     # repeat it a second time in the hint (#49).
@@ -475,6 +478,7 @@ def _call(
     page_limit: int | None = None,
     page_offset: int = 0,
     page_label: str | None = None,
+    paged_spill: bool = False,
     stem: str,
     result_exit_code: Callable[[Any], int] | None = None,
     bridge_writes_output: bool = False,
@@ -530,7 +534,10 @@ def _call(
         stem=stem,
         spill_label=page_label or op.replace("_", " "),
         spill_context=spill_context,
-        paged=page_limit is not None,
+        # paged_spill keeps the "--limit/--offset to page" spill hint for
+        # commands (function list/search) that page bridge-side and so don't set
+        # the client-side page_limit (#59).
+        paged=(page_limit is not None) or paged_spill,
     )
     return exit_code
 
