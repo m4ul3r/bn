@@ -1015,6 +1015,8 @@ def _render_values_text(value: Any) -> str:
         summary += f"  ranges={pvs['ranges']}"
     lines.append(f"possible values: {summary}")
     lines.append(f"  raw: {pvs.get('raw', '')}")
+    if value.get("value_basis") == "source_expression" and value.get("source_expression"):
+        lines.append(f"  of source expression: {value['source_expression']}")
     return "\n".join(lines)
 
 

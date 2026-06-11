@@ -4712,6 +4712,62 @@ def test_annotate_types_declare_noop_when_unchanged(monkeypatch):
     assert out[0]["status"] == "noop"
 
 
+def _pvs(type_name, **kw):
+    return types.SimpleNamespace(type=types.SimpleNamespace(name=type_name), **kw)
+
+
+def _dataflow_values_instance(monkeypatch, ins):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    il = types.SimpleNamespace(instructions=[ins])
+    func = types.SimpleNamespace(name="f", start=0x1000)
+    monkeypatch.setattr(instance, "_resolve_view", lambda sel: object())
+    monkeypatch.setattr(instance, "_find_function", lambda bv, ident: func)
+    monkeypatch.setattr(instance, "_il_function_for", lambda fn, view, ssa: il)
+    return bridge, instance
+
+
+def test_possible_values_uses_source_when_instruction_undetermined(monkeypatch):
+    # BN leaves a SET_VAR instruction's value-set undetermined while the SOURCE
+    # expression carries the real const; report the source's value-set (#52).
+    src = types.SimpleNamespace(possible_values=_pvs("ConstantValue", value=0xc48))
+    ins = types.SimpleNamespace(address=0x1000, possible_values=_pvs("UndeterminedValue"), src=src)
+    bridge, instance = _dataflow_values_instance(monkeypatch, ins)
+    res = instance._possible_values(None, "f", "0x1000")
+    assert res["value_basis"] == "source_expression"
+    assert res["possible_values"]["type"] == "ConstantValue"
+    assert res["possible_values"]["value"] == 0xc48
+
+
+def test_possible_values_keeps_instruction_set_when_determined(monkeypatch):
+    # When the instruction itself has a determined value-set, keep it (don't
+    # blindly prefer the source).
+    src = types.SimpleNamespace(possible_values=_pvs("UndeterminedValue"))
+    ins = types.SimpleNamespace(address=0x1000, possible_values=_pvs("ConstantValue", value=7), src=src)
+    bridge, instance = _dataflow_values_instance(monkeypatch, ins)
+    res = instance._possible_values(None, "f", "0x1000")
+    assert res["value_basis"] == "instruction"
+    assert res["possible_values"]["value"] == 7
+
+
+def test_possible_values_no_source_uses_instruction(monkeypatch):
+    # An instruction with no .src (e.g. not an assignment) falls back to its own
+    # value-set.
+    ins = types.SimpleNamespace(address=0x1000, possible_values=_pvs("ConstantValue", value=3))
+    bridge, instance = _dataflow_values_instance(monkeypatch, ins)
+    res = instance._possible_values(None, "f", "0x1000")
+    assert res["value_basis"] == "instruction"
+    assert res["possible_values"]["value"] == 3
+
+
+def test_pvs_determined_helper(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    assert instance._pvs_determined(_pvs("ConstantValue", value=1)) is True
+    assert instance._pvs_determined(_pvs("UndeterminedValue")) is False
+    assert instance._pvs_determined(None) is False
+
+
 def test_struct_field_offset_grammar_matches_set(monkeypatch):
     # A zero-padded offset that `struct field set` accepts (_parse_address) must
     # also resolve in rename/delete; int(text, 0) rejected leading zeros (#25).

@@ -3200,13 +3200,42 @@ class BinaryNinjaBridge:
                     break
         except Exception:
             target_ins = None
-        pvs = getattr(target_ins, "possible_values", None) if target_ins is not None else None
+        instr_pvs = getattr(target_ins, "possible_values", None) if target_ins is not None else None
+        src_expr = getattr(target_ins, "src", None) if target_ins is not None else None
+        src_pvs = getattr(src_expr, "possible_values", None) if src_expr is not None else None
+        # BN leaves a SET_VAR/STORE *instruction* value-set undetermined while the
+        # SOURCE expression (the value being assigned) carries the real value-set
+        # -- const / range / lookup-table. Report the source's value-set for an
+        # assignment so values surface as the help promises, instead of always
+        # printing UndeterminedValue; fall back to the instruction-level set when
+        # there is no source or only the instruction-level set is determined (#52).
+        if self._pvs_determined(src_pvs) and not self._pvs_determined(instr_pvs):
+            chosen, basis = src_pvs, "source_expression"
+        elif self._pvs_determined(instr_pvs):
+            chosen, basis = instr_pvs, "instruction"
+        elif src_pvs is not None:
+            chosen, basis = src_pvs, "source_expression"
+        else:
+            chosen, basis = instr_pvs, "instruction"
         return {
             "function": {"name": func.name, "address": hex(func.start)},
             "at": hex(address),
             "expression": str(target_ins) if target_ins is not None else None,
-            "possible_values": self._serialize_pvs(pvs),
+            "value_basis": basis,
+            "source_expression": str(src_expr) if src_expr is not None else None,
+            "possible_values": self._serialize_pvs(chosen),
         }
+
+    def _pvs_determined(self, pvs) -> bool:
+        """True if a PossibleValueSet carries an actual value (not BN's
+        UndeterminedValue). Used to prefer a determined source-expression
+        value-set over an undetermined instruction-level one (#52)."""
+        if pvs is None:
+            return False
+        tname = str(getattr(getattr(pvs, "type", None), "name", "") or "")
+        if tname:
+            return tname != "UndeterminedValue"
+        return "undetermined" not in str(pvs).lower()
 
     def _taint(self, selector, params: dict[str, Any]):
         bv = self._resolve_view(selector)
