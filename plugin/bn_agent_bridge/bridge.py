@@ -122,6 +122,25 @@ class OperationFailure(RuntimeError):
 USER_FACING_ERRORS: tuple[type[BaseException], ...] = (OperationFailure, RuntimeError, ValueError)
 
 
+# Required request fields per mutation op kind, validated before dispatch so a
+# missing field is reported as a malformed REQUEST (invalid_request, naming the
+# field) rather than letting a raw KeyError surface -- and so a KeyError raised
+# by BN internals inside a handler is NOT mislabeled as a missing request field.
+# Optional fields (read via op.get(...)) are intentionally omitted.
+REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
+    "rename_symbol": ("identifier", "new_name"),
+    "set_comment": ("comment", "address"),
+    "delete_comment": ("address",),
+    "set_prototype": ("identifier", "prototype"),
+    "local_rename": ("function", "variable", "new_name"),
+    "local_retype": ("function", "variable", "new_type"),
+    "struct_field_set": ("struct_name", "field_type", "offset", "field_name"),
+    "struct_field_rename": ("struct_name", "old_name", "new_name"),
+    "struct_field_delete": ("struct_name", "field_name"),
+    "types_declare": ("declaration",),
+}
+
+
 def _validate_count(value: Any, *, label: str, minimum: int, allow_none: bool = False) -> int | None:
     """Coerce a limit/offset param to int and enforce *minimum*.
 
@@ -4812,9 +4831,16 @@ class BinaryNinjaBridge:
         if kind.startswith("struct_") and op.get("struct_name"):
             return [str(op["struct_name"])]
         if kind == "types_declare":
+            # Tolerate a malformed op here (the pre-apply snapshot pass): a
+            # missing `declaration` must surface as the precise invalid_request
+            # from _apply_operation's field validation, not a raw KeyError that
+            # escapes _mutation before the apply loop.
+            declaration = op.get("declaration")
+            if not declaration:
+                return []
             return [name for name, _ in self._parse_declaration_source(
                 bv,
-                str(op["declaration"]),
+                str(declaration),
                 source_path=op.get("source_path"),
             )["types"]]
         return []
@@ -5324,15 +5350,19 @@ class BinaryNinjaBridge:
                 requested=item.get("requested"),
                 observed={"type_name": item["struct_name"]},
             )
-        member = self._find_member(type_obj, name=item["new_name"])
-        old_member = self._find_member(type_obj, name=item["old_name"])
+        # Verify by OFFSET, not by name: with duplicate member names a global
+        # name lookup would see the OTHER same-named member and falsely report
+        # failure (the #25 duplicate-name case). The member at the renamed
+        # offset must now carry new_name.
+        offset = int(item.get("member_offset", -1))
+        member = self._find_member(type_obj, offset=offset, name=item["new_name"])
         observed = {
             "type_name": item["struct_name"],
+            "offset": hex(offset) if offset >= 0 else None,
             "new_name": getattr(member, "name", None),
-            "old_name_present": old_member is not None,
         }
         item["observed"] = observed
-        if member is None or old_member is not None:
+        if member is None:
             raise OperationFailure(
                 "verification_failed",
                 f"Live struct field rename verification failed for {item['struct_name']}",
@@ -5352,8 +5382,17 @@ class BinaryNinjaBridge:
                 requested=item.get("requested"),
                 observed={"type_name": item["struct_name"]},
             )
-        member = self._find_member(type_obj, name=item["field_name"])
-        item["observed"] = {"type_name": item["struct_name"], "field_present": member is not None}
+        # Verify by (offset, name), not by name alone: with duplicate member
+        # names a global name lookup would see the OTHER same-named member at a
+        # different offset and falsely report the delete failed (#25). The
+        # specific member that was removed must be gone from its offset.
+        offset = int(item.get("member_offset", -1))
+        member = self._find_member(type_obj, offset=offset, name=item["field_name"])
+        item["observed"] = {
+            "type_name": item["struct_name"],
+            "offset": hex(offset) if offset >= 0 else None,
+            "field_present": member is not None,
+        }
         if member is not None:
             raise OperationFailure(
                 "verification_failed",
@@ -5405,6 +5444,17 @@ class BinaryNinjaBridge:
 
     def _apply_operation(self, bv, op: dict[str, Any], restores: list | None = None):
         kind = op.get("op") or "rename_symbol"
+        # Validate required request fields up front so a malformed request is
+        # reported precisely (invalid_request, naming the field) and a KeyError
+        # raised deeper -- e.g. by BN internals inside a handler -- is no longer
+        # misreported as a missing request field.
+        for field in REQUIRED_FIELDS.get(kind, ()):
+            if field not in op:
+                raise OperationFailure(
+                    "invalid_request",
+                    f"operation {kind!r} is missing required field {field!r}",
+                    requested=self._operation_requested(op),
+                )
         try:
             if kind == "rename_symbol":
                 return self._op_rename_symbol(bv, op)
@@ -5426,19 +5476,9 @@ class BinaryNinjaBridge:
                 return self._op_struct_field_delete(bv, op)
             if kind == "types_declare":
                 return self._op_types_declare(bv, op)
-            raise OperationFailure("unsupported", f"Unsupported batch operation: {kind}", requested=self._operation_requested(op))
+            raise OperationFailure("unsupported", f"Unsupported operation: {kind}", requested=self._operation_requested(op))
         except OperationFailure:
             raise
-        except KeyError as exc:
-            # A missing required field is a malformed REQUEST, not an
-            # unsupported operation -- name the field instead of leaking a raw
-            # KeyError tagged "unsupported".
-            field = exc.args[0] if exc.args else "?"
-            raise OperationFailure(
-                "invalid_request",
-                f"batch operation {kind!r} is missing required field {field!r}",
-                requested=self._operation_requested(op),
-            ) from exc
         except Exception as exc:
             raise OperationFailure(
                 "unsupported",
@@ -5810,22 +5850,30 @@ class BinaryNinjaBridge:
             "requested": self._operation_requested(op),
         }
 
-    def _resolve_struct_field(self, builder, resolved_name: str, locator: Any) -> str:
+    def _resolve_struct_field(self, builder, resolved_name: str, locator: Any):
         """Resolve a struct-field locator (a field NAME, or an OFFSET like 0x8 /
-        8) to the field's name. `struct field set` takes an offset, so accept one
-        here too. Raises invalid_request (not a raw RuntimeError tagged
-        ``unsupported``) when nothing matches."""
+        8) to its ``(index, member)`` in *builder* from a SINGLE scan.
+
+        Returning the index+member directly -- instead of a name that the caller
+        re-looks-up -- is what makes ``rename``/``delete`` hit the right field
+        when two members share a name at different offsets: a name round-trip
+        went through ``index_by_name`` (first-match), silently mutating the
+        wrong field. The offset is parsed with ``_parse_address`` so the grammar
+        is identical to ``struct field set`` (a zero-padded ``0008`` resolves the
+        same in all three). Raises invalid_request when nothing matches."""
         text = str(locator)
-        if builder.index_by_name(text) is not None:
-            return text
+        members = list(getattr(builder, "members", []) or [])
+        for index, member in enumerate(members):
+            if str(getattr(member, "name", "")) == text:
+                return index, member
         try:
-            offset = int(text, 0)
-        except (TypeError, ValueError):
+            offset = _parse_address(text)
+        except ValueError:
             offset = None
         if offset is not None:
-            for member in list(getattr(builder, "members", []) or []):
+            for index, member in enumerate(members):
                 if int(getattr(member, "offset", -1)) == offset:
-                    return str(member.name)
+                    return index, member
         raise OperationFailure(
             "invalid_request",
             f"no field named or at offset {text!r} in struct {resolved_name}",
@@ -5834,30 +5882,33 @@ class BinaryNinjaBridge:
     def _op_struct_field_rename(self, bv, op: dict[str, Any]):
         struct_name = str(op["struct_name"])
         resolved_name, builder = self._struct_builder(bv, struct_name)
-        field_name = self._resolve_struct_field(builder, resolved_name, op["old_name"])
-        index = builder.index_by_name(field_name)
-        member = builder[field_name]
+        index, member = self._resolve_struct_field(builder, resolved_name, op["old_name"])
+        old_name = str(getattr(member, "name", ""))
+        member_offset = int(getattr(member, "offset", -1))
         builder.replace(index, member.type, str(op["new_name"]), True)
         self._commit_struct_builder(bv, resolved_name, builder)
         return {
             "op": "struct_field_rename",
             "struct_name": resolved_name,
-            "old_name": field_name,
+            "old_name": old_name,
             "new_name": str(op["new_name"]),
+            "member_offset": member_offset,
             "requested": self._operation_requested(op),
         }
 
     def _op_struct_field_delete(self, bv, op: dict[str, Any]):
         struct_name = str(op["struct_name"])
         resolved_name, builder = self._struct_builder(bv, struct_name)
-        field_name = self._resolve_struct_field(builder, resolved_name, op["field_name"])
-        index = builder.index_by_name(field_name)
+        index, member = self._resolve_struct_field(builder, resolved_name, op["field_name"])
+        field_name = str(getattr(member, "name", ""))
+        member_offset = int(getattr(member, "offset", -1))
         builder.remove(index)
         self._commit_struct_builder(bv, resolved_name, builder)
         return {
             "op": "struct_field_delete",
             "struct_name": resolved_name,
             "field_name": field_name,
+            "member_offset": member_offset,
             "requested": self._operation_requested(op),
         }
 
