@@ -884,10 +884,13 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
         call_addr = row.get("call_addr", "<unknown>")
         caller_static = row.get("caller_static", "<unknown>")
         call_index = row.get("call_index")
+        # A tailcall (tail-branch into the target) has no real return site, so flag
+        # it -- its caller_static is the byte after the branch, not a return addr (#47).
+        kind_tag = "  [tailcall]" if row.get("call_kind") == "tailcall" else ""
         primary = (
-            f"caller_static {caller_static} | call {call_addr}"
+            f"caller_static {caller_static} | call {call_addr}{kind_tag}"
             if prefer_caller_static
-            else f"call {call_addr} | caller_static {caller_static}"
+            else f"call {call_addr} | caller_static {caller_static}{kind_tag}"
         )
         lines = [
             primary,

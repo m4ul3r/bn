@@ -2456,11 +2456,16 @@ class BinaryNinjaBridge:
         rows = []
         for insn in self._iter_llil_instructions(func):
             op_name = self._il_op_name(insn)
-            if op_name not in {"LLIL_CALL", "LLIL_CALL_STACK_ADJUST"}:
+            # Count tail-branch references too (a `b`/branch into the sink rendered
+            # as `return <addr>(...) __tailcall`), not just bl/blx -- xrefs and
+            # taint backward already treat these as calls, so callsites must agree
+            # or it silently misses a reachable sink during triage (#47).
+            if op_name not in {"LLIL_CALL", "LLIL_CALL_STACK_ADJUST", "LLIL_TAILCALL"}:
                 continue
             dest_value = self._llil_constant_value(getattr(insn, "dest", None))
             if dest_value != callee_address:
                 continue
+            call_kind = "tailcall" if "TAILCALL" in op_name else "call"
 
             call_addr = int(getattr(insn, "address", 0))
             instruction_length = self._instruction_length(bv, call_addr, arch=func_arch)
@@ -2498,6 +2503,7 @@ class BinaryNinjaBridge:
                         "address": hex(int(func.start)),
                     },
                     "call_addr": hex(call_addr),
+                    "call_kind": call_kind,
                     "instruction_length": instruction_length,
                     "caller_static": hex(caller_static),
                     "call_instruction": call_instruction,

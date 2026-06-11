@@ -1559,6 +1559,53 @@ def test_callsites_ignores_indirect_calls_and_returns_null_context_when_unmapped
     assert rows[0]["pre_branch_condition"] is None
 
 
+def test_callsites_counts_tailcall_into_target(monkeypatch):
+    # A tail-branch into the target (`return <addr>(...) __tailcall`, e.g. a
+    # j_memcpy veneer) must be reported as a callsite -- xrefs and taint already
+    # treat it as a call, so callsites must agree (#47).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    callee = _FakeFunction(0x461746, "memcpy")
+    fn = _FakeFunction(0x700000, "j_memcpy")
+    fn.basic_blocks = [_FakeBasicBlock(0x700010, 0x700014)]
+    fn.low_level_il = [[
+        _FakeLLILInstruction(0x700010, _FakeConstPtr(0x461746), operation="LLIL_TAILCALL"),
+    ]]
+    bv = _FakeBV(
+        functions=[callee, fn],
+        instruction_lengths={0x700010: 4},
+        disassembly={0x700010: "b #memcpy"},
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    rows = instance._callsites("active", "memcpy", within_identifiers=["j_memcpy"], context=1)
+
+    assert len(rows) == 1
+    assert rows[0]["call_addr"] == "0x700010"
+    assert rows[0]["call_kind"] == "tailcall"
+
+
+def test_callsites_marks_regular_call_kind(monkeypatch):
+    # A normal bl/blx call is reported with call_kind 'call' (not tailcall).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    callee = _FakeFunction(0x461746, "memcpy")
+    fn = _FakeFunction(0x700000, "caller")
+    fn.basic_blocks = [_FakeBasicBlock(0x700010, 0x700014)]
+    fn.low_level_il = [[_FakeLLILInstruction(0x700010, _FakeConstPtr(0x461746))]]  # default LLIL_CALL
+    bv = _FakeBV(
+        functions=[callee, fn],
+        instruction_lengths={0x700010: 4},
+        disassembly={0x700010: "bl #memcpy"},
+    )
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+
+    rows = instance._callsites("active", "memcpy", within_identifiers=["caller"], context=1)
+
+    assert len(rows) == 1
+    assert rows[0]["call_kind"] == "call"
+
+
 def test_callsites_returns_null_for_coarse_only_hlil(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
