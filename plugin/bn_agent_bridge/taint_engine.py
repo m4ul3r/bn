@@ -114,9 +114,16 @@ _FORMAT_SPEC_RE = re.compile(
     r"%([-+ 0#]*)(\*|[0-9]+)?(?:\.(\*|[0-9]+))?(?:hh|h|ll|l|L|q|j|z|t)?([diouxXeEfFgGaAcspn%])")
 
 
-def _count_format_args(fmt: str) -> int:
+def _count_format_args(fmt: str) -> int | None:
     """Number of varargs a printf-style *constant* format string consumes, so a
-    tainted vararg beyond it can be recognized as a provably-dead flow (#45)."""
+    tainted vararg beyond it can be recognized as a provably-dead flow (#45).
+
+    Returns None when the consumed count can't be determined reliably -- a POSIX
+    positional ``%n$`` specifier reorders/reuses args, so a positional format is
+    not the linear consumption this regex pass assumes (#69). The caller stays
+    conservative (every vararg live) on None, avoiding a false-negative sink."""
+    if re.search(r"%\d+\$", fmt):
+        return None
     n = 0
     for m in _FORMAT_SPEC_RE.finditer(fmt):
         if m.group(4) == "%":
@@ -1169,7 +1176,9 @@ class TaintEngine:
                 if base >= 1 and (base - 1) < len(params):
                     fmt = self._const_format_string(ssaf, params[base - 1])
                     if fmt is not None:
-                        upper = min(upper, base + _count_format_args(fmt))
+                        consumed = _count_format_args(fmt)
+                        if consumed is not None:  # None -> positional %n$; stay conservative (#69)
+                            upper = min(upper, base + consumed)
                 for i in range(max(base, 0), upper):
                     ht = arg_taint(params[i])
                     if not ht:

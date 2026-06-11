@@ -582,6 +582,28 @@ def test_count_format_args_handles_literals_and_star():
     assert te._count_format_args("no conversions here") == 0
 
 
+def test_count_format_args_positional_returns_none():
+    # POSIX positional %n$ specifiers reorder/reuse args; a linear count would
+    # under-count them to 0 and wrongly suppress a real sink, so return None to
+    # keep the caller conservative (#69).
+    assert te._count_format_args("%2$s") is None
+    assert te._count_format_args("%1$s %2$d") is None
+    assert te._count_format_args("err %3$d: %1$s") is None
+    # plain (non-positional) formats are still counted precisely
+    assert te._count_format_args("%s %d") == 2
+
+
+def test_forward_positional_format_does_not_suppress_sink(models):
+    # A constant format with a positional specifier must NOT have its varargs
+    # gated away -- the tainted vararg stays a reportable sink (#69, guarding the
+    # #45 fix from over-reaching into a false negative).
+    func, bv = _sprintf_unconsumed_vararg_func("%1$s %2$s %3$s")
+    engine = te.TaintEngine(bv, te.load_models())
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert any(s["sink"]["callee"] == "sprintf" and s["sink"]["tainted_arg_index"] == 5
+               for s in result["reached_sinks"]), result["reached_sinks"]
+
+
 def test_var_label_of_global():
     assert te.var_label_of((("global", 0x404060), None)) == "glob_0x404060"
     assert te.var_label_of((("global", 0x404060), 2)) == "glob_0x404060#2"
