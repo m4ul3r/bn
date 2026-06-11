@@ -4942,15 +4942,31 @@ class BinaryNinjaBridge:
         if members is None:
             return header
 
+        # Enum members carry a .value (the enumerator constant) but no .offset/
+        # .type, so the struct-shaped line collapses every one to
+        # "0x0000: <unknown> NAME", dropping the only meaningful datum. Render the
+        # value instead for enums (#54).
+        tc = str(getattr(getattr(type_obj, "type_class", None), "name", "") or "")
+        is_enum = "Enum" in tc
+
         lines = [header]
         for member in list(members):
-            try:
-                offset = int(getattr(member, "offset", 0))
-            except Exception:
-                offset = 0
             name = str(getattr(member, "name", "<anonymous>"))
-            member_type = str(getattr(member, "type", "<unknown>"))
-            lines.append(f"0x{offset:04x}: {member_type} {name}")
+            value = getattr(member, "value", None)
+            if is_enum or (getattr(member, "offset", None) is None and value is not None):
+                try:
+                    ival = int(value)
+                    suffix = f" (0x{ival:x})" if ival >= 0 else ""
+                    lines.append(f"{name} = {ival}{suffix}")
+                except Exception:
+                    lines.append(f"{name} = {value}")
+            else:
+                try:
+                    offset = int(getattr(member, "offset", 0))
+                except Exception:
+                    offset = 0
+                member_type = str(getattr(member, "type", "<unknown>"))
+                lines.append(f"0x{offset:04x}: {member_type} {name}")
         return "\n".join(lines)
 
     def _capture_type_snapshots(self, bv, operations: list[dict[str, Any]]):

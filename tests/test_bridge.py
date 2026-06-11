@@ -4827,6 +4827,44 @@ def test_pvs_determined_helper(monkeypatch):
     assert instance._pvs_determined(None) is False
 
 
+def test_render_type_layout_enum_shows_values(monkeypatch):
+    # Enum members carry .value but no .offset/.type; the layout must show the
+    # value, not collapse to "0x0000: <unknown> NAME" (#54).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    enum = types.SimpleNamespace(
+        width=4,
+        type_class=types.SimpleNamespace(name="EnumerationTypeClass"),
+        members=[
+            types.SimpleNamespace(name="ET_NONE", value=0),
+            types.SimpleNamespace(name="ET_REL", value=1),
+            types.SimpleNamespace(name="FLAG_HI", value=0x100),
+        ],
+    )
+    out = instance._render_type_layout(enum)
+    assert "ET_NONE = 0 (0x0)" in out
+    assert "ET_REL = 1 (0x1)" in out
+    assert "FLAG_HI = 256 (0x100)" in out
+    assert "<unknown>" not in out
+
+
+def test_render_type_layout_struct_unchanged(monkeypatch):
+    # The struct rendering path is unaffected (offset: type name).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    struct = types.SimpleNamespace(
+        width=8,
+        type_class=types.SimpleNamespace(name="StructureTypeClass"),
+        members=[
+            types.SimpleNamespace(name="a", offset=0, type="int32_t"),
+            types.SimpleNamespace(name="b", offset=4, type="char"),
+        ],
+    )
+    out = instance._render_type_layout(struct)
+    assert "0x0000: int32_t a" in out
+    assert "0x0004: char b" in out
+
+
 def test_struct_field_offset_grammar_matches_set(monkeypatch):
     # A zero-padded offset that `struct field set` accepts (_parse_address) must
     # also resolve in rename/delete; int(text, 0) rejected leading zeros (#25).
