@@ -5463,7 +5463,7 @@ class BinaryNinjaBridge:
             if kind == "delete_comment":
                 return self._op_delete_comment(bv, op)
             if kind == "set_prototype":
-                return self._op_set_prototype(bv, op)
+                return self._op_set_prototype(bv, op, restores)
             if kind == "local_rename":
                 return self._op_local_rename(bv, op, restores)
             if kind == "local_retype":
@@ -5511,11 +5511,12 @@ class BinaryNinjaBridge:
             return None
 
     def _run_local_restores(self, bv, restores) -> bool:
-        """Explicitly undo local var rename/retype on revert. BN's undo buffer
-        does NOT journal Function.create_user_var(), so revert_undo_actions is a
-        silent no-op for locals -- without this, --preview and rollback-on-failure
-        would leave the renamed/retyped local permanently applied. Runs in reverse
-        apply order. Returns False if any restore failed."""
+        """Explicitly undo changes BN's undo buffer does NOT journal -- local var
+        rename/retype (Function.create_user_var) and function prototypes
+        (Function.set_user_type). For these, revert_undo_actions is a silent no-op,
+        so without replaying these restores --preview and rollback-on-failure would
+        leave the change permanently applied. Runs in reverse apply order, then
+        reanalyzes. Returns False if any restore failed."""
         if not restores:
             return True
         ok = True
@@ -5525,8 +5526,9 @@ class BinaryNinjaBridge:
             except Exception as exc:
                 ok = False
                 bn.log_error(
-                    "BN Agent Bridge: failed to restore local var on revert "
-                    f"(create_user_var isn't journaled by BN undo): {exc!r}"
+                    "BN Agent Bridge: failed to restore a non-journaled change "
+                    "(local var create_user_var / prototype set_user_type) on revert: "
+                    f"{exc!r}"
                 )
         # create_user_var only materializes once analysis runs again (same as the
         # forward apply path), so settle the view before returning -- otherwise the
@@ -5595,13 +5597,13 @@ class BinaryNinjaBridge:
             message = None
             if preview:
                 message = "Preview verified and reverted." if restored else (
-                    "Preview verified, but reverting a local variable change failed; "
-                    "the view may be left modified."
+                    "Preview verified, but reverting a non-journaled change "
+                    "(local variable or prototype) failed; the view may be left modified."
                 )
             elif failed:
                 message = "Rolled back because live-session verification failed." if restored else (
-                    "Live-session verification failed AND reverting a local variable change failed; "
-                    "the view may be left modified."
+                    "Live-session verification failed AND reverting a non-journaled change "
+                    "(local variable or prototype) failed; the view may be left modified."
                 )
             else:
                 message = "Applied and verified in the live Binary Ninja session."
@@ -5707,12 +5709,22 @@ class BinaryNinjaBridge:
             "requested": self._operation_requested(op),
         }
 
-    def _op_set_prototype(self, bv, op: dict[str, Any]):
+    def _op_set_prototype(self, bv, op: dict[str, Any], restores: list | None = None):
         fn = self._find_function(bv, op["identifier"])
         expected_type, _ = bv.parse_type_string(str(op["prototype"]))
         before_prototype = str(fn.type)
+        before_type_obj = fn.type
         expected_prototype = str(expected_type)
         if before_prototype != expected_prototype:
+            # Function.set_user_type is NOT journaled by BN's undo buffer (same
+            # class as create_user_var for locals), so revert_undo_actions is a
+            # silent no-op for prototypes -- without an explicit restore, --preview
+            # and rollback-on-failure would leave the previewed prototype committed
+            # to the view (#51). Register the restore before mutating.
+            self._register_prototype_restore(
+                bv, restores, fn=fn,
+                before_prototype=before_prototype, before_type_obj=before_type_obj,
+            )
             try:
                 fn.set_user_type(expected_prototype)
             except TypeError:
@@ -5725,6 +5737,31 @@ class BinaryNinjaBridge:
             "expected_prototype": expected_prototype,
             "requested": self._operation_requested(op),
         }
+
+    def _register_prototype_restore(self, bv, restores, *, fn, before_prototype, before_type_obj):
+        """Capture how to put a function prototype back on revert. Mirrors
+        :meth:`_register_local_restore`: ``set_user_type`` is not journaled by BN's
+        undo buffer, so the preview/rollback paths replay this explicitly. Re-resolves
+        the function fresh at restore time by its start address."""
+        if restores is None:
+            return
+        fn_start = int(fn.start)
+
+        def _restore():
+            rfn = bv.get_function_at(fn_start)
+            if rfn is None:
+                raise RuntimeError(f"function {hex(fn_start)} missing on prototype restore")
+            # Restore via the .type property setter with the captured Type object:
+            # it puts back the EXACT prior prototype, whereas set_user_type would
+            # re-pin the calling convention explicitly (turning an implicit-default
+            # auto prototype into `... __convention("cdecl") ...`), which is not a
+            # true no-op. Fall back to the type string only if the object path fails.
+            try:
+                rfn.type = before_type_obj
+            except Exception:
+                rfn.set_user_type(before_prototype)
+
+        restores.append(_restore)
 
     def _register_local_restore(self, bv, restores, *, fn, var, name, type_obj, is_parameter):
         """Capture how to put a local back to (name, type_obj) on revert.

@@ -725,6 +725,67 @@ def test_op_set_prototype_uses_string_user_type_for_bn_compat(monkeypatch):
     assert verified["observed"]["prototype"] == "void* __thiscall(struct GarbageHazardRuntime* self)"
 
 
+def test_op_set_prototype_registers_restore_for_preview(monkeypatch):
+    # set_user_type is NOT journaled by BN's undo buffer, so --preview/rollback
+    # must register an explicit restore that puts the prototype back, else the
+    # previewed prototype silently persists in the view (#51). The restore uses
+    # the .type property setter (a clean revert, no convention re-pinning).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _SetterFunction(_FakeFunction):
+        def __init__(self):
+            super().__init__(0x1000, "f", "int32_t(int32_t* arg1)")
+
+        def set_user_type(self, value):
+            self.type = value if isinstance(value, str) else str(value)
+
+    class _PrototypeBV(_FakeBV):
+        def parse_type_string(self, declaration):
+            return _FakeType("void(uint32_t* p)", type_class="FunctionTypeClass"), None
+
+    fn = _SetterFunction()
+    bv = _PrototypeBV(functions=[fn])
+    baseline = fn.type
+    restores: list = []
+    instance._op_set_prototype(
+        bv, {"op": "set_prototype", "identifier": "f", "prototype": "void f(uint32_t* p)"}, restores
+    )
+    # the prototype was applied ...
+    assert fn.type == "void(uint32_t* p)"
+    # ... and exactly one restore was registered for the preview/rollback path
+    assert len(restores) == 1
+    # running it (as the preview path does) puts the original prototype back
+    restores[0]()
+    assert fn.type == baseline
+
+
+def test_op_set_prototype_no_restore_when_unchanged(monkeypatch):
+    # Setting the same prototype mutates nothing, so no restore is queued (the
+    # revert path stays a true no-op).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _SetterFunction(_FakeFunction):
+        def __init__(self):
+            super().__init__(0x1000, "f", "int32_t(int32_t* arg1)")
+
+        def set_user_type(self, value):
+            self.type = value if isinstance(value, str) else str(value)
+
+    class _PrototypeBV(_FakeBV):
+        def parse_type_string(self, declaration):
+            return _FakeType("int32_t(int32_t* arg1)", type_class="FunctionTypeClass"), None
+
+    fn = _SetterFunction()
+    bv = _PrototypeBV(functions=[fn])
+    restores: list = []
+    instance._op_set_prototype(
+        bv, {"op": "set_prototype", "identifier": "f", "prototype": "int32_t f(int32_t* arg1)"}, restores
+    )
+    assert restores == []
+
+
 def test_resolve_type_field_accepts_offset_and_suggests_near_match(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
