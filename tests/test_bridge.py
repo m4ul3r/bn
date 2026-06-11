@@ -5553,3 +5553,55 @@ def test_struct_snapshot_tolerates_unresolvable_name(monkeypatch):
 
     assert instance._affected_type_names(bv, ops) == ["NoSuchStruct"]
     assert instance._capture_type_snapshots(bv, ops) == {}
+
+
+# ---------------------------------------------------------------------------
+# Batch 5: bridge-side validation (#94 comment guard, #100 count validation)
+# ---------------------------------------------------------------------------
+
+
+def test_get_comment_rejects_both_locators(monkeypatch):
+    # #94: a raw socket client sending both function and address must be rejected
+    # (the CLI mutex group doesn't protect raw clients).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: _FakeBV())
+    with pytest.raises(RuntimeError, match="not both"):
+        instance._get_comment("active", "0x1000", "main")
+
+
+def test_op_set_comment_rejects_both_locators(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._op_set_comment(_FakeBV(), {"op": "set_comment", "function": "main", "address": "0x1000", "comment": "x"})
+    assert exc.value.status == "invalid_request"
+
+
+def test_op_delete_comment_rejects_both_locators(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._op_delete_comment(_FakeBV(), {"op": "delete_comment", "function": "main", "address": "0x1000"})
+    assert exc.value.status == "invalid_request"
+
+
+def test_sections_rejects_negative_count(monkeypatch):
+    # #100: _sections re-enforces the count contract for raw callers.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: _FakeBV(sections={}))
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._sections("active", offset=-1)
+    assert exc.value.status == "invalid_request"
+
+
+def test_list_comments_rejects_negative_count(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+    bv.address_comments = {}
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._list_comments("active", limit=-3)
+    assert exc.value.status == "invalid_request"

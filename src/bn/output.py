@@ -235,6 +235,44 @@ def write_output_result(
     )
 
 
+def write_bytes_result(
+    data: bytes,
+    *,
+    out_path: Path | None,
+    fmt: str,
+    summary: dict[str, Any] | None = None,
+) -> OutputWriteResult:
+    """Write raw *data* to *out_path* with the same guarantees as
+    :func:`write_output_result`: create parent dirs, wrap OSError in a clean
+    OutputWriteError (not a raw traceback), and return an artifact envelope
+    (path/sha256/size, ``format: bytes``). The previous raw-bytes path did
+    ``out_path.write_bytes(data)`` directly -- no mkdir, no error wrap, no
+    envelope (#96). With no out_path the caller writes the raw bytes to stdout.
+    """
+    if out_path is None:
+        return OutputWriteResult(rendered="")
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(data)
+    except OSError as exc:
+        raise OutputWriteError(f"Failed to write --out file {out_path}: {exc}") from exc
+    artifact = {
+        "ok": True,
+        "spilled": False,
+        "artifact_path": str(out_path),
+        "format": "bytes",
+        "bytes": len(data),
+        "sha256": hashlib.sha256(data).hexdigest(),
+    }
+    if summary is not None:
+        artifact["summary"] = summary
+    return OutputWriteResult(
+        rendered=render_envelope(artifact, fmt),
+        artifact=artifact,
+        spilled=False,
+    )
+
+
 def write_output(
     value: Any,
     *,

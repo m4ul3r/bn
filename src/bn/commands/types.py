@@ -58,6 +58,23 @@ def _types_show(args: argparse.Namespace) -> int:
              arg("declaration", nargs="?"),
          ])
 def _types_declare(args: argparse.Namespace) -> int:
+    # Exactly one declaration source. The handler used to pick file > stdin >
+    # positional and silently ignore the rest, so a script could apply a
+    # different declaration than the one it visibly passed (#94).
+    provided = [
+        label for label, present in (
+            ("--file", args.file is not None),
+            ("--stdin", bool(args.stdin)),
+            ("a declaration string", args.declaration is not None),
+        ) if present
+    ]
+    if not provided:
+        raise BridgeError("Provide a declaration string, --file, or --stdin")
+    if len(provided) > 1:
+        raise BridgeError(
+            f"Provide exactly one declaration source, but got {len(provided)}: "
+            f"{', '.join(provided)}."
+        )
     source_path = None
     if args.file is not None:
         if not args.file.exists():
@@ -66,10 +83,8 @@ def _types_declare(args: argparse.Namespace) -> int:
         source_path = str(args.file)
     elif args.stdin:
         declaration = sys.stdin.read()
-    elif args.declaration:
-        declaration = args.declaration
     else:
-        raise BridgeError("Provide a declaration string, --file, or --stdin")
+        declaration = args.declaration
 
     return _call(
         args,

@@ -5,7 +5,7 @@ import json
 import sys
 from pathlib import Path
 
-from ..cli import _call, _int_or_hex, _mutation_exit_code, _pick, arg, command, mutex
+from ..cli import _call, _int_or_hex, _mutation_exit_code, _non_negative_int, _pick, arg, command, mutex
 from ..formatters import (
     _render_imports_summary_text,
     _render_mutation_text,
@@ -23,7 +23,7 @@ from ..transport import BridgeError
              arg("--query"),
              arg("--regex", action="store_true", default=False,
                  help="Interpret --query as a case-insensitive regular expression"),
-             arg("--min-length", type=int, default=None,
+             arg("--min-length", type=_non_negative_int, default=None,
                  help="Exclude strings shorter than N characters"),
              arg("--section",
                  help="Only include strings in this section (e.g. .rodata, .rdata)"),
@@ -160,7 +160,15 @@ def _read_raw_bytes(args: argparse.Namespace, address: str) -> int:
     except ValueError:
         raise BridgeError("bridge returned malformed read response (invalid hex payload)") from None
     if args.out:
-        args.out.write_bytes(data)
+        from ..output import write_bytes_result
+
+        result = write_bytes_result(
+            data,
+            out_path=args.out,
+            fmt=args.format,
+            summary={"kind": "bytes", "address": address, "length": len(data)},
+        )
+        sys.stdout.write(result.rendered)
     else:
         sys.stdout.buffer.write(data)
         sys.stdout.buffer.flush()

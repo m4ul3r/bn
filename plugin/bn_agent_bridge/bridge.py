@@ -4609,6 +4609,11 @@ class BinaryNinjaBridge:
 
     def _sections(self, selector: str | None, *, query: str | None = None,
                   offset: int = 0, limit: int | None = None):
+        # Re-enforce the count contract for raw socket / py exec callers: a
+        # negative offset/limit must be a clean invalid_request, not Python
+        # negative-slice behavior returning a silently-wrong subset (#100).
+        offset = _validate_count(offset, label="offset", minimum=0)
+        limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
         bv = self._resolve_view(selector)
         items = []
         sections = getattr(bv, "sections", {})
@@ -4798,6 +4803,10 @@ class BinaryNinjaBridge:
 
     def _get_comment(self, selector: str | None, address, function):
         bv = self._resolve_view(selector)
+        if function and address is not None:
+            raise RuntimeError(
+                "Pass --address or --function, not both: they target different locations."
+            )
         if function:
             fn = self._find_function(bv, function)
             comment = bv.get_comment_at(fn.start)
@@ -4827,6 +4836,10 @@ class BinaryNinjaBridge:
         offset: int = 0,
         limit: int | None = None,
     ):
+        # Re-enforce the count contract (see _sections) so a negative offset/
+        # limit is a clean invalid_request, not a silent negative-slice (#100).
+        offset = _validate_count(offset, label="offset", minimum=0)
+        limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
         bv = self._resolve_view(selector)
         needle = query.lower() if query else None
         items = []
@@ -6035,6 +6048,12 @@ class BinaryNinjaBridge:
 
     def _op_set_comment(self, bv, op: dict[str, Any]):
         comment = str(op["comment"])
+        if op.get("function") and op.get("address"):
+            raise OperationFailure(
+                "invalid_request",
+                "Pass function OR address, not both: they target different locations.",
+                requested=self._operation_requested(op),
+            )
         if op.get("function"):
             fn = self._find_function(bv, op["function"])
             before_comment = bv.get_comment_at(fn.start) or ""
@@ -6059,6 +6078,12 @@ class BinaryNinjaBridge:
         }
 
     def _op_delete_comment(self, bv, op: dict[str, Any]):
+        if op.get("function") and op.get("address"):
+            raise OperationFailure(
+                "invalid_request",
+                "Pass function OR address, not both: they target different locations.",
+                requested=self._operation_requested(op),
+            )
         if op.get("function"):
             fn = self._find_function(bv, op["function"])
             before_comment = bv.get_comment_at(fn.start) or ""

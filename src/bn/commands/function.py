@@ -320,7 +320,7 @@ def _load_within_identifiers(path: Path) -> list[str]:
          target=True,
          args=[
              arg("callee", help="Callee function name or address whose callsites to locate"),
-             arg("--context", type=int, default=3,
+             arg("--context", type=_non_negative_int, default=3,
                  help="Number of previous and next instructions to include around each callsite"),
              arg("--caller-static", action="store_true",
                  help="Prefer caller_static-first text output for return-address mapping workflows"),
@@ -372,7 +372,7 @@ def _callsites(args: argparse.Namespace) -> int:
          target=True,
          args=[
              arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
-             arg("--context", type=int, default=2,
+             arg("--context", type=_non_negative_int, default=2,
                  help="Number of previous and next disassembly instructions to include around calls"),
          ])
 def _evidence_function(args: argparse.Namespace) -> int:
@@ -491,7 +491,7 @@ def _evidence_init(args: argparse.Namespace) -> int:
          args=[
              arg("identifier", help="Function name or entry address containing the call"),
              arg("address", help="Address of the call instruction to trace from (hex 0x.. or decimal)"),
-             arg("--arg", type=int, default=0,
+             arg("--arg", type=_non_negative_int, default=0,
                  help="Zero-based argument index to trace (default: 0)"),
              arg("--view", default="mlil", choices=("mlil", "hlil"),
                  help="IL view for SSA walking (default: mlil, broadest call coverage; "

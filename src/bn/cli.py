@@ -510,7 +510,18 @@ def _call(
         )
     spill_context = result
     if text_renderer is not None and args.format == "text":
-        result = text_renderer(result)
+        try:
+            result = text_renderer(result)
+        except (AttributeError, TypeError, KeyError, IndexError, ValueError) as exc:
+            # A malformed/unexpected bridge result (version skew, future protocol
+            # change) must not crash a text renderer with a raw traceback -- that
+            # breaks the exit-code contract (main() only catches BridgeError).
+            # Surface a clean error pointing at --format json for the raw result (#101).
+            raise BridgeError(
+                f"could not render the {op} result as text -- the bridge response was "
+                f"malformed or newer than this CLI. Rerun with --format json to see the "
+                f"raw result. ({type(exc).__name__}: {exc})"
+            ) from exc
     _render_result(
         result,
         fmt=args.format,
@@ -699,17 +710,19 @@ def _protect_flag_like_option_values(
     ``--opt=value`` spelling before parsing.
     """
     protected_options = _PROTECTED_DATA_OPTIONS
-    selected_parser = _selected_parser_for_argv(parser, argv)
-    known_options = _known_option_strings(selected_parser)
-    help_options = {"-h", "--help", "--help-full"}
     out: list[str] = []
     index = 0
     while index < len(argv):
         item = argv[index]
         if item in protected_options and index + 1 < len(argv):
             value = argv[index + 1]
-            value_option = value.split("=", 1)[0]
-            if value.startswith("-") and (value_option not in known_options or value_option in help_options):
+            # Rewrite ANY following flag-like token to the --opt=value spelling,
+            # including ones that collide with KNOWN options (--format, --target,
+            # --limit). These data options are documented as free-form, so
+            # `bn strings --query --format` must search the literal "--format",
+            # not have argparse consume it as the format flag (#102). A user who
+            # genuinely wants --query followed by a real flag uses = themselves.
+            if value.startswith("-"):
                 out.append(f"{item}={value}")
                 index += 2
                 continue

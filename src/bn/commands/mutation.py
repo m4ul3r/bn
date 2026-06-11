@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from ..cli import _call, _mutation_exit_code, arg, command
+from ..cli import _call, _mutation_exit_code, arg, command, mutex
 from ..formatters import (
     _render_comment_list_text,
     _render_comment_text,
@@ -66,10 +66,11 @@ def _comment_list(args: argparse.Namespace) -> int:
          args=[
              arg("--preview", action="store_true",
                  help="Apply, capture diffs, then revert without committing"),
-             arg("--address"),
-             arg("--function"),
              arg("comment"),
-         ])
+         ],
+         # --address and --function target different locations; the bridge checks
+         # function first, so accepting both silently dropped the address (#94).
+         mutex_groups=[mutex(True, arg("--address"), arg("--function"))])
 def _comment_set(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -89,7 +90,7 @@ def _comment_set(args: argparse.Namespace) -> int:
 
 
 @command("comment", "get", help="Get a comment", target=True,
-         args=[arg("--address"), arg("--function")])
+         mutex_groups=[mutex(True, arg("--address"), arg("--function"))])
 def _comment_get(args: argparse.Namespace) -> int:
     return _call(
         args,
@@ -109,9 +110,8 @@ def _comment_get(args: argparse.Namespace) -> int:
          args=[
              arg("--preview", action="store_true",
                  help="Apply, capture diffs, then revert without committing"),
-             arg("--address"),
-             arg("--function"),
-         ])
+         ],
+         mutex_groups=[mutex(True, arg("--address"), arg("--function"))])
 def _comment_delete(args: argparse.Namespace) -> int:
     return _call(
         args,

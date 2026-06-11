@@ -2640,18 +2640,25 @@ def test_strings_query_value_can_look_like_flag(monkeypatch, capsys):
     assert captured_queries == ["-h", "--"]
 
 
-def test_strings_query_does_not_swallow_known_sibling_flags(monkeypatch, capsys):
+def test_strings_query_value_can_be_a_known_sibling_flag(monkeypatch, capsys):
+    # #102: a protected data option must accept ANY following flag-like token as
+    # its literal value, including ones that collide with KNOWN sibling options
+    # (--regex, --format, --target). `bn strings --query --format` searches for
+    # the literal "--format". A user wanting --query <val> --regex uses = syntax.
+    captured_queries = []
+
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        raise AssertionError("parse failure should happen before bridge call")
+        if op == "strings":
+            captured_queries.append(params["query"])
+            return {"ok": True, "result": []}
+        raise AssertionError(f"unexpected op: {op}")
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
-    with pytest.raises(SystemExit) as exc_info:
-        bn.cli.main(["strings", "--target", "active", "--query", "--regex"])
-
-    assert exc_info.value.code == 2
-    _, stderr = capsys.readouterr()
-    assert "argument --query: expected one argument" in stderr
+    assert bn.cli.main(["strings", "--target", "active", "--query", "--regex"]) == 0
+    assert bn.cli.main(["strings", "--target", "active", "--query", "--format"]) == 0
+    assert bn.cli.main(["strings", "--target", "active", "--query", "--limit"]) == 0
+    assert captured_queries == ["--regex", "--format", "--limit"]
 
 
 # --- I5: sections CLI ---
@@ -4192,3 +4199,102 @@ def test_text_format_error_stays_on_stderr(monkeypatch, capsys):
     out, err = capsys.readouterr()
     assert out == ""                        # nothing on stdout in text mode
     assert "Type not found" in err
+
+
+# ---------------------------------------------------------------------------
+# Batch 5: CLI validation/rendering (#94, #96, #100, #101, #102)
+# ---------------------------------------------------------------------------
+
+
+def test_comment_get_rejects_both_address_and_function(capsys):
+    # #94: --address and --function are mutually exclusive (the bridge checks
+    # function first, so accepting both silently dropped the address).
+    with pytest.raises(SystemExit) as exc:
+        bn.cli.main(["comment", "get", "--target", "active", "--address", "0x1000", "--function", "main"])
+    assert exc.value.code == 2
+    assert "not allowed with" in capsys.readouterr().err
+
+
+def test_comment_get_requires_a_locator(capsys):
+    with pytest.raises(SystemExit) as exc:
+        bn.cli.main(["comment", "get", "--target", "active"])
+    assert exc.value.code == 2  # required mutex group: exactly one
+
+
+def test_types_declare_rejects_multiple_sources(monkeypatch, capsys, tmp_path):
+    # #94 Problem B: --file + positional must not silently pick one.
+    f = tmp_path / "d.h"
+    f.write_text("struct S { int a; };", encoding="utf-8")
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        raise AssertionError("must reject before calling the bridge")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["types", "declare", "--target", "active", "--file", str(f), "struct T { int b; };"])
+    assert rc == 2  # BridgeError -> exit 2
+    assert "exactly one declaration source" in capsys.readouterr().err
+
+
+def test_read_bytes_out_writes_envelope_and_creates_parents(monkeypatch, capsys, tmp_path):
+    # #96: the bytes --out path must mkdir parents and emit an artifact envelope.
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        if op == "read":
+            return {"ok": True, "result": {"hex": "deadbeef"}}
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    out = tmp_path / "nested" / "dir" / "out.bin"  # parent does not exist yet
+    rc = bn.cli.main(["read", "0x1000", "--length", "4", "--encoding", "bytes",
+                      "--target", "active", "--out", str(out), "--format", "json"])
+    assert rc == 0
+    assert out.read_bytes() == bytes.fromhex("deadbeef")  # parents created, data written
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["format"] == "bytes"
+    assert envelope["bytes"] == 4
+    assert envelope["artifact_path"] == str(out)
+    assert "sha256" in envelope
+
+
+def test_read_bytes_out_bad_dir_is_clean_error(monkeypatch, capsys, tmp_path):
+    # A write failure must be a clean BridgeError, not a raw traceback.
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": {"hex": "00"}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    # A path whose parent is an existing FILE can't be mkdir'd.
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x", encoding="utf-8")
+    out = blocker / "sub" / "out.bin"
+    rc = bn.cli.main(["read", "0x1000", "--length", "1", "--encoding", "bytes",
+                      "--target", "active", "--out", str(out)])
+    assert rc == 2  # OutputWriteError is a BridgeError -> exit 2
+    assert "Failed to write --out file" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("argv", [
+    ["strings", "--target", "active", "--min-length", "-5"],
+    ["callsites", "memcpy", "--target", "active", "--context", "-1"],
+    ["trace", "main", "0x1000", "--target", "active", "--arg", "-2"],
+])
+def test_negative_count_flags_rejected(argv, capsys):
+    # #100 Problem B: these flags now use the shared non-negative validator.
+    with pytest.raises(SystemExit) as exc:
+        bn.cli.main(argv)
+    assert exc.value.code == 2
+    assert "must be an integer >= 0" in capsys.readouterr().err
+
+
+def test_text_renderer_failure_becomes_clean_error(monkeypatch, capsys):
+    # #101: a malformed bridge result that trips a text renderer must surface a
+    # clean BridgeError (exit 2) pointing at --format json, not a raw traceback.
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        if op == "function_info":
+            # 'function' present but a STRING, not a dict -> .get() would crash.
+            return {"ok": True, "result": {"function": "not-a-dict"}}
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    # function info should now render with placeholders (defensive _as_dict), not crash.
+    rc = bn.cli.main(["function", "info", "main", "--target", "active", "--format", "text"])
+    assert rc == 0
+    assert "<unknown>" in capsys.readouterr().out

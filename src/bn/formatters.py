@@ -12,6 +12,17 @@ def _render_fallback_text(value: Any) -> str:
     return json.dumps(value, indent=2, sort_keys=True)
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    """Coerce a nested field to a dict for safe ``.get()`` chains.
+
+    A renderer that does ``value.get("function") or {}`` still crashes when the
+    field is present but a NON-dict (a string/list from a malformed or future
+    bridge result), because the non-dict is truthy and reaches ``.get()``. This
+    returns ``{}`` for anything that isn't a dict so the renderer degrades to
+    placeholder text instead of an AttributeError (#101)."""
+    return value if isinstance(value, dict) else {}
+
+
 def _render_string_literal(value: Any, *, truncated: bool = False) -> str:
     text = json.dumps(value, ensure_ascii=True)
     if truncated:
@@ -61,7 +72,7 @@ def _render_function_info_text(value: Any, verbose: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
 
-    function = value.get("function") or {}
+    function = _as_dict(value.get("function"))
     lines = [
         f"{function.get('name', '<unknown>')} @ {function.get('address', '<unknown>')}",
         str(value.get("prototype", "")),
@@ -939,12 +950,17 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
 def _render_structured_il_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    fn = value.get("function") or {}
+    fn = _as_dict(value.get("function"))
     form = "ssa" if value.get("ssa") else "non-ssa"
     lines = [f"{fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}  ({value.get('view', 'mlil')} {form})"]
     for ins in list(value.get("instructions") or []):
-        reads = ",".join(v.get("ssa", v.get("name", "?")) for v in (ins.get("vars_read") or []))
-        writes = ",".join(v.get("ssa", v.get("name", "?")) for v in (ins.get("vars_written") or []))
+        # A malformed list element (non-dict) must render as fallback text, not
+        # crash the whole listing with an AttributeError (#101).
+        if not isinstance(ins, dict):
+            lines.append(f"  {ins}")
+            continue
+        reads = ",".join(_as_dict(v).get("ssa", _as_dict(v).get("name", "?")) for v in (ins.get("vars_read") or []))
+        writes = ",".join(_as_dict(v).get("ssa", _as_dict(v).get("name", "?")) for v in (ins.get("vars_written") or []))
         head = f"  [{ins.get('il_index')}] {ins.get('address')}  {ins.get('op')}  {ins.get('text', '')}".rstrip()
         lines.append(head)
         if reads or writes:
