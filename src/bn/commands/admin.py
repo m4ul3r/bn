@@ -429,6 +429,25 @@ def _target_matches(item: dict[str, Any], selector: str) -> bool:
 @command("target", "use", help="Pin a target selector for subsequent calls", fmt="text",
          args=[arg("selector", help="Target selector to pin (see `bn target list`)")])
 def _target_use(args: argparse.Namespace) -> int:
+    # Validate the selector against the open targets BEFORE persisting, so a typo
+    # doesn't silently poison the sticky project pin and brick every subsequent
+    # selectorless target-required command (the consuming paths already reject an
+    # unknown selector with exit 2) (#55).
+    response = cli.send_request(
+        "list_targets", params={}, instance_id=getattr(args, "instance", None)
+    )
+    targets = response.get("result") or []
+    matched = isinstance(targets, list) and any(
+        isinstance(item, dict) and _target_matches(item, args.selector) for item in targets
+    )
+    if not matched:
+        open_sel = ", ".join(
+            str(item.get("selector")) for item in targets if isinstance(item, dict)
+        ) or "<none open>"
+        raise BridgeError(
+            f"Unknown target selector: {args.selector}. Open targets: {open_sel}. "
+            f"Run `bn target list` to see them. The pin was left unchanged."
+        )
     cli.session_state.update(target=args.selector)
     result: Any = {"target": args.selector, "set": True}
     if args.format == "text":

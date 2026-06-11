@@ -3048,17 +3048,42 @@ def test_instance_clear_removes_state(tmp_session, monkeypatch, capsys):
     assert capsys.readouterr().out.strip() == "cleared"
 
 
-def test_target_use_writes_state_without_bridge_call(tmp_session, monkeypatch, capsys):
-    def fail(*_a, **_kw):
-        raise AssertionError("target use must not call the bridge")
-
-    monkeypatch.setattr(bn.cli, "send_request", fail)
+def test_target_use_validates_and_writes_state(tmp_session, monkeypatch, capsys):
+    # target use validates the selector against the open targets before pinning,
+    # so a known selector is persisted (#55).
+    targets = [{"selector": "pam_qnx.so.2", "filename": "/x/pam_qnx.so.2"}]
+    monkeypatch.setattr(bn.cli, "send_request", lambda *_a, **_kw: {"result": targets})
 
     rc = bn.cli.main(["target", "use", "pam_qnx.so.2"])
 
     assert rc == 0
     assert bn.session_state.read()["target"] == "pam_qnx.so.2"
     assert "target: pam_qnx.so.2" in capsys.readouterr().out
+
+
+def test_target_use_rejects_unknown_selector_without_pinning(tmp_session, monkeypatch, capsys):
+    # A typo must NOT be persisted: an unknown selector is rejected with exit 2
+    # and the pin is left unchanged, instead of poisoning every later command (#55).
+    targets = [{"selector": "pam_qnx.so.2", "filename": "/x/pam_qnx.so.2"}]
+    monkeypatch.setattr(bn.cli, "send_request", lambda *_a, **_kw: {"result": targets})
+
+    rc = bn.cli.main(["target", "use", "TOTALLY-BOGUS-XYZ"])
+
+    assert rc == 2
+    assert "Unknown target selector" in capsys.readouterr().err
+    assert bn.session_state.read() == {}   # pin NOT written
+
+
+def test_target_use_does_not_overwrite_existing_pin_on_reject(tmp_session, monkeypatch, capsys):
+    # A failed `target use` must leave a previously-valid pin intact.
+    bn.session_state.update(target="pam_qnx.so.2")
+    targets = [{"selector": "pam_qnx.so.2", "filename": "/x/pam_qnx.so.2"}]
+    monkeypatch.setattr(bn.cli, "send_request", lambda *_a, **_kw: {"result": targets})
+
+    rc = bn.cli.main(["target", "use", "bogus"])
+
+    assert rc == 2
+    assert bn.session_state.read()["target"] == "pam_qnx.so.2"   # unchanged
 
 
 def test_target_clear_removes_state(tmp_session, capsys):
