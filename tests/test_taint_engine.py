@@ -247,6 +247,32 @@ def test_builtin_models_load():
     assert "system" in models and "recv" in models
 
 
+def test_secure_crt_annex_k_models_present_and_shaped():
+    models = te.load_models()
+    # Copy family: destsz after the dest shifts src->arg2, count->arg3.
+    assert models["memcpy_s"]["propagates"] == [{"from": "*arg:2", "to": "*arg:0"}]
+    assert models["memcpy_s"]["sink"]["tainted_args"] == [3]
+    assert models["memcpy_s"]["sink"]["class"] == "fortified_overflow"
+    assert models["memmove_s"]["sink"]["tainted_args"] == [3]
+    # memset_s has no data propagation (arg2 is the fill byte), count at arg3.
+    assert "propagates" not in models["memset_s"]
+    assert models["memset_s"]["sink"]["tainted_args"] == [3]
+    # strcpy_s/strcat_s: src at arg2 is the reportable arg (no count arg).
+    assert models["strcpy_s"]["sink"]["tainted_args"] == [2]
+    assert models["strcat_s"]["sink"]["tainted_args"] == [2]
+    # strncpy_s/strncat_s: count at arg3.
+    assert models["strncpy_s"]["sink"]["tainted_args"] == [3]
+    assert models["strncat_s"]["sink"]["tainted_args"] == [3]
+    # printf family: format at arg2, varargs first_index 3 (bufsz shifts right).
+    assert models["sprintf_s"]["varargs"]["first_index"] == 3
+    assert models["sprintf_s"]["sink"]["tainted_args"] == [2]
+    assert models["sprintf_s"]["sink"]["class"] == "fortified_format"
+    assert models["snprintf_s"]["varargs"]["first_index"] == 3
+    # decorated / leading-underscore forms still resolve (e.g. MS _snprintf_s name)
+    assert te.lookup_model(models, "_memcpy_s")[0] == "memcpy_s"
+    assert te.lookup_model(models, "memcpy_s@plt")[0] == "memcpy_s"
+
+
 def test_lookup_model_strips_decorations():
     models = te.load_models()
     name, model = te.lookup_model(models, "memcpy@plt")
