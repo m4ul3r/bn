@@ -1596,21 +1596,41 @@ class TaintEngine:
                 sink_status.append({**desc, "seeded": False, "note": str(exc)})
                 continue
             n_before = len(slices)
+            sink_slices: list[dict[str, Any]] = []
+            # Collapse near-duplicate slices: the same origin reached through many
+            # caller call-sites otherwise emits one full copy of the ~20-step
+            # in-function chain per caller, which buries the single real origin and
+            # spills to disk. Keep one representative per (seed, sink-site, origin)
+            # and count how many call sites reached it (#46).
+            seen_origin: dict[tuple, dict[str, Any]] = {}
             try:
                 for seed_var, sink_ins in seeds:
+                    sink_addr = hex(int(getattr(sink_ins, "address", 0)))
+                    seed_label = var_label(seed_var)
                     for sl in self._backward_slice(func, seed_var, 0, max_depth, set()):
-                        slices.append({
+                        o = sl["origin"]
+                        key = (seed_label, sink_addr, o.get("kind"), o.get("var"),
+                               o.get("value"), o.get("callee"), o.get("index"))
+                        rep = seen_origin.get(key)
+                        if rep is not None:
+                            rep["reached_via_call_sites"] = rep.get("reached_via_call_sites", 1) + 1
+                            continue
+                        entry = {
                             "sink": {
                                 "kind": sink.get("kind"),
                                 "callee": sink.get("callee"),
-                                "address": hex(int(getattr(sink_ins, "address", 0))),
-                                "seed": var_label(seed_var),
+                                "address": sink_addr,
+                                "seed": seed_label,
                             },
                             "origin": sl["origin"],
                             "crossed_functions": sl["crossed"],
                             "slice": sl["steps"],
-                        })
+                        }
+                        seen_origin[key] = entry
+                        sink_slices.append(entry)
+                slices.extend(sink_slices)
             except RecursionError:
+                slices.extend(sink_slices)  # keep the partial, already-deduped slices
                 # Per-sink isolation: a pathological cycle truncates this sink's
                 # slice (keeping any partial steps already collected) without
                 # taking down the other sinks or the whole op.

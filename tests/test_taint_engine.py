@@ -1207,6 +1207,55 @@ def test_backward_param_seed_ascends_into_caller(models):
     assert ("source", "recv") in origins
 
 
+def test_backward_dedupes_caller_fanout_by_origin(models):
+    # use_len(dst, src, n): memcpy(dst, src, n). Two caller sites both pass the
+    # recv length, so both ascents bottom out at the SAME origin (source recv).
+    # Instead of two near-duplicate slices that repeat the in-function chain, the
+    # result collapses to ONE slice noting it was reached via 2 call sites (#46).
+    dst = FVar("dst", ident=20); src = FVar("src", ident=21); n = FVar("n", ident=22)
+    dst0 = FSSA(dst, 0); src0 = FSSA(src, 0); n0 = FSSA(n, 0)
+    use_len = FFunc("use_len", 0x800, FSSAFunc([
+        FInstr(0, 0x804, "MLIL_CALL_SSA", "0x940(dst#0, src#0, n#0)", reads=[dst0, src0, n0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x940", constant=0x940),
+               params=[FExpr("MLIL_VAR_SSA", "dst#0", reads=[dst0]),
+                       FExpr("MLIL_VAR_SSA", "src#0", reads=[src0]),
+                       FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])]),
+    ]), params=[dst, src, n])
+
+    buf = FVar("buf"); nh = FVar("nh"); nh1 = FSSA(nh, 1); rb = FVar("rb"); rb1 = FSSA(rb, 1)
+    CALL_A = 0x920; CALL_B = 0x960
+    recv = FInstr(1, 0x910, "MLIL_CALL_SSA", "nh#1 = 0x930(fd, rb#1, 0x40, 0)", reads=[rb1], writes=[nh1],
+                  dest=FExpr("MLIL_CONST_PTR", "0x930", constant=0x930),
+                  params=[FExpr("MLIL_VAR_SSA", "fd", reads=[]),
+                          FExpr("MLIL_VAR_SSA", "rb#1", reads=[rb1]),
+                          FExpr("MLIL_CONST", "0x40", constant=0x40),
+                          FExpr("MLIL_CONST", "0", constant=0)])
+
+    def _use_len_call(idx, addr):
+        return FInstr(idx, addr, "MLIL_CALL_SSA", "0x800(out, rb#1, nh#1)", reads=[rb1, nh1], writes=[],
+                      dest=FExpr("MLIL_CONST_PTR", "0x800", constant=0x800),
+                      params=[FExpr("MLIL_VAR_SSA", "out", reads=[]),
+                              FExpr("MLIL_VAR_SSA", "rb#1", reads=[rb1]),
+                              FExpr("MLIL_VAR_SSA", "nh#1", reads=[nh1])])
+
+    handler = FFunc("handler", 0x900, FSSAFunc([
+        FInstr(0, 0x904, "MLIL_SET_VAR_SSA", "rb#1 = &buf", writes=[rb1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+        recv,
+        _use_len_call(2, CALL_A),
+        _use_len_call(3, CALL_B),
+    ]), params=[FVar("fd")])
+    use_len.caller_sites = [FSite(handler, CALL_A), FSite(handler, CALL_B)]
+
+    bv = FBV({0x940: "memcpy", 0x930: "recv", 0x800: "use_len"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.backward(use_len, [te.parse_locator("param:2")])
+
+    source_slices = [s for s in result["slices"] if s["origin"].get("callee") == "recv"]
+    assert len(source_slices) == 1, [s["origin"] for s in result["slices"]]
+    assert source_slices[0].get("reached_via_call_sites") == 2
+
+
 def test_backward_ret_sink_rejected_with_guidance(process_func, models):
     bv = FBV({0x401070: "read", 0x401080: "memcpy"})
     engine = te.TaintEngine(bv, models)
