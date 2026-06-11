@@ -235,9 +235,12 @@ class _ReadWriteLock:
 
 READ_LOCKED_OPS = {
     # These three read live BinaryViews (targets.refresh() dereferences each
-    # view's file/session), so they must exclude write-locked close_binary /
-    # load_binary. "shutdown" stays unlocked on purpose: it only sets an event
-    # and must work even while a write op is wedged.
+    # view's file/session), so they must exclude write-locked close_binary and
+    # the brief exclusive sections of load_binary (its open + publish; the slow
+    # analysis runs unlocked, and the loading view isn't published until after,
+    # so reads never observe a half-analyzed target -- #99). "shutdown" stays
+    # unlocked on purpose: it only sets an event and must work even while a
+    # write op is wedged.
     "doctor",
     "list_targets",
     "target_info",
@@ -289,7 +292,10 @@ WRITE_LOCKED_OPS = {
     "types_declare",
     "batch_apply",
     "refresh",
-    "load_binary",
+    # load_binary is intentionally NOT here: it does its OWN fine-grained
+    # locking (exclusive only around the BN open and the publish, NOT around the
+    # multi-minute update_analysis_and_wait), so doctor/target reads stay
+    # responsive during a large load (#99). See _load_binary.
     "close_binary",
     "save_database",
 }
@@ -1127,8 +1133,16 @@ class BinaryNinjaBridge:
         # imports and strings are usable in ~1s while the function set stays
         # minimal until `bn refresh` promotes it to full analysis. A .bndb
         # already carries its saved analysis, so --quick is a no-op there.
+        #
+        # load_binary is NOT in WRITE_LOCKED_OPS (#99): hold the exclusive lock
+        # only around the BN open (which touches global open-file state), then
+        # run the multi-minute analysis UNLOCKED so doctor/target reads keep
+        # responding. The view is published (and only then visible to reads)
+        # under the lock at the end, so no reader ever sees a half-analyzed
+        # target.
         try:
-            bv = binaryninja.load(str(load_path), update_analysis=False)
+            with self._target_lock.write():
+                bv = binaryninja.load(str(load_path), update_analysis=False)
         except Exception as exc:  # noqa: BLE001 - surface BN open failures cleanly
             # BN raises a bare Exception ("Unable to create new BinaryView") on a
             # corrupt/truncated .bndb; without this it reached the caller as
@@ -1149,11 +1163,18 @@ class BinaryNinjaBridge:
             )
             _quick_loaded_views.add(bv)
         else:
+            # Slow phase, deliberately OUTSIDE the lock. bv is still unpublished
+            # (not in _headless_views), so concurrent reads can't touch it.
             bv.update_analysis_and_wait()
             _quick_loaded_views.discard(bv)
 
-        with _headless_views_lock:
-            _headless_views.append(bv)
+        # Publish under the exclusive lock so a concurrent target read sees a
+        # consistent set. Append under _headless_views_lock, then refresh
+        # (which re-acquires that non-reentrant lock itself).
+        with self._target_lock.write():
+            with _headless_views_lock:
+                _headless_views.append(bv)
+            targets = self.targets.refresh()
 
         return {
             "loaded": True,
@@ -1161,7 +1182,7 @@ class BinaryNinjaBridge:
             "requested_path": str(resolved),
             "analyzed": not quick_effective,
             "notes": notes,
-            "targets": self.targets.refresh(),
+            "targets": targets,
         }
 
     def _close_binary(self, path: str | None = None, target: str | None = None, all_: bool = False):

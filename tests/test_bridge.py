@@ -3489,6 +3489,48 @@ def test_load_binary_quick_is_noop_for_bndb(monkeypatch, tmp_path):
     bridge._headless_views.clear()
 
 
+def test_load_binary_runs_analysis_outside_write_lock(monkeypatch, tmp_path):
+    # #99: load_binary must hold the exclusive lock around the BN open and the
+    # publish, but NOT around the multi-minute update_analysis_and_wait -- else
+    # doctor/target reads block for the whole load.
+    bridge, instance, loaded_paths = _setup_load_test(monkeypatch)
+    lock = instance._target_lock
+    states: dict[str, bool] = {}
+    binaryninja = sys.modules["binaryninja"]
+
+    def fake_load(path, update_analysis=True):
+        states["open_writer_held"] = lock._writer  # open is under the write lock
+        bv = _LoadBV()
+        original = bv.update_analysis_and_wait
+
+        def analyze():
+            states["analyze_writer_held"] = lock._writer  # analysis is unlocked
+            original()
+
+        bv.update_analysis_and_wait = analyze
+        return bv
+
+    binaryninja.load = fake_load
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+
+    result = instance._load_binary(str(raw))
+
+    assert states["open_writer_held"] is True       # BN open held the lock
+    assert states["analyze_writer_held"] is False   # analysis ran unlocked
+    assert result["analyzed"] is True
+    assert lock._writer is False                     # lock released at the end
+    bridge._headless_views.clear()
+
+
+def test_load_binary_not_in_write_locked_ops(monkeypatch):
+    # The dispatcher must NOT take the exclusive lock for the whole load (#99);
+    # load_binary does its own fine-grained locking instead.
+    bridge = _load_bridge(monkeypatch)
+    assert "load_binary" not in bridge.WRITE_LOCKED_OPS
+    assert "load_binary" not in bridge.READ_LOCKED_OPS
+
+
 class _FakeFileBV:
     def __init__(self, filename: str, session_id: str = "0", view_name: str = "ELF"):
         self.file = types.SimpleNamespace(session_id=session_id, filename=filename)
