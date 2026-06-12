@@ -27,6 +27,7 @@ from . import read_evidence
 from . import read_listing
 from . import read_misc
 from . import read_taint_slice
+from . import read_types
 from . import read_xrefs
 from . import vars as vars_mod
 from ._shared import (
@@ -1196,19 +1197,8 @@ class BinaryNinjaBridge:
     def _field_xrefs(self, *a, **k):
         return read_xrefs._field_xrefs(self.ctx, *a, **k)
 
-    def _types(self, selector: str | None, *, query, offset: int, limit: int):
-        offset = _validate_count(offset, label="offset", minimum=0)
-        limit = _validate_count(limit, label="limit", minimum=1)
-        bv = self._resolve_view(selector)
-        items = []
-        needle = str(query).lower() if query else None
-        for name, type_obj in list(bv.types.items()):
-            entry = self._type_entry(name, type_obj)
-            if needle and needle not in entry["name"].lower() and needle not in entry["decl"].lower():
-                continue
-            items.append(entry)
-        items.sort(key=lambda item: item["name"].lower())
-        return items[offset : offset + limit]
+    def _types(self, *a, **k):
+        return read_types._types(self.ctx, *a, **k)
 
     def _find_type(self, *a, **k):
         # Relocated to the BridgeContext seam (cycle-break, design spec §3.2).
@@ -1223,13 +1213,8 @@ class BinaryNinjaBridge:
         # Relocated to the BridgeContext seam (see _type_entry).
         return self.ctx._current_type_entry(*a, **k)
 
-    def _type_info(self, selector: str | None, type_name: str, *, require_struct: bool = False):
-        bv = self._resolve_view(selector)
-        resolved_name, type_obj = self._find_type(bv, type_name)
-        members = getattr(type_obj, "members", None)
-        if require_struct and members is None:
-            raise RuntimeError(f"Type is not a struct-like type: {resolved_name}")
-        return self._type_entry(resolved_name, type_obj)
+    def _type_info(self, *a, **k):
+        return read_types._type_info(self.ctx, *a, **k)
 
     def _strings(self, *a, **k):
         return read_misc._strings(self.ctx, *a, **k)
