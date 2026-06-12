@@ -4073,7 +4073,7 @@ def test_backward_slice_simple_chain(monkeypatch):
         definitions={var_r0: def_insn},
     )
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._backward_slice("active", "test_func", "0x10010", arg_index=0)
 
@@ -4109,7 +4109,7 @@ def test_backward_slice_undefined_var(monkeypatch):
     fn = _FakeFunction(0x10000, "test_func")
     fn.medium_level_il = _FakeMLILFunction(instructions=[call_insn])
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._backward_slice("active", "test_func", "0x10020", arg_index=0)
 
@@ -4140,7 +4140,7 @@ def test_backward_slice_labels_true_parameter(monkeypatch):
     fn.parameter_vars = [_FakeSSAVariable("arg1")]
     fn.medium_level_il.ssa_form.source_function = fn
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._backward_slice("active", "test_func", "0x10020", arg_index=0)
 
@@ -4169,7 +4169,7 @@ def test_backward_slice_depth_is_def_use_distance(monkeypatch):
     fn = _FakeFunction(0x2000, "f")
     fn.medium_level_il = _FakeMLILFunction(instructions=[def_x, call_insn], definitions={x: def_x})
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._backward_slice("active", "f", "0x2010", arg_index=0)
     by_var = {s["ssa_var"]: s for s in result["trace"]}
@@ -4187,7 +4187,7 @@ def test_backward_slice_no_call_at_address(monkeypatch):
     fn = _FakeFunction(0x10000, "test_func")
     fn.medium_level_il = _FakeMLILFunction(instructions=[])
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     with pytest.raises(bridge.OperationFailure, match="No call instruction"):
         instance._backward_slice("active", "test_func", "0x99999", arg_index=0)
@@ -4207,7 +4207,7 @@ def test_backward_slice_bad_arg_index(monkeypatch):
     fn = _FakeFunction(0x10000, "test_func")
     fn.medium_level_il = _FakeMLILFunction(instructions=[call_insn])
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     with pytest.raises(bridge.OperationFailure, match="out of range"):
         instance._backward_slice("active", "test_func", "0x10010", arg_index=5)
@@ -4221,7 +4221,7 @@ def test_backward_slice_no_mlil(monkeypatch):
     fn = _FakeFunction(0x10000, "test_func")
     fn.medium_level_il = None
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     with pytest.raises(bridge.OperationFailure, match="has no mlil"):
         instance._backward_slice("active", "test_func", "0x10010", arg_index=0)
@@ -4269,7 +4269,7 @@ def test_backward_slice_interprocedural_follows_callee(monkeypatch):
     )
     # Register both functions so _resolve_callee can find callee by address.
     bv = _FakeBV(functions=[caller, callee])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._backward_slice(
         "active", "caller_fn", "0x10010", arg_index=0,
@@ -4309,7 +4309,7 @@ def test_backward_slice_ip_rejects_llil(monkeypatch):
         basic_blocks = []
     fn.low_level_il.ssa_form = _NoSsaDefs()
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
     with pytest.raises(bridge.OperationFailure, match="SSA form does not support"):
         instance._backward_slice("active", "test_func", "0x10010", arg_index=0,
                                  view="llil", interprocedural=True)
