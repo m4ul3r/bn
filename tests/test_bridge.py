@@ -2993,9 +2993,11 @@ def test_strings_min_length_excludes_short_strings(monkeypatch):
 
     result = instance._strings(None, query=None, offset=0, limit=100, min_length=4)
 
-    assert len(result) == 2
-    assert result[0]["value"] == "hello"
-    assert result[1]["value"] == "helloworld"
+    items = result["items"]
+    assert len(items) == 2
+    assert result["total"] == 2
+    assert items[0]["value"] == "hello"
+    assert items[1]["value"] == "helloworld"
 
 
 def test_strings_section_filter_keeps_only_matching_section(monkeypatch):
@@ -3015,8 +3017,9 @@ def test_strings_section_filter_keeps_only_matching_section(monkeypatch):
 
     result = instance._strings(None, query=None, offset=0, limit=100, section=".rodata")
 
-    assert len(result) == 1
-    assert result[0]["value"] == "rodata"
+    items = result["items"]
+    assert len(items) == 1
+    assert items[0]["value"] == "rodata"
 
 
 def test_strings_no_crt_excludes_locale_and_text_section(monkeypatch):
@@ -3039,8 +3042,9 @@ def test_strings_no_crt_excludes_locale_and_text_section(monkeypatch):
 
     result = instance._strings(None, query=None, offset=0, limit=100, no_crt=True)
 
-    assert len(result) == 1
-    assert result[0]["value"] == "player"
+    items = result["items"]
+    assert len(items) == 1
+    assert items[0]["value"] == "player"
 
 
 def test_strings_filters_combine(monkeypatch):
@@ -3063,8 +3067,9 @@ def test_strings_filters_combine(monkeypatch):
     result = instance._strings(None, query=None, offset=0, limit=100,
                                min_length=4, section=".rodata", no_crt=True)
 
-    assert len(result) == 1
-    assert result[0]["value"] == "player"
+    items = result["items"]
+    assert len(items) == 1
+    assert items[0]["value"] == "player"
 
 
 def test_strings_regex_search_matches_or_patterns(monkeypatch):
@@ -3081,7 +3086,7 @@ def test_strings_regex_search_matches_or_patterns(monkeypatch):
 
     result = instance._strings(None, query="vehicle|headunit", offset=0, limit=100, regex=True)
 
-    assert [item["value"] for item in result] == ["Vehicle", "HeadUnitInfo"]
+    assert [item["value"] for item in result["items"]] == ["Vehicle", "HeadUnitInfo"]
 
 
 def test_strings_invalid_regex_is_actionable(monkeypatch):
@@ -3115,8 +3120,10 @@ def test_sections_returns_all_sections_with_permissions(monkeypatch):
 
     result = instance._sections(None)
 
-    assert len(result) == 3
-    text_sec = result[0]
+    items = result["items"]
+    assert len(items) == 3
+    assert result["total"] == 3
+    text_sec = items[0]
     assert text_sec["name"] == ".text"
     assert text_sec["start"] == "0x1000"
     assert text_sec["end"] == "0x5000"
@@ -3126,12 +3133,12 @@ def test_sections_returns_all_sections_with_permissions(monkeypatch):
     assert text_sec["writable"] is False
     assert text_sec["executable"] is True
 
-    data_sec = result[1]
+    data_sec = items[1]
     assert data_sec["name"] == ".data"
     assert data_sec["semantics"] == "ReadWriteData"
     assert data_sec["writable"] is True
 
-    rodata_sec = result[2]
+    rodata_sec = items[2]
     assert rodata_sec["name"] == ".rodata"
     assert rodata_sec["semantics"] == "ReadOnlyData"
     assert rodata_sec["executable"] is False
@@ -3179,8 +3186,9 @@ def test_sections_query_filters_by_name(monkeypatch):
 
     result = instance._sections(None, query="data")
 
-    assert len(result) == 2
-    names = [s["name"] for s in result]
+    items = result["items"]
+    assert len(items) == 2
+    names = [s["name"] for s in items]
     assert ".rodata" in names
     assert ".data" in names
 
@@ -3196,8 +3204,9 @@ def test_sections_null_segment_omits_rwx(monkeypatch):
 
     result = instance._sections(None)
 
-    assert len(result) == 1
-    assert "readable" not in result[0]
+    items = result["items"]
+    assert len(items) == 1
+    assert "readable" not in items[0]
 
 
 def test_sections_without_segments_omits_rwx(monkeypatch):
@@ -3213,10 +3222,11 @@ def test_sections_without_segments_omits_rwx(monkeypatch):
 
     result = instance._sections(None)
 
-    assert len(result) == 1
-    assert "readable" not in result[0]
-    assert "writable" not in result[0]
-    assert "executable" not in result[0]
+    items = result["items"]
+    assert len(items) == 1
+    assert "readable" not in items[0]
+    assert "writable" not in items[0]
+    assert "executable" not in items[0]
 
 
 # --- I8: enhanced imports ---
@@ -3244,8 +3254,10 @@ def test_imports_includes_function_data_and_address_symbols(monkeypatch):
 
     result = instance._imports(None)
 
-    assert len(result) == 3
-    kinds = {item["name"]: item["kind"] for item in result}
+    items = result["items"]
+    assert len(items) == 3
+    assert result["total"] == 3
+    kinds = {item["name"]: item["kind"] for item in items}
     assert kinds["printf"] == "function"
     assert kinds["__stdout"] == "data"
     assert kinds["iat_entry"] == "address"
@@ -3269,10 +3281,11 @@ def test_imports_sorts_by_library_kind_name(monkeypatch):
 
     result = instance._imports(None)
 
-    assert result[0]["name"] == "alpha"
-    assert result[0]["library"] == "liba"
-    assert result[1]["name"] == "zebra"
-    assert result[1]["library"] == "libz"
+    items = result["items"]
+    assert items[0]["name"] == "alpha"
+    assert items[0]["library"] == "liba"
+    assert items[1]["name"] == "zebra"
+    assert items[1]["library"] == "libz"
 
 
 def test_imports_bn_sentinel_namespace_is_not_surfaced_as_library(monkeypatch):
@@ -3289,10 +3302,11 @@ def test_imports_bn_sentinel_namespace_is_not_surfaced_as_library(monkeypatch):
 
     result = instance._imports(None)
 
+    item = result["items"][0]
     # The meaningless sentinel must not masquerade as a real library...
-    assert result[0]["library"] is None
+    assert item["library"] is None
     # ...but stays available under an honestly-named field.
-    assert result[0]["namespace"] == "BNINTERNALNAMESPACE"
+    assert item["namespace"] == "BNINTERNALNAMESPACE"
 
 
 def test_imports_summary_includes_needed_libraries(monkeypatch):
@@ -5378,9 +5392,15 @@ def test_imports_pagination_slices_offset_and_limit(monkeypatch):
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     full = instance._imports(None)
-    assert [item["name"] for item in full] == ["fn0", "fn1", "fn2", "fn3", "fn4"]
+    full_items = full["items"]
+    assert [item["name"] for item in full_items] == ["fn0", "fn1", "fn2", "fn3", "fn4"]
+    assert full["total"] == 5 and full["has_more"] is False
     page = instance._imports(None, offset=1, limit=2)
-    assert page == full[1:3]
+    # The page carries the slice AND the honest total/remainder metadata.
+    assert page["items"] == full_items[1:3]
+    assert page["total"] == 5
+    assert page["offset"] == 1 and page["limit"] == 2 and page["returned"] == 2
+    assert page["has_more"] is True   # offset 1 + 2 returned < 5 total
     # summary aggregates the whole set regardless of offset/limit.
     summary = instance._imports(None, summary=True, offset=1, limit=2)
     assert summary["total_symbols"] == 5
@@ -5402,6 +5422,55 @@ def test_imports_rejects_negative_offset_and_limit(monkeypatch):
     with pytest.raises(bridge.OperationFailure) as e3:
         instance._imports(None, limit=0)   # zero limit is degenerate too
     assert e3.value.status == "invalid_request"
+
+
+def test_list_ops_return_paged_envelope_with_true_total(monkeypatch):
+    # #122: strings/imports/sections return the same {items, total, offset,
+    # limit, returned, has_more} envelope as function list, so a truncating
+    # limit still reports the honest total + remainder instead of a bare slice.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+
+    strings = [_FakeStringRef(0x1000 + i * 0x10, 8, f"tok_{i:03d}") for i in range(5)]
+    secs = {f".s{i}": _FakeSection(f".s{i}", 0x2000 + i * 0x100, 0x2080 + i * 0x100)
+            for i in range(5)}
+    syms = []
+    for i in range(5):
+        s = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x4000 + i, f"imp{i}")
+        s.short_name = f"imp{i}"
+        s.namespace = "lib"
+        syms.append(s)
+    bv = _FakeBV(strings=strings, sections=secs, symbols=syms)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    envelope_keys = {"items", "total", "offset", "limit", "returned", "has_more"}
+
+    # A limit that truncates: 2 of 5 come back, but the total stays honest.
+    strings_page = instance._strings(None, query=None, offset=0, limit=2)
+    assert set(strings_page) == envelope_keys
+    assert strings_page["total"] == 5
+    assert strings_page["returned"] == 2
+    assert len(strings_page["items"]) == 2
+    assert strings_page["has_more"] is True
+
+    imports_page = instance._imports(None, offset=0, limit=2)
+    assert set(imports_page) == envelope_keys
+    assert imports_page["total"] == 5 and imports_page["returned"] == 2
+    assert imports_page["has_more"] is True
+
+    sections_page = instance._sections(None, offset=0, limit=2)
+    assert set(sections_page) == envelope_keys
+    assert sections_page["total"] == 5 and sections_page["returned"] == 2
+    assert sections_page["has_more"] is True
+
+    # The last page (offset past the truncation point) reports no remainder.
+    tail = instance._strings(None, query=None, offset=4, limit=2)
+    assert tail["total"] == 5 and tail["returned"] == 1 and tail["has_more"] is False
+
+    # limit=None means "no limit": every item, has_more False.
+    everything = instance._strings(None, query=None, offset=0, limit=None)
+    assert everything["returned"] == 5 and everything["has_more"] is False
 
 
 def test_apply_operation_comment_function_only_form_accepted(monkeypatch):
@@ -5490,9 +5559,12 @@ def test_sections_pagination_slices_offset_and_limit(monkeypatch):
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     full = instance._sections(None)
-    assert [s["name"] for s in full] == [".a", ".b", ".c"]
+    assert [s["name"] for s in full["items"]] == [".a", ".b", ".c"]
+    assert full["total"] == 3 and full["has_more"] is False
     page = instance._sections(None, offset=1, limit=1)
-    assert [s["name"] for s in page] == [".b"]
+    assert [s["name"] for s in page["items"]] == [".b"]
+    # The truncated page still reports the true total + remainder.
+    assert page["total"] == 3 and page["returned"] == 1 and page["has_more"] is True
 
 
 def test_py_exec_reports_script_error_with_type_prefix(monkeypatch):
@@ -5562,7 +5634,8 @@ def test_strings_requires_refresh_when_quick_loaded(monkeypatch):
 
     # Once analysis lands, strings answers normally (here: genuinely empty).
     bridge._quick_loaded_views.discard(bv)
-    assert instance._strings(None, query=None, offset=0, limit=100) == []
+    result = instance._strings(None, query=None, offset=0, limit=100)
+    assert result["items"] == [] and result["total"] == 0
 
 
 def test_target_info_reports_quick_analysis_state(monkeypatch):
@@ -5596,7 +5669,8 @@ def test_refresh_clears_quick_state_and_enables_strings(monkeypatch):
 
     assert bv not in bridge._quick_loaded_views
     assert getattr(bv, "analysis_updated", False) is True
-    assert instance._strings(None, query=None, offset=0, limit=100) == []
+    result = instance._strings(None, query=None, offset=0, limit=100)
+    assert result["items"] == [] and result["total"] == 0
 
 
 def test_load_quick_marks_view_full_load_does_not(monkeypatch, tmp_path):

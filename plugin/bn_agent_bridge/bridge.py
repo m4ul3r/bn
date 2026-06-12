@@ -1761,7 +1761,9 @@ def _bind_strings(bridge, params, target):
         target,
         query=params.get("query"),
         offset=int(params.get("offset", 0)),
-        limit=int(params.get("limit", 100)),
+        # limit=None means "no limit" -- match the imports/sections binders so a
+        # raw-socket / py exec caller that omits limit gets every string (#122).
+        limit=int(params["limit"]) if params.get("limit") is not None else None,
         min_length=int(params["min_length"]) if params.get("min_length") is not None else None,
         section=params.get("section"),
         no_crt=bool(params.get("no_crt", False)),

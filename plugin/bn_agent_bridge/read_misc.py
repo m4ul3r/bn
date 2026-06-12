@@ -76,11 +76,39 @@ _SECTION_SEMANTICS_NAMES: dict[int, str] = {
 }
 
 
-def _strings(ctx, selector: str | None, *, query, offset: int, limit: int,
+def _paged_list_result(items: list[dict[str, Any]], *, offset: int,
+                       limit: int | None) -> dict[str, Any]:
+    """Return a list page WITH paging metadata (the strings/imports/sections
+    envelope).
+
+    Mirrors ``read_listing._paged_function_result`` so the simple list ops
+    expose the same honest paging contract -- the true total plus the remainder
+    -- as ``function list``/``function search`` (#122). The only difference is
+    the page key: this returns ``items`` (a generic list) where the function
+    listing returns ``functions``. The CLI can't compute the true total itself
+    (it asks for a bounded page), so the bridge, which has the full filtered
+    set, returns total/offset/limit/returned/has_more alongside the page."""
+    total = len(items)
+    page = items[offset:]
+    if limit is not None:
+        page = page[:limit]
+    return {
+        "items": page,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "returned": len(page),
+        "has_more": (offset + len(page)) < total,
+    }
+
+
+def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None,
              min_length: int | None = None, section: str | None = None,
              no_crt: bool = False, regex: bool = False):
     offset = _validate_count(offset, label="offset", minimum=0)
-    limit = _validate_count(limit, label="limit", minimum=1)
+    # allow_none mirrors the sibling list ops (imports/sections): limit=None
+    # means "no limit", so a raw-socket / py exec caller can fetch every string.
+    limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     bv = ctx._resolve_view(selector)
     if bv in _quick_loaded_views:
         # In --quick mode string analysis hasn't run, so bv.strings is empty
@@ -139,7 +167,7 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int,
         }
         items.append(entry)
     items.sort(key=lambda item: (int(item["address"], 16), item["value"]))
-    return items[offset : offset + limit]
+    return _paged_list_result(items, offset=offset, limit=limit)
 
 
 def _needed_libraries(bv) -> list[str]:
@@ -187,9 +215,7 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
         # counts, so it always reflects every symbol regardless of offset/limit.
         return _imports_build_summary(items, needed_libraries)
     items.sort(key=lambda item: (item["library"] or "", item["kind"], item["name"], int(item["address"], 16)))
-    if limit is not None:
-        return items[offset : offset + limit]
-    return items[offset:] if offset else items
+    return _paged_list_result(items, offset=offset, limit=limit)
 
 
 def _imports_build_summary(
@@ -255,9 +281,7 @@ def _sections(ctx, selector: str | None, *, query: str | None = None,
 
         items.append(entry)
     items.sort(key=lambda item: int(item["start"], 16))
-    if limit is not None:
-        return items[offset : offset + limit]
-    return items[offset:] if offset else items
+    return _paged_list_result(items, offset=offset, limit=limit)
 
 
 def _ascii_render(data: bytes) -> str:

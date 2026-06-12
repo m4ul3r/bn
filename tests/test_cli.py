@@ -1589,14 +1589,17 @@ def test_strings_text_format_renders_rows(monkeypatch, capsys):
         assert op == "strings"
         return {
             "ok": True,
-            "result": [
-                {
-                    "address": "0x500000",
-                    "length": 6,
-                    "type": "AsciiString",
-                    "value": "follow",
-                }
-            ],
+            "result": {
+                "items": [
+                    {
+                        "address": "0x500000",
+                        "length": 6,
+                        "type": "AsciiString",
+                        "value": "follow",
+                    }
+                ],
+                "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False,
+            },
         }
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
@@ -2420,6 +2423,74 @@ def test_function_list_json_carries_paging_metadata(monkeypatch, capsys):
     assert payload["total"] == 6350 and payload["has_more"] is True and payload["returned"] == 1
 
 
+def test_strings_json_carries_paging_envelope(monkeypatch, capsys):
+    # #122: strings now returns the {items, total, ...} envelope, so machine
+    # consumers see the true total + remainder, not a bare truncated list. The
+    # CLI forwards the REAL --limit (no client-side limit+1 probe).
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        captured["params"] = params
+        return {"ok": True, "result": {
+            "items": [{"address": "0x1000", "length": 5, "chars": 5,
+                       "type": "ascii", "value": "alpha"}],
+            "total": 4096, "offset": 0, "limit": 1, "returned": 1, "has_more": True,
+        }}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["strings", "--target", "active", "--query", "alpha",
+                      "--limit", "1", "--format", "json"])
+    assert rc == 0
+    assert captured["params"]["limit"] == 1   # real limit, not limit+1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["total"] == 4096
+    assert payload["has_more"] is True and payload["returned"] == 1
+    assert payload["items"][0]["value"] == "alpha"
+
+
+def test_strings_text_footer_states_true_total(monkeypatch, capsys):
+    # Text mode renders the rows AND a "showing N of TOTAL (R more)" footer that
+    # mirrors function list, so a truncated dump still admits the remainder (#122).
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": {
+            "items": [{"address": hex(0x1000 + i), "length": 5, "chars": 5,
+                       "type": "ascii", "value": f"str{i}"} for i in range(3)],
+            "total": 50, "offset": 0, "limit": 3, "returned": 3, "has_more": True,
+        }}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["strings", "--target", "active", "--query", "str",
+                      "--limit", "3", "--format", "text"])
+    assert rc == 0
+    stdout, _ = capsys.readouterr()
+    assert '"str0"' in stdout                                # rows are rendered
+    assert "// showing 3 of 50 (47 more)" in stdout          # honest total + remainder
+    assert "--offset 3" in stdout
+
+
+def test_imports_json_carries_paging_envelope(monkeypatch, capsys):
+    # The non-summary imports list also returns the envelope, and the CLI
+    # forwards the REAL --limit (no client-side limit+1 probe) (#122).
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        captured["params"] = params
+        return {"ok": True, "result": {
+            "items": [{"name": "printf", "address": "0x1000", "library": "libc",
+                       "raw_name": "printf", "kind": "function"}],
+            "total": 512, "offset": 0, "limit": 1, "returned": 1, "has_more": True,
+        }}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["imports", "--target", "active", "--limit", "1", "--format", "json"])
+    assert rc == 0
+    assert captured["params"]["limit"] == 1   # real limit, not limit+1
+    assert captured["params"].get("summary") is False
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["total"] == 512 and payload["has_more"] is True
+    assert payload["items"][0]["name"] == "printf"
+
+
 def test_function_search_pagination_forwards_offset(monkeypatch, capsys):
     captured = {}
 
@@ -2960,18 +3031,21 @@ def test_sections_text_format_renders_rows(monkeypatch, capsys):
         assert op == "sections"
         return {
             "ok": True,
-            "result": [
-                {
-                    "name": ".text",
-                    "start": "0x1000",
-                    "end": "0x5000",
-                    "length": 16384,
-                    "semantics": "ReadOnlyCode",
-                    "readable": True,
-                    "writable": False,
-                    "executable": True,
-                }
-            ],
+            "result": {
+                "items": [
+                    {
+                        "name": ".text",
+                        "start": "0x1000",
+                        "end": "0x5000",
+                        "length": 16384,
+                        "semantics": "ReadOnlyCode",
+                        "readable": True,
+                        "writable": False,
+                        "executable": True,
+                    }
+                ],
+                "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False,
+            },
         }
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
@@ -3010,10 +3084,13 @@ def test_imports_text_shows_kind_for_non_function(monkeypatch, capsys):
         assert op == "imports"
         return {
             "ok": True,
-            "result": [
-                {"name": "printf", "address": "0x1000", "library": "libc", "raw_name": "printf", "kind": "function"},
-                {"name": "__stdout", "address": "0x2000", "library": "libc", "raw_name": "__stdout", "kind": "data"},
-            ],
+            "result": {
+                "items": [
+                    {"name": "printf", "address": "0x1000", "library": "libc", "raw_name": "printf", "kind": "function"},
+                    {"name": "__stdout", "address": "0x2000", "library": "libc", "raw_name": "__stdout", "kind": "data"},
+                ],
+                "total": 2, "offset": 0, "limit": 100, "returned": 2, "has_more": False,
+            },
         }
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
