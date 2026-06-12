@@ -300,10 +300,31 @@ def _pointer_table_for_view(
     entries: int,
     stride_size: int,
     stop_after_invalid: int | None = None,
+    error_on_unmapped: bool = False,
 ) -> dict[str, Any]:
+    # Consult the address context up front: a table whose BASE is unmapped is
+    # not backed by any segment, so every row would be a fabricated
+    # readable:false slot. The top-level `evidence table` command errors like
+    # `bn read`; internal reuse (message-lens / init-array windows) flags it as
+    # a warning instead of aborting the surrounding scan (#119).
+    table_context = ctx._address_context(bv, start)
+    try:
+        base_readable = len(bytes(bv.read(start, 1) or b"")) > 0
+    except Exception:
+        base_readable = False
+    # "unmapped" only when the context says so AND we genuinely cannot read the
+    # base. A readable base (even one without segment metadata) is not the
+    # fabricated-readable:false-slots bug this guards against.
+    base_unmapped = table_context.get("kind") == "unmapped" and not base_readable
+    if base_unmapped and error_on_unmapped:
+        raise RuntimeError(f"Address 0x{start:x} is not mapped (no bytes available)")
     pointer_size = ctx._pointer_size(bv)
     rows = []
     warnings = []
+    if base_unmapped:
+        warnings.append(
+            f"table base {hex(start)} is unmapped; entries are not backed by any segment"
+        )
     invalid_run = 0
     for index in range(entries):
         entry_address = start + index * stride_size
@@ -345,7 +366,6 @@ def _pointer_table_for_view(
             )
             break
 
-    table_context = ctx._address_context(bv, start)
     segment = table_context.get("segment")
     section_names = [
         str(section.get("name", "")).lower()
@@ -409,6 +429,7 @@ def _pointer_table(ctx, selector: str | None, address, *, entries: int = 16, str
         start,
         entries=entries,
         stride_size=stride_size,
+        error_on_unmapped=True,
     )
 
 
