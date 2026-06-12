@@ -3369,12 +3369,15 @@ class BinaryNinjaBridge:
         return mutation_engine._op_types_declare(self.ctx, *a, **k)
 
 _bridge: BinaryNinjaBridge | None = None
-_headless_views: list[Any] = []
-_headless_views_lock = threading.Lock()
-# Views loaded with --quick (analysis not run yet). Strings/full function set
-# are unavailable until `bn refresh`, so commands consult this to stay honest
-# instead of returning a misleading empty result. Weak so closed views drop out.
-_quick_loaded_views: "weakref.WeakSet[Any]" = weakref.WeakSet()
+# Mutable view-tracking globals now live in bridge_state.py so read-op modules
+# can read them without importing bridge. Re-imported here as the SAME objects
+# (tests and handlers mutate bridge._headless_views / _quick_loaded_views in
+# place, so every importer must share one object).
+from .bridge_state import (  # noqa: E402
+    _headless_views,
+    _headless_views_lock,
+    _quick_loaded_views,
+)
 
 
 # ---- op binders: each reproduces one former _dispatch_on_main if-arm verbatim
