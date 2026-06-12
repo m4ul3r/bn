@@ -7,9 +7,10 @@ every other helper takes a ``BinaryView`` (``bv``) explicitly and is otherwise
 state-free.
 
 ``_find_type`` and ``_render_type_layout`` are relocated here from the read_types
-and mutation clusters respectively (both are state-free). This breaks the one
-real import cycle (``read_types`` <-> ``mutation_engine``): each ends up importing
-only this seam, never each other (design spec §3.2).
+and mutation clusters respectively (both are state-free), as are the shared
+type-entry builders ``_type_entry`` and ``_current_type_entry``. This breaks the
+one real import cycle (``read_types`` <-> ``mutation_engine``): each ends up
+importing only this seam, never each other (design spec §3.2).
 
 This module imports ONLY stdlib + binaryninja + ``._shared`` -- never ``bridge``.
 """
@@ -26,6 +27,22 @@ from ._shared import (
     _format_ambiguous_symbol_error,
     _parse_address,
 )
+
+_TYPE_CLASS_NAMES: dict[int, str] = {
+    0: "void",
+    1: "bool",
+    2: "int",
+    3: "float",
+    4: "struct",
+    5: "enum",
+    6: "pointer",
+    7: "array",
+    8: "function",
+    9: "varargs",
+    10: "value",
+    11: "named_type_ref",
+    12: "wide_char",
+}
 
 
 class BridgeContext:
@@ -671,3 +688,24 @@ class BridgeContext:
                 member_type = str(getattr(member, "type", "<unknown>"))
                 lines.append(f"0x{offset:04x}: {member_type} {name}")
         return "\n".join(lines)
+
+    def _type_entry(self, type_name, type_obj):
+        type_class = getattr(type_obj, "type_class", None)
+        kind = "unknown"
+        if type_class is not None:
+            try:
+                kind = _TYPE_CLASS_NAMES.get(int(type_class), str(type_class))
+            except (TypeError, ValueError):
+                kind = str(type_class)
+        return {
+            "name": str(type_name),
+            "kind": kind,
+            "decl": str(type_obj),
+            "layout": self._render_type_layout(type_obj),
+        }
+
+    def _current_type_entry(self, bv, type_name: str):
+        type_obj = bv.get_type_by_name(type_name)
+        if type_obj is None:
+            return None
+        return self._type_entry(type_name, type_obj)

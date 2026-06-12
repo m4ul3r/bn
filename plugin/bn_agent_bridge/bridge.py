@@ -507,22 +507,6 @@ class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamSer
         super().__init__(socket_path, handler)
 
 
-_TYPE_CLASS_NAMES: dict[int, str] = {
-    0: "void",
-    1: "bool",
-    2: "int",
-    3: "float",
-    4: "struct",
-    5: "enum",
-    6: "pointer",
-    7: "array",
-    8: "function",
-    9: "varargs",
-    10: "value",
-    11: "named_type_ref",
-    12: "wide_char",
-}
-
 _STRING_TYPE_NAMES: dict[int, str] = {
     0: "ascii",
     1: "utf16",
@@ -2687,26 +2671,14 @@ class BinaryNinjaBridge:
         # Relocated to the BridgeContext seam (cycle-break, design spec §3.2).
         return self.ctx._find_type(*a, **k)
 
-    def _type_entry(self, type_name, type_obj):
-        type_class = getattr(type_obj, "type_class", None)
-        kind = "unknown"
-        if type_class is not None:
-            try:
-                kind = _TYPE_CLASS_NAMES.get(int(type_class), str(type_class))
-            except (TypeError, ValueError):
-                kind = str(type_class)
-        return {
-            "name": str(type_name),
-            "kind": kind,
-            "decl": str(type_obj),
-            "layout": self._render_type_layout(type_obj),
-        }
+    def _type_entry(self, *a, **k):
+        # Relocated to the BridgeContext seam (joins find_type/render_type_layout
+        # so read_types + the mutation engine depend only on the seam).
+        return self.ctx._type_entry(*a, **k)
 
-    def _current_type_entry(self, bv, type_name: str):
-        type_obj = bv.get_type_by_name(type_name)
-        if type_obj is None:
-            return None
-        return self._type_entry(type_name, type_obj)
+    def _current_type_entry(self, *a, **k):
+        # Relocated to the BridgeContext seam (see _type_entry).
+        return self.ctx._current_type_entry(*a, **k)
 
     def _type_info(self, selector: str | None, type_name: str, *, require_struct: bool = False):
         bv = self._resolve_view(selector)
