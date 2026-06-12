@@ -4354,7 +4354,8 @@ def test_xrefs_falls_back_to_import_symbol_when_function_not_found(monkeypatch):
         functions=[_FakeFunction(0x10000, "main")],
         symbols=[malloc_sym],
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _xrefs now resolves the view through the BridgeContext seam (read_xrefs).
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._xrefs(None, "malloc")
 
@@ -4367,7 +4368,8 @@ def test_xrefs_import_symbol_raises_for_unknown_symbol(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV(functions=[_FakeFunction(0x10000, "main")])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _xrefs now resolves the view through the BridgeContext seam (read_xrefs).
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     with pytest.raises(RuntimeError, match="Function not found: nonexistent"):
         instance._xrefs(None, "nonexistent")
@@ -4678,7 +4680,8 @@ def test_xrefs_reraises_ambiguous_function_identifier(monkeypatch):
             _FakeFunction(0x402000, "duplicate_name"),
         ]
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _xrefs now resolves the view through the BridgeContext seam (read_xrefs).
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     with pytest.raises(RuntimeError, match="Ambiguous function identifier"):
         instance._xrefs(None, "duplicate_name")
@@ -4879,11 +4882,14 @@ def test_field_xrefs_resolves_data_var_type(monkeypatch):
         disassembly={0x1010: "ldr r0, [r1, #4]"},
     )
 
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _field_xrefs now resolves the view through the BridgeContext seam and calls
+    # the module-level _resolve_type_field directly (read_xrefs), so patch both
+    # where the moved free function reaches them.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
     monkeypatch.setattr(
-        instance,
+        bridge.read_xrefs,
         "_resolve_type_field",
-        lambda view, spec: {"type_name": "Foo", "offset": 4, "field_name": "bar"},
+        lambda ctx, view, spec: {"type_name": "Foo", "offset": 4, "field_name": "bar"},
     )
 
     # Must not raise (the old get_type_at call would AttributeError here).
