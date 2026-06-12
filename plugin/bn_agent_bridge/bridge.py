@@ -27,8 +27,6 @@ from ._shared import (
     USER_FACING_ERRORS,
     OperationFailure,
     _artifact_summary,
-    _format_ambiguous_function_error,
-    _format_ambiguous_symbol_error,
     _json_response,
     _normalize_prototype,
     _parse_address,
