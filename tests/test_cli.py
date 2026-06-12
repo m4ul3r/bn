@@ -4282,6 +4282,45 @@ def test_trace_render_step_grammar_singular_and_plural():
     assert "2 steps" in formatters._render_trace_text(two)
 
 
+def test_render_mutation_text_does_not_claim_rollback_when_revert_failed():
+    """When a mutation failed AND its revert failed (rolled_back=False), the
+    text renderer must not print 'rolled back' -- that contradicts the honest
+    'view may be left modified' message and re-states the #117 symptom (#117)."""
+    from bn import formatters
+    value = {
+        "preview": True,
+        "success": False,
+        "committed": False,
+        "rolled_back": False,
+        "message": "Preview verified, but removing the created function on revert failed; the view may be left modified.",
+        "results": [{"op": "function_create", "status": "rollback_failed", "address": "0x1000", "function": "sub_1000"}],
+        "affected_functions": [],
+        "affected_types": [],
+    }
+    out = formatters._render_mutation_text(value)
+    assert "rolled back: live verification failed" not in out
+    assert "rollback failed" in out
+    assert "may be left modified" in out
+    # the op renders under 'failed:', not as a bare '[verified]'
+    assert "failed: " in out
+    assert "[verified]" not in out
+
+
+def test_render_mutation_text_still_reports_clean_rollback():
+    """A failed batch that WAS cleanly reverted still says 'rolled back'."""
+    from bn import formatters
+    value = {
+        "preview": False,
+        "success": False,
+        "committed": False,
+        "rolled_back": True,
+        "message": "Rolled back because live-session verification failed.",
+        "results": [{"op": "rename_symbol", "status": "verification_failed", "address": "0x1000"}],
+    }
+    out = formatters._render_mutation_text(value)
+    assert "rolled back: live verification failed" in out
+
+
 def test_unknown_ref_label_prefers_symbol_then_section():
     from bn import formatters
     assert formatters._unknown_ref_label({"symbol": {"name": "some_export"}}) == "some_export"

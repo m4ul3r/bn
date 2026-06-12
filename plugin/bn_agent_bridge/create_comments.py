@@ -39,6 +39,30 @@ from . import read_misc
 from ._shared import _parse_address, _validate_count
 
 
+def _remove_created_function(ctx, bv, addr: int) -> bool:
+    """Remove a just-created function and confirm it is gone.
+
+    ``bv.add_function`` is NOT journaled in BN's undo buffer, so the preview /
+    rollback revert (which relies on ``revert_undo_actions``) is a silent no-op
+    for function creation -- the function persists in the view. Explicitly
+    remove it via ``remove_user_function``, reanalyze, and read back that no
+    function starts at the address. Returns True only when the function is
+    actually gone, so callers never report a revert they did not verify (#117).
+    """
+    fn = bv.get_function_at(addr)
+    if fn is None:
+        return True
+    try:
+        bv.remove_user_function(fn)
+        bv.update_analysis_and_wait()
+    except Exception as exc:  # noqa: BLE001 - report the revert as failed, don't raise
+        bn.log_error(
+            f"BN Agent Bridge: failed to remove created function at 0x{addr:x} on revert: {exc!r}"
+        )
+        return False
+    return bv.get_function_at(addr) is None
+
+
 def _function_create(ctx, selector: str | None, address, preview: bool):
     bv = ctx._resolve_view(selector)
     addr = _parse_address(address)
@@ -111,21 +135,45 @@ def _function_create(ctx, selector: str | None, address, preview: bool):
             }
 
         function_name = str(created.name)
+        op_status = "verified"
         if preview:
+            # add_function is NOT journaled by BN's undo buffer, so
+            # revert_undo_actions is a silent no-op for function creation (the
+            # same non-journaled class as create_user_var / set_user_type).
+            # Explicitly remove the created function and read back that it is
+            # gone -- never claim a revert we did not verify (#117).
             bv.revert_undo_actions(state)
-            message = "Preview verified and reverted."
+            reverted = _remove_created_function(ctx, bv, addr)
+            committed = False
+            success = reverted
+            if reverted:
+                message = "Preview verified and reverted."
+            else:
+                # The function was created+verified, but removing it on revert
+                # failed -- it may still be in the view. Mark the op the way the
+                # batch engine marks a failed rollback so the text renderer
+                # routes it to 'failed:' instead of '[verified]' and the per-op
+                # status stops contradicting success:false (#117).
+                message = (
+                    "Preview verified, but removing the created function on "
+                    "revert failed; the view may be left modified."
+                )
+                op_status = "rollback_failed"
         else:
             bv.commit_undo_actions(state)
+            reverted = None
+            committed = True
+            success = True
             message = "Function created and verified in the live Binary Ninja session."
-        return {
+        result = {
             "preview": preview,
-            "success": True,
-            "committed": bool(not preview),
+            "success": success,
+            "committed": committed,
             "message": message,
             "results": [
                 {
                     "op": "function_create",
-                    "status": "verified",
+                    "status": op_status,
                     "address": hex(addr),
                     "function": function_name,
                     "requested": requested,
@@ -141,8 +189,15 @@ def _function_create(ctx, selector: str | None, address, preview: bool):
             ],
             "affected_types": [],
         }
+        if preview:
+            result["rolled_back"] = reverted
+        return result
     except Exception as exc:
-        if not mutation_engine._revert_undo_safely(ctx, bv, state):
+        # revert_undo_actions cannot remove a non-journaled add_function, so
+        # also explicitly drop any function left at the address (#117).
+        undo_ok = mutation_engine._revert_undo_safely(ctx, bv, state)
+        removed = _remove_created_function(ctx, bv, addr)
+        if not (undo_ok and removed):
             raise RuntimeError(
                 f"{exc} (additionally, rollback failed; the view may be left partially modified)"
             ) from exc

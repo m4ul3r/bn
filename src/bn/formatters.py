@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 from typing import Any, Callable
 
-FAILED_MUTATION_STATUSES = {"unsupported", "verification_failed", "invalid_request"}
+# "rollback_failed" = an op succeeded but the batch revert that should have
+# undone it failed, so the view may be left modified -- a real failure. A
+# cleanly rolled-back sibling ("reverted") is NOT a failure and is omitted (#118).
+FAILED_MUTATION_STATUSES = {"unsupported", "verification_failed", "invalid_request", "rollback_failed"}
 
 
 def _render_fallback_text(value: Any) -> str:
@@ -1434,7 +1437,14 @@ def _render_mutation_text(value: Any) -> str:
 
     if not success or failed:
         if not committed:
-            lines.append("rolled back: live verification failed")
+            # Only claim a rollback we actually performed. When rolled_back is
+            # explicitly False the revert failed and the view may be modified --
+            # saying "rolled back" there contradicts the honest message and
+            # re-states the very symptom #117 set out to fix.
+            if value.get("rolled_back") is False:
+                lines.append("rollback failed: the view may be left modified")
+            else:
+                lines.append("rolled back: live verification failed")
         if value.get("message"):
             lines.append(value["message"])
         for item in failed:

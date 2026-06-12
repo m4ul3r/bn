@@ -279,6 +279,60 @@ def _annotate_operation_results(ctx, results: list[dict[str, Any]], type_diffs: 
 
 
 
+def _function_comment_state(ctx, bv, fn) -> dict[str, str]:
+    """View-level comments at addresses inside this function. The comment ops
+    write to BN's GLOBAL comment store (bv.set_comment_at ->
+    BNSetGlobalCommentForAddress, surfaced as bv.address_comments), which is a
+    DIFFERENT store from Function.comments (the function-local
+    BNSetCommentForAddress) -- the two never share data. So the snapshot must
+    read the global store, filtered to this function, or a verified comment
+    set/delete --preview still shows changed:false / empty diff (#121)."""
+    try:
+        # bv.address_comments is a property over BN core; guard the access
+        # itself (not just a missing attr) so a raising getter degrades to an
+        # empty comment signal instead of aborting the whole mutation snapshot.
+        all_comments = bv.address_comments
+        items = list(dict(all_comments).items()) if all_comments else []
+    except Exception:
+        return {}
+    if not items:
+        return {}
+    target = int(fn.start)
+    state: dict[str, str] = {}
+    for addr, text in items:
+        if not text:
+            continue
+        try:
+            a = int(addr)
+        except Exception:
+            continue  # skip one malformed key, don't zero out the whole signal
+        try:
+            containing = bv.get_functions_containing(a) or []
+        except Exception:
+            continue
+        if any(int(getattr(f, "start", -1)) == target for f in containing):
+            state[hex(a)] = str(text)
+    return state
+
+
+def _function_local_state(ctx, fn) -> dict[str, str]:
+    """Map of local identifier -> 'name:type' for a function. A local
+    rename/retype of a variable not rendered in the HLIL body leaves the body
+    text identical, so the diff/changed signal must reflect local name/type
+    state too (#121). Reuses the canonical-variable walk the restore paths rely
+    on; guarded so functions without resolvable locals just yield {}."""
+    state: dict[str, str] = {}
+    try:
+        for var, _ in vars_mod._iter_canonical_variables(fn):
+            identifier = vars_mod._variable_identifier(var)
+            if identifier is None:
+                continue
+            state[str(identifier)] = f"{var.name}:{var.type}"
+    except Exception:
+        return state
+    return state
+
+
 def _capture_function_snapshots(ctx, bv, functions):
     snapshots = {}
     for fn in functions:
@@ -286,8 +340,30 @@ def _capture_function_snapshots(ctx, bv, functions):
             "name": fn.name,
             "address": hex(fn.start),
             "text": il_format._function_text(bv, fn, view="hlil"),
+            "comments": _function_comment_state(ctx, bv, fn),
+            "locals": _function_local_state(ctx, fn),
         }
     return snapshots
+
+
+def _format_metadata_change(old: dict[str, Any], new: dict[str, Any], address: int) -> str:
+    """A compact diff for changes invisible in the HLIL body text -- a function
+    rename, comment set/delete, or local rename/retype -- so a verified
+    --preview of them shows a real before/after instead of an empty diff (#121).
+    For a name-only change this reduces to the original two-line header."""
+    lines = [
+        f"--- before:{old.get('name', hex(address))}",
+        f"+++ after:{new.get('name', hex(address))}",
+    ]
+    ob, nb = old.get("comments") or {}, new.get("comments") or {}
+    for addr in sorted(set(ob) | set(nb)):
+        if ob.get(addr) != nb.get(addr):
+            lines.append(f"comment @ {addr}: {ob.get(addr, '')!r} -> {nb.get(addr, '')!r}")
+    ol, nl = old.get("locals") or {}, new.get("locals") or {}
+    for ident in sorted(set(ol) | set(nl)):
+        if ol.get(ident) != nl.get(ident):
+            lines.append(f"local {ident}: {ol.get(ident, '')} -> {nl.get(ident, '')}")
+    return "\n".join(lines)
 
 
 
@@ -325,6 +401,12 @@ def _diff_snapshots(ctx, before: dict[int, Any], after: dict[int, Any]):
         new = after.get(address, {"text": ""})
         text_changed = old.get("text", "") != new.get("text", "")
         name_changed = old.get("name") != new.get("name")
+        # Comment set/delete and local rename/retype of non-body variables do
+        # not alter the HLIL body text, so a text-only compare reports them as
+        # changed:false / empty diff even when verified. Fold them into the
+        # change signal and synthesize a diff for them (#121).
+        comments_changed = old.get("comments") != new.get("comments")
+        locals_changed = old.get("locals") != new.get("locals")
         diff = "\n".join(
             difflib.unified_diff(
                 old["text"].splitlines(),
@@ -334,19 +416,14 @@ def _diff_snapshots(ctx, before: dict[int, Any], after: dict[int, Any]):
                 lineterm="",
             )
         )
-        if not diff and name_changed:
-            diff = "\n".join(
-                [
-                    f"--- before:{old.get('name', hex(address))}",
-                    f"+++ after:{new.get('name', hex(address))}",
-                ]
-            )
+        if not diff and (name_changed or comments_changed or locals_changed):
+            diff = _format_metadata_change(old, new, address)
         diffs.append(
             {
                 "address": hex(address),
                 "before_name": old.get("name"),
                 "after_name": new.get("name"),
-                "changed": bool(text_changed or name_changed),
+                "changed": bool(text_changed or name_changed or comments_changed or locals_changed),
                 "diff": diff,
             }
         )
@@ -380,11 +457,20 @@ def _operation_failure_result(ctx, op: dict[str, Any], exc: OperationFailure) ->
 
 
 
-def _mark_unverified_results(ctx, results: list[dict[str, Any]], message: str) -> list[dict[str, Any]]:
+def _mark_unverified_results(
+    ctx, results: list[dict[str, Any]], message: str, status: str = "reverted"
+) -> list[dict[str, Any]]:
+    """Stamp an honest *status* on ops that ran before a sibling op failed.
+
+    These ops WERE supported and applied -- they were rolled back because a
+    later op failed, so the old generic ``unsupported`` was a lie (#118).
+    ``reverted`` = cleanly rolled back (not a failure); ``rollback_failed`` =
+    the revert itself failed, so the op may still be applied (a real failure
+    state, so it stays in ``FAILED_MUTATION_STATUSES``)."""
     annotated = []
     for result in results:
         item = dict(result)
-        item["status"] = "unsupported"
+        item["status"] = status
         item["message"] = message
         annotated.append(item)
     return annotated
@@ -1099,19 +1185,21 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
         if reverted:
             message = "Rolled back before post-state verification because an operation failed to apply."
             result_note = "Rolled back before post-state verification."
+            result_status = "reverted"
         else:
             message = (
                 "An operation failed to apply AND the rollback itself failed; "
                 "the view may be left partially modified."
             )
             result_note = "Rollback failed; this operation may still be applied."
+            result_status = "rollback_failed"
         return {
             "preview": preview,
             "success": False,
             "committed": False,
             "rolled_back": reverted,
             "message": message,
-            "results": _mark_unverified_results(ctx, results, result_note)
+            "results": _mark_unverified_results(ctx, results, result_note, status=result_status)
             + [_operation_failure_result(ctx, operations[len(results)], exc)],
             "affected_functions": [],
             "affected_types": [],
