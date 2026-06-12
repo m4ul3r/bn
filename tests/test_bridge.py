@@ -2272,6 +2272,38 @@ def test_pointer_table_warns_when_start_looks_like_code_not_table(monkeypatch):
     assert any("low confidence" in warning for warning in result["warnings"])
 
 
+def test_pointer_table_errors_on_unmapped_base(monkeypatch):
+    """`evidence table` at an unmapped address must error like `bn read`, not
+    return exit 0 with 16 fabricated readable:false slots and empty warnings
+    (#119)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    # Memory mapped elsewhere (so reads model real BN: b"" outside it); 0xdeadbeef
+    # has no segment/section and is unreadable -> genuinely unmapped.
+    bv = _FakeBV(memory={0x1000: b"\x00\x00\x00\x00"})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(RuntimeError, match="0xdeadbeef.*not mapped"):
+        instance._pointer_table("active", "0xdeadbeef", entries=16)
+
+
+def test_pointer_table_for_view_warns_on_unmapped_base_without_erroring(monkeypatch):
+    """The shared helper (used by message-lens / init-array windows) must FLAG
+    an unmapped base instead of silently fabricating slots, but it must not
+    abort the surrounding scan -- only the top-level command errors (#119)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(memory={0x1000: b"\x00\x00\x00\x00"})  # 0xdeadbeef unreadable -> unmapped
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    table = bridge.read_evidence._pointer_table_for_view(
+        instance.ctx, bv, 0xDEADBEEF, entries=4, stride_size=4,
+    )
+
+    assert table["context"]["kind"] == "unmapped"
+    assert any("unmapped" in warning for warning in table["warnings"])
+
+
 def test_message_lens_summarizes_type_string_xrefs_and_metadata_window(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

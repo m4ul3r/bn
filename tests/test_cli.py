@@ -186,6 +186,28 @@ def test_decompile_spill_warning_suggests_line_slicing(monkeypatch, capsys):
     )
 
 
+def test_decompile_json_spill_warning_does_not_suggest_lines(monkeypatch, capsys):
+    # --lines is a text-only flag; when decompile --format json spills, the hint
+    # must NOT tell JSON consumers to rerun with --lines (a dead end) -- it
+    # should point at --out / the artifact instead (#120).
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": {"text": "long decompiled text"}}
+
+    def fake_write_output_result(value, *, fmt, out_path, stem):
+        assert stem == "decompile"
+        return _spill_artifact_namespace("/tmp/decompile.json")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli, "write_output_result", fake_write_output_result)
+
+    rc = bn.cli.main(["decompile", "sub_401000", "--target", "active", "--format", "json"])
+
+    assert rc == 0
+    _, stderr = capsys.readouterr()
+    assert "--lines" not in stderr
+    assert "--out" in stderr
+
+
 def test_scalar_spill_warning_points_at_artifact(monkeypatch, capsys):
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         # type_info returns a dict (non-list) payload that can spill.

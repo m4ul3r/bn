@@ -387,7 +387,9 @@ def _render_result(
         artifact = result.artifact
         artifact_path = artifact["artifact_path"]
         sys.stdout.write(result.rendered)
-        hint = _spill_next_step_hint(stem, spill_context, artifact_path, paged=paged)
+        hint = _spill_next_step_hint(
+            stem, spill_context, artifact_path, paged=paged, text_format=(fmt == "text")
+        )
         print(
             f"warning: {label} output spilled to {artifact_path}; {hint}",
             file=sys.stderr,
@@ -402,6 +404,7 @@ def _spill_next_step_hint(
     artifact_path: str,
     *,
     paged: bool = False,
+    text_format: bool = True,
 ) -> str:
     """Build a command-keyed next-step slicing hint for spilled output.
 
@@ -410,9 +413,13 @@ def _spill_next_step_hint(
     and anything else points at --out or the artifact. ``paged`` is threaded
     from the command's @command declaration via ``_call``; only commands that
     actually expose --limit/--offset may suggest them.
+
+    ``--lines`` only slices the TEXT renderer, so it is only suggested for text
+    output -- recommending it to a JSON consumer is a dead end (#120). In JSON
+    mode the line-oriented commands fall through to the --out/artifact hint.
     """
 
-    if stem in ("decompile", "il", "disasm"):
+    if text_format and stem in ("decompile", "il", "disasm"):
         return "rerun with --lines START:END to fetch a slice instead"
     # `paged` is only set for commands that actually expose --limit/--offset, so
     # it alone gates the paging hint (function list/search now page bridge-side
