@@ -403,6 +403,49 @@ def test_resolve_rename_target_rejects_ambiguous_function_identifier(monkeypatch
         instance._resolve_rename_target(bv, "duplicate_name", "function")
 
 
+class _FakeSymbol:
+    def __init__(self, type_name: str):
+        self.type = type("_FakeSymType", (), {"name": type_name})()
+
+
+def test_find_function_auto_resolves_impl_over_import_stub(monkeypatch):
+    """A name shared by a PLT/import stub and the real implementation resolves
+    to the IMPLEMENTATION instead of erroring -- the stub is distinguishable by
+    symbol.type, so the common collision Just Works with no new CLI surface
+    (#122)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    stub = _FakeFunction(0x401030, "send")        # PLT/import trampoline
+    stub.symbol = _FakeSymbol("ImportedFunctionSymbol")
+    impl = _FakeFunction(0x401500, "send")        # real body
+    impl.symbol = _FakeSymbol("FunctionSymbol")
+    bv = _FakeBV(functions=[stub, impl])
+
+    fn = instance._find_function(bv, "send")
+    assert int(fn.start) == 0x401500
+
+    # the rename resolver shares the same chokepoint -> same auto-resolution
+    target = instance._resolve_rename_target(bv, "send", "function")
+    assert target["address"] == 0x401500
+
+
+def test_find_function_stays_ambiguous_for_two_real_bodies_with_kinds(monkeypatch):
+    """Two genuine same-named bodies (the A/B-duplicate firmware case) stay
+    ambiguous -- auto-pick must NOT guess -- and the error now names each
+    candidate's symbol kind so the collision self-documents (#122)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    a = _FakeFunction(0x401000, "dup")
+    a.symbol = _FakeSymbol("FunctionSymbol")
+    b = _FakeFunction(0x402000, "dup")
+    b.symbol = _FakeSymbol("FunctionSymbol")
+    bv = _FakeBV(functions=[a, b])
+
+    with pytest.raises(RuntimeError, match="Ambiguous function identifier") as excinfo:
+        instance._find_function(bv, "dup")
+    assert "[FunctionSymbol]" in str(excinfo.value)
+
+
 def test_verify_rename_symbol_reports_noop(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

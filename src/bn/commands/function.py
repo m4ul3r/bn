@@ -105,6 +105,7 @@ def _function_search(args: argparse.Namespace) -> int:
         page_label="function search",
         paged_spill=True,
         stem="function-search",
+        regex_hint_query=args.query,
     )
 
 

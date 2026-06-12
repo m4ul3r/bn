@@ -398,6 +398,31 @@ def _render_result(
     sys.stdout.write(result.rendered)
 
 
+# Regex metacharacters that make a literal substring query silently match
+# nothing without --regex. Deliberately EXCLUDES '.' -- it is too common in
+# legitimate literal names/strings (std::x, a.b.c) to flag (#122).
+_REGEX_METACHARS = "|()[]{}*+?^$\\"
+
+
+def _maybe_regex_hint(args: argparse.Namespace, result: Any, query: str | None) -> None:
+    """When a NON-regex search whose query contains regex metacharacters matched
+    nothing, nudge toward --regex on stderr -- the query was taken literally, so
+    a pattern like `init|fini` silently returns zero results with no clue (#122).
+    Suppressed when --regex/--exact is set or the query is plain text."""
+    if not query or getattr(args, "regex", False) or getattr(args, "exact", False):
+        return
+    empty = (isinstance(result, list) and not result) or (
+        isinstance(result, dict) and result.get("total") == 0
+    )
+    if not empty or not any(ch in query for ch in _REGEX_METACHARS):
+        return
+    print(
+        f'note: 0 matches; "{query}" was matched literally. It contains regex '
+        "metacharacters -- add --regex to match it as a pattern.",
+        file=sys.stderr,
+    )
+
+
 def _spill_next_step_hint(
     stem: str,
     spill_context: Any,
@@ -490,6 +515,7 @@ def _call(
     result_exit_code: Callable[[Any], int] | None = None,
     bridge_writes_output: bool = False,
     spawn_missing_named: bool = False,
+    regex_hint_query: str | None = None,
 ) -> int:
     request_params = dict(params or {})
     effective_page_limit = None
@@ -520,6 +546,7 @@ def _call(
             f"warning: {label} output truncated to {effective_page_limit} {item_word}; rerun with --offset {next_offset} or a larger --limit",
             file=sys.stderr,
         )
+    _maybe_regex_hint(args, result, regex_hint_query)
     spill_context = result
     if text_renderer is not None and args.format == "text":
         try:
