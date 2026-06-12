@@ -234,74 +234,6 @@ class _ReadWriteLock:
                 self._condition.notify_all()
 
 
-READ_LOCKED_OPS = {
-    # These three read live BinaryViews (targets.refresh() dereferences each
-    # view's file/session), so they must exclude write-locked close_binary and
-    # the brief exclusive sections of load_binary (its open + publish; the slow
-    # analysis runs unlocked, and the loading view isn't published until after,
-    # so reads never observe a half-analyzed target -- #99). "shutdown" stays
-    # unlocked on purpose: it only sets an event and must work even while a
-    # write op is wedged.
-    "doctor",
-    "list_targets",
-    "target_info",
-    "function_info",
-    "get_prototype",
-    "list_functions",
-    "list_locals",
-    "search_functions",
-    "callsites",
-    "decompile",
-    "il",
-    "structured_il",
-    "defuse",
-    "resolved_calls",
-    "possible_values",
-    "taint",
-    "disasm",
-    "function_evidence",
-    "xrefs",
-    "field_xrefs",
-    "pointer_table",
-    "message_lens",
-    "init_arrays",
-    "backward_slice",
-    "types",
-    "type_info",
-    "strings",
-    "imports",
-    "bundle_function",
-    "get_comment",
-    "list_comments",
-    "sections",
-    "read",
-}
-
-
-WRITE_LOCKED_OPS = {
-    "py_exec",
-    "function_create",
-    "rename_symbol",
-    "set_comment",
-    "delete_comment",
-    "set_prototype",
-    "local_rename",
-    "local_retype",
-    "struct_field_set",
-    "struct_field_rename",
-    "struct_field_delete",
-    "types_declare",
-    "batch_apply",
-    "refresh",
-    # load_binary is intentionally NOT here: it does its OWN fine-grained
-    # locking (exclusive only around the BN open and the publish, NOT around the
-    # multi-minute update_analysis_and_wait), so doctor/target reads stay
-    # responsive during a large load (#99). See _load_binary.
-    "close_binary",
-    "save_database",
-}
-
-
 def _run_on_main_thread(func):
     if is_main_thread():
         return func()
@@ -864,17 +796,18 @@ class BinaryNinjaBridge:
         params = payload.get("params") or {}
         target = payload.get("target")
         try:
+            spec = REGISTRY.spec(op)
             lock = contextlib.nullcontext()
-            if op in WRITE_LOCKED_OPS:
-                lock = self._target_lock.write()
-            elif op == "decompile" and _validate_bool(
-                params.get("force_analysis"), label="force_analysis", default=False
-            ):
+            if spec is not None:
+                lock_class = spec.lock
                 # --force-analysis reanalyzes the function, mutating the view, so
                 # it needs the exclusive lock even though decompile is a read op.
-                lock = self._target_lock.write()
-            elif op in READ_LOCKED_OPS:
-                lock = self._target_lock.read()
+                if spec.lock_escalation is not None and spec.lock_escalation(params):
+                    lock_class = "write"
+                if lock_class == "write":
+                    lock = self._target_lock.write()
+                elif lock_class == "read":
+                    lock = self._target_lock.read()
             with lock:
                 result = self._dispatch_on_main(op, params, target)
             return _json_response(ok=True, result=result)
@@ -882,224 +815,10 @@ class BinaryNinjaBridge:
             return _json_response(ok=False, error=_serialize_error(exc))
 
     def _dispatch_on_main(self, op: str, params: dict[str, Any], target: str | None):
-        if op == "doctor":
-            return self._doctor()
-        if op == "list_targets":
-            return self.targets.refresh()
-        if op == "target_info":
-            return self._target_info(params.get("selector") or target)
-        if op == "refresh":
-            return self._refresh(target)
-        if op == "shutdown":
-            self._shutdown_event.set()
-            return {"shutting_down": True}
-
-        if op == "load_binary":
-            return self._load_binary(
-                str(params["path"]),
-                prefer_bndb=_validate_bool(params.get("prefer_bndb"), label="prefer_bndb", default=True),
-                quick=_validate_bool(params.get("quick"), label="quick", default=False),
-            )
-        if op == "close_binary":
-            return self._close_binary(
-                params.get("path"),
-                target,
-                _validate_bool(params.get("all"), label="all", default=False),
-            )
-        if op == "save_database":
-            return self._save_database(target, params.get("path"))
-
-        if op == "list_functions":
-            return self._list_functions(
-                target,
-                min_address=params.get("min_address"),
-                max_address=params.get("max_address"),
-                offset=int(params.get("offset", 0)),
-                limit=int(params["limit"]) if "limit" in params else None,
-                count_only=bool(params.get("count_only", False)),
-            )
-        if op == "search_functions":
-            return self._search_functions(
-                target,
-                str(params.get("query", "")),
-                regex=bool(params.get("regex", False)),
-                exact=bool(params.get("exact", False)),
-                min_address=params.get("min_address"),
-                max_address=params.get("max_address"),
-                offset=int(params.get("offset", 0)),
-                limit=int(params["limit"]) if "limit" in params else None,
-            )
-        if op == "callsites":
-            return self._callsites(
-                target,
-                str(params["callee"]),
-                within_identifiers=list(params.get("within_identifiers") or []),
-                context=int(params.get("context", 3)),
-            )
-        if op == "function_info":
-            return self._function_info(target, params["identifier"])
-        if op == "get_prototype":
-            return self._get_prototype(target, params["identifier"])
-        if op == "list_locals":
-            return self._list_locals_for_function(target, params["identifier"])
-        if op == "decompile":
-            return self._decompile(
-                target,
-                params["identifier"],
-                addresses=bool(params.get("addresses")),
-                force_analysis=bool(params.get("force_analysis")),
-            )
-        if op == "il":
-            return self._il(target, params["identifier"], str(params.get("view", "hlil")), bool(params.get("ssa")))
-        if op == "structured_il":
-            return self._structured_il(
-                target,
-                params["identifier"],
-                view=str(params.get("view", "mlil")),
-                ssa=bool(params.get("ssa", True)),
-            )
-        if op == "defuse":
-            return self._defuse(target, params["identifier"], str(params["var"]))
-        if op == "resolved_calls":
-            return self._resolved_calls(
-                target,
-                params["identifier"],
-                direction=str(params.get("direction", "both")),
-                resolve_indirect=bool(params.get("resolve_indirect", True)),
-            )
-        if op == "possible_values":
-            return self._possible_values(target, params["identifier"], params["at"])
-        if op == "taint":
-            return self._taint(target, params)
-        if op == "disasm":
-            return self._disasm(target, params["identifier"])
-        if op == "function_evidence":
-            return self._function_evidence(
-                target,
-                params["identifier"],
-                context=int(params.get("context", 2)),
-            )
-        if op == "xrefs":
-            return self._xrefs(target, params["identifier"])
-        if op == "field_xrefs":
-            return self._field_xrefs(target, str(params["field"]))
-        if op == "pointer_table":
-            return self._pointer_table(
-                target,
-                params["address"],
-                entries=int(params.get("entries", 16)),
-                stride=params.get("stride"),
-            )
-        if op == "message_lens":
-            return self._message_lens(
-                target,
-                str(params["query"]),
-                limit=int(params.get("limit", 20)),
-                table_entries=int(params.get("table_entries", 6)),
-            )
-        if op == "init_arrays":
-            return self._init_arrays(
-                target,
-                limit=int(params.get("limit", 64)),
-            )
-        if op == "backward_slice":
-            return self._backward_slice(
-                target,
-                str(params["identifier"]),
-                str(params["address"]),
-                arg_index=int(params.get("arg_index", 0)),
-                view=str(params.get("view", "mlil")),
-                max_depth=int(params.get("max_depth", 50)),
-                interprocedural=bool(params.get("interprocedural", False)),
-                ip_depth=int(params.get("ip_depth", 2)),
-            )
-        if op == "types":
-            return self._types(
-                target,
-                query=params.get("query"),
-                offset=int(params.get("offset", 0)),
-                limit=int(params.get("limit", 100)),
-            )
-        if op == "type_info":
-            return self._type_info(
-                target,
-                str(params["type_name"]),
-                require_struct=bool(params.get("require_struct")),
-            )
-        if op == "strings":
-            return self._strings(
-                target,
-                query=params.get("query"),
-                offset=int(params.get("offset", 0)),
-                limit=int(params.get("limit", 100)),
-                min_length=int(params["min_length"]) if params.get("min_length") is not None else None,
-                section=params.get("section"),
-                no_crt=bool(params.get("no_crt", False)),
-                regex=bool(params.get("regex", False)),
-            )
-        if op == "imports":
-            return self._imports(
-                target,
-                summary=bool(params.get("summary", False)),
-                offset=int(params.get("offset", 0)),
-                limit=int(params["limit"]) if params.get("limit") is not None else None,
-            )
-        if op == "sections":
-            return self._sections(
-                target,
-                query=params.get("query"),
-                offset=int(params.get("offset", 0)),
-                limit=int(params["limit"]) if params.get("limit") is not None else None,
-            )
-        if op == "read":
-            return self._read(target, params["address"], int(params["length"]))
-        if op == "function_create":
-            return self._function_create(target, params["address"], bool(params.get("preview")))
-        if op == "bundle_function":
-            return self._bundle_function(target, params["identifier"], params.get("out_path"))
-        if op == "py_exec":
-            return self._py_exec(target, str(params["script"]))
-
-        if op == "rename_symbol":
-            return self._mutation(target, bool(params.get("preview")), [{"op": "rename_symbol", **params}])
-        if op == "get_comment":
-            return self._get_comment(target, params.get("address"), params.get("function"))
-        if op == "list_comments":
-            return self._list_comments(
-                target,
-                query=params.get("query"),
-                offset=int(params.get("offset", 0)),
-                limit=int(params["limit"]) if "limit" in params else None,
-            )
-        if op == "set_comment":
-            return self._mutation(target, bool(params.get("preview")), [{"op": "set_comment", **params}])
-        if op == "delete_comment":
-            return self._mutation(target, bool(params.get("preview")), [{"op": "delete_comment", **params}])
-        if op == "set_prototype":
-            return self._mutation(target, bool(params.get("preview")), [{"op": "set_prototype", **params}])
-        if op == "local_rename":
-            return self._mutation(target, bool(params.get("preview")), [{"op": "local_rename", **params}])
-        if op == "local_retype":
-            return self._mutation(target, bool(params.get("preview")), [{"op": "local_retype", **params}])
-        if op == "struct_field_set":
-            return self._mutation(target, bool(params.get("preview")), [{"op": "struct_field_set", **params}])
-        if op == "struct_field_rename":
-            return self._mutation(target, bool(params.get("preview")), [{"op": "struct_field_rename", **params}])
-        if op == "struct_field_delete":
-            return self._mutation(target, bool(params.get("preview")), [{"op": "struct_field_delete", **params}])
-        if op == "types_declare":
-            return self._mutation(target, bool(params.get("preview")), [{"op": "types_declare", **params}])
-        if op == "batch_apply":
-            manifest = dict(params)
-            preview = bool(manifest.get("preview"))
-            # Keep None as None so the single-open-target default still applies;
-            # str(None) would become the bogus selector "None".
-            chosen = manifest.get("target") or target
-            target = str(chosen) if chosen is not None else None
-            operations = list(manifest.get("ops") or [])
-            return self._mutation(target, preview, operations)
-
-        raise ValueError(f"Unknown operation: {op}")
+        spec = REGISTRY.spec(op)
+        if spec is None:
+            raise ValueError(f"Unknown operation: {op}")
+        return spec.binder(self, params, target)
 
     def _doctor(self):
         return {
@@ -6823,6 +6542,25 @@ def _bind_batch_apply(bridge, params, target):
     target = str(chosen) if chosen is not None else None
     operations = list(manifest.get("ops") or [])
     return bridge._mutation(target, preview, operations)
+
+
+# Derived from the op registry -- single source of truth, replacing the former
+# hand-maintained literal sets. Kept as module-level names because callers/tests
+# reference bridge.READ_LOCKED_OPS / bridge.WRITE_LOCKED_OPS. Must run AFTER the
+# binder block above so every op is registered before the sets are derived.
+#
+# Read-locked ops read live BinaryViews (targets.refresh() dereferences each
+# view's file/session), so they must exclude write-locked close_binary and the
+# brief exclusive sections of load_binary (its open + publish; the slow analysis
+# runs unlocked, and the loading view isn't published until after, so reads
+# never observe a half-analyzed target -- #99). "shutdown" stays unlocked on
+# purpose (lock="none"): it only sets an event and must work even while a write
+# op is wedged. load_binary is intentionally not write-locked (lock="none"): it
+# does its OWN fine-grained locking (exclusive only around the BN open and the
+# publish, NOT around the multi-minute update_analysis_and_wait), so doctor/
+# target reads stay responsive during a large load (#99). See _load_binary.
+READ_LOCKED_OPS = frozenset(REGISTRY.read_locked_ops())
+WRITE_LOCKED_OPS = frozenset(REGISTRY.write_locked_ops())
 
 
 def _preload_binary(path: str, quick: bool):
