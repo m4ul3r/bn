@@ -22,6 +22,7 @@ import binaryninja as bn
 from binaryninja import SSAVariable
 from binaryninja.plugin import PluginCommand
 
+from . import il_format
 from . import taint_engine as _taint
 from . import vars as vars_mod
 from ._shared import (
@@ -963,197 +964,23 @@ class BinaryNinjaBridge:
     def _iter_hlil_variables(self, *a, **k):
         return vars_mod._iter_hlil_variables(*a, **k)
 
-    def _format_hlil_tree(self, ins, indent=0, *, _else_prefix=False, addresses: bool = True):
-        """Recursively format HLIL tree with proper indentation."""
-        lines = []
-        pad = "    " * indent
-        op = ins.operation.name
+    def _format_hlil_tree(self, *a, **k):
+        return il_format._format_hlil_tree(*a, **k)
 
-        BODY_INDENT = "    "
-        if addresses:
-            def _prefix(i):
-                a = getattr(i, "address", None)
-                return f"{int(a):08x}        " if a is not None else "                "
+    def _function_text(self, *a, **k):
+        return il_format._function_text(*a, **k)
 
-            NO_PREFIX = "                "
-        else:
-            def _prefix(i):
-                return BODY_INDENT
+    def _instruction_length(self, *a, **k):
+        return il_format._instruction_length(*a, **k)
 
-            NO_PREFIX = BODY_INDENT
+    def _disasm_entry(self, *a, **k):
+        return il_format._disasm_entry(*a, **k)
 
-        if op == "HLIL_NOP":
-            pass
+    def _structured_disasm_entries(self, *a, **k):
+        return il_format._structured_disasm_entries(*a, **k)
 
-        elif op == "HLIL_BLOCK":
-            for stmt in ins:
-                lines.extend(self._format_hlil_tree(stmt, indent, addresses=addresses))
-
-        elif op == "HLIL_IF":
-            if _else_prefix:
-                lines.append(f"{_prefix(ins)}{pad}}} else if ({ins.condition})")
-            else:
-                lines.append(f"{_prefix(ins)}{pad}if ({ins.condition})")
-            lines.append(f"{NO_PREFIX}{pad}{{")
-            lines.extend(self._format_hlil_tree(ins.true, indent + 1, addresses=addresses))
-            false_branch = ins.false
-            false_op = false_branch.operation.name
-            if false_op == "HLIL_NOP":
-                lines.append(f"{NO_PREFIX}{pad}}}")
-            elif false_op == "HLIL_IF":
-                lines.extend(self._format_hlil_tree(false_branch, indent, _else_prefix=True, addresses=addresses))
-            else:
-                lines.append(f"{NO_PREFIX}{pad}}} else {{")
-                lines.extend(self._format_hlil_tree(false_branch, indent + 1, addresses=addresses))
-                lines.append(f"{NO_PREFIX}{pad}}}")
-
-        elif op in ("HLIL_WHILE", "HLIL_WHILE_SSA"):
-            lines.append(f"{_prefix(ins)}{pad}while ({ins.condition})")
-            lines.append(f"{NO_PREFIX}{pad}{{")
-            lines.extend(self._format_hlil_tree(ins.body, indent + 1, addresses=addresses))
-            lines.append(f"{NO_PREFIX}{pad}}}")
-
-        elif op in ("HLIL_DO_WHILE", "HLIL_DO_WHILE_SSA"):
-            lines.append(f"{_prefix(ins)}{pad}do")
-            lines.append(f"{NO_PREFIX}{pad}{{")
-            lines.extend(self._format_hlil_tree(ins.body, indent + 1, addresses=addresses))
-            lines.append(f"{NO_PREFIX}{pad}}} while ({ins.condition})")
-
-        elif op in ("HLIL_FOR", "HLIL_FOR_SSA"):
-            lines.append(f"{_prefix(ins)}{pad}for ({ins.init}; {ins.condition}; {ins.update})")
-            lines.append(f"{NO_PREFIX}{pad}{{")
-            lines.extend(self._format_hlil_tree(ins.body, indent + 1, addresses=addresses))
-            lines.append(f"{NO_PREFIX}{pad}}}")
-
-        elif op == "HLIL_SWITCH":
-            lines.append(f"{_prefix(ins)}{pad}switch ({ins.condition})")
-            lines.append(f"{NO_PREFIX}{pad}{{")
-            for case in ins.cases:
-                lines.extend(self._format_hlil_tree(case, indent + 1, addresses=addresses))
-            default = getattr(ins, "default", None)
-            if default is not None and default.operation.name != "HLIL_NOP":
-                lines.append(f"{NO_PREFIX}{pad}    default:")
-                lines.extend(self._format_hlil_tree(default, indent + 2, addresses=addresses))
-            lines.append(f"{NO_PREFIX}{pad}}}")
-
-        elif op == "HLIL_CASE":
-            for val in ins.values:
-                lines.append(f"{_prefix(ins)}{pad}case {val}:")
-            lines.extend(self._format_hlil_tree(ins.body, indent + 1, addresses=addresses))
-
-        else:
-            lines.append(f"{_prefix(ins)}{pad}{ins}")
-
-        return lines
-
-    def _function_text(self, bv, func, *, view: str = "hlil", ssa: bool = False, addresses: bool = True) -> str:
-        il_name = {"hlil": "hlil", "mlil": "mlil", "llil": "llil"}.get(view, "hlil")
-        try:
-            il = getattr(func, il_name)
-            if ssa and hasattr(il, "ssa_form") and il.ssa_form is not None:
-                il = il.ssa_form
-            if il_name == "hlil" and hasattr(il, "root"):
-                try:
-                    lines = self._format_hlil_tree(il.root, addresses=addresses)
-                    if lines:
-                        return "\n".join(lines)
-                except Exception:
-                    pass
-            lines = []
-            for ins in il.instructions:
-                if addresses:
-                    address = getattr(ins, "address", func.start)
-                    lines.append(f"{int(address):08x}        {ins}")
-                else:
-                    lines.append(f"    {ins}")
-            if lines:
-                return "\n".join(lines)
-        except Exception as exc:
-            # Degrade to the prototype, but say so: a silent prototype-only
-            # body with ok:true reads like a successful (empty) render.
-            bn.log_warn(
-                f"BN Agent Bridge: {view} rendering failed for {getattr(func, 'name', func)}: "
-                f"{type(exc).__name__}: {exc}"
-            )
-            return (
-                f"// bn: IL rendering failed ({type(exc).__name__}: {exc}); "
-                f"showing prototype only\n{func}"
-            )
-        return str(func)
-
-    def _instruction_length(self, bv, address: int, *, arch=None) -> int:
-        if arch is None:
-            arch = getattr(bv, "arch", None)
-        try:
-            max_length = int(getattr(arch, "max_instr_length", 16) or 16)
-        except Exception:
-            max_length = 16
-
-        if arch is not None and hasattr(arch, "get_instruction_info"):
-            try:
-                data = bv.read(address, max_length)
-                info = arch.get_instruction_info(data, address)
-                length = int(getattr(info, "length", 0))
-                if length > 0:
-                    return length
-            except Exception:
-                pass
-
-        try:
-            length = int(bv.get_instruction_length(address))
-            if length > 0:
-                return length
-        except Exception:
-            pass
-        return 1
-
-    def _disasm_entry(self, bv, address: int, *, arch=None) -> dict[str, Any]:
-        text = ""
-        if arch is not None:
-            try:
-                max_length = int(getattr(arch, "max_instr_length", 16) or 16)
-                data = bv.read(address, max_length)
-                tokens, _length = arch.get_instruction_text(data, address)
-                if tokens:
-                    text = "".join(str(t) for t in tokens)
-            except Exception:
-                pass
-        if not text:
-            text = bv.get_disassembly(address) or ""
-        return {
-            "address": hex(int(address)),
-            "text": text,
-        }
-
-    def _structured_disasm_entries(self, bv, func) -> list[dict[str, Any]]:
-        arch = getattr(func, "arch", None)
-        entries = []
-        for block in list(func.basic_blocks):
-            addr = int(block.start)
-            end = int(block.end)
-            while addr < end:
-                entry = self._disasm_entry(bv, addr, arch=arch)
-                if entry["text"]:
-                    entry["_address_int"] = addr
-                    entries.append(entry)
-                addr += max(1, self._instruction_length(bv, addr, arch=arch))
-        entries.sort(key=lambda item: int(item["_address_int"]))
-        return entries
-
-    def _disasm_text(self, bv, func) -> str:
-        arch = getattr(func, "arch", None)
-        lines = []
-        for block in list(func.basic_blocks):
-            addr = block.start
-            while addr < block.end:
-                length = max(1, self._instruction_length(bv, int(addr), arch=arch))
-                entry = self._disasm_entry(bv, addr, arch=arch)
-                disasm = entry["text"]
-                raw = bv.read(addr, length)
-                hex_bytes = raw.hex(" ") if raw else ""
-                lines.append(f"{addr:08x}  {hex_bytes:<16} {disasm}")
-                addr += length
-        return "\n".join(lines)
+    def _disasm_text(self, *a, **k):
+        return il_format._disasm_text(*a, **k)
 
     def _sort_variable_entries(self, *a, **k):
         return vars_mod._sort_variable_entries(*a, **k)
@@ -1167,296 +994,68 @@ class BinaryNinjaBridge:
     def _find_variable_selector(self, *a, **k):
         return vars_mod._find_variable_selector(*a, **k)
 
-    def _function_size(self, func) -> int | None:
-        try:
-            total = getattr(func, "total_bytes", None)
-            if total is not None:
-                return int(total)
-        except Exception:
-            pass
-        try:
-            end = max(int(block.end) for block in list(func.basic_blocks))
-            return end - int(func.start)
-        except Exception:
-            return None
+    def _function_size(self, *a, **k):
+        return il_format._function_size(*a, **k)
 
-    def _function_metadata(self, func) -> dict[str, Any]:
-        func_type = getattr(func, "type", None)
-        calling_convention = getattr(func, "calling_convention", None)
-        if calling_convention is None and func_type is not None:
-            calling_convention = getattr(func_type, "calling_convention", None)
-        return_type = getattr(func, "return_type", None)
-        if return_type is None and func_type is not None:
-            return_type = getattr(func_type, "return_value", None)
-        return {
-            "prototype": str(func_type),
-            "return_type": str(return_type) if return_type is not None else None,
-            "calling_convention": str(calling_convention) if calling_convention is not None else None,
-            "size": self._function_size(func),
-        }
+    def _function_metadata(self, *a, **k):
+        return il_format._function_metadata(*a, **k)
 
-    def _comment_map(self, bv, func) -> dict[str, str]:
-        arch = getattr(func, "arch", None)
-        comments: dict[str, str] = {}
-        for block in list(func.basic_blocks):
-            addr = block.start
-            while addr < block.end:
-                text = bv.get_comment_at(addr)
-                if text:
-                    comments[hex(addr)] = text
-                addr += max(1, self._instruction_length(bv, int(addr), arch=arch))
-        return comments
+    def _comment_map(self, *a, **k):
+        return il_format._comment_map(*a, **k)
 
-    def _il_op_name(self, item) -> str:
-        operation = getattr(item, "operation", None)
-        name = getattr(operation, "name", None)
-        if name:
-            return str(name)
-        return str(operation)
+    def _il_op_name(self, *a, **k):
+        return il_format._il_op_name(*a, **k)
 
-    def _llil_constant_value(self, expr) -> int | None:
-        if expr is None:
-            return None
-        if self._il_op_name(expr) not in {"LLIL_CONST", "LLIL_CONST_PTR"}:
-            return None
-        constant = getattr(expr, "constant", None)
-        if constant is not None:
-            return int(constant)
-        value = getattr(expr, "value", None)
-        if value is None:
-            return None
-        nested_value = getattr(value, "value", None)
-        if nested_value is not None:
-            return int(nested_value)
-        try:
-            return int(value)
-        except Exception:
-            return None
+    def _llil_constant_value(self, *a, **k):
+        return il_format._llil_constant_value(*a, **k)
 
-    def _coerce_il_list(self, value: Any) -> list[Any]:
-        if value is None:
-            return []
-        if isinstance(value, (list, tuple, set)):
-            return list(value)
-        return [value]
+    def _coerce_il_list(self, *a, **k):
+        return il_format._coerce_il_list(*a, **k)
 
-    def _iter_llil_instructions(self, func) -> list[Any]:
-        il = getattr(func, "low_level_il", None)
-        if il is None:
-            il = getattr(func, "llil", None)
-        if il is None:
-            return []
+    def _iter_llil_instructions(self, *a, **k):
+        return il_format._iter_llil_instructions(*a, **k)
 
-        instructions = []
-        try:
-            blocks = list(il)
-        except Exception:
-            blocks = list(getattr(il, "basic_blocks", []) or [])
-        for block in blocks:
-            try:
-                instructions.extend(list(block))
-            except Exception:
-                continue
-        instructions.sort(key=lambda item: int(getattr(item, "address", 0)))
-        return instructions
+    def _hlil_candidates_for_llil(self, *a, **k):
+        return il_format._hlil_candidates_for_llil(*a, **k)
 
-    def _hlil_candidates_for_llil(self, insn) -> list[Any]:
-        candidates = []
-        seen: set[tuple[str, int]] = set()
+    def _il_parent(self, *a, **k):
+        return il_format._il_parent(*a, **k)
 
-        def add(candidate: Any) -> None:
-            if candidate is None:
-                return
-            expr_index = getattr(candidate, "expr_index", None)
-            marker = (type(candidate).__name__, int(expr_index) if expr_index is not None else id(candidate))
-            if marker in seen:
-                return
-            seen.add(marker)
-            candidates.append(candidate)
+    def _hlil_marker(self, *a, **k):
+        return il_format._hlil_marker(*a, **k)
 
-        for attr in ("hlils", "hlil"):
-            for candidate in self._coerce_il_list(getattr(insn, attr, None)):
-                add(candidate)
+    def _hlil_type_name(self, *a, **k):
+        return il_format._hlil_type_name(*a, **k)
 
-        mapped_mlil = getattr(insn, "mapped_medium_level_il", None)
-        if mapped_mlil is not None:
-            for attr in ("hlils", "hlil"):
-                for candidate in self._coerce_il_list(getattr(mapped_mlil, attr, None)):
-                    add(candidate)
+    def _hlil_text_is_local(self, *a, **k):
+        return il_format._hlil_text_is_local(*a, **k)
 
-        for mlil in self._coerce_il_list(getattr(insn, "mlils", None)):
-            for attr in ("hlils", "hlil"):
-                for candidate in self._coerce_il_list(getattr(mlil, attr, None)):
-                    add(candidate)
+    def _hlil_condition_is_meaningful(self, *a, **k):
+        return il_format._hlil_condition_is_meaningful(*a, **k)
 
-        return candidates
+    def _is_hlil_assignment_like(self, *a, **k):
+        return il_format._is_hlil_assignment_like(*a, **k)
 
-    def _il_parent(self, instruction) -> Any | None:
-        for attr in ("parent", "parent_instruction"):
-            parent = getattr(instruction, attr, None)
-            if parent is not None and parent is not instruction:
-                return parent
-        return None
+    def _is_hlil_control_flow(self, *a, **k):
+        return il_format._is_hlil_control_flow(*a, **k)
 
-    def _hlil_marker(self, instruction) -> tuple[str, int]:
-        expr_index = getattr(instruction, "expr_index", None)
-        return (
-            type(instruction).__name__,
-            int(expr_index) if expr_index is not None else id(instruction),
-        )
+    def _is_hlil_hard_boundary(self, *a, **k):
+        return il_format._is_hlil_hard_boundary(*a, **k)
 
-    def _hlil_type_name(self, instruction) -> str:
-        return type(instruction).__name__
+    def _is_hlil_trivial_wrapper(self, *a, **k):
+        return il_format._is_hlil_trivial_wrapper(*a, **k)
 
-    def _hlil_text_is_local(self, text: str) -> bool:
-        stripped = text.strip()
-        if not stripped:
-            return False
-        if len(stripped) > 240:
-            return False
-        if stripped.count("\n") > 1:
-            return False
-        return True
+    def _hlil_call_roots(self, *a, **k):
+        return il_format._hlil_call_roots(*a, **k)
 
-    def _hlil_condition_is_meaningful(self, text: str) -> bool:
-        stripped = text.strip()
-        if not stripped:
-            return False
-        if "\n" in stripped:
-            return False
-        if re.search(r"\bcond:\d", stripped):
-            return False
-        return True
+    def _select_local_hlil_node(self, *a, **k):
+        return il_format._select_local_hlil_node(*a, **k)
 
-    def _is_hlil_assignment_like(self, instruction) -> bool:
-        return self._hlil_type_name(instruction) in {
-            "HighLevelILAssign",
-            "HighLevelILVarAssign",
-            "HighLevelILVarInit",
-            "HighLevelILAssignMem",
-            "HighLevelILAssignUnpack",
-            "HighLevelILVarDeclare",
-        }
+    def _hlil_statement_text(self, *a, **k):
+        return il_format._hlil_statement_text(*a, **k)
 
-    def _is_hlil_control_flow(self, instruction) -> bool:
-        return self._hlil_type_name(instruction) in {
-            "HighLevelILIf",
-            "HighLevelILWhile",
-            "HighLevelILDoWhile",
-            "HighLevelILFor",
-            "HighLevelILSwitch",
-            "HighLevelILCase",
-        }
-
-    def _is_hlil_hard_boundary(self, instruction) -> bool:
-        if self._is_hlil_assignment_like(instruction) or self._is_hlil_control_flow(instruction):
-            return True
-        return self._hlil_type_name(instruction) in {
-            "HighLevelILRet",
-            "HighLevelILBlock",
-            "HighLevelILCall",
-            "HighLevelILTailcall",
-        }
-
-    def _is_hlil_trivial_wrapper(self, instruction) -> bool:
-        return self._hlil_type_name(instruction) in {
-            "HighLevelILCall",
-            "HighLevelILSx",
-            "HighLevelILZx",
-            "HighLevelILLowPart",
-            "HighLevelILIntToFloat",
-            "HighLevelILFloatToInt",
-            "HighLevelILBoolToInt",
-            "HighLevelILFloatConv",
-            "HighLevelILAddressOf",
-            "HighLevelILAddressOfField",
-            "HighLevelILArrayIndex",
-        }
-
-    def _hlil_call_roots(self, insn) -> list[Any]:
-        roots = []
-        seen: set[tuple[str, int]] = set()
-        for candidate in self._hlil_candidates_for_llil(insn):
-            current = candidate
-            while current is not None:
-                if self._hlil_type_name(current) == "HighLevelILCall":
-                    marker = self._hlil_marker(current)
-                    if marker not in seen:
-                        seen.add(marker)
-                        roots.append(current)
-                    break
-                current = self._il_parent(current)
-        return roots
-
-    def _select_local_hlil_node(self, insn) -> Any | None:
-        roots = self._hlil_call_roots(insn)
-        if not roots:
-            return None
-
-        for root in roots:
-            current = root
-            best_expression = None
-            assignment_candidate = None
-            seen: set[tuple[str, int]] = set()
-            while current is not None:
-                marker = self._hlil_marker(current)
-                if marker in seen:
-                    break
-                seen.add(marker)
-
-                parent = self._il_parent(current)
-                if parent is None:
-                    break
-                if self._is_hlil_control_flow(parent):
-                    break
-                if self._is_hlil_assignment_like(parent):
-                    text = str(parent)
-                    if self._hlil_text_is_local(text):
-                        assignment_candidate = parent
-                    break
-                if self._is_hlil_hard_boundary(parent):
-                    break
-
-                parent_text = str(parent)
-                if not self._is_hlil_trivial_wrapper(parent) and self._hlil_text_is_local(parent_text):
-                    best_expression = parent
-                current = parent
-
-            if best_expression is not None:
-                return best_expression
-            if assignment_candidate is not None:
-                return assignment_candidate
-        return None
-
-    def _hlil_statement_text(self, insn) -> str | None:
-        node = self._select_local_hlil_node(insn)
-        if node is None:
-            return None
-        text = str(node)
-        return text if self._hlil_text_is_local(text) else None
-
-    def _hlil_pre_branch_condition(self, insn) -> str | None:
-        current = self._select_local_hlil_node(insn)
-        if current is None:
-            return None
-
-        seen: set[tuple[str, int]] = set()
-        while current is not None:
-            marker = self._hlil_marker(current)
-            if marker in seen:
-                break
-            seen.add(marker)
-            parent = self._il_parent(current)
-            if parent is None:
-                break
-            if self._is_hlil_control_flow(parent):
-                condition = getattr(parent, "condition", None)
-                if condition is None:
-                    return None
-                text = str(condition).strip()
-                return text if self._hlil_condition_is_meaningful(text) else None
-            current = parent
-        return None
+    def _hlil_pre_branch_condition(self, *a, **k):
+        return il_format._hlil_pre_branch_condition(*a, **k)
 
     def _callsites_within_function(self, bv, callee, func, *, context: int) -> list[dict[str, Any]]:
         func_arch = getattr(func, "arch", None)
@@ -1723,125 +1322,17 @@ class BinaryNinjaBridge:
                 items.append({"name": fn.name, "address": hex(fn.start), "raw_name": getattr(fn, "raw_name", fn.name)})
         return self._paged_function_result(items, offset=offset, limit=limit)
 
-    def _function_signature(self, func) -> str:
-        """Build a C-style function signature from Binary Ninja metadata."""
-        func_type = getattr(func, "type", None)
-        if func_type is None:
-            return func.name
-        return_type = getattr(func_type, "return_value", getattr(func, "return_type", None))
-        ret = str(return_type) if return_type is not None else "void"
-        params = []
-        for var in list(func.parameter_vars):
-            params.append(f"{var.type} {var.name}")
-        return f"{ret} {func.name}({', '.join(params)})"
+    def _function_signature(self, *a, **k):
+        return il_format._function_signature(*a, **k)
 
-    def _pseudo_c_text(self, func, *, addresses: bool = False) -> str:
-        """Render Binary Ninja's Pseudo C for one function (GUI-equivalent).
+    def _pseudo_c_text(self, *a, **k):
+        return il_format._pseudo_c_text(*a, **k)
 
-        Walks the language-representation linear view a batch of lines at a
-        time. Each line carries its own address, so the optional gutter matches
-        what Binary Ninja shows in its UI. Comments are rendered inline by BN.
-        """
-        settings = bn.DisassemblySettings()
-        # Suppress BN's built-in address column so `--addresses` controls the
-        # gutter (and its format) on our side rather than doubling it. Keep the
-        # explicit type casts (e.g. `*(uint8_t*)x`) that make the access width
-        # legible — they are off in a default DisassemblySettings.
-        settings.set_option(bn.DisassemblyOption.ShowAddress, False)
-        settings.set_option(bn.DisassemblyOption.ShowTypeCasts, True)
-        settings.set_option(bn.DisassemblyOption.WaitForIL, True)
-        # Keep long statements (and string literals) on one line instead of
-        # wrapping them into adjacent fragments — one statement per line is
-        # easier to read, slice (--lines), and grep without splitting strings.
-        settings.set_option(bn.DisassemblyOption.DisableLineFormatting, True)
-        view_obj = bn.lineardisassembly.LinearViewObject.single_function_language_representation(func, settings)
-        cursor = bn.lineardisassembly.LinearViewCursor(view_obj)
-        cursor.seek_to_begin()
-        out: list[str] = []
-        seen_content = False
-        while True:
-            for line in cursor.lines:
-                text = str(line.contents)
-                if not text.strip():
-                    # Blank separator line: keep the spacing but never emit a
-                    # lone address in the gutter (decide blankness on content,
-                    # not on the prefixed string).
-                    out.append("")
-                    continue
-                if not seen_content:
-                    # BN indents the function-header (signature) line by two
-                    # spaces; the braces and body don't share that indent, so
-                    # left-justify the header to line up with them.
-                    text = text.lstrip()
-                    seen_content = True
-                if addresses:
-                    addr = getattr(line.contents, "address", None)
-                    prefix = f"{int(addr):08x}        " if addr is not None else " " * 16
-                    out.append(f"{prefix}{text}")
-                else:
-                    out.append(text)
-            if not cursor.next():
-                break
-        while out and not out[0]:
-            out.pop(0)
-        while out and not out[-1]:
-            out.pop()
-        return "\n".join(out)
+    def _decompile_text(self, *a, **k):
+        return il_format._decompile_text(*a, **k)
 
-    def _decompile_text(self, bv, func, *, addresses: bool = False) -> str:
-        """Pseudo C for a function, degrading to wrapped HLIL if it is unavailable."""
-        marker = ""
-        try:
-            text = self._pseudo_c_text(func, addresses=addresses)
-        except Exception as exc:
-            # Make the failure visible instead of silently returning the HLIL
-            # fallback (or worse, an empty body) with ok:true.
-            bn.log_warn(
-                f"BN Agent Bridge: pseudo-C decompilation failed for "
-                f"{getattr(func, 'name', func)}: {type(exc).__name__}: {exc}"
-            )
-            marker = (
-                f"// bn: decompilation failed ({type(exc).__name__}: {exc}); "
-                "showing HLIL fallback\n"
-            )
-            text = ""
-        if text.strip():
-            return text
-        sig = self._function_signature(func)
-        body = self._function_text(bv, func, view="hlil", addresses=addresses)
-        if addresses:
-            return f"{marker}{int(func.start):08x}        {sig}\n{body}"
-        return f"{marker}{sig}\n{{\n{body}\n}}"
-
-    def _analysis_stub_warning(self, func, text: str, *, forced: bool = False) -> str | None:
-        """Warn when a decompile body is a Binary Ninja analysis stub, not a real body.
-
-        BN skips analysis for oversized functions and renders a placeholder
-        instead of a body. The authoritative signal is ``func.analysis_skipped``;
-        a distinctive-phrase text match is kept as a fallback.
-        """
-        skipped = bool(getattr(func, "analysis_skipped", False))
-        placeholder = "taking too long to analyze" in text
-        if not (skipped or placeholder):
-            return None
-        reason = None
-        try:
-            raw = func.analysis_skip_reason
-            # BN's AnalysisSkipReason is an IntEnum; on Python 3.11+ str() yields
-            # the bare number, so prefer the member name.
-            reason = getattr(raw, "name", None) or str(raw)
-        except Exception:
-            reason = None
-        detail = f" (skip reason: {reason})" if reason else ""
-        if forced:
-            return (
-                f"{func.name}: Binary Ninja could not complete analysis even after --force-analysis{detail}; "
-                f"this decompile is still an incomplete stub, not the real function body."
-            )
-        return (
-            f"Binary Ninja skipped analysis for {func.name}{detail}; this decompile is an incomplete stub, "
-            f"not the real function body. Re-run with --force-analysis to analyze it (may be slow on large functions)."
-        )
+    def _analysis_stub_warning(self, *a, **k):
+        return il_format._analysis_stub_warning(*a, **k)
 
     def _force_function_analysis(self, bv, func):
         """Override a skipped function's analysis and reanalyze it in place.
@@ -1957,63 +1448,17 @@ class BinaryNinjaBridge:
     # Structured data-flow primitives (def-use / value-set / call graph)
     # ------------------------------------------------------------------
 
-    def _il_function_for(self, func, view: str, ssa: bool):
-        attr = {"hlil": "hlil", "mlil": "mlil", "llil": "llil"}.get(view, "mlil")
-        il = getattr(func, attr, None)
-        if il is None:
-            raise OperationFailure("unsupported", f"function has no {view.upper()}")
-        if ssa:
-            ssa_form = getattr(il, "ssa_form", None)
-            if ssa_form is not None:
-                il = ssa_form
-        return il
+    def _il_function_for(self, *a, **k):
+        return il_format._il_function_for(*a, **k)
 
-    def _ssa_var_entry(self, v) -> dict[str, Any]:
-        """Serialize an SSAVariable or plain Variable consistently.
+    def _ssa_var_entry(self, *a, **k):
+        return il_format._ssa_var_entry(*a, **k)
 
-        SSA vars expose ``.var`` (-> Variable) and ``.version``; AddressOf
-        targets surface as plain Variables (no version) in ``vars_read``.
-        """
-        base = getattr(v, "var", v)
-        version = getattr(v, "version", None)
-        name = str(getattr(base, "name", base))
-        entry: dict[str, Any] = {
-            "name": name,
-            "version": int(version) if version is not None else None,
-            "ssa": f"{name}#{version}" if version is not None else name,
-            "type": str(getattr(base, "type", "")) or None,
-            "identifier": self._variable_identifier(base),
-        }
-        return entry
+    def _collect_ssa_vars(self, *a, **k):
+        return il_format._collect_ssa_vars(*a, **k)
 
-    def _collect_ssa_vars(self, il) -> dict[tuple[str, int], Any]:
-        found: dict[tuple[str, int], Any] = {}
-        try:
-            items = list(il.instructions)
-        except Exception:
-            items = []
-        for ins in items:
-            for v in list(getattr(ins, "vars_read", None) or []) + list(getattr(ins, "vars_written", None) or []):
-                version = getattr(v, "version", None)
-                if version is None:
-                    continue
-                base = getattr(v, "var", v)
-                found[(str(getattr(base, "name", base)), int(version))] = v
-        return found
-
-    def _resolve_ssa_variable(self, func, il, selector: str):
-        index = self._collect_ssa_vars(il)
-        name, sep, version = str(selector).partition("#")
-        if sep and version:
-            key = (name, int(version))
-            if key in index:
-                return index[key], None
-            raise OperationFailure("unsupported", f"SSA variable not found: {selector}")
-        # bare name: return the lowest-version instance plus the list of versions
-        versions = sorted(v for (n, v) in index if n == name)
-        if not versions:
-            raise OperationFailure("unsupported", f"SSA variable not found: {selector}")
-        return index[(name, versions[0])], versions
+    def _resolve_ssa_variable(self, *a, **k):
+        return il_format._resolve_ssa_variable(*a, **k)
 
     def _structured_il(self, selector, identifier, *, view: str = "mlil", ssa: bool = True):
         bv = self._resolve_view(selector)
@@ -2084,39 +1529,8 @@ class BinaryNinjaBridge:
             "other_versions": other_versions or [],
         }
 
-    def _serialize_pvs(self, pvs) -> dict[str, Any] | None:
-        if pvs is None:
-            return None
-        out: dict[str, Any] = {"raw": str(pvs)}
-        t = getattr(pvs, "type", None)
-        out["type"] = getattr(t, "name", None) or (str(t) if t is not None else None)
-
-        def _coerce(v):
-            try:
-                return int(v)
-            except Exception:
-                return str(v)
-
-        value = getattr(pvs, "value", None)
-        if value is not None:
-            out["value"] = _coerce(value)
-        values = getattr(pvs, "values", None)
-        if values:
-            try:
-                out["values"] = sorted(_coerce(v) for v in values)
-            except Exception:
-                out["values"] = [_coerce(v) for v in values]
-        ranges = getattr(pvs, "ranges", None)
-        if ranges:
-            out["ranges"] = [
-                {
-                    "start": _coerce(getattr(r, "start", 0)),
-                    "end": _coerce(getattr(r, "end", 0)),
-                    "step": _coerce(getattr(r, "step", 1)),
-                }
-                for r in ranges
-            ]
-        return out
+    def _serialize_pvs(self, *a, **k):
+        return il_format._serialize_pvs(*a, **k)
 
     def _pvs_targets(self, bv, pvs) -> list[dict[str, Any]]:
         if pvs is None:
@@ -2276,16 +1690,8 @@ class BinaryNinjaBridge:
             "possible_values": self._serialize_pvs(chosen),
         }
 
-    def _pvs_determined(self, pvs) -> bool:
-        """True if a PossibleValueSet carries an actual value (not BN's
-        UndeterminedValue). Used to prefer a determined source-expression
-        value-set over an undetermined instruction-level one (#52)."""
-        if pvs is None:
-            return False
-        tname = str(getattr(getattr(pvs, "type", None), "name", "") or "")
-        if tname:
-            return tname != "UndeterminedValue"
-        return "undetermined" not in str(pvs).lower()
+    def _pvs_determined(self, *a, **k):
+        return il_format._pvs_determined(*a, **k)
 
     def _taint(self, selector, params: dict[str, Any]):
         bv = self._resolve_view(selector)
@@ -2746,20 +2152,8 @@ class BinaryNinjaBridge:
             "truncated": total_matched > len(matches),
         }
 
-    def _iter_il_instructions(self, il_func):
-        if il_func is None:
-            return []
-        instructions = []
-        try:
-            blocks = list(il_func)
-        except Exception:
-            blocks = list(getattr(il_func, "basic_blocks", []) or [])
-        for block in blocks:
-            try:
-                instructions.extend(list(block))
-            except Exception:
-                continue
-        return instructions
+    def _iter_il_instructions(self, *a, **k):
+        return il_format._iter_il_instructions(*a, **k)
 
     @staticmethod
     def _ssa_vars_from(vars_list: list) -> list[SSAVariable]:
@@ -3866,13 +3260,8 @@ class BinaryNinjaBridge:
         }
         return result
 
-    def _render_warnings(self, text: str) -> list[str]:
-        warnings: list[str] = []
-        if "__offset(" in text:
-            warnings.append(
-                "Decompile still contains raw __offset(...) expressions; use `bn types show` or `bn struct show` as the authoritative layout until Binary Ninja refreshes the presentation."
-            )
-        return warnings
+    def _render_warnings(self, *a, **k):
+        return il_format._render_warnings(*a, **k)
 
     def _guess_type_affected_functions(self, bv, type_name: str, limit: int = 10):
         matches = []

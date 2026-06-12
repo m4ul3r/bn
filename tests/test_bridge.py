@@ -64,8 +64,13 @@ def _load_bridge(monkeypatch):
     monkeypatch.delitem(sys.modules, "binaryninjaui", raising=False)
     package_name = "bn_test_bridge"
     module_name = f"{package_name}.bridge"
-    monkeypatch.delitem(sys.modules, module_name, raising=False)
-    monkeypatch.delitem(sys.modules, package_name, raising=False)
+    # Purge every cached bn_test_bridge.* submodule (bridge + its helper modules
+    # il_format/vars/seam/_shared/op_registry/taint_engine/...) so each load
+    # re-imports them against THIS call's fake `binaryninja`. Without this, a
+    # helper module loaded by an earlier _load_bridge stays bound to a stale
+    # fake_bn, and patches against the fresh `bridge.bn` never reach it.
+    for cached in [name for name in sys.modules if name == package_name or name.startswith(f"{package_name}.")]:
+        monkeypatch.delitem(sys.modules, cached, raising=False)
 
     bridge_path = Path(__file__).resolve().parents[1] / "plugin" / "bn_agent_bridge" / "bridge.py"
     package = types.ModuleType(package_name)
@@ -1359,8 +1364,10 @@ def test_decompile_falls_back_to_hlil_when_pseudo_c_unavailable(monkeypatch):
     monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
     monkeypatch.setattr(instance, "_comment_map", lambda bv, func: {})
     # No fake lineardisassembly module installed -> _pseudo_c_text raises and we
-    # fall back to wrapped HLIL produced by _function_text.
-    monkeypatch.setattr(instance, "_function_text", lambda bv, func, **kw: "    return 1;")
+    # fall back to wrapped HLIL produced by _function_text. The renderer now
+    # lives in il_format and _decompile_text calls it module-locally, so stub it
+    # there (patching instance._function_text no longer intercepts that call).
+    monkeypatch.setattr(bridge.il_format, "_function_text", lambda bv, func, **kw: "    return 1;")
 
     result = instance._decompile("active", "player_update")
 
