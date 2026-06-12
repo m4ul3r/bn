@@ -635,6 +635,63 @@ def test_preview_with_successful_restore_still_succeeds(monkeypatch):
     assert result["rolled_back"] is True
 
 
+def test_rolled_back_sibling_op_reports_reverted_not_unsupported(monkeypatch):
+    """When a later op fails mid-batch and the batch is reverted, an op that
+    ALREADY succeeded must be reported as 'reverted', not 'unsupported' -- it
+    was supported and applied; a sibling failed. 'reverted' is not a failure
+    status (#118)."""
+    from bn.formatters import FAILED_MUTATION_STATUSES
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+
+    def apply(bv_, op, restores=None):
+        if op.get("op") == "boom":
+            raise bridge.OperationFailure("unsupported", "Function not found: x", requested={})
+        return {"op": "rename_symbol", "status": "applied", "requested": {}}
+
+    _mutation_with_stubs(monkeypatch, bridge, instance, bv, apply=apply)
+    monkeypatch.setattr(bridge.mutation_engine, "_revert_undo_safely", lambda ctx, bv_, state: True)
+    monkeypatch.setattr(bridge.mutation_engine, "_run_local_restores", lambda ctx, bv_, restores: True)
+
+    result = instance._mutation("active", False, [{"op": "rename_symbol"}, {"op": "boom"}])
+
+    assert result["success"] is False
+    assert result["rolled_back"] is True
+    statuses = [r["status"] for r in result["results"]]
+    assert statuses[0] == "reverted"          # succeeded-then-reverted, honestly
+    assert statuses[1] == "unsupported"        # the real failing op keeps its status
+    assert "reverted" not in FAILED_MUTATION_STATUSES
+
+
+def test_rolled_back_sibling_reports_rollback_failed_when_revert_fails(monkeypatch):
+    """If the rollback itself fails, a preceding op may STILL be applied -- it
+    must not be labeled 'reverted'. Use a distinct failed status so exit codes
+    and rendering treat the left-modified view as the failure it is (#118)."""
+    from bn.formatters import FAILED_MUTATION_STATUSES
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+
+    def apply(bv_, op, restores=None):
+        if op.get("op") == "boom":
+            raise bridge.OperationFailure("unsupported", "nope", requested={})
+        return {"op": "rename_symbol", "status": "applied", "requested": {}}
+
+    _mutation_with_stubs(monkeypatch, bridge, instance, bv, apply=apply)
+    monkeypatch.setattr(bridge.mutation_engine, "_revert_undo_safely", lambda ctx, bv_, state: False)
+    monkeypatch.setattr(bridge.mutation_engine, "_run_local_restores", lambda ctx, bv_, restores: True)
+
+    result = instance._mutation("active", False, [{"op": "rename_symbol"}, {"op": "boom"}])
+
+    assert result["success"] is False
+    assert result["rolled_back"] is False
+    assert result["results"][0]["status"] == "rollback_failed"
+    assert "rollback_failed" in FAILED_MUTATION_STATUSES
+
+
 def test_capture_and_restore_local_var_drift_reverts_propagated_siblings(monkeypatch):
     """BN's create_user_var propagates a user name onto aliased siblings (naming
     a stack var also renames the aliased register). The drift snapshot/restore
@@ -2427,6 +2484,69 @@ def test_diff_snapshots_marks_name_only_changes(monkeypatch):
     assert "before_excerpt" not in diffs[0]
 
 
+def test_diff_snapshots_marks_comment_only_change(monkeypatch):
+    """A comment set/delete changes no HLIL body text, so a text-only snapshot
+    reports changed:false with an empty diff. The diff/changed signal must also
+    reflect comment state (#121)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    diffs = instance._diff_snapshots(
+        {0x401000: {"name": "f", "address": "0x401000", "text": "return 7;", "comments": {}, "locals": {}}},
+        {0x401000: {"name": "f", "address": "0x401000", "text": "return 7;",
+                    "comments": {"0x401010": "decryption key"}, "locals": {}}},
+    )
+
+    assert len(diffs) == 1
+    assert diffs[0]["changed"] is True
+    assert diffs[0]["diff"]
+    assert "decryption key" in diffs[0]["diff"]
+
+
+def test_diff_snapshots_marks_local_only_change(monkeypatch):
+    """A local rename/retype of a variable not rendered in the HLIL body leaves
+    the body text identical; the diff/changed signal must reflect local
+    name/type state too (#121)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    diffs = instance._diff_snapshots(
+        {0x401000: {"name": "f", "address": "0x401000", "text": "return arg1;",
+                    "comments": {}, "locals": {"1": "arg1:int32_t"}}},
+        {0x401000: {"name": "f", "address": "0x401000", "text": "return arg1;",
+                    "comments": {}, "locals": {"1": "session_id:int32_t"}}},
+    )
+
+    assert len(diffs) == 1
+    assert diffs[0]["changed"] is True
+    assert diffs[0]["diff"]
+    assert "session_id" in diffs[0]["diff"]
+
+
+def test_capture_function_snapshots_reads_global_comment_store(monkeypatch):
+    """Comment ops write to BN's GLOBAL comment store (bv.set_comment_at /
+    bv.address_comments), which is a DIFFERENT store from Function.comments.
+    The snapshot must read the global store filtered to the function -- reading
+    Function.comments (as a first cut did) sees nothing the op wrote and the
+    comment --preview still shows changed:false (#121)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(bridge.il_format, "_function_text", lambda bv, fn, view="hlil": "body")
+    fn = _FakeFunction(0x401000, "f")
+    fn.basic_blocks = [_FakeBasicBlock(0x401000, 0x401020)]
+    # Function.comments is the WRONG (function-local) store -- it must be ignored.
+    fn.comments = {0x401000: "stale-local-store"}
+    bv = _FakeMutationBV()
+    bv.functions = [fn]
+    # Where bv.set_comment_at actually lands: in-function + an out-of-function one.
+    bv.address_comments = {0x401004: "decryption key", 0x500000: "outside"}
+
+    snaps = instance._capture_function_snapshots(bv, [fn])
+
+    assert snaps[0x401000]["comments"] == {"0x401004": "decryption key"}
+    assert snaps[0x401000]["locals"] == {}
+
+
 def test_read_write_lock_blocks_reader_until_writer_releases(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     lock = bridge._ReadWriteLock()
@@ -3017,6 +3137,13 @@ class _FakeFunctionCreateBV(_FakeMutationBV):
         self.functions.append(fn)
         return fn
 
+    def remove_user_function(self, fn):
+        # Model BN faithfully: add_function is NOT journaled by the undo buffer,
+        # so revert_undo_actions never removes it -- only remove_user_function
+        # does. The preview/rollback revert must call this explicitly (#117).
+        self.events.append(("remove_user_function", int(fn.start)))
+        self.functions = [f for f in self.functions if int(f.start) != int(fn.start)]
+
     def is_offset_executable(self, addr: int) -> bool:
         seg = self.get_segment_at(int(addr))
         return bool(seg is not None and seg.executable)
@@ -3112,6 +3239,58 @@ def test_function_create_non_executable_address_is_rejected(monkeypatch):
         instance._function_create(None, "0x5000", False)
 
     assert bv.added == []
+
+
+def test_function_create_preview_actually_removes_function(monkeypatch):
+    """--preview must leave NO trace. add_function is not journaled, so the
+    preview revert has to explicitly remove the created function and read back
+    that it is gone -- reporting 'reverted' while the function persists in the
+    view is the bug (#117)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFunctionCreateBV(
+        segments={0x1000: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x55\x48\x89\xe5"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_create(None, "0x1000", True)
+
+    assert result["preview"] is True
+    assert result["committed"] is False
+    assert result["success"] is True
+    assert result["rolled_back"] is True
+    assert result["results"][0]["status"] == "verified"
+    assert ("remove_user_function", 0x1000) in bv.events
+    # The crux: no function may persist at the address after a preview.
+    assert bv.get_function_at(0x1000) is None
+
+
+def test_function_create_preview_revert_failure_is_not_success(monkeypatch):
+    """If removing the created function on preview-revert fails, the view is
+    left modified -- report success:false / rolled_back:false, never a clean
+    'reverted'. Honesty over an unverified revert claim (#117)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFunctionCreateBV(
+        segments={0x1000: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x55\x48\x89\xe5"},
+    )
+    # Removal silently does nothing, so the function persists past the revert.
+    bv.remove_user_function = lambda fn: bv.events.append(("remove_attempt", int(fn.start)))
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_create(None, "0x1000", True)
+
+    assert result["success"] is False
+    assert result["rolled_back"] is False
+    assert "may be left modified" in result["message"]
+    assert bv.get_function_at(0x1000) is not None
+    # The per-op status must not keep claiming 'verified' when the revert failed
+    # and the function persists -- route it to 'failed:' like the batch engine.
+    assert result["results"][0]["status"] == "rollback_failed"
+    from bn.formatters import FAILED_MUTATION_STATUSES
+    assert "rollback_failed" in FAILED_MUTATION_STATUSES
 
 
 # ---------------------------------------------------------------------------
