@@ -1035,6 +1035,100 @@ def test_op_set_prototype_uses_string_user_type_for_bn_compat(monkeypatch):
     assert verified["observed"]["prototype"] == "void* __thiscall(struct GarbageHazardRuntime* self)"
 
 
+def test_apply_operation_user_error_message_has_no_class_name(monkeypatch):
+    """A handler raising a user-facing RuntimeError (e.g. a mistyped function
+    name -> 'Function not found') must surface a clean, actionable message --
+    not 'unsupported: RuntimeError: ...' that reads like an internal crash
+    (#122)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    me = bridge.mutation_engine
+
+    def boom_user(ctx, bv, op):
+        raise RuntimeError("Function not found: ghost")
+
+    monkeypatch.setattr(me, "_op_set_comment", boom_user)
+    bv = _FakeBV()
+
+    with pytest.raises(bridge.OperationFailure) as excinfo:
+        instance._apply_operation(bv, {"op": "set_comment", "comment": "x", "function": "ghost"})
+
+    assert excinfo.value.status == "unsupported"
+    assert excinfo.value.message == "Function not found: ghost"
+    assert "RuntimeError" not in excinfo.value.message
+
+
+def test_apply_operation_unexpected_error_gets_internal_error_status(monkeypatch):
+    """A genuinely UNEXPECTED internal error gets the distinct 'internal_error'
+    status (kept in FAILED_MUTATION_STATUSES so exit codes still flag it) and
+    keeps the class name for debugging -- not the misleading 'unsupported'
+    (#122)."""
+    from bn.formatters import FAILED_MUTATION_STATUSES
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    me = bridge.mutation_engine
+
+    def boom_internal(ctx, bv, op):
+        raise KeyError("unexpected")
+
+    monkeypatch.setattr(me, "_op_set_comment", boom_internal)
+    bv = _FakeBV()
+
+    with pytest.raises(bridge.OperationFailure) as excinfo:
+        instance._apply_operation(bv, {"op": "set_comment", "comment": "x", "function": "g"})
+
+    assert excinfo.value.status == "internal_error"
+    assert "KeyError" in excinfo.value.message
+    assert "internal_error" in FAILED_MUTATION_STATUSES
+
+
+def test_types_declare_malformed_declaration_is_clean_invalid_request(monkeypatch):
+    """A malformed C declaration (the top `types declare` user mistake) raises a
+    built-in SyntaxError from BN's parser -- which is NOT a RuntimeError/
+    ValueError. It must surface as a clean invalid_request, not a leaked
+    'SyntaxError:' class name or 'internal_error' (#122)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _BadDeclBV(_FakeBV):
+        def parse_types_from_string(self, declaration):
+            raise SyntaxError("error: input:1:1 expected unqualified-id")
+
+    bv = _BadDeclBV()
+    with pytest.raises(bridge.OperationFailure) as excinfo:
+        instance._apply_operation(bv, {"op": "types_declare", "declaration": "this is not valid C"})
+
+    assert excinfo.value.status == "invalid_request"
+    assert "could not parse declaration" in excinfo.value.message
+    assert "SyntaxError" not in excinfo.value.message
+
+
+def test_mutation_malformed_types_declare_reports_clean_failure_not_escape(monkeypatch):
+    """End-to-end: a malformed types_declare must flow through the mutation
+    machinery as a clean, reverted invalid_request -- it must NOT escape the
+    pre-apply snapshot pass as a raw SyntaxError out of _mutation (#122)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _BadDeclMutationBV(_FakeMutationBV):
+        def parse_types_from_string(self, declaration):
+            raise SyntaxError("error: input:1:1 expected unqualified-id")
+
+    bv = _BadDeclMutationBV()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.mutation_engine, "_capture_function_snapshots", lambda ctx, bv_, fns: {})
+    monkeypatch.setattr(bridge.mutation_engine, "_diff_snapshots", lambda ctx, b, a: [])
+
+    result = instance._mutation("active", False, [{"op": "types_declare", "declaration": "garbage @#$"}])
+
+    assert result["success"] is False
+    statuses = [r.get("status") for r in result["results"]]
+    assert "invalid_request" in statuses
+    joined = " ".join(r.get("message", "") for r in result["results"])
+    assert "SyntaxError" not in joined
+
+
 def test_op_set_prototype_hints_to_declare_unknown_struct(monkeypatch):
     """A prototype that references a not-yet-defined struct makes
     parse_type_string fail. Surface a clear invalid_request that hints to
