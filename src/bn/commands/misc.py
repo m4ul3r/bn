@@ -40,6 +40,10 @@ def _strings(args: argparse.Namespace) -> int:
             "narrow with --section .rodata (or --query / --min-length) for signal.",
             file=sys.stderr,
         )
+    # Bridge-authoritative paging (#122): forward the real limit/offset so the
+    # bridge returns the page WITH the true total in a {items, total, ...}
+    # envelope, matching function list/search. paged_spill keeps the
+    # "--limit/--offset to page" spill hint without the client-side limit+1 probe.
     return _call(
         args,
         "strings",
@@ -55,9 +59,8 @@ def _strings(args: argparse.Namespace) -> int:
         require_target=True,
         allow_implicit_target=True,
         text_renderer=_render_strings_text,
-        page_limit=args.limit,
-        page_offset=args.offset,
         page_label="strings",
+        paged_spill=True,
         stem="strings",
         regex_hint_query=args.query,
     )
@@ -68,19 +71,23 @@ def _strings(args: argparse.Namespace) -> int:
                    help="Show aggregate counts by namespace and kind instead of the full list")])
 def _imports(args: argparse.Namespace) -> int:
     summary_mode = bool(args.summary)
-    # Summary is a single aggregate object, so it ignores paging; the full list
-    # (often 500+ entries on firmware libs) pages like strings/function list.
-    page_limit = None if summary_mode else args.limit
+    # Summary is a single aggregate object, so it ignores paging entirely. The
+    # full list (often 500+ entries on firmware libs) pages bridge-side like
+    # strings/function list, returning a {items, total, ...} envelope (#122).
+    params = {"summary": summary_mode, "offset": args.offset}
+    if not summary_mode:
+        params["limit"] = args.limit
     return _call(
         args,
         "imports",
-        {"summary": summary_mode, "offset": args.offset},
+        params,
         require_target=True,
         allow_implicit_target=True,
         text_renderer=_render_imports_summary_text if summary_mode else _render_name_address_list_text,
-        page_limit=page_limit,
-        page_offset=args.offset,
         page_label="imports",
+        # Only the list path pages; the summary aggregate has no remainder to
+        # hint about, so it does not opt into the paging spill hint.
+        paged_spill=not summary_mode,
         stem="imports-summary" if summary_mode else "imports",
     )
 
@@ -88,16 +95,17 @@ def _imports(args: argparse.Namespace) -> int:
 @command("sections", help="List binary sections with address ranges and permissions", target=True,
          paged=True, args=[arg("--query", help="Filter sections by name substring")])
 def _sections(args: argparse.Namespace) -> int:
+    # Bridge-authoritative paging (#122): forward the real limit/offset so the
+    # bridge returns the {items, total, ...} envelope with the true total.
     return _call(
         args,
         "sections",
-        {"query": args.query, "offset": args.offset},
+        {"query": args.query, "offset": args.offset, "limit": args.limit},
         require_target=True,
         allow_implicit_target=True,
         text_renderer=_render_sections_text,
-        page_limit=args.limit,
-        page_offset=args.offset,
         page_label="sections",
+        paged_spill=True,
         stem="sections",
     )
 

@@ -462,7 +462,8 @@ def _render_pin_clear_text(value: Any) -> str:
     return "cleared"
 
 
-def _render_name_address_list_text(value: Any) -> str:
+def _render_name_address_rows(value: Any) -> str:
+    """Render a BARE list of name/address rows (imports, function pages)."""
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value:
@@ -489,31 +490,59 @@ def _render_name_address_list_text(value: Any) -> str:
     return "\n".join(lines)
 
 
-def _render_function_list_text(value: Any) -> str:
-    """Render a paged function listing (the {functions, total, ...} envelope),
-    with a footer stating the true total and remainder (#59)."""
-    if not isinstance(value, dict) or "functions" not in value:
-        return _render_name_address_list_text(value)  # back-compat / fallback
-    functions = value.get("functions") or []
-    body = _render_name_address_list_text(functions)
+def _render_name_address_list_text(value: Any) -> str:
+    """Render imports: the paged {items, total, ...} envelope (with a footer),
+    or a bare list for back-compat / internal callers (#122)."""
+    return _render_paged_list_text(value, "items", _render_name_address_rows)
+
+
+def _paging_footer(value: dict[str, Any], items: list[Any]) -> str | None:
+    """Build the "// showing N of TOTAL" footer for a paged-list envelope.
+
+    Shared by every paged list renderer (function list/search, strings, imports,
+    sections) so the honest-total convention reads identically across them (#59,
+    #122). Returns None when the page IS the whole set (no paging happened) or
+    the envelope lacks an integer total to report against."""
     total = value.get("total")
-    returned = value.get("returned", len(functions) if isinstance(functions, list) else 0)
+    returned = value.get("returned", len(items) if isinstance(items, list) else 0)
     offset = value.get("offset", 0) or 0
     if not isinstance(total, int):
-        return body
-    footer = None
+        return None
     if value.get("has_more"):
         remaining = total - (offset + returned)
         next_offset = offset + returned
-        footer = (
+        return (
             f"// showing {returned} of {total} ({remaining} more); "
             f"rerun with --offset {next_offset} or a larger --limit"
         )
-    elif offset or returned != total:
-        footer = f"// showing {returned} of {total}"
+    if offset or returned != total:
+        return f"// showing {returned} of {total}"
+    return None
+
+
+def _render_paged_list_text(
+    value: Any, page_key: str, item_renderer: Callable[[Any], str]
+) -> str:
+    """Render a paged-list envelope ({<page_key>, total, ...}) with a footer.
+
+    Delegates the body to *item_renderer* (which renders a bare list) and
+    appends the shared paging footer. Falls back to rendering *value* as a bare
+    list when it isn't an envelope, so internal callers or older bridges that
+    still hand over a plain list keep working (#122)."""
+    if not isinstance(value, dict) or page_key not in value:
+        return item_renderer(value)  # back-compat / fallback for a bare list
+    items = value.get(page_key) or []
+    body = item_renderer(items)
+    footer = _paging_footer(value, items)
     if footer is None:
         return body
     return footer if body == "none" else f"{body}\n\n{footer}"
+
+
+def _render_function_list_text(value: Any) -> str:
+    """Render a paged function listing (the {functions, total, ...} envelope),
+    with a footer stating the true total and remainder (#59)."""
+    return _render_paged_list_text(value, "functions", _render_name_address_rows)
 
 
 def _group_refs_by_caller(refs: list[Any]) -> list[dict[str, Any]]:
@@ -1258,7 +1287,8 @@ def _render_imports_summary_text(value: Any) -> str:
     return "\n".join(lines)
 
 
-def _render_strings_text(value: Any) -> str:
+def _render_strings_rows(value: Any) -> str:
+    """Render a BARE list of string rows."""
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value:
@@ -1284,7 +1314,14 @@ def _render_strings_text(value: Any) -> str:
     return "\n".join(lines)
 
 
-def _render_sections_text(value: Any) -> str:
+def _render_strings_text(value: Any) -> str:
+    """Render strings: the paged {items, total, ...} envelope (with a footer),
+    or a bare list for back-compat / internal callers (#122)."""
+    return _render_paged_list_text(value, "items", _render_strings_rows)
+
+
+def _render_sections_rows(value: Any) -> str:
+    """Render a BARE list of section rows."""
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value:
@@ -1306,6 +1343,12 @@ def _render_sections_text(value: Any) -> str:
         line = f"{start}-{end}  {length:>8}  {perms:>3}  {semantics:<20}  {name}"
         lines.append(line.rstrip())
     return "\n".join(lines)
+
+
+def _render_sections_text(value: Any) -> str:
+    """Render sections: the paged {items, total, ...} envelope (with a footer),
+    or a bare list for back-compat / internal callers (#122)."""
+    return _render_paged_list_text(value, "items", _render_sections_rows)
 
 
 def _render_read_text(value: Any) -> str:
