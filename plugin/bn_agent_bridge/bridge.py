@@ -24,6 +24,7 @@ from binaryninja.plugin import PluginCommand
 
 from . import il_format
 from . import mutation_engine
+from . import read_evidence
 from . import read_xrefs
 from . import taint_engine as _taint
 from . import vars as vars_mod
@@ -1643,423 +1644,42 @@ class BinaryNinjaBridge:
             raise OperationFailure("unsupported", str(exc)) from exc
         raise OperationFailure("unsupported", f"unknown taint direction: {direction}")
 
-    def _call_destination_value(self, insn) -> int | None:
-        return self._llil_constant_value(getattr(insn, "dest", None))
+    def _call_destination_value(self, *a, **k):
+        return read_evidence._call_destination_value(self.ctx, *a, **k)
 
-    def _target_entry_for_call(self, bv, value: int | None) -> dict[str, Any] | None:
-        if value is None:
-            return None
-        return self._normalize_code_pointer(bv, value)
+    def _target_entry_for_call(self, *a, **k):
+        return read_evidence._target_entry_for_call(self.ctx, *a, **k)
 
-    def _il_argument_texts(self, node) -> list[str]:
-        for attr in ("params", "parameters"):
-            params = getattr(node, attr, None)
-            if params is None:
-                continue
-            try:
-                return [str(item) for item in list(params)]
-            except Exception:
-                return [str(params)]
-        return []
+    def _il_argument_texts(self, *a, **k):
+        return read_evidence._il_argument_texts(self.ctx, *a, **k)
 
     @staticmethod
-    def _safe_int(value) -> int | None:
-        if value is None:
-            return None
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return None
+    def _safe_int(*a, **k):
+        return read_evidence._safe_int(*a, **k)
 
-    _ARG_CONSTANT_RE = re.compile(r"0x[0-9a-fA-F]+")
+    def _resolve_argument_value(self, *a, **k):
+        return read_evidence._resolve_argument_value(self.ctx, *a, **k)
 
-    def _resolve_argument_value(self, bv, text: str) -> dict[str, Any] | None:
-        """Annotate a pointer-constant argument with what it points at.
+    def _call_arguments(self, *a, **k):
+        return read_evidence._call_arguments(self.ctx, *a, **k)
 
-        Generic: fixes std::string::append literals, log format strings, RTTI
-        names, and service identifiers in one place. Returns None for arguments
-        that are not a bare hex pointer or that resolve to nothing useful.
-        """
-        match = self._ARG_CONSTANT_RE.fullmatch(text.strip())
-        if match is None:
-            return None
-        address = self._safe_int(int(match.group(0), 16))
-        if not address:
-            return None
-        context = self._address_context(bv, address)
-        resolved: dict[str, Any] = {"address": hex(address), "kind": context.get("kind")}
-        string = context.get("string")
-        if string:
-            resolved["string"] = string.get("value")
-            if string.get("encoding") and string.get("encoding") != "ascii":
-                resolved["encoding"] = string["encoding"]
-            if string.get("truncated"):
-                resolved["truncated"] = True
-        symbol = context.get("symbol")
-        if symbol and symbol.get("name"):
-            resolved["symbol"] = symbol["name"]
-        function = context.get("function")
-        if function and function.get("name"):
-            resolved["function"] = function["name"]
-        sections = context.get("sections")
-        if sections:
-            resolved["section"] = sections[0].get("name")
-        if not any(key in resolved for key in ("string", "symbol", "function")):
-            return None
-        return resolved
+    def _function_call_evidence(self, *a, **k):
+        return read_evidence._function_call_evidence(self.ctx, *a, **k)
 
-    def _call_arguments(self, bv, insn, call_addr: int) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
-        """Pick one primary argument source and quarantine uncertain extras.
+    def _function_thunk_summary(self, *a, **k):
+        return read_evidence._function_thunk_summary(self.ctx, *a, **k)
 
-        One LLIL call can map to several HLIL call expressions (BN folds adjacent
-        statements); blindly merging their params attributes another call's
-        arguments to this one. Prefer the single HLIL call whose address matches
-        this call site; if that is ambiguous fall back to MLIL, then LLIL. Other
-        candidates are returned separately (JSON-only, not shown in text).
-        """
-        roots = self._hlil_call_roots(insn)
-        chosen = None
-        matched = [r for r in roots if self._safe_int(getattr(r, "address", None)) == int(call_addr)]
-        if len(matched) == 1:
-            chosen = matched[0]
-        elif len(roots) == 1:
-            chosen = roots[0]
+    def _function_evidence(self, *a, **k):
+        return read_evidence._function_evidence(self.ctx, *a, **k)
 
-        mlil = getattr(insn, "mapped_medium_level_il", None)
-        if chosen is not None:
-            source, texts = "hlil", self._il_argument_texts(chosen)
-        elif mlil is not None:
-            source, texts = "mlil", self._il_argument_texts(mlil)
-        else:
-            source, texts = "llil", self._il_argument_texts(insn)
+    def _pointer_table_for_view(self, *a, **k):
+        return read_evidence._pointer_table_for_view(self.ctx, *a, **k)
 
-        primary: list[dict[str, Any]] = []
-        for index, text in enumerate(texts):
-            entry: dict[str, Any] = {"index": index, "text": text}
-            resolved = self._resolve_argument_value(bv, text)
-            if resolved is not None:
-                entry["resolved"] = resolved
-            primary.append(entry)
+    def _pointer_table(self, *a, **k):
+        return read_evidence._pointer_table(self.ctx, *a, **k)
 
-        candidates: list[dict[str, Any]] = []
-        seen: set[tuple[str, int, str]] = {(source, e["index"], e["text"]) for e in primary}
-
-        def add_candidates(candidate_source: str, candidate_texts: list[str]) -> None:
-            for index, text in enumerate(candidate_texts):
-                marker = (candidate_source, index, text)
-                if marker in seen:
-                    continue
-                seen.add(marker)
-                candidates.append({"source": candidate_source, "index": index, "text": text})
-
-        add_candidates("llil", self._il_argument_texts(insn))
-        if mlil is not None:
-            add_candidates("mlil", self._il_argument_texts(mlil))
-        for root in roots:
-            if root is chosen:
-                continue
-            add_candidates("hlil", self._il_argument_texts(root))
-        return source, primary, candidates
-
-    def _function_call_evidence(self, bv, func, *, context: int) -> list[dict[str, Any]]:
-        disasm_entries = self._structured_disasm_entries(bv, func)
-        index_by_addr = {
-            int(item["_address_int"]): index for index, item in enumerate(disasm_entries)
-        }
-        calls = []
-        for insn in self._iter_llil_instructions(func):
-            op_name = self._il_op_name(insn)
-            if op_name not in {
-                "LLIL_CALL",
-                "LLIL_CALL_STACK_ADJUST",
-                "LLIL_TAILCALL",
-            }:
-                continue
-            call_addr = int(getattr(insn, "address", 0))
-            disasm_index = index_by_addr.get(call_addr)
-            previous: list[dict[str, Any]] = []
-            next_instructions: list[dict[str, Any]] = []
-            call_instruction = self._disasm_entry(bv, call_addr, arch=getattr(func, "arch", None))
-            if disasm_index is not None:
-                previous = [
-                    {"address": item["address"], "text": item["text"]}
-                    for item in disasm_entries[max(0, disasm_index - context) : disasm_index]
-                ]
-                next_instructions = [
-                    {"address": item["address"], "text": item["text"]}
-                    for item in disasm_entries[disasm_index + 1 : disasm_index + 1 + context]
-                ]
-                call_instruction = {
-                    "address": disasm_entries[disasm_index]["address"],
-                    "text": disasm_entries[disasm_index]["text"],
-                }
-
-            mlil = getattr(insn, "mapped_medium_level_il", None)
-            dest_value = self._call_destination_value(insn)
-            target = self._target_entry_for_call(bv, dest_value)
-            arg_source, arguments, argument_candidates = self._call_arguments(bv, insn, call_addr)
-            calls.append(
-                {
-                    "address": hex(call_addr),
-                    "operation": op_name,
-                    "direct": dest_value is not None,
-                    "target": target,
-                    "llil": str(insn),
-                    "mlil": str(mlil) if mlil is not None else None,
-                    "hlil_statement": self._hlil_statement_text(insn),
-                    "pre_branch_condition": self._hlil_pre_branch_condition(insn),
-                    "argument_source": arg_source,
-                    "arguments": arguments,
-                    "argument_candidates": argument_candidates,
-                    "call_instruction": call_instruction,
-                    "previous_instructions": previous,
-                    "next_instructions": next_instructions,
-                }
-            )
-        return calls
-
-    def _function_thunk_summary(self, bv, func) -> dict[str, Any]:
-        sections = self._sections_at(bv, int(func.start))
-        if any("plt" in str(section.get("name", "")).lower() for section in sections):
-            return {
-                "is_candidate": True,
-                "reason": "function starts in a PLT/import trampoline section",
-                "target": None,
-                "sections": sections,
-            }
-
-        llil = [
-            insn
-            for insn in self._iter_llil_instructions(func)
-            if self._il_op_name(insn) not in {"LLIL_NOP", "LLIL_UNDEF"}
-        ]
-        result: dict[str, Any] = {
-            "is_candidate": False,
-            "reason": None,
-            "target": None,
-            "sections": sections,
-        }
-        if not llil or len(llil) > 3:
-            return result
-        for insn in llil:
-            op_name = self._il_op_name(insn)
-            if op_name not in {"LLIL_JUMP", "LLIL_TAILCALL", "LLIL_CALL", "LLIL_CALL_STACK_ADJUST"}:
-                continue
-            target = self._target_entry_for_call(bv, self._call_destination_value(insn))
-            if target is None:
-                continue
-            result.update(
-                {
-                    "is_candidate": True,
-                    "reason": f"small function with {op_name.lower()} to another address",
-                    "target": target,
-                }
-            )
-            return result
-
-        try:
-            text = self._decompile_text(bv, func)
-        except Exception:
-            text = ""
-        if "/* tailcall */" in text and len(llil) <= 3:
-            result.update(
-                {
-                    "is_candidate": True,
-                    "reason": "small function rendered as a pseudo-C tailcall",
-                }
-            )
-        return result
-
-    def _function_evidence(self, selector: str | None, identifier, *, context: int = 2):
-        if context < 0:
-            raise OperationFailure("invalid_context", f"Invalid evidence context size: {context}")
-        bv = self._resolve_view(selector)
-        func = self._find_function(bv, identifier)
-        text = self._decompile_text(bv, func)
-        return {
-            "function": {
-                "name": func.name,
-                "address": hex(func.start),
-                "raw_name": getattr(func, "raw_name", func.name),
-            },
-            **self._function_metadata(func),
-            "thunk": self._function_thunk_summary(bv, func),
-            "calls": self._function_call_evidence(bv, func, context=context),
-            "warnings": self._render_warnings(text),
-        }
-
-    def _pointer_table_for_view(
-        self,
-        bv,
-        start: int,
-        *,
-        entries: int,
-        stride_size: int,
-        stop_after_invalid: int | None = None,
-    ) -> dict[str, Any]:
-        pointer_size = self._pointer_size(bv)
-        rows = []
-        warnings = []
-        invalid_run = 0
-        for index in range(entries):
-            entry_address = start + index * stride_size
-            value = self._read_pointer_value(bv, entry_address, size=pointer_size)
-            if value is None:
-                rows.append(
-                    {
-                        "index": index,
-                        "entry_address": hex(entry_address),
-                        "value": None,
-                        "readable": False,
-                    }
-                )
-                invalid_run += 1
-                if stop_after_invalid is not None and invalid_run >= stop_after_invalid:
-                    warnings.append(
-                        f"stopped after {invalid_run} unreadable/implausible entries at {hex(entry_address)}"
-                    )
-                    break
-                continue
-            target = self._normalize_code_pointer(bv, value)
-            if target["plausible"] or target["status"] == "null":
-                invalid_run = 0
-            else:
-                invalid_run += 1
-            rows.append(
-                {
-                    "index": index,
-                    "entry_address": hex(entry_address),
-                    "value": hex(value),
-                    "readable": True,
-                    "plausible": bool(target["plausible"]),
-                    "target": target,
-                }
-            )
-            if stop_after_invalid is not None and invalid_run >= stop_after_invalid:
-                warnings.append(
-                    f"stopped after {invalid_run} unreadable/implausible entries at {hex(entry_address)}"
-                )
-                break
-
-        table_context = self._address_context(bv, start)
-        segment = table_context.get("segment")
-        section_names = [
-            str(section.get("name", "")).lower()
-            for section in list(table_context.get("sections") or [])
-            if isinstance(section, dict)
-        ]
-        code_like_section = any(
-            name in {".text", "__text"} or name.startswith(".plt")
-            for name in section_names
-        )
-        data_like_section = any(
-            marker in name
-            for name in section_names
-            for marker in ("data", "rodata", "got", "rdata", "bss", "init_array", "fini_array", "ctors", "dtors")
-        )
-        if isinstance(segment, dict) and segment.get("executable") and (code_like_section or not data_like_section):
-            warnings.append("table start is in an executable segment; this may be code, not a pointer table")
-        non_null_rows = [
-            row for row in rows
-            if row.get("readable") and row.get("value") not in {None, "0x0"}
-        ]
-        plausible_rows = [row for row in non_null_rows if row.get("plausible")]
-        if non_null_rows and not plausible_rows:
-            warnings.append("no non-null entries resolve to mapped addresses; low confidence pointer table")
-        elif non_null_rows and len(plausible_rows) < len(non_null_rows):
-            warnings.append(
-                f"{len(non_null_rows) - len(plausible_rows)} non-null entries do not resolve to mapped addresses"
-            )
-        interior_function_rows = [
-            row for row in non_null_rows
-            if isinstance(row.get("target"), dict)
-            and isinstance(row["target"].get("function"), dict)
-            and row["target"]["function"].get("exact_start") is False
-        ]
-        if interior_function_rows:
-            warnings.append(
-                f"{len(interior_function_rows)} entries resolve inside functions but not at function starts"
-            )
-        return {
-            "address": hex(start),
-            "pointer_size": pointer_size,
-            "stride": stride_size,
-            "context": table_context,
-            "entries": rows,
-            "warnings": warnings,
-        }
-
-    def _pointer_table(self, selector: str | None, address, *, entries: int = 16, stride=None):
-        if entries < 0:
-            raise OperationFailure("invalid_entries", f"Invalid table entry count: {entries}")
-        bv = self._resolve_view(selector)
-        start = _parse_address(address)
-        pointer_size = self._pointer_size(bv)
-        stride_size = _parse_address(stride) if stride not in (None, "") else pointer_size
-        if stride_size <= 0:
-            raise OperationFailure("invalid_stride", f"Invalid table stride: {stride_size}")
-        return self._pointer_table_for_view(
-            bv,
-            start,
-            entries=entries,
-            stride_size=stride_size,
-        )
-
-    def _message_lens(self, selector: str | None, query: str, *, limit: int = 20, table_entries: int = 6):
-        limit = _validate_count(limit, label="limit", minimum=1)
-        table_entries = _validate_count(table_entries, label="table_entries", minimum=0)
-        bv = self._resolve_view(selector)
-        needle = query.lower()
-        matches = []
-        total_matched = 0
-        for item in list(getattr(bv, "strings", [])):
-            value = str(getattr(item, "value", ""))
-            if needle and needle not in value.lower():
-                continue
-            # Count every match so the reported total is honest, but only build
-            # the expensive per-match evidence (xrefs + pointer tables) for the
-            # first `limit` matches that are actually returned.
-            total_matched += 1
-            if len(matches) >= limit:
-                continue
-            address = int(getattr(item, "start", 0))
-            xrefs = self._xrefs_to_address(bv, address)
-            metadata_tables = []
-            for ref in list(xrefs.get("data_refs") or [])[:3]:
-                try:
-                    ref_addr = _parse_address(ref["address"])
-                except Exception:
-                    continue
-                start = max(0, ref_addr - self._pointer_size(bv) * 2)
-                metadata_tables.append(
-                    self._pointer_table_for_view(
-                        bv,
-                        start,
-                        entries=table_entries,
-                        stride_size=self._pointer_size(bv),
-                        stop_after_invalid=1,
-                    )
-                )
-
-            matches.append(
-                {
-                    "type_string": {
-                        "address": hex(address),
-                        "value": value,
-                        "length": int(getattr(item, "length", len(value))),
-                        "context": self._address_context(bv, address),
-                    },
-                    "xrefs": xrefs,
-                    "metadata_table_windows": metadata_tables,
-                }
-            )
-        return {
-            "query": query,
-            "matches": matches,
-            "count": len(matches),
-            "total": total_matched,
-            "truncated": total_matched > len(matches),
-        }
+    def _message_lens(self, *a, **k):
+        return read_evidence._message_lens(self.ctx, *a, **k)
 
     def _iter_il_instructions(self, *a, **k):
         return il_format._iter_il_instructions(*a, **k)
@@ -2520,52 +2140,8 @@ class BinaryNinjaBridge:
         items.sort(key=lambda item: (int(item["address"], 16), item["value"]))
         return items[offset : offset + limit]
 
-    _INIT_SECTION_HINTS = (
-        "init_array",
-        "preinit_array",
-        "fini_array",
-        ".ctors",
-        ".dtors",
-        "__mod_init_func",
-        "__mod_term_func",
-    )
-
-    def _init_arrays(self, selector: str | None, *, limit: int = 64):
-        if limit < 0:
-            raise OperationFailure("invalid_limit", f"Invalid init-array limit: {limit}")
-        bv = self._resolve_view(selector)
-        pointer_size = self._pointer_size(bv)
-        sections = []
-        for name, sec in getattr(bv, "sections", {}).items():
-            lowered = str(name).lower()
-            if not any(hint in lowered for hint in self._INIT_SECTION_HINTS):
-                continue
-            start = int(getattr(sec, "start", 0))
-            end = int(getattr(sec, "end", 0))
-            total_entries = max(0, (end - start) // pointer_size)
-            shown_entries = min(total_entries, limit)
-            table = self._pointer_table_for_view(
-                bv,
-                start,
-                entries=shown_entries,
-                stride_size=pointer_size,
-            )
-            sections.append(
-                {
-                    "name": str(name),
-                    "start": hex(start),
-                    "end": hex(end),
-                    "total_entries": total_entries,
-                    "shown_entries": shown_entries,
-                    "truncated": total_entries > shown_entries,
-                    "table": table,
-                }
-            )
-        sections.sort(key=lambda item: int(item["start"], 16))
-        return {
-            "pointer_size": pointer_size,
-            "sections": sections,
-        }
+    def _init_arrays(self, *a, **k):
+        return read_evidence._init_arrays(self.ctx, *a, **k)
 
     _IMPORT_SYMBOL_TYPES: list[tuple[str, str]] = [
         ("ImportedFunctionSymbol", "function"),

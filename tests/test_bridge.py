@@ -1957,7 +1957,9 @@ def test_function_evidence_reports_calls_arguments_and_thunk_candidate(monkeypat
             0x500000: "b send_message",
         },
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _function_evidence now resolves the view through the BridgeContext seam
+    # (read_evidence), so patch the moved free function's resolution path.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._function_evidence("active", "build_response", context=1)
     call = result["calls"][0]
@@ -2063,7 +2065,9 @@ def test_function_evidence_resolves_pointer_constant_arguments(monkeypatch):
         segments={0x2A4F4: _FakeSegment(readable=True)},
         memory={0x2A4F4: b"4\x00"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _function_evidence now resolves the view through the BridgeContext seam
+    # (read_evidence), so patch the moved free function's resolution path.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._function_evidence("active", "createBTService", context=0)
     call = result["calls"][0]
@@ -2099,7 +2103,9 @@ def test_function_evidence_does_not_merge_unrelated_hlil_call_args(monkeypatch):
         instruction_lengths={0x17188: 4},
         disassembly={0x17188: "blx getopt_long"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _function_evidence now resolves the view through the BridgeContext seam
+    # (read_evidence), so patch the moved free function's resolution path.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._function_evidence("active", "main", context=0)
     call = result["calls"][0]
@@ -2122,7 +2128,9 @@ def test_pointer_table_normalizes_thumb_function_pointers(monkeypatch):
             return super().get_function_at(address)
 
     bv = _ThumbTolerantBV(functions=[target], arch=_FakeArch(name="armv7"), memory={0x3000: table})
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _pointer_table now resolves the view through the BridgeContext seam
+    # (read_evidence), so patch the moved free function's resolution path.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._pointer_table("active", "0x3000", entries=2)
 
@@ -2149,7 +2157,9 @@ def test_pointer_table_does_not_thumb_normalize_non_arm_pointers(monkeypatch):
             return super().get_function_at(address)
 
     bv = _OddTolerantBV(functions=[target], arch=_FakeArch(name="x86"), memory={0x3000: table})
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _pointer_table now resolves the view through the BridgeContext seam
+    # (read_evidence), so patch the moved free function's resolution path.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._pointer_table("active", "0x3000", entries=1)
     target_info = result["entries"][0]["target"]
@@ -2175,7 +2185,9 @@ def test_function_evidence_marks_plt_stubs_as_thunk_candidates(monkeypatch):
         sections={".plt.got": _FakeSection(".plt.got", 0x404020, 0x404100)},
         disassembly={0x404020: "jmp qword ptr [rip+0x2000]"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _function_evidence now resolves the view through the BridgeContext seam
+    # (read_evidence), so patch the moved free function's resolution path.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._function_evidence("active", "puts@plt", context=0)
 
@@ -2192,7 +2204,9 @@ def test_pointer_table_warns_when_start_looks_like_code_not_table(monkeypatch):
         segments={0x64EA0: _FakeSegment(readable=True, executable=True)},
         memory=memory,
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _pointer_table now resolves the view through the BridgeContext seam
+    # (read_evidence), so patch the moved free function's resolution path.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._pointer_table("active", "0x64ea0", entries=2)
 
@@ -2215,7 +2229,9 @@ def test_message_lens_summarizes_type_string_xrefs_and_metadata_window(monkeypat
         disassembly={0x586C0: "adr r1, common.HeadUnitInfo"},
         memory=memory,
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _message_lens now resolves the view through the BridgeContext seam
+    # (read_evidence), so patch the moved free function's resolution path.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._message_lens("active", "HeadUnitInfo", limit=5, table_entries=2)
 
@@ -2278,7 +2294,9 @@ def test_message_lens_reports_true_total_and_flags_truncation(monkeypatch):
     # but the reported total must be the honest 5 with truncated=True (issue #13).
     strings = [_FakeStringRef(0x1000 + i * 0x20, 9, f"Evt{i}_token") for i in range(5)]
     bv = _FakeBV(arch=_FakeArch(name="armv7"), strings=strings)
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _message_lens now resolves the view through the BridgeContext seam
+    # (read_evidence), so patch the moved free function's resolution path.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._message_lens("active", "token", limit=2)
 
@@ -2293,7 +2311,9 @@ def test_message_lens_not_truncated_when_all_matches_fit(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     strings = [_FakeStringRef(0x1000 + i * 0x20, 9, f"Evt{i}_token") for i in range(3)]
     bv = _FakeBV(arch=_FakeArch(name="armv7"), strings=strings)
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _message_lens now resolves the view through the BridgeContext seam
+    # (read_evidence), so patch the moved free function's resolution path.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._message_lens("active", "token", limit=20)
 
@@ -2321,7 +2341,9 @@ def test_message_lens_metadata_window_stops_at_obvious_non_pointer(monkeypatch):
         data_refs={0x175BE4: [0x6008]},
         memory=memory,
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _message_lens now resolves the view through the BridgeContext seam
+    # (read_evidence), so patch the moved free function's resolution path.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._message_lens("active", "HeadUnitInfo", limit=5, table_entries=8)
     table = result["matches"][0]["metadata_table_windows"][0]
@@ -2754,7 +2776,9 @@ def test_init_arrays_summarizes_constructor_pointer_sections(monkeypatch):
         },
         memory={0x5000: table},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _init_arrays now resolves the view through the BridgeContext seam
+    # (read_evidence), so patch the moved free function's resolution path.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._init_arrays("active", limit=4)
 
