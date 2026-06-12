@@ -2390,7 +2390,7 @@ def test_py_exec_non_serializable_result_falls_back_to_repr(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV()
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._py_exec("active", "result = object()")
 
@@ -3029,7 +3029,7 @@ def test_function_create_at_executable_address_returns_verified(monkeypatch):
         segments={0x1000: _FakeSegment(readable=True, executable=True)},
         memory={0x1000: b"\x55\x48\x89\xe5"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._function_create(None, "0x1000", False)
 
@@ -3053,7 +3053,7 @@ def test_function_create_preview_reverts_without_committing(monkeypatch):
         segments={0x1000: _FakeSegment(readable=True, executable=True)},
         memory={0x1000: b"\x55\x48\x89\xe5"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._function_create(None, "0x1000", True)
 
@@ -3072,7 +3072,7 @@ def test_function_create_existing_function_is_noop(monkeypatch):
         segments={0x1000: _FakeSegment(readable=True, executable=True)},
         memory={0x1000: b"\x55\x48\x89\xe5"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._function_create(None, "0x1000", False)
 
@@ -3091,7 +3091,7 @@ def test_function_create_unmapped_address_is_rejected(monkeypatch):
         segments={0x1000: _FakeSegment(readable=True, executable=True)},
         memory={0x1000: b"\x55\x48\x89\xe5"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     with pytest.raises(RuntimeError, match="0xdead.*not mapped"):
         instance._function_create(None, "0xdead", False)
@@ -3106,7 +3106,7 @@ def test_function_create_non_executable_address_is_rejected(monkeypatch):
         segments={0x5000: _FakeSegment(readable=True, writable=True, executable=False)},
         memory={0x5000: b"\x01\x02\x03\x04"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     with pytest.raises(RuntimeError, match="0x5000.*not inside an executable segment"):
         instance._function_create(None, "0x5000", False)
@@ -5065,7 +5065,7 @@ def test_py_exec_reports_script_error_with_type_prefix(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV()
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     # A NameError used to be tagged "internal error: NameError:" while a raised
     # ValueError surfaced as a bare message. Both now read "TypeName: message".
@@ -5667,7 +5667,7 @@ def test_get_comment_rejects_both_locators(monkeypatch):
     # (the CLI mutex group doesn't protect raw clients).
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: _FakeBV())
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: _FakeBV())
     with pytest.raises(RuntimeError, match="not both"):
         instance._get_comment("active", "0x1000", "main")
 
@@ -5703,7 +5703,7 @@ def test_list_comments_rejects_negative_count(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV()
     bv.address_comments = {}
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
     with pytest.raises(bridge.OperationFailure) as exc:
         instance._list_comments("active", limit=-3)
     assert exc.value.status == "invalid_request"

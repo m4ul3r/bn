@@ -4,7 +4,6 @@ import atexit
 import contextlib
 import difflib
 import errno
-import io
 import json
 import os
 import socket
@@ -20,6 +19,7 @@ from typing import Any
 import binaryninja as bn
 from binaryninja.plugin import PluginCommand
 
+from . import create_comments
 from . import il_format
 from . import mutation_engine
 from . import read_decompile
@@ -1243,175 +1243,14 @@ class BinaryNinjaBridge:
     def _is_executable_address(self, *a, **k):
         return read_misc._is_executable_address(self.ctx, *a, **k)
 
-    def _function_create(self, selector: str | None, address, preview: bool):
-        bv = self._resolve_view(selector)
-        addr = _parse_address(address)
-        requested = {"op": "function_create", "address": hex(addr)}
+    def _function_create(self, *a, **k):
+        return create_comments._function_create(self.ctx, *a, **k)
 
-        existing = bv.get_function_at(addr)
-        if existing is not None:
-            return {
-                "preview": preview,
-                "success": True,
-                "committed": False,
-                "message": "A function already starts at this address.",
-                "results": [
-                    {
-                        "op": "function_create",
-                        "status": "noop",
-                        "address": hex(addr),
-                        "function": str(existing.name),
-                        "message": "A function already starts at this address.",
-                        "requested": requested,
-                    }
-                ],
-                "affected_functions": [],
-                "affected_types": [],
-            }
+    def _get_comment(self, *a, **k):
+        return create_comments._get_comment(self.ctx, *a, **k)
 
-        # Refuse to create junk functions: the address must be mapped and live
-        # inside an executable region. Auto-analysis skips exactly these handler
-        # entry points (reachable only via data/function-pointer tables), so we
-        # still create them on request -- but only where code can actually run.
-        if len(bytes(bv.read(addr, 1))) == 0:
-            raise RuntimeError(
-                f"Cannot create function: address 0x{addr:x} is not mapped"
-            )
-        if not self._is_executable_address(bv, addr):
-            raise RuntimeError(
-                f"Cannot create function: address 0x{addr:x} is not inside an executable segment"
-            )
-
-        state = bv.begin_undo_actions()
-        try:
-            bv.add_function(addr)
-            bv.update_analysis_and_wait()
-            created = bv.get_function_at(addr)
-            if created is None:
-                reverted = self._revert_undo_safely(bv, state)
-                return {
-                    "preview": preview,
-                    "success": False,
-                    "committed": False,
-                    "rolled_back": reverted,
-                    "message": (
-                        "Rolled back because no function was created at the address."
-                        if reverted
-                        else "No function was created at the address AND the rollback failed; "
-                        "the view may be left partially modified."
-                    ),
-                    "results": [
-                        {
-                            "op": "function_create",
-                            "status": "verification_failed",
-                            "address": hex(addr),
-                            "message": f"No function starts at 0x{addr:x} after analysis.",
-                            "requested": requested,
-                            "observed": {"address": hex(addr), "function": None},
-                        }
-                    ],
-                    "affected_functions": [],
-                    "affected_types": [],
-                }
-
-            function_name = str(created.name)
-            if preview:
-                bv.revert_undo_actions(state)
-                message = "Preview verified and reverted."
-            else:
-                bv.commit_undo_actions(state)
-                message = "Function created and verified in the live Binary Ninja session."
-            return {
-                "preview": preview,
-                "success": True,
-                "committed": bool(not preview),
-                "message": message,
-                "results": [
-                    {
-                        "op": "function_create",
-                        "status": "verified",
-                        "address": hex(addr),
-                        "function": function_name,
-                        "requested": requested,
-                    }
-                ],
-                "affected_functions": [
-                    {
-                        "address": hex(addr),
-                        "before_name": None,
-                        "after_name": function_name,
-                        "changed": True,
-                    }
-                ],
-                "affected_types": [],
-            }
-        except Exception as exc:
-            if not self._revert_undo_safely(bv, state):
-                raise RuntimeError(
-                    f"{exc} (additionally, rollback failed; the view may be left partially modified)"
-                ) from exc
-            raise
-
-    def _get_comment(self, selector: str | None, address, function):
-        bv = self._resolve_view(selector)
-        if function and address is not None:
-            raise RuntimeError(
-                "Pass --address or --function, not both: they target different locations."
-            )
-        if function:
-            fn = self._find_function(bv, function)
-            comment = bv.get_comment_at(fn.start)
-            return {
-                "function": fn.name,
-                "address": hex(fn.start),
-                "comment": comment or "",
-                "has_comment": bool(comment),
-            }
-
-        if address is None:
-            raise RuntimeError("comment get requires --address or --function")
-
-        comment_address = _parse_address(address)
-        comment = bv.get_comment_at(comment_address)
-        return {
-            "address": hex(comment_address),
-            "comment": comment or "",
-            "has_comment": bool(comment),
-        }
-
-    def _list_comments(
-        self,
-        selector: str | None,
-        *,
-        query: str | None = None,
-        offset: int = 0,
-        limit: int | None = None,
-    ):
-        # Re-enforce the count contract (see _sections) so a negative offset/
-        # limit is a clean invalid_request, not a silent negative-slice (#100).
-        offset = _validate_count(offset, label="offset", minimum=0)
-        limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
-        bv = self._resolve_view(selector)
-        needle = query.lower() if query else None
-        items = []
-        for addr in sorted(bv.address_comments):
-            text = bv.address_comments[addr]
-            if not text:
-                continue
-            if needle and needle not in text.lower():
-                continue
-            funcs = bv.get_functions_containing(addr)
-            func_name = funcs[0].name if funcs else None
-            items.append({
-                "address": hex(addr),
-                "function": func_name,
-                "comment": text,
-            })
-        if offset:
-            items = items[offset:]
-        if limit is not None:
-            items = items[:limit]
-        return items
+    def _list_comments(self, *a, **k):
+        return create_comments._list_comments(self.ctx, *a, **k)
 
     def _bundle_function(self, selector: str | None, identifier, out_path: str | None):
         bv = self._resolve_view(selector)
@@ -1443,47 +1282,11 @@ class BinaryNinjaBridge:
         artifact = _write_json_artifact(out_path, bundle)
         return artifact or bundle
 
-    def _normalize_py_result(self, value: Any) -> tuple[Any, list[str]]:
-        def normalize(item: Any) -> Any:
-            if item is None or isinstance(item, (bool, int, float, str)):
-                return item
-            if isinstance(item, (list, tuple)):
-                return [normalize(part) for part in item]
-            if isinstance(item, dict):
-                return {str(key): normalize(val) for key, val in item.items()}
-            raise TypeError(type(item).__name__)
+    def _normalize_py_result(self, *a, **k):
+        return create_comments._normalize_py_result(self.ctx, *a, **k)
 
-        try:
-            return normalize(value), []
-        except TypeError:
-            return repr(value), ["`result` was not JSON-serializable; returned repr(result) instead."]
-
-    def _py_exec(self, selector: str | None, script: str):
-        bv = self._resolve_view(selector)
-        stdout = io.StringIO()
-        scope = {
-            "bn": bn,
-            "binaryninja": bn,
-            "bv": bv,
-            "result": None,
-        }
-        with contextlib.redirect_stdout(stdout):
-            try:
-                exec(script, scope, scope)
-            except Exception as exc:  # noqa: BLE001 - user script errors are user-facing
-                # Report every script failure the same way -- "TypeName: message".
-                # Previously a ValueError surfaced as a bare message while a
-                # NameError was tagged "internal error: NameError:", because only
-                # some builtins are whitelisted as user-facing. The user's own
-                # script raised this, so it is always a user-facing error.
-                raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
-        result_value, warnings = self._normalize_py_result(scope.get("result"))
-        result = {
-            "stdout": stdout.getvalue(),
-            "result": result_value,
-            "warnings": warnings,
-        }
-        return result
+    def _py_exec(self, *a, **k):
+        return create_comments._py_exec(self.ctx, *a, **k)
 
     def _render_warnings(self, *a, **k):
         return il_format._render_warnings(*a, **k)
@@ -1497,7 +1300,7 @@ class BinaryNinjaBridge:
     # the BridgeContext (self.ctx). These thin shims keep the bridge method
     # names alive so the op binders and the test suite (which call many of
     # these directly) keep working -- the existing _taint -> taint_engine
-    # pattern. _function_create (the create-cluster op) stays in the bridge.
+    # pattern.
     def _guess_type_affected_functions(self, *a, **k):
         return mutation_engine._guess_type_affected_functions(self.ctx, *a, **k)
 
