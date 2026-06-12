@@ -24,6 +24,7 @@ from binaryninja.plugin import PluginCommand
 
 from . import il_format
 from . import mutation_engine
+from . import read_decompile
 from . import read_evidence
 from . import read_misc
 from . import read_xrefs
@@ -1240,115 +1241,26 @@ class BinaryNinjaBridge:
     def _analysis_stub_warning(self, *a, **k):
         return il_format._analysis_stub_warning(*a, **k)
 
-    def _force_function_analysis(self, bv, func):
-        """Override a skipped function's analysis and reanalyze it in place.
+    def _force_function_analysis(self, *a, **k):
+        return read_decompile._force_function_analysis(self.ctx, *a, **k)
 
-        Mutates the BinaryView (skip override + reanalysis), so callers must hold
-        the exclusive write lock. Returns the (possibly rebuilt) function object.
-        """
-        start = int(func.start)
-        try:
-            func.analysis_skipped = False  # setter installs NeverSkipFunctionAnalysis
-        except Exception:
-            pass
-        try:
-            func.reanalyze()
-        except Exception:
-            pass
-        bv.update_analysis_and_wait()
-        return bv.get_function_at(start) or func
+    def _decompile(self, *a, **k):
+        return read_decompile._decompile(self.ctx, *a, **k)
 
-    def _decompile(self, selector: str | None, identifier, *, addresses: bool = False, force_analysis: bool = False):
-        bv = self._resolve_view(selector)
-        func = self._find_function(bv, identifier)
-        forced = False
-        if force_analysis and bool(getattr(func, "analysis_skipped", False)):
-            func = self._force_function_analysis(bv, func)
-            forced = True
-        text = self._decompile_text(bv, func, addresses=addresses)
-        warnings = self._render_warnings(text)
-        stub = self._analysis_stub_warning(func, text, forced=forced)
-        if stub:
-            warnings.append(stub)
-        comments = self._comment_map(bv, func)
-        return {
-            "function": {"name": func.name, "address": hex(func.start)},
-            "text": text,
-            "comments": comments,
-            "warnings": warnings,
-            "analysis_skipped": bool(getattr(func, "analysis_skipped", False)),
-            # `analysis_force_requested` echoes the --force-analysis flag; `analysis_forced`
-            # is True only when a reanalysis actually ran this call. On a second forced
-            # decompile the function is no longer skipped, so nothing reruns and
-            # analysis_forced is False -- the echo tells callers the flag wasn't ignored.
-            "analysis_force_requested": bool(force_analysis),
-            "analysis_forced": forced,
-        }
+    def _function_info(self, *a, **k):
+        return read_decompile._function_info(self.ctx, *a, **k)
 
-    def _function_info(self, selector: str | None, identifier):
-        bv = self._resolve_view(selector)
-        func = self._find_function(bv, identifier)
-        metadata = self._function_metadata(func)
-        variables = self._list_locals(func)
-        parameters = [item for item in variables if item["is_parameter"]]
-        locals_only = [item for item in variables if not item["is_parameter"]]
-        code_ref_count = len(list(bv.get_code_refs(func.start)))
-        return {
-            "function": {
-                "name": func.name,
-                "address": hex(func.start),
-                "raw_name": getattr(func, "raw_name", func.name),
-            },
-            **metadata,
-            "parameters": parameters,
-            "locals": locals_only,
-            "xref_count": code_ref_count,
-        }
+    def _get_prototype(self, *a, **k):
+        return read_decompile._get_prototype(self.ctx, *a, **k)
 
-    def _get_prototype(self, selector: str | None, identifier):
-        bv = self._resolve_view(selector)
-        func = self._find_function(bv, identifier)
-        return {
-            "function": {
-                "name": func.name,
-                "address": hex(func.start),
-                "raw_name": getattr(func, "raw_name", func.name),
-            },
-            **self._function_metadata(func),
-        }
+    def _list_locals_for_function(self, *a, **k):
+        return read_decompile._list_locals_for_function(self.ctx, *a, **k)
 
-    def _list_locals_for_function(self, selector: str | None, identifier):
-        bv = self._resolve_view(selector)
-        func = self._find_function(bv, identifier)
-        variables = self._list_locals(func)
-        return {
-            "function": {
-                "name": func.name,
-                "address": hex(func.start),
-                "raw_name": getattr(func, "raw_name", func.name),
-            },
-            "locals": variables,
-        }
+    def _il(self, *a, **k):
+        return read_decompile._il(self.ctx, *a, **k)
 
-    def _il(self, selector: str | None, identifier, view: str, ssa: bool):
-        bv = self._resolve_view(selector)
-        func = self._find_function(bv, identifier)
-        text = self._function_text(bv, func, view=view, ssa=ssa)
-        return {
-            "function": {"name": func.name, "address": hex(func.start)},
-            "view": view,
-            "ssa": ssa,
-            "text": text,
-            "warnings": self._render_warnings(text),
-        }
-
-    def _disasm(self, selector: str | None, identifier):
-        bv = self._resolve_view(selector)
-        func = self._find_function(bv, identifier)
-        return {
-            "function": {"name": func.name, "address": hex(func.start)},
-            "text": self._disasm_text(bv, func),
-        }
+    def _disasm(self, *a, **k):
+        return read_decompile._disasm(self.ctx, *a, **k)
 
     # ------------------------------------------------------------------
     # Structured data-flow primitives (def-use / value-set / call graph)
@@ -1366,235 +1278,23 @@ class BinaryNinjaBridge:
     def _resolve_ssa_variable(self, *a, **k):
         return il_format._resolve_ssa_variable(*a, **k)
 
-    def _structured_il(self, selector, identifier, *, view: str = "mlil", ssa: bool = True):
-        bv = self._resolve_view(selector)
-        func = self._find_function(bv, identifier)
-        il = self._il_function_for(func, view, ssa)
-        instructions = []
-        try:
-            items = list(il.instructions)
-        except Exception:
-            items = []
-        for ins in items:
-            opn = self._il_op_name(ins)
-            instructions.append({
-                "il_index": int(getattr(ins, "instr_index", -1)),
-                "address": hex(int(getattr(ins, "address", func.start))),
-                "op": opn,
-                "text": str(ins),
-                "vars_read": [self._ssa_var_entry(v) for v in (getattr(ins, "vars_read", None) or [])],
-                "vars_written": [self._ssa_var_entry(v) for v in (getattr(ins, "vars_written", None) or [])],
-                "operands_summary": [str(o) for o in (getattr(ins, "operands", None) or [])],
-                "is_call": "CALL" in opn,
-            })
-        return {
-            "function": {"name": func.name, "address": hex(func.start)},
-            "view": view,
-            "ssa": ssa,
-            "instructions": instructions,
-        }
+    def _structured_il(self, *a, **k):
+        return read_decompile._structured_il(self.ctx, *a, **k)
 
-    def _defuse(self, selector, identifier, var_selector: str):
-        bv = self._resolve_view(selector)
-        func = self._find_function(bv, identifier)
-        il = self._il_function_for(func, "mlil", True)
-        ssa_var, other_versions = self._resolve_ssa_variable(func, il, var_selector)
-
-        try:
-            definition = il.get_ssa_var_definition(ssa_var)
-        except Exception:
-            definition = None
-        try:
-            uses = list(il.get_ssa_var_uses(ssa_var) or [])
-        except Exception:
-            uses = []
-
-        def _ref(ins):
-            if ins is None:
-                return None
-            return {
-                "il_index": int(getattr(ins, "instr_index", -1)),
-                "address": hex(int(getattr(ins, "address", func.start))),
-                "op": self._il_op_name(ins),
-                "text": str(ins),
-            }
-
-        is_phi = definition is not None and "PHI" in self._il_op_name(definition)
-        phi_sources = []
-        if is_phi:
-            for s in (getattr(definition, "src", None) or []):
-                phi_sources.append(self._ssa_var_entry(s))
-
-        return {
-            "function": {"name": func.name, "address": hex(func.start)},
-            "variable": self._ssa_var_entry(ssa_var),
-            "definition": _ref(definition),
-            "uses": [_ref(u) for u in uses],
-            "is_phi": is_phi,
-            "phi_sources": phi_sources,
-            "other_versions": other_versions or [],
-        }
+    def _defuse(self, *a, **k):
+        return read_decompile._defuse(self.ctx, *a, **k)
 
     def _serialize_pvs(self, *a, **k):
         return il_format._serialize_pvs(*a, **k)
 
-    def _pvs_targets(self, bv, pvs) -> list[dict[str, Any]]:
-        if pvs is None:
-            return []
-        type_name = getattr(getattr(pvs, "type", None), "name", "") or ""
-        addrs: list[int] = []
-        if type_name in {"ConstantValue", "ConstantPointerValue", "ImportedAddressValue", "ExternalPointerValue"}:
-            value = getattr(pvs, "value", None)
-            if value is not None:
-                try:
-                    addrs.append(int(value))
-                except Exception:
-                    pass
-        elif type_name == "InSetOfValues":
-            for v in (getattr(pvs, "values", None) or []):
-                try:
-                    addrs.append(int(v))
-                except Exception:
-                    pass
-        elif type_name == "LookupTableValue":
-            mapping = getattr(pvs, "mapping", None)
-            if isinstance(mapping, dict):
-                for v in mapping.values():
-                    try:
-                        addrs.append(int(v))
-                    except Exception:
-                        pass
-            else:
-                for entry in (getattr(pvs, "table", None) or []):
-                    target = getattr(entry, "to", None)
-                    if target is not None:
-                        try:
-                            addrs.append(int(target))
-                        except Exception:
-                            pass
-        targets = []
-        for addr in addrs:
-            # function_at normalizes the Thumb low bit so an odd value-set target
-            # resolves to its function (#89 Problem B). The raw address is kept
-            # in the reported "address".
-            fn = _taint.function_at(bv, addr)
-            name = None
-            if fn is not None:
-                name = str(getattr(fn, "name", None))
-            else:
-                sym = bv.get_symbol_at(addr) if hasattr(bv, "get_symbol_at") else None
-                if sym is None and (addr & 1) and hasattr(bv, "get_symbol_at"):
-                    sym = bv.get_symbol_at(addr & ~1)
-                name = str(getattr(sym, "name", None)) if sym is not None else None
-            targets.append({"address": hex(addr), "name": name})
-        return targets
+    def _pvs_targets(self, *a, **k):
+        return read_decompile._pvs_targets(self.ctx, *a, **k)
 
-    def _resolved_calls(self, selector, identifier, *, direction: str = "both", resolve_indirect: bool = True):
-        bv = self._resolve_view(selector)
-        func = self._find_function(bv, identifier)
-        result: dict[str, Any] = {"function": {"name": func.name, "address": hex(func.start)}}
+    def _resolved_calls(self, *a, **k):
+        return read_decompile._resolved_calls(self.ctx, *a, **k)
 
-        if direction in ("callees", "both"):
-            il = self._il_function_for(func, "mlil", True)
-            callees = []
-            try:
-                items = list(il.instructions)
-            except Exception:
-                items = []
-            for ins in items:
-                opn = self._il_op_name(ins)
-                if "CALL" not in opn and "TAILCALL" not in opn:
-                    continue
-                # resolve_call_target (no thunk following) resolves MLIL_IMPORT
-                # calls and Thumb-tagged targets that const_target/exact-address
-                # lookup miss (#89). Constant direct calls resolve identically.
-                resolved = _taint.resolve_call_target(bv, ins, follow_thunks=False)
-                target = resolved.address
-                row = {
-                    "call_addr": hex(int(getattr(ins, "address", func.start))),
-                    "il_index": int(getattr(ins, "instr_index", -1)),
-                }
-                if target is not None:
-                    fn = resolved.function or (bv.get_function_at(target) if hasattr(bv, "get_function_at") else None)
-                    name = str(fn.name) if fn is not None else None
-                    if name is None:
-                        sym = bv.get_symbol_at(target) if hasattr(bv, "get_symbol_at") else None
-                        name = str(sym.name) if sym is not None else None
-                    row.update({"kind": "direct", "target": {"address": hex(target), "name": name}})
-                else:
-                    row.update({"kind": "indirect", "dest_expr": str(getattr(ins, "dest", ""))})
-                    if resolve_indirect:
-                        pvs = getattr(getattr(ins, "dest", None), "possible_values", None)
-                        resolved = self._pvs_targets(bv, pvs)
-                        row["resolved"] = resolved
-                        type_name = getattr(getattr(pvs, "type", None), "name", "") or "none"
-                        row["resolution"] = "possible_values" if resolved else "unresolved"
-                        row["resolution_detail"] = type_name
-                callees.append(row)
-            result["callees"] = callees
-
-        if direction in ("callers", "both"):
-            callers = []
-            seen: set[int] = set()
-            for site in (list(getattr(func, "caller_sites", None) or [])):
-                addr = int(getattr(site, "address", 0))
-                fn = getattr(site, "function", None)
-                if fn is None:
-                    functions = self._functions_containing(bv, addr)
-                    fn = functions[0] if functions else None
-                caller = (
-                    {"address": hex(int(fn.start)), "name": str(fn.name)} if fn is not None else None
-                )
-                callers.append({"call_addr": hex(addr), "caller": caller})
-            if not callers:
-                for fn in (list(getattr(func, "callers", None) or [])):
-                    marker = int(getattr(fn, "start", 0))
-                    if marker in seen:
-                        continue
-                    seen.add(marker)
-                    callers.append({"caller": {"address": hex(marker), "name": str(fn.name)}})
-            result["callers"] = callers
-
-        return result
-
-    def _possible_values(self, selector, identifier, at):
-        bv = self._resolve_view(selector)
-        func = self._find_function(bv, identifier)
-        address = _parse_address(at)
-        il = self._il_function_for(func, "mlil", True)
-        target_ins = None
-        try:
-            for ins in list(il.instructions):
-                if int(getattr(ins, "address", -1)) == address:
-                    target_ins = ins
-                    break
-        except Exception:
-            target_ins = None
-        instr_pvs = getattr(target_ins, "possible_values", None) if target_ins is not None else None
-        src_expr = getattr(target_ins, "src", None) if target_ins is not None else None
-        src_pvs = getattr(src_expr, "possible_values", None) if src_expr is not None else None
-        # BN leaves a SET_VAR/STORE *instruction* value-set undetermined while the
-        # SOURCE expression (the value being assigned) carries the real value-set
-        # -- const / range / lookup-table. Report the source's value-set for an
-        # assignment so values surface as the help promises, instead of always
-        # printing UndeterminedValue; fall back to the instruction-level set when
-        # there is no source or only the instruction-level set is determined (#52).
-        if self._pvs_determined(src_pvs) and not self._pvs_determined(instr_pvs):
-            chosen, basis = src_pvs, "source_expression"
-        elif self._pvs_determined(instr_pvs):
-            chosen, basis = instr_pvs, "instruction"
-        elif src_pvs is not None:
-            chosen, basis = src_pvs, "source_expression"
-        else:
-            chosen, basis = instr_pvs, "instruction"
-        return {
-            "function": {"name": func.name, "address": hex(func.start)},
-            "at": hex(address),
-            "expression": str(target_ins) if target_ins is not None else None,
-            "value_basis": basis,
-            "source_expression": str(src_expr) if src_expr is not None else None,
-            "possible_values": self._serialize_pvs(chosen),
-        }
+    def _possible_values(self, *a, **k):
+        return read_decompile._possible_values(self.ctx, *a, **k)
 
     def _pvs_determined(self, *a, **k):
         return il_format._pvs_determined(*a, **k)

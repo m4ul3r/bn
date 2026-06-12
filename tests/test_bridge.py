@@ -1129,7 +1129,7 @@ def test_list_locals_returns_stable_ids(monkeypatch):
         _FakeVariable(name="var_4", storage=-4, var_type="float", identifier=2001, index=1)
     ]
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._list_locals_for_function("active", "player_update")
 
@@ -1234,7 +1234,7 @@ def test_function_info_includes_metadata(monkeypatch):
         _FakeVariable(name="arg1", storage=4, var_type="int32_t", identifier=1001, index=0)
     ]
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._function_info("active", "player_update")
 
@@ -1314,8 +1314,8 @@ def test_decompile_renders_pseudo_c(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     fn = _FakeFunction(0x401000, "player_update")
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
-    monkeypatch.setattr(instance, "_comment_map", lambda bv, func: {})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.il_format, "_comment_map", lambda bv, func: {})
     _install_fake_pseudo_c(
         monkeypatch,
         bridge,
@@ -1342,8 +1342,8 @@ def test_decompile_pseudo_c_with_address_gutter(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     fn = _FakeFunction(0x401000, "player_update")
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
-    monkeypatch.setattr(instance, "_comment_map", lambda bv, func: {})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.il_format, "_comment_map", lambda bv, func: {})
     _install_fake_pseudo_c(
         monkeypatch,
         bridge,
@@ -1371,8 +1371,8 @@ def test_decompile_falls_back_to_hlil_when_pseudo_c_unavailable(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     fn = _FakeFunction(0x401000, "player_update", "int32_t player_update()")
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
-    monkeypatch.setattr(instance, "_comment_map", lambda bv, func: {})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.il_format, "_comment_map", lambda bv, func: {})
     # No fake lineardisassembly module installed -> _pseudo_c_text raises and we
     # fall back to wrapped HLIL produced by _function_text. The renderer now
     # lives in il_format and _decompile_text calls it module-locally, so stub it
@@ -1395,8 +1395,8 @@ def test_decompile_warns_on_skipped_analysis(monkeypatch):
     fn.analysis_skipped = True
     fn.analysis_skip_reason = "ExceedFunctionSize"
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
-    monkeypatch.setattr(instance, "_comment_map", lambda bv, func: {})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.il_format, "_comment_map", lambda bv, func: {})
     # Body has no telltale text -> warning must fire on the analysis_skipped flag alone.
     _install_fake_pseudo_c(
         monkeypatch, bridge, fn,
@@ -1417,8 +1417,8 @@ def test_decompile_warns_on_placeholder_text_when_flag_clear(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     fn = _FakeFunction(0x401000, "big_fn")  # analysis_skipped defaults False
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
-    monkeypatch.setattr(instance, "_comment_map", lambda bv, func: {})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.il_format, "_comment_map", lambda bv, func: {})
     _install_fake_pseudo_c(
         monkeypatch, bridge, fn,
         [
@@ -1442,8 +1442,8 @@ def test_decompile_force_analysis_reanalyzes_and_clears_warning(monkeypatch):
     fn.analysis_skipped = True
     fn.analysis_skip_reason = "ExceedFunctionSize"
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
-    monkeypatch.setattr(instance, "_comment_map", lambda bv, func: {})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.il_format, "_comment_map", lambda bv, func: {})
     _install_fake_pseudo_c(
         monkeypatch, bridge, fn,
         [
@@ -5096,8 +5096,8 @@ def test_decompile_force_requested_but_not_skipped_echoes_flag(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     fn = _FakeFunction(0x401000, "small_fn")  # analysis_skipped defaults False
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
-    monkeypatch.setattr(instance, "_comment_map", lambda bv, func: {})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.il_format, "_comment_map", lambda bv, func: {})
     _install_fake_pseudo_c(
         monkeypatch, bridge, fn,
         [[(0x401000, "int32_t small_fn()")], [(0x401000, "{")], [(0x401000, "}")]],
@@ -5414,9 +5414,9 @@ def _dataflow_values_instance(monkeypatch, ins):
     instance = bridge.BinaryNinjaBridge()
     il = types.SimpleNamespace(instructions=[ins])
     func = types.SimpleNamespace(name="f", start=0x1000)
-    monkeypatch.setattr(instance, "_resolve_view", lambda sel: object())
-    monkeypatch.setattr(instance, "_find_function", lambda bv, ident: func)
-    monkeypatch.setattr(instance, "_il_function_for", lambda fn, view, ssa: il)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda sel: object())
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda bv, ident: func)
+    monkeypatch.setattr(bridge.il_format, "_il_function_for", lambda fn, view, ssa: il)
     return bridge, instance
 
 
