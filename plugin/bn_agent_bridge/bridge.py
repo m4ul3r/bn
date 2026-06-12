@@ -7,7 +7,6 @@ import errno
 import io
 import json
 import os
-import re
 import socket
 import socketserver
 import tempfile
@@ -26,6 +25,7 @@ from . import il_format
 from . import mutation_engine
 from . import read_decompile
 from . import read_evidence
+from . import read_listing
 from . import read_misc
 from . import read_xrefs
 from . import taint_engine as _taint
@@ -1013,221 +1013,29 @@ class BinaryNinjaBridge:
     def _hlil_pre_branch_condition(self, *a, **k):
         return il_format._hlil_pre_branch_condition(*a, **k)
 
-    def _callsites_within_function(self, bv, callee, func, *, context: int) -> list[dict[str, Any]]:
-        func_arch = getattr(func, "arch", None)
-        disasm_entries = self._structured_disasm_entries(bv, func)
-        index_by_addr = {
-            int(item["_address_int"]): index for index, item in enumerate(disasm_entries)
-        }
-        callee_address = int(callee.start)
-        rows = []
-        for insn in self._iter_llil_instructions(func):
-            op_name = self._il_op_name(insn)
-            # Count tail-branch references too (a `b`/branch into the sink rendered
-            # as `return <addr>(...) __tailcall`), not just bl/blx -- xrefs and
-            # taint backward already treat these as calls, so callsites must agree
-            # or it silently misses a reachable sink during triage (#47).
-            if op_name not in {"LLIL_CALL", "LLIL_CALL_STACK_ADJUST", "LLIL_TAILCALL"}:
-                continue
-            dest_value = self._llil_constant_value(getattr(insn, "dest", None))
-            if dest_value != callee_address:
-                continue
-            call_kind = "tailcall" if "TAILCALL" in op_name else "call"
+    def _callsites_within_function(self, *a, **k):
+        return read_listing._callsites_within_function(self.ctx, *a, **k)
 
-            call_addr = int(getattr(insn, "address", 0))
-            instruction_length = self._instruction_length(bv, call_addr, arch=func_arch)
-            caller_static = call_addr + instruction_length
-            disasm_index = index_by_addr.get(call_addr)
-            if disasm_index is None:
-                continue
-
-            previous = [
-                {
-                    "address": item["address"],
-                    "text": item["text"],
-                }
-                for item in disasm_entries[max(0, disasm_index - context) : disasm_index]
-            ]
-            next_instructions = [
-                {
-                    "address": item["address"],
-                    "text": item["text"],
-                }
-                for item in disasm_entries[disasm_index + 1 : disasm_index + 1 + context]
-            ]
-            call_instruction = {
-                "address": disasm_entries[disasm_index]["address"],
-                "text": disasm_entries[disasm_index]["text"],
-            }
-            rows.append(
-                {
-                    "callee": {
-                        "name": str(callee.name),
-                        "address": hex(callee_address),
-                    },
-                    "containing_function": {
-                        "name": str(func.name),
-                        "address": hex(int(func.start)),
-                    },
-                    "call_addr": hex(call_addr),
-                    "call_kind": call_kind,
-                    "instruction_length": instruction_length,
-                    "caller_static": hex(caller_static),
-                    "call_instruction": call_instruction,
-                    "previous_instructions": previous,
-                    "next_instructions": next_instructions,
-                    "hlil_statement": self._hlil_statement_text(insn),
-                    "pre_branch_condition": self._hlil_pre_branch_condition(insn),
-                }
-            )
-        rows.sort(key=lambda item: int(item["call_addr"], 16))
-        return rows
-
-    def _callsites(
-        self,
-        selector: str | None,
-        callee_identifier: str,
-        *,
-        within_identifiers: list[Any],
-        context: int = 3,
-    ) -> list[dict[str, Any]]:
-        if context < 0:
-            raise OperationFailure("invalid_context", f"Invalid callsite context size: {context}")
-
-        bv = self._resolve_view(selector)
-        callee = self._find_function(bv, callee_identifier)
-        scope_functions = self._resolve_scope_functions(bv, within_identifiers)
-
-        rows = []
-        for within_query, func in scope_functions:
-            function_rows = self._callsites_within_function(bv, callee, func, context=context)
-            for call_index, row in enumerate(function_rows):
-                row["call_index"] = call_index
-                row["within_query"] = str(within_query)
-            rows.extend(function_rows)
-        return rows
+    def _callsites(self, *a, **k):
+        return read_listing._callsites(self.ctx, *a, **k)
 
     def _xrefs_to_address(self, *a, **k):
         return read_xrefs._xrefs_to_address(self.ctx, *a, **k)
 
-    def _parse_function_address_bounds(
-        self,
-        min_address: Any = None,
-        max_address: Any = None,
-    ) -> tuple[int | None, int | None]:
-        lower = _parse_address(min_address) if min_address not in (None, "") else None
-        upper = _parse_address(max_address) if max_address not in (None, "") else None
-        if lower is not None and upper is not None and lower > upper:
-            raise OperationFailure(
-                "invalid_address_range",
-                f"Invalid function address range: {hex(lower)} is greater than {hex(upper)}",
-            )
-        return lower, upper
+    def _parse_function_address_bounds(self, *a, **k):
+        return read_listing._parse_function_address_bounds(self.ctx, *a, **k)
 
-    def _filtered_functions(
-        self,
-        bv,
-        *,
-        min_address: Any = None,
-        max_address: Any = None,
-    ) -> list[Any]:
-        lower, upper = self._parse_function_address_bounds(min_address, max_address)
-        functions = []
-        for fn in list(bv.functions):
-            address = int(fn.start)
-            if lower is not None and address < lower:
-                continue
-            if upper is not None and address > upper:
-                continue
-            functions.append(fn)
-        functions.sort(key=lambda fn: (int(fn.start), fn.name))
-        return functions
+    def _filtered_functions(self, *a, **k):
+        return read_listing._filtered_functions(self.ctx, *a, **k)
 
-    def _list_functions(
-        self,
-        selector: str | None,
-        *,
-        min_address: Any = None,
-        max_address: Any = None,
-        offset: int = 0,
-        limit: int | None = None,
-        count_only: bool = False,
-    ):
-        offset = _validate_count(offset, label="offset", minimum=0)
-        limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
-        bv = self._resolve_view(selector)
-        functions = list(self._filtered_functions(bv, min_address=min_address, max_address=max_address))
-        if count_only:
-            return {"count": len(functions)}
-        items = [
-            {"name": fn.name, "address": hex(fn.start), "raw_name": getattr(fn, "raw_name", fn.name)}
-            for fn in functions
-        ]
-        return self._paged_function_result(items, offset=offset, limit=limit)
+    def _list_functions(self, *a, **k):
+        return read_listing._list_functions(self.ctx, *a, **k)
 
-    def _paged_function_result(self, items: list[dict[str, Any]], *, offset: int,
-                               limit: int | None) -> dict[str, Any]:
-        """Return a function-listing page WITH paging metadata.
+    def _paged_function_result(self, *a, **k):
+        return read_listing._paged_function_result(self.ctx, *a, **k)
 
-        The CLI can't compute the true total itself -- it fetches a bounded page
-        -- so the bridge, which has the full filtered set, returns total/offset/
-        limit/returned/has_more alongside the page. This lets `function list`
-        state the real total + remainder (text) and expose paging in JSON, the
-        same honesty convention as evidence xrefs (#59)."""
-        total = len(items)
-        page = items[offset:]
-        if limit is not None:
-            page = page[:limit]
-        return {
-            "functions": page,
-            "total": total,
-            "offset": offset,
-            "limit": limit,
-            "returned": len(page),
-            "has_more": (offset + len(page)) < total,
-        }
-
-    def _search_functions(
-        self,
-        selector: str | None,
-        query: str,
-        *,
-        regex: bool = False,
-        exact: bool = False,
-        min_address: Any = None,
-        max_address: Any = None,
-        offset: int = 0,
-        limit: int | None = None,
-    ):
-        offset = _validate_count(offset, label="offset", minimum=0)
-        limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
-        bv = self._resolve_view(selector)
-        items = []
-        if regex:
-            try:
-                pattern = re.compile(query, re.IGNORECASE)
-            except re.error as exc:
-                raise OperationFailure("invalid_regex", f"Invalid function regex: {exc}") from exc
-
-            def matches(name: str) -> bool:
-                return bool(pattern.search(name))
-
-        elif exact:
-            needle = query.lower()
-
-            def matches(name: str) -> bool:
-                return name.lower() == needle
-
-        else:
-            needle = query.lower()
-
-            def matches(name: str) -> bool:
-                return needle in name.lower()
-
-        for fn in self._filtered_functions(bv, min_address=min_address, max_address=max_address):
-            if matches(fn.name):
-                items.append({"name": fn.name, "address": hex(fn.start), "raw_name": getattr(fn, "raw_name", fn.name)})
-        return self._paged_function_result(items, offset=offset, limit=limit)
+    def _search_functions(self, *a, **k):
+        return read_listing._search_functions(self.ctx, *a, **k)
 
     def _function_signature(self, *a, **k):
         return il_format._function_signature(*a, **k)

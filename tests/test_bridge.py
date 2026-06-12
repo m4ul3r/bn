@@ -1475,7 +1475,7 @@ def test_list_functions_is_sorted_by_address(monkeypatch):
             _FakeFunction(0x401000, "sub_401000"),
         ]
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._list_functions("active")
 
@@ -1493,7 +1493,7 @@ def test_list_functions_can_filter_by_address_range(monkeypatch):
             _FakeFunction(0x403000, "sub_403000"),
         ]
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._list_functions("active", min_address="0x401800", max_address="0x402fff")
 
@@ -1511,7 +1511,7 @@ def test_search_functions_supports_regex(monkeypatch):
             _FakeFunction(0x403000, "update_camera"),
         ]
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._search_functions("active", "attach|detach", regex=True)
 
@@ -1522,7 +1522,7 @@ def test_search_functions_rejects_invalid_regex(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV(functions=[_FakeFunction(0x401000, "load_attachment")])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     with pytest.raises(bridge.OperationFailure, match="Invalid function regex"):
         instance._search_functions("active", "(", regex=True)
@@ -1600,7 +1600,7 @@ def test_callsites_returns_local_hlil_assignment_and_pre_branch_condition(monkey
             0x4124D6: "test al, 0x3f",
         },
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     rows = instance._callsites(
         "active",
@@ -1695,7 +1695,7 @@ def test_callsites_prefers_local_expression_over_broad_enclosing_hlil(monkeypatc
             0x427760: "and eax, 0xf",
         },
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     rows = instance._callsites(
         "active",
@@ -1726,7 +1726,7 @@ def test_callsites_within_file_scope_preserves_file_order_and_dedupes(monkeypatc
         instruction_lengths={0x401010: 5, 0x402020: 5},
         disassembly={0x401010: "call crt_rand", 0x402020: "call crt_rand"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     rows = instance._callsites(
         "active",
@@ -1758,7 +1758,7 @@ def test_callsites_ignores_indirect_calls_and_returns_null_context_when_unmapped
         instruction_lengths={0x500010: 5, 0x500015: 5},
         disassembly={0x500010: "call eax", 0x500015: "call crt_rand"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     rows = instance._callsites(
         "active",
@@ -1790,7 +1790,7 @@ def test_callsites_counts_tailcall_into_target(monkeypatch):
         instruction_lengths={0x700010: 4},
         disassembly={0x700010: "b #memcpy"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     rows = instance._callsites("active", "memcpy", within_identifiers=["j_memcpy"], context=1)
 
@@ -1812,7 +1812,7 @@ def test_callsites_marks_regular_call_kind(monkeypatch):
         instruction_lengths={0x700010: 4},
         disassembly={0x700010: "bl #memcpy"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     rows = instance._callsites("active", "memcpy", within_identifiers=["caller"], context=1)
 
@@ -1838,7 +1838,7 @@ def test_callsites_returns_null_for_coarse_only_hlil(monkeypatch):
         instruction_lengths={0x600010: 5},
         disassembly={0x600010: "call crt_rand"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     rows = instance._callsites(
         "active",
@@ -1885,7 +1885,7 @@ def test_callsites_filters_placeholder_pre_branch_condition(monkeypatch):
         instruction_lengths={0x700010: 5},
         disassembly={0x700010: "call crt_rand"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     rows = instance._callsites(
         "active",
@@ -3873,7 +3873,7 @@ def test_list_functions_count_only_returns_count(monkeypatch):
         _FakeFunction(0x2000, "b"),
         _FakeFunction(0x3000, "c"),
     ])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     assert instance._list_functions(None, count_only=True) == {"count": 3}
     # count must match the full listing's reported total
@@ -4458,7 +4458,7 @@ def test_search_functions_exact_match(monkeypatch):
             _FakeFunction(0x403000, "sprintf"),
         ]
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._search_functions("active", "system", exact=True)
 
@@ -4476,7 +4476,7 @@ def test_search_functions_exact_case_insensitive(monkeypatch):
             _FakeFunction(0x402000, "QSystemPlugin"),
         ]
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._search_functions("active", "system", exact=True)
 
@@ -4493,7 +4493,7 @@ def test_search_functions_exact_no_match(monkeypatch):
             _FakeFunction(0x402000, "_system"),
         ]
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._search_functions("active", "system", exact=True)
 
