@@ -54,14 +54,16 @@ The bridge runs either as a **GUI plugin** (auto-starts when BN loads) or as a *
 ### Adding a New Command
 
 1. Add a handler in the appropriate `src/bn/commands/*.py` module, decorated with `@command(...)` (declares help, output format, target requirement, pagination, address filter, args).
-2. Add the matching operation in `plugin/bn_agent_bridge/bridge.py`'s `dispatch()` and decide whether it belongs in `READ_LOCKED_OPS` or `WRITE_LOCKED_OPS`.
+2. On the bridge, register the op with `@op("name", lock="read"|"write"|"none")` (from `op_registry.py`) and bind it to a handler. Put the handler logic as a free function in the relevant sibling module (`read_*.py`, `mutation_engine.py`, `taint_engine.py`, `vars.py`, `create_comments.py`), taking the `BridgeContext` seam (`ctx`) instead of `self`. The lock sets and dispatch routing are *derived* from the registry — don't hand-edit `READ_LOCKED_OPS` / `WRITE_LOCKED_OPS`.
 3. Add tests in `tests/` (mirror the source layout).
 
 `build_parser()` in `cli.py` walks `_COMMANDS` to construct the full argparse tree — no manual parser wiring needed.
 
-### Bridge (`plugin/bn_agent_bridge/bridge.py`)
+### Bridge (`plugin/bn_agent_bridge/`)
 
-Single ~5.5k-LOC module containing the `TargetManager` (weak-reffed `BinaryView`s, selector resolution), op handlers, and the mutation engine. Read ops dispatch under a shared lock (writer-priority `_ReadWriteLock`); write ops under an exclusive lock (`READ_LOCKED_OPS` / `WRITE_LOCKED_OPS`). Ops in neither set run unlocked — only do that for ops that touch no BN state (e.g. `shutdown`).
+The bridge is a package, not a monolith. `bridge.py` (~2k LOC) is the coordinator: it owns `TargetManager` (weak-reffed `BinaryView`s, selector resolution), the `BinaryNinjaBridge` facade + `dispatch()`, and the block of `@op` binders. Op *handler logic* lives in sibling modules as free functions that take the `BridgeContext` seam (`ctx`, in `seam.py`) instead of `self`: `read_*.py` (decompile/listing/xrefs/types/evidence/taint-slice/misc), `mutation_engine.py`, `taint_engine.py`, `vars.py`, `create_comments.py`. `BinaryNinjaBridge` keeps thin delegating shims for every handler the op binders and test suite reference, and the seam exists to break import cycles (read modules never import `bridge`/`mutation_engine`).
+
+`op_registry.py` is the single source of truth: `@op(name, lock="read"|"write"|"none")` declares each op once, and both the lock sets and dispatch routing are derived from it (`REGISTRY.read_locked_ops()` / `write_locked_ops()`). Read ops dispatch under a shared writer-priority `_ReadWriteLock`; write ops under an exclusive lock; `none` ops run unlocked — only for ops that touch no BN state (e.g. `shutdown`).
 
 ### Target Selection
 
@@ -89,3 +91,9 @@ Response: `{"ok": true, "result": ...}` or `{"ok": false, "error": "..."}`
 - Type hints everywhere, `from __future__ import annotations` in all modules
 - Test files mirror source: `test_cli.py`, `test_bridge.py`, `test_transport.py`, `test_output.py`
 - Tests use `monkeypatch` fixtures and fake `binaryninja` module stubs
+
+## Issues, PRs & Commits — Sanitize Test Data
+
+This tool is dogfooded against real binaries (firmware, proprietary apps). **Never disclose data from those targets in anything shared or committed** — GitHub issues, PR descriptions, commit messages, review notes, or checked-in fixtures. Treat as sensitive: binary/target names, instance IDs, subsystem or product names, paths that reveal them, real function/symbol names, concrete addresses, and decompiled output lifted verbatim from a target.
+
+Instead, **reproduce the bug or demonstrate the fix with realistic mock data that stands on its own.** Invent plausible function names, addresses, and structures that exhibit the same behavior, and keep them internally consistent so the example reads like a real session. A reader should understand the defect or the change from the example alone, without access to — or knowledge of — the original binary.
