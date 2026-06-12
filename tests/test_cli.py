@@ -1696,8 +1696,12 @@ def test_local_list_text_is_slim(monkeypatch, capsys):
     assert "locals:" in output
     assert "arg1" in output and "int32_t" in output
     assert "var_c" in output and "char*" in output
-    # internal IDs must not leak into text mode
-    assert "0x401000:param:stack:4:0:1" not in output
+    # local_id IS shown in text mode: it is the stable handle that `local rename`
+    # / `local retype` take, so omitting it forced a --format json round-trip to
+    # drive those commands (#122). The other internal fields stay out of the
+    # slim text view.
+    assert "0x401000:param:stack:4:0:1" in output
+    assert "0x401000:local:stack:-12:0:2" in output
     assert "storage=" not in output
     assert "source=" not in output
     assert "identifier=" not in output
@@ -1730,6 +1734,24 @@ def test_local_list_json_retains_ids(monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["locals"][0]["local_id"] == "0x401000:param:stack:4:0:1"
     assert payload["locals"][0]["identifier"] == 1
+
+
+def test_target_summary_text_shows_function_counts():
+    # target info should surface the function-count + named-vs-auto summary that
+    # every agent immediately reaches for (#122).
+    from bn import formatters
+    out = formatters._render_target_summary({
+        "selector": "active",
+        "arch": "x86_64",
+        "function_count": 412,
+        "named_function_count": 87,
+        "unnamed_function_count": 313,
+        "imported_function_count": 12,
+    })
+    assert "412 functions" in out
+    assert "87 named" in out
+    assert "313 auto-named" in out
+    assert "12 imported" in out
 
 
 def test_bundle_function_out_path_is_bridge_owned(monkeypatch, tmp_path, capsys):

@@ -489,6 +489,54 @@ class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamSer
 # _VAR_DRIFT_OPS moved to mutation_engine.py with the mutation cluster (#33).
 
 
+def _is_auto_function_name(name: str) -> bool:
+    """True for BN's auto-generated function names -- ``sub_<hex>`` and the
+    ``j_sub_<hex>`` thunk variant. Everything else counts as a meaningful name."""
+    core = name[2:] if name.startswith("j_") else name
+    if not core.startswith("sub_"):
+        return False
+    suffix = core[4:]
+    return bool(suffix) and all(c in "0123456789abcdefABCDEF" for c in suffix)
+
+
+# Symbol types whose NAME comes from relocations/imports, not from analysis or a
+# human. Counting these as "named" badly overstates how much real code is named
+# on a stripped binary (PLT import trampolines dominate it), so they get their
+# own bucket (#122). Compared by enum-member name to avoid importing the enum.
+_IMPORT_SYMBOL_TYPE_NAMES = frozenset(
+    {"ImportedFunctionSymbol", "ImportAddressSymbol", "ExternalSymbol"}
+)
+
+
+def _is_imported_function(fn) -> bool:
+    sym = getattr(fn, "symbol", None)
+    sym_type = getattr(sym, "type", None)
+    return getattr(sym_type, "name", None) in _IMPORT_SYMBOL_TYPE_NAMES
+
+
+def _function_name_summary(bv) -> dict[str, int]:
+    """Function-count breakdown for `target info` (#122): own functions split
+    into named vs auto-named (sub_<hex>), with import/extern stubs (whose names
+    come from relocations) in a separate bucket so they don't inflate "named".
+    Reflects whatever functions analysis has discovered so far."""
+    functions = list(getattr(bv, "functions", []) or [])
+    total = len(functions)
+    named = imported = 0
+    for fn in functions:
+        if _is_imported_function(fn):
+            imported += 1
+            continue
+        name = str(getattr(fn, "name", "") or "")
+        if name and not _is_auto_function_name(name):
+            named += 1
+    return {
+        "function_count": total,
+        "named_function_count": named,
+        "unnamed_function_count": total - named - imported,
+        "imported_function_count": imported,
+    }
+
+
 class BinaryNinjaBridge:
     def __init__(self, instance_id: str | None = None):
         self.instance_id = instance_id
@@ -808,6 +856,8 @@ class BinaryNinjaBridge:
             # (strings/full function set pending `bn refresh`) from a real one.
             "analyzed": not quick,
             "analysis_state": "quick" if quick else "full",
+            # Function-count summary every agent reaches for (#122).
+            **_function_name_summary(bv),
         }
 
     def _refresh(self, selector: str | None):

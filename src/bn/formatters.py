@@ -36,7 +36,15 @@ def _render_string_literal(value: Any, *, truncated: bool = False) -> str:
 def _format_local_entry(item: dict[str, Any]) -> str:
     name = str(item.get("name", "<unknown>"))
     type_str = str(item.get("type", "<unknown>"))
-    return f"  {name:<20} {type_str}"
+    line = f"  {name:<20} {type_str}"
+    # local_id is the stable handle `local rename` / `local retype` take; show it
+    # so the text view is self-sufficient and doesn't force a --format json
+    # round-trip just to drive those commands (#122). Other internal fields
+    # (storage / source / identifier) stay out of the slim view.
+    local_id = item.get("local_id")
+    if local_id:
+        line += f"  [id: {local_id}]"
+    return line
 
 
 def _text_field(field: str) -> Callable[[Any], str]:
@@ -378,6 +386,21 @@ def _render_target_summary(value: dict[str, Any]) -> str:
     for key, item in details:
         if item not in (None, ""):
             lines.append(f"\t{key}: {item}")
+    # Function-count + named-vs-auto-named summary that every agent reaches for
+    # first (#122). Counts reflect the current analysis state (a --quick view
+    # reports what it has so far; analysis_state already flags that).
+    fn_count = value.get("function_count")
+    if fn_count is not None:
+        summary = f"{fn_count} functions"
+        named = value.get("named_function_count")
+        unnamed = value.get("unnamed_function_count")
+        if named is not None and unnamed is not None:
+            parts = [f"{named} named", f"{unnamed} auto-named"]
+            imported = value.get("imported_function_count")
+            if imported:
+                parts.append(f"{imported} imported")
+            summary += f" ({', '.join(parts)})"
+        lines.append(f"\tfunctions: {summary}")
     return "\n".join(lines)
 
 

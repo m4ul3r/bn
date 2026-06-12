@@ -992,6 +992,92 @@ def test_op_set_prototype_uses_string_user_type_for_bn_compat(monkeypatch):
     assert verified["observed"]["prototype"] == "void* __thiscall(struct GarbageHazardRuntime* self)"
 
 
+def test_op_set_prototype_hints_to_declare_unknown_struct(monkeypatch):
+    """A prototype that references a not-yet-defined struct makes
+    parse_type_string fail. Surface a clear invalid_request that hints to
+    declare the type first -- not a raw 'unsupported: SyntaxError: ...' that
+    leaks the Python exception class and gives no next step (#122)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _UnknownTypeBV(_FakeBV):
+        def parse_type_string(self, declaration):
+            raise SyntaxError("unexpected token 'GarbageHazardRuntime'")
+
+    fn = _FakeFunction(0x401000, "handler")
+    bv = _UnknownTypeBV(functions=[fn])
+
+    with pytest.raises(bridge.OperationFailure) as excinfo:
+        instance._op_set_prototype(
+            bv,
+            {
+                "op": "set_prototype",
+                "identifier": "handler",
+                "prototype": "int handler(struct GarbageHazardRuntime* self)",
+            },
+        )
+
+    assert excinfo.value.status == "invalid_request"
+    message = excinfo.value.message.lower()
+    assert "declare" in message            # actionable next step
+    assert "syntaxerror" not in message    # raw exception class must not leak
+
+
+def test_parse_type_or_hint_shared_by_all_type_ops(monkeypatch):
+    """set_prototype, local_retype, and struct_field_set all route their
+    bv.parse_type_string through this helper, so an undefined-type reference
+    yields a clean invalid_request + correct 'bn types declare' hint instead of
+    a leaked exception class or BN's multi-line parser text (#122)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    me = bridge.mutation_engine
+
+    class _BadParseBV(_FakeBV):
+        def parse_type_string(self, decl):
+            raise SyntaxError("error: <unknown>: Reference to unknown type Foo\n1 error generated.")
+
+    with pytest.raises(bridge.OperationFailure) as excinfo:
+        me._parse_type_or_hint(instance.ctx, _BadParseBV(), {"op": "local_retype"}, "struct Foo*", label="type")
+
+    msg = excinfo.value.message
+    assert excinfo.value.status == "invalid_request"
+    assert "bn types declare" in msg        # correct command spelling (not `type`)
+    assert "declare it first" in msg
+    assert "syntaxerror" not in msg.lower()  # no raw Python exception class
+    assert "\n" not in msg                   # BN's multi-line parser text collapsed
+
+
+def test_function_name_summary_counts_named_vs_auto(monkeypatch):
+    """target info needs a function-count summary every agent reaches for.
+    Auto-named functions are BN's sub_<addr> / j_sub_<addr> defaults; named are
+    everything else EXCEPT import/extern stubs (whose names come from
+    relocations), which get their own bucket so they don't inflate "named" on a
+    stripped binary (#122)."""
+    bridge = _load_bridge(monkeypatch)
+
+    class _Sym:
+        def __init__(self, type_name):
+            self.type = type("_SymType", (), {"name": type_name})()
+
+    imported = _FakeFunction(0x401400, "puts")
+    imported.symbol = _Sym("ImportedFunctionSymbol")
+
+    bv = _FakeBV(functions=[
+        _FakeFunction(0x401000, "main"),
+        _FakeFunction(0x401100, "parse_header"),
+        _FakeFunction(0x401200, "sub_401200"),
+        _FakeFunction(0x401300, "j_sub_401300"),
+        imported,
+    ])
+
+    summary = bridge._function_name_summary(bv)
+
+    assert summary["function_count"] == 5
+    assert summary["named_function_count"] == 2       # main, parse_header
+    assert summary["unnamed_function_count"] == 2      # sub_401200, j_sub_401300
+    assert summary["imported_function_count"] == 1     # puts (PLT stub), not "named"
+
+
 def test_op_set_prototype_registers_restore_for_preview(monkeypatch):
     # set_user_type is NOT journaled by BN's undo buffer, so --preview/rollback
     # must register an explicit restore that puts the prototype back, else the

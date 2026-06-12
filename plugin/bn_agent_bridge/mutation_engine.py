@@ -1363,9 +1363,35 @@ def _op_delete_comment(ctx, bv, op: dict[str, Any]):
 
 
 
+def _parse_type_or_hint(ctx, bv, op: dict[str, Any], type_text: Any, *, label: str):
+    """``bv.parse_type_string`` with a friendly, actionable error.
+
+    A prototype/type that references a struct or type not defined yet fails to
+    parse. Surface a clear ``invalid_request`` with a next step instead of the
+    generic ``unsupported: <ExceptionClass>: ...`` the catch-all in
+    ``_apply_operation`` would otherwise emit -- which leaks the Python
+    exception class name and gives no way forward (#122)."""
+    try:
+        return bv.parse_type_string(str(type_text))
+    except OperationFailure:
+        raise
+    except Exception as exc:
+        # Collapse BN's multi-line parser output ("error: ...\n1 error
+        # generated.") into a single clean clause.
+        detail = " ".join(str(exc).split())
+        raise OperationFailure(
+            "invalid_request",
+            f"could not parse {label} {str(type_text)!r}"
+            + (f": {detail}" if detail else "")
+            + ". If it references a struct or type that isn't defined yet, "
+            "declare it first (e.g. with `bn types declare`), then retry.",
+            requested=_operation_requested(ctx, op),
+        ) from exc
+
+
 def _op_set_prototype(ctx, bv, op: dict[str, Any], restores: list | None = None):
     fn = ctx._find_function(bv, op["identifier"])
-    expected_type, _ = bv.parse_type_string(str(op["prototype"]))
+    expected_type, _ = _parse_type_or_hint(ctx, bv, op, op["prototype"], label="prototype")
     before_prototype = str(fn.type)
     before_type_obj = fn.type
     expected_prototype = str(expected_type)
@@ -1479,7 +1505,7 @@ def _op_local_rename(ctx, bv, op: dict[str, Any], restores: list | None = None):
 def _op_local_retype(ctx, bv, op: dict[str, Any], restores: list | None = None):
     fn = ctx._find_function(bv, op["function"])
     var, is_parameter = vars_mod._find_variable_selector(fn, str(op["variable"]))
-    expected_type, _ = bv.parse_type_string(str(op["new_type"]))
+    expected_type, _ = _parse_type_or_hint(ctx, bv, op, op["new_type"], label="type")
     # Variable.type is a live property backed by the core: snapshot it
     # before mutating (see _op_local_rename).
     before_type_obj = var.type
@@ -1525,7 +1551,7 @@ def _commit_struct_builder(ctx, bv, struct_name: str, builder):
 def _op_struct_field_set(ctx, bv, op: dict[str, Any]):
     struct_name = str(op["struct_name"])
     resolved_name, builder = _struct_builder(ctx, bv, struct_name)
-    field_type, _ = bv.parse_type_string(str(op["field_type"]))
+    field_type, _ = _parse_type_or_hint(ctx, bv, op, op["field_type"], label="field type")
     offset = _parse_address(op["offset"])
     overwrite = bool(op.get("overwrite_existing", True))
     before_type = bv.get_type_by_name(resolved_name)
