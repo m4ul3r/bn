@@ -4,7 +4,6 @@ import atexit
 import contextlib
 import difflib
 import errno
-import hashlib
 import io
 import json
 import os
@@ -13,7 +12,6 @@ import socket
 import socketserver
 import tempfile
 import threading
-import traceback
 import weakref
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -22,7 +20,6 @@ from typing import Any
 
 import binaryninja as bn
 from binaryninja import SSAVariable
-from binaryninja.mainthread import execute_on_main_thread_and_wait, is_main_thread
 from binaryninja.plugin import PluginCommand
 
 from . import taint_engine as _taint
