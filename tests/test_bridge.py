@@ -2614,7 +2614,7 @@ def test_strings_min_length_excludes_short_strings(monkeypatch):
         _FakeStringRef(0x2000, 5, "hello"),
         _FakeStringRef(0x3000, 10, "helloworld"),
     ])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._strings(None, query=None, offset=0, limit=100, min_length=4)
 
@@ -2636,7 +2636,7 @@ def test_strings_section_filter_keeps_only_matching_section(monkeypatch):
             ".rodata": _FakeSection(".rodata", 0x5000, 0x6000),
         },
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._strings(None, query=None, offset=0, limit=100, section=".rodata")
 
@@ -2660,7 +2660,7 @@ def test_strings_no_crt_excludes_locale_and_text_section(monkeypatch):
             ".text": _FakeSection(".text", 0x6000, 0x7000),
         },
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._strings(None, query=None, offset=0, limit=100, no_crt=True)
 
@@ -2683,7 +2683,7 @@ def test_strings_filters_combine(monkeypatch):
             ".rodata": _FakeSection(".rodata", 0x5000, 0x6000),
         },
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._strings(None, query=None, offset=0, limit=100,
                                min_length=4, section=".rodata", no_crt=True)
@@ -2702,7 +2702,7 @@ def test_strings_regex_search_matches_or_patterns(monkeypatch):
             _FakeStringRef(0x5020, 4, "skip"),
         ]
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._strings(None, query="vehicle|headunit", offset=0, limit=100, regex=True)
 
@@ -2712,7 +2712,7 @@ def test_strings_regex_search_matches_or_patterns(monkeypatch):
 def test_strings_invalid_regex_is_actionable(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: _FakeBV())
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: _FakeBV())
 
     with pytest.raises(bridge.OperationFailure, match="Invalid string regex"):
         instance._strings(None, query="(", offset=0, limit=100, regex=True)
@@ -2736,7 +2736,7 @@ def test_sections_returns_all_sections_with_permissions(monkeypatch):
             0x6000: _FakeSegment(readable=True, writable=False, executable=False),
         },
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._sections(None)
 
@@ -2800,7 +2800,7 @@ def test_sections_query_filters_by_name(monkeypatch):
             ".data": _FakeSection(".data", 0x6000, 0x7000),
         },
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._sections(None, query="data")
 
@@ -2817,7 +2817,7 @@ def test_sections_null_segment_omits_rwx(monkeypatch):
         sections={".bss": _FakeSection(".bss", 0x9000, 0xa000)},
         segments={0x1000: _FakeSegment(readable=True, writable=False, executable=True)},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._sections(None)
 
@@ -2834,7 +2834,7 @@ def test_sections_without_segments_omits_rwx(monkeypatch):
             self.sections = {".text": _FakeSection(".text", 0x1000, 0x2000)}
 
     bv = _BareView()
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._sections(None)
 
@@ -2865,7 +2865,7 @@ def test_imports_includes_function_data_and_address_symbols(monkeypatch):
     addr_sym.namespace = ""
 
     bv = _FakeBV(symbols=[func_sym, data_sym, addr_sym])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._imports(None)
 
@@ -2890,7 +2890,7 @@ def test_imports_sorts_by_library_kind_name(monkeypatch):
     sym_a.namespace = "liba"
 
     bv = _FakeBV(symbols=[sym_b, sym_a])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._imports(None)
 
@@ -2910,7 +2910,7 @@ def test_imports_bn_sentinel_namespace_is_not_surfaced_as_library(monkeypatch):
     sym.namespace = "BNINTERNALNAMESPACE"
 
     bv = _FakeBV(symbols=[sym])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._imports(None)
 
@@ -2931,7 +2931,7 @@ def test_imports_summary_includes_needed_libraries(monkeypatch):
 
     bv = _FakeBV(symbols=[sym])
     bv.libraries = ["libssl.so.1.1", "libc.so.6"]
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._imports(None, summary=True)
 
@@ -2948,7 +2948,7 @@ def test_read_returns_hex_and_ascii_for_mapped_address(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV(memory={0x1000: b"\x48\x65\x6c\x6c\x6f\x00\x90\xff"})
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._read(None, "0x1000", 8)
 
@@ -2964,7 +2964,7 @@ def test_read_accepts_decimal_address(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV(memory={0x1000: b"\x41\x42\x43\x44"})
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._read(None, "4096", 4)
 
@@ -2977,7 +2977,7 @@ def test_read_unmapped_address_raises_naming_the_address(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV(memory={0x1000: b"\x41\x42\x43\x44"})
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     with pytest.raises(RuntimeError, match="0xdead.*not mapped"):
         instance._read(None, "0xdead", 16)
@@ -2987,7 +2987,7 @@ def test_read_short_read_returns_mapped_bytes_with_note(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV(memory={0x1000: b"\x01\x02\x03\x04"})
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._read(None, "0x1000", 16)
 
@@ -4340,7 +4340,7 @@ def test_imports_summary_aggregates_counts(monkeypatch):
     sym_d.namespace = "libfoo"
 
     bv = _FakeBV(symbols=[sym_a, sym_b, sym_c, sym_d])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._imports(None, summary=True)
 
@@ -4353,7 +4353,7 @@ def test_imports_summary_empty(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV()
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._imports(None, summary=True)
 
@@ -4941,7 +4941,7 @@ def test_imports_pagination_slices_offset_and_limit(monkeypatch):
         s.namespace = "lib"
         syms.append(s)
     bv = _FakeBV(symbols=syms)
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     full = instance._imports(None)
     assert [item["name"] for item in full] == ["fn0", "fn1", "fn2", "fn3", "fn4"]
@@ -5053,7 +5053,7 @@ def test_sections_pagination_slices_offset_and_limit(monkeypatch):
         ".c": _FakeSection(".c", 0x3000, 0x3100),
     }
     bv = _FakeBV(sections=secs)
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     full = instance._sections(None)
     assert [s["name"] for s in full] == [".a", ".b", ".c"]
@@ -5119,7 +5119,7 @@ def test_strings_requires_refresh_when_quick_loaded(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV(strings=[])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     # Quick-loaded: strings analysis hasn't run, so refuse rather than return [].
     bridge._quick_loaded_views.add(bv)

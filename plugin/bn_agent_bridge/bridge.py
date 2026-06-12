@@ -25,6 +25,7 @@ from binaryninja.plugin import PluginCommand
 from . import il_format
 from . import mutation_engine
 from . import read_evidence
+from . import read_misc
 from . import read_xrefs
 from . import taint_engine as _taint
 from . import vars as vars_mod
@@ -486,12 +487,7 @@ class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamSer
         super().__init__(socket_path, handler)
 
 
-_STRING_TYPE_NAMES: dict[int, str] = {
-    0: "ascii",
-    1: "utf16",
-    2: "utf32",
-}
-
+# _STRING_TYPE_NAMES moved to read_misc.py with the strings op (#33).
 # _VAR_DRIFT_OPS moved to mutation_engine.py with the mutation cluster (#33).
 
 
@@ -2060,263 +2056,32 @@ class BinaryNinjaBridge:
             raise RuntimeError(f"Type is not a struct-like type: {resolved_name}")
         return self._type_entry(resolved_name, type_obj)
 
-    _NO_CRT_PATTERNS = re.compile(
-        r"^(?:"
-        r"[A-Za-z]$"                                      # single letters
-        r"|[a-z]{2}(?:-[A-Z]{2})?$"                        # locale codes: en, en-US
-        r"|[A-Z]{2,3}$"                                    # short uppercase tokens
-        r"|(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)$"                # day abbreviations
-        r"|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$"  # month abbreviations
-        r"|(?:Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday)$"
-        r"|(?:January|February|March|April|June|July|August|September|October|November|December)$"
-        r"|(?:AM|PM|am|pm)$"
-        r"|(?:UTF-?(?:7|8|16|32)|(?:us-)?ascii|iso-\d{4}.*|euc-\w+|big5|gb\d+|shift_jis|windows-\d+|cp\d+)$"
-        r")",
-        re.IGNORECASE,
-    )
-
-    def _strings(self, selector: str | None, *, query, offset: int, limit: int,
-                 min_length: int | None = None, section: str | None = None,
-                 no_crt: bool = False, regex: bool = False):
-        offset = _validate_count(offset, label="offset", minimum=0)
-        limit = _validate_count(limit, label="limit", minimum=1)
-        bv = self._resolve_view(selector)
-        if bv in _quick_loaded_views:
-            # In --quick mode string analysis hasn't run, so bv.strings is empty
-            # and `[]` would be indistinguishable from "this binary has none".
-            # Refuse with a directive instead of misleading the caller.
-            raise RuntimeError(
-                "Strings are not available: this target was loaded with --quick (no analysis). "
-                "Run `bn refresh` to build the full string set first."
-            )
-        items = []
-        needle = str(query) if query else None
-        pattern = None
-        if needle and regex:
-            try:
-                pattern = re.compile(needle, re.IGNORECASE)
-            except re.error as exc:
-                raise OperationFailure("invalid_regex", f"Invalid string regex: {exc}") from exc
-        elif needle:
-            needle = needle.lower()
-        for item in list(getattr(bv, "strings", [])):
-            value = str(getattr(item, "value", ""))
-            length = int(getattr(item, "length", 0))
-            address = int(getattr(item, "start", 0))
-            raw_type = getattr(item, "type", "")
-            try:
-                string_type = _STRING_TYPE_NAMES.get(int(raw_type), str(raw_type))
-            except (TypeError, ValueError):
-                string_type = str(raw_type)
-
-            if pattern is not None:
-                if not pattern.search(value):
-                    continue
-            elif needle and needle not in value.lower():
-                continue
-            if min_length is not None and length < min_length:
-                continue
-            if section:
-                secs = bv.get_sections_at(address) if hasattr(bv, "get_sections_at") else []
-                if not any(getattr(s, "name", "") == section for s in secs):
-                    continue
-            if no_crt:
-                if self._NO_CRT_PATTERNS.match(value):
-                    continue
-                if len(value) >= 2 and len(set(value)) == 1:
-                    continue
-                secs = bv.get_sections_at(address) if hasattr(bv, "get_sections_at") else []
-                if any(getattr(s, "name", "") == ".text" for s in secs):
-                    continue
-
-            entry = {
-                "address": hex(address),
-                "length": length,
-                "chars": len(value),
-                "type": string_type,
-                "value": value,
-            }
-            items.append(entry)
-        items.sort(key=lambda item: (int(item["address"], 16), item["value"]))
-        return items[offset : offset + limit]
+    def _strings(self, *a, **k):
+        return read_misc._strings(self.ctx, *a, **k)
 
     def _init_arrays(self, *a, **k):
         return read_evidence._init_arrays(self.ctx, *a, **k)
 
-    _IMPORT_SYMBOL_TYPES: list[tuple[str, str]] = [
-        ("ImportedFunctionSymbol", "function"),
-        ("ImportedDataSymbol", "data"),
-        ("ImportAddressSymbol", "address"),
-    ]
+    def _needed_libraries(self, *a, **k):
+        return read_misc._needed_libraries(*a, **k)
 
-    # BN tags standard-ELF import symbols with these namespace sentinels rather
-    # than a real shared-object name (the dynamic linker only resolves the actual
-    # provider at runtime). Treat them as "no known library".
-    _BN_SENTINEL_NAMESPACES: frozenset[str] = frozenset(
-        {"", "BNINTERNALNAMESPACE", "BNEXTERNALNAMESPACE"}
-    )
+    def _imports(self, *a, **k):
+        return read_misc._imports(self.ctx, *a, **k)
 
-    @staticmethod
-    def _needed_libraries(bv) -> list[str]:
-        """DT_NEEDED shared objects this binary links against, if BN exposes them."""
-        try:
-            return sorted({str(lib) for lib in (getattr(bv, "libraries", None) or [])})
-        except Exception:
-            return []
+    def _imports_build_summary(self, *a, **k):
+        return read_misc._imports_build_summary(*a, **k)
 
-    def _imports(self, selector: str | None, *, summary: bool = False,
-                 offset: int = 0, limit: int | None = None):
-        # Guard paging the same way the sibling list ops do, so a raw-socket /
-        # py exec caller passing a negative offset/limit gets a clean
-        # invalid_request instead of a silent Python negative-index slice (#68).
-        offset = _validate_count(offset, label="offset", minimum=0)
-        limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
-        bv = self._resolve_view(selector)
-        needed_libraries = self._needed_libraries(bv)
-        items = []
-        for attr_name, kind in self._IMPORT_SYMBOL_TYPES:
-            sym_type = getattr(bn.SymbolType, attr_name, None)
-            if sym_type is None:
-                continue
-            for sym in list(bv.get_symbols_of_type(sym_type)):
-                name = self._import_symbol_name(sym)
-                raw_name = str(getattr(sym, "raw_name", sym.name))
-                namespace = str(getattr(sym, "namespace", "") or "")
-                # Only surface `library` when it's a real per-library namespace;
-                # BN's sentinels become None so agents don't read them as a
-                # dependency. `namespace` keeps the raw value under an honest name.
-                library = namespace if namespace not in self._BN_SENTINEL_NAMESPACES else None
-                items.append(
-                    {
-                        "name": name,
-                        "address": hex(sym.address),
-                        "library": library,
-                        "namespace": namespace,
-                        "raw_name": raw_name,
-                        "kind": kind,
-                    }
-                )
-        if summary:
-            # Summary aggregates the whole import set; paging would distort the
-            # counts, so it always reflects every symbol regardless of offset/limit.
-            return self._imports_build_summary(items, needed_libraries)
-        items.sort(key=lambda item: (item["library"] or "", item["kind"], item["name"], int(item["address"], 16)))
-        if limit is not None:
-            return items[offset : offset + limit]
-        return items[offset:] if offset else items
+    def _sections(self, *a, **k):
+        return read_misc._sections(self.ctx, *a, **k)
 
-    def _imports_build_summary(
-        self, items: list[dict], needed_libraries: list[str] | None = None
-    ) -> dict[str, Any]:
-        # "namespaces" groups BN's symbol namespace (sentinels on standard ELF),
-        # not a per-shared-object breakdown. The real dependency list is
-        # "needed_libraries" (DT_NEEDED), which is what agents actually want.
-        namespaces: dict[str, int] = {}
-        by_kind: dict[str, int] = {}
-        for item in items:
-            ns = str(item.get("namespace", "") or "") or "(none)"
-            namespaces[ns] = namespaces.get(ns, 0) + 1
-            kind = str(item.get("kind", "unknown"))
-            by_kind[kind] = by_kind.get(kind, 0) + 1
-        return {
-            "total_symbols": len(items),
-            "needed_libraries": needed_libraries or [],
-            "namespaces": dict(sorted(namespaces.items(), key=lambda x: -x[1])),
-            "by_kind": dict(sorted(by_kind.items(), key=lambda x: -x[1])),
-        }
+    def _ascii_render(self, *a, **k):
+        return read_misc._ascii_render(*a, **k)
 
-    _SECTION_SEMANTICS_NAMES: dict[int, str] = {
-        0: "DefaultSection",
-        1: "ReadOnlyCode",
-        2: "ReadOnlyData",
-        3: "ReadWriteData",
-        4: "ExternalSection",
-    }
+    def _read(self, *a, **k):
+        return read_misc._read(self.ctx, *a, **k)
 
-    def _sections(self, selector: str | None, *, query: str | None = None,
-                  offset: int = 0, limit: int | None = None):
-        # Re-enforce the count contract for raw socket / py exec callers: a
-        # negative offset/limit must be a clean invalid_request, not Python
-        # negative-slice behavior returning a silently-wrong subset (#100).
-        offset = _validate_count(offset, label="offset", minimum=0)
-        limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
-        bv = self._resolve_view(selector)
-        items = []
-        sections = getattr(bv, "sections", {})
-        needle = str(query).lower() if query else None
-        for name, sec in sections.items():
-            if needle and needle not in name.lower():
-                continue
-            start = int(getattr(sec, "start", 0))
-            end = int(getattr(sec, "end", 0))
-            length = end - start
-
-            raw_semantics = getattr(sec, "semantics", 0)
-            try:
-                semantics_int = int(raw_semantics)
-            except (TypeError, ValueError):
-                semantics_int = 0
-            semantics = self._SECTION_SEMANTICS_NAMES.get(semantics_int, str(raw_semantics))
-
-            entry: dict[str, Any] = {
-                "name": name,
-                "start": hex(start),
-                "end": hex(end),
-                "length": length,
-                "semantics": semantics,
-            }
-
-            if hasattr(bv, "get_segment_at"):
-                seg = bv.get_segment_at(start)
-                if seg is not None:
-                    entry["readable"] = bool(getattr(seg, "readable", None))
-                    entry["writable"] = bool(getattr(seg, "writable", None))
-                    entry["executable"] = bool(getattr(seg, "executable", None))
-
-            items.append(entry)
-        items.sort(key=lambda item: int(item["start"], 16))
-        if limit is not None:
-            return items[offset : offset + limit]
-        return items[offset:] if offset else items
-
-    @staticmethod
-    def _ascii_render(data: bytes) -> str:
-        return "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in data)
-
-    def _read(self, selector: str | None, address, length: int):
-        bv = self._resolve_view(selector)
-        addr = _parse_address(address)
-        if length < 0:
-            raise RuntimeError(f"read length must be non-negative, got {length}")
-
-        data = bytes(bv.read(addr, length))
-        if length > 0 and not data:
-            raise RuntimeError(f"Address 0x{addr:x} is not mapped (no bytes available)")
-
-        result: dict[str, Any] = {
-            "address": hex(addr),
-            "length": len(data),
-            "hex": data.hex(),
-            "ascii": self._ascii_render(data),
-        }
-        if len(data) < length:
-            result["requested_length"] = length
-            result["short_read"] = True
-            result["note"] = (
-                f"short read: requested {length} bytes, only {len(data)} mapped from 0x{addr:x}"
-            )
-        return result
-
-    def _is_executable_address(self, bv, addr: int) -> bool:
-        is_offset_executable = getattr(bv, "is_offset_executable", None)
-        if callable(is_offset_executable):
-            return bool(is_offset_executable(addr))
-        get_segment_at = getattr(bv, "get_segment_at", None)
-        if callable(get_segment_at):
-            seg = get_segment_at(addr)
-            if seg is not None:
-                return bool(getattr(seg, "executable", False))
-        return False
+    def _is_executable_address(self, *a, **k):
+        return read_misc._is_executable_address(self.ctx, *a, **k)
 
     def _function_create(self, selector: str | None, address, preview: bool):
         bv = self._resolve_view(selector)
