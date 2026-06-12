@@ -1754,6 +1754,52 @@ def test_target_summary_text_shows_function_counts():
     assert "12 imported" in out
 
 
+def _zero_function_search(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+    return {"ok": True, "result": {"functions": [], "total": 0, "offset": 0,
+                                   "limit": None, "returned": 0, "has_more": False}}
+
+
+def test_function_search_hints_regex_on_zero_matches_with_metachars(monkeypatch, capsys):
+    """A non-regex search whose query has regex metacharacters and matches
+    nothing should suggest --regex instead of a bare 'none' (#122)."""
+    monkeypatch.setattr(bn.cli, "send_request", _zero_function_search)
+    rc = bn.cli.main(["function", "search", "init|fini", "--target", "active"])
+    assert rc == 0
+    _, err = capsys.readouterr()
+    assert "--regex" in err
+    assert "init|fini" in err
+
+
+def test_function_search_no_regex_hint_when_regex_flag_set(monkeypatch, capsys):
+    """--regex already set: the query IS a pattern, so no hint even at 0 matches."""
+    monkeypatch.setattr(bn.cli, "send_request", _zero_function_search)
+    rc = bn.cli.main(["function", "search", "init|fini", "--regex", "--target", "active"])
+    assert rc == 0
+    _, err = capsys.readouterr()
+    assert "add --regex" not in err
+
+
+def test_function_search_no_regex_hint_for_plain_query(monkeypatch, capsys):
+    """A plain query with no metacharacters and 0 matches gets no regex hint."""
+    monkeypatch.setattr(bn.cli, "send_request", _zero_function_search)
+    rc = bn.cli.main(["function", "search", "plainname", "--target", "active"])
+    assert rc == 0
+    _, err = capsys.readouterr()
+    assert "add --regex" not in err
+
+
+def test_strings_hints_regex_on_zero_matches_with_metachars(monkeypatch, capsys):
+    """strings (a bare list today) with a metacharacter query and 0 matches also
+    suggests --regex (#122)."""
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": []}
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["strings", "--query", "foo(bar", "--target", "active"])
+    assert rc == 0
+    _, err = capsys.readouterr()
+    assert "--regex" in err
+
+
 def test_bundle_function_out_path_is_bridge_owned(monkeypatch, tmp_path, capsys):
     captured = {}
     out_path = tmp_path / "bundle.json"

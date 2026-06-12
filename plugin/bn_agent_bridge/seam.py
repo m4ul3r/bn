@@ -26,6 +26,7 @@ from ._shared import (
     _format_ambiguous_function_error,
     _format_ambiguous_symbol_error,
     _parse_address,
+    _symbol_type_name,
 )
 
 _TYPE_CLASS_NAMES: dict[int, str] = {
@@ -43,6 +44,11 @@ _TYPE_CLASS_NAMES: dict[int, str] = {
     11: "named_type_ref",
     12: "wide_char",
 }
+
+# Symbol types whose function is an import/extern stub (PLT trampoline / extern
+# ref), not the real body. When a name collision is only such stubs shadowing
+# one real implementation, resolution auto-picks the implementation (#122).
+_STUB_SYMBOL_TYPE_NAMES = frozenset({"ImportedFunctionSymbol", "ExternalSymbol"})
 
 
 class BridgeContext:
@@ -83,12 +89,18 @@ class BridgeContext:
         if len(exact) == 1:
             return exact[0]
         if len(exact) > 1:
+            resolved = self._resolve_impl_over_stub(exact)
+            if resolved is not None:
+                return resolved
             raise RuntimeError(_format_ambiguous_function_error(identifier, exact))
 
         folded = self._find_functions_by_name(bv, text, case_sensitive=False)
         if len(folded) == 1:
             return folded[0]
         if len(folded) > 1:
+            resolved = self._resolve_impl_over_stub(folded)
+            if resolved is not None:
+                return resolved
             raise RuntimeError(_format_ambiguous_function_error(identifier, folded))
 
         symbol = bv.get_symbol_by_raw_name(text)
@@ -109,6 +121,19 @@ class BridgeContext:
                 f"Function not found: {identifier}. Did you mean: {', '.join(suggestions)}"
             )
         raise RuntimeError(f"Function not found: {identifier}")
+
+    def _resolve_impl_over_stub(self, matches: list[Any]):
+        """When a name collision is only import/extern stubs shadowing exactly
+        ONE real function body, return that body; otherwise None (caller raises
+        the ambiguous error). The stub is reliably distinguishable from the
+        implementation by ``symbol.type`` (ImportedFunctionSymbol/ExternalSymbol)
+        on real BN; a genuine A/B duplicate (two real bodies) stays ambiguous --
+        auto-pick must never guess between two real implementations (#122)."""
+        impls = [
+            fn for fn in matches
+            if _symbol_type_name(fn) not in _STUB_SYMBOL_TYPE_NAMES
+        ]
+        return impls[0] if len(impls) == 1 else None
 
     def _find_functions_by_name(self, bv, text: str, *, case_sensitive: bool) -> list[Any]:
         matches = []
@@ -208,12 +233,14 @@ class BridgeContext:
 
         if kind in {"auto", "function"}:
             exact_functions = self._find_functions_by_name(bv, str(identifier), case_sensitive=True)
-            if len(exact_functions) == 1:
-                fn = exact_functions[0]
+            resolved = exact_functions[0] if len(exact_functions) == 1 else (
+                self._resolve_impl_over_stub(exact_functions) if len(exact_functions) > 1 else None
+            )
+            if resolved is not None:
                 return {
                     "kind": "function",
-                    "address": int(fn.start),
-                    "before_name": str(fn.name),
+                    "address": int(resolved.start),
+                    "before_name": str(resolved.name),
                 }
             if len(exact_functions) > 1:
                 raise OperationFailure(
@@ -223,12 +250,14 @@ class BridgeContext:
                 )
 
             folded_functions = self._find_functions_by_name(bv, str(identifier), case_sensitive=False)
-            if len(folded_functions) == 1:
-                fn = folded_functions[0]
+            resolved = folded_functions[0] if len(folded_functions) == 1 else (
+                self._resolve_impl_over_stub(folded_functions) if len(folded_functions) > 1 else None
+            )
+            if resolved is not None:
                 return {
                     "kind": "function",
-                    "address": int(fn.start),
-                    "before_name": str(fn.name),
+                    "address": int(resolved.start),
+                    "before_name": str(resolved.name),
                 }
             if len(folded_functions) > 1:
                 raise OperationFailure(

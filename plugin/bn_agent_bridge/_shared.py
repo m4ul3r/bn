@@ -23,10 +23,29 @@ def _json_response(*, ok: bool, result: Any = None, error: str | None = None) ->
     return {"ok": ok, "result": result, "error": error}
 
 
+def _symbol_type_name(fn: Any) -> str | None:
+    """The symbol-type enum-member name of a function (e.g. ``FunctionSymbol``,
+    ``ImportedFunctionSymbol``), or None. Guards the WHOLE access: BN's
+    ``Function.symbol`` property asserts its core symbol is non-None, so a rare
+    invariant-violating None would raise an ``AssertionError`` that plain
+    ``getattr(..., None)`` does NOT swallow -- catch it so name resolution never
+    crashes on a weird binary (#122)."""
+    try:
+        sym = getattr(fn, "symbol", None)
+        return getattr(getattr(sym, "type", None), "name", None)
+    except Exception:
+        return None
+
+
 def _format_ambiguous_function_error(identifier: Any, matches: list[Any]) -> str:
     lines = [f"Ambiguous function identifier: {identifier} matches {len(matches)} functions:"]
     for fn in sorted(matches, key=lambda f: int(f.start)):
-        lines.append(f"  {int(fn.start):#010x}  {str(fn.name)}")
+        # Show each candidate's symbol kind (e.g. [FunctionSymbol] /
+        # [ImportedFunctionSymbol]) so the collision self-documents -- the stub
+        # vs implementation is then obvious (#122). Mirrors the symbol variant.
+        kind = _symbol_type_name(fn) or ""
+        suffix = f"  [{kind}]" if kind else ""
+        lines.append(f"  {int(fn.start):#010x}  {str(fn.name)}{suffix}")
     lines.append("retry with one of the addresses above (e.g. `bn function info 0x…`)")
     return "\n".join(lines)
 

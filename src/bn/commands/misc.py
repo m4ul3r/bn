@@ -59,6 +59,7 @@ def _strings(args: argparse.Namespace) -> int:
         page_offset=args.offset,
         page_label="strings",
         stem="strings",
+        regex_hint_query=args.query,
     )
 
 
