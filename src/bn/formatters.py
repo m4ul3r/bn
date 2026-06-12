@@ -6,7 +6,9 @@ from typing import Any, Callable
 # "rollback_failed" = an op succeeded but the batch revert that should have
 # undone it failed, so the view may be left modified -- a real failure. A
 # cleanly rolled-back sibling ("reverted") is NOT a failure and is omitted (#118).
-FAILED_MUTATION_STATUSES = {"unsupported", "verification_failed", "invalid_request", "rollback_failed"}
+# "internal_error" = an unexpected engine bug (distinct from an unsupported
+# request); still a failure, so exit codes/rendering flag it (#122).
+FAILED_MUTATION_STATUSES = {"unsupported", "verification_failed", "invalid_request", "rollback_failed", "internal_error"}
 
 
 def _render_fallback_text(value: Any) -> str:

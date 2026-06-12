@@ -34,9 +34,11 @@ import binaryninja as bn
 from . import il_format
 from . import vars as vars_mod
 from ._shared import (
+    USER_FACING_ERRORS,
     OperationFailure,
     _normalize_prototype,
     _parse_address,
+    _serialize_error,
 )
 
 # Required request fields per mutation op kind, validated before dispatch so a
@@ -140,11 +142,16 @@ def _operation_type_names(ctx, bv, op: dict[str, Any]) -> list[str]:
         declaration = op.get("declaration")
         if not declaration:
             return []
-        return [name for name, _ in _parse_declaration_source(ctx,
-            bv,
-            str(declaration),
-            source_path=op.get("source_path"),
-        )["types"]]
+        try:
+            parsed = _parse_declaration_source(
+                ctx, bv, str(declaration), source_path=op.get("source_path"),
+            )
+        except Exception:
+            # A malformed declaration must NOT raise from this pre-apply pass --
+            # _op_types_declare surfaces the precise, clean parse error instead
+            # (otherwise the SyntaxError escapes _mutation entirely) (#122).
+            return []
+        return [name for name, _ in parsed["types"]]
     return []
 
 
@@ -1002,9 +1009,17 @@ def _apply_operation(ctx, bv, op: dict[str, Any], restores: list | None = None):
     except OperationFailure:
         raise
     except Exception as exc:
+        # Expected user errors (a mistyped function/struct/variable name -> a
+        # RuntimeError "X not found", a bad address -> ValueError) carry an
+        # already-actionable message: surface it verbatim with the usual
+        # `unsupported` status. A genuinely UNEXPECTED error is a bug, not an
+        # unsupported request -- give it a distinct `internal_error` status and
+        # keep the class name for debugging. Reuses the bridge-wide taxonomy so
+        # mutation errors read the same as every other op (#122).
+        user_facing = isinstance(exc, USER_FACING_ERRORS)
         raise OperationFailure(
-            "unsupported",
-            f"{type(exc).__name__}: {exc}",
+            "unsupported" if user_facing else "internal_error",
+            _serialize_error(exc),
             requested=_operation_requested(ctx, op),
         ) from exc
 
@@ -1678,11 +1693,25 @@ def _op_struct_field_delete(ctx, bv, op: dict[str, Any]):
 
 
 def _op_types_declare(ctx, bv, op: dict[str, Any]):
-    parsed = _parse_declaration_source(ctx,
-        bv,
-        str(op["declaration"]),
-        source_path=op.get("source_path"),
-    )
+    try:
+        parsed = _parse_declaration_source(ctx,
+            bv,
+            str(op["declaration"]),
+            source_path=op.get("source_path"),
+        )
+    except OperationFailure:
+        raise
+    except Exception as exc:
+        # A malformed C declaration is a user mistake, not an engine bug: surface
+        # a clean invalid_request carrying BN's parser message, instead of
+        # leaking the raw SyntaxError class / mislabeling it internal_error.
+        # Mirrors _parse_type_or_hint for the other type-taking ops (#122).
+        detail = " ".join(str(exc).split())
+        raise OperationFailure(
+            "invalid_request",
+            "could not parse declaration" + (f": {detail}" if detail else "") + ".",
+            requested=_operation_requested(ctx, op),
+        ) from exc
     named_types = list(parsed["types"])
     defined_types = {}
     defined_type_layouts = {}
