@@ -64,8 +64,13 @@ def _load_bridge(monkeypatch):
     monkeypatch.delitem(sys.modules, "binaryninjaui", raising=False)
     package_name = "bn_test_bridge"
     module_name = f"{package_name}.bridge"
-    monkeypatch.delitem(sys.modules, module_name, raising=False)
-    monkeypatch.delitem(sys.modules, package_name, raising=False)
+    # Purge every cached bn_test_bridge.* submodule (bridge + its helper modules
+    # il_format/vars/seam/_shared/op_registry/taint_engine/...) so each load
+    # re-imports them against THIS call's fake `binaryninja`. Without this, a
+    # helper module loaded by an earlier _load_bridge stays bound to a stale
+    # fake_bn, and patches against the fresh `bridge.bn` never reach it.
+    for cached in [name for name in sys.modules if name == package_name or name.startswith(f"{package_name}.")]:
+        monkeypatch.delitem(sys.modules, cached, raising=False)
 
     bridge_path = Path(__file__).resolve().parents[1] / "plugin" / "bn_agent_bridge" / "bridge.py"
     package = types.ModuleType(package_name)
@@ -428,16 +433,18 @@ def test_mutation_reverts_on_verification_failure(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeMutationBV()
 
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
-    monkeypatch.setattr(instance, "_guess_affected_functions", lambda bv, operations: [])
-    monkeypatch.setattr(instance, "_capture_function_snapshots", lambda bv, functions: {})
-    monkeypatch.setattr(instance, "_capture_type_snapshots", lambda bv, operations: {})
-    monkeypatch.setattr(instance, "_diff_snapshots", lambda before, after: [])
-    monkeypatch.setattr(instance, "_diff_type_snapshots", lambda before, after: [])
+    # _mutation moved to mutation_engine and calls these peers module-locally;
+    # patch the seam helper on instance.ctx and the mutation peers on the module.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.mutation_engine, "_guess_affected_functions", lambda ctx, bv, operations: [])
+    monkeypatch.setattr(bridge.mutation_engine, "_capture_function_snapshots", lambda ctx, bv, functions: {})
+    monkeypatch.setattr(bridge.mutation_engine, "_capture_type_snapshots", lambda ctx, bv, operations: {})
+    monkeypatch.setattr(bridge.mutation_engine, "_diff_snapshots", lambda ctx, before, after: [])
+    monkeypatch.setattr(bridge.mutation_engine, "_diff_type_snapshots", lambda ctx, before, after: [])
     monkeypatch.setattr(
-        instance,
+        bridge.mutation_engine,
         "_apply_operation",
-        lambda bv, op, restores=None: {
+        lambda ctx, bv, op, restores=None: {
             "op": "rename_symbol",
             "kind": "function",
             "address": "0x401000",
@@ -446,9 +453,9 @@ def test_mutation_reverts_on_verification_failure(monkeypatch):
         },
     )
     monkeypatch.setattr(
-        instance,
+        bridge.mutation_engine,
         "_verify_operation",
-        lambda bv, result: {
+        lambda ctx, bv, result: {
             **result,
             "status": "verification_failed",
             "message": "Live rename verification failed at 0x401000",
@@ -497,15 +504,20 @@ def test_run_local_restores_runs_reverse_and_reports_failure(monkeypatch):
 
 
 def _mutation_with_stubs(monkeypatch, bridge, instance, bv, *, apply, verify=None):
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
-    monkeypatch.setattr(instance, "_guess_affected_functions", lambda bv, operations: [])
-    monkeypatch.setattr(instance, "_capture_function_snapshots", lambda bv, functions: {})
-    monkeypatch.setattr(instance, "_capture_type_snapshots", lambda bv, operations: {})
-    monkeypatch.setattr(instance, "_diff_snapshots", lambda before, after: [])
-    monkeypatch.setattr(instance, "_diff_type_snapshots", lambda before, after: [])
-    monkeypatch.setattr(instance, "_apply_operation", apply)
+    # _mutation moved to mutation_engine and calls its peers module-locally; patch
+    # the seam helper on instance.ctx and the mutation peers on the module. The
+    # passed apply/verify keep their (bv, op[, restores]) / (bv, result) signature
+    # -- wrap them to drop the new leading ctx the module-level call now passes.
+    me = bridge.mutation_engine
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(me, "_guess_affected_functions", lambda ctx, bv, operations: [])
+    monkeypatch.setattr(me, "_capture_function_snapshots", lambda ctx, bv, functions: {})
+    monkeypatch.setattr(me, "_capture_type_snapshots", lambda ctx, bv, operations: {})
+    monkeypatch.setattr(me, "_diff_snapshots", lambda ctx, before, after: [])
+    monkeypatch.setattr(me, "_diff_type_snapshots", lambda ctx, before, after: [])
+    monkeypatch.setattr(me, "_apply_operation", lambda ctx, *a, **k: apply(*a, **k))
     if verify is not None:
-        monkeypatch.setattr(instance, "_verify_operation", verify)
+        monkeypatch.setattr(me, "_verify_operation", lambda ctx, *a, **k: verify(*a, **k))
 
 
 def test_apply_failure_runs_restores_even_when_undo_revert_fails(monkeypatch):
@@ -524,14 +536,14 @@ def test_apply_failure_runs_restores_even_when_undo_revert_fails(monkeypatch):
         return {"op": "local_rename", "requested": {}}
 
     _mutation_with_stubs(monkeypatch, bridge, instance, bv, apply=apply)
-    monkeypatch.setattr(instance, "_revert_undo_safely", lambda bv_, state: False)
+    monkeypatch.setattr(bridge.mutation_engine, "_revert_undo_safely", lambda ctx, bv_, state: False)
 
-    def run_restores(bv_, restores):
+    def run_restores(ctx, bv_, restores):
         calls["restores"] += 1
         assert len(restores) == 1
         return True
 
-    monkeypatch.setattr(instance, "_run_local_restores", run_restores)
+    monkeypatch.setattr(bridge.mutation_engine, "_run_local_restores", run_restores)
 
     result = instance._mutation("active", False, [{"op": "local_rename"}, {"op": "boom"}])
 
@@ -557,7 +569,7 @@ def test_preview_restore_failure_is_not_success(monkeypatch):
         apply=apply,
         verify=lambda bv_, result: {**result, "status": "verified"},
     )
-    monkeypatch.setattr(instance, "_run_local_restores", lambda bv_, restores: False)
+    monkeypatch.setattr(bridge.mutation_engine, "_run_local_restores", lambda ctx, bv_, restores: False)
 
     result = instance._mutation("active", True, [{"op": "local_rename"}])
 
@@ -586,10 +598,10 @@ def test_preview_drift_restore_failure_is_not_success(monkeypatch):
         apply=apply,
         verify=lambda bv_, result: {**result, "status": "verified"},
     )
-    monkeypatch.setattr(instance, "_run_local_restores", lambda bv_, restores: True)
+    monkeypatch.setattr(bridge.mutation_engine, "_run_local_restores", lambda ctx, bv_, restores: True)
     # Force a non-empty var snapshot and a failing drift restore.
-    monkeypatch.setattr(instance, "_capture_local_var_snapshots", lambda bv_, fns: {0x1: {1: ("a", "int")}})
-    monkeypatch.setattr(instance, "_restore_local_var_drift", lambda bv_, snap: False)
+    monkeypatch.setattr(bridge.mutation_engine, "_capture_local_var_snapshots", lambda ctx, bv_, fns: {0x1: {1: ("a", "int")}})
+    monkeypatch.setattr(bridge.mutation_engine, "_restore_local_var_drift", lambda ctx, bv_, snap: False)
 
     result = instance._mutation("active", True, [{"op": "local_rename"}])
 
@@ -613,7 +625,7 @@ def test_preview_with_successful_restore_still_succeeds(monkeypatch):
         apply=apply,
         verify=lambda bv_, result: {**result, "status": "verified"},
     )
-    monkeypatch.setattr(instance, "_run_local_restores", lambda bv_, restores: True)
+    monkeypatch.setattr(bridge.mutation_engine, "_run_local_restores", lambda ctx, bv_, restores: True)
 
     result = instance._mutation("active", True, [{"op": "local_rename"}])
 
@@ -708,10 +720,13 @@ def test_op_local_rename_registers_restore_that_undoes_the_rename(monkeypatch):
 
     fn = _RecordingFunc()
     bv = types.SimpleNamespace(get_function_at=lambda addr: fn)
-    monkeypatch.setattr(instance, "_find_function", lambda _bv, ident: fn)
-    monkeypatch.setattr(instance, "_find_variable_selector", lambda _f, sel: (var, False))
-    monkeypatch.setattr(instance, "_find_var_for_restore", lambda _f, identifier, storage, is_parameter: var)
-    monkeypatch.setattr(instance, "_local_id", lambda _f, _v, is_parameter: "lid")
+    # _op_local_rename moved to mutation_engine; it resolves _find_function via
+    # the seam (instance.ctx), the variable helpers via vars_mod, and
+    # _find_var_for_restore module-locally (now ctx-first).
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda _bv, ident: fn)
+    monkeypatch.setattr(bridge.vars_mod, "_find_variable_selector", lambda _f, sel: (var, False))
+    monkeypatch.setattr(bridge.mutation_engine, "_find_var_for_restore", lambda ctx, _f, identifier, storage, is_parameter: var)
+    monkeypatch.setattr(bridge.vars_mod, "_local_id", lambda _f, _v, is_parameter: "lid")
 
     restores: list = []
     result = instance._op_local_rename(
@@ -736,9 +751,9 @@ def test_op_local_rename_noop_registers_no_restore(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     var = _FakeVariable(name="keep", storage=2, var_type="int32_t", identifier=1)
     fn = types.SimpleNamespace(start=0x1000, name="f", create_user_var=lambda *a: None)
-    monkeypatch.setattr(instance, "_find_function", lambda _bv, ident: fn)
-    monkeypatch.setattr(instance, "_find_variable_selector", lambda _f, sel: (var, False))
-    monkeypatch.setattr(instance, "_local_id", lambda _f, _v, is_parameter: "lid")
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda _bv, ident: fn)
+    monkeypatch.setattr(bridge.vars_mod, "_find_variable_selector", lambda _f, sel: (var, False))
+    monkeypatch.setattr(bridge.vars_mod, "_local_id", lambda _f, _v, is_parameter: "lid")
 
     restores: list = []
     instance._op_local_rename(bv := object(), {"op": "local_rename", "function": "f", "variable": "keep", "new_name": "keep"}, restores)
@@ -1114,7 +1129,7 @@ def test_list_locals_returns_stable_ids(monkeypatch):
         _FakeVariable(name="var_4", storage=-4, var_type="float", identifier=2001, index=1)
     ]
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._list_locals_for_function("active", "player_update")
 
@@ -1219,7 +1234,7 @@ def test_function_info_includes_metadata(monkeypatch):
         _FakeVariable(name="arg1", storage=4, var_type="int32_t", identifier=1001, index=0)
     ]
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._function_info("active", "player_update")
 
@@ -1299,8 +1314,8 @@ def test_decompile_renders_pseudo_c(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     fn = _FakeFunction(0x401000, "player_update")
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
-    monkeypatch.setattr(instance, "_comment_map", lambda bv, func: {})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.il_format, "_comment_map", lambda bv, func: {})
     _install_fake_pseudo_c(
         monkeypatch,
         bridge,
@@ -1327,8 +1342,8 @@ def test_decompile_pseudo_c_with_address_gutter(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     fn = _FakeFunction(0x401000, "player_update")
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
-    monkeypatch.setattr(instance, "_comment_map", lambda bv, func: {})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.il_format, "_comment_map", lambda bv, func: {})
     _install_fake_pseudo_c(
         monkeypatch,
         bridge,
@@ -1356,11 +1371,13 @@ def test_decompile_falls_back_to_hlil_when_pseudo_c_unavailable(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     fn = _FakeFunction(0x401000, "player_update", "int32_t player_update()")
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
-    monkeypatch.setattr(instance, "_comment_map", lambda bv, func: {})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.il_format, "_comment_map", lambda bv, func: {})
     # No fake lineardisassembly module installed -> _pseudo_c_text raises and we
-    # fall back to wrapped HLIL produced by _function_text.
-    monkeypatch.setattr(instance, "_function_text", lambda bv, func, **kw: "    return 1;")
+    # fall back to wrapped HLIL produced by _function_text. The renderer now
+    # lives in il_format and _decompile_text calls it module-locally, so stub it
+    # there (patching instance._function_text no longer intercepts that call).
+    monkeypatch.setattr(bridge.il_format, "_function_text", lambda bv, func, **kw: "    return 1;")
 
     result = instance._decompile("active", "player_update")
 
@@ -1378,8 +1395,8 @@ def test_decompile_warns_on_skipped_analysis(monkeypatch):
     fn.analysis_skipped = True
     fn.analysis_skip_reason = "ExceedFunctionSize"
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
-    monkeypatch.setattr(instance, "_comment_map", lambda bv, func: {})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.il_format, "_comment_map", lambda bv, func: {})
     # Body has no telltale text -> warning must fire on the analysis_skipped flag alone.
     _install_fake_pseudo_c(
         monkeypatch, bridge, fn,
@@ -1400,8 +1417,8 @@ def test_decompile_warns_on_placeholder_text_when_flag_clear(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     fn = _FakeFunction(0x401000, "big_fn")  # analysis_skipped defaults False
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
-    monkeypatch.setattr(instance, "_comment_map", lambda bv, func: {})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.il_format, "_comment_map", lambda bv, func: {})
     _install_fake_pseudo_c(
         monkeypatch, bridge, fn,
         [
@@ -1425,8 +1442,8 @@ def test_decompile_force_analysis_reanalyzes_and_clears_warning(monkeypatch):
     fn.analysis_skipped = True
     fn.analysis_skip_reason = "ExceedFunctionSize"
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
-    monkeypatch.setattr(instance, "_comment_map", lambda bv, func: {})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.il_format, "_comment_map", lambda bv, func: {})
     _install_fake_pseudo_c(
         monkeypatch, bridge, fn,
         [
@@ -1458,7 +1475,7 @@ def test_list_functions_is_sorted_by_address(monkeypatch):
             _FakeFunction(0x401000, "sub_401000"),
         ]
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._list_functions("active")
 
@@ -1476,7 +1493,7 @@ def test_list_functions_can_filter_by_address_range(monkeypatch):
             _FakeFunction(0x403000, "sub_403000"),
         ]
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._list_functions("active", min_address="0x401800", max_address="0x402fff")
 
@@ -1494,7 +1511,7 @@ def test_search_functions_supports_regex(monkeypatch):
             _FakeFunction(0x403000, "update_camera"),
         ]
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._search_functions("active", "attach|detach", regex=True)
 
@@ -1505,7 +1522,7 @@ def test_search_functions_rejects_invalid_regex(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV(functions=[_FakeFunction(0x401000, "load_attachment")])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     with pytest.raises(bridge.OperationFailure, match="Invalid function regex"):
         instance._search_functions("active", "(", regex=True)
@@ -1583,7 +1600,7 @@ def test_callsites_returns_local_hlil_assignment_and_pre_branch_condition(monkey
             0x4124D6: "test al, 0x3f",
         },
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     rows = instance._callsites(
         "active",
@@ -1678,7 +1695,7 @@ def test_callsites_prefers_local_expression_over_broad_enclosing_hlil(monkeypatc
             0x427760: "and eax, 0xf",
         },
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     rows = instance._callsites(
         "active",
@@ -1709,7 +1726,7 @@ def test_callsites_within_file_scope_preserves_file_order_and_dedupes(monkeypatc
         instruction_lengths={0x401010: 5, 0x402020: 5},
         disassembly={0x401010: "call crt_rand", 0x402020: "call crt_rand"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     rows = instance._callsites(
         "active",
@@ -1741,7 +1758,7 @@ def test_callsites_ignores_indirect_calls_and_returns_null_context_when_unmapped
         instruction_lengths={0x500010: 5, 0x500015: 5},
         disassembly={0x500010: "call eax", 0x500015: "call crt_rand"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     rows = instance._callsites(
         "active",
@@ -1773,7 +1790,7 @@ def test_callsites_counts_tailcall_into_target(monkeypatch):
         instruction_lengths={0x700010: 4},
         disassembly={0x700010: "b #memcpy"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     rows = instance._callsites("active", "memcpy", within_identifiers=["j_memcpy"], context=1)
 
@@ -1795,7 +1812,7 @@ def test_callsites_marks_regular_call_kind(monkeypatch):
         instruction_lengths={0x700010: 4},
         disassembly={0x700010: "bl #memcpy"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     rows = instance._callsites("active", "memcpy", within_identifiers=["caller"], context=1)
 
@@ -1821,7 +1838,7 @@ def test_callsites_returns_null_for_coarse_only_hlil(monkeypatch):
         instruction_lengths={0x600010: 5},
         disassembly={0x600010: "call crt_rand"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     rows = instance._callsites(
         "active",
@@ -1868,7 +1885,7 @@ def test_callsites_filters_placeholder_pre_branch_condition(monkeypatch):
         instruction_lengths={0x700010: 5},
         disassembly={0x700010: "call crt_rand"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     rows = instance._callsites(
         "active",
@@ -1940,7 +1957,9 @@ def test_function_evidence_reports_calls_arguments_and_thunk_candidate(monkeypat
             0x500000: "b send_message",
         },
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _function_evidence now resolves the view through the BridgeContext seam
+    # (read_evidence), so patch the moved free function's resolution path.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._function_evidence("active", "build_response", context=1)
     call = result["calls"][0]
@@ -2046,7 +2065,9 @@ def test_function_evidence_resolves_pointer_constant_arguments(monkeypatch):
         segments={0x2A4F4: _FakeSegment(readable=True)},
         memory={0x2A4F4: b"4\x00"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _function_evidence now resolves the view through the BridgeContext seam
+    # (read_evidence), so patch the moved free function's resolution path.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._function_evidence("active", "createBTService", context=0)
     call = result["calls"][0]
@@ -2082,7 +2103,9 @@ def test_function_evidence_does_not_merge_unrelated_hlil_call_args(monkeypatch):
         instruction_lengths={0x17188: 4},
         disassembly={0x17188: "blx getopt_long"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _function_evidence now resolves the view through the BridgeContext seam
+    # (read_evidence), so patch the moved free function's resolution path.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._function_evidence("active", "main", context=0)
     call = result["calls"][0]
@@ -2105,7 +2128,9 @@ def test_pointer_table_normalizes_thumb_function_pointers(monkeypatch):
             return super().get_function_at(address)
 
     bv = _ThumbTolerantBV(functions=[target], arch=_FakeArch(name="armv7"), memory={0x3000: table})
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _pointer_table now resolves the view through the BridgeContext seam
+    # (read_evidence), so patch the moved free function's resolution path.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._pointer_table("active", "0x3000", entries=2)
 
@@ -2132,7 +2157,9 @@ def test_pointer_table_does_not_thumb_normalize_non_arm_pointers(monkeypatch):
             return super().get_function_at(address)
 
     bv = _OddTolerantBV(functions=[target], arch=_FakeArch(name="x86"), memory={0x3000: table})
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _pointer_table now resolves the view through the BridgeContext seam
+    # (read_evidence), so patch the moved free function's resolution path.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._pointer_table("active", "0x3000", entries=1)
     target_info = result["entries"][0]["target"]
@@ -2158,7 +2185,9 @@ def test_function_evidence_marks_plt_stubs_as_thunk_candidates(monkeypatch):
         sections={".plt.got": _FakeSection(".plt.got", 0x404020, 0x404100)},
         disassembly={0x404020: "jmp qword ptr [rip+0x2000]"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _function_evidence now resolves the view through the BridgeContext seam
+    # (read_evidence), so patch the moved free function's resolution path.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._function_evidence("active", "puts@plt", context=0)
 
@@ -2175,7 +2204,9 @@ def test_pointer_table_warns_when_start_looks_like_code_not_table(monkeypatch):
         segments={0x64EA0: _FakeSegment(readable=True, executable=True)},
         memory=memory,
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _pointer_table now resolves the view through the BridgeContext seam
+    # (read_evidence), so patch the moved free function's resolution path.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._pointer_table("active", "0x64ea0", entries=2)
 
@@ -2198,7 +2229,9 @@ def test_message_lens_summarizes_type_string_xrefs_and_metadata_window(monkeypat
         disassembly={0x586C0: "adr r1, common.HeadUnitInfo"},
         memory=memory,
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _message_lens now resolves the view through the BridgeContext seam
+    # (read_evidence), so patch the moved free function's resolution path.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._message_lens("active", "HeadUnitInfo", limit=5, table_entries=2)
 
@@ -2261,7 +2294,9 @@ def test_message_lens_reports_true_total_and_flags_truncation(monkeypatch):
     # but the reported total must be the honest 5 with truncated=True (issue #13).
     strings = [_FakeStringRef(0x1000 + i * 0x20, 9, f"Evt{i}_token") for i in range(5)]
     bv = _FakeBV(arch=_FakeArch(name="armv7"), strings=strings)
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _message_lens now resolves the view through the BridgeContext seam
+    # (read_evidence), so patch the moved free function's resolution path.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._message_lens("active", "token", limit=2)
 
@@ -2276,7 +2311,9 @@ def test_message_lens_not_truncated_when_all_matches_fit(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     strings = [_FakeStringRef(0x1000 + i * 0x20, 9, f"Evt{i}_token") for i in range(3)]
     bv = _FakeBV(arch=_FakeArch(name="armv7"), strings=strings)
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _message_lens now resolves the view through the BridgeContext seam
+    # (read_evidence), so patch the moved free function's resolution path.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._message_lens("active", "token", limit=20)
 
@@ -2304,7 +2341,9 @@ def test_message_lens_metadata_window_stops_at_obvious_non_pointer(monkeypatch):
         data_refs={0x175BE4: [0x6008]},
         memory=memory,
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _message_lens now resolves the view through the BridgeContext seam
+    # (read_evidence), so patch the moved free function's resolution path.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._message_lens("active", "HeadUnitInfo", limit=5, table_entries=8)
     table = result["matches"][0]["metadata_table_windows"][0]
@@ -2351,7 +2390,7 @@ def test_py_exec_non_serializable_result_falls_back_to_repr(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV()
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._py_exec("active", "result = object()")
 
@@ -2575,7 +2614,7 @@ def test_strings_min_length_excludes_short_strings(monkeypatch):
         _FakeStringRef(0x2000, 5, "hello"),
         _FakeStringRef(0x3000, 10, "helloworld"),
     ])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._strings(None, query=None, offset=0, limit=100, min_length=4)
 
@@ -2597,7 +2636,7 @@ def test_strings_section_filter_keeps_only_matching_section(monkeypatch):
             ".rodata": _FakeSection(".rodata", 0x5000, 0x6000),
         },
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._strings(None, query=None, offset=0, limit=100, section=".rodata")
 
@@ -2621,7 +2660,7 @@ def test_strings_no_crt_excludes_locale_and_text_section(monkeypatch):
             ".text": _FakeSection(".text", 0x6000, 0x7000),
         },
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._strings(None, query=None, offset=0, limit=100, no_crt=True)
 
@@ -2644,7 +2683,7 @@ def test_strings_filters_combine(monkeypatch):
             ".rodata": _FakeSection(".rodata", 0x5000, 0x6000),
         },
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._strings(None, query=None, offset=0, limit=100,
                                min_length=4, section=".rodata", no_crt=True)
@@ -2663,7 +2702,7 @@ def test_strings_regex_search_matches_or_patterns(monkeypatch):
             _FakeStringRef(0x5020, 4, "skip"),
         ]
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._strings(None, query="vehicle|headunit", offset=0, limit=100, regex=True)
 
@@ -2673,7 +2712,7 @@ def test_strings_regex_search_matches_or_patterns(monkeypatch):
 def test_strings_invalid_regex_is_actionable(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: _FakeBV())
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: _FakeBV())
 
     with pytest.raises(bridge.OperationFailure, match="Invalid string regex"):
         instance._strings(None, query="(", offset=0, limit=100, regex=True)
@@ -2697,7 +2736,7 @@ def test_sections_returns_all_sections_with_permissions(monkeypatch):
             0x6000: _FakeSegment(readable=True, writable=False, executable=False),
         },
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._sections(None)
 
@@ -2737,7 +2776,9 @@ def test_init_arrays_summarizes_constructor_pointer_sections(monkeypatch):
         },
         memory={0x5000: table},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _init_arrays now resolves the view through the BridgeContext seam
+    # (read_evidence), so patch the moved free function's resolution path.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._init_arrays("active", limit=4)
 
@@ -2759,7 +2800,7 @@ def test_sections_query_filters_by_name(monkeypatch):
             ".data": _FakeSection(".data", 0x6000, 0x7000),
         },
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._sections(None, query="data")
 
@@ -2776,7 +2817,7 @@ def test_sections_null_segment_omits_rwx(monkeypatch):
         sections={".bss": _FakeSection(".bss", 0x9000, 0xa000)},
         segments={0x1000: _FakeSegment(readable=True, writable=False, executable=True)},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._sections(None)
 
@@ -2793,7 +2834,7 @@ def test_sections_without_segments_omits_rwx(monkeypatch):
             self.sections = {".text": _FakeSection(".text", 0x1000, 0x2000)}
 
     bv = _BareView()
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._sections(None)
 
@@ -2824,7 +2865,7 @@ def test_imports_includes_function_data_and_address_symbols(monkeypatch):
     addr_sym.namespace = ""
 
     bv = _FakeBV(symbols=[func_sym, data_sym, addr_sym])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._imports(None)
 
@@ -2849,7 +2890,7 @@ def test_imports_sorts_by_library_kind_name(monkeypatch):
     sym_a.namespace = "liba"
 
     bv = _FakeBV(symbols=[sym_b, sym_a])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._imports(None)
 
@@ -2869,7 +2910,7 @@ def test_imports_bn_sentinel_namespace_is_not_surfaced_as_library(monkeypatch):
     sym.namespace = "BNINTERNALNAMESPACE"
 
     bv = _FakeBV(symbols=[sym])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._imports(None)
 
@@ -2890,7 +2931,7 @@ def test_imports_summary_includes_needed_libraries(monkeypatch):
 
     bv = _FakeBV(symbols=[sym])
     bv.libraries = ["libssl.so.1.1", "libc.so.6"]
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._imports(None, summary=True)
 
@@ -2907,7 +2948,7 @@ def test_read_returns_hex_and_ascii_for_mapped_address(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV(memory={0x1000: b"\x48\x65\x6c\x6c\x6f\x00\x90\xff"})
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._read(None, "0x1000", 8)
 
@@ -2923,7 +2964,7 @@ def test_read_accepts_decimal_address(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV(memory={0x1000: b"\x41\x42\x43\x44"})
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._read(None, "4096", 4)
 
@@ -2936,7 +2977,7 @@ def test_read_unmapped_address_raises_naming_the_address(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV(memory={0x1000: b"\x41\x42\x43\x44"})
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     with pytest.raises(RuntimeError, match="0xdead.*not mapped"):
         instance._read(None, "0xdead", 16)
@@ -2946,7 +2987,7 @@ def test_read_short_read_returns_mapped_bytes_with_note(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV(memory={0x1000: b"\x01\x02\x03\x04"})
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._read(None, "0x1000", 16)
 
@@ -2988,7 +3029,7 @@ def test_function_create_at_executable_address_returns_verified(monkeypatch):
         segments={0x1000: _FakeSegment(readable=True, executable=True)},
         memory={0x1000: b"\x55\x48\x89\xe5"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._function_create(None, "0x1000", False)
 
@@ -3012,7 +3053,7 @@ def test_function_create_preview_reverts_without_committing(monkeypatch):
         segments={0x1000: _FakeSegment(readable=True, executable=True)},
         memory={0x1000: b"\x55\x48\x89\xe5"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._function_create(None, "0x1000", True)
 
@@ -3031,7 +3072,7 @@ def test_function_create_existing_function_is_noop(monkeypatch):
         segments={0x1000: _FakeSegment(readable=True, executable=True)},
         memory={0x1000: b"\x55\x48\x89\xe5"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._function_create(None, "0x1000", False)
 
@@ -3050,7 +3091,7 @@ def test_function_create_unmapped_address_is_rejected(monkeypatch):
         segments={0x1000: _FakeSegment(readable=True, executable=True)},
         memory={0x1000: b"\x55\x48\x89\xe5"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     with pytest.raises(RuntimeError, match="0xdead.*not mapped"):
         instance._function_create(None, "0xdead", False)
@@ -3065,7 +3106,7 @@ def test_function_create_non_executable_address_is_rejected(monkeypatch):
         segments={0x5000: _FakeSegment(readable=True, writable=True, executable=False)},
         memory={0x5000: b"\x01\x02\x03\x04"},
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     with pytest.raises(RuntimeError, match="0x5000.*not inside an executable segment"):
         instance._function_create(None, "0x5000", False)
@@ -3832,7 +3873,7 @@ def test_list_functions_count_only_returns_count(monkeypatch):
         _FakeFunction(0x2000, "b"),
         _FakeFunction(0x3000, "c"),
     ])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     assert instance._list_functions(None, count_only=True) == {"count": 3}
     # count must match the full listing's reported total
@@ -4032,7 +4073,7 @@ def test_backward_slice_simple_chain(monkeypatch):
         definitions={var_r0: def_insn},
     )
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._backward_slice("active", "test_func", "0x10010", arg_index=0)
 
@@ -4068,7 +4109,7 @@ def test_backward_slice_undefined_var(monkeypatch):
     fn = _FakeFunction(0x10000, "test_func")
     fn.medium_level_il = _FakeMLILFunction(instructions=[call_insn])
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._backward_slice("active", "test_func", "0x10020", arg_index=0)
 
@@ -4099,7 +4140,7 @@ def test_backward_slice_labels_true_parameter(monkeypatch):
     fn.parameter_vars = [_FakeSSAVariable("arg1")]
     fn.medium_level_il.ssa_form.source_function = fn
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._backward_slice("active", "test_func", "0x10020", arg_index=0)
 
@@ -4128,7 +4169,7 @@ def test_backward_slice_depth_is_def_use_distance(monkeypatch):
     fn = _FakeFunction(0x2000, "f")
     fn.medium_level_il = _FakeMLILFunction(instructions=[def_x, call_insn], definitions={x: def_x})
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._backward_slice("active", "f", "0x2010", arg_index=0)
     by_var = {s["ssa_var"]: s for s in result["trace"]}
@@ -4146,7 +4187,7 @@ def test_backward_slice_no_call_at_address(monkeypatch):
     fn = _FakeFunction(0x10000, "test_func")
     fn.medium_level_il = _FakeMLILFunction(instructions=[])
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     with pytest.raises(bridge.OperationFailure, match="No call instruction"):
         instance._backward_slice("active", "test_func", "0x99999", arg_index=0)
@@ -4166,7 +4207,7 @@ def test_backward_slice_bad_arg_index(monkeypatch):
     fn = _FakeFunction(0x10000, "test_func")
     fn.medium_level_il = _FakeMLILFunction(instructions=[call_insn])
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     with pytest.raises(bridge.OperationFailure, match="out of range"):
         instance._backward_slice("active", "test_func", "0x10010", arg_index=5)
@@ -4180,7 +4221,7 @@ def test_backward_slice_no_mlil(monkeypatch):
     fn = _FakeFunction(0x10000, "test_func")
     fn.medium_level_il = None
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     with pytest.raises(bridge.OperationFailure, match="has no mlil"):
         instance._backward_slice("active", "test_func", "0x10010", arg_index=0)
@@ -4228,7 +4269,7 @@ def test_backward_slice_interprocedural_follows_callee(monkeypatch):
     )
     # Register both functions so _resolve_callee can find callee by address.
     bv = _FakeBV(functions=[caller, callee])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._backward_slice(
         "active", "caller_fn", "0x10010", arg_index=0,
@@ -4268,7 +4309,7 @@ def test_backward_slice_ip_rejects_llil(monkeypatch):
         basic_blocks = []
     fn.low_level_il.ssa_form = _NoSsaDefs()
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
     with pytest.raises(bridge.OperationFailure, match="SSA form does not support"):
         instance._backward_slice("active", "test_func", "0x10010", arg_index=0,
                                  view="llil", interprocedural=True)
@@ -4299,7 +4340,7 @@ def test_imports_summary_aggregates_counts(monkeypatch):
     sym_d.namespace = "libfoo"
 
     bv = _FakeBV(symbols=[sym_a, sym_b, sym_c, sym_d])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._imports(None, summary=True)
 
@@ -4312,7 +4353,7 @@ def test_imports_summary_empty(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV()
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._imports(None, summary=True)
 
@@ -4337,7 +4378,8 @@ def test_xrefs_falls_back_to_import_symbol_when_function_not_found(monkeypatch):
         functions=[_FakeFunction(0x10000, "main")],
         symbols=[malloc_sym],
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _xrefs now resolves the view through the BridgeContext seam (read_xrefs).
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._xrefs(None, "malloc")
 
@@ -4350,7 +4392,8 @@ def test_xrefs_import_symbol_raises_for_unknown_symbol(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV(functions=[_FakeFunction(0x10000, "main")])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _xrefs now resolves the view through the BridgeContext seam (read_xrefs).
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     with pytest.raises(RuntimeError, match="Function not found: nonexistent"):
         instance._xrefs(None, "nonexistent")
@@ -4415,7 +4458,7 @@ def test_search_functions_exact_match(monkeypatch):
             _FakeFunction(0x403000, "sprintf"),
         ]
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._search_functions("active", "system", exact=True)
 
@@ -4433,7 +4476,7 @@ def test_search_functions_exact_case_insensitive(monkeypatch):
             _FakeFunction(0x402000, "QSystemPlugin"),
         ]
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._search_functions("active", "system", exact=True)
 
@@ -4450,7 +4493,7 @@ def test_search_functions_exact_no_match(monkeypatch):
             _FakeFunction(0x402000, "_system"),
         ]
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._search_functions("active", "system", exact=True)
 
@@ -4661,7 +4704,8 @@ def test_xrefs_reraises_ambiguous_function_identifier(monkeypatch):
             _FakeFunction(0x402000, "duplicate_name"),
         ]
     )
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _xrefs now resolves the view through the BridgeContext seam (read_xrefs).
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     with pytest.raises(RuntimeError, match="Ambiguous function identifier"):
         instance._xrefs(None, "duplicate_name")
@@ -4862,11 +4906,14 @@ def test_field_xrefs_resolves_data_var_type(monkeypatch):
         disassembly={0x1010: "ldr r0, [r1, #4]"},
     )
 
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    # _field_xrefs now resolves the view through the BridgeContext seam and calls
+    # the module-level _resolve_type_field directly (read_xrefs), so patch both
+    # where the moved free function reaches them.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
     monkeypatch.setattr(
-        instance,
+        bridge.read_xrefs,
         "_resolve_type_field",
-        lambda view, spec: {"type_name": "Foo", "offset": 4, "field_name": "bar"},
+        lambda ctx, view, spec: {"type_name": "Foo", "offset": 4, "field_name": "bar"},
     )
 
     # Must not raise (the old get_type_at call would AttributeError here).
@@ -4894,7 +4941,7 @@ def test_imports_pagination_slices_offset_and_limit(monkeypatch):
         s.namespace = "lib"
         syms.append(s)
     bv = _FakeBV(symbols=syms)
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     full = instance._imports(None)
     assert [item["name"] for item in full] == ["fn0", "fn1", "fn2", "fn3", "fn4"]
@@ -4928,8 +4975,8 @@ def test_apply_operation_comment_function_only_form_accepted(monkeypatch):
     # required-field validation, not be rejected as missing `address` (#67).
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    monkeypatch.setattr(instance, "_op_set_comment", lambda bv, op: {"ok": "set"})
-    monkeypatch.setattr(instance, "_op_delete_comment", lambda bv, op: {"ok": "del"})
+    monkeypatch.setattr(bridge.mutation_engine, "_op_set_comment", lambda ctx, bv, op: {"ok": "set"})
+    monkeypatch.setattr(bridge.mutation_engine, "_op_delete_comment", lambda ctx, bv, op: {"ok": "del"})
     assert instance._apply_operation(
         None, {"op": "set_comment", "function": "main", "comment": "hi"}) == {"ok": "set"}
     assert instance._apply_operation(
@@ -4939,7 +4986,7 @@ def test_apply_operation_comment_function_only_form_accepted(monkeypatch):
 def test_apply_operation_comment_address_form_still_accepted(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    monkeypatch.setattr(instance, "_op_set_comment", lambda bv, op: {"ok": "set"})
+    monkeypatch.setattr(bridge.mutation_engine, "_op_set_comment", lambda ctx, bv, op: {"ok": "set"})
     assert instance._apply_operation(
         None, {"op": "set_comment", "address": "0x1000", "comment": "hi"}) == {"ok": "set"}
 
@@ -5006,7 +5053,7 @@ def test_sections_pagination_slices_offset_and_limit(monkeypatch):
         ".c": _FakeSection(".c", 0x3000, 0x3100),
     }
     bv = _FakeBV(sections=secs)
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     full = instance._sections(None)
     assert [s["name"] for s in full] == [".a", ".b", ".c"]
@@ -5018,7 +5065,7 @@ def test_py_exec_reports_script_error_with_type_prefix(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV()
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     # A NameError used to be tagged "internal error: NameError:" while a raised
     # ValueError surfaced as a bare message. Both now read "TypeName: message".
@@ -5049,8 +5096,8 @@ def test_decompile_force_requested_but_not_skipped_echoes_flag(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     fn = _FakeFunction(0x401000, "small_fn")  # analysis_skipped defaults False
     bv = _FakeBV(functions=[fn])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
-    monkeypatch.setattr(instance, "_comment_map", lambda bv, func: {})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.il_format, "_comment_map", lambda bv, func: {})
     _install_fake_pseudo_c(
         monkeypatch, bridge, fn,
         [[(0x401000, "int32_t small_fn()")], [(0x401000, "{")], [(0x401000, "}")]],
@@ -5072,7 +5119,7 @@ def test_strings_requires_refresh_when_quick_loaded(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV(strings=[])
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     # Quick-loaded: strings analysis hasn't run, so refuse rather than return [].
     bridge._quick_loaded_views.add(bv)
@@ -5189,8 +5236,10 @@ def _struct_instance(monkeypatch, members):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     builder = _FakeStructBuilder(members)
-    monkeypatch.setattr(instance, "_struct_builder", lambda bv, name: ("S", builder))
-    monkeypatch.setattr(instance, "_commit_struct_builder", lambda *a, **k: None)
+    # _op_struct_field_* moved to mutation_engine and call these module-locally,
+    # so stub them on the module (patching instance._* no longer intercepts).
+    monkeypatch.setattr(bridge.mutation_engine, "_struct_builder", lambda ctx, bv, name: ("S", builder))
+    monkeypatch.setattr(bridge.mutation_engine, "_commit_struct_builder", lambda *a, **k: None)
     return bridge, instance, builder
 
 
@@ -5267,8 +5316,8 @@ def _struct_set_instance(monkeypatch, occupied_offsets):
         def get_type_by_name(self, n):
             return occupied_type
 
-    monkeypatch.setattr(instance, "_struct_builder", lambda bv, name: ("S", builder))
-    monkeypatch.setattr(instance, "_commit_struct_builder", lambda *a, **k: None)
+    monkeypatch.setattr(bridge.mutation_engine, "_struct_builder", lambda ctx, bv, name: ("S", builder))
+    monkeypatch.setattr(bridge.mutation_engine, "_commit_struct_builder", lambda *a, **k: None)
     return bridge, instance, builder, _BV()
 
 
@@ -5311,8 +5360,8 @@ def test_struct_field_set_no_overwrite_refuses_interior_overlap(monkeypatch):
         def get_type_by_name(self, n):
             return occupied_type
 
-    monkeypatch.setattr(instance, "_struct_builder", lambda bv, name: ("S", builder))
-    monkeypatch.setattr(instance, "_commit_struct_builder", lambda *a, **k: None)
+    monkeypatch.setattr(bridge.mutation_engine, "_struct_builder", lambda ctx, bv, name: ("S", builder))
+    monkeypatch.setattr(bridge.mutation_engine, "_commit_struct_builder", lambda *a, **k: None)
     with pytest.raises(bridge.OperationFailure) as exc:
         instance._op_struct_field_set(_BV(), {
             "struct_name": "S", "offset": "0x4", "field_name": "mid",
@@ -5365,9 +5414,9 @@ def _dataflow_values_instance(monkeypatch, ins):
     instance = bridge.BinaryNinjaBridge()
     il = types.SimpleNamespace(instructions=[ins])
     func = types.SimpleNamespace(name="f", start=0x1000)
-    monkeypatch.setattr(instance, "_resolve_view", lambda sel: object())
-    monkeypatch.setattr(instance, "_find_function", lambda bv, ident: func)
-    monkeypatch.setattr(instance, "_il_function_for", lambda fn, view, ssa: il)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda sel: object())
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda bv, ident: func)
+    monkeypatch.setattr(bridge.il_format, "_il_function_for", lambda fn, view, ssa: il)
     return bridge, instance
 
 
@@ -5451,11 +5500,14 @@ def test_render_type_layout_struct_unchanged(monkeypatch):
 
 
 def _stub_code_context(monkeypatch, instance, function_entry):
-    monkeypatch.setattr(instance, "_sections_at", lambda bv, a: [{"name": ".text"}])
-    monkeypatch.setattr(instance, "_segment_at", lambda bv, a: {"name": "seg"})
-    monkeypatch.setattr(instance, "_symbol_at", lambda bv, a: None)
-    monkeypatch.setattr(instance, "_function_entry_for_address", lambda bv, a: function_entry)
-    monkeypatch.setattr(instance, "_address_is_code", lambda bv, a: True)
+    # _address_context and its resolution/address-context helpers now live on the
+    # BridgeContext seam (instance.ctx); patch the helpers where the method under
+    # test resolves them.
+    monkeypatch.setattr(instance.ctx, "_sections_at", lambda bv, a: [{"name": ".text"}])
+    monkeypatch.setattr(instance.ctx, "_segment_at", lambda bv, a: {"name": "seg"})
+    monkeypatch.setattr(instance.ctx, "_symbol_at", lambda bv, a: None)
+    monkeypatch.setattr(instance.ctx, "_function_entry_for_address", lambda bv, a: function_entry)
+    monkeypatch.setattr(instance.ctx, "_address_is_code", lambda bv, a: True)
 
 
 def test_address_context_disasm_uses_target_function_arch(monkeypatch):
@@ -5477,7 +5529,7 @@ def test_address_context_disasm_uses_target_function_arch(monkeypatch):
         recorded["arch"] = arch
         return "bx pc" if arch is thumb_arch else "udf #0xd478"
 
-    monkeypatch.setattr(instance, "_safe_disassembly", fake_safe)
+    monkeypatch.setattr(instance.ctx, "_safe_disassembly", fake_safe)
     ctx = instance._address_context(_BV(), 0x12e74, include_disasm=True)
     assert recorded["arch"] is thumb_arch           # used the target function's arch
     assert ctx["disasm"] == "bx pc"                 # not the ARM misdecode
@@ -5496,7 +5548,7 @@ def test_address_context_disasm_respects_explicit_arch(monkeypatch):
         recorded["arch"] = arch
         return "x"
 
-    monkeypatch.setattr(instance, "_safe_disassembly", fake_safe)
+    monkeypatch.setattr(instance.ctx, "_safe_disassembly", fake_safe)
     instance._address_context(object(), 0x1000, include_disasm=True, arch=explicit, assume_code=True)
     assert recorded["arch"] is explicit
 
@@ -5533,10 +5585,10 @@ def test_internal_keyerror_not_mislabeled_as_missing_field(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeMutationBV()
 
-    def boom(b, o):
+    def boom(ctx, b, o):
         raise KeyError("some_internal_key")
 
-    monkeypatch.setattr(instance, "_op_rename_symbol", boom)
+    monkeypatch.setattr(bridge.mutation_engine, "_op_rename_symbol", boom)
     with pytest.raises(bridge.OperationFailure) as e:
         instance._apply_operation(bv, {"op": "rename_symbol", "identifier": "x", "new_name": "y"})
     assert "missing required field" not in str(e.value)
@@ -5615,7 +5667,7 @@ def test_get_comment_rejects_both_locators(monkeypatch):
     # (the CLI mutex group doesn't protect raw clients).
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: _FakeBV())
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: _FakeBV())
     with pytest.raises(RuntimeError, match="not both"):
         instance._get_comment("active", "0x1000", "main")
 
@@ -5651,7 +5703,7 @@ def test_list_comments_rejects_negative_count(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV()
     bv.address_comments = {}
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
     with pytest.raises(bridge.OperationFailure) as exc:
         instance._list_comments("active", limit=-3)
     assert exc.value.status == "invalid_request"
