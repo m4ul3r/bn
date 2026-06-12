@@ -23,6 +23,7 @@ from binaryninja import SSAVariable
 from binaryninja.plugin import PluginCommand
 
 from . import il_format
+from . import mutation_engine
 from . import taint_engine as _taint
 from . import vars as vars_mod
 from ._shared import (
@@ -75,32 +76,8 @@ def _format_unknown_target_error(selector: Any, targets: list[dict[str, Any]]) -
     return "\n".join(lines)
 
 
-# Required request fields per mutation op kind, validated before dispatch so a
-# missing field is reported as a malformed REQUEST (invalid_request, naming the
-# field) rather than letting a raw KeyError surface -- and so a KeyError raised
-# by BN internals inside a handler is NOT mislabeled as a missing request field.
-# Optional fields (read via op.get(...)) are intentionally omitted.
-REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
-    "rename_symbol": ("identifier", "new_name"),
-    "set_comment": ("comment",),
-    "delete_comment": (),
-    "set_prototype": ("identifier", "prototype"),
-    "local_rename": ("function", "variable", "new_name"),
-    "local_retype": ("function", "variable", "new_type"),
-    "struct_field_set": ("struct_name", "field_type", "offset", "field_name"),
-    "struct_field_rename": ("struct_name", "old_name", "new_name"),
-    "struct_field_delete": ("struct_name", "field_name"),
-    "types_declare": ("declaration",),
-}
-
-# Ops that accept one of several alternative locator fields. set_comment /
-# delete_comment target EITHER a function (`function`) OR an address (`address`):
-# listing `address` as unconditionally required wrongly rejected the documented
-# function-only form (#67). Each group requires at least one of its fields.
-REQUIRED_ONE_OF: dict[str, tuple[tuple[str, ...], ...]] = {
-    "set_comment": (("function", "address"),),
-    "delete_comment": (("function", "address"),),
-}
+# REQUIRED_FIELDS / REQUIRED_ONE_OF moved to mutation_engine.py with the
+# mutation cluster they validate (issue #33 Stage 4).
 
 
 class _ReadWriteLock:
@@ -513,11 +490,7 @@ _STRING_TYPE_NAMES: dict[int, str] = {
     2: "utf32",
 }
 
-# Op kinds that mutate a function's local variables via create_user_var /
-# set_user_type, which BN may PROPAGATE onto aliased siblings. Batches with any
-# of these get a full per-function local snapshot so revert paths can undo the
-# propagation, not just the targeted variable (see _capture_local_var_snapshots).
-_VAR_DRIFT_OPS = {"local_rename", "local_retype", "set_prototype"}
+# _VAR_DRIFT_OPS moved to mutation_engine.py with the mutation cluster (#33).
 
 
 class BinaryNinjaBridge:
@@ -3235,1432 +3208,165 @@ class BinaryNinjaBridge:
     def _render_warnings(self, *a, **k):
         return il_format._render_warnings(*a, **k)
 
-    def _guess_type_affected_functions(self, bv, type_name: str, limit: int = 10):
-        matches = []
-        needle = type_name.lower()
-        for fn in list(bv.functions):
-            text = str(fn.type).lower()
-            if needle in text:
-                matches.append(fn)
-                if len(matches) >= limit:
-                    break
-        return matches
-
-    def _parse_declaration_source(self, bv, declaration: str, *, source_path: str | None = None):
-        parse_result = None
-        source_error: Exception | None = None
-        platform = getattr(bv, "platform", None)
-        if platform is not None and hasattr(platform, "parse_types_from_source"):
-            kwargs: dict[str, Any] = {}
-            if source_path:
-                kwargs["filename"] = source_path
-                kwargs["include_dirs"] = [str(Path(source_path).expanduser().resolve().parent)]
-            try:
-                parse_result = platform.parse_types_from_source(declaration, **kwargs)
-            except Exception as exc:
-                source_error = exc
-
-        if parse_result is None:
-            try:
-                parse_result = bv.parse_types_from_string(declaration)
-            except Exception:
-                if source_error is not None:
-                    raise source_error
-                raise
-
-        return {
-            "types": [(str(name), type_obj) for name, type_obj in list(getattr(parse_result, "types", {}).items())],
-            "variables": [(str(name), type_obj) for name, type_obj in list(getattr(parse_result, "variables", {}).items())],
-            "functions": [(str(name), type_obj) for name, type_obj in list(getattr(parse_result, "functions", {}).items())],
-        }
-
-    def _operation_type_names(self, bv, op: dict[str, Any]) -> list[str]:
-        kind = op.get("op") or "rename_symbol"
-        if kind.startswith("struct_") and op.get("struct_name"):
-            # Struct ops resolve the name canonically (case-insensitively) via
-            # _find_type and commit under the RESOLVED name. Snapshot under
-            # that same name, or a request like "mystruct" against an actual
-            # "MyStruct" misses both pre- and post-snapshots and the layout
-            # diff silently drops out of affected_types. Fall back to the raw
-            # name when resolution fails: this pre-apply pass must not raise --
-            # _apply_operation surfaces the precise error.
-            raw_name = str(op["struct_name"])
-            try:
-                resolved_name, _ = self._find_type(bv, raw_name)
-            except Exception:
-                return [raw_name]
-            return [resolved_name]
-        if kind == "types_declare":
-            # Tolerate a malformed op here (the pre-apply snapshot pass): a
-            # missing `declaration` must surface as the precise invalid_request
-            # from _apply_operation's field validation, not a raw KeyError that
-            # escapes _mutation before the apply loop.
-            declaration = op.get("declaration")
-            if not declaration:
-                return []
-            return [name for name, _ in self._parse_declaration_source(
-                bv,
-                str(declaration),
-                source_path=op.get("source_path"),
-            )["types"]]
-        return []
-
-    def _guess_affected_functions(self, bv, operations: list[dict[str, Any]]):
-        affected = []
-        seen = set()
-        for op in operations:
-            if not isinstance(op, dict):
-                continue  # a non-dict op is rejected cleanly in _apply_operation (#48)
-            kind = op.get("op") or "rename_symbol"
-            functions = []
-            try:
-                if kind == "rename_symbol" and op.get("kind") != "data":
-                    functions = [self._find_function(bv, op["identifier"])]
-                elif kind in {"set_prototype", "local_rename", "local_retype"}:
-                    ident = op.get("identifier") or op.get("function")
-                    functions = [self._find_function(bv, ident)]
-                elif kind in {"set_comment", "delete_comment"}:
-                    if op.get("function"):
-                        functions = [self._find_function(bv, op["function"])]
-                    elif op.get("address"):
-                        functions = self._functions_containing(bv, _parse_address(op["address"]))
-                elif kind.startswith("struct_") or kind == "types_declare":
-                    for type_name in self._operation_type_names(bv, op):
-                        functions.extend(self._guess_type_affected_functions(bv, type_name))
-            except Exception:
-                functions = []
-
-            for fn in functions:
-                if fn is None:
-                    continue
-                marker = int(fn.start)
-                if marker not in seen:
-                    seen.add(marker)
-                    affected.append(fn)
-        return affected
-
-    def _affected_type_names(self, bv, operations: list[dict[str, Any]]) -> list[str]:
-        names: list[str] = []
-        seen: set[str] = set()
-        for op in operations:
-            if not isinstance(op, dict):
-                continue  # a non-dict op is rejected cleanly in _apply_operation (#48)
-            for type_name in self._operation_type_names(bv, op):
-                if type_name not in seen:
-                    seen.add(type_name)
-                    names.append(type_name)
-        return names
-
     def _render_type_layout(self, *a, **k) -> str:
         # Relocated to the BridgeContext seam (cycle-break, design spec §3.2).
         return self.ctx._render_type_layout(*a, **k)
 
-    def _capture_type_snapshots(self, bv, operations: list[dict[str, Any]]):
-        snapshots: dict[str, dict[str, Any]] = {}
-        for type_name in self._affected_type_names(bv, operations):
-            type_obj = bv.get_type_by_name(type_name)
-            if type_obj is None:
-                continue
-            snapshots[type_name] = {
-                "type_name": type_name,
-                "decl": str(type_obj),
-                "layout": self._render_type_layout(type_obj),
-            }
-        return snapshots
+    # ---- mutation engine: delegating shims ----
+    # Every method body moved to mutation_engine.py as a free function taking
+    # the BridgeContext (self.ctx). These thin shims keep the bridge method
+    # names alive so the op binders and the test suite (which call many of
+    # these directly) keep working -- the existing _taint -> taint_engine
+    # pattern. _function_create (the create-cluster op) stays in the bridge.
+    def _guess_type_affected_functions(self, *a, **k):
+        return mutation_engine._guess_type_affected_functions(self.ctx, *a, **k)
 
-    def _diff_type_snapshots(self, before: dict[str, Any], after: dict[str, Any]):
-        diffs = []
-        for type_name in sorted(set(before) | set(after)):
-            old = before.get(type_name, {"decl": "", "layout": ""})
-            new = after.get(type_name, {"decl": "", "layout": ""})
-            layout_diff = "\n".join(
-                difflib.unified_diff(
-                    old["layout"].splitlines(),
-                    new["layout"].splitlines(),
-                    fromfile=f"before:{type_name}",
-                    tofile=f"after:{type_name}",
-                    lineterm="",
-                )
-            )
-            changed = old["decl"] != new["decl"] or old["layout"] != new["layout"]
-            entry = {
-                "type_name": type_name,
-                "before_decl": old["decl"],
-                "after_decl": new["decl"],
-                "before_layout": old["layout"],
-                "after_layout": new["layout"],
-                "layout_diff": layout_diff,
-                "changed": changed,
-            }
-            if not changed:
-                entry["message"] = "No effective change detected"
-            diffs.append(entry)
-        return diffs
+    def _parse_declaration_source(self, *a, **k):
+        return mutation_engine._parse_declaration_source(self.ctx, *a, **k)
 
-    def _annotate_operation_results(self, results: list[dict[str, Any]], type_diffs: list[dict[str, Any]]):
-        type_changes = {item["type_name"]: item for item in type_diffs}
-        annotated = []
-        for result in results:
-            item = dict(result)
-            type_name = item.get("struct_name")
-            if type_name and type_name in type_changes:
-                change = type_changes[type_name]
-                item["changed"] = bool(change["changed"])
-                if not change["changed"]:
-                    item["message"] = change["message"]
-                    if item.get("status") == "verified":
-                        item["status"] = "noop"
-            defined_types = dict(item.get("defined_types") or {})
-            if defined_types:
-                changed_types = {name: bool(type_changes.get(name, {}).get("changed")) for name in defined_types}
-                item["changed_types"] = changed_types
-                # The authoritative change signal is the before/after layout diff
-                # (changed_types), not the verify step's decl-string compare -- a
-                # redeclaration of an existing NAME renders the same `struct QA`
-                # decl before and after, so that compare wrongly reported `noop`
-                # on a real layout change (#57). Reclassify from changed_types for
-                # the success statuses only (never override a *_failed status).
-                if item.get("status") in ("verified", "noop"):
-                    if any(changed_types.values()):
-                        item["status"] = "verified"
-                    else:
-                        item["status"] = "noop"
-                        item["message"] = "No effective change detected"
-            annotated.append(item)
-        return annotated
+    def _operation_type_names(self, *a, **k):
+        return mutation_engine._operation_type_names(self.ctx, *a, **k)
 
-    def _capture_function_snapshots(self, bv, functions):
-        snapshots = {}
-        for fn in functions:
-            snapshots[int(fn.start)] = {
-                "name": fn.name,
-                "address": hex(fn.start),
-                "text": self._function_text(bv, fn, view="hlil"),
-            }
-        return snapshots
+    def _guess_affected_functions(self, *a, **k):
+        return mutation_engine._guess_affected_functions(self.ctx, *a, **k)
 
-    def _snippet_for_change(self, before_text: str, after_text: str, *, context_lines: int = 3, max_lines: int = 10):
-        before_lines = before_text.splitlines()
-        after_lines = after_text.splitlines()
-        line_count = max(len(before_lines), len(after_lines))
+    def _affected_type_names(self, *a, **k):
+        return mutation_engine._affected_type_names(self.ctx, *a, **k)
 
-        changed_line = None
-        for index in range(line_count):
-            before_line = before_lines[index] if index < len(before_lines) else None
-            after_line = after_lines[index] if index < len(after_lines) else None
-            if before_line != after_line:
-                changed_line = index
-                break
+    def _capture_type_snapshots(self, *a, **k):
+        return mutation_engine._capture_type_snapshots(self.ctx, *a, **k)
 
-        if changed_line is None:
-            return None
+    def _diff_type_snapshots(self, *a, **k):
+        return mutation_engine._diff_type_snapshots(self.ctx, *a, **k)
 
-        start = max(0, changed_line - context_lines)
-        end = min(line_count, start + max_lines)
-        return {
-            "start_line": start + 1,
-            "before_excerpt": "\n".join(before_lines[start:end]),
-            "after_excerpt": "\n".join(after_lines[start:end]),
-        }
+    def _annotate_operation_results(self, *a, **k):
+        return mutation_engine._annotate_operation_results(self.ctx, *a, **k)
 
-    def _diff_snapshots(self, before: dict[int, Any], after: dict[int, Any]):
-        diffs = []
-        snippets_added = 0
-        for address in sorted(set(before) | set(after)):
-            old = before.get(address, {"text": ""})
-            new = after.get(address, {"text": ""})
-            text_changed = old.get("text", "") != new.get("text", "")
-            name_changed = old.get("name") != new.get("name")
-            diff = "\n".join(
-                difflib.unified_diff(
-                    old["text"].splitlines(),
-                    new["text"].splitlines(),
-                    fromfile=f"before:{old.get('name', hex(address))}",
-                    tofile=f"after:{new.get('name', hex(address))}",
-                    lineterm="",
-                )
-            )
-            if not diff and name_changed:
-                diff = "\n".join(
-                    [
-                        f"--- before:{old.get('name', hex(address))}",
-                        f"+++ after:{new.get('name', hex(address))}",
-                    ]
-                )
-            diffs.append(
-                {
-                    "address": hex(address),
-                    "before_name": old.get("name"),
-                    "after_name": new.get("name"),
-                    "changed": bool(text_changed or name_changed),
-                    "diff": diff,
-                }
-            )
-            if text_changed and snippets_added < 3:
-                snippet = self._snippet_for_change(old.get("text", ""), new.get("text", ""))
-                if snippet is not None:
-                    diffs[-1].update(snippet)
-                    snippets_added += 1
-        return diffs
+    def _capture_function_snapshots(self, *a, **k):
+        return mutation_engine._capture_function_snapshots(self.ctx, *a, **k)
 
-    def _operation_requested(self, op: dict[str, Any]) -> dict[str, Any]:
-        if not isinstance(op, dict):
-            return {}
-        return {key: value for key, value in op.items() if key != "preview"}
+    def _snippet_for_change(self, *a, **k):
+        return mutation_engine._snippet_for_change(self.ctx, *a, **k)
 
-    def _operation_failure_result(self, op: dict[str, Any], exc: OperationFailure) -> dict[str, Any]:
-        op_label = str(op.get("op") or "<missing>") if isinstance(op, dict) else "<non-object>"
-        result = {
-            "op": op_label,
-            "status": exc.status,
-            "message": exc.message,
-            "requested": exc.requested or self._operation_requested(op),
-        }
-        if exc.observed:
-            result["observed"] = exc.observed
-        return result
+    def _diff_snapshots(self, *a, **k):
+        return mutation_engine._diff_snapshots(self.ctx, *a, **k)
 
-    def _mark_unverified_results(self, results: list[dict[str, Any]], message: str) -> list[dict[str, Any]]:
-        annotated = []
-        for result in results:
-            item = dict(result)
-            item["status"] = "unsupported"
-            item["message"] = message
-            annotated.append(item)
-        return annotated
+    def _operation_requested(self, *a, **k):
+        return mutation_engine._operation_requested(self.ctx, *a, **k)
 
-    def _has_failed_results(self, results: list[dict[str, Any]]) -> bool:
-        return any(item.get("status") in {"unsupported", "verification_failed"} for item in results)
+    def _operation_failure_result(self, *a, **k):
+        return mutation_engine._operation_failure_result(self.ctx, *a, **k)
 
-    def _first_overlapping_member(self, type_obj, offset: int, width: int):
-        """The first existing member whose byte range intersects the range a new
-        field of *width* bytes at *offset* would occupy, else None. Width 0/unknown
-        is treated as 1 byte so an exact start-offset collision is always caught.
-        Used to enforce struct field set --no-overwrite (#56)."""
-        members = getattr(type_obj, "members", None)
-        if members is None:
-            return None
-        new_start = int(offset)
-        new_end = new_start + max(int(width or 0), 1)
-        for member in list(members):
-            m_start = int(getattr(member, "offset", 0))
-            try:
-                m_width = int(getattr(getattr(member, "type", None), "width", 0) or 0)
-            except Exception:
-                m_width = 0
-            m_end = m_start + max(m_width, 1)
-            if new_start < m_end and m_start < new_end:
-                return member
-        return None
+    def _mark_unverified_results(self, *a, **k):
+        return mutation_engine._mark_unverified_results(self.ctx, *a, **k)
 
-    def _find_member(self, type_obj, *, offset: int | None = None, name: str | None = None):
-        members = getattr(type_obj, "members", None)
-        if members is None:
-            return None
-        for member in list(members):
-            member_offset = int(getattr(member, "offset", 0))
-            member_name = str(getattr(member, "name", ""))
-            if offset is not None and member_offset != int(offset):
-                continue
-            if name is not None and member_name != name:
-                continue
-            return member
-        return None
+    def _has_failed_results(self, *a, **k):
+        return mutation_engine._has_failed_results(self.ctx, *a, **k)
 
-    def _verify_operation(self, bv, result: dict[str, Any]) -> dict[str, Any]:
-        op = result.get("op")
-        try:
-            if op == "rename_symbol":
-                return self._verify_rename_symbol(bv, result)
-            if op == "set_comment":
-                return self._verify_set_comment(bv, result)
-            if op == "delete_comment":
-                return self._verify_delete_comment(bv, result)
-            if op == "set_prototype":
-                return self._verify_set_prototype(bv, result)
-            if op == "local_rename":
-                return self._verify_local_rename(bv, result)
-            if op == "local_retype":
-                return self._verify_local_retype(bv, result)
-            if op == "struct_field_set":
-                return self._verify_struct_field_set(bv, result)
-            if op == "struct_field_rename":
-                return self._verify_struct_field_rename(bv, result)
-            if op == "struct_field_delete":
-                return self._verify_struct_field_delete(bv, result)
-            if op == "types_declare":
-                return self._verify_declared_types(bv, result)
-            raise OperationFailure("unsupported", f"Unsupported verification path: {op}", requested=result.get("requested"))
-        except OperationFailure as exc:
-            item = dict(result)
-            item["status"] = exc.status
-            item["message"] = exc.message
-            if exc.requested:
-                item["requested"] = exc.requested
-            if exc.observed:
-                item["observed"] = exc.observed
-            return item
-        except Exception as exc:
-            item = dict(result)
-            item["status"] = "verification_failed"
-            item["message"] = f"{type(exc).__name__}: {exc}"
-            if item.get("requested") is None:
-                item["requested"] = {}
-            return item
+    def _first_overlapping_member(self, *a, **k):
+        return mutation_engine._first_overlapping_member(self.ctx, *a, **k)
 
-    def _verify_rename_symbol(self, bv, result: dict[str, Any]) -> dict[str, Any]:
-        item = dict(result)
-        address = _parse_address(item["address"])
-        requested_name = str(item["new_name"])
-        before_name = item.get("before_name")
-        observed_name = None
-        if item.get("kind") == "function":
-            fn = bv.get_function_at(address)
-            if fn is None:
-                raise OperationFailure(
-                    "verification_failed",
-                    f"Function missing after rename at {item['address']}",
-                    requested=item.get("requested"),
-                    observed={"address": item["address"], "name": None},
-                )
-            observed_name = str(fn.name)
-        else:
-            symbol = bv.get_symbol_at(address)
-            observed_name = str(symbol.name) if symbol is not None else None
-        item["observed"] = {"address": item["address"], "name": observed_name}
-        if observed_name != requested_name:
-            raise OperationFailure(
-                "verification_failed",
-                f"Live rename verification failed at {item['address']}",
-                requested=item.get("requested"),
-                observed=item["observed"],
-            )
-        item["status"] = "noop" if before_name == requested_name else "verified"
-        return item
+    def _find_member(self, *a, **k):
+        return mutation_engine._find_member(self.ctx, *a, **k)
 
-    def _verify_set_comment(self, bv, result: dict[str, Any]) -> dict[str, Any]:
-        item = dict(result)
-        address = _parse_address(item["address"])
-        expected = str(item["requested"]["comment"])
-        observed = bv.get_comment_at(address) or ""
-        item["observed"] = {"address": item["address"], "comment": observed}
-        if observed != expected:
-            raise OperationFailure(
-                "verification_failed",
-                f"Live comment verification failed at {item['address']}",
-                requested=item.get("requested"),
-                observed=item["observed"],
-            )
-        item["status"] = "noop" if item.get("before_comment", "") == expected else "verified"
-        return item
+    def _verify_operation(self, *a, **k):
+        return mutation_engine._verify_operation(self.ctx, *a, **k)
 
-    def _verify_delete_comment(self, bv, result: dict[str, Any]) -> dict[str, Any]:
-        item = dict(result)
-        address = _parse_address(item["address"])
-        observed = bv.get_comment_at(address) or ""
-        item["observed"] = {"address": item["address"], "comment": observed}
-        if observed:
-            raise OperationFailure(
-                "verification_failed",
-                f"Live comment deletion verification failed at {item['address']}",
-                requested=item.get("requested"),
-                observed=item["observed"],
-            )
-        item["status"] = "noop" if not item.get("before_comment") else "verified"
-        return item
+    def _verify_rename_symbol(self, *a, **k):
+        return mutation_engine._verify_rename_symbol(self.ctx, *a, **k)
 
-    def _verify_set_prototype(self, bv, result: dict[str, Any]) -> dict[str, Any]:
-        item = dict(result)
-        address = _parse_address(item["address"])
-        fn = bv.get_function_at(address)
-        if fn is None:
-            raise OperationFailure(
-                "verification_failed",
-                f"Function missing after prototype change at {item['address']}",
-                requested=item.get("requested"),
-                observed={"address": item["address"], "prototype": None},
-            )
-        observed = str(fn.type)
-        item["observed"] = {"address": item["address"], "prototype": observed}
-        expected = item["expected_prototype"]
-        if observed != expected:
-            # BN analysis may add an implicit calling convention (e.g.
-            # __convention("cdecl")) that wasn't present in the parsed
-            # expected type.  Normalize both before rejecting.
-            if _normalize_prototype(observed) != _normalize_prototype(expected):
-                raise OperationFailure(
-                    "verification_failed",
-                    f"Live prototype verification failed at {item['address']}",
-                    requested=item.get("requested"),
-                    observed=item["observed"],
-                )
-        item["status"] = "noop" if item.get("before_prototype") == expected else "verified"
-        return item
+    def _verify_set_comment(self, *a, **k):
+        return mutation_engine._verify_set_comment(self.ctx, *a, **k)
 
-    def _verify_local_rename(self, bv, result: dict[str, Any]) -> dict[str, Any]:
-        item = dict(result)
-        address = _parse_address(item["address"])
-        fn = bv.get_function_at(address)
-        if fn is None:
-            raise OperationFailure(
-                "verification_failed",
-                f"Function missing after local rename at {item['address']}",
-                requested=item.get("requested"),
-                observed={"address": item["address"], "variable": None},
-            )
-        # After analysis, variable objects may be reconstructed.  Try
-        # identifier-based lookup first (stable across analysis passes),
-        # then fall back to storage.  Check all variables at the storage
-        # offset because BN may keep both auto and user-named entries.
-        expected_name = item["new_name"]
-        storage = int(item["storage"])
-        identifier = item.get("identifier")
-        var = None
-        if identifier is not None:
-            for v, _ in self._iter_canonical_variables(fn):
-                if self._variable_identifier(v) == identifier:
-                    var = v
-                    break
-        if var is None:
-            var, _ = self._find_variable_by_storage(
-                fn, storage, is_parameter=bool(item["is_parameter"]),
-            )
-        observed_name = str(var.name)
-        # If the primary variable still shows the auto name, scan the
-        # raw variable lists (bypassing dedup) because BN may keep both
-        # auto-named and user-named entries at the same storage offset
-        # after analysis. The alternate entry must still be the *same*
-        # variable (matching identifier); an unrelated neighbor that
-        # happens to carry the requested name must not count as success.
-        if observed_name != expected_name:
-            is_param = bool(item["is_parameter"])
-            collections = [fn.parameter_vars] if is_param else [fn.stack_layout]
-            for collection in collections:
-                for v in list(collection):
-                    if (
-                        int(getattr(v, "storage", -1)) == storage
-                        and str(v.name) == expected_name
-                        and (identifier is None or self._variable_identifier(v) == identifier)
-                    ):
-                        observed_name = expected_name
-                        var = v
-                        break
-                if observed_name == expected_name:
-                    break
-        item["observed"] = {"address": item["address"], "variable": observed_name, "storage": storage}
-        if observed_name != expected_name:
-            raise OperationFailure(
-                "verification_failed",
-                f"Live local rename verification failed at {item['address']}",
-                requested=item.get("requested"),
-                observed=item["observed"],
-            )
-        item["status"] = "noop" if item.get("before_name") == expected_name else "verified"
-        return item
+    def _verify_delete_comment(self, *a, **k):
+        return mutation_engine._verify_delete_comment(self.ctx, *a, **k)
 
-    def _verify_local_retype(self, bv, result: dict[str, Any]) -> dict[str, Any]:
-        item = dict(result)
-        address = _parse_address(item["address"])
-        fn = bv.get_function_at(address)
-        if fn is None:
-            raise OperationFailure(
-                "verification_failed",
-                f"Function missing after local retype at {item['address']}",
-                requested=item.get("requested"),
-                observed={"address": item["address"], "type": None},
-            )
-        # Mirror _verify_local_rename: identifier-based lookup first (stable
-        # across analysis passes, and it covers register/HLIL-visible locals
-        # that _find_variable_by_storage cannot see because that helper scans
-        # only parameter_vars/stack_layout). Fall back to storage ONLY when no
-        # identifier was recorded -- with an identifier in hand, a same-storage
-        # variable with a different identifier is a different variable, and
-        # types collide far more often than names (every other local is an
-        # int32_t), so a storage-only match could verify the wrong one.
-        expected_type = item["expected_type"]
-        storage = int(item["storage"])
-        identifier = item.get("identifier")
-        var = None
-        if identifier is not None:
-            for v, _ in self._iter_canonical_variables(fn):
-                if self._variable_identifier(v) == identifier:
-                    var = v
-                    break
-        else:
-            var, _ = self._find_variable_by_storage(
-                fn,
-                storage,
-                is_parameter=bool(item["is_parameter"]),
-            )
-        observed_type = None if var is None else str(var.type)
-        # If the primary variable still shows the old type, scan the raw
-        # variable lists (bypassing dedup) because BN may keep both auto and
-        # user entries at the same storage offset after analysis. The alternate
-        # entry must still be the *same* variable (matching identifier); an
-        # unrelated neighbor that happens to carry the expected type must not
-        # count as success (see _verify_local_rename).
-        if var is not None and observed_type != expected_type:
-            is_param = bool(item["is_parameter"])
-            collections = [fn.parameter_vars] if is_param else [fn.stack_layout]
-            for collection in collections:
-                for v in list(collection):
-                    if (
-                        int(getattr(v, "storage", -1)) == storage
-                        and str(v.type) == expected_type
-                        and (identifier is None or self._variable_identifier(v) == identifier)
-                    ):
-                        observed_type = expected_type
-                        var = v
-                        break
-                if observed_type == expected_type:
-                    break
-        item["observed"] = {
-            "address": item["address"],
-            "variable": None if var is None else str(var.name),
-            "type": observed_type,
-        }
-        if observed_type != expected_type:
-            raise OperationFailure(
-                "verification_failed",
-                f"Live local retype verification failed at {item['address']}",
-                requested=item.get("requested"),
-                observed=item["observed"],
-            )
-        item["status"] = "noop" if item.get("before_type") == expected_type else "verified"
-        return item
+    def _verify_set_prototype(self, *a, **k):
+        return mutation_engine._verify_set_prototype(self.ctx, *a, **k)
 
-    def _verify_struct_field_set(self, bv, result: dict[str, Any]) -> dict[str, Any]:
-        item = dict(result)
-        type_obj = bv.get_type_by_name(item["struct_name"])
-        if type_obj is None:
-            raise OperationFailure(
-                "verification_failed",
-                f"Struct missing after field set: {item['struct_name']}",
-                requested=item.get("requested"),
-                observed={"type_name": item["struct_name"]},
-            )
-        member = self._find_member(type_obj, offset=int(item["member_offset"]), name=item["field_name"])
-        observed = {
-            "type_name": item["struct_name"],
-            "offset": item["offset"],
-            "field_name": getattr(member, "name", None),
-            "field_type": str(getattr(member, "type", "")) if member is not None else None,
-        }
-        item["observed"] = observed
-        if member is None or observed["field_type"] != item["field_type"]:
-            raise OperationFailure(
-                "verification_failed",
-                f"Live struct field verification failed for {item['struct_name']} at {item['offset']}",
-                requested=item.get("requested"),
-                observed=observed,
-            )
-        previous = item.get("before_member")
-        if previous and previous.get("field_name") == item["field_name"] and previous.get("field_type") == item["field_type"]:
-            item["status"] = "noop"
-        else:
-            item["status"] = "verified"
-        return item
+    def _verify_local_rename(self, *a, **k):
+        return mutation_engine._verify_local_rename(self.ctx, *a, **k)
 
-    def _verify_struct_field_rename(self, bv, result: dict[str, Any]) -> dict[str, Any]:
-        item = dict(result)
-        type_obj = bv.get_type_by_name(item["struct_name"])
-        if type_obj is None:
-            raise OperationFailure(
-                "verification_failed",
-                f"Struct missing after field rename: {item['struct_name']}",
-                requested=item.get("requested"),
-                observed={"type_name": item["struct_name"]},
-            )
-        # Verify by OFFSET, not by name: with duplicate member names a global
-        # name lookup would see the OTHER same-named member and falsely report
-        # failure (the #25 duplicate-name case). The member at the renamed
-        # offset must now carry new_name.
-        offset = int(item.get("member_offset", -1))
-        member = self._find_member(type_obj, offset=offset, name=item["new_name"])
-        observed = {
-            "type_name": item["struct_name"],
-            "offset": hex(offset) if offset >= 0 else None,
-            "new_name": getattr(member, "name", None),
-        }
-        item["observed"] = observed
-        if member is None:
-            raise OperationFailure(
-                "verification_failed",
-                f"Live struct field rename verification failed for {item['struct_name']}",
-                requested=item.get("requested"),
-                observed=observed,
-            )
-        item["status"] = "noop" if item["old_name"] == item["new_name"] else "verified"
-        return item
+    def _verify_local_retype(self, *a, **k):
+        return mutation_engine._verify_local_retype(self.ctx, *a, **k)
 
-    def _verify_struct_field_delete(self, bv, result: dict[str, Any]) -> dict[str, Any]:
-        item = dict(result)
-        type_obj = bv.get_type_by_name(item["struct_name"])
-        if type_obj is None:
-            raise OperationFailure(
-                "verification_failed",
-                f"Struct missing after field delete: {item['struct_name']}",
-                requested=item.get("requested"),
-                observed={"type_name": item["struct_name"]},
-            )
-        # Verify by (offset, name), not by name alone: with duplicate member
-        # names a global name lookup would see the OTHER same-named member at a
-        # different offset and falsely report the delete failed (#25). The
-        # specific member that was removed must be gone from its offset.
-        offset = int(item.get("member_offset", -1))
-        member = self._find_member(type_obj, offset=offset, name=item["field_name"])
-        item["observed"] = {
-            "type_name": item["struct_name"],
-            "offset": hex(offset) if offset >= 0 else None,
-            "field_present": member is not None,
-        }
-        if member is not None:
-            raise OperationFailure(
-                "verification_failed",
-                f"Live struct field delete verification failed for {item['struct_name']}",
-                requested=item.get("requested"),
-                observed=item["observed"],
-            )
-        item["status"] = "verified"
-        return item
+    def _verify_struct_field_set(self, *a, **k):
+        return mutation_engine._verify_struct_field_set(self.ctx, *a, **k)
 
-    def _verify_declared_types(self, bv, result: dict[str, Any]) -> dict[str, Any]:
-        item = dict(result)
-        defined_types = dict(item.get("defined_types") or {})
-        defined_type_layouts = dict(item.get("defined_type_layouts") or {})
-        if not defined_types:
-            item["observed"] = {
-                "defined_types": {},
-                "parsed_functions": list(item.get("parsed_functions") or []),
-                "parsed_variables": list(item.get("parsed_variables") or []),
-            }
-            item["status"] = "noop"
-            item["message"] = "Parsed declarations but no named types were defined."
-            return item
-        observed_types: dict[str, str | None] = {}
-        observed_type_layouts: dict[str, str | None] = {}
-        for name, expected in defined_types.items():
-            type_obj = bv.get_type_by_name(name)
-            observed_types[name] = str(type_obj) if type_obj is not None else None
-            observed_type_layouts[name] = self._render_type_layout(type_obj) if type_obj is not None else None
-            if observed_types[name] != expected:
-                if defined_type_layouts.get(name) and observed_type_layouts[name] == defined_type_layouts[name]:
-                    continue
-                raise OperationFailure(
-                    "verification_failed",
-                    f"Live type verification failed for {name}",
-                    requested=item.get("requested"),
-                    observed={
-                        "defined_types": observed_types,
-                        "defined_type_layouts": observed_type_layouts,
-                    },
-                )
-        item["observed"] = {
-            "defined_types": observed_types,
-            "defined_type_layouts": observed_type_layouts,
-        }
-        before = dict(item.get("before_defined_types") or {})
-        item["status"] = "noop" if before and all(before.get(name) == expected for name, expected in defined_types.items()) else "verified"
-        return item
+    def _verify_struct_field_rename(self, *a, **k):
+        return mutation_engine._verify_struct_field_rename(self.ctx, *a, **k)
 
-    def _apply_operation(self, bv, op: dict[str, Any], restores: list | None = None):
-        # A manifest op must be a JSON object; a non-object element (e.g.
-        # "ops": ["foo"]) gets a clean invalid_request, not an AttributeError (#48).
-        if not isinstance(op, dict):
-            raise OperationFailure(
-                "invalid_request",
-                f"each manifest operation must be a JSON object, got {type(op).__name__}",
-            )
-        # A missing `op` key must be its own invalid_request, NOT silently assumed
-        # to be a rename_symbol -- a typo'd/absent op kind would otherwise apply
-        # the wrong mutation (#48). Internal single-op callers always set `op`.
-        kind = op.get("op")
-        if not kind:
-            raise OperationFailure(
-                "invalid_request",
-                "operation is missing required field 'op' (the mutation kind, e.g. "
-                "'rename_symbol', 'set_comment', 'types_declare')",
-                requested=self._operation_requested(op),
-            )
-        # Validate required request fields up front so a malformed request is
-        # reported precisely (invalid_request, naming the field) and a KeyError
-        # raised deeper -- e.g. by BN internals inside a handler -- is no longer
-        # misreported as a missing request field.
-        for field in REQUIRED_FIELDS.get(kind, ()):
-            if field not in op:
-                raise OperationFailure(
-                    "invalid_request",
-                    f"operation {kind!r} is missing required field {field!r}",
-                    requested=self._operation_requested(op),
-                )
-        for group in REQUIRED_ONE_OF.get(kind, ()):
-            if not any(field in op for field in group):
-                raise OperationFailure(
-                    "invalid_request",
-                    f"operation {kind!r} requires one of "
-                    f"{' / '.join(repr(f) for f in group)}",
-                    requested=self._operation_requested(op),
-                )
-        try:
-            if kind == "rename_symbol":
-                return self._op_rename_symbol(bv, op)
-            if kind == "set_comment":
-                return self._op_set_comment(bv, op)
-            if kind == "delete_comment":
-                return self._op_delete_comment(bv, op)
-            if kind == "set_prototype":
-                return self._op_set_prototype(bv, op, restores)
-            if kind == "local_rename":
-                return self._op_local_rename(bv, op, restores)
-            if kind == "local_retype":
-                return self._op_local_retype(bv, op, restores)
-            if kind == "struct_field_set":
-                return self._op_struct_field_set(bv, op)
-            if kind == "struct_field_rename":
-                return self._op_struct_field_rename(bv, op)
-            if kind == "struct_field_delete":
-                return self._op_struct_field_delete(bv, op)
-            if kind == "types_declare":
-                return self._op_types_declare(bv, op)
-            raise OperationFailure("unsupported", f"Unsupported operation: {kind}", requested=self._operation_requested(op))
-        except OperationFailure:
-            raise
-        except Exception as exc:
-            raise OperationFailure(
-                "unsupported",
-                f"{type(exc).__name__}: {exc}",
-                requested=self._operation_requested(op),
-            ) from exc
+    def _verify_struct_field_delete(self, *a, **k):
+        return mutation_engine._verify_struct_field_delete(self.ctx, *a, **k)
 
-    def _revert_undo_safely(self, bv, state) -> bool:
-        """Best-effort rollback. Returns False when the revert itself failed,
-        meaning partially-applied changes may still be live in the view."""
-        try:
-            bv.revert_undo_actions(state)
-            return True
-        except Exception as exc:
-            bn.log_error(f"BN Agent Bridge: rollback failed, view may be partially modified: {exc!r}")
-            return False
+    def _verify_declared_types(self, *a, **k):
+        return mutation_engine._verify_declared_types(self.ctx, *a, **k)
 
-    def _find_var_for_restore(self, fn, identifier, storage, is_parameter):
-        """Re-resolve a local for restore the way verification does: identifier
-        first (stable across analysis passes and covers register vars, which
-        stack_layout omits), then storage. Returns None if it can't be found."""
-        if identifier is not None:
-            for var, _ in self._iter_canonical_variables(fn):
-                if self._variable_identifier(var) == identifier:
-                    return var
-        try:
-            var, _ = self._find_variable_by_storage(fn, int(storage), is_parameter=is_parameter)
-            return var
-        except RuntimeError:
-            return None
+    def _apply_operation(self, *a, **k):
+        return mutation_engine._apply_operation(self.ctx, *a, **k)
 
-    def _capture_local_var_snapshots(self, bv, functions) -> dict[int, dict[int, tuple[str, Any]]]:
-        """Snapshot every identifiable local's (name, type) per affected function.
+    def _revert_undo_safely(self, *a, **k):
+        return mutation_engine._revert_undo_safely(self.ctx, *a, **k)
 
-        BN's create_user_var/set_user_type PROPAGATE a user name/type onto
-        aliased variables -- naming a stack var also names the register that
-        copies it (e.g. naming var_8 also renames the aliased r2 to var_8_1).
-        Those propagated siblings are NOT the variable an op targeted, so the
-        per-op explicit restore (_run_local_restores) never reverts them, and a
-        --preview or a rolled-back batch would leave them modified. Snapshotting
-        the whole canonical set lets _restore_local_var_drift put every drifted
-        local back, not just the targeted one."""
-        snapshots: dict[int, dict[int, tuple[str, Any]]] = {}
-        for fn in functions:
-            entries: dict[int, tuple[str, Any]] = {}
-            try:
-                for var, _ in self._iter_canonical_variables(fn):
-                    identifier = self._variable_identifier(var)
-                    if identifier is None:
-                        continue  # can't re-resolve it after reanalysis
-                    entries[identifier] = (str(var.name), var.type)
-            except Exception as exc:
-                bn.log_error(f"BN Agent Bridge: local var snapshot failed for {hex(int(fn.start))}: {exc!r}")
-            snapshots[int(fn.start)] = entries
-        return snapshots
+    def _find_var_for_restore(self, *a, **k):
+        return mutation_engine._find_var_for_restore(self.ctx, *a, **k)
 
-    def _restore_local_var_drift(self, bv, snapshots) -> bool:
-        """Put any local whose (name, type) drifted from *snapshots* back, then
-        reanalyze. Covers BN's name/type propagation onto aliased siblings that
-        the targeted per-op restores miss (see _capture_local_var_snapshots).
-        Returns False if any restore raised."""
-        if not snapshots:
-            return True
-        ok = True
-        touched = False
-        for fn_start, entries in snapshots.items():
-            if not entries:
-                continue
-            rfn = bv.get_function_at(int(fn_start))
-            if rfn is None:
-                ok = False
-                bn.log_error(f"BN Agent Bridge: function {hex(int(fn_start))} missing on var-drift restore")
-                continue
-            try:
-                current = list(self._iter_canonical_variables(rfn))
-            except Exception as exc:
-                ok = False
-                bn.log_error(f"BN Agent Bridge: var-drift re-enumeration failed for {hex(int(fn_start))}: {exc!r}")
-                continue
-            for var, _ in current:
-                identifier = self._variable_identifier(var)
-                if identifier is None or identifier not in entries:
-                    continue
-                snap_name, snap_type = entries[identifier]
-                if str(var.name) == snap_name and str(var.type) == str(snap_type):
-                    continue
-                try:
-                    rfn.create_user_var(var, snap_type, snap_name)
-                    touched = True
-                except Exception as exc:
-                    ok = False
-                    bn.log_error(
-                        "BN Agent Bridge: failed to restore a propagated local "
-                        f"(identifier {identifier}) in {hex(int(fn_start))}: {exc!r}"
-                    )
-        if touched:
-            try:
-                bv.update_analysis_and_wait()
-            except Exception as exc:
-                ok = False
-                bn.log_error(f"BN Agent Bridge: reanalysis after var-drift restore failed: {exc!r}")
-        return ok
+    def _capture_local_var_snapshots(self, *a, **k):
+        return mutation_engine._capture_local_var_snapshots(self.ctx, *a, **k)
 
-    def _run_local_restores(self, bv, restores) -> bool:
-        """Explicitly undo changes BN's undo buffer does NOT journal -- local var
-        rename/retype (Function.create_user_var) and function prototypes
-        (Function.set_user_type). For these, revert_undo_actions is a silent no-op,
-        so without replaying these restores --preview and rollback-on-failure would
-        leave the change permanently applied. Runs in reverse apply order, then
-        reanalyzes. Returns False if any restore failed."""
-        if not restores:
-            return True
-        ok = True
-        for restore in reversed(restores):
-            try:
-                restore()
-            except Exception as exc:
-                ok = False
-                bn.log_error(
-                    "BN Agent Bridge: failed to restore a non-journaled change "
-                    "(local var create_user_var / prototype set_user_type) on revert: "
-                    f"{exc!r}"
-                )
-        # create_user_var only materializes once analysis runs again (same as the
-        # forward apply path), so settle the view before returning -- otherwise the
-        # restore is queued but the old name/type is still showing.
-        try:
-            bv.update_analysis_and_wait()
-        except Exception as exc:
-            ok = False
-            bn.log_error(f"BN Agent Bridge: reanalysis after local restore failed: {exc!r}")
-        return ok
+    def _restore_local_var_drift(self, *a, **k):
+        return mutation_engine._restore_local_var_drift(self.ctx, *a, **k)
 
-    def _mutation(self, selector: str | None, preview: bool, operations: list[dict[str, Any]]):
-        if not operations:
-            raise ValueError("Batch operation list is empty")
+    def _run_local_restores(self, *a, **k):
+        return mutation_engine._run_local_restores(self.ctx, *a, **k)
 
-        bv = self._resolve_view(selector)
-        affected = self._guess_affected_functions(bv, operations)
-        before = self._capture_function_snapshots(bv, affected)
-        type_before = self._capture_type_snapshots(bv, operations)
-        # Snapshot affected-function locals up front when the batch mutates any
-        # (rename/retype/prototype), so the revert paths can undo BN's name/type
-        # propagation onto aliased siblings (see _capture_local_var_snapshots).
-        var_before = (
-            self._capture_local_var_snapshots(bv, affected)
-            if any(
-                isinstance(op, dict)
-                and (op.get("op") or "rename_symbol") in _VAR_DRIFT_OPS
-                for op in operations
-            )
-            else {}
-        )
-        state = bv.begin_undo_actions()
-        results = []
-        # Explicit restores for local var ops, which BN's undo buffer can't
-        # revert (see _run_local_restores). Replayed on every revert path.
-        restores: list = []
-        try:
-            for op in operations:
-                results.append(self._apply_operation(bv, op, restores))
-        except OperationFailure as exc:
-            # Run BOTH revert steps unconditionally: an `and` would short-circuit
-            # past the explicit restores when the undo revert fails, leaving
-            # non-journaled local/prototype changes applied.
-            undo_ok = self._revert_undo_safely(bv, state)
-            restore_ok = self._run_local_restores(bv, restores)
-            drift_ok = self._restore_local_var_drift(bv, var_before)
-            reverted = undo_ok and restore_ok and drift_ok
-            if reverted:
-                message = "Rolled back before post-state verification because an operation failed to apply."
-                result_note = "Rolled back before post-state verification."
-            else:
-                message = (
-                    "An operation failed to apply AND the rollback itself failed; "
-                    "the view may be left partially modified."
-                )
-                result_note = "Rollback failed; this operation may still be applied."
-            return {
-                "preview": preview,
-                "success": False,
-                "committed": False,
-                "rolled_back": reverted,
-                "message": message,
-                "results": self._mark_unverified_results(results, result_note)
-                + [self._operation_failure_result(operations[len(results)], exc)],
-                "affected_functions": [],
-                "affected_types": [],
-            }
+    def _mutation(self, *a, **k):
+        return mutation_engine._mutation(self.ctx, *a, **k)
 
-        try:
-            bv.update_analysis_and_wait()
-            after = self._capture_function_snapshots(bv, affected)
-            type_after = self._capture_type_snapshots(bv, operations)
-            diffs = self._diff_snapshots(before, after)
-            type_diffs = self._diff_type_snapshots(type_before, type_after)
-            verified_results = [self._verify_operation(bv, result) for result in results]
-            annotated_results = self._annotate_operation_results(verified_results, type_diffs)
-            failed = self._has_failed_results(annotated_results)
-            restored = True
-            if preview or failed:
-                bv.revert_undo_actions(state)
-                # Targeted/prototype restores first, then mop up BN's propagation
-                # onto aliased siblings; both must succeed for a clean revert.
-                restored = self._run_local_restores(bv, restores)
-                restored = self._restore_local_var_drift(bv, var_before) and restored
-            else:
-                bv.commit_undo_actions(state)
-            message = None
-            if preview:
-                message = "Preview verified and reverted." if restored else (
-                    "Preview verified, but reverting a non-journaled change "
-                    "(local variable or prototype) failed; the view may be left modified."
-                )
-            elif failed:
-                message = "Rolled back because live-session verification failed." if restored else (
-                    "Live-session verification failed AND reverting a non-journaled change "
-                    "(local variable or prototype) failed; the view may be left modified."
-                )
-            else:
-                message = "Applied and verified in the live Binary Ninja session."
-            # A preview whose non-journaled restore failed left the view
-            # modified -- that is not a success, even if every operation
-            # verified. Automation keys off `success`; `restored` is only
-            # False on the preview/failed paths.
-            result = {
-                "preview": preview,
-                "success": (not failed) and restored,
-                "committed": bool((not preview) and (not failed)),
-                "message": message,
-                "results": annotated_results,
-                "affected_functions": diffs,
-                "affected_types": type_diffs,
-            }
-            if preview or failed:
-                result["rolled_back"] = restored
-            return result
-        except Exception as exc:
-            undo_ok = self._revert_undo_safely(bv, state)
-            restore_ok = self._run_local_restores(bv, restores)
-            drift_ok = self._restore_local_var_drift(bv, var_before)
-            if not (undo_ok and restore_ok and drift_ok):
-                raise RuntimeError(
-                    f"{exc} (additionally, rollback failed; the view may be left partially modified)"
-                ) from exc
-            raise
+    def _op_rename_symbol(self, *a, **k):
+        return mutation_engine._op_rename_symbol(self.ctx, *a, **k)
 
-    def _op_rename_symbol(self, bv, op: dict[str, Any]):
-        kind = str(op.get("kind", "auto"))
-        identifier = op["identifier"]
-        new_name = str(op["new_name"])
-        target = self._resolve_rename_target(bv, identifier, kind)
-        requested = self._operation_requested(op)
-        if target["kind"] == "function":
-            fn = bv.get_function_at(target["address"])
-            if fn is None:
-                raise OperationFailure("unsupported", f"Function not found: {identifier}", requested=requested)
-            if target["before_name"] != new_name:
-                fn.name = new_name
-            return {
-                "op": "rename_symbol",
-                "kind": "function",
-                "address": hex(target["address"]),
-                "before_name": target["before_name"],
-                "new_name": new_name,
-                "requested": requested,
-            }
-        address = int(target["address"])
-        if target["before_name"] != new_name:
-            bv.define_user_symbol(bn.Symbol(bn.SymbolType.DataSymbol, address, new_name))
-        return {
-            "op": "rename_symbol",
-            "kind": "data",
-            "address": hex(address),
-            "before_name": target["before_name"],
-            "new_name": new_name,
-            "requested": requested,
-        }
+    def _op_set_comment(self, *a, **k):
+        return mutation_engine._op_set_comment(self.ctx, *a, **k)
 
-    def _op_set_comment(self, bv, op: dict[str, Any]):
-        comment = str(op["comment"])
-        if op.get("function") and op.get("address"):
-            raise OperationFailure(
-                "invalid_request",
-                "Pass function OR address, not both: they target different locations.",
-                requested=self._operation_requested(op),
-            )
-        if op.get("function"):
-            fn = self._find_function(bv, op["function"])
-            before_comment = bv.get_comment_at(fn.start) or ""
-            if before_comment != comment:
-                bv.set_comment_at(fn.start, comment)
-            return {
-                "op": "set_comment",
-                "address": hex(fn.start),
-                "function": fn.name,
-                "before_comment": before_comment,
-                "requested": self._operation_requested(op),
-            }
-        address = _parse_address(op["address"])
-        before_comment = bv.get_comment_at(address) or ""
-        if before_comment != comment:
-            bv.set_comment_at(address, comment)
-        return {
-            "op": "set_comment",
-            "address": hex(address),
-            "before_comment": before_comment,
-            "requested": self._operation_requested(op),
-        }
+    def _op_delete_comment(self, *a, **k):
+        return mutation_engine._op_delete_comment(self.ctx, *a, **k)
 
-    def _op_delete_comment(self, bv, op: dict[str, Any]):
-        if op.get("function") and op.get("address"):
-            raise OperationFailure(
-                "invalid_request",
-                "Pass function OR address, not both: they target different locations.",
-                requested=self._operation_requested(op),
-            )
-        if op.get("function"):
-            fn = self._find_function(bv, op["function"])
-            before_comment = bv.get_comment_at(fn.start) or ""
-            if before_comment:
-                bv.set_comment_at(fn.start, None)
-            return {
-                "op": "delete_comment",
-                "address": hex(fn.start),
-                "function": fn.name,
-                "before_comment": before_comment,
-                "requested": self._operation_requested(op),
-            }
-        address = _parse_address(op["address"])
-        before_comment = bv.get_comment_at(address) or ""
-        if before_comment:
-            bv.set_comment_at(address, None)
-        return {
-            "op": "delete_comment",
-            "address": hex(address),
-            "before_comment": before_comment,
-            "requested": self._operation_requested(op),
-        }
+    def _op_set_prototype(self, *a, **k):
+        return mutation_engine._op_set_prototype(self.ctx, *a, **k)
 
-    def _op_set_prototype(self, bv, op: dict[str, Any], restores: list | None = None):
-        fn = self._find_function(bv, op["identifier"])
-        expected_type, _ = bv.parse_type_string(str(op["prototype"]))
-        before_prototype = str(fn.type)
-        before_type_obj = fn.type
-        expected_prototype = str(expected_type)
-        if before_prototype != expected_prototype:
-            # Function.set_user_type is NOT journaled by BN's undo buffer (same
-            # class as create_user_var for locals), so revert_undo_actions is a
-            # silent no-op for prototypes -- without an explicit restore, --preview
-            # and rollback-on-failure would leave the previewed prototype committed
-            # to the view (#51). Register the restore before mutating.
-            self._register_prototype_restore(
-                bv, restores, fn=fn,
-                before_prototype=before_prototype, before_type_obj=before_type_obj,
-            )
-            try:
-                fn.set_user_type(expected_prototype)
-            except TypeError:
-                fn.set_user_type(expected_type)
-        return {
-            "op": "set_prototype",
-            "function": fn.name,
-            "address": hex(fn.start),
-            "before_prototype": before_prototype,
-            "expected_prototype": expected_prototype,
-            "requested": self._operation_requested(op),
-        }
+    def _register_prototype_restore(self, *a, **k):
+        return mutation_engine._register_prototype_restore(self.ctx, *a, **k)
 
-    def _register_prototype_restore(self, bv, restores, *, fn, before_prototype, before_type_obj):
-        """Capture how to put a function prototype back on revert. Mirrors
-        :meth:`_register_local_restore`: ``set_user_type`` is not journaled by BN's
-        undo buffer, so the preview/rollback paths replay this explicitly. Re-resolves
-        the function fresh at restore time by its start address."""
-        if restores is None:
-            return
-        fn_start = int(fn.start)
+    def _register_local_restore(self, *a, **k):
+        return mutation_engine._register_local_restore(self.ctx, *a, **k)
 
-        def _restore():
-            rfn = bv.get_function_at(fn_start)
-            if rfn is None:
-                raise RuntimeError(f"function {hex(fn_start)} missing on prototype restore")
-            # Restore via the .type property setter with the captured Type object:
-            # it puts back the EXACT prior prototype, whereas set_user_type would
-            # re-pin the calling convention explicitly (turning an implicit-default
-            # auto prototype into `... __convention("cdecl") ...`), which is not a
-            # true no-op. Fall back to the type string only if the object path fails.
-            try:
-                rfn.type = before_type_obj
-            except Exception:
-                rfn.set_user_type(before_prototype)
+    def _op_local_rename(self, *a, **k):
+        return mutation_engine._op_local_rename(self.ctx, *a, **k)
 
-        restores.append(_restore)
+    def _op_local_retype(self, *a, **k):
+        return mutation_engine._op_local_retype(self.ctx, *a, **k)
 
-    def _register_local_restore(self, bv, restores, *, fn, var, name, type_obj, is_parameter):
-        """Capture how to put a local back to (name, type_obj) on revert.
-        Re-resolves the variable fresh at restore time by identifier/storage,
-        because the captured Variable's index can shift across reanalysis."""
-        if restores is None:
-            return
-        fn_start = int(fn.start)
-        identifier = self._variable_identifier(var)
-        storage = int(var.storage)
+    def _struct_builder(self, *a, **k):
+        return mutation_engine._struct_builder(self.ctx, *a, **k)
 
-        def _restore():
-            rfn = bv.get_function_at(fn_start)
-            if rfn is None:
-                raise RuntimeError(f"function {hex(fn_start)} missing on restore")
-            rvar = self._find_var_for_restore(rfn, identifier, storage, is_parameter)
-            if rvar is None:
-                raise RuntimeError(f"local at storage {storage} missing on restore in {hex(fn_start)}")
-            rfn.create_user_var(rvar, type_obj, name)
+    def _commit_struct_builder(self, *a, **k):
+        return mutation_engine._commit_struct_builder(self.ctx, *a, **k)
 
-        restores.append(_restore)
+    def _op_struct_field_set(self, *a, **k):
+        return mutation_engine._op_struct_field_set(self.ctx, *a, **k)
 
-    def _op_local_rename(self, bv, op: dict[str, Any], restores: list | None = None):
-        fn = self._find_function(bv, op["function"])
-        var, is_parameter = self._find_variable_selector(fn, str(op["variable"]))
-        new_name = str(op["new_name"])
-        # Variable.name is a live property backed by the core: snapshot it
-        # before mutating, or before_name reads back the new name and
-        # verification misclassifies a real change as a noop.
-        before_name = str(var.name)
-        if before_name != new_name:
-            # create_user_var isn't journaled by BN's undo buffer, so register
-            # an explicit restore for the preview/rollback paths.
-            self._register_local_restore(
-                bv, restores, fn=fn, var=var, name=before_name, type_obj=var.type, is_parameter=is_parameter
-            )
-            fn.create_user_var(var, var.type, new_name)
-        return {
-            "op": "local_rename",
-            "function": fn.name,
-            "address": hex(fn.start),
-            "variable": str(op["variable"]),
-            "local_id": self._local_id(fn, var, is_parameter=is_parameter),
-            "storage": int(var.storage),
-            "identifier": self._variable_identifier(var),
-            "source_type": self._variable_source_name(var),
-            "is_parameter": is_parameter,
-            "before_name": before_name,
-            "new_name": new_name,
-            "requested": self._operation_requested(op),
-        }
+    def _resolve_struct_field(self, *a, **k):
+        return mutation_engine._resolve_struct_field(self.ctx, *a, **k)
 
-    def _op_local_retype(self, bv, op: dict[str, Any], restores: list | None = None):
-        fn = self._find_function(bv, op["function"])
-        var, is_parameter = self._find_variable_selector(fn, str(op["variable"]))
-        expected_type, _ = bv.parse_type_string(str(op["new_type"]))
-        # Variable.type is a live property backed by the core: snapshot it
-        # before mutating (see _op_local_rename).
-        before_type_obj = var.type
-        before_type = str(before_type_obj)
-        if before_type != str(expected_type):
-            # create_user_var isn't journaled by BN's undo buffer, so register
-            # an explicit restore for the preview/rollback paths.
-            self._register_local_restore(
-                bv, restores, fn=fn, var=var, name=str(var.name), type_obj=before_type_obj, is_parameter=is_parameter
-            )
-            fn.create_user_var(var, expected_type, var.name)
-        return {
-            "op": "local_retype",
-            "function": fn.name,
-            "address": hex(fn.start),
-            "variable": str(op["variable"]),
-            "local_id": self._local_id(fn, var, is_parameter=is_parameter),
-            "storage": int(var.storage),
-            "identifier": self._variable_identifier(var),
-            "source_type": self._variable_source_name(var),
-            "is_parameter": is_parameter,
-            "before_type": before_type,
-            "expected_type": str(expected_type),
-            "requested": self._operation_requested(op),
-        }
+    def _op_struct_field_rename(self, *a, **k):
+        return mutation_engine._op_struct_field_rename(self.ctx, *a, **k)
 
-    def _struct_builder(self, bv, struct_name: str):
-        try:
-            resolved_name, type_obj = self._find_type(bv, struct_name)
-        except RuntimeError:
-            raise RuntimeError(f"Struct not found: {struct_name}")
-        return resolved_name, type_obj.mutable_copy()
+    def _op_struct_field_delete(self, *a, **k):
+        return mutation_engine._op_struct_field_delete(self.ctx, *a, **k)
 
-    def _commit_struct_builder(self, bv, struct_name: str, builder):
-        bv.define_user_type(struct_name, builder)
-
-    def _op_struct_field_set(self, bv, op: dict[str, Any]):
-        struct_name = str(op["struct_name"])
-        resolved_name, builder = self._struct_builder(bv, struct_name)
-        field_type, _ = bv.parse_type_string(str(op["field_type"]))
-        offset = _parse_address(op["offset"])
-        overwrite = bool(op.get("overwrite_existing", True))
-        before_type = bv.get_type_by_name(resolved_name)
-        before_member = None
-        if before_type is not None:
-            member = self._find_member(before_type, offset=offset)
-            if member is not None:
-                before_member = {
-                    "field_name": str(getattr(member, "name", "")),
-                    "field_type": str(getattr(member, "type", "")),
-                    "offset": hex(int(getattr(member, "offset", offset))),
-                }
-        # --no-overwrite must REFUSE when the new field would clobber existing
-        # data, not add an overlapping member: BN's add_member_at_offset(...,
-        # overwrite=False) silently appends an overlapping member (worse than the
-        # overwrite path). Guard the whole BYTE RANGE the new field occupies, not
-        # just an exact start-offset collision -- an offset that lands *inside* a
-        # wider member (e.g. 0x4 within an int64_t at 0x0) overlaps just as much
-        # (#56).
-        if not overwrite and before_type is not None:
-            new_width = 0
-            try:
-                new_width = int(field_type.width)
-            except Exception:
-                new_width = 0
-            clash = self._first_overlapping_member(before_type, offset, new_width)
-            if clash is not None:
-                raise OperationFailure(
-                    "invalid_request",
-                    f"a {new_width or 1}-byte field at offset {hex(offset)} in struct "
-                    f"{resolved_name} would overlap existing member "
-                    f"{str(getattr(clash, 'name', ''))!r} "
-                    f"({str(getattr(clash, 'type', ''))}) at "
-                    f"{hex(int(getattr(clash, 'offset', offset)))}; --no-overwrite refuses "
-                    f"to clobber it. Re-run without --no-overwrite to replace it, or choose "
-                    f"a free range.",
-                    requested=self._operation_requested(op),
-                )
-        builder.add_member_at_offset(str(op["field_name"]), field_type, offset, overwrite)
-        try:
-            builder.width = max(int(builder.width), int(offset) + int(field_type.width))
-        except Exception:
-            pass
-        self._commit_struct_builder(bv, resolved_name, builder)
-        return {
-            "op": "struct_field_set",
-            "struct_name": resolved_name,
-            "offset": hex(offset),
-            "field_name": str(op["field_name"]),
-            "field_type": str(field_type),
-            "member_offset": int(offset),
-            "before_member": before_member,
-            "requested": self._operation_requested(op),
-        }
-
-    def _resolve_struct_field(self, builder, resolved_name: str, locator: Any):
-        """Resolve a struct-field locator (a field NAME, or an OFFSET like 0x8 /
-        8) to its ``(index, member)`` in *builder* from a SINGLE scan.
-
-        Returning the index+member directly -- instead of a name that the caller
-        re-looks-up -- is what makes ``rename``/``delete`` hit the right field
-        when two members share a name at different offsets: a name round-trip
-        went through ``index_by_name`` (first-match), silently mutating the
-        wrong field. The offset is parsed with ``_parse_address`` so the grammar
-        is identical to ``struct field set`` (a zero-padded ``0008`` resolves the
-        same in all three). Raises invalid_request when nothing matches."""
-        text = str(locator)
-        members = list(getattr(builder, "members", []) or [])
-        for index, member in enumerate(members):
-            if str(getattr(member, "name", "")) == text:
-                return index, member
-        try:
-            offset = _parse_address(text)
-        except ValueError:
-            offset = None
-        if offset is not None:
-            for index, member in enumerate(members):
-                if int(getattr(member, "offset", -1)) == offset:
-                    return index, member
-        raise OperationFailure(
-            "invalid_request",
-            f"no field named or at offset {text!r} in struct {resolved_name}",
-        )
-
-    def _op_struct_field_rename(self, bv, op: dict[str, Any]):
-        struct_name = str(op["struct_name"])
-        resolved_name, builder = self._struct_builder(bv, struct_name)
-        index, member = self._resolve_struct_field(builder, resolved_name, op["old_name"])
-        old_name = str(getattr(member, "name", ""))
-        member_offset = int(getattr(member, "offset", -1))
-        builder.replace(index, member.type, str(op["new_name"]), True)
-        self._commit_struct_builder(bv, resolved_name, builder)
-        return {
-            "op": "struct_field_rename",
-            "struct_name": resolved_name,
-            "old_name": old_name,
-            "new_name": str(op["new_name"]),
-            "member_offset": member_offset,
-            "requested": self._operation_requested(op),
-        }
-
-    def _op_struct_field_delete(self, bv, op: dict[str, Any]):
-        struct_name = str(op["struct_name"])
-        resolved_name, builder = self._struct_builder(bv, struct_name)
-        index, member = self._resolve_struct_field(builder, resolved_name, op["field_name"])
-        field_name = str(getattr(member, "name", ""))
-        member_offset = int(getattr(member, "offset", -1))
-        builder.remove(index)
-        self._commit_struct_builder(bv, resolved_name, builder)
-        return {
-            "op": "struct_field_delete",
-            "struct_name": resolved_name,
-            "field_name": field_name,
-            "member_offset": member_offset,
-            "requested": self._operation_requested(op),
-        }
-
-    def _op_types_declare(self, bv, op: dict[str, Any]):
-        parsed = self._parse_declaration_source(
-            bv,
-            str(op["declaration"]),
-            source_path=op.get("source_path"),
-        )
-        named_types = list(parsed["types"])
-        defined_types = {}
-        defined_type_layouts = {}
-        before_defined_types = {}
-        for name, type_obj in named_types:
-            existing = self._current_type_entry(bv, str(name))
-            before_defined_types[str(name)] = existing["decl"] if existing is not None else None
-            bv.define_user_type(name, type_obj)
-            current = self._current_type_entry(bv, str(name))
-            defined_types[str(name)] = current["decl"] if current is not None else str(type_obj)
-            defined_type_layouts[str(name)] = current["layout"] if current is not None else self._render_type_layout(type_obj)
-        return {
-            "op": "types_declare",
-            "defined_types": defined_types,
-            "defined_type_layouts": defined_type_layouts,
-            "before_defined_types": before_defined_types,
-            "count": len(defined_types),
-            "parsed_functions": [name for name, _ in parsed["functions"]],
-            "parsed_variables": [name for name, _ in parsed["variables"]],
-            "parsed_type_count": len(named_types),
-            "parsed_function_count": len(parsed["functions"]),
-            "parsed_variable_count": len(parsed["variables"]),
-            "requested": self._operation_requested(op),
-        }
+    def _op_types_declare(self, *a, **k):
+        return mutation_engine._op_types_declare(self.ctx, *a, **k)
 
 _bridge: BinaryNinjaBridge | None = None
 _headless_views: list[Any] = []

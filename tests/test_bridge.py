@@ -433,16 +433,18 @@ def test_mutation_reverts_on_verification_failure(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeMutationBV()
 
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
-    monkeypatch.setattr(instance, "_guess_affected_functions", lambda bv, operations: [])
-    monkeypatch.setattr(instance, "_capture_function_snapshots", lambda bv, functions: {})
-    monkeypatch.setattr(instance, "_capture_type_snapshots", lambda bv, operations: {})
-    monkeypatch.setattr(instance, "_diff_snapshots", lambda before, after: [])
-    monkeypatch.setattr(instance, "_diff_type_snapshots", lambda before, after: [])
+    # _mutation moved to mutation_engine and calls these peers module-locally;
+    # patch the seam helper on instance.ctx and the mutation peers on the module.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.mutation_engine, "_guess_affected_functions", lambda ctx, bv, operations: [])
+    monkeypatch.setattr(bridge.mutation_engine, "_capture_function_snapshots", lambda ctx, bv, functions: {})
+    monkeypatch.setattr(bridge.mutation_engine, "_capture_type_snapshots", lambda ctx, bv, operations: {})
+    monkeypatch.setattr(bridge.mutation_engine, "_diff_snapshots", lambda ctx, before, after: [])
+    monkeypatch.setattr(bridge.mutation_engine, "_diff_type_snapshots", lambda ctx, before, after: [])
     monkeypatch.setattr(
-        instance,
+        bridge.mutation_engine,
         "_apply_operation",
-        lambda bv, op, restores=None: {
+        lambda ctx, bv, op, restores=None: {
             "op": "rename_symbol",
             "kind": "function",
             "address": "0x401000",
@@ -451,9 +453,9 @@ def test_mutation_reverts_on_verification_failure(monkeypatch):
         },
     )
     monkeypatch.setattr(
-        instance,
+        bridge.mutation_engine,
         "_verify_operation",
-        lambda bv, result: {
+        lambda ctx, bv, result: {
             **result,
             "status": "verification_failed",
             "message": "Live rename verification failed at 0x401000",
@@ -502,15 +504,20 @@ def test_run_local_restores_runs_reverse_and_reports_failure(monkeypatch):
 
 
 def _mutation_with_stubs(monkeypatch, bridge, instance, bv, *, apply, verify=None):
-    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
-    monkeypatch.setattr(instance, "_guess_affected_functions", lambda bv, operations: [])
-    monkeypatch.setattr(instance, "_capture_function_snapshots", lambda bv, functions: {})
-    monkeypatch.setattr(instance, "_capture_type_snapshots", lambda bv, operations: {})
-    monkeypatch.setattr(instance, "_diff_snapshots", lambda before, after: [])
-    monkeypatch.setattr(instance, "_diff_type_snapshots", lambda before, after: [])
-    monkeypatch.setattr(instance, "_apply_operation", apply)
+    # _mutation moved to mutation_engine and calls its peers module-locally; patch
+    # the seam helper on instance.ctx and the mutation peers on the module. The
+    # passed apply/verify keep their (bv, op[, restores]) / (bv, result) signature
+    # -- wrap them to drop the new leading ctx the module-level call now passes.
+    me = bridge.mutation_engine
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(me, "_guess_affected_functions", lambda ctx, bv, operations: [])
+    monkeypatch.setattr(me, "_capture_function_snapshots", lambda ctx, bv, functions: {})
+    monkeypatch.setattr(me, "_capture_type_snapshots", lambda ctx, bv, operations: {})
+    monkeypatch.setattr(me, "_diff_snapshots", lambda ctx, before, after: [])
+    monkeypatch.setattr(me, "_diff_type_snapshots", lambda ctx, before, after: [])
+    monkeypatch.setattr(me, "_apply_operation", lambda ctx, *a, **k: apply(*a, **k))
     if verify is not None:
-        monkeypatch.setattr(instance, "_verify_operation", verify)
+        monkeypatch.setattr(me, "_verify_operation", lambda ctx, *a, **k: verify(*a, **k))
 
 
 def test_apply_failure_runs_restores_even_when_undo_revert_fails(monkeypatch):
@@ -529,14 +536,14 @@ def test_apply_failure_runs_restores_even_when_undo_revert_fails(monkeypatch):
         return {"op": "local_rename", "requested": {}}
 
     _mutation_with_stubs(monkeypatch, bridge, instance, bv, apply=apply)
-    monkeypatch.setattr(instance, "_revert_undo_safely", lambda bv_, state: False)
+    monkeypatch.setattr(bridge.mutation_engine, "_revert_undo_safely", lambda ctx, bv_, state: False)
 
-    def run_restores(bv_, restores):
+    def run_restores(ctx, bv_, restores):
         calls["restores"] += 1
         assert len(restores) == 1
         return True
 
-    monkeypatch.setattr(instance, "_run_local_restores", run_restores)
+    monkeypatch.setattr(bridge.mutation_engine, "_run_local_restores", run_restores)
 
     result = instance._mutation("active", False, [{"op": "local_rename"}, {"op": "boom"}])
 
@@ -562,7 +569,7 @@ def test_preview_restore_failure_is_not_success(monkeypatch):
         apply=apply,
         verify=lambda bv_, result: {**result, "status": "verified"},
     )
-    monkeypatch.setattr(instance, "_run_local_restores", lambda bv_, restores: False)
+    monkeypatch.setattr(bridge.mutation_engine, "_run_local_restores", lambda ctx, bv_, restores: False)
 
     result = instance._mutation("active", True, [{"op": "local_rename"}])
 
@@ -591,10 +598,10 @@ def test_preview_drift_restore_failure_is_not_success(monkeypatch):
         apply=apply,
         verify=lambda bv_, result: {**result, "status": "verified"},
     )
-    monkeypatch.setattr(instance, "_run_local_restores", lambda bv_, restores: True)
+    monkeypatch.setattr(bridge.mutation_engine, "_run_local_restores", lambda ctx, bv_, restores: True)
     # Force a non-empty var snapshot and a failing drift restore.
-    monkeypatch.setattr(instance, "_capture_local_var_snapshots", lambda bv_, fns: {0x1: {1: ("a", "int")}})
-    monkeypatch.setattr(instance, "_restore_local_var_drift", lambda bv_, snap: False)
+    monkeypatch.setattr(bridge.mutation_engine, "_capture_local_var_snapshots", lambda ctx, bv_, fns: {0x1: {1: ("a", "int")}})
+    monkeypatch.setattr(bridge.mutation_engine, "_restore_local_var_drift", lambda ctx, bv_, snap: False)
 
     result = instance._mutation("active", True, [{"op": "local_rename"}])
 
@@ -618,7 +625,7 @@ def test_preview_with_successful_restore_still_succeeds(monkeypatch):
         apply=apply,
         verify=lambda bv_, result: {**result, "status": "verified"},
     )
-    monkeypatch.setattr(instance, "_run_local_restores", lambda bv_, restores: True)
+    monkeypatch.setattr(bridge.mutation_engine, "_run_local_restores", lambda ctx, bv_, restores: True)
 
     result = instance._mutation("active", True, [{"op": "local_rename"}])
 
@@ -713,10 +720,13 @@ def test_op_local_rename_registers_restore_that_undoes_the_rename(monkeypatch):
 
     fn = _RecordingFunc()
     bv = types.SimpleNamespace(get_function_at=lambda addr: fn)
-    monkeypatch.setattr(instance, "_find_function", lambda _bv, ident: fn)
-    monkeypatch.setattr(instance, "_find_variable_selector", lambda _f, sel: (var, False))
-    monkeypatch.setattr(instance, "_find_var_for_restore", lambda _f, identifier, storage, is_parameter: var)
-    monkeypatch.setattr(instance, "_local_id", lambda _f, _v, is_parameter: "lid")
+    # _op_local_rename moved to mutation_engine; it resolves _find_function via
+    # the seam (instance.ctx), the variable helpers via vars_mod, and
+    # _find_var_for_restore module-locally (now ctx-first).
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda _bv, ident: fn)
+    monkeypatch.setattr(bridge.vars_mod, "_find_variable_selector", lambda _f, sel: (var, False))
+    monkeypatch.setattr(bridge.mutation_engine, "_find_var_for_restore", lambda ctx, _f, identifier, storage, is_parameter: var)
+    monkeypatch.setattr(bridge.vars_mod, "_local_id", lambda _f, _v, is_parameter: "lid")
 
     restores: list = []
     result = instance._op_local_rename(
@@ -741,9 +751,9 @@ def test_op_local_rename_noop_registers_no_restore(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     var = _FakeVariable(name="keep", storage=2, var_type="int32_t", identifier=1)
     fn = types.SimpleNamespace(start=0x1000, name="f", create_user_var=lambda *a: None)
-    monkeypatch.setattr(instance, "_find_function", lambda _bv, ident: fn)
-    monkeypatch.setattr(instance, "_find_variable_selector", lambda _f, sel: (var, False))
-    monkeypatch.setattr(instance, "_local_id", lambda _f, _v, is_parameter: "lid")
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda _bv, ident: fn)
+    monkeypatch.setattr(bridge.vars_mod, "_find_variable_selector", lambda _f, sel: (var, False))
+    monkeypatch.setattr(bridge.vars_mod, "_local_id", lambda _f, _v, is_parameter: "lid")
 
     restores: list = []
     instance._op_local_rename(bv := object(), {"op": "local_rename", "function": "f", "variable": "keep", "new_name": "keep"}, restores)
@@ -4935,8 +4945,8 @@ def test_apply_operation_comment_function_only_form_accepted(monkeypatch):
     # required-field validation, not be rejected as missing `address` (#67).
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    monkeypatch.setattr(instance, "_op_set_comment", lambda bv, op: {"ok": "set"})
-    monkeypatch.setattr(instance, "_op_delete_comment", lambda bv, op: {"ok": "del"})
+    monkeypatch.setattr(bridge.mutation_engine, "_op_set_comment", lambda ctx, bv, op: {"ok": "set"})
+    monkeypatch.setattr(bridge.mutation_engine, "_op_delete_comment", lambda ctx, bv, op: {"ok": "del"})
     assert instance._apply_operation(
         None, {"op": "set_comment", "function": "main", "comment": "hi"}) == {"ok": "set"}
     assert instance._apply_operation(
@@ -4946,7 +4956,7 @@ def test_apply_operation_comment_function_only_form_accepted(monkeypatch):
 def test_apply_operation_comment_address_form_still_accepted(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    monkeypatch.setattr(instance, "_op_set_comment", lambda bv, op: {"ok": "set"})
+    monkeypatch.setattr(bridge.mutation_engine, "_op_set_comment", lambda ctx, bv, op: {"ok": "set"})
     assert instance._apply_operation(
         None, {"op": "set_comment", "address": "0x1000", "comment": "hi"}) == {"ok": "set"}
 
@@ -5196,8 +5206,10 @@ def _struct_instance(monkeypatch, members):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     builder = _FakeStructBuilder(members)
-    monkeypatch.setattr(instance, "_struct_builder", lambda bv, name: ("S", builder))
-    monkeypatch.setattr(instance, "_commit_struct_builder", lambda *a, **k: None)
+    # _op_struct_field_* moved to mutation_engine and call these module-locally,
+    # so stub them on the module (patching instance._* no longer intercepts).
+    monkeypatch.setattr(bridge.mutation_engine, "_struct_builder", lambda ctx, bv, name: ("S", builder))
+    monkeypatch.setattr(bridge.mutation_engine, "_commit_struct_builder", lambda *a, **k: None)
     return bridge, instance, builder
 
 
@@ -5274,8 +5286,8 @@ def _struct_set_instance(monkeypatch, occupied_offsets):
         def get_type_by_name(self, n):
             return occupied_type
 
-    monkeypatch.setattr(instance, "_struct_builder", lambda bv, name: ("S", builder))
-    monkeypatch.setattr(instance, "_commit_struct_builder", lambda *a, **k: None)
+    monkeypatch.setattr(bridge.mutation_engine, "_struct_builder", lambda ctx, bv, name: ("S", builder))
+    monkeypatch.setattr(bridge.mutation_engine, "_commit_struct_builder", lambda *a, **k: None)
     return bridge, instance, builder, _BV()
 
 
@@ -5318,8 +5330,8 @@ def test_struct_field_set_no_overwrite_refuses_interior_overlap(monkeypatch):
         def get_type_by_name(self, n):
             return occupied_type
 
-    monkeypatch.setattr(instance, "_struct_builder", lambda bv, name: ("S", builder))
-    monkeypatch.setattr(instance, "_commit_struct_builder", lambda *a, **k: None)
+    monkeypatch.setattr(bridge.mutation_engine, "_struct_builder", lambda ctx, bv, name: ("S", builder))
+    monkeypatch.setattr(bridge.mutation_engine, "_commit_struct_builder", lambda *a, **k: None)
     with pytest.raises(bridge.OperationFailure) as exc:
         instance._op_struct_field_set(_BV(), {
             "struct_name": "S", "offset": "0x4", "field_name": "mid",
@@ -5543,10 +5555,10 @@ def test_internal_keyerror_not_mislabeled_as_missing_field(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeMutationBV()
 
-    def boom(b, o):
+    def boom(ctx, b, o):
         raise KeyError("some_internal_key")
 
-    monkeypatch.setattr(instance, "_op_rename_symbol", boom)
+    monkeypatch.setattr(bridge.mutation_engine, "_op_rename_symbol", boom)
     with pytest.raises(bridge.OperationFailure) as e:
         instance._apply_operation(bv, {"op": "rename_symbol", "identifier": "x", "new_name": "y"})
     assert "missing required field" not in str(e.value)
