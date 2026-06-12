@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import atexit
 import contextlib
-import difflib
 import errno
 import json
 import os
@@ -31,7 +30,6 @@ from . import read_types
 from . import read_xrefs
 from . import vars as vars_mod
 from ._shared import (
-    USER_FACING_ERRORS,
     OperationFailure,
     _artifact_summary,
     _json_response,
@@ -42,7 +40,6 @@ from ._shared import (
     _validate_bool,
     _validate_count,
     _write_json_artifact,
-    _CONVENTION_RE,
 )
 from .op_registry import REGISTRY, op
 from .paths import PLUGIN_NAME, bridge_registry_path, bridge_socket_path, instances_dir
@@ -1464,8 +1461,8 @@ from .bridge_state import (  # noqa: E402
 
 
 # ---- op binders: each reproduces one former _dispatch_on_main if-arm verbatim
-# (self -> bridge). Registered at import; dispatch still uses the legacy if-chain
-# until Task 1.4 wires the registry in. ----
+# (self -> bridge). dispatch() and _dispatch_on_main route through this registry
+# (REGISTRY.spec(op)); READ_LOCKED_OPS/WRITE_LOCKED_OPS are derived from it. ----
 # Clear first so re-executing this module (the test harness's _load_bridge re-runs
 # the whole file via exec_module against this same global registry) re-registers
 # the identical op set instead of tripping the duplicate-registration guard.
