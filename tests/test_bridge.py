@@ -5451,11 +5451,14 @@ def test_render_type_layout_struct_unchanged(monkeypatch):
 
 
 def _stub_code_context(monkeypatch, instance, function_entry):
-    monkeypatch.setattr(instance, "_sections_at", lambda bv, a: [{"name": ".text"}])
-    monkeypatch.setattr(instance, "_segment_at", lambda bv, a: {"name": "seg"})
-    monkeypatch.setattr(instance, "_symbol_at", lambda bv, a: None)
-    monkeypatch.setattr(instance, "_function_entry_for_address", lambda bv, a: function_entry)
-    monkeypatch.setattr(instance, "_address_is_code", lambda bv, a: True)
+    # _address_context and its resolution/address-context helpers now live on the
+    # BridgeContext seam (instance.ctx); patch the helpers where the method under
+    # test resolves them.
+    monkeypatch.setattr(instance.ctx, "_sections_at", lambda bv, a: [{"name": ".text"}])
+    monkeypatch.setattr(instance.ctx, "_segment_at", lambda bv, a: {"name": "seg"})
+    monkeypatch.setattr(instance.ctx, "_symbol_at", lambda bv, a: None)
+    monkeypatch.setattr(instance.ctx, "_function_entry_for_address", lambda bv, a: function_entry)
+    monkeypatch.setattr(instance.ctx, "_address_is_code", lambda bv, a: True)
 
 
 def test_address_context_disasm_uses_target_function_arch(monkeypatch):
@@ -5477,7 +5480,7 @@ def test_address_context_disasm_uses_target_function_arch(monkeypatch):
         recorded["arch"] = arch
         return "bx pc" if arch is thumb_arch else "udf #0xd478"
 
-    monkeypatch.setattr(instance, "_safe_disassembly", fake_safe)
+    monkeypatch.setattr(instance.ctx, "_safe_disassembly", fake_safe)
     ctx = instance._address_context(_BV(), 0x12e74, include_disasm=True)
     assert recorded["arch"] is thumb_arch           # used the target function's arch
     assert ctx["disasm"] == "bx pc"                 # not the ARM misdecode
@@ -5496,7 +5499,7 @@ def test_address_context_disasm_respects_explicit_arch(monkeypatch):
         recorded["arch"] = arch
         return "x"
 
-    monkeypatch.setattr(instance, "_safe_disassembly", fake_safe)
+    monkeypatch.setattr(instance.ctx, "_safe_disassembly", fake_safe)
     instance._address_context(object(), 0x1000, include_disasm=True, arch=explicit, assume_code=True)
     assert recorded["arch"] is explicit
 
