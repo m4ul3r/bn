@@ -423,6 +423,33 @@ def _maybe_regex_hint(args: argparse.Namespace, result: Any, query: str | None) 
     )
 
 
+def _maybe_offset_hint(args: argparse.Namespace, result: Any, identifier: str | None) -> None:
+    """When `xrefs <bare-number>` matched nothing and the value is small enough to
+    look like a struct-field offset (< 0x10000), nudge toward --field: a bare value
+    is taken as an absolute address, so a field offset like 0x308 silently returns
+    zero xrefs with no clue. Suppressed for function-name identifiers and for
+    plausible code/data addresses (>= 0x10000)."""
+    if not identifier:
+        return
+    text = str(identifier).strip()
+    try:
+        value = int(text, 16) if text.lower().startswith("0x") else int(text, 10)
+    except ValueError:
+        return
+    empty = (
+        isinstance(result, dict)
+        and not result.get("code_refs")
+        and not result.get("data_refs")
+    )
+    if not empty or value >= 0x10000:
+        return
+    print(
+        f"note: 0 xrefs to {text} -- a bare value is taken as an absolute address. "
+        f"If {text} is a struct field offset, use `bn xrefs --field <Struct.field>` instead.",
+        file=sys.stderr,
+    )
+
+
 def _spill_next_step_hint(
     stem: str,
     spill_context: Any,
@@ -516,6 +543,7 @@ def _call(
     bridge_writes_output: bool = False,
     spawn_missing_named: bool = False,
     regex_hint_query: str | None = None,
+    offset_hint_identifier: str | None = None,
 ) -> int:
     request_params = dict(params or {})
     effective_page_limit = None
@@ -547,6 +575,7 @@ def _call(
             file=sys.stderr,
         )
     _maybe_regex_hint(args, result, regex_hint_query)
+    _maybe_offset_hint(args, result, offset_hint_identifier)
     spill_context = result
     if text_renderer is not None and args.format == "text":
         try:
