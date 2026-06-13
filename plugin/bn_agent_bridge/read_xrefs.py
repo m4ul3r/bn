@@ -28,6 +28,7 @@ import binaryninja as bn
 
 from . import il_format
 from ._shared import _parse_address
+from .bridge_state import require_analysis
 
 # Import symbol kinds, in resolution-preference order. Mirrors the literal that
 # also lives as ``BinaryNinjaBridge._IMPORT_SYMBOL_TYPES`` (used by the imports
@@ -42,6 +43,7 @@ _IMPORT_SYMBOL_TYPES: list[tuple[str, str]] = [
 
 def _xrefs(ctx, selector: str | None, identifier):
     bv = ctx._resolve_view(selector)
+    require_analysis(bv, "Cross-references")
     try:
         address = _parse_address(identifier)
     except Exception:

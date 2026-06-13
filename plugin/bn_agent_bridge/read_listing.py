@@ -31,6 +31,7 @@ import binaryninja as bn  # noqa: F401  (kept for parity / future use)
 
 from . import il_format
 from ._shared import OperationFailure, _parse_address, _validate_count
+from .bridge_state import require_analysis
 
 
 def _callsites_within_function(ctx, bv, callee, func, *, context: int) -> list[dict[str, Any]]:
@@ -116,6 +117,7 @@ def _callsites(
         raise OperationFailure("invalid_context", f"Invalid callsite context size: {context}")
 
     bv = ctx._resolve_view(selector)
+    require_analysis(bv, "Callsites")
     callee = ctx._find_function(bv, callee_identifier)
     scope_functions = ctx._resolve_scope_functions(bv, within_identifiers)
 
