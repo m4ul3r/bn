@@ -42,6 +42,19 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int) -> list[d
         int(item["_address_int"]): index for index, item in enumerate(disasm_entries)
     }
     callee_address = int(callee.start)
+    # Align callsites' edge set with xrefs. The LLIL `dest` is a literal const
+    # only on statically-resolved calls; on stripped/kernel/register-resolved
+    # calls BN records the edge in the code-ref DB (the same source xrefs reads)
+    # while the LLIL dest is a register/computed value. Union the two so
+    # callsites never silently drops an edge xrefs/dataflow-callgraph confirm.
+    # A code-ref addr is specific to THIS callee and we only inspect this
+    # function's call insns, so matching on it stays correctly scoped.
+    _get_code_refs = getattr(bv, "get_code_refs", None)
+    code_ref_addrs = (
+        {int(getattr(ref, "address", -1)) for ref in _get_code_refs(callee_address)}
+        if callable(_get_code_refs)
+        else set()
+    )
     rows = []
     for insn in il_format._iter_llil_instructions(func):
         op_name = il_format._il_op_name(insn)
@@ -51,12 +64,12 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int) -> list[d
         # or it silently misses a reachable sink during triage (#47).
         if op_name not in {"LLIL_CALL", "LLIL_CALL_STACK_ADJUST", "LLIL_TAILCALL"}:
             continue
+        call_addr = int(getattr(insn, "address", 0))
         dest_value = il_format._llil_constant_value(getattr(insn, "dest", None))
-        if dest_value != callee_address:
+        if dest_value != callee_address and call_addr not in code_ref_addrs:
             continue
         call_kind = "tailcall" if "TAILCALL" in op_name else "call"
 
-        call_addr = int(getattr(insn, "address", 0))
         instruction_length = il_format._instruction_length(bv, call_addr, arch=func_arch)
         caller_static = call_addr + instruction_length
         disasm_index = index_by_addr.get(call_addr)
