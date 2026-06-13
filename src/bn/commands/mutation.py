@@ -55,8 +55,10 @@ def _comment_list(args: argparse.Namespace) -> int:
         require_target=True,
         allow_implicit_target=True,
         text_renderer=_render_comment_list_text,
-        page_limit=args.limit,
-        page_offset=args.offset,
+        # Bridge returns the {items,total,...} envelope and applies the page, so
+        # forward the real limit/offset (above) and keep the spill hint -- no
+        # client-side limit+1 probe (#131, mirrors strings/imports/#130).
+        paged_spill=True,
         page_label="comments",
         stem="comments",
     )

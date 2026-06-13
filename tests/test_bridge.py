@@ -1808,6 +1808,17 @@ def test_search_functions_rejects_invalid_regex(monkeypatch):
         instance._search_functions("active", "(", regex=True)
 
 
+def _callsites_items(instance, *args, **kwargs):
+    """Unwrap the {items,total,...} callsites envelope to the row list (#131).
+
+    callsites now returns the same paging envelope as the sibling list ops; these
+    tests assert on the rows, so unwrap once here rather than in every assertion.
+    Also asserts the envelope shape so the contract stays covered."""
+    result = instance._callsites(*args, **kwargs)
+    assert isinstance(result, dict) and "items" in result and "total" in result
+    return result["items"]
+
+
 def test_callsites_returns_local_hlil_assignment_and_pre_branch_condition(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -1882,7 +1893,7 @@ def test_callsites_returns_local_hlil_assignment_and_pre_branch_condition(monkey
     )
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
-    rows = instance._callsites(
+    rows = _callsites_items(instance,
         "active",
         "crt_rand",
         within_identifiers=["bonus_pick_random_type"],
@@ -1977,7 +1988,7 @@ def test_callsites_prefers_local_expression_over_broad_enclosing_hlil(monkeypatc
     )
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
-    rows = instance._callsites(
+    rows = _callsites_items(instance,
         "active",
         "crt_rand",
         within_identifiers=["fx_queue_add_random"],
@@ -2008,7 +2019,7 @@ def test_callsites_within_file_scope_preserves_file_order_and_dedupes(monkeypatc
     )
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
-    rows = instance._callsites(
+    rows = _callsites_items(instance,
         "active",
         "crt_rand",
         within_identifiers=["beta", "alpha", "beta"],
@@ -2040,7 +2051,7 @@ def test_callsites_ignores_indirect_calls_and_returns_null_context_when_unmapped
     )
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
-    rows = instance._callsites(
+    rows = _callsites_items(instance,
         "active",
         "crt_rand",
         within_identifiers=["fx_queue_add_random"],
@@ -2072,7 +2083,7 @@ def test_callsites_counts_tailcall_into_target(monkeypatch):
     )
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
-    rows = instance._callsites("active", "memcpy", within_identifiers=["j_memcpy"], context=1)
+    rows = _callsites_items(instance,"active", "memcpy", within_identifiers=["j_memcpy"], context=1)
 
     assert len(rows) == 1
     assert rows[0]["call_addr"] == "0x700010"
@@ -2094,7 +2105,7 @@ def test_callsites_marks_regular_call_kind(monkeypatch):
     )
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
-    rows = instance._callsites("active", "memcpy", within_identifiers=["caller"], context=1)
+    rows = _callsites_items(instance,"active", "memcpy", within_identifiers=["caller"], context=1)
 
     assert len(rows) == 1
     assert rows[0]["call_kind"] == "call"
@@ -2120,7 +2131,7 @@ def test_callsites_returns_null_for_coarse_only_hlil(monkeypatch):
     )
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
-    rows = instance._callsites(
+    rows = _callsites_items(instance,
         "active",
         "crt_rand",
         within_identifiers=["coarse"],
@@ -2167,7 +2178,7 @@ def test_callsites_filters_placeholder_pre_branch_condition(monkeypatch):
     )
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
-    rows = instance._callsites(
+    rows = _callsites_items(instance,
         "active",
         "crt_rand",
         within_identifiers=["placeholder_cond"],
@@ -5694,7 +5705,7 @@ def test_callsites_requires_refresh_when_quick_loaded(monkeypatch):
     # to a typo. Refuse with a directive instead.
     bridge._quick_loaded_views.add(bv)
     with pytest.raises(RuntimeError, match="loaded with --quick"):
-        instance._callsites(None, "strcpy", within_identifiers=["main"])
+        _callsites_items(instance,None, "strcpy", within_identifiers=["main"])
     bridge._quick_loaded_views.discard(bv)
 
 
@@ -6289,3 +6300,20 @@ def test_list_comments_rejects_negative_count(monkeypatch):
     with pytest.raises(bridge.OperationFailure) as exc:
         instance._list_comments("active", limit=-3)
     assert exc.value.status == "invalid_request"
+
+
+def test_list_comments_returns_paging_envelope(monkeypatch):
+    # #131: comment list returns the {items,total,offset,limit,returned,has_more}
+    # envelope (parity with strings/imports/sections), not a bare list.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+    bv.address_comments = {0x1000: "first", 0x2000: "second", 0x3000: "third"}
+    bv.get_functions_containing = lambda addr: []
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    res = instance._list_comments("active", offset=0, limit=2)
+    assert res["total"] == 3
+    assert res["returned"] == 2
+    assert res["has_more"] is True
+    assert [i["comment"] for i in res["items"]] == ["first", "second"]

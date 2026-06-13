@@ -213,6 +213,10 @@ def _render_comment_text(value: Any) -> str:
 
 
 def _render_comment_list_text(value: Any) -> str:
+    # Paged envelope ({items,total,...}) -> render the page + the shared footer;
+    # a bare list falls through to the per-item body below (back-compat) (#131).
+    if isinstance(value, dict) and "items" in value:
+        return _render_paged_list_text(value, "items", _render_comment_list_text)
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value:
@@ -977,6 +981,11 @@ def _render_init_arrays_text(value: Any) -> str:
 
 
 def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) -> str:
+    # callsites now returns the {items,total,...} envelope (#131 / item 11);
+    # unwrap to the row list. has_more is always false (no bridge-side paging),
+    # so no footer -- the --limit cap below stays a text-only renderer feature.
+    if isinstance(value, dict) and "items" in value:
+        value = value.get("items") or []
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value:
@@ -1245,6 +1254,10 @@ def _describe_loc(loc: Any) -> str:
 
 
 def _render_type_list_text(value: Any) -> str:
+    # Paged envelope ({items,total,...}) -> render the page + the shared footer;
+    # a bare list falls through to the per-item body below (back-compat) (#131).
+    if isinstance(value, dict) and "items" in value:
+        return _render_paged_list_text(value, "items", _render_type_list_text)
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value:
