@@ -1915,6 +1915,32 @@ def test_callsites_returns_local_hlil_assignment_and_pre_branch_condition(monkey
     assert [item["address"] for item in rows[0]["next_instructions"][:1]] == ["0x4124a5"]
 
 
+def test_callsites_finds_register_dest_call_via_code_ref_db(monkeypatch):
+    # On stripped/kernel/MIPS targets a call's LLIL dest is a register/computed
+    # value BN resolved via analysis and recorded in the code-ref DB (what xrefs
+    # reads), NOT a literal const. callsites must agree with xrefs, not silently
+    # drop the edge. Here the only call dest is a register, so the literal-const
+    # match misses it and only the code-ref DB resolves it.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    callee = _FakeFunction(0x461746, "target_fn")
+    fn = _FakeFunction(0x412470, "caller_fn")
+    fn.basic_blocks = [_FakeBasicBlock(0x4124A0, 0x4124A4)]
+    fn.low_level_il = [[_FakeLLILInstruction(0x4124A0, _FakeReg("x8"))]]
+    bv = _FakeBV(
+        functions=[callee, fn],
+        instruction_lengths={0x4124A0: 4},
+        disassembly={0x4124A0: "blr x8"},
+        code_refs={0x461746: [_FakeCodeRef(0x4124A0, fn)]},  # BN's DB knows the edge
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    rows = _callsites_items(instance, "active", "target_fn", within_identifiers=["caller_fn"], context=1)
+    assert len(rows) == 1
+    assert rows[0]["call_addr"] == "0x4124a0"
+    assert rows[0]["caller_static"] == "0x4124a4"
+
+
 def test_callsites_prefers_local_expression_over_broad_enclosing_hlil(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
