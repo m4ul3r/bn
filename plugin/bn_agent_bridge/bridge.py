@@ -389,6 +389,12 @@ class TargetManager:
                         "selector": selectors[view_id],
                         "view_name": record.view_name,
                         "active": bool(view is active),
+                        # Per-target analysis state so `target list` can flag a
+                        # --quick (unanalyzed) view without a per-target lookup.
+                        "analyzed": view not in _quick_loaded_views,
+                        "analysis_state": (
+                            "quick" if view in _quick_loaded_views else "full"
+                        ),
                     }
                 )
             return result

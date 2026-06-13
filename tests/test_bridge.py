@@ -4077,6 +4077,25 @@ def test_selector_falls_back_to_target_id_for_identical_paths(monkeypatch):
     bridge._headless_views.clear()
 
 
+def test_refresh_rows_carry_analysis_state(monkeypatch):
+    # target list rows must expose per-target analysis state so an agent can tell
+    # a --quick view from a full one without a separate target info per target.
+    bridge = _load_bridge(monkeypatch)
+    bv_quick = _FakeFileBV("/proj/q.bndb", session_id="1")
+    bv_full = _FakeFileBV("/proj/f.bndb", session_id="2")
+    _register_views(bridge, bv_quick, bv_full)
+    bridge._quick_loaded_views.add(bv_quick)
+
+    rows = {t["filename"]: t for t in bridge.TargetManager().refresh()}
+    assert rows["/proj/q.bndb"]["analysis_state"] == "quick"
+    assert rows["/proj/q.bndb"]["analyzed"] is False
+    assert rows["/proj/f.bndb"]["analysis_state"] == "full"
+    assert rows["/proj/f.bndb"]["analyzed"] is True
+
+    bridge._quick_loaded_views.discard(bv_quick)
+    bridge._headless_views.clear()
+
+
 def test_resolve_accepts_path_suffix_selector(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     bv1 = _FakeFileBV("/work/01_arithmetic_lock/target.bndb", session_id="1")

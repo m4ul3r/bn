@@ -375,6 +375,10 @@ def _render_target_summary(value: dict[str, Any]) -> str:
         lines[0] += " [active]"
     if value.get("sticky"):
         lines[0] += " [sticky]"
+    # Flag a --quick (unanalyzed) view in text, not just JSON, so a cold agent
+    # doesn't trust an empty/partial result from a view whose analysis is pending.
+    if value.get("analyzed") is False:
+        lines[0] += " [not analyzed]"
 
     details = [
         ("target", value.get("target_id")),

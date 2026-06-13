@@ -1757,6 +1757,19 @@ def test_target_summary_text_shows_function_counts():
     assert "12 imported" in out
 
 
+def test_target_summary_text_marks_quick_view():
+    """A --quick (unanalyzed) target must be flagged in text output, not just JSON."""
+    from bn import formatters
+    quick = formatters._render_target_summary({
+        "selector": "active", "view_id": 1, "analyzed": False, "analysis_state": "quick",
+    })
+    assert "[not analyzed]" in quick
+    full = formatters._render_target_summary({
+        "selector": "active", "view_id": 1, "analyzed": True, "analysis_state": "full",
+    })
+    assert "[not analyzed]" not in full
+
+
 def _zero_function_search(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
     return {"ok": True, "result": {"functions": [], "total": 0, "offset": 0,
                                    "limit": None, "returned": 0, "has_more": False}}
