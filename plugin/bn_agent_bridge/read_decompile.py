@@ -37,6 +37,7 @@ from . import il_format
 from . import taint_engine as _taint
 from . import vars as vars_mod
 from ._shared import OperationFailure, _parse_address  # noqa: F401
+from .bridge_state import require_analysis
 
 
 def _force_function_analysis(ctx, bv, func):
@@ -88,6 +89,7 @@ def _decompile(ctx, selector: str | None, identifier, *, addresses: bool = False
 
 def _function_info(ctx, selector: str | None, identifier):
     bv = ctx._resolve_view(selector)
+    require_analysis(bv, "Function info")
     func = ctx._find_function(bv, identifier)
     metadata = il_format._function_metadata(func)
     variables = vars_mod._list_locals(func)

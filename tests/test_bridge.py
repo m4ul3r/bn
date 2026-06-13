@@ -5638,6 +5638,61 @@ def test_strings_requires_refresh_when_quick_loaded(monkeypatch):
     assert result["items"] == [] and result["total"] == 0
 
 
+def test_xrefs_requires_refresh_when_quick_loaded(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    # Quick-loaded: code-ref analysis hasn't run, so a 0/0 result reads as
+    # "no xrefs" rather than "not analyzed". Refuse with a directive instead.
+    bridge._quick_loaded_views.add(bv)
+    with pytest.raises(RuntimeError, match="loaded with --quick"):
+        instance._xrefs(None, "main")
+    bridge._quick_loaded_views.discard(bv)
+
+
+def test_function_info_requires_refresh_when_quick_loaded(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    # Quick-loaded: size/xref/signature fields are bogus until analysis runs.
+    bridge._quick_loaded_views.add(bv)
+    with pytest.raises(RuntimeError, match="loaded with --quick"):
+        instance._function_info(None, "main")
+    bridge._quick_loaded_views.discard(bv)
+
+
+def test_callsites_requires_refresh_when_quick_loaded(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    # Quick-loaded: "Function not found" would misattribute missing analysis
+    # to a typo. Refuse with a directive instead.
+    bridge._quick_loaded_views.add(bv)
+    with pytest.raises(RuntimeError, match="loaded with --quick"):
+        instance._callsites(None, "strcpy", within_identifiers=["main"])
+    bridge._quick_loaded_views.discard(bv)
+
+
+def test_taint_requires_refresh_when_quick_loaded(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    # Quick-loaded: "no call to <sink> found" would misdiagnose missing
+    # analysis. Refuse with a directive instead.
+    bridge._quick_loaded_views.add(bv)
+    with pytest.raises(RuntimeError, match="loaded with --quick"):
+        instance._taint(None, {"function": "main", "direction": "backward", "sinks": ["system"]})
+    bridge._quick_loaded_views.discard(bv)
+
+
 def test_target_info_reports_quick_analysis_state(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

@@ -35,10 +35,12 @@ from . import il_format
 from . import taint_engine as _taint
 from . import vars as vars_mod
 from ._shared import OperationFailure, _parse_address
+from .bridge_state import require_analysis
 
 
 def _taint_op(ctx, selector, params: dict[str, Any]):
     bv = ctx._resolve_view(selector)
+    require_analysis(bv, "Taint analysis")
     direction = str(params.get("direction", "forward"))
     func = ctx._find_function(bv, params["function"])
     try:
