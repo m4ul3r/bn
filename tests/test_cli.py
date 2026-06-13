@@ -1786,6 +1786,30 @@ def test_function_search_hints_regex_on_zero_matches_with_metachars(monkeypatch,
     assert "init|fini" in err
 
 
+def _empty_xrefs(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+    return {"ok": True, "result": {"address": "0x308", "code_refs": [], "data_refs": []}}
+
+
+def test_xrefs_hints_struct_field_on_small_offset_zero_match(monkeypatch, capsys):
+    """`xrefs 0x308` with 0 matches: 0x308 looks like a struct-field offset
+    misread as an absolute address. Nudge toward --field."""
+    monkeypatch.setattr(bn.cli, "send_request", _empty_xrefs)
+    rc = bn.cli.main(["xrefs", "0x308", "--target", "active"])
+    assert rc == 0
+    _, err = capsys.readouterr()
+    assert "--field" in err
+
+
+def test_xrefs_no_offset_hint_for_real_address(monkeypatch, capsys):
+    """A plausible code/data address (>= 0x10000) with 0 xrefs is a normal
+    'nothing references this' result -- no struct-field hint."""
+    monkeypatch.setattr(bn.cli, "send_request", _empty_xrefs)
+    rc = bn.cli.main(["xrefs", "0x401000", "--target", "active"])
+    assert rc == 0
+    _, err = capsys.readouterr()
+    assert "--field" not in err
+
+
 def test_function_search_no_regex_hint_when_regex_flag_set(monkeypatch, capsys):
     """--regex already set: the query IS a pattern, so no hint even at 0 matches."""
     monkeypatch.setattr(bn.cli, "send_request", _zero_function_search)

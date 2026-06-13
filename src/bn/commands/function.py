@@ -309,6 +309,7 @@ def _xrefs(args: argparse.Namespace) -> int:
         require_target=True,
         allow_implicit_target=True,
         text_renderer=lambda v: _render_xrefs_text(v, limit=limit),
+        offset_hint_identifier=identifier,
         stem="xrefs",
     )
 
