@@ -31,20 +31,11 @@ from ..transport import BridgeError
                  help="Heuristic filter: exclude likely CRT/locale strings (platform-biased, best-effort)"),
          ])
 def _strings(args: argparse.Namespace) -> int:
-    # An unfiltered dump pulls in .dynsym/.hash/.symtab byte noise that buries the
-    # real .rodata literals. Nudge toward narrowing -- only when no filter is set,
-    # so a targeted `--section`/`--query`/`--min-length` query stays quiet.
-    if args.section is None and args.query is None and args.min_length is None and not args.no_crt:
-        print(
-            "tip: an unfiltered string dump includes .dynsym/.hash/.symtab noise; "
-            "narrow with --section .rodata (or --query / --min-length) for signal.",
-            file=sys.stderr,
-        )
     # Bridge-authoritative paging (#122): forward the real limit/offset so the
     # bridge returns the page WITH the true total in a {items, total, ...}
     # envelope, matching function list/search. paged_spill keeps the
     # "--limit/--offset to page" spill hint without the client-side limit+1 probe.
-    return _call(
+    rc = _call(
         args,
         "strings",
         {
@@ -64,6 +55,16 @@ def _strings(args: argparse.Namespace) -> int:
         stem="strings",
         regex_hint_query=args.query,
     )
+    # The "narrow your noisy dump" tip only makes sense after a successful,
+    # unfiltered dump. Emitting it BEFORE the request put it ahead of (and buried)
+    # a --quick refusal / error; print it after a clean result instead.
+    if rc == 0 and args.section is None and args.query is None and args.min_length is None and not args.no_crt:
+        print(
+            "tip: an unfiltered string dump includes .dynsym/.hash/.symtab noise; "
+            "narrow with --section .rodata (or --query / --min-length) for signal.",
+            file=sys.stderr,
+        )
+    return rc
 
 
 @command("imports", help="List imports", target=True, paged=True,

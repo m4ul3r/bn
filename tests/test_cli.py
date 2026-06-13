@@ -4472,6 +4472,22 @@ def test_strings_with_filter_suppresses_section_hint(monkeypatch, capsys):
     assert "tip:" not in stderr
 
 
+def test_strings_section_hint_suppressed_when_request_fails(monkeypatch, capsys):
+    """The unfiltered-dump tip must not precede/bury a failure (e.g. a --quick
+    refusal). It belongs after a successful dump, not before the request."""
+    def boom(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        raise bn.cli.BridgeError(
+            "Strings are not available: this target was loaded with --quick (no analysis)."
+        )
+
+    monkeypatch.setattr(bn.cli, "send_request", boom)
+    rc = bn.cli.main(["strings", "--target", "active"])
+    assert rc == 2
+    _, stderr = capsys.readouterr()
+    assert "tip:" not in stderr          # the noise tip must not lead
+    assert "--quick" in stderr           # the real reason is what surfaces
+
+
 def test_trace_render_step_grammar_singular_and_plural():
     from bn import formatters
     base = {
