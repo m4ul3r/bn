@@ -260,11 +260,10 @@ def _list_comments(
             "function": func_name,
             "comment": text,
         })
-    if offset:
-        items = items[offset:]
-    if limit is not None:
-        items = items[:limit]
-    return items
+    # Honest paging envelope ({items,total,offset,limit,returned,has_more}),
+    # matching strings/imports/sections/function-list (#122/#131). The helper
+    # applies the offset/limit slice itself off the full filtered set.
+    return read_misc._paged_list_result(items, offset=offset, limit=limit)
 
 
 def _normalize_py_result(ctx, value: Any) -> tuple[Any, list[str]]:

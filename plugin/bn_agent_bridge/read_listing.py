@@ -30,6 +30,7 @@ from typing import Any
 import binaryninja as bn  # noqa: F401  (kept for parity / future use)
 
 from . import il_format
+from . import read_misc
 from ._shared import OperationFailure, _parse_address, _validate_count
 from .bridge_state import require_analysis
 
@@ -128,7 +129,10 @@ def _callsites(
             row["call_index"] = call_index
             row["within_query"] = str(within_query)
         rows.extend(function_rows)
-    return rows
+    # Honest paging envelope for JSON parity (#131 / item 11): callsites is a
+    # flat row list, so wrap it like the sibling list ops. --limit stays a
+    # text-only renderer cap (no bridge-side paging), hence offset=0/limit=None.
+    return read_misc._paged_list_result(rows, offset=0, limit=None)
 
 
 def _parse_function_address_bounds(
