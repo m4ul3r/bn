@@ -183,6 +183,27 @@ def _filtered_functions(
     return functions
 
 
+_FUNCTION_SORTS = ("address", "size", "name")
+
+
+def _sort_function_items(items: list[dict[str, Any]], sort: str) -> list[dict[str, Any]]:
+    """Order function-listing rows. 'address' (default) keeps the bridge's
+    natural start-address order; 'size' ranks largest-first (the common
+    'find the biggest function' triage step that otherwise needs a write-locked
+    py exec); 'name' is case-insensitive."""
+    if sort not in _FUNCTION_SORTS:
+        raise OperationFailure(
+            "invalid_request",
+            f"Invalid sort '{sort}'; choose one of {', '.join(_FUNCTION_SORTS)}",
+        )
+    if sort == "size":
+        items.sort(key=lambda it: (it.get("size") or 0), reverse=True)
+    elif sort == "name":
+        items.sort(key=lambda it: str(it.get("name", "")).lower())
+    # 'address': already in start-address order from _filtered_functions.
+    return items
+
+
 def _list_functions(
     ctx,
     selector: str | None,
@@ -192,6 +213,7 @@ def _list_functions(
     offset: int = 0,
     limit: int | None = None,
     count_only: bool = False,
+    sort: str = "address",
 ):
     offset = _validate_count(offset, label="offset", minimum=0)
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
@@ -200,9 +222,15 @@ def _list_functions(
     if count_only:
         return {"count": len(functions)}
     items = [
-        {"name": fn.name, "address": hex(fn.start), "raw_name": getattr(fn, "raw_name", fn.name)}
+        {
+            "name": fn.name,
+            "address": hex(fn.start),
+            "raw_name": getattr(fn, "raw_name", fn.name),
+            "size": il_format._function_size(fn),
+        }
         for fn in functions
     ]
+    _sort_function_items(items, sort)
     return _paged_function_result(ctx, items, offset=offset, limit=limit)
 
 
@@ -240,6 +268,7 @@ def _search_functions(
     max_address: Any = None,
     offset: int = 0,
     limit: int | None = None,
+    sort: str = "address",
 ):
     offset = _validate_count(offset, label="offset", minimum=0)
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
@@ -268,5 +297,11 @@ def _search_functions(
 
     for fn in _filtered_functions(ctx, bv, min_address=min_address, max_address=max_address):
         if matches(fn.name):
-            items.append({"name": fn.name, "address": hex(fn.start), "raw_name": getattr(fn, "raw_name", fn.name)})
+            items.append({
+                "name": fn.name,
+                "address": hex(fn.start),
+                "raw_name": getattr(fn, "raw_name", fn.name),
+                "size": il_format._function_size(fn),
+            })
+    _sort_function_items(items, sort)
     return _paged_function_result(ctx, items, offset=offset, limit=limit)
