@@ -1321,25 +1321,29 @@ def _render_imports_summary_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     total = value.get("total_symbols", 0)
-    lines = [f"total imports: {total}"]
+    # Label matches the JSON key (`total_symbols`) instead of drifting to
+    # "total imports".
+    lines = [f"total symbols: {total}"]
     needed = value.get("needed_libraries") or []
     if needed:
         lines.append("")
         lines.append("needed libraries (DT_NEEDED):")
         for lib in needed:
             lines.append(f"  {lib}")
-    lines.append("")
-    lines.append("by namespace:")
-    for ns, count in sorted(
-        value.get("namespaces", {}).items(), key=lambda x: -x[1]
-    ):
-        lines.append(f"  {count:>5}  {ns if ns else '(unnamed)'}")
-    lines.append("")
-    lines.append("by kind:")
-    for kind, count in sorted(
-        value.get("by_kind", {}).items(), key=lambda x: -x[1]
-    ):
-        lines.append(f"  {count:>5}  {kind}")
+    # Skip the breakdown sections entirely when empty (e.g. a 0-import target),
+    # rather than printing dangling "by namespace:"/"by kind:" headers.
+    namespaces = value.get("namespaces") or {}
+    if namespaces:
+        lines.append("")
+        lines.append("by namespace:")
+        for ns, count in sorted(namespaces.items(), key=lambda x: -x[1]):
+            lines.append(f"  {count:>5}  {ns if ns else '(unnamed)'}")
+    by_kind = value.get("by_kind") or {}
+    if by_kind:
+        lines.append("")
+        lines.append("by kind:")
+        for kind, count in sorted(by_kind.items(), key=lambda x: -x[1]):
+            lines.append(f"  {count:>5}  {kind}")
     return "\n".join(lines)
 
 

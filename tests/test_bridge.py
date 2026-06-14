@@ -1812,6 +1812,24 @@ def test_list_functions_binder_forwards_sort(monkeypatch):
     assert [r["name"] for r in res2["functions"]] == ["big_fn", "small_fn"]
 
 
+def test_function_list_envelope_exposes_items_alias_and_count_total(monkeypatch):
+    # JSON-consistency: function list/search expose the universal `items` key
+    # (alias of `functions`) so `data["items"]` works across every list command;
+    # and --count carries `total` to match the list envelope's key.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[_FakeFunction(0x1000, "a"), _FakeFunction(0x2000, "b")])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    res = instance._list_functions("active")
+    assert res["items"] == res["functions"]
+    sres = instance._search_functions("active", "a")
+    assert sres["items"] == sres["functions"]
+
+    count = instance._list_functions("active", count_only=True)
+    assert count["count"] == 2 and count["total"] == 2
+
+
 def test_list_functions_can_filter_by_address_range(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -4428,10 +4446,13 @@ def test_list_functions_count_only_returns_count(monkeypatch):
     ])
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
-    assert instance._list_functions(None, count_only=True) == {"count": 3}
+    # count_only now carries `total` (matching the list envelope's key) alongside
+    # the back-compat `count`.
+    assert instance._list_functions(None, count_only=True) == {"count": 3, "total": 3}
     # count must match the full listing's reported total
     listing = instance._list_functions(None)
     assert listing["total"] == 3 and listing["returned"] == 3 and len(listing["functions"]) == 3
+    assert listing["items"] == listing["functions"]  # universal items alias
 
 
 def test_resolve_raises_on_ambiguous_basename(monkeypatch):
