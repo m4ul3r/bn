@@ -4194,10 +4194,22 @@ def test_imports_summary_routes_and_renders_text(monkeypatch, capsys):
     assert captured["op"] == "imports"
     assert captured["params"]["summary"] is True
     output = capsys.readouterr().out
-    assert "total imports: 4" in output
+    assert "total symbols: 4" in output  # label matches the JSON key total_symbols
     assert "by namespace:" in output
     assert "libc" in output
     assert "by kind:" in output
+
+
+def test_imports_summary_text_omits_empty_breakdown_sections():
+    """A 0-import target must not print dangling 'by namespace:'/'by kind:'
+    headers with nothing under them, and the label matches the JSON key."""
+    from bn import formatters
+    out = formatters._render_imports_summary_text(
+        {"total_symbols": 0, "needed_libraries": [], "namespaces": {}, "by_kind": {}}
+    )
+    assert "total symbols: 0" in out
+    assert "by namespace:" not in out
+    assert "by kind:" not in out
 
 
 def test_imports_without_summary_routes_false(monkeypatch, capsys):

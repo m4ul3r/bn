@@ -29,6 +29,21 @@ def test_default_spill_token_limit_is_10k():
     assert DEFAULT_SPILL_TOKEN_LIMIT == 10_000
 
 
+def test_summary_reports_array_count_for_paged_envelope():
+    # A paged-list envelope must summarize the array's element count + logical
+    # total, not the count of envelope KEYS (which read as count=6 on any spill).
+    from bn.output import _summary
+    s = _summary({"items": [1, 2, 3], "total": 42, "offset": 0,
+                  "limit": 3, "returned": 3, "has_more": True})
+    assert s["count"] == 3 and s["total"] == 42 and s["page_key"] == "items"
+    # function-listing envelope (key 'functions') is handled too
+    s2 = _summary({"functions": [1, 2], "total": 2, "offset": 0,
+                   "limit": None, "returned": 2, "has_more": False})
+    assert s2["count"] == 2 and s2["total"] == 2
+    # a plain (non-envelope) object still reports its key count
+    assert _summary({"a": 1, "b": 2})["count"] == 2
+
+
 def test_write_output_renders_small_payload_without_spill(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
 

@@ -65,6 +65,23 @@ def render_value(value: Any, fmt: str) -> str:
 
 def _summary(value: Any) -> dict[str, Any]:
     if isinstance(value, dict):
+        # A paged-list envelope ({items|functions:[...], total, ...}) must report
+        # the array's element count (and the logical total), NOT the count of
+        # envelope keys -- the latter misled callers about result size (e.g. a
+        # 486-item page summarized as count=6).
+        for page_key in ("items", "functions"):
+            page = value.get(page_key)
+            if isinstance(page, list):
+                out: dict[str, Any] = {
+                    "kind": "object",
+                    "keys": sorted(value.keys())[:10],
+                    "page_key": page_key,
+                    "count": len(page),
+                }
+                total = value.get("total")
+                if isinstance(total, int):
+                    out["total"] = total
+                return out
         return {"kind": "object", "keys": sorted(value.keys())[:10], "count": len(value)}
     if isinstance(value, list):
         return {"kind": "array", "count": len(value)}
