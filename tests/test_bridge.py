@@ -2309,6 +2309,11 @@ def test_xrefs_include_address_context(monkeypatch):
     assert result["code_refs"][0]["context"]["disasm"] == "ldr r0, =type_name"
     assert result["code_refs"][0]["context"]["sections"][0]["name"] == ".text"
     assert result["data_refs"][0]["context"]["sections"][0]["name"] == ".rodata"
+    # JSON carries the same summary counts the text header shows, so an agent
+    # can size/triage without materializing the (spilling) code_refs[] array.
+    assert result["code_ref_count"] == 1
+    assert result["data_ref_count"] == 1
+    assert result["caller_function_count"] == 1
 
 
 def test_function_evidence_reports_calls_arguments_and_thunk_candidate(monkeypatch):
