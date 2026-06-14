@@ -3372,7 +3372,10 @@ def test_imports_includes_function_data_and_address_symbols(monkeypatch):
     assert kinds["iat_entry"] == "address"
 
 
-def test_imports_sorts_by_library_kind_name(monkeypatch):
+def test_imports_sorts_function_kind_first_then_library_name(monkeypatch):
+    # Imports order by kind usefulness (function -> data -> address) first, then
+    # library/name (#07). The data symbol here has the alphabetically-EARLIER
+    # library, yet the function still sorts first -- kind dominates library.
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     fake_bn = sys.modules["binaryninja"]
@@ -3391,10 +3394,10 @@ def test_imports_sorts_by_library_kind_name(monkeypatch):
     result = instance._imports(None)
 
     items = result["items"]
-    assert items[0]["name"] == "alpha"
-    assert items[0]["library"] == "liba"
-    assert items[1]["name"] == "zebra"
-    assert items[1]["library"] == "libz"
+    assert items[0]["name"] == "zebra" and items[0]["kind"] == "function"
+    assert items[0]["library"] == "libz"
+    assert items[1]["name"] == "alpha" and items[1]["kind"] == "data"
+    assert items[1]["library"] == "liba"
 
 
 def test_imports_bn_sentinel_namespace_is_not_surfaced_as_library(monkeypatch):
@@ -4939,6 +4942,27 @@ def test_imports_summary_empty(monkeypatch):
     assert result["total_symbols"] == 0
     assert result["namespaces"] == {}
     assert result["by_kind"] == {}
+
+
+def test_imports_default_sort_surfaces_function_imports_first(monkeypatch):
+    # #07: address-kind internals must not bury function/libc imports in the
+    # default listing -- a `head`/page read should show the function imports.
+    # The address symbol is named to sort FIRST alphabetically, so only a
+    # kind-priority sort (not a name sort) can surface the function import.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    addr_sym = fake_bn.Symbol(fake_bn.SymbolType.ImportAddressSymbol, 0x1000, "aaa_internal")
+    addr_sym.short_name = "aaa_internal"
+    fn_sym = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x2000, "memcpy")
+    fn_sym.short_name = "memcpy"
+    bv = _FakeBV(symbols=[addr_sym, fn_sym])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    items = instance._imports(None)["items"]
+    assert items[0]["kind"] == "function" and items[0]["name"] == "memcpy"
+    kinds = [it["kind"] for it in items]
+    assert kinds.index("function") < kinds.index("address")
 
 
 # --- xrefs import symbol resolution ---

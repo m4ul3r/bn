@@ -67,6 +67,11 @@ _BN_SENTINEL_NAMESPACES: frozenset[str] = frozenset(
     {"", "BNINTERNALNAMESPACE", "BNEXTERNALNAMESPACE"}
 )
 
+# Default `imports` ordering: surface the useful function/libc imports first,
+# then data, then address-kind internals (often the bulk on real targets) -- so
+# a `head`/first-page read isn't dominated by address symbols.
+_IMPORT_KIND_ORDER: dict[str, int] = {"function": 0, "data": 1, "address": 2}
+
 _SECTION_SEMANTICS_NAMES: dict[int, str] = {
     0: "DefaultSection",
     1: "ReadOnlyCode",
@@ -214,7 +219,17 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
         # Summary aggregates the whole import set; paging would distort the
         # counts, so it always reflects every symbol regardless of offset/limit.
         return _imports_build_summary(items, needed_libraries)
-    items.sort(key=lambda item: (item["library"] or "", item["kind"], item["name"], int(item["address"], 16)))
+    # Order by kind USEFULNESS first (function -> data -> address), not the old
+    # alphabetical kind sort which put "address"-kind internals ahead of
+    # everything and buried the function/libc imports -- a `head`/first-page read
+    # then concluded "0 function imports" on targets with many address symbols.
+    # Library/name/address are tie-breakers within a kind.
+    items.sort(key=lambda item: (
+        _IMPORT_KIND_ORDER.get(item["kind"], 99),
+        item["library"] or "",
+        item["name"],
+        int(item["address"], 16),
+    ))
     return _paged_list_result(items, offset=offset, limit=limit)
 
 
