@@ -1763,6 +1763,55 @@ def test_list_functions_is_sorted_by_address(monkeypatch):
     assert result["total"] == 2 and result["has_more"] is False
 
 
+def test_function_list_rows_carry_size_and_sort_by_size(monkeypatch):
+    # The dogfood's most-repeated friction: no size field forces per-function
+    # info loops / write-locked py exec to find large functions. Expose `size`
+    # on every row and a `--sort size` that ranks largest-first.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    small = _FakeFunction(0x1000, "small_fn"); small.total_bytes = 16
+    big = _FakeFunction(0x2000, "big_fn"); big.total_bytes = 4096
+    mid = _FakeFunction(0x3000, "mid_fn"); mid.total_bytes = 256
+    bv = _FakeBV(functions=[small, big, mid])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    res = instance._list_functions("active")
+    by_name = {r["name"]: r for r in res["functions"]}
+    assert by_name["small_fn"]["size"] == 16
+    assert by_name["big_fn"]["size"] == 4096
+
+    ranked = instance._list_functions("active", sort="size")
+    assert [r["name"] for r in ranked["functions"]] == ["big_fn", "mid_fn", "small_fn"]
+
+
+def test_function_search_rows_carry_size(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x2000, "parse_packet"); fn.total_bytes = 512
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    res = instance._search_functions("active", "parse")
+    assert res["functions"][0]["size"] == 512
+
+
+def test_list_functions_binder_forwards_sort(monkeypatch):
+    # Regression: the op binder must FORWARD `sort` to the handler. A unit test
+    # that calls the handler directly misses a binder that drops the param --
+    # the live re-use gate caught exactly this, so guard it through the binder.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    small = _FakeFunction(0x1000, "small_fn"); small.total_bytes = 8
+    big = _FakeFunction(0x2000, "big_fn"); big.total_bytes = 9000
+    bv = _FakeBV(functions=[small, big])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    res = bridge._bind_list_functions(instance, {"sort": "size"}, "active")
+    assert [r["name"] for r in res["functions"]] == ["big_fn", "small_fn"]
+    res2 = bridge._bind_search_functions(instance, {"query": "_fn", "sort": "size"}, "active")
+    assert [r["name"] for r in res2["functions"]] == ["big_fn", "small_fn"]
+
+
 def test_list_functions_can_filter_by_address_range(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

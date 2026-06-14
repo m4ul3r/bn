@@ -1583,6 +1583,7 @@ def _bind_list_functions(bridge, params, target):
         offset=int(params.get("offset", 0)),
         limit=int(params["limit"]) if "limit" in params else None,
         count_only=bool(params.get("count_only", False)),
+        sort=str(params.get("sort", "address")),
     )
 
 
@@ -1597,6 +1598,7 @@ def _bind_search_functions(bridge, params, target):
         max_address=params.get("max_address"),
         offset=int(params.get("offset", 0)),
         limit=int(params["limit"]) if "limit" in params else None,
+        sort=str(params.get("sort", "address")),
     )
 
 

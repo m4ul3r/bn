@@ -30,6 +30,8 @@ from ..transport import BridgeError
          args=[
              arg("--count", action="store_true", default=False,
                  help="Show total function count instead of listing"),
+             arg("--sort", choices=["address", "size", "name"], default="address",
+                 help="Order results: address (default), size (largest first), or name"),
          ])
 def _function_list(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
@@ -55,6 +57,8 @@ def _function_list(args: argparse.Namespace) -> int:
     # the renderer surfaces (#59). The bridge envelope is {functions, total, ...}.
     if args.limit is not None:
         params["limit"] = args.limit
+    if args.sort != "address":
+        params["sort"] = args.sort
     return _call(
         args,
         "list_functions",
@@ -72,6 +76,8 @@ def _function_list(args: argparse.Namespace) -> int:
          target=True, paged=True, address_filter=True,
          args=[
              arg("query"),
+             arg("--sort", choices=["address", "size", "name"], default="address",
+                 help="Order results: address (default), size (largest first), or name"),
          ],
          mutex_groups=[
              mutex(False,
@@ -95,6 +101,8 @@ def _function_search(args: argparse.Namespace) -> int:
         params["offset"] = args.offset
     if args.limit is not None:
         params["limit"] = args.limit
+    if args.sort != "address":
+        params["sort"] = args.sort
     return _call(
         args,
         "search_functions",

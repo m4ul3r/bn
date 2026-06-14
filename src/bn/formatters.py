@@ -494,6 +494,9 @@ def _render_name_address_rows(value: Any) -> str:
         raw_name = item.get("raw_name")
         if raw_name and raw_name != name:
             line += f" (raw: {raw_name})"
+        size = item.get("size")
+        if size is not None:
+            line += f"  ({size} bytes)"
         lines.append(line)
     return "\n".join(lines)
 
@@ -1174,7 +1177,15 @@ def _render_taint_text(value: Any) -> str:
         findings = list(value.get("reached_sinks") or [])
         lines.append("")
         if not findings:
-            lines.append("no sinks reached by tainted data")
+            # Distinguish "no flow at all" from "flow stopped at an unmodeled
+            # frontier" -- a bare "no sinks reached" over a non-empty leaves[]
+            # is a dangerous false all-clear (#8).
+            fwd_leaves = list(value.get("leaves") or [])
+            if fwd_leaves:
+                lines.append(
+                    f"no modeled sink reached; {len(fwd_leaves)} tainted frontier(s) -- see leaves")
+            else:
+                lines.append("no sinks reached by tainted data")
         else:
             lines.append(f"reached {len(findings)} sink(s):")
             for f in findings:
@@ -1217,15 +1228,43 @@ def _render_taint_text(value: Any) -> str:
             for s in unseeded:
                 lines.append(f"  {_describe_loc(s)} -- {s.get('note', 'could not seed')}")
 
+    by_source = value.get("by_source")
+    if direction == "forward" and isinstance(by_source, dict) and by_source:
+        lines.append("")
+        lines.append(f"PER-SOURCE ({len(by_source)} call site(s)):")
+        for addr, br in by_source.items():
+            bsinks = br.get("reached_sinks") or []
+            bleaves = br.get("leaves") or []
+            if bsinks:
+                desc = ", ".join(
+                    f"{(s.get('sink') or {}).get('class', '?')} {(s.get('sink') or {}).get('callee', '?')}"
+                    for s in bsinks)
+            else:
+                desc = "no sinks"
+            nfront = sum(1 for l in bleaves if l.get("kind") == "unmodeled_callee")
+            if bleaves:
+                desc += f"; {len(bleaves)} leaf(s)" + (f" ({nfront} frontier)" if nfront else "")
+            lines.append(f"  {addr}: {desc}")
+
     leaves = list(value.get("leaves") or [])
     if leaves:
         lines.append("")
         lines.append(f"UNRESOLVED LEAVES ({len(leaves)}):")
         for leaf in leaves:
-            lines.append(
-                f"  {leaf.get('kind')} @ {leaf.get('address')}  [{leaf.get('dest_expr', leaf.get('il_text', ''))}]"
-                + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
-            )
+            if leaf.get("kind") == "unmodeled_callee":
+                cal = leaf.get("callee") or {}
+                args = leaf.get("tainted_args") or []
+                lines.append(
+                    f"  unmodeled_callee @ {leaf.get('address')}"
+                    f"  -> {cal.get('name', '?')} @ {cal.get('address', '?')}"
+                    f"  (tainted arg(s) {args})"
+                    + (f"  -- {leaf.get('note')}" if leaf.get("note") else "")
+                )
+            else:
+                lines.append(
+                    f"  {leaf.get('kind')} @ {leaf.get('address')}  [{leaf.get('dest_expr', leaf.get('il_text', ''))}]"
+                    + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
+                )
     assumptions = list(value.get("assumptions") or [])
     if assumptions:
         lines.append("")
