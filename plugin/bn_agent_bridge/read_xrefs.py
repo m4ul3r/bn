@@ -104,9 +104,21 @@ def _xrefs_to_address(ctx, bv, address: int) -> dict[str, Any]:
                 "context": ctx._address_context(bv, ref_addr),
             }
         )
+    caller_addrs = {
+        ref["caller_function"]["address"]
+        for ref in code_refs
+        if isinstance(ref.get("caller_function"), dict) and ref["caller_function"].get("address")
+    }
     return {
         "address": hex(address),
         "target_context": ctx._address_context(bv, address, include_disasm=True),
+        # Summary counts mirroring the text header ("(N code, M data)" + "across
+        # K functions") so a JSON consumer can size + triage the result without
+        # materializing and len()-ing the (potentially spilling) code_refs[]
+        # array -- which removes the reason agents reached for --limit in JSON.
+        "code_ref_count": len(code_refs),
+        "data_ref_count": len(data_refs),
+        "caller_function_count": len(caller_addrs),
         "code_refs": code_refs,
         "data_refs": data_refs,
     }
