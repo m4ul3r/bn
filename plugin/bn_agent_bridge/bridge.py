@@ -1612,7 +1612,7 @@ def _bind_list_targets(bridge, params, target):
 
 @op("target_info", lock="read")
 def _bind_target_info(bridge, params, target):
-    return bridge._target_info(params.get("selector") or target, verbose=bool(params.get("verbose")))
+    return bridge._target_info(params.get("selector") or target, verbose=_validate_bool(params.get("verbose"), label="verbose", default=False))
 
 
 @op("refresh", lock="write")
@@ -1657,7 +1657,7 @@ def _bind_list_functions(bridge, params, target):
         max_address=params.get("max_address"),
         offset=int(params.get("offset", 0)),
         limit=int(params["limit"]) if "limit" in params else None,
-        count_only=bool(params.get("count_only", False)),
+        count_only=_validate_bool(params.get("count_only"), label="count_only", default=False),
         sort=str(params.get("sort", "address")),
     )
 
@@ -1667,8 +1667,8 @@ def _bind_search_functions(bridge, params, target):
     return bridge._search_functions(
         target,
         str(params.get("query", "")),
-        regex=bool(params.get("regex", False)),
-        exact=bool(params.get("exact", False)),
+        regex=_validate_bool(params.get("regex"), label="regex", default=False),
+        exact=_validate_bool(params.get("exact"), label="exact", default=False),
         min_address=params.get("min_address"),
         max_address=params.get("max_address"),
         offset=int(params.get("offset", 0)),
@@ -1708,14 +1708,14 @@ def _bind_decompile(bridge, params, target):
     return bridge._decompile(
         target,
         params["identifier"],
-        addresses=bool(params.get("addresses")),
-        force_analysis=bool(params.get("force_analysis")),
+        addresses=_validate_bool(params.get("addresses"), label="addresses", default=False),
+        force_analysis=_validate_bool(params.get("force_analysis"), label="force_analysis", default=False),
     )
 
 
 @op("il", lock="read")
 def _bind_il(bridge, params, target):
-    return bridge._il(target, params["identifier"], str(params.get("view", "hlil")), bool(params.get("ssa")))
+    return bridge._il(target, params["identifier"], str(params.get("view", "hlil")), _validate_bool(params.get("ssa"), label="ssa", default=False))
 
 
 @op("structured_il", lock="read")
@@ -1724,7 +1724,7 @@ def _bind_structured_il(bridge, params, target):
         target,
         params["identifier"],
         view=str(params.get("view", "mlil")),
-        ssa=bool(params.get("ssa", True)),
+        ssa=_validate_bool(params.get("ssa"), label="ssa", default=True),
     )
 
 
@@ -1739,7 +1739,7 @@ def _bind_resolved_calls(bridge, params, target):
         target,
         params["identifier"],
         direction=str(params.get("direction", "both")),
-        resolve_indirect=bool(params.get("resolve_indirect", True)),
+        resolve_indirect=_validate_bool(params.get("resolve_indirect"), label="resolve_indirect", default=True),
     )
 
 
@@ -1814,7 +1814,7 @@ def _bind_backward_slice(bridge, params, target):
         arg_index=int(params.get("arg_index", 0)),
         view=str(params.get("view", "mlil")),
         max_depth=int(params.get("max_depth", 50)),
-        interprocedural=bool(params.get("interprocedural", False)),
+        interprocedural=_validate_bool(params.get("interprocedural"), label="interprocedural", default=False),
         ip_depth=int(params.get("ip_depth", 2)),
     )
 
@@ -1834,7 +1834,7 @@ def _bind_type_info(bridge, params, target):
     return bridge._type_info(
         target,
         str(params["type_name"]),
-        require_struct=bool(params.get("require_struct")),
+        require_struct=_validate_bool(params.get("require_struct"), label="require_struct", default=False),
     )
 
 
@@ -1849,8 +1849,8 @@ def _bind_strings(bridge, params, target):
         limit=int(params["limit"]) if params.get("limit") is not None else None,
         min_length=int(params["min_length"]) if params.get("min_length") is not None else None,
         section=params.get("section"),
-        no_crt=bool(params.get("no_crt", False)),
-        regex=bool(params.get("regex", False)),
+        no_crt=_validate_bool(params.get("no_crt"), label="no_crt", default=False),
+        regex=_validate_bool(params.get("regex"), label="regex", default=False),
     )
 
 
@@ -1858,7 +1858,7 @@ def _bind_strings(bridge, params, target):
 def _bind_imports(bridge, params, target):
     return bridge._imports(
         target,
-        summary=bool(params.get("summary", False)),
+        summary=_validate_bool(params.get("summary"), label="summary", default=False),
         offset=int(params.get("offset", 0)),
         limit=int(params["limit"]) if params.get("limit") is not None else None,
     )
@@ -1881,7 +1881,7 @@ def _bind_read(bridge, params, target):
 
 @op("function_create", lock="write")
 def _bind_function_create(bridge, params, target):
-    return bridge._function_create(target, params["address"], bool(params.get("preview")))
+    return bridge._function_create(target, params["address"], _validate_bool(params.get("preview"), label="preview", default=False))
 
 
 @op("bundle_function", lock="read")
@@ -1896,7 +1896,7 @@ def _bind_py_exec(bridge, params, target):
 
 @op("rename_symbol", lock="write")
 def _bind_rename_symbol(bridge, params, target):
-    return bridge._mutation(target, bool(params.get("preview")), [{"op": "rename_symbol", **params}])
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{"op": "rename_symbol", **params}])
 
 
 @op("get_comment", lock="read")
@@ -1916,53 +1916,53 @@ def _bind_list_comments(bridge, params, target):
 
 @op("set_comment", lock="write")
 def _bind_set_comment(bridge, params, target):
-    return bridge._mutation(target, bool(params.get("preview")), [{"op": "set_comment", **params}])
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{"op": "set_comment", **params}])
 
 
 @op("delete_comment", lock="write")
 def _bind_delete_comment(bridge, params, target):
-    return bridge._mutation(target, bool(params.get("preview")), [{"op": "delete_comment", **params}])
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{"op": "delete_comment", **params}])
 
 
 @op("set_prototype", lock="write")
 def _bind_set_prototype(bridge, params, target):
-    return bridge._mutation(target, bool(params.get("preview")), [{"op": "set_prototype", **params}])
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{"op": "set_prototype", **params}])
 
 
 @op("local_rename", lock="write")
 def _bind_local_rename(bridge, params, target):
-    return bridge._mutation(target, bool(params.get("preview")), [{"op": "local_rename", **params}])
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{"op": "local_rename", **params}])
 
 
 @op("local_retype", lock="write")
 def _bind_local_retype(bridge, params, target):
-    return bridge._mutation(target, bool(params.get("preview")), [{"op": "local_retype", **params}])
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{"op": "local_retype", **params}])
 
 
 @op("struct_field_set", lock="write")
 def _bind_struct_field_set(bridge, params, target):
-    return bridge._mutation(target, bool(params.get("preview")), [{"op": "struct_field_set", **params}])
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{"op": "struct_field_set", **params}])
 
 
 @op("struct_field_rename", lock="write")
 def _bind_struct_field_rename(bridge, params, target):
-    return bridge._mutation(target, bool(params.get("preview")), [{"op": "struct_field_rename", **params}])
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{"op": "struct_field_rename", **params}])
 
 
 @op("struct_field_delete", lock="write")
 def _bind_struct_field_delete(bridge, params, target):
-    return bridge._mutation(target, bool(params.get("preview")), [{"op": "struct_field_delete", **params}])
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{"op": "struct_field_delete", **params}])
 
 
 @op("types_declare", lock="write")
 def _bind_types_declare(bridge, params, target):
-    return bridge._mutation(target, bool(params.get("preview")), [{"op": "types_declare", **params}])
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{"op": "types_declare", **params}])
 
 
 @op("batch_apply", lock="write")
 def _bind_batch_apply(bridge, params, target):
     manifest = dict(params)
-    preview = bool(manifest.get("preview"))
+    preview = _validate_bool(manifest.get("preview"), label="preview", default=False)
     # Keep None as None so the single-open-target default still applies;
     # str(None) would become the bogus selector "None".
     chosen = manifest.get("target") or target

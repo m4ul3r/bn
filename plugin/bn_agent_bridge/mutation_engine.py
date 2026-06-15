@@ -39,6 +39,7 @@ from ._shared import (
     _normalize_prototype,
     _parse_address,
     _serialize_error,
+    _validate_bool,
 )
 
 # Required request fields per mutation op kind, validated before dispatch so a
@@ -801,6 +802,14 @@ def _verify_local_retype(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
             if vars_mod._variable_identifier(v) == identifier:
                 var = v
                 break
+        # A width-narrowing retype can drop a register-backed local out of
+        # hlil.vars (it never lived in parameter_vars/stack_layout), so the
+        # canonical scan misses it even though the change landed. The complete
+        # func.vars set keeps it; relocate by identifier there. (#156)
+        if var is None or str(var.type) != expected_type:
+            relocated = vars_mod._find_variable_by_identifier(fn, identifier)
+            if relocated is not None:
+                var = relocated
     else:
         var, _ = vars_mod._find_variable_by_storage(
             fn,
@@ -1088,6 +1097,13 @@ def _find_var_for_restore(ctx, fn, identifier, storage, is_parameter):
         for var, _ in vars_mod._iter_canonical_variables(fn):
             if vars_mod._variable_identifier(var) == identifier:
                 return var
+        # Register local dropped from hlil.vars by a width-narrowing retype:
+        # the canonical scan misses it, but func.vars still has it. Without
+        # this, the restore closure raises and a clean preview falsely warns
+        # "the view may be left modified". (#156)
+        relocated = vars_mod._find_variable_by_identifier(fn, identifier)
+        if relocated is not None:
+            return relocated
     try:
         var, _ = vars_mod._find_variable_by_storage(fn, int(storage), is_parameter=is_parameter)
         return var
@@ -1617,7 +1633,7 @@ def _op_struct_field_set(ctx, bv, op: dict[str, Any]):
     resolved_name, builder = _struct_builder(ctx, bv, struct_name)
     field_type, _ = _parse_type_or_hint(ctx, bv, op, op["field_type"], label="field type")
     offset = _parse_address(op["offset"])
-    overwrite = bool(op.get("overwrite_existing", True))
+    overwrite = _validate_bool(op.get("overwrite_existing"), label="overwrite_existing", default=True)
     before_type = bv.get_type_by_name(resolved_name)
     before_member = None
     if before_type is not None:
