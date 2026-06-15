@@ -1818,6 +1818,36 @@ class TaintEngine:
                             if pidx is not None and pidx not in out_params:
                                 out_params.add(pidx)
                                 changed = True
+                            # T1: _pointee_var could not correlate the store
+                            # destination to a tracked buffer (a struct-field
+                            # pointer and/or a non-constant index), so the engine
+                            # cannot follow downstream reads of these bytes. An
+                            # out-param write is at best a coarse caller-side
+                            # approximation (and at the analysis root it goes
+                            # nowhere). Record a frontier leaf + assumption rather
+                            # than dropping the flow silently -- an empty
+                            # leaves+assumptions on a function that DID propagate
+                            # taint into a store is exactly the honesty gap the
+                            # soundness disclaimer promises not to produce.
+                            saddr = hex(int(getattr(ins, "address", 0)))
+                            leaf = {
+                                "kind": "coarse_memory_store",
+                                "address": saddr,
+                                "dest_expr": str(dest),
+                                "il_text": str(ins),
+                                "detail": (
+                                    "tainted value stored through a pointer the engine "
+                                    "could not correlate to a tracked buffer (field-derived "
+                                    "and/or non-constant index); downstream reads of these "
+                                    "bytes are not followed"
+                                ),
+                            }
+                            if leaf not in leaves:
+                                leaves.append(leaf)
+                            add_assumption(
+                                f"coarse memory store at {saddr}: tainted bytes written "
+                                "through an uncorrelated pointer; downstream reads not tracked"
+                            )
             if not changed:
                 break
 
@@ -1930,12 +1960,14 @@ class TaintEngine:
                     add_assumption(f"seeded from {callee} callsite at {hex(only)} (per-source attribution)")
                 elif len(calls) > 1:
                     add_assumption(f"{len(calls)} callsites of {callee}; seeded from all")
+                ret_seeded = False
                 for c in calls:
                     if kind == "ret":
                         for w in ssa_writes(c):
                             if taint_node((var_key(w), getattr(w, "version", None)), var_label(w), c,
                                           f"source: return of {callee}", []):
                                 seeded = True
+                                ret_seeded = True
                     else:  # arg:<callee>:<n> -> the buffer that arg n points at
                         idx = int(src["index"])
                         params = self._call_params(c)
@@ -1951,6 +1983,19 @@ class TaintEngine:
                                     if taint_node((var_key(r), getattr(r, "version", None)), var_label(r), c,
                                                   f"source: {callee} arg{idx}", []):
                                         seeded = True
+                if kind == "ret" and not ret_seeded:
+                    # T3: callsites of `callee` exist but NONE consume its return
+                    # value (a void or discarded return), so a ret: source has
+                    # nothing to seed. This is a well-formed locator, NOT the
+                    # "check --source locator" misdiagnosis the generic
+                    # not-seeded failure would produce -- name the real cause.
+                    raise TaintError(
+                        f"{callee} return value is not consumed at any of its "
+                        f"{len(calls)} callsite(s) in {func.name} (void or discarded "
+                        f"return); a ret: source has nothing to seed -- use arg:<n> "
+                        f"for an output-pointer argument, or seed at a callsite that "
+                        f"uses the return value"
+                    )
             else:
                 raise TaintError(f"unknown source kind: {kind}")
         return seeded

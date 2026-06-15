@@ -2101,3 +2101,19 @@ def test_const_target_resolves_extern_ptr():
     assert te.const_target(None) is None
     # MLIL_IMPORT is intentionally excluded (its .constant is a GOT slot)
     assert te.const_target(FExpr("MLIL_IMPORT", "got", constant=0x900000)) is None
+
+
+def test_forward_ret_source_void_return_gives_honest_error(process_func, models):
+    """A ret: source whose callee return is not consumed at any callsite (a void
+    or discarded return) raises an honest 'return value is not consumed' error
+    naming the real cause, NOT the misleading 'check --source locator' the
+    generic not-seeded failure produced. (T3)"""
+    # process_func calls 0x401080 (memcpy) with writes=[] -> return not consumed
+    bv = FBV({0x401070: "read", 0x401080: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    with pytest.raises(te.TaintError) as exc:
+        engine.forward(process_func, [te.parse_locator("ret:memcpy")])
+    msg = str(exc.value)
+    assert "not consumed" in msg
+    assert "memcpy" in msg
+    assert "check --source locator" not in msg
