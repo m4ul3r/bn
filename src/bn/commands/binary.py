@@ -112,12 +112,16 @@ def _refresh(args: argparse.Namespace) -> int:
     )
 
 
-@command("target", "info", help="Show one target", target=True)
+@command("target", "info", help="Show one target", target=True,
+         args=[
+             arg("--verbose", "-v", action="store_true",
+                 help="Include the segment map (r/w/x address ranges)"),
+         ])
 def _target_info(args: argparse.Namespace) -> int:
     return _call(
         args,
         "target_info",
-        {"selector": args.target},
+        {"selector": args.target, "verbose": bool(args.verbose)},
         require_target=True,
         allow_implicit_target=True,
         text_renderer=_render_target_info_text,

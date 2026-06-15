@@ -148,11 +148,31 @@ def _sort_variable_entries(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     )
 
 
+def _annotate_stack_spans(entries: list[dict[str, Any]]) -> None:
+    """Add ``span_to_next`` (bytes to the next stack slot) to each stack variable.
+
+    BN gives a variable's frame offset (``storage``, negative for a stack slot)
+    but not its size, so judging a buffer overflow meant dropping to a ``py exec``
+    over ``func.stack_layout`` to subtract adjacent offsets. The distance to the
+    next-higher stack slot IS the slot's capacity; compute it once here so every
+    stack var carries it. The top-most slot spans to 0 (the saved frame base).
+    Register/flag locals (non-negative storage) get no span. (F20)
+    """
+    stack = sorted(
+        (e for e in entries if isinstance(e.get("storage"), int) and e["storage"] < 0),
+        key=lambda e: e["storage"],
+    )
+    for i, entry in enumerate(stack):
+        next_storage = stack[i + 1]["storage"] if i + 1 < len(stack) else 0
+        entry["span_to_next"] = next_storage - entry["storage"]
+
+
 def _list_locals(func) -> list[dict[str, Any]]:
     variables = [
         _variable_entry(func, var, is_parameter=is_parameter)
         for var, is_parameter in _iter_canonical_variables(func)
     ]
+    _annotate_stack_spans(variables)
     return _sort_variable_entries(variables)
 
 

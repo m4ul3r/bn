@@ -552,6 +552,23 @@ def _is_imported_function(fn) -> bool:
     return getattr(sym_type, "name", None) in _IMPORT_SYMBOL_TYPE_NAMES
 
 
+def _segment_entries(bv) -> list[dict[str, Any]]:
+    """Segment map (r/w/x ranges) for `target info --verbose` (F21)."""
+    entries = []
+    for seg in getattr(bv, "segments", None) or []:
+        start = int(getattr(seg, "start", 0))
+        end = int(getattr(seg, "end", 0))
+        entries.append({
+            "start": hex(start),
+            "end": hex(end),
+            "length": end - start,
+            "readable": bool(getattr(seg, "readable", False)),
+            "writable": bool(getattr(seg, "writable", False)),
+            "executable": bool(getattr(seg, "executable", False)),
+        })
+    return entries
+
+
 def _function_name_summary(bv) -> dict[str, int]:
     """Function-count breakdown for `target info` (#122): own functions split
     into named vs auto-named (sub_<hex>), with import/extern stubs (whose names
@@ -878,7 +895,7 @@ class BinaryNinjaBridge:
         self.targets.clear_dirty(bv)  # mutations are now persisted (L15)
         return {"saved": True, "path": out}
 
-    def _target_info(self, selector: str | None):
+    def _target_info(self, selector: str | None, *, verbose: bool = False):
         bv = self.targets.resolve(selector)
         record = None
         for item in self.targets.refresh():
@@ -889,7 +906,7 @@ class BinaryNinjaBridge:
                 record = item
                 break
         quick = bv in _quick_loaded_views
-        return {
+        info = {
             **(record or {}),
             "arch": str(getattr(bv, "arch", "")),
             "platform": str(getattr(bv, "platform", "")),
@@ -901,6 +918,12 @@ class BinaryNinjaBridge:
             # Function-count summary every agent reaches for (#122).
             **_function_name_summary(bv),
         }
+        # --verbose surfaces the segment map (r/w/x ranges) so reaching for it on
+        # target info -- the natural reflex, since function info accepts it -- is
+        # rewarded with real detail instead of an "unrecognized arguments". (F21)
+        if verbose:
+            info["segments"] = _segment_entries(bv)
+        return info
 
     def _refresh(self, selector: str | None):
         bv = self._resolve_view(selector)
@@ -1589,7 +1612,7 @@ def _bind_list_targets(bridge, params, target):
 
 @op("target_info", lock="read")
 def _bind_target_info(bridge, params, target):
-    return bridge._target_info(params.get("selector") or target)
+    return bridge._target_info(params.get("selector") or target, verbose=bool(params.get("verbose")))
 
 
 @op("refresh", lock="write")
