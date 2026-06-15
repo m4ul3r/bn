@@ -250,11 +250,12 @@ def _paged_function_result(ctx, items: list[dict[str, Any]], *, offset: int,
     if limit is not None:
         page = page[:limit]
     return {
+        # DEPRECATED: `functions` duplicates `items` byte-for-byte, kept only for
+        # back-compat since #139. `items` is the universal paged-array key
+        # (imports/strings/sections/types/xrefs/comment-list/callsites all use
+        # it) -- new consumers should read `items`; `functions` will be dropped on
+        # the next breaking (feat(json)!) bump (#165).
         "functions": page,
-        # `items` is the universal paged-array key (imports/strings/sections/
-        # types/comment-list/callsites all use it); exposed here too so a JSON
-        # consumer can read `data["items"]` across every list command. `functions`
-        # is kept for back-compat.
         "items": page,
         "total": total,
         "offset": offset,

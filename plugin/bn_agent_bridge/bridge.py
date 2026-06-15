@@ -1769,7 +1769,12 @@ def _bind_function_evidence(bridge, params, target):
 
 @op("xrefs", lock="read")
 def _bind_xrefs(bridge, params, target):
-    return bridge._xrefs(target, params["identifier"])
+    return bridge._xrefs(
+        target,
+        params["identifier"],
+        offset=int(params.get("offset", 0)),
+        limit=int(params["limit"]) if params.get("limit") is not None else None,
+    )
 
 
 @op("field_xrefs", lock="read")
@@ -1825,7 +1830,10 @@ def _bind_types(bridge, params, target):
         target,
         query=params.get("query"),
         offset=int(params.get("offset", 0)),
-        limit=int(params.get("limit", 100)),
+        # limit absent -> None ("no limit"), matching strings/imports/sections so
+        # `types --out` exports the full body instead of capping at 100 (#165).
+        limit=int(params["limit"]) if params.get("limit") is not None else None,
+        count_only=_validate_bool(params.get("count_only"), label="count_only", default=False),
     )
 
 
@@ -1851,6 +1859,7 @@ def _bind_strings(bridge, params, target):
         section=params.get("section"),
         no_crt=_validate_bool(params.get("no_crt"), label="no_crt", default=False),
         regex=_validate_bool(params.get("regex"), label="regex", default=False),
+        count_only=_validate_bool(params.get("count_only"), label="count_only", default=False),
     )
 
 
@@ -1861,6 +1870,7 @@ def _bind_imports(bridge, params, target):
         summary=_validate_bool(params.get("summary"), label="summary", default=False),
         offset=int(params.get("offset", 0)),
         limit=int(params["limit"]) if params.get("limit") is not None else None,
+        count_only=_validate_bool(params.get("count_only"), label="count_only", default=False),
     )
 
 
@@ -1871,6 +1881,7 @@ def _bind_sections(bridge, params, target):
         query=params.get("query"),
         offset=int(params.get("offset", 0)),
         limit=int(params["limit"]) if params.get("limit") is not None else None,
+        count_only=_validate_bool(params.get("count_only"), label="count_only", default=False),
     )
 
 

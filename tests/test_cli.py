@@ -4360,24 +4360,96 @@ def test_lines_flag_rejected_outside_text_mode(monkeypatch, capsys, argv):
     assert "Traceback" not in err
 
 
-def test_xrefs_limit_rejected_outside_text_mode(monkeypatch, capsys):
-    _assert_no_bridge_call(monkeypatch)
+def _capture_xrefs_call(monkeypatch):
+    captured = {}
 
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        captured["op"] = op
+        captured["params"] = params or {}
+        return {"ok": True, "result": {
+            "address": "0x401000", "target_context": {}, "code_refs": [], "data_refs": [],
+            "code_ref_count": 0, "data_ref_count": 0, "caller_function_count": 0,
+            "items": [], "total": 0, "offset": 0, "limit": 3, "returned": 0, "has_more": False,
+        }}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    return captured
+
+
+def test_xrefs_json_limit_pages_instead_of_erroring(monkeypatch, capsys):
+    # #164: xrefs --format json --limit N now pages (forwards offset/limit to the
+    # bridge) instead of rejecting the flag.
+    captured = _capture_xrefs_call(monkeypatch)
     rc = bn.cli.main(["xrefs", "sub_401000", "--target", "active", "--format", "json", "--limit", "3"])
+    assert rc == 0
+    assert captured["op"] == "xrefs"
+    assert captured["params"].get("limit") == 3
 
-    assert rc == 2
-    assert "--limit only applies to --format text" in capsys.readouterr().err
 
-
-def test_evidence_xrefs_limit_rejected_outside_text_mode(monkeypatch, capsys):
-    _assert_no_bridge_call(monkeypatch)
-
+def test_evidence_xrefs_json_limit_pages_instead_of_erroring(monkeypatch, capsys):
+    captured = _capture_xrefs_call(monkeypatch)
     rc = bn.cli.main(
-        ["evidence", "xrefs", "sub_401000", "--target", "active", "--format", "json", "--limit", "3"]
+        ["evidence", "xrefs", "sub_401000", "--target", "active", "--format", "json", "--limit", "3", "--offset", "6"]
     )
+    assert rc == 0
+    assert captured["op"] == "xrefs"
+    assert captured["params"].get("limit") == 3
+    assert captured["params"].get("offset") == 6
 
-    assert rc == 2
-    assert "--limit only applies to --format text" in capsys.readouterr().err
+
+@pytest.mark.parametrize(
+    "cmd,op,total_label",
+    [
+        ("strings", "strings", "Total strings:"),
+        ("imports", "imports", "Total imports:"),
+        ("sections", "sections", "Total sections:"),
+        ("types", "types", "Total types:"),
+    ],
+)
+def test_list_count_flag_forwards_count_only(monkeypatch, capsys, cmd, op, total_label):
+    # #165: --count on strings/imports/sections/types forwards count_only and
+    # renders the total (mirrors `function list --count`).
+    captured = {}
+
+    def fake_send_request(o, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        captured["op"] = o
+        captured["params"] = params or {}
+        return {"ok": True, "result": {"count": 42, "total": 42}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main([cmd, "--count", "--target", "active"])
+    assert rc == 0
+    assert captured["op"] == op
+    assert captured["params"].get("count_only") is True
+    assert total_label in capsys.readouterr().out
+
+
+def test_effective_limit_uncaps_for_out_export():
+    # #165: default page limit is 100, but --out uncaps it (full-body export);
+    # an explicit --limit always wins.
+    import argparse as _argparse
+    from bn.cli import _effective_limit
+    assert _effective_limit(_argparse.Namespace(limit=None, out=None)) == 100
+    assert _effective_limit(_argparse.Namespace(limit=None, out="fns.json")) is None
+    assert _effective_limit(_argparse.Namespace(limit=25, out="fns.json")) == 25
+    assert _effective_limit(_argparse.Namespace(limit=25, out=None)) == 25
+
+
+def test_function_list_out_exports_full_body(monkeypatch, capsys, tmp_path):
+    # #165: `function list --out` must not silently cap at the default 100-item
+    # page -- it sends no limit so the bridge returns the full body.
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        captured["params"] = params or {}
+        return {"ok": True, "result": {"functions": [], "items": [], "total": 0,
+                                       "offset": 0, "limit": None, "returned": 0, "has_more": False}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    out = tmp_path / "fns.json"
+    rc = bn.cli.main(["function", "list", "--out", str(out), "--format", "json", "--target", "active"])
+    assert rc == 0
+    assert "limit" not in captured["params"]  # uncapped full-body export
 
 
 def test_xrefs_identifier_and_field_are_mutually_exclusive(monkeypatch, capsys):

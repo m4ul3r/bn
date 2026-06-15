@@ -27,7 +27,7 @@ from typing import Any
 import binaryninja as bn
 
 from . import il_format
-from ._shared import _parse_address
+from ._shared import _parse_address, _validate_count
 from .bridge_state import require_analysis
 
 # Import symbol kinds, in resolution-preference order. Mirrors the literal that
@@ -41,9 +41,11 @@ _IMPORT_SYMBOL_TYPES: list[tuple[str, str]] = [
 ]
 
 
-def _xrefs(ctx, selector: str | None, identifier):
+def _xrefs(ctx, selector: str | None, identifier, *, offset: int = 0, limit: int | None = None):
     bv = ctx._resolve_view(selector)
     require_analysis(bv, "Cross-references")
+    offset = _validate_count(offset, label="offset", minimum=0)
+    limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     try:
         address = _parse_address(identifier)
     except Exception:
@@ -55,11 +57,53 @@ def _xrefs(ctx, selector: str | None, identifier):
             # Only fall back to import-symbol lookup for genuine misses.
             if "Ambiguous" in str(exc):
                 raise
-            return _xrefs_import_symbol(ctx, bv, identifier)
-    return _xrefs_to_address(ctx, bv, address)
+            return _xrefs_import_symbol(ctx, bv, identifier, offset=offset, limit=limit)
+    return _xrefs_to_address(ctx, bv, address, offset=offset, limit=limit)
 
 
-def _xrefs_to_address(ctx, bv, address: int) -> dict[str, Any]:
+def _xref_envelope(address, target_context, code_refs, data_refs, *,
+                   offset: int = 0, limit: int | None = None,
+                   extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Wrap xref results in the canonical paging envelope (#164).
+
+    ``items`` is the unified list (code refs first, then data refs), each row
+    carrying its ``kind`` (code|data). ``code_refs``/``data_refs`` are kept as a
+    deprecated dual shape for back-compat, the text renderer, and ``function
+    info`` (which embeds the full set, unpaged). Summary counts (#140) reflect
+    the FULL set regardless of paging."""
+    caller_addrs = {
+        ref["caller_function"]["address"]
+        for ref in code_refs
+        if isinstance(ref.get("caller_function"), dict) and ref["caller_function"].get("address")
+    }
+    items = code_refs + data_refs
+    total = len(items)
+    page = items[offset:]
+    if limit is not None:
+        page = page[:limit]
+    out: dict[str, Any] = {
+        "address": hex(address) if isinstance(address, int) else address,
+        "target_context": target_context,
+        "code_ref_count": len(code_refs),
+        "data_ref_count": len(data_refs),
+        "caller_function_count": len(caller_addrs),
+        # Deprecated dual shape (kept for back-compat + function-info embedding).
+        "code_refs": code_refs,
+        "data_refs": data_refs,
+        # Canonical paging envelope.
+        "items": page,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "returned": len(page),
+        "has_more": (offset + len(page)) < total,
+    }
+    if extra:
+        out.update(extra)
+    return out
+
+
+def _xrefs_to_address(ctx, bv, address: int, *, offset: int = 0, limit: int | None = None) -> dict[str, Any]:
     code_refs = []
     data_refs = []
     get_code_refs = getattr(bv, "get_code_refs", None)
@@ -104,24 +148,14 @@ def _xrefs_to_address(ctx, bv, address: int) -> dict[str, Any]:
                 "context": ctx._address_context(bv, ref_addr),
             }
         )
-    caller_addrs = {
-        ref["caller_function"]["address"]
-        for ref in code_refs
-        if isinstance(ref.get("caller_function"), dict) and ref["caller_function"].get("address")
-    }
-    return {
-        "address": hex(address),
-        "target_context": ctx._address_context(bv, address, include_disasm=True),
-        # Summary counts mirroring the text header ("(N code, M data)" + "across
-        # K functions") so a JSON consumer can size + triage the result without
-        # materializing and len()-ing the (potentially spilling) code_refs[]
-        # array -- which removes the reason agents reached for --limit in JSON.
-        "code_ref_count": len(code_refs),
-        "data_ref_count": len(data_refs),
-        "caller_function_count": len(caller_addrs),
-        "code_refs": code_refs,
-        "data_refs": data_refs,
-    }
+    return _xref_envelope(
+        address,
+        ctx._address_context(bv, address, include_disasm=True),
+        code_refs,
+        data_refs,
+        offset=offset,
+        limit=limit,
+    )
 
 
 def _import_symbol_name(sym) -> str:
@@ -145,7 +179,7 @@ def _find_import_symbol(ctx, bv, name: str):
     return None
 
 
-def _xrefs_import_symbol(ctx, bv, identifier: str) -> dict[str, Any]:
+def _xrefs_import_symbol(ctx, bv, identifier: str, *, offset: int = 0, limit: int | None = None) -> dict[str, Any]:
     sym = _find_import_symbol(ctx, bv, identifier)
     if sym is None:
         available: list[str] = []
@@ -163,15 +197,21 @@ def _xrefs_import_symbol(ctx, bv, identifier: str) -> dict[str, Any]:
         raise RuntimeError(msg)
 
     sym_address = int(sym.address)
-    result = _xrefs_to_address(ctx, bv, sym_address)
+    result = _xrefs_to_address(ctx, bv, sym_address, offset=offset, limit=limit)
     result["import_resolved"] = True
     result["import_name"] = str(identifier)
 
     if not result.get("code_refs"):
         manual = _scan_for_calls_to(ctx, bv, sym_address)
         if manual:
-            result["code_refs"] = manual
-            result["code_refs_scanned"] = True
+            # Rebuild the envelope so the manually-discovered code refs land in
+            # both the deprecated `code_refs` and the canonical `items` page.
+            result = _xref_envelope(
+                sym_address, result["target_context"], manual, result["data_refs"],
+                offset=offset, limit=limit,
+                extra={"import_resolved": True, "import_name": str(identifier),
+                       "code_refs_scanned": True},
+            )
 
     return result
 

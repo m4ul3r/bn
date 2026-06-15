@@ -26,7 +26,8 @@ from . import read_misc
 from ._shared import _validate_count
 
 
-def _types(ctx, selector: str | None, *, query, offset: int, limit: int | None):
+def _types(ctx, selector: str | None, *, query, offset: int, limit: int | None,
+           count_only: bool = False):
     offset = _validate_count(offset, label="offset", minimum=0)
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     bv = ctx._resolve_view(selector)
@@ -37,6 +38,8 @@ def _types(ctx, selector: str | None, *, query, offset: int, limit: int | None):
         if needle and needle not in entry["name"].lower() and needle not in entry["decl"].lower():
             continue
         items.append(entry)
+    if count_only:
+        return {"count": len(items), "total": len(items)}
     items.sort(key=lambda item: item["name"].lower())
     # Honest paging envelope ({items,total,offset,limit,returned,has_more}),
     # matching strings/imports/sections/function-list (#122/#131).
