@@ -411,6 +411,19 @@ def _render_target_summary(value: dict[str, Any]) -> str:
                 parts.append(f"{imported} imported")
             summary += f" ({', '.join(parts)})"
         lines.append(f"\tfunctions: {summary}")
+    # Segment-level detail only when present -- target info --verbose adds it;
+    # target list rows do not, so this stays out of the list view. (F21)
+    segments = value.get("segments")
+    if isinstance(segments, list) and segments:
+        lines.append("\tsegments:")
+        for seg in segments:
+            perms = "".join(
+                flag if seg.get(name) else "-"
+                for name, flag in (("readable", "r"), ("writable", "w"), ("executable", "x"))
+            )
+            lines.append(
+                f"\t\t{seg.get('start')}-{seg.get('end')} {perms} ({seg.get('length')} bytes)"
+            )
     return "\n".join(lines)
 
 

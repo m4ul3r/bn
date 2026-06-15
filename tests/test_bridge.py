@@ -1262,6 +1262,56 @@ def test_preview_diff_truncated_to_stay_inline(monkeypatch):
     assert "before_excerpt" in d
 
 
+def test_evidence_mlil_drops_clobber_lhs(monkeypatch):
+    """evidence function's per-call `mlil` shows the call + its inputs, not the
+    full caller-saved clobber set BN renders as the assignment LHS. (E17)"""
+    bridge = _load_bridge(monkeypatch)
+    render = bridge.read_evidence._mlil_call_text
+    clobber = "arg1, arg2, x2, x3, lr, v0, v31 = call(0x471d60, arg1, arg2, x2, stack = &fp)"
+    assert render(clobber) == "call(0x471d60, arg1, arg2, x2, stack = &fp)"
+    assert render("call(0x401000, arg1)") == "call(0x401000, arg1)"  # no output: unchanged
+    assert render(None) is None
+
+    class _M:
+        def __str__(self):
+            return clobber
+
+    assert render(_M()) == "call(0x471d60, arg1, arg2, x2, stack = &fp)"
+
+
+def test_stack_var_span_annotation(monkeypatch):
+    """Stack vars carry span_to_next (bytes to the next stack slot = the slot's
+    capacity); register/flag locals (non-negative storage) do not. (F20)"""
+    bridge = _load_bridge(monkeypatch)
+    entries = [
+        {"name": "buf", "storage": -1016},
+        {"name": "x", "storage": -8},
+        {"name": "reg", "storage": 53},     # register var -> no span
+        {"name": "buf2", "storage": -1024},
+    ]
+    bridge.vars_mod._annotate_stack_spans(entries)
+    by = {e["name"]: e for e in entries}
+    # sorted stack: -1024 (buf2) -> -1016 (buf) -> -8 (x) -> 0 (frame base)
+    assert by["buf2"]["span_to_next"] == 8       # -1016 - (-1024)
+    assert by["buf"]["span_to_next"] == 1008     # -8 - (-1016)
+    assert by["x"]["span_to_next"] == 8          # 0 - (-8)
+    assert "span_to_next" not in by["reg"]       # register var untouched
+
+
+def test_segment_entries_for_verbose_target_info(monkeypatch):
+    """target info --verbose builds a segment map with r/w/x flags + length;
+    a bv with no segments yields an empty list, not an error. (F21)"""
+    bridge = _load_bridge(monkeypatch)
+    seg = type("S", (), {"start": 0x1000, "end": 0x2000,
+                         "readable": True, "writable": False, "executable": True})()
+    bv = type("BV", (), {"segments": [seg]})()
+    assert bridge._segment_entries(bv) == [{
+        "start": "0x1000", "end": "0x2000", "length": 0x1000,
+        "readable": True, "writable": False, "executable": True,
+    }]
+    assert bridge._segment_entries(type("BV", (), {})()) == []
+
+
 def test_function_name_summary_counts_named_vs_auto(monkeypatch):
     """target info needs a function-count summary every agent reaches for.
     Auto-named functions are BN's sub_<addr> / j_sub_<addr> defaults; named are

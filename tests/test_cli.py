@@ -2264,6 +2264,25 @@ def test_doctor_json_carries_reachable_and_status(monkeypatch, tmp_path, capsys)
     assert by_pid[2]["reachable"] is False and by_pid[2]["status"] == "error"
 
 
+def test_target_info_verbose_renders_segments():
+    """target info --verbose text appends the segment map with r/w/x perms; the
+    block is absent when no segments are present (target list rows). (F21)"""
+    from bn.formatters import _render_target_summary
+
+    out = _render_target_summary({
+        "selector": "svc", "arch": "aarch64",
+        "segments": [
+            {"start": "0x1000", "end": "0x2000", "length": 0x1000,
+             "readable": True, "writable": False, "executable": True},
+        ],
+    })
+    assert "segments:" in out
+    assert "0x1000-0x2000 r-x (4096 bytes)" in out
+
+    out2 = _render_target_summary({"selector": "svc", "arch": "aarch64"})
+    assert "segments:" not in out2
+
+
 def test_symbol_rename_text_format_renders_mutation_summary(monkeypatch, capsys):
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "rename_symbol"

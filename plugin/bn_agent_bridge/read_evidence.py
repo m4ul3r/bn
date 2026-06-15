@@ -162,6 +162,26 @@ def _call_arguments(ctx, bv, insn, call_addr: int) -> tuple[str, list[dict[str, 
     return source, primary, candidates
 
 
+def _mlil_call_text(mlil) -> str | None:
+    """Render a mapped-MLIL call WITHOUT its clobber-LHS.
+
+    BN renders a mapped-MLIL call as "<written regs> = call(dest, args...)". For
+    a varargs / full-clobber callee the LHS is the entire caller-saved register
+    set (~44 regs on aarch64: arg1, arg2, x2..x18, lr, v0..v31), which buries the
+    one thing the field is for -- the call and its inputs. Drop the assignment
+    LHS so the line mirrors the concise `arguments:` block; the full instruction
+    (with outputs) is still available in the sibling `llil` field. (E17)
+    """
+    if mlil is None:
+        return None
+    text = str(mlil)
+    marker = " = call("
+    idx = text.find(marker)
+    if idx != -1:
+        return text[idx + len(" = "):]
+    return text
+
+
 def _function_call_evidence(ctx, bv, func, *, context: int) -> list[dict[str, Any]]:
     disasm_entries = il_format._structured_disasm_entries(bv, func)
     index_by_addr = {
@@ -206,7 +226,7 @@ def _function_call_evidence(ctx, bv, func, *, context: int) -> list[dict[str, An
                 "direct": dest_value is not None,
                 "target": target,
                 "llil": str(insn),
-                "mlil": str(mlil) if mlil is not None else None,
+                "mlil": _mlil_call_text(mlil),
                 "hlil_statement": il_format._hlil_statement_text(insn),
                 "pre_branch_condition": il_format._hlil_pre_branch_condition(insn),
                 "argument_source": arg_source,
