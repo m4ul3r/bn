@@ -132,6 +132,14 @@ def lookup_model(models: dict[str, Any], name: str | None) -> tuple[str | None, 
     return None, None
 
 
+def _try_arg_index(token: str) -> int | None:
+    """Parse N from a model source token ``arg:N`` / ``*arg:N``; None if malformed."""
+    try:
+        return int(str(token).split("arg:", 1)[1])
+    except (IndexError, ValueError):
+        return None
+
+
 # --------------------------------------------------------------------------
 # small IL helpers (defensive getattr style, matching bridge.py)
 # --------------------------------------------------------------------------
@@ -1257,6 +1265,48 @@ class TaintEngine:
             return False
         return self._same_ssa_value(ssaf, size_expr, params[length_idx])
 
+    def _const_value(self, expr: Any) -> int | None:
+        """The integer constant of a CONST/CONST_PTR expression, else None."""
+        if op_name(expr) in ("MLIL_CONST", "MLIL_CONST_PTR"):
+            c = getattr(expr, "constant", None)
+            try:
+                return int(c) if c is not None else None
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _syscall_bound_for_length(self, ssaf: Any, length_expr: Any) -> int | None:
+        """If the copy length is the return value of a modeled receive call whose
+        bounding count argument is a constant, return that constant max, else
+        None. Recognizes e.g. ``n = read(fd, buf, 0x1000); memcpy(dst, buf, n)``
+        -- the length is attacker-derived but provably ``<= 0x1000``, so it is a
+        bounded copy, not an unbounded overflow (#159). Mirrors
+        ``_alloc_size_expr``'s def-chain walk."""
+        var = length_expr if is_ssa_var(length_expr) else None
+        if var is None:
+            reads = expr_reads(length_expr)
+            if len(reads) == 1:
+                var = reads[0]
+        if var is None:
+            return None
+        var = self._canonical_ssa_var(ssaf, var)
+        try:
+            d = ssaf.get_ssa_var_definition(var)
+        except Exception:
+            d = None
+        if d is None or "CALL" not in op_name(d):
+            return None
+        callee = self._callee_name(self._resolve_direct_target(d))
+        _, model = lookup_model(self.models, callee)
+        rb = (model or {}).get("return_bound") or {}
+        bidx = rb.get("max_from_arg")
+        if bidx is None:
+            return None
+        aparams = self._call_params(d)
+        if bidx >= len(aparams):
+            return None
+        return self._const_value(aparams[bidx])
+
     def _local_definition_for(self, name: str | None) -> Any | None:
         """An in-binary DEFINED function with this name, or None.
 
@@ -1509,6 +1559,22 @@ class TaintEngine:
                                         "allocated with the same size in this function -- "
                                         "provably bounded, not an overflow)",
                                     }
+                                elif sink.get("class") == "overflow_len":
+                                    # Length is the return of a modeled receive
+                                    # call bounded by a constant count arg
+                                    # (n = read(fd, buf, MAX); memcpy(dst, buf, n)):
+                                    # attacker-derived but provably <= MAX (#159).
+                                    _bnd = self._syscall_bound_for_length(ssaf, params[argidx])
+                                    if _bnd is not None:
+                                        eff_sink = {
+                                            **sink,
+                                            "class": "bounded_len",
+                                            "source_bound": hex(_bnd),
+                                            "detail": (sink.get("detail") or "")
+                                            + f" (length is a modeled receive return provably "
+                                            f"bounded by {hex(_bnd)} -- bounded copy, not an "
+                                            "unbounded overflow)",
+                                        }
                                 findings.append(self._make_finding(ins, mkey or name, argidx, eff_sink, ht, why))
             for rule in model.get("propagates") or []:
                 to = rule.get("to")
@@ -1949,6 +2015,19 @@ class TaintEngine:
                 calls = self._find_callsites(instrs, callee)
                 if not calls:
                     raise TaintError(f"no callsite of {callee} found in {func.name}")
+                if kind == "ret":
+                    # A ret: source on a function whose model also fills an
+                    # output-pointer buffer would silently miss those bytes;
+                    # point the user at call: instead of a false all-clear (#157).
+                    _, _hm = lookup_model(self.models, callee)
+                    _outs = [str(s.get("to")) for s in (_hm or {}).get("sources") or []
+                             if str(s.get("to", "")).startswith("*arg:")]
+                    if _outs:
+                        add_assumption(
+                            f"{callee} also writes tainted data to {', '.join(_outs)} per its "
+                            f"model; --source ret:{callee} seeds only the return -- try "
+                            f"--source call:{callee} to also taint the output buffer(s)"
+                        )
                 # #5: a per-callsite re-run seeds from exactly one call address;
                 # the "seeded from all" conflation note becomes a per-callsite note.
                 only = getattr(self, "_only_callsite_addr", None)
@@ -1996,6 +2075,62 @@ class TaintEngine:
                         f"for an output-pointer argument, or seed at a callsite that "
                         f"uses the return value"
                     )
+            elif kind == "call":
+                # Preset: seed every output the callee's taint model declares --
+                # the return value AND each output-pointer buffer (*arg:N) -- so a
+                # receive/fill API like read/recv/recvfrom taints the buffer it
+                # writes, not just (or instead of) its return value (#157).
+                callee = src["callee"]
+                calls = self._find_callsites(instrs, callee)
+                if not calls:
+                    raise TaintError(f"no callsite of {callee} found in {func.name}")
+                only = getattr(self, "_only_callsite_addr", None)
+                if only is not None:
+                    calls = [c for c in calls
+                             if (int(getattr(c, "address", 0)) & ~1) == (only & ~1)]
+                    if not calls:
+                        continue
+                    add_assumption(f"seeded from {callee} callsite at {hex(only)} (per-source attribution)")
+                elif len(calls) > 1:
+                    add_assumption(f"{len(calls)} callsites of {callee}; seeded from all")
+                _, model = lookup_model(self.models, callee)
+                src_defs = (model or {}).get("sources") or []
+                if not src_defs:
+                    raise TaintError(
+                        f"call:{callee} has no taint-model sources to seed (the model "
+                        f"declares no ret/*arg:N output); use ret:{callee} or "
+                        f"arg:{callee}:<n> explicitly"
+                    )
+                for c in calls:
+                    params = self._call_params(c)
+                    for sd in src_defs:
+                        to = str(sd.get("to") or "")
+                        if to == "ret":
+                            for w in ssa_writes(c):
+                                if taint_node((var_key(w), getattr(w, "version", None)), var_label(w), c,
+                                              f"source: return of {callee} (call: preset)", []):
+                                    seeded = True
+                        elif to.startswith("*arg:"):
+                            idx = _try_arg_index(to)
+                            if idx is not None and idx < len(params):
+                                bt = self._buffer_target(ssaf, params[idx])
+                                if bt is not None:
+                                    key, label = bt
+                                    if taint_node((key, None), label, c,
+                                                  f"source: {callee} fills arg{idx} buffer (call: preset)", []):
+                                        seeded = True
+                                else:
+                                    for r in expr_reads(params[idx]):
+                                        if taint_node((var_key(r), getattr(r, "version", None)), var_label(r), c,
+                                                      f"source: {callee} arg{idx} (call: preset)", []):
+                                            seeded = True
+                        elif to.startswith("arg:"):
+                            idx = _try_arg_index(to)
+                            if idx is not None and idx < len(params):
+                                for r in expr_reads(params[idx]):
+                                    if taint_node((var_key(r), getattr(r, "version", None)), var_label(r), c,
+                                                  f"source: {callee} arg{idx} value (call: preset)", []):
+                                        seeded = True
             else:
                 raise TaintError(f"unknown source kind: {kind}")
         return seeded
@@ -2011,6 +2146,7 @@ class TaintEngine:
                 "tainted_arg_index": argidx,
                 "class": sink.get("class"),
                 "detail": sink.get("detail"),
+                **({"source_bound": sink["source_bound"]} if sink.get("source_bound") else {}),
             },
             "path": path,
         }
@@ -2410,7 +2546,15 @@ def parse_locator(spec: str) -> dict[str, Any]:
         if not sep or not callee or not n:
             raise TaintError("arg: locator must be arg:<callee>:<n>")
         return {"kind": "arg", "callee": callee, "index": _locator_index(n, f"arg:{callee}")}
-    raise TaintError(f"unknown locator kind: {head!r} (use param:/var:/ret:/arg:)")
+    if head in ("call", "model"):
+        # call:<callee> / model:<callee> -- seed ALL outputs the callee's taint
+        # model declares (return value AND output-pointer buffers), so a
+        # receive-style API like read/recv that writes its tainted bytes through
+        # an output-pointer arg is no longer a silent all-clear (#157).
+        if not rest:
+            raise TaintError(f"{head}: locator needs a callee")
+        return {"kind": "call", "callee": rest}
+    raise TaintError(f"unknown locator kind: {head!r} (use param:/var:/ret:/arg:/call:/model:)")
 
 
 def _locator_index(text: str, what: str) -> int:

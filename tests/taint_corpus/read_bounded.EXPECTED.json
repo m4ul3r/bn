@@ -1,0 +1,12 @@
+{
+  "description": "read() return used directly as the memcpy length is provably bounded by the constant count -> bounded_len with source_bound, not overflow (#159); call:read seeds the return so the length is tainted (#157)",
+  "lang": "c",
+  "forward": [
+    {"function": "process_bounded", "source": "call:read",
+     "sinks": [{"callee": "memcpy", "class": "bounded_len", "arg": 2}]}
+  ],
+  "negative": [
+    {"function": "process_bounded", "source": "call:read",
+     "forbid_sink_classes": ["overflow_len", "overflow_unbounded"]}
+  ]
+}
