@@ -1103,6 +1103,173 @@ def test_forward_memory_ssa_untainted_store_no_false_positive(models):
     assert result["reached_sinks"] == []
 
 
+# --------------------------------------------------------------------------
+# #8 frontier honesty: tainted data into an unmodeled in-binary callee
+# --------------------------------------------------------------------------
+
+def _frontier_no_params_program():
+    """ipc_read(fd): recv fills a buffer, which then flows into an in-binary
+    parser that has a body (so it is "internal") but NO recovered parameters --
+    taint cannot be mapped into it, so it is never descended (max_depth stays 0).
+    The flow must surface as an unmodeled_callee frontier leaf, not vanish."""
+    buf = FVar("buf", typ="char[0x40]")
+    rsi = FVar("rsi"); rdi = FVar("rdi"); rax = FVar("rax")
+    rsi1 = FSSA(rsi, 1); rdi1 = FSSA(rdi, 1); rax2 = FSSA(rax, 2)
+    caller = FSSAFunc([
+        FInstr(0, 0x1000, "MLIL_SET_VAR_SSA", "rsi#1 = &buf", writes=[rsi1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+        FInstr(1, 0x1004, "MLIL_CALL_SSA", "rax#2 = recv(rdi#1, rsi#1, 0x40, 0)",
+               reads=[rdi1, rsi1], writes=[rax2],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_VAR_SSA", "rdi#1", reads=[rdi1]),
+                       FExpr("MLIL_VAR_SSA", "rsi#1", reads=[rsi1]),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40),
+                       FExpr("MLIL_CONST", "0", constant=0)]),
+        FInstr(2, 0x1008, "MLIL_CALL_SSA", "parse_event(rsi#1)",
+               reads=[rsi1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x3000", constant=0x3000),
+               params=[FExpr("MLIL_VAR_SSA", "rsi#1", reads=[rsi1])]),
+    ])
+    # in-binary parser: a real body (so _is_internal is True) but no recovered
+    # parameter_vars, so _descend cannot map the tainted arg into it.
+    parser = FFunc("parse_event", 0x3000,
+                   FSSAFunc([FInstr(0, 0x3000, "MLIL_RET", "return", reads=[])]),
+                   params=[])
+    bv = FBV({0x2000: "recv"}, funcs={0x3000: parser})
+    return FFunc("ipc_read", 0x1000, caller, params=[FVar("fd")]), bv
+
+
+def test_forward_unmodeled_in_binary_callee_records_frontier_leaf(models):
+    func, bv = _frontier_no_params_program()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:recv:1")])
+
+    # no modeled sink fires, but the flow must NOT vanish silently (#8)
+    assert result["reached_sinks"] == []
+    frontier = [l for l in result["leaves"] if l.get("kind") == "unmodeled_callee"]
+    assert len(frontier) == 1, result["leaves"]
+    leaf = frontier[0]
+    assert leaf["address"] == "0x1008"                                  # the call site
+    assert leaf["callee"] == {"name": "parse_event", "address": "0x3000"}
+    assert leaf["tainted_args"] == [0]                                  # arg 0 carried taint
+    assert leaf.get("note")                                            # human guidance present
+
+
+def _frontier_depth_program():
+    """ipc_read(fd): recv(&buf); parse_event(&buf), where parse_event is an
+    in-binary callee WITH a parameter. Run with a depth bound that forbids
+    descent so the depth-bounded frontier must still be reported."""
+    p = FVar("p"); p0 = FSSA(p, 0)
+    parser = FFunc("parse_event", 0x3000, FSSAFunc([
+        FInstr(0, 0x3004, "MLIL_CALL_SSA", "0x4000(p#0)", reads=[p0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x4000", constant=0x4000),
+               params=[FExpr("MLIL_VAR_SSA", "p#0", reads=[p0])]),
+    ]), params=[p])
+    buf = FVar("buf", typ="char[0x40]")
+    rsi = FVar("rsi"); rdi = FVar("rdi"); rax = FVar("rax")
+    rsi1 = FSSA(rsi, 1); rdi1 = FSSA(rdi, 1); rax2 = FSSA(rax, 2)
+    caller = FSSAFunc([
+        FInstr(0, 0x1000, "MLIL_SET_VAR_SSA", "rsi#1 = &buf", writes=[rsi1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+        FInstr(1, 0x1004, "MLIL_CALL_SSA", "recv(rdi#1, rsi#1, 0x40, 0)",
+               reads=[rdi1, rsi1], writes=[rax2],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_VAR_SSA", "rdi#1", reads=[rdi1]),
+                       FExpr("MLIL_VAR_SSA", "rsi#1", reads=[rsi1]),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40),
+                       FExpr("MLIL_CONST", "0", constant=0)]),
+        FInstr(2, 0x1008, "MLIL_CALL_SSA", "parse_event(rsi#1)",
+               reads=[rsi1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x3000", constant=0x3000),
+               params=[FExpr("MLIL_VAR_SSA", "rsi#1", reads=[rsi1])]),
+    ])
+    bv = FBV({0x2000: "recv", 0x4000: "system"}, funcs={0x3000: parser})
+    return FFunc("ipc_read", 0x1000, caller, params=[FVar("fd")]), bv
+
+
+def test_forward_depth_bound_records_frontier_leaf(models):
+    func, bv = _frontier_depth_program()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:recv:1")], max_depth=0)
+
+    # depth bound forbids descent into parse_event -> the system() sink deeper
+    # in is unreached, but the frontier must be reported rather than dropped.
+    assert result["reached_sinks"] == []
+    frontier = [l for l in result["leaves"] if l.get("kind") == "unmodeled_callee"]
+    assert len(frontier) == 1, result["leaves"]
+    assert frontier[0]["callee"] == {"name": "parse_event", "address": "0x3000"}
+    assert frontier[0]["address"] == "0x1008"
+    assert frontier[0]["tainted_args"] == [0]
+
+
+# --------------------------------------------------------------------------
+# #5 per-source attribution: per-callsite re-run for N>1 source callsites
+# --------------------------------------------------------------------------
+
+def _multi_callsite_program():
+    """server(fd): recv into buf1 (callsite @0x14), recv into buf2 (@0x1c);
+    only buf1 flows into strcpy. Per-callsite attribution must report the
+    strcpy sink under callsite 0x14 and nothing under 0x1c."""
+    buf1 = FVar("buf1", typ="char[0x40]"); buf2 = FVar("buf2", typ="char[0x40]")
+    dst = FVar("dst", typ="char[0x10]")
+    r1 = FVar("r1"); r2 = FVar("r2"); rd = FVar("rd"); fd = FVar("fd")
+    r1_1 = FSSA(r1, 1); r2_1 = FSSA(r2, 1); rd1 = FSSA(rd, 1); fd0 = FSSA(fd, 0)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "r1#1 = &buf1", writes=[r1_1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf1", src=buf1)),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "recv(fd#0, r1#1, 0x40, 0)", reads=[r1_1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[fd0]),
+                       FExpr("MLIL_VAR_SSA", "r1#1", reads=[r1_1]),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40),
+                       FExpr("MLIL_CONST", "0", constant=0)]),
+        FInstr(2, 0x18, "MLIL_SET_VAR_SSA", "r2#1 = &buf2", writes=[r2_1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf2", src=buf2)),
+        FInstr(3, 0x1c, "MLIL_CALL_SSA", "recv(fd#0, r2#1, 0x40, 0)", reads=[r2_1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[fd0]),
+                       FExpr("MLIL_VAR_SSA", "r2#1", reads=[r2_1]),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40),
+                       FExpr("MLIL_CONST", "0", constant=0)]),
+        FInstr(4, 0x20, "MLIL_SET_VAR_SSA", "rd#1 = &dst", writes=[rd1],
+               src=FExpr("MLIL_ADDRESS_OF", "&dst", src=dst)),
+        FInstr(5, 0x24, "MLIL_CALL_SSA", "strcpy(rd#1, &buf1)", reads=[rd1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x3000", constant=0x3000),
+               params=[FExpr("MLIL_VAR_SSA", "rd#1", reads=[rd1]),
+                       FExpr("MLIL_ADDRESS_OF", "&buf1", src=buf1)]),
+    ]
+    bv = FBV({0x2000: "recv", 0x3000: "strcpy"})
+    return FFunc("server", 0x10, FSSAFunc(instrs), params=[fd]), bv
+
+
+def test_forward_multi_callsite_attribution(models):
+    func, bv = _multi_callsite_program()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:recv:1")])
+
+    # back-compat: top-level reached_sinks stays the union (the strcpy sink)
+    assert any(s["sink"]["callee"] == "strcpy" for s in result["reached_sinks"])
+
+    # additive per-source breakdown keyed by call address (#5)
+    assert "by_source" in result
+    by = result["by_source"]
+    assert set(by.keys()) == {"0x14", "0x1c"}
+    # callsite @0x14 (buf1) reaches strcpy; callsite @0x1c (buf2) reaches nothing
+    assert any(s["sink"]["callee"] == "strcpy" for s in by["0x14"]["reached_sinks"])
+    assert by["0x1c"]["reached_sinks"] == []
+    assert by["0x14"]["leaves"] == [] and by["0x1c"]["leaves"] == []
+
+
+def test_forward_single_callsite_no_by_source(process_func, models):
+    # process_func has exactly ONE read callsite -> attribution is a no-op:
+    # no by_source key, single-callsite behavior is byte-for-byte unchanged.
+    bv = FBV({0x401070: "read", 0x401080: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(process_func, [te.parse_locator("arg:read:1")])
+    assert "by_source" not in result
+    assert len(result["reached_sinks"]) == 1
+
+
 def test_backward_follows_into_caller(models):
     # use_len(dst, src, n): memcpy(dst, src, n) -- n is a parameter.
     # handler: n = recv(...); use_len(out, buf, n). Backward from memcpy length

@@ -974,14 +974,36 @@ class TaintEngine:
 
     def forward(self, func: Any, sources: list[dict[str, Any]], *,
                 enabled_sink_classes: set[str] | None = None, max_depth: int = 8) -> dict[str, Any]:
-        # Per-call analysis state (reset each public call):
         # optional-sink classes the caller opted into (e.g. file_write); a sink
         # marked "optional" in the model DB fires only if its class is in here.
+        # Set once for the whole request and shared by every per-callsite re-run.
         self._enabled_sink_classes: set[str] = set(enabled_sink_classes or ())
+
+        # #5 per-source attribution: a single ret/arg source whose callee is
+        # called from N>1 sites would otherwise seed from ALL of them into one
+        # merged verdict, conflating N distinct buffers. When that is the case,
+        # re-run the propagation once per callsite (seeding from exactly that
+        # site) so each flow is reported on its own, and expose the breakdown
+        # additively under `by_source`. Single-callsite (the common case) and
+        # any multi-source / param / var request are unchanged (no `by_source`).
+        callsite_addrs = self._attributable_callsites(func, sources)
+        if not callsite_addrs:
+            return self._forward_run(func, sources, max_depth=max_depth)
+        return self._forward_attributed(func, sources, callsite_addrs, max_depth=max_depth)
+
+    def _forward_run(self, func: Any, sources: list[dict[str, Any]], *, max_depth: int,
+                     only_callsite_addr: int | None = None) -> dict[str, Any]:
+        """One forward propagation over *func* and its single-result contract.
+
+        ``only_callsite_addr`` (internal, no CLI surface) restricts ret/arg
+        source seeding to exactly that call address so a single callsite's flow
+        can be isolated for per-source attribution (#5)."""
+        # Per-run analysis state (each per-callsite re-run is independent):
         self._cache: dict[tuple, Any] = {}          # (func_start, frozenset(params)) -> summary
         self._funcs_visited: set[int] = set()
         self._max_depth_seen = 0
         self._truncated = False
+        self._only_callsite_addr = only_callsite_addr
 
         try:
             sub = self._run_forward(func, sources, depth=0, max_depth=max_depth, top=True)
@@ -1016,6 +1038,105 @@ class TaintEngine:
                 "max_depth": self._max_depth_seen,
                 "sinks": len(unique_findings),
                 "truncated": self._truncated,
+            },
+            "soundness": SOUNDNESS,
+        }
+
+    def _attributable_callsites(self, func: Any, sources: list[dict[str, Any]]) -> list[int]:
+        """Distinct call addresses to attribute a single ret/arg source across.
+
+        Returns ``[]`` (no attribution) unless there is exactly ONE source, it is
+        a ret/arg locator, and its callee is called from >1 distinct sites -- the
+        only case where per-callsite attribution adds anything (#5)."""
+        if len(sources) != 1:
+            return []
+        src = sources[0]
+        if src.get("kind") not in ("ret", "arg"):
+            return []
+        callee = src.get("callee")
+        if not callee:
+            return []
+        try:
+            ssaf = self._ssa_func(func)
+            instrs = self._instrs(ssaf)
+        except TaintError:
+            return []
+        addrs: list[int] = []
+        for c in self._find_callsites(instrs, callee):
+            a = int(getattr(c, "address", 0))
+            if a not in addrs:
+                addrs.append(a)
+        return addrs if len(addrs) > 1 else []
+
+    def _forward_attributed(self, func: Any, sources: list[dict[str, Any]],
+                            callsite_addrs: list[int], *, max_depth: int) -> dict[str, Any]:
+        """Run the propagation once per source callsite and merge: top-level
+        ``reached_sinks``/``leaves`` are the UNION across runs (back-compat),
+        plus an additive ``by_source`` map keyed by call address (#5)."""
+        callee = sources[0].get("callee")
+        by_source: dict[str, Any] = {}
+        base: dict[str, Any] | None = None
+        union_findings: list[dict[str, Any]] = []
+        union_leaves: list[dict[str, Any]] = []
+        union_assumptions: list[str] = []
+        funcs_visited: set[int] = set()
+        max_depth_seen = 0
+        truncated = False
+
+        for addr in callsite_addrs:
+            res = self._forward_run(func, sources, max_depth=max_depth, only_callsite_addr=addr)
+            funcs_visited |= self._funcs_visited        # union of per-run visited sets
+            if base is None:
+                base = res
+            by_source[hex(addr)] = {
+                "reached_sinks": res["reached_sinks"],
+                "leaves": res["leaves"],
+            }
+            union_findings.extend(res["reached_sinks"])
+            union_leaves.extend(res["leaves"])
+            union_assumptions.extend(res["assumptions"])
+            max_depth_seen = max(max_depth_seen, res["stats"]["max_depth"])
+            truncated = truncated or res["stats"]["truncated"]
+
+        # Union the per-callsite results back into the historical top-level shape.
+        # Stats follow the pinned rule: max_depth = max across runs; functions_visited
+        # = size of the union (a function reached from two callsites counts once);
+        # sinks = count of the deduped union; truncated = any run truncated.
+        seen_sink: set[tuple] = set()
+        findings: list[dict[str, Any]] = []
+        for f in union_findings:
+            s = f.get("sink", {})
+            sig = (s.get("callee"), s.get("address"), s.get("tainted_arg_index"))
+            if sig in seen_sink:
+                continue
+            seen_sink.add(sig)
+            findings.append(f)
+        leaves: list[dict[str, Any]] = []
+        for lf in union_leaves:
+            if lf not in leaves:
+                leaves.append(lf)
+        assumptions: list[str] = []
+        for a in union_assumptions:
+            if a not in assumptions:
+                assumptions.append(a)
+        assumptions.append(
+            f"per-source attribution: {len(callsite_addrs)} callsites of {callee} analyzed "
+            f"independently ({len(callsite_addrs)} propagations); top-level reached_sinks/leaves "
+            f"are the union, by_source has the per-callsite split")
+
+        return {
+            "direction": "forward",
+            "function": base["function"],
+            "sources": base["sources"],
+            "reached_sinks": findings,
+            "leaves": leaves,
+            "assumptions": assumptions,
+            "by_source": by_source,
+            "stats": {
+                "functions_visited": len(funcs_visited),
+                "max_depth": max_depth_seen,
+                "sinks": len(findings),
+                "truncated": truncated,
             },
             "soundness": SOUNDNESS,
         }
@@ -1185,7 +1306,8 @@ class TaintEngine:
             cached = self._cache[key]
             if cached is None:  # in-progress -> recursion cycle
                 return {"reached_return": True, "out_params": frozenset(), "findings": [], "leaves": [],
-                        "assumptions": [f"recursion cycle at {callee.name}; return conservatively tainted"]}
+                        "assumptions": [f"recursion cycle at {callee.name}; return conservatively tainted"],
+                        "frontier": "recursion cycle stopped descent"}
             return cached
         self._cache[key] = None  # mark in-progress (cycle guard)
         locators = [{"kind": "param", "index": i} for i in sorted(param_set)]
@@ -1193,15 +1315,36 @@ class TaintEngine:
             sub = self._run_forward(callee, locators, depth, max_depth, top=False)
         except TaintError as exc:
             sub = {"reached_return": True, "out_params": frozenset(), "findings": [], "leaves": [],
-                   "assumptions": [f"could not analyze {callee.name}: {exc}; return conservatively tainted"]}
+                   "assumptions": [f"could not analyze {callee.name}: {exc}; return conservatively tainted"],
+                   "frontier": f"body could not be analyzed ({exc})"}
         self._cache[key] = sub
         return sub
+
+    @staticmethod
+    def _frontier_leaf(ins: Any, callee_fn: Any, tainted_arg_indices, note: str) -> dict[str, Any]:
+        """An honest "taint stopped here" leaf for an unmodeled in-binary callee
+        that was NOT descended into (no mappable params, depth bound, recursion
+        cycle, or an unanalyzable body). Extends the existing leaves[] honesty
+        channel (#8) -- the call->callee hand-off that would otherwise vanish."""
+        return {
+            "kind": "unmodeled_callee",
+            "address": hex(int(getattr(ins, "address", 0))),
+            "callee": {"name": str(getattr(callee_fn, "name", "?")),
+                       "address": hex(int(getattr(callee_fn, "start", 0)))},
+            "tainted_args": sorted(tainted_arg_indices),
+            "note": note,
+        }
 
     def _descend(self, ins: Any, callee_fn: Any, tainted_args: dict, why: dict,
                  depth: int, max_depth: int, *, via: str | None = None) -> dict[str, Any]:
         """Recurse into a (direct or resolved-indirect) internal callee and return
         its findings with a caller-side path prefix prepended, plus whether it
-        propagates taint to its return."""
+        propagates taint to its return.
+
+        When the callee is NOT actually descended into (no mappable parameters,
+        depth bound reached, recursion cycle, or an unanalyzable body), the
+        tainted call->callee hand-off is recorded as an ``unmodeled_callee``
+        frontier leaf instead of silently dropping the flow (#8)."""
         n_params = len(list(getattr(callee_fn, "parameter_vars", []) or []))
         valid = frozenset(i for i in tainted_args if i < n_params)
         out: dict[str, Any] = {"findings": [], "reached_return": False, "leaves": [],
@@ -1209,12 +1352,20 @@ class TaintEngine:
         if not valid:
             out["reached_return"] = True
             out["assumptions"].append(f"tainted args to {callee_fn.name} fall beyond its parameters; conservative")
+            out["leaves"].append(self._frontier_leaf(
+                ins, callee_fn, tainted_args,
+                "tainted data passed to in-binary callee with no model and no "
+                "mappable parameters; investigate"))
             return out
         if depth + 1 > max_depth:
             self._truncated = True
             out["reached_return"] = True
             out["assumptions"].append(
                 f"max interprocedural depth {max_depth} reached at {callee_fn.name}; not descended")
+            out["leaves"].append(self._frontier_leaf(
+                ins, callee_fn, tainted_args,
+                f"tainted data passed to in-binary callee with no model; depth bound "
+                f"({max_depth}) stopped descent -- investigate or raise --depth"))
             return out
         sub = self._summarize(callee_fn, valid, depth + 1, max_depth)
         first_hit = tainted_args[sorted(valid)[0]][0]
@@ -1226,6 +1377,12 @@ class TaintEngine:
         for f in sub["findings"]:
             out["findings"].append({"sink": f["sink"], "path": prefix + f["path"]})
         out["leaves"] = list(sub["leaves"])
+        frontier = sub.get("frontier")
+        if frontier:
+            out["leaves"].append(self._frontier_leaf(
+                ins, callee_fn, tainted_args,
+                f"tainted data passed to in-binary callee with no model; {frontier} "
+                f"-- investigate"))
         out["assumptions"] = list(sub["assumptions"])
         out["reached_return"] = sub["reached_return"]
         out["out_params"] = sub.get("out_params", frozenset())
@@ -1762,7 +1919,16 @@ class TaintEngine:
                 calls = self._find_callsites(instrs, callee)
                 if not calls:
                     raise TaintError(f"no callsite of {callee} found in {func.name}")
-                if len(calls) > 1:
+                # #5: a per-callsite re-run seeds from exactly one call address;
+                # the "seeded from all" conflation note becomes a per-callsite note.
+                only = getattr(self, "_only_callsite_addr", None)
+                if only is not None:
+                    calls = [c for c in calls
+                             if (int(getattr(c, "address", 0)) & ~1) == (only & ~1)]
+                    if not calls:
+                        continue  # this source has no callsite at the attributed address
+                    add_assumption(f"seeded from {callee} callsite at {hex(only)} (per-source attribution)")
+                elif len(calls) > 1:
                     add_assumption(f"{len(calls)} callsites of {callee}; seeded from all")
                 for c in calls:
                     if kind == "ret":
