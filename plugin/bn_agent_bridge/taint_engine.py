@@ -232,10 +232,21 @@ def function_at(bv: Any, addr: int | None) -> Any | None:
 
 
 def const_target(expr: Any) -> int | None:
-    """Constant call destination (direct call) or None (indirect)."""
+    """Constant call destination (direct call) or None (indirect).
+
+    Accepts MLIL_CONST_PTR *and* MLIL_EXTERN_PTR. On a statically-linked object
+    (e.g. a kernel .ko) a direct `bl` to an external helper (strlen / sscanf /
+    memcpy / copy_from_user) renders as an EXTERN_PTR whose `.constant` IS the
+    stub address that `get_symbol_at` resolves to the real name -- so without
+    this the callee name (and its sink/source model) is never recovered and the
+    call is misreported as an unresolved indirect call, all-clearing every .ko
+    sink reached through a stub. (T2; MLIL_IMPORT stays out: its `.constant` is
+    a GOT slot, resolved by name via resolve_call_target/extract_dest_address.)
+    """
     if expr is None:
         return None
-    if "CONST" not in op_name(expr):
+    name = op_name(expr)
+    if "CONST" not in name and "EXTERN_PTR" not in name:
         return None
     c = getattr(expr, "constant", None)
     if c is None:
