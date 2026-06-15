@@ -339,6 +339,11 @@ def _pointer_table_for_view(
     if base_unmapped and error_on_unmapped:
         raise RuntimeError(f"Address 0x{start:x} is not mapped (no bytes available)")
     pointer_size = ctx._pointer_size(bv)
+    # A non-null value below the lowest mapped address can't be a pointer into
+    # the image -- at a fixed --stride it's almost always an inline scalar field
+    # (a uint8/uint16 flag/enum in a mixed record), not a failed pointer slot.
+    # Tag those so they don't inflate the "do not resolve" warning. (#170)
+    mapped_floor = max(int(getattr(bv, "start", 0) or 0), 0x1000)
     rows = []
     warnings = []
     if base_unmapped:
@@ -366,7 +371,10 @@ def _pointer_table_for_view(
                 break
             continue
         target = ctx._normalize_code_pointer(bv, value)
-        if target["plausible"] or target["status"] == "null":
+        likely_scalar = target["status"] == "unmapped" and 0 < value < mapped_floor
+        # A legitimate inline scalar field is not an "invalid" run member either,
+        # so it must not trip stop_after_invalid in interior windows.
+        if target["plausible"] or target["status"] == "null" or likely_scalar:
             invalid_run = 0
         else:
             invalid_run += 1
@@ -377,6 +385,7 @@ def _pointer_table_for_view(
                 "value": hex(value),
                 "readable": True,
                 "plausible": bool(target["plausible"]),
+                "likely_scalar": bool(likely_scalar),
                 "target": target,
             }
         )
@@ -408,11 +417,22 @@ def _pointer_table_for_view(
         if row.get("readable") and row.get("value") not in {None, "0x0"}
     ]
     plausible_rows = [row for row in non_null_rows if row.get("plausible")]
-    if non_null_rows and not plausible_rows:
+    scalar_rows = [row for row in non_null_rows if row.get("likely_scalar")]
+    # Genuine pointer slots that failed to resolve -- excludes inline scalars.
+    unresolved_rows = [
+        row for row in non_null_rows
+        if not row.get("plausible") and not row.get("likely_scalar")
+    ]
+    if non_null_rows and not plausible_rows and unresolved_rows:
         warnings.append("no non-null entries resolve to mapped addresses; low confidence pointer table")
-    elif non_null_rows and len(plausible_rows) < len(non_null_rows):
+    elif unresolved_rows:
         warnings.append(
-            f"{len(non_null_rows) - len(plausible_rows)} non-null entries do not resolve to mapped addresses"
+            f"{len(unresolved_rows)} non-null entries do not resolve to mapped addresses"
+        )
+    if scalar_rows:
+        warnings.append(
+            f"{len(scalar_rows)} non-null entries look like inline scalar fields, not pointers "
+            "(small values below the lowest mapped address)"
         )
     interior_function_rows = [
         row for row in non_null_rows

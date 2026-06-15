@@ -66,7 +66,8 @@ assert_rc() {
 
 start_session() {
     local out
-    out=$($BN session start "$@" 2>/dev/null)
+    # session start defaults to text; request JSON so we can parse instance_id.
+    out=$($BN session start "$@" --format json 2>/dev/null)
     local id
     id=$(echo "$out" | python3 -c "import sys,json; print(json.load(sys.stdin)['instance_id'])")
     STARTED_INSTANCES+=("$id")
@@ -98,11 +99,23 @@ done
 shopt -u nullglob
 sleep 1
 
-# Check fixtures exist
-for bin in hello_x86_64 add_x86_64 crypto_x86_64 statemachine_x86_64 parser_x86_64; do
+# Check fixtures exist; build them from the committed src/*.c on a clean checkout.
+FIXTURE_BINS=(hello_x86_64 add_x86_64 crypto_x86_64 statemachine_x86_64 parser_x86_64)
+need_build=0
+for bin in "${FIXTURE_BINS[@]}"; do
+    [[ -f "$FIXTURE_DIR/$bin" ]] || need_build=1
+done
+if [[ $need_build -eq 1 ]]; then
+    blue "  Building synthetic fixtures (make -C $FIXTURE_DIR)..."
+    if ! make -C "$FIXTURE_DIR" >/dev/null 2>&1; then
+        red "Fixture build failed. Need a C compiler (cc/gcc) and make."
+        red "Run manually: make -C $FIXTURE_DIR"
+        exit 99
+    fi
+fi
+for bin in "${FIXTURE_BINS[@]}"; do
     if [[ ! -f "$FIXTURE_DIR/$bin" ]]; then
-        red "Missing fixture: $FIXTURE_DIR/$bin"
-        red "Run: cd $FIXTURE_DIR && make"
+        red "Missing fixture after build: $FIXTURE_DIR/$bin"
         exit 99
     fi
 done
