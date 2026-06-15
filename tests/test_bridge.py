@@ -4918,12 +4918,28 @@ class _FakeMLILInsn:
         params: list | None = None,
         vars_read: list | None = None,
         dest=None,
+        src=None,
+        size=None,
+        left=None,
+        right=None,
+        constant=None,
     ):
         self._address = address
         self._operation_name = operation
         self._params = params or []
         self._vars_read = vars_read or []
         self.dest = dest
+        # Operand attrs for load/address-expr fakes (#162); left unset -> getattr None.
+        if src is not None:
+            self.src = src
+        if size is not None:
+            self.size = size
+        if left is not None:
+            self.left = left
+        if right is not None:
+            self.right = right
+        if constant is not None:
+            self.constant = constant
 
     @property
     def address(self):
@@ -5109,6 +5125,96 @@ def test_backward_slice_depth_is_def_use_distance(monkeypatch):
     assert by_var["x#3"]["depth"] == 0
     assert by_var["y#1"]["depth"] == 1
     assert by_var["z#2"]["depth"] == 1  # sibling of y#1, same depth (not 2)
+
+
+def test_backward_slice_steps_carry_ssa_label_and_definition_reason(monkeypatch):
+    """Every step gets a stable ssa_label, and an ordinary definition step now
+    reports reason `definition` instead of null (#162)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    r0 = _FakeSSAVariable("r0#1")
+    r1 = _FakeSSAVariable("r1#2")
+    call_insn = _FakeMLILInsn(
+        0x10010, operation="MLIL_CALL_SSA",
+        params=[_FakeMLILInsn(0x10010, operation="MLIL_VAR_SSA", vars_read=[r0])], vars_read=[r0])
+    def_insn = _FakeMLILInsn(0x10008, operation="MLIL_SET_VAR_SSA", vars_read=[r1])
+    fn = _FakeFunction(0x10000, "f")
+    fn.medium_level_il = _FakeMLILFunction(instructions=[call_insn], definitions={r0: def_insn})
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._backward_slice("active", "f", "0x10010", arg_index=0)
+    assert result["trace"][0]["ssa_label"] == "r0#1"
+    assert result["trace"][0]["reason"] == "definition"
+    assert result["trace"][1]["ssa_label"] == "r1#2"
+
+
+def test_backward_slice_field_load_carries_base_offset_width(monkeypatch):
+    """A `len = [obj + 8]` field load reports reason `field_load` with structured
+    base/offset/width metadata (#162)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    length = _FakeSSAVariable("len#3")
+    obj = _FakeSSAVariable("obj#1")
+    addr_expr = _FakeMLILInsn(
+        0x2000, operation="MLIL_ADD",
+        left=_FakeMLILInsn(0x2000, operation="MLIL_VAR_SSA", vars_read=[obj]),
+        right=_FakeMLILInsn(0x2000, operation="MLIL_CONST", constant=8))
+    load_expr = _FakeMLILInsn(0x2000, operation="MLIL_LOAD_SSA", src=addr_expr, size=4, vars_read=[obj])
+    load_def = _FakeMLILInsn(0x2000, operation="MLIL_SET_VAR_SSA", src=load_expr, vars_read=[obj])
+    call_insn = _FakeMLILInsn(
+        0x2010, operation="MLIL_CALL_SSA",
+        params=[_FakeMLILInsn(0x2010, operation="MLIL_VAR_SSA", vars_read=[length])], vars_read=[length])
+    fn = _FakeFunction(0x2000, "f")
+    fn.medium_level_il = _FakeMLILFunction([load_def, call_insn], definitions={length: load_def})
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._backward_slice("active", "f", "0x2010", arg_index=0)
+    step = result["trace"][0]
+    assert step["ssa_label"] == "len#3"
+    assert step["reason"] == "field_load"
+    assert step["base"] == "obj#1"
+    assert step["offset"] == "0x8"
+    assert step["width"] == 4
+
+
+def test_backward_slice_phi_step_reason(monkeypatch):
+    """A phi definition reports reason `phi_source` (#162)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    merged = _FakeSSAVariable("v#3")
+    a = _FakeSSAVariable("v#1")
+    b = _FakeSSAVariable("v#2")
+    phi_def = _FakeMLILInsn(0x3000, operation="MLIL_VAR_PHI", vars_read=[a, b])
+    call_insn = _FakeMLILInsn(
+        0x3010, operation="MLIL_CALL_SSA",
+        params=[_FakeMLILInsn(0x3010, operation="MLIL_VAR_SSA", vars_read=[merged])], vars_read=[merged])
+    fn = _FakeFunction(0x3000, "f")
+    fn.medium_level_il = _FakeMLILFunction([phi_def, call_insn], definitions={merged: phi_def})
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._backward_slice("active", "f", "0x3010", arg_index=0)
+    assert result["trace"][0]["reason"] == "phi_source"
+
+
+def test_backward_slice_arg_label_and_output_pointer_hint(monkeypatch):
+    """An address-of arg with no value reads yields the calling-convention
+    register label plus an output-pointer dead-end hint, not a bare empty trace
+    (#166)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    addr_of = _FakeMLILInsn(0x4010, operation="MLIL_ADDRESS_OF", vars_read=[])
+    other = _FakeMLILInsn(0x4010, operation="MLIL_VAR_SSA", vars_read=[])
+    call_insn = _FakeMLILInsn(0x4010, operation="MLIL_CALL_SSA", params=[other, addr_of], vars_read=[])
+    fn = _FakeFunction(0x4000, "f")
+    fn.calling_convention = type("CC", (), {"int_arg_regs": ["x0", "x1", "x2"]})()
+    fn.medium_level_il = _FakeMLILFunction([call_insn])
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._backward_slice("active", "f", "0x4010", arg_index=1)
+    assert result["arg_label"]["index"] == 1
+    assert result["arg_label"]["register"] == "x1"
+    assert result["hints"]
+    assert "pointer" in result["hints"][0]
 
 
 def test_backward_slice_no_call_at_address(monkeypatch):

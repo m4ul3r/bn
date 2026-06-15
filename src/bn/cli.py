@@ -652,6 +652,10 @@ _non_negative_int = _int_at_least(0, "index")
 # A depth-labeled non-negative validator so e.g. `--max-depth -1` reads
 # "depth must be an integer >= 0", not the generic "index ..." (#49).
 _depth_int = _int_at_least(0, "depth")
+# `trace --max-depth` is a *step budget* -- a depth of 0 collects nothing, which
+# the bridge rejects as `Invalid max_depth: 0`. Require >= 1 at parse time so the
+# CLI contract matches the bridge instead of round-tripping to an error (#129).
+_positive_depth_int = _int_at_least(1, "depth")
 
 
 def _pick(positional: Any, flag: Any, label: str, *, required: bool = True) -> Any:

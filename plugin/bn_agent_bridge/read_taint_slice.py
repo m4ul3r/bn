@@ -85,6 +85,112 @@ def _ssa_vars_from(vars_list: list) -> list[SSAVariable]:
     return [v for v in vars_list if isinstance(v, SSAVariable)]
 
 
+def _ssa_label(ssa_var) -> str:
+    """Stable analyst-friendly label for an SSA var, e.g. ``var_10#3`` -- avoids
+    the verbose ``<SSAVariable ...>`` repr some BN builds emit for ``str()`` and
+    keeps trace JSON machine-consumable (#162)."""
+    base = getattr(ssa_var, "var", ssa_var)
+    name = getattr(base, "name", None)
+    version = getattr(ssa_var, "version", None)
+    if name and version is not None:
+        return f"{name}#{version}"
+    return str(ssa_var)
+
+
+def _const_int(expr) -> int | None:
+    if expr is None or "CONST" not in il_format._il_op_name(expr):
+        return None
+    c = getattr(expr, "constant", None)
+    try:
+        return int(c) if c is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _addr_base_offset_label(expr, depth: int = 0) -> tuple[str | None, int | None]:
+    """Best-effort (base_label, offset) for a load address expression: a base
+    pointer var plus a constant field offset. Either may be None when the address
+    isn't a simple ``base [+ const]`` shape."""
+    if expr is None or depth > 6:
+        return None, None
+    op = il_format._il_op_name(expr)
+    if "ADD" in op or "SUB" in op:
+        left = getattr(expr, "left", None)
+        right = getattr(expr, "right", None)
+        rc = _const_int(right)
+        if rc is not None:
+            bl, _ = _addr_base_offset_label(left, depth + 1)
+            return bl, (rc if "ADD" in op else -rc)
+        lc = _const_int(left)
+        if lc is not None and "ADD" in op:
+            br, _ = _addr_base_offset_label(right, depth + 1)
+            return br, lc
+        return None, None
+    reads = _ssa_vars_from(getattr(expr, "vars_read", []) or [])
+    if len(reads) == 1:
+        return _ssa_label(reads[0]), 0
+    return None, None
+
+
+def _load_expr_of(def_insn):
+    """The load expression a definition reads from, or None. Handles both MLIL
+    forms: a top-level load def, and the common ``x = [addr]`` SET_VAR whose
+    ``.src`` is the load."""
+    if "LOAD" in il_format._il_op_name(def_insn):
+        return def_insn
+    src = getattr(def_insn, "src", None)
+    if src is not None and "LOAD" in il_format._il_op_name(src):
+        return src
+    return None
+
+
+def _field_load_meta(load_expr) -> tuple[str | None, int | None, int | None]:
+    """(base_label, offset, width) for a load expression, best-effort. Lets a
+    field load (`*(obj + off)`) carry structured metadata in the trace instead of
+    just a `memory_load` reason (#162)."""
+    width = getattr(load_expr, "size", None)
+    base, offset = _addr_base_offset_label(getattr(load_expr, "src", None))
+    return base, offset, (int(width) if isinstance(width, int) else None)
+
+
+def _is_address_of(expr) -> bool:
+    return "ADDRESS_OF" in il_format._il_op_name(expr)
+
+
+def _arg_register(caller_func, arg_index: int) -> str | None:
+    """The calling-convention integer-arg register for *arg_index* (e.g. `x1`,
+    `rsi`, `r1`), or None when the convention isn't recoverable (#166)."""
+    try:
+        cc = getattr(caller_func, "calling_convention", None)
+        regs = list(getattr(cc, "int_arg_regs", []) or [])
+        if 0 <= arg_index < len(regs):
+            return str(regs[arg_index])
+    except Exception:
+        return None
+    return None
+
+
+def _arg_label(ctx, bv, call_insn, arg_index: int, caller_func) -> dict[str, Any]:
+    """{index, [register], [name]} for the traced call argument: its
+    calling-convention register plus the callee's C parameter name when the
+    callee resolves (#166)."""
+    label: dict[str, Any] = {"index": arg_index}
+    reg = _arg_register(caller_func, arg_index)
+    if reg:
+        label["register"] = reg
+    try:
+        rt = _taint.resolve_call_target(bv, call_insn, follow_thunks=True)
+        callee = getattr(rt, "function", None)
+        pvars = list(getattr(callee, "parameter_vars", []) or []) if callee else []
+        if 0 <= arg_index < len(pvars):
+            nm = getattr(pvars[arg_index], "name", None)
+            if nm:
+                label["name"] = str(nm)
+    except Exception:
+        pass
+    return label
+
+
 def _build_backward_trace(
     ctx,
     bv,
@@ -115,6 +221,7 @@ def _build_backward_trace(
         if not isinstance(ssa_var, SSAVariable):
             trace.append({
                 "ssa_var": str(ssa_var),
+                "ssa_label": str(ssa_var),
                 "depth": depth,
                 "terminates": True,
                 "reason": "undefined_or_global",
@@ -135,6 +242,7 @@ def _build_backward_trace(
             )
         entry: dict[str, Any] = {
             "ssa_var": str(ssa_var),
+            "ssa_label": _ssa_label(ssa_var),
             "depth": depth,
         }
 
@@ -189,9 +297,23 @@ def _build_backward_trace(
             trace.append(entry)
             continue
 
-        if "LOAD" in def_op:
-            entry["terminates"] = True
-            entry["reason"] = "memory_load"
+        load_expr = _load_expr_of(def_insn)
+        if load_expr is not None:
+            base, offset, width = _field_load_meta(load_expr)
+            # A resolvable base+offset means this is a struct/field load, not an
+            # opaque pointer deref -- label it `field_load` and carry the
+            # structured fields so the slice is machine-consumable (#162).
+            entry["reason"] = "field_load" if base is not None else "memory_load"
+            if base is not None:
+                entry["base"] = base
+            if offset is not None:
+                entry["offset"] = hex(offset) if isinstance(offset, int) else offset
+            if width is not None:
+                entry["width"] = width
+            # Preserve prior per-form walk behavior: a top-level load def
+            # terminated; a `x = [addr]` SET_VAR continued through its base
+            # pointer (so provenance reaches where the struct came from).
+            entry["terminates"] = "LOAD" in def_op
             trace.append(entry)
             for rv in _ssa_vars_from(getattr(def_insn, "vars_read", []) or []):
                 if rv not in visited:
@@ -199,7 +321,10 @@ def _build_backward_trace(
             continue
 
         entry["terminates"] = False
-        entry["reason"] = None
+        # Populate `reason` from a controlled vocabulary instead of leaving it
+        # null on ordinary steps: a phi merge is `phi_source`, everything else is
+        # a plain `definition` (#162).
+        entry["reason"] = "phi_source" if "PHI" in def_op else "definition"
         trace.append(entry)
 
         for rv in _ssa_vars_from(getattr(def_insn, "vars_read", []) or []):
@@ -386,6 +511,23 @@ def _backward_slice(
     param_expr = params[arg_index]
     initial_vars: list[Any] = _ssa_vars_from(getattr(param_expr, "vars_read", []) or [])
 
+    arg_label = _arg_label(ctx, bv, call_insn, arg_index, func)
+
+    # An address-of arg with no SSA value reads is an output-pointer dead-end:
+    # tracing it would follow where the *pointer* came from (a local buffer),
+    # not the data the callee writes through it. Surface that instead of the
+    # misleading "constant or immediate -- no SSA trace" (#166).
+    hints: list[str] = []
+    if not initial_vars and _is_address_of(param_expr):
+        callee_nm = arg_label.get("name") or "the callee"
+        hints.append(
+            f"arg {arg_index} is a pointer (address-of); this traces where the "
+            f"pointer came from, not the data written through it. To follow data "
+            f"{callee_nm} writes into the pointee, run a forward taint from the "
+            f"call site (e.g. `taint forward --source call:<callee>`) or trace the "
+            f"buffer's later consumers."
+        )
+
     trace = _build_backward_trace(
         ctx, bv, ssa_func, initial_vars, max_depth,
         interprocedural=interprocedural,
@@ -398,10 +540,12 @@ def _backward_slice(
         "function_address": hex(func.start),
         "target_address": hex(target_addr),
         "arg_index": arg_index,
+        "arg_label": arg_label,
         "view": view,
         "interprocedural": interprocedural,
         "ip_depth": ip_depth if interprocedural else 0,
         "truncated": len(trace) >= max_depth,
         "step_count": len(trace),
         "trace": trace,
+        "hints": hints,
     }
