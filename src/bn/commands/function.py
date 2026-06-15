@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-from ..cli import _call, _depth_int, _mutation_exit_code, _non_negative_int, _parse_line_range, _positive_depth_int, _positive_int, arg, command, mutex
+from ..cli import _call, _depth_int, _effective_limit, _mutation_exit_code, _non_negative_int, _parse_line_range, _positive_depth_int, _positive_int, arg, command, mutex
 from ..formatters import (
     _render_callsites_text,
     _render_evidence_xrefs_text,
@@ -55,8 +55,10 @@ def _function_list(args: argparse.Namespace) -> int:
     # Bridge-authoritative paging: send the real limit/offset (not the generic
     # +1 page_limit) so the bridge returns the page WITH the true total, which
     # the renderer surfaces (#59). The bridge envelope is {functions, total, ...}.
-    if args.limit is not None:
-        params["limit"] = args.limit
+    # _effective_limit defaults to 100 but uncaps for --out full-body export (#165).
+    limit = _effective_limit(args)
+    if limit is not None:
+        params["limit"] = limit
     if args.sort != "address":
         params["sort"] = args.sort
     return _call(
@@ -99,8 +101,9 @@ def _function_search(args: argparse.Namespace) -> int:
         params["max_address"] = args.max_address
     if args.offset:
         params["offset"] = args.offset
-    if args.limit is not None:
-        params["limit"] = args.limit
+    limit = _effective_limit(args)
+    if limit is not None:
+        params["limit"] = limit
     if args.sort != "address":
         params["sort"] = args.sort
     return _call(
@@ -278,27 +281,23 @@ def _disasm(args: argparse.Namespace) -> int:
 
 
 @command("xrefs", help="List xrefs to an address or function; use --field for struct field xrefs",
-         target=True,
+         target=True, paged=True,
          args=[
              arg("identifier", nargs="?",
                  help="Function name or address (hex 0x.. or decimal) to find inbound refs to"),
              arg("--field", dest="field_spec",
                  help="Struct field xref spec (e.g., TrackRowCell.tile_type)"),
-             arg("--limit", type=_positive_int, default=None,
-                 help="Max caller/data-ref groups to show (text output only)"),
          ])
 def _xrefs(args: argparse.Namespace) -> int:
     field_spec = getattr(args, "field_spec", None)
     identifier = getattr(args, "identifier", None)
-    limit = getattr(args, "limit", None)
-    if limit is not None:
-        _require_text_format(args, "--limit")
     if field_spec and identifier:
         raise BridgeError(
             "xrefs takes either an identifier or --field, not both "
             f"(got {identifier!r} and --field {field_spec!r})"
         )
     if field_spec:
+        # --field is a distinct shape (field info + refs); paging args don't apply.
         return _call(
             args,
             "field_xrefs",
@@ -310,14 +309,26 @@ def _xrefs(args: argparse.Namespace) -> int:
         )
     if not identifier:
         raise BridgeError("xrefs requires an identifier or --field")
+    # xrefs now adopts the canonical paging envelope (#164): JSON carries
+    # {items, total, offset, limit, returned, has_more} (each item keeps its
+    # kind) and --limit pages it instead of erroring. The text renderer reads the
+    # back-compat code_refs/data_refs (full) and uses `limit` as a caller-group
+    # display cap, so text behavior is unchanged.
+    params: dict[str, Any] = {"identifier": identifier}
+    if args.offset:
+        params["offset"] = args.offset
+    limit = _effective_limit(args)
+    if limit is not None:
+        params["limit"] = limit
     return _call(
         args,
         "xrefs",
-        {"identifier": identifier},
+        params,
         require_target=True,
         allow_implicit_target=True,
         text_renderer=lambda v: _render_xrefs_text(v, limit=limit),
         offset_hint_identifier=identifier,
+        paged_spill=True,
         stem="xrefs",
     )
 
@@ -408,23 +419,28 @@ def _evidence_function(args: argparse.Namespace) -> int:
 
 @command("evidence", "xrefs",
          help="List xrefs with section/segment/symbol/disassembly context",
-         target=True,
+         target=True, paged=True,
          args=[
              arg("identifier", help="Function name or address (hex 0x.. or decimal) to find inbound refs to"),
-             arg("--limit", type=_positive_int, default=None,
-                 help="Max refs per code/data bucket to show; text-render cap only "
-                      "(not allowed with --format json, which returns every ref)"),
          ])
 def _evidence_xrefs(args: argparse.Namespace) -> int:
-    if args.limit is not None:
-        _require_text_format(args, "--limit")
+    # Same canonical paging envelope as `xrefs` (#164): --limit pages the JSON
+    # items; the text renderer reads the full code_refs/data_refs with `limit` as
+    # a per-bucket display cap.
+    params: dict[str, Any] = {"identifier": args.identifier}
+    if args.offset:
+        params["offset"] = args.offset
+    limit = _effective_limit(args)
+    if limit is not None:
+        params["limit"] = limit
     return _call(
         args,
         "xrefs",
-        {"identifier": args.identifier},
+        params,
         require_target=True,
         allow_implicit_target=True,
-        text_renderer=lambda value: _render_evidence_xrefs_text(value, limit=args.limit),
+        text_renderer=lambda value: _render_evidence_xrefs_text(value, limit=limit),
+        paged_spill=True,
         stem="evidence-xrefs",
     )
 

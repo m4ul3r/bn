@@ -5,7 +5,7 @@ import json
 import sys
 from pathlib import Path
 
-from ..cli import _call, _int_or_hex, _mutation_exit_code, _non_negative_int, _pick, arg, command, mutex
+from ..cli import _call, _effective_limit, _int_or_hex, _mutation_exit_code, _non_negative_int, _pick, arg, command, mutex
 from ..formatters import (
     _render_imports_summary_text,
     _render_mutation_text,
@@ -29,8 +29,28 @@ from ..transport import BridgeError
                  help="Only include strings in this section (e.g. .rodata, .rdata)"),
              arg("--no-crt", action="store_true", default=False,
                  help="Heuristic filter: exclude likely CRT/locale strings (platform-biased, best-effort)"),
+             arg("--count", action="store_true", default=False,
+                 help="Show the matching string count instead of listing"),
          ])
 def _strings(args: argparse.Namespace) -> int:
+    common = {
+        "query": args.query,
+        "min_length": args.min_length,
+        "section": args.section,
+        "no_crt": args.no_crt,
+        "regex": bool(args.regex),
+    }
+    if args.count:
+        return _call(
+            args,
+            "strings",
+            {**common, "count_only": True},
+            require_target=True,
+            allow_implicit_target=True,
+            text_renderer=lambda value: f"Total strings: {value.get('count', 0)}",
+            stem="strings-count",
+            regex_hint_query=args.query,
+        )
     # Bridge-authoritative paging (#122): forward the real limit/offset so the
     # bridge returns the page WITH the true total in a {items, total, ...}
     # envelope, matching function list/search. paged_spill keeps the
@@ -39,13 +59,9 @@ def _strings(args: argparse.Namespace) -> int:
         args,
         "strings",
         {
-            "query": args.query,
+            **common,
             "offset": args.offset,
-            "limit": args.limit,
-            "min_length": args.min_length,
-            "section": args.section,
-            "no_crt": args.no_crt,
-            "regex": bool(args.regex),
+            "limit": _effective_limit(args),
         },
         require_target=True,
         allow_implicit_target=True,
@@ -69,15 +85,27 @@ def _strings(args: argparse.Namespace) -> int:
 
 @command("imports", help="List imports", target=True, paged=True,
          args=[arg("--summary", action="store_true", default=False,
-                   help="Show aggregate counts by namespace and kind instead of the full list")])
+                   help="Show aggregate counts by namespace and kind instead of the full list"),
+               arg("--count", action="store_true", default=False,
+                   help="Show the total import count instead of listing")])
 def _imports(args: argparse.Namespace) -> int:
+    if args.count:
+        return _call(
+            args,
+            "imports",
+            {"count_only": True},
+            require_target=True,
+            allow_implicit_target=True,
+            text_renderer=lambda value: f"Total imports: {value.get('count', 0)}",
+            stem="imports-count",
+        )
     summary_mode = bool(args.summary)
     # Summary is a single aggregate object, so it ignores paging entirely. The
     # full list (often 500+ entries on firmware libs) pages bridge-side like
     # strings/function list, returning a {items, total, ...} envelope (#122).
     params = {"summary": summary_mode, "offset": args.offset}
     if not summary_mode:
-        params["limit"] = args.limit
+        params["limit"] = _effective_limit(args)
     return _call(
         args,
         "imports",
@@ -94,14 +122,26 @@ def _imports(args: argparse.Namespace) -> int:
 
 
 @command("sections", help="List binary sections with address ranges and permissions", target=True,
-         paged=True, args=[arg("--query", help="Filter sections by name substring")])
+         paged=True, args=[arg("--query", help="Filter sections by name substring"),
+                           arg("--count", action="store_true", default=False,
+                               help="Show the section count instead of listing")])
 def _sections(args: argparse.Namespace) -> int:
+    if args.count:
+        return _call(
+            args,
+            "sections",
+            {"query": args.query, "count_only": True},
+            require_target=True,
+            allow_implicit_target=True,
+            text_renderer=lambda value: f"Total sections: {value.get('count', 0)}",
+            stem="sections-count",
+        )
     # Bridge-authoritative paging (#122): forward the real limit/offset so the
     # bridge returns the {items, total, ...} envelope with the true total.
     return _call(
         args,
         "sections",
-        {"query": args.query, "offset": args.offset, "limit": args.limit},
+        {"query": args.query, "offset": args.offset, "limit": _effective_limit(args)},
         require_target=True,
         allow_implicit_target=True,
         text_renderer=_render_sections_text,

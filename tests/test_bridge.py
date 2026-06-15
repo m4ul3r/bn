@@ -2444,6 +2444,40 @@ def test_xrefs_include_address_context(monkeypatch):
     assert result["caller_function_count"] == 1
 
 
+def test_xrefs_to_address_emits_paging_envelope(monkeypatch):
+    # #164: xrefs adopts the canonical {items,total,offset,limit,returned,has_more}
+    # envelope (items = code refs then data refs, each keeping its kind), pages on
+    # offset/limit, and keeps the #140 summary counts + the deprecated dual shape.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    caller = _FakeFunction(0x401000, "caller")
+    bv = _FakeBV(
+        functions=[caller],
+        code_refs={0x5000: [_FakeCodeRef(0x401010, caller), _FakeCodeRef(0x401020, caller)]},
+        data_refs={0x5000: [0x6000]},
+        sections={".text": _FakeSection(".text", 0x400000, 0x410000),
+                  ".rodata": _FakeSection(".rodata", 0x5000, 0x7000)},
+        segments={0x401010: _FakeSegment(readable=True, executable=True),
+                  0x401020: _FakeSegment(readable=True, executable=True),
+                  0x6000: _FakeSegment(readable=True, writable=True)},
+    )
+    full = instance._xrefs_to_address(bv, 0x5000)
+    assert full["total"] == 3
+    assert full["returned"] == 3
+    assert full["has_more"] is False
+    assert [it["kind"] for it in full["items"]] == ["code", "code", "data"]
+    assert full["code_ref_count"] == 2 and full["data_ref_count"] == 1
+    # deprecated dual shape stays full (function-info embeds it unpaged)
+    assert len(full["code_refs"]) == 2 and len(full["data_refs"]) == 1
+
+    page = instance._xrefs_to_address(bv, 0x5000, offset=0, limit=2)
+    assert page["returned"] == 2 and page["has_more"] is True
+    assert [it["kind"] for it in page["items"]] == ["code", "code"]
+    assert page["total"] == 3
+    # summary counts + dual shape reflect the FULL set regardless of paging
+    assert page["code_ref_count"] == 2 and len(page["code_refs"]) == 2
+
+
 def test_function_evidence_reports_calls_arguments_and_thunk_candidate(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

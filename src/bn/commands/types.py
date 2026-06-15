@@ -4,7 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from ..cli import _call, _mutation_exit_code, arg, command
+from ..cli import _call, _effective_limit, _mutation_exit_code, arg, command
 from ..formatters import (
     _render_mutation_text,
     _render_type_info_text,
@@ -14,12 +14,28 @@ from ..transport import BridgeError
 
 
 @command("types", help="List or search types", target=True, paged=True,
-         args=[arg("--query")])
+         args=[arg("--query"),
+               arg("--count", action="store_true", default=False,
+                   help="Show the total type count instead of listing")])
 def _types(args: argparse.Namespace) -> int:
+    if args.count:
+        return _call(
+            args,
+            "types",
+            {"query": args.query, "count_only": True},
+            require_target=True,
+            allow_implicit_target=True,
+            text_renderer=lambda value: f"Total types: {value.get('count', 0)}",
+            stem="types-count",
+        )
+    params = {"query": args.query, "offset": args.offset}
+    limit = _effective_limit(args)
+    if limit is not None:
+        params["limit"] = limit
     return _call(
         args,
         "types",
-        {"query": args.query, "offset": args.offset, "limit": args.limit},
+        params,
         require_target=True,
         allow_implicit_target=True,
         text_renderer=_render_type_list_text,

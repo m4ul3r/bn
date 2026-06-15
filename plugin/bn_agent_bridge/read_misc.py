@@ -109,7 +109,7 @@ def _paged_list_result(items: list[dict[str, Any]], *, offset: int,
 
 def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None,
              min_length: int | None = None, section: str | None = None,
-             no_crt: bool = False, regex: bool = False):
+             no_crt: bool = False, regex: bool = False, count_only: bool = False):
     offset = _validate_count(offset, label="offset", minimum=0)
     # allow_none mirrors the sibling list ops (imports/sections): limit=None
     # means "no limit", so a raw-socket / py exec caller can fetch every string.
@@ -171,6 +171,9 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
             "value": value,
         }
         items.append(entry)
+    if count_only:
+        # `total` mirrors the list envelope key for the same number (#165).
+        return {"count": len(items), "total": len(items)}
     items.sort(key=lambda item: (int(item["address"], 16), item["value"]))
     return _paged_list_result(items, offset=offset, limit=limit)
 
@@ -184,7 +187,7 @@ def _needed_libraries(bv) -> list[str]:
 
 
 def _imports(ctx, selector: str | None, *, summary: bool = False,
-             offset: int = 0, limit: int | None = None):
+             offset: int = 0, limit: int | None = None, count_only: bool = False):
     # Guard paging the same way the sibling list ops do, so a raw-socket /
     # py exec caller passing a negative offset/limit gets a clean
     # invalid_request instead of a silent Python negative-index slice (#68).
@@ -215,6 +218,8 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
                     "kind": kind,
                 }
             )
+    if count_only:
+        return {"count": len(items), "total": len(items)}
     if summary:
         # Summary aggregates the whole import set; paging would distort the
         # counts, so it always reflects every symbol regardless of offset/limit.
@@ -255,7 +260,7 @@ def _imports_build_summary(
 
 
 def _sections(ctx, selector: str | None, *, query: str | None = None,
-              offset: int = 0, limit: int | None = None):
+              offset: int = 0, limit: int | None = None, count_only: bool = False):
     # Re-enforce the count contract for raw socket / py exec callers: a
     # negative offset/limit must be a clean invalid_request, not Python
     # negative-slice behavior returning a silently-wrong subset (#100).
@@ -295,6 +300,8 @@ def _sections(ctx, selector: str | None, *, query: str | None = None,
                 entry["executable"] = bool(getattr(seg, "executable", None))
 
         items.append(entry)
+    if count_only:
+        return {"count": len(items), "total": len(items)}
     items.sort(key=lambda item: int(item["start"], 16))
     return _paged_list_result(items, offset=offset, limit=limit)
 

@@ -700,9 +700,22 @@ def _add_paged_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--limit",
         type=_positive_int,
-        default=100,
-        help="Maximum number of items to return (default: 100)",
+        default=None,
+        help="Maximum number of items to return (default: 100; full body with --out)",
     )
+
+
+def _effective_limit(args: argparse.Namespace) -> int | None:
+    """Resolve a paged command's page limit.
+
+    An explicit ``--limit`` always wins. Otherwise the default is 100 for an
+    on-screen page, but an unlimited (full-body) export when ``--out`` is given
+    -- so ``--out`` writes the complete result instead of silently capping at the
+    default page (#165). The argparse default is therefore None (the sentinel for
+    "not set"), not 100."""
+    if getattr(args, "limit", None) is not None:
+        return args.limit
+    return None if getattr(args, "out", None) else 100
 
 
 def _add_function_address_args(parser: argparse.ArgumentParser) -> None:
