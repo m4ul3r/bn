@@ -71,9 +71,16 @@ def _doctor(args: argparse.Namespace) -> int:
 
         loaded_version = ping.get("plugin_version") if isinstance(ping, dict) else None
         loaded_build_id = ping.get("plugin_build_id") if isinstance(ping, dict) else None
+        # Health signal in the JSON itself, matching what the text renderer
+        # prints (status=ok/error). Without these a scripted JSON health check
+        # could not tell a reachable instance from an unreachable one -- it had
+        # to re-derive reachability from the absence of `doctor.error`. (L16)
+        reachable = isinstance(ping, dict) and not ping.get("error")
         instances.append(
             {
                 "pid": instance.pid,
+                "reachable": reachable,
+                "status": "ok" if reachable else "error",
                 "socket_path": str(instance.socket_path),
                 "plugin_version": instance.plugin_version,
                 "plugin_build_id": loaded_build_id,

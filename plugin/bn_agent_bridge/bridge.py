@@ -249,6 +249,38 @@ class TargetManager:
         # otherwise inherit a dead view's stable view_id.
         self._ids_by_object: dict[int, tuple[weakref.ref, str]] = {}
         self._next_id = 1
+        # Stable view_ids of views with a committed-but-unsaved mutation. BN's
+        # bv.file.modified does NOT flip True after our verified rename/comment/
+        # retype writes, so `close` could not tell an agent it was about to
+        # discard annotations. We track dirtiness ourselves: set on a committed
+        # change, cleared on save, surfaced by close. (L15)
+        self._dirty_view_ids: set[str] = set()
+
+    def _stable_view_id(self, bv) -> str | None:
+        entry = self._ids_by_object.get(id(bv))
+        if entry is not None:
+            ref, vid = entry
+            if ref() is bv:
+                return vid
+        return None
+
+    def mark_dirty(self, bv) -> None:
+        """Record that *bv* has a committed mutation not yet written to a .bndb."""
+        with self._lock:
+            vid = self._stable_view_id(bv)
+            if vid is not None:
+                self._dirty_view_ids.add(vid)
+
+    def clear_dirty(self, bv) -> None:
+        with self._lock:
+            vid = self._stable_view_id(bv)
+            if vid is not None:
+                self._dirty_view_ids.discard(vid)
+
+    def is_dirty(self, bv) -> bool:
+        with self._lock:
+            vid = self._stable_view_id(bv)
+            return vid is not None and vid in self._dirty_view_ids
 
     def _view_name(self, bv) -> str:
         for attr in ("view_type", "name"):
@@ -747,9 +779,12 @@ class BinaryNinjaBridge:
 
     def _close_binary(self, path: str | None = None, target: str | None = None, all_: bool = False):
         def _snapshot(bv) -> dict[str, Any]:
+            # BN's bv.file.modified does not flip True after our verified
+            # mutations, so OR in the bridge's own committed-but-unsaved tracking
+            # (L15) -- otherwise close silently discards annotations.
             return {
                 "path": str(getattr(bv.file, "filename", "")),
-                "unsaved": bool(getattr(bv.file, "modified", False)),
+                "unsaved": bool(getattr(bv.file, "modified", False)) or self.targets.is_dirty(bv),
             }
 
         # A named path and all=true are mutually exclusive. The CLI already
@@ -840,6 +875,7 @@ class BinaryNinjaBridge:
                 f"Failed to save database to {out}: Binary Ninja reported no file was "
                 "written (check that the directory exists and is writable)"
             )
+        self.targets.clear_dirty(bv)  # mutations are now persisted (L15)
         return {"saved": True, "path": out}
 
     def _target_info(self, selector: str | None):
@@ -1457,7 +1493,23 @@ class BinaryNinjaBridge:
         return mutation_engine._run_local_restores(self.ctx, *a, **k)
 
     def _mutation(self, *a, **k):
-        return mutation_engine._mutation(self.ctx, *a, **k)
+        result = mutation_engine._mutation(self.ctx, *a, **k)
+        # A committed (non-preview) write that actually changed state leaves the
+        # view dirty until saved -- mark it so `close` can warn. A pure no-op
+        # (every op already in the requested state) changes nothing, so it does
+        # not dirty the view. (L15)
+        if isinstance(result, dict) and result.get("committed") and not result.get("preview"):
+            changed = any(
+                isinstance(r, dict) and r.get("status") == "verified"
+                for r in (result.get("results") or [])
+            )
+            if changed:
+                try:
+                    selector = a[0] if a else k.get("selector")
+                    self.targets.mark_dirty(self.targets.resolve(selector))
+                except Exception:
+                    pass
+        return result
 
     def _op_rename_symbol(self, *a, **k):
         return mutation_engine._op_rename_symbol(self.ctx, *a, **k)
