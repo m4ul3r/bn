@@ -2033,6 +2033,17 @@ def test_max_depth_validator_says_depth_not_index(capsys):
     assert "index must be" not in err
 
 
+def test_trace_max_depth_zero_rejected_at_parse_time(capsys):
+    # `trace --max-depth 0` is a 0-step budget the bridge rejects; the CLI must
+    # reject it at parse time so the contract matches (#129). --ip-depth 0 stays
+    # valid (it means "do not cross call boundaries").
+    with pytest.raises(SystemExit) as exc:
+        bn.cli.main(["trace", "f", "0x10", "--target", "active", "--max-depth", "0"])
+    assert exc.value.code == 2
+    _, err = capsys.readouterr()
+    assert "depth must be an integer >= 1" in err
+
+
 def test_entries_validator_hex_aware_and_rejects_zero(capsys):
     # evidence table --entries is wired to the shared count validator: hex is
     # accepted and a degenerate 0/negative is rejected with the standard message (#59).
@@ -4570,6 +4581,42 @@ def test_trace_render_step_grammar_singular_and_plural():
     two = dict(base, trace=base["trace"] + [
         {"ssa_var": "y#1", "terminates": True, "reason": "undefined_or_global", "depth": 1}])
     assert "2 steps" in formatters._render_trace_text(two)
+
+
+def test_trace_render_shows_arg_register_and_field_load_meta():
+    # header labels the traced arg with its register + C name; a field_load step
+    # renders base/offset/width (#162, #166).
+    from bn import formatters
+    value = {
+        "function": "parse", "function_address": "0x1000", "target_address": "0x1040",
+        "arg_index": 1, "arg_label": {"index": 1, "register": "x1", "name": "buf"},
+        "truncated": False, "step_count": 1,
+        "trace": [{"ssa_var": "len#3", "ssa_label": "len#3", "depth": 0,
+                   "reason": "field_load", "terminates": True,
+                   "base": "obj#1", "offset": "0x8", "width": 4,
+                   "il_text": "len#3 = [obj#1 + 8]", "address": "0x1030"}],
+        "hints": [],
+    }
+    text = formatters._render_trace_text(value)
+    assert 'arg[1] (x1, "buf")' in text
+    assert "field load" in text
+    assert "base=obj#1" in text and "offset=0x8" in text and "width=4" in text
+
+
+def test_trace_render_output_pointer_hint_replaces_empty_trace_message():
+    # an empty trace WITH an output-pointer hint shows the hint, not the bare
+    # "constant or immediate" dead-end (#166).
+    from bn import formatters
+    value = {
+        "function": "h", "function_address": "0x1000", "target_address": "0x1040",
+        "arg_index": 1, "arg_label": {"index": 1, "register": "x1"},
+        "truncated": False, "step_count": 0, "trace": [],
+        "hints": ["arg 1 is a pointer (address-of); trace the pointee instead."],
+    }
+    text = formatters._render_trace_text(value)
+    assert "constant or immediate" not in text
+    assert "hint:" in text
+    assert "pointer" in text
 
 
 def test_render_mutation_text_does_not_claim_rollback_when_revert_failed():

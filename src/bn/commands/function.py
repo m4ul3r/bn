@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-from ..cli import _call, _depth_int, _mutation_exit_code, _non_negative_int, _parse_line_range, _positive_int, arg, command, mutex
+from ..cli import _call, _depth_int, _mutation_exit_code, _non_negative_int, _parse_line_range, _positive_depth_int, _positive_int, arg, command, mutex
 from ..formatters import (
     _render_callsites_text,
     _render_evidence_xrefs_text,
@@ -512,8 +512,8 @@ def _evidence_init(args: argparse.Namespace) -> int:
              arg("--view", default="mlil", choices=("mlil", "hlil"),
                  help="IL view for SSA walking (default: mlil, broadest call coverage; "
                       "hlil misses calls whose return value is assigned)"),
-             arg("--max-depth", type=_depth_int, default=50,
-                 help="Maximum trace steps before truncation (default: 50)"),
+             arg("--max-depth", type=_positive_depth_int, default=50,
+                 help="Maximum trace steps before truncation (>= 1; default: 50)"),
              arg("--interprocedural", action="store_true", default=False,
                  help="Follow return values across call boundaries into callees"),
              arg("--ip-depth", type=_depth_int, default=2,

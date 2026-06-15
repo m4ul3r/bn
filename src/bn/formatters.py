@@ -1697,7 +1697,11 @@ _TRACE_REASON_LABELS: dict[str, str] = {
     # Legacy combined reason (still accepted on input): stay neutral.
     "function_parameter_or_global": "function parameter, global, or undefined",
     "memory_load": "memory load",
+    "field_load": "field load",
     "call_or_jump_boundary": "call boundary",
+    "definition": "definition",
+    "phi_source": "phi source",
+    "cross_function": "crosses into callee",
 }
 
 
@@ -1709,17 +1713,24 @@ def _render_trace_text(value: Any) -> str:
     target_addr = value.get("target_address", "<unknown>")
     arg_index = value.get("arg_index", 0)
     trace = list(value.get("trace") or [])
+    hints = [h for h in (value.get("hints") or []) if h]
 
-    header = (
-        f"backward trace of arg[{arg_index}] in {fn_name} @ {target_addr}"
-    )
+    # arg[N] (reg, "name") -- the calling-convention register + C-arg name (#166)
+    arg_lbl = value.get("arg_label") or {}
+    extra = ", ".join(
+        x for x in (arg_lbl.get("register"),
+                    (f'"{arg_lbl["name"]}"' if arg_lbl.get("name") else None)) if x)
+    arg_desc = f"arg[{arg_index}]" + (f" ({extra})" if extra else "")
+    header = f"backward trace of {arg_desc} in {fn_name} @ {target_addr}"
     step_word = "step" if len(trace) == 1 else "steps"
     info = f"  {fn_name} @ {fn_addr}  •  {len(trace)} {step_word}"
     if value.get("truncated"):
         info += "  •  truncated"
 
     if not trace:
-        return f"{header}\n{info}\n\n  constant or immediate — no SSA trace"
+        body = "\n".join(f"  hint: {h}" for h in hints) if hints \
+            else "  constant or immediate — no SSA trace"
+        return f"{header}\n{info}\n\n{body}"
 
     lines = [header, info, ""]
     current_fn: str | None = None
@@ -1730,7 +1741,7 @@ def _render_trace_text(value: Any) -> str:
 
         fn_ctx = step.get("function_context")
         cross_fn = step.get("cross_function")
-        ssa_var = step.get("ssa_var", "")
+        ssa_var = step.get("ssa_label") or step.get("ssa_var", "")
         addr = step.get("address")
         il_text = step.get("il_text") or ""
         reason = step.get("reason") or ""
@@ -1749,6 +1760,11 @@ def _render_trace_text(value: Any) -> str:
         if terminates:
             label = _TRACE_REASON_LABELS.get(reason, reason.replace("_", " "))
             line = f"  {ssa_var}  —  {label}"
+            if reason == "field_load":
+                meta = " ".join(
+                    f"{k}={step[k]}" for k in ("base", "offset", "width") if step.get(k) is not None)
+                if meta:
+                    line += f"  [{meta}]"
             if il_text:
                 line += f"  @ {addr}  {il_text}" if addr else f"  {il_text}"
             lines.append(line)
@@ -1758,4 +1774,6 @@ def _render_trace_text(value: Any) -> str:
             else:
                 lines.append(f"  {il_text}")
 
+    for h in hints:
+        lines.append(f"  hint: {h}")
     return "\n".join(lines)
