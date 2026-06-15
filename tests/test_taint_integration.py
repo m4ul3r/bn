@@ -118,6 +118,9 @@ def test_corpus_target(expected_path, tmp_path):
             kinds = {sl["origin"]["kind"] for sl in result["slices"]}
             assert kinds & set(case["origin_kinds"]), \
                 f"{stem}: backward origin {kinds} not in {case['origin_kinds']}"
+            for want_leaf in case.get("leaves", []):
+                assert any(l["kind"] == want_leaf["kind"] for l in result["leaves"]), \
+                    f"{stem}: expected backward leaf {want_leaf} not in {result['leaves']}"
             if case.get("expect_crossed"):
                 crossed = [c for sl in result["slices"] for c in (sl.get("crossed_functions") or [])]
                 assert case["expect_crossed"] in crossed, \

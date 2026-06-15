@@ -223,6 +223,56 @@ def test_render_taint_backward_text():
     assert "len#2 = len#1 + 4" in text
 
 
+def test_render_taint_groups_repeated_leaves():
+    # many near-identical frontier leaves must collapse to one grouped line with
+    # a count, not a wall of per-leaf lines (#160).
+    leaves = [{"kind": "unmodeled_callee", "address": hex(0x1000 + i),
+               "callee": {"name": "g_free", "address": "0x3000"}, "tainted_args": [0]}
+              for i in range(37)]
+    leaves.append({"kind": "unmodeled_callee", "address": "0x2000",
+                   "callee": {"name": "g_slist_append", "address": "0x3100"}, "tainted_args": [1]})
+    value = {"direction": "forward", "function": {"name": "f", "address": "0x10"},
+             "sources": [], "reached_sinks": [], "leaves": leaves,
+             "assumptions": [], "soundness": "x"}
+    text = _render_taint_text(value)
+    assert "UNRESOLVED LEAVES (38 in 2 group(s))" in text
+    assert "g_free" in text and "(x37)" in text
+    assert "g_slist_append" in text
+    # the 38 leaves collapse to exactly two rendered leaf lines
+    assert text.count("unmodeled_callee @") == 2
+
+
+def test_render_taint_grouped_leaves_top_n_cap():
+    # more distinct groups than the cap -> a "... and N more group(s)" summary.
+    leaves = [{"kind": "unmodeled_callee", "address": hex(0x1000 + i),
+               "callee": {"name": f"fn_{i}", "address": "0x3000"}, "tainted_args": [0]}
+              for i in range(20)]
+    value = {"direction": "forward", "function": {"name": "f", "address": "0x10"},
+             "sources": [], "reached_sinks": [], "leaves": leaves,
+             "assumptions": [], "soundness": "x"}
+    text = _render_taint_text(value)
+    assert "UNRESOLVED LEAVES (20)" in text
+    assert "... and 8 more group(s)" in text
+    assert "see --format json" in text
+
+
+def test_render_taint_field_load_unresolved_leaf():
+    # the #158 field_load_unresolved leaf renders base/offset/width, not a bare kind.
+    value = {"direction": "backward", "function": {"name": "parse", "address": "0x10"},
+             "sinks": [{"kind": "arg", "callee": "memcpy", "index": 2}],
+             "slices": [{"sink": {"callee": "memcpy", "address": "0x40", "seed": "x#1"},
+                         "origin": {"kind": "field_load_unresolved", "base": "obj#1",
+                                    "offset": "0x8", "width": 4},
+                         "slice": []}],
+             "leaves": [{"kind": "field_load_unresolved", "address": "0x30", "base": "obj#1",
+                         "offset": "0x8", "width": 4, "il_text": "x#1 = [obj#1 + 8]"}],
+             "assumptions": [], "soundness": "x"}
+    text = _render_taint_text(value)
+    assert "field_load_unresolved @ 0x30" in text
+    assert "base=obj#1" in text and "offset=0x8" in text and "width=4" in text
+    assert "origin: field_load_unresolved" in text
+
+
 def test_render_callgraph_indirect_unresolved():
     value = {
         "function": {"name": "dispatch", "address": "0x401200"},

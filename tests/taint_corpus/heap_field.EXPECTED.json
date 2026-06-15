@@ -1,0 +1,11 @@
+{
+  "description": "backward slice through a heap struct-field length: reaching-store recovery (handle_store) and an honest field_load_unresolved leaf when the store is out of scope (handle_extern) -- never a silent dead-end at malloc (#158)",
+  "lang": "c",
+  "backward": [
+    {"function": "handle_store", "sink": "arg:memcpy:2",
+     "origin_kinds": ["call", "source", "constant", "entry", "parameter", "field_load_unresolved"]},
+    {"function": "handle_extern", "sink": "arg:memcpy:2",
+     "origin_kinds": ["field_load_unresolved", "call", "source", "entry", "parameter"],
+     "leaves": [{"kind": "field_load_unresolved"}]}
+  ]
+}

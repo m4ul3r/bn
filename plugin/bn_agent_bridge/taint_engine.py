@@ -884,6 +884,124 @@ class TaintEngine:
             return None
         return self._walk_mem(ssaf, mv, la, tainted, set(), 0)
 
+    def _addr_base_var(self, ssaf: Any, expr: Any, depth: int = 0):
+        """The root SSA var / Variable an address expression is based on (the
+        ``base`` of ``*(base + off)``), following SSA copies. Like
+        :meth:`_addr_base_offset` but returns the var itself, so the backward
+        slice can inspect *its* definition (allocator? parameter?). None if the
+        base is not a single resolvable variable."""
+        if expr is None or depth > 8:
+            return None
+        op = op_name(expr)
+        if "ADDRESS_OF" in op:
+            return getattr(expr, "src", None) or getattr(expr, "var", None)
+        if op in ("MLIL_ADD", "MLIL_SUB"):
+            left = getattr(expr, "left", None)
+            right = getattr(expr, "right", None)
+            if self._int_const(right) is not None:
+                return self._addr_base_var(ssaf, left, depth + 1)
+            if op == "MLIL_ADD" and self._int_const(left) is not None:
+                return self._addr_base_var(ssaf, right, depth + 1)
+            return None
+        if is_ssa_var(expr):
+            try:
+                d = ssaf.get_ssa_var_definition(expr)
+            except Exception:
+                d = None
+            if d is not None and op_name(d) == "MLIL_SET_VAR_SSA":
+                sub = self._addr_base_var(ssaf, getattr(d, "src", None), depth + 1)
+                if sub is not None:
+                    return sub
+            return expr
+        reads = expr_reads(expr)
+        if len(reads) == 1:
+            return self._addr_base_var(ssaf, reads[0], depth + 1)
+        return None
+
+    def _source_call_fills(self, ssaf: Any, call_ins: Any, la: tuple):
+        """If *call_ins* is a modeled source whose output-pointer buffer
+        (``*arg:N``) resolves to ``la``'s base, return the callee name; else
+        None. Lets a backward field load recover the receive/fill API that
+        produced the bytes (e.g. ``read(fd, buf, n)``) instead of dead-ending."""
+        name = self._callee_name(self._resolve_direct_target(call_ins))
+        mkey, model = lookup_model(self.models, name)
+        if not model:
+            return None
+        params = self._call_params(call_ins)
+        for sd in model.get("sources") or []:
+            to = str(sd.get("to") or "")
+            if to.startswith("*arg:"):
+                idx = _try_arg_index(to)
+                if idx is not None and idx < len(params):
+                    ba = self._addr_base_offset(ssaf, params[idx])
+                    if ba is not None and ba[0] == la[0]:
+                        return mkey or name
+        return None
+
+    def _reaching_writer(self, ssaf, mv, la, seen, depth):
+        """Walk the memory-SSA chain backward from version *mv* for the writer of
+        address *la* = ``(base, offset)``. Returns ``("store", defn)`` for a
+        matching ``MLIL_STORE``, ``("source", call_defn, callee)`` for a modeled
+        source call that fills la's buffer, or None when the chain ends without a
+        recoverable writer (a genuinely unresolved field load, #158)."""
+        if mv is None or depth > 64:
+            return None
+        try:
+            mv = int(mv)
+        except Exception:
+            return None
+        if mv in seen:
+            return None
+        seen.add(mv)
+        try:
+            defn = ssaf.get_ssa_memory_definition(mv)
+        except Exception:
+            defn = None
+        if defn is None:
+            return None
+        op = op_name(defn)
+        if "STORE" in op:
+            sa = self._addr_base_offset(ssaf, getattr(defn, "dest", None))
+            if sa is not None and sa == la:
+                return ("store", defn)
+            return self._reaching_writer(ssaf, getattr(defn, "src_memory", None), la, seen, depth + 1)
+        if "MEM_PHI" in op:
+            for sv in self._mem_phi_sources(defn):
+                res = self._reaching_writer(ssaf, sv, la, seen, depth + 1)
+                if res is not None:
+                    return res
+            return None
+        if self._is_call(defn):
+            # Opaque memory writer: only recoverable if it is a modeled source
+            # filling la's buffer; otherwise the field load is unresolved.
+            hit = self._source_call_fills(ssaf, defn, la)
+            if hit is not None:
+                return ("source", defn, hit)
+        return None
+
+    def _field_base_is_alloc_or_param(self, ssaf: Any, func: Any, base_var: Any) -> bool:
+        """True when *base_var* (the pointer a field load is based on) is itself
+        defined by an allocator call or is a function parameter -- the two cases
+        where a silent dead-end reads as "locally allocated / clean" and so
+        warrants an explicit ``field_load_unresolved`` leaf (#158). A plain stack
+        buffer is neither, so its load keeps the existing slice behavior."""
+        if base_var is None:
+            return False
+        try:
+            defn = ssaf.get_ssa_var_definition(base_var)
+        except Exception:
+            defn = None
+        if defn is None:
+            return self._param_index_of(func, base_var) is not None
+        if self._is_call(defn):
+            name = self._callee_name(self._resolve_direct_target(defn))
+            _, model = lookup_model(self.models, name)
+            if model and (model.get("sink") or {}).get("class") == "alloc_size":
+                return True
+            if name and ("malloc" in name or "alloc" in name):
+                return True
+        return False
+
     def _param_index_of(self, func: Any, v: Any) -> int | None:
         """Index of the function parameter that *v* (an SSAVariable/Variable) is,
         or None. Matches by identifier first, then storage+name."""
@@ -2274,6 +2392,11 @@ class TaintEngine:
         origin = {"kind": "unresolved"}
         terminal_params: dict[int, Any] = {}
 
+        def _set_origin(o):
+            nonlocal origin
+            if origin["kind"] == "unresolved":
+                origin = o
+
         def walk(v, d):
             nonlocal origin
             if d > self.max_depth:
@@ -2314,6 +2437,56 @@ class TaintEngine:
                     origin = {"kind": "call", "callee": name}
                 return
             steps.append(_instr_dict(defn, reason="definition"))
+            src_expr = getattr(defn, "src", None)
+            if src_expr is not None and "LOAD" in op_name(src_expr):
+                la = self._addr_base_offset(ssaf, getattr(src_expr, "src", None))
+                if la is not None:
+                    rec = self._reaching_writer(
+                        ssaf, getattr(src_expr, "src_memory", None), la, set(), 0)
+                    if rec is not None and rec[0] == "store":
+                        # Recover the reaching store and continue the slice through
+                        # the value it wrote -- not the base pointer's allocation,
+                        # which dead-ends at malloc and reads as "clean" (#158).
+                        store_defn = rec[1]
+                        steps.append(_instr_dict(store_defn, reason="reaching store to field"))
+                        st_reads = expr_reads(getattr(store_defn, "src", None))
+                        if st_reads:
+                            for r in st_reads:
+                                walk(r, d + 1)
+                        else:
+                            cval = self._int_const(getattr(store_defn, "src", None))
+                            if cval is not None:
+                                _set_origin({"kind": "constant", "value": cval})
+                        return
+                    if rec is not None and rec[0] == "source":
+                        # The buffer was filled by a modeled receive/fill API; the
+                        # loaded bytes originate from that source.
+                        call_defn, callee = rec[1], rec[2]
+                        steps.append(_instr_dict(
+                            call_defn, reason=f"field filled by source {callee}"))
+                        _set_origin({"kind": "source", "callee": callee})
+                        return
+                    base_var = self._addr_base_var(ssaf, getattr(src_expr, "src", None))
+                    if self._field_base_is_alloc_or_param(ssaf, func, base_var):
+                        # No reaching store/source in scope and the base is an
+                        # allocation/parameter: a silent stop here reads as
+                        # "locally allocated / clean". Surface it honestly (#158).
+                        width = getattr(src_expr, "size", None)
+                        base_label = var_label(base_var) if base_var is not None else None
+                        leaf = {
+                            "kind": "field_load_unresolved",
+                            "address": hex(int(getattr(defn, "address", 0))),
+                            "base": base_label,
+                            "offset": (hex(la[1]) if isinstance(la[1], int) else None),
+                            "width": (int(width) if isinstance(width, int) else None),
+                            "il_text": str(defn),
+                        }
+                        if leaf not in self._bw_leaves:
+                            self._bw_leaves.append(leaf)
+                        _set_origin({"kind": "field_load_unresolved",
+                                     "base": base_label,
+                                     "offset": leaf["offset"], "width": leaf["width"]})
+                        return
             reads = ssa_reads(defn)
             # A definition that reads no further SSA vars is a leaf: if its source
             # is a compile-time constant, the slice bottoms out at that literal.

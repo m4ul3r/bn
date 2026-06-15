@@ -26,6 +26,7 @@ brittle across compilers/optimisation.
 | `vararg_sprintf.c`     | a tainted *later* vararg into sprintf taints the dest buffer -> system (full vararg propagation, not just the first) |
 | `global_buf.c`         | read() fills a global/static buffer, loaded back into a memcpy length (global buffer tracking) |
 | `file_write.c`         | tainted data into fwrite: flagged only with `--sink-class file_write`, silent by default (positive + negative) |
+| `heap_field.c`         | backward slice through a heap struct-field length: reaching-store recovery, and a `field_load_unresolved` leaf when the store is out of scope (no silent dead-end at malloc) |
 
 ## `EXPECTED.json` schema
 

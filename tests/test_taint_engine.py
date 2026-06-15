@@ -1565,6 +1565,186 @@ def test_backward_walk_truncation_recorded(process_func, models):
     assert any("truncated" in a for a in result["assumptions"])
 
 
+# --------------------------------------------------------------------------
+# #158 backward field-load: reaching-store recovery + field_load_unresolved leaf
+# --------------------------------------------------------------------------
+
+def _field8_addr(h1):
+    """Address expression [h#1 + 8] for the synthetic field load/store."""
+    a = FExpr("MLIL_ADD", "h#1 + 8", reads=[h1])
+    a.left = FExpr("MLIL_VAR_SSA", "h#1", reads=[h1])
+    a.right = FExpr("MLIL_CONST", "8", constant=8)
+    return a
+
+
+def _heap_field_program(with_store):
+    """g(src): h = malloc(0x10); t = read_u32(src); [h+8] = t; x = [h+8];
+    memcpy(d, s, x). Backward from memcpy:2 must, with the store present,
+    continue through it to read_u32; without it, surface the heap field load."""
+    MALLOC, READ_U32, MEMCPY = 0xa00, 0xa10, 0xa20
+    h = FVar("h", ident=40); t = FVar("t", ident=41); x = FVar("x", ident=42)
+    src = FVar("src", ident=43)
+    h1 = FSSA(h, 1); t1 = FSSA(t, 1); x1 = FSSA(x, 1); src0 = FSSA(src, 0)
+    malloc_call = FInstr(0, 0x10, "MLIL_CALL_SSA", "h#1 = malloc(0x10)", reads=[], writes=[h1],
+                         dest=FExpr("MLIL_CONST_PTR", hex(MALLOC), constant=MALLOC),
+                         params=[FExpr("MLIL_CONST", "0x10", constant=0x10)])
+    read_call = FInstr(1, 0x14, "MLIL_CALL_SSA", "t#1 = read_u32(src#0)", reads=[src0], writes=[t1],
+                       dest=FExpr("MLIL_CONST_PTR", hex(READ_U32), constant=READ_U32),
+                       params=[FExpr("MLIL_VAR_SSA", "src#0", reads=[src0])])
+    store = FInstr(2, 0x18, "MLIL_STORE_SSA", "[h#1 + 8] = t#1", reads=[h1, t1], writes=[],
+                   dest=_field8_addr(h1), src=FExpr("MLIL_VAR_SSA", "t#1", reads=[t1]))
+    store.src_memory = 0
+    store.dest_memory = 1
+    load_src = FExpr("MLIL_LOAD_SSA", "[h#1 + 8]", reads=[h1], src=_field8_addr(h1), src_memory=1)
+    load_src.size = 4
+    load = FInstr(3, 0x1c, "MLIL_SET_VAR_SSA", "x#1 = [h#1 + 8]", reads=[h1], writes=[x1], src=load_src)
+    sink = FInstr(4, 0x20, "MLIL_CALL_SSA", "memcpy(d, s, x#1)", reads=[x1], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", hex(MEMCPY), constant=MEMCPY),
+                  params=[FExpr("MLIL_VAR_SSA", "d", reads=[]),
+                          FExpr("MLIL_VAR_SSA", "s", reads=[]),
+                          FExpr("MLIL_VAR_SSA", "x#1", reads=[x1])])
+    body = [malloc_call, read_call] + ([store] if with_store else []) + [load, sink]
+    ssa = FSSAFunc(body, mem_defs={1: store} if with_store else {})
+    func = FFunc("g", 0x10, ssa, params=[src])
+    bv = FBV({MALLOC: "malloc", READ_U32: "read_u32", MEMCPY: "memcpy"})
+    return func, bv
+
+
+def test_backward_recovers_reaching_store_to_field(models):
+    # WITH the reaching store: the slice must continue through it to read_u32,
+    # not dead-end at malloc -- and emit NO field_load_unresolved leaf (#158).
+    func, bv = _heap_field_program(with_store=True)
+    engine = te.TaintEngine(bv, models)
+    result = engine.backward(func, [te.parse_locator("arg:memcpy:2")])
+    assert result["slices"]
+    origins = [(sl["origin"]["kind"], sl["origin"].get("callee")) for sl in result["slices"]]
+    assert ("call", "read_u32") in origins, origins
+    assert not any(l["kind"] == "field_load_unresolved" for l in result["leaves"])
+    reasons = [st.get("reason", "") for sl in result["slices"] for st in sl["slice"]]
+    assert any("reaching store to field" in r for r in reasons), reasons
+
+
+def test_backward_unresolved_field_load_emits_leaf(models):
+    # WITHOUT a reaching store, a heap field load (base is malloc) must surface a
+    # field_load_unresolved leaf with base/offset/width and origin -- not a
+    # silent dead-end at the allocation (#158).
+    func, bv = _heap_field_program(with_store=False)
+    engine = te.TaintEngine(bv, models)
+    result = engine.backward(func, [te.parse_locator("arg:memcpy:2")])
+    assert result["slices"]
+    leaf = next((l for l in result["leaves"] if l["kind"] == "field_load_unresolved"), None)
+    assert leaf is not None, result["leaves"]
+    assert leaf["base"] == "h#1"
+    assert leaf["offset"] == "0x8"
+    assert leaf["width"] == 4
+    assert any(sl["origin"]["kind"] == "field_load_unresolved" for sl in result["slices"])
+
+
+def test_backward_field_load_recovers_source_call(models):
+    # The buffer is filled by a modeled source (read) writing *arg:1; the load of
+    # that buffer must recover the source, not dead-end (#158).
+    READ, MEMCPY = 0xb00, 0xb20
+    h = FVar("h", ident=44); x = FVar("x", ident=45)
+    h1 = FSSA(h, 1); x1 = FSSA(x, 1)
+    malloc_call = FInstr(0, 0x10, "MLIL_CALL_SSA", "h#1 = malloc(0x10)", reads=[], writes=[h1],
+                         dest=FExpr("MLIL_CONST_PTR", "0xa00", constant=0xa00),
+                         params=[FExpr("MLIL_CONST", "0x10", constant=0x10)])
+    read_call = FInstr(1, 0x14, "MLIL_CALL_SSA", "read(fd, h#1 + 8, 0x4)", reads=[h1], writes=[],
+                       dest=FExpr("MLIL_CONST_PTR", hex(READ), constant=READ),
+                       params=[FExpr("MLIL_VAR_SSA", "fd", reads=[]),
+                               _field8_addr(h1),
+                               FExpr("MLIL_CONST", "0x4", constant=0x4)])
+    read_call.src_memory = 0
+    read_call.dest_memory = 1
+    load_src = FExpr("MLIL_LOAD_SSA", "[h#1 + 8]", reads=[h1], src=_field8_addr(h1), src_memory=1)
+    load_src.size = 4
+    load = FInstr(2, 0x18, "MLIL_SET_VAR_SSA", "x#1 = [h#1 + 8]", reads=[h1], writes=[x1], src=load_src)
+    sink = FInstr(3, 0x1c, "MLIL_CALL_SSA", "memcpy(d, s, x#1)", reads=[x1], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", hex(MEMCPY), constant=MEMCPY),
+                  params=[FExpr("MLIL_VAR_SSA", "d", reads=[]),
+                          FExpr("MLIL_VAR_SSA", "s", reads=[]),
+                          FExpr("MLIL_VAR_SSA", "x#1", reads=[x1])])
+    ssa = FSSAFunc([malloc_call, read_call, load, sink], mem_defs={1: read_call})
+    func = FFunc("g", 0x10, ssa, params=[FVar("fd")])
+    bv = FBV({0xa00: "malloc", READ: "read", MEMCPY: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.backward(func, [te.parse_locator("arg:memcpy:2")])
+    origins = [(sl["origin"]["kind"], sl["origin"].get("callee")) for sl in result["slices"]]
+    assert ("source", "read") in origins, origins
+    assert not any(l["kind"] == "field_load_unresolved" for l in result["leaves"])
+
+
+def test_backward_stack_buffer_load_keeps_prior_behavior(models):
+    # A plain stack-buffer byte load (base is neither allocator nor parameter)
+    # with no in-scope store/source must NOT become field_load_unresolved -- the
+    # #158 path must not over-trigger on ordinary stack loads.
+    buf = FVar("buf", typ="char[0x40]"); x = FVar("x", ident=60)
+    x1 = FSSA(x, 1)
+    load_src = FExpr("MLIL_LOAD_SSA", "[&buf]", reads=[], src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                     src_memory=1)
+    load_src.size = 1
+    load = FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "x#1 = buf[0]", reads=[], writes=[x1], src=load_src)
+    sink = FInstr(1, 0x14, "MLIL_CALL_SSA", "memcpy(d, s, x#1)", reads=[x1], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", "0x90", constant=0x90),
+                  params=[FExpr("MLIL_VAR_SSA", "d", reads=[]),
+                          FExpr("MLIL_VAR_SSA", "s", reads=[]),
+                          FExpr("MLIL_VAR_SSA", "x#1", reads=[x1])])
+    ssa = FSSAFunc([load, sink], mem_defs={})
+    func = FFunc("g", 0x10, ssa, params=[FVar("fd")])
+    bv = FBV({0x90: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.backward(func, [te.parse_locator("arg:memcpy:2")])
+    assert result["slices"]
+    assert not any(l["kind"] == "field_load_unresolved" for l in result["leaves"])
+    assert {sl["origin"]["kind"] for sl in result["slices"]} <= {"entry", "unresolved"}
+
+
+# --------------------------------------------------------------------------
+# #160 GLib library models
+# --------------------------------------------------------------------------
+
+def test_glib_models_present_and_shaped(models):
+    for name in ("g_malloc", "g_malloc0", "g_try_malloc0", "g_free", "g_strndup",
+                 "g_strdup_printf", "g_slist_append", "g_realloc", "g_memdup"):
+        assert name in models, name
+    assert models["g_malloc"]["sink"]["class"] == "alloc_size"
+    assert models["g_malloc"]["sink"]["tainted_args"] == [0]
+    assert models["g_realloc"]["sink"]["tainted_args"] == [1]
+    assert models["g_free"] == {}
+    assert models["g_strndup"]["propagates"][0]["to"] == "*ret"
+    assert models["g_slist_append"]["propagates"][0]["from"] == "arg:1"
+
+
+def test_forward_propagates_through_g_strndup(models):
+    # read fills buf; g_strndup(buf, n) returns a tainted copy; system(copy) must
+    # be reported -- the GLib dup must propagate, not be an unmodeled leaf (#160).
+    READ, GSTRNDUP, SYSTEM = 0x2000, 0x2100, 0x2200
+    buf = FVar("buf", typ="char[0x40]"); dup = FVar("dup", ident=80)
+    rsi = FVar("rsi"); rsi1 = FSSA(rsi, 1); dup1 = FSSA(dup, 1)
+    instrs = [
+        FInstr(0, 0x1000, "MLIL_SET_VAR_SSA", "rsi#1 = &buf", writes=[rsi1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+        FInstr(1, 0x1004, "MLIL_CALL_SSA", "read(fd, rsi#1, 0x40)", reads=[rsi1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", hex(READ), constant=READ),
+               params=[FExpr("MLIL_VAR_SSA", "fd", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "rsi#1", reads=[rsi1]),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+        FInstr(2, 0x1008, "MLIL_CALL_SSA", "dup#1 = g_strndup(rsi#1, 0x20)", reads=[rsi1], writes=[dup1],
+               dest=FExpr("MLIL_CONST_PTR", hex(GSTRNDUP), constant=GSTRNDUP),
+               params=[FExpr("MLIL_VAR_SSA", "rsi#1", reads=[rsi1]),
+                       FExpr("MLIL_CONST", "0x20", constant=0x20)]),
+        FInstr(3, 0x100c, "MLIL_CALL_SSA", "system(dup#1)", reads=[dup1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", hex(SYSTEM), constant=SYSTEM),
+               params=[FExpr("MLIL_VAR_SSA", "dup#1", reads=[dup1])]),
+    ]
+    func = FFunc("h", 0x1000, FSSAFunc(instrs), params=[FVar("fd")])
+    bv = FBV({READ: "read", GSTRNDUP: "g_strndup", SYSTEM: "system"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:read:1")])
+    assert any(s["sink"]["class"] == "command_injection" for s in result["reached_sinks"])
+    assert not any((l.get("callee") or {}).get("name") == "g_strndup" for l in result["leaves"])
+
+
 def test_backward_constant_through_copy_labeled_constant(models):
     # size = 0 reaches memcpy's length arg through a variable copy:
     #   var_2c#1 = 0 ; r2#4 = var_2c#1 ; memcpy(dst, src, r2#4)
