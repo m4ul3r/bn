@@ -44,7 +44,8 @@ def _bn(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
 
 
 def _session_start(*binaries: str, timeout: float = 30.0) -> dict:
-    cmd = [*_BN_CLI, "session", "start"]
+    # session start defaults to text output; this helper parses JSON.
+    cmd = [*_BN_CLI, "session", "start", "--format", "json"]
     cmd.extend(str(b) for b in binaries)
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     assert result.returncode == 0, f"session start failed: {result.stderr}"

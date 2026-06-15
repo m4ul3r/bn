@@ -2691,6 +2691,36 @@ def test_pointer_table_does_not_thumb_normalize_non_arm_pointers(monkeypatch):
     assert any("inside functions" in warning for warning in result["warnings"])
 
 
+def test_pointer_table_downgrades_inline_scalar_fields(monkeypatch):
+    """A mixed record {function ptr, uint8 flag, ptr} read at a fixed stride must
+    not count the inline scalar as a failed pointer resolution; only genuine
+    pointer slots feed the 'do not resolve' warning (#170)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    handler = _FakeFunction(0x401000, "handler")
+    # entry0: function pointer (plausible); entry1: a uint8 flag = 5 read as a
+    # pointer-sized slot (inline scalar); entry2: a large unmapped value (a
+    # genuine failed pointer slot that SHOULD still be counted).
+    table = (
+        (0x401000).to_bytes(4, "little")
+        + (5).to_bytes(4, "little")
+        + (0xDEADBEEF).to_bytes(4, "little")
+    )
+    bv = _FakeBV(functions=[handler], arch=_FakeArch(name="x86", address_size=4),
+                 memory={0x3000: table})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._pointer_table("active", "0x3000", entries=3)
+    rows = result["entries"]
+    assert rows[0]["plausible"] is True
+    assert rows[1]["likely_scalar"] is True and rows[1]["plausible"] is False
+    assert rows[2]["likely_scalar"] is False and rows[2]["plausible"] is False
+    warnings = " ".join(result["warnings"])
+    assert "1 non-null entries do not resolve to mapped addresses" in warnings  # only entry2
+    assert "inline scalar fields" in warnings                                   # entry1 noted
+
+
+
 def test_function_evidence_marks_plt_stubs_as_thunk_candidates(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

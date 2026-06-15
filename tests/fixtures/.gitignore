@@ -1,0 +1,2 @@
+# Built fixtures are regenerated from src/*.c by the Makefile; never commit them.
+*_x86_64

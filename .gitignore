@@ -11,8 +11,10 @@ wheels/
 .pytest_cache/
 *.sock
 
-# Test fixtures (compiled binaries and databases)
-tests/fixtures/
+# Test fixtures: ignore built binaries + databases, keep src/*.c + Makefile (#167)
+tests/fixtures/*_x86_64
+tests/fixtures/*.bndb
+tests/fixtures/*.bndb.*
 
 # Local dogfood/review scratch artifacts (not part of the project)
 DEEPSEEK_*.md
