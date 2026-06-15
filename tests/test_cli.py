@@ -2190,6 +2190,106 @@ def test_doctor_reports_stale_loaded_plugin(monkeypatch, tmp_path, capsys):
     assert payload["instances"][0]["stale_plugin_code"] is True
 
 
+def test_build_id_for_package_detects_engine_edit(tmp_path):
+    # #161: the whole-package fingerprint changes when ANY .py / model .json in
+    # the package changes -- not just bridge.py.
+    from bn.version import build_id_for_package
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "bridge.py").write_text("print('a')\n", encoding="utf-8")
+    (pkg / "taint_engine.py").write_text("X = 1\n", encoding="utf-8")
+    (pkg / "taint_models.json").write_text("{}\n", encoding="utf-8")
+    before = build_id_for_package(pkg)
+    assert before
+    # Editing a sibling module (NOT bridge.py) must change the package id.
+    (pkg / "taint_engine.py").write_text("X = 2\n", encoding="utf-8")
+    after = build_id_for_package(pkg)
+    assert after and after != before
+
+
+def test_doctor_flags_stale_engine(monkeypatch, tmp_path, capsys):
+    # #161: doctor reports a per-instance engine fingerprint and flags
+    # stale_engine when the loaded engine package diverges from on-disk.
+    install_dir = tmp_path / "install"
+    source_dir = tmp_path / "source"
+    install_dir.mkdir()
+    source_dir.mkdir()
+    for d in (install_dir, source_dir):
+        (d / "bridge.py").write_text("print('bridge')\n", encoding="utf-8")
+        (d / "taint_engine.py").write_text("X = 1\n", encoding="utf-8")
+
+    fake_instance = type("FakeInstance", (), {
+        "instance_id": "abc123", "pid": 123, "socket_path": tmp_path / "bridge.sock",
+        "plugin_version": bn.cli.VERSION, "started_at": "2026-03-09T00:00:00+00:00",
+    })()
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [fake_instance])
+    monkeypatch.setattr(bn.cli, "plugin_install_dir", lambda: install_dir)
+    monkeypatch.setattr(bn.cli, "plugin_source_dir", lambda: source_dir)
+    monkeypatch.setattr(
+        bn.cli, "_send_request_to_instance",
+        lambda instance, op, params=None, target=None: {"ok": True, "result": {
+            "plugin_name": "bn_agent_bridge", "plugin_version": bn.cli.VERSION,
+            "plugin_build_id": bn.cli.build_id_for_file(install_dir / "bridge.py"),
+            # Loaded engine fingerprint differs from on-disk -> stale_engine.
+            "engine_build_id": "staleengine00",
+            "pid": 123, "socket_path": str(tmp_path / "bridge.sock"), "targets": [],
+        }},
+    )
+
+    rc = bn.cli.main(["doctor", "--format", "json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    inst = payload["instances"][0]
+    assert inst["stale_engine"] is True
+    assert inst["stale_plugin_code"] is False  # bridge.py matches; only the engine is stale
+    assert payload["engine_install_build_id"]
+
+
+def test_session_restart_respawns_and_reloads_targets(monkeypatch, capsys):
+    from bn.transport import BridgeInstance
+    old = type("FakeInstance", (), {
+        "instance_id": "keep-me", "pid": 500,
+        "socket_path": __import__("pathlib").Path("/tmp/old.sock"),
+    })()
+    new = BridgeInstance(
+        pid=999, socket_path=__import__("pathlib").Path("/tmp/new.sock"),
+        registry_path=__import__("pathlib").Path("/tmp/new.json"),
+        plugin_name="bn_agent_bridge", plugin_version="0.1.0",
+        started_at="2026-01-01T00:00:00Z", meta={}, instance_id="keep-me",
+    )
+    calls = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        calls.append((op, instance_id, params))
+        return {"ok": True, "result": {"path": (params or {}).get("path")}}
+
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [old])
+    monkeypatch.setattr(bn.cli, "instance_selector", lambda i: getattr(i, "instance_id", ""))
+    monkeypatch.setattr(
+        bn.cli, "_send_request_to_instance",
+        lambda instance, op, params=None, target=None: {"ok": True, "result": [
+            {"filename": "/fw/svc_a", "analysis_state": "full"},
+        ]},
+    )
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
+    spawned = {}
+    def fake_spawn(instance_id=None):
+        spawned["id"] = instance_id
+        return new
+    monkeypatch.setattr(bn.cli, "spawn_instance", fake_spawn)
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["session", "restart", "keep-me", "--format", "json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["restarted"] is True
+    assert payload["instance_id"] == "keep-me"
+    assert spawned["id"] == "keep-me"             # respawned under the same id
+    ops = [c[0] for c in calls]
+    assert "shutdown" in ops and "load_binary" in ops   # stopped, then reloaded the target
+    assert any(c[0] == "load_binary" and (c[2] or {}).get("path") == "/fw/svc_a" for c in calls)
+
+
 def test_doctor_text_marks_healthy_instance_ok(monkeypatch, tmp_path, capsys):
     install_dir = tmp_path / "install"
     source_dir = tmp_path / "source"

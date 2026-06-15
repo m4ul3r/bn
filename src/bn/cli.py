@@ -36,7 +36,7 @@ from .transport import (  # noqa: F401
     validate_instance_id,
     wait_for_teardown,
 )
-from .version import VERSION, build_id_for_file  # noqa: F401
+from .version import VERSION, build_id_for_file, build_id_for_package  # noqa: F401
 
 
 class _HelpFullAction(argparse.Action):

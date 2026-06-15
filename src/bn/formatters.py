@@ -1561,6 +1561,10 @@ def _render_doctor_text(value: Any) -> str:
             lines.append("  stale: loaded plugin version differs from CLI version")
         if item.get("stale_plugin_code"):
             lines.append("  stale: loaded plugin code does not match installed plugin file")
+        if item.get("stale_engine"):
+            lines.append(
+                "  stale: loaded engine code (taint/IL modules) is out of date -- "
+                "run `bn session restart " + str(item.get("instance_id") or "<id>") + "`")
         if item.get("started_at"):
             lines.append(f"  started: {item['started_at']}")
         if item.get("socket_path"):

@@ -1,15 +1,20 @@
-"""Intraprocedural taint engine over Binary Ninja MLIL-SSA.
+"""Taint engine over Binary Ninja MLIL-SSA (forward propagation + backward slice).
 
 This module is intentionally free of any ``binaryninja`` import: it operates on
 whatever MLIL-SSA objects the bridge hands it (functions, instructions,
 SSAVariables, PossibleValueSets). That keeps it unit-testable against the same
 synthetic IL fakes the bridge tests use.
 
-Scope (MVP): single-function forward propagation and single-function backward
-slicing. Interprocedural stepping, indirect-call resolution and precise
-memory-SSA aliasing are explicitly deferred — every place the analysis is
-coarse or stops is surfaced in ``assumptions``/``leaves`` and the output always
-carries a ``soundness`` disclaimer. We never silently drop an edge.
+Scope (as shipped, not MVP): forward propagation and backward slicing, with
+*bounded* interprocedural stepping (descent into modeled/in-binary callees and
+ascent into callers, #146/#147), indirect-call resolution (value-set +
+agent-supplied ``resolve_map``), external/import-stub resolution (MLIL_EXTERN_PTR
+-> symbol model), per-callsite source attribution (additive ``by_source``), and
+memory-SSA store/load correlation where addresses match (coarse otherwise). What
+stays out of scope: precise path-sensitivity, full alias analysis, and any proof
+of reachability. Every place the analysis is coarse or stops is surfaced in
+``assumptions``/``leaves`` and the output always carries a ``soundness``
+disclaimer — we never silently drop an edge.
 
 API behaviour verified against /opt/binaryninja (see the design's spike):
   - ``func.mlil.ssa_form`` -> MediumLevelILFunction; ``.instructions`` iterable

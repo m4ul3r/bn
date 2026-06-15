@@ -56,3 +56,32 @@ def build_id_for_file(path: Path) -> str | None:
     except OSError:
         return None
     return hashlib.sha256(data).hexdigest()[:12]
+
+
+def build_id_for_package(directory: Path) -> str | None:
+    """Combined fingerprint of a bridge package: the sha256 of every ``*.py``
+    source plus the model DB (``*.json``) in *directory*, hashed in sorted order
+    (name + bytes). The single-file :func:`build_id_for_file` on ``bridge.py``
+    misses edits to sibling modules, so a live session running an edited
+    ``taint_engine.py`` looked fresh; this whole-package hash lets ``doctor`` flag
+    a stale *engine* (#161). Returns None if the directory can't be read."""
+    try:
+        files = sorted(
+            list(directory.glob("*.py")) + list(directory.glob("*.json")),
+            key=lambda p: p.name,
+        )
+    except OSError:
+        return None
+    if not files:
+        return None
+    digest = hashlib.sha256()
+    for path in files:
+        try:
+            data = path.read_bytes()
+        except OSError:
+            return None
+        digest.update(path.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(data)
+        digest.update(b"\0")
+    return digest.hexdigest()[:12]
