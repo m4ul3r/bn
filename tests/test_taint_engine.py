@@ -1920,3 +1920,17 @@ def test_local_definition_for_skips_import_only(models):
     bv = _ReimportBV({0x3000: FFunc("recv", 0x3000, FSSAFunc([]), symbol_type="ImportedFunctionSymbol")}, syms)
     engine = te.TaintEngine(bv, models)
     assert engine._local_definition_for("recv") is None
+
+
+def test_const_target_resolves_extern_ptr():
+    """const_target extracts the stub address from an MLIL_EXTERN_PTR dest (a
+    direct `bl` to an external helper on a statically-linked .ko), not just
+    MLIL_CONST_PTR -- so the callee name + its sink/source model are recovered
+    instead of the call looking indirect and all-clearing the sink. (T2)"""
+    assert te.const_target(FExpr("MLIL_EXTERN_PTR", "strlen", constant=0x997708)) == 0x997708
+    assert te.const_target(FExpr("MLIL_CONST_PTR", "f", constant=0x401000)) == 0x401000
+    # genuinely indirect (register-dest) and None stay None
+    assert te.const_target(FExpr("MLIL_VAR_SSA", "x")) is None
+    assert te.const_target(None) is None
+    # MLIL_IMPORT is intentionally excluded (its .constant is a GOT slot)
+    assert te.const_target(FExpr("MLIL_IMPORT", "got", constant=0x900000)) is None
