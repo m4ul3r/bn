@@ -1162,6 +1162,82 @@ def _render_values_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+def _render_leaf_line(leaf: dict[str, Any]) -> str:
+    """One text line for a single unresolved-frontier leaf."""
+    kind = leaf.get("kind")
+    if kind == "unmodeled_callee":
+        cal = leaf.get("callee") or {}
+        args = leaf.get("tainted_args") or []
+        return (
+            f"  unmodeled_callee @ {leaf.get('address')}"
+            f"  -> {cal.get('name', '?')} @ {cal.get('address', '?')}"
+            f"  (tainted arg(s) {args})"
+            + (f"  -- {leaf.get('note')}" if leaf.get("note") else "")
+        )
+    if kind == "field_load_unresolved":
+        bits = []
+        if leaf.get("base") is not None:
+            bits.append(f"base={leaf['base']}")
+        if leaf.get("offset") is not None:
+            bits.append(f"offset={leaf['offset']}")
+        if leaf.get("width") is not None:
+            bits.append(f"width={leaf['width']}")
+        meta = ("  " + " ".join(bits)) if bits else ""
+        return f"  field_load_unresolved @ {leaf.get('address')}{meta}"
+    return (
+        f"  {kind} @ {leaf.get('address')}  [{leaf.get('dest_expr', leaf.get('il_text', ''))}]"
+        + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
+    )
+
+
+def _leaf_group_key(leaf: dict[str, Any]) -> tuple:
+    """Collapse near-identical frontier leaves: one group per callee for
+    unmodeled calls, per (base, offset) for field loads, per kind otherwise."""
+    kind = leaf.get("kind")
+    if kind == "unmodeled_callee":
+        return (kind, (leaf.get("callee") or {}).get("name", "?"))
+    if kind == "field_load_unresolved":
+        return (kind, leaf.get("base"), leaf.get("offset"))
+    return (kind,)
+
+
+def _render_grouped_leaves(leaves: list[dict[str, Any]], *, top_n: int = 12) -> list[str]:
+    """Render unresolved leaves grouped by kind/callee with counts and a top-N
+    cap (full detail stays in --format json) so real binaries don't flood the
+    text output with a wall of near-identical leaves (#160)."""
+    groups: dict[tuple, dict[str, Any]] = {}
+    order: list[tuple] = []
+    for leaf in leaves:
+        gk = _leaf_group_key(leaf)
+        g = groups.get(gk)
+        if g is None:
+            groups[gk] = {"rep": leaf, "count": 1}
+            order.append(gk)
+        else:
+            g["count"] += 1
+    order.sort(key=lambda gk: groups[gk]["count"], reverse=True)
+    total = len(leaves)
+    ngroups = len(order)
+    hdr = f"UNRESOLVED LEAVES ({total}"
+    if ngroups != total:
+        hdr += f" in {ngroups} group(s)"
+    hdr += "):"
+    out = [hdr]
+    for gk in order[:top_n]:
+        g = groups[gk]
+        line = _render_leaf_line(g["rep"])
+        if g["count"] > 1:
+            line += f"  (x{g['count']})"
+        out.append(line)
+    if ngroups > top_n:
+        hidden = order[top_n:]
+        hidden_leaves = sum(groups[gk]["count"] for gk in hidden)
+        out.append(
+            f"  ... and {len(hidden)} more group(s) ({hidden_leaves} leaf(s)); "
+            "see --format json for the full list")
+    return out
+
+
 def _render_taint_path(steps: list[Any]) -> list[str]:
     out = []
     last = len(steps) - 1
@@ -1262,22 +1338,7 @@ def _render_taint_text(value: Any) -> str:
     leaves = list(value.get("leaves") or [])
     if leaves:
         lines.append("")
-        lines.append(f"UNRESOLVED LEAVES ({len(leaves)}):")
-        for leaf in leaves:
-            if leaf.get("kind") == "unmodeled_callee":
-                cal = leaf.get("callee") or {}
-                args = leaf.get("tainted_args") or []
-                lines.append(
-                    f"  unmodeled_callee @ {leaf.get('address')}"
-                    f"  -> {cal.get('name', '?')} @ {cal.get('address', '?')}"
-                    f"  (tainted arg(s) {args})"
-                    + (f"  -- {leaf.get('note')}" if leaf.get("note") else "")
-                )
-            else:
-                lines.append(
-                    f"  {leaf.get('kind')} @ {leaf.get('address')}  [{leaf.get('dest_expr', leaf.get('il_text', ''))}]"
-                    + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
-                )
+        lines.extend(_render_grouped_leaves(leaves))
     assumptions = list(value.get("assumptions") or [])
     if assumptions:
         lines.append("")
