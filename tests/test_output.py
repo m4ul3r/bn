@@ -114,6 +114,33 @@ def test_text_spill_envelope_stays_plaintext(tmp_path, monkeypatch):
     assert envelope["path"].endswith(".txt")
 
 
+def test_ndjson_streams_paged_envelope_records():
+    """ndjson on a paged envelope emits ONE record per item per line plus a
+    trailing {"_meta": true, ...} line -- real newline-delimited streaming, not
+    the whole envelope collapsed onto a single line. (J5)"""
+    from bn.output import render_value
+
+    env = {"items": [{"i": 0}, {"i": 1}, {"i": 2}], "total": 3, "offset": 0,
+           "limit": 3, "returned": 3, "has_more": False}
+    lines = render_value(env, "ndjson").strip().split("\n")
+    assert len(lines) == 4  # 3 records + 1 meta
+    recs = [json.loads(line) for line in lines]
+    assert recs[:3] == [{"i": 0}, {"i": 1}, {"i": 2}]
+    assert recs[3]["_meta"] is True
+    assert recs[3]["total"] == 3 and recs[3]["has_more"] is False
+    assert "items" not in recs[3]
+
+    # function-list dual key: stream by items, meta excludes BOTH page arrays
+    env2 = {"functions": [{"a": 1}], "items": [{"a": 1}], "total": 1, "has_more": False}
+    lines2 = render_value(env2, "ndjson").strip().split("\n")
+    assert len(lines2) == 2
+    meta2 = json.loads(lines2[1])
+    assert "functions" not in meta2 and "items" not in meta2
+
+    # a non-paged dict still renders as a single line (decompile, target info, ...)
+    assert len(render_value({"text": "x", "name": "f"}, "ndjson").strip().split("\n")) == 1
+
+
 def test_ndjson_spill_envelope_is_one_json_line(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     payload = [{"i": index} for index in range(1000)]

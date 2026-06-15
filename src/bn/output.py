@@ -56,6 +56,26 @@ def render_value(value: Any, fmt: str) -> str:
                 json.dumps(item, sort_keys=True, default=_json_default) for item in value
             ]
             return "\n".join(lines) + ("\n" if lines else "")
+        # A paged-list envelope ({items|functions:[...], total, offset, ...})
+        # is the common ndjson target; emit ONE record per item per line, then a
+        # trailing {"_meta": true, ...paging...} line -- actual newline-delimited
+        # streaming, not the whole envelope collapsed onto a single line (which
+        # was identical to compact --format json and defeated the point). (J5)
+        if isinstance(value, dict):
+            for page_key in ("items", "functions"):
+                page = value.get(page_key)
+                if isinstance(page, list):
+                    lines = [
+                        json.dumps(item, sort_keys=True, default=_json_default)
+                        for item in page
+                    ]
+                    meta = {
+                        k: v for k, v in value.items()
+                        if k not in ("items", "functions")
+                    }
+                    meta["_meta"] = True
+                    lines.append(json.dumps(meta, sort_keys=True, default=_json_default))
+                    return "\n".join(lines) + "\n"
         return json.dumps(value, sort_keys=True, default=_json_default) + "\n"
 
     if isinstance(value, str):
