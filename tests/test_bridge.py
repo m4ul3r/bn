@@ -4026,6 +4026,106 @@ def test_verify_local_retype_fails_when_identifier_vanished(monkeypatch):
     assert verified["observed"]["variable"] is None
 
 
+def test_verify_local_retype_relocates_register_local_dropped_from_hlil(monkeypatch):
+    """Narrowing a register-backed local (u32 -> u8) can drop it out of
+    hlil.vars even though func.vars still carries it correctly narrowed, so the
+    canonical (param/stack/hlil) scan misses it. Verification must relocate it
+    by its stable identifier across the full func.vars set and report
+    `verified`, not a cry-wolf `verification_failed` (#156)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    narrowed = _FakeVariable(
+        name="x0_1", storage=34, var_type="uint8_t", identifier=3001,
+        source_type="RegisterVariableSourceType",
+    )
+    fn = _FakeFunction(0x401000, "process_usb")
+    fn.hlil = types.SimpleNamespace(vars=[])  # dropped out of HLIL after narrow
+    fn.vars = [narrowed]                       # but still in the complete set
+    bv = _FakeBV(functions=[fn])
+
+    result = _local_retype_result(
+        variable="x0_1", storage=34, identifier=3001,
+        source_type="RegisterVariableSourceType",
+        before_type="int32_t", expected_type="uint8_t",
+    )
+    verified = instance._verify_operation(bv, result)
+    assert verified["status"] == "verified"
+    assert verified["observed"]["type"] == "uint8_t"
+    assert verified["observed"]["variable"] == "x0_1"
+
+
+def test_verify_local_retype_relocates_register_local_narrowed_u16(monkeypatch):
+    """Same relocation, u32 -> u16 (the other narrowing in #156's AC)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    narrowed = _FakeVariable(
+        name="x0_1", storage=34, var_type="uint16_t", identifier=3001,
+        source_type="RegisterVariableSourceType",
+    )
+    fn = _FakeFunction(0x401000, "process_usb")
+    fn.hlil = types.SimpleNamespace(vars=[])
+    fn.vars = [narrowed]
+    bv = _FakeBV(functions=[fn])
+
+    result = _local_retype_result(
+        variable="x0_1", storage=34, identifier=3001,
+        source_type="RegisterVariableSourceType",
+        before_type="int32_t", expected_type="uint16_t",
+    )
+    verified = instance._verify_operation(bv, result)
+    assert verified["status"] == "verified"
+    assert verified["observed"]["type"] == "uint16_t"
+
+
+def test_verify_local_retype_funcvars_match_is_identifier_exact(monkeypatch):
+    """The func.vars fallback matches on the unique identifier only: a
+    same-storage stranger with the expected type but a different identifier
+    must not be accepted (mirrors the canonical-scan safety guarantee)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    stranger = _FakeVariable(
+        name="other", storage=34, var_type="uint8_t", identifier=9999,
+        source_type="RegisterVariableSourceType",
+    )
+    fn = _FakeFunction(0x401000, "process_usb")
+    fn.hlil = types.SimpleNamespace(vars=[])
+    fn.vars = [stranger]  # id 3001 truly gone
+    bv = _FakeBV(functions=[fn])
+
+    result = _local_retype_result(
+        variable="x0_1", storage=34, identifier=3001,
+        source_type="RegisterVariableSourceType",
+        before_type="int32_t", expected_type="uint8_t",
+    )
+    verified = instance._verify_operation(bv, result)
+    assert verified["status"] == "verification_failed"
+    assert verified["observed"]["variable"] is None
+
+
+def test_find_var_for_restore_relocates_register_local_via_func_vars(monkeypatch):
+    """On revert, the non-journaled restore must also relocate a register local
+    that dropped out of the canonical set; otherwise the closure raises and the
+    clean preview falsely reports 'the view may be left modified' (#156)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    narrowed = _FakeVariable(
+        name="x0_1", storage=34, var_type="uint8_t", identifier=3001,
+        source_type="RegisterVariableSourceType",
+    )
+    fn = _FakeFunction(0x401000, "process_usb")
+    fn.hlil = types.SimpleNamespace(vars=[])
+    fn.vars = [narrowed]
+
+    found = bridge.mutation_engine._find_var_for_restore(
+        instance, fn, 3001, 34, False
+    )
+    assert found is narrowed
+
+
 # ---------------------------------------------------------------------------
 # Verification: prototype with implicit calling convention
 # ---------------------------------------------------------------------------
@@ -4614,6 +4714,54 @@ def test_validate_bool_accepts_real_booleans_and_default(monkeypatch):
     for bad in ("false", "true", 0, 1, "", "yes"):
         with pytest.raises(bridge.OperationFailure):
             bridge._validate_bool(bad, label="all", default=False)
+
+
+def test_batch_apply_binder_rejects_nonboolean_preview(monkeypatch):
+    """A raw/manifest client sending {"preview": "false"} must be rejected, not
+    silently coerced to truthy preview mode (#128)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    with pytest.raises(bridge.OperationFailure) as exc:
+        bridge._bind_batch_apply(instance, {"preview": "false", "ops": []}, None)
+    assert exc.value.status == "invalid_request"
+
+
+def test_mutation_binders_reject_nonboolean_preview(monkeypatch):
+    """Every single-mutation binder validates its `preview` flag as a real JSON
+    boolean before dispatching to _mutation (#128)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    binders = [
+        bridge._bind_function_create,
+        bridge._bind_rename_symbol,
+        bridge._bind_set_comment,
+        bridge._bind_delete_comment,
+        bridge._bind_set_prototype,
+        bridge._bind_local_rename,
+        bridge._bind_local_retype,
+        bridge._bind_struct_field_set,
+        bridge._bind_struct_field_rename,
+        bridge._bind_struct_field_delete,
+        bridge._bind_types_declare,
+    ]
+    # `address` satisfies _bind_function_create's params["address"] lookup, which
+    # is evaluated before the preview arg; harmless for the other binders.
+    for binder in binders:
+        with pytest.raises(bridge.OperationFailure) as exc:
+            binder(instance, {"preview": "false", "address": "0x1000"}, None)
+        assert exc.value.status == "invalid_request", binder.__name__
+
+
+def test_struct_field_set_rejects_nonboolean_overwrite_existing(monkeypatch):
+    """`overwrite_existing` is a documented boolean op field; a string must be
+    rejected rather than coerced to True and silently overwriting (#128)."""
+    bridge, instance, builder, bv = _struct_set_instance(monkeypatch, [(0, "x")])
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._op_struct_field_set(bv, {
+            "struct_name": "S", "offset": "0x8", "field_name": "newf",
+            "field_type": "int32_t", "overwrite_existing": "false"})
+    assert exc.value.status == "invalid_request"
+    assert builder.added == []  # never reached add_member_at_offset
 
 
 def test_list_functions_count_only_returns_count(monkeypatch):

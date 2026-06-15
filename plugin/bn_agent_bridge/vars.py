@@ -35,6 +35,30 @@ def _find_variable_by_storage(func, storage: int, *, is_parameter: bool | None =
     raise RuntimeError(f"Variable not found at storage {storage}")
 
 
+def _find_variable_by_identifier(func, identifier):
+    """Locate a variable by its BN identifier across the COMPLETE set
+    (``func.vars``), not just the canonical param/stack/HLIL union.
+
+    Narrowing a register-backed local (e.g. uint32_t -> uint8_t) can drop it
+    out of ``hlil.vars`` even though the retype landed and ``func.vars`` still
+    carries it correctly typed -- so ``_iter_canonical_variables`` (which
+    surfaces register locals only via HLIL) no longer yields it. The BN
+    identifier packs source_type|index|storage and is unique per variable, so
+    a match here is exact (no same-storage type-collision risk). Returns None
+    if ``identifier`` is None, ``func.vars`` is unavailable, or nothing
+    matches. (#156)"""
+    if identifier is None:
+        return None
+    try:
+        variables = list(func.vars)
+    except Exception:
+        return None
+    for var in variables:
+        if _variable_identifier(var) == identifier:
+            return var
+    return None
+
+
 def _variable_source_name(var) -> str:
     source_type = getattr(var, "source_type", None)
     if source_type is None:
