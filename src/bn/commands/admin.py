@@ -41,6 +41,10 @@ def _doctor(args: argparse.Namespace) -> int:
     source_bridge = source_dir / "bridge.py"
     install_build_id = cli.build_id_for_file(install_bridge)
     source_build_id = cli.build_id_for_file(source_bridge)
+    # Whole-package fingerprint (all *.py + model DB), so an edited engine module
+    # (e.g. taint_engine.py) is flagged even though bridge.py is unchanged (#161).
+    install_engine_id = cli.build_id_for_package(install_dir)
+    source_engine_id = cli.build_id_for_package(source_dir)
     requested = getattr(args, "instance", None)
     candidates = cli.list_instances()
     if requested:
@@ -71,6 +75,7 @@ def _doctor(args: argparse.Namespace) -> int:
 
         loaded_version = ping.get("plugin_version") if isinstance(ping, dict) else None
         loaded_build_id = ping.get("plugin_build_id") if isinstance(ping, dict) else None
+        loaded_engine_id = ping.get("engine_build_id") if isinstance(ping, dict) else None
         # Health signal in the JSON itself, matching what the text renderer
         # prints (status=ok/error). Without these a scripted JSON health check
         # could not tell a reachable instance from an unreachable one -- it had
@@ -78,6 +83,7 @@ def _doctor(args: argparse.Namespace) -> int:
         reachable = isinstance(ping, dict) and not ping.get("error")
         instances.append(
             {
+                "instance_id": getattr(instance, "instance_id", None),
                 "pid": instance.pid,
                 "reachable": reachable,
                 "status": "ok" if reachable else "error",
@@ -95,6 +101,16 @@ def _doctor(args: argparse.Namespace) -> int:
                     and install_build_id is not None
                     and loaded_build_id != install_build_id
                 ),
+                "engine_build_id": loaded_engine_id,
+                "installed_engine_build_id": install_engine_id,
+                # The loaded engine package diverges from on-disk: this live
+                # session is running stale logic (e.g. an edited taint_engine.py
+                # after a git pull). `bn session restart <id>` reloads it (#161).
+                "stale_engine": (
+                    bool(loaded_engine_id)
+                    and install_engine_id is not None
+                    and loaded_engine_id != install_engine_id
+                ),
                 "started_at": instance.started_at,
                 "doctor": ping,
             }
@@ -106,6 +122,8 @@ def _doctor(args: argparse.Namespace) -> int:
         "plugin_install_dir": str(install_dir),
         "plugin_source_build_id": source_build_id,
         "plugin_install_build_id": install_build_id,
+        "engine_source_build_id": source_engine_id,
+        "engine_install_build_id": install_engine_id,
         "instances": instances,
     }
     if args.format == "text":
@@ -342,6 +360,82 @@ def _session_stop(args: argparse.Namespace) -> int:
         result = _render_session_stop_text(result)
     cli._render_result(result, fmt=args.format, out_path=args.out, stem="session-stop")
     return 0
+
+
+@command("session", "restart", help="Stop a bridge session and respawn it (same id), reloading its targets",
+         args=[arg("instance", help="Instance ID to restart")])
+def _session_restart(args: argparse.Namespace) -> int:
+    """Cleanly reload a live session running stale code (#161): capture its open
+    targets, stop the process, respawn under the same instance id, and reload the
+    same binaries -- so the new bridge serves current code without the caller
+    hunting for the right paths."""
+    target_id = args.instance
+    inst = next(
+        (
+            i for i in cli.list_instances()
+            if i.instance_id == target_id or cli.instance_selector(i) == target_id
+        ),
+        None,
+    )
+    if inst is None:
+        raise BridgeError(
+            f"No bridge instance found with id: {target_id}. See `bn session list`."
+        )
+    resolved_id = inst.instance_id
+
+    # Capture loaded targets (+ their analysis state) BEFORE tearing down.
+    reload_targets: list[dict[str, Any]] = []
+    try:
+        resp = cli._send_request_to_instance(inst, "list_targets", params={}, target=None)
+        for t in (resp.get("result") or []):
+            path = t.get("filename")
+            if path:
+                reload_targets.append({"path": path, "quick": t.get("analysis_state") == "quick"})
+    except Exception:
+        pass
+
+    # Stop the old process: graceful shutdown, then SIGTERM/SIGKILL escalation,
+    # blocking until the socket/registry are gone so the respawn can reuse the id.
+    try:
+        cli.send_request("shutdown", instance_id=resolved_id)
+    except BridgeError:
+        with contextlib.suppress(OSError):
+            os.kill(inst.pid, signal.SIGTERM)
+    if not cli.wait_for_teardown(inst, timeout=5.0):
+        with contextlib.suppress(OSError):
+            os.kill(inst.pid, signal.SIGKILL)
+        if not cli.wait_for_teardown(inst, timeout=2.0):
+            raise BridgeError(
+                f"bridge instance {target_id} (pid {inst.pid}) did not tear down; "
+                "cannot restart cleanly. Stop it manually and re-spawn."
+            )
+
+    instance = cli.spawn_instance(resolved_id)
+    reloaded: list[Any] = []
+    for t in reload_targets:
+        try:
+            r = cli.send_request(
+                "load_binary",
+                params={"path": t["path"], "prefer_bndb": True, "quick": t["quick"]},
+                instance_id=instance.instance_id,
+            )
+            reloaded.append(r["result"])
+        except BridgeError as exc:
+            reloaded.append({"path": t["path"], "error": str(exc)})
+
+    failures = [x for x in reloaded if isinstance(x, dict) and x.get("error")]
+    result: dict[str, Any] = {
+        "instance_id": instance.instance_id,
+        "pid": instance.pid,
+        "socket_path": str(instance.socket_path),
+        "restarted": True,
+        # Rendered by the session-start text renderer under "loaded".
+        "loaded": reloaded,
+    }
+    if args.format == "text":
+        result = _render_session_start_text(result)
+    cli._render_result(result, fmt=args.format, out_path=args.out, stem="session-restart")
+    return 1 if failures else 0
 
 
 def _rss_mb(pid: int) -> float | None:

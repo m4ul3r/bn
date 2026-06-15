@@ -44,7 +44,7 @@ from ._shared import (
 from .op_registry import REGISTRY, op
 from .paths import PLUGIN_NAME, bridge_registry_path, bridge_socket_path, instances_dir
 from .seam import BridgeContext
-from .version import VERSION, build_id_for_file
+from .version import VERSION, build_id_for_file, build_id_for_package
 
 try:
     import binaryninjaui as ui
@@ -53,6 +53,10 @@ except Exception:  # ImportError or UIPluginInHeadlessError
 
 
 PLUGIN_BUILD_ID = build_id_for_file(Path(__file__).resolve())
+# Whole-package fingerprint captured at import time: the code this live process
+# is actually running. `doctor` compares it to the on-disk package so an edited
+# engine module (e.g. taint_engine.py) is flagged stale, not just bridge.py (#161).
+ENGINE_BUILD_ID = build_id_for_package(Path(__file__).resolve().parent)
 
 # Upper bound on a single newline-terminated JSON request. Anything larger is
 # rejected with a clean error instead of being buffered without limit.
@@ -714,6 +718,8 @@ class BinaryNinjaBridge:
             "plugin_name": PLUGIN_NAME,
             "plugin_version": VERSION,
             "plugin_build_id": PLUGIN_BUILD_ID,
+            # Whole-package fingerprint of the code this process loaded (#161).
+            "engine_build_id": ENGINE_BUILD_ID,
             "pid": os.getpid(),
             "socket_path": str(self.socket_path),
             "targets": self.targets.refresh(),
