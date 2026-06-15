@@ -11,6 +11,7 @@ brittle across compilers/optimisation.
 | target                 | exercises                                              |
 |------------------------|--------------------------------------------------------|
 | `overflow.c`           | read() -> load -> arithmetic -> memcpy length (positive, fwd + bwd) |
+| `read_bounded.c`       | `call:` source seeds the read() return; the read-bounded memcpy length is `bounded_len` (with source bound), not overflow (#157/#159) |
 | `sanitized.c`          | constant memcpy length (negative — no false positive)  |
 | `command_injection.c`  | tainted buffer -> system() pointer arg (external model)|
 | `indirect_call.c`      | tainted data into a function-pointer call (leaf, not dropped) |

@@ -3,6 +3,8 @@
   "lang": "c",
   "forward": [
     {"function": "handler", "source": "arg:read:1",
+     "sinks": [{"callee": "system", "class": "command_injection", "arg": 0}]},
+    {"function": "handler", "source": "call:read",
      "sinks": [{"callee": "system", "class": "command_injection", "arg": 0}]}
   ]
 }
