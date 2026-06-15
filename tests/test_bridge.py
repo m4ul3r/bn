@@ -1184,6 +1184,84 @@ def test_parse_type_or_hint_shared_by_all_type_ops(monkeypatch):
     assert "\n" not in msg                   # BN's multi-line parser text collapsed
 
 
+def test_batch_struct_field_accepts_type_name_alias(monkeypatch):
+    """A struct_field_* batch op may use `type_name` (the key the output /
+    affected_types surface uses, and an analyst's natural reflex) as an alias
+    for the canonical `struct_name`, instead of failing validation with
+    'missing required field struct_name' (M12)."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+
+    # the alias is normalized in place for every struct_field_* kind
+    for kind in ("struct_field_set", "struct_field_rename", "struct_field_delete"):
+        op = {"op": kind, "type_name": "Elf64_Sym"}
+        me._normalize_struct_alias(op)
+        assert op["struct_name"] == "Elf64_Sym", kind
+
+    # an explicit struct_name always wins (alias never clobbers it)
+    op = {"op": "struct_field_rename", "struct_name": "A", "type_name": "B"}
+    me._normalize_struct_alias(op)
+    assert op["struct_name"] == "A"
+
+    # non-struct ops are left untouched
+    op = {"op": "rename_symbol", "type_name": "X"}
+    me._normalize_struct_alias(op)
+    assert "struct_name" not in op
+
+    # end-to-end through _apply_operation: validation no longer rejects a
+    # type_name-only struct op, and the handler receives struct_name
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[])
+    seen = {}
+
+    def _stub_rename(ctx, bv_, op_):
+        seen["op"] = op_
+        return {"status": "verified"}
+
+    monkeypatch.setattr(me, "_op_struct_field_rename", _stub_rename)
+    result = me._apply_operation(
+        instance.ctx, bv,
+        {"op": "struct_field_rename", "type_name": "Elf64_Sym",
+         "old_name": "st_info", "new_name": "sym_info"},
+    )
+    assert result == {"status": "verified"}
+    assert seen["op"]["struct_name"] == "Elf64_Sym"
+
+
+def test_preview_diff_truncated_to_stay_inline(monkeypatch):
+    """A previewed mutation's per-function `diff` is capped so a single rename /
+    proto preview on a large function stays inline instead of tripping the 10k
+    spill threshold; the full diff stays available via --out. (M14)"""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+
+    # a short diff passes through untouched
+    short = "\n".join(f"line {i}" for i in range(10))
+    assert me._truncate_preview_diff(short) == short
+
+    # a long diff is capped to max_lines + a marker pointing at --out
+    long = "\n".join(f"line {i}" for i in range(me.PREVIEW_DIFF_MAX_LINES + 500))
+    out = me._truncate_preview_diff(long)
+    body, _, marker = out.rpartition("\n")
+    assert len(body.splitlines()) == me.PREVIEW_DIFF_MAX_LINES
+    assert "diff truncated" in marker and "500 more" in marker and "--out" in marker
+
+    # integration: a whole-body change yields a bounded diff, changed=True, and
+    # the focused snippet excerpt is still present for the glance
+    ctx = bridge.BinaryNinjaBridge().ctx
+    big_before = "\n".join(f"old {i}" for i in range(2000))
+    big_after = "\n".join(f"new {i}" for i in range(2000))
+    diffs = me._diff_snapshots(
+        ctx,
+        {0x1000: {"text": big_before, "name": "f"}},
+        {0x1000: {"text": big_after, "name": "f"}},
+    )
+    d = diffs[0]
+    assert d["changed"] is True
+    assert len(d["diff"].splitlines()) <= me.PREVIEW_DIFF_MAX_LINES + 1
+    assert "before_excerpt" in d
+
+
 def test_function_name_summary_counts_named_vs_auto(monkeypatch):
     """target info needs a function-count summary every agent reaches for.
     Auto-named functions are BN's sub_<addr> / j_sub_<addr> defaults; named are
