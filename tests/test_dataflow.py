@@ -158,6 +158,53 @@ def test_render_taint_forward_text():
     assert "soundness:" in text
 
 
+def test_render_taint_forward_frontier_message():
+    # reached_sinks empty BUT an unmodeled_callee frontier leaf -> the terminal
+    # line must be frontier-aware, not the bare "no sinks reached" (#8).
+    value = {
+        "direction": "forward",
+        "function": {"name": "ipc_read", "address": "0x1000"},
+        "sources": [{"kind": "arg", "callee": "recv", "index": 1}],
+        "reached_sinks": [],
+        "leaves": [{"kind": "unmodeled_callee", "address": "0x1008",
+                    "callee": {"name": "parse_event", "address": "0x3000"},
+                    "tainted_args": [0],
+                    "note": "tainted data passed to in-binary callee with no model; investigate"}],
+        "assumptions": [],
+        "soundness": "may-analysis",
+    }
+    text = _render_taint_text(value)
+    assert "no sinks reached by tainted data" not in text
+    assert "no modeled sink reached" in text
+    assert "1 tainted frontier" in text
+    # the call -> callee hand-off line for the frontier leaf
+    assert "parse_event @ 0x3000" in text
+    assert "0x1008" in text
+
+
+def test_render_taint_forward_by_source():
+    # by_source present -> a per-source attribution section keyed by call addr.
+    sink = {"callee": "strcpy", "address": "0x24", "tainted_arg_index": 1,
+            "class": "overflow_unbounded", "detail": "unbounded copy"}
+    value = {
+        "direction": "forward",
+        "function": {"name": "server", "address": "0x10"},
+        "sources": [{"kind": "arg", "callee": "recv", "index": 1}],
+        "reached_sinks": [{"sink": sink, "path": []}],
+        "leaves": [],
+        "assumptions": [],
+        "by_source": {
+            "0x14": {"reached_sinks": [{"sink": sink, "path": []}], "leaves": []},
+            "0x1c": {"reached_sinks": [], "leaves": []},
+        },
+        "soundness": "may-analysis",
+    }
+    text = _render_taint_text(value)
+    assert "PER-SOURCE" in text
+    assert "0x14" in text and "0x1c" in text
+    assert "strcpy" in text
+
+
 def test_render_taint_backward_text():
     value = {
         "direction": "backward",
