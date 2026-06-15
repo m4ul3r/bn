@@ -68,6 +68,25 @@ REQUIRED_ONE_OF: dict[str, tuple[tuple[str, ...], ...]] = {
     "delete_comment": (("function", "address"),),
 }
 
+
+def _normalize_struct_alias(op: dict[str, Any]) -> dict[str, Any]:
+    """Accept ``type_name`` as an alias for ``struct_name`` on struct_field_* ops.
+
+    The output surfaces a struct's identifier under ``type_name`` (affected_types
+    entries, ``types show``), so a batch manifest inferred from what the tool
+    *shows* naturally uses ``type_name`` and would otherwise fail validation with
+    "missing required field 'struct_name'". Normalize to the canonical
+    ``struct_name`` in place (an explicit ``struct_name`` always wins) so the
+    pre-apply snapshot pass and the apply both resolve the struct. (M12)
+    """
+    if not isinstance(op, dict):
+        return op
+    kind = op.get("op")
+    if isinstance(kind, str) and kind.startswith("struct_field_"):
+        if "struct_name" not in op and "type_name" in op:
+            op["struct_name"] = op["type_name"]
+    return op
+
 # Op kinds that mutate a function's local variables via create_user_var /
 # set_user_type, which BN may PROPAGATE onto aliased siblings. Batches with any
 # of these get a full per-function local snapshot so revert paths can undo the
@@ -400,6 +419,29 @@ def _snippet_for_change(ctx, before_text: str, after_text: str, *, context_lines
 
 
 
+# A previewed mutation's per-function `diff` is a full unified diff of the HLIL
+# body. A rename/prototype change ripples through every call site, so for a large
+# function the diff can be the whole body (~85 KB / ~1.5k lines) -- enough that a
+# single-op preview trips the 10k-token spill threshold and the analyst must read
+# an artifact off disk just to confirm one rename landed. The focused
+# before/after_excerpt already captures the change for a glance; cap the full
+# diff so the common single-op preview stays inline, and point at --out / the
+# spill artifact for the complete diff. (M14)
+PREVIEW_DIFF_MAX_LINES = 120
+
+
+def _truncate_preview_diff(diff: str, max_lines: int = PREVIEW_DIFF_MAX_LINES) -> str:
+    lines = diff.splitlines()
+    if len(lines) <= max_lines:
+        return diff
+    hidden = len(lines) - max_lines
+    kept = "\n".join(lines[:max_lines])
+    return (
+        f"{kept}\n... (diff truncated: {hidden} more line(s); "
+        f"re-run with --out <path> for the full diff)"
+    )
+
+
 def _diff_snapshots(ctx, before: dict[int, Any], after: dict[int, Any]):
     diffs = []
     snippets_added = 0
@@ -431,7 +473,7 @@ def _diff_snapshots(ctx, before: dict[int, Any], after: dict[int, Any]):
                 "before_name": old.get("name"),
                 "after_name": new.get("name"),
                 "changed": bool(text_changed or name_changed or comments_changed or locals_changed),
-                "diff": diff,
+                "diff": _truncate_preview_diff(diff),
             }
         )
         if text_changed and snippets_added < 3:
@@ -954,6 +996,7 @@ def _apply_operation(ctx, bv, op: dict[str, Any], restores: list | None = None):
             "invalid_request",
             f"each manifest operation must be a JSON object, got {type(op).__name__}",
         )
+    _normalize_struct_alias(op)  # type_name -> struct_name alias for struct ops (M12)
     # A missing `op` key must be its own invalid_request, NOT silently assumed
     # to be a rename_symbol -- a typo'd/absent op kind would otherwise apply
     # the wrong mutation (#48). Internal single-op callers always set `op`.
@@ -1164,6 +1207,12 @@ def _run_local_restores(ctx, bv, restores) -> bool:
 def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[str, Any]]):
     if not operations:
         raise ValueError("Batch operation list is empty")
+
+    # Normalize struct field op aliases up front so the pre-apply snapshot pass
+    # (_guess_affected_functions / _capture_type_snapshots) resolves the struct
+    # under the same key the apply will, not just _apply_operation. (M12)
+    for op in operations:
+        _normalize_struct_alias(op)
 
     bv = ctx._resolve_view(selector)
     affected = _guess_affected_functions(ctx, bv, operations)
