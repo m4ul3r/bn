@@ -13,3 +13,11 @@ wheels/
 
 # Test fixtures (compiled binaries and databases)
 tests/fixtures/
+
+# Local dogfood/review scratch artifacts (not part of the project)
+DEEPSEEK_*.md
+*VIBERSS*
+RE-VIBE.json
+vibe_check.py
+vibe_report.json
+.dogfood/
