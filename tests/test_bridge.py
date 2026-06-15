@@ -4223,6 +4223,50 @@ def _register_views(bridge, *bvs):
     bridge._headless_views.extend(bvs)
 
 
+def test_committed_mutation_marks_view_dirty_until_saved(monkeypatch):
+    """A committed (non-preview) mutation that actually changed state marks the
+    view dirty so `close` can warn -- BN's bv.file.modified never flips True for
+    our writes. A preview or a pure no-op must NOT dirty the view, and
+    clear_dirty (called on save) resets it. (L15)"""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFileBV("/proj/svc", session_id="1")
+    bridge._headless_views.clear()
+    bridge._headless_views.extend([bv])
+    instance.targets.refresh()  # assign the stable view_id
+    tm = instance.targets
+
+    assert tm._stable_view_id(bv) is not None
+    assert tm.is_dirty(bv) is False
+
+    # low-level mark/clear round-trips
+    tm.mark_dirty(bv)
+    assert tm.is_dirty(bv) is True
+    tm.clear_dirty(bv)            # this is what _save_database calls
+    assert tm.is_dirty(bv) is False
+
+    me = bridge.mutation_engine
+    verified = {"committed": True, "preview": False, "results": [{"status": "verified"}]}
+    noop = {"committed": True, "preview": False, "results": [{"status": "noop"}]}
+    previewed = {"committed": False, "preview": True, "results": [{"status": "verified"}]}
+
+    # the facade marks dirty only on a committed write that actually changed state
+    monkeypatch.setattr(me, "_mutation", lambda ctx, *a, **k: verified)
+    instance._mutation("active", False, [{"op": "rename_symbol"}])
+    assert tm.is_dirty(bv) is True
+
+    tm.clear_dirty(bv)
+    monkeypatch.setattr(me, "_mutation", lambda ctx, *a, **k: previewed)
+    instance._mutation("active", True, [{"op": "rename_symbol"}])
+    assert tm.is_dirty(bv) is False  # preview never dirties
+
+    monkeypatch.setattr(me, "_mutation", lambda ctx, *a, **k: noop)
+    instance._mutation("active", False, [{"op": "rename_symbol"}])
+    assert tm.is_dirty(bv) is False  # a pure no-op changed nothing
+
+    bridge._headless_views.clear()
+
+
 def test_selector_uses_basename_when_unique(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     bv_a = _FakeFileBV("/proj/alpha.bndb", session_id="11")

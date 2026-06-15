@@ -1473,7 +1473,9 @@ def _render_doctor_text(value: Any) -> str:
             lines.append("- " + _render_fallback_text(item))
             continue
         doctor = item.get("doctor") if isinstance(item.get("doctor"), dict) else {}
-        status = "ok" if doctor and not doctor.get("error") else "error"
+        # Prefer the status the JSON carries (L16) so text and JSON can't drift;
+        # fall back to deriving it for any caller that built the dict the old way.
+        status = item.get("status") or ("ok" if doctor and not doctor.get("error") else "error")
         lines.append(
             "- "
             + f"pid={item.get('pid', '<unknown>')} plugin={item.get('plugin_version', '<unknown>')} status={status}"

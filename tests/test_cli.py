@@ -2225,6 +2225,45 @@ def test_doctor_text_marks_healthy_instance_ok(monkeypatch, tmp_path, capsys):
     assert "status=error" not in output
 
 
+def test_doctor_json_carries_reachable_and_status(monkeypatch, tmp_path, capsys):
+    """doctor --format json must carry the same health signal the text mode shows
+    (reachable / status), so a scripted JSON health check can read it directly
+    instead of re-deriving reachability from the absence of doctor.error. (L16)"""
+    install_dir = tmp_path / "install"
+    source_dir = tmp_path / "source"
+    install_dir.mkdir()
+    source_dir.mkdir()
+    (install_dir / "bridge.py").write_text("print('b')\n", encoding="utf-8")
+    (source_dir / "bridge.py").write_text("print('b')\n", encoding="utf-8")
+
+    def _inst(pid, name):
+        return type("FakeInstance", (), {
+            "pid": pid, "socket_path": tmp_path / f"{name}.sock",
+            "plugin_version": bn.cli.VERSION, "started_at": "2026-03-09T00:00:00+00:00",
+            "instance_id": name,
+        })()
+
+    ok_inst, bad_inst = _inst(1, "ok"), _inst(2, "bad")
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [ok_inst, bad_inst])
+    monkeypatch.setattr(bn.cli, "plugin_install_dir", lambda: install_dir)
+    monkeypatch.setattr(bn.cli, "plugin_source_dir", lambda: source_dir)
+
+    def fake_send(instance, op, params=None, target=None):
+        if instance is ok_inst:
+            return {"ok": True, "result": {
+                "plugin_version": bn.cli.VERSION, "plugin_build_id": "b", "targets": []}}
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(bn.cli, "_send_request_to_instance", fake_send)
+
+    rc = bn.cli.main(["doctor", "--format", "json"])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    by_pid = {i["pid"]: i for i in data["instances"]}
+    assert by_pid[1]["reachable"] is True and by_pid[1]["status"] == "ok"
+    assert by_pid[2]["reachable"] is False and by_pid[2]["status"] == "error"
+
+
 def test_symbol_rename_text_format_renders_mutation_summary(monkeypatch, capsys):
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "rename_symbol"
