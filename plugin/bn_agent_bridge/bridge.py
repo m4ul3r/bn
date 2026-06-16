@@ -1661,7 +1661,7 @@ def _bind_list_functions(bridge, params, target):
         min_address=params.get("min_address"),
         max_address=params.get("max_address"),
         offset=int(params.get("offset", 0)),
-        limit=int(params["limit"]) if "limit" in params else None,
+        limit=int(params["limit"]) if params.get("limit") is not None else None,
         count_only=_validate_bool(params.get("count_only"), label="count_only", default=False),
         sort=str(params.get("sort", "address")),
     )
@@ -1677,7 +1677,7 @@ def _bind_search_functions(bridge, params, target):
         min_address=params.get("min_address"),
         max_address=params.get("max_address"),
         offset=int(params.get("offset", 0)),
-        limit=int(params["limit"]) if "limit" in params else None,
+        limit=int(params["limit"]) if params.get("limit") is not None else None,
         sort=str(params.get("sort", "address")),
     )
 
@@ -1926,7 +1926,11 @@ def _bind_list_comments(bridge, params, target):
         target,
         query=params.get("query"),
         offset=int(params.get("offset", 0)),
-        limit=int(params["limit"]) if "limit" in params else None,
+        # `limit: None` ("no limit") is the CLI default and is sent as a present
+        # key, so guard on the VALUE not key presence -- `"limit" in params`
+        # would do int(None) and crash a bare `comment list`. Matches the
+        # strings/imports/sections/types binders.
+        limit=int(params["limit"]) if params.get("limit") is not None else None,
     )
 
 

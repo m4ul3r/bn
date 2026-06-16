@@ -2188,6 +2188,23 @@ def test_list_functions_binder_forwards_sort(monkeypatch):
     assert [r["name"] for r in res2["functions"]] == ["big_fn", "small_fn"]
 
 
+def test_function_binders_tolerate_none_limit(monkeypatch):
+    """A raw-protocol / py-exec / batch caller can send `limit: None` (key
+    present, null value) to list_functions / search_functions -- the CLI omits
+    the key when None, but the bridge protocol accepts arbitrary params. The
+    binder must read None as "no limit", not int(None) -- the same key-presence
+    vs value-not-None guard bug that crashed `comment list`."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[_FakeFunction(0x1000, "alpha"), _FakeFunction(0x2000, "beta")])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    res = bridge._bind_list_functions(instance, {"limit": None, "offset": 0}, "active")
+    assert len(res["functions"]) == 2
+    res2 = bridge._bind_search_functions(instance, {"query": "alpha", "limit": None, "offset": 0}, "active")
+    assert len(res2["functions"]) == 1
+
+
 def test_function_list_envelope_exposes_items_alias_and_count_total(monkeypatch):
     # JSON-consistency: function list/search expose the universal `items` key
     # (alias of `functions`) so `data["items"]` works across every list command;
@@ -7286,3 +7303,30 @@ def test_list_comments_returns_paging_envelope(monkeypatch):
     assert res["returned"] == 2
     assert res["has_more"] is True
     assert [i["comment"] for i in res["items"]] == ["first", "second"]
+
+
+def test_bind_list_comments_tolerates_none_limit(monkeypatch):
+    """The CLI sends `limit: None` (the --limit default) for a bare `comment
+    list`, so the key is present with value None. The binder must read that as
+    "no limit" -- guarding on `params.get("limit") is not None`, like every
+    sibling list binder -- not on key presence, which does int(None) and crashes
+    the command with a raw `int() argument must be ... not 'NoneType'` TypeError
+    (regression from the #131 paging-envelope adoption)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+    bv.address_comments = {0x1000: "first", 0x2000: "second"}
+    bv.get_functions_containing = lambda addr: []
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    # Exactly what the CLI forwards for `bn comment list` with no --limit/--offset.
+    res = bridge._bind_list_comments(instance, {"query": None, "offset": 0, "limit": None}, "active")
+    assert res["total"] == 2
+    assert res["returned"] == 2
+    assert res["limit"] is None       # None means "no limit", parity with siblings
+    assert res["has_more"] is False
+
+    # An explicit --limit still pages.
+    res2 = bridge._bind_list_comments(instance, {"query": None, "offset": 0, "limit": 1}, "active")
+    assert res2["returned"] == 1
+    assert res2["has_more"] is True
