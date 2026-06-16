@@ -82,6 +82,14 @@ Pass `--no-bndb` to force loading the raw binary even when a sibling `.bndb` exi
 
 `bn load` blocks until analysis completes (the bridge runs `update_analysis_and_wait()` and the CLI socket has no timeout). Plan for it on large binaries.
 
+**Quick load (`--quick` / `--no-analysis`).** `bn load --quick` and `bn session start --quick` skip that analysis pass (~1s instead of waiting for the full function set), at the cost of a **capability boundary** — the container is parsed but the code is not yet analyzed:
+
+- Ready immediately: `bn sections`, `bn imports`, the symbol table, `bn target list` / `bn target info` (flagged `[not analyzed]`, JSON `analysis_state: "quick"`).
+- `bn strings` **errors** until `bn refresh` (it refuses with a "Strings are not available … Run `bn refresh`" directive rather than return an empty list that reads as "no strings").
+- **Partial** until `bn refresh`: `bn function list` / `bn function search` (only entry-point + symbol functions exist pre-analysis; the count grows after refresh), and `bn decompile` / `bn il` / `bn disasm` / `bn xrefs` across the binary.
+
+Run `bn refresh` once to promote the view to full analysis (`analysis_state` flips to `"full"`), or `bn decompile <fn> --force-analysis` to analyze a single function without the full pass. Branch on `analysis_state` rather than guessing from empty results. Loading a `.bndb` ignores `--quick` (the database already carries its analysis).
+
 `--instance` is accepted on every subcommand (env `BN_INSTANCE`).
 
 Requests time out after 600s by default so a wedged bridge can't hang the CLI; override with `BN_REQUEST_TIMEOUT=<seconds>` (`0` disables).

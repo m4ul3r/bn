@@ -29,6 +29,8 @@ Start broad, then narrow:
    ```
    Note the total count, address range, and whether symbols are stripped. A stripped binary with 2000 functions requires different tactics than a symbolicated one with 50. For *vulnerability* work on a stripped static target, see the "Stripped / static lane" in `bn-vr`, which inverts the import-first workflow (strings → string-xref → behavioral sink recovery).
 
+> **Quick-loaded target?** If the binary was opened with `bn load --quick` / `bn session start --quick` (fast, no analysis), `bn imports` and `bn sections` work, but `bn strings` **errors** until `bn refresh` (it refuses rather than return nothing) and `bn function list` is **partial** (only entry-point + symbol functions) — steps 2–3 would otherwise read as "no strings, almost no functions" and mislead the survey. Check `analysis_state` in `bn target info` (`"quick"` vs `"full"`) and `bn refresh` before surveying. See "Quick Load" in the `bn` skill.
+
 ## Function Triage
 
 Not all functions matter equally. Prioritize:

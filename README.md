@@ -84,6 +84,57 @@ bn instance clear
 
 If exactly one BinaryView is open, target-specific commands can omit `--target` entirely. If multiple targets are open, pass `--target <selector>` from `bn target list`, or pin one with `bn target use <selector>` (and `bn target clear` to undo).
 
+## Quick Load
+
+`bn load --quick` (alias `--no-analysis`) and `bn session start --quick` skip Binary Ninja's full analysis pass (`update_analysis_and_wait`), so a binary is ready in ~1s instead of after the whole function set has been recovered. The trade-off is a **capability boundary**: a quick-loaded view has its container parsed but its code not yet analyzed, so some commands refuse outright and others return a partial result until you refresh.
+
+Ready immediately after `--quick`:
+
+- `bn sections`
+- `bn imports`
+- the symbol table (and `bn rename` against named symbols)
+- `bn target list` / `bn target info` (the view is flagged `[not analyzed]`)
+
+Need `bn refresh` first — these depend on the analysis pass:
+
+- `bn strings` **errors** until you refresh — it refuses with "Strings are not available: this target was loaded with --quick (no analysis). Run bn refresh …" rather than return an empty list that looks like "this binary has no strings".
+- `bn function list` / `bn function search` return a **partial** set — only entry-point and symbol functions exist before analysis; the count grows once the analysis pass recovers the rest.
+- `bn decompile` / `bn il` / `bn disasm` / `bn xrefs` across the binary are partial for the same reason (functions BN hasn't discovered yet aren't there to read).
+
+Run `bn refresh` once to promote a quick view to full analysis:
+
+```bash
+bn load /path/to/firmware.bin --quick   # fast: container ready, code not analyzed yet
+bn sections                             # works now
+bn strings                              # errors: "Strings are not available … Run bn refresh"
+bn refresh                              # runs update_analysis_and_wait()
+bn strings                              # now returns the full string set
+```
+
+Single-function escape hatch — analyze just one function without a full refresh:
+
+```bash
+bn decompile handle_request --force-analysis
+```
+
+Loading a `.bndb` ignores `--quick`: a database already carries its saved analysis, so the flag is a no-op there.
+
+### Detecting a quick view programmatically
+
+`bn target list` / `bn target info --format json` carry an `analysis_state` field (and the matching `analyzed` boolean), so automation can branch on it instead of inferring the state from a `strings` error or a short function list:
+
+```json
+{
+  "target_id": "firmware.bin@0",
+  "selector": "firmware.bin",
+  "basename": "firmware.bin",
+  "analyzed": false,
+  "analysis_state": "quick"
+}
+```
+
+`analysis_state` is `"quick"` before analysis and `"full"` after `bn refresh`. A consumer that sees `"quick"` should `bn refresh` before relying on `strings` or the full function set.
+
 ## Target Selection
 
 Use `bn target list` to see available targets:
