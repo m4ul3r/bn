@@ -869,6 +869,82 @@ def test_forward_value_operand_taint_keeps_overflow_class(models):
     assert "tainted_index" not in classes
 
 
+def test_forward_var_defined_index_downgraded(models):
+    # #163 followup: real BN does NOT inline the address -- it computes it into a
+    # temp and passes the SSA var: `t = (i << 3) + 0x404060; strcpy(dst, t)`. The
+    # arg is a MLIL_VAR_SSA wrapper, so the detector must follow its definition to
+    # the index computation (shift-scaled offset off a bare MLIL_CONST base).
+    i = FVar("i"); i0 = FSSA(i, 0)
+    t = FVar("t"); t1 = FSSA(t, 1)
+    add_src = FExpr("MLIL_ADD", "(i#0 << 3) + 0x404060", reads=[i0],
+                    left=FExpr("MLIL_LSL", "i#0 << 3", reads=[i0],
+                               left=FExpr("MLIL_VAR_SSA", "i#0", reads=[i0]),
+                               right=FExpr("MLIL_CONST", "3", constant=3)),
+                    right=FExpr("MLIL_CONST", "0x404060", constant=0x404060))
+    def_ins = FInstr(0, 0x40, "MLIL_SET_VAR_SSA", "t#1 = (i#0 << 3) + 0x404060",
+                     reads=[i0], writes=[t1], src=add_src)
+    call = FInstr(1, 0x44, "MLIL_CALL_SSA", "strcpy(dst, t#1)", reads=[t1], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", "strcpy", constant=0x800),
+                  params=[FExpr("MLIL_VAR_SSA", "dst#0", reads=[]),
+                          FExpr("MLIL_VAR_SSA", "t#1", reads=[t1])])
+    func = FFunc("copy_idx", 0x40, FSSAFunc([def_ins, call]), params=[i])
+    engine = te.TaintEngine(FBV({0x800: "strcpy"}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+
+    classes = {x["sink"]["class"] for x in result["reached_sinks"]}
+    assert "tainted_index" in classes
+    assert "overflow_unbounded" not in classes
+
+
+def test_forward_fortified_overflow_source_index_downgraded(models):
+    # #163 followup: the fortified copy family (__strcpy_chk etc.) carries class
+    # `fortified_overflow`; an index-only tainted SOURCE must downgrade too.
+    i = FVar("i"); i0 = FSSA(i, 0)
+    src_expr = FExpr("MLIL_ADD", "0x9000 + i#0 * 0x38", reads=[i0],
+                     left=FExpr("MLIL_CONST_PTR", "0x9000", constant=0x9000),
+                     right=FExpr("MLIL_MUL", "i#0 * 0x38", reads=[i0],
+                                 left=FExpr("MLIL_VAR_SSA", "i#0", reads=[i0]),
+                                 right=FExpr("MLIL_CONST", "0x38", constant=0x38)))
+    call = FInstr(0, 0x40, "MLIL_CALL_SSA", "__strcpy_chk(dst, 0x9000+i#0*0x38, n)",
+                  reads=[i0], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", "strcpy_chk", constant=0x820),
+                  params=[FExpr("MLIL_VAR_SSA", "dst#0", reads=[]), src_expr,
+                          FExpr("MLIL_CONST", "0x100", constant=0x100)])
+    func = FFunc("copy_chk", 0x40, FSSAFunc([call]), params=[i])
+    engine = te.TaintEngine(FBV({0x820: "strcpy_chk"}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+
+    classes = {x["sink"]["class"] for x in result["reached_sinks"]}
+    assert "tainted_index" in classes
+    assert "fortified_overflow" not in classes
+
+
+def test_forward_fortified_length_keeps_overflow(models):
+    # Soundness lock: a fortified LENGTH (__memcpy_chk arg2) computed as
+    # `header + count*elem` is a real attacker-controlled length -- the source-arg
+    # only broadening must leave it fortified_overflow, not downgrade it.
+    count = FVar("count"); c0 = FSSA(count, 0)
+    header = FVar("hdr"); h0 = FSSA(header, 0)
+    len_expr = FExpr("MLIL_ADD", "hdr#0 + count#0 * 0x10", reads=[h0, c0],
+                     left=FExpr("MLIL_VAR_SSA", "hdr#0", reads=[h0]),
+                     right=FExpr("MLIL_MUL", "count#0 * 0x10", reads=[c0],
+                                 left=FExpr("MLIL_VAR_SSA", "count#0", reads=[c0]),
+                                 right=FExpr("MLIL_CONST", "0x10", constant=0x10)))
+    call = FInstr(0, 0x40, "MLIL_CALL_SSA", "__memcpy_chk(dst, src, hdr#0+count#0*0x10, n)",
+                  reads=[h0, c0], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", "memcpy_chk", constant=0x830),
+                  params=[FExpr("MLIL_VAR_SSA", "dst#0", reads=[]),
+                          FExpr("MLIL_VAR_SSA", "src#0", reads=[]), len_expr,
+                          FExpr("MLIL_CONST", "0x100", constant=0x100)])
+    func = FFunc("copy_chk_n", 0x40, FSSAFunc([call]), params=[count])
+    engine = te.TaintEngine(FBV({0x830: "memcpy_chk"}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+
+    classes = {x["sink"]["class"] for x in result["reached_sinks"]}
+    assert "fortified_overflow" in classes
+    assert "tainted_index" not in classes
+
+
 def test_forward_resolve_map_overrides_unresolved(models):
     # an indirect call with no VSA info, resolved by an agent-supplied map
     buf = FVar("buf"); buf0 = FSSA(buf, 0)

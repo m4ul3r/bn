@@ -46,6 +46,29 @@ SOUNDNESS = (
     "leaves; NOT a proof of reachability"
 )
 
+# Overflow sink classes whose finding is reclassified to `tainted_index` when the
+# taint reaches the sink only through an array index/offset (#163). Covers the
+# plain copy/length classes and the fortified (__*_chk / *_s) family, which spans
+# both copy-source pointer args and length args -- the per-arg pointer role is
+# resolved separately from the model's buffer-propagation rules, not the class.
+_OVERFLOW_INDEX_CLASSES = frozenset({"overflow_unbounded", "overflow_len", "fortified_overflow"})
+
+
+def _model_buffer_source_args(model: dict[str, Any]) -> frozenset[int]:
+    """Arg indices the model propagates a buffer FROM (``*arg:N`` in a
+    ``propagates`` rule's ``from``). These are the copy-SOURCE pointer args (e.g.
+    strcpy / __strcpy_chk arg1), as opposed to length scalars -- used to decide
+    whether the index-role broadening applies to a given sink arg (#163)."""
+    out: set[int] = set()
+    for rule in model.get("propagates") or []:
+        frm = rule.get("from")
+        if isinstance(frm, str) and "arg:" in frm:
+            try:
+                out.add(int(frm.split("arg:", 1)[1]))
+            except ValueError:
+                pass
+    return frozenset(out)
+
 
 class TaintError(RuntimeError):
     """User-facing taint configuration/resolution error."""
@@ -712,9 +735,16 @@ class TaintEngine:
         if expr is None or depth > 8 or not self._expr_has_taint(expr, tainted):
             return roles
         op = op_name(expr)
-        if is_ssa_var(expr):
+        # Resolve a bare var read -- a raw SSAVariable OR its MLIL_VAR_SSA
+        # expression wrapper (what real BN emits as a call arg) -- to its
+        # definition, so an address computed into a temp
+        # (`t = base + i*stride; sink(t)`) is analyzed structurally instead of
+        # being treated as an opaque tainted leaf. Without this the detector only
+        # ever saw inline-arithmetic args and missed the real BN shape (#163).
+        ssa_var = self._as_single_ssa_var(expr)
+        if ssa_var is not None:
             try:
-                d = ssaf.get_ssa_var_definition(expr)
+                d = ssaf.get_ssa_var_definition(ssa_var)
             except Exception:
                 d = None
             if d is not None and op_name(d) == "MLIL_SET_VAR_SSA":
@@ -1830,10 +1860,19 @@ class TaintEngine:
                                 # overflow) rather than over-stating overflow_*
                                 # (#163). Conservative: ambiguous cases stay
                                 # overflow_* so a real overflow is never hidden.
-                                if eff_sink.get("class") in ("overflow_unbounded", "overflow_len") \
+                                # The arg is a copy-SOURCE pointer (vs a length
+                                # scalar) when the model propagates a buffer FROM
+                                # it (`*arg:<argidx>` in propagates.from) -- true
+                                # for strcpy/strcpy_chk arg1, false for the memcpy/
+                                # memcpy_chk length arg2. This drives the register-
+                                # base index broadening per-arg, so a fortified
+                                # length stays an overflow while a fortified source
+                                # index downgrades.
+                                _ptr_arg = eff_sink.get("class") == "overflow_unbounded" \
+                                    or argidx in _model_buffer_source_args(model)
+                                if eff_sink.get("class") in _OVERFLOW_INDEX_CLASSES \
                                         and self._sink_taint_is_index_only(
-                                            ssaf, params[argidx], tainted,
-                                            pointer_arg=eff_sink.get("class") == "overflow_unbounded"):
+                                            ssaf, params[argidx], tainted, pointer_arg=_ptr_arg):
                                     _prior = eff_sink.get("class")
                                     eff_sink = {
                                         **eff_sink,
