@@ -734,13 +734,12 @@ class BinaryNinjaBridge:
 
         load_path = resolved
         notes: list[str] = []
-        if prefer_bndb and resolved.suffix != ".bndb":
-            sibling = Path(str(resolved) + ".bndb")
-            if sibling.exists():
-                load_path = sibling
-                notes.append(
-                    f"loaded {sibling} instead of {resolved} (use --no-bndb to skip)"
-                )
+        sibling = _resolve_bndb_sidecar(resolved, prefer_bndb)
+        if sibling is not None:
+            load_path = sibling
+            notes.append(
+                f"loaded {sibling} instead of {resolved} (use --no-bndb to skip)"
+            )
 
         # Always open without auto-analysis, then analyze explicitly unless
         # --quick. Quick load skips update_analysis_and_wait() entirely -- the
@@ -2007,24 +2006,49 @@ READ_LOCKED_OPS = frozenset(REGISTRY.read_locked_ops())
 WRITE_LOCKED_OPS = frozenset(REGISTRY.write_locked_ops())
 
 
-def _preload_binary(path: str, quick: bool):
+def _resolve_bndb_sidecar(resolved: Path, prefer_bndb: bool) -> Path | None:
+    """Adjacent ``<path>.bndb`` to load instead of ``resolved``, or None.
+
+    Shared by the runtime ``bn load`` path (`_load_binary`) and the headless
+    preload path (`_preload_binary`) so both honor a saved database sitting next
+    to the binary -- otherwise `bn-agent foo` silently re-analyzes from scratch
+    and drops the saved work that `bn load foo` would have picked up (#178). A
+    request that already points at a ``.bndb`` (or prefer_bndb=False) resolves to
+    None: load the path as given.
+    """
+    if prefer_bndb and resolved.suffix != ".bndb":
+        sibling = Path(str(resolved) + ".bndb")
+        if sibling.exists():
+            return sibling
+    return None
+
+
+def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
     """Open one headless preload binary and register it.
 
-    Mirrors _load_binary's --quick bookkeeping so the preload path and the
-    runtime `bn load` path agree: a .bndb already carries its analysis (so
+    Mirrors _load_binary's sidecar + --quick bookkeeping so the preload path and
+    the runtime `bn load` path agree: an adjacent <binary>.bndb is loaded
+    instead of re-analyzing the raw binary (the substitution is logged so it is
+    visible in the headless log), a .bndb already carries its analysis (so
     --quick is a no-op there), and a genuinely quick preload is recorded in
     _quick_loaded_views so target_info/strings stay honest ("run bn refresh")
-    instead of reporting full analysis or a misleading empty string list (#90).
-    Returns the opened BinaryView, or None if the open failed.
+    instead of reporting full analysis or a misleading empty string list
+    (#90, #178). Returns the opened BinaryView, or None if the open failed.
     """
     import binaryninja
 
     resolved = Path(path).expanduser().resolve()
-    bv = binaryninja.load(str(resolved), update_analysis=False)
+    sibling = _resolve_bndb_sidecar(resolved, prefer_bndb)
+    if sibling is not None:
+        bn.log_info(f"loaded {sibling} instead of {resolved} (use --no-bndb to skip)")
+        load_path = sibling
+    else:
+        load_path = resolved
+    bv = binaryninja.load(str(load_path), update_analysis=False)
     if bv is None:
-        bn.log_warn(f"Failed to open binary: {resolved}")
+        bn.log_warn(f"Failed to open binary: {load_path}")
         return None
-    quick_effective = quick and resolved.suffix != ".bndb"
+    quick_effective = quick and load_path.suffix != ".bndb"
     if quick_effective:
         _quick_loaded_views.add(bv)
     else:
@@ -2032,7 +2056,7 @@ def _preload_binary(path: str, quick: bool):
         _quick_loaded_views.discard(bv)
     with _headless_views_lock:
         _headless_views.append(bv)
-    bn.log_info(f"Loaded {resolved}{' (no analysis)' if quick_effective else ''}")
+    bn.log_info(f"Loaded {load_path}{' (no analysis)' if quick_effective else ''}")
     return bv
 
 
@@ -2054,12 +2078,16 @@ def start_headless(
     binaries: list[str] | None = None,
     instance_id: str | None = None,
     quick: bool = False,
+    prefer_bndb: bool = True,
 ):
     """Start the bridge in headless mode (no GUI required).
 
     Opens any binary file paths provided, starts the socket server,
     and blocks the calling thread until shutdown is requested. With ``quick``,
     preloaded binaries skip ``update_analysis_and_wait()`` (see ``--quick``).
+    With ``prefer_bndb`` (the default), a binary with an adjacent
+    ``<binary>.bndb`` loads the sidecar instead of re-analyzing -- matching
+    ``bn load``; pass ``--no-bndb`` (prefer_bndb=False) to open the raw binary.
     """
     global _bridge
     if _bridge is not None:
@@ -2086,7 +2114,7 @@ def start_headless(
     # dead instance instead of an invisible orphan process.
     if binaries:
         for path in binaries:
-            _preload_binary(path, quick)
+            _preload_binary(path, quick, prefer_bndb)
 
     try:
         _bridge._shutdown_event.wait()

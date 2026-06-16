@@ -52,6 +52,13 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="Preload binaries without full analysis (fast); run `bn refresh` for full analysis",
     )
+    parser.add_argument(
+        "--no-bndb",
+        dest="no_bndb",
+        action="store_true",
+        help="Open the raw binary even if an adjacent <binary>.bndb exists "
+        "(default: load the saved sidecar database, like `bn load`)",
+    )
     args = parser.parse_args(argv)
 
     # Make the binaryninja package importable.
@@ -67,7 +74,12 @@ def main(argv: list[str] | None = None) -> int:
 
     from bn_agent_bridge.bridge import start_headless
 
-    start_headless(args.binaries, instance_id=args.instance_id, quick=args.quick)
+    start_headless(
+        args.binaries,
+        instance_id=args.instance_id,
+        quick=args.quick,
+        prefer_bndb=not args.no_bndb,
+    )
     return 0
 
 

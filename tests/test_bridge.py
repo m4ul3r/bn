@@ -4746,6 +4746,74 @@ def test_preload_binary_full_analysis_not_marked_quick(monkeypatch, tmp_path):
     bridge._headless_views.clear()
 
 
+def test_preload_binary_prefers_sibling_bndb(monkeypatch, tmp_path):
+    # Headless preload must mirror `bn load`: an adjacent <binary>.bndb carries
+    # saved work (renames/comments/types) and must be loaded instead of
+    # re-analyzing the raw binary from scratch (#178).
+    bridge = _load_bridge(monkeypatch)
+    bridge._headless_views.clear()
+    binaryninja = sys.modules["binaryninja"]
+    loaded_paths: list[str] = []
+    binaryninja.load = lambda path, update_analysis=True: (
+        loaded_paths.append(path) or _LoadBV()
+    )
+
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+    bndb = tmp_path / "foo.so.bndb"
+    bndb.write_bytes(b"")
+
+    bridge._preload_binary(str(raw), quick=False)
+
+    assert loaded_paths == [str(bndb)]
+    bridge._headless_views.clear()
+
+
+def test_preload_binary_no_bndb_opt_out(monkeypatch, tmp_path):
+    # `bn-agent foo --no-bndb` (prefer_bndb=False) must open the raw binary even
+    # when a sidecar exists, matching `bn load --no-bndb` (#178).
+    bridge = _load_bridge(monkeypatch)
+    bridge._headless_views.clear()
+    binaryninja = sys.modules["binaryninja"]
+    loaded_paths: list[str] = []
+    binaryninja.load = lambda path, update_analysis=True: (
+        loaded_paths.append(path) or _LoadBV()
+    )
+
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+    bndb = tmp_path / "foo.so.bndb"
+    bndb.write_bytes(b"")
+
+    bridge._preload_binary(str(raw), quick=False, prefer_bndb=False)
+
+    assert loaded_paths == [str(raw)]
+    bridge._headless_views.clear()
+
+
+def test_preload_binary_quick_is_noop_for_sibling_bndb(monkeypatch, tmp_path):
+    # When preload resolves to the sidecar .bndb, --quick is a no-op there (the
+    # .bndb already carries its analysis), so the view is fully analyzed and not
+    # marked quick -- same contract as `bn load --quick` on a .bndb (#178/#90).
+    bridge = _load_bridge(monkeypatch)
+    bridge._headless_views.clear()
+    bridge._quick_loaded_views.clear()
+    binaryninja = sys.modules["binaryninja"]
+    binaryninja.load = lambda path, update_analysis=True: _LoadBV()
+
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+    bndb = tmp_path / "foo.so.bndb"
+    bndb.write_bytes(b"")
+
+    bv = bridge._preload_binary(str(raw), quick=True)
+
+    assert bv not in bridge._quick_loaded_views
+    assert bv.analysis_updated is True
+    bridge._headless_views.clear()
+    bridge._quick_loaded_views.clear()
+
+
 def test_dispatch_rejects_non_boolean_all(monkeypatch):
     # Raw JSON params must be real booleans: "all": "false" is truthy under
     # bool() and used to close every target. Reject it as invalid_request (#91).
