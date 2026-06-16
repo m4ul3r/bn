@@ -309,17 +309,20 @@ def _xrefs(args: argparse.Namespace) -> int:
         )
     if not identifier:
         raise BridgeError("xrefs requires an identifier or --field")
-    # xrefs now adopts the canonical paging envelope (#164): JSON carries
-    # {items, total, offset, limit, returned, has_more} (each item keeps its
-    # kind) and --limit pages it instead of erroring. The text renderer reads the
-    # back-compat code_refs/data_refs (full) and uses `limit` as a caller-group
-    # display cap, so text behavior is unchanged.
+    # xrefs adopts the canonical paging envelope (#164): JSON carries
+    # {items, total, offset, limit, returned, has_more} (each item keeps its kind)
+    # and --limit pages it. The op no longer ships the deprecated full
+    # code_refs/data_refs arrays (#184), so paging now bounds the WHOLE payload.
+    # Text mode groups the full set and uses `limit` only as a renderer-side
+    # caller-group display cap, so it must fetch the full set -- don't forward
+    # offset/limit to the op or the renderer would group only a slice.
     params: dict[str, Any] = {"identifier": identifier}
-    if args.offset:
-        params["offset"] = args.offset
     limit = _effective_limit(args)
-    if limit is not None:
-        params["limit"] = limit
+    if args.format != "text":
+        if args.offset:
+            params["offset"] = args.offset
+        if limit is not None:
+            params["limit"] = limit
     return _call(
         args,
         "xrefs",
@@ -424,15 +427,17 @@ def _evidence_function(args: argparse.Namespace) -> int:
              arg("identifier", help="Function name or address (hex 0x.. or decimal) to find inbound refs to"),
          ])
 def _evidence_xrefs(args: argparse.Namespace) -> int:
-    # Same canonical paging envelope as `xrefs` (#164): --limit pages the JSON
-    # items; the text renderer reads the full code_refs/data_refs with `limit` as
-    # a per-bucket display cap.
+    # Same canonical paging envelope and #184 payload-bounding as `xrefs`: JSON
+    # pages the items (and the op drops the deprecated full arrays). Text fetches
+    # the full set and uses `limit` as a per-bucket display cap, so don't forward
+    # offset/limit to the op in text mode.
     params: dict[str, Any] = {"identifier": args.identifier}
-    if args.offset:
-        params["offset"] = args.offset
     limit = _effective_limit(args)
-    if limit is not None:
-        params["limit"] = limit
+    if args.format != "text":
+        if args.offset:
+            params["offset"] = args.offset
+        if limit is not None:
+            params["limit"] = limit
     return _call(
         args,
         "xrefs",
