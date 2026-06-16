@@ -2478,6 +2478,44 @@ def test_xrefs_to_address_emits_paging_envelope(monkeypatch):
     assert page["code_ref_count"] == 2 and len(page["code_refs"]) == 2
 
 
+def test_xrefs_op_drops_deprecated_arrays(monkeypatch):
+    # #184: the `xrefs` OP response must NOT carry the full code_refs/data_refs
+    # arrays -- they rode unbounded past --offset/--limit and spilled the JSON on
+    # high-fanout symbols. Keep the full-set summary counts (#140) + the paged
+    # `items`. The lower-level _xrefs_to_address still produces the dual shape,
+    # which `function info` and evidence message-lensing embed directly (locked by
+    # test_xrefs_to_address_emits_paging_envelope above).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    caller = _FakeFunction(0x401000, "caller")
+    bv = _FakeBV(
+        functions=[caller],
+        code_refs={0x5000: [_FakeCodeRef(0x401010, caller), _FakeCodeRef(0x401020, caller)]},
+        data_refs={0x5000: [0x6000]},
+        sections={".text": _FakeSection(".text", 0x400000, 0x410000),
+                  ".rodata": _FakeSection(".rodata", 0x5000, 0x7000)},
+        segments={0x401010: _FakeSegment(readable=True, executable=True),
+                  0x401020: _FakeSegment(readable=True, executable=True),
+                  0x6000: _FakeSegment(readable=True, writable=True)},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._xrefs(None, "0x5000", limit=1)
+
+    # deprecated dual arrays are gone -> --limit truly bounds the payload
+    assert "code_refs" not in result
+    assert "data_refs" not in result
+    # full-set summary counts survive paging (the triage signal)
+    assert result["code_ref_count"] == 2
+    assert result["data_ref_count"] == 1
+    assert result["caller_function_count"] == 1
+    assert result["total"] == 3
+    # items is bounded by --limit
+    assert result["returned"] == 1 and len(result["items"]) == 1
+    assert result["has_more"] is True
+    assert result["items"][0]["kind"] == "code"
+
+
 def test_function_evidence_reports_calls_arguments_and_thunk_candidate(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

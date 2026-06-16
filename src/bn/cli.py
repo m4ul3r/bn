@@ -436,8 +436,13 @@ def _maybe_offset_hint(args: argparse.Namespace, result: Any, identifier: str | 
         value = int(text, 16) if text.lower().startswith("0x") else int(text, 10)
     except ValueError:
         return
+    # Key off the full-set `total` (the canonical envelope count): the xrefs op no
+    # longer ships the code_refs/data_refs arrays (#184), so checking them alone
+    # would read as "empty" even when refs exist. Keep the array checks as a
+    # back-compat fallback for the field-xrefs / function-info shapes.
     empty = (
         isinstance(result, dict)
+        and not result.get("total")
         and not result.get("code_refs")
         and not result.get("data_refs")
     )

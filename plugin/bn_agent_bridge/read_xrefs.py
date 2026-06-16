@@ -57,8 +57,28 @@ def _xrefs(ctx, selector: str | None, identifier, *, offset: int = 0, limit: int
             # Only fall back to import-symbol lookup for genuine misses.
             if "Ambiguous" in str(exc):
                 raise
-            return _xrefs_import_symbol(ctx, bv, identifier, offset=offset, limit=limit)
-    return _xrefs_to_address(ctx, bv, address, offset=offset, limit=limit)
+            return _drop_legacy_ref_arrays(
+                _xrefs_import_symbol(ctx, bv, identifier, offset=offset, limit=limit)
+            )
+    return _drop_legacy_ref_arrays(
+        _xrefs_to_address(ctx, bv, address, offset=offset, limit=limit)
+    )
+
+
+def _drop_legacy_ref_arrays(envelope: dict[str, Any]) -> dict[str, Any]:
+    """Strip the deprecated full ``code_refs``/``data_refs`` arrays from the
+    ``xrefs`` OP response so ``--offset``/``--limit`` bound the entire serialized
+    payload, not just ``items`` (#184). On a high-fanout symbol the arrays rode
+    full regardless of paging and spilled the JSON even at ``--limit 1``. The
+    full-set summary counts (``code_ref_count``/``data_ref_count``/
+    ``caller_function_count``) and the paged ``items`` (each carrying its
+    ``kind``) are everything a "who references X" triage needs. The lower-level
+    builders (``_xrefs_to_address``/``_xrefs_import_symbol`` via
+    ``_xref_envelope``) still produce the dual shape, which ``function info`` and
+    evidence message-lensing embed by calling them directly."""
+    envelope.pop("code_refs", None)
+    envelope.pop("data_refs", None)
+    return envelope
 
 
 def _xref_envelope(address, target_context, code_refs, data_refs, *,

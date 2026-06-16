@@ -623,14 +623,35 @@ def _unknown_ref_label(context: Any) -> str:
     return ""
 
 
+def _xref_buckets(value: dict[str, Any]) -> tuple[list[Any], list[Any], int, int]:
+    """Split an xrefs response into ``(code_refs, data_refs, total_code, total_data)``.
+
+    Tolerates both shapes: the deprecated dual arrays (still embedded by
+    ``function info`` and emitted by field xrefs) and the #184 items-only ``xrefs``
+    op response (reconstruct the buckets by splitting ``items`` on ``kind``).
+    Totals come from the full-set summary counts (``code_ref_count`` /
+    ``data_ref_count``) when present, so the header stays honest even though the op
+    no longer ships the full arrays."""
+    code_refs = value.get("code_refs")
+    data_refs = value.get("data_refs")
+    if code_refs is None and data_refs is None:
+        items = list(value.get("items") or [])
+        code_refs = [r for r in items if isinstance(r, dict) and r.get("kind") == "code"]
+        data_refs = [r for r in items if isinstance(r, dict) and r.get("kind") == "data"]
+    code_refs = list(code_refs or [])
+    data_refs = list(data_refs or [])
+    total_code = value.get("code_ref_count")
+    total_code = len(code_refs) if total_code is None else total_code
+    total_data = value.get("data_ref_count")
+    total_data = len(data_refs) if total_data is None else total_data
+    return code_refs, data_refs, total_code, total_data
+
+
 def _render_xrefs_text(value: Any, limit: int | None = None) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
 
-    code_refs = list(value.get("code_refs") or [])
-    data_refs = list(value.get("data_refs") or [])
-    total_code = len(code_refs)
-    total_data = len(data_refs)
+    code_refs, data_refs, total_code, total_data = _xref_buckets(value)
 
     import_label = ""
     if value.get("import_resolved"):
@@ -732,11 +753,12 @@ def _render_evidence_xrefs_text(value: Any, limit: int | None = None) -> str:
     if suffix:
         lines.append(f"target{suffix}")
 
-    for label in ("code_refs", "data_refs"):
-        refs = list(value.get(label) or [])
-        total = len(refs)
+    code_refs, data_refs, total_code, total_data = _xref_buckets(value)
+    for nice, kind, refs, total in (
+        ("code refs", "code", code_refs, total_code),
+        ("data refs", "data", data_refs, total_data),
+    ):
         shown = refs[:limit] if limit else refs
-        nice = label.replace("_", " ")
         lines.append("")
         # Report the true total and a truncation marker when capped, matching
         # the honesty convention used by strings/function list/evidence message
@@ -754,9 +776,9 @@ def _render_evidence_xrefs_text(value: Any, limit: int | None = None) -> str:
                 continue
             address = ref.get("address", "<unknown>")
             function = ref.get("function") or "<unknown>"
-            kind = ref.get("kind") or label.removesuffix("_refs")
+            ref_kind = ref.get("kind") or kind
             lines.append(
-                f"- {address}  {kind}  {function}{_context_suffix(ref.get('context'))}"
+                f"- {address}  {ref_kind}  {function}{_context_suffix(ref.get('context'))}"
             )
     return "\n".join(lines)
 

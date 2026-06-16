@@ -1091,6 +1091,54 @@ def test_evidence_xrefs_routes_and_renders_context(monkeypatch, capsys):
     assert "seg=r-x" in output
 
 
+def test_render_xrefs_text_from_items_when_arrays_dropped():
+    # #184: the xrefs op no longer ships the full code_refs/data_refs arrays, so
+    # the text renderer reconstructs the grouped view from `items` (split by kind)
+    # and the full-set summary counts. Output must match the dual-array rendering.
+    from bn import formatters
+    value = {
+        "address": "0x401000",
+        "code_ref_count": 1,
+        "data_ref_count": 1,
+        "caller_function_count": 1,
+        "items": [
+            {"address": "0x402000", "function": "sub_402000", "kind": "code",
+             "caller_function": {"address": "0x401f00", "name": "sub_402000"}},
+            {"address": "0x403000", "function": "sub_403000", "kind": "data",
+             "caller_function": {"address": "0x402f00", "name": "sub_403000"}},
+        ],
+        "total": 2, "offset": 0, "limit": None, "returned": 2, "has_more": False,
+    }
+    out = formatters._render_xrefs_text(value)
+    assert "xrefs to 0x401000 (1 code, 1 data)" in out
+    assert "code refs: 1 site across 1 function" in out
+    assert "0x401f00  sub_402000  (1 site: 0x402000)" in out
+    assert "data refs: 1 site across 1 function" in out
+    assert "0x402f00  sub_403000  (1 site: 0x403000)" in out
+
+
+def test_render_evidence_xrefs_text_from_items_when_arrays_dropped():
+    # #184: same for the evidence-xrefs renderer -- render from `items` + summary
+    # counts when the deprecated arrays are absent.
+    from bn import formatters
+    value = {
+        "address": "0x175b20",
+        "target_context": {},
+        "code_ref_count": 1,
+        "data_ref_count": 0,
+        "items": [
+            {"address": "0x586c0", "function": "sub_586a2", "kind": "code"},
+        ],
+        "total": 1, "offset": 0, "limit": None, "returned": 1, "has_more": False,
+    }
+    out = formatters._render_evidence_xrefs_text(value)
+    assert "xrefs to 0x175b20" in out
+    assert "code refs:" in out
+    assert "0x586c0  code  sub_586a2" in out
+    assert "data refs:" in out
+    assert "- none" in out
+
+
 def test_evidence_function_routes_and_renders_calls(monkeypatch, capsys):
     captured = {}
 
@@ -4495,6 +4543,51 @@ def test_evidence_xrefs_json_limit_pages_instead_of_erroring(monkeypatch, capsys
     assert captured["op"] == "xrefs"
     assert captured["params"].get("limit") == 3
     assert captured["params"].get("offset") == 6
+
+
+def test_xrefs_text_does_not_page_the_op(monkeypatch, capsys):
+    # #184: text mode groups the FULL set, so the CLI must not forward --limit/
+    # --offset to the op (that would page `items` and group only a slice). --limit
+    # stays a renderer-side caller-group display cap.
+    captured = _capture_xrefs_call(monkeypatch)
+    rc = bn.cli.main(
+        ["xrefs", "sub_401000", "--target", "active", "--format", "text", "--limit", "5"]
+    )
+    assert rc == 0
+    assert captured["op"] == "xrefs"
+    assert "limit" not in captured["params"]
+    assert "offset" not in captured["params"]
+
+
+def test_evidence_xrefs_text_does_not_page_the_op(monkeypatch, capsys):
+    captured = _capture_xrefs_call(monkeypatch)
+    rc = bn.cli.main(
+        ["evidence", "xrefs", "sub_401000", "--target", "active", "--format", "text", "--limit", "5"]
+    )
+    assert rc == 0
+    assert captured["op"] == "xrefs"
+    assert "limit" not in captured["params"]
+    assert "offset" not in captured["params"]
+
+
+def test_xrefs_offset_hint_uses_total_not_dropped_arrays(monkeypatch, capsys):
+    # #184: with code_refs/data_refs dropped from the op response, the struct-field
+    # offset hint must key off the full-set `total`, not the (now-absent) arrays --
+    # otherwise a small bare offset WITH refs would wrongly trigger the "0 xrefs"
+    # nudge.
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": {
+            "address": "0x308", "target_context": {},
+            "code_ref_count": 2, "data_ref_count": 0, "caller_function_count": 1,
+            "items": [{"address": "0x401000", "function": "f", "kind": "code"}],
+            "total": 2, "offset": 0, "limit": None, "returned": 1, "has_more": True,
+        }}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["xrefs", "0x308", "--target", "active"])
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "struct field offset" not in err  # refs exist -> no nudge
 
 
 @pytest.mark.parametrize(
