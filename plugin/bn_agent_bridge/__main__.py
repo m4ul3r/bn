@@ -5,7 +5,7 @@ import argparse
 import sys
 
 
-def main():
+def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
         prog="bn_agent_bridge",
         description="Run the BN Agent Bridge in headless mode",
@@ -15,11 +15,18 @@ def main():
         nargs="*",
         help="Binary file paths to open at startup",
     )
-    args = parser.parse_args()
+    parser.add_argument(
+        "--no-bndb",
+        dest="no_bndb",
+        action="store_true",
+        help="Open the raw binary even if an adjacent <binary>.bndb exists "
+        "(default: load the saved sidecar database, like `bn load`)",
+    )
+    args = parser.parse_args(argv)
 
     from .bridge import start_headless
 
-    start_headless(args.binaries)
+    start_headless(args.binaries, prefer_bndb=not args.no_bndb)
 
 
 if __name__ == "__main__":
