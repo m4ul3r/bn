@@ -1228,6 +1228,208 @@ def test_batch_struct_field_accepts_type_name_alias(monkeypatch):
     assert seen["op"]["struct_name"] == "Elf64_Sym"
 
 
+# --- batch field/locator parity audit (#173) -------------------------------
+#
+# Per-op parity table: for each of the 10 batch ops, the fields the batch
+# validator constrains and the interactive command whose field set it must
+# match. `required`/`one_of`/`enum` mirror REQUIRED_FIELDS / REQUIRED_ONE_OF /
+# ENUM_FIELDS in mutation_engine; `test_batch_op_parity_table_locked_to_validators`
+# asserts they stay in lock-step so the table can't silently drift from the code.
+# `optional` lists handler-read op.get() fields (documented, not asserted).
+#
+#   op kind             | required                                  | one_of               | enum                          | optional            | interactive command
+#   --------------------|-------------------------------------------|----------------------|-------------------------------|---------------------|--------------------
+#   rename_symbol       | identifier, new_name                      | --                   | kind: auto/function/data      | kind                | bn rename / symbol rename
+#   set_comment         | comment                                   | function|address     | --                            | --                  | bn comment set
+#   delete_comment      | --                                        | function|address     | --                            | --                  | bn comment delete
+#   set_prototype       | identifier, prototype                     | --                   | --                            | --                  | bn proto set
+#   local_rename        | function, variable, new_name              | --                   | --                            | --                  | bn local rename
+#   local_retype        | function, variable, new_type              | --                   | --                            | --                  | bn local retype
+#   struct_field_set    | struct_name, field_type, offset, field_name | --                 | --                            | overwrite_existing, type_name | bn struct field set
+#   struct_field_rename | struct_name, old_name, new_name           | --                   | --                            | type_name           | bn struct field rename
+#   struct_field_delete | struct_name, field_name                   | --                   | --                            | type_name           | bn struct field delete
+#   types_declare       | declaration                               | --                   | --                            | source_path         | bn types declare
+_BATCH_OP_PARITY = {
+    "rename_symbol":       {"required": ("identifier", "new_name"),                         "one_of": (),                           "enum": {"kind": ("auto", "function", "data")}, "cli": "bn rename"},
+    "set_comment":         {"required": ("comment",),                                        "one_of": (("function", "address"),),   "enum": {},                                     "cli": "bn comment set"},
+    "delete_comment":      {"required": (),                                                  "one_of": (("function", "address"),),   "enum": {},                                     "cli": "bn comment delete"},
+    "set_prototype":       {"required": ("identifier", "prototype"),                         "one_of": (),                           "enum": {},                                     "cli": "bn proto set"},
+    "local_rename":        {"required": ("function", "variable", "new_name"),                "one_of": (),                           "enum": {},                                     "cli": "bn local rename"},
+    "local_retype":        {"required": ("function", "variable", "new_type"),                "one_of": (),                           "enum": {},                                     "cli": "bn local retype"},
+    "struct_field_set":    {"required": ("struct_name", "field_type", "offset", "field_name"), "one_of": (),                         "enum": {},                                     "cli": "bn struct field set"},
+    "struct_field_rename": {"required": ("struct_name", "old_name", "new_name"),             "one_of": (),                           "enum": {},                                     "cli": "bn struct field rename"},
+    "struct_field_delete": {"required": ("struct_name", "field_name"),                       "one_of": (),                           "enum": {},                                     "cli": "bn struct field delete"},
+    "types_declare":       {"required": ("declaration",),                                    "one_of": (),                           "enum": {},                                     "cli": "bn types declare"},
+}
+
+
+def _minimal_valid_op(kind):
+    """Build the smallest batch op of *kind* that passes _apply_operation's field
+    validation: every required field, one field from each one-of group, and a
+    valid value for each enum field. Values only need to be present (validation
+    checks presence/membership, not resolvability), so a downstream handler may
+    still fail to resolve them -- the missing-field tests delete one field at a
+    time and assert the rejection comes from validation, before dispatch."""
+    op = {"op": kind}
+    for field in _BATCH_OP_PARITY[kind]["required"]:
+        op[field] = "0x0" if field == "offset" else "x"
+    for group in _BATCH_OP_PARITY[kind]["one_of"]:
+        op[group[0]] = "0x1000" if "address" in group else "x"
+    for field, allowed in _BATCH_OP_PARITY[kind]["enum"].items():
+        op[field] = allowed[0]
+    return op
+
+
+def test_batch_op_parity_table_locked_to_validators(monkeypatch):
+    """The checked-in parity table must match the live validators exactly, and
+    cover every dispatched op kind -- so the audit can't rot as ops are added or
+    their field sets change (#173)."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+
+    for kind, row in _BATCH_OP_PARITY.items():
+        assert me.REQUIRED_FIELDS.get(kind, ()) == row["required"], kind
+        assert me.REQUIRED_ONE_OF.get(kind, ()) == row["one_of"], kind
+        assert me.ENUM_FIELDS.get(kind, {}) == row["enum"], kind
+
+    # No validator names an op the table forgot, and vice versa.
+    assert set(me.REQUIRED_FIELDS) == set(_BATCH_OP_PARITY)
+    assert set(me.REQUIRED_ONE_OF) <= set(_BATCH_OP_PARITY)
+    assert set(me.ENUM_FIELDS) <= set(_BATCH_OP_PARITY)
+
+
+def test_batch_missing_required_field_rejected_per_op(monkeypatch):
+    """Dropping any single required field from any of the 10 ops yields a clean
+    invalid_request that NAMES the field -- never a raw KeyError mislabeled
+    internal_error/unsupported from a handler hard-reading op[field] (#173)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+
+    for kind, row in _BATCH_OP_PARITY.items():
+        for field in row["required"]:
+            op = _minimal_valid_op(kind)
+            del op[field]
+            with pytest.raises(bridge.OperationFailure) as exc:
+                instance._apply_operation(bv, op)
+            assert exc.value.status == "invalid_request", (kind, field)
+            assert field in exc.value.message, (kind, field)
+
+
+def test_batch_comment_ops_require_one_locator(monkeypatch):
+    """set_comment / delete_comment target a function OR an address; a manifest
+    op with neither is rejected with a clear invalid_request, not silently
+    no-op'd against address 0 (#173, locator parity with #67/#94)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+
+    for op in (
+        {"op": "set_comment", "comment": "hi"},   # no function, no address
+        {"op": "delete_comment"},                 # no function, no address
+    ):
+        with pytest.raises(bridge.OperationFailure) as exc:
+            instance._apply_operation(bv, op)
+        assert exc.value.status == "invalid_request"
+        assert "one of" in exc.value.message
+        assert "function" in exc.value.message and "address" in exc.value.message
+
+
+def test_batch_comment_ops_reject_both_locators(monkeypatch):
+    """function and address target DIFFERENT locations; passing both is
+    ambiguous and rejected, rather than silently honoring one and dropping the
+    other (#94 parity, now asserted for the batch path) (#173)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+
+    for op in (
+        {"op": "set_comment", "comment": "hi", "function": "f", "address": "0x1000"},
+        {"op": "delete_comment", "function": "f", "address": "0x1000"},
+    ):
+        with pytest.raises(bridge.OperationFailure) as exc:
+            instance._apply_operation(bv, op)
+        assert exc.value.status == "invalid_request"
+        assert "not both" in exc.value.message
+
+
+def test_batch_rename_rejects_invalid_kind(monkeypatch):
+    """An out-of-set rename `kind` must be rejected the way interactive
+    `bn rename --kind` rejects it via argparse choices. The batch path has no
+    argparse layer, and the unguarded handler SILENTLY treated an unknown kind
+    as a (failing) data-symbol lookup -- so `kind: "garbage"` against a function
+    that plainly exists produced a misleading "Symbol not found" instead of a
+    clear "kind must be one of ..." (#173)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[_FakeFunction(0x1000, "foo")])
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._apply_operation(
+            bv, {"op": "rename_symbol", "identifier": "foo", "new_name": "bar", "kind": "garbage"}
+        )
+    assert exc.value.status == "invalid_request"
+    msg = exc.value.message
+    assert "kind" in msg and "garbage" in msg
+    assert "auto" in msg and "function" in msg and "data" in msg
+
+    # The guard must NOT over-reject a valid kind: kind="function" still resolves
+    # (here a noop, since new_name == current name) without raising.
+    result = instance._apply_operation(
+        bv, {"op": "rename_symbol", "identifier": "foo", "new_name": "foo", "kind": "function"}
+    )
+    assert result["op"] == "rename_symbol"
+
+
+class _FakeCommentMutationBV(_FakeMutationBV):
+    """Records begin/revert/commit (via _FakeMutationBV) and stores comments so a
+    batch can apply one then have the whole batch reverted."""
+
+    def __init__(self):
+        super().__init__()
+        self.comments: dict[int, str] = {}
+
+    def get_comment_at(self, address):
+        return self.comments.get(int(address), "")
+
+    def set_comment_at(self, address, comment):
+        if comment is None:
+            self.comments.pop(int(address), None)
+        else:
+            self.comments[int(address)] = comment
+
+
+def test_batch_invalid_op_rolls_back_prior_applied_op(monkeypatch):
+    """A manifest whose 2nd op is malformed (missing a required field) fails the
+    WHOLE batch: the 1st op's already-applied change is reverted (no partial
+    apply -- the undo state is reverted, never committed) and the failing op is
+    reported as a clean invalid_request (#173)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeCommentMutationBV()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._mutation(
+        "active",
+        False,
+        [
+            {"op": "set_comment", "address": "0x1000", "comment": "first op applied"},
+            {"op": "set_comment", "address": "0x2000"},  # missing required 'comment'
+        ],
+    )
+
+    assert result["success"] is False
+    assert result["committed"] is False
+    assert result["rolled_back"] is True
+    assert ("revert", "state") in bv.events
+    assert ("commit", "state") not in bv.events
+
+    statuses = [r.get("status") for r in result["results"]]
+    assert statuses[0] == "reverted"          # 1st op applied, then rolled back
+    assert statuses[1] == "invalid_request"   # 2nd op rejected before apply
+    assert "comment" in result["results"][1].get("message", "")
+
+
 def test_preview_diff_truncated_to_stay_inline(monkeypatch):
     """A previewed mutation's per-function `diff` is capped so a single rename /
     proto preview on a large function stays inline instead of tripping the 10k

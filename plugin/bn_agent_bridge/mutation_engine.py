@@ -69,6 +69,18 @@ REQUIRED_ONE_OF: dict[str, tuple[tuple[str, ...], ...]] = {
     "delete_comment": (("function", "address"),),
 }
 
+# Fields restricted to a fixed value set, mirroring an interactive command's
+# argparse `choices=`. The batch path has no argparse layer, so without this an
+# out-of-set value reaches a handler and silently mis-resolves -- e.g. an
+# unknown rename `kind` skips the function branch in _resolve_rename_target and
+# falls through to data-symbol resolution, surfacing a misleading "Symbol not
+# found" instead of being rejected the way `bn rename --kind` rejects it. Only a
+# PRESENT field is checked; absence is governed by REQUIRED_FIELDS (e.g. `kind`
+# is optional, the handler defaults it to "auto"). (#173)
+ENUM_FIELDS: dict[str, dict[str, tuple[str, ...]]] = {
+    "rename_symbol": {"kind": ("auto", "function", "data")},
+}
+
 
 def _normalize_struct_alias(op: dict[str, Any]) -> dict[str, Any]:
     """Accept ``type_name`` as an alias for ``struct_name`` on struct_field_* ops.
@@ -1034,6 +1046,14 @@ def _apply_operation(ctx, bv, op: dict[str, Any], restores: list | None = None):
                 "invalid_request",
                 f"operation {kind!r} requires one of "
                 f"{' / '.join(repr(f) for f in group)}",
+                requested=_operation_requested(ctx, op),
+            )
+    for field, allowed in ENUM_FIELDS.get(kind, {}).items():
+        if field in op and str(op[field]) not in allowed:
+            raise OperationFailure(
+                "invalid_request",
+                f"operation {kind!r} field {field!r} must be one of "
+                f"{' / '.join(repr(v) for v in allowed)}, got {str(op[field])!r}",
                 requested=_operation_requested(ctx, op),
             )
     try:
