@@ -1725,7 +1725,53 @@ def test_find_type_not_found_without_close_match(monkeypatch):
     with pytest.raises(RuntimeError) as exc_info:
         instance._find_type(bv, "zzzzzzzz")
 
-    assert str(exc_info.value) == "Type not found: zzzzzzzz"
+    message = str(exc_info.value)
+    assert message.startswith("Type not found: zzzzzzzz")
+    # No close match -> point the user at the substring search command (#174).
+    assert "Did you mean" not in message
+    assert "bn types --query zzzzzzzz" in message
+
+
+def test_find_type_missing_primitive_typedef_hints_query_root(monkeypatch):
+    """The common dead-end is a missing primitive typedef (e.g. `uint32_t` on a
+    target that defines `unsigned int`). With no close match, the hint suggests
+    a substring search on the typedef root (`_t` dropped) so the user can find
+    the underlying type they actually have (#174)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(types_={"unsigned int": _FakeType("unsigned int")})
+
+    with pytest.raises(RuntimeError) as exc_info:
+        instance._find_type(bv, "uint32_t")
+
+    message = str(exc_info.value)
+    assert message.startswith("Type not found: uint32_t")
+    assert "bn types --query uint32" in message
+    assert "bn types --query uint32_t" not in message
+
+
+def test_find_type_primitive_typedef_hints_query_even_with_close_matches(monkeypatch):
+    """On a real target, difflib returns UNRELATED `_t` typedefs as "close" to a
+    missing primitive (`uint32_t` -> wint_t, off64_t, uint64_t), so a hint gated
+    on get_close_matches() being empty never fires for exactly the case #174 is
+    meant to help. The search hint must accompany the suggestions, not replace
+    or hide behind them (PR #189 dogfood)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(types_={
+        "wint_t": _FakeType("typedef int wint_t"),
+        "off64_t": _FakeType("typedef long off64_t"),
+        "uint64_t": _FakeType("typedef unsigned long uint64_t"),
+    })
+
+    with pytest.raises(RuntimeError) as exc_info:
+        instance._find_type(bv, "uint32_t")
+
+    message = str(exc_info.value)
+    assert message.startswith("Type not found: uint32_t")
+    assert "Did you mean:" in message               # difflib suggestions kept
+    assert "bn types --query uint32" in message       # AND the search hint fires
+    assert "bn types --query uint32_t" not in message  # `_t` root dropped
 
 
 def test_list_locals_returns_stable_ids(monkeypatch):
