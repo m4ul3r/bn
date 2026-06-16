@@ -79,7 +79,8 @@ class FPVS:
 
 
 class FExpr:
-    def __init__(self, opname, text, reads=(), src=None, constant=None, possible_values=None, src_memory=None):
+    def __init__(self, opname, text, reads=(), src=None, constant=None, possible_values=None, src_memory=None,
+                 left=None, right=None, operands=None):
         self.operation = FOp(opname)
         self._text = text
         self.vars_read = list(reads)
@@ -91,6 +92,12 @@ class FExpr:
             self.possible_values = possible_values
         if src_memory is not None:
             self.src_memory = src_memory
+        if left is not None:
+            self.left = left
+        if right is not None:
+            self.right = right
+        if operands is not None:
+            self.operands = operands
 
     def __str__(self):
         return self._text
@@ -738,6 +745,128 @@ def test_forward_resolves_indirect_via_value_set(models):
     assert any("resolved via value-set" in a for a in result["assumptions"])
     # no unresolved leaf since VSA pinned the targets
     assert not any(l["kind"] == "indirect_call_unresolved" for l in result["leaves"])
+
+
+def _indexed_source_strcpy_program():
+    """strcpy(dst, base + i*0x38) with tainted i (param:0): the SOURCE pointer is
+    an array index/offset, NOT attacker-controlled string content -- the classic
+    `dst[i*stride] = src[i]` shape lowered to a copy. arg_taint fires because i
+    is read in the source arg, but the taint sits in the index, not the buffer
+    being copied (#163)."""
+    i = FVar("i"); i0 = FSSA(i, 0)
+    src_expr = FExpr("MLIL_ADD", "0x9000 + i#0 * 0x38", reads=[i0],
+                     left=FExpr("MLIL_CONST_PTR", "0x9000", constant=0x9000),
+                     right=FExpr("MLIL_MUL", "i#0 * 0x38", reads=[i0],
+                                 left=FExpr("MLIL_VAR_SSA", "i#0", reads=[i0]),
+                                 right=FExpr("MLIL_CONST", "0x38", constant=0x38)))
+    call = FInstr(0, 0x40, "MLIL_CALL_SSA", "strcpy(dst, 0x9000 + i#0*0x38)",
+                  reads=[i0], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", "strcpy", constant=0x800),
+                  params=[FExpr("MLIL_VAR_SSA", "dst#0", reads=[]), src_expr])
+    return FFunc("copy_row", 0x40, FSSAFunc([call]), params=[i])
+
+
+def test_forward_overflow_downgraded_to_tainted_index(models):
+    # #163: taint reaching an overflow sink only through an array index/offset
+    # must be reclassified from overflow_* to the distinct, lower-confidence
+    # `tainted_index`, with a `via: "index"` marker -- overflow_* is reserved for
+    # buffer/length-operand taint.
+    func = _indexed_source_strcpy_program()
+    engine = te.TaintEngine(FBV({0x800: "strcpy"}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+
+    classes = {s["sink"]["class"] for s in result["reached_sinks"]}
+    assert "tainted_index" in classes
+    assert "overflow_unbounded" not in classes
+    idx = next(s for s in result["reached_sinks"] if s["sink"]["class"] == "tainted_index")
+    assert idx["sink"]["via"] == "index"
+
+
+def test_forward_register_base_index_downgraded(models):
+    # #163: the common real-firmware shape -- a stride-scaled tainted index added
+    # to a base pointer held in a REGISTER (not an inline const-ptr) -- must also
+    # downgrade. Scaling (i*0x10) is the index signal; the base var is untainted.
+    i = FVar("i"); i0 = FSSA(i, 0)
+    base = FVar("bp"); bp0 = FSSA(base, 0)
+    src_expr = FExpr("MLIL_ADD", "bp#0 + i#0 * 0x10", reads=[bp0, i0],
+                     left=FExpr("MLIL_VAR_SSA", "bp#0", reads=[bp0]),
+                     right=FExpr("MLIL_MUL", "i#0 * 0x10", reads=[i0],
+                                 left=FExpr("MLIL_VAR_SSA", "i#0", reads=[i0]),
+                                 right=FExpr("MLIL_CONST", "0x10", constant=0x10)))
+    call = FInstr(0, 0x40, "MLIL_CALL_SSA", "strcpy(dst, bp#0 + i#0*0x10)",
+                  reads=[bp0, i0], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", "strcpy", constant=0x800),
+                  params=[FExpr("MLIL_VAR_SSA", "dst#0", reads=[]), src_expr])
+    func = FFunc("copy_reg", 0x40, FSSAFunc([call]), params=[i])
+    engine = te.TaintEngine(FBV({0x800: "strcpy"}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+
+    classes = {x["sink"]["class"] for x in result["reached_sinks"]}
+    assert "tainted_index" in classes
+    assert "overflow_unbounded" not in classes
+
+
+def test_forward_computed_length_keeps_overflow_len(models):
+    # Soundness lock: a tainted LENGTH computed as `header + count*elem` (count
+    # tainted) is a genuine attacker-controlled length. The register-base index
+    # broadening is gated to pointer args, so overflow_len must NOT downgrade.
+    count = FVar("count"); c0 = FSSA(count, 0)
+    header = FVar("hdr"); h0 = FSSA(header, 0)
+    len_expr = FExpr("MLIL_ADD", "hdr#0 + count#0 * 0x38", reads=[h0, c0],
+                     left=FExpr("MLIL_VAR_SSA", "hdr#0", reads=[h0]),
+                     right=FExpr("MLIL_MUL", "count#0 * 0x38", reads=[c0],
+                                 left=FExpr("MLIL_VAR_SSA", "count#0", reads=[c0]),
+                                 right=FExpr("MLIL_CONST", "0x38", constant=0x38)))
+    call = FInstr(0, 0x40, "MLIL_CALL_SSA", "memcpy(dst, src, hdr#0 + count#0*0x38)",
+                  reads=[h0, c0], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", "memcpy", constant=0x810),
+                  params=[FExpr("MLIL_VAR_SSA", "dst#0", reads=[]),
+                          FExpr("MLIL_VAR_SSA", "src#0", reads=[]), len_expr])
+    func = FFunc("copy_n", 0x40, FSSAFunc([call]), params=[count])
+    engine = te.TaintEngine(FBV({0x810: "memcpy"}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+
+    classes = {x["sink"]["class"] for x in result["reached_sinks"]}
+    assert "overflow_len" in classes
+    assert "tainted_index" not in classes
+
+
+def test_forward_tainted_source_pointer_plus_const_keeps_overflow(models):
+    # Soundness lock: strcpy(dst, p + 4) where the SOURCE POINTER p is tainted
+    # (attacker controls where to read from) is NOT an index -- the tainted base
+    # is unscaled, so it stays overflow_unbounded rather than being downgraded.
+    p = FVar("p"); p0 = FSSA(p, 0)
+    src_expr = FExpr("MLIL_ADD", "p#0 + 4", reads=[p0],
+                     left=FExpr("MLIL_VAR_SSA", "p#0", reads=[p0]),
+                     right=FExpr("MLIL_CONST", "4", constant=4))
+    call = FInstr(0, 0x40, "MLIL_CALL_SSA", "strcpy(dst, p#0 + 4)", reads=[p0], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", "strcpy", constant=0x800),
+                  params=[FExpr("MLIL_VAR_SSA", "dst#0", reads=[]), src_expr])
+    func = FFunc("copy_p", 0x40, FSSAFunc([call]), params=[p])
+    engine = te.TaintEngine(FBV({0x800: "strcpy"}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+
+    classes = {x["sink"]["class"] for x in result["reached_sinks"]}
+    assert "overflow_unbounded" in classes
+    assert "tainted_index" not in classes
+
+
+def test_forward_value_operand_taint_keeps_overflow_class(models):
+    # Control: a directly tainted source operand (the buffer pointer value, not an
+    # index) must STILL be overflow_unbounded -- the downgrade is reserved for
+    # index/offset-only taint and must not hide a real overflow (#163).
+    s = FVar("s"); s0 = FSSA(s, 0)
+    call = FInstr(0, 0x40, "MLIL_CALL_SSA", "strcpy(dst, s#0)", reads=[s0], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", "strcpy", constant=0x800),
+                  params=[FExpr("MLIL_VAR_SSA", "dst#0", reads=[]),
+                          FExpr("MLIL_VAR_SSA", "s#0", reads=[s0])])
+    func = FFunc("copy_s", 0x40, FSSAFunc([call]), params=[s])
+    engine = te.TaintEngine(FBV({0x800: "strcpy"}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+
+    classes = {x["sink"]["class"] for x in result["reached_sinks"]}
+    assert "overflow_unbounded" in classes
+    assert "tainted_index" not in classes
 
 
 def test_forward_resolve_map_overrides_unresolved(models):

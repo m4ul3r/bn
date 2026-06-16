@@ -644,6 +644,129 @@ class TaintEngine:
                 return node
         return None
 
+    # -- operand-role classification at a sink (#163) ----------------------
+    # A tainted value can reach an overflow sink either as the buffer/length
+    # OPERAND (a real overflow) or merely as an array INDEX/offset inside a
+    # pointer computation (`base + i*stride`) -- an out-of-bounds access risk,
+    # not an unbounded/length overflow. arg_taint() flattens the whole arg
+    # expression, so without role analysis both look identical and the index
+    # case over-states the overflow_* class.
+
+    def _expr_has_taint(self, expr: Any, tainted: set) -> bool:
+        """Any tainted SSA read anywhere in *expr* (BN's vars_read is recursive)."""
+        for r in expr_reads(expr):
+            if (var_key(r), getattr(r, "version", None)) in tainted or (var_key(r), None) in tainted:
+                return True
+        return False
+
+    def _ptr_base_like(self, ssaf: Any, expr: Any, depth: int = 0) -> bool:
+        """*expr* is (or resolves to) a base POINTER -- an address, not a scalar
+        index/length. Conservative: recognizes &var / const-ptr / extern-ptr and
+        SSA copies of those, plus stack-pointer vars via _pointee_var."""
+        if expr is None or depth > 8:
+            return False
+        op = op_name(expr)
+        if "ADDRESS_OF" in op or "CONST_PTR" in op or "EXTERN_PTR" in op:
+            return True
+        if is_ssa_var(expr):
+            if self._pointee_var(ssaf, expr, depth + 1) is not None:
+                return True
+            try:
+                d = ssaf.get_ssa_var_definition(expr)
+            except Exception:
+                d = None
+            if d is not None and op_name(d) == "MLIL_SET_VAR_SSA":
+                return self._ptr_base_like(ssaf, getattr(d, "src", None), depth + 1)
+        return False
+
+    def _is_scaled_taint(self, expr: Any, tainted: set, depth: int = 0) -> bool:
+        """*expr* is a tainted value scaled by a constant stride -- ``i * const``
+        or ``i << const`` -- the unambiguous array-index signal (a base pointer is
+        never multiplied/shifted by a stride)."""
+        if expr is None or depth > 6:
+            return False
+        op = op_name(expr)
+        if op in ("MLIL_MUL", "MLIL_LSL"):
+            left = getattr(expr, "left", None)
+            right = getattr(expr, "right", None)
+            if self._int_const(right) is not None and self._expr_has_taint(left, tainted):
+                return True
+            if op == "MLIL_MUL" and self._int_const(left) is not None and self._expr_has_taint(right, tainted):
+                return True
+        return False
+
+    def _taint_operand_roles(self, ssaf: Any, expr: Any, tainted: set, *,
+                             pointer_arg: bool = False, depth: int = 0) -> set[str]:
+        """Roles in which tainted reads appear in *expr*: ``{'index'}`` and/or
+        ``{'value'}``. ``index`` = a tainted (possibly stride-scaled) offset added
+        to a base pointer; ``value`` = a tainted read anywhere else (the buffer
+        base/pointee or a plain scalar/length). Conservative -- anything not
+        provably an index counts as ``value`` so overflow_* is never under-stated.
+
+        ``pointer_arg`` is set when the whole arg is known to be a source POINTER
+        (an overflow_unbounded sink): then a stride-scaled tainted offset added to
+        any UNtainted base is array indexing even when the base sits in a register
+        we can't prove is a pointer. It stays False for scalar/length args so a
+        computed length like ``header + count*elem`` is never taken for an index."""
+        roles: set[str] = set()
+        if expr is None or depth > 8 or not self._expr_has_taint(expr, tainted):
+            return roles
+        op = op_name(expr)
+        if is_ssa_var(expr):
+            try:
+                d = ssaf.get_ssa_var_definition(expr)
+            except Exception:
+                d = None
+            if d is not None and op_name(d) == "MLIL_SET_VAR_SSA":
+                return self._taint_operand_roles(ssaf, getattr(d, "src", None), tainted,
+                                                 pointer_arg=pointer_arg, depth=depth + 1)
+            roles.add("value")  # tainted leaf used directly
+            return roles
+        if op in ("MLIL_ADD", "MLIL_SUB"):
+            left = getattr(expr, "left", None)
+            right = getattr(expr, "right", None)
+            l_taint = self._expr_has_taint(left, tainted)
+            r_taint = self._expr_has_taint(right, tainted)
+            # base_ptr + tainted_offset (recognized inline base): index role.
+            if self._ptr_base_like(ssaf, left) and not l_taint and r_taint:
+                roles.add("index")
+                return roles
+            if op == "MLIL_ADD" and self._ptr_base_like(ssaf, right) and not r_taint and l_taint:
+                roles.add("index")
+                return roles
+            # Pointer-arg only: a stride-scaled tainted offset added to an
+            # untainted base is indexing even with a register-held base. Scaling
+            # distinguishes an index from a tainted base pointer (tainted_ptr+const
+            # has an unscaled tainted base -> stays value -> overflow kept).
+            if pointer_arg:
+                if self._is_scaled_taint(left, tainted) and not r_taint:
+                    roles.add("index")
+                    return roles
+                if self._is_scaled_taint(right, tainted) and not l_taint:
+                    roles.add("index")
+                    return roles
+            roles |= self._taint_operand_roles(ssaf, left, tainted, pointer_arg=pointer_arg, depth=depth + 1)
+            roles |= self._taint_operand_roles(ssaf, right, tainted, pointer_arg=pointer_arg, depth=depth + 1)
+            return roles
+        subs = list(getattr(expr, "operands", None) or [])
+        if not subs:
+            subs = [s for s in (getattr(expr, "left", None), getattr(expr, "right", None)) if s is not None]
+        if subs:
+            for sub in subs:
+                roles |= self._taint_operand_roles(ssaf, sub, tainted, pointer_arg=pointer_arg, depth=depth + 1)
+            return roles
+        roles.add("value")  # tainted leaf wrapper, used as a value
+        return roles
+
+    def _sink_taint_is_index_only(self, ssaf: Any, expr: Any, tainted: set, *, pointer_arg: bool = False) -> bool:
+        """True iff every tainted read in the sink arg *expr* is an array
+        index/offset and the pointee buffer itself is not tainted -- the case
+        overflow_* over-states (#163). ``pointer_arg`` enables register-base index
+        detection for source-pointer (overflow_unbounded) args."""
+        if self._pointee_tainted(ssaf, expr, tainted) is not None:
+            return False  # buffer contents tainted -> a real overflow operand
+        return self._taint_operand_roles(ssaf, expr, tainted, pointer_arg=pointer_arg) == {"index"}
+
     # -- global/static buffers as taint locations -------------------------
     # A global buffer is referenced by an absolute address (MLIL_CONST_PTR), which
     # _pointee_var (stack-only) misses. We make it a single coarse taint location
@@ -1698,6 +1821,31 @@ class TaintEngine:
                                             f"bounded by {hex(_bnd)} -- bounded copy, not an "
                                             "unbounded overflow)",
                                         }
+                                # Reserve overflow_* for buffer/length-operand
+                                # taint: if the taint reaches this sink only
+                                # through an array index/offset (`base + i*stride`)
+                                # and the buffer itself is untainted, reclassify to
+                                # the distinct, lower-confidence `tainted_index`
+                                # (an OOB-access risk, not an unbounded/length
+                                # overflow) rather than over-stating overflow_*
+                                # (#163). Conservative: ambiguous cases stay
+                                # overflow_* so a real overflow is never hidden.
+                                if eff_sink.get("class") in ("overflow_unbounded", "overflow_len") \
+                                        and self._sink_taint_is_index_only(
+                                            ssaf, params[argidx], tainted,
+                                            pointer_arg=eff_sink.get("class") == "overflow_unbounded"):
+                                    _prior = eff_sink.get("class")
+                                    eff_sink = {
+                                        **eff_sink,
+                                        "class": "tainted_index",
+                                        "via": "index",
+                                        "detail": (eff_sink.get("detail") or "")
+                                        + " (taint reaches this sink through an array "
+                                        "index/offset, not the copied buffer or the length "
+                                        f"operand -- reclassified from {_prior}; an "
+                                        "out-of-bounds access risk, not a plain "
+                                        "unbounded/length overflow)",
+                                    }
                                 findings.append(self._make_finding(ins, mkey or name, argidx, eff_sink, ht, why))
             for rule in model.get("propagates") or []:
                 to = rule.get("to")
@@ -2270,6 +2418,7 @@ class TaintEngine:
                 "class": sink.get("class"),
                 "detail": sink.get("detail"),
                 **({"source_bound": sink["source_bound"]} if sink.get("source_bound") else {}),
+                **({"via": sink["via"]} if sink.get("via") else {}),
             },
             "path": path,
         }
