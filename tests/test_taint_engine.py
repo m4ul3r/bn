@@ -690,6 +690,69 @@ def test_forward_indirect_call_is_a_leaf_not_dropped(models):
     assert any("indirect call" in a for a in result["assumptions"])
 
 
+def _two_indirect_leaf_program():
+    """dispatch(arg) makes TWO unresolved indirect calls with the tainted arg ->
+    two distinct frontier leaves. Used to pin the authoritative leaf count and
+    run-to-run determinism (#181)."""
+    arg = FVar("arg"); fp = FVar("fp"); gp = FVar("gp")
+    arg0 = FSSA(arg, 0); fp1 = FSSA(fp, 1); gp1 = FSSA(gp, 1)
+    ssa = FSSAFunc([
+        FInstr(0, 0x20, "MLIL_SET_VAR_SSA", "tmp = arg#0", reads=[arg0], writes=[FSSA(FVar("tmp"), 1)]),
+        FInstr(1, 0x24, "MLIL_CALL_SSA", "fp#1(arg#0)", reads=[arg0, fp1], writes=[],
+               dest=FExpr("MLIL_VAR_SSA", "fp#1", reads=[fp1]),
+               params=[FExpr("MLIL_VAR_SSA", "arg#0", reads=[arg0])]),
+        FInstr(2, 0x28, "MLIL_CALL_SSA", "gp#1(arg#0)", reads=[arg0, gp1], writes=[],
+               dest=FExpr("MLIL_VAR_SSA", "gp#1", reads=[gp1]),
+               params=[FExpr("MLIL_VAR_SSA", "arg#0", reads=[arg0])]),
+    ])
+    return FFunc("dispatch2", 0x20, ssa, params=[arg])
+
+
+def test_forward_stats_reports_authoritative_leaves_count(models):
+    # #181: stats must carry an authoritative leaf count so TEXT (len(leaves)),
+    # JSON (len(result["leaves"])), and stats.leaves all cite the same number.
+    func = _two_indirect_leaf_program()
+    engine = te.TaintEngine(FBV({}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+
+    assert len(result["leaves"]) == 2
+    assert result["stats"]["leaves"] == len(result["leaves"]) == 2
+
+
+def test_forward_result_is_reproducible_across_runs(models):
+    # #181 acceptance: two identical runs on the same input produce the same
+    # leaves array (and count). The leaf set is a monotone fixed point over
+    # instruction-ordered IL, so this already holds for a fixed analysis state --
+    # this is a forward regression guard against a future change introducing
+    # order-dependence (e.g. iterating an unsorted set to emit leaves). The
+    # value-set descent path's determinism is pinned separately by
+    # test_targets_from_pvs_is_order_independent.
+    func = _two_indirect_leaf_program()
+    engine = te.TaintEngine(FBV({}), models)
+    r1 = engine.forward(func, [te.parse_locator("param:0")])
+    r2 = engine.forward(func, [te.parse_locator("param:0")])
+
+    assert r1["leaves"] == r2["leaves"]
+    assert r1["stats"]["leaves"] == r2["stats"]["leaves"] == len(r1["leaves"])
+
+    # full-result reproducibility through the value-set multi-target resolution
+    # path (the one set-derived ordering in the walk).
+    dispatch, bv = _dispatch_table_program()
+    de = te.TaintEngine(bv, models)
+    assert de.forward(dispatch, [te.parse_locator("param:0")]) == \
+        de.forward(dispatch, [te.parse_locator("param:0")])
+
+
+def test_targets_from_pvs_is_order_independent():
+    # #181: indirect-call target resolution is the only set-derived list in the
+    # forward walk. It must return a deterministic (sorted) order regardless of
+    # value-set iteration order, so downstream descent + leaf emission stays
+    # reproducible across processes (hash-seed independent). Guards the sorted()
+    # in targets_from_pvs -- removing it would make this order set-dependent.
+    pvs = FPVS("InSetOfValues", values=[0x910, 0x500, 0x700])
+    assert te.targets_from_pvs(pvs) == [0x500, 0x700, 0x910]
+
+
 def test_forward_unresolved_source_raises(models):
     func = FFunc("x", 0x0, FSSAFunc([]), params=[])
     engine = te.TaintEngine(FBV({}), models)
@@ -1260,6 +1323,21 @@ def test_forward_multi_callsite_attribution(models):
     assert by["0x14"]["leaves"] == [] and by["0x1c"]["leaves"] == []
 
 
+def test_forward_attributed_stats_leaves_and_frontier_total(models):
+    # #181: in the per-source (by_source) union, stats.leaves is the deduped
+    # top-level count and stats.frontier_total is the pre-dedup sum across
+    # callsites -- so an agent can reconcile sum(by_source leaves) vs the union.
+    func, bv = _multi_callsite_program()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:recv:1")])
+
+    assert "by_source" in result
+    assert result["stats"]["leaves"] == len(result["leaves"])
+    per_source_total = sum(len(bs["leaves"]) for bs in result["by_source"].values())
+    assert result["stats"]["frontier_total"] == per_source_total
+    assert result["stats"]["frontier_total"] >= result["stats"]["leaves"]
+
+
 def test_forward_single_callsite_no_by_source(process_func, models):
     # process_func has exactly ONE read callsite -> attribution is a no-op:
     # no by_source key, single-callsite behavior is byte-for-byte unchanged.
@@ -1314,6 +1392,16 @@ def test_backward_follows_into_caller(models):
     assert "use_len" in crossed
     origins = [(sl["origin"]["kind"], sl["origin"].get("callee")) for sl in result["slices"]]
     assert ("source", "recv") in origins
+
+
+def test_backward_stats_reports_leaves_count(process_func, models):
+    # #181: backward results carried no stats at all -> no authoritative leaf
+    # count to reconcile against the TEXT header / JSON array. Add stats.leaves.
+    bv = FBV({0x401070: "read", 0x401080: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.backward(process_func, [te.parse_locator("arg:memcpy:2")])
+
+    assert result["stats"]["leaves"] == len(result["leaves"])
 
 
 def test_backward_slices_from_memcpy_length(process_func, models):
