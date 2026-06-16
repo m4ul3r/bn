@@ -677,7 +677,18 @@ class BridgeContext:
             raise RuntimeError(
                 f"Type not found: {type_name}. Did you mean: {', '.join(suggestions)}"
             )
-        raise RuntimeError(f"Type not found: {type_name}")
+        # No near-miss to suggest -- most often a missing primitive typedef on a
+        # target that defines the underlying type under another name (e.g.
+        # `uint32_t` vs `unsigned int`). Point at the substring search so the
+        # user isn't left at a dead end. Drop a trailing `_t` from the suggested
+        # query so the typedef root (`uint32`, `size`) matches the names a target
+        # actually carries; keep the full name when there's no meaningful root.
+        name = str(type_name)
+        query = name[:-2] if name.endswith("_t") and len(name) > 2 else name
+        raise RuntimeError(
+            f"Type not found: {name}. No similar type names; "
+            f"try `bn types --query {query}` to search available types."
+        )
 
     def _render_type_layout(self, type_obj) -> str:
         header = str(type_obj)
