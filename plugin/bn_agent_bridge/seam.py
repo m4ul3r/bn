@@ -673,21 +673,25 @@ class BridgeContext:
             available.append(str(name))
 
         suggestions = difflib.get_close_matches(str(type_name), available, n=5, cutoff=0.5)
-        if suggestions:
-            raise RuntimeError(
-                f"Type not found: {type_name}. Did you mean: {', '.join(suggestions)}"
-            )
-        # No near-miss to suggest -- most often a missing primitive typedef on a
-        # target that defines the underlying type under another name (e.g.
-        # `uint32_t` vs `unsigned int`). Point at the substring search so the
-        # user isn't left at a dead end. Drop a trailing `_t` from the suggested
-        # query so the typedef root (`uint32`, `size`) matches the names a target
+        # Always point at the substring search, whether or not difflib found a
+        # near-miss. The common dead-end is a missing primitive typedef on a
+        # target that defines the underlying type under another name (`uint32_t`
+        # vs `unsigned int`), and on a real target difflib readily returns
+        # UNRELATED `_t` typedefs as "close" (`uint32_t` -> wint_t, off64_t) --
+        # so a hint gated on having NO close match never fires for exactly the
+        # case it's meant to help. Drop a trailing `_t` so the query is the
+        # typedef root (`uint32`, `size`) that matches the names a target
         # actually carries; keep the full name when there's no meaningful root.
         name = str(type_name)
         query = name[:-2] if name.endswith("_t") and len(name) > 2 else name
+        search_hint = f"`bn types --query {query}` to search available types"
+        if suggestions:
+            raise RuntimeError(
+                f"Type not found: {name}. Did you mean: {', '.join(suggestions)}. "
+                f"Or try {search_hint}."
+            )
         raise RuntimeError(
-            f"Type not found: {name}. No similar type names; "
-            f"try `bn types --query {query}` to search available types."
+            f"Type not found: {name}. No similar type names; try {search_hint}."
         )
 
     def _render_type_layout(self, type_obj) -> str:
