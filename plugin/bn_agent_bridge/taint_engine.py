@@ -62,9 +62,13 @@ def _model_buffer_source_args(model: dict[str, Any]) -> frozenset[int]:
     out: set[int] = set()
     for rule in model.get("propagates") or []:
         frm = rule.get("from")
-        if isinstance(frm, str) and "arg:" in frm:
+        # Require the POINTEE form ``*arg:N`` -- the buffer arg N points at. A
+        # scalar ``arg:N`` (arg N's value, e.g. GLib g_slist_append's
+        # ``from: "arg:1"``) is NOT a buffer source, and treating it as one would
+        # enable the pointer index broadening on a scalar/length arg (#163 review).
+        if isinstance(frm, str) and frm.startswith("*arg:"):
             try:
-                out.add(int(frm.split("arg:", 1)[1]))
+                out.add(int(frm[len("*arg:"):]))
             except ValueError:
                 pass
     return frozenset(out)

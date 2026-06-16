@@ -853,6 +853,35 @@ def test_forward_const_ptr_plus_tainted_length_keeps_overflow_len(models):
     assert "tainted_index" not in classes
 
 
+def test_forward_scalar_arg_propagation_is_not_a_buffer_source(models):
+    # #163 followup: _model_buffer_source_args must require the POINTEE form
+    # `*arg:N`. A custom/override model may legitimately propagate a SCALAR
+    # `arg:N` (the value, not the pointee -- e.g. GLib g_slist_append). Treating
+    # that as a source pointer would enable the index broadening on a scalar and
+    # misclassify a tainted LENGTH as tainted_index. Pin the parser.
+    custom = dict(models)
+    custom["weird_copy"] = {
+        "propagates": [{"from": "arg:1", "to": "*arg:0"}],   # SCALAR arg:1, not *arg:1
+        "sink": {"tainted_args": [1], "class": "overflow_len",
+                 "detail": "attacker-controlled length to weird_copy"},
+    }
+    count = FVar("count"); c0 = FSSA(count, 0)
+    len_expr = FExpr("MLIL_ADD", "0x4000 + count#0", reads=[c0],
+                     left=FExpr("MLIL_CONST_PTR", "0x4000", constant=0x4000),
+                     right=FExpr("MLIL_VAR_SSA", "count#0", reads=[c0]))
+    call = FInstr(0, 0x40, "MLIL_CALL_SSA", "weird_copy(dst, 0x4000 + count#0)",
+                  reads=[c0], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", "weird_copy", constant=0x840),
+                  params=[FExpr("MLIL_VAR_SSA", "dst#0", reads=[]), len_expr])
+    func = FFunc("wc", 0x40, FSSAFunc([call]), params=[count])
+    engine = te.TaintEngine(FBV({0x840: "weird_copy"}), custom)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+
+    classes = {x["sink"]["class"] for x in result["reached_sinks"]}
+    assert "overflow_len" in classes
+    assert "tainted_index" not in classes
+
+
 def test_forward_tainted_source_pointer_plus_const_keeps_overflow(models):
     # Soundness lock: strcpy(dst, p + 4) where the SOURCE POINTER p is tainted
     # (attacker controls where to read from) is NOT an index -- the tainted base
