@@ -1325,6 +1325,9 @@ class TaintEngine:
                 "functions_visited": len(self._funcs_visited),
                 "max_depth": self._max_depth_seen,
                 "sinks": len(unique_findings),
+                # Authoritative unresolved-leaf count so the TEXT header, the JSON
+                # `leaves` array length, and stats all cite the same number (#181).
+                "leaves": len(sub["leaves"]),
                 "truncated": self._truncated,
             },
             "soundness": SOUNDNESS,
@@ -1424,6 +1427,11 @@ class TaintEngine:
                 "functions_visited": len(funcs_visited),
                 "max_depth": max_depth_seen,
                 "sinks": len(findings),
+                # Authoritative deduped union leaf count (#181). frontier_total is
+                # the pre-dedup sum across per-callsite runs, so an agent can
+                # reconcile sum(by_source leaves) against the collapsed union.
+                "leaves": len(leaves),
+                "frontier_total": len(union_leaves),
                 "truncated": truncated,
             },
             "soundness": SOUNDNESS,
@@ -2572,6 +2580,9 @@ class TaintEngine:
             "slices": slices,
             "leaves": self._bw_leaves,
             "assumptions": self._bw_assumptions,
+            # Authoritative leaf count, matching the forward contract so the TEXT
+            # header / JSON array / stats all reconcile for backward too (#181).
+            "stats": {"leaves": len(self._bw_leaves), "slices": len(slices)},
             "soundness": SOUNDNESS,
         }
 
