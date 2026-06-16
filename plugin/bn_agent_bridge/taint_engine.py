@@ -757,18 +757,18 @@ class TaintEngine:
             right = getattr(expr, "right", None)
             l_taint = self._expr_has_taint(left, tainted)
             r_taint = self._expr_has_taint(right, tainted)
-            # base_ptr + tainted_offset (recognized inline base): index role.
-            if self._ptr_base_like(ssaf, left) and not l_taint and r_taint:
-                roles.add("index")
-                return roles
-            if op == "MLIL_ADD" and self._ptr_base_like(ssaf, right) and not r_taint and l_taint:
-                roles.add("index")
-                return roles
-            # Pointer-arg only: a stride-scaled tainted offset added to an
-            # untainted base is indexing even with a register-held base. Scaling
-            # distinguishes an index from a tainted base pointer (tainted_ptr+const
-            # has an unscaled tainted base -> stays value -> overflow kept).
+            # Pointer-arg only: a tainted offset added to an untainted base is
+            # indexing for source-pointer args. Recognized pointer bases can use
+            # unscaled offsets (`base + i`); unknown/register bases require a
+            # stride-scaled offset. Scalar length args never use these pointer-base
+            # shortcuts, so `CONST_PTR(k) + tainted_len` stays a value/length.
             if pointer_arg:
+                if self._ptr_base_like(ssaf, left) and not l_taint and r_taint:
+                    roles.add("index")
+                    return roles
+                if op == "MLIL_ADD" and self._ptr_base_like(ssaf, right) and not r_taint and l_taint:
+                    roles.add("index")
+                    return roles
                 if self._is_scaled_taint(left, tainted) and not r_taint:
                     roles.add("index")
                     return roles

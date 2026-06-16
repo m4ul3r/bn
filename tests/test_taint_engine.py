@@ -831,6 +831,28 @@ def test_forward_computed_length_keeps_overflow_len(models):
     assert "tainted_index" not in classes
 
 
+def test_forward_const_ptr_plus_tainted_length_keeps_overflow_len(models):
+    # Soundness lock: even if BN types a constant as CONST_PTR, a sink arg modeled
+    # as a LENGTH is still a scalar operand. Do not let the inline pointer-base
+    # shortcut downgrade `CONST_PTR(k) + tainted` on memcpy's length arg.
+    count = FVar("count"); c0 = FSSA(count, 0)
+    len_expr = FExpr("MLIL_ADD", "0x4000 + count#0", reads=[c0],
+                     left=FExpr("MLIL_CONST_PTR", "0x4000", constant=0x4000),
+                     right=FExpr("MLIL_VAR_SSA", "count#0", reads=[c0]))
+    call = FInstr(0, 0x40, "MLIL_CALL_SSA", "memcpy(dst, src, 0x4000 + count#0)",
+                  reads=[c0], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", "memcpy", constant=0x810),
+                  params=[FExpr("MLIL_VAR_SSA", "dst#0", reads=[]),
+                          FExpr("MLIL_VAR_SSA", "src#0", reads=[]), len_expr])
+    func = FFunc("copy_const_ptr_n", 0x40, FSSAFunc([call]), params=[count])
+    engine = te.TaintEngine(FBV({0x810: "memcpy"}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+
+    classes = {x["sink"]["class"] for x in result["reached_sinks"]}
+    assert "overflow_len" in classes
+    assert "tainted_index" not in classes
+
+
 def test_forward_tainted_source_pointer_plus_const_keeps_overflow(models):
     # Soundness lock: strcpy(dst, p + 4) where the SOURCE POINTER p is tainted
     # (attacker controls where to read from) is NOT an index -- the tainted base
