@@ -294,6 +294,11 @@ def _build_backward_trace(
                                 continue
             entry["terminates"] = True
             entry["reason"] = "call_or_jump_boundary"
+            # Resolve the call target to its symbol so a library-call origin reads
+            # as e.g. `call strlen` rather than a bare PLT address (#193).
+            callee_nm = _callee_display_name(ctx, bv, def_insn)
+            if callee_nm:
+                entry["callee"] = callee_nm
             trace.append(entry)
             continue
 
@@ -365,6 +370,39 @@ def _resolve_callee(ctx, bv, call_insn):
     interprocedural tracing works through PLT stubs and GCC thunks.
     """
     return _taint.resolve_call_target(bv, call_insn, follow_thunks=True).function
+
+
+def _callee_display_name(ctx, bv, def_insn) -> str | None:
+    """Best-effort symbol name for a call/jump target, so a value that
+    originates at a call boundary names the callee instead of just showing the
+    raw PLT target address -- the same resolution ``taint backward`` already
+    performs (#193). Returns None for a genuinely indirect/unresolved target.
+    """
+    try:
+        fn = _resolve_callee(ctx, bv, def_insn)
+    except Exception:
+        fn = None
+    if fn is not None and getattr(fn, "name", None):
+        return str(fn.name)
+    # No resolvable function (a PLT stub with only a symbol, or an extern): fall
+    # back to a symbol at the raw dest address, Thumb-bit normalized.
+    dest = getattr(def_insn, "dest", None)
+    if dest is None:
+        return None
+    try:
+        addr = _extract_dest_address(bv, dest)
+    except Exception:
+        addr = None
+    if addr is None:
+        return None
+    for cand in (addr, addr & ~1):
+        try:
+            sym = bv.get_symbol_at(cand)
+        except Exception:
+            sym = None
+        if sym is not None and getattr(sym, "name", None):
+            return str(sym.name)
+    return None
 
 
 def _resolve_thunk(ctx, bv, fn):
@@ -503,9 +541,18 @@ def _backward_slice(
             f"Call at {address} has no exposed parameters in {view}",
         )
     if arg_index < 0 or arg_index >= len(params):
+        n = len(params)
+        only = " (index 0)" if n == 1 else f" (indices 0..{n - 1})"
         raise OperationFailure(
             "invalid_arg_index",
-            f"Argument index {arg_index} out of range (0..{len(params) - 1})",
+            # --arg is 0-based against the MLIL call's recovered parameters, which
+            # can differ from the argument positions the decompiler renders (an
+            # implicit/struct-return or coalesced arg shifts the count). State the
+            # convention so a user reading pseudo-C doesn't reach for the wrong
+            # index (#226).
+            f"Argument index {arg_index} out of range: this call has {n} "
+            f"MLIL argument(s){only}. --arg is 0-based and indexes the MLIL call "
+            f"parameters, which may differ from the decompiler's displayed args.",
         )
 
     param_expr = params[arg_index]

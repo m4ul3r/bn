@@ -1870,6 +1870,10 @@ def _render_trace_text(value: Any) -> str:
         if terminates:
             label = _TRACE_REASON_LABELS.get(reason, reason.replace("_", " "))
             line = f"  {ssa_var}  —  {label}"
+            # Name the resolved callee at a call boundary so a library-call origin
+            # reads as `call boundary (strlen)` not a bare PLT address (#193).
+            if reason == "call_or_jump_boundary" and step.get("callee"):
+                line += f" ({step['callee']})"
             if reason == "field_load":
                 meta = " ".join(
                     f"{k}={step[k]}" for k in ("base", "offset", "width") if step.get(k) is not None)
