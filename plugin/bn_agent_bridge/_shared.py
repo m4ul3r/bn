@@ -165,11 +165,25 @@ def _run_on_main_thread(func):
 
 
 _CONVENTION_RE = re.compile(r'\s*__convention\("[^"]*"\)\s*')
+# BN-inferred function-type attributes, rendered as a trailing token (e.g.
+# ``int64_t() __pure``). Matched as whole words so a parameter/type that merely
+# contains the substring is untouched (#199).
+_ATTRIBUTE_RE = re.compile(r'\s*\b__(?:pure|noreturn)\b')
 
 
 def _normalize_prototype(proto: str) -> str:
-    """Strip ``__convention("...")`` annotations and normalize whitespace for comparison."""
-    return " ".join(_CONVENTION_RE.sub("", proto).split())
+    """Normalize a prototype for verification comparison.
+
+    Strips BN-inferred annotations that a requested prototype need not carry but
+    that analysis re-adds on readback -- the ``__convention("...")`` calling
+    convention and the ``__pure`` / ``__noreturn`` function attributes -- and
+    collapses whitespace. Without this, a valid edit on a function BN tags
+    ``__pure`` (common on accessors) reads back as a textual mismatch and is
+    reported ``verification_failed`` + reverted, even though the requested type
+    landed (#199)."""
+    stripped = _CONVENTION_RE.sub("", proto)
+    stripped = _ATTRIBUTE_RE.sub("", stripped)
+    return " ".join(stripped.split())
 
 
 def _parse_address(value: Any) -> int:

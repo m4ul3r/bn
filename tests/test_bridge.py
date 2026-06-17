@@ -37,8 +37,21 @@ def _load_bridge(monkeypatch):
             self.name = name
             self.raw_name = name
 
+    class Type:
+        # Minimal stand-ins for the BN class methods the namespaced-type
+        # fallback uses (#200). named_type_from_type yields a reference whose
+        # str is the type name; pointer wraps with a trailing '*'.
+        @staticmethod
+        def named_type_from_type(name, type_obj):
+            return _FakeType(str(name), type_class="NamedTypeReferenceClass")
+
+        @staticmethod
+        def pointer(arch, type_obj):
+            return _FakeType(f"{type_obj}*", type_class="PointerTypeClass")
+
     fake_bn.SymbolType = SymbolType
     fake_bn.Symbol = Symbol
+    fake_bn.Type = Type
     fake_bn.log_info = lambda *args, **kwargs: None
     fake_bn.log_warn = lambda *args, **kwargs: None
     fake_bn.log_error = lambda *args, **kwargs: None
@@ -1182,6 +1195,53 @@ def test_parse_type_or_hint_shared_by_all_type_ops(monkeypatch):
     assert "declare it first" in msg
     assert "syntaxerror" not in msg.lower()  # no raw Python exception class
     assert "\n" not in msg                   # BN's multi-line parser text collapsed
+
+
+def test_parse_type_or_hint_resolves_namespaced_user_type(monkeypatch):
+    """BN's C type-string parser rejects a ::-qualified user type even when it is
+    defined and resolvable via get_type_by_name. local retype / field type should
+    fall back to building the type from the named type (optionally pointer-wrapped)
+    so a C++ class type applies without a flat-name alias workaround (#200)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    me = bridge.mutation_engine
+
+    class _NsBV(_FakeBV):
+        def parse_type_string(self, decl):
+            # BN rejects the namespaced name outright.
+            raise SyntaxError(
+                "error: <unknown>:1:1 use of undeclared identifier 'ns'\n1 error generated."
+            )
+
+    bv = _NsBV(functions=[], types_={"ns::demo::Foo": _FakeType("struct ns::demo::Foo")})
+
+    # pointer to a ::-qualified type resolves via the fallback. The named type
+    # keeps its `struct` tag (matching BN's live readback, so verification passes).
+    t, name = me._parse_type_or_hint(
+        instance.ctx, bv, {"op": "local_retype"}, "ns::demo::Foo*", label="type"
+    )
+    assert str(t) == "struct ns::demo::Foo*"
+    assert name is None
+
+    # the bare ::-qualified type (no pointer) resolves too
+    t2, _ = me._parse_type_or_hint(
+        instance.ctx, bv, {"op": "local_retype"}, "ns::demo::Foo", label="type"
+    )
+    assert str(t2) == "struct ns::demo::Foo"
+
+    # double-pointer too
+    t3, _ = me._parse_type_or_hint(
+        instance.ctx, bv, {"op": "local_retype"}, "ns::demo::Foo **", label="type"
+    )
+    assert str(t3) == "struct ns::demo::Foo**"
+
+    # a name that is NOT a known type still raises the actionable declare hint
+    with pytest.raises(bridge.OperationFailure) as excinfo:
+        me._parse_type_or_hint(
+            instance.ctx, bv, {"op": "local_retype"}, "ns::demo::Unknown*", label="type"
+        )
+    assert excinfo.value.status == "invalid_request"
+    assert "declare it first" in excinfo.value.message
 
 
 def test_batch_struct_field_accepts_type_name_alias(monkeypatch):
@@ -4576,6 +4636,47 @@ def test_verify_prototype_still_fails_on_real_mismatch(monkeypatch):
 
     verified = instance._verify_operation(bv, result)
     assert verified["status"] == "verification_failed"
+
+
+def test_verify_prototype_passes_when_bn_infers_pure_attribute(monkeypatch):
+    """BN may re-infer a __pure / __noreturn attribute suffix after
+    set_user_type (common on accessors). The requested type lacked it but is
+    semantically identical, so the readback must normalise the attribute and
+    report `verified` -- not verification_failed + revert the valid edit (#199)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _PureFunction(_FakeFunction):
+        def __init__(self):
+            # BN auto-typed this accessor int64_t() __pure before the edit.
+            super().__init__(0x405250, "reset", "int64_t() __pure")
+
+        def set_user_type(self, value):
+            # After set_user_type + analysis BN re-adds the __pure suffix that
+            # the requested prototype did not carry.
+            self.type = "void(void* self) __pure"
+
+    class _PureBV(_FakeBV):
+        def parse_type_string(self, declaration):
+            # parse_type_string returns the requested type WITHOUT __pure.
+            return _FakeType("void(void* self)", type_class="FunctionTypeClass"), None
+
+    fn = _PureFunction()
+    bv = _PureBV(functions=[fn])
+
+    result = instance._op_set_prototype(
+        bv,
+        {
+            "op": "set_prototype",
+            "identifier": "reset",
+            "prototype": "void reset(void* self)",
+        },
+    )
+
+    assert result["expected_prototype"] == "void(void* self)"
+    verified = instance._verify_operation(bv, result)
+    assert verified["status"] == "verified"
+    assert "__pure" in verified["observed"]["prototype"]
 
 
 class _LoadBV:
