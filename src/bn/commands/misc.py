@@ -4,6 +4,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 from ..cli import _call, _effective_limit, _int_or_hex, _mutation_exit_code, _non_negative_int, _pick, arg, command, mutex
 from ..formatters import (
@@ -83,6 +84,14 @@ def _strings(args: argparse.Namespace) -> int:
     return rc
 
 
+def _imports_count_text(value: Any) -> str:
+    line = f"Total imports: {value.get('count', 0)}"
+    excluded = value.get("self_defined_excluded")
+    if isinstance(excluded, int) and excluded > 0:
+        line += f" ({excluded} self-defined excluded)"
+    return line
+
+
 @command("imports", help="List imports", target=True, paged=True,
          args=[arg("--summary", action="store_true", default=False,
                    help="Show aggregate counts by namespace and kind instead of the full list"),
@@ -96,7 +105,7 @@ def _imports(args: argparse.Namespace) -> int:
             {"count_only": True},
             require_target=True,
             allow_implicit_target=True,
-            text_renderer=lambda value: f"Total imports: {value.get('count', 0)}",
+            text_renderer=_imports_count_text,
             stem="imports-count",
         )
     summary_mode = bool(args.summary)

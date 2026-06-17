@@ -517,7 +517,17 @@ def _render_name_address_rows(value: Any) -> str:
 def _render_name_address_list_text(value: Any) -> str:
     """Render imports: the paged {items, total, ...} envelope (with a footer),
     or a bare list for back-compat / internal callers (#122)."""
-    return _render_paged_list_text(value, "items", _render_name_address_rows)
+    body = _render_paged_list_text(value, "items", _render_name_address_rows)
+    # Surface PIC self-references dropped from the survey so the exclusion isn't
+    # silent (#202).
+    excluded = value.get("self_defined_excluded") if isinstance(value, dict) else None
+    if isinstance(excluded, int) and excluded > 0:
+        note = (
+            f"// {excluded} self-defined export(s) excluded "
+            "(this module's own symbols modeled as import veneers / GOT slots)"
+        )
+        body = note if body == "none" else f"{body}\n{note}"
+    return body
 
 
 def _paging_footer(value: dict[str, Any], items: list[Any]) -> str | None:
@@ -1420,6 +1430,9 @@ def _render_imports_summary_text(value: Any) -> str:
     # Label matches the JSON key (`total_symbols`) instead of drifting to
     # "total imports".
     lines = [f"total symbols: {total}"]
+    excluded = value.get("self_defined_excluded")
+    if isinstance(excluded, int) and excluded > 0:
+        lines.append(f"self-defined excluded: {excluded}")
     needed = value.get("needed_libraries") or []
     if needed:
         lines.append("")

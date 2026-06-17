@@ -186,6 +186,23 @@ def _needed_libraries(bv) -> list[str]:
         return []
 
 
+def _defined_symbol_names(bv) -> set[str]:
+    """Raw names of symbols DEFINED in this module (function/data definitions).
+
+    Used to recognize a PIC shared object's own exports that BN also models as
+    import veneers / GOT slots, so those self-references can be dropped from the
+    imports survey (#202). Keyed on ``raw_name`` because that's what the import
+    veneer and GOT slot carry too."""
+    names: set[str] = set()
+    for attr_name in ("FunctionSymbol", "DataSymbol"):
+        sym_type = getattr(bn.SymbolType, attr_name, None)
+        if sym_type is None:
+            continue
+        for sym in list(bv.get_symbols_of_type(sym_type)):
+            names.add(str(getattr(sym, "raw_name", sym.name)))
+    return names
+
+
 def _imports(ctx, selector: str | None, *, summary: bool = False,
              offset: int = 0, limit: int | None = None, count_only: bool = False):
     # Guard paging the same way the sibling list ops do, so a raw-socket /
@@ -195,7 +212,9 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     bv = ctx._resolve_view(selector)
     needed_libraries = _needed_libraries(bv)
+    defined_names = _defined_symbol_names(bv)
     items = []
+    self_defined_excluded = 0
     for attr_name, kind in _IMPORT_SYMBOL_TYPES:
         sym_type = getattr(bn.SymbolType, attr_name, None)
         if sym_type is None:
@@ -203,6 +222,15 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
         for sym in list(bv.get_symbols_of_type(sym_type)):
             name = read_xrefs._import_symbol_name(sym)
             raw_name = str(getattr(sym, "raw_name", sym.name))
+            # On a PIC shared object BN models the library's OWN defined+exported
+            # symbols as import veneers (ImportedFunctionSymbol) plus GOT/GLOB_DAT
+            # slots (ImportAddressSymbol) -- internal self-references, not genuine
+            # external dependencies. When the same name is defined in this module,
+            # drop the import entry (counted below) so the survey isn't ~2x
+            # bloated and real deps aren't buried (#202).
+            if raw_name in defined_names:
+                self_defined_excluded += 1
+                continue
             namespace = str(getattr(sym, "namespace", "") or "")
             # Only surface `library` when it's a real per-library namespace;
             # BN's sentinels become None so agents don't read them as a
@@ -219,11 +247,17 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
                 }
             )
     if count_only:
-        return {"count": len(items), "total": len(items)}
+        result = {"count": len(items), "total": len(items)}
+        if self_defined_excluded:
+            result["self_defined_excluded"] = self_defined_excluded
+        return result
     if summary:
         # Summary aggregates the whole import set; paging would distort the
         # counts, so it always reflects every symbol regardless of offset/limit.
-        return _imports_build_summary(items, needed_libraries)
+        result = _imports_build_summary(items, needed_libraries)
+        if self_defined_excluded:
+            result["self_defined_excluded"] = self_defined_excluded
+        return result
     # Order by kind USEFULNESS first (function -> data -> address), not the old
     # alphabetical kind sort which put "address"-kind internals ahead of
     # everything and buried the function/libc imports -- a `head`/first-page read
@@ -235,7 +269,12 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
         item["name"],
         int(item["address"], 16),
     ))
-    return _paged_list_result(items, offset=offset, limit=limit)
+    result = _paged_list_result(items, offset=offset, limit=limit)
+    # Only present when there's something to report, so the common case keeps the
+    # standard paged-list envelope shared with strings/sections (#202).
+    if self_defined_excluded:
+        result["self_defined_excluded"] = self_defined_excluded
+    return result
 
 
 def _imports_build_summary(
