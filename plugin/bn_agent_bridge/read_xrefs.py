@@ -216,6 +216,22 @@ def _xrefs_import_symbol(ctx, bv, identifier: str, *, offset: int = 0, limit: in
         msg += " Not found as an import symbol either. Use 'bn imports' to see available imports."
         raise RuntimeError(msg)
 
+    # #201: a demangled C++ name matches an import veneer (PLT stub) via its
+    # short_name, but the same symbol may also be DEFINED in this module (a PIC
+    # self-reference). Resolving xrefs to the stub gives the wrong call-graph, so
+    # redirect to the real definition -- reusing the same impl-over-stub resolver
+    # `_find_function` uses for a name collision. `xrefs <mangled>` and decompile
+    # already reach the definition; this makes `xrefs <demangled>` consistent.
+    raw_name = str(getattr(sym, "raw_name", sym.name))
+    bodies = ctx._find_functions_by_name(bv, raw_name, case_sensitive=True)
+    impl = ctx._resolve_impl_over_stub(bodies) if bodies else None
+    if impl is not None and int(impl.start) != int(sym.address):
+        result = _xrefs_to_address(ctx, bv, int(impl.start), offset=offset, limit=limit)
+        result["import_resolved"] = True
+        result["import_name"] = str(identifier)
+        result["resolved_to_definition"] = hex(int(impl.start))
+        return result
+
     sym_address = int(sym.address)
     result = _xrefs_to_address(ctx, bv, sym_address, offset=offset, limit=limit)
     result["import_resolved"] = True

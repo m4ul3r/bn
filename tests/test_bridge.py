@@ -3867,6 +3867,47 @@ def test_imports_includes_function_data_and_address_symbols(monkeypatch):
     assert kinds["iat_entry"] == "address"
 
 
+def test_imports_excludes_pic_self_defined_exports(monkeypatch):
+    """On a PIC .so BN models the lib's own defined+exported functions as import
+    veneers (ImportedFunctionSymbol) plus their GOT slots (ImportAddressSymbol),
+    even though they're defined in the same module. These self-references must be
+    excluded from the imports survey (and counted, not silently dropped), leaving
+    only genuine external dependencies (#202)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+
+    NAME = "_ZN5boost6system15system_categoryEv"
+    # the real, DEFINED export (function body in this module)
+    defined = fake_bn.Symbol(fake_bn.SymbolType.FunctionSymbol, 0x401c90, NAME)
+    defined.short_name = NAME
+    # BN's PIC self-references: an import veneer + a GOT slot, both library:null
+    veneer = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x401980, NAME)
+    veneer.short_name = NAME
+    veneer.namespace = "BNINTERNALNAMESPACE"
+    got = fake_bn.Symbol(fake_bn.SymbolType.ImportAddressSymbol, 0x413f58, NAME)
+    got.short_name = NAME
+    got.namespace = "BNINTERNALNAMESPACE"
+    # a genuine external import (no in-module definition)
+    ext = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x401000, "memcpy")
+    ext.short_name = "memcpy"
+    ext.namespace = ""
+
+    bv = _FakeBV(symbols=[defined, veneer, got, ext])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._imports(None)
+    names = [it["name"] for it in result["items"]]
+    assert names == ["memcpy"]                    # only the genuine import remains
+    assert result["total"] == 1
+    assert result["self_defined_excluded"] == 2   # veneer + GOT slot, visibly dropped
+
+    # the summary path excludes them too, and surfaces the count
+    summary = instance._imports(None, summary=True)
+    assert summary["total_symbols"] == 1
+    assert summary["self_defined_excluded"] == 2
+
+
 def test_imports_sorts_function_kind_first_then_library_name(monkeypatch):
     # Imports order by kind usefulness (function -> data -> address) first, then
     # library/name (#07). The data symbol here has the alphabetically-EARLIER
@@ -5850,6 +5891,35 @@ def test_xrefs_falls_back_to_import_symbol_when_function_not_found(monkeypatch):
     assert result["import_resolved"] is True
     assert result["import_name"] == "malloc"
     assert result["address"] == "0x20000"
+
+
+def test_xrefs_demangled_name_resolves_to_definition_not_veneer(monkeypatch):
+    """A demangled C++ name matches an import veneer (PLT stub) via short_name,
+    but the same symbol is also DEFINED in this module. xrefs must resolve to the
+    real definition, not the stub, so the call-graph matches `xrefs <mangled>` /
+    decompile rather than silently returning the veneer's refs (#201)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+
+    MANGLED = "_ZN5proto3Msg6handleEv"
+    DEMANGLED = "proto::Msg::handle"
+    # the PLT import veneer (matched by the demangled short_name)
+    veneer = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x403380, MANGLED)
+    veneer.short_name = DEMANGLED
+    veneer.raw_name = MANGLED
+    veneer.namespace = "BNINTERNALNAMESPACE"
+    # the real function body, defined in this module
+    impl = _FakeFunction(0x405250, MANGLED)
+    impl.symbol = _FakeSymbol("FunctionSymbol")
+
+    bv = _FakeBV(functions=[impl], symbols=[veneer])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._xrefs(None, DEMANGLED)
+    assert result["address"] == "0x405250"               # the definition, not 0x403380
+    assert result["resolved_to_definition"] == "0x405250"
+    assert result["import_resolved"] is True
 
 
 def test_xrefs_import_symbol_raises_for_unknown_symbol(monkeypatch):
