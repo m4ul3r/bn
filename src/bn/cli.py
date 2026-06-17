@@ -402,9 +402,9 @@ def _render_result(
             # (#195). (A terminal / agent-capture isn't a pipe, so this is quiet
             # there.)
             print(
-                f"note: stdout is a pipe -- grep/jq/awk see only the envelope above, "
-                f"not the data. Re-run with --out FILE and search the file "
-                f"(or grep {artifact_path}).",
+                f"note: stdout is a pipe -- grep/jq/awk receive only the spill "
+                f"envelope, not the data, so a no-match is NOT a real absence. "
+                f"Re-run with --out FILE and search the file (or grep {artifact_path}).",
                 file=sys.stderr,
             )
         return

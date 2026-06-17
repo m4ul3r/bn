@@ -215,9 +215,12 @@ def _get_comment(ctx, selector: str | None, address, function):
         # Aggregate ALL comments within the function's address range, not just the
         # entry-address comment -- a comment lands on the interesting call/branch,
         # not the prologue, so the entry-only read reported (no comment) for a
-        # function that has several, contradicting `comment list` (#203). Uses the
-        # same global address_comments + containing-function attribution as
-        # `comment list`, so the two agree.
+        # function that has several, contradicting `comment list` (#203). Reads the
+        # same global address_comments and uses containing-function membership, so
+        # the two agree for the common case. (One divergence: an address shared by
+        # OVERLAPPING functions is reported here for EACH containing function --
+        # inclusive -- where `comment list` attributes it to just the first; both
+        # are defensible and neither loses data.)
         address_comments = getattr(bv, "address_comments", {}) or {}
         comments = []
         for addr in sorted(address_comments):
