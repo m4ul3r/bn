@@ -2019,6 +2019,31 @@ def test_function_info_includes_metadata(monkeypatch):
     assert result["return_type"] == "int32_t"
     assert result["calling_convention"] == "__cdecl"
     assert result["size"] is None
+    # A function with no unlifted instructions reports a 0 count, not absence.
+    assert result["unimplemented_instructions"] == {"count": 0, "addresses": [], "truncated": False}
+
+
+def test_function_info_reports_unimplemented_instructions(monkeypatch):
+    """function info aggregates instructions BN's lifter could not model so an
+    FP-heavy function isn't mistaken for fully analyzed (#206)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x405000, "transform")
+    # Two unlifted FP instructions (e.g. AArch64 fnmsub) surface as LLIL_UNIMPL.
+    fn.low_level_il = [_FakeBlock([
+        _FakeMLILInsn(0x4056f8, operation="LLIL_UNIMPL"),
+        _FakeMLILInsn(0x4056fc, operation="LLIL_UNIMPL"),
+        _FakeMLILInsn(0x405700, operation="LLIL_SET_REG"),
+    ])]
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_info("active", "transform")
+
+    ui = result["unimplemented_instructions"]
+    assert ui["count"] == 2
+    assert ui["addresses"] == ["0x4056f8", "0x4056fc"]
+    assert ui["truncated"] is False
 
 
 def _install_fake_pseudo_c(monkeypatch, bridge, func, batches):
@@ -5959,6 +5984,70 @@ def test_backward_slice_ip_rejects_llil(monkeypatch):
     with pytest.raises(bridge.OperationFailure, match="SSA form does not support"):
         instance._backward_slice("active", "test_func", "0x10010", arg_index=0,
                                  view="llil", interprocedural=True)
+
+
+def test_backward_slice_arg_index_message_states_mlil_convention(monkeypatch):
+    """An out-of-range --arg names the MLIL count and the 0-based/MLIL
+    convention so a user reading pseudo-C doesn't reach for the wrong index (#226)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    # A call the decompiler may render with one visible argument: exactly one
+    # MLIL param, so only --arg 0 is valid.
+    call_insn = _FakeMLILInsn(
+        0x10010,
+        operation="MLIL_CALL_SSA",
+        params=[_FakeMLILInsn(0x10010, operation="MLIL_VAR_SSA")],
+    )
+    fn = _FakeFunction(0x10000, "test_func")
+    fn.medium_level_il = _FakeMLILFunction(instructions=[call_insn])
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._backward_slice("active", "test_func", "0x10010", arg_index=1)
+    msg = str(exc.value)
+    assert "this call has 1 MLIL argument(s)" in msg
+    assert "(index 0)" in msg
+    assert "0-based" in msg and "MLIL" in msg
+
+
+def test_backward_slice_call_boundary_names_callee(monkeypatch):
+    """A value originating at a (non-interprocedural) call boundary names the
+    resolved callee symbol instead of just terminating at the raw target (#193)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    # Callee body so the resolver returns a real function with a name.
+    callee = _FakeFunction(0x20000, "strlen")
+    callee.medium_level_il = _FakeMLILFunction(instructions=[])
+
+    # Caller: arg 0 of the traced call is `ret_var`, defined by an inner call to
+    # `strlen`. Default (non-interprocedural) mode terminates at the boundary.
+    ret_var = _FakeSSAVariable("r0#3")
+    inner_call_insn = _FakeMLILInsn(
+        0x1000c, operation="MLIL_CALL_SSA", dest=_FakeConstPtr(0x20000),
+    )
+    target_call_insn = _FakeMLILInsn(
+        0x10010,
+        operation="MLIL_CALL_SSA",
+        params=[_FakeMLILInsn(0x10010, operation="MLIL_VAR_SSA", vars_read=[ret_var])],
+        vars_read=[ret_var],
+    )
+    caller = _FakeFunction(0x10000, "caller_fn")
+    caller.medium_level_il = _FakeMLILFunction(
+        instructions=[inner_call_insn, target_call_insn],
+        definitions={ret_var: inner_call_insn},
+    )
+    bv = _FakeBV(functions=[caller, callee])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._backward_slice("active", "caller_fn", "0x10010", arg_index=0)
+
+    boundary = [s for s in result["trace"] if s.get("reason") == "call_or_jump_boundary"]
+    assert len(boundary) == 1, f"expected one call boundary, got {result['trace']}"
+    assert boundary[0]["terminates"] is True
+    assert boundary[0]["callee"] == "strlen"
 
 
 # --- imports --summary ---

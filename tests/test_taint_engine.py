@@ -364,6 +364,191 @@ def test_forward_no_flow_no_false_positive(models):
     assert result["reached_sinks"] == []
 
 
+def test_forward_flags_unlifted_instruction_as_assumption(models):
+    # A visited function containing an unlifted instruction (e.g. AArch64 FP
+    # fnmsub, which renders as MLIL_UNIMPL) must surface an assumption instead of
+    # flowing through it silently -- the silent-hole class #206 targets.
+    a = FVar("a"); r = FVar("r")
+    a0 = FSSA(a, 0); r1 = FSSA(r, 1)
+    ssa = FSSAFunc([
+        FInstr(0, 0x10, "MLIL_UNIMPL", "fnmsub s0, s0, s5, s3"),
+        FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "r#1 = a#0 + 1", reads=[a0], writes=[r1]),
+        FInstr(2, 0x18, "MLIL_RET", "return r#1", reads=[r1]),
+    ])
+    func = FFunc("transform", 0x10, ssa, params=[a])
+    engine = te.TaintEngine(FBV({}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert any("unlifted/unimplemented" in s for s in result["assumptions"])
+    assert any("0x10" in s for s in result["assumptions"])
+
+
+class FType:
+    """Minimal BN Type stand-in for broad-source detection (#219)."""
+    def __init__(self, type_class, *, target=None, width=0, members=()):
+        self.type_class = type("TC", (), {"name": type_class})()
+        if target is not None:
+            self.target = target
+        self.width = width
+        self.members = list(members)
+
+
+def test_forward_broad_source_hint_on_large_struct_pointer(models):
+    # A param:0 that is a pointer to a large aggregate must add a broad-source
+    # nudge (whole struct treated as one taint location -> over-taint) (#219).
+    struct_t = FType("StructureTypeClass", width=0x200, members=[1, 2, 3, 4, 5, 6, 7, 8, 9])
+    ptr_t = FType("PointerTypeClass", target=struct_t)
+    a = FVar("ctx"); a.type = ptr_t
+    r = FVar("r")
+    a0 = FSSA(a, 0); r1 = FSSA(r, 1)
+    ssa = FSSAFunc([
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "r#1 = a#0 + 1", reads=[a0], writes=[r1]),
+        FInstr(1, 0x14, "MLIL_RET", "return r#1", reads=[r1]),
+    ])
+    func = FFunc("handler", 0x10, ssa, params=[a])
+    engine = te.TaintEngine(FBV({}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert any("broad source" in s for s in result["assumptions"])
+    assert any("9 fields" in s for s in result["assumptions"])
+
+
+def test_forward_no_broad_source_hint_for_scalar_param(models):
+    # A scalar (non-pointer) param must NOT trigger the broad-source nudge.
+    a = FVar("n", typ="int32_t")  # FVar default .type is a plain string
+    r = FVar("r")
+    a0 = FSSA(a, 0); r1 = FSSA(r, 1)
+    ssa = FSSAFunc([
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "r#1 = a#0 + 1", reads=[a0], writes=[r1]),
+        FInstr(1, 0x14, "MLIL_RET", "return r#1", reads=[r1]),
+    ])
+    func = FFunc("handler", 0x10, ssa, params=[a])
+    engine = te.TaintEngine(FBV({}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert not any("broad source" in s for s in result["assumptions"])
+
+
+def _stack_var(name):
+    v = FVar(name)
+    v.source_type = type("ST", (), {"name": "StackVariableSourceType"})()
+    return v
+
+
+def test_forward_pointer_escape_into_stack_descriptor_is_not_silent(models):
+    # recvfrom fills buf; &buf is then stashed into a stack descriptor local that
+    # the engine cannot follow (a separate &descriptor would be handed to a
+    # handler). The result must NOT be a silent 0-leaf clear: a pointer_escape
+    # leaf + assumption flag the dropped flow (#228).
+    buf = FVar("buf", typ="char[0xbb8]")
+    fd = FVar("fd")
+    desc = _stack_var("desc")
+    desc1 = FSSA(desc, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "recvfrom(fd, &buf, 0xbb8, ...)",
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[FSSA(fd, 0)]),
+                       FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       FExpr("MLIL_CONST", "0xbb8", constant=0xbb8)]),
+        FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "desc#1 = &buf", writes=[desc1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+    ]
+    func = FFunc("net_handler", 0x10, FSSAFunc(instrs), params=[fd])
+    bv = FBV({0x900: "recvfrom"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:recvfrom:1")])
+
+    assert result["reached_sinks"] == []                      # no false sink
+    assert "pointer_escape" in [l.get("kind") for l in result["leaves"]]
+    assert result["stats"]["leaves"] >= 1                     # NOT a silent clear
+    assert any("escapes" in a for a in result["assumptions"])
+
+
+def test_forward_pointer_escape_single_var_descriptor_propagates(models):
+    # desc = &buf (single-var descriptor); handler(&desc) -- tainting the captured
+    # descriptor lets the by-address handoff descend into the handler (#228).
+    buf = FVar("buf"); fd = FVar("fd"); desc = _stack_var("desc")
+    desc1 = FSSA(desc, 1)
+    handler = FFunc("handler", 0x500,
+                    FSSAFunc([FInstr(0, 0x500, "MLIL_RET", "return", reads=[])]),
+                    params=[FVar("p")])
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "recvfrom(fd, &buf, 0xbb8)",
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[FSSA(fd, 0)]),
+                       FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       FExpr("MLIL_CONST", "0xbb8", constant=0xbb8)]),
+        FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "desc#1 = &buf", writes=[desc1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+        FInstr(2, 0x18, "MLIL_CALL_SSA", "handler(&desc)",
+               dest=FExpr("MLIL_CONST_PTR", "0x500", constant=0x500),
+               params=[FExpr("MLIL_ADDRESS_OF", "&desc", src=desc)]),
+    ]
+    func = FFunc("net_handler", 0x10, FSSAFunc(instrs), params=[fd])
+    bv = FBV({0x900: "recvfrom", 0x500: "handler"}, funcs={0x500: handler})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:recvfrom:1")])
+
+    # descended into the handler: the escaped descriptor propagated by address.
+    assert result["stats"]["functions_visited"] >= 2
+
+
+def test_forward_register_buffer_setup_is_not_a_false_escape(models):
+    # `x1 = &buf` setting up recvfrom's OWN buffer arg is a register write, not a
+    # stack-descriptor capture, so it must NOT be reported as a pointer_escape.
+    buf = FVar("buf"); fd = FVar("fd")
+    x1 = FVar("x1")  # register var: no source_type -> not a stack write
+    x1_1 = FSSA(x1, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "x1#1 = &buf", writes=[x1_1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "recvfrom(fd, x1#1, 0xbb8)",
+               reads=[x1_1],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[FSSA(fd, 0)]),
+                       FExpr("MLIL_VAR_SSA", "x1#1", reads=[x1_1]),
+                       FExpr("MLIL_CONST", "0xbb8", constant=0xbb8)]),
+    ]
+    func = FFunc("h", 0x10, FSSAFunc(instrs), params=[fd])
+    bv = FBV({0x900: "recvfrom"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:recvfrom:1")])
+    assert "pointer_escape" not in [l.get("kind") for l in result["leaves"]]
+
+
+def test_forward_arg_source_indirect_pointer_warns(models):
+    # recvfrom(fd, G.pkt, n) where the dest buffer pointer is loaded from a global
+    # slot: the seed can't anchor the pointee and won't correlate later re-loads,
+    # so it must add an honest indirect-pointer note, not a silent clear (#193).
+    fd = FVar("fd"); t = FVar("t"); t1 = FSSA(t, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "t#1 = [G]", writes=[t1],
+               src=FExpr("MLIL_LOAD", "[G]", reads=[])),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "recvfrom(fd, t#1, 0x100)",
+               reads=[t1],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[FSSA(fd, 0)]),
+                       FExpr("MLIL_VAR_SSA", "t#1", reads=[t1]),
+                       FExpr("MLIL_CONST", "0x100", constant=0x100)]),
+    ]
+    func = FFunc("recv_handler", 0x10, FSSAFunc(instrs), params=[fd])
+    bv = FBV({0x900: "recvfrom"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:recvfrom:1")])
+    assert any("indirectly" in a and "param:N" in a for a in result["assumptions"])
+
+
+def test_forward_no_unlifted_no_assumption(models):
+    # The unlifted signal must not fire on a clean function (no false noise).
+    a = FVar("a"); r = FVar("r")
+    a0 = FSSA(a, 0); r1 = FSSA(r, 1)
+    ssa = FSSAFunc([
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "r#1 = a#0 + 1", reads=[a0], writes=[r1]),
+        FInstr(1, 0x14, "MLIL_RET", "return r#1", reads=[r1]),
+    ])
+    func = FFunc("clean", 0x10, ssa, params=[a])
+    engine = te.TaintEngine(FBV({}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert not any("unlifted" in s for s in result["assumptions"])
+
+
 def _fwrite_func():
     # dump(fd): read(fd, &buf, 0x40); fwrite(&buf, 1, 0x40, fp)
     buf = FVar("buf", typ="char[0x40]")
@@ -2552,6 +2737,159 @@ def test_forward_keeps_overflow_when_alloc_size_differs_from_length(models):
     memcpy_sinks = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
     assert len(memcpy_sinks) == 1
     assert memcpy_sinks[0]["class"] == "overflow_len"          # NOT downgraded
+
+
+def _copy_func_alloc_offset(*, alloc_const, dest_off, alloc_addr=0x2000,
+                            alloc_name_addr=0x2000, len_const=0, param=None):
+    # dst = alloc(len + alloc_const); memcpy(dst + dest_off, src, len + len_const)
+    n = FVar("n"); n0 = FSSA(n, 0)
+    dst = FVar("dst"); src = FVar("src")
+    dst1 = FSSA(dst, 1); src0 = FSSA(src, 0)
+
+    def _len_plus(const):
+        base = FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])
+        if const == 0:
+            return base
+        return FExpr("MLIL_ADD", f"n#0 + {hex(const)}", reads=[n0],
+                     left=base, right=FExpr("MLIL_CONST", hex(const), constant=const))
+
+    size_arg = _len_plus(alloc_const)
+    if dest_off == 0:
+        dest_expr = FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1])
+    else:
+        dest_expr = FExpr("MLIL_ADD", f"dst#1 + {hex(dest_off)}", reads=[dst1],
+                          left=FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1]),
+                          right=FExpr("MLIL_CONST", hex(dest_off), constant=dest_off))
+    src_param = FExpr("MLIL_VAR_SSA", "src#0", reads=[src0])
+    len_param = _len_plus(len_const)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "dst#1 = alloc(...)",
+               reads=[n0], writes=[dst1],
+               dest=FExpr("MLIL_CONST_PTR", hex(alloc_addr), constant=alloc_addr),
+               params=[size_arg]),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "memcpy(dst, src, len)",
+               reads=[dst1, src0, n0],
+               dest=FExpr("MLIL_CONST_PTR", "0x2010", constant=0x2010),
+               params=[dest_expr, src_param, len_param]),
+    ]
+    return FFunc("copy", 0x10, FSSAFunc(instrs), params=[param or n])
+
+
+def test_forward_downgrades_len_plus_const_alloc_with_dest_offset(models):
+    # dst = malloc(len + 0x2d); memcpy(dst + 0x2c, src, len): 0x2c + len + 1 fits
+    # len + 0x2d, so the copy is provably bounded -> bounded_len, not overflow (#229).
+    func = _copy_func_alloc_offset(alloc_const=0x2d, dest_off=0x2c, alloc_name_addr=0x2000)
+    bv = FBV({0x2000: "malloc", 0x2010: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    memcpy = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(memcpy) == 1
+    assert memcpy[0]["class"] == "bounded_len"
+    assert "0x2d" in memcpy[0]["detail"]
+
+
+def test_forward_keeps_overflow_when_dest_offset_exceeds_alloc_slack(models):
+    # dst = malloc(len + 0x10); memcpy(dst + 0x20, src, len): 0x20 > 0x10 slack,
+    # so the copy can overrun -> must STAY overflow_len (no false downgrade) (#229).
+    func = _copy_func_alloc_offset(alloc_const=0x10, dest_off=0x20)
+    bv = FBV({0x2000: "malloc", 0x2010: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    memcpy = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(memcpy) == 1
+    assert memcpy[0]["class"] == "overflow_len"
+
+
+def test_forward_downgrades_unmodeled_single_arg_allocator_wrapper(models):
+    # dst = my_alloc_wrapper(len); memcpy(dst, src, len): an unmodeled one-arg
+    # allocator wrapper whose sole arg is the copy length -> bounded_len (#229).
+    func = _copy_func_alloc_offset(alloc_const=0, dest_off=0, alloc_addr=0x3000)
+    bv = FBV({0x3000: "my_alloc_wrapper", 0x2010: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    memcpy = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(memcpy) == 1
+    assert memcpy[0]["class"] == "bounded_len"
+    assert "assumed allocator wrapper" in memcpy[0]["detail"]
+
+
+def test_forward_keeps_overflow_when_copy_length_underflows(models):
+    # dst = malloc(n); memcpy(dst, src, n - 0x10): in unsigned C the length
+    # underflows to a huge value when n < 0x10 (a real overflow). A negative
+    # copy-length addend must NEVER downgrade to bounded_len (#229 review Finding 1).
+    n = FVar("n"); n0 = FSSA(n, 0)
+    dst = FVar("dst"); src = FVar("src")
+    dst1 = FSSA(dst, 1); src0 = FSSA(src, 0)
+    len_arg = FExpr("MLIL_SUB", "n#0 - 0x10", reads=[n0],
+                    left=FExpr("MLIL_VAR_SSA", "n#0", reads=[n0]),
+                    right=FExpr("MLIL_CONST", "0x10", constant=0x10))
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "dst#1 = malloc(n)",
+               reads=[n0], writes=[dst1],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])]),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "memcpy(dst, src, n - 0x10)",
+               reads=[dst1, src0, n0],
+               dest=FExpr("MLIL_CONST_PTR", "0x2010", constant=0x2010),
+               params=[FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1]),
+                       FExpr("MLIL_VAR_SSA", "src#0", reads=[src0]),
+                       len_arg]),
+    ]
+    func = FFunc("copy", 0x10, FSSAFunc(instrs), params=[n])
+    bv = FBV({0x2000: "malloc", 0x2010: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    memcpy = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(memcpy) == 1
+    assert memcpy[0]["class"] == "overflow_len"
+
+
+def test_forward_keeps_overflow_when_copy_addend_is_sign_extended_negative(models):
+    # BN sign-extends constants at bit 63, so a >= 2^63 copy-length addend surfaces
+    # as a negative Python int. dst = malloc(n + 0x10); memcpy(dst, src, n + HUGE)
+    # must stay overflow_len even though (c + cc <= ac) would be True with cc < 0
+    # (#229 review Finding 1, the bit-63 variant).
+    n = FVar("n"); n0 = FSSA(n, 0)
+    dst = FVar("dst"); src = FVar("src")
+    dst1 = FSSA(dst, 1); src0 = FSSA(src, 0)
+    size_arg = FExpr("MLIL_ADD", "n#0 + 0x10", reads=[n0],
+                     left=FExpr("MLIL_VAR_SSA", "n#0", reads=[n0]),
+                     right=FExpr("MLIL_CONST", "0x10", constant=0x10))
+    len_arg = FExpr("MLIL_ADD", "n#0 + HUGE", reads=[n0],
+                    left=FExpr("MLIL_VAR_SSA", "n#0", reads=[n0]),
+                    right=FExpr("MLIL_CONST", "huge", constant=-1))  # 0xFFFF... sign-extended
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "dst#1 = malloc(n + 0x10)",
+               reads=[n0], writes=[dst1],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[size_arg]),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "memcpy(dst, src, n + HUGE)",
+               reads=[dst1, src0, n0],
+               dest=FExpr("MLIL_CONST_PTR", "0x2010", constant=0x2010),
+               params=[FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1]),
+                       FExpr("MLIL_VAR_SSA", "src#0", reads=[src0]),
+                       len_arg]),
+    ]
+    func = FFunc("copy", 0x10, FSSAFunc(instrs), params=[n])
+    bv = FBV({0x2000: "malloc", 0x2010: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    memcpy = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(memcpy) == 1
+    assert memcpy[0]["class"] == "overflow_len"
+
+
+def test_forward_keeps_overflow_for_non_allocator_single_arg_call(models):
+    # dst = get_scratch(n); memcpy(dst, src, n): get_scratch is a 1-arg call but
+    # NOT allocator-named and has no pointer return type, so it must NOT be assumed
+    # an allocator -> stays overflow_len (#229 review Finding 2).
+    func = _copy_func_alloc_offset(alloc_const=0, dest_off=0, alloc_addr=0x3000)
+    bv = FBV({0x3000: "get_scratch", 0x2010: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    memcpy = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(memcpy) == 1
+    assert memcpy[0]["class"] == "overflow_len"
 
 
 def test_forward_cxx_new_backed_buffer_downgrades_like_malloc(models):

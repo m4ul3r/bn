@@ -53,6 +53,12 @@ SOUNDNESS = (
 # resolved separately from the model's buffer-propagation rules, not the class.
 _OVERFLOW_INDEX_CLASSES = frozenset({"overflow_unbounded", "overflow_len", "fortified_overflow"})
 
+# A param: source that is a pointer to an aggregate at least this large (by byte
+# size OR member count) is flagged as a "broad source" -- the whole struct is
+# treated as one tainted location, which over-taints into unrelated code (#219).
+_BROAD_SOURCE_BYTES = 0x40
+_BROAD_SOURCE_MEMBERS = 8
+
 
 def _model_buffer_source_args(model: dict[str, Any]) -> frozenset[int]:
     """Arg indices the model propagates a buffer FROM (``*arg:N`` in a
@@ -596,6 +602,8 @@ class TaintEngine:
         # engine's lifetime -- avoids re-materializing a veneer's MLIL on every
         # candidate visit (forward) and every callsite scan (backward).
         self._thunk_cache: dict[int, Any] = {}
+        # Per-function unlifted-instruction scan, cached by function start (#206).
+        self._unimpl_cache: dict[int, list[int]] = {}
 
     # -- shared resolution ------------------------------------------------
 
@@ -633,6 +641,120 @@ class TaintEngine:
 
     def _is_call(self, ins: Any) -> bool:
         return "CALL" in op_name(ins) or "TAILCALL" in op_name(ins)
+
+    def _unimplemented_addrs(self, func: Any, instrs: list[Any]) -> list[int]:
+        """Addresses of instructions BN's lifter could not model in *func*.
+
+        Scans both the MLIL-SSA instructions already in hand (integer ops that
+        surface as ``MLIL_UNIMPL``) and the function's LLIL (FP/SIMD ops like the
+        AArch64 ``fnmsub``/``fmadd`` family are unlifted at decode and never reach
+        MLIL, so a MLIL-only scan misses the motivating case). Cached per function
+        start; defensive so the synthetic test fakes (no LLIL) just see the MLIL
+        scan. Lets forward taint flag an otherwise-silent dataflow hole (#206)."""
+        key = int(getattr(func, "start", 0))
+        if key in self._unimpl_cache:
+            return self._unimpl_cache[key]
+        addrs: set[int] = set()
+        for ins in instrs:
+            if "UNIMPL" in op_name(ins):
+                addrs.add(int(getattr(ins, "address", 0)))
+        il = getattr(func, "low_level_il", None) or getattr(func, "llil", None)
+        if il is not None:
+            try:
+                blocks = list(il)
+            except Exception:
+                blocks = list(getattr(il, "basic_blocks", None) or [])
+            for block in blocks:
+                try:
+                    items = list(block)
+                except Exception:
+                    continue
+                for ins in items:
+                    if "UNIMPL" in op_name(ins):
+                        addrs.add(int(getattr(ins, "address", 0)))
+        result = sorted(addrs)
+        self._unimpl_cache[key] = result
+        return result
+
+    @staticmethod
+    def _is_stack_write(writes: list[Any]) -> bool:
+        """True if any written SSA var is a STACK variable (vs a register/flag).
+
+        Gates the pointer_escape leaf (#228) to genuine stack-descriptor captures
+        (`stack_local = &buf`), so a register `x1 = &buf` that merely sets up the
+        source call's own buffer argument is NOT mistaken for an escape. Returns
+        False when the source type is unavailable (the unit fakes / unknown), so
+        the conservative default is "not an escape" rather than a false leaf."""
+        for w in writes:
+            base = getattr(w, "var", w)
+            st = getattr(base, "source_type", None)
+            name = str(getattr(st, "name", None) or (str(st) if st is not None else ""))
+            if "Stack" in name:
+                return True
+        return False
+
+    @staticmethod
+    def _type_class_name(t: Any) -> str:
+        tc = getattr(t, "type_class", None)
+        return str(getattr(tc, "name", None) or (str(tc) if tc is not None else ""))
+
+    def _resolve_named_type(self, t: Any, depth: int = 0) -> Any:
+        """Resolve a NamedTypeReference (a typedef'd struct pointer's pointee, the
+        common firmware case) to its concrete type via the view, best-effort.
+        Returns *t* unchanged when it isn't a named ref or can't be resolved."""
+        if t is None or depth > 4 or "NamedTypeReference" not in self._type_class_name(t):
+            return t
+        for getter in (
+            lambda: t.target(self.bv),
+            lambda: self.bv.get_type_by_name(getattr(t, "name", None)),
+        ):
+            try:
+                r = getter()
+            except Exception:
+                r = None
+            if r is not None and r is not t:
+                return self._resolve_named_type(r, depth + 1)
+        return t
+
+    def _broad_source_hint(self, pv: Any, idx: int) -> str | None:
+        """A "broad source" nudge when a ``param:idx`` source is a pointer to a
+        large aggregate: the whole struct is one coarse taint location, so it
+        over-taints into unrelated code. Suggest a narrower locator (#219).
+
+        Duck-typed over the BN ``Type`` API (``type_class.name`` / ``target`` /
+        ``width`` / ``members``); a string/None type (the unit fakes) yields no
+        hint, so this is silent unless a genuine aggregate pointer is seen."""
+        t = getattr(pv, "type", None)
+        if t is None or "Pointer" not in self._type_class_name(t):
+            return None
+        pointee = getattr(t, "target", None)
+        if pointee is None:
+            children = list(getattr(t, "children", None) or [])
+            pointee = children[0] if children else None
+        pointee = self._resolve_named_type(pointee)
+        if pointee is None:
+            return None
+        pcn = self._type_class_name(pointee)
+        if "Structure" not in pcn and "Array" not in pcn:
+            return None
+        try:
+            size = int(getattr(pointee, "width", 0) or 0)
+        except Exception:
+            size = 0
+        try:
+            members = len(list(getattr(pointee, "members", None) or []))
+        except Exception:
+            members = 0
+        if size < _BROAD_SOURCE_BYTES and members < _BROAD_SOURCE_MEMBERS:
+            return None
+        desc = ", ".join(
+            x for x in (f"{members} fields" if members else None,
+                        f"{hex(size)} bytes" if size else None) if x) or "large aggregate"
+        return (
+            f"broad source: param:{idx} is a pointer to a large aggregate ({desc}); "
+            f"the whole struct is treated as one tainted location, which can "
+            f"over-taint into unrelated code -- consider a narrower locator (e.g. the "
+            f"actual input/recv buffer field) for a tighter result")
 
     def _resolve_direct_target(self, ins: Any) -> int | None:
         """Resolved direct/import call-target address, or None for a genuinely
@@ -1524,6 +1646,36 @@ class TaintEngine:
         aparams = self._call_params(d)
         return aparams[idx] if idx < len(aparams) else None
 
+    def _arg_ptr_is_indirect_load(self, ssaf: Any, expr: Any, depth: int = 0) -> bool:
+        """True when a buffer-pointer arg is itself loaded from memory -- a global
+        or struct-field pointer slot (`recvfrom(fd, G.pkt, n)` where ``G.pkt`` is
+        ``*(G+off)``) rather than a direct ``&stackbuf``. In that case the engine
+        anchors the seed to the loaded pointer value but does not correlate it with
+        a later re-load of the same slot, so the recv->parse flow can be missed --
+        worth an honest note when the buffer couldn't be anchored (#193)."""
+        if expr is None or depth > 6:
+            return False
+        if "LOAD" in op_name(expr):
+            return True
+        v = self._as_single_ssa_var(expr)
+        if v is None:
+            reads = expr_reads(expr)
+            v = reads[0] if len(reads) == 1 else None
+        if v is None:
+            return False
+        try:
+            d = ssaf.get_ssa_var_definition(v)
+        except Exception:
+            d = None
+        if d is None:
+            return False
+        src = getattr(d, "src", None)
+        if src is None:
+            return False
+        if "LOAD" in op_name(src):
+            return True
+        return self._arg_ptr_is_indirect_load(ssaf, src, depth + 1)
+
     def _as_single_ssa_var(self, expr: Any) -> Any | None:
         """The lone SSA variable an expression reads, but ONLY when the
         expression is a bare var read (MLIL_VAR_SSA / an SSAVariable) -- not
@@ -1582,18 +1734,148 @@ class TaintEngine:
             and getattr(ra, "version", None) == getattr(rb, "version", None)
         )
 
+    def _dest_alloc(self, ssaf: Any, ptr_expr: Any) -> tuple[Any | None, bool]:
+        """``(size_expr, assumed_wrapper)`` for the allocator that produced the
+        buffer *ptr_expr* points into. Recognizes the modeled allocators (and
+        C++ ``new``) via :meth:`_alloc_size_expr`; failing that, conservatively
+        treats an UNMODELED single-argument call feeding the buffer as an
+        allocator wrapper whose sole arg is the size (``assumed_wrapper=True``) so
+        ``dst = wrap(len); memcpy(dst, src, len)`` can downgrade too (#229)."""
+        size = self._alloc_size_expr(ssaf, ptr_expr)
+        if size is not None:
+            return size, False
+        var = ptr_expr if is_ssa_var(ptr_expr) else None
+        if var is None:
+            reads = expr_reads(ptr_expr)
+            if len(reads) == 1:
+                var = reads[0]
+        if var is None:
+            return None, False
+        try:
+            d = ssaf.get_ssa_var_definition(var)
+        except Exception:
+            d = None
+        if d is None or "CALL" not in op_name(d):
+            return None, False
+        aparams = self._call_params(d)
+        # Only a single-arg call qualifies as an assumed size-by-len wrapper, AND
+        # it must be CORROBORATED as an allocator -- by an allocator-ish name or a
+        # pointer return type. Without corroboration a non-allocator one-arg call
+        # (e.g. `get_scratch(len)` returning a fixed buffer) would be mistaken for
+        # an allocator and hide a real overflow; staying overflow_len (no
+        # downgrade) is the safe direction (review Finding 2). The bound check
+        # still additionally requires the sole arg to be linear in the copy length.
+        if len(aparams) == 1 and self._looks_like_allocator(d):
+            return aparams[0], True
+        return None, False
+
+    _ALLOC_NAME_HINTS = ("alloc", "dup", "salloc")
+
+    def _looks_like_allocator(self, call_ins: Any) -> bool:
+        """Corroborate that a call is plausibly an allocator wrapper: its name
+        contains an allocator hint (malloc/calloc/realloc/xalloc/.../strdup), or
+        the resolved callee returns a pointer. Conservative -- an opaque-named,
+        unknown-return wrapper is NOT downgraded (#229 review Finding 2)."""
+        addr = self._resolve_direct_target(call_ins)
+        name = (self._callee_name(addr) or "").split("@", 1)[0].lstrip("_").lower()
+        if any(tok in name for tok in self._ALLOC_NAME_HINTS):
+            return True
+        fn = function_at(self.bv, addr) if addr is not None else None
+        rt = getattr(fn, "return_type", None)
+        if rt is not None:
+            tcn = self._type_class_name(rt)
+            if "Pointer" in tcn or str(rt).rstrip().endswith("*"):
+                return True
+        return False
+
+    def _linear_in_var(self, ssaf: Any, expr: Any, depth: int = 0):
+        """Decompose *expr* into ``(canonical_ssa_var, const)`` when it is ``v``,
+        ``v + const``, ``const + v`` or ``v - const`` (following pure SSA copies
+        to v's canonical root); ``None`` otherwise. The const is 0 for a bare var.
+        Lets the bound check compare an allocation ``len + C`` against a copy
+        ``len + D`` by their shared length var and constant offsets (#229)."""
+        if expr is None or depth > 6:
+            return None
+        v = self._as_single_ssa_var(expr)
+        if v is not None:
+            try:
+                d = ssaf.get_ssa_var_definition(v)
+            except Exception:
+                d = None
+            if d is not None and op_name(d) == "MLIL_SET_VAR_SSA":
+                sub = self._linear_in_var(ssaf, getattr(d, "src", None), depth + 1)
+                if sub is not None:
+                    return sub
+            return (self._canonical_ssa_var(ssaf, v), 0)
+        op = op_name(expr)
+        if op in ("MLIL_ADD", "MLIL_SUB"):
+            left = getattr(expr, "left", None)
+            right = getattr(expr, "right", None)
+            rc = self._int_const(right)
+            if rc is not None:
+                sub = self._linear_in_var(ssaf, left, depth + 1)
+                if sub is not None:
+                    return (sub[0], sub[1] + (rc if op == "MLIL_ADD" else -rc))
+            if op == "MLIL_ADD":
+                lc = self._int_const(left)
+                if lc is not None:
+                    sub = self._linear_in_var(ssaf, right, depth + 1)
+                    if sub is not None:
+                        return (sub[0], sub[1] + lc)
+        return None
+
+    def _bounded_copy_reason(self, ssaf: Any, params: list[Any], length_idx: int,
+                             dest_idx: int = 0) -> str | None:
+        """A human reason when the copy (dest=params[dest_idx],
+        length=params[length_idx]) provably fits the buffer the destination was
+        allocated with in this same function, else None.
+
+        Generalizes the exact ``dst = malloc(n); memcpy(dst, src, n)`` case
+        (#46 item 1) to ``dst = alloc(len + C); memcpy(dst + c, src, len + D)``,
+        which is bounded iff ``c + D <= C`` for the same length var, and to
+        unmodeled single-arg allocator wrappers (#229)."""
+        if dest_idx >= len(params) or length_idx >= len(params):
+            return None
+        dest_expr = params[dest_idx]
+        len_expr = params[length_idx]
+        size_expr, assumed_wrapper = self._dest_alloc(ssaf, dest_expr)
+        if size_expr is None:
+            return None
+        off_info = self._addr_base_offset(ssaf, dest_expr)
+        c = off_info[1] if (off_info is not None and isinstance(off_info[1], int)) else 0
+        if c < 0:
+            return None
+        wrap = " (assumed allocator wrapper sized by the copy length)" if assumed_wrapper else ""
+        # Exact same-value, no dest offset: the original #46 case.
+        if c == 0 and self._same_ssa_value(ssaf, size_expr, len_expr):
+            return ("the destination is allocated with the same size in this "
+                    "function -- provably bounded, not an overflow" + wrap)
+        alloc = self._linear_in_var(ssaf, size_expr)
+        copy = self._linear_in_var(ssaf, len_expr)
+        if alloc is None or copy is None:
+            return None
+        (av, ac), (cv, cc) = alloc, copy
+        if not (var_key(av) == var_key(cv)
+                and getattr(av, "version", None) == getattr(cv, "version", None)):
+            return None
+        # SOUNDNESS: a NEGATIVE copy-length addend means `len - C`, which in
+        # unsigned C underflows to a huge value when len < C (a real overflow);
+        # it is also how BN surfaces a >= 2^63 addend (constants are sign-extended
+        # at bit 63). Likewise a negative alloc addend (`alloc(len - C)`) can
+        # under-allocate. Either way the copy is NOT provably bounded, so never
+        # downgrade -- staying overflow_len is the safe (over-report) direction.
+        if cc < 0 or ac < 0:
+            return None
+        if c + cc <= ac:
+            return (f"the destination is allocated with len+{hex(ac)} and the copy "
+                    f"writes len+{hex(cc)} bytes at offset {hex(c)} "
+                    f"({hex(c)}+{hex(cc)} <= {hex(ac)}) -- provably bounded" + wrap)
+        return None
+
     def _provably_bounded_length(self, ssaf: Any, params: list[Any], length_idx: int,
                                  dest_idx: int = 0) -> bool:
-        """True when the copy length (params[length_idx]) is provably equal to
-        the size the destination buffer (params[dest_idx]) was allocated with in
-        this same function -- e.g. dst = malloc(n); memcpy(dst, src, n). Used to
-        downgrade an overflow_len label to a bounded one (#46 item 1)."""
-        if dest_idx >= len(params) or length_idx >= len(params):
-            return False
-        size_expr = self._alloc_size_expr(ssaf, params[dest_idx])
-        if size_expr is None:
-            return False
-        return self._same_ssa_value(ssaf, size_expr, params[length_idx])
+        """Backward-compatible bool wrapper over :meth:`_bounded_copy_reason`."""
+        return self._bounded_copy_reason(ssaf, params, length_idx, dest_idx) is not None
 
     def _const_value(self, expr: Any) -> int | None:
         """The integer constant of a CONST/CONST_PTR expression, else None."""
@@ -1808,6 +2090,35 @@ class TaintEngine:
             return {"reached_return": False, "out_params": set(), "findings": [],
                     "leaves": [], "assumptions": []}
 
+        # Honesty signal: a visited function with unlifted instructions is a
+        # potential silent dataflow hole -- BN couldn't model those ops, so taint
+        # through them isn't tracked. Surface it the way unmodeled calls/coarse
+        # stores already are, instead of flowing through silently (#206).
+        unimpl = self._unimplemented_addrs(func, instrs)
+        if unimpl:
+            sample = ", ".join(hex(a) for a in unimpl[:5])
+            more = "" if len(unimpl) <= 5 else f", +{len(unimpl) - 5} more"
+            add_assumption(
+                f"{func.name} contains {len(unimpl)} unlifted/unimplemented "
+                f"instruction(s) (e.g. {sample}{more}); BN's lifter could not model "
+                f"them, so a tainted value passing through is not tracked (possible "
+                f"silent hole) -- see `bn function info` for the full list")
+
+        # Broad-source nudge: only for the user's own param: source (top run), not
+        # the synthetic param locators of descended callees (#219).
+        if top:
+            for loc in locators:
+                if loc.get("kind") != "param":
+                    continue
+                try:
+                    pv = self._param_var(func, int(loc["index"]))
+                except (KeyError, ValueError, TypeError):
+                    pv = None
+                if pv is not None:
+                    hint = self._broad_source_hint(pv, int(loc["index"]))
+                    if hint:
+                        add_assumption(hint)
+
         def read_taint(ins: Any) -> list[tuple]:
             hit = []
             for r in ssa_reads(ins):
@@ -1872,22 +2183,24 @@ class TaintEngine:
                                 recorded_sinks.add(sig)
                                 eff_sink = sink
                                 # Downgrade a tainted memcpy-family LENGTH from
-                                # overflow to bounded when the destination is
-                                # provably allocated with that same length in
-                                # this function (e.g. dst=malloc(n); memcpy(dst,
-                                # src,n)) -- the length is attacker-derived but
-                                # the copy cannot overflow (#46 item 1). Still
-                                # reported, just relabeled, so it's not noise in
-                                # the overflow set.
-                                if sink.get("class") == "overflow_len" and \
-                                        self._provably_bounded_length(ssaf, params, argidx):
+                                # overflow to bounded when the copy provably fits
+                                # the buffer the destination was allocated with in
+                                # this function -- the exact dst=malloc(n);
+                                # memcpy(dst,src,n) case AND the generalized
+                                # dst=alloc(len+C); memcpy(dst+c,src,len+D) with
+                                # c+D<=C, plus unmodeled single-arg allocator
+                                # wrappers (#46 item 1, #229). The length is
+                                # attacker-derived but the copy cannot overflow.
+                                # Still reported, just relabeled, so it's not noise
+                                # in the overflow set.
+                                _bnd_reason = (self._bounded_copy_reason(ssaf, params, argidx)
+                                               if sink.get("class") == "overflow_len" else None)
+                                if _bnd_reason is not None:
                                     eff_sink = {
                                         **sink,
                                         "class": "bounded_len",
                                         "detail": (sink.get("detail") or "")
-                                        + " (attacker-derived length, but the destination is "
-                                        "allocated with the same size in this function -- "
-                                        "provably bounded, not an overflow)",
+                                        + f" (attacker-derived length, but {_bnd_reason})",
                                     }
                                 elif sink.get("class") == "overflow_len":
                                     # Length is the return of a modeled receive
@@ -2278,6 +2591,73 @@ class TaintEngine:
                                 f"coarse memory store at {saddr}: tainted bytes written "
                                 "through an uncorrelated pointer; downstream reads not tracked"
                             )
+
+                # Address-of-tainted escape (#228): an assignment or store whose
+                # VALUE is a POINTER to a tainted buffer (`stack_local = &buf`,
+                # `*p = &buf`) is invisible to read_taint -- AddressOf targets are
+                # not value-reads -- so a captured pointer to tainted data is
+                # silently dropped, yielding a confident 0-leaf "no sinks reached"
+                # even though the buffer escaped (the worst VR failure mode: an
+                # agent reads it as proof of safety). When the generic flow above
+                # found no tainted value-read, check whether the source is a
+                # pointer to a tainted buffer and record a pointer_escape leaf so
+                # the all-clear is never silent, best-effort propagating the taint.
+                if not reads:
+                    src_val = getattr(ins, "src", None)
+                    esc = (self._pointee_tainted(ssaf, src_val, tainted)
+                           if src_val is not None else None)
+                    escaped = False
+                    dest_desc = None
+                    if esc is not None:
+                        writes = ssa_writes(ins)
+                        if writes and self._is_stack_write(writes):
+                            # `stack_local = &buf`: the pointer is stashed into a
+                            # stack descriptor/local (not a call-arg register), so a
+                            # later `&descriptor` handed to a handler re-loads it out
+                            # of the engine's sight. Tainting the dest also lets a
+                            # single-var descriptor propagate when passed by address.
+                            for w in writes:
+                                node = (var_key(w), getattr(w, "version", None))
+                                if taint_node(node, var_label(w), ins,
+                                              "captured pointer to tainted buffer (pointer_escape)", [esc]):
+                                    changed = True
+                            escaped = True
+                            dest_desc = f"stashed into stack local {var_label(writes[0])}"
+                        elif "STORE" in opn:
+                            # `*p = &buf`: pointer to a tainted buffer written into
+                            # memory. Taint the pointee (the descriptor) coarsely so
+                            # a later `&descriptor` propagates, and record the escape.
+                            pv = self._pointee_var(ssaf, getattr(ins, "dest", None))
+                            if pv is not None and taint_node((var_key(pv), None), var_label(pv), ins,
+                                                             "descriptor holds pointer to tainted buffer (pointer_escape)", [esc]):
+                                changed = True
+                            escaped = True
+                            dest_desc = "stored into memory through a pointer"
+                    if escaped:
+                        saddr = hex(int(getattr(ins, "address", 0)))
+                        buf_lbl = node_label(esc, why)
+                        leaf = {
+                            "kind": "pointer_escape",
+                            "address": saddr,
+                            "buffer": buf_lbl,
+                            "dest": dest_desc,
+                            "il_text": str(ins),
+                            "detail": (
+                                "the address of a tainted buffer escapes here -- a "
+                                "pointer to tainted data is captured into a local/"
+                                "descriptor/memory the engine cannot correlate "
+                                "downstream; flows that re-load this pointer (e.g. a "
+                                "descriptor field passed by address to a handler) are "
+                                "not followed, so a 'no sinks reached' result is NOT "
+                                "proof of safety -- investigate the consumer"
+                            ),
+                        }
+                        if leaf not in leaves:
+                            leaves.append(leaf)
+                        add_assumption(
+                            f"pointer to tainted buffer {buf_lbl} escapes at {saddr} "
+                            f"({dest_desc}); downstream uses through the captured pointer "
+                            f"are not tracked")
             if not changed:
                 break
 
@@ -2426,6 +2806,22 @@ class TaintEngine:
                                     if taint_node((var_key(r), getattr(r, "version", None)), var_label(r), c,
                                                   f"source: {callee} arg{idx}", []):
                                         seeded = True
+                                # The buffer couldn't be anchored to a stack var or
+                                # writable global. If the pointer is itself loaded
+                                # from a global/struct slot, the seed rides the
+                                # pointer value, not the pointee, and won't correlate
+                                # with a later re-load of the same slot -- a recv->
+                                # parse flow can be missed. Say so instead of a
+                                # silent 0-propagation clear (#193).
+                                if self._arg_ptr_is_indirect_load(ssaf, params[idx]):
+                                    add_assumption(
+                                        f"source {callee} arg{idx} buffer pointer is loaded "
+                                        f"indirectly (from a global/struct slot); the seed "
+                                        f"anchors to the pointer value, not the pointee, and "
+                                        f"is not correlated with later re-loads of the same "
+                                        f"slot -- a flow that re-loads the pointer and parses "
+                                        f"it may be missed. Consider seeding the parser entry "
+                                        f"directly with param:N")
                 if kind == "ret" and not ret_seeded:
                     # T3: callsites of `callee` exist but NONE consume its return
                     # value (a void or discarded return), so a ret: source has
@@ -2488,6 +2884,15 @@ class TaintEngine:
                                         if taint_node((var_key(r), getattr(r, "version", None)), var_label(r), c,
                                                       f"source: {callee} arg{idx} (call: preset)", []):
                                             seeded = True
+                                    if self._arg_ptr_is_indirect_load(ssaf, params[idx]):
+                                        add_assumption(
+                                            f"source {callee} arg{idx} buffer pointer is loaded "
+                                            f"indirectly (from a global/struct slot); the seed "
+                                            f"anchors to the pointer value, not the pointee, and "
+                                            f"is not correlated with later re-loads of the same "
+                                            f"slot -- a flow that re-loads the pointer and parses "
+                                            f"it may be missed. Consider seeding the parser entry "
+                                            f"directly with param:N")
                         elif to.startswith("arg:"):
                             idx = _try_arg_index(to)
                             if idx is not None and idx < len(params):

@@ -98,6 +98,19 @@ def _render_function_info_text(value: Any, verbose: bool = False) -> str:
     if locals_only:
         lines.append(f"locals: {len(locals_only)} variables")
 
+    # Surface unlifted instructions (#206) -- a function whose computation BN
+    # couldn't model otherwise reads as fully analyzed.
+    unimpl = value.get("unimplemented_instructions")
+    if isinstance(unimpl, dict) and unimpl.get("count"):
+        addrs = list(unimpl.get("addresses") or [])
+        shown = ", ".join(addrs)
+        if unimpl.get("truncated"):
+            shown += ", …"
+        suffix = f" (e.g. {shown})" if shown else ""
+        lines.append(
+            f"unlifted instructions: {unimpl['count']} — BN could not model these; "
+            f"dataflow through them is not tracked{suffix}")
+
     if verbose:
         parameters = list(value.get("parameters") or [])
         if parameters:
@@ -1216,6 +1229,13 @@ def _render_leaf_line(leaf: dict[str, Any]) -> str:
             f"  (tainted arg(s) {args})"
             + (f"  -- {leaf.get('note')}" if leaf.get("note") else "")
         )
+    if kind == "pointer_escape":
+        return (
+            f"  pointer_escape @ {leaf.get('address')}"
+            f"  buffer={leaf.get('buffer', '?')}"
+            + (f"  {leaf.get('dest')}" if leaf.get("dest") else "")
+            + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
+        )
     if kind == "field_load_unresolved":
         bits = []
         if leaf.get("base") is not None:
@@ -1870,6 +1890,10 @@ def _render_trace_text(value: Any) -> str:
         if terminates:
             label = _TRACE_REASON_LABELS.get(reason, reason.replace("_", " "))
             line = f"  {ssa_var}  —  {label}"
+            # Name the resolved callee at a call boundary so a library-call origin
+            # reads as `call boundary (strlen)` not a bare PLT address (#193).
+            if reason == "call_or_jump_boundary" and step.get("callee"):
+                line += f" ({step['callee']})"
             if reason == "field_load":
                 meta = " ".join(
                     f"{k}={step[k]}" for k in ("base", "offset", "width") if step.get(k) is not None)
