@@ -143,11 +143,44 @@ def load_models(extra: dict[str, Any] | None = None) -> dict[str, Any]:
     return models
 
 
+def _canonical_cxx_alloc(name: str) -> str | None:
+    """Canonical model key for a C++ ``operator new`` / ``operator new[]``
+    spelling -- mangled or demangled -- or None when *name* is neither (#204).
+
+    BN renders these allocators either Itanium-mangled (``Znwm``/``Znwj`` for
+    ``operator new``, ``Znam``/``Znaj`` for ``operator new[]``; the ``m``/``j``
+    is the 64-/32-bit ``size_t`` overload, with optional ``St11align_val_t`` /
+    ``RKSt9nothrow_t`` suffixes) or demangled (``operator new(unsigned long)``).
+    All of those allocate with the size at arg 0, so they collapse to the two
+    keys ``Znwm`` / ``Znam``. Placement new (``_ZnwmPv`` / ``operator
+    new(unsigned long, void*)``) constructs in caller-supplied storage -- it
+    does NOT allocate -- so it is excluded to avoid a false ``alloc_size`` sink.
+
+    *name* is expected already stripped of a leading ``_`` (as ``lookup_model``
+    passes it).
+    """
+    if not name:
+        return None
+    if name.startswith("operator new"):
+        if "void*" in name or "void *" in name:        # placement new
+            return None
+        return "Znam" if name.startswith("operator new[]") else "Znwm"
+    if name.startswith("Znw") or name.startswith("Zna"):
+        if name[3:4] not in ("m", "j"):                # not a size_t overload
+            return None
+        if name[4:].startswith("Pv"):                  # placement new (..., void*)
+            return None
+        return "Znam" if name.startswith("Zna") else "Znwm"
+    return None
+
+
 def lookup_model(models: dict[str, Any], name: str | None) -> tuple[str | None, dict[str, Any] | None]:
     """Match a (possibly decorated) symbol name against the model DB.
 
     Tries the raw name, then the part before ``@`` (``memcpy@plt`` ->
-    ``memcpy``), then with leading underscores stripped.
+    ``memcpy``), then with leading underscores stripped, then the canonical
+    C++ allocator key (so mangled ``_Znam`` and demangled ``operator new[]``
+    both resolve to the ``Znam`` model -- #204).
     """
     if not name:
         return None, None
@@ -158,6 +191,9 @@ def lookup_model(models: dict[str, Any], name: str | None) -> tuple[str | None, 
     stripped = base.lstrip("_")
     if stripped and stripped != base:
         candidates.append(stripped)
+    alias = _canonical_cxx_alloc(stripped or base)
+    if alias and alias not in candidates:
+        candidates.append(alias)
     for cand in candidates:
         if cand in models:
             return cand, models[cand]
@@ -1456,6 +1492,8 @@ class TaintEngine:
         "malloc": 0, "xmalloc": 0, "g_malloc": 0, "g_malloc0": 0,
         "valloc": 0, "pvalloc": 0, "alloca": 0, "__builtin_alloca": 0,
         "realloc": 1, "reallocf": 1, "g_realloc": 1,
+        # C++ operator new / new[] -- canonical keys (see _canonical_cxx_alloc).
+        "Znwm": 0, "Znam": 0,
     }
 
     def _alloc_size_expr(self, ssaf: Any, ptr_expr: Any) -> Any | None:
@@ -1477,6 +1515,10 @@ class TaintEngine:
         callee = self._callee_name(self._resolve_direct_target(d))
         base = (callee or "").split("@", 1)[0].lstrip("_")
         idx = self._ALLOC_SIZE_ARG.get(base)
+        if idx is None:
+            # C++ operator new/new[] (mangled variants / demangled) -> canonical key.
+            canon = _canonical_cxx_alloc(base)
+            idx = self._ALLOC_SIZE_ARG.get(canon) if canon else None
         if idx is None:
             return None
         aparams = self._call_params(d)

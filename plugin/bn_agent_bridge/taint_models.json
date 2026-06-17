@@ -73,6 +73,10 @@
     "realloc":      {"sink": {"tainted_args": [1], "class": "alloc_size", "detail": "attacker-controlled allocation size to realloc"}},
     "alloca":       {"sink": {"tainted_args": [0], "class": "alloc_size", "detail": "attacker-controlled alloca size (stack)"}},
 
+    "_comment_cxx_new": "C++ operator new / new[] (Itanium ABI). Keyed underscore-stripped (Znwm/Znam) so the mangled symbols resolve via lookup_model, which also canonicalizes the size_t-overload (Znwm/Znwj), nothrow/aligned suffixes, and the demangled 'operator new'/'operator new[]' spellings to these two keys (#204). Like malloc, the size is arg 0. Placement new (_ZnwmPv / 'operator new(size, void*)') does not allocate and is excluded by lookup_model, so it never reaches here.",
+    "Znwm":         {"sink": {"tainted_args": [0], "class": "alloc_size", "detail": "attacker-controlled allocation size to operator new"}},
+    "Znam":         {"sink": {"tainted_args": [0], "class": "alloc_size", "detail": "attacker-controlled allocation size to operator new[]"}},
+
     "_comment_fortified": "FORTIFY_SOURCE (-D_FORTIFY_SOURCE) _chk variants. Keyed underscore-stripped so __memcpy_chk etc. resolve here (lookup_model strips leading underscores). The extra trailing destlen/objsize args are compile-time guards, not data flow. Copy/concat use the 'fortified_overflow' class: the call still aborts at runtime, so it is lower-severity than the raw variant but a tainted length/source reaching it is worth surfacing. Format _chk variants live in the format section (they also carry 'varargs').",
     "read_chk":     {"sources": [{"to": "*arg:1"}, {"to": "ret"}], "return_bound": {"max_from_arg": 2}},
     "recv_chk":     {"sources": [{"to": "*arg:1"}, {"to": "ret"}], "return_bound": {"max_from_arg": 2}},

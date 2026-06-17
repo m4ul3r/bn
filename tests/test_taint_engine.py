@@ -2089,6 +2089,50 @@ def test_forward_propagates_through_g_strndup(models):
     assert not any((l.get("callee") or {}).get("name") == "g_strndup" for l in result["leaves"])
 
 
+def test_cxx_operator_new_models_present_and_shaped():
+    # #204: operator new / new[] are heap allocators -- a tainted size to them is
+    # an alloc_size sink, the same as malloc. Keyed underscore-stripped (Znwm/Znam)
+    # so the Itanium-mangled symbols resolve via lookup_model.
+    models = te.load_models()
+    assert models["Znwm"]["sink"]["class"] == "alloc_size"
+    assert models["Znwm"]["sink"]["tainted_args"] == [0]
+    assert models["Znam"]["sink"]["class"] == "alloc_size"
+    assert models["Znam"]["sink"]["tainted_args"] == [0]
+    # mangled spellings resolve: 64-bit (m) and 32-bit (j) size_t, nothrow, aligned.
+    for nm in ("_Znwm", "_Znwj", "_ZnwmRKSt9nothrow_t", "_ZnwmSt11align_val_t"):
+        assert te.lookup_model(models, nm)[0] == "Znwm", nm
+    for nm in ("_Znam", "_Znaj", "_ZnamRKSt9nothrow_t", "_ZnamSt11align_val_t"):
+        assert te.lookup_model(models, nm)[0] == "Znam", nm
+    # demangled spellings (what BN renders for an imported operator new) resolve too.
+    assert te.lookup_model(models, "operator new(unsigned long)")[0] == "Znwm"
+    assert te.lookup_model(models, "operator new[](unsigned long)")[0] == "Znam"
+    # placement new does NOT allocate -> must not be flagged as an alloc_size sink.
+    assert te.lookup_model(models, "_ZnwmPv")[0] is None
+    assert te.lookup_model(models, "operator new(unsigned long, void*)")[0] is None
+
+
+@pytest.mark.parametrize("alloc_name", ["_Znam", "operator new[](unsigned long)"])
+def test_forward_flags_tainted_size_to_cxx_operator_new(models, alloc_name):
+    # on_data(n): buf = operator new[](n) -- attacker-controlled n to new[] must
+    # raise an alloc_size sink exactly as malloc(n) would, whether BN renders the
+    # callee mangled (_Znam) or demangled (operator new[](unsigned long)) (#204).
+    NEW = 0x3000
+    n = FVar("n"); n0 = FSSA(n, 0); buf = FVar("buf"); buf1 = FSSA(buf, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "buf#1 = new[](n)",
+               reads=[n0], writes=[buf1],
+               dest=FExpr("MLIL_CONST_PTR", hex(NEW), constant=NEW),
+               params=[FExpr("MLIL_VAR_SSA", "n", reads=[n0])]),
+    ]
+    func = FFunc("on_data", 0x10, FSSAFunc(instrs), params=[n])
+    bv = FBV({NEW: alloc_name})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    sinks = [s["sink"] for s in result["reached_sinks"] if s["sink"]["class"] == "alloc_size"]
+    assert len(sinks) == 1, result["reached_sinks"]
+    assert sinks[0]["tainted_arg_index"] == 0
+
+
 def test_backward_constant_through_copy_labeled_constant(models):
     # size = 0 reaches memcpy's length arg through a variable copy:
     #   var_2c#1 = 0 ; r2#4 = var_2c#1 ; memcpy(dst, src, r2#4)
@@ -2508,6 +2552,20 @@ def test_forward_keeps_overflow_when_alloc_size_differs_from_length(models):
     memcpy_sinks = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
     assert len(memcpy_sinks) == 1
     assert memcpy_sinks[0]["class"] == "overflow_len"          # NOT downgraded
+
+
+def test_forward_cxx_new_backed_buffer_downgrades_like_malloc(models):
+    # dst = operator new[](n); memcpy(dst, src, n) -- a new[]-backed buffer must
+    # downgrade the overflow to bounded_len exactly like a malloc-backed one, i.e.
+    # _ALLOC_SIZE_ARG must recognize the C++ allocator's size arg (#204).
+    n = FVar("n"); n0 = FSSA(n, 0)
+    func = _copy_func(n0, n0, param=n)        # SAME SSA var feeds new[] and memcpy
+    bv = FBV({0x2000: "_Znam", 0x2010: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    memcpy_sinks = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(memcpy_sinks) == 1
+    assert memcpy_sinks[0]["class"] == "bounded_len"
 
 
 def test_same_ssa_value_only_matches_identical_var():
