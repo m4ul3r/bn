@@ -1463,6 +1463,89 @@ def _op_delete_comment(ctx, bv, op: dict[str, Any]):
 
 
 
+def _split_qualified_name(name: str) -> list[str]:
+    """Split a ``::``-qualified C++ name into its components, splitting ONLY at
+    bracket depth 0 so template arguments are not torn apart -- e.g.
+    ``__alloc_traits<std::allocator<char> >::pointer`` ->
+    ``['__alloc_traits<std::allocator<char> >', 'pointer']``, not three pieces
+    (#200)."""
+    parts: list[str] = []
+    buf: list[str] = []
+    depth = 0
+    i = 0
+    while i < len(name):
+        ch = name[i]
+        if ch in "<([":
+            depth += 1
+        elif ch in ">)]":
+            depth -= 1
+        elif depth <= 0 and name[i:i + 2] == "::":
+            parts.append("".join(buf))
+            buf = []
+            i += 2
+            continue
+        buf.append(ch)
+        i += 1
+    parts.append("".join(buf))
+    return parts
+
+
+def _lookup_named_type(bv, base: str):
+    """Resolve a (possibly ``::``-qualified) type name to a BN Type, or None.
+
+    BN keys namespaced types by a multi-component ``QualifiedName``, NOT the raw
+    ``::``-joined string -- ``get_type_by_name("ns::Foo")`` coerces to a SINGLE
+    component and misses a type registered as ``['ns','Foo']``. So try the raw
+    string first (flat / single-component names), then a depth-aware
+    ``QualifiedName`` split for the namespaced case (#200, verified live on real
+    recovered C++ types)."""
+    try:
+        named = bv.get_type_by_name(base)
+    except Exception:
+        named = None
+    if named is not None:
+        return named
+    if "::" not in base:
+        return None
+    try:
+        return bv.get_type_by_name(bn.QualifiedName(_split_qualified_name(base)))
+    except Exception:
+        return None
+
+
+def _resolve_named_type_string(bv, text: str):
+    """Build a Type for a string that names an existing user/named type,
+    optionally with trailing ``*`` pointer levels, or None when the base name is
+    not a known type.
+
+    BN's C type-string parser rejects ``::``-qualified names ("use of undeclared
+    identifier 'ns'"), so a recovered C++ class type can't be applied by name
+    even when it's defined. This rebuilds the type directly from
+    ``get_type_by_name`` + a named-type reference, so ``ns::demo::Foo`` /
+    ``ns::demo::Foo*`` resolve without a flat-name alias workaround (#200)."""
+    base = str(text).strip()
+    depth = 0
+    while base.endswith("*"):
+        base = base[:-1].rstrip()
+        depth += 1
+    if not base:
+        return None
+    named = _lookup_named_type(bv, base)
+    if named is None:
+        return None
+    try:
+        # Pointer directly to the named type: BN preserves the registered name
+        # (rendering `struct ns::demo::Foo*`), which is what the live readback
+        # reports -- so verification matches. Building a fresh typedef reference
+        # instead renders without the `struct` tag and fails verification (#200).
+        resolved = named
+        for _ in range(depth):
+            resolved = bn.Type.pointer(bv.arch, resolved)
+    except Exception:
+        return None
+    return resolved
+
+
 def _parse_type_or_hint(ctx, bv, op: dict[str, Any], type_text: Any, *, label: str):
     """``bv.parse_type_string`` with a friendly, actionable error.
 
@@ -1476,6 +1559,13 @@ def _parse_type_or_hint(ctx, bv, op: dict[str, Any], type_text: Any, *, label: s
     except OperationFailure:
         raise
     except Exception as exc:
+        # BN's C type-string parser rejects a ::-qualified user type even when it
+        # is defined and resolvable (every recovered C++ class type is
+        # namespaced). Before erroring, try to build the type from an existing
+        # named type, optionally wrapped in trailing '*' pointer levels (#200).
+        resolved = _resolve_named_type_string(bv, str(type_text))
+        if resolved is not None:
+            return resolved, None
         # Collapse BN's multi-line parser output ("error: ...\n1 error
         # generated.") into a single clean clause.
         detail = " ".join(str(exc).split())

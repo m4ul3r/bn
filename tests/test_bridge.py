@@ -37,8 +37,37 @@ def _load_bridge(monkeypatch):
             self.name = name
             self.raw_name = name
 
+    class Type:
+        # Minimal stand-ins for the BN class methods the namespaced-type
+        # fallback uses (#200). named_type_from_type yields a reference whose
+        # str is the type name; pointer wraps with a trailing '*'.
+        @staticmethod
+        def named_type_from_type(name, type_obj):
+            return _FakeType(str(name), type_class="NamedTypeReferenceClass")
+
+        @staticmethod
+        def pointer(arch, type_obj):
+            return _FakeType(f"{type_obj}*", type_class="PointerTypeClass")
+
+    class QualifiedName:
+        # Models BN's QualifiedName: a multi-component name. Crucially, coercing a
+        # raw string does NOT split on '::' -- it becomes a SINGLE component, just
+        # like real BN -- so a raw "ns::Foo" lookup misses a type registered as
+        # the components ['ns','Foo']. _FakeBV.get_type_by_name keys on the
+        # component tuple, so the test reproduces the #200 lookup behavior.
+        def __init__(self, components):
+            if isinstance(components, str):
+                self.name = [components]
+            else:
+                self.name = [str(c) for c in components]
+
+        def __str__(self):
+            return "::".join(self.name)
+
     fake_bn.SymbolType = SymbolType
     fake_bn.Symbol = Symbol
+    fake_bn.QualifiedName = QualifiedName
+    fake_bn.Type = Type
     fake_bn.log_info = lambda *args, **kwargs: None
     fake_bn.log_warn = lambda *args, **kwargs: None
     fake_bn.log_error = lambda *args, **kwargs: None
@@ -246,11 +275,15 @@ class _FakeSegment:
 
 
 class _FakeBV:
-    def __init__(self, *, functions=None, symbols=None, types_=None, arch=None, disassembly=None, instruction_lengths=None,
+    def __init__(self, *, functions=None, symbols=None, types_=None, qualified_types_=None, arch=None, disassembly=None, instruction_lengths=None,
                  strings=None, sections=None, segments=None, memory=None, code_refs=None, data_refs=None):
         self.functions = list(functions or [])
         self._symbols = list(symbols or [])
         self.types = dict(types_ or {})
+        # Types registered under a multi-component QualifiedName (keyed by the
+        # component tuple), mirroring how BN registers namespaced C++ types -- a
+        # raw "ns::Foo" string lookup misses these (#200).
+        self._qualified_types = dict(qualified_types_ or {})
         self.arch = arch or _FakeArch(instruction_lengths)
         self._disassembly = dict(disassembly or {})
         self._instruction_lengths = dict(instruction_lengths or {})
@@ -289,11 +322,23 @@ class _FakeBV:
                 return symbol
         return None
 
-    def get_type_by_name(self, name: str):
+    def get_type_by_name(self, name):
+        fake_bn = sys.modules["binaryninja"]
+        qn_cls = getattr(fake_bn, "QualifiedName", None)
+        if qn_cls is not None and isinstance(name, qn_cls):
+            # BN keys namespaced types by component tuple, NOT the joined string.
+            hit = self._qualified_types.get(tuple(name.name))
+            if hit is not None:
+                return hit
         return self.types.get(str(name))
 
-    def define_user_type(self, name: str, type_obj):
-        self.types[str(name)] = type_obj
+    def define_user_type(self, name, type_obj):
+        fake_bn = sys.modules["binaryninja"]
+        qn_cls = getattr(fake_bn, "QualifiedName", None)
+        if qn_cls is not None and isinstance(name, qn_cls):
+            self._qualified_types[tuple(name.name)] = type_obj
+        else:
+            self.types[str(name)] = type_obj
 
     def get_instruction_length(self, address: int):
         return self._instruction_lengths.get(int(address), 1)
@@ -1182,6 +1227,82 @@ def test_parse_type_or_hint_shared_by_all_type_ops(monkeypatch):
     assert "declare it first" in msg
     assert "syntaxerror" not in msg.lower()  # no raw Python exception class
     assert "\n" not in msg                   # BN's multi-line parser text collapsed
+
+
+def test_split_qualified_name_is_bracket_depth_aware(monkeypatch):
+    """The ::-split for namespaced lookups must split only at bracket depth 0, so
+    template arguments are not torn apart (#200)."""
+    me = _load_bridge(monkeypatch).mutation_engine
+    assert me._split_qualified_name("ns::demo::Foo") == ["ns", "demo", "Foo"]
+    assert me._split_qualified_name("Foo") == ["Foo"]
+    # '::' inside template args must NOT split
+    assert me._split_qualified_name("__alloc_traits<std::allocator<char> >::pointer") == [
+        "__alloc_traits<std::allocator<char> >",
+        "pointer",
+    ]
+    # the leading 'std::' IS a top-level separator; only the '::' INSIDE the
+    # template args must be preserved.
+    assert me._split_qualified_name("std::vector<std::pair<int, long> >::iterator") == [
+        "std",
+        "vector<std::pair<int, long> >",
+        "iterator",
+    ]
+
+
+def test_parse_type_or_hint_resolves_namespaced_user_type(monkeypatch):
+    """BN's C type-string parser rejects a ::-qualified user type even when it is
+    defined. local retype / field type should fall back to resolving it via a
+    multi-component QualifiedName lookup (BN does NOT match the raw "::"-string,
+    so a naive get_type_by_name(string) misses it) and build a name-preserving
+    pointer, so a C++ class type applies without a flat-name alias (#200)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    me = bridge.mutation_engine
+
+    class _NsBV(_FakeBV):
+        def parse_type_string(self, decl):
+            # BN rejects the namespaced name outright.
+            raise SyntaxError(
+                "error: <unknown>:1:1 use of undeclared identifier 'ns'\n1 error generated."
+            )
+
+    # Registered the way BN registers a recovered namespaced type: under the
+    # component tuple, NOT the raw "::"-joined string. A raw-string lookup misses
+    # it (that is the bug the fix must survive); only the QualifiedName path hits.
+    bv = _NsBV(
+        functions=[],
+        qualified_types_={("ns", "demo", "Foo"): _FakeType("struct ns::demo::Foo")},
+    )
+    # guard: a raw-string get_type_by_name MUST miss (mirrors real BN)
+    assert bv.get_type_by_name("ns::demo::Foo") is None
+
+    # pointer to a ::-qualified type resolves via the QualifiedName fallback. The
+    # named type keeps its `struct` tag (matching BN's readback, so verify passes).
+    t, name = me._parse_type_or_hint(
+        instance.ctx, bv, {"op": "local_retype"}, "ns::demo::Foo*", label="type"
+    )
+    assert str(t) == "struct ns::demo::Foo*"
+    assert name is None
+
+    # the bare ::-qualified type (no pointer) resolves too
+    t2, _ = me._parse_type_or_hint(
+        instance.ctx, bv, {"op": "local_retype"}, "ns::demo::Foo", label="type"
+    )
+    assert str(t2) == "struct ns::demo::Foo"
+
+    # double-pointer too
+    t3, _ = me._parse_type_or_hint(
+        instance.ctx, bv, {"op": "local_retype"}, "ns::demo::Foo **", label="type"
+    )
+    assert str(t3) == "struct ns::demo::Foo**"
+
+    # a name that is NOT a known type still raises the actionable declare hint
+    with pytest.raises(bridge.OperationFailure) as excinfo:
+        me._parse_type_or_hint(
+            instance.ctx, bv, {"op": "local_retype"}, "ns::demo::Unknown*", label="type"
+        )
+    assert excinfo.value.status == "invalid_request"
+    assert "declare it first" in excinfo.value.message
 
 
 def test_batch_struct_field_accepts_type_name_alias(monkeypatch):
@@ -4576,6 +4697,47 @@ def test_verify_prototype_still_fails_on_real_mismatch(monkeypatch):
 
     verified = instance._verify_operation(bv, result)
     assert verified["status"] == "verification_failed"
+
+
+def test_verify_prototype_passes_when_bn_infers_pure_attribute(monkeypatch):
+    """BN may re-infer a __pure / __noreturn attribute suffix after
+    set_user_type (common on accessors). The requested type lacked it but is
+    semantically identical, so the readback must normalise the attribute and
+    report `verified` -- not verification_failed + revert the valid edit (#199)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _PureFunction(_FakeFunction):
+        def __init__(self):
+            # BN auto-typed this accessor int64_t() __pure before the edit.
+            super().__init__(0x405250, "reset", "int64_t() __pure")
+
+        def set_user_type(self, value):
+            # After set_user_type + analysis BN re-adds the __pure suffix that
+            # the requested prototype did not carry.
+            self.type = "void(void* self) __pure"
+
+    class _PureBV(_FakeBV):
+        def parse_type_string(self, declaration):
+            # parse_type_string returns the requested type WITHOUT __pure.
+            return _FakeType("void(void* self)", type_class="FunctionTypeClass"), None
+
+    fn = _PureFunction()
+    bv = _PureBV(functions=[fn])
+
+    result = instance._op_set_prototype(
+        bv,
+        {
+            "op": "set_prototype",
+            "identifier": "reset",
+            "prototype": "void reset(void* self)",
+        },
+    )
+
+    assert result["expected_prototype"] == "void(void* self)"
+    verified = instance._verify_operation(bv, result)
+    assert verified["status"] == "verified"
+    assert "__pure" in verified["observed"]["prototype"]
 
 
 class _LoadBV:
