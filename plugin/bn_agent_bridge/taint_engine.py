@@ -53,6 +53,12 @@ SOUNDNESS = (
 # resolved separately from the model's buffer-propagation rules, not the class.
 _OVERFLOW_INDEX_CLASSES = frozenset({"overflow_unbounded", "overflow_len", "fortified_overflow"})
 
+# A param: source that is a pointer to an aggregate at least this large (by byte
+# size OR member count) is flagged as a "broad source" -- the whole struct is
+# treated as one tainted location, which over-taints into unrelated code (#219).
+_BROAD_SOURCE_BYTES = 0x40
+_BROAD_SOURCE_MEMBERS = 8
+
 
 def _model_buffer_source_args(model: dict[str, Any]) -> frozenset[int]:
     """Arg indices the model propagates a buffer FROM (``*arg:N`` in a
@@ -669,6 +675,69 @@ class TaintEngine:
         result = sorted(addrs)
         self._unimpl_cache[key] = result
         return result
+
+    @staticmethod
+    def _type_class_name(t: Any) -> str:
+        tc = getattr(t, "type_class", None)
+        return str(getattr(tc, "name", None) or (str(tc) if tc is not None else ""))
+
+    def _resolve_named_type(self, t: Any, depth: int = 0) -> Any:
+        """Resolve a NamedTypeReference (a typedef'd struct pointer's pointee, the
+        common firmware case) to its concrete type via the view, best-effort.
+        Returns *t* unchanged when it isn't a named ref or can't be resolved."""
+        if t is None or depth > 4 or "NamedTypeReference" not in self._type_class_name(t):
+            return t
+        for getter in (
+            lambda: t.target(self.bv),
+            lambda: self.bv.get_type_by_name(getattr(t, "name", None)),
+        ):
+            try:
+                r = getter()
+            except Exception:
+                r = None
+            if r is not None and r is not t:
+                return self._resolve_named_type(r, depth + 1)
+        return t
+
+    def _broad_source_hint(self, pv: Any, idx: int) -> str | None:
+        """A "broad source" nudge when a ``param:idx`` source is a pointer to a
+        large aggregate: the whole struct is one coarse taint location, so it
+        over-taints into unrelated code. Suggest a narrower locator (#219).
+
+        Duck-typed over the BN ``Type`` API (``type_class.name`` / ``target`` /
+        ``width`` / ``members``); a string/None type (the unit fakes) yields no
+        hint, so this is silent unless a genuine aggregate pointer is seen."""
+        t = getattr(pv, "type", None)
+        if t is None or "Pointer" not in self._type_class_name(t):
+            return None
+        pointee = getattr(t, "target", None)
+        if pointee is None:
+            children = list(getattr(t, "children", None) or [])
+            pointee = children[0] if children else None
+        pointee = self._resolve_named_type(pointee)
+        if pointee is None:
+            return None
+        pcn = self._type_class_name(pointee)
+        if "Structure" not in pcn and "Array" not in pcn:
+            return None
+        try:
+            size = int(getattr(pointee, "width", 0) or 0)
+        except Exception:
+            size = 0
+        try:
+            members = len(list(getattr(pointee, "members", None) or []))
+        except Exception:
+            members = 0
+        if size < _BROAD_SOURCE_BYTES and members < _BROAD_SOURCE_MEMBERS:
+            return None
+        desc = ", ".join(
+            x for x in (f"{members} fields" if members else None,
+                        f"{hex(size)} bytes" if size else None) if x) or "large aggregate"
+        return (
+            f"broad source: param:{idx} is a pointer to a large aggregate ({desc}); "
+            f"the whole struct is treated as one tainted location, which can "
+            f"over-taint into unrelated code -- consider a narrower locator (e.g. the "
+            f"actual input/recv buffer field) for a tighter result")
 
     def _resolve_direct_target(self, ins: Any) -> int | None:
         """Resolved direct/import call-target address, or None for a genuinely
@@ -1857,6 +1926,21 @@ class TaintEngine:
                 f"instruction(s) (e.g. {sample}{more}); BN's lifter could not model "
                 f"them, so a tainted value passing through is not tracked (possible "
                 f"silent hole) -- see `bn function info` for the full list")
+
+        # Broad-source nudge: only for the user's own param: source (top run), not
+        # the synthetic param locators of descended callees (#219).
+        if top:
+            for loc in locators:
+                if loc.get("kind") != "param":
+                    continue
+                try:
+                    pv = self._param_var(func, int(loc["index"]))
+                except (KeyError, ValueError, TypeError):
+                    pv = None
+                if pv is not None:
+                    hint = self._broad_source_hint(pv, int(loc["index"]))
+                    if hint:
+                        add_assumption(hint)
 
         def read_taint(ins: Any) -> list[tuple]:
             hit = []

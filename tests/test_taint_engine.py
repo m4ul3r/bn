@@ -382,6 +382,50 @@ def test_forward_flags_unlifted_instruction_as_assumption(models):
     assert any("0x10" in s for s in result["assumptions"])
 
 
+class FType:
+    """Minimal BN Type stand-in for broad-source detection (#219)."""
+    def __init__(self, type_class, *, target=None, width=0, members=()):
+        self.type_class = type("TC", (), {"name": type_class})()
+        if target is not None:
+            self.target = target
+        self.width = width
+        self.members = list(members)
+
+
+def test_forward_broad_source_hint_on_large_struct_pointer(models):
+    # A param:0 that is a pointer to a large aggregate must add a broad-source
+    # nudge (whole struct treated as one taint location -> over-taint) (#219).
+    struct_t = FType("StructureTypeClass", width=0x200, members=[1, 2, 3, 4, 5, 6, 7, 8, 9])
+    ptr_t = FType("PointerTypeClass", target=struct_t)
+    a = FVar("ctx"); a.type = ptr_t
+    r = FVar("r")
+    a0 = FSSA(a, 0); r1 = FSSA(r, 1)
+    ssa = FSSAFunc([
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "r#1 = a#0 + 1", reads=[a0], writes=[r1]),
+        FInstr(1, 0x14, "MLIL_RET", "return r#1", reads=[r1]),
+    ])
+    func = FFunc("handler", 0x10, ssa, params=[a])
+    engine = te.TaintEngine(FBV({}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert any("broad source" in s for s in result["assumptions"])
+    assert any("9 fields" in s for s in result["assumptions"])
+
+
+def test_forward_no_broad_source_hint_for_scalar_param(models):
+    # A scalar (non-pointer) param must NOT trigger the broad-source nudge.
+    a = FVar("n", typ="int32_t")  # FVar default .type is a plain string
+    r = FVar("r")
+    a0 = FSSA(a, 0); r1 = FSSA(r, 1)
+    ssa = FSSAFunc([
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "r#1 = a#0 + 1", reads=[a0], writes=[r1]),
+        FInstr(1, 0x14, "MLIL_RET", "return r#1", reads=[r1]),
+    ])
+    func = FFunc("handler", 0x10, ssa, params=[a])
+    engine = te.TaintEngine(FBV({}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert not any("broad source" in s for s in result["assumptions"])
+
+
 def test_forward_no_unlifted_no_assumption(models):
     # The unlifted signal must not fire on a clean function (no false noise).
     a = FVar("a"); r = FVar("r")
