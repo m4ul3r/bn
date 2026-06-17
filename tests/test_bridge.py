@@ -7483,6 +7483,36 @@ def test_get_comment_rejects_both_locators(monkeypatch):
         instance._get_comment("active", "0x1000", "main")
 
 
+def test_get_comment_function_aggregates_body_comments(monkeypatch):
+    """`comment get --function` must aggregate ALL comments within the function's
+    address range (matching `comment list`'s attribution), not just the
+    entry-address comment -- a function with body comments but no entry comment
+    previously reported (no comment), contradicting `comment list` (#203)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    fn = _FakeFunction(0x40a810, "ns::Cls::rwBuffer")
+    fn.basic_blocks = [_FakeBasicBlock(0x40a810, 0x410900)]  # covers the body addrs
+
+    class _CommentBV(_FakeBV):
+        def get_comment_at(self, addr):
+            return self.address_comments.get(int(addr), "")
+
+    bv = _CommentBV(functions=[fn])
+    # body comments only -- nothing at the entry address 0x40a810
+    bv.address_comments = {0x4105f4: "validate length here", 0x410858: "off-by-one risk"}
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda _bv, ident: fn)
+
+    result = instance._get_comment(None, None, "ns::Cls::rwBuffer")
+    assert result["has_comment"] is True
+    assert result["function"] == "ns::Cls::rwBuffer"
+    assert [c["address"] for c in result["comments"]] == ["0x4105f4", "0x410858"]
+    assert [c["comment"] for c in result["comments"]] == [
+        "validate length here", "off-by-one risk"
+    ]
+
+
 def test_op_set_comment_rejects_both_locators(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

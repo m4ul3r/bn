@@ -33,6 +33,8 @@ Start broad, then narrow:
 
 ## Function Triage
 
+> **Pipe trap:** large `bn` read output (decompile, `function list`, etc.) spills to disk and stdout carries only an envelope. Piping that into `grep`/`jq`/`awk`/`c++filt` makes the filter see the envelope, **not** the data — a no-match then misreads as "absent" (e.g. concluding a name is mangled because `| grep _Z` matched nothing). Write to a file first and process it: `bn function list --out /tmp/fns.json && jq '.functions|length' /tmp/fns.json`, or slice with `--limit`/`--lines` so it doesn't spill.
+
 Not all functions matter equally. Prioritize:
 
 - **Entry point and exports** — start with what the OS calls. `bn target info` gives the entry point; `bn function search main` or `bn function search start` may find the real main.

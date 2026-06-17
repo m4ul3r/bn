@@ -148,6 +148,32 @@ def test_function_list_warns_when_output_auto_spills(monkeypatch, capsys):
     )
 
 
+def test_spill_warns_about_pipe_trap_when_stdout_is_a_pipe(monkeypatch, capsys):
+    """When spilled output is piped (FIFO) into grep/jq, the consumer sees only
+    the envelope, not the data -- a no-match then misreads as "absent". Emit an
+    explicit caution in that case so the trap isn't silent (#195). The caution
+    fires only for a real pipe (not a terminal / capsys), so the other spill
+    tests are unaffected."""
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": {"text": "long decompiled text"}}
+
+    def fake_write_output_result(value, *, fmt, out_path, stem):
+        return _spill_artifact_namespace("/tmp/decompile.txt")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli, "write_output_result", fake_write_output_result)
+    monkeypatch.setattr(bn.cli, "_stdout_is_pipe", lambda: True, raising=False)
+
+    rc = bn.cli.main(["decompile", "sub_401000", "--target", "active"])
+
+    assert rc == 0
+    _, stderr = capsys.readouterr()
+    assert "spilled to /tmp/decompile.txt" in stderr
+    # the pipe-specific caution: names the trap and the --out remedy
+    assert "grep" in stderr and "jq" in stderr
+    assert "--out" in stderr
+
+
 def _spill_artifact_namespace(path: str) -> types.SimpleNamespace:
     return types.SimpleNamespace(
         rendered=f"ok: true\nspilled: true\npath: {path}\n",
