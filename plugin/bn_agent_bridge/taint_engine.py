@@ -1758,14 +1758,35 @@ class TaintEngine:
         if d is None or "CALL" not in op_name(d):
             return None, False
         aparams = self._call_params(d)
-        # Only a single-arg call qualifies as an assumed size-by-len wrapper; the
-        # bound check still requires that sole arg to be linear in the SAME var as
-        # the copy length, so a non-allocator one-arg call only ever downgrades
-        # when its argument provably bounds the copy (and the sink stays reported,
-        # just relabeled bounded_len).
-        if len(aparams) == 1:
+        # Only a single-arg call qualifies as an assumed size-by-len wrapper, AND
+        # it must be CORROBORATED as an allocator -- by an allocator-ish name or a
+        # pointer return type. Without corroboration a non-allocator one-arg call
+        # (e.g. `get_scratch(len)` returning a fixed buffer) would be mistaken for
+        # an allocator and hide a real overflow; staying overflow_len (no
+        # downgrade) is the safe direction (review Finding 2). The bound check
+        # still additionally requires the sole arg to be linear in the copy length.
+        if len(aparams) == 1 and self._looks_like_allocator(d):
             return aparams[0], True
         return None, False
+
+    _ALLOC_NAME_HINTS = ("alloc", "dup", "salloc")
+
+    def _looks_like_allocator(self, call_ins: Any) -> bool:
+        """Corroborate that a call is plausibly an allocator wrapper: its name
+        contains an allocator hint (malloc/calloc/realloc/xalloc/.../strdup), or
+        the resolved callee returns a pointer. Conservative -- an opaque-named,
+        unknown-return wrapper is NOT downgraded (#229 review Finding 2)."""
+        addr = self._resolve_direct_target(call_ins)
+        name = (self._callee_name(addr) or "").split("@", 1)[0].lstrip("_").lower()
+        if any(tok in name for tok in self._ALLOC_NAME_HINTS):
+            return True
+        fn = function_at(self.bv, addr) if addr is not None else None
+        rt = getattr(fn, "return_type", None)
+        if rt is not None:
+            tcn = self._type_class_name(rt)
+            if "Pointer" in tcn or str(rt).rstrip().endswith("*"):
+                return True
+        return False
 
     def _linear_in_var(self, ssaf: Any, expr: Any, depth: int = 0):
         """Decompose *expr* into ``(canonical_ssa_var, const)`` when it is ``v``,
@@ -1836,6 +1857,14 @@ class TaintEngine:
         (av, ac), (cv, cc) = alloc, copy
         if not (var_key(av) == var_key(cv)
                 and getattr(av, "version", None) == getattr(cv, "version", None)):
+            return None
+        # SOUNDNESS: a NEGATIVE copy-length addend means `len - C`, which in
+        # unsigned C underflows to a huge value when len < C (a real overflow);
+        # it is also how BN surfaces a >= 2^63 addend (constants are sign-extended
+        # at bit 63). Likewise a negative alloc addend (`alloc(len - C)`) can
+        # under-allocate. Either way the copy is NOT provably bounded, so never
+        # downgrade -- staying overflow_len is the safe (over-report) direction.
+        if cc < 0 or ac < 0:
             return None
         if c + cc <= ac:
             return (f"the destination is allocated with len+{hex(ac)} and the copy "

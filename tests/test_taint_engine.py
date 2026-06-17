@@ -2813,6 +2813,85 @@ def test_forward_downgrades_unmodeled_single_arg_allocator_wrapper(models):
     assert "assumed allocator wrapper" in memcpy[0]["detail"]
 
 
+def test_forward_keeps_overflow_when_copy_length_underflows(models):
+    # dst = malloc(n); memcpy(dst, src, n - 0x10): in unsigned C the length
+    # underflows to a huge value when n < 0x10 (a real overflow). A negative
+    # copy-length addend must NEVER downgrade to bounded_len (#229 review Finding 1).
+    n = FVar("n"); n0 = FSSA(n, 0)
+    dst = FVar("dst"); src = FVar("src")
+    dst1 = FSSA(dst, 1); src0 = FSSA(src, 0)
+    len_arg = FExpr("MLIL_SUB", "n#0 - 0x10", reads=[n0],
+                    left=FExpr("MLIL_VAR_SSA", "n#0", reads=[n0]),
+                    right=FExpr("MLIL_CONST", "0x10", constant=0x10))
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "dst#1 = malloc(n)",
+               reads=[n0], writes=[dst1],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])]),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "memcpy(dst, src, n - 0x10)",
+               reads=[dst1, src0, n0],
+               dest=FExpr("MLIL_CONST_PTR", "0x2010", constant=0x2010),
+               params=[FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1]),
+                       FExpr("MLIL_VAR_SSA", "src#0", reads=[src0]),
+                       len_arg]),
+    ]
+    func = FFunc("copy", 0x10, FSSAFunc(instrs), params=[n])
+    bv = FBV({0x2000: "malloc", 0x2010: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    memcpy = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(memcpy) == 1
+    assert memcpy[0]["class"] == "overflow_len"
+
+
+def test_forward_keeps_overflow_when_copy_addend_is_sign_extended_negative(models):
+    # BN sign-extends constants at bit 63, so a >= 2^63 copy-length addend surfaces
+    # as a negative Python int. dst = malloc(n + 0x10); memcpy(dst, src, n + HUGE)
+    # must stay overflow_len even though (c + cc <= ac) would be True with cc < 0
+    # (#229 review Finding 1, the bit-63 variant).
+    n = FVar("n"); n0 = FSSA(n, 0)
+    dst = FVar("dst"); src = FVar("src")
+    dst1 = FSSA(dst, 1); src0 = FSSA(src, 0)
+    size_arg = FExpr("MLIL_ADD", "n#0 + 0x10", reads=[n0],
+                     left=FExpr("MLIL_VAR_SSA", "n#0", reads=[n0]),
+                     right=FExpr("MLIL_CONST", "0x10", constant=0x10))
+    len_arg = FExpr("MLIL_ADD", "n#0 + HUGE", reads=[n0],
+                    left=FExpr("MLIL_VAR_SSA", "n#0", reads=[n0]),
+                    right=FExpr("MLIL_CONST", "huge", constant=-1))  # 0xFFFF... sign-extended
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "dst#1 = malloc(n + 0x10)",
+               reads=[n0], writes=[dst1],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[size_arg]),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "memcpy(dst, src, n + HUGE)",
+               reads=[dst1, src0, n0],
+               dest=FExpr("MLIL_CONST_PTR", "0x2010", constant=0x2010),
+               params=[FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1]),
+                       FExpr("MLIL_VAR_SSA", "src#0", reads=[src0]),
+                       len_arg]),
+    ]
+    func = FFunc("copy", 0x10, FSSAFunc(instrs), params=[n])
+    bv = FBV({0x2000: "malloc", 0x2010: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    memcpy = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(memcpy) == 1
+    assert memcpy[0]["class"] == "overflow_len"
+
+
+def test_forward_keeps_overflow_for_non_allocator_single_arg_call(models):
+    # dst = get_scratch(n); memcpy(dst, src, n): get_scratch is a 1-arg call but
+    # NOT allocator-named and has no pointer return type, so it must NOT be assumed
+    # an allocator -> stays overflow_len (#229 review Finding 2).
+    func = _copy_func_alloc_offset(alloc_const=0, dest_off=0, alloc_addr=0x3000)
+    bv = FBV({0x3000: "get_scratch", 0x2010: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    memcpy = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(memcpy) == 1
+    assert memcpy[0]["class"] == "overflow_len"
+
+
 def test_forward_cxx_new_backed_buffer_downgrades_like_malloc(models):
     # dst = operator new[](n); memcpy(dst, src, n) -- a new[]-backed buffer must
     # downgrade the overflow to bounded_len exactly like a malloc-backed one, i.e.
