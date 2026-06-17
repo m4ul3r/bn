@@ -45,10 +45,9 @@ def test_target_flag_root_does_not_clobber_subparser_value():
     assert args.target == "second"
 
 
-def test_target_list_text_format_renders_summary(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        assert op == "list_targets"
-        return {
+def test_target_list_text_format_renders_summary(fake_transport, capsys):
+    fake_transport({
+        "list_targets": {
             "ok": True,
             "result": [
                 {
@@ -61,8 +60,7 @@ def test_target_list_text_format_renders_summary(monkeypatch, capsys):
                 }
             ],
         }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    })
 
     rc = bn.cli.main(["target", "list", "--format", "text"])
 
@@ -73,34 +71,27 @@ def test_target_list_text_format_renders_summary(monkeypatch, capsys):
     assert '"selector"' not in output
 
 
-def test_refresh_uses_implicit_target_when_single_target_is_open(monkeypatch, capsys):
-    calls = []
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        calls.append({"op": op, "params": params, "target": target})
-        if op == "list_targets":
-            return {
-                "ok": True,
-                "result": [{"target_id": "123:1:7", "selector": "SnailMail_unwrapped.exe.bndb"}],
-            }
-        if op == "refresh":
-            return {
-                "ok": True,
-                "result": {
-                    "refreshed": True,
-                    "target": {
-                        "selector": "SnailMail_unwrapped.exe.bndb",
-                        "target_id": "123:1:7",
-                        "view_id": "1",
-                        "view_name": "PE",
-                        "filename": "/tmp/SnailMail_unwrapped.exe.bndb",
-                        "active": True,
-                    },
+def test_refresh_uses_implicit_target_when_single_target_is_open(fake_transport, capsys):
+    calls = fake_transport({
+        "list_targets": {
+            "ok": True,
+            "result": [{"target_id": "123:1:7", "selector": "SnailMail_unwrapped.exe.bndb"}],
+        },
+        "refresh": {
+            "ok": True,
+            "result": {
+                "refreshed": True,
+                "target": {
+                    "selector": "SnailMail_unwrapped.exe.bndb",
+                    "target_id": "123:1:7",
+                    "view_id": "1",
+                    "view_name": "PE",
+                    "filename": "/tmp/SnailMail_unwrapped.exe.bndb",
+                    "active": True,
                 },
-            }
-        raise AssertionError(f"unexpected op: {op}")
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+            },
+        },
+    })
 
     rc = bn.cli.main(["refresh", "--format", "text"])
 
@@ -161,17 +152,15 @@ def test_save_accepts_path_flag(monkeypatch, tmp_path):
     assert captured_params["path"] == str(out.expanduser().resolve())
 
 
-def test_close_warns_on_unsaved_changes(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        assert op == "close_binary"
-        return {
+def test_close_warns_on_unsaved_changes(fake_transport, capsys):
+    fake_transport({
+        "close_binary": {
             "ok": True,
             "result": {
                 "closed": [{"path": "/tmp/foo.bndb", "unsaved": True}],
             },
         }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    })
 
     rc = bn.cli.main(["close", "--format", "text"])
 
@@ -182,17 +171,15 @@ def test_close_warns_on_unsaved_changes(monkeypatch, capsys):
     assert "bn save" in output
 
 
-def test_close_silent_when_clean(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        assert op == "close_binary"
-        return {
+def test_close_silent_when_clean(fake_transport, capsys):
+    fake_transport({
+        "close_binary": {
             "ok": True,
             "result": {
                 "closed": [{"path": "/tmp/foo.bndb", "unsaved": False}],
             },
         }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    })
 
     rc = bn.cli.main(["close", "--format", "text"])
 
@@ -203,38 +190,26 @@ def test_close_silent_when_clean(monkeypatch, capsys):
     assert "unsaved" not in output.lower()
 
 
-def test_close_forwards_explicit_target_selector(monkeypatch, capsys):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        assert op == "close_binary"
-        captured["target"] = target
-        return {"ok": True, "result": {"closed": [{"path": "/tmp/foo", "unsaved": False}]}}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_close_forwards_explicit_target_selector(fake_transport, monkeypatch, capsys):
+    calls = fake_transport({
+        "close_binary": {"ok": True, "result": {"closed": [{"path": "/tmp/foo", "unsaved": False}]}}
+    })
     monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
 
     rc = bn.cli.main(["close", "-t", "foo", "--format", "text"])
 
     assert rc == 0
-    assert captured["target"] == "foo"
+    assert calls[-1]["target"] == "foo"
 
 
-def test_close_all_flag_sets_param(monkeypatch, capsys):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["params"] = params
-        captured["target"] = target
-        return {"ok": True, "result": {"closed": []}}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_close_all_flag_sets_param(fake_transport, monkeypatch, capsys):
+    calls = fake_transport({"close_binary": {"ok": True, "result": {"closed": []}}})
     monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
 
     rc = bn.cli.main(["close", "--all", "--format", "text"])
 
     assert rc == 0
-    assert captured["params"].get("all") is True
+    assert calls[-1]["params"].get("all") is True
 
 
 def test_close_rejects_path_and_all_together(monkeypatch, capsys):
@@ -309,38 +284,28 @@ def test_target_clear_removes_state(tmp_session, capsys):
 # --- bn load --no-bndb plumbing ---
 
 
-def test_load_defaults_to_prefer_bndb(monkeypatch, tmp_path):
+def test_load_defaults_to_prefer_bndb(fake_transport, tmp_path):
     raw = tmp_path / "foo.so"
     raw.write_bytes(b"")
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        assert op == "load_binary"
-        captured.update(params)
-        return {"ok": True, "result": {"loaded": True, "path": str(raw), "notes": [], "targets": []}}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    calls = fake_transport({
+        "load_binary": {"ok": True, "result": {"loaded": True, "path": str(raw), "notes": [], "targets": []}}
+    })
     rc = bn.cli.main(["load", str(raw)])
 
     assert rc == 0
-    assert captured["prefer_bndb"] is True
+    assert calls[-1]["params"]["prefer_bndb"] is True
 
 
-def test_load_no_bndb_flag_disables_prefer_bndb(monkeypatch, tmp_path):
+def test_load_no_bndb_flag_disables_prefer_bndb(fake_transport, tmp_path):
     raw = tmp_path / "foo.so"
     raw.write_bytes(b"")
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        assert op == "load_binary"
-        captured.update(params)
-        return {"ok": True, "result": {"loaded": True, "path": str(raw), "notes": [], "targets": []}}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    calls = fake_transport({
+        "load_binary": {"ok": True, "result": {"loaded": True, "path": str(raw), "notes": [], "targets": []}}
+    })
     rc = bn.cli.main(["load", "--no-bndb", str(raw)])
 
     assert rc == 0
-    assert captured["prefer_bndb"] is False
+    assert calls[-1]["params"]["prefer_bndb"] is False
 
 
 def test_load_quick_flag_sets_quick_param(monkeypatch, tmp_path):
@@ -373,13 +338,13 @@ def test_load_quick_output_marks_not_analyzed(monkeypatch, tmp_path, capsys):
     assert "bn refresh" in out
 
 
-def test_load_text_renders_notes(monkeypatch, tmp_path, capsys):
+def test_load_text_renders_notes(fake_transport, tmp_path, capsys):
     raw = tmp_path / "foo.so"
     raw.write_bytes(b"")
     bndb = tmp_path / "foo.so.bndb"
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        return {
+    fake_transport({
+        "load_binary": {
             "ok": True,
             "result": {
                 "loaded": True,
@@ -389,8 +354,7 @@ def test_load_text_renders_notes(monkeypatch, tmp_path, capsys):
                 "targets": [],
             },
         }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    })
     rc = bn.cli.main(["load", str(raw)])
 
     assert rc == 0

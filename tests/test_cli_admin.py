@@ -612,22 +612,16 @@ def test_session_start_partial_failure_keeps_bridge_but_exits_nonzero(monkeypatc
     assert "stopped" not in parsed
 
 
-def test_close_ignores_sticky_target_pin(monkeypatch, capsys):
+def test_close_ignores_sticky_target_pin(fake_transport, monkeypatch, capsys):
     # A sticky pin must NOT turn a bare `close` (documented close-all) into
     # close-one, and a stale pin must not make cleanup fail.
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["target"] = target
-        return {"ok": True, "result": {"closed": []}}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    calls = fake_transport({"close_binary": {"ok": True, "result": {"closed": []}}})
     monkeypatch.setattr(bn.cli.session_state, "read", lambda: {"target": "stale_pin"})
 
     rc = bn.cli.main(["close", "--format", "text"])
 
     assert rc == 0
-    assert captured["target"] is None  # pin ignored -> close-all
+    assert calls[-1]["target"] is None  # pin ignored -> close-all
 
 
 def test_instance_use_writes_state(tmp_session, monkeypatch, capsys):
@@ -806,17 +800,16 @@ def test_session_list_marks_sticky(tmp_session, monkeypatch, capsys):
     assert "sticky" not in by_id["bbbb2222"]
 
 
-def test_target_list_marks_sticky(tmp_session, monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        return {
+def test_target_list_marks_sticky(tmp_session, fake_transport, capsys):
+    fake_transport({
+        "list_targets": {
             "ok": True,
             "result": [
                 {"target_id": "1", "selector": "foo.so", "filename": "/p/foo.so"},
                 {"target_id": "2", "selector": "bar.so", "filename": "/p/bar.so"},
             ],
         }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    })
     bn.session_state.update(target="foo.so")
 
     rc = bn.cli.main(["target", "list", "--format", "json"])

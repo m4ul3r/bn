@@ -9,16 +9,8 @@ import pytest
 from _cli_helpers import *  # noqa: F401,F403
 
 
-def test_symbol_rename_builds_preview_payload(monkeypatch):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["op"] = op
-        captured["params"] = params
-        captured["target"] = target
-        return {"ok": True, "result": {"preview": True}}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_symbol_rename_builds_preview_payload(fake_transport):
+    calls = fake_transport({"rename_symbol": {"ok": True, "result": {"preview": True}}})
 
     rc = bn.cli.main(
         [
@@ -32,18 +24,15 @@ def test_symbol_rename_builds_preview_payload(monkeypatch):
         ]
     )
     assert rc == 0
-    assert captured["op"] == "rename_symbol"
-    assert captured["target"] == "123:1:7"
-    assert captured["params"]["preview"] is True
+    assert calls[-1]["op"] == "rename_symbol"
+    assert calls[-1]["target"] == "123:1:7"
+    assert calls[-1]["params"]["preview"] is True
 
 
-def test_symbol_rename_uses_implicit_target_when_single_target_is_open(monkeypatch):
-    calls = []
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        calls.append({"op": op, "params": params, "target": target})
-        if op == "list_targets":
-            return {
+def test_symbol_rename_uses_implicit_target_when_single_target_is_open(fake_transport):
+    calls = fake_transport(
+        {
+            "list_targets": {
                 "ok": True,
                 "result": [
                     {
@@ -51,12 +40,10 @@ def test_symbol_rename_uses_implicit_target_when_single_target_is_open(monkeypat
                         "selector": "SnailMail_unwrapped.exe.bndb",
                     }
                 ],
-            }
-        if op == "rename_symbol":
-            return {"ok": True, "result": {"preview": True}}
-        raise AssertionError(f"unexpected op: {op}")
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+            },
+            "rename_symbol": {"ok": True, "result": {"preview": True}},
+        }
+    )
 
     rc = bn.cli.main(["symbol", "rename", "--preview", "sub_401000", "player_update"])
 
@@ -65,10 +52,10 @@ def test_symbol_rename_uses_implicit_target_when_single_target_is_open(monkeypat
     assert calls[1]["target"] == "active"
 
 
-def test_symbol_rename_requires_target_when_multiple_targets_are_open(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        if op == "list_targets":
-            return {
+def test_symbol_rename_requires_target_when_multiple_targets_are_open(fake_transport, capsys):
+    fake_transport(
+        {
+            "list_targets": {
                 "ok": True,
                 "result": [
                     {
@@ -79,9 +66,8 @@ def test_symbol_rename_requires_target_when_multiple_targets_are_open(monkeypatc
                     {"target_id": "123:2:8", "selector": "other.exe.bndb", "active": False},
                 ],
             }
-        raise AssertionError(f"unexpected op: {op}")
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+        }
+    )
 
     rc = bn.cli.main(["symbol", "rename", "sub_401000", "player_update"])
 
@@ -94,70 +80,67 @@ def test_symbol_rename_requires_target_when_multiple_targets_are_open(monkeypatc
     )
 
 
-def test_function_create_builds_payload_and_defaults_to_json(monkeypatch, capsys):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["op"] = op
-        captured["params"] = params
-        captured["target"] = target
-        return {
-            "ok": True,
-            "result": {
-                "preview": False,
-                "success": True,
-                "committed": True,
-                "message": "Function created and verified in the live Binary Ninja session.",
-                "results": [
-                    {
-                        "op": "function_create",
-                        "status": "verified",
-                        "address": "0x401000",
-                        "function": "sub_401000",
-                        "requested": {"op": "function_create", "address": "0x401000"},
-                    }
-                ],
-                "affected_functions": [],
-                "affected_types": [],
-            },
+def test_function_create_builds_payload_and_defaults_to_json(fake_transport, capsys):
+    calls = fake_transport(
+        {
+            "function_create": {
+                "ok": True,
+                "result": {
+                    "preview": False,
+                    "success": True,
+                    "committed": True,
+                    "message": "Function created and verified in the live Binary Ninja session.",
+                    "results": [
+                        {
+                            "op": "function_create",
+                            "status": "verified",
+                            "address": "0x401000",
+                            "function": "sub_401000",
+                            "requested": {"op": "function_create", "address": "0x401000"},
+                        }
+                    ],
+                    "affected_functions": [],
+                    "affected_types": [],
+                },
+            }
         }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    )
 
     rc = bn.cli.main(["function", "create", "--target", "123:1:7", "0x401000"])
 
     assert rc == 0
-    assert captured["op"] == "function_create"
-    assert captured["target"] == "123:1:7"
-    assert captured["params"] == {"address": "0x401000", "preview": False}
+    assert calls[-1]["op"] == "function_create"
+    assert calls[-1]["target"] == "123:1:7"
+    assert calls[-1]["params"] == {"address": "0x401000", "preview": False}
     payload = json.loads(capsys.readouterr().out)
     assert payload["results"][0]["status"] == "verified"
 
 
-def test_function_create_text_output_renders_verified_summary(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        return {
-            "ok": True,
-            "result": {
-                "preview": False,
-                "success": True,
-                "committed": True,
-                "message": "Function created and verified in the live Binary Ninja session.",
-                "results": [
-                    {
-                        "op": "function_create",
-                        "status": "verified",
-                        "address": "0x401000",
-                        "function": "sub_401000",
-                        "requested": {"op": "function_create", "address": "0x401000"},
-                    }
-                ],
-                "affected_functions": [],
-                "affected_types": [],
-            },
+def test_function_create_text_output_renders_verified_summary(fake_transport, capsys):
+    fake_transport(
+        {
+            "function_create": {
+                "ok": True,
+                "result": {
+                    "preview": False,
+                    "success": True,
+                    "committed": True,
+                    "message": "Function created and verified in the live Binary Ninja session.",
+                    "results": [
+                        {
+                            "op": "function_create",
+                            "status": "verified",
+                            "address": "0x401000",
+                            "function": "sub_401000",
+                            "requested": {"op": "function_create", "address": "0x401000"},
+                        }
+                    ],
+                    "affected_functions": [],
+                    "affected_types": [],
+                },
+            }
         }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    )
 
     rc = bn.cli.main(["function", "create", "--target", "123:1:7", "--format", "text", "0x401000"])
 
@@ -166,45 +149,42 @@ def test_function_create_text_output_renders_verified_summary(monkeypatch, capsy
     assert "function_create 0x401000 (sub_401000) [verified]" in out
 
 
-def test_function_create_forwards_preview_flag(monkeypatch):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["params"] = params
-        return {"ok": True, "result": {"preview": True, "success": True, "committed": False, "results": []}}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_function_create_forwards_preview_flag(fake_transport):
+    calls = fake_transport(
+        {"function_create": {"ok": True, "result": {"preview": True, "success": True, "committed": False, "results": []}}}
+    )
 
     rc = bn.cli.main(["function", "create", "--target", "123:1:7", "--preview", "0x401000"])
 
     assert rc == 0
-    assert captured["params"]["preview"] is True
+    assert calls[-1]["params"]["preview"] is True
 
 
-def test_function_create_verification_failure_exits_three(monkeypatch):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        return {
-            "ok": True,
-            "result": {
-                "preview": False,
-                "success": False,
-                "committed": False,
-                "message": "Rolled back because no function was created at the address.",
-                "results": [
-                    {
-                        "op": "function_create",
-                        "status": "verification_failed",
-                        "address": "0x401000",
-                        "message": "No function starts at 0x401000 after analysis.",
-                        "requested": {"op": "function_create", "address": "0x401000"},
-                    }
-                ],
-                "affected_functions": [],
-                "affected_types": [],
-            },
+def test_function_create_verification_failure_exits_three(fake_transport):
+    fake_transport(
+        {
+            "function_create": {
+                "ok": True,
+                "result": {
+                    "preview": False,
+                    "success": False,
+                    "committed": False,
+                    "message": "Rolled back because no function was created at the address.",
+                    "results": [
+                        {
+                            "op": "function_create",
+                            "status": "verification_failed",
+                            "address": "0x401000",
+                            "message": "No function starts at 0x401000 after analysis.",
+                            "requested": {"op": "function_create", "address": "0x401000"},
+                        }
+                    ],
+                    "affected_functions": [],
+                    "affected_types": [],
+                },
+            }
         }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    )
 
     rc = bn.cli.main(["function", "create", "--target", "123:1:7", "0x401000"])
 
@@ -263,21 +243,14 @@ def test_render_target_line_shows_symbol_and_string_for_mapped_targets():
     assert "[.rodata, truncated]" in line
 
 
-def test_callsites_within_file_ignores_comments_and_blank_lines(monkeypatch, tmp_path):
-    captured = {}
+def test_callsites_within_file_ignores_comments_and_blank_lines(fake_transport, tmp_path):
     scope_file = tmp_path / "functions.txt"
     scope_file.write_text(
         "\n# curated trial functions\nbonus_pick_random_type\n\nfx_queue_add_random\n",
         encoding="utf-8",
     )
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["op"] = op
-        captured["params"] = params
-        captured["target"] = target
-        return {"ok": True, "result": []}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    calls = fake_transport({"callsites": {"ok": True, "result": []}})
 
     rc = bn.cli.main(
         [
@@ -291,28 +264,23 @@ def test_callsites_within_file_ignores_comments_and_blank_lines(monkeypatch, tmp
     )
 
     assert rc == 0
-    assert captured["op"] == "callsites"
-    assert captured["params"]["within_identifiers"] == [
+    assert calls[-1]["op"] == "callsites"
+    assert calls[-1]["params"]["within_identifiers"] == [
         "bonus_pick_random_type",
         "fx_queue_add_random",
     ]
 
 
-def test_comment_get_uses_implicit_target_when_single_target_is_open(monkeypatch, capsys):
-    calls = []
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        calls.append({"op": op, "params": params, "target": target})
-        if op == "list_targets":
-            return {
+def test_comment_get_uses_implicit_target_when_single_target_is_open(fake_transport, capsys):
+    calls = fake_transport(
+        {
+            "list_targets": {
                 "ok": True,
                 "result": [{"target_id": "123:1:7", "selector": "SnailMail_unwrapped.exe.bndb"}],
-            }
-        if op == "get_comment":
-            return {"ok": True, "result": {"address": "0x401000", "comment": "interesting branch", "has_comment": True}}
-        raise AssertionError(f"unexpected op: {op}")
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+            },
+            "get_comment": {"ok": True, "result": {"address": "0x401000", "comment": "interesting branch", "has_comment": True}},
+        }
+    )
 
     rc = bn.cli.main(["comment", "get", "--format", "text", "--address", "0x401000"])
 
@@ -474,43 +442,32 @@ def test_comment_get_empty_comment_shows_placeholder(monkeypatch, capsys):
     assert capsys.readouterr().out == "(no comment)\n"
 
 
-def test_batch_apply_stdin_forwards_preview_flag(monkeypatch):
+def test_batch_apply_stdin_forwards_preview_flag(monkeypatch, fake_transport):
     import io
 
     monkeypatch.setattr(
         "sys.stdin",
         io.StringIO('{"ops": [{"op": "set_comment", "address": "0x1000", "comment": "x"}]}'),
     )
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["params"] = params
-        return {"ok": True, "result": {"preview": True, "success": True, "committed": False, "results": []}}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    calls = fake_transport(
+        {"batch_apply": {"ok": True, "result": {"preview": True, "success": True, "committed": False, "results": []}}}
+    )
 
     rc = bn.cli.main(["batch", "apply", "--preview", "-"])
 
     assert rc == 0
-    assert captured["params"]["preview"] is True
+    assert calls[-1]["params"]["preview"] is True
 
 
-def test_rename_alias_maps_to_symbol_rename(monkeypatch):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["op"] = op
-        captured["params"] = params
-        return {"ok": True, "result": {"preview": True}}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_rename_alias_maps_to_symbol_rename(fake_transport):
+    calls = fake_transport({"rename_symbol": {"ok": True, "result": {"preview": True}}})
 
     rc = bn.cli.main(["rename", "--target", "123:1:7", "--preview", "sub_401000", "player_update"])
 
     assert rc == 0
-    assert captured["op"] == "rename_symbol"
-    assert captured["params"]["identifier"] == "sub_401000"
-    assert captured["params"]["new_name"] == "player_update"
+    assert calls[-1]["op"] == "rename_symbol"
+    assert calls[-1]["params"]["identifier"] == "sub_401000"
+    assert calls[-1]["params"]["new_name"] == "player_update"
 
 
 def test_render_mutation_text_does_not_claim_rollback_when_revert_failed():

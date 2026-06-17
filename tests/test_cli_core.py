@@ -83,10 +83,9 @@ def test_unrecognized_argument_at_root_routes_to_root_usage(capsys):
     assert "bn: error: unrecognized arguments: --bogus" in stderr
 
 
-def test_local_list_text_is_slim(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        assert op == "list_locals"
-        return {
+def test_local_list_text_is_slim(fake_transport, capsys):
+    fake_transport({
+        "list_locals": {
             "ok": True,
             "result": {
                 "function": {"name": "sub_401000", "address": "0x401000"},
@@ -113,9 +112,8 @@ def test_local_list_text_is_slim(monkeypatch, capsys):
                     },
                 ],
             },
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+        },
+    })
 
     rc = bn.cli.main(["local", "list", "--format", "text", "--target", "active", "sub_401000"])
 
@@ -137,9 +135,9 @@ def test_local_list_text_is_slim(monkeypatch, capsys):
     assert "identifier=" not in output
 
 
-def test_local_list_json_retains_ids(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        return {
+def test_local_list_json_retains_ids(fake_transport, capsys):
+    fake_transport({
+        "list_locals": {
             "ok": True,
             "result": {
                 "function": {"name": "sub_401000", "address": "0x401000"},
@@ -156,9 +154,8 @@ def test_local_list_json_retains_ids(monkeypatch, capsys):
                     }
                 ],
             },
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+        },
+    })
     rc = bn.cli.main(["local", "list", "--format", "json", "--target", "active", "sub_401000"])
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
@@ -371,21 +368,14 @@ def test_format_operation_result_falls_back_to_requested():
         ("types", "types", "Total types:"),
     ],
 )
-def test_list_count_flag_forwards_count_only(monkeypatch, capsys, cmd, op, total_label):
+def test_list_count_flag_forwards_count_only(fake_transport, capsys, cmd, op, total_label):
     # #165: --count on strings/imports/sections/types forwards count_only and
     # renders the total (mirrors `function list --count`).
-    captured = {}
-
-    def fake_send_request(o, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["op"] = o
-        captured["params"] = params or {}
-        return {"ok": True, "result": {"count": 42, "total": 42}}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    calls = fake_transport(default={"ok": True, "result": {"count": 42, "total": 42}})
     rc = bn.cli.main([cmd, "--count", "--target", "active"])
     assert rc == 0
-    assert captured["op"] == op
-    assert captured["params"].get("count_only") is True
+    assert calls[-1]["op"] == op
+    assert (calls[-1]["params"] or {}).get("count_only") is True
     assert total_label in capsys.readouterr().out
 
 

@@ -10,22 +10,15 @@ from _cli_helpers import *  # noqa: F401,F403
 
 
 
-def test_function_list_uses_implicit_target_when_single_target_is_open(monkeypatch, capsys):
-    calls = []
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        calls.append({"op": op, "params": params, "target": target})
-        if op == "list_targets":
-            return {
-                "ok": True,
-                "result": [{"target_id": "123:1:7", "selector": "SnailMail_unwrapped.exe.bndb"}],
-            }
-        if op == "list_functions":
-            return {"ok": True, "result": {"functions": [{"name": "sub_401000", "address": "0x401000"}],
-                                           "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False}}
-        raise AssertionError(f"unexpected op: {op}")
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_function_list_uses_implicit_target_when_single_target_is_open(fake_transport, capsys):
+    calls = fake_transport({
+        "list_targets": {
+            "ok": True,
+            "result": [{"target_id": "123:1:7", "selector": "SnailMail_unwrapped.exe.bndb"}],
+        },
+        "list_functions": {"ok": True, "result": {"functions": [{"name": "sub_401000", "address": "0x401000"}],
+                                                  "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False}},
+    })
 
     rc = bn.cli.main(["function", "list"])
     assert rc == 0
@@ -37,23 +30,20 @@ def test_function_list_uses_implicit_target_when_single_target_is_open(monkeypat
     assert '"name"' not in output
 
 
-def test_function_list_requires_target_when_multiple_targets_are_open(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        if op == "list_targets":
-            return {
-                "ok": True,
-                "result": [
-                    {
-                        "target_id": "123:1:7",
-                        "selector": "SnailMail_unwrapped.exe.bndb",
-                        "active": True,
-                    },
-                    {"target_id": "123:2:8", "selector": "other.exe.bndb", "active": False},
-                ],
-            }
-        raise AssertionError(f"unexpected op: {op}")
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_function_list_requires_target_when_multiple_targets_are_open(fake_transport, capsys):
+    fake_transport({
+        "list_targets": {
+            "ok": True,
+            "result": [
+                {
+                    "target_id": "123:1:7",
+                    "selector": "SnailMail_unwrapped.exe.bndb",
+                    "active": True,
+                },
+                {"target_id": "123:2:8", "selector": "other.exe.bndb", "active": False},
+            ],
+        },
+    })
 
     rc = bn.cli.main(["function", "list"])
 
@@ -66,26 +56,18 @@ def test_function_list_requires_target_when_multiple_targets_are_open(monkeypatc
     )
 
 
-def test_function_list_returns_full_result_set(monkeypatch, capsys):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["op"] = op
-        captured["params"] = params
-        captured["target"] = target
-        return {
-            "ok": True,
-            "result": {"functions": [{"name": f"sub_{index:06x}", "address": hex(index)} for index in range(150)],
-                       "total": 150, "offset": 0, "limit": 200, "returned": 150, "has_more": False},
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_function_list_returns_full_result_set(fake_transport, capsys):
+    calls = fake_transport({"list_functions": {
+        "ok": True,
+        "result": {"functions": [{"name": f"sub_{index:06x}", "address": hex(index)} for index in range(150)],
+                   "total": 150, "offset": 0, "limit": 200, "returned": 150, "has_more": False},
+    }})
 
     rc = bn.cli.main(["function", "list", "--target", "active", "--format", "json", "--limit", "200"])
 
     assert rc == 0
-    assert captured["op"] == "list_functions"
-    assert captured["params"] == {"limit": 200}
+    assert calls[-1]["op"] == "list_functions"
+    assert calls[-1]["params"] == {"limit": 200}
     stdout, stderr = capsys.readouterr()
     payload = json.loads(stdout)
     assert len(payload["functions"]) == 150
@@ -93,18 +75,16 @@ def test_function_list_returns_full_result_set(monkeypatch, capsys):
     assert stderr == ""
 
 
-def test_function_list_warns_when_output_auto_spills(monkeypatch, capsys):
+def test_function_list_warns_when_output_auto_spills(fake_transport, monkeypatch, capsys):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["op"] = op
-        return {
-            "ok": True,
-            "result": {"functions": [
-                {"name": "sub_401000", "address": "0x401000"},
-                {"name": "sub_402000", "address": "0x402000"},
-            ], "total": 2, "offset": 0, "limit": 100, "returned": 2, "has_more": False},
-        }
+    fake_transport({"list_functions": {
+        "ok": True,
+        "result": {"functions": [
+            {"name": "sub_401000", "address": "0x401000"},
+            {"name": "sub_402000", "address": "0x402000"},
+        ], "total": 2, "offset": 0, "limit": 100, "returned": 2, "has_more": False},
+    }})
 
     def fake_write_output_result(value, *, fmt, out_path, stem):
         captured["value"] = value
@@ -136,7 +116,6 @@ def test_function_list_warns_when_output_auto_spills(monkeypatch, capsys):
             },
         )
 
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
     monkeypatch.setattr(bn.cli, "write_output_result", fake_write_output_result)
 
     rc = bn.cli.main(["function", "list", "--target", "active"])
@@ -151,15 +130,13 @@ def test_function_list_warns_when_output_auto_spills(monkeypatch, capsys):
     )
 
 
-def test_decompile_spill_warning_suggests_line_slicing(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        return {"ok": True, "result": {"text": "long decompiled text"}}
+def test_decompile_spill_warning_suggests_line_slicing(fake_transport, monkeypatch, capsys):
+    fake_transport({"decompile": {"ok": True, "result": {"text": "long decompiled text"}}})
 
     def fake_write_output_result(value, *, fmt, out_path, stem):
         assert stem == "decompile"
         return _spill_artifact_namespace("/tmp/decompile.txt")
 
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
     monkeypatch.setattr(bn.cli, "write_output_result", fake_write_output_result)
 
     rc = bn.cli.main(["decompile", "sub_401000", "--target", "active"])
@@ -172,18 +149,16 @@ def test_decompile_spill_warning_suggests_line_slicing(monkeypatch, capsys):
     )
 
 
-def test_decompile_json_spill_warning_does_not_suggest_lines(monkeypatch, capsys):
+def test_decompile_json_spill_warning_does_not_suggest_lines(fake_transport, monkeypatch, capsys):
     # --lines is a text-only flag; when decompile --format json spills, the hint
     # must NOT tell JSON consumers to rerun with --lines (a dead end) -- it
     # should point at --out / the artifact instead (#120).
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        return {"ok": True, "result": {"text": "long decompiled text"}}
+    fake_transport({"decompile": {"ok": True, "result": {"text": "long decompiled text"}}})
 
     def fake_write_output_result(value, *, fmt, out_path, stem):
         assert stem == "decompile"
         return _spill_artifact_namespace("/tmp/decompile.json")
 
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
     monkeypatch.setattr(bn.cli, "write_output_result", fake_write_output_result)
 
     rc = bn.cli.main(["decompile", "sub_401000", "--target", "active", "--format", "json"])
@@ -194,16 +169,8 @@ def test_decompile_json_spill_warning_does_not_suggest_lines(monkeypatch, capsys
     assert "--out" in stderr
 
 
-def test_function_list_forwards_address_filters(monkeypatch, capsys):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["op"] = op
-        captured["params"] = params
-        captured["target"] = target
-        return {"ok": True, "result": []}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_function_list_forwards_address_filters(fake_transport, capsys):
+    calls = fake_transport({"list_functions": {"ok": True, "result": []}})
 
     rc = bn.cli.main(
         [
@@ -219,32 +186,24 @@ def test_function_list_forwards_address_filters(monkeypatch, capsys):
     )
 
     assert rc == 0
-    assert captured["op"] == "list_functions"
-    assert captured["params"]["min_address"] == "0x401000"
-    assert captured["params"]["max_address"] == "0x402000"
+    assert calls[-1]["op"] == "list_functions"
+    assert calls[-1]["params"]["min_address"] == "0x401000"
+    assert calls[-1]["params"]["max_address"] == "0x402000"
     assert capsys.readouterr().out == "none\n"
 
 
-def test_function_search_can_request_regex_matching(monkeypatch, capsys):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["op"] = op
-        captured["params"] = params
-        captured["target"] = target
-        return {"ok": True, "result": {"functions": [{"name": "load_attachment", "address": "0x401000"}],
-                                       "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False}}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_function_search_can_request_regex_matching(fake_transport, capsys):
+    calls = fake_transport({"search_functions": {"ok": True, "result": {"functions": [{"name": "load_attachment", "address": "0x401000"}],
+                                                                        "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False}}})
 
     rc = bn.cli.main(["function", "search", "--target", "active", "--regex", "attach|detach"])
 
     assert rc == 0
-    assert captured["op"] == "search_functions"
-    assert captured["params"]["query"] == "attach|detach"
-    assert captured["params"]["regex"] is True
-    assert "offset" not in captured["params"]
-    assert captured["params"]["limit"] == 100
+    assert calls[-1]["op"] == "search_functions"
+    assert calls[-1]["params"]["query"] == "attach|detach"
+    assert calls[-1]["params"]["regex"] is True
+    assert "offset" not in calls[-1]["params"]
+    assert calls[-1]["params"]["limit"] == 100
     assert capsys.readouterr().out == "0x401000  load_attachment\n"
 
 
@@ -278,11 +237,8 @@ def test_callsites_both_scope_flags_still_rejected():
         )
 
 
-def test_callsites_missing_scope_raises_actionable_error(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        raise AssertionError("bridge should not be called when scope is missing")
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_callsites_missing_scope_raises_actionable_error(fake_transport, capsys):
+    fake_transport()
 
     rc = bn.cli.main(["callsites", "crt_rand", "--target", "active"])
 
@@ -295,33 +251,25 @@ def test_callsites_missing_scope_raises_actionable_error(monkeypatch, capsys):
     assert "bn xrefs crt_rand" in text
 
 
-def test_function_info_uses_active_target_and_text_renderer(monkeypatch, capsys):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["op"] = op
-        captured["params"] = params
-        captured["target"] = target
-        return {
-            "ok": True,
-            "result": {
-                "function": {"name": "sub_401000", "address": "0x401000"},
-                "prototype": "int32_t sub_401000(int32_t arg1)",
-                "return_type": "int32_t",
-                "calling_convention": "__cdecl",
-                "size": 24,
-                "parameters": [{"name": "arg1", "type": "int32_t", "storage": 0, "is_parameter": True, "local_id": "0x401000:param:stack:0:0:1"}],
-                "locals": [{"name": "var_4", "type": "int32_t", "storage": -4, "is_parameter": False, "local_id": "0x401000:local:stack:-4:1:2"}],
-            },
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_function_info_uses_active_target_and_text_renderer(fake_transport, capsys):
+    calls = fake_transport({"function_info": {
+        "ok": True,
+        "result": {
+            "function": {"name": "sub_401000", "address": "0x401000"},
+            "prototype": "int32_t sub_401000(int32_t arg1)",
+            "return_type": "int32_t",
+            "calling_convention": "__cdecl",
+            "size": 24,
+            "parameters": [{"name": "arg1", "type": "int32_t", "storage": 0, "is_parameter": True, "local_id": "0x401000:param:stack:0:0:1"}],
+            "locals": [{"name": "var_4", "type": "int32_t", "storage": -4, "is_parameter": False, "local_id": "0x401000:local:stack:-4:1:2"}],
+        },
+    }})
 
     rc = bn.cli.main(["function", "info", "--format", "text", "--target", "active", "sub_401000"])
 
     assert rc == 0
-    assert captured["op"] == "function_info"
-    assert captured["target"] == "active"
+    assert calls[-1]["op"] == "function_info"
+    assert calls[-1]["target"] == "active"
     output = capsys.readouterr().out
     assert "sub_401000 @ 0x401000" in output
     assert "calling convention: __cdecl" in output
@@ -332,65 +280,53 @@ def test_function_info_uses_active_target_and_text_renderer(monkeypatch, capsys)
     assert "id=0x401000:param:stack:0:0:1" not in output
 
 
-def test_xrefs_field_routes_to_field_xrefs(monkeypatch, capsys):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["op"] = op
-        captured["params"] = params
-        captured["target"] = target
-        return {
-            "ok": True,
-            "result": {
-                "field": {
-                    "type_name": "TrackRowCell",
-                    "field_name": "tile_type",
-                    "offset": 8,
-                    "field_type": "uint32_t",
-                },
-                "code_refs": [{"address": "0x401000", "function": "sub_401000", "incoming_type": "TrackRowCell*", "disasm": "mov eax, [ecx+8]"}],
-                "data_refs": [],
+def test_xrefs_field_routes_to_field_xrefs(fake_transport, capsys):
+    calls = fake_transport({"field_xrefs": {
+        "ok": True,
+        "result": {
+            "field": {
+                "type_name": "TrackRowCell",
+                "field_name": "tile_type",
+                "offset": 8,
+                "field_type": "uint32_t",
             },
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+            "code_refs": [{"address": "0x401000", "function": "sub_401000", "incoming_type": "TrackRowCell*", "disasm": "mov eax, [ecx+8]"}],
+            "data_refs": [],
+        },
+    }})
 
     rc = bn.cli.main(["xrefs", "--field", "TrackRowCell.tile_type", "--format", "text", "--target", "active"])
 
     assert rc == 0
-    assert captured["op"] == "field_xrefs"
-    assert captured["params"]["field"] == "TrackRowCell.tile_type"
-    assert captured["target"] == "active"
+    assert calls[-1]["op"] == "field_xrefs"
+    assert calls[-1]["params"]["field"] == "TrackRowCell.tile_type"
+    assert calls[-1]["target"] == "active"
     output = capsys.readouterr().out
     assert "TrackRowCell.tile_type" in output
     assert "code refs:" in output
 
 
-def test_xrefs_text_format_renders_summary(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        assert op == "xrefs"
-        return {
-            "ok": True,
-            "result": {
-                "address": "0x401000",
-                "code_refs": [
-                    {
-                        "address": "0x402000",
-                        "function": "sub_402000",
-                        "caller_function": {"address": "0x401f00", "name": "sub_402000"},
-                    }
-                ],
-                "data_refs": [
-                    {
-                        "address": "0x403000",
-                        "function": "sub_403000",
-                        "caller_function": {"address": "0x402f00", "name": "sub_403000"},
-                    }
-                ],
-            },
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_xrefs_text_format_renders_summary(fake_transport, capsys):
+    fake_transport({"xrefs": {
+        "ok": True,
+        "result": {
+            "address": "0x401000",
+            "code_refs": [
+                {
+                    "address": "0x402000",
+                    "function": "sub_402000",
+                    "caller_function": {"address": "0x401f00", "name": "sub_402000"},
+                }
+            ],
+            "data_refs": [
+                {
+                    "address": "0x403000",
+                    "function": "sub_403000",
+                    "caller_function": {"address": "0x402f00", "name": "sub_403000"},
+                }
+            ],
+        },
+    }})
 
     rc = bn.cli.main(["xrefs", "--format", "text", "--target", "active", "sub_401000"])
 
@@ -403,49 +339,41 @@ def test_xrefs_text_format_renders_summary(monkeypatch, capsys):
     assert "0x402f00  sub_403000  (1 site: 0x403000)" in output
 
 
-def test_evidence_xrefs_routes_and_renders_context(monkeypatch, capsys):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["op"] = op
-        captured["params"] = params
-        captured["target"] = target
-        return {
-            "ok": True,
-            "result": {
-                "address": "0x175b20",
-                "target_context": {
-                    "sections": [{"name": ".rodata"}],
-                    "symbol": {"name": "common.HeadUnitInfo", "type": "DataSymbol"},
-                    "string": {
-                        "value": "Usage: %s [OPTION]...\n",
-                        "encoding": "ascii",
-                        "truncated": True,
-                    },
+def test_evidence_xrefs_routes_and_renders_context(fake_transport, capsys):
+    calls = fake_transport({"xrefs": {
+        "ok": True,
+        "result": {
+            "address": "0x175b20",
+            "target_context": {
+                "sections": [{"name": ".rodata"}],
+                "symbol": {"name": "common.HeadUnitInfo", "type": "DataSymbol"},
+                "string": {
+                    "value": "Usage: %s [OPTION]...\n",
+                    "encoding": "ascii",
+                    "truncated": True,
                 },
-                "code_refs": [
-                    {
-                        "address": "0x586c0",
-                        "function": "sub_586a2",
-                        "kind": "code",
-                        "context": {
-                            "sections": [{"name": ".text"}],
-                            "segment": {"readable": True, "writable": False, "executable": True},
-                            "disasm": "adr r1, common.HeadUnitInfo",
-                        },
-                    }
-                ],
-                "data_refs": [],
             },
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+            "code_refs": [
+                {
+                    "address": "0x586c0",
+                    "function": "sub_586a2",
+                    "kind": "code",
+                    "context": {
+                        "sections": [{"name": ".text"}],
+                        "segment": {"readable": True, "writable": False, "executable": True},
+                        "disasm": "adr r1, common.HeadUnitInfo",
+                    },
+                }
+            ],
+            "data_refs": [],
+        },
+    }})
 
     rc = bn.cli.main(["evidence", "xrefs", "--format", "text", "--target", "active", "0x175b20"])
 
     assert rc == 0
-    assert captured["op"] == "xrefs"
-    assert captured["params"]["identifier"] == "0x175b20"
+    assert calls[-1]["op"] == "xrefs"
+    assert calls[-1]["params"]["identifier"] == "0x175b20"
     output = capsys.readouterr().out
     assert "target | section=.rodata | symbol=common.HeadUnitInfo[DataSymbol]" in output
     assert 'string="Usage: %s [OPTION]...\\n" [truncated]' in output
@@ -501,16 +429,11 @@ def test_render_evidence_xrefs_text_from_items_when_arrays_dropped():
     assert "- none" in out
 
 
-def test_evidence_function_routes_and_renders_calls(monkeypatch, capsys):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["op"] = op
-        captured["params"] = params
-        return {
-            "ok": True,
-            "result": {
-                "function": {"name": "build_response", "address": "0x412470"},
+def test_evidence_function_routes_and_renders_calls(fake_transport, capsys):
+    calls = fake_transport({"function_evidence": {
+        "ok": True,
+        "result": {
+            "function": {"name": "build_response", "address": "0x412470"},
                 "prototype": "int32_t build_response(void*)",
                 "calling_convention": "__cdecl",
                 "thunk": {"is_candidate": False},
@@ -541,15 +464,13 @@ def test_evidence_function_routes_and_renders_calls(monkeypatch, capsys):
                     }
                 ],
             },
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+        }})
 
     rc = bn.cli.main(["evidence", "function", "--target", "active", "--context", "1", "build_response"])
 
     assert rc == 0
-    assert captured["op"] == "function_evidence"
-    assert captured["params"] == {"identifier": "build_response", "context": 1}
+    assert calls[-1]["op"] == "function_evidence"
+    assert calls[-1]["params"] == {"identifier": "build_response", "context": 1}
     output = capsys.readouterr().out
     assert "build_response @ 0x412470" in output
     assert "target: send_message @ 0x461746" in output
@@ -559,16 +480,11 @@ def test_evidence_function_routes_and_renders_calls(monkeypatch, capsys):
     assert "r0" not in output
 
 
-def test_evidence_table_routes_and_renders_targets(monkeypatch, capsys):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["op"] = op
-        captured["params"] = params
-        return {
-            "ok": True,
-            "result": {
-                "address": "0x64ea0",
+def test_evidence_table_routes_and_renders_targets(fake_transport, capsys):
+    calls = fake_transport({"pointer_table": {
+        "ok": True,
+        "result": {
+            "address": "0x64ea0",
                 "pointer_size": 4,
                 "stride": 4,
                 "warnings": [
@@ -590,29 +506,25 @@ def test_evidence_table_routes_and_renders_targets(monkeypatch, capsys):
                     }
                 ],
             },
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+        }})
 
     rc = bn.cli.main(["evidence", "table", "--target", "active", "--entries", "1", "0x64ea0"])
 
     assert rc == 0
-    assert captured["op"] == "pointer_table"
-    assert captured["params"]["address"] == "0x64ea0"
-    assert captured["params"]["entries"] == 1
+    assert calls[-1]["op"] == "pointer_table"
+    assert calls[-1]["params"]["address"] == "0x64ea0"
+    assert calls[-1]["params"]["entries"] == 1
     output = capsys.readouterr().out
     assert "pointer table @ 0x64ea0" in output
     assert "warning: table start is in an executable segment" in output
     assert "sub_46970 @ 0x46970 (raw 0x46971) [thumb-adjusted]" in output
 
 
-def test_evidence_table_renders_interior_function_targets(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        assert op == "pointer_table"
-        return {
-            "ok": True,
-            "result": {
-                "address": "0x402000",
+def test_evidence_table_renders_interior_function_targets(fake_transport, capsys):
+    fake_transport({"pointer_table": {
+        "ok": True,
+        "result": {
+            "address": "0x402000",
                 "pointer_size": 8,
                 "stride": 8,
                 "warnings": ["1 entries resolve inside functions but not at function starts"],
@@ -637,9 +549,7 @@ def test_evidence_table_renders_interior_function_targets(monkeypatch, capsys):
                     }
                 ],
             },
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+        }})
 
     rc = bn.cli.main(["evidence", "table", "--target", "active", "--entries", "1", "0x402000"])
 
@@ -650,16 +560,11 @@ def test_evidence_table_renders_interior_function_targets(monkeypatch, capsys):
     assert "[thumb-adjusted]" not in output
 
 
-def test_evidence_message_routes_and_renders_lens(monkeypatch, capsys):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["op"] = op
-        captured["params"] = params
-        return {
-            "ok": True,
-            "result": {
-                "query": "HeadUnitInfo",
+def test_evidence_message_routes_and_renders_lens(fake_transport, capsys):
+    calls = fake_transport({"message_lens": {
+        "ok": True,
+        "result": {
+            "query": "HeadUnitInfo",
                 "count": 1,
                 "matches": [
                     {
@@ -676,9 +581,7 @@ def test_evidence_message_routes_and_renders_lens(monkeypatch, capsys):
                     }
                 ],
             },
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+        }})
 
     rc = bn.cli.main(
         [
@@ -695,26 +598,20 @@ def test_evidence_message_routes_and_renders_lens(monkeypatch, capsys):
     )
 
     assert rc == 0
-    assert captured["op"] == "message_lens"
-    assert captured["params"] == {"query": "HeadUnitInfo", "limit": 5, "table_entries": 4}
+    assert calls[-1]["op"] == "message_lens"
+    assert calls[-1]["params"] == {"query": "HeadUnitInfo", "limit": 5, "table_entries": 4}
     output = capsys.readouterr().out
     assert "message lens: HeadUnitInfo (1 matches)" in output
     assert "0x175b20  \"common.HeadUnitInfo\"" in output
     assert "metadata table windows: 1" in output
 
 
-def test_callsites_routes_within_scope_and_renders_text(monkeypatch, capsys):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["op"] = op
-        captured["params"] = params
-        captured["target"] = target
-        return {
-            "ok": True,
-            "result": [
-                {
-                    "callee": {"name": "crt_rand", "address": "0x461746"},
+def test_callsites_routes_within_scope_and_renders_text(fake_transport, capsys):
+    calls = fake_transport({"callsites": {
+        "ok": True,
+        "result": [
+            {
+                "callee": {"name": "crt_rand", "address": "0x461746"},
                     "containing_function": {
                         "name": "bonus_pick_random_type",
                         "address": "0x412470",
@@ -735,9 +632,7 @@ def test_callsites_routes_within_scope_and_renders_text(monkeypatch, capsys):
                     "pre_branch_condition": "result == 2",
                 }
             ],
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+        }})
 
     rc = bn.cli.main(
         [
@@ -754,12 +649,12 @@ def test_callsites_routes_within_scope_and_renders_text(monkeypatch, capsys):
     )
 
     assert rc == 0
-    assert captured["op"] == "callsites"
-    assert captured["target"] == "active"
-    assert captured["params"]["callee"] == "crt_rand"
-    assert captured["params"]["within_identifiers"] == ["bonus_pick_random_type"]
-    assert captured["params"]["context"] == 3
-    assert captured["params"]["caller_static"] is True
+    assert calls[-1]["op"] == "callsites"
+    assert calls[-1]["target"] == "active"
+    assert calls[-1]["params"]["callee"] == "crt_rand"
+    assert calls[-1]["params"]["within_identifiers"] == ["bonus_pick_random_type"]
+    assert calls[-1]["params"]["context"] == 3
+    assert calls[-1]["params"]["caller_static"] is True
     output = capsys.readouterr().out
     assert output.startswith("caller_static 0x4124a5 | call 0x4124a0")
     assert "within: bonus_pick_random_type @ 0x412470" in output
@@ -770,30 +665,26 @@ def test_callsites_routes_within_scope_and_renders_text(monkeypatch, capsys):
     assert "> 0x4124a0  call crt_rand" in output
 
 
-def test_callsites_text_omits_null_hlil_and_pre_branch(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        assert op == "callsites"
-        return {
-            "ok": True,
-            "result": [
-                {
-                    "callee": {"name": "crt_rand", "address": "0x461746"},
-                    "containing_function": {"name": "fx_queue_add_random", "address": "0x427700"},
-                    "within_query": "fx_queue_add_random",
-                    "call_index": 3,
-                    "call_addr": "0x427806",
-                    "instruction_length": 5,
-                    "caller_static": "0x42780b",
-                    "call_instruction": {"address": "0x427806", "text": "call crt_rand"},
-                    "previous_instructions": [],
-                    "next_instructions": [],
-                    "hlil_statement": None,
-                    "pre_branch_condition": None,
-                }
-            ],
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_callsites_text_omits_null_hlil_and_pre_branch(fake_transport, capsys):
+    fake_transport({"callsites": {
+        "ok": True,
+        "result": [
+            {
+                "callee": {"name": "crt_rand", "address": "0x461746"},
+                "containing_function": {"name": "fx_queue_add_random", "address": "0x427700"},
+                "within_query": "fx_queue_add_random",
+                "call_index": 3,
+                "call_addr": "0x427806",
+                "instruction_length": 5,
+                "caller_static": "0x42780b",
+                "call_instruction": {"address": "0x427806", "text": "call crt_rand"},
+                "previous_instructions": [],
+                "next_instructions": [],
+                "hlil_statement": None,
+                "pre_branch_condition": None,
+            }
+        ],
+    }})
 
     rc = bn.cli.main(["callsites", "--format", "text", "--target", "active", "--within", "fx_queue_add_random", "crt_rand"])
 
@@ -880,17 +771,14 @@ def test_trace_max_depth_zero_rejected_at_parse_time(capsys):
     assert "depth must be an integer >= 1" in err
 
 
-def test_decompile_text_format_unwraps_text_field(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        return {
-            "ok": True,
-            "result": {
-                "function": {"name": "sub_401000", "address": "0x401000"},
-                "text": "return 7;",
-            },
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_decompile_text_format_unwraps_text_field(fake_transport, capsys):
+    fake_transport({"decompile": {
+        "ok": True,
+        "result": {
+            "function": {"name": "sub_401000", "address": "0x401000"},
+            "text": "return 7;",
+        },
+    }})
 
     rc = bn.cli.main(["decompile", "--format", "text", "--target", "active", "sub_401000"])
 
@@ -898,12 +786,8 @@ def test_decompile_text_format_unwraps_text_field(monkeypatch, capsys):
     assert capsys.readouterr().out == "return 7;\n"
 
 
-def test_callsites_empty_result_shows_descriptive_message(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        assert op == "callsites"
-        return {"ok": True, "result": []}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_callsites_empty_result_shows_descriptive_message(fake_transport, capsys):
+    fake_transport({"callsites": {"ok": True, "result": []}})
 
     rc = bn.cli.main(["callsites", "--format", "text", "--target", "active", "--within", "main", "sub_401000"])
 
@@ -911,62 +795,47 @@ def test_callsites_empty_result_shows_descriptive_message(monkeypatch, capsys):
     assert capsys.readouterr().out == "no callsites found\n"
 
 
-def test_function_list_pagination_states_true_total(monkeypatch, capsys):
+def test_function_list_pagination_states_true_total(fake_transport, capsys):
     # #59: the bridge returns the page WITH the true total; the footer states it
     # (showing N of TOTAL (REMAINING more)) on stdout. The CLI sends the real
     # limit (not limit+1).
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["params"] = params
-        return {
-            "ok": True,
-            "result": {
-                "functions": [{"name": f"sub_{i:06x}", "address": hex(i)} for i in range(20)],
-                "total": 6350, "offset": 0, "limit": 20, "returned": 20, "has_more": True,
-            },
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    calls = fake_transport({"list_functions": {
+        "ok": True,
+        "result": {
+            "functions": [{"name": f"sub_{i:06x}", "address": hex(i)} for i in range(20)],
+            "total": 6350, "offset": 0, "limit": 20, "returned": 20, "has_more": True,
+        },
+    }})
 
     rc = bn.cli.main(["function", "list", "--target", "active", "--limit", "20"])
 
     assert rc == 0
-    assert captured["params"]["limit"] == 20            # real limit, not +1
+    assert calls[-1]["params"]["limit"] == 20            # real limit, not +1
     stdout, _ = capsys.readouterr()
     assert "// showing 20 of 6350 (6330 more)" in stdout   # true total + remainder
     assert "--offset 20" in stdout
 
 
-def test_function_list_json_carries_paging_metadata(monkeypatch, capsys):
+def test_function_list_json_carries_paging_metadata(fake_transport, capsys):
     # #59: machine consumers get total/has_more in JSON, not only a stderr note.
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        return {"ok": True, "result": {
-            "functions": [{"name": "sub_0", "address": "0x0"}],
-            "total": 6350, "offset": 0, "limit": 1, "returned": 1, "has_more": True,
-        }}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    fake_transport({"list_functions": {"ok": True, "result": {
+        "functions": [{"name": "sub_0", "address": "0x0"}],
+        "total": 6350, "offset": 0, "limit": 1, "returned": 1, "has_more": True,
+    }}})
     rc = bn.cli.main(["function", "list", "--target", "active", "--limit", "1", "--format", "json"])
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["total"] == 6350 and payload["has_more"] is True and payload["returned"] == 1
 
 
-def test_function_search_pagination_forwards_offset(monkeypatch, capsys):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["params"] = params
-        return {"ok": True, "result": [{"name": "sub_401000", "address": "0x401000"}]}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_function_search_pagination_forwards_offset(fake_transport, capsys):
+    calls = fake_transport({"search_functions": {"ok": True, "result": [{"name": "sub_401000", "address": "0x401000"}]}})
 
     rc = bn.cli.main(["function", "search", "--target", "active", "--offset", "50", "--limit", "25", "sub"])
 
     assert rc == 0
-    assert captured["params"]["offset"] == 50
-    assert captured["params"]["limit"] == 25
+    assert calls[-1]["params"]["offset"] == 50
+    assert calls[-1]["params"]["limit"] == 25
 
 
 def test_session_start_all_loads_fail_stops_bridge_and_exits_nonzero(monkeypatch, capsys):
@@ -1005,13 +874,8 @@ def test_session_start_all_loads_fail_stops_bridge_and_exits_nonzero(monkeypatch
     assert parsed["stopped"] is True
 
 
-def test_il_lines_slices_output_with_header(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        if op == "il":
-            return {"ok": True, "result": {"text": "line1\nline2\nline3\nline4\nline5"}}
-        raise AssertionError(f"unexpected op: {op}")
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_il_lines_slices_output_with_header(fake_transport, capsys):
+    fake_transport({"il": {"ok": True, "result": {"text": "line1\nline2\nline3\nline4\nline5"}}})
 
     rc = bn.cli.main(["il", "main", "--target", "active", "--lines", "2:4"])
 
@@ -1023,13 +887,8 @@ def test_il_lines_slices_output_with_header(monkeypatch, capsys):
     assert "line5" not in out
 
 
-def test_disasm_lines_slices_output_with_header(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        if op == "disasm":
-            return {"ok": True, "result": {"text": "aaa\nbbb\nccc\nddd"}}
-        raise AssertionError(f"unexpected op: {op}")
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_disasm_lines_slices_output_with_header(fake_transport, capsys):
+    fake_transport({"disasm": {"ok": True, "result": {"text": "aaa\nbbb\nccc\nddd"}}})
 
     rc = bn.cli.main(["disasm", "0x1000", "--target", "active", "--lines", "1:2"])
 
@@ -1058,60 +917,43 @@ def test_function_list_count_prints_total(monkeypatch, capsys):
     assert "Total functions: 4242" in capsys.readouterr().out
 
 
-def test_taint_forward_passes_enabled_sink_classes(monkeypatch):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        if op == "list_targets":
-            return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "a.bndb"}]}
-        captured["op"] = op
-        captured["params"] = params
-        return {"ok": True, "result": {"direction": "forward",
-                                       "function": {"name": "handler", "address": "0x10"},
-                                       "sources": [], "reached_sinks": [], "leaves": [],
-                                       "assumptions": [], "soundness": "may"}}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_taint_forward_passes_enabled_sink_classes(fake_transport):
+    calls = fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "a.bndb"}]},
+        "taint": {"ok": True, "result": {"direction": "forward",
+                                         "function": {"name": "handler", "address": "0x10"},
+                                         "sources": [], "reached_sinks": [], "leaves": [],
+                                         "assumptions": [], "soundness": "may"}},
+    })
 
     rc = bn.cli.main(["taint", "forward", "-f", "handler", "--source", "arg:read:1",
                       "--sink-class", "file_write", "--sink-class", "net_write",
                       "--format", "json"])
     assert rc == 0
-    assert captured["op"] == "taint"
-    assert captured["params"]["enabled_sink_classes"] == ["file_write", "net_write"]
+    assert calls[-1]["op"] == "taint"
+    assert calls[-1]["params"]["enabled_sink_classes"] == ["file_write", "net_write"]
 
 
-def test_taint_forward_sink_classes_default_empty(monkeypatch):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        if op == "list_targets":
-            return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "a.bndb"}]}
-        captured["params"] = params
-        return {"ok": True, "result": {"direction": "forward",
-                                       "function": {"name": "handler", "address": "0x10"},
-                                       "sources": [], "reached_sinks": [], "leaves": [],
-                                       "assumptions": [], "soundness": "may"}}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_taint_forward_sink_classes_default_empty(fake_transport):
+    calls = fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "a.bndb"}]},
+        "taint": {"ok": True, "result": {"direction": "forward",
+                                         "function": {"name": "handler", "address": "0x10"},
+                                         "sources": [], "reached_sinks": [], "leaves": [],
+                                         "assumptions": [], "soundness": "may"}},
+    })
 
     rc = bn.cli.main(["taint", "forward", "-f", "handler", "--source", "arg:read:1",
                       "--format", "json"])
     assert rc == 0
-    assert captured["params"]["enabled_sink_classes"] == []
+    assert calls[-1]["params"]["enabled_sink_classes"] == []
 
 
-def test_trace_routes_and_renders_text(monkeypatch, capsys):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["op"] = op
-        captured["params"] = params
-        captured["target"] = target
-        return {
-            "ok": True,
-            "result": {
-                "function": "test_func",
+def test_trace_routes_and_renders_text(fake_transport, capsys):
+    calls = fake_transport({"backward_slice": {
+        "ok": True,
+        "result": {
+            "function": "test_func",
                 "function_address": "0x10000",
                 "target_address": "0x10010",
                 "arg_index": 0,
@@ -1139,9 +981,7 @@ def test_trace_routes_and_renders_text(monkeypatch, capsys):
                     },
                 ],
             },
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+        }})
 
     rc = bn.cli.main([
         "trace",
@@ -1153,11 +993,11 @@ def test_trace_routes_and_renders_text(monkeypatch, capsys):
     ])
 
     assert rc == 0
-    assert captured["op"] == "backward_slice"
-    assert captured["target"] == "active"
-    assert captured["params"]["identifier"] == "test_func"
-    assert captured["params"]["address"] == "0x10010"
-    assert captured["params"]["arg_index"] == 0
+    assert calls[-1]["op"] == "backward_slice"
+    assert calls[-1]["target"] == "active"
+    assert calls[-1]["params"]["identifier"] == "test_func"
+    assert calls[-1]["params"]["address"] == "0x10010"
+    assert calls[-1]["params"]["arg_index"] == 0
     output = capsys.readouterr().out
     assert "backward trace of arg[0]" in output
     assert "test_func" in output
@@ -1200,13 +1040,8 @@ def test_trace_respects_view_and_max_depth(monkeypatch, capsys):
     assert captured["params"]["max_depth"] == 10
 
 
-def test_trace_text_renderer_empty_trace(monkeypatch, capsys):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        return {"ok": True, "result": {"function": "f", "trace": [], "step_count": 0, "truncated": False}}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_trace_text_renderer_empty_trace(fake_transport, capsys):
+    fake_transport({"backward_slice": {"ok": True, "result": {"function": "f", "trace": [], "step_count": 0, "truncated": False}}})
 
     rc = bn.cli.main(["trace", "f", "0x10010", "--target", "active"])
     assert rc == 0
@@ -1214,28 +1049,23 @@ def test_trace_text_renderer_empty_trace(monkeypatch, capsys):
     assert "constant or immediate" in output or "no SSA trace" in output
 
 
-def test_trace_json_renders_structure(monkeypatch, capsys):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        return {
-            "ok": True,
-            "result": {
-                "function": "f",
-                "function_address": "0x10000",
-                "target_address": "0x10010",
-                "arg_index": 0,
-                "view": "mlil",
-                "truncated": False,
-                "step_count": 2,
-                "trace": [
-                    {"ssa_var": "x#1", "depth": 0, "terminates": False},
-                    {"ssa_var": "y#2", "depth": 1, "terminates": True, "reason": "function_parameter_or_global"},
-                ],
-            },
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_trace_json_renders_structure(fake_transport, capsys):
+    fake_transport({"backward_slice": {
+        "ok": True,
+        "result": {
+            "function": "f",
+            "function_address": "0x10000",
+            "target_address": "0x10010",
+            "arg_index": 0,
+            "view": "mlil",
+            "truncated": False,
+            "step_count": 2,
+            "trace": [
+                {"ssa_var": "x#1", "depth": 0, "terminates": False},
+                {"ssa_var": "y#2", "depth": 1, "terminates": True, "reason": "function_parameter_or_global"},
+            ],
+        },
+    }})
 
     rc = bn.cli.main(["trace", "f", "0x10010", "--target", "active", "--format", "json"])
     assert rc == 0
@@ -1249,23 +1079,16 @@ def test_trace_json_renders_structure(monkeypatch, capsys):
 # --- function search --exact CLI routing + mutual exclusion ---
 
 
-def test_function_search_exact_routes(monkeypatch, capsys):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["op"] = op
-        captured["params"] = params
-        return {"ok": True, "result": [{"name": "system", "address": "0x401000"}]}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_function_search_exact_routes(fake_transport, capsys):
+    calls = fake_transport({"search_functions": {"ok": True, "result": [{"name": "system", "address": "0x401000"}]}})
 
     rc = bn.cli.main(["function", "search", "--target", "active", "--exact", "system"])
 
     assert rc == 0
-    assert captured["op"] == "search_functions"
-    assert captured["params"]["query"] == "system"
-    assert captured["params"]["exact"] is True
-    assert captured["params"]["regex"] is False
+    assert calls[-1]["op"] == "search_functions"
+    assert calls[-1]["params"]["query"] == "system"
+    assert calls[-1]["params"]["exact"] is True
+    assert calls[-1]["params"]["regex"] is False
 
 
 def test_function_search_regex_and_exact_are_mutually_exclusive(monkeypatch):
@@ -1326,20 +1149,17 @@ def test_evidence_xrefs_text_does_not_page_the_op(monkeypatch, capsys):
     assert "offset" not in captured["params"]
 
 
-def test_xrefs_offset_hint_uses_total_not_dropped_arrays(monkeypatch, capsys):
+def test_xrefs_offset_hint_uses_total_not_dropped_arrays(fake_transport, capsys):
     # #184: with code_refs/data_refs dropped from the op response, the struct-field
     # offset hint must key off the full-set `total`, not the (now-absent) arrays --
     # otherwise a small bare offset WITH refs would wrongly trigger the "0 xrefs"
     # nudge.
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        return {"ok": True, "result": {
-            "address": "0x308", "target_context": {},
-            "code_ref_count": 2, "data_ref_count": 0, "caller_function_count": 1,
-            "items": [{"address": "0x401000", "function": "f", "kind": "code"}],
-            "total": 2, "offset": 0, "limit": None, "returned": 1, "has_more": True,
-        }}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    fake_transport({"xrefs": {"ok": True, "result": {
+        "address": "0x308", "target_context": {},
+        "code_ref_count": 2, "data_ref_count": 0, "caller_function_count": 1,
+        "items": [{"address": "0x401000", "function": "f", "kind": "code"}],
+        "total": 2, "offset": 0, "limit": None, "returned": 1, "has_more": True,
+    }}})
     rc = bn.cli.main(["xrefs", "0x308", "--target", "active"])
     assert rc == 0
     err = capsys.readouterr().err

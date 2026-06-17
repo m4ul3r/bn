@@ -125,16 +125,11 @@ def test_text_format_error_stays_on_stderr(monkeypatch, capsys):
     assert "Type not found" in err
 
 
-def test_text_renderer_failure_becomes_clean_error(monkeypatch, capsys):
+def test_text_renderer_failure_becomes_clean_error(fake_transport, capsys):
     # #101: a malformed bridge result that trips a text renderer must surface a
     # clean BridgeError (exit 2) pointing at --format json, not a raw traceback.
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        if op == "function_info":
-            # 'function' present but a STRING, not a dict -> .get() would crash.
-            return {"ok": True, "result": {"function": "not-a-dict"}}
-        raise AssertionError(f"unexpected op: {op}")
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    # 'function' present but a STRING, not a dict -> .get() would crash.
+    fake_transport({"function_info": {"ok": True, "result": {"function": "not-a-dict"}}})
     # function info should now render with placeholders (defensive _as_dict), not crash.
     rc = bn.cli.main(["function", "info", "main", "--target", "active", "--format", "text"])
     assert rc == 0

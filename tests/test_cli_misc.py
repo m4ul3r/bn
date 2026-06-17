@@ -9,13 +9,9 @@ import pytest
 from _cli_helpers import *  # noqa: F401,F403
 
 
-def test_evidence_init_routes_and_renders_sections(monkeypatch, capsys):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["op"] = op
-        captured["params"] = params
-        return {
+def test_evidence_init_routes_and_renders_sections(fake_transport, capsys):
+    calls = fake_transport({
+        "init_arrays": {
             "ok": True,
             "result": {
                 "pointer_size": 4,
@@ -46,39 +42,30 @@ def test_evidence_init_routes_and_renders_sections(monkeypatch, capsys):
                     }
                 ],
             },
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+        },
+    })
 
     rc = bn.cli.main(["evidence", "init", "--target", "active", "--limit", "4"])
 
     assert rc == 0
-    assert captured["op"] == "init_arrays"
-    assert captured["params"] == {"limit": 4}
+    assert calls[-1]["op"] == "init_arrays"
+    assert calls[-1]["params"] == {"limit": 4}
     output = capsys.readouterr().out
     assert "init arrays: 1 section(s), pointer-size=4" in output
     assert ".init_array 0x5000-0x5008 entries=2" in output
     assert "global_ctor @ 0x401000 (raw 0x401001) [thumb-adjusted]" in output
 
 
-def test_py_exec_accepts_inline_code(monkeypatch):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["op"] = op
-        captured["params"] = params
-        captured["target"] = target
-        return {"ok": True, "result": {"stdout": "", "result": None}}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_py_exec_accepts_inline_code(fake_transport):
+    calls = fake_transport({"py_exec": {"ok": True, "result": {"stdout": "", "result": None}}})
 
     rc = bn.cli.main(["py", "exec", "--target", "active", "--code", "print('hi')"])
 
     assert rc == 0
-    assert captured["op"] == "py_exec"
-    assert captured["target"] == "active"
-    assert captured["params"]["script"] == "print('hi')"
-    assert "out_path" not in captured["params"]
+    assert calls[-1]["op"] == "py_exec"
+    assert calls[-1]["target"] == "active"
+    assert calls[-1]["params"]["script"] == "print('hi')"
+    assert "out_path" not in calls[-1]["params"]
 
 
 def test_py_exec_missing_script_mentions_code(capsys):
@@ -88,10 +75,9 @@ def test_py_exec_missing_script_mentions_code(capsys):
     assert "Use --code for inline Python" in capsys.readouterr().err
 
 
-def test_strings_text_format_renders_rows(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        assert op == "strings"
-        return {
+def test_strings_text_format_renders_rows(fake_transport, capsys):
+    calls = fake_transport({
+        "strings": {
             "ok": True,
             "result": {
                 "items": [
@@ -104,9 +90,8 @@ def test_strings_text_format_renders_rows(monkeypatch, capsys):
                 ],
                 "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False,
             },
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+        },
+    })
 
     rc = bn.cli.main(["strings", "--format", "text", "--target", "active", "--query", "follow"])
 
@@ -116,19 +101,17 @@ def test_strings_text_format_renders_rows(monkeypatch, capsys):
     assert '"value"' not in output
 
 
-def test_py_exec_text_format_renders_stdout_and_result(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        assert op == "py_exec"
-        return {
+def test_py_exec_text_format_renders_stdout_and_result(fake_transport, capsys):
+    fake_transport({
+        "py_exec": {
             "ok": True,
             "result": {
                 "stdout": "hi\n",
                 "result": {"functions": 7},
                 "warnings": ["warning one"],
             },
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+        },
+    })
 
     rc = bn.cli.main(["py", "exec", "--format", "text", "--target", "active", "--code", "print('hi')"])
 
@@ -139,31 +122,25 @@ def test_py_exec_text_format_renders_stdout_and_result(monkeypatch, capsys):
     assert "warnings:" in output
 
 
-def test_strings_hints_regex_on_zero_matches_with_metachars(monkeypatch, capsys):
+def test_strings_hints_regex_on_zero_matches_with_metachars(fake_transport, capsys):
     """strings (a bare list today) with a metacharacter query and 0 matches also
     suggests --regex (#122)."""
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        return {"ok": True, "result": []}
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    fake_transport({"strings": {"ok": True, "result": []}})
     rc = bn.cli.main(["strings", "--query", "foo(bar", "--target", "active"])
     assert rc == 0
     _, err = capsys.readouterr()
     assert "--regex" in err
 
 
-def test_bundle_function_out_path_is_bridge_owned(monkeypatch, tmp_path, capsys):
-    captured = {}
+def test_bundle_function_out_path_is_bridge_owned(fake_transport, tmp_path, capsys):
     out_path = tmp_path / "bundle.json"
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        if op == "list_targets":
-            return {
-                "ok": True,
-                "result": [{"target_id": "123:1:7", "selector": "SnailMail_unwrapped.exe.bndb"}],
-            }
-        captured["op"] = op
-        captured["params"] = params
-        return {
+    calls = fake_transport({
+        "list_targets": {
+            "ok": True,
+            "result": [{"target_id": "123:1:7", "selector": "SnailMail_unwrapped.exe.bndb"}],
+        },
+        "bundle_function": {
             "ok": True,
             "result": {
                 "ok": True,
@@ -173,15 +150,14 @@ def test_bundle_function_out_path_is_bridge_owned(monkeypatch, tmp_path, capsys)
                 "sha256": "deadbeef",
                 "summary": {"kind": "object", "count": 3},
             },
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+        },
+    })
 
     rc = bn.cli.main(["bundle", "function", "--out", str(out_path), "sub_401000"])
 
     assert rc == 0
-    assert captured["op"] == "bundle_function"
-    assert captured["params"]["out_path"] == str(out_path)
+    assert calls[-1]["op"] == "bundle_function"
+    assert calls[-1]["params"]["out_path"] == str(out_path)
     assert not out_path.exists()
     output = capsys.readouterr().out
     # bundle function defaults to --format json; the bridge-owned --out envelope
@@ -192,42 +168,33 @@ def test_bundle_function_out_path_is_bridge_owned(monkeypatch, tmp_path, capsys)
     assert payload["spilled"] is False
 
 
-def test_strings_json_carries_paging_envelope(monkeypatch, capsys):
+def test_strings_json_carries_paging_envelope(fake_transport, capsys):
     # #122: strings now returns the {items, total, ...} envelope, so machine
     # consumers see the true total + remainder, not a bare truncated list. The
     # CLI forwards the REAL --limit (no client-side limit+1 probe).
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["params"] = params
-        return {"ok": True, "result": {
-            "items": [{"address": "0x1000", "length": 5, "chars": 5,
-                       "type": "ascii", "value": "alpha"}],
-            "total": 4096, "offset": 0, "limit": 1, "returned": 1, "has_more": True,
-        }}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    calls = fake_transport({"strings": {"ok": True, "result": {
+        "items": [{"address": "0x1000", "length": 5, "chars": 5,
+                   "type": "ascii", "value": "alpha"}],
+        "total": 4096, "offset": 0, "limit": 1, "returned": 1, "has_more": True,
+    }}})
     rc = bn.cli.main(["strings", "--target", "active", "--query", "alpha",
                       "--limit", "1", "--format", "json"])
     assert rc == 0
-    assert captured["params"]["limit"] == 1   # real limit, not limit+1
+    assert calls[-1]["params"]["limit"] == 1   # real limit, not limit+1
     payload = json.loads(capsys.readouterr().out)
     assert payload["total"] == 4096
     assert payload["has_more"] is True and payload["returned"] == 1
     assert payload["items"][0]["value"] == "alpha"
 
 
-def test_strings_text_footer_states_true_total(monkeypatch, capsys):
+def test_strings_text_footer_states_true_total(fake_transport, capsys):
     # Text mode renders the rows AND a "showing N of TOTAL (R more)" footer that
     # mirrors function list, so a truncated dump still admits the remainder (#122).
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        return {"ok": True, "result": {
-            "items": [{"address": hex(0x1000 + i), "length": 5, "chars": 5,
-                       "type": "ascii", "value": f"str{i}"} for i in range(3)],
-            "total": 50, "offset": 0, "limit": 3, "returned": 3, "has_more": True,
-        }}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    fake_transport({"strings": {"ok": True, "result": {
+        "items": [{"address": hex(0x1000 + i), "length": 5, "chars": 5,
+                   "type": "ascii", "value": f"str{i}"} for i in range(3)],
+        "total": 50, "offset": 0, "limit": 3, "returned": 3, "has_more": True,
+    }}})
     rc = bn.cli.main(["strings", "--target", "active", "--query", "str",
                       "--limit", "3", "--format", "text"])
     assert rc == 0
@@ -237,24 +204,18 @@ def test_strings_text_footer_states_true_total(monkeypatch, capsys):
     assert "--offset 3" in stdout
 
 
-def test_imports_json_carries_paging_envelope(monkeypatch, capsys):
+def test_imports_json_carries_paging_envelope(fake_transport, capsys):
     # The non-summary imports list also returns the envelope, and the CLI
     # forwards the REAL --limit (no client-side limit+1 probe) (#122).
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["params"] = params
-        return {"ok": True, "result": {
-            "items": [{"name": "printf", "address": "0x1000", "library": "libc",
-                       "raw_name": "printf", "kind": "function"}],
-            "total": 512, "offset": 0, "limit": 1, "returned": 1, "has_more": True,
-        }}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    calls = fake_transport({"imports": {"ok": True, "result": {
+        "items": [{"name": "printf", "address": "0x1000", "library": "libc",
+                   "raw_name": "printf", "kind": "function"}],
+        "total": 512, "offset": 0, "limit": 1, "returned": 1, "has_more": True,
+    }}})
     rc = bn.cli.main(["imports", "--target", "active", "--limit", "1", "--format", "json"])
     assert rc == 0
-    assert captured["params"]["limit"] == 1   # real limit, not limit+1
-    assert captured["params"].get("summary") is False
+    assert calls[-1]["params"]["limit"] == 1   # real limit, not limit+1
+    assert calls[-1]["params"].get("summary") is False
     payload = json.loads(capsys.readouterr().out)
     assert payload["total"] == 512 and payload["has_more"] is True
     assert payload["items"][0]["name"] == "printf"
@@ -264,13 +225,10 @@ def test_imports_json_carries_paging_envelope(monkeypatch, capsys):
     pytest.param('[{"op": "set_comment", "address": "0x1000", "comment": "x"}]', "must be a JSON object", id="bare-array"),
     pytest.param('{"target": "x"}', '"ops" array', id="without-ops"),
 ])
-def test_batch_apply_file_clean_error(monkeypatch, capsys, tmp_path, manifest, expected):
+def test_batch_apply_file_clean_error(fake_transport, capsys, tmp_path, manifest, expected):
     # Bad manifest files must surface a clean BridgeError (exit 2), never a
     # client-side traceback (e.g. a bare array hitting _call's dict(params), #48).
-    monkeypatch.setattr(
-        bn.cli, "send_request",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("bridge should not be contacted")),
-    )
+    fake_transport()
     if manifest is None:
         path = tmp_path / "no" / "such" / "manifest.json"
     else:
@@ -290,14 +248,11 @@ def test_batch_apply_file_clean_error(monkeypatch, capsys, tmp_path, manifest, e
     pytest.param("{not valid json", "Invalid JSON in manifest (<stdin>)", id="invalid-json"),
     pytest.param('[{"op": "set_comment", "address": "0x1000", "comment": "x"}]', "must be a JSON object", id="bare-array"),
 ])
-def test_batch_apply_stdin_clean_error(monkeypatch, capsys, stdin, expected):
+def test_batch_apply_stdin_clean_error(monkeypatch, fake_transport, capsys, stdin, expected):
     import io
 
     monkeypatch.setattr("sys.stdin", io.StringIO(stdin))
-    monkeypatch.setattr(
-        bn.cli, "send_request",
-        lambda *a, **k: (_ for _ in ()).throw(AssertionError("bridge should not be contacted")),
-    )
+    fake_transport()
 
     rc = bn.cli.main(["batch", "apply", "-"])
 
@@ -309,7 +264,7 @@ def test_batch_apply_stdin_clean_error(monkeypatch, capsys, stdin, expected):
 
 
 
-def test_batch_apply_reads_manifest_from_stdin(monkeypatch, capsys):
+def test_batch_apply_reads_manifest_from_stdin(monkeypatch, fake_transport, capsys):
     # "-" reads the manifest from stdin, enabling the quoted-heredoc form. A
     # comment containing ', ", $, and parens must survive verbatim with no
     # escaping (that is the whole point of a quoted heredoc) (#104).
@@ -323,21 +278,14 @@ def test_batch_apply_reads_manifest_from_stdin(monkeypatch, capsys):
     )
     monkeypatch.setattr("sys.stdin", io.StringIO(manifest))
 
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["op"] = op
-        captured["params"] = params
-        return {"ok": True, "result": {"preview": False, "success": True, "results": []}}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    calls = fake_transport({"batch_apply": {"ok": True, "result": {"preview": False, "success": True, "results": []}}})
 
     rc = bn.cli.main(["batch", "apply", "-"])
 
     assert rc == 0
-    assert captured["op"] == "batch_apply"
+    assert calls[-1]["op"] == "batch_apply"
     # The free-text comment reached the bridge byte-for-byte.
-    assert captured["params"]["ops"][0]["comment"] == comment
+    assert calls[-1]["params"]["ops"][0]["comment"] == comment
 @pytest.mark.parametrize("argv, expected", [
     pytest.param(["--min-length", "5"], {"min_length": 5}, id="min-length"),
     pytest.param(["--section", ".rodata", "--no-crt"], {"section": ".rodata", "no_crt": True}, id="section-no-crt"),
@@ -399,10 +347,9 @@ def test_strings_query_value_can_be_a_known_sibling_flag(monkeypatch, capsys):
 # --- I5: sections CLI ---
 
 
-def test_sections_text_format_renders_rows(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        assert op == "sections"
-        return {
+def test_sections_text_format_renders_rows(fake_transport, capsys):
+    fake_transport({
+        "sections": {
             "ok": True,
             "result": {
                 "items": [
@@ -419,9 +366,8 @@ def test_sections_text_format_renders_rows(monkeypatch, capsys):
                 ],
                 "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False,
             },
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+        },
+    })
 
     rc = bn.cli.main(["sections", "--format", "text", "--target", "active"])
 
@@ -432,30 +378,21 @@ def test_sections_text_format_renders_rows(monkeypatch, capsys):
     assert "r-x" in output
 
 
-def test_sections_passes_query_to_bridge(monkeypatch, capsys):
-    captured_params = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        if op == "sections":
-            captured_params.update(params)
-            return {"ok": True, "result": []}
-        raise AssertionError(f"unexpected op: {op}")
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_sections_passes_query_to_bridge(fake_transport, capsys):
+    calls = fake_transport({"sections": {"ok": True, "result": []}})
 
     rc = bn.cli.main(["sections", "--target", "active", "--query", "data"])
 
     assert rc == 0
-    assert captured_params["query"] == "data"
+    assert calls[-1]["params"]["query"] == "data"
 
 
 # --- I8: enhanced imports CLI ---
 
 
-def test_imports_text_shows_kind_for_non_function(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        assert op == "imports"
-        return {
+def test_imports_text_shows_kind_for_non_function(fake_transport, capsys):
+    fake_transport({
+        "imports": {
             "ok": True,
             "result": {
                 "items": [
@@ -464,9 +401,8 @@ def test_imports_text_shows_kind_for_non_function(monkeypatch, capsys):
                 ],
                 "total": 2, "offset": 0, "limit": 100, "returned": 2, "has_more": False,
             },
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+        },
+    })
 
     rc = bn.cli.main(["imports", "--format", "text", "--target", "active"])
 
@@ -480,13 +416,9 @@ def test_imports_text_shows_kind_for_non_function(monkeypatch, capsys):
 # --- read: raw bytes at an address ---
 
 
-def test_read_text_renders_hexdump(monkeypatch, capsys):
-    captured_params = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        assert op == "read"
-        captured_params.update(params)
-        return {
+def test_read_text_renders_hexdump(fake_transport, capsys):
+    calls = fake_transport({
+        "read": {
             "ok": True,
             "result": {
                 "address": "0x1000",
@@ -494,23 +426,21 @@ def test_read_text_renders_hexdump(monkeypatch, capsys):
                 "hex": "48656c6c6f0090ff",
                 "ascii": "Hello...",
             },
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+        },
+    })
 
     rc = bn.cli.main(["read", "--target", "active", "--address", "0x1000", "--length", "8"])
 
     assert rc == 0
-    assert captured_params == {"address": "0x1000", "length": 8}
+    assert calls[-1]["params"] == {"address": "0x1000", "length": 8}
     output = capsys.readouterr().out
     assert "00001000: 48 65 6c 6c 6f 00 90 ff" in output
     assert "Hello..." in output
 
 
-def test_read_json_returns_structured_payload(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        assert op == "read"
-        return {
+def test_read_json_returns_structured_payload(fake_transport, capsys):
+    fake_transport({
+        "read": {
             "ok": True,
             "result": {
                 "address": "0x1000",
@@ -518,9 +448,8 @@ def test_read_json_returns_structured_payload(monkeypatch, capsys):
                 "hex": "41424344",
                 "ascii": "ABCD",
             },
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+        },
+    })
 
     rc = bn.cli.main(
         ["read", "--format", "json", "--target", "active", "--address", "0x1000", "--length", "4"]
@@ -552,10 +481,9 @@ def test_read_unmapped_address_surfaces_bridge_error(monkeypatch, capsys):
     assert "not mapped" in err
 
 
-def test_read_short_read_text_includes_note(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        assert op == "read"
-        return {
+def test_read_short_read_text_includes_note(fake_transport, capsys):
+    fake_transport({
+        "read": {
             "ok": True,
             "result": {
                 "address": "0x1000",
@@ -566,9 +494,8 @@ def test_read_short_read_text_includes_note(monkeypatch, capsys):
                 "short_read": True,
                 "note": "short read: requested 16 bytes, only 4 mapped from 0x1000",
             },
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+        },
+    })
 
     rc = bn.cli.main(["read", "--target", "active", "--address", "0x1000", "--length", "16"])
 
@@ -578,10 +505,9 @@ def test_read_short_read_text_includes_note(monkeypatch, capsys):
     assert "note: short read: requested 16 bytes, only 4 mapped from 0x1000" in output
 
 
-def test_read_bytes_encoding_writes_raw_bytes(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        assert op == "read"
-        return {
+def test_read_bytes_encoding_writes_raw_bytes(fake_transport, capsys):
+    fake_transport({
+        "read": {
             "ok": True,
             "result": {
                 "address": "0x1000",
@@ -589,9 +515,8 @@ def test_read_bytes_encoding_writes_raw_bytes(monkeypatch, capsys):
                 "hex": "41424344",
                 "ascii": "ABCD",
             },
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+        },
+    })
 
     rc = bn.cli.main(
         ["read", "--target", "active", "--address", "0x1000", "--length", "4", "--encoding", "bytes"]
@@ -601,43 +526,31 @@ def test_read_bytes_encoding_writes_raw_bytes(monkeypatch, capsys):
     assert capsys.readouterr().out == "ABCD"
 
 
-def test_read_accepts_positional_address(monkeypatch):
-    captured_params = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        assert op == "read"
-        captured_params.update(params)
-        return {"ok": True, "result": {"address": "0x1000", "length": 8, "hex": "00" * 8, "ascii": "." * 8}}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_read_accepts_positional_address(fake_transport):
+    calls = fake_transport({
+        "read": {"ok": True, "result": {"address": "0x1000", "length": 8, "hex": "00" * 8, "ascii": "." * 8}},
+    })
 
     # Positional address matches the convention used by decompile/disasm/il/xrefs.
     rc = bn.cli.main(["read", "--target", "active", "0x1000", "--length", "8"])
 
     assert rc == 0
-    assert captured_params == {"address": "0x1000", "length": 8}
+    assert calls[-1]["params"] == {"address": "0x1000", "length": 8}
 
 
-def test_read_length_accepts_hex(monkeypatch):
-    captured_params = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured_params.update(params)
-        return {"ok": True, "result": {"address": "0x1000", "length": 194, "hex": "", "ascii": ""}}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_read_length_accepts_hex(fake_transport):
+    calls = fake_transport({
+        "read": {"ok": True, "result": {"address": "0x1000", "length": 194, "hex": "", "ascii": ""}},
+    })
 
     rc = bn.cli.main(["read", "--target", "active", "0x1000", "--length", "0xc2"])
 
     assert rc == 0
-    assert captured_params["length"] == 194
+    assert calls[-1]["params"]["length"] == 194
 
 
-def test_read_conflicting_address_errors(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        raise AssertionError("send_request should not run when addresses conflict")
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_read_conflicting_address_errors(fake_transport, capsys):
+    fake_transport()
 
     rc = bn.cli.main(["read", "--target", "active", "0x1000", "--address", "0x2000", "--length", "8"])
 
@@ -657,28 +570,23 @@ def test_read_missing_address_errors(monkeypatch, capsys):
 # --- imports --summary CLI routing/rendering ---
 
 
-def test_imports_summary_routes_and_renders_text(monkeypatch, capsys):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["op"] = op
-        captured["params"] = params
-        return {
+def test_imports_summary_routes_and_renders_text(fake_transport, capsys):
+    calls = fake_transport({
+        "imports": {
             "ok": True,
             "result": {
                 "total_symbols": 4,
                 "namespaces": {"libc": 3, "libfoo": 1},
                 "by_kind": {"function": 3, "data": 1},
             },
-        }
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+        },
+    })
 
     rc = bn.cli.main(["imports", "--summary", "--format", "text", "--target", "active"])
 
     assert rc == 0
-    assert captured["op"] == "imports"
-    assert captured["params"]["summary"] is True
+    assert calls[-1]["op"] == "imports"
+    assert calls[-1]["params"]["summary"] is True
     output = capsys.readouterr().out
     assert "total symbols: 4" in output  # label matches the JSON key total_symbols
     assert "by namespace:" in output
@@ -719,26 +627,17 @@ def test_imports_summary_and_count_text_surface_self_defined_excluded():
     assert _imports_count_text({"count": 3}) == "Total imports: 3"
 
 
-def test_imports_without_summary_routes_false(monkeypatch, capsys):
-    captured = {}
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        captured["params"] = params
-        return {"ok": True, "result": []}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_imports_without_summary_routes_false(fake_transport, capsys):
+    calls = fake_transport({"imports": {"ok": True, "result": []}})
 
     rc = bn.cli.main(["imports", "--target", "active"])
 
     assert rc == 0
-    assert captured["params"]["summary"] is False
+    assert calls[-1]["params"]["summary"] is False
 
 
-def test_read_bytes_malformed_response_clean_error(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        return {"ok": True, "result": {"length": 4}}  # no "hex" payload
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_read_bytes_malformed_response_clean_error(fake_transport, capsys):
+    fake_transport({"read": {"ok": True, "result": {"length": 4}}})  # no "hex" payload
 
     rc = bn.cli.main(
         ["read", "0x1000", "--length", "4", "--encoding", "bytes", "--target", "active"]
@@ -750,22 +649,16 @@ def test_read_bytes_malformed_response_clean_error(monkeypatch, capsys):
     assert "Traceback" not in err
 
 
-def test_strings_unfiltered_emits_section_hint(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        return {"ok": True, "result": []}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_strings_unfiltered_emits_section_hint(fake_transport, capsys):
+    fake_transport({"strings": {"ok": True, "result": []}})
     assert bn.cli.main(["strings", "--target", "active"]) == 0
 
     _, stderr = capsys.readouterr()
     assert "--section .rodata" in stderr
 
 
-def test_strings_with_filter_suppresses_section_hint(monkeypatch, capsys):
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        return {"ok": True, "result": []}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_strings_with_filter_suppresses_section_hint(fake_transport, capsys):
+    fake_transport({"strings": {"ok": True, "result": []}})
     assert bn.cli.main(["strings", "--section", ".rodata", "--target", "active"]) == 0
 
     _, stderr = capsys.readouterr()
@@ -788,14 +681,9 @@ def test_strings_section_hint_suppressed_when_request_fails(monkeypatch, capsys)
     assert "--quick" in stderr           # the real reason is what surfaces
 
 
-def test_read_bytes_out_writes_envelope_and_creates_parents(monkeypatch, capsys, tmp_path):
+def test_read_bytes_out_writes_envelope_and_creates_parents(fake_transport, capsys, tmp_path):
     # #96: the bytes --out path must mkdir parents and emit an artifact envelope.
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        if op == "read":
-            return {"ok": True, "result": {"hex": "deadbeef"}}
-        raise AssertionError(f"unexpected op: {op}")
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    fake_transport({"read": {"ok": True, "result": {"hex": "deadbeef"}}})
     out = tmp_path / "nested" / "dir" / "out.bin"  # parent does not exist yet
     rc = bn.cli.main(["read", "0x1000", "--length", "4", "--encoding", "bytes",
                       "--target", "active", "--out", str(out), "--format", "json"])
@@ -808,12 +696,9 @@ def test_read_bytes_out_writes_envelope_and_creates_parents(monkeypatch, capsys,
     assert "sha256" in envelope
 
 
-def test_read_bytes_out_bad_dir_is_clean_error(monkeypatch, capsys, tmp_path):
+def test_read_bytes_out_bad_dir_is_clean_error(fake_transport, capsys, tmp_path):
     # A write failure must be a clean BridgeError, not a raw traceback.
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        return {"ok": True, "result": {"hex": "00"}}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    fake_transport({"read": {"ok": True, "result": {"hex": "00"}}})
     # A path whose parent is an existing FILE can't be mkdir'd.
     blocker = tmp_path / "blocker"
     blocker.write_text("x", encoding="utf-8")
