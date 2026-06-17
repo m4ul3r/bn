@@ -1,10 +1,10 @@
 from __future__ import annotations
-import importlib
+
+import sys
 
 import pytest
 
-import bn_agent_bridge.bridge as bridge
-from bn_agent_bridge import op_registry
+from _bridge_fakes import _load_bridge
 
 # Frozen from the pre-refactor tip (Task 0.1). If a future PR legitimately adds
 # an op, update these two sets in the SAME commit — that is the single point of
@@ -26,26 +26,40 @@ EXPECTED_WRITE = {
 }
 
 
-def test_read_locked_ops_membership_unchanged():
+@pytest.fixture
+def bridge(monkeypatch):
+    # Load the bridge against the shared fake `binaryninja` seam so collection
+    # never pulls real BN (bn_agent_bridge/__init__ eagerly imports bridge,
+    # which imports binaryninja). The op registry is a pure-Python submodule,
+    # but it is only reachable through that package import.
+    return _load_bridge(monkeypatch)
+
+
+@pytest.fixture
+def op_registry(bridge):
+    return sys.modules["bn_test_bridge.op_registry"]
+
+
+def test_read_locked_ops_membership_unchanged(bridge):
     assert set(bridge.READ_LOCKED_OPS) == EXPECTED_READ
 
 
-def test_write_locked_ops_membership_unchanged():
+def test_write_locked_ops_membership_unchanged(bridge):
     assert set(bridge.WRITE_LOCKED_OPS) == EXPECTED_WRITE
 
 
-def test_no_op_is_both_read_and_write():
+def test_no_op_is_both_read_and_write(bridge):
     assert set(bridge.READ_LOCKED_OPS).isdisjoint(bridge.WRITE_LOCKED_OPS)
 
 
-def test_load_binary_and_shutdown_are_unlocked():
+def test_load_binary_and_shutdown_are_unlocked(bridge):
     assert "load_binary" not in bridge.READ_LOCKED_OPS
     assert "load_binary" not in bridge.WRITE_LOCKED_OPS
     assert "shutdown" not in bridge.READ_LOCKED_OPS
     assert "shutdown" not in bridge.WRITE_LOCKED_OPS
 
 
-def test_op_decorator_registers_and_derives_locks():
+def test_op_decorator_registers_and_derives_locks(op_registry):
     reg = op_registry.OpRegistry()
 
     @reg.op("alpha", lock="read")
@@ -61,7 +75,7 @@ def test_op_decorator_registers_and_derives_locks():
     assert reg.spec("alpha").binder(None, {}, "t") == ("alpha", "t")
 
 
-def test_duplicate_op_registration_raises():
+def test_duplicate_op_registration_raises(op_registry):
     reg = op_registry.OpRegistry()
 
     @reg.op("dup", lock="read")
@@ -72,14 +86,14 @@ def test_duplicate_op_registration_raises():
         def _b(bridge, params, target): return 2
 
 
-def test_invalid_lock_class_raises():
+def test_invalid_lock_class_raises(op_registry):
     reg = op_registry.OpRegistry()
     with pytest.raises(ValueError, match="invalid lock class"):
         @reg.op("x", lock="sometimes")
         def _x(bridge, params, target): return 1
 
 
-def test_escalation_is_stored():
+def test_escalation_is_stored(op_registry):
     reg = op_registry.OpRegistry()
 
     @reg.op("e", lock="read", escalation=lambda p: bool(p.get("force")))
@@ -88,13 +102,13 @@ def test_escalation_is_stored():
     assert reg.spec("e").lock_escalation({"force": True}) is True
 
 
-def test_registry_covers_every_dispatch_op():
-    from bn_agent_bridge.op_registry import REGISTRY
+def test_registry_covers_every_dispatch_op(op_registry):
+    REGISTRY = op_registry.REGISTRY
     expected = EXPECTED_READ | EXPECTED_WRITE | {"load_binary", "shutdown"}
     assert REGISTRY.names() == expected
 
 
-def test_decompile_is_the_only_escalating_op():
-    from bn_agent_bridge.op_registry import REGISTRY
+def test_decompile_is_the_only_escalating_op(op_registry):
+    REGISTRY = op_registry.REGISTRY
     escalating = {n for n in REGISTRY.names() if REGISTRY.spec(n).lock_escalation is not None}
     assert escalating == {"decompile"}
