@@ -1430,6 +1430,9 @@ def _render_imports_summary_text(value: Any) -> str:
     # Label matches the JSON key (`total_symbols`) instead of drifting to
     # "total imports".
     lines = [f"total symbols: {total}"]
+    excluded = value.get("self_defined_excluded")
+    if isinstance(excluded, int) and excluded > 0:
+        lines.append(f"self-defined excluded: {excluded}")
     needed = value.get("needed_libraries") or []
     if needed:
         lines.append("")

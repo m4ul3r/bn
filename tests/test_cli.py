@@ -4429,6 +4429,27 @@ def test_imports_summary_text_omits_empty_breakdown_sections():
     assert "by kind:" not in out
 
 
+def test_imports_summary_and_count_text_surface_self_defined_excluded():
+    """The PIC self-export exclusion count (#202) must show in the summary AND
+    count text renderers, not just the default list footer -- the reviewer noted
+    those two paths silently omitted it (#209 follow-up)."""
+    from bn import formatters
+    from bn.commands.misc import _imports_count_text
+    summary = formatters._render_imports_summary_text(
+        {"total_symbols": 3, "needed_libraries": [], "namespaces": {}, "by_kind": {},
+         "self_defined_excluded": 9}
+    )
+    assert "self-defined excluded: 9" in summary
+    # absent when zero / missing
+    assert "self-defined" not in formatters._render_imports_summary_text(
+        {"total_symbols": 3, "needed_libraries": [], "namespaces": {}, "by_kind": {}}
+    )
+    assert _imports_count_text({"count": 3, "self_defined_excluded": 9}) == (
+        "Total imports: 3 (9 self-defined excluded)"
+    )
+    assert _imports_count_text({"count": 3}) == "Total imports: 3"
+
+
 def test_imports_without_summary_routes_false(monkeypatch, capsys):
     captured = {}
 
