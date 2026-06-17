@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import stat
 import sys
 from pathlib import Path
 from typing import Any, Callable
@@ -394,6 +395,18 @@ def _render_result(
             f"warning: {label} output spilled to {artifact_path}; {hint}",
             file=sys.stderr,
         )
+        if _stdout_is_pipe():
+            # Output spilled AND stdout is a pipe: a downstream grep/jq/awk reads
+            # only this small envelope, never the spilled data, so a no-match
+            # reads as "absent" -- a silent false negative. Make the trap loud
+            # (#195). (A terminal / agent-capture isn't a pipe, so this is quiet
+            # there.)
+            print(
+                f"note: stdout is a pipe -- grep/jq/awk see only the envelope above, "
+                f"not the data. Re-run with --out FILE and search the file "
+                f"(or grep {artifact_path}).",
+                file=sys.stderr,
+            )
         return
     sys.stdout.write(result.rendered)
 
@@ -453,6 +466,20 @@ def _maybe_offset_hint(args: argparse.Namespace, result: Any, identifier: str | 
         f"If {text} is a struct field offset, use `bn xrefs --field <Struct.field>` instead.",
         file=sys.stderr,
     )
+
+
+def _stdout_is_pipe() -> bool:
+    """True when stdout is a pipe (FIFO), e.g. ``bn ... | grep``.
+
+    Distinguishes the pipe case from a terminal or a regular-file redirect so the
+    spill pipe-trap caution (#195) fires only where a downstream filter would
+    silently consume the envelope instead of the data. Defensive: any error
+    inspecting the fd (e.g. a captured/replaced stdout with no real fileno)
+    yields False, so the caution stays quiet rather than misfiring."""
+    try:
+        return stat.S_ISFIFO(os.fstat(sys.stdout.fileno()).st_mode)
+    except Exception:
+        return False
 
 
 def _spill_next_step_hint(

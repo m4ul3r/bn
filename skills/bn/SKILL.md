@@ -112,7 +112,7 @@ Defaults:
 - `bytes`, `tokens` (estimate), `tokenizer` (`estimate`), `sha256` — size + integrity.
 - `summary` — shape hint with `kind` and `count` / `chars` / `keys`.
 
-Don't pipe `bn ... | rg ...` and expect `rg` to see real content when output spills — read the artifact path instead.
+**Pipe trap (correctness).** When output spills, a downstream `grep`/`jq`/`awk`/`rg` reads only the small envelope, **not** the data — so a no-match silently reads as "absent" (e.g. `bn decompile <fn> | grep memcpy` finding nothing does *not* mean there's no `memcpy`). `bn` now prints an extra `note:` on stderr when stdout is a pipe and output spilled, but don't rely on noticing it. Instead, write to a file first and process that: `bn decompile <fn> --out /tmp/f.txt && grep memcpy /tmp/f.txt`, or slice with `--lines`/`--limit` so it doesn't spill.
 
 Slicing knobs to avoid spilling in the first place:
 

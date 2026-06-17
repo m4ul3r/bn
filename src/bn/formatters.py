@@ -206,6 +206,16 @@ def _render_field_xrefs_text(value: Any) -> str:
 def _render_comment_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
+    # `comment get --function` aggregates all in-function comments as a list (#203).
+    comments = value.get("comments")
+    if isinstance(comments, list):
+        if not comments:
+            return "(no comment)"
+        return "\n".join(
+            f"{c.get('address', '?')}  {c.get('comment', '')}"
+            for c in comments
+            if isinstance(c, dict)
+        )
     comment = value.get("comment")
     if isinstance(comment, str):
         return comment if comment else "(no comment)"

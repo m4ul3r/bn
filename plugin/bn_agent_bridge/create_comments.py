@@ -212,12 +212,28 @@ def _get_comment(ctx, selector: str | None, address, function):
         )
     if function:
         fn = ctx._find_function(bv, function)
-        comment = bv.get_comment_at(fn.start)
+        # Aggregate ALL comments within the function's address range, not just the
+        # entry-address comment -- a comment lands on the interesting call/branch,
+        # not the prologue, so the entry-only read reported (no comment) for a
+        # function that has several, contradicting `comment list` (#203). Uses the
+        # same global address_comments + containing-function attribution as
+        # `comment list`, so the two agree.
+        address_comments = getattr(bv, "address_comments", {}) or {}
+        comments = []
+        for addr in sorted(address_comments):
+            text = address_comments[addr]
+            if not text:
+                continue
+            funcs = bv.get_functions_containing(addr)
+            if not any(int(f.start) == int(fn.start) for f in funcs):
+                continue
+            comments.append({"address": hex(int(addr)), "comment": text})
         return {
             "function": fn.name,
             "address": hex(fn.start),
-            "comment": comment or "",
-            "has_comment": bool(comment),
+            "comments": comments,
+            "comment_count": len(comments),
+            "has_comment": bool(comments),
         }
 
     if address is None:
