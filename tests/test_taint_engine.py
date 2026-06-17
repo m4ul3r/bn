@@ -364,6 +364,38 @@ def test_forward_no_flow_no_false_positive(models):
     assert result["reached_sinks"] == []
 
 
+def test_forward_flags_unlifted_instruction_as_assumption(models):
+    # A visited function containing an unlifted instruction (e.g. AArch64 FP
+    # fnmsub, which renders as MLIL_UNIMPL) must surface an assumption instead of
+    # flowing through it silently -- the silent-hole class #206 targets.
+    a = FVar("a"); r = FVar("r")
+    a0 = FSSA(a, 0); r1 = FSSA(r, 1)
+    ssa = FSSAFunc([
+        FInstr(0, 0x10, "MLIL_UNIMPL", "fnmsub s0, s0, s5, s3"),
+        FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "r#1 = a#0 + 1", reads=[a0], writes=[r1]),
+        FInstr(2, 0x18, "MLIL_RET", "return r#1", reads=[r1]),
+    ])
+    func = FFunc("transform", 0x10, ssa, params=[a])
+    engine = te.TaintEngine(FBV({}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert any("unlifted/unimplemented" in s for s in result["assumptions"])
+    assert any("0x10" in s for s in result["assumptions"])
+
+
+def test_forward_no_unlifted_no_assumption(models):
+    # The unlifted signal must not fire on a clean function (no false noise).
+    a = FVar("a"); r = FVar("r")
+    a0 = FSSA(a, 0); r1 = FSSA(r, 1)
+    ssa = FSSAFunc([
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "r#1 = a#0 + 1", reads=[a0], writes=[r1]),
+        FInstr(1, 0x14, "MLIL_RET", "return r#1", reads=[r1]),
+    ])
+    func = FFunc("clean", 0x10, ssa, params=[a])
+    engine = te.TaintEngine(FBV({}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert not any("unlifted" in s for s in result["assumptions"])
+
+
 def _fwrite_func():
     # dump(fd): read(fd, &buf, 0x40); fwrite(&buf, 1, 0x40, fp)
     buf = FVar("buf", typ="char[0x40]")

@@ -2019,6 +2019,31 @@ def test_function_info_includes_metadata(monkeypatch):
     assert result["return_type"] == "int32_t"
     assert result["calling_convention"] == "__cdecl"
     assert result["size"] is None
+    # A function with no unlifted instructions reports a 0 count, not absence.
+    assert result["unimplemented_instructions"] == {"count": 0, "addresses": [], "truncated": False}
+
+
+def test_function_info_reports_unimplemented_instructions(monkeypatch):
+    """function info aggregates instructions BN's lifter could not model so an
+    FP-heavy function isn't mistaken for fully analyzed (#206)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x405000, "transform")
+    # Two unlifted FP instructions (e.g. AArch64 fnmsub) surface as LLIL_UNIMPL.
+    fn.low_level_il = [_FakeBlock([
+        _FakeMLILInsn(0x4056f8, operation="LLIL_UNIMPL"),
+        _FakeMLILInsn(0x4056fc, operation="LLIL_UNIMPL"),
+        _FakeMLILInsn(0x405700, operation="LLIL_SET_REG"),
+    ])]
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_info("active", "transform")
+
+    ui = result["unimplemented_instructions"]
+    assert ui["count"] == 2
+    assert ui["addresses"] == ["0x4056f8", "0x4056fc"]
+    assert ui["truncated"] is False
 
 
 def _install_fake_pseudo_c(monkeypatch, bridge, func, batches):

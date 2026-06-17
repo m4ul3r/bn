@@ -596,6 +596,8 @@ class TaintEngine:
         # engine's lifetime -- avoids re-materializing a veneer's MLIL on every
         # candidate visit (forward) and every callsite scan (backward).
         self._thunk_cache: dict[int, Any] = {}
+        # Per-function unlifted-instruction scan, cached by function start (#206).
+        self._unimpl_cache: dict[int, list[int]] = {}
 
     # -- shared resolution ------------------------------------------------
 
@@ -633,6 +635,40 @@ class TaintEngine:
 
     def _is_call(self, ins: Any) -> bool:
         return "CALL" in op_name(ins) or "TAILCALL" in op_name(ins)
+
+    def _unimplemented_addrs(self, func: Any, instrs: list[Any]) -> list[int]:
+        """Addresses of instructions BN's lifter could not model in *func*.
+
+        Scans both the MLIL-SSA instructions already in hand (integer ops that
+        surface as ``MLIL_UNIMPL``) and the function's LLIL (FP/SIMD ops like the
+        AArch64 ``fnmsub``/``fmadd`` family are unlifted at decode and never reach
+        MLIL, so a MLIL-only scan misses the motivating case). Cached per function
+        start; defensive so the synthetic test fakes (no LLIL) just see the MLIL
+        scan. Lets forward taint flag an otherwise-silent dataflow hole (#206)."""
+        key = int(getattr(func, "start", 0))
+        if key in self._unimpl_cache:
+            return self._unimpl_cache[key]
+        addrs: set[int] = set()
+        for ins in instrs:
+            if "UNIMPL" in op_name(ins):
+                addrs.add(int(getattr(ins, "address", 0)))
+        il = getattr(func, "low_level_il", None) or getattr(func, "llil", None)
+        if il is not None:
+            try:
+                blocks = list(il)
+            except Exception:
+                blocks = list(getattr(il, "basic_blocks", None) or [])
+            for block in blocks:
+                try:
+                    items = list(block)
+                except Exception:
+                    continue
+                for ins in items:
+                    if "UNIMPL" in op_name(ins):
+                        addrs.add(int(getattr(ins, "address", 0)))
+        result = sorted(addrs)
+        self._unimpl_cache[key] = result
+        return result
 
     def _resolve_direct_target(self, ins: Any) -> int | None:
         """Resolved direct/import call-target address, or None for a genuinely
@@ -1807,6 +1843,20 @@ class TaintEngine:
                 raise TaintError("no taint sources resolved; check --source locator")
             return {"reached_return": False, "out_params": set(), "findings": [],
                     "leaves": [], "assumptions": []}
+
+        # Honesty signal: a visited function with unlifted instructions is a
+        # potential silent dataflow hole -- BN couldn't model those ops, so taint
+        # through them isn't tracked. Surface it the way unmodeled calls/coarse
+        # stores already are, instead of flowing through silently (#206).
+        unimpl = self._unimplemented_addrs(func, instrs)
+        if unimpl:
+            sample = ", ".join(hex(a) for a in unimpl[:5])
+            more = "" if len(unimpl) <= 5 else f", +{len(unimpl) - 5} more"
+            add_assumption(
+                f"{func.name} contains {len(unimpl)} unlifted/unimplemented "
+                f"instruction(s) (e.g. {sample}{more}); BN's lifter could not model "
+                f"them, so a tainted value passing through is not tracked (possible "
+                f"silent hole) -- see `bn function info` for the full list")
 
         def read_taint(ins: Any) -> list[tuple]:
             hit = []

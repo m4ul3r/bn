@@ -49,6 +49,54 @@ def _function_metadata(func) -> dict[str, Any]:
     }
 
 
+def _unimplemented_instructions(func, *, cap: int = 64) -> dict[str, Any]:
+    """Aggregate signal for instructions Binary Ninja's lifter could not model.
+
+    When BN can't lift an instruction it emits an ``*_UNIMPL`` / ``*_UNIMPL_MEM``
+    IL op and renders it inline in HLIL as ``🚫 /* unimplemented {...} */`` -- the
+    *only* signal today. A function whose core computation is unlifted (e.g. the
+    AArch64 FP fused-multiply-add family ``fnmsub``/``fmadd``, which never reach
+    MLIL while the surrounding integer ops do) otherwise reads as fully analyzed,
+    and a dataflow/taint pass flows through it as a silent hole (#206).
+
+    We scan LLIL first (closest to decode, so it catches FP/SIMD ops that never
+    surface in MLIL) and fall back to MLIL. Returns ``{count, addresses,
+    truncated}``; ``addresses`` is capped so a pathological function can't bloat
+    the response.
+    """
+    addrs: list[int] = []
+    seen: set[int] = set()
+    for attr in ("low_level_il", "llil", "mlil", "medium_level_il"):
+        il = getattr(func, attr, None)
+        if il is None:
+            continue
+        try:
+            blocks = list(il)
+        except Exception:
+            blocks = list(getattr(il, "basic_blocks", []) or [])
+        found = False
+        for block in blocks:
+            try:
+                items = list(block)
+            except Exception:
+                continue
+            for ins in items:
+                if "UNIMPL" in _il_op_name(ins):
+                    found = True
+                    a = int(getattr(ins, "address", 0))
+                    if a not in seen:
+                        seen.add(a)
+                        addrs.append(a)
+        if found:
+            break  # first IL level that exposes them is authoritative
+    addrs.sort()
+    return {
+        "count": len(addrs),
+        "addresses": [hex(a) for a in addrs[:cap]],
+        "truncated": len(addrs) > cap,
+    }
+
+
 def _comment_map(bv, func) -> dict[str, str]:
     arch = getattr(func, "arch", None)
     comments: dict[str, str] = {}

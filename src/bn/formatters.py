@@ -98,6 +98,19 @@ def _render_function_info_text(value: Any, verbose: bool = False) -> str:
     if locals_only:
         lines.append(f"locals: {len(locals_only)} variables")
 
+    # Surface unlifted instructions (#206) -- a function whose computation BN
+    # couldn't model otherwise reads as fully analyzed.
+    unimpl = value.get("unimplemented_instructions")
+    if isinstance(unimpl, dict) and unimpl.get("count"):
+        addrs = list(unimpl.get("addresses") or [])
+        shown = ", ".join(addrs)
+        if unimpl.get("truncated"):
+            shown += ", …"
+        suffix = f" (e.g. {shown})" if shown else ""
+        lines.append(
+            f"unlifted instructions: {unimpl['count']} — BN could not model these; "
+            f"dataflow through them is not tracked{suffix}")
+
     if verbose:
         parameters = list(value.get("parameters") or [])
         if parameters:

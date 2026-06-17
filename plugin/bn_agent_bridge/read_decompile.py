@@ -106,6 +106,10 @@ def _function_info(ctx, selector: str | None, identifier):
         "parameters": parameters,
         "locals": locals_only,
         "xref_count": code_ref_count,
+        # Count (+ addresses) of instructions BN's lifter could not model, so a
+        # function with unlifted computation isn't mistaken for fully analyzed
+        # (#206). count:0 means no unlifted instruction was found.
+        "unimplemented_instructions": il_format._unimplemented_instructions(func),
     }
 
 
