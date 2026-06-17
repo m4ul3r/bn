@@ -1687,18 +1687,119 @@ class TaintEngine:
             and getattr(ra, "version", None) == getattr(rb, "version", None)
         )
 
+    def _dest_alloc(self, ssaf: Any, ptr_expr: Any) -> tuple[Any | None, bool]:
+        """``(size_expr, assumed_wrapper)`` for the allocator that produced the
+        buffer *ptr_expr* points into. Recognizes the modeled allocators (and
+        C++ ``new``) via :meth:`_alloc_size_expr`; failing that, conservatively
+        treats an UNMODELED single-argument call feeding the buffer as an
+        allocator wrapper whose sole arg is the size (``assumed_wrapper=True``) so
+        ``dst = wrap(len); memcpy(dst, src, len)`` can downgrade too (#229)."""
+        size = self._alloc_size_expr(ssaf, ptr_expr)
+        if size is not None:
+            return size, False
+        var = ptr_expr if is_ssa_var(ptr_expr) else None
+        if var is None:
+            reads = expr_reads(ptr_expr)
+            if len(reads) == 1:
+                var = reads[0]
+        if var is None:
+            return None, False
+        try:
+            d = ssaf.get_ssa_var_definition(var)
+        except Exception:
+            d = None
+        if d is None or "CALL" not in op_name(d):
+            return None, False
+        aparams = self._call_params(d)
+        # Only a single-arg call qualifies as an assumed size-by-len wrapper; the
+        # bound check still requires that sole arg to be linear in the SAME var as
+        # the copy length, so a non-allocator one-arg call only ever downgrades
+        # when its argument provably bounds the copy (and the sink stays reported,
+        # just relabeled bounded_len).
+        if len(aparams) == 1:
+            return aparams[0], True
+        return None, False
+
+    def _linear_in_var(self, ssaf: Any, expr: Any, depth: int = 0):
+        """Decompose *expr* into ``(canonical_ssa_var, const)`` when it is ``v``,
+        ``v + const``, ``const + v`` or ``v - const`` (following pure SSA copies
+        to v's canonical root); ``None`` otherwise. The const is 0 for a bare var.
+        Lets the bound check compare an allocation ``len + C`` against a copy
+        ``len + D`` by their shared length var and constant offsets (#229)."""
+        if expr is None or depth > 6:
+            return None
+        v = self._as_single_ssa_var(expr)
+        if v is not None:
+            try:
+                d = ssaf.get_ssa_var_definition(v)
+            except Exception:
+                d = None
+            if d is not None and op_name(d) == "MLIL_SET_VAR_SSA":
+                sub = self._linear_in_var(ssaf, getattr(d, "src", None), depth + 1)
+                if sub is not None:
+                    return sub
+            return (self._canonical_ssa_var(ssaf, v), 0)
+        op = op_name(expr)
+        if op in ("MLIL_ADD", "MLIL_SUB"):
+            left = getattr(expr, "left", None)
+            right = getattr(expr, "right", None)
+            rc = self._int_const(right)
+            if rc is not None:
+                sub = self._linear_in_var(ssaf, left, depth + 1)
+                if sub is not None:
+                    return (sub[0], sub[1] + (rc if op == "MLIL_ADD" else -rc))
+            if op == "MLIL_ADD":
+                lc = self._int_const(left)
+                if lc is not None:
+                    sub = self._linear_in_var(ssaf, right, depth + 1)
+                    if sub is not None:
+                        return (sub[0], sub[1] + lc)
+        return None
+
+    def _bounded_copy_reason(self, ssaf: Any, params: list[Any], length_idx: int,
+                             dest_idx: int = 0) -> str | None:
+        """A human reason when the copy (dest=params[dest_idx],
+        length=params[length_idx]) provably fits the buffer the destination was
+        allocated with in this same function, else None.
+
+        Generalizes the exact ``dst = malloc(n); memcpy(dst, src, n)`` case
+        (#46 item 1) to ``dst = alloc(len + C); memcpy(dst + c, src, len + D)``,
+        which is bounded iff ``c + D <= C`` for the same length var, and to
+        unmodeled single-arg allocator wrappers (#229)."""
+        if dest_idx >= len(params) or length_idx >= len(params):
+            return None
+        dest_expr = params[dest_idx]
+        len_expr = params[length_idx]
+        size_expr, assumed_wrapper = self._dest_alloc(ssaf, dest_expr)
+        if size_expr is None:
+            return None
+        off_info = self._addr_base_offset(ssaf, dest_expr)
+        c = off_info[1] if (off_info is not None and isinstance(off_info[1], int)) else 0
+        if c < 0:
+            return None
+        wrap = " (assumed allocator wrapper sized by the copy length)" if assumed_wrapper else ""
+        # Exact same-value, no dest offset: the original #46 case.
+        if c == 0 and self._same_ssa_value(ssaf, size_expr, len_expr):
+            return ("the destination is allocated with the same size in this "
+                    "function -- provably bounded, not an overflow" + wrap)
+        alloc = self._linear_in_var(ssaf, size_expr)
+        copy = self._linear_in_var(ssaf, len_expr)
+        if alloc is None or copy is None:
+            return None
+        (av, ac), (cv, cc) = alloc, copy
+        if not (var_key(av) == var_key(cv)
+                and getattr(av, "version", None) == getattr(cv, "version", None)):
+            return None
+        if c + cc <= ac:
+            return (f"the destination is allocated with len+{hex(ac)} and the copy "
+                    f"writes len+{hex(cc)} bytes at offset {hex(c)} "
+                    f"({hex(c)}+{hex(cc)} <= {hex(ac)}) -- provably bounded" + wrap)
+        return None
+
     def _provably_bounded_length(self, ssaf: Any, params: list[Any], length_idx: int,
                                  dest_idx: int = 0) -> bool:
-        """True when the copy length (params[length_idx]) is provably equal to
-        the size the destination buffer (params[dest_idx]) was allocated with in
-        this same function -- e.g. dst = malloc(n); memcpy(dst, src, n). Used to
-        downgrade an overflow_len label to a bounded one (#46 item 1)."""
-        if dest_idx >= len(params) or length_idx >= len(params):
-            return False
-        size_expr = self._alloc_size_expr(ssaf, params[dest_idx])
-        if size_expr is None:
-            return False
-        return self._same_ssa_value(ssaf, size_expr, params[length_idx])
+        """Backward-compatible bool wrapper over :meth:`_bounded_copy_reason`."""
+        return self._bounded_copy_reason(ssaf, params, length_idx, dest_idx) is not None
 
     def _const_value(self, expr: Any) -> int | None:
         """The integer constant of a CONST/CONST_PTR expression, else None."""
@@ -2006,22 +2107,24 @@ class TaintEngine:
                                 recorded_sinks.add(sig)
                                 eff_sink = sink
                                 # Downgrade a tainted memcpy-family LENGTH from
-                                # overflow to bounded when the destination is
-                                # provably allocated with that same length in
-                                # this function (e.g. dst=malloc(n); memcpy(dst,
-                                # src,n)) -- the length is attacker-derived but
-                                # the copy cannot overflow (#46 item 1). Still
-                                # reported, just relabeled, so it's not noise in
-                                # the overflow set.
-                                if sink.get("class") == "overflow_len" and \
-                                        self._provably_bounded_length(ssaf, params, argidx):
+                                # overflow to bounded when the copy provably fits
+                                # the buffer the destination was allocated with in
+                                # this function -- the exact dst=malloc(n);
+                                # memcpy(dst,src,n) case AND the generalized
+                                # dst=alloc(len+C); memcpy(dst+c,src,len+D) with
+                                # c+D<=C, plus unmodeled single-arg allocator
+                                # wrappers (#46 item 1, #229). The length is
+                                # attacker-derived but the copy cannot overflow.
+                                # Still reported, just relabeled, so it's not noise
+                                # in the overflow set.
+                                _bnd_reason = (self._bounded_copy_reason(ssaf, params, argidx)
+                                               if sink.get("class") == "overflow_len" else None)
+                                if _bnd_reason is not None:
                                     eff_sink = {
                                         **sink,
                                         "class": "bounded_len",
                                         "detail": (sink.get("detail") or "")
-                                        + " (attacker-derived length, but the destination is "
-                                        "allocated with the same size in this function -- "
-                                        "provably bounded, not an overflow)",
+                                        + f" (attacker-derived length, but {_bnd_reason})",
                                     }
                                 elif sink.get("class") == "overflow_len":
                                     # Length is the return of a modeled receive

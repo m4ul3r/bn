@@ -2630,6 +2630,80 @@ def test_forward_keeps_overflow_when_alloc_size_differs_from_length(models):
     assert memcpy_sinks[0]["class"] == "overflow_len"          # NOT downgraded
 
 
+def _copy_func_alloc_offset(*, alloc_const, dest_off, alloc_addr=0x2000,
+                            alloc_name_addr=0x2000, len_const=0, param=None):
+    # dst = alloc(len + alloc_const); memcpy(dst + dest_off, src, len + len_const)
+    n = FVar("n"); n0 = FSSA(n, 0)
+    dst = FVar("dst"); src = FVar("src")
+    dst1 = FSSA(dst, 1); src0 = FSSA(src, 0)
+
+    def _len_plus(const):
+        base = FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])
+        if const == 0:
+            return base
+        return FExpr("MLIL_ADD", f"n#0 + {hex(const)}", reads=[n0],
+                     left=base, right=FExpr("MLIL_CONST", hex(const), constant=const))
+
+    size_arg = _len_plus(alloc_const)
+    if dest_off == 0:
+        dest_expr = FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1])
+    else:
+        dest_expr = FExpr("MLIL_ADD", f"dst#1 + {hex(dest_off)}", reads=[dst1],
+                          left=FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1]),
+                          right=FExpr("MLIL_CONST", hex(dest_off), constant=dest_off))
+    src_param = FExpr("MLIL_VAR_SSA", "src#0", reads=[src0])
+    len_param = _len_plus(len_const)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "dst#1 = alloc(...)",
+               reads=[n0], writes=[dst1],
+               dest=FExpr("MLIL_CONST_PTR", hex(alloc_addr), constant=alloc_addr),
+               params=[size_arg]),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "memcpy(dst, src, len)",
+               reads=[dst1, src0, n0],
+               dest=FExpr("MLIL_CONST_PTR", "0x2010", constant=0x2010),
+               params=[dest_expr, src_param, len_param]),
+    ]
+    return FFunc("copy", 0x10, FSSAFunc(instrs), params=[param or n])
+
+
+def test_forward_downgrades_len_plus_const_alloc_with_dest_offset(models):
+    # dst = malloc(len + 0x2d); memcpy(dst + 0x2c, src, len): 0x2c + len + 1 fits
+    # len + 0x2d, so the copy is provably bounded -> bounded_len, not overflow (#229).
+    func = _copy_func_alloc_offset(alloc_const=0x2d, dest_off=0x2c, alloc_name_addr=0x2000)
+    bv = FBV({0x2000: "malloc", 0x2010: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    memcpy = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(memcpy) == 1
+    assert memcpy[0]["class"] == "bounded_len"
+    assert "0x2d" in memcpy[0]["detail"]
+
+
+def test_forward_keeps_overflow_when_dest_offset_exceeds_alloc_slack(models):
+    # dst = malloc(len + 0x10); memcpy(dst + 0x20, src, len): 0x20 > 0x10 slack,
+    # so the copy can overrun -> must STAY overflow_len (no false downgrade) (#229).
+    func = _copy_func_alloc_offset(alloc_const=0x10, dest_off=0x20)
+    bv = FBV({0x2000: "malloc", 0x2010: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    memcpy = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(memcpy) == 1
+    assert memcpy[0]["class"] == "overflow_len"
+
+
+def test_forward_downgrades_unmodeled_single_arg_allocator_wrapper(models):
+    # dst = my_alloc_wrapper(len); memcpy(dst, src, len): an unmodeled one-arg
+    # allocator wrapper whose sole arg is the copy length -> bounded_len (#229).
+    func = _copy_func_alloc_offset(alloc_const=0, dest_off=0, alloc_addr=0x3000)
+    bv = FBV({0x3000: "my_alloc_wrapper", 0x2010: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    memcpy = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(memcpy) == 1
+    assert memcpy[0]["class"] == "bounded_len"
+    assert "assumed allocator wrapper" in memcpy[0]["detail"]
+
+
 def test_forward_cxx_new_backed_buffer_downgrades_like_malloc(models):
     # dst = operator new[](n); memcpy(dst, src, n) -- a new[]-backed buffer must
     # downgrade the overflow to bounded_len exactly like a malloc-backed one, i.e.
