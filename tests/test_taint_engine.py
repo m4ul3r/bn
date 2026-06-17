@@ -426,6 +426,115 @@ def test_forward_no_broad_source_hint_for_scalar_param(models):
     assert not any("broad source" in s for s in result["assumptions"])
 
 
+def _stack_var(name):
+    v = FVar(name)
+    v.source_type = type("ST", (), {"name": "StackVariableSourceType"})()
+    return v
+
+
+def test_forward_pointer_escape_into_stack_descriptor_is_not_silent(models):
+    # recvfrom fills buf; &buf is then stashed into a stack descriptor local that
+    # the engine cannot follow (a separate &descriptor would be handed to a
+    # handler). The result must NOT be a silent 0-leaf clear: a pointer_escape
+    # leaf + assumption flag the dropped flow (#228).
+    buf = FVar("buf", typ="char[0xbb8]")
+    fd = FVar("fd")
+    desc = _stack_var("desc")
+    desc1 = FSSA(desc, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "recvfrom(fd, &buf, 0xbb8, ...)",
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[FSSA(fd, 0)]),
+                       FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       FExpr("MLIL_CONST", "0xbb8", constant=0xbb8)]),
+        FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "desc#1 = &buf", writes=[desc1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+    ]
+    func = FFunc("net_handler", 0x10, FSSAFunc(instrs), params=[fd])
+    bv = FBV({0x900: "recvfrom"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:recvfrom:1")])
+
+    assert result["reached_sinks"] == []                      # no false sink
+    assert "pointer_escape" in [l.get("kind") for l in result["leaves"]]
+    assert result["stats"]["leaves"] >= 1                     # NOT a silent clear
+    assert any("escapes" in a for a in result["assumptions"])
+
+
+def test_forward_pointer_escape_single_var_descriptor_propagates(models):
+    # desc = &buf (single-var descriptor); handler(&desc) -- tainting the captured
+    # descriptor lets the by-address handoff descend into the handler (#228).
+    buf = FVar("buf"); fd = FVar("fd"); desc = _stack_var("desc")
+    desc1 = FSSA(desc, 1)
+    handler = FFunc("handler", 0x500,
+                    FSSAFunc([FInstr(0, 0x500, "MLIL_RET", "return", reads=[])]),
+                    params=[FVar("p")])
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "recvfrom(fd, &buf, 0xbb8)",
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[FSSA(fd, 0)]),
+                       FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       FExpr("MLIL_CONST", "0xbb8", constant=0xbb8)]),
+        FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "desc#1 = &buf", writes=[desc1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+        FInstr(2, 0x18, "MLIL_CALL_SSA", "handler(&desc)",
+               dest=FExpr("MLIL_CONST_PTR", "0x500", constant=0x500),
+               params=[FExpr("MLIL_ADDRESS_OF", "&desc", src=desc)]),
+    ]
+    func = FFunc("net_handler", 0x10, FSSAFunc(instrs), params=[fd])
+    bv = FBV({0x900: "recvfrom", 0x500: "handler"}, funcs={0x500: handler})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:recvfrom:1")])
+
+    # descended into the handler: the escaped descriptor propagated by address.
+    assert result["stats"]["functions_visited"] >= 2
+
+
+def test_forward_register_buffer_setup_is_not_a_false_escape(models):
+    # `x1 = &buf` setting up recvfrom's OWN buffer arg is a register write, not a
+    # stack-descriptor capture, so it must NOT be reported as a pointer_escape.
+    buf = FVar("buf"); fd = FVar("fd")
+    x1 = FVar("x1")  # register var: no source_type -> not a stack write
+    x1_1 = FSSA(x1, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "x1#1 = &buf", writes=[x1_1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "recvfrom(fd, x1#1, 0xbb8)",
+               reads=[x1_1],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[FSSA(fd, 0)]),
+                       FExpr("MLIL_VAR_SSA", "x1#1", reads=[x1_1]),
+                       FExpr("MLIL_CONST", "0xbb8", constant=0xbb8)]),
+    ]
+    func = FFunc("h", 0x10, FSSAFunc(instrs), params=[fd])
+    bv = FBV({0x900: "recvfrom"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:recvfrom:1")])
+    assert "pointer_escape" not in [l.get("kind") for l in result["leaves"]]
+
+
+def test_forward_arg_source_indirect_pointer_warns(models):
+    # recvfrom(fd, G.pkt, n) where the dest buffer pointer is loaded from a global
+    # slot: the seed can't anchor the pointee and won't correlate later re-loads,
+    # so it must add an honest indirect-pointer note, not a silent clear (#193).
+    fd = FVar("fd"); t = FVar("t"); t1 = FSSA(t, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "t#1 = [G]", writes=[t1],
+               src=FExpr("MLIL_LOAD", "[G]", reads=[])),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "recvfrom(fd, t#1, 0x100)",
+               reads=[t1],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[FSSA(fd, 0)]),
+                       FExpr("MLIL_VAR_SSA", "t#1", reads=[t1]),
+                       FExpr("MLIL_CONST", "0x100", constant=0x100)]),
+    ]
+    func = FFunc("recv_handler", 0x10, FSSAFunc(instrs), params=[fd])
+    bv = FBV({0x900: "recvfrom"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:recvfrom:1")])
+    assert any("indirectly" in a and "param:N" in a for a in result["assumptions"])
+
+
 def test_forward_no_unlifted_no_assumption(models):
     # The unlifted signal must not fire on a clean function (no false noise).
     a = FVar("a"); r = FVar("r")

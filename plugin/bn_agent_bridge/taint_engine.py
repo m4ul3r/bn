@@ -677,6 +677,23 @@ class TaintEngine:
         return result
 
     @staticmethod
+    def _is_stack_write(writes: list[Any]) -> bool:
+        """True if any written SSA var is a STACK variable (vs a register/flag).
+
+        Gates the pointer_escape leaf (#228) to genuine stack-descriptor captures
+        (`stack_local = &buf`), so a register `x1 = &buf` that merely sets up the
+        source call's own buffer argument is NOT mistaken for an escape. Returns
+        False when the source type is unavailable (the unit fakes / unknown), so
+        the conservative default is "not an escape" rather than a false leaf."""
+        for w in writes:
+            base = getattr(w, "var", w)
+            st = getattr(base, "source_type", None)
+            name = str(getattr(st, "name", None) or (str(st) if st is not None else ""))
+            if "Stack" in name:
+                return True
+        return False
+
+    @staticmethod
     def _type_class_name(t: Any) -> str:
         tc = getattr(t, "type_class", None)
         return str(getattr(tc, "name", None) or (str(tc) if tc is not None else ""))
@@ -1629,6 +1646,36 @@ class TaintEngine:
         aparams = self._call_params(d)
         return aparams[idx] if idx < len(aparams) else None
 
+    def _arg_ptr_is_indirect_load(self, ssaf: Any, expr: Any, depth: int = 0) -> bool:
+        """True when a buffer-pointer arg is itself loaded from memory -- a global
+        or struct-field pointer slot (`recvfrom(fd, G.pkt, n)` where ``G.pkt`` is
+        ``*(G+off)``) rather than a direct ``&stackbuf``. In that case the engine
+        anchors the seed to the loaded pointer value but does not correlate it with
+        a later re-load of the same slot, so the recv->parse flow can be missed --
+        worth an honest note when the buffer couldn't be anchored (#193)."""
+        if expr is None or depth > 6:
+            return False
+        if "LOAD" in op_name(expr):
+            return True
+        v = self._as_single_ssa_var(expr)
+        if v is None:
+            reads = expr_reads(expr)
+            v = reads[0] if len(reads) == 1 else None
+        if v is None:
+            return False
+        try:
+            d = ssaf.get_ssa_var_definition(v)
+        except Exception:
+            d = None
+        if d is None:
+            return False
+        src = getattr(d, "src", None)
+        if src is None:
+            return False
+        if "LOAD" in op_name(src):
+            return True
+        return self._arg_ptr_is_indirect_load(ssaf, src, depth + 1)
+
     def _as_single_ssa_var(self, expr: Any) -> Any | None:
         """The lone SSA variable an expression reads, but ONLY when the
         expression is a bare var read (MLIL_VAR_SSA / an SSAVariable) -- not
@@ -2515,6 +2562,73 @@ class TaintEngine:
                                 f"coarse memory store at {saddr}: tainted bytes written "
                                 "through an uncorrelated pointer; downstream reads not tracked"
                             )
+
+                # Address-of-tainted escape (#228): an assignment or store whose
+                # VALUE is a POINTER to a tainted buffer (`stack_local = &buf`,
+                # `*p = &buf`) is invisible to read_taint -- AddressOf targets are
+                # not value-reads -- so a captured pointer to tainted data is
+                # silently dropped, yielding a confident 0-leaf "no sinks reached"
+                # even though the buffer escaped (the worst VR failure mode: an
+                # agent reads it as proof of safety). When the generic flow above
+                # found no tainted value-read, check whether the source is a
+                # pointer to a tainted buffer and record a pointer_escape leaf so
+                # the all-clear is never silent, best-effort propagating the taint.
+                if not reads:
+                    src_val = getattr(ins, "src", None)
+                    esc = (self._pointee_tainted(ssaf, src_val, tainted)
+                           if src_val is not None else None)
+                    escaped = False
+                    dest_desc = None
+                    if esc is not None:
+                        writes = ssa_writes(ins)
+                        if writes and self._is_stack_write(writes):
+                            # `stack_local = &buf`: the pointer is stashed into a
+                            # stack descriptor/local (not a call-arg register), so a
+                            # later `&descriptor` handed to a handler re-loads it out
+                            # of the engine's sight. Tainting the dest also lets a
+                            # single-var descriptor propagate when passed by address.
+                            for w in writes:
+                                node = (var_key(w), getattr(w, "version", None))
+                                if taint_node(node, var_label(w), ins,
+                                              "captured pointer to tainted buffer (pointer_escape)", [esc]):
+                                    changed = True
+                            escaped = True
+                            dest_desc = f"stashed into stack local {var_label(writes[0])}"
+                        elif "STORE" in opn:
+                            # `*p = &buf`: pointer to a tainted buffer written into
+                            # memory. Taint the pointee (the descriptor) coarsely so
+                            # a later `&descriptor` propagates, and record the escape.
+                            pv = self._pointee_var(ssaf, getattr(ins, "dest", None))
+                            if pv is not None and taint_node((var_key(pv), None), var_label(pv), ins,
+                                                             "descriptor holds pointer to tainted buffer (pointer_escape)", [esc]):
+                                changed = True
+                            escaped = True
+                            dest_desc = "stored into memory through a pointer"
+                    if escaped:
+                        saddr = hex(int(getattr(ins, "address", 0)))
+                        buf_lbl = node_label(esc, why)
+                        leaf = {
+                            "kind": "pointer_escape",
+                            "address": saddr,
+                            "buffer": buf_lbl,
+                            "dest": dest_desc,
+                            "il_text": str(ins),
+                            "detail": (
+                                "the address of a tainted buffer escapes here -- a "
+                                "pointer to tainted data is captured into a local/"
+                                "descriptor/memory the engine cannot correlate "
+                                "downstream; flows that re-load this pointer (e.g. a "
+                                "descriptor field passed by address to a handler) are "
+                                "not followed, so a 'no sinks reached' result is NOT "
+                                "proof of safety -- investigate the consumer"
+                            ),
+                        }
+                        if leaf not in leaves:
+                            leaves.append(leaf)
+                        add_assumption(
+                            f"pointer to tainted buffer {buf_lbl} escapes at {saddr} "
+                            f"({dest_desc}); downstream uses through the captured pointer "
+                            f"are not tracked")
             if not changed:
                 break
 
@@ -2663,6 +2777,22 @@ class TaintEngine:
                                     if taint_node((var_key(r), getattr(r, "version", None)), var_label(r), c,
                                                   f"source: {callee} arg{idx}", []):
                                         seeded = True
+                                # The buffer couldn't be anchored to a stack var or
+                                # writable global. If the pointer is itself loaded
+                                # from a global/struct slot, the seed rides the
+                                # pointer value, not the pointee, and won't correlate
+                                # with a later re-load of the same slot -- a recv->
+                                # parse flow can be missed. Say so instead of a
+                                # silent 0-propagation clear (#193).
+                                if self._arg_ptr_is_indirect_load(ssaf, params[idx]):
+                                    add_assumption(
+                                        f"source {callee} arg{idx} buffer pointer is loaded "
+                                        f"indirectly (from a global/struct slot); the seed "
+                                        f"anchors to the pointer value, not the pointee, and "
+                                        f"is not correlated with later re-loads of the same "
+                                        f"slot -- a flow that re-loads the pointer and parses "
+                                        f"it may be missed. Consider seeding the parser entry "
+                                        f"directly with param:N")
                 if kind == "ret" and not ret_seeded:
                     # T3: callsites of `callee` exist but NONE consume its return
                     # value (a void or discarded return), so a ret: source has
@@ -2725,6 +2855,15 @@ class TaintEngine:
                                         if taint_node((var_key(r), getattr(r, "version", None)), var_label(r), c,
                                                       f"source: {callee} arg{idx} (call: preset)", []):
                                             seeded = True
+                                    if self._arg_ptr_is_indirect_load(ssaf, params[idx]):
+                                        add_assumption(
+                                            f"source {callee} arg{idx} buffer pointer is loaded "
+                                            f"indirectly (from a global/struct slot); the seed "
+                                            f"anchors to the pointer value, not the pointee, and "
+                                            f"is not correlated with later re-loads of the same "
+                                            f"slot -- a flow that re-loads the pointer and parses "
+                                            f"it may be missed. Consider seeding the parser entry "
+                                            f"directly with param:N")
                         elif to.startswith("arg:"):
                             idx = _try_arg_index(to)
                             if idx is not None and idx < len(params):

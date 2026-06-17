@@ -1229,6 +1229,13 @@ def _render_leaf_line(leaf: dict[str, Any]) -> str:
             f"  (tainted arg(s) {args})"
             + (f"  -- {leaf.get('note')}" if leaf.get("note") else "")
         )
+    if kind == "pointer_escape":
+        return (
+            f"  pointer_escape @ {leaf.get('address')}"
+            f"  buffer={leaf.get('buffer', '?')}"
+            + (f"  {leaf.get('dest')}" if leaf.get("dest") else "")
+            + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
+        )
     if kind == "field_load_unresolved":
         bits = []
         if leaf.get("base") is not None:
