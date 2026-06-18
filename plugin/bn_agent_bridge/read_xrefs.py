@@ -61,12 +61,26 @@ def _xrefs(ctx, selector: str | None, identifier, *, offset: int = 0, limit: int
         if not bodies:
             bodies = ctx._find_functions_by_name(bv, str(identifier), case_sensitive=False)
         if len(bodies) >= 2:
+            # An import/extern STUB shadowing exactly one real body is the #201
+            # PIC self-reference case (a demangled name matching both a PLT veneer
+            # and the local definition): resolve to the DEFINITION and never report
+            # the stub over it -- the stub usually carries the call traffic, so a
+            # pure ref-count tiebreak would pick it (regressing #201). Reuse the
+            # same impl-over-stub chokepoint _find_function uses. Only a genuine
+            # same-name group with NO stub-typed member (a GCC thunk/real pair,
+            # both FunctionSymbol) reaches the collision surfacing (#220).
+            impl = ctx._resolve_impl_over_stub(bodies)
+            if impl is not None:
+                result = _xrefs_to_address(ctx, bv, int(impl.start), offset=offset, limit=limit)
+                if any(int(getattr(f, "start", -1)) != int(impl.start) for f in bodies):
+                    result["resolved_to_definition"] = hex(int(impl.start))
+                return _drop_legacy_ref_arrays(result)
             reals = [f for f in bodies if not _is_thunk_like(bv, f)]
             if len(reals) <= 1:
                 return _drop_legacy_ref_arrays(
                     _xrefs_ambiguous(ctx, bv, str(identifier), bodies, offset=offset, limit=limit)
                 )
-            # else: >=2 genuine bodies -> let _find_function raise the ambiguous error.
+            # else: >=2 genuine non-thunk bodies -> let _find_function raise ambiguous.
         try:
             address = ctx._find_function(bv, identifier).start
         except RuntimeError as exc:

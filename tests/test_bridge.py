@@ -6202,6 +6202,42 @@ def test_xrefs_thunk_real_collision_surfaces_ambiguity_and_picks_hot(monkeypatch
     assert result["code_ref_count"] == 2
 
 
+def test_xrefs_demangled_collision_prefers_definition_over_import_veneer(monkeypatch):
+    """The #201 ⊕ #220 intersection: a demangled name matches BOTH the real body
+    (FunctionSymbol) and a PIC import veneer (ImportedFunctionSymbol, is_thunk) --
+    both present in bv.functions with the demangled short_name. xrefs must resolve
+    to the DEFINITION, not the ref-carrying stub (the #220 ref-count tiebreak must
+    not regress #201)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    DEMANGLED = "proto::Msg::handle"
+    caller = _FakeFunction(0x500000, "caller")
+
+    veneer = _FakeFunction(0x401050, "_ZN5proto3Msg6handleEv")   # PLT veneer: hot
+    veneer.is_thunk = True
+    vsym = _FakeSymbol("ImportedFunctionSymbol")
+    vsym.short_name = DEMANGLED
+    veneer.symbol = vsym
+
+    impl = _FakeFunction(0x40114a, "_ZN5proto3Msg6handleEv")     # real body: 0 direct callers
+    isym = _FakeSymbol("FunctionSymbol")
+    isym.short_name = DEMANGLED
+    impl.symbol = isym
+
+    bv = _FakeBV(
+        functions=[caller, veneer, impl],
+        code_refs={0x401050: [_FakeCodeRef(0x500010, caller)], 0x40114a: []},
+        sections={".text": _FakeSection(".text", 0x400000, 0x500000)},
+        segments={0x500010: _FakeSegment(readable=True, executable=True)},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._xrefs(None, DEMANGLED)
+    assert result["address"] == "0x40114a"               # the definition, NOT the stub
+    assert result["resolved_to_definition"] == "0x40114a"
+    assert "ambiguous_symbol" not in result              # stub-vs-impl, not a thunk/real collision
+
+
 def test_find_function_resolves_demangled_via_symbol_short_name(monkeypatch):
     """A function whose `fn.name` BN kept mangled resolves by its demangled
     `symbol.short_name`/`full_name`, so callsites/decompile/xrefs all accept the
