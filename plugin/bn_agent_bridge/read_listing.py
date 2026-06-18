@@ -228,6 +228,7 @@ def _list_functions(
             "name": fn.name,
             "address": hex(fn.start),
             "raw_name": getattr(fn, "raw_name", fn.name),
+            "display_name": il_format._display_name(fn),
             "size": il_format._function_size(fn),
         }
         for fn in functions
@@ -304,11 +305,17 @@ def _search_functions(
             return needle in name.lower()
 
     for fn in _filtered_functions(ctx, bv, min_address=min_address, max_address=max_address):
-        if matches(fn.name):
+        # Match across name forms (mangled fn.name, demangled display_name, raw)
+        # so a demangled C++ query finds a function BN named with the mangled
+        # symbol -- the same greppability `--demangle` gives the listing (#196).
+        display = il_format._display_name(fn)
+        raw = str(getattr(fn, "raw_name", fn.name))
+        if any(matches(str(form)) for form in (fn.name, display, raw) if form):
             items.append({
                 "name": fn.name,
                 "address": hex(fn.start),
-                "raw_name": getattr(fn, "raw_name", fn.name),
+                "raw_name": raw,
+                "display_name": display,
                 "size": il_format._function_size(fn),
             })
     _sort_function_items(items, sort)

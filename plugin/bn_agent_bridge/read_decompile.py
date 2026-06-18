@@ -101,6 +101,7 @@ def _function_info(ctx, selector: str | None, identifier):
             "name": func.name,
             "address": hex(func.start),
             "raw_name": getattr(func, "raw_name", func.name),
+            "display_name": il_format._display_name(func),
         },
         **metadata,
         "parameters": parameters,

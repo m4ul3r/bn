@@ -1345,6 +1345,9 @@ class BinaryNinjaBridge:
     def _imports(self, *a, **k):
         return read_misc._imports(self.ctx, *a, **k)
 
+    def _exports(self, *a, **k):
+        return read_misc._exports(self.ctx, *a, **k)
+
     def _imports_build_summary(self, *a, **k):
         return read_misc._imports_build_summary(*a, **k)
 
@@ -1874,6 +1877,17 @@ def _bind_imports(bridge, params, target):
     return bridge._imports(
         target,
         summary=_validate_bool(params.get("summary"), label="summary", default=False),
+        offset=int(params.get("offset", 0)),
+        limit=int(params["limit"]) if params.get("limit") is not None else None,
+        count_only=_validate_bool(params.get("count_only"), label="count_only", default=False),
+        include_got=_validate_bool(params.get("include_got"), label="include_got", default=False),
+    )
+
+
+@op("list_exports", lock="read")
+def _bind_exports(bridge, params, target):
+    return bridge._exports(
+        target,
         offset=int(params.get("offset", 0)),
         limit=int(params["limit"]) if params.get("limit") is not None else None,
         count_only=_validate_bool(params.get("count_only"), label="count_only", default=False),

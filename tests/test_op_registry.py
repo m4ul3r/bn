@@ -15,7 +15,7 @@ EXPECTED_READ = {
     "il", "structured_il", "defuse", "resolved_calls", "possible_values", "taint",
     "disasm", "function_evidence", "xrefs", "field_xrefs", "pointer_table",
     "message_lens", "init_arrays", "backward_slice", "types", "type_info",
-    "strings", "imports", "bundle_function", "get_comment", "list_comments",
+    "strings", "imports", "list_exports", "bundle_function", "get_comment", "list_comments",
     "sections", "read",
 }
 EXPECTED_WRITE = {
