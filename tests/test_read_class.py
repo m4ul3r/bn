@@ -403,3 +403,31 @@ def test_render_class_show_text_matches_mock_shape():
     assert "vtable [0] 0x40e8b0  onData" in text
     assert "vtable [1] 0x0  __cxa_pure_virtual" in text
     assert "instances: new @ 0x443abc (size 0xd0) ; stored -> g_session @ 0x4cabcd" in text
+
+
+def test_render_class_show_lists_non_virtual_methods_and_empty_vtable_note():
+    # A class whose vtable symbol exists but resolves no slots (PIE/relocated)
+    # and whose members are all non-virtual: the renderer must list the members
+    # and explain the empty vtable rather than render a near-blank class.
+    from bn.formatters import _render_class_show_text
+    rec = {
+        "name": "Controller", "confidence": "rtti", "size": None,
+        "vtable": {"address": "0x4b6270", "slots": []},
+        "bases": [], "instances": {"construction_sites": [], "stored_globals": []},
+        "methods": [
+            {"kind": "method", "address": "0x401000", "demangled": "Controller::setAudioFocus(int)"},
+            {"kind": "method", "address": "0x401100", "demangled": "Controller::sendPingRequest()"},
+        ],
+    }
+    text = _render_class_show_text(rec)
+    assert "methods (2):" in text
+    assert "0x401000  Controller::setAudioFocus(int)" in text
+    assert "vtable: present but no slots resolved" in text
+
+
+def test_render_class_show_no_vtable_note_when_no_vtable():
+    from bn.formatters import _render_class_show_text
+    rec = {"name": "GalMutex", "confidence": "ctor", "size": None,
+           "vtable": None, "bases": [], "methods": [],
+           "instances": {"construction_sites": [], "stored_globals": []}}
+    assert "no slots resolved" not in _render_class_show_text(rec)

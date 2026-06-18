@@ -2047,7 +2047,8 @@ def _render_one_class(rec: Any) -> str:
     if bits:
         head += "  (" + ", ".join(bits) + ")"
     lines = [head, f"  [{rec.get('confidence', '?')}]"]
-    for m in rec.get("methods") or []:
+    methods = rec.get("methods") or []
+    for m in methods:
         if m.get("kind") in ("ctor", "dtor"):
             lines.append(f"  {m['kind']:<6} {m.get('address', '?')}  {m.get('demangled', '')}")
     if vt and vt.get("slots"):
@@ -2059,6 +2060,21 @@ def _render_one_class(rec: Any) -> str:
                 else "<unnamed>"
             )
             lines.append(f"  vtable [{s.get('index')}] {s.get('address', '?')}  {label}")
+    elif vt_addr:
+        # A vtable symbol exists but no slots resolved -- on PIE/PIC targets the
+        # function pointers live in .data.rel.ro and are zero in the static image
+        # (applied at load time via relocations BN may not surface). Say so
+        # rather than render a class that looks like it has no virtuals.
+        lines.append("  vtable: present but no slots resolved "
+                     "(pointers may be applied at load time via relocations)")
+    # Non-virtual member functions (kind=method). Virtual ones already appear as
+    # vtable slots above; listing the symbol-side methods makes `class show`
+    # useful for classes whose vtable is empty or absent (e.g. Controller).
+    member_methods = [m for m in methods if m.get("kind") == "method"]
+    if member_methods:
+        lines.append(f"  methods ({len(member_methods)}):")
+        for m in member_methods:
+            lines.append(f"    {m.get('address', '?')}  {m.get('demangled', '')}")
     inst = rec.get("instances") if isinstance(rec.get("instances"), dict) else {}
     parts = []
     for site in inst.get("construction_sites") or []:
