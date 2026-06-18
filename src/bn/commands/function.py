@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-from ..cli import _call, _depth_int, _effective_limit, _mutation_exit_code, _non_negative_int, _parse_line_range, _positive_depth_int, _positive_int, arg, command, mutex
+from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _positive_depth_int, _positive_int, arg, command, mutex, preview_arg
 from ..formatters import (
     _render_callsites_text,
     _render_evidence_xrefs_text,
@@ -12,7 +12,6 @@ from ..formatters import (
     _render_function_evidence_text,
     _render_init_arrays_text,
     _render_function_info_text,
-    _render_mutation_text,
     _render_function_list_text,
     _render_name_address_list_text,
     _render_message_lens_text,
@@ -153,22 +152,16 @@ def _function_info(args: argparse.Namespace) -> int:
          help="Create and analyze a function at an address auto-analysis missed",
          target=True, fmt="json",
          args=[
-             arg("--preview", action="store_true",
-                 help="Create, verify, then revert without committing"),
+             preview_arg("Create, verify, then revert without committing"),
              arg("address", help="Address of the function entry point (hex or decimal)"),
          ])
 def _function_create(args: argparse.Namespace) -> int:
-    return _call(
+    return _mutate(
         args,
         "function_create",
-        {
-            "address": args.address,
-            "preview": bool(args.preview),
-        },
-        require_target=True,
-        text_renderer=_render_mutation_text,
+        {"address": args.address},
+        preview=bool(args.preview),
         stem="function-create",
-        result_exit_code=_mutation_exit_code,
     )
 
 

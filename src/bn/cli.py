@@ -11,6 +11,7 @@ from . import session_state
 from .formatters import (
     FAILED_MUTATION_STATUSES,
     _format_operation_result,  # noqa: F401  -- re-exported for tests/scripts that monkeypatch bn.cli
+    _render_mutation_text,
     _render_target_choices,
 )
 from .output import render_envelope, render_error, write_output_result
@@ -274,6 +275,17 @@ def arg(*flags: str, **kwargs: Any) -> tuple[tuple[str, ...], dict[str, Any]]:
 def mutex(required: bool, *args: tuple[tuple[str, ...], dict[str, Any]]) -> tuple[bool, list[tuple[tuple[str, ...], dict[str, Any]]]]:
     """Define a mutually exclusive argument group for :func:`command`."""
     return (required, list(args))
+
+
+def preview_arg(
+    help: str = "Apply, capture diffs, then revert without committing",
+) -> tuple[tuple[str, ...], dict[str, Any]]:
+    """The shared ``--preview`` flag every mutation command exposes.
+
+    A few commands phrase the help slightly differently (e.g. ``function create``
+    says "Create, verify, then revert"); pass *help* to override.
+    """
+    return arg("--preview", action="store_true", help=help)
 
 
 def command(
@@ -565,6 +577,38 @@ def _mutation_exit_code(result: Any) -> int:
     if result.get("success") is False:
         return 3
     return 0
+
+
+def _mutate(
+    args: argparse.Namespace,
+    op: str,
+    params: dict[str, Any],
+    *,
+    stem: str,
+    require_target: bool = True,
+    preview: bool | None = None,
+    **call_kwargs: Any,
+) -> int:
+    """:func:`_call` specialized for mutations.
+
+    Every mutation command shares the same tail -- the mutation text renderer and
+    the verification-aware exit code -- and differs only in its op, param dict,
+    and stem. This bakes in that tail and, when *preview* is supplied, injects the
+    ``preview`` param so handlers don't each repeat ``"preview": bool(args.preview)``.
+    Extra keyword args (e.g. ``bridge_writes_output``) pass through to ``_call``.
+    """
+    if preview is not None:
+        params = {**params, "preview": preview}
+    return _call(
+        args,
+        op,
+        params,
+        require_target=require_target,
+        text_renderer=_render_mutation_text,
+        result_exit_code=_mutation_exit_code,
+        stem=stem,
+        **call_kwargs,
+    )
 
 
 def _call(

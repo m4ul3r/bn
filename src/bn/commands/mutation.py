@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import argparse
 
-from ..cli import _call, _mutation_exit_code, arg, command, mutex
+from ..cli import _call, _mutate, arg, command, mutex, preview_arg
 from ..formatters import (
     _render_comment_list_text,
     _render_comment_text,
     _render_local_list_text,
-    _render_mutation_text,
     _render_proto_text,
 )
 
@@ -15,8 +14,7 @@ from ..formatters import (
 _RENAME_ARGS = [
     arg("--kind", choices=("auto", "function", "data"), default="auto",
         help="Symbol kind to rename: auto-detect (default), function, or data"),
-    arg("--preview", action="store_true",
-        help="Apply, capture diffs, then revert without committing"),
+    preview_arg(),
     arg("identifier", help="Current symbol name or address (hex 0x.. or decimal)"),
     arg("new_name", help="New symbol name"),
 ]
@@ -28,19 +26,16 @@ _RENAME_ARGS = [
          target=True, fmt="json", args=_RENAME_ARGS)
 @command("symbol", "rename", help="Rename a symbol", target=True, fmt="json", args=_RENAME_ARGS)
 def _symbol_rename(args: argparse.Namespace) -> int:
-    return _call(
+    return _mutate(
         args,
         "rename_symbol",
         {
             "kind": args.kind,
             "identifier": args.identifier,
             "new_name": args.new_name,
-            "preview": bool(args.preview),
         },
-        require_target=True,
-        text_renderer=_render_mutation_text,
+        preview=bool(args.preview),
         stem="symbol-rename",
-        result_exit_code=_mutation_exit_code,
     )
 
 
@@ -64,27 +59,23 @@ def _comment_list(args: argparse.Namespace) -> int:
 
 @command("comment", "set", help="Set a comment", target=True, fmt="json",
          args=[
-             arg("--preview", action="store_true",
-                 help="Apply, capture diffs, then revert without committing"),
+             preview_arg(),
              arg("comment"),
          ],
          # --address and --function target different locations; the bridge checks
          # function first, so accepting both silently dropped the address (#94).
          mutex_groups=[mutex(True, arg("--address"), arg("--function"))])
 def _comment_set(args: argparse.Namespace) -> int:
-    return _call(
+    return _mutate(
         args,
         "set_comment",
         {
             "address": args.address,
             "function": args.function,
             "comment": args.comment,
-            "preview": bool(args.preview),
         },
-        require_target=True,
-        text_renderer=_render_mutation_text,
+        preview=bool(args.preview),
         stem="comment-set",
-        result_exit_code=_mutation_exit_code,
     )
 
 
@@ -105,47 +96,37 @@ def _comment_get(args: argparse.Namespace) -> int:
 
 
 @command("comment", "delete", help="Delete a comment", target=True, fmt="json",
-         args=[
-             arg("--preview", action="store_true",
-                 help="Apply, capture diffs, then revert without committing"),
-         ],
+         args=[preview_arg()],
          mutex_groups=[mutex(True, arg("--address"), arg("--function"))])
 def _comment_delete(args: argparse.Namespace) -> int:
-    return _call(
+    return _mutate(
         args,
         "delete_comment",
         {
             "address": args.address,
             "function": args.function,
-            "preview": bool(args.preview),
         },
-        require_target=True,
-        text_renderer=_render_mutation_text,
+        preview=bool(args.preview),
         stem="comment-delete",
-        result_exit_code=_mutation_exit_code,
     )
 
 
 @command("proto", "set", help="Set a prototype", target=True, fmt="json",
          args=[
-             arg("--preview", action="store_true",
-                 help="Apply, capture diffs, then revert without committing"),
+             preview_arg(),
              arg("identifier", help="Function name or address (hex 0x.. or decimal)"),
              arg("prototype", help="Full C prototype string, e.g. \"int __cdecl f(Player* self)\""),
          ])
 def _proto_set(args: argparse.Namespace) -> int:
-    return _call(
+    return _mutate(
         args,
         "set_prototype",
         {
             "identifier": args.identifier,
             "prototype": args.prototype,
-            "preview": bool(args.preview),
         },
-        require_target=True,
-        text_renderer=_render_mutation_text,
+        preview=bool(args.preview),
         stem="prototype-set",
-        result_exit_code=_mutation_exit_code,
     )
 
 
@@ -177,49 +158,41 @@ def _local_list(args: argparse.Namespace) -> int:
 
 @command("local", "rename", help="Rename a local", target=True, fmt="json",
          args=[
-             arg("--preview", action="store_true",
-                 help="Apply, capture diffs, then revert without committing"),
+             preview_arg(),
              arg("function"),
              arg("variable", help="Stable local_id or legacy variable name"),
              arg("new_name"),
          ])
 def _local_rename(args: argparse.Namespace) -> int:
-    return _call(
+    return _mutate(
         args,
         "local_rename",
         {
             "function": args.function,
             "variable": args.variable,
             "new_name": args.new_name,
-            "preview": bool(args.preview),
         },
-        require_target=True,
-        text_renderer=_render_mutation_text,
+        preview=bool(args.preview),
         stem="local-rename",
-        result_exit_code=_mutation_exit_code,
     )
 
 
 @command("local", "retype", help="Retype a local", target=True, fmt="json",
          args=[
-             arg("--preview", action="store_true",
-                 help="Apply, capture diffs, then revert without committing"),
+             preview_arg(),
              arg("function"),
              arg("variable", help="Stable local_id or legacy variable name"),
              arg("new_type"),
          ])
 def _local_retype(args: argparse.Namespace) -> int:
-    return _call(
+    return _mutate(
         args,
         "local_retype",
         {
             "function": args.function,
             "variable": args.variable,
             "new_type": args.new_type,
-            "preview": bool(args.preview),
         },
-        require_target=True,
-        text_renderer=_render_mutation_text,
+        preview=bool(args.preview),
         stem="local-retype",
-        result_exit_code=_mutation_exit_code,
     )

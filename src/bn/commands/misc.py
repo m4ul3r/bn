@@ -6,10 +6,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ..cli import _call, _effective_limit, _int_or_hex, _mutation_exit_code, _non_negative_int, _pick, arg, command, mutex
+from ..cli import _call, _effective_limit, _int_or_hex, _mutate, _non_negative_int, _pick, arg, command, mutex, preview_arg
 from ..formatters import (
     _render_imports_summary_text,
-    _render_mutation_text,
     _render_name_address_list_text,
     _render_py_exec_text,
     _render_read_text,
@@ -298,8 +297,7 @@ def _py_exec(args: argparse.Namespace) -> int:
 
 @command("batch", "apply", help="Apply a JSON manifest", fmt="json",
          args=[
-             arg("--preview", action="store_true",
-                 help="Apply the whole batch, capture diffs, then revert without committing"),
+             preview_arg("Apply the whole batch, capture diffs, then revert without committing"),
              arg("manifest", type=Path,
                  help=(
                      "JSON manifest source: a file path, or \"-\" to read from stdin. "
@@ -375,12 +373,12 @@ def _batch_apply(args: argparse.Namespace) -> int:
         manifest.pop("target", None)
     if args.preview:
         manifest["preview"] = True
-    return _call(
+    # preview is already set on the manifest above, so it is not passed through
+    # _mutate's preview= injection here.
+    return _mutate(
         args,
         "batch_apply",
         manifest,
         require_target=False,
-        text_renderer=_render_mutation_text,
         stem="batch-apply",
-        result_exit_code=_mutation_exit_code,
     )
