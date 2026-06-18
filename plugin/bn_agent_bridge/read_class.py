@@ -232,6 +232,41 @@ def _build_class_registry(ctx, bv, *, query: str | None = None) -> dict[str, dic
     return registry
 
 
+# Standard-library / ABI-runtime top-level namespaces folded out by --no-stl.
+_LIBRARY_NAMESPACES = frozenset({"std", "__gnu_cxx", "__cxxabiv1"})
+
+
+def _first_toplevel_component(head: str) -> str:
+    """The component before the first top-level ``::`` (angle-depth aware), or
+    *head* itself when there is none -- i.e. the outermost namespace."""
+    angle = 0
+    i = 0
+    n = len(head)
+    while i < n:
+        ch = head[i]
+        if ch == "<":
+            angle += 1
+        elif ch == ">" and angle:
+            angle -= 1
+        elif ch == ":" and angle == 0 and i + 1 < n and head[i + 1] == ":":
+            return head[:i]
+        i += 1
+    return head
+
+
+def _is_library_class(name: str) -> bool:
+    """True for a C++ standard-library / ABI-runtime class -- `std::`,
+    `__gnu_cxx::`, `__cxxabiv1::` -- or a reserved-identifier implementation
+    internal at top level (`__detail`, `_Hashtable`, `_Sp_counted_ptr_inplace`).
+    Used by ``--no-stl`` to fold library noise out of the class listing so the
+    domain classes surface."""
+    first = _first_toplevel_component(_strip_signature(name))
+    if first in _LIBRARY_NAMESPACES:
+        return True
+    base = first.split("<", 1)[0]  # drop any template args on the component
+    return base.startswith("__") or (len(base) >= 2 and base[0] == "_" and base[1].isupper())
+
+
 def _list_row(rec: dict[str, Any]) -> dict[str, Any]:
     return {
         "name": rec["name"],
@@ -249,25 +284,37 @@ def _class_list(
     *,
     query: str | None = None,
     include_all: bool = False,
+    no_stl: bool = False,
     offset: int = 0,
     limit: int | None = None,
 ) -> dict[str, Any]:
     bv = ctx._resolve_view(selector)
     registry = _build_class_registry(ctx, bv, query=query)
-    rows = [
-        _list_row(rec)
-        for rec in registry.values()
-        if include_all or rec["confidence"] in ("rtti", "ctor")
-    ]
+    rows = []
+    library_suppressed = 0
+    for rec in registry.values():
+        if not (include_all or rec["confidence"] in ("rtti", "ctor")):
+            continue
+        if no_stl and _is_library_class(rec["name"]):
+            library_suppressed += 1
+            continue
+        rows.append(_list_row(rec))
     rows.sort(key=lambda r: r["name"])
-    # `total` counts the rows AFTER the confidence filter but before paging, so
-    # it reflects what this query matched (it grows when --all is added).
+    # `total` counts the rows AFTER the confidence + --no-stl filters but before
+    # paging, so it reflects what this query actually surfaced.
     total = len(rows)
     if offset:
         rows = rows[offset:]
     if limit is not None:
         rows = rows[:limit]
-    return {"classes": rows, "total": total, "offset": offset, "include_all": include_all}
+    return {
+        "classes": rows,
+        "total": total,
+        "offset": offset,
+        "include_all": include_all,
+        "no_stl": no_stl,
+        "library_suppressed": library_suppressed,
+    }
 
 
 def _slot_is_code(target: dict[str, Any]) -> bool:

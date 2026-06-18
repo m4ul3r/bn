@@ -1784,6 +1784,7 @@ def _bind_class_list(bridge, params, target):
         target,
         query=params.get("query"),
         include_all=_validate_bool(params.get("include_all"), label="include_all", default=False),
+        no_stl=_validate_bool(params.get("no_stl"), label="no_stl", default=False),
         offset=int(params.get("offset", 0)),
         limit=int(params["limit"]) if params.get("limit") is not None else None,
     )

@@ -5354,6 +5354,11 @@ def test_class_list_invokes_op(monkeypatch):
     assert captured["op"] == "class_list"
     assert captured["params"]["include_all"] is True
     assert captured["params"]["query"] == "Session"
+    assert "no_stl" not in captured["params"]   # flag absent unless passed
+
+    args = build_parser().parse_args(["class", "list", "--no-stl"])
+    assert args.handler(args) == 0
+    assert captured["params"]["no_stl"] is True
 
 
 def test_class_show_invokes_op(monkeypatch):

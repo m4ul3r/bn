@@ -244,6 +244,49 @@ def test_class_list_envelope_filters_and_pages():
     assert "net::Session" in [c["name"] for c in confirmed["classes"]]
 
 
+def test_is_library_class():
+    f = read_class._is_library_class
+    assert f("std::vector<int>")
+    assert f("std::__cxx11::basic_string<char>")
+    assert f("__gnu_cxx::__normal_iterator<char*>")
+    assert f("__cxxabiv1::__si_class_type_info")
+    assert f("std::_Bind<bool ()>")
+    assert f("_Hashtable<std::pair<int, int>>")        # bare reserved-id internal
+    assert f("_Sp_counted_ptr_inplace<Foo>")
+    assert f("__detail::_Map_base")
+    assert not f("alexaClientSDK::endpoints::EndpointBuilder")
+    assert not f("net::Session")
+    assert not f("Controller")
+    assert not f("MyStd")          # 'std' must be a whole component, not a prefix
+    assert not f("standard::Foo")
+
+
+def test_class_list_no_stl_filters_library_classes():
+    fns = [
+        _Fn(0x1000, "_ZN3net7SessionC1Ev", "net::Session::Session()"),
+        _Fn(0x1100, "_ZNSt6vectorIiE9push_backEi", "std::vector<int>::push_back(int)"),
+        _Fn(0x1200, "_ZN9__gnu_cxx3fooEv", "__gnu_cxx::foo()"),
+    ]
+    syms = [_Sym("_ZTVN3net7SessionE", "_vtable_for_net::Session", 0x9000)]
+    bv = _RegistryBV(fns, syms)
+
+    class _Ctx:
+        def _resolve_view(self, sel):
+            return bv
+
+    out = read_class._class_list(_Ctx(), None, include_all=True, no_stl=True)
+    names = [c["name"] for c in out["classes"]]
+    assert "net::Session" in names
+    assert "std::vector<int>" not in names
+    assert "__gnu_cxx" not in names
+    assert out["no_stl"] is True
+    assert out["library_suppressed"] >= 2
+    # Without --no-stl the library classes are present.
+    full = read_class._class_list(_Ctx(), None, include_all=True)
+    assert "std::vector<int>" in [c["name"] for c in full["classes"]]
+    assert full["library_suppressed"] == 0
+
+
 class _VtableCtx:
     """Minimal ctx exposing the pointer-table reader over a fake slot map."""
     def __init__(self, slots, pure_addr=0xDEAD):

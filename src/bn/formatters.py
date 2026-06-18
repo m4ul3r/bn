@@ -1997,7 +1997,11 @@ def _render_class_list_text(value: Any) -> str:
         return _render_fallback_text(value)
     rows = list(value.get("classes") or [])
     total = value.get("total", len(rows))
-    lines = [f"classes: {len(rows)} shown of {total}"]
+    header = f"classes: {len(rows)} shown of {total}"
+    suppressed = value.get("library_suppressed") or 0
+    if value.get("no_stl") and suppressed:
+        header += f" ({suppressed} library/STL classes hidden)"
+    lines = [header]
     for rec in rows:
         if not isinstance(rec, dict):
             lines.append(_render_fallback_text(rec))
