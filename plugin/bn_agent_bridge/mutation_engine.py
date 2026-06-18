@@ -269,6 +269,10 @@ def _diff_type_snapshots(ctx, before: dict[str, Any], after: dict[str, Any]):
         )
         changed = old["decl"] != new["decl"] or old["layout"] != new["layout"]
         entry = {
+            # `name` mirrors `type_name` (the qualified type name): an agent keying
+            # off affected_types[].name previously read null because only
+            # `type_name` was emitted, making a real change look anonymous (#211).
+            "name": type_name,
             "type_name": type_name,
             "before_decl": old["decl"],
             "after_decl": new["decl"],
