@@ -970,7 +970,8 @@ def _render_pointer_table_text(value: Any) -> str:
         return _render_fallback_text(value)
     lines = [
         f"pointer table @ {value.get('address', '<unknown>')}",
-        f"pointer-size: {value.get('pointer_size', '<unknown>')}  stride: {value.get('stride', '<unknown>')}",
+        f"pointer-size: {value.get('pointer_size', '<unknown>')}  stride: {value.get('stride', '<unknown>')}"
+        f"  read-width: {value.get('read_width', value.get('pointer_size', '<unknown>'))}",
     ]
     suffix = _context_suffix(value.get("context"))
     if suffix:
@@ -1029,6 +1030,22 @@ def _render_message_lens_text(value: Any) -> str:
                     lines.append(f"    table @ {table.get('address', '<unknown>')}")
                     for warning in list(table.get("warnings") or [])[:2]:
                         lines.append(f"      warning: {warning}")
+    # Resolved RTTI data symbols (the real vtable/typeinfo the lens targets, #194)
+    for sym in list(value.get("rtti_symbols") or []):
+        if not isinstance(sym, dict):
+            continue
+        xr = sym.get("xrefs") if isinstance(sym.get("xrefs"), dict) else {}
+        cc = len(list(xr.get("code_refs") or []))
+        dc = len(list(xr.get("data_refs") or []))
+        lines.append("")
+        lines.append(f"rtti {sym.get('kind', '?')}: {sym.get('symbol', '')} @ {sym.get('address', '?')}"
+                     f"  xrefs: {cc} code, {dc} data")
+        tw = sym.get("table_window")
+        if isinstance(tw, dict):
+            lines.append(f"    vtable window @ {tw.get('address', '?')} "
+                         f"({len(list(tw.get('entries') or []))} slots)")
+    for hint in list(value.get("hints") or []):
+        lines.append(f"hint: {hint}")
     return "\n".join(lines)
 
 
