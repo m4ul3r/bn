@@ -211,3 +211,66 @@ def test_size_survives_find_type_raising():
             raise RuntimeError("Type not found: " + name)
     out = read_class._object_size(_RaisingCtx(new_size=(0x40, 0x1000)), object(), {"name": "X", "methods": []})
     assert out["value"] == "0x40" and out["source"] == "operator_new"
+
+
+class _RttiCtx:
+    """ctx reading little-endian words from a fake memory map and resolving a
+    typeinfo address back to a class name."""
+    def __init__(self, words, ti_names):
+        self._words = words            # {addr: int}
+        self._ti_names = ti_names      # {addr: class_name}
+
+    def _pointer_size(self, bv):
+        return 8
+
+    def _read_pointer_value(self, bv, addr, *, size=None):
+        return self._words.get(addr)
+
+    def _read_u32(self, bv, addr):
+        return self._words.get(addr)
+
+    def _typeinfo_name_at(self, bv, addr):
+        return self._ti_names.get(addr)
+
+
+def test_rtti_si_single_base():
+    # __si_class_type_info: [vptr][name-ptr][base-ti-ptr]; base at after_name(0x9110)
+    words = {0x9100: 0xAB00, 0x9108: 0x9300, 0x9110: 0x9200}
+    ctx = _RttiCtx(words, {0x9200: "net::Endpoint"})
+    bases = read_class._rtti_bases(ctx, object(), 0x9100, kind_hint="si")
+    assert bases == [{"name": "net::Endpoint", "address": "0x9200", "kind": "public"}]
+
+
+def test_rtti_vmi_multiple_bases():
+    # __vmi_class_type_info. after_name = 0x9100 + 2*8 = 0x9110.
+    #   flags  (u32) @ 0x9110, base_count (u32) @ 0x9114, base array @ 0x9118.
+    words = {
+        0x9100: 0xAB10, 0x9108: 0x9300,
+        0x9110: 0x0,            # flags
+        0x9114: 2,              # base_count
+        0x9118: 0x9200, 0x9120: (2 << 8) | 0x2,   # base0: ti ptr, off_flags (public)
+        0x9128: 0x9240, 0x9130: (4 << 8) | 0x2,   # base1: ti ptr, off_flags
+    }
+    ctx = _RttiCtx(words, {0x9200: "net::A", 0x9240: "net::B"})
+    bases = read_class._rtti_bases(ctx, object(), 0x9100, kind_hint="vmi")
+    assert [b["name"] for b in bases] == ["net::A", "net::B"]
+
+
+def test_rtti_no_base():
+    ctx = _RttiCtx({0x9100: 0xAB20, 0x9108: 0x9300}, {})
+    assert read_class._rtti_bases(ctx, object(), 0x9100, kind_hint="base") == []
+
+
+def test_rtti_infers_si_without_hint():
+    # No kind_hint -> structural inference: a resolvable base ptr at after_name -> si.
+    words = {0x9100: 0xAB00, 0x9108: 0x9300, 0x9110: 0x9200}
+    ctx = _RttiCtx(words, {0x9200: "net::Endpoint"})
+    bases = read_class._rtti_bases(ctx, object(), 0x9100)
+    assert [b["name"] for b in bases] == ["net::Endpoint"]
+
+
+def test_rtti_infers_no_base_without_hint():
+    # after_name word doesn't resolve to a typeinfo and no plausible count -> base.
+    words = {0x9100: 0xAB20, 0x9108: 0x9300, 0x9110: 0x0, 0x9114: 0}
+    ctx = _RttiCtx(words, {})
+    assert read_class._rtti_bases(ctx, object(), 0x9100) == []

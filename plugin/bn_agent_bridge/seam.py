@@ -692,6 +692,25 @@ class BridgeContext:
         _object_size still yields real sizes when a type is defined."""
         return None
 
+    def _read_u32(self, bv, address):
+        try:
+            data = bytes(bv.read(address, 4))
+        except Exception:
+            return None
+        return int.from_bytes(data, self._byteorder(bv), signed=False) if len(data) == 4 else None
+
+    def _typeinfo_name_at(self, bv, address):
+        """Class name for a _ZTI object address: prefer its data symbol's
+        demangled 'typeinfo for X' marker; None if unresolved."""
+        sym = bv.get_symbol_at(address) if hasattr(bv, "get_symbol_at") else None
+        if sym is None:
+            return None
+        short = str(getattr(sym, "short_name", "") or "")
+        for marker in ("typeinfo for ", "_typeinfo_for_"):
+            if short.startswith(marker):
+                return short[len(marker):].strip()
+        return None
+
     # ---- relocated cycle-breakers (design spec §3.2): both state-free ----
 
     def _find_type(self, bv, type_name: str):

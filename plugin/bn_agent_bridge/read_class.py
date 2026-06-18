@@ -284,6 +284,60 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
     return {"address": hex(int(vtable_addr)), "slots": slots}
 
 
+def _rtti_bases(ctx, bv, typeinfo_addr: int, *, kind_hint: str | None = None) -> list[dict[str, Any]]:
+    """Base classes from an Itanium ``_ZTI`` object. ``kind_hint`` selects the
+    layout: 'base' (no bases), 'si' (single), 'vmi' (multiple). When absent,
+    infer structurally from the base-typeinfo pointers that resolve."""
+    ptr = ctx._pointer_size(bv)
+    name_field = typeinfo_addr + ptr          # word[1] = type-name ptr  # noqa: F841
+    after_name = typeinfo_addr + 2 * ptr      # first layout-specific word
+
+    def resolve(ti_addr: int, kind: str = "public") -> dict[str, Any]:
+        return {
+            "name": ctx._typeinfo_name_at(bv, ti_addr),
+            "address": hex(int(ti_addr)),
+            "kind": kind,
+        }
+
+    kind = kind_hint or _infer_rtti_kind(ctx, bv, typeinfo_addr, ptr)
+    if kind == "base":
+        return []
+    if kind == "si":
+        base = ctx._read_pointer_value(bv, after_name, size=ptr)
+        return [resolve(base)] if base else []
+    if kind == "vmi":
+        # [flags:u32][base_count:u32] then base_count * (base-ti-ptr, off_flags)
+        count = ctx._read_u32(bv, after_name + 4) or 0
+        rec = after_name + 8
+        out: list[dict[str, Any]] = []
+        for _ in range(min(int(count), 64)):
+            ti = ctx._read_pointer_value(bv, rec, size=ptr)
+            off_flags = ctx._read_pointer_value(bv, rec + ptr, size=ptr) or 0
+            rec += 2 * ptr
+            if not ti:
+                continue
+            kind_s = "virtual" if (off_flags & 0x1) else "public"
+            out.append(resolve(ti, kind_s))
+        return out
+    return []
+
+
+def _infer_rtti_kind(ctx, bv, typeinfo_addr: int, ptr: int) -> str:
+    """Best-effort layout inference when the __*_class_type_info selector
+    symbol is unavailable: a resolvable single base ptr -> 'si'; a small
+    plausible count followed by resolvable base ptrs -> 'vmi'; else 'base'."""
+    after_name = typeinfo_addr + 2 * ptr
+    candidate = ctx._read_pointer_value(bv, after_name, size=ptr)
+    if candidate and ctx._typeinfo_name_at(bv, candidate):
+        return "si"
+    count = ctx._read_u32(bv, after_name + 4) or 0
+    if 0 < count <= 16:
+        first = ctx._read_pointer_value(bv, after_name + 8, size=ptr)
+        if first and ctx._typeinfo_name_at(bv, first):
+            return "vmi"
+    return "base"
+
+
 def _object_size(ctx, bv, record: dict[str, Any]) -> dict[str, Any] | None:
     """Object size with provenance. A defined BN type's width wins (authoritative
     when present); else the operator-new size at a construction site; else None
