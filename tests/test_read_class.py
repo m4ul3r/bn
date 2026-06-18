@@ -186,6 +186,46 @@ def test_vtable_layout_skips_when_header_not_typeinfo():
     assert layout["slots"] == []
 
 
+def test_vtable_layout_demangles_slot_name():
+    # Slot labels should be demangled (symbol short_name), like the methods list,
+    # not the raw mangled fn.name. The mangled name is kept alongside. (#205)
+    class _Fn2:
+        start = 0x41eeb0
+        name = "_ZN3net7Session6onDataEv"
+        symbol = _Sym("_ZN3net7Session6onDataEv", "net::Session::onData()", 0x41eeb0)
+
+    class _BV2:
+        def get_function_at(self, a):
+            return _Fn2() if a == 0x41eeb0 else None
+
+    class _Ctx:
+        def _pointer_size(self, bv):
+            return 8
+
+        def _read_pointer_value(self, bv, addr, *, size=None):
+            return 0x9100
+
+        def _typeinfo_name_at(self, bv, addr):
+            return "net::Session"
+
+        def _pointer_table_layout(self, bv, start, *, entries, stride):
+            return {"entries": [
+                {"index": 0, "value": "0x41eeb0", "readable": True,
+                 "target": {"status": "function",
+                            "function": {"name": "_ZN3net7Session6onDataEv", "address": "0x41eeb0"}}}]}
+
+    slot = read_class._vtable_layout(_Ctx(), _BV2(), 0x9000)["slots"][0]
+    assert slot["method"]["display_name"] == "net::Session::onData()"
+    assert slot["method"]["name"] == "_ZN3net7Session6onDataEv"   # mangled kept
+
+    from bn.formatters import _render_class_show_text
+    rec = {"name": "net::Session", "confidence": "rtti", "size": None, "bases": [],
+           "methods": [], "instances": {"construction_sites": [], "stored_globals": []},
+           "vtable": {"address": "0x9000", "slots": [slot]}}
+    assert "net::Session::onData()" in _render_class_show_text(rec)
+    assert "_ZN3net7Session6onDataEv" not in _render_class_show_text(rec)
+
+
 def test_vtable_layout_stops_at_data_slot():
     # A pointer the classifier deems data (kind != "code") is not a slot -- it
     # ends the scan rather than rendering adjacent data as fake slots (#205).

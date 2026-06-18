@@ -2058,9 +2058,10 @@ def _render_one_class(rec: Any) -> str:
     if vt and vt.get("slots"):
         for s in vt["slots"]:
             method = s.get("method") or {}
+            slot_name = method.get("display_name") or method.get("name") if isinstance(method, dict) else None
             label = (
                 "__cxa_pure_virtual" if s.get("pure_virtual")
-                else method.get("name") if isinstance(method, dict) and method.get("name")
+                else slot_name if slot_name
                 else "<unnamed>"
             )
             lines.append(f"  vtable [{s.get('index')}] {s.get('address', '?')}  {label}")

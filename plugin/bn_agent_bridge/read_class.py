@@ -376,14 +376,39 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
         if not row.get("readable") or not _slot_is_code(target):
             break
         name = (fn or {}).get("name") if isinstance(fn, dict) else None
+        method = None
+        if isinstance(fn, dict):
+            # The pointer-table function dict carries the MANGLED fn.name; add the
+            # demangled display name (symbol short_name) so vtable slots read like
+            # the methods list, not raw `_ZN...`. Mangled `name` is kept. (#205)
+            method = {**fn, "display_name": _demangled_slot_name(bv, fn)}
         slots.append({
             "index": i,
             "address": row.get("value"),
-            "method": fn if isinstance(fn, dict) else None,
+            "method": method,
             "pure_virtual": name == "__cxa_pure_virtual",
             "unnamed": (isinstance(name, str) and name.startswith("sub_")) or (fn is None),
         })
     return {"address": hex(int(vtable_addr)), "slots": slots}
+
+
+def _demangled_slot_name(bv, fn: dict[str, Any]) -> str | None:
+    """Demangled display name for a vtable slot's function (the symbol's
+    short_name, via il_format._display_name), falling back to the mangled
+    ``fn.name`` when the function can't be resolved on *bv* (e.g. in tests)."""
+    mangled = fn.get("name")
+    addr = fn.get("address")
+    getf = getattr(bv, "get_function_at", None)
+    if callable(getf) and addr:
+        try:
+            func = getf(int(addr, 16))
+        except Exception:
+            func = None
+        if func is not None:
+            disp = il_format._display_name(func)
+            if disp:
+                return disp
+    return mangled
 
 
 def _rtti_bases(ctx, bv, typeinfo_addr: int, *, kind_hint: str | None = None) -> list[dict[str, Any]]:
