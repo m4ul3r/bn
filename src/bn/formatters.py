@@ -136,9 +136,18 @@ def _render_proto_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     prototype = value.get("prototype")
-    if isinstance(prototype, str):
-        return prototype
-    return _render_fallback_text(value)
+    if not isinstance(prototype, str):
+        return _render_fallback_text(value)
+    # BN renders the prototype anonymously (`uint64_t (int32_t arg1)`); splice in
+    # the function name so the output is a copy-pasteable C declaration (#222).
+    fn = value.get("function")
+    name = fn.get("name") if isinstance(fn, dict) else None
+    head, sep, rest = prototype.partition("(")
+    if name and sep and name not in head:
+        head = head.rstrip()
+        joiner = "" if head.endswith("*") else " "
+        return f"{head}{joiner}{name}({rest}"
+    return prototype
 
 
 def _render_local_list_text(value: Any) -> str:
@@ -323,7 +332,13 @@ def _render_close_text(value: Any) -> str:
 def _render_save_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    return f"saved: {value.get('path', '<unknown>')}"
+    line = f"saved: {value.get('path', '<unknown>')}"
+    if value.get("fallback"):
+        # The default path was unwritable (e.g. a read-only firmware mount); the
+        # database landed in the writable cache instead (#214).
+        line += (f"\nnote: {value.get('requested_path')} was not writable; "
+                 f"saved to the cache instead")
+    return line
 
 
 def _render_session_start_text(value: Any) -> str:
@@ -690,6 +705,25 @@ def _xref_buckets(value: dict[str, Any]) -> tuple[list[Any], list[Any], int, int
     total_data = value.get("data_ref_count")
     total_data = len(data_refs) if total_data is None else total_data
     return code_refs, data_refs, total_code, total_data
+
+
+def _render_xrefs_any_text(value: Any) -> str:
+    """Render the multi-symbol sink-sweep (`xrefs --any`): one line per symbol,
+    present (with counts) or absent (#218)."""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    syms = list(value.get("symbols") or [])
+    lines = [f"xrefs --any: {value.get('present', 0)}/{value.get('count', len(syms))} symbol(s) present"]
+    for s in syms:
+        if not isinstance(s, dict):
+            continue
+        if s.get("present"):
+            lines.append(
+                f"  {s.get('symbol')}: {s.get('code_ref_count', 0)} code refs across "
+                f"{s.get('caller_function_count', 0)} fn(s)  @ {s.get('address', '?')}")
+        else:
+            lines.append(f"  {s.get('symbol')}: absent")
+    return "\n".join(lines)
 
 
 def _render_xrefs_text(value: Any, limit: int | None = None) -> str:

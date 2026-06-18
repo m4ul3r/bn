@@ -3,6 +3,7 @@ from __future__ import annotations
 import atexit
 import contextlib
 import errno
+import hashlib
 import json
 import os
 import socket
@@ -42,7 +43,7 @@ from ._shared import (
     _write_json_artifact,
 )
 from .op_registry import REGISTRY, op
-from .paths import PLUGIN_NAME, bridge_registry_path, bridge_socket_path, instances_dir
+from .paths import PLUGIN_NAME, bridge_registry_path, bridge_socket_path, cache_home, instances_dir
 from .seam import BridgeContext
 from .version import VERSION, build_id_for_file, build_id_for_package
 
@@ -872,33 +873,59 @@ class BinaryNinjaBridge:
     def _save_database(self, target: str | None, path: str | None = None):
         bv = self.targets.resolve(target)
         filename = getattr(bv.file, "filename", "")
+        explicit = path is not None
         if path:
             out = str(Path(path).expanduser().resolve())
         elif filename.endswith(".bndb"):
             out = filename
         else:
             out = filename + ".bndb"
-        out_path = Path(out)
-        if not out_path.parent.exists():
-            raise RuntimeError(
-                f"Cannot save database to {out}: directory does not exist: {out_path.parent}"
-            )
-        # create_database returns a bool: False means Binary Ninja could not write
-        # the file (e.g. an unwritable directory). The previous code discarded that
-        # return value and unconditionally reported success, silently losing the
-        # analysis. Treat a falsy result -- or a path that simply isn't there
-        # afterward -- as a hard failure so callers never get a false "saved".
+
+        def _attempt(dest: str, *, make_parent: bool = False) -> str:
+            dp = Path(dest)
+            if make_parent:
+                dp.parent.mkdir(parents=True, exist_ok=True)
+            if not dp.parent.exists():
+                raise RuntimeError(
+                    f"Cannot save database to {dest}: directory does not exist: {dp.parent}"
+                )
+            # create_database returns a bool: False means Binary Ninja could not
+            # write the file (e.g. an unwritable directory). A falsy result -- or
+            # a path that simply isn't there afterward -- is a hard failure so
+            # callers never get a false "saved".
+            try:
+                created = bv.create_database(dest)
+            except Exception as exc:  # noqa: BLE001 - surface BN I/O errors cleanly
+                raise RuntimeError(f"Failed to save database to {dest}: {exc}") from exc
+            if created is False or not dp.exists():
+                raise RuntimeError(
+                    f"Failed to save database to {dest}: Binary Ninja reported no file was "
+                    "written (check that the directory exists and is writable)"
+                )
+            return dest
+
         try:
-            created = bv.create_database(out)
-        except Exception as exc:  # noqa: BLE001 - surface BN I/O errors cleanly
-            raise RuntimeError(f"Failed to save database to {out}: {exc}") from exc
-        if created is False or not out_path.exists():
-            raise RuntimeError(
-                f"Failed to save database to {out}: Binary Ninja reported no file was "
-                "written (check that the directory exists and is writable)"
-            )
+            saved = _attempt(out)
+        except RuntimeError as exc:
+            # The common VR case is a binary on a read-only mount (firmware
+            # image): the default <binary>.bndb write fails. Rather than lose the
+            # annotations, retry into a writable cache dir and report where it
+            # landed (#214). An EXPLICIT --path failure stays a hard error -- the
+            # user chose that location, so a silent relocation would be wrong.
+            if explicit:
+                raise
+            stem = Path(filename or out).name or "target"
+            digest = hashlib.sha256((filename or out).encode("utf-8")).hexdigest()[:16]
+            fallback = cache_home() / "bndb" / f"{stem}.{digest}.bndb"
+            try:
+                saved = _attempt(str(fallback), make_parent=True)
+            except RuntimeError:
+                raise exc  # report the ORIGINAL (default-path) failure, not the fallback's
+            self.targets.clear_dirty(bv)
+            return {"saved": True, "path": saved, "fallback": True, "requested_path": out}
+
         self.targets.clear_dirty(bv)  # mutations are now persisted (L15)
-        return {"saved": True, "path": out}
+        return {"saved": True, "path": saved}
 
     def _target_info(self, selector: str | None, *, verbose: bool = False):
         bv = self.targets.resolve(selector)
@@ -1296,6 +1323,9 @@ class BinaryNinjaBridge:
     def _xrefs(self, *a, **k):
         return read_xrefs._xrefs(self.ctx, *a, **k)
 
+    def _xrefs_any(self, *a, **k):
+        return read_xrefs._xrefs_any(self.ctx, *a, **k)
+
     def _import_symbol_name(self, *a, **k):
         return read_xrefs._import_symbol_name(*a, **k)
 
@@ -1667,6 +1697,7 @@ def _bind_list_functions(bridge, params, target):
         limit=int(params["limit"]) if params.get("limit") is not None else None,
         count_only=_validate_bool(params.get("count_only"), label="count_only", default=False),
         sort=str(params.get("sort", "address")),
+        reverse=_validate_bool(params.get("reverse"), label="reverse", default=False),
     )
 
 
@@ -1682,6 +1713,7 @@ def _bind_search_functions(bridge, params, target):
         offset=int(params.get("offset", 0)),
         limit=int(params["limit"]) if params.get("limit") is not None else None,
         sort=str(params.get("sort", "address")),
+        reverse=_validate_bool(params.get("reverse"), label="reverse", default=False),
     )
 
 
@@ -1783,6 +1815,11 @@ def _bind_xrefs(bridge, params, target):
         offset=int(params.get("offset", 0)),
         limit=int(params["limit"]) if params.get("limit") is not None else None,
     )
+
+
+@op("xrefs_any", lock="read")
+def _bind_xrefs_any(bridge, params, target):
+    return bridge._xrefs_any(target, list(params.get("symbols") or []))
 
 
 @op("field_xrefs", lock="read")

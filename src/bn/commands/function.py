@@ -19,6 +19,7 @@ from ..formatters import (
     _render_pointer_table_text,
     _render_structured_il_text,
     _render_trace_text,
+    _render_xrefs_any_text,
     _render_xrefs_text,
     _slice_text_lines,
     _text_field,
@@ -32,6 +33,8 @@ from ..transport import BridgeError
                  help="Show total function count instead of listing"),
              arg("--sort", choices=["address", "size", "name"], default="address",
                  help="Order results: address (default), size (largest first), or name"),
+             arg("--reverse", "--desc", action="store_true", default=False, dest="reverse",
+                 help="Reverse the sort's natural order (e.g. --sort size --reverse = smallest first)"),
              arg("--demangle", action="store_true", default=False,
                  help="Show demangled C++ names in text (JSON always carries display_name)"),
          ])
@@ -63,6 +66,8 @@ def _function_list(args: argparse.Namespace) -> int:
         params["limit"] = limit
     if args.sort != "address":
         params["sort"] = args.sort
+    if args.reverse:
+        params["reverse"] = True
     return _call(
         args,
         "list_functions",
@@ -82,6 +87,8 @@ def _function_list(args: argparse.Namespace) -> int:
              arg("query"),
              arg("--sort", choices=["address", "size", "name"], default="address",
                  help="Order results: address (default), size (largest first), or name"),
+             arg("--reverse", "--desc", action="store_true", default=False, dest="reverse",
+                 help="Reverse the sort's natural order (e.g. --sort size --reverse = smallest first)"),
              arg("--demangle", action="store_true", default=False,
                  help="Show demangled C++ names in text (JSON always carries display_name)"),
          ],
@@ -110,6 +117,8 @@ def _function_search(args: argparse.Namespace) -> int:
         params["limit"] = limit
     if args.sort != "address":
         params["sort"] = args.sort
+    if args.reverse:
+        params["reverse"] = True
     return _call(
         args,
         "search_functions",
@@ -294,10 +303,26 @@ def _disasm(args: argparse.Namespace) -> int:
                  help="Function name or address (hex 0x.. or decimal) to find inbound refs to"),
              arg("--field", dest="field_spec",
                  help="Struct field xref spec (e.g., TrackRowCell.tile_type)"),
+             arg("--any", nargs="+", dest="any_symbols", metavar="SYMBOL",
+                 help="Batch-probe several symbols (a sink sweep); absent symbols are "
+                      "reported, not errors"),
          ])
 def _xrefs(args: argparse.Namespace) -> int:
     field_spec = getattr(args, "field_spec", None)
     identifier = getattr(args, "identifier", None)
+    any_symbols = getattr(args, "any_symbols", None)
+    if any_symbols:
+        if identifier or field_spec:
+            raise BridgeError("xrefs --any takes only the symbol list, not an identifier or --field")
+        return _call(
+            args,
+            "xrefs_any",
+            {"symbols": any_symbols},
+            require_target=True,
+            allow_implicit_target=True,
+            text_renderer=_render_xrefs_any_text,
+            stem="xrefs-any",
+        )
     if field_spec and identifier:
         raise BridgeError(
             "xrefs takes either an identifier or --field, not both "

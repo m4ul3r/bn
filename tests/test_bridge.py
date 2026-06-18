@@ -4236,6 +4236,49 @@ def test_exports_lists_global_weak_definitions_only(monkeypatch):
     assert instance._exports(None, count_only=True)["count"] == 2
 
 
+def test_save_database_falls_back_to_writable_cache(monkeypatch, tmp_path):
+    """A default-path save whose directory is unwritable (read-only firmware
+    mount) falls back to a writable cache dir instead of losing annotations;
+    an EXPLICIT --path failure stays a hard error (#214)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(bridge, "cache_home", lambda: tmp_path / "cache")
+
+    ro_dir = tmp_path / "ro"
+    ro_dir.mkdir()
+    ro_file = str(ro_dir / "firmware.bin")
+    ro_bndb = ro_file + ".bndb"
+    created: list[str] = []
+
+    class _SaveBV:
+        class file:
+            filename = ro_file
+
+        def create_database(self, dest):
+            if str(dest) == ro_bndb:
+                return False                       # simulate an unwritable default dir
+            from pathlib import Path as _P
+            _P(dest).parent.mkdir(parents=True, exist_ok=True)
+            _P(dest).write_bytes(b"BNDB")
+            created.append(str(dest))
+            return True
+
+    bv = _SaveBV()
+    monkeypatch.setattr(instance.targets, "resolve", lambda sel: bv)
+    monkeypatch.setattr(instance.targets, "clear_dirty", lambda b: None)
+
+    result = instance._save_database(None)
+    assert result["saved"] is True
+    assert result["fallback"] is True
+    assert result["requested_path"] == ro_bndb
+    assert "cache" in result["path"] and result["path"].endswith(".bndb")
+    assert created == [result["path"]]
+
+    # explicit --path failure must NOT silently relocate
+    with pytest.raises(RuntimeError, match="no file was written"):
+        instance._save_database(None, path=ro_bndb)
+
+
 def test_function_list_carries_demangled_display_name(monkeypatch):
     """function list entries carry a demangled display_name (#196)."""
     bridge = _load_bridge(monkeypatch)
