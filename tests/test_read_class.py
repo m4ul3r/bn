@@ -189,6 +189,26 @@ def test_vtable_layout_skips_header_and_marks_slots():
     assert s2["pure_virtual"] is True
 
 
+def test_vtable_layout_stops_at_unmapped_slot():
+    # The scan must terminate at the first non-function/unreadable slot (the next
+    # object / padding), not skip it and keep collecting later rows.
+    class _Ctx:
+        def _pointer_size(self, bv):
+            return 8
+
+        def _pointer_table_layout(self, bv, start, *, entries, stride):
+            return {"entries": [
+                {"index": 0, "value": "0x1000", "readable": True,
+                 "target": {"status": "function", "function": {"name": "f0"}}},
+                {"index": 1, "value": None, "readable": False, "target": {}},
+                {"index": 2, "value": "0x2000", "readable": True,
+                 "target": {"status": "function", "function": {"name": "f2"}}},
+            ]}
+
+    layout = read_class._vtable_layout(_Ctx(), object(), 0x9000)
+    assert [s["index"] for s in layout["slots"]] == [0]   # stopped at the gap
+
+
 class _SizeCtx:
     def __init__(self, type_width=None, new_size=None):
         self._type_width = type_width
@@ -274,6 +294,27 @@ def test_rtti_vmi_multiple_bases():
     ctx = _RttiCtx(words, {0x9200: "net::A", 0x9240: "net::B"})
     bases = read_class._rtti_bases(ctx, object(), 0x9100, kind_hint="vmi")
     assert [b["name"] for b in bases] == ["net::A", "net::B"]
+    # off_flags 0x2 has the public bit set -> "public".
+    assert bases[0]["kind"] == "public"
+
+
+def test_rtti_vmi_base_access_flags():
+    # __offset_flags low bits: 0x1=virtual, 0x2=public. Decode independently so a
+    # private base is never mislabeled "public".
+    words = {
+        0x9100: 0xAB10, 0x9108: 0x9300,
+        0x9110: 0x0, 0x9114: 3,                   # base_count = 3
+        0x9118: 0x9200, 0x9120: 0x0,              # private non-virtual
+        0x9128: 0x9240, 0x9130: 0x1,              # private virtual
+        0x9138: 0x9280, 0x9140: 0x3,              # public virtual
+    }
+    ctx = _RttiCtx(words, {0x9200: "Priv", 0x9240: "PrivV", 0x9280: "PubV"})
+    bases = read_class._rtti_bases(ctx, object(), 0x9100, kind_hint="vmi")
+    assert [(b["name"], b["kind"]) for b in bases] == [
+        ("Priv", "private"),
+        ("PrivV", "private virtual"),
+        ("PubV", "public virtual"),
+    ]
 
 
 def test_rtti_no_base():

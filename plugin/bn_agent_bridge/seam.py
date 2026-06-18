@@ -745,7 +745,7 @@ class BridgeContext:
                 continue
             for ref in get_refs(addr):
                 ra = int(getattr(ref, "address", 0) or 0)
-                if ra in seen:
+                if ra == 0 or ra in seen:
                     continue
                 seen.add(ra)
                 caller = getattr(ref, "function", None)

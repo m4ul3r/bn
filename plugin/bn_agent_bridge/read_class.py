@@ -10,7 +10,7 @@ import re
 from typing import Any
 
 from . import il_format
-from ._shared import OperationFailure, _parse_address
+from ._shared import OperationFailure
 
 
 def _strip_signature(name: str) -> str:
@@ -259,6 +259,8 @@ def _class_list(
         if include_all or rec["confidence"] in ("rtti", "ctor")
     ]
     rows.sort(key=lambda r: r["name"])
+    # `total` counts the rows AFTER the confidence filter but before paging, so
+    # it reflects what this query matched (it grows when --all is added).
     total = len(rows)
     if offset:
         rows = rows[offset:]
@@ -297,8 +299,9 @@ def _rtti_bases(ctx, bv, typeinfo_addr: int, *, kind_hint: str | None = None) ->
     layout: 'base' (no bases), 'si' (single), 'vmi' (multiple). When absent,
     infer structurally from the base-typeinfo pointers that resolve."""
     ptr = ctx._pointer_size(bv)
-    name_field = typeinfo_addr + ptr          # word[1] = type-name ptr  # noqa: F841
-    after_name = typeinfo_addr + 2 * ptr      # first layout-specific word
+    # Itanium layout: word[0] = vptr, word[1] = type-name ptr (skipped),
+    # word[2+] (``after_name``) = the layout-specific fields.
+    after_name = typeinfo_addr + 2 * ptr
 
     def resolve(ti_addr: int, kind: str = "public") -> dict[str, Any]:
         return {
@@ -324,8 +327,14 @@ def _rtti_bases(ctx, bv, typeinfo_addr: int, *, kind_hint: str | None = None) ->
             rec += 2 * ptr
             if not ti:
                 continue
-            kind_s = "virtual" if (off_flags & 0x1) else "public"
-            out.append(resolve(ti, kind_s))
+            # __offset_flags carries two independent bits: 0x1 = virtual base,
+            # 0x2 = public base. Both clear => private non-virtual. Report
+            # access and virtual-ness separately so a private base is not
+            # mislabeled "public".
+            kind_parts = ["public" if (off_flags & 0x2) else "private"]
+            if off_flags & 0x1:
+                kind_parts.append("virtual")
+            out.append(resolve(ti, " ".join(kind_parts)))
         return out
     return []
 
