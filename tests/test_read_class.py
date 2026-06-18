@@ -569,5 +569,3 @@ def test_render_construction_site_includes_function():
                 "kind": "ctor-call", "size": None}],
                "stored_globals": []}}
     assert "ctor-call @ 0x443abc (in AapGalifStart)" in _render_class_show_text(rec)
-
-
