@@ -1862,7 +1862,11 @@ def _blast_radius_line(value: dict[str, Any]) -> str | None:
     reflowed = int(summary.get("reflowed") or 0)
     if referenced <= 0:
         return None
-    affected = [a for a in (value.get("affected_functions") or []) if isinstance(a, dict)]
+    # A directly-mutated function (set_prototype/rename target, tagged `direct`)
+    # is not part of the type's reference set, so keep it out of these names --
+    # in a mixed batch it belongs under the direct op's affected block instead.
+    affected = [a for a in (value.get("affected_functions") or [])
+                if isinstance(a, dict) and not a.get("direct")]
     names = [a.get("after_name") or a.get("before_name") for a in affected if a.get("changed")]
     names += [a.get("after_name") or a.get("before_name") for a in affected if not a.get("changed")]
     names = [n for n in names if n]
@@ -1872,6 +1876,16 @@ def _blast_radius_line(value: dict[str, Any]) -> str | None:
         if referenced > len(names[:5]):
             line += f" (+{referenced - len(names[:5])} more)"
     return line
+
+
+def _is_type_result(result: Any) -> bool:
+    """A type-shape result (type (re)declaration or struct field edit), whose
+    blast radius is "functions referencing the type" -- as opposed to a direct op
+    (rename/prototype/comment) that targets one specific function."""
+    if not isinstance(result, dict):
+        return False
+    op = str(result.get("op") or "")
+    return op == "types_declare" or op.startswith("struct_")
 
 
 def _format_op_summary(item: dict[str, Any]) -> str:
@@ -1923,10 +1937,9 @@ def _render_mutation_text(value: Any) -> str:
         lines.append("preview: change applied + reverted")
         lines.append("")
 
-    is_type_op = any(
-        isinstance(r, dict) and (r.get("op") == "types_declare" or str(r.get("op") or "").startswith("struct_"))
-        for r in results
-    )
+    has_type_op = any(_is_type_result(r) for r in results)
+    has_direct_op = any(r.get("op") and not _is_type_result(r)
+                        for r in results if isinstance(r, dict))
 
     if results:
         if len(results) == 1 and success and not failed and not preview:
@@ -1936,22 +1949,32 @@ def _render_mutation_text(value: Any) -> str:
             for item in results:
                 lines.append("- " + _format_op_summary(item))
 
-    # "What landed" detail for a single op, so a verified mutation confirms itself
-    # without a follow-up read: the live prototype for set_prototype.
-    if len(results) == 1 and not failed and results[0].get("op") == "set_prototype":
-        lines.extend(_set_prototype_detail(results[0]))
+    # "What landed" detail so a verified mutation confirms itself without a
+    # follow-up read: the live prototype for each set_prototype. Emitted per
+    # result (not only single-op batches) so a mixed batch still surfaces it.
+    if not failed:
+        for item in results:
+            if item.get("op") == "set_prototype" and item.get("status") not in FAILED_MUTATION_STATUSES:
+                lines.extend(_set_prototype_detail(item))
 
-    if is_type_op:
-        # The struct's size/field delta (or shape, if unchanged), then the blast
-        # radius. This replaces the per-function dump, which for a type edit was
-        # either empty (no body reflowed) or a wall of unrelated callers.
+    # Type and direct detail are independent: a mixed batch shows BOTH the type's
+    # size/field delta + blast radius AND the direct ops' affected-function diffs.
+    # The blast radius replaces the per-function dump for type ops (which was
+    # either empty or a wall of unrelated callers).
+    if has_type_op:
         lines.extend(_types_affected_lines(value))
         blast = _blast_radius_line(value)
         if blast:
             lines.append(blast)
-    else:
+    if has_direct_op:
         affected_functions = [a for a in (value.get("affected_functions") or []) if isinstance(a, dict)]
-        changed_functions = [a for a in affected_functions if a.get("changed")]
+        # In a mixed batch, only the direct-op targets belong here -- the type's
+        # reflowed callers are summarised by the blast-radius line above. With no
+        # type op, every changed function is a direct-op effect.
+        changed_functions = [
+            a for a in affected_functions
+            if a.get("changed") and (a.get("direct") if has_type_op else True)
+        ]
         if changed_functions:
             lines.extend(["", f"affected functions ({len(changed_functions)}):"])
             for item in changed_functions:

@@ -5208,6 +5208,51 @@ def test_render_mutation_text_field_rename_omits_unchanged_size_line():
     assert "referenced by 3 fns, 1 reflowed: user" in out
 
 
+def test_render_mutation_text_mixed_batch_splits_type_and_direct_detail():
+    """A mixed batch (types_declare + set_prototype) must show BOTH the type's
+    blast radius AND the direct op's prototype/affected-function detail, and must
+    not list the directly-mutated function under the type 'referenced by' line
+    (Codex review on #240)."""
+    from bn import formatters
+    value = {
+        "preview": True, "success": True, "committed": False,
+        "results": [
+            {"op": "types_declare", "status": "verified", "defined_types": {"Ep": "struct Ep"}},
+            {"op": "set_prototype", "function": "handler", "address": "0x401000",
+             "status": "verified",
+             "observed": {"address": "0x401000",
+                          "prototype": 'void __convention("cdecl")(struct Ep* ep)'}},
+        ],
+        "affected_functions": [
+            # a type-referencing function that reflowed (NOT a direct-op target)
+            {"address": "0x10", "before_name": "uses_ep", "after_name": "uses_ep",
+             "changed": True, "direct": False},
+            # the directly-mutated function (the set_prototype target)
+            {"address": "0x401000", "before_name": "handler", "after_name": "handler",
+             "changed": True, "direct": True},
+        ],
+        "affected_types": [{
+            "type_name": "Ep", "name": "Ep", "changed": True,
+            "before_layout": "struct Ep // size=0x4\n0x0000: int32_t x",
+            "after_layout": "struct Ep // size=0x8\n0x0000: int32_t x\n0x0004: uint32_t seq",
+            "layout_diff": "--- before:Ep\n+++ after:Ep\n@@ -1,2 +1,3 @@\n-struct Ep // size=0x4\n+struct Ep // size=0x8\n 0x0000: int32_t x\n+0x0004: uint32_t seq",
+        }],
+        "affected_summary": {"referenced": 1, "reflowed": 1},
+    }
+    out = formatters._render_mutation_text(value)
+    # Type detail still renders.
+    assert "size 0x4 -> 0x8 (+4)" in out
+    # Blast radius excludes the directly-mutated function, names the type user.
+    blast = [l for l in out.splitlines() if "referenced by" in l]
+    assert blast, out
+    assert "uses_ep" in blast[0] and "handler" not in blast[0]
+    # Direct op detail is no longer hidden: the landed prototype shows...
+    assert "void __cdecl(struct Ep* ep)" in out
+    # ...and the directly-mutated function appears in its own affected block.
+    assert "affected functions" in out
+    assert "handler" in out.split("affected functions", 1)[1]
+
+
 def test_blast_radius_line_caps_names_and_orders_reflowed_first():
     from bn import formatters
     value = {
