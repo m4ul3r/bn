@@ -203,8 +203,17 @@ def _defined_symbol_names(bv) -> set[str]:
     return names
 
 
+# ExternalSymbol surfaces (a) statically-linked-but-undefined helpers and (b)
+# the kernel-symbol refs of an ET_REL `.ko` (which BN models in .extern, not as
+# Imported*Symbol) -- enumerating it makes a kernel module's API surface visible
+# via `bn imports` (#213). Appended AFTER the Imported* kinds so a regular ELF's
+# externals that also appear as PLT imports dedup against them.
+_IMPORT_PLUS_EXTERNAL: list[tuple[str, str]] = _IMPORT_SYMBOL_TYPES + [("ExternalSymbol", "external")]
+
+
 def _imports(ctx, selector: str | None, *, summary: bool = False,
-             offset: int = 0, limit: int | None = None, count_only: bool = False):
+             offset: int = 0, limit: int | None = None, count_only: bool = False,
+             include_got: bool = False):
     # Guard paging the same way the sibling list ops do, so a raw-socket /
     # py exec caller passing a negative offset/limit gets a clean
     # invalid_request instead of a silent Python negative-index slice (#68).
@@ -215,7 +224,9 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
     defined_names = _defined_symbol_names(bv)
     items = []
     self_defined_excluded = 0
-    for attr_name, kind in _IMPORT_SYMBOL_TYPES:
+    got_collapsed = 0
+    func_data_names: set[str] = set()
+    for attr_name, kind in _IMPORT_PLUS_EXTERNAL:
         sym_type = getattr(bn.SymbolType, attr_name, None)
         if sym_type is None:
             continue
@@ -230,6 +241,17 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
             # bloated and real deps aren't buried (#202).
             if raw_name in defined_names:
                 self_defined_excluded += 1
+                continue
+            # #212: an address-kind entry is the GOT slot for an import already
+            # listed as its function/data PLT entry -- ~half of a standard ELF's
+            # import list is these duplicates. Collapse them by default; show with
+            # --include-got. A genuinely unique address symbol is still listed.
+            if kind == "address" and not include_got and raw_name in func_data_names:
+                got_collapsed += 1
+                continue
+            # An ET_REL external that ALSO appeared as a PLT import on a regular
+            # ELF is the same dependency -- dedup so #213 doesn't double-list.
+            if kind == "external" and raw_name in func_data_names:
                 continue
             namespace = str(getattr(sym, "namespace", "") or "")
             # Only surface `library` when it's a real per-library namespace;
@@ -246,10 +268,14 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
                     "kind": kind,
                 }
             )
+            if kind in ("function", "data"):
+                func_data_names.add(raw_name)
     if count_only:
         result = {"count": len(items), "total": len(items)}
         if self_defined_excluded:
             result["self_defined_excluded"] = self_defined_excluded
+        if got_collapsed:
+            result["got_collapsed"] = got_collapsed
         return result
     if summary:
         # Summary aggregates the whole import set; paging would distort the
@@ -257,6 +283,8 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
         result = _imports_build_summary(items, needed_libraries)
         if self_defined_excluded:
             result["self_defined_excluded"] = self_defined_excluded
+        if got_collapsed:
+            result["got_collapsed"] = got_collapsed
         return result
     # Order by kind USEFULNESS first (function -> data -> address), not the old
     # alphabetical kind sort which put "address"-kind internals ahead of
@@ -274,7 +302,57 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
     # standard paged-list envelope shared with strings/sections (#202).
     if self_defined_excluded:
         result["self_defined_excluded"] = self_defined_excluded
+    if got_collapsed:
+        result["got_collapsed"] = got_collapsed
     return result
+
+
+def _exports(ctx, selector: str | None, *, offset: int = 0, limit: int | None = None,
+             count_only: bool = False):
+    """List a binary's EXPORTED symbols -- its public API. Exports are the
+    globally/weakly-bound DEFINITIONS (the dynsym entries `nm -D --defined-only`
+    shows); local/no-binding symbols are internal and excluded. Mirrors the
+    `imports` envelope (name/address/kind + demangled display_name) (#198)."""
+    offset = _validate_count(offset, label="offset", minimum=0)
+    limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
+    bv = ctx._resolve_view(selector)
+    export_bindings = set()
+    for bname in ("GlobalBinding", "WeakBinding"):
+        b = getattr(getattr(bn, "SymbolBinding", None), bname, None)
+        if b is not None:
+            export_bindings.add(b)
+    items = []
+    for attr_name, kind in (("FunctionSymbol", "function"), ("DataSymbol", "data")):
+        sym_type = getattr(bn.SymbolType, attr_name, None)
+        if sym_type is None:
+            continue
+        for sym in list(bv.get_symbols_of_type(sym_type)):
+            binding = getattr(sym, "binding", None)
+            # Keep only global/weak definitions; LocalBinding/NoBinding are
+            # internal. When binding info is unavailable (test fakes), keep the
+            # symbol so callers still get the definition list.
+            if export_bindings and binding is not None and binding not in export_bindings:
+                continue
+            short = getattr(sym, "short_name", None)
+            items.append(
+                {
+                    "name": str(getattr(sym, "name", "")),
+                    "display_name": str(short or getattr(sym, "name", "")),
+                    "raw_name": str(getattr(sym, "raw_name", getattr(sym, "name", ""))),
+                    "address": hex(int(sym.address)),
+                    "kind": kind,
+                    "binding": str(getattr(binding, "name", binding)) if binding is not None else None,
+                    "ordinal": (int(getattr(sym, "ordinal", 0)) or None),
+                }
+            )
+    if count_only:
+        return {"count": len(items), "total": len(items)}
+    items.sort(key=lambda item: (
+        0 if item["kind"] == "function" else 1,
+        item["name"],
+        int(item["address"], 16),
+    ))
+    return _paged_list_result(items, offset=offset, limit=limit)
 
 
 def _imports_build_summary(

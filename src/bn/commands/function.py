@@ -32,6 +32,8 @@ from ..transport import BridgeError
                  help="Show total function count instead of listing"),
              arg("--sort", choices=["address", "size", "name"], default="address",
                  help="Order results: address (default), size (largest first), or name"),
+             arg("--demangle", action="store_true", default=False,
+                 help="Show demangled C++ names in text (JSON always carries display_name)"),
          ])
 def _function_list(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
@@ -67,7 +69,7 @@ def _function_list(args: argparse.Namespace) -> int:
         params,
         require_target=True,
         allow_implicit_target=True,
-        text_renderer=_render_function_list_text,
+        text_renderer=lambda value: _render_function_list_text(value, demangle=args.demangle),
         page_label="function list",
         paged_spill=True,
         stem="functions",
@@ -80,6 +82,8 @@ def _function_list(args: argparse.Namespace) -> int:
              arg("query"),
              arg("--sort", choices=["address", "size", "name"], default="address",
                  help="Order results: address (default), size (largest first), or name"),
+             arg("--demangle", action="store_true", default=False,
+                 help="Show demangled C++ names in text (JSON always carries display_name)"),
          ],
          mutex_groups=[
              mutex(False,
@@ -112,7 +116,7 @@ def _function_search(args: argparse.Namespace) -> int:
         params,
         require_target=True,
         allow_implicit_target=True,
-        text_renderer=_render_function_list_text,
+        text_renderer=lambda value: _render_function_list_text(value, demangle=args.demangle),
         page_label="function search",
         paged_spill=True,
         stem="function-search",
@@ -123,16 +127,19 @@ def _function_search(args: argparse.Namespace) -> int:
 @command("function", "info", help="Show function prototype and variables", target=True,
          args=[arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
                arg("--verbose", "-v", action="store_true", default=False,
-                   help="Show full parameter and local variable details")])
+                   help="Show full parameter and local variable details"),
+               arg("--demangle", action="store_true", default=False,
+                   help="Show the demangled C++ name in text (JSON always carries display_name)")])
 def _function_info(args: argparse.Namespace) -> int:
     verbose = getattr(args, "verbose", False)
+    demangle = getattr(args, "demangle", False)
     return _call(
         args,
         "function_info",
         {"identifier": args.identifier},
         require_target=True,
         allow_implicit_target=True,
-        text_renderer=lambda v: _render_function_info_text(v, verbose=verbose),
+        text_renderer=lambda v: _render_function_info_text(v, verbose=verbose, demangle=demangle),
         stem="function-info",
     )
 

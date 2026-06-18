@@ -49,6 +49,18 @@ def _function_metadata(func) -> dict[str, Any]:
     }
 
 
+def _display_name(func) -> str:
+    """Demangled display name for a function: the symbol's ``short_name`` when BN
+    has one (it keeps ``fn.name`` mangled for C++), else ``fn.name``. Lets
+    function list/search/info expose a greppable/clusterable C++ name without
+    shelling out to c++filt -- `decompile` already demangles (#196)."""
+    sym = getattr(func, "symbol", None)
+    short = getattr(sym, "short_name", None) if sym is not None else None
+    if short:
+        return str(short)
+    return str(getattr(func, "name", ""))
+
+
 def _unimplemented_instructions(func, *, cap: int = 64) -> dict[str, Any]:
     """Aggregate signal for instructions Binary Ninja's lifter could not model.
 

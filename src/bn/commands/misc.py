@@ -96,13 +96,16 @@ def _imports_count_text(value: Any) -> str:
          args=[arg("--summary", action="store_true", default=False,
                    help="Show aggregate counts by namespace and kind instead of the full list"),
                arg("--count", action="store_true", default=False,
-                   help="Show the total import count instead of listing")])
+                   help="Show the total import count instead of listing"),
+               arg("--include-got", action="store_true", default=False,
+                   help="Include GOT-slot (address) entries that duplicate a PLT import "
+                        "(collapsed by default)")])
 def _imports(args: argparse.Namespace) -> int:
     if args.count:
         return _call(
             args,
             "imports",
-            {"count_only": True},
+            {"count_only": True, "include_got": bool(args.include_got)},
             require_target=True,
             allow_implicit_target=True,
             text_renderer=_imports_count_text,
@@ -112,7 +115,7 @@ def _imports(args: argparse.Namespace) -> int:
     # Summary is a single aggregate object, so it ignores paging entirely. The
     # full list (often 500+ entries on firmware libs) pages bridge-side like
     # strings/function list, returning a {items, total, ...} envelope (#122).
-    params = {"summary": summary_mode, "offset": args.offset}
+    params = {"summary": summary_mode, "offset": args.offset, "include_got": bool(args.include_got)}
     if not summary_mode:
         params["limit"] = _effective_limit(args)
     return _call(
@@ -127,6 +130,34 @@ def _imports(args: argparse.Namespace) -> int:
         # hint about, so it does not opt into the paging spill hint.
         paged_spill=not summary_mode,
         stem="imports-summary" if summary_mode else "imports",
+    )
+
+
+@command("exports", help="List exported symbols (a binary's public API)", target=True, paged=True,
+         args=[arg("--count", action="store_true", default=False,
+                   help="Show the total export count instead of listing")])
+def _exports(args: argparse.Namespace) -> int:
+    if args.count:
+        return _call(
+            args,
+            "list_exports",
+            {"count_only": True},
+            require_target=True,
+            allow_implicit_target=True,
+            text_renderer=lambda value: f"Total exports: {value.get('count', 0)}",
+            stem="exports-count",
+        )
+    params = {"offset": args.offset, "limit": _effective_limit(args)}
+    return _call(
+        args,
+        "list_exports",
+        params,
+        require_target=True,
+        allow_implicit_target=True,
+        text_renderer=_render_name_address_list_text,
+        page_label="exports",
+        paged_spill=True,
+        stem="exports",
     )
 
 

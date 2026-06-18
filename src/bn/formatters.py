@@ -81,13 +81,16 @@ def _slice_text_lines(
     return header + "\n" + "\n".join(sliced)
 
 
-def _render_function_info_text(value: Any, verbose: bool = False) -> str:
+def _render_function_info_text(value: Any, verbose: bool = False, demangle: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
 
     function = _as_dict(value.get("function"))
+    header_name = function.get("name", "<unknown>")
+    if demangle and function.get("display_name"):
+        header_name = function["display_name"]
     lines = [
-        f"{function.get('name', '<unknown>')} @ {function.get('address', '<unknown>')}",
+        f"{header_name} @ {function.get('address', '<unknown>')}",
         str(value.get("prototype", "")),
         f"calling convention: {value.get('calling_convention', '<unknown>')}",
         f"size: {value.get('size', '<unknown>')}",
@@ -506,8 +509,10 @@ def _render_pin_clear_text(value: Any) -> str:
     return "cleared"
 
 
-def _render_name_address_rows(value: Any) -> str:
-    """Render a BARE list of name/address rows (imports, function pages)."""
+def _render_name_address_rows(value: Any, *, demangle: bool = False) -> str:
+    """Render a BARE list of name/address rows (imports, function pages). With
+    ``demangle``, show the demangled ``display_name`` instead of the raw name so
+    a C++ listing is greppable/clusterable without c++filt (#196)."""
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value:
@@ -520,6 +525,8 @@ def _render_name_address_rows(value: Any) -> str:
             continue
         address = item.get("address", "<unknown>")
         name = item.get("name") or item.get("function") or "<unknown>"
+        if demangle and item.get("display_name"):
+            name = item["display_name"]
         line = f"{address}  {name}"
         kind = item.get("kind")
         if kind and kind != "function":
@@ -596,13 +603,15 @@ def _render_paged_list_text(
     return footer if body == "none" else f"{body}\n\n{footer}"
 
 
-def _render_function_list_text(value: Any) -> str:
+def _render_function_list_text(value: Any, *, demangle: bool = False) -> str:
     """Render a paged function listing, with a footer stating the true total and
     remainder (#59). Prefers the canonical `items` key (every other list command
     uses it), falling back to the deprecated byte-identical `functions` alias for
-    an older bridge that emits only the latter (#223)."""
+    an older bridge that emits only the latter (#223). ``demangle`` shows the
+    demangled display_name (#196)."""
     page_key = "items" if isinstance(value, dict) and "items" in value else "functions"
-    return _render_paged_list_text(value, page_key, _render_name_address_rows)
+    return _render_paged_list_text(
+        value, page_key, lambda items: _render_name_address_rows(items, demangle=demangle))
 
 
 def _group_refs_by_caller(refs: list[Any]) -> list[dict[str, Any]]:
