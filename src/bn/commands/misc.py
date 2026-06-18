@@ -47,7 +47,6 @@ def _strings(args: argparse.Namespace) -> int:
             "strings",
             {**common, "count_only": True},
             require_target=True,
-            allow_implicit_target=True,
             text_renderer=lambda value: f"Total strings: {value.get('count', 0)}",
             stem="strings-count",
             regex_hint_query=args.query,
@@ -65,7 +64,6 @@ def _strings(args: argparse.Namespace) -> int:
             "limit": _effective_limit(args),
         },
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=_render_strings_text,
         page_label="strings",
         paged_spill=True,
@@ -107,7 +105,6 @@ def _imports(args: argparse.Namespace) -> int:
             "imports",
             {"count_only": True, "include_got": bool(args.include_got)},
             require_target=True,
-            allow_implicit_target=True,
             text_renderer=_imports_count_text,
             stem="imports-count",
         )
@@ -123,7 +120,6 @@ def _imports(args: argparse.Namespace) -> int:
         "imports",
         params,
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=_render_imports_summary_text if summary_mode else _render_name_address_list_text,
         page_label="imports",
         # Only the list path pages; the summary aggregate has no remainder to
@@ -143,7 +139,6 @@ def _exports(args: argparse.Namespace) -> int:
             "list_exports",
             {"count_only": True},
             require_target=True,
-            allow_implicit_target=True,
             text_renderer=lambda value: f"Total exports: {value.get('count', 0)}",
             stem="exports-count",
         )
@@ -153,7 +148,6 @@ def _exports(args: argparse.Namespace) -> int:
         "list_exports",
         params,
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=_render_name_address_list_text,
         page_label="exports",
         paged_spill=True,
@@ -172,7 +166,6 @@ def _sections(args: argparse.Namespace) -> int:
             "sections",
             {"query": args.query, "count_only": True},
             require_target=True,
-            allow_implicit_target=True,
             text_renderer=lambda value: f"Total sections: {value.get('count', 0)}",
             stem="sections-count",
         )
@@ -183,7 +176,6 @@ def _sections(args: argparse.Namespace) -> int:
         "sections",
         {"query": args.query, "offset": args.offset, "limit": _effective_limit(args)},
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=_render_sections_text,
         page_label="sections",
         paged_spill=True,
@@ -199,7 +191,6 @@ def _bundle_function(args: argparse.Namespace) -> int:
         "bundle_function",
         {"identifier": args.identifier, "out_path": str(args.out) if args.out else None},
         require_target=True,
-        allow_implicit_target=True,
         stem="function-bundle",
         bridge_writes_output=bool(args.out),
     )
@@ -225,7 +216,6 @@ def _read(args: argparse.Namespace) -> int:
         "read",
         {"address": address, "length": args.length},
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=_render_read_text,
         stem="read",
     )
@@ -301,7 +291,6 @@ def _py_exec(args: argparse.Namespace) -> int:
         "py_exec",
         {"script": script},
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=_render_py_exec_text,
         stem="py-exec",
     )

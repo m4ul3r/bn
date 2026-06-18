@@ -53,7 +53,6 @@ def _function_list(args: argparse.Namespace) -> int:
             "list_functions",
             params,
             require_target=True,
-            allow_implicit_target=True,
             text_renderer=lambda value: f"Total functions: {value.get('count', 0)}",
             stem="function-count",
         )
@@ -73,7 +72,6 @@ def _function_list(args: argparse.Namespace) -> int:
         "list_functions",
         params,
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=lambda value: _render_function_list_text(value, demangle=args.demangle),
         page_label="function list",
         paged_spill=True,
@@ -124,7 +122,6 @@ def _function_search(args: argparse.Namespace) -> int:
         "search_functions",
         params,
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=lambda value: _render_function_list_text(value, demangle=args.demangle),
         page_label="function search",
         paged_spill=True,
@@ -147,7 +144,6 @@ def _function_info(args: argparse.Namespace) -> int:
         "function_info",
         {"identifier": args.identifier},
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=lambda v: _render_function_info_text(v, verbose=verbose, demangle=demangle),
         stem="function-info",
     )
@@ -170,7 +166,6 @@ def _function_create(args: argparse.Namespace) -> int:
             "preview": bool(args.preview),
         },
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=_render_mutation_text,
         stem="function-create",
         result_exit_code=_mutation_exit_code,
@@ -220,7 +215,6 @@ def _decompile(args: argparse.Namespace) -> int:
             "force_analysis": args.force_analysis,
         },
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=_render_decompile_text,
         stem="decompile",
     )
@@ -246,7 +240,6 @@ def _il(args: argparse.Namespace) -> int:
         "il",
         {"identifier": args.identifier, "view": args.view, "ssa": bool(args.ssa)},
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=lambda value: _slice_text_lines(base(value), lines_range),
         stem="il",
     )
@@ -268,7 +261,6 @@ def _function_structured_il(args: argparse.Namespace) -> int:
         "structured_il",
         {"identifier": args.identifier, "view": args.view, "ssa": bool(args.ssa)},
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=_render_structured_il_text,
         stem="structured-il",
     )
@@ -290,7 +282,6 @@ def _disasm(args: argparse.Namespace) -> int:
         "disasm",
         {"identifier": args.identifier},
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=lambda value: _slice_text_lines(base(value), lines_range),
         stem="disasm",
     )
@@ -319,7 +310,6 @@ def _xrefs(args: argparse.Namespace) -> int:
             "xrefs_any",
             {"symbols": any_symbols},
             require_target=True,
-            allow_implicit_target=True,
             text_renderer=_render_xrefs_any_text,
             stem="xrefs-any",
         )
@@ -335,7 +325,6 @@ def _xrefs(args: argparse.Namespace) -> int:
             "field_xrefs",
             {"field": field_spec},
             require_target=True,
-            allow_implicit_target=True,
             text_renderer=_render_field_xrefs_text,
             stem="field-xrefs",
         )
@@ -360,7 +349,6 @@ def _xrefs(args: argparse.Namespace) -> int:
         "xrefs",
         params,
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=lambda v: _render_xrefs_text(v, limit=limit),
         offset_hint_identifier=identifier,
         paged_spill=True,
@@ -420,7 +408,6 @@ def _callsites(args: argparse.Namespace) -> int:
             "caller_static": bool(args.caller_static),
         },
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=lambda value: _render_callsites_text(
             value,
             prefer_caller_static=bool(args.caller_static),
@@ -446,7 +433,6 @@ def _evidence_function(args: argparse.Namespace) -> int:
             "context": args.context,
         },
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=_render_function_evidence_text,
         stem="function-evidence",
     )
@@ -475,7 +461,6 @@ def _evidence_xrefs(args: argparse.Namespace) -> int:
         "xrefs",
         params,
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=lambda value: _render_evidence_xrefs_text(value, limit=limit),
         paged_spill=True,
         stem="evidence-xrefs",
@@ -506,7 +491,6 @@ def _evidence_table(args: argparse.Namespace) -> int:
             "width": args.width,
         },
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=_render_pointer_table_text,
         stem="pointer-table",
     )
@@ -533,7 +517,6 @@ def _evidence_message(args: argparse.Namespace) -> int:
             "table_entries": args.table_entries,
         },
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=_render_message_lens_text,
         stem="message-lens",
     )
@@ -552,7 +535,6 @@ def _evidence_init(args: argparse.Namespace) -> int:
         "init_arrays",
         {"limit": args.limit},
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=_render_init_arrays_text,
         stem="init-arrays",
     )
@@ -590,7 +572,6 @@ def _trace(args: argparse.Namespace) -> int:
             "ip_depth": args.ip_depth,
         },
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=_render_trace_text,
         stem="trace",
     )

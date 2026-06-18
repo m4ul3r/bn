@@ -573,7 +573,12 @@ def _call(
     params: dict[str, Any] | None = None,
     *,
     require_target: bool,
-    allow_implicit_target: bool = False,
+    # Defaults True: every target-required command wants the single-open-target
+    # convenience, and `require_target=False` commands (load/close/save/batch)
+    # never reach the implicit-resolution branch in _resolve_target anyway, so
+    # the flag carried no independent signal at any call site. Pass False only to
+    # force an explicit -t/--target on a target-required command.
+    allow_implicit_target: bool = True,
     text_renderer: Callable[[Any], str] | None = None,
     page_limit: int | None = None,
     page_offset: int = 0,
