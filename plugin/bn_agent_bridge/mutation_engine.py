@@ -107,14 +107,14 @@ def _normalize_struct_alias(op: dict[str, Any]) -> dict[str, Any]:
 _VAR_DRIFT_OPS = {"local_rename", "local_retype", "set_prototype"}
 
 
-def _guess_type_affected_functions(ctx, bv, type_name: str, limit: int = 10):
+def _guess_type_affected_functions(ctx, bv, type_name: str, limit: int | None = 10):
     matches = []
     needle = type_name.lower()
     for fn in list(bv.functions):
         text = str(fn.type).lower()
         if needle in text:
             matches.append(fn)
-            if len(matches) >= limit:
+            if limit is not None and len(matches) >= limit:
                 break
     return matches
 
@@ -188,39 +188,79 @@ def _operation_type_names(ctx, bv, op: dict[str, Any]) -> list[str]:
 
 
 
+def _functions_for_op(ctx, bv, op: dict[str, Any], *, type_limit: int | None):
+    """Resolve the functions a single op touches. ``type_limit`` caps how many
+    type-referencing functions come back (None = uncapped, for a true count).
+    Shared by _guess_affected_functions (the capped snapshot set) and
+    _count_referenced_functions (the uncapped blast-radius total) so both agree
+    on what "affected" means."""
+    kind = op.get("op") or "rename_symbol"
+    functions = []
+    try:
+        if kind == "rename_symbol" and op.get("kind") != "data":
+            functions = [ctx._find_function(bv, op["identifier"])]
+        elif kind in {"set_prototype", "local_rename", "local_retype"}:
+            ident = op.get("identifier") or op.get("function")
+            functions = [ctx._find_function(bv, ident)]
+        elif kind in {"set_comment", "delete_comment"}:
+            if op.get("function"):
+                functions = [ctx._find_function(bv, op["function"])]
+            elif op.get("address"):
+                functions = ctx._functions_containing(bv, _parse_address(op["address"]))
+        elif kind.startswith("struct_") or kind == "types_declare":
+            for type_name in _operation_type_names(ctx, bv, op):
+                functions.extend(_guess_type_affected_functions(ctx, bv, type_name, limit=type_limit))
+    except Exception:
+        functions = []
+    return [fn for fn in functions if fn is not None]
+
+
 def _guess_affected_functions(ctx, bv, operations: list[dict[str, Any]]):
     affected = []
     seen = set()
     for op in operations:
         if not isinstance(op, dict):
             continue  # a non-dict op is rejected cleanly in _apply_operation (#48)
-        kind = op.get("op") or "rename_symbol"
-        functions = []
-        try:
-            if kind == "rename_symbol" and op.get("kind") != "data":
-                functions = [ctx._find_function(bv, op["identifier"])]
-            elif kind in {"set_prototype", "local_rename", "local_retype"}:
-                ident = op.get("identifier") or op.get("function")
-                functions = [ctx._find_function(bv, ident)]
-            elif kind in {"set_comment", "delete_comment"}:
-                if op.get("function"):
-                    functions = [ctx._find_function(bv, op["function"])]
-                elif op.get("address"):
-                    functions = ctx._functions_containing(bv, _parse_address(op["address"]))
-            elif kind.startswith("struct_") or kind == "types_declare":
-                for type_name in _operation_type_names(ctx, bv, op):
-                    functions.extend(_guess_type_affected_functions(ctx, bv, type_name))
-        except Exception:
-            functions = []
-
-        for fn in functions:
-            if fn is None:
-                continue
+        for fn in _functions_for_op(ctx, bv, op, type_limit=10):
             marker = int(fn.start)
             if marker not in seen:
                 seen.add(marker)
                 affected.append(fn)
     return affected
+
+
+def _is_type_op(op: Any) -> bool:
+    """A type-shape op (type (re)declaration or struct field edit), whose blast
+    radius is "functions referencing the type" -- as opposed to a direct op
+    (rename/prototype/comment) that targets one specific function."""
+    kind = str((op or {}).get("op") or "") if isinstance(op, dict) else ""
+    return kind == "types_declare" or kind.startswith("struct_")
+
+
+def _operation_function_starts(ctx, bv, operations: list[dict[str, Any]]) -> set[int]:
+    """Uncapped set of distinct function start addresses in the affected set of
+    ``operations`` (type-referencing functions for type ops; the targeted
+    function for direct ops). The basis for both the blast-radius count and the
+    direct/type origin tag on each affected-function diff."""
+    starts: set[int] = set()
+    for op in operations:
+        if not isinstance(op, dict):
+            continue
+        for fn in _functions_for_op(ctx, bv, op, type_limit=None):
+            starts.add(int(fn.start))
+    return starts
+
+
+def _count_referenced_functions(ctx, bv, operations: list[dict[str, Any]], *, fallback: int) -> int:
+    """Uncapped distinct count of functions in the affected set, so a mutation can
+    report its true blast radius even though affected_functions is capped at 10
+    for snapshotting. A struct referenced by 200 functions previously surfaced as
+    "10" with no hint of the real scope. Falls back to the capped length when the
+    scan can't run (e.g. a stubbed view in tests)."""
+    try:
+        return max(len(_operation_function_starts(ctx, bv, operations)), fallback)
+    except Exception:
+        return fallback
 
 
 
@@ -286,6 +326,25 @@ def _diff_type_snapshots(ctx, before: dict[str, Any], after: dict[str, Any]):
         diffs.append(entry)
     return diffs
 
+
+
+def _slim_type_result_for_output(result: dict[str, Any]) -> dict[str, Any]:
+    """Drop the heavy per-type layout dump from a verified types_declare result.
+    The canonical before/after layout already rides on ``affected_types``; echoing
+    it again under ``defined_type_layouts`` and ``observed.defined_type_layouts``
+    stamped the same layout up to four times per response for zero new signal.
+    Only applied on the success path -- on a failure ``affected_types`` is empty
+    and the observed layout is the only evidence, so it stays put there."""
+    if result.get("op") != "types_declare":
+        return result
+    slim = dict(result)
+    slim.pop("defined_type_layouts", None)
+    observed = slim.get("observed")
+    if isinstance(observed, dict) and "defined_type_layouts" in observed:
+        observed = dict(observed)
+        observed.pop("defined_type_layouts", None)
+        slim["observed"] = observed
+    return slim
 
 
 def _annotate_operation_results(ctx, results: list[dict[str, Any]], type_diffs: list[dict[str, Any]]):
@@ -493,13 +552,26 @@ def _diff_snapshots(ctx, before: dict[int, Any], after: dict[int, Any]):
                 "diff": _truncate_preview_diff(diff),
             }
         )
-        if text_changed and snippets_added < 3:
+        # The focused excerpt only earns its tokens when the full diff was
+        # truncated; otherwise the inline `diff` already shows the whole change and
+        # the excerpt just duplicates it (the common small-function case, which is
+        # where the redundant before/after_excerpt bloat came from). (M14)
+        if text_changed and snippets_added < 3 and len(diff.splitlines()) > PREVIEW_DIFF_MAX_LINES:
             snippet = _snippet_for_change(ctx, old.get("text", ""), new.get("text", ""))
             if snippet is not None:
                 diffs[-1].update(snippet)
                 snippets_added += 1
     return diffs
 
+
+
+def _diff_function_start(diff: dict[str, Any]) -> int | None:
+    """The int start address of an affected-function diff (its ``address`` is a
+    hex string), or None when it can't be parsed."""
+    try:
+        return int(str(diff.get("address")), 16)
+    except (TypeError, ValueError):
+        return None
 
 
 def _operation_requested(ctx, op: dict[str, Any]) -> dict[str, Any]:
@@ -1256,6 +1328,13 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
 
     bv = ctx._resolve_view(selector)
     affected = _guess_affected_functions(ctx, bv, operations)
+    # Partition for blast-radius attribution: a type op's reach is "functions
+    # referencing the type"; a direct op targets one function. direct_starts are
+    # the direct ops' targets, so they can be excluded from a type's blast radius.
+    type_ops = [op for op in operations if _is_type_op(op)]
+    direct_starts = _operation_function_starts(
+        ctx, bv, [op for op in operations if isinstance(op, dict) and not _is_type_op(op)]
+    )
     before = _capture_function_snapshots(ctx, bv, affected)
     type_before = _capture_type_snapshots(ctx, bv, operations)
     # Snapshot affected-function locals up front when the batch mutates any
@@ -1307,6 +1386,10 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
             + [_operation_failure_result(ctx, operations[len(results)], exc)],
             "affected_functions": [],
             "affected_types": [],
+            "affected_summary": {
+                "referenced": _count_referenced_functions(ctx, bv, type_ops, fallback=0),
+                "reflowed": 0,
+            },
         }
 
     try:
@@ -1318,6 +1401,27 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
         verified_results = [_verify_operation(ctx, bv, result) for result in results]
         annotated_results = _annotate_operation_results(ctx, verified_results, type_diffs)
         failed = _has_failed_results(ctx, annotated_results)
+        # Origin tag: a direct op (rename/prototype/comment) targets a specific
+        # function; mark its affected-function diffs `direct` so a mixed batch
+        # never attributes that function to a type's "referenced by" set.
+        for d in diffs:
+            d["direct"] = _diff_function_start(d) in direct_starts
+        # Blast radius is a TYPE concept, so scope it to the type ops only:
+        # reflowed = type-referencing functions whose body text actually moved;
+        # referenced = uncapped distinct functions referencing the type(s) (so a
+        # struct used by 200 functions reads as 200, not the 10-fn snapshot cap).
+        # A batch with no type op reports referenced=0 (no blast line).
+        reflowed = sum(1 for d in diffs if d.get("changed") and not d.get("direct"))
+        referenced = (
+            _count_referenced_functions(ctx, bv, type_ops,
+                                        fallback=sum(1 for d in diffs if not d.get("direct")))
+            if type_ops else 0
+        )
+        # On success the canonical type layout lives in affected_types; slim the
+        # redundant copies out of results. On failure keep them as the evidence.
+        output_results = annotated_results if failed else [
+            _slim_type_result_for_output(item) for item in annotated_results
+        ]
         restored = True
         if preview or failed:
             bv.revert_undo_actions(state)
@@ -1349,9 +1453,10 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
             "success": (not failed) and restored,
             "committed": bool((not preview) and (not failed)),
             "message": message,
-            "results": annotated_results,
+            "results": output_results,
             "affected_functions": diffs,
             "affected_types": type_diffs,
+            "affected_summary": {"referenced": referenced, "reflowed": reflowed},
         }
         if preview or failed:
             result["rolled_back"] = restored
