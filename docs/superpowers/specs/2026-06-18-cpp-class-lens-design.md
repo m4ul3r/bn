@@ -234,16 +234,24 @@ as such in `--help` and output.
 ## 5. Command surface & output
 
 ```
-bn class <Name> [--format text|json] [--out PATH]
+bn class show <Name> [--format text|json] [--out PATH]
 bn class list [--all] [--query SUBSTR] [--limit N] [--offset N]
               [--format text|json] [--out PATH]
 ```
 
-`@command("class", ...)` (bare) and `@command("class", "list", ...)` coexist —
-the same dual pattern `bn types` / `bn types show` already uses, confirmed in
-`src/bn/commands/types.py`.
+> **Surface note (revised during implementation).** The original design proposed
+> a bare `bn class <Name>` alongside `bn class list`, citing the `bn types` /
+> `bn types show` dual pattern. That pattern only works because bare `bn types`
+> has **no positional** — it has only optional flags. A bare `bn class <Name>`
+> needs a positional `name` on the `class` parser, but `bn class list` requires a
+> subparsers action on that same node; argparse treats both as positionals, so
+> `bn class list` would bind `name="list"`. The show command is therefore
+> registered as `bn class show <Name>` — matching the existing `struct show` /
+> `types show` convention — keeping both user-selected commands as clean
+> subcommands. (#205 offered `bn class <Name>` *and/or* `bn type show --class`;
+> `bn class show <Name>` realizes the same intent.)
 
-**Text — `bn class <Name>` (mirrors the issue mock):**
+**Text — `bn class show <Name>` (mirrors the issue mock):**
 ```
 class net::Session  (size 0xd0, vtable @ 0x4xxxxx, base: net::Endpoint)
   ctor   0x40abc0  net::Session::Session(uint8_t, Router*)
@@ -263,7 +271,7 @@ paging envelope other list ops use. Both spill to disk past the token threshold
 like every other read op.
 
 **Exit codes:** standard read-command behavior — 0 on success; an unknown class
-name to `bn class <Name>` is a `BridgeError` (exit 2) with a message that
+name to `bn class show <Name>` is a `BridgeError` (exit 2) with a message that
 suggests `bn class list` (and `--all`) for discovery.
 
 ## 6. Edge cases
@@ -271,8 +279,8 @@ suggests `bn class list` (and `--all`) for discovery.
 - **No C++ / no demangled names** — `class list` returns an empty list; not an
   error.
 - **Namespace mistaken for a class** — mitigated by confidence (§4.3); a
-  `name-only` cluster passed to `bn class <Name>` still renders its methods but
-  notes low confidence and absent vtable/RTTI.
+  `name-only` cluster passed to `bn class show <Name>` still renders its methods
+  but notes low confidence and absent vtable/RTTI.
 - **Templates / nested classes / operator overloads** — handled by the
   depth-aware split (§4.2), which is the most heavily unit-tested unit.
 - **Stripped RTTI** — vtable still readable; base classes degrade to
