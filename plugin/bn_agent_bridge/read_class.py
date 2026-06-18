@@ -318,19 +318,20 @@ def _class_list(
 
 
 def _slot_is_code(target: dict[str, Any]) -> bool:
-    """A real vtable slot is a CODE pointer: a resolved function, or a mapped
-    pointer into an executable segment (code BN simply hasn't analyzed into a
-    function yet). A mapped pointer into DATA (a GOT/.data entry read past the
-    end of the table, or an import slot misread as a vtable) is NOT a slot --
-    rejecting it stops the scan instead of rendering adjacent data as fake slots
-    (#205 review)."""
-    status = target.get("status")
-    if status == "function":
+    """A real vtable slot is a CODE pointer: a resolved function, or an address
+    the repo's classifier deems code (``context.kind == "code"`` -- function
+    membership or a Code-semantics section).
+
+    It deliberately does NOT accept "any mapped pointer in an executable
+    segment": firmware ELFs routinely map ``.rodata`` into the same r-x load
+    segment as ``.text``, so the executable bit is not evidence of code (see
+    ``seam._address_is_code`` / the ``kind`` classification in
+    ``_address_context``). Accepting it would render data/string pointers in an
+    r-x mapping as fake unnamed virtual methods. A non-code pointer ends the
+    scan rather than fabricating slots (#205 review)."""
+    if target.get("status") == "function":
         return True
-    if status == "mapped":
-        seg = (target.get("context") or {}).get("segment") or {}
-        return bool(seg.get("executable"))
-    return False
+    return (target.get("context") or {}).get("kind") == "code"
 
 
 def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[str, Any]:

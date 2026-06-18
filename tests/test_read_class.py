@@ -186,16 +186,15 @@ def test_vtable_layout_skips_when_header_not_typeinfo():
     assert layout["slots"] == []
 
 
-def test_vtable_layout_stops_at_mapped_data_slot():
-    # A mapped pointer into a NON-executable segment (GOT/.data read past the
-    # table end, or an import slot misread) is not a slot -- it ends the scan,
-    # rather than rendering adjacent data as fake slots (#205 review).
+def test_vtable_layout_stops_at_data_slot():
+    # A pointer the classifier deems data (kind != "code") is not a slot -- it
+    # ends the scan rather than rendering adjacent data as fake slots (#205).
     rows = [
         {"index": 0, "value": "0x1000", "readable": True,
          "target": {"status": "function", "function": {"name": "f0"}}},
         {"index": 1, "value": "0x9999", "readable": True,
          "target": {"status": "mapped", "function": None,
-                    "context": {"segment": {"executable": False}}}},
+                    "context": {"kind": "data", "segment": {"executable": False}}}},
         {"index": 2, "value": "0x2000", "readable": True,
          "target": {"status": "function", "function": {"name": "f2"}}},
     ]
@@ -203,16 +202,32 @@ def test_vtable_layout_stops_at_mapped_data_slot():
     assert [s["index"] for s in layout["slots"]] == [0]
 
 
-def test_vtable_layout_includes_executable_mapped_slot():
-    # A mapped pointer into an EXECUTABLE segment is code BN hasn't analyzed into
-    # a function yet -- still a valid (unnamed) vtable slot.
+def test_vtable_layout_includes_unanalyzed_code_slot():
+    # A pointer the classifier deems code (kind == "code") but with no function
+    # yet is code BN hasn't analyzed -- still a valid (unnamed) vtable slot.
     rows = [
         {"index": 0, "value": "0x1000", "readable": True,
          "target": {"status": "mapped", "function": None,
-                    "context": {"segment": {"executable": True}}}},
+                    "context": {"kind": "code", "segment": {"executable": True}}}},
     ]
     layout = read_class._vtable_layout(_SlotCtx(rows), object(), 0x9000)
     assert len(layout["slots"]) == 1 and layout["slots"][0]["unnamed"] is True
+
+
+def test_vtable_layout_rejects_data_in_executable_segment():
+    # The firmware case: a string/data pointer that lives in an r-x segment
+    # (.rodata mapped into the code LOAD segment). The executable bit must NOT
+    # make it a slot -- only kind == "code" does. Otherwise data renders as fake
+    # unnamed virtual methods (#205 review; cf. seam._address_is_code).
+    rows = [
+        {"index": 0, "value": "0x1000", "readable": True,
+         "target": {"status": "mapped", "function": None,
+                    "context": {"kind": "string", "segment": {"executable": True}}}},
+        {"index": 1, "value": "0x2000", "readable": True,
+         "target": {"status": "function", "function": {"name": "f1"}}},
+    ]
+    layout = read_class._vtable_layout(_SlotCtx(rows), object(), 0x9000)
+    assert layout["slots"] == []   # stops at the data-in-r-x slot, no fake method
 
 
 def test_resolve_class_names_template_query_not_collapsed():
