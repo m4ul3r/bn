@@ -1,6 +1,6 @@
 ---
 name: bn-re
-description: Reverse engineering methodology for analyzing unknown binaries with the bn CLI. Covers systematic triage, function identification, iterative type recovery, call graph analysis, naming conventions, and struct reconstruction.
+description: Reverse-engineering methodology for unknown binaries via the bn CLI. Highest-value moves over raw decompilation — a C++ class-lens triage that maps the type lattice (public API vs implementation, vtables, inheritance) before reading code, and a conditional hidden-surface sweep that recovers .init_array constructors, dispatch tables, and RTTI handlers only when the target's signatures warrant it (and deliberately skips them when they don't). Also covers function triage, iterative type/struct recovery, call-graph mapping, and naming.
 ---
 
 # bn-re — Reverse Engineering Methodology
@@ -28,6 +28,13 @@ Start broad, then narrow:
    bn function list
    ```
    Note the total count, address range, and whether symbols are stripped. A stripped binary with 2000 functions requires different tactics than a symbolicated one with 50. For *vulnerability* work on a stripped static target, see the "Stripped / static lane" in `bn-vr`, which inverts the import-first workflow (strings → string-xref → behavioral sink recovery).
+
+4. **Map the C++ type lattice (RTTI / symbolicated C++ targets)** — when the symbols show C++ (mangled `_Z…` names, RTTI), lead with the class lens instead of grepping symbols by hand:
+   ```bash
+   bn class list --no-stl          # domain classes, folding std/ABI noise
+   bn class show <ClassName>        # one class: methods, vtable slots, bases, construction sites
+   ```
+   `class list` clusters functions by class and separates the public API surface from the implementation/engine classes at a glance; `class show` resolves a class's inheritance, vtable layout, and where it is constructed. On a rich C++ binary this is the fastest orientation there is — start here, then drill with the sections below. (Plain-C / stripped targets have no classes to show — skip it.)
 
 > **Quick-loaded target?** If the binary was opened with `bn load --quick` / `bn session start --quick` (fast, no analysis), `bn imports` and `bn sections` work, but `bn strings` **errors** until `bn refresh` (it refuses rather than return nothing) and `bn function list` is **partial** (only entry-point + symbol functions) — steps 2–3 would otherwise read as "no strings, almost no functions" and mislead the survey. Check `analysis_state` in `bn target info` (`"quick"` vs `"full"`) and `bn refresh` before surveying. See "Quick Load" in the `bn` skill.
 
@@ -90,6 +97,7 @@ When this comes up most: VM opcode handler tables, FSA predicate tables, COM-sty
 
 Stripped C++ firmware leaks structure through RTTI type-name strings and vtables even when symbols are gone. To turn a type name into code:
 
+- **First, if the binary still has demangled C++ symbols, use the class lens.** `bn class list --no-stl` clusters the recovered classes and `bn class show <Name>` gives one class's vtable + bases + construction sites — it correlates the symbols/RTTI/vtables BN already recovered, so reach for it before the lower-level evidence helpers below (which you still need on a *fully stripped* target where the class lens has no symbols to cluster).
 - `bn evidence message <TypeName>` locates the type-name string (e.g. a mangled `N…E` typeinfo name or a `pkg.Message` proto string), lists its xrefs, and dumps the nearby metadata windows — the typeinfo table and the serializer/handler pointer slots sitting next to it. This is how you get from "I see the string `common.HeadUnitInfo`" to "its serializer is `sub_…`" without reading raw bytes by hand.
 - `bn evidence table <vtable-addr>` lists a class vtable's methods (Thumb-normalized), so you can tell construction from dispatch from generated boilerplate.
 - `bn evidence function <fn>` flags thunks (a `j_*` veneer or PLT/import trampoline → its target) and, for each call, shows the raw ABI argument evidence beside the pseudo-C — including the vtable offset for an indirect/virtual call (`(*(*this + 0xNN))(...)`). Reach for it when the decompiler's argument story is incomplete and you'd otherwise drop to MLIL/disassembly.
