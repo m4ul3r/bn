@@ -1365,6 +1365,50 @@ class TaintEngine:
         matched, _ = lookup_model({callee: True}, name)
         return bool(matched)
 
+    def _callee_name_forms(self, addr: int | None) -> list[str]:
+        """Every name spelling of the function/symbol at *addr*: display name, raw
+        (mangled) name, and the symbol's demangled short_name/full_name. Lets a
+        demangled --source callee (`arg:foo::bar::recv:1`) match a callsite whose
+        fn.name BN kept mangled -- the same forms seam._function_name_forms uses
+        for xrefs/callsites, kept import-free here (#224a)."""
+        forms: list[str] = []
+        if addr is None or self.bv is None:
+            return forms
+        fn = function_at(self.bv, addr)
+        if fn is not None:
+            for v in (getattr(fn, "name", None), getattr(fn, "raw_name", None)):
+                if v:
+                    forms.append(str(v))
+            sym = getattr(fn, "symbol", None)
+            if sym is not None:
+                for v in (getattr(sym, "short_name", None), getattr(sym, "full_name", None)):
+                    if v:
+                        forms.append(str(v))
+        for cand in ((addr, addr & ~1) if (addr & 1) else (addr,)):
+            try:
+                sym = self.bv.get_symbol_at(cand)
+            except Exception:
+                sym = None
+            if sym is not None:
+                for v in (getattr(sym, "name", None), getattr(sym, "short_name", None),
+                          getattr(sym, "full_name", None)):
+                    if v:
+                        forms.append(str(v))
+        out: list[str] = []
+        for f in forms:
+            if f and f not in out:
+                out.append(f)
+        return out
+
+    def _callee_matches(self, addr: int | None, callee: str) -> bool:
+        """True if the callee at *addr* matches the user's callee under ANY of its
+        name forms (incl. the demangled short/full name) -- so callsite seeding
+        agrees with xrefs/callsites resolution for C++ names (#224a)."""
+        for form in self._callee_name_forms(addr):
+            if self._name_matches_callee(form, callee):
+                return True
+        return False
+
     @staticmethod
     def _callee_as_addr(callee: str) -> int | None:
         """An address-form callee locator (``0x12fa4`` or a bare decimal) as an
@@ -1396,11 +1440,11 @@ class TaintEngine:
             if not self._is_call(ins):
                 continue
             target = const_target(getattr(ins, "dest", None))
-            name = self._callee_name(target)
-            # Match by symbol name, or by the address the call renders -- the same
+            # Match by any name form of the callee (display / mangled / demangled
+            # short+full -- #224a), or by the address the call renders -- the same
             # address xrefs/trace use -- so an address-form locator seeds the same
             # callsites the name form does.
-            if self._name_matches_callee(name, callee) or addr_match(target):
+            if self._callee_matches(target, callee) or addr_match(target):
                 hits.append(ins)
                 continue
             # Follow a thunk/veneer (j_memcpy -> memcpy) and match the resolved
@@ -1409,9 +1453,7 @@ class TaintEngine:
             # `bn trace` already perform.
             rt = resolve_call_target(self.bv, ins, follow_thunks=True)
             if rt.address is not None:
-                rname = self._callee_name(int(rt.address)) \
-                    or (str(rt.function.name) if getattr(rt.function, "name", None) else None)
-                if (rt.via == "thunk" and self._name_matches_callee(rname, callee)) \
+                if (rt.via == "thunk" and self._callee_matches(int(rt.address), callee)) \
                         or addr_match(rt.address):
                     hits.append(ins)
         return hits

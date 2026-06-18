@@ -6173,6 +6173,76 @@ def test_xrefs_demangled_name_resolves_to_definition_not_veneer(monkeypatch):
     assert result["import_resolved"] is True
 
 
+def test_xrefs_thunk_real_collision_surfaces_ambiguity_and_picks_hot(monkeypatch):
+    """A bare name that resolves to a 16-byte thunk AND the real body must not
+    silently pick the zero-caller member: surface both under `ambiguous_symbol`
+    and report xrefs for the member carrying the call traffic (#220)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    caller = _FakeFunction(0x500000, "caller")
+    thunk = _FakeFunction(0x440030, "util_free")    # PLT-style thunk: hot
+    thunk.is_thunk = True
+    real = _FakeFunction(0x4d2e70, "util_free")     # real body: zero direct callers
+    real.symbol = _FakeSymbol("FunctionSymbol")
+    bv = _FakeBV(
+        functions=[caller, thunk, real],
+        code_refs={0x440030: [_FakeCodeRef(0x500010, caller), _FakeCodeRef(0x500020, caller)],
+                   0x4d2e70: []},
+        sections={".text": _FakeSection(".text", 0x400000, 0x500000)},
+        segments={0x500010: _FakeSegment(readable=True, executable=True),
+                  0x500020: _FakeSegment(readable=True, executable=True)},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._xrefs(None, "util_free")
+    amb = result["ambiguous_symbol"]
+    assert amb["resolved_to"] == "0x440030"                       # the hot member
+    assert {m["address"] for m in amb["members"]} == {"0x440030", "0x4d2e70"}
+    assert result["address"] == "0x440030"
+    assert result["code_ref_count"] == 2
+
+
+def test_find_function_resolves_demangled_via_symbol_short_name(monkeypatch):
+    """A function whose `fn.name` BN kept mangled resolves by its demangled
+    `symbol.short_name`/`full_name`, so callsites/decompile/xrefs all accept the
+    same C++ name (#224a)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x405250, "_ZN3foo3bar4recvEi")   # BN kept fn.name mangled
+    sym = _FakeSymbol("FunctionSymbol")
+    sym.short_name = "foo::bar::recv"
+    sym.full_name = "foo::bar::recv(int32_t)"
+    fn.symbol = sym
+    bv = _FakeBV(functions=[fn])
+
+    assert int(instance._find_function(bv, "foo::bar::recv").start) == 0x405250
+    assert int(instance._find_function(bv, "foo::bar::recv(int32_t)").start) == 0x405250
+    assert int(instance._find_function(bv, "_ZN3foo3bar4recvEi").start) == 0x405250
+
+
+def test_xrefs_resolves_data_symbol_by_name(monkeypatch):
+    """`xrefs <data-symbol>` resolves a non-function symbol (a global table) to
+    its address instead of failing with a misleading import-only error (#224b)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    data_sym = fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x56b688, "g_state_table")
+    caller = _FakeFunction(0x401000, "user")
+    bv = _FakeBV(
+        functions=[caller],
+        symbols=[data_sym],
+        code_refs={0x56b688: [_FakeCodeRef(0x401010, caller)]},
+        sections={".text": _FakeSection(".text", 0x400000, 0x410000)},
+        segments={0x401010: _FakeSegment(readable=True, executable=True)},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._xrefs(None, "g_state_table")
+    assert result["address"] == "0x56b688"
+    assert result["resolved_symbol"]["kind"] == "data"
+    assert result["code_ref_count"] == 1
+
+
 def test_xrefs_import_symbol_raises_for_unknown_symbol(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

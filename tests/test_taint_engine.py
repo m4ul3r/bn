@@ -535,6 +535,25 @@ def test_forward_arg_source_indirect_pointer_warns(models):
     assert any("indirectly" in a and "param:N" in a for a in result["assumptions"])
 
 
+def test_find_callsites_matches_demangled_callee(models):
+    # A callsite to a function whose fn.name BN kept mangled must be found by its
+    # demangled short_name, so arg:<demangled>:N seeds it the same way xrefs
+    # resolves it (#224a).
+    callee = FFunc("_ZN3foo3bar4recvEi", 0x500, FSSAFunc([]), params=[FVar("x")])
+    callee.symbol = type("S", (), {
+        "type": type("T", (), {"name": "FunctionSymbol"})(),
+        "short_name": "foo::bar::recv",
+        "full_name": "foo::bar::recv(int32_t)",
+        "name": "_ZN3foo3bar4recvEi",
+    })()
+    call = FInstr(0, 0x100, "MLIL_CALL_SSA", "_ZN3foo3bar4recvEi()",
+                  dest=FExpr("MLIL_CONST_PTR", "0x500", constant=0x500), params=[])
+    bv = FBV({0x500: "_ZN3foo3bar4recvEi"}, funcs={0x500: callee})
+    engine = te.TaintEngine(bv, models)
+    assert len(engine._find_callsites([call], "foo::bar::recv")) == 1
+    assert len(engine._find_callsites([call], "_ZN3foo3bar4recvEi")) == 1   # mangled still works
+
+
 def test_forward_no_unlifted_no_assumption(models):
     # The unlifted signal must not fire on a clean function (no false noise).
     a = FVar("a"); r = FVar("r")
