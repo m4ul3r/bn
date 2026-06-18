@@ -1783,6 +1783,102 @@ def test_proto_get_renders_prototype_text(monkeypatch, capsys):
     assert capsys.readouterr().out == "int32_t sub_401000(int32_t arg1)\n"
 
 
+def test_proto_get_splices_function_name_into_anonymous_prototype(monkeypatch, capsys):
+    """BN renders the prototype anonymously; the renderer splices in the function
+    name so it's a copy-pasteable C declaration (#222)."""
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": {
+            "function": {"name": "parse_image", "address": "0x401000"},
+            "prototype": "uint64_t (int32_t arg1, char* arg2)",
+        }}
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["proto", "get", "--format", "text", "--target", "active", "parse_image"])
+    assert rc == 0
+    assert capsys.readouterr().out == "uint64_t parse_image(int32_t arg1, char* arg2)\n"
+
+
+def test_proto_get_splices_name_that_is_substring_of_return_type(monkeypatch, capsys):
+    """A function name that is a substring of the return type must still be
+    spliced (the naive `name in head` guard wrongly skipped it) (#222 review)."""
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": {
+            "function": {"name": "t", "address": "0x1000"},
+            "prototype": "uint64_t (int32_t a)"}}
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["proto", "get", "--format", "text", "--target", "active", "t"])
+    assert rc == 0
+    assert capsys.readouterr().out == "uint64_t t(int32_t a)\n"
+
+
+def test_py_exec_accepts_positional_code(monkeypatch):
+    """`bn py exec '<code>'` positional works, matching the skill examples (#197)."""
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        captured["params"] = params
+        return {"ok": True, "result": {"stdout": "", "result": None}}
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["py", "exec", "--target", "active", "print('hi')"])
+    assert rc == 0
+    assert captured["params"]["script"] == "print('hi')"
+
+
+def test_function_list_reverse_threads_to_op(monkeypatch):
+    """--reverse threads a reverse param so the bridge flips the sort order (#221)."""
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        captured["params"] = params
+        return {"ok": True, "result": {"items": [], "total": 0, "offset": 0,
+                                       "limit": None, "returned": 0, "has_more": False}}
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["function", "list", "--target", "active", "--sort", "size", "--reverse"])
+    assert rc == 0
+    assert captured["params"].get("reverse") is True
+    assert captured["params"].get("sort") == "size"
+
+
+def test_xrefs_any_batch_probes_symbols(monkeypatch, capsys):
+    """`xrefs --any` probes several symbols in one call; absent ones are reported,
+    not errors, and the command exits 0 (#218)."""
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        assert op == "xrefs_any"
+        assert params["symbols"] == ["memcpy", "strcpy", "system"]
+        return {"ok": True, "result": {
+            "count": 3, "present": 2,
+            "symbols": [
+                {"symbol": "memcpy", "present": True, "code_ref_count": 12,
+                 "caller_function_count": 4, "address": "0x1000"},
+                {"symbol": "strcpy", "present": False, "note": "Function not found: strcpy"},
+                {"symbol": "system", "present": True, "code_ref_count": 1,
+                 "caller_function_count": 1, "address": "0x2000"},
+            ]}}
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["xrefs", "--target", "active", "--any", "memcpy", "strcpy", "system"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "memcpy: 12 code refs across 4 fn(s)" in out
+    assert "strcpy: absent" in out
+
+
+def test_batch_apply_drops_instance_id_target(monkeypatch):
+    """A fan-out agent putting the --instance id in the manifest target has it
+    dropped, so the instance's single open target resolves (#227)."""
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        captured["params"] = params
+        captured["instance_id"] = instance_id
+        return {"ok": True, "result": {"results": [], "status": "verified"}}
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    import io
+    manifest = '{"target": "my_inst", "ops": []}'
+    monkeypatch.setattr("sys.stdin", io.StringIO(manifest))
+    rc = bn.cli.main(["--instance", "my_inst", "batch", "apply", "-"])
+    assert rc == 0
+    assert "target" not in captured["params"]      # instance-id target was dropped
+
+
 def test_local_list_text_is_slim(monkeypatch, capsys):
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "list_locals"

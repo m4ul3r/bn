@@ -13,7 +13,7 @@ EXPECTED_READ = {
     "doctor", "list_targets", "target_info", "function_info", "get_prototype",
     "list_functions", "list_locals", "search_functions", "callsites", "decompile",
     "il", "structured_il", "defuse", "resolved_calls", "possible_values", "taint",
-    "disasm", "function_evidence", "xrefs", "field_xrefs", "pointer_table",
+    "disasm", "function_evidence", "xrefs", "xrefs_any", "field_xrefs", "pointer_table",
     "message_lens", "init_arrays", "backward_slice", "types", "type_info",
     "strings", "imports", "list_exports", "bundle_function", "get_comment", "list_comments",
     "sections", "read",

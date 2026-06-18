@@ -186,21 +186,26 @@ def _filtered_functions(
 _FUNCTION_SORTS = ("address", "size", "name")
 
 
-def _sort_function_items(items: list[dict[str, Any]], sort: str) -> list[dict[str, Any]]:
+def _sort_function_items(items: list[dict[str, Any]], sort: str,
+                         reverse: bool = False) -> list[dict[str, Any]]:
     """Order function-listing rows. 'address' (default) keeps the bridge's
     natural start-address order; 'size' ranks largest-first (the common
     'find the biggest function' triage step that otherwise needs a write-locked
-    py exec); 'name' is case-insensitive."""
+    py exec); 'name' is case-insensitive. ``reverse`` flips the NATURAL order of
+    the chosen sort, so e.g. ``--sort size --reverse`` surfaces the SMALLEST
+    functions and ``--sort address --reverse`` walks high->low (#221)."""
     if sort not in _FUNCTION_SORTS:
         raise OperationFailure(
             "invalid_request",
             f"Invalid sort '{sort}'; choose one of {', '.join(_FUNCTION_SORTS)}",
         )
     if sort == "size":
-        items.sort(key=lambda it: (it.get("size") or 0), reverse=True)
+        # natural = largest first; reverse -> smallest first
+        items.sort(key=lambda it: (it.get("size") or 0), reverse=not reverse)
     elif sort == "name":
-        items.sort(key=lambda it: str(it.get("name", "")).lower())
-    # 'address': already in start-address order from _filtered_functions.
+        items.sort(key=lambda it: str(it.get("name", "")).lower(), reverse=reverse)
+    elif reverse:  # 'address': natural is the start-address order; flip it
+        items.sort(key=lambda it: int(str(it.get("address", "0x0")), 16), reverse=True)
     return items
 
 
@@ -214,6 +219,7 @@ def _list_functions(
     limit: int | None = None,
     count_only: bool = False,
     sort: str = "address",
+    reverse: bool = False,
 ):
     offset = _validate_count(offset, label="offset", minimum=0)
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
@@ -233,7 +239,7 @@ def _list_functions(
         }
         for fn in functions
     ]
-    _sort_function_items(items, sort)
+    _sort_function_items(items, sort, reverse)
     return _paged_function_result(ctx, items, offset=offset, limit=limit)
 
 
@@ -278,6 +284,7 @@ def _search_functions(
     offset: int = 0,
     limit: int | None = None,
     sort: str = "address",
+    reverse: bool = False,
 ):
     offset = _validate_count(offset, label="offset", minimum=0)
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
@@ -318,5 +325,5 @@ def _search_functions(
                 "display_name": display,
                 "size": il_format._function_size(fn),
             })
-    _sort_function_items(items, sort)
+    _sort_function_items(items, sort, reverse)
     return _paged_function_result(ctx, items, offset=offset, limit=limit)

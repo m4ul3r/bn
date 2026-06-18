@@ -156,6 +156,45 @@ def _xrefs_ambiguous(ctx, bv, identifier: str, bodies, *, offset: int = 0, limit
     return result
 
 
+def _xrefs_any(ctx, selector: str | None, symbols: list[Any]) -> dict[str, Any]:
+    """Batch-probe several symbols in one call (a VR sink sweep): resolve+count
+    refs for each, recording present+counts or absent. "Not linked" is a valid
+    answer, not an error, so the call succeeds (exit 0) regardless of which
+    symbols exist -- no `set -e` shell loop aborting on the first absent one
+    (#218)."""
+    bv = ctx._resolve_view(selector)
+    require_analysis(bv, "Cross-references")
+    results: list[dict[str, Any]] = []
+    present = 0
+    for raw in symbols:
+        sym = str(raw)
+        try:
+            res = _xrefs(ctx, selector, sym)
+        except RuntimeError as exc:
+            msg = str(exc)
+            if "Ambiguous" in msg:
+                # The symbol DOES exist (it resolves to >=2 bodies); "absent"
+                # would be a false negative for a sink sweep. Record it present
+                # but ambiguous so the analyst probes it directly (#218 review).
+                present += 1
+                results.append({"symbol": sym, "present": True, "ambiguous": True,
+                                "note": msg.splitlines()[0]})
+            else:
+                results.append({"symbol": sym, "present": False,
+                                "note": msg.splitlines()[0]})
+            continue
+        present += 1
+        results.append({
+            "symbol": sym,
+            "present": True,
+            "address": res.get("address"),
+            "code_ref_count": res.get("code_ref_count", 0),
+            "data_ref_count": res.get("data_ref_count", 0),
+            "caller_function_count": res.get("caller_function_count", 0),
+        })
+    return {"symbols": results, "count": len(results), "present": present}
+
+
 def _drop_legacy_ref_arrays(envelope: dict[str, Any]) -> dict[str, Any]:
     """Strip the deprecated full ``code_refs``/``data_refs`` arrays from the
     ``xrefs`` OP response so ``--offset``/``--limit`` bound the entire serialized

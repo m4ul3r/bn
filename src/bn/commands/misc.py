@@ -266,21 +266,35 @@ def _read_raw_bytes(args: argparse.Namespace, address: str) -> int:
 
 
 @command("py", "exec", help="Execute a Python snippet", target=True,
+         args=[arg("code_pos", nargs="?", metavar="CODE",
+                   help="Inline Python code (positional; same as --code)")],
          mutex_groups=[
-             mutex(True,
+             mutex(False,
                    arg("--script", type=Path, help="Read Python code from a file"),
                    arg("--code", help="Inline Python code"),
                    arg("--stdin", action="store_true")),
          ])
 def _py_exec(args: argparse.Namespace) -> int:
-    if getattr(args, "code", None) is not None:
-        script = args.code
+    # Accept a bare positional as the code (the natural `bn py exec '<code>'`
+    # form the skill examples imply), in addition to --code/--script/--stdin (#197).
+    pos = getattr(args, "code_pos", None)
+    flag = getattr(args, "code", None)
+    if pos is not None and flag is not None:
+        raise BridgeError("py exec: pass code positionally OR with --code, not both")
+    inline = flag if flag is not None else pos
+    if inline is not None:
+        script = inline
     elif args.script:
         if not args.script.exists():
             raise BridgeError(f"Script file not found: {args.script}. Use --code for inline Python.")
         script = args.script.read_text(encoding="utf-8")
-    else:
+    elif args.stdin:
         script = sys.stdin.read()
+    else:
+        raise BridgeError(
+            "py exec needs code: pass it positionally (bn py exec '<code>'), "
+            "or use --code / --script FILE / --stdin"
+        )
 
     return _call(
         args,
@@ -362,6 +376,14 @@ def _batch_apply(args: argparse.Namespace) -> int:
             f'Manifest ({source}) must have an "ops" array (the list of '
             f"operations to apply)."
         )
+    # #227: fan-out agents are told to thread `--instance <id>` everywhere and
+    # naturally put that id in the manifest "target" -- but an instance id is a
+    # bridge, not a target selector, so it gets rejected. When the manifest target
+    # is just the --instance id, drop it: the bridge then resolves the instance's
+    # single open target (the manifest "target" is optional with --instance).
+    inst = getattr(args, "instance", None)
+    if inst and manifest.get("target") == inst:
+        manifest.pop("target", None)
     if args.preview:
         manifest["preview"] = True
     return _call(
