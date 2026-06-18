@@ -257,3 +257,28 @@ def _class_list(
     if limit is not None:
         rows = rows[:limit]
     return {"classes": rows, "total": total, "offset": offset, "include_all": include_all}
+
+
+def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[str, Any]:
+    """Function slots of an Itanium vtable. Words [0] (offset-to-top) and [1]
+    (typeinfo ptr) are header; slots start at +2*ptr_size. Reuses the
+    Thumb-aware pointer-table reader."""
+    ptr = ctx._pointer_size(bv)
+    start = vtable_addr + 2 * ptr
+    table = ctx._pointer_table_layout(bv, start, entries=max_slots, stride=ptr)
+    slots: list[dict[str, Any]] = []
+    for i, row in enumerate(table.get("entries") or []):
+        target = row.get("target") or {}
+        fn = target.get("function") if isinstance(target, dict) else None
+        # A null/unmapped slot ends the vtable (next object / padding).
+        if not row.get("readable") or target.get("status") not in ("function", "mapped"):
+            break
+        name = (fn or {}).get("name") if isinstance(fn, dict) else None
+        slots.append({
+            "index": i,
+            "address": row.get("value"),
+            "method": fn if isinstance(fn, dict) else None,
+            "pure_virtual": name == "__cxa_pure_virtual",
+            "unnamed": (isinstance(name, str) and name.startswith("sub_")) or (fn is None),
+        })
+    return {"address": hex(int(vtable_addr)), "slots": slots}

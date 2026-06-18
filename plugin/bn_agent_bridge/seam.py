@@ -678,6 +678,12 @@ class BridgeContext:
             "context": context,
         }
 
+    def _pointer_table_layout(self, bv, start, *, entries, stride):
+        from . import read_evidence
+        return read_evidence._pointer_table_for_view(
+            self, bv, start, entries=entries, stride_size=stride
+        )
+
     # ---- relocated cycle-breakers (design spec §3.2): both state-free ----
 
     def _find_type(self, bv, type_name: str):

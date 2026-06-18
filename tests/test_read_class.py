@@ -131,3 +131,39 @@ def test_class_list_envelope_filters_and_pages():
     confirmed = read_class._class_list(_Ctx(), None, include_all=False)
     assert "net" not in [c["name"] for c in confirmed["classes"]]
     assert "net::Session" in [c["name"] for c in confirmed["classes"]]
+
+
+class _VtableCtx:
+    """Minimal ctx exposing the pointer-table reader over a fake slot map."""
+    def __init__(self, slots, pure_addr=0xDEAD):
+        # slots: list of (value_addr, function_name_or_None)
+        self._slots = slots
+        self._pure = pure_addr
+
+    def _pointer_size(self, bv):
+        return 8
+
+    def _pointer_table_layout(self, bv, start, *, entries, stride):
+        rows = []
+        for i, (val, fname) in enumerate(self._slots):
+            target = {"status": "function", "normalized": hex(val),
+                      "function": ({"name": fname, "address": hex(val)} if fname else None)}
+            if val == self._pure:
+                target = {"status": "function", "normalized": hex(val),
+                          "function": {"name": "__cxa_pure_virtual", "address": hex(val)}}
+            rows.append({"index": i, "entry_address": hex(start + i * stride),
+                         "value": hex(val), "readable": True, "plausible": True, "target": target})
+        return {"entries": rows}
+
+
+def test_vtable_layout_skips_header_and_marks_slots():
+    bv = object()
+    slots = [(0x40e8b0, "onData"), (0x40e3d0, None), (0xDEAD, "__cxa_pure_virtual")]
+    ctx = _VtableCtx(slots)
+    layout = read_class._vtable_layout(ctx, bv, 0x9000)
+    assert layout["address"] == "0x9000"
+    # header words skipped: read starts at 0x9000 + 2*8
+    s0, s1, s2 = layout["slots"]
+    assert s0["index"] == 0 and s0["method"]["name"] == "onData"
+    assert s1["unnamed"] is True            # sub_* / no symbol
+    assert s2["pure_virtual"] is True
