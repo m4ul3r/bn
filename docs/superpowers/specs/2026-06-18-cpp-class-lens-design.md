@@ -328,3 +328,42 @@ invented names in this doc.
 - Caching the registry across requests for very large binaries.
 - A `--by-class` flag on `bn function list` (the `class list` subcommand
   subsumes the discovery need #205 raised; revisit only if requested).
+
+## 9. Implementation status (as shipped)
+
+Recorded after implementation + a sanitized live dogfood against a real C++
+target. All examples below use invented names.
+
+**Fully working (validated live):**
+- Method clustering + confidence (`class list`, `class show`).
+- Vtable layout for vtables with absolute pointers (`.rodata`): slots resolved,
+  `__cxa_pure_virtual` and unnamed `sub_*` slots marked.
+- RTTI base classes (`__si`/`__vmi` decode + structural inference).
+- Object size from a defined BN type (`source: bn_type`).
+- Instances: construction sites (ctor inbound call sites) + globals storing the
+  vtable.
+
+**Dogfood-found fix (regression-tested):** BN demangles RTTI markers with
+underscores and the vtable form carries a leading underscore (`_vtable_for_X`)
+while typeinfo does not (`typeinfo_for_X`, `typeinfo_name_for_X`). The original
+fixed marker list only matched the vtable form, so typeinfo — and therefore all
+RTTI base classes — never resolved. Replaced with a regex matching both space
+and underscore spellings.
+
+**Best-effort gaps (honest, not fabricated; documented in `--help`/output):**
+- **PIE vtables.** On position-independent targets, vtable function pointers
+  live in `.data.rel.ro` and are zero in the static image (applied at load time
+  via relocations BN does not surface here). Such a vtable resolves no slots;
+  `class show` says so explicitly rather than rendering a class that looks like
+  it has no virtuals.
+- **`operator new` object size.** Recovering the allocation size that feeds a
+  ctor's `this` needs MLIL def-use analysis that BN often does not expose at the
+  call site. Not implemented; size falls back to a defined BN type when present,
+  else `null` (never fabricated). `source: operator_new` is reserved for a
+  follow-up.
+- **Construction-site storage kind.** Sites are reported as `ctor-call` with the
+  caller named; new/stack/global classification (and per-`new` size) is the same
+  deferred MLIL-arg-recovery work as above.
+
+These two MLIL-analysis gaps are the natural next follow-up (and pair well with
+the §8 "acting on the lens" mutations).
