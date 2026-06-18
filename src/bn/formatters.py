@@ -2061,12 +2061,13 @@ def _render_one_class(rec: Any) -> str:
             )
             lines.append(f"  vtable [{s.get('index')}] {s.get('address', '?')}  {label}")
     elif vt_addr:
-        # A vtable symbol exists but no slots resolved -- on PIE/PIC targets the
-        # function pointers live in .data.rel.ro and are zero in the static image
-        # (applied at load time via relocations BN may not surface). Say so
-        # rather than render a class that looks like it has no virtuals.
-        lines.append("  vtable: present but no slots resolved "
-                     "(pointers may be applied at load time via relocations)")
+        # A vtable symbol exists but no slots resolved. Either the vtable is
+        # defined in another module (the local symbol is an import/GOT slot) or
+        # it is a PIE/.data.rel.ro vtable whose pointers are applied at load time
+        # via relocations (zero in the static image). In both cases there is no
+        # decodable local body; say so rather than render fake or empty virtuals.
+        lines.append("  vtable: symbol present but no slots resolved here "
+                     "(defined in another module, or applied at load time via relocations)")
     # Non-virtual member functions (kind=method). Virtual ones already appear as
     # vtable slots above; listing the symbol-side methods makes `class show`
     # useful for classes whose vtable is empty or absent (e.g. Controller).

@@ -269,19 +269,45 @@ def _class_list(
     return {"classes": rows, "total": total, "offset": offset, "include_all": include_all}
 
 
+def _slot_is_code(target: dict[str, Any]) -> bool:
+    """A real vtable slot is a CODE pointer: a resolved function, or a mapped
+    pointer into an executable segment (code BN simply hasn't analyzed into a
+    function yet). A mapped pointer into DATA (a GOT/.data entry read past the
+    end of the table, or an import slot misread as a vtable) is NOT a slot --
+    rejecting it stops the scan instead of rendering adjacent data as fake slots
+    (#205 review)."""
+    status = target.get("status")
+    if status == "function":
+        return True
+    if status == "mapped":
+        seg = (target.get("context") or {}).get("segment") or {}
+        return bool(seg.get("executable"))
+    return False
+
+
 def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[str, Any]:
     """Function slots of an Itanium vtable. Words [0] (offset-to-top) and [1]
     (typeinfo ptr) are header; slots start at +2*ptr_size. Reuses the
-    Thumb-aware pointer-table reader."""
+    Thumb-aware pointer-table reader. Only CODE targets count as slots."""
     ptr = ctx._pointer_size(bv)
+    # Itanium invariant: word[1] (vtable_addr + ptr) points to the class's
+    # typeinfo. If it doesn't resolve to a typeinfo symbol, this address is NOT
+    # the start of a real local vtable OBJECT -- it's an import/GOT pointer slot
+    # (the vtable is defined in another module) or a PIE slot relocated to zero.
+    # Decoding +2*ptr there would render adjacent GOT/data as fake slots
+    # (#205 review), so report no slots and let the caller note it.
+    ti_ptr = ctx._read_pointer_value(bv, vtable_addr + ptr, size=ptr)
+    if not ti_ptr or ctx._typeinfo_name_at(bv, ti_ptr) is None:
+        return {"address": hex(int(vtable_addr)), "slots": []}
     start = vtable_addr + 2 * ptr
     table = ctx._pointer_table_layout(bv, start, entries=max_slots, stride=ptr)
     slots: list[dict[str, Any]] = []
     for i, row in enumerate(table.get("entries") or []):
         target = row.get("target") or {}
         fn = target.get("function") if isinstance(target, dict) else None
-        # A null/unmapped slot ends the vtable (next object / padding).
-        if not row.get("readable") or target.get("status") not in ("function", "mapped"):
+        # A null/unmapped/non-code slot ends the vtable (next object / padding /
+        # a misidentified table over data).
+        if not row.get("readable") or not _slot_is_code(target):
             break
         name = (fn or {}).get("name") if isinstance(fn, dict) else None
         slots.append({
@@ -384,12 +410,26 @@ def _instances(ctx, bv, record: dict[str, Any], *, cap: int = 128) -> dict[str, 
     return {"construction_sites": sites, "stored_globals": stored}
 
 
+def _query_leaf(name: str) -> str:
+    """Last TOP-LEVEL ``::`` component, template arguments PRESERVED. Unlike
+    ``_last_component`` (which drops ``<...>`` for ctor/dtor-name comparison),
+    this keeps the template args so a specific query like ``Vec<std::string>``
+    is not collapsed to ``Vec`` and matched against unrelated specializations.
+    The scope check is depth-aware, so ``::`` inside ``<...>`` is not a scope
+    separator (#205 review)."""
+    head = _strip_signature(name)
+    idx = _last_toplevel_scope(head)
+    return head[idx + 2:] if idx is not None else head
+
+
 def _resolve_class_names(registry: dict[str, dict], name: str) -> list[str]:
-    """Exact match, else all classes whose leaf component equals *name*."""
+    """Exact match, else all classes whose top-level leaf equals *name*'s leaf
+    (template args preserved), so an unqualified query matches the same class
+    across namespaces without conflating template specializations."""
     if name in registry:
         return [name]
-    leaf = _last_component(name) if "::" in name else name
-    return sorted(k for k in registry if _last_component(k) == leaf)
+    leaf = _query_leaf(name)
+    return sorted(k for k in registry if _query_leaf(k) == leaf)
 
 
 def _enrich(ctx, bv, rec: dict[str, Any]) -> dict[str, Any]:

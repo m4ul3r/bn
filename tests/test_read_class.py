@@ -52,11 +52,12 @@ def test_split_no_scope_returns_none():
 
 
 class _Sym:
-    def __init__(self, raw_name, short_name, address):
+    def __init__(self, raw_name, short_name, address, sym_type="SymbolType.DataSymbol"):
         self.raw_name = raw_name
         self.short_name = short_name
         self.name = raw_name
         self.address = address
+        self.type = sym_type
 
 
 class _Fn:
@@ -137,6 +138,79 @@ def test_registry_handles_underscore_rtti_markers():
     assert rec["confidence"] == "rtti"
 
 
+class _SlotCtx:
+    """ctx for _vtable_layout slot-scan tests. Supplies a valid Itanium typeinfo
+    header (word[1] resolves to a typeinfo) so the layout gate passes and the
+    slot rows are exercised; ``ti_ok=False`` makes the header invalid."""
+    def __init__(self, rows, ti_ok=True):
+        self._rows = rows
+        self._ti_ok = ti_ok
+
+    def _pointer_size(self, bv):
+        return 8
+
+    def _read_pointer_value(self, bv, addr, *, size=None):
+        return 0x9100 if self._ti_ok else 0   # word[1] = typeinfo ptr (or null)
+
+    def _typeinfo_name_at(self, bv, addr):
+        return "net::Klass" if self._ti_ok else None
+
+    def _pointer_table_layout(self, bv, start, *, entries, stride):
+        return {"entries": self._rows}
+
+
+def test_vtable_layout_skips_when_header_not_typeinfo():
+    # The Itanium gate: if word[1] doesn't resolve to a typeinfo, this isn't a
+    # real local vtable object (import/GOT slot or relocated-to-zero PIE slot) --
+    # return no slots instead of decoding adjacent GOT/data as fake slots.
+    rows = [{"index": 0, "value": "0x1000", "readable": True,
+             "target": {"status": "function", "function": {"name": "f0"}}}]
+    layout = read_class._vtable_layout(_SlotCtx(rows, ti_ok=False), object(), 0x9000)
+    assert layout["slots"] == []
+
+
+def test_vtable_layout_stops_at_mapped_data_slot():
+    # A mapped pointer into a NON-executable segment (GOT/.data read past the
+    # table end, or an import slot misread) is not a slot -- it ends the scan,
+    # rather than rendering adjacent data as fake slots (#205 review).
+    rows = [
+        {"index": 0, "value": "0x1000", "readable": True,
+         "target": {"status": "function", "function": {"name": "f0"}}},
+        {"index": 1, "value": "0x9999", "readable": True,
+         "target": {"status": "mapped", "function": None,
+                    "context": {"segment": {"executable": False}}}},
+        {"index": 2, "value": "0x2000", "readable": True,
+         "target": {"status": "function", "function": {"name": "f2"}}},
+    ]
+    layout = read_class._vtable_layout(_SlotCtx(rows), object(), 0x9000)
+    assert [s["index"] for s in layout["slots"]] == [0]
+
+
+def test_vtable_layout_includes_executable_mapped_slot():
+    # A mapped pointer into an EXECUTABLE segment is code BN hasn't analyzed into
+    # a function yet -- still a valid (unnamed) vtable slot.
+    rows = [
+        {"index": 0, "value": "0x1000", "readable": True,
+         "target": {"status": "mapped", "function": None,
+                    "context": {"segment": {"executable": True}}}},
+    ]
+    layout = read_class._vtable_layout(_SlotCtx(rows), object(), 0x9000)
+    assert len(layout["slots"]) == 1 and layout["slots"][0]["unnamed"] is True
+
+
+def test_resolve_class_names_template_query_not_collapsed():
+    # A specific template query must match only its specialization, not every
+    # Vec<...> (the old raw-"::"-substring + template-arg-dropping bug).
+    reg = {"ns::Vec<std::string>": {}, "ns::Vec<float>": {}, "ns::Vec": {}}
+    assert read_class._resolve_class_names(reg, "Vec<std::string>") == ["ns::Vec<std::string>"]
+    assert read_class._resolve_class_names(reg, "Vec") == ["ns::Vec"]
+
+
+def test_resolve_class_names_cross_namespace_leaf():
+    reg = {"a::Foo": {}, "b::Foo": {}, "Bar": {}}
+    assert read_class._resolve_class_names(reg, "Foo") == ["a::Foo", "b::Foo"]
+
+
 def test_class_list_envelope_filters_and_pages():
     bv = _make_registry_bv()
 
@@ -162,6 +236,12 @@ class _VtableCtx:
 
     def _pointer_size(self, bv):
         return 8
+
+    def _read_pointer_value(self, bv, addr, *, size=None):
+        return 0x9100   # word[1] = a valid typeinfo ptr (passes the layout gate)
+
+    def _typeinfo_name_at(self, bv, addr):
+        return "net::Klass"
 
     def _pointer_table_layout(self, bv, start, *, entries, stride):
         rows = []
@@ -195,6 +275,12 @@ def test_vtable_layout_stops_at_unmapped_slot():
     class _Ctx:
         def _pointer_size(self, bv):
             return 8
+
+        def _read_pointer_value(self, bv, addr, *, size=None):
+            return 0x9100   # valid typeinfo header -> passes the layout gate
+
+        def _typeinfo_name_at(self, bv, addr):
+            return "net::Klass"
 
         def _pointer_table_layout(self, bv, start, *, entries, stride):
             return {"entries": [
@@ -463,7 +549,7 @@ def test_render_class_show_lists_non_virtual_methods_and_empty_vtable_note():
     text = _render_class_show_text(rec)
     assert "methods (2):" in text
     assert "0x401000  Controller::setAudioFocus(int)" in text
-    assert "vtable: present but no slots resolved" in text
+    assert "vtable: symbol present but no slots resolved here" in text
 
 
 def test_render_class_show_no_vtable_note_when_no_vtable():
@@ -483,3 +569,5 @@ def test_render_construction_site_includes_function():
                 "kind": "ctor-call", "size": None}],
                "stored_globals": []}}
     assert "ctor-call @ 0x443abc (in AapGalifStart)" in _render_class_show_text(rec)
+
+
