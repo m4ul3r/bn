@@ -174,6 +174,59 @@ def test_spill_warns_about_pipe_trap_when_stdout_is_a_pipe(monkeypatch, capsys):
     assert "--out" in stderr
 
 
+def test_spill_emits_greppable_marker_on_piped_text(monkeypatch, capsys):
+    """A piped TEXT spill prepends a loud __BN_SPILLED__ marker as the FIRST
+    stdout line, so a downstream grep/awk can't mistake a no-match for absence
+    (#216) -- the stderr note alone is invisible to the pipe consumer."""
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": {"text": "long decompiled text"}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli, "write_output_result",
+                        lambda value, *, fmt, out_path, stem: _spill_artifact_namespace("/tmp/decompile.txt"))
+    monkeypatch.setattr(bn.cli, "_stdout_is_pipe", lambda: True, raising=False)
+
+    rc = bn.cli.main(["decompile", "sub_401000", "--target", "active"])
+    assert rc == 0
+    stdout, _ = capsys.readouterr()
+    assert stdout.splitlines()[0] == "__BN_SPILLED__ /tmp/decompile.txt"
+
+
+def test_spill_json_pipe_has_no_marker(monkeypatch, capsys):
+    """A piped JSON spill must NOT get the text marker -- it would corrupt the
+    jq-parseable envelope, whose spilled:true field is already machine-checkable
+    (#216)."""
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": {"text": "long decompiled text"}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli, "write_output_result",
+                        lambda value, *, fmt, out_path, stem: _spill_artifact_namespace("/tmp/decompile.txt"))
+    monkeypatch.setattr(bn.cli, "_stdout_is_pipe", lambda: True, raising=False)
+
+    rc = bn.cli.main(["decompile", "sub_401000", "--target", "active", "--format", "json"])
+    assert rc == 0
+    stdout, _ = capsys.readouterr()
+    assert "__BN_SPILLED__" not in stdout
+
+
+def test_spill_no_marker_when_not_piped(monkeypatch, capsys):
+    """A non-pipe (terminal / capture) text spill stays quiet -- no marker line
+    pollutes interactive output (#216)."""
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": {"text": "long decompiled text"}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli, "write_output_result",
+                        lambda value, *, fmt, out_path, stem: _spill_artifact_namespace("/tmp/decompile.txt"))
+    monkeypatch.setattr(bn.cli, "_stdout_is_pipe", lambda: False, raising=False)
+
+    rc = bn.cli.main(["decompile", "sub_401000", "--target", "active"])
+    assert rc == 0
+    stdout, _ = capsys.readouterr()
+    assert "__BN_SPILLED__" not in stdout
+
+
 def _spill_artifact_namespace(path: str) -> types.SimpleNamespace:
     return types.SimpleNamespace(
         rendered=f"ok: true\nspilled: true\npath: {path}\n",
@@ -841,7 +894,7 @@ def test_skill_install_json_output_remains_available(tmp_path, monkeypatch, caps
 
     assert rc == 0
     output = capsys.readouterr().out
-    assert '"installed": true' in output
+    assert '"installed":true' in output          # compact json (#215)
     assert '"installed_destinations"' in output
 
 

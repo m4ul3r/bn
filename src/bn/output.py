@@ -48,7 +48,12 @@ def _json_default(value: Any) -> Any:
 
 def render_value(value: Any, fmt: str) -> str:
     if fmt == "json":
-        return json.dumps(value, indent=2, sort_keys=True, default=_json_default) + "\n"
+        # COMPACT json (no indent): pretty-printing inflated structured/list output
+        # ~3x, tripping the spill threshold so early that `function list --format
+        # json | jq` of a few-hundred-function binary already read the spill
+        # envelope instead of the data (#215). Compact ~3x's the pre-spill ceiling;
+        # `| jq` re-pretties for humans. sort_keys keeps output deterministic.
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), default=_json_default) + "\n"
 
     if fmt == "ndjson":
         if isinstance(value, list):
@@ -201,9 +206,9 @@ def render_error(message: str, fmt: str) -> str:
     """Render an error as a machine-readable envelope under json/ndjson.
 
     Routes through :func:`render_value` so error envelopes match successful
-    JSON output (``indent=2, sort_keys=True``) instead of a hand-rolled compact
-    ``json.dumps``. Lets ``bn ... --format json | jq`` parse an error object
-    rather than an empty stream.
+    JSON output (compact, ``sort_keys=True`` since #215) instead of a divergent
+    hand-rolled ``json.dumps``. Lets ``bn ... --format json | jq`` parse an error
+    object rather than an empty stream.
     """
     return render_value({"ok": False, "error": message}, fmt)
 

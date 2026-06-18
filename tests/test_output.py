@@ -194,7 +194,8 @@ def test_write_output_falls_back_to_full_output_when_spill_write_fails(
 ):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     payload = {"data": [f"item-{index:04d}" for index in range(1000)]}
-    expected = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    # json is emitted compact now (#215), so the fallback full output is compact too.
+    expected = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
 
     def _boom(self, data):
         raise OSError(28, "No space left on device")

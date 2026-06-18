@@ -387,6 +387,15 @@ def _render_result(
         label = spill_label or stem.replace("_", " ")
         artifact = result.artifact
         artifact_path = artifact["artifact_path"]
+        # #216: a piped TEXT consumer (grep/awk/rg) reads only the small spill
+        # envelope, so a no-match silently reads as "absent" -- a false negative
+        # that has misled agents. Emit a loud, greppable marker as the FIRST
+        # stdout line so the spill is impossible to miss in the stream itself (the
+        # stderr note is lossy and invisible to the pipe consumer). Text only: a
+        # marker line would corrupt the json/ndjson envelope, whose `spilled:true`
+        # field is already machine-checkable.
+        if fmt == "text" and _stdout_is_pipe():
+            sys.stdout.write(f"__BN_SPILLED__ {artifact_path}\n")
         sys.stdout.write(result.rendered)
         hint = _spill_next_step_hint(
             stem, spill_context, artifact_path, paged=paged, text_format=(fmt == "text")
