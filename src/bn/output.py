@@ -206,9 +206,9 @@ def render_error(message: str, fmt: str) -> str:
     """Render an error as a machine-readable envelope under json/ndjson.
 
     Routes through :func:`render_value` so error envelopes match successful
-    JSON output (``indent=2, sort_keys=True``) instead of a hand-rolled compact
-    ``json.dumps``. Lets ``bn ... --format json | jq`` parse an error object
-    rather than an empty stream.
+    JSON output (compact, ``sort_keys=True`` since #215) instead of a divergent
+    hand-rolled ``json.dumps``. Lets ``bn ... --format json | jq`` parse an error
+    object rather than an empty stream.
     """
     return render_value({"ok": False, "error": message}, fmt)
 
