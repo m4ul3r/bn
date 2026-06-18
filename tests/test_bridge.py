@@ -3566,6 +3566,77 @@ def test_diff_snapshots_marks_name_only_changes(monkeypatch):
     assert "before_excerpt" not in diffs[0]
 
 
+def test_count_referenced_functions_is_uncapped_past_snapshot_cap(monkeypatch):
+    """affected_functions is capped at 10 for snapshotting, but the reported
+    blast radius (affected_summary.referenced) must be the true total -- a struct
+    used by 200 functions previously surfaced as "10" with no hint of real scope."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    ctx = bridge.BinaryNinjaBridge().ctx
+    funcs = [_FakeFunction(0x1000 + i * 4, f"f{i}", "void(struct Widget* w)") for i in range(15)]
+    bv = _FakeBV(functions=funcs)
+    # Sidestep the C parser: the type resolution is exercised elsewhere.
+    monkeypatch.setattr(me, "_operation_type_names", lambda c, b, op: ["Widget"])
+    ops = [{"op": "types_declare", "declaration": "struct Widget { int x; };"}]
+
+    assert len(me._guess_affected_functions(ctx, bv, ops)) == 10  # snapshot set, capped
+    assert me._count_referenced_functions(ctx, bv, ops, fallback=10) == 15  # true total
+
+
+def test_count_referenced_functions_falls_back_on_scan_error(monkeypatch):
+    """A stubbed/odd view must never crash a mutation: the count degrades to the
+    capped fallback rather than raising."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    ctx = bridge.BinaryNinjaBridge().ctx
+
+    def _boom(*a, **k):
+        raise RuntimeError("view scan blew up")
+
+    monkeypatch.setattr(me, "_functions_for_op", _boom)
+    assert me._count_referenced_functions(ctx, _FakeBV(), [{"op": "set_prototype"}], fallback=4) == 4
+
+
+def test_slim_type_result_drops_redundant_layouts(monkeypatch):
+    """A verified types_declare result echoes the layout under defined_type_layouts
+    AND observed.defined_type_layouts, duplicating affected_types[].after_layout.
+    The output slim drops both heavy copies but keeps the short decl strings."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    layout = "struct Widget // size=0x4\n0x0000: int32_t x"
+    result = {
+        "op": "types_declare",
+        "defined_types": {"Widget": "struct Widget"},
+        "defined_type_layouts": {"Widget": layout},
+        "observed": {"defined_types": {"Widget": "struct Widget"}, "defined_type_layouts": {"Widget": layout}},
+    }
+    slim = me._slim_type_result_for_output(result)
+    assert "defined_type_layouts" not in slim
+    assert "defined_type_layouts" not in slim["observed"]
+    assert slim["defined_types"] == {"Widget": "struct Widget"}  # short decl kept
+    assert slim["observed"]["defined_types"] == {"Widget": "struct Widget"}
+    assert "defined_type_layouts" in result  # original untouched (copy, not mutate)
+
+    other = {"op": "set_prototype", "observed": {"prototype": "void()"}}
+    assert me._slim_type_result_for_output(other) is other  # non-type op passes through
+
+
+def test_diff_snapshots_omits_excerpt_when_full_diff_fits(monkeypatch):
+    """A small real body change: the full unified diff fits inline, so the focused
+    before/after_excerpt would only duplicate it. The excerpt is reserved for the
+    large-function case where the diff gets truncated (see the M14 test above)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    diffs = instance._diff_snapshots(
+        {0x1000: {"text": "x = 1;\ny = prev;\nz = 3;", "name": "f"}},
+        {0x1000: {"text": "x = 1;\ny = next;\nz = 3;", "name": "f"}},
+    )
+    d = diffs[0]
+    assert d["changed"] is True
+    assert "prev" in d["diff"] and "next" in d["diff"]  # change visible inline
+    assert "before_excerpt" not in d and "after_excerpt" not in d
+
+
 def test_diff_snapshots_marks_comment_only_change(monkeypatch):
     """A comment set/delete changes no HLIL body text, so a text-only snapshot
     reports changed:false with an empty diff. The diff/changed signal must also

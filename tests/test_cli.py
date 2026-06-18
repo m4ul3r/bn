@@ -5119,6 +5119,109 @@ def test_render_mutation_text_still_reports_clean_rollback():
     assert "rolled back: live verification failed" in out
 
 
+def test_render_mutation_text_set_prototype_shows_landed_signature():
+    """A verified set_prototype confirms itself with the live signature (convention
+    cleaned) so no follow-up `proto get` is needed."""
+    from bn import formatters
+    value = {
+        "preview": False, "success": True, "committed": True,
+        "results": [{
+            "op": "set_prototype", "function": "session_read", "address": "0x401000",
+            "status": "verified",
+            "observed": {"address": "0x401000", "prototype": 'void __convention("cdecl")(struct Ep* ep, uint32_t flags)'},
+        }],
+        "affected_functions": [{"address": "0x401000", "before_name": "session_read", "after_name": "session_read", "changed": True}],
+        "affected_types": [],
+        "affected_summary": {"referenced": 1, "reflowed": 1},
+    }
+    out = formatters._render_mutation_text(value)
+    assert "set_prototype session_read @ 0x401000 [verified]" in out
+    assert "void __cdecl(struct Ep* ep, uint32_t flags)" in out
+
+
+def test_render_mutation_text_types_declare_shows_size_and_field_delta():
+    from bn import formatters
+    value = {
+        "preview": True, "success": True, "committed": False,
+        "results": [{"op": "types_declare", "status": "verified", "defined_types": {"Ep": "struct Ep"}}],
+        "affected_functions": [
+            {"address": "0x10", "before_name": "a", "after_name": "a", "changed": False},
+            {"address": "0x20", "before_name": "b", "after_name": "b", "changed": False},
+        ],
+        "affected_types": [{
+            "type_name": "Ep", "name": "Ep", "changed": True,
+            "before_layout": "struct Ep // size=0x214\n0x0000: int32_t x",
+            "after_layout": "struct Ep // size=0x218\n0x0000: int32_t x\n0x0214: uint32_t seq",
+            "layout_diff": "--- before:Ep\n+++ after:Ep\n@@ -1,2 +1,3 @@\n-struct Ep // size=0x214\n+struct Ep // size=0x218\n 0x0000: int32_t x\n+0x0214: uint32_t seq",
+        }],
+        "affected_summary": {"referenced": 2, "reflowed": 0},
+    }
+    out = formatters._render_mutation_text(value)
+    assert "types_declare Ep [verified]" in out
+    assert "size 0x214 -> 0x218 (+4)" in out  # single type: no redundant 'Ep:' prefix
+    assert "Ep:" not in out.split("[verified]", 1)[1]  # name not repeated after the header
+    assert "+ 0x0214: uint32_t seq" in out
+    assert "referenced by 2 fns, 0 reflowed: a, b" in out
+    assert "affected functions" not in out  # the per-function dump is not used for type ops
+
+
+def test_render_mutation_text_types_declare_noop_shows_shape_and_blast_radius():
+    from bn import formatters
+    value = {
+        "preview": False, "success": True, "committed": True,
+        "results": [{"op": "types_declare", "status": "noop", "defined_types": {"Ep": "struct Ep"}, "message": "No effective change detected"}],
+        "affected_functions": [{"address": "0x10", "before_name": "a", "after_name": "a", "changed": False}],
+        "affected_types": [{
+            "type_name": "Ep", "name": "Ep", "changed": False,
+            "after_layout": "struct Ep // size=0x8\n0x0000: int32_t x\n0x0004: int32_t y",
+            "message": "No effective change detected",
+        }],
+        "affected_summary": {"referenced": 1, "reflowed": 0},
+    }
+    out = formatters._render_mutation_text(value)
+    assert "types_declare Ep" in out
+    assert "struct Ep // size=0x8, 2 fields" in out
+    assert "referenced by 1 fn, 0 reflowed: a" in out
+
+
+def test_render_mutation_text_field_rename_omits_unchanged_size_line():
+    """A field rename moves no bytes, so a 'size 0xNN' line would be pure noise --
+    the +/- field lines carry the change."""
+    from bn import formatters
+    value = {
+        "preview": True, "success": True, "committed": False,
+        "results": [{"op": "struct_field_rename", "struct_name": "Ep", "status": "verified",
+                     "old_name": "flag", "new_name": "ready"}],
+        "affected_functions": [{"address": "0x10", "before_name": "user", "after_name": "user", "changed": True}],
+        "affected_types": [{
+            "type_name": "Ep", "name": "Ep", "changed": True,
+            "before_layout": "struct Ep // size=0x4\n0x0000: uint8_t flag",
+            "after_layout": "struct Ep // size=0x4\n0x0000: uint8_t ready",
+            "layout_diff": "--- before:Ep\n+++ after:Ep\n@@ -1,2 +1,2 @@\n struct Ep // size=0x4\n-0x0000: uint8_t flag\n+0x0000: uint8_t ready",
+        }],
+        "affected_summary": {"referenced": 3, "reflowed": 1},
+    }
+    out = formatters._render_mutation_text(value)
+    assert "- 0x0000: uint8_t flag" in out
+    assert "+ 0x0000: uint8_t ready" in out
+    assert "size 0x4" not in out  # size unchanged + fields moved -> no size line
+    assert "referenced by 3 fns, 1 reflowed: user" in out
+
+
+def test_blast_radius_line_caps_names_and_orders_reflowed_first():
+    from bn import formatters
+    value = {
+        "affected_summary": {"referenced": 12, "reflowed": 1},
+        "affected_functions": [
+            {"address": hex(i), "before_name": f"f{i}", "after_name": f"f{i}", "changed": (i == 0)}
+            for i in range(8)
+        ],
+    }
+    line = formatters._blast_radius_line(value)
+    assert line.strip().startswith("referenced by 12 fns, 1 reflowed: f0")  # reflowed name first
+    assert "(+7 more)" in line  # 12 referenced - 5 shown
+
+
 def test_unknown_ref_label_prefers_symbol_then_section():
     from bn import formatters
     assert formatters._unknown_ref_label({"symbol": {"name": "some_export"}}) == "some_export"

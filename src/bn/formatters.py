@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Callable
 
 # "rollback_failed" = an op succeeded but the batch revert that should have
@@ -1756,12 +1757,121 @@ def _format_operation_result(item: dict[str, Any]) -> str:
     if op == "struct_field_delete":
         return f"struct_field_delete {_get('struct_name')}::{_get('field_name')}"
     if op == "types_declare":
-        return (
-            f"types_declare {item.get('count', 0)} types"
-            f" (parsed functions={item.get('parsed_function_count', len(item.get('parsed_functions') or []))},"
-            f" variables={item.get('parsed_variable_count', len(item.get('parsed_variables') or []))})"
-        )
+        # Name the type(s) defined, not a bare count -- "which type?" is the first
+        # thing an agent needs. Parser bookkeeping (parsed functions/variables) is
+        # internal noise and moves out of the default line.
+        names = list((item.get("defined_types") or {}).keys())
+        if names:
+            return f"types_declare {', '.join(names)}"
+        return f"types_declare {item.get('count', 0)} types"
     return _render_fallback_text(item)
+
+
+_BN_CONVENTION_RE = re.compile(r'__convention\("([^"]+)"\)')
+
+
+def _clean_prototype(proto: Any) -> str | None:
+    """Render BN's prototype readably: ``__convention("cdecl")`` -> ``__cdecl``."""
+    if not isinstance(proto, str) or not proto:
+        return None
+    return _BN_CONVENTION_RE.sub(r"__\1", proto).strip()
+
+
+def _set_prototype_detail(item: dict[str, Any]) -> list[str]:
+    observed = item.get("observed")
+    proto = observed.get("prototype") if isinstance(observed, dict) else None
+    proto = _clean_prototype(proto)
+    return ["  " + proto] if proto else []
+
+
+def _layout_size(layout: Any) -> str | None:
+    """Pull the ``size=0x..`` (or decimal) off a rendered type layout's header."""
+    if not isinstance(layout, str) or not layout:
+        return None
+    match = re.search(r"size=(0x[0-9a-fA-F]+|\d+)", layout.splitlines()[0])
+    return match.group(1) if match else None
+
+
+def _layout_field_count(layout: Any) -> int:
+    if not isinstance(layout, str):
+        return 0
+    return sum(1 for line in layout.splitlines()[1:] if line.strip().startswith("0x"))
+
+
+def _size_delta(before_layout: Any, after_layout: Any) -> str | None:
+    after = _layout_size(after_layout)
+    if after is None:
+        return None
+    before = _layout_size(before_layout)
+    if before is None or before == after:
+        return f"size {after}"
+    try:
+        delta = int(after, 0) - int(before, 0)
+    except (TypeError, ValueError):
+        return f"size {before} -> {after}"
+    return f"size {before} -> {after} ({'+' if delta >= 0 else ''}{delta})"
+
+
+def _layout_field_deltas(layout_diff: Any) -> list[str]:
+    """The +/- field lines from a unified layout diff (skips the struct-header and
+    @@ hunk lines), so a type change shows just the fields that moved."""
+    out: list[str] = []
+    for line in (layout_diff or "").splitlines() if isinstance(layout_diff, str) else []:
+        if len(line) >= 2 and line[0] in "+-" and line[1:].lstrip().startswith("0x"):
+            out.append(f"  {line[0]} {line[1:].strip()}")
+    return out
+
+
+def _types_affected_lines(value: dict[str, Any]) -> list[str]:
+    entries = [e for e in (value.get("affected_types") or []) if isinstance(e, dict)]
+    multi = len(entries) > 1
+    out: list[str] = []
+    for entry in entries:
+        name = entry.get("type_name") or entry.get("name") or "<type>"
+        # Only prefix the type name when a batch touched more than one type --
+        # for a single type the op-summary header already names it.
+        prefix = f"{name}: " if multi else ""
+        if entry.get("changed"):
+            before_sz = _layout_size(entry.get("before_layout"))
+            after_sz = _layout_size(entry.get("after_layout"))
+            deltas = _layout_field_deltas(entry.get("layout_diff"))
+            if before_sz is not None and after_sz is not None and before_sz != after_sz:
+                out.append(f"  {prefix}{_size_delta(entry.get('before_layout'), entry.get('after_layout'))}")
+            elif not deltas:
+                # No field/size delta to show (e.g. a decl-only change) -- fall back
+                # to the size so the line isn't empty.
+                out.append(f"  {prefix}{_size_delta(entry.get('before_layout'), entry.get('after_layout')) or 'changed'}")
+            # else: size unchanged but fields moved (e.g. a rename) -- the +/- field
+            # lines below carry the change; a 'size 0xNN' line would just be noise.
+            out.extend(deltas)
+        else:
+            after = entry.get("after_layout") or ""
+            head = after.splitlines()[0].strip() if after.strip() else f"struct {name}"
+            count = _layout_field_count(after)
+            out.append(f"  {head}, {count} field{'s' if count != 1 else ''}")
+    return out
+
+
+def _blast_radius_line(value: dict[str, Any]) -> str | None:
+    """One line of blast radius for a type op: how many functions reference the
+    type and how many actually reflowed, with a few names (reflowed first)."""
+    summary = value.get("affected_summary")
+    if not isinstance(summary, dict):
+        return None
+    referenced = int(summary.get("referenced") or 0)
+    reflowed = int(summary.get("reflowed") or 0)
+    if referenced <= 0:
+        return None
+    affected = [a for a in (value.get("affected_functions") or []) if isinstance(a, dict)]
+    names = [a.get("after_name") or a.get("before_name") for a in affected if a.get("changed")]
+    names += [a.get("after_name") or a.get("before_name") for a in affected if not a.get("changed")]
+    names = [n for n in names if n]
+    line = f"  referenced by {referenced} fn{'s' if referenced != 1 else ''}, {reflowed} reflowed"
+    if names[:5]:
+        line += ": " + ", ".join(names[:5])
+        if referenced > len(names[:5]):
+            line += f" (+{referenced - len(names[:5])} more)"
+    return line
 
 
 def _format_op_summary(item: dict[str, Any]) -> str:
@@ -1807,10 +1917,16 @@ def _render_mutation_text(value: Any) -> str:
                 lines.append("  observed: " + json.dumps(item["observed"], sort_keys=True))
         lines.append("")
     elif preview:
+        # The banner already says applied+reverted; the bridge's matching
+        # "Preview verified and reverted." message would only repeat it. (A
+        # restore-failure preview is success=False and renders above instead.)
         lines.append("preview: change applied + reverted")
-        if value.get("message"):
-            lines.append(value["message"])
         lines.append("")
+
+    is_type_op = any(
+        isinstance(r, dict) and (r.get("op") == "types_declare" or str(r.get("op") or "").startswith("struct_"))
+        for r in results
+    )
 
     if results:
         if len(results) == 1 and success and not failed and not preview:
@@ -1820,31 +1936,33 @@ def _render_mutation_text(value: Any) -> str:
             for item in results:
                 lines.append("- " + _format_op_summary(item))
 
-    affected_functions = [a for a in (value.get("affected_functions") or []) if isinstance(a, dict)]
-    changed_functions = [a for a in affected_functions if a.get("changed")]
-    if changed_functions:
-        lines.extend(["", f"affected functions ({len(changed_functions)}):"])
-        for item in changed_functions:
-            before_name = item.get("before_name") or item.get("after_name") or "<unknown>"
-            after_name = item.get("after_name") or before_name
-            summary = f"{item.get('address', '<unknown>')} {before_name}"
-            if after_name != before_name:
-                summary += f" -> {after_name}"
-            lines.append("- " + summary)
-            if preview and item.get("diff"):
-                lines.append(str(item["diff"]))
+    # "What landed" detail for a single op, so a verified mutation confirms itself
+    # without a follow-up read: the live prototype for set_prototype.
+    if len(results) == 1 and not failed and results[0].get("op") == "set_prototype":
+        lines.extend(_set_prototype_detail(results[0]))
 
-    affected_types = [a for a in (value.get("affected_types") or []) if isinstance(a, dict)]
-    changed_types = [a for a in affected_types if a.get("changed")]
-    if changed_types:
-        lines.extend(["", f"affected types ({len(changed_types)}):"])
-        for item in changed_types:
-            summary = item.get("type_name", "<unknown>")
-            if item.get("message"):
-                summary += f" ({item['message']})"
-            lines.append("- " + summary)
-            if preview and item.get("layout_diff"):
-                lines.append(str(item["layout_diff"]))
+    if is_type_op:
+        # The struct's size/field delta (or shape, if unchanged), then the blast
+        # radius. This replaces the per-function dump, which for a type edit was
+        # either empty (no body reflowed) or a wall of unrelated callers.
+        lines.extend(_types_affected_lines(value))
+        blast = _blast_radius_line(value)
+        if blast:
+            lines.append(blast)
+    else:
+        affected_functions = [a for a in (value.get("affected_functions") or []) if isinstance(a, dict)]
+        changed_functions = [a for a in affected_functions if a.get("changed")]
+        if changed_functions:
+            lines.extend(["", f"affected functions ({len(changed_functions)}):"])
+            for item in changed_functions:
+                before_name = item.get("before_name") or item.get("after_name") or "<unknown>"
+                after_name = item.get("after_name") or before_name
+                summary = f"{item.get('address', '<unknown>')} {before_name}"
+                if after_name != before_name:
+                    summary += f" -> {after_name}"
+                lines.append("- " + summary)
+                if preview and item.get("diff"):
+                    lines.append(str(item["diff"]))
 
     return "\n".join(lines).rstrip() + "\n"
 
