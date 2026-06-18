@@ -597,9 +597,12 @@ def _render_paged_list_text(
 
 
 def _render_function_list_text(value: Any) -> str:
-    """Render a paged function listing (the {functions, total, ...} envelope),
-    with a footer stating the true total and remainder (#59)."""
-    return _render_paged_list_text(value, "functions", _render_name_address_rows)
+    """Render a paged function listing, with a footer stating the true total and
+    remainder (#59). Prefers the canonical `items` key (every other list command
+    uses it), falling back to the deprecated byte-identical `functions` alias for
+    an older bridge that emits only the latter (#223)."""
+    page_key = "items" if isinstance(value, dict) and "items" in value else "functions"
+    return _render_paged_list_text(value, page_key, _render_name_address_rows)
 
 
 def _group_refs_by_caller(refs: list[Any]) -> list[dict[str, Any]]:
