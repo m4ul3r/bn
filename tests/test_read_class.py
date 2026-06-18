@@ -49,3 +49,69 @@ def test_split_operator_new():
 def test_split_no_scope_returns_none():
     assert split("memcpy") == (None, "memcpy")
     assert split("main") == (None, "main")
+
+
+class _Sym:
+    def __init__(self, raw_name, short_name, address):
+        self.raw_name = raw_name
+        self.short_name = short_name
+        self.name = raw_name
+        self.address = address
+
+
+class _Fn:
+    def __init__(self, start, mangled, demangled):
+        self.start = start
+        self.name = mangled
+        self.raw_name = mangled
+        self.symbol = _Sym(mangled, demangled, start)
+
+
+class _RegistryBV:
+    def __init__(self, functions, symbols):
+        self.functions = list(functions)
+        self._symbols = list(symbols)
+
+    def get_symbols(self):
+        return list(self._symbols)
+
+
+def _make_registry_bv():
+    fns = [
+        _Fn(0x1000, "_ZN3net7SessionC1Eh", "net::Session::Session(unsigned char)"),
+        _Fn(0x1100, "_ZN3net7SessionD1Ev", "net::Session::~Session()"),
+        _Fn(0x1200, "_ZN3net7Session6onDataEi", "net::Session::onData(int)"),
+        _Fn(0x1300, "_ZN3net4makeEv", "net::make()"),          # free fn -> name-only
+        _Fn(0x1400, "_ZN3net4Pool5allocEv", "net::Pool::alloc()"),  # ctor-less; ti present
+    ]
+    syms = [
+        _Sym("_ZTVN3net7SessionE", "vtable for net::Session", 0x9000),
+        _Sym("_ZTIN3net7SessionE", "typeinfo for net::Session", 0x9100),
+        _Sym("_ZTIN3net4PoolE", "typeinfo for net::Pool", 0x9200),
+    ]
+    return _RegistryBV(fns, syms)
+
+
+def test_registry_clusters_methods():
+    bv = _make_registry_bv()
+    reg = read_class._build_class_registry(None, bv)
+    assert set(reg) >= {"net::Session", "net::Pool", "net"}
+    sess = reg["net::Session"]
+    kinds = {m["demangled"]: m["kind"] for m in sess["methods"]}
+    assert kinds["net::Session::Session(unsigned char)"] == "ctor"
+    assert kinds["net::Session::~Session()"] == "dtor"
+    assert kinds["net::Session::onData(int)"] == "method"
+
+
+def test_registry_confidence_levels():
+    reg = read_class._build_class_registry(None, _make_registry_bv())
+    assert reg["net::Session"]["confidence"] == "rtti"   # has vtable+typeinfo
+    assert reg["net::Pool"]["confidence"] == "rtti"       # has typeinfo only
+    assert reg["net"]["confidence"] == "name-only"        # namespace-like
+
+
+def test_registry_attaches_vtable_and_typeinfo():
+    reg = read_class._build_class_registry(None, _make_registry_bv())
+    assert reg["net::Session"]["vtable"]["address"] == "0x9000"
+    assert reg["net::Session"]["typeinfo"]["address"] == "0x9100"
+    assert reg["net::Pool"]["vtable"] is None
