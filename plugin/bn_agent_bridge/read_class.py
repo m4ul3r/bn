@@ -221,3 +221,39 @@ def _build_class_registry(ctx, bv, *, query: str | None = None) -> dict[str, dic
     if needle:
         registry = {k: v for k, v in registry.items() if needle in k.lower()}
     return registry
+
+
+def _list_row(rec: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": rec["name"],
+        "method_count": len(rec["methods"]),
+        "has_vtable": rec["vtable"] is not None,
+        "size": rec["size"],
+        "bases": [b.get("name") for b in rec.get("bases", [])],
+        "confidence": rec["confidence"],
+    }
+
+
+def _class_list(
+    ctx,
+    selector: str | None,
+    *,
+    query: str | None = None,
+    include_all: bool = False,
+    offset: int = 0,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    bv = ctx._resolve_view(selector)
+    registry = _build_class_registry(ctx, bv, query=query)
+    rows = [
+        _list_row(rec)
+        for rec in registry.values()
+        if include_all or rec["confidence"] in ("rtti", "ctor")
+    ]
+    rows.sort(key=lambda r: r["name"])
+    total = len(rows)
+    if offset:
+        rows = rows[offset:]
+    if limit is not None:
+        rows = rows[:limit]
+    return {"classes": rows, "total": total, "offset": offset, "include_all": include_all}

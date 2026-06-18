@@ -5336,3 +5336,38 @@ def test_text_renderer_failure_becomes_clean_error(monkeypatch, capsys):
     rc = bn.cli.main(["function", "info", "main", "--target", "active", "--format", "text"])
     assert rc == 0
     assert "<unknown>" in capsys.readouterr().out
+
+
+def test_class_list_invokes_op(monkeypatch):
+    captured = {}
+
+    def fake_call(args, op, params, **kwargs):
+        captured["op"] = op
+        captured["params"] = params
+        return 0
+
+    import bn.commands.cpp_class as cpp_class
+    monkeypatch.setattr(cpp_class, "_call", fake_call)
+    from bn.cli import build_parser
+    args = build_parser().parse_args(["class", "list", "--all", "--query", "Session"])
+    assert args.handler(args) == 0
+    assert captured["op"] == "class_list"
+    assert captured["params"]["include_all"] is True
+    assert captured["params"]["query"] == "Session"
+
+
+def test_class_show_invokes_op(monkeypatch):
+    captured = {}
+
+    def fake_call(args, op, params, **kwargs):
+        captured["op"] = op
+        captured["params"] = params
+        return 0
+
+    import bn.commands.cpp_class as cpp_class
+    monkeypatch.setattr(cpp_class, "_call", fake_call)
+    from bn.cli import build_parser
+    args = build_parser().parse_args(["class", "show", "net::Session"])
+    assert args.handler(args) == 0
+    assert captured["op"] == "class_show"
+    assert captured["params"]["name"] == "net::Session"

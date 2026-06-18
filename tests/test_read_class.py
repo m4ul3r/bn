@@ -115,3 +115,19 @@ def test_registry_attaches_vtable_and_typeinfo():
     assert reg["net::Session"]["vtable"]["address"] == "0x9000"
     assert reg["net::Session"]["typeinfo"]["address"] == "0x9100"
     assert reg["net::Pool"]["vtable"] is None
+
+
+def test_class_list_envelope_filters_and_pages():
+    bv = _make_registry_bv()
+
+    class _Ctx:
+        def _resolve_view(self, sel):
+            return bv
+
+    out = read_class._class_list(_Ctx(), None, include_all=True)
+    names = [c["name"] for c in out["classes"]]
+    assert "net::Session" in names and out["total"] == len(names)
+    # Default (no --all) drops name-only clusters like the bare "net" namespace.
+    confirmed = read_class._class_list(_Ctx(), None, include_all=False)
+    assert "net" not in [c["name"] for c in confirmed["classes"]]
+    assert "net::Session" in [c["name"] for c in confirmed["classes"]]

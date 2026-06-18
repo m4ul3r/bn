@@ -23,6 +23,7 @@ from . import create_comments
 from . import il_format
 from . import mutation_engine
 from . import read_decompile
+from . import read_class
 from . import read_evidence
 from . import read_listing
 from . import read_misc
@@ -1294,6 +1295,12 @@ class BinaryNinjaBridge:
     def _message_lens(self, *a, **k):
         return read_evidence._message_lens(self.ctx, *a, **k)
 
+    def _class_list(self, *a, **k):
+        return read_class._class_list(self.ctx, *a, **k)
+
+    def _class_show(self, *a, **k):
+        return read_class._class_show(self.ctx, *a, **k)
+
     def _iter_il_instructions(self, *a, **k):
         return il_format._iter_il_instructions(*a, **k)
 
@@ -1769,6 +1776,22 @@ def _bind_structured_il(bridge, params, target):
         view=str(params.get("view", "mlil")),
         ssa=_validate_bool(params.get("ssa"), label="ssa", default=True),
     )
+
+
+@op("class_list", lock="read")
+def _bind_class_list(bridge, params, target):
+    return bridge._class_list(
+        target,
+        query=params.get("query"),
+        include_all=_validate_bool(params.get("include_all"), label="include_all", default=False),
+        offset=int(params.get("offset", 0)),
+        limit=int(params["limit"]) if params.get("limit") is not None else None,
+    )
+
+
+@op("class_show", lock="read")
+def _bind_class_show(bridge, params, target):
+    return bridge._class_show(target, str(params["name"]))
 
 
 @op("defuse", lock="read")

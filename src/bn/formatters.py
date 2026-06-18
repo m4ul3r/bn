@@ -1990,3 +1990,32 @@ def _render_trace_text(value: Any) -> str:
     for h in hints:
         lines.append(f"  hint: {h}")
     return "\n".join(lines)
+
+
+def _render_class_list_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    rows = list(value.get("classes") or [])
+    total = value.get("total", len(rows))
+    lines = [f"classes: {len(rows)} shown of {total}"]
+    for rec in rows:
+        if not isinstance(rec, dict):
+            lines.append(_render_fallback_text(rec))
+            continue
+        vt = "vtable" if rec.get("has_vtable") else "no-vtable"
+        size = rec.get("size")
+        size_s = size.get("value") if isinstance(size, dict) else size
+        bases = ", ".join(b for b in (rec.get("bases") or []) if b)
+        base_s = f"  : {bases}" if bases else ""
+        lines.append(
+            f"  {rec.get('name', '<unknown>')}  "
+            f"methods={rec.get('method_count', 0)}  {vt}  "
+            f"size={size_s if size_s is not None else '?'}  "
+            f"[{rec.get('confidence', '?')}]{base_s}"
+        )
+    return "\n".join(lines)
+
+
+def _render_class_show_text(value: Any) -> str:
+    # Filled in by Task 8; fallback keeps the import valid meanwhile.
+    return _render_fallback_text(value)
