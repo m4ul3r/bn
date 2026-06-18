@@ -431,3 +431,14 @@ def test_render_class_show_no_vtable_note_when_no_vtable():
            "vtable": None, "bases": [], "methods": [],
            "instances": {"construction_sites": [], "stored_globals": []}}
     assert "no slots resolved" not in _render_class_show_text(rec)
+
+
+def test_render_construction_site_includes_function():
+    from bn.formatters import _render_class_show_text
+    rec = {"name": "X", "confidence": "ctor", "size": None, "vtable": None,
+           "bases": [], "methods": [],
+           "instances": {"construction_sites": [
+               {"address": "0x443abc", "function": "AapGalifStart",
+                "kind": "ctor-call", "size": None}],
+               "stored_globals": []}}
+    assert "ctor-call @ 0x443abc (in AapGalifStart)" in _render_class_show_text(rec)

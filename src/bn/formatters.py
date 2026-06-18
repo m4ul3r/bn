@@ -2079,7 +2079,8 @@ def _render_one_class(rec: Any) -> str:
     parts = []
     for site in inst.get("construction_sites") or []:
         sz = f" (size {site['size']})" if site.get("size") else ""
-        parts.append(f"{site.get('kind', '?')} @ {site.get('address', '?')}{sz}")
+        fn = f" (in {site['function']})" if site.get("function") else ""
+        parts.append(f"{site.get('kind', '?')} @ {site.get('address', '?')}{sz}{fn}")
     for g in inst.get("stored_globals") or []:
         parts.append(f"stored -> {g.get('symbol') or '?'} @ {g.get('address', '?')}")
     if parts:

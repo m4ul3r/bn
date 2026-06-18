@@ -725,12 +725,42 @@ class BridgeContext:
             })
         return out
 
-    def _ctor_construction_sites(self, bv, record):
-        """Construction sites of this class, classified new/stack/global with
-        operator-new size. TODO(#205 Task 9): implement against live BN — walk
-        each ctor's inbound call sites, classify the `this` storage, and recover
-        the operator-new size. Returns [] for now (honest "none recovered yet")."""
-        return []
+    def _ctor_construction_sites(self, bv, record, *, cap=128):
+        """Where this class is constructed: each ctor's inbound call sites, from
+        code xrefs. This is sound (no arg recovery needed). Classifying the
+        `this` storage (new/stack/global) and recovering the operator-new size
+        needs MLIL arg recovery that BN often does not expose at these sites, so
+        it is left as a best-effort gap: kind is "ctor-call" and size is None."""
+        get_refs = getattr(bv, "get_code_refs", None)
+        if not callable(get_refs):
+            return []
+        sites: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for m in record.get("methods", []):
+            if m.get("kind") != "ctor":
+                continue
+            try:
+                addr = int(m["address"], 16)
+            except (KeyError, ValueError, TypeError):
+                continue
+            for ref in get_refs(addr):
+                ra = int(getattr(ref, "address", 0) or 0)
+                if ra in seen:
+                    continue
+                seen.add(ra)
+                caller = getattr(ref, "function", None)
+                csym = getattr(caller, "symbol", None) if caller is not None else None
+                cname = (getattr(csym, "short_name", None) or getattr(caller, "name", None)) \
+                    if caller is not None else None
+                sites.append({
+                    "address": hex(ra),
+                    "function": str(cname) if cname else None,
+                    "kind": "ctor-call",
+                    "size": None,
+                })
+                if len(sites) >= cap:
+                    return sites
+        return sites
 
     def _vtable_layout_for(self, bv, addr):
         from . import read_class
