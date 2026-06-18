@@ -684,6 +684,14 @@ class BridgeContext:
             self, bv, start, entries=entries, stride_size=stride
         )
 
+    def _operator_new_size_at_ctor(self, bv, record):
+        """(size, addr) of the operator-new allocation feeding a ctor's ``this``,
+        else None. TODO(#205 Task 9): implement against live BN — backward-slice
+        the ctor call's arg0 to its ``operator new(N)`` allocation and read N.
+        Returns None for now (honest "unknown"); the BN-type-width path in
+        _object_size still yields real sizes when a type is defined."""
+        return None
+
     # ---- relocated cycle-breakers (design spec §3.2): both state-free ----
 
     def _find_type(self, bv, type_name: str):

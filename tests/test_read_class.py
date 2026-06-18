@@ -167,3 +167,47 @@ def test_vtable_layout_skips_header_and_marks_slots():
     assert s0["index"] == 0 and s0["method"]["name"] == "onData"
     assert s1["unnamed"] is True            # sub_* / no symbol
     assert s2["pure_virtual"] is True
+
+
+class _SizeCtx:
+    def __init__(self, type_width=None, new_size=None):
+        self._type_width = type_width
+        self._new_size = new_size
+
+    def _find_type(self, bv, name):
+        if self._type_width is None:
+            return None
+        class _T:
+            width = self._type_width
+        return name, _T()
+
+    def _operator_new_size_at_ctor(self, bv, record):
+        return self._new_size  # (size, addr) or None
+
+
+def test_size_prefers_bn_type_width():
+    rec = {"name": "net::Session", "methods": [], "vtable": None}
+    out = read_class._object_size(_SizeCtx(type_width=0xD0), object(), rec)
+    assert out == {"value": "0xd0", "source": "bn_type"}
+
+
+def test_size_from_operator_new_when_no_type():
+    rec = {"name": "net::Session", "methods": []}
+    out = read_class._object_size(_SizeCtx(new_size=(0xD0, 0x443abc)), object(), rec)
+    assert out["value"] == "0xd0" and out["source"] == "operator_new"
+    assert out["at"] == "0x443abc"
+
+
+def test_size_none_when_nothing_resolves():
+    rec = {"name": "net::Session", "methods": []}
+    assert read_class._object_size(_SizeCtx(), object(), rec) is None
+
+
+def test_size_survives_find_type_raising():
+    # Real ctx._find_type RAISES on a missing type; _object_size must treat that
+    # as "no type" and fall through, not propagate the exception.
+    class _RaisingCtx(_SizeCtx):
+        def _find_type(self, bv, name):
+            raise RuntimeError("Type not found: " + name)
+    out = read_class._object_size(_RaisingCtx(new_size=(0x40, 0x1000)), object(), {"name": "X", "methods": []})
+    assert out["value"] == "0x40" and out["source"] == "operator_new"

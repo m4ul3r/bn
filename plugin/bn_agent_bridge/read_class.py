@@ -282,3 +282,24 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
             "unnamed": (isinstance(name, str) and name.startswith("sub_")) or (fn is None),
         })
     return {"address": hex(int(vtable_addr)), "slots": slots}
+
+
+def _object_size(ctx, bv, record: dict[str, Any]) -> dict[str, Any] | None:
+    """Object size with provenance. A defined BN type's width wins (authoritative
+    when present); else the operator-new size at a construction site; else None
+    (never fabricated). ``ctx._find_type`` raises on a miss, so the lookup is
+    guarded."""
+    try:
+        found = ctx._find_type(bv, record["name"])
+    except Exception:
+        found = None
+    if found is not None:
+        _, type_obj = found
+        width = int(getattr(type_obj, "width", 0) or 0)
+        if width > 0:
+            return {"value": hex(width), "source": "bn_type"}
+    new = ctx._operator_new_size_at_ctor(bv, record)
+    if new is not None:
+        size, at = new
+        return {"value": hex(int(size)), "source": "operator_new", "at": hex(int(at))}
+    return None
