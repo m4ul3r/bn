@@ -678,6 +678,109 @@ class BridgeContext:
             "context": context,
         }
 
+    def _pointer_table_layout(self, bv, start, *, entries, stride):
+        from . import read_evidence
+        return read_evidence._pointer_table_for_view(
+            self, bv, start, entries=entries, stride_size=stride
+        )
+
+    def _operator_new_size_at_ctor(self, bv, record):
+        """(size, addr) of the operator-new allocation feeding a ctor's ``this``,
+        else None. TODO(#205 Task 9): implement against live BN — backward-slice
+        the ctor call's arg0 to its ``operator new(N)`` allocation and read N.
+        Returns None for now (honest "unknown"); the BN-type-width path in
+        _object_size still yields real sizes when a type is defined."""
+        return None
+
+    def _read_u32(self, bv, address):
+        try:
+            data = bytes(bv.read(address, 4))
+        except Exception:
+            return None
+        return int.from_bytes(data, self._byteorder(bv), signed=False) if len(data) == 4 else None
+
+    def _typeinfo_name_at(self, bv, address):
+        """Class name for a _ZTI object address from its data symbol's demangled
+        RTTI marker; None if unresolved. Reuses read_class's marker matcher so
+        the space/underscore spelling variants are handled in one place."""
+        sym = bv.get_symbol_at(address) if hasattr(bv, "get_symbol_at") else None
+        if sym is None:
+            return None
+        from . import read_class
+        return read_class._class_of_rtti_symbol(sym)
+
+    def _global_vtable_stores(self, bv, record):
+        """Global data symbols whose stored value is this class's vtable addr."""
+        vt = record.get("vtable")
+        if not vt:
+            return []
+        addr = int(vt["address"], 16)
+        out = []
+        getter = getattr(bv, "get_data_refs", None)
+        for ref in (getter(addr) if callable(getter) else []):
+            sym = bv.get_symbol_at(int(ref)) if hasattr(bv, "get_symbol_at") else None
+            out.append({
+                "symbol": str(getattr(sym, "short_name", "") or getattr(sym, "name", "")) if sym else None,
+                "address": hex(int(ref)),
+            })
+        return out
+
+    def _ctor_construction_sites(self, bv, record, *, cap=128):
+        """Where this class is constructed: each ctor's inbound call sites, from
+        code xrefs. This is sound (no arg recovery needed). Classifying the
+        `this` storage (new/stack/global) and recovering the operator-new size
+        needs MLIL arg recovery that BN often does not expose at these sites, so
+        it is left as a best-effort gap: kind is "ctor-call" and size is None."""
+        get_refs = getattr(bv, "get_code_refs", None)
+        if not callable(get_refs):
+            return []
+        sites: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        for m in record.get("methods", []):
+            if m.get("kind") != "ctor":
+                continue
+            try:
+                addr = int(m["address"], 16)
+            except (KeyError, ValueError, TypeError):
+                continue
+            for ref in get_refs(addr):
+                ra = int(getattr(ref, "address", 0) or 0)
+                if ra == 0 or ra in seen:
+                    continue
+                seen.add(ra)
+                caller = getattr(ref, "function", None)
+                csym = getattr(caller, "symbol", None) if caller is not None else None
+                cname = (getattr(csym, "short_name", None) or getattr(caller, "name", None)) \
+                    if caller is not None else None
+                sites.append({
+                    "address": hex(ra),
+                    "function": str(cname) if cname else None,
+                    "kind": "ctor-call",
+                    "size": None,
+                })
+                if len(sites) >= cap:
+                    return sites
+        return sites
+
+    def _vtable_layout_for(self, bv, addr):
+        from . import read_class
+        return read_class._vtable_layout(self, bv, addr)
+
+    def _object_size_for(self, bv, record):
+        from . import read_class
+        return read_class._object_size(self, bv, record)
+
+    def _bases_for(self, bv, record):
+        from . import read_class
+        ti = record.get("typeinfo")
+        if not ti:
+            return []
+        return read_class._rtti_bases(self, bv, int(ti["address"], 16))
+
+    def _instances_for(self, bv, record):
+        from . import read_class
+        return read_class._instances(self, bv, record)
+
     # ---- relocated cycle-breakers (design spec §3.2): both state-free ----
 
     def _find_type(self, bv, type_name: str):

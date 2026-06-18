@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from . import admin  # noqa: F401
 from . import binary  # noqa: F401
+from . import cpp_class  # noqa: F401
 from . import dataflow  # noqa: F401
 from . import function  # noqa: F401
 from . import misc  # noqa: F401

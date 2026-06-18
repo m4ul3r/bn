@@ -1990,3 +1990,105 @@ def _render_trace_text(value: Any) -> str:
     for h in hints:
         lines.append(f"  hint: {h}")
     return "\n".join(lines)
+
+
+def _render_class_list_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    rows = list(value.get("items") or value.get("classes") or [])
+    total = value.get("total", len(rows))
+    header = f"classes: {len(rows)} shown of {total}"
+    suppressed = value.get("library_suppressed") or 0
+    if value.get("no_stl") and suppressed:
+        header += f" ({suppressed} library/STL classes hidden)"
+    lines = [header]
+    for rec in rows:
+        if not isinstance(rec, dict):
+            lines.append(_render_fallback_text(rec))
+            continue
+        vt = "vtable" if rec.get("has_vtable") else "no-vtable"
+        size = rec.get("size")
+        size_s = size.get("value") if isinstance(size, dict) else size
+        bases = ", ".join(b for b in (rec.get("bases") or []) if b)
+        base_s = f"  : {bases}" if bases else ""
+        lines.append(
+            f"  {rec.get('name', '<unknown>')}  "
+            f"methods={rec.get('method_count', 0)}  {vt}  "
+            f"size={size_s if size_s is not None else '?'}  "
+            f"[{rec.get('confidence', '?')}]{base_s}"
+        )
+    return "\n".join(lines)
+
+
+def _render_class_show_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    if value.get("ambiguous"):
+        out = [f"ambiguous class {value.get('query', '')!r}: {len(value.get('matches') or [])} matches"]
+        for rec in value.get("matches") or []:
+            out.append("")
+            out.append(_render_one_class(rec))
+        return "\n".join(out)
+    return _render_one_class(value)
+
+
+def _render_one_class(rec: Any) -> str:
+    if not isinstance(rec, dict):
+        return _render_fallback_text(rec)
+    size = rec.get("size")
+    size_s = size.get("value") if isinstance(size, dict) else None
+    vt = rec.get("vtable") if isinstance(rec.get("vtable"), dict) else None
+    vt_addr = vt.get("address") if vt else None
+    bases = ", ".join(b.get("name") or "?" for b in (rec.get("bases") or []))
+    head = f"class {rec.get('name', '<unknown>')}"
+    bits = []
+    if size_s:
+        bits.append(f"size {size_s}")
+    if vt_addr:
+        bits.append(f"vtable @ {vt_addr}")
+    if bases:
+        bits.append(f"base: {bases}")
+    if bits:
+        head += "  (" + ", ".join(bits) + ")"
+    lines = [head, f"  [{rec.get('confidence', '?')}]"]
+    methods = rec.get("methods") or []
+    for m in methods:
+        if m.get("kind") in ("ctor", "dtor"):
+            lines.append(f"  {m['kind']:<6} {m.get('address', '?')}  {m.get('demangled', '')}")
+    if vt and vt.get("slots"):
+        for s in vt["slots"]:
+            method = s.get("method") or {}
+            slot_name = method.get("display_name") or method.get("name") if isinstance(method, dict) else None
+            label = (
+                "__cxa_pure_virtual" if s.get("pure_virtual")
+                else slot_name if slot_name
+                else "<unnamed>"
+            )
+            lines.append(f"  vtable [{s.get('index')}] {s.get('address', '?')}  {label}")
+    elif vt_addr:
+        # A vtable symbol exists but no slots resolved. Either the vtable is
+        # defined in another module (the local symbol is an import/GOT slot) or
+        # it is a PIE/.data.rel.ro vtable whose pointers are applied at load time
+        # via relocations (zero in the static image). In both cases there is no
+        # decodable local body; say so rather than render fake or empty virtuals.
+        lines.append("  vtable: symbol present but no slots resolved here "
+                     "(defined in another module, or applied at load time via relocations)")
+    # Non-virtual member functions (kind=method). Virtual ones already appear as
+    # vtable slots above; listing the symbol-side methods makes `class show`
+    # useful for classes whose vtable is empty or absent (e.g. Controller).
+    member_methods = [m for m in methods if m.get("kind") == "method"]
+    if member_methods:
+        lines.append(f"  methods ({len(member_methods)}):")
+        for m in member_methods:
+            lines.append(f"    {m.get('address', '?')}  {m.get('demangled', '')}")
+    inst = rec.get("instances") if isinstance(rec.get("instances"), dict) else {}
+    parts = []
+    for site in inst.get("construction_sites") or []:
+        sz = f" (size {site['size']})" if site.get("size") else ""
+        fn = f" (in {site['function']})" if site.get("function") else ""
+        parts.append(f"{site.get('kind', '?')} @ {site.get('address', '?')}{sz}{fn}")
+    for g in inst.get("stored_globals") or []:
+        parts.append(f"stored -> {g.get('symbol') or '?'} @ {g.get('address', '?')}")
+    if parts:
+        lines.append("  instances: " + " ; ".join(parts))
+    return "\n".join(lines)
