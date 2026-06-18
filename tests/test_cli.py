@@ -1797,6 +1797,19 @@ def test_proto_get_splices_function_name_into_anonymous_prototype(monkeypatch, c
     assert capsys.readouterr().out == "uint64_t parse_image(int32_t arg1, char* arg2)\n"
 
 
+def test_proto_get_splices_name_that_is_substring_of_return_type(monkeypatch, capsys):
+    """A function name that is a substring of the return type must still be
+    spliced (the naive `name in head` guard wrongly skipped it) (#222 review)."""
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": {
+            "function": {"name": "t", "address": "0x1000"},
+            "prototype": "uint64_t (int32_t a)"}}
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["proto", "get", "--format", "text", "--target", "active", "t"])
+    assert rc == 0
+    assert capsys.readouterr().out == "uint64_t t(int32_t a)\n"
+
+
 def test_py_exec_accepts_positional_code(monkeypatch):
     """`bn py exec '<code>'` positional works, matching the skill examples (#197)."""
     captured = {}

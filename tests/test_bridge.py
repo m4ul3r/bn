@@ -4236,6 +4236,22 @@ def test_exports_lists_global_weak_definitions_only(monkeypatch):
     assert instance._exports(None, count_only=True)["count"] == 2
 
 
+def test_xrefs_any_marks_ambiguous_symbol_present(monkeypatch):
+    """In a sink sweep an AMBIGUOUS symbol (resolves to >=2 bodies) must be
+    reported present (it exists), not absent -- otherwise a real sink reads as
+    unlinked (#218 review)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[_FakeFunction(0x401000, "dup"), _FakeFunction(0x402000, "dup")])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    res = instance._xrefs_any(None, ["dup", "nope"])
+    syms = {s["symbol"]: s for s in res["symbols"]}
+    assert syms["dup"]["present"] is True and syms["dup"].get("ambiguous") is True
+    assert syms["nope"]["present"] is False
+    assert res["present"] == 1
+
+
 def test_save_database_falls_back_to_writable_cache(monkeypatch, tmp_path):
     """A default-path save whose directory is unwritable (read-only firmware
     mount) falls back to a writable cache dir instead of losing annotations;

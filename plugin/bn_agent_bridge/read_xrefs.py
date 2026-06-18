@@ -171,7 +171,17 @@ def _xrefs_any(ctx, selector: str | None, symbols: list[Any]) -> dict[str, Any]:
         try:
             res = _xrefs(ctx, selector, sym)
         except RuntimeError as exc:
-            results.append({"symbol": sym, "present": False, "note": str(exc).split(". ")[0]})
+            msg = str(exc)
+            if "Ambiguous" in msg:
+                # The symbol DOES exist (it resolves to >=2 bodies); "absent"
+                # would be a false negative for a sink sweep. Record it present
+                # but ambiguous so the analyst probes it directly (#218 review).
+                present += 1
+                results.append({"symbol": sym, "present": True, "ambiguous": True,
+                                "note": msg.splitlines()[0]})
+            else:
+                results.append({"symbol": sym, "present": False,
+                                "note": msg.splitlines()[0]})
             continue
         present += 1
         results.append({

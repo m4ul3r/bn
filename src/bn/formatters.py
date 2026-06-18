@@ -143,10 +143,15 @@ def _render_proto_text(value: Any) -> str:
     fn = value.get("function")
     name = fn.get("name") if isinstance(fn, dict) else None
     head, sep, rest = prototype.partition("(")
-    if name and sep and name not in head:
+    if name and sep:
         head = head.rstrip()
-        joiner = "" if head.endswith("*") else " "
-        return f"{head}{joiner}{name}({rest}"
+        # Skip only when the return-type already ENDS with the name as its own
+        # declarator token (an already-named prototype) -- a naive `name in head`
+        # substring test wrongly skipped when the name was a substring of the
+        # return type (e.g. name "t" in "uint64_t") (#222 review).
+        already_named = head.split()[-1:] == [name] if head else False
+        if not already_named:
+            return f"{head} {name}({rest}"
     return prototype
 
 

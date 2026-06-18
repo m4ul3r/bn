@@ -919,8 +919,11 @@ class BinaryNinjaBridge:
             fallback = cache_home() / "bndb" / f"{stem}.{digest}.bndb"
             try:
                 saved = _attempt(str(fallback), make_parent=True)
-            except RuntimeError:
-                raise exc  # report the ORIGINAL (default-path) failure, not the fallback's
+            except Exception:
+                # ANY fallback failure (incl. an OSError from the cache-dir mkdir
+                # if it too is unwritable) re-raises the ORIGINAL default-path
+                # error -- that's the actionable message, not the fallback's.
+                raise exc
             self.targets.clear_dirty(bv)
             return {"saved": True, "path": saved, "fallback": True, "requested_path": out}
 
