@@ -1995,7 +1995,7 @@ def _render_trace_text(value: Any) -> str:
 def _render_class_list_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    rows = list(value.get("classes") or [])
+    rows = list(value.get("items") or value.get("classes") or [])
     total = value.get("total", len(rows))
     header = f"classes: {len(rows)} shown of {total}"
     suppressed = value.get("library_suppressed") or 0

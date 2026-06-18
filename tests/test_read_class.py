@@ -251,12 +251,29 @@ def test_class_list_envelope_filters_and_pages():
             return bv
 
     out = read_class._class_list(_Ctx(), None, include_all=True)
-    names = [c["name"] for c in out["classes"]]
+    assert out["items"] == out["classes"]
+    assert out["returned"] == len(out["items"])
+    assert out["has_more"] is False
+    names = [c["name"] for c in out["items"]]
     assert "net::Session" in names and out["total"] == len(names)
     # Default (no --all) drops name-only clusters like the bare "net" namespace.
     confirmed = read_class._class_list(_Ctx(), None, include_all=False)
-    assert "net" not in [c["name"] for c in confirmed["classes"]]
-    assert "net::Session" in [c["name"] for c in confirmed["classes"]]
+    assert "net" not in [c["name"] for c in confirmed["items"]]
+    assert "net::Session" in [c["name"] for c in confirmed["items"]]
+
+
+def test_class_list_envelope_has_more_when_paged():
+    bv = _make_registry_bv()
+
+    class _Ctx:
+        def _resolve_view(self, sel):
+            return bv
+
+    out = read_class._class_list(_Ctx(), None, include_all=True, limit=1)
+    assert out["items"] == out["classes"]
+    assert out["limit"] == 1
+    assert out["returned"] == 1
+    assert out["has_more"] is True
 
 
 def test_is_library_class():
@@ -290,7 +307,7 @@ def test_class_list_no_stl_filters_library_classes():
             return bv
 
     out = read_class._class_list(_Ctx(), None, include_all=True, no_stl=True)
-    names = [c["name"] for c in out["classes"]]
+    names = [c["name"] for c in out["items"]]
     assert "net::Session" in names
     assert "std::vector<int>" not in names
     assert "__gnu_cxx" not in names
@@ -298,8 +315,33 @@ def test_class_list_no_stl_filters_library_classes():
     assert out["library_suppressed"] >= 2
     # Without --no-stl the library classes are present.
     full = read_class._class_list(_Ctx(), None, include_all=True)
-    assert "std::vector<int>" in [c["name"] for c in full["classes"]]
+    assert "std::vector<int>" in [c["name"] for c in full["items"]]
     assert full["library_suppressed"] == 0
+
+
+def test_class_list_populates_bases_for_shown_rows():
+    # `class list` must populate the per-row `bases` field (it was always [] —
+    # base decode ran only in the `show` path). Bases are decoded for the
+    # returned page so a single list recovers the inheritance graph. (#205 review)
+    fns = [_Fn(0x1000, "_ZN3net7SessionC1Ev", "net::Session::Session()")]
+    syms = [
+        _Sym("_ZTVN3net7SessionE", "_vtable_for_net::Session", 0x9000),
+        _Sym("_ZTIN3net7SessionE", "typeinfo_for_net::Session", 0x9100),
+    ]
+    bv = _RegistryBV(fns, syms)
+
+    class _Ctx:
+        def _resolve_view(self, sel):
+            return bv
+
+        def _bases_for(self, b, rec):
+            if rec["name"] == "net::Session":
+                return [{"name": "net::Endpoint", "address": "0x9200", "kind": "public"}]
+            return []
+
+    out = read_class._class_list(_Ctx(), None)
+    row = next(c for c in out["items"] if c["name"] == "net::Session")
+    assert row["bases"] == ["net::Endpoint"]
 
 
 class _VtableCtx:

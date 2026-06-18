@@ -290,7 +290,7 @@ def _class_list(
 ) -> dict[str, Any]:
     bv = ctx._resolve_view(selector)
     registry = _build_class_registry(ctx, bv, query=query)
-    rows = []
+    candidates = []
     library_suppressed = 0
     for rec in registry.values():
         if not (include_all or rec["confidence"] in ("rtti", "ctor")):
@@ -298,19 +298,36 @@ def _class_list(
         if no_stl and _is_library_class(rec["name"]):
             library_suppressed += 1
             continue
-        rows.append(_list_row(rec))
-    rows.sort(key=lambda r: r["name"])
-    # `total` counts the rows AFTER the confidence + --no-stl filters but before
+        candidates.append(rec)
+    candidates.sort(key=lambda r: r["name"])
+    # `total` counts candidates AFTER the confidence + --no-stl filters but before
     # paging, so it reflects what this query actually surfaced.
-    total = len(rows)
-    if offset:
-        rows = rows[offset:]
+    total = len(candidates)
+    page = candidates[offset:] if offset else candidates
     if limit is not None:
-        rows = rows[:limit]
+        page = page[:limit]
+    # Populate RTTI bases for the RETURNED PAGE only: base decode is cheap (a few
+    # typeinfo reads per class) and bounded to the page, so a single `class list`
+    # recovers the inheritance graph without N `class show` calls. Vtable layout
+    # and object size stay show-only -- they are far costlier per class. (#205 review)
+    rows = []
+    for rec in page:
+        try:
+            rec["bases"] = ctx._bases_for(bv, rec)
+        except Exception:
+            rec["bases"] = []
+        rows.append(_list_row(rec))
+    returned = len(rows)
     return {
+        "items": rows,
+        # Back-compat alias for early #205 builds. New consumers should use
+        # `items`, matching the rest of the paged list-command surface.
         "classes": rows,
         "total": total,
         "offset": offset,
+        "limit": limit,
+        "returned": returned,
+        "has_more": offset + returned < total,
         "include_all": include_all,
         "no_stl": no_stl,
         "library_suppressed": library_suppressed,
