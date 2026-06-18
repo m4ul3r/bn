@@ -963,7 +963,8 @@ class TaintEngine:
     # A global buffer is referenced by an absolute address (MLIL_CONST_PTR), which
     # _pointee_var (stack-only) misses. We make it a single coarse taint location
     # keyed ("global", base_addr). Precise offset/aliasing is deliberately out of
-    # scope (motiongraph's territory); we over-approximate the whole buffer.
+    # scope (the domain of a heavyweight whole-program/CPG analyzer); we
+    # over-approximate the whole buffer.
 
     def _buffer_target(self, ssaf: Any, expr: Any):
         """Resolve a pointer expr to ``(key, label)`` for the buffer it points at:
