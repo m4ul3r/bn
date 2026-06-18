@@ -2805,10 +2805,20 @@ class TaintEngine:
                     # A ret: source on a function whose model also fills an
                     # output-pointer buffer would silently miss those bytes;
                     # point the user at call: instead of a false all-clear (#157).
+                    # But if the user ALSO passed a sibling arg:<callee>:<n> or
+                    # call:<callee> source for the SAME callee, that buffer is
+                    # already seeded -- the nudge is then redundant and
+                    # misleading, so suppress it.
+                    sibling_covers_output = any(
+                        s is not src
+                        and s.get("kind") in ("arg", "call")
+                        and s.get("callee") == callee
+                        for s in sources
+                    )
                     _, _hm = lookup_model(self.models, callee)
                     _outs = [str(s.get("to")) for s in (_hm or {}).get("sources") or []
                              if str(s.get("to", "")).startswith("*arg:")]
-                    if _outs:
+                    if _outs and not sibling_covers_output:
                         add_assumption(
                             f"{callee} also writes tainted data to {', '.join(_outs)} per its "
                             f"model; --source ret:{callee} seeds only the return -- try "

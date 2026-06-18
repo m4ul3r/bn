@@ -574,6 +574,18 @@ def _backward_slice(
             f"call site (e.g. `taint forward --source call:<callee>`) or trace the "
             f"buffer's later consumers."
         )
+    elif not initial_vars:
+        # A constant/immediate arg (e.g. a literal length/flag) has no SSA
+        # definition to trace. Surface the value as a structured hint so both
+        # text and JSON consumers see *which* constant -- not just the renderer's
+        # generic "constant or immediate" line (which carried no value and left
+        # JSON `hints` empty).
+        cval = _const_int(param_expr)
+        if cval is not None:
+            hints.append(
+                f"arg {arg_index} is the constant {hex(cval)} -- a compile-time "
+                f"immediate with no SSA definition to trace back."
+            )
 
     trace = _build_backward_trace(
         ctx, bv, ssa_func, initial_vars, max_depth,

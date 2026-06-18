@@ -79,7 +79,9 @@ def _dataflow_values(args: argparse.Namespace) -> int:
 
 
 _LOCATOR_HELP = (
-    "Locator: param:<n> | var:<selector> | ret:<callee> | arg:<callee>:<n>"
+    "Locator: param:<n> | var:<selector> | ret:<callee> | arg:<callee>:<n> | "
+    "call:<callee> (seeds every output the callee's model declares -- return "
+    "value AND output-pointer buffers)"
 )
 
 _SINK_LOCATOR_HELP = (
