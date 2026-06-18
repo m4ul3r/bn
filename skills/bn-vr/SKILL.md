@@ -1,6 +1,6 @@
 ---
 name: bn-vr
-description: Vulnerability research methodology for finding security bugs in binaries with the bn CLI. Covers attack surface identification, input tracing, common vulnerability patterns, systematic audit workflow, manual taint analysis, and reporting findings.
+description: Vulnerability-research methodology for finding security bugs in binaries via the bn CLI. Core discipline — exhaustive sink enumeration plus source→sink tracing — is what stops a fast false all-clear: when the import table looks empty or bounded, it forces the audit onto the binary's own copy/format/dispatch sinks and (on C++) the class lens to the directive/parse handlers, then taint/trace to prove or refute attacker control. Covers attack-surface mapping, the stripped/static lane, common bug patterns, the taint engine, and reporting.
 ---
 
 # bn-vr — Vulnerability Research Methodology
@@ -14,6 +14,8 @@ Start by mapping what the binary does and where untrusted data enters:
 > **No imports? (static / stripped firmware.)** If `bn imports` comes back empty or near-empty, the binary is statically linked and the import-first steps below won't bite — `bn xrefs strcpy` / `function search strcpy` return nothing when no function is *named* `strcpy`. Use the **Stripped / static lane** at the end of this section instead.
 
 > **Quick-loaded target?** If the binary was opened with `bn load --quick` / `bn session start --quick`, the code is not analyzed yet: `bn imports` and `bn sections` work, but `bn strings` (step 3) **errors** until `bn refresh` (it refuses rather than return nothing) and `bn function list` / `bn function search` return only a **partial** set — a false "no dangerous strings, no sinks" all-clear. Confirm `analysis_state` is `"full"` (`bn target info`) and `bn refresh` before auditing. See "Quick Load" in the `bn` skill.
+
+> **C++ / symbolicated target? Use the class lens to reach the handlers fast.** On a binary with demangled C++ symbols/RTTI, `bn class list --no-stl` surfaces the domain classes and `bn class show <Name>` lists a class's methods + vtable — the quickest way to locate the directive/parse/dispatch/`handle*`/`onReceive` entry points that take untrusted input, *before* you enumerate sinks. (On stripped/static firmware with no symbols, skip it and use the "Stripped / static lane" below.)
 
 1. **Dangerous imports** — scan for functions with known vulnerability history:
    ```bash
