@@ -28,7 +28,6 @@ def _dataflow_defuse(args: argparse.Namespace) -> int:
         "defuse",
         {"identifier": args.identifier, "var": args.var},
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=_render_defuse_text,
         stem="defuse",
     )
@@ -53,7 +52,6 @@ def _dataflow_callgraph(args: argparse.Namespace) -> int:
             "resolve_indirect": bool(args.resolve_indirect),
         },
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=_render_callgraph_text,
         stem="callgraph",
     )
@@ -72,7 +70,6 @@ def _dataflow_values(args: argparse.Namespace) -> int:
         "possible_values",
         {"identifier": args.identifier, "at": args.at},
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=_render_values_text,
         stem="values",
     )
@@ -131,7 +128,6 @@ def _taint_forward(args: argparse.Namespace) -> int:
         "taint",
         params,
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=_render_taint_text,
         stem="taint-forward",
     )
@@ -162,7 +158,6 @@ def _taint_backward(args: argparse.Namespace) -> int:
             "max_depth": int(args.max_depth),
         },
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=_render_taint_text,
         stem="taint-backward",
     )

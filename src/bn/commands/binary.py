@@ -106,7 +106,6 @@ def _refresh(args: argparse.Namespace) -> int:
         "refresh",
         {},
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=_render_refresh_text,
         stem="refresh",
     )
@@ -123,7 +122,6 @@ def _target_info(args: argparse.Namespace) -> int:
         "target_info",
         {"selector": args.target, "verbose": bool(args.verbose)},
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=_render_target_info_text,
         stem="target-info",
     )

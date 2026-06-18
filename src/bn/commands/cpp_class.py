@@ -27,7 +27,7 @@ def _class_list(args: argparse.Namespace) -> int:
         params["limit"] = limit
     return _call(
         args, "class_list", params,
-        require_target=True, allow_implicit_target=True,
+        require_target=True,
         text_renderer=_render_class_list_text,
         paged_spill=True, page_label="classes", stem="class-list",
     )
@@ -39,7 +39,7 @@ def _class_list(args: argparse.Namespace) -> int:
 def _class_show(args: argparse.Namespace) -> int:
     return _call(
         args, "class_show", {"name": args.name},
-        require_target=True, allow_implicit_target=True,
+        require_target=True,
         text_renderer=_render_class_show_text,
         stem="class-show",
     )

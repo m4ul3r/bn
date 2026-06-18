@@ -11,6 +11,7 @@ from . import session_state
 from .formatters import (
     FAILED_MUTATION_STATUSES,
     _format_operation_result,  # noqa: F401  -- re-exported for tests/scripts that monkeypatch bn.cli
+    _render_mutation_text,
     _render_target_choices,
 )
 from .output import render_envelope, render_error, write_output_result
@@ -276,6 +277,17 @@ def mutex(required: bool, *args: tuple[tuple[str, ...], dict[str, Any]]) -> tupl
     return (required, list(args))
 
 
+def preview_arg(
+    help: str = "Apply, capture diffs, then revert without committing",
+) -> tuple[tuple[str, ...], dict[str, Any]]:
+    """The shared ``--preview`` flag every mutation command exposes.
+
+    A few commands phrase the help slightly differently (e.g. ``function create``
+    says "Create, verify, then revert"); pass *help* to override.
+    """
+    return arg("--preview", action="store_true", help=help)
+
+
 def command(
     *path: str,
     help: str = "",
@@ -418,6 +430,36 @@ def _render_result(
             )
         return
     sys.stdout.write(result.rendered)
+
+
+def _emit_result(
+    args: argparse.Namespace,
+    result: Any,
+    *,
+    text_renderer: Callable[[Any], str] | None = None,
+    stem: str,
+) -> None:
+    """Render a locally-built result for handlers that can't go through :func:`_call`.
+
+    The admin commands (doctor, session/instance/target management) orchestrate
+    several bridge requests, so they assemble the result themselves instead of
+    making one ``_call``. This is ``_call``'s rendering tail factored out so they
+    share it: under ``--format text`` it applies *text_renderer* behind the same
+    malformed-result guard ``_call`` uses (a renderer crash on a malformed/newer
+    bridge response becomes a clean :class:`BridgeError` pointing at ``--format
+    json``, never a raw traceback), then writes via :func:`_render_result`. With no
+    *text_renderer* the value renders as-is in every format.
+    """
+    if text_renderer is not None and args.format == "text":
+        try:
+            result = text_renderer(result)
+        except (AttributeError, TypeError, KeyError, IndexError, ValueError) as exc:
+            raise BridgeError(
+                f"could not render the {stem} result as text -- the bridge response was "
+                f"malformed or newer than this CLI. Rerun with --format json to see the "
+                f"raw result. ({type(exc).__name__}: {exc})"
+            ) from exc
+    _render_result(result, fmt=args.format, out_path=args.out, stem=stem)
 
 
 # Regex metacharacters that make a literal substring query silently match
@@ -567,13 +609,50 @@ def _mutation_exit_code(result: Any) -> int:
     return 0
 
 
+def _mutate(
+    args: argparse.Namespace,
+    op: str,
+    params: dict[str, Any],
+    *,
+    stem: str,
+    require_target: bool = True,
+    preview: bool | None = None,
+    **call_kwargs: Any,
+) -> int:
+    """:func:`_call` specialized for mutations.
+
+    Every mutation command shares the same tail -- the mutation text renderer and
+    the verification-aware exit code -- and differs only in its op, param dict,
+    and stem. This bakes in that tail and, when *preview* is supplied, injects the
+    ``preview`` param so handlers don't each repeat ``"preview": bool(args.preview)``.
+    Extra keyword args (e.g. ``bridge_writes_output``) pass through to ``_call``.
+    """
+    if preview is not None:
+        params = {**params, "preview": preview}
+    return _call(
+        args,
+        op,
+        params,
+        require_target=require_target,
+        text_renderer=_render_mutation_text,
+        result_exit_code=_mutation_exit_code,
+        stem=stem,
+        **call_kwargs,
+    )
+
+
 def _call(
     args: argparse.Namespace,
     op: str,
     params: dict[str, Any] | None = None,
     *,
     require_target: bool,
-    allow_implicit_target: bool = False,
+    # Defaults True: every target-required command wants the single-open-target
+    # convenience, and `require_target=False` commands (load/close/save/batch)
+    # never reach the implicit-resolution branch in _resolve_target anyway, so
+    # the flag carried no independent signal at any call site. Pass False only to
+    # force an explicit -t/--target on a target-required command.
+    allow_implicit_target: bool = True,
     text_renderer: Callable[[Any], str] | None = None,
     page_limit: int | None = None,
     page_offset: int = 0,

@@ -4,9 +4,8 @@ import argparse
 import sys
 from pathlib import Path
 
-from ..cli import _call, _effective_limit, _mutation_exit_code, arg, command
+from ..cli import _call, _effective_limit, _mutate, arg, command, preview_arg
 from ..formatters import (
-    _render_mutation_text,
     _render_type_info_text,
     _render_type_list_text,
 )
@@ -24,7 +23,6 @@ def _types(args: argparse.Namespace) -> int:
             "types",
             {"query": args.query, "count_only": True},
             require_target=True,
-            allow_implicit_target=True,
             text_renderer=lambda value: f"Total types: {value.get('count', 0)}",
             stem="types-count",
         )
@@ -37,7 +35,6 @@ def _types(args: argparse.Namespace) -> int:
         "types",
         params,
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=_render_type_list_text,
         # Bridge returns the {items,total,...} envelope and applies the page, so
         # forward the real limit/offset (above) and keep the spill hint -- no
@@ -61,7 +58,6 @@ def _types_show(args: argparse.Namespace) -> int:
             "require_struct": False,
         },
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=_render_type_info_text,
         stem="type-show",
     )
@@ -69,8 +65,7 @@ def _types_show(args: argparse.Namespace) -> int:
 
 @command("types", "declare", help="Import C declarations as user types", target=True, fmt="json",
          args=[
-             arg("--preview", action="store_true",
-                 help="Apply, capture diffs, then revert without committing"),
+             preview_arg(),
              arg("--file", type=Path, help="Read declarations from a file"),
              arg("--stdin", action="store_true", help="Read declarations from stdin"),
              arg("declaration", nargs="?"),
@@ -104,19 +99,15 @@ def _types_declare(args: argparse.Namespace) -> int:
     else:
         declaration = args.declaration
 
-    return _call(
+    return _mutate(
         args,
         "types_declare",
         {
             "declaration": declaration,
             "source_path": source_path,
-            "preview": bool(args.preview),
         },
-        require_target=True,
-        allow_implicit_target=True,
-        text_renderer=_render_mutation_text,
+        preview=bool(args.preview),
         stem="types-declare",
-        result_exit_code=_mutation_exit_code,
     )
 
 
@@ -131,7 +122,6 @@ def _struct_show(args: argparse.Namespace) -> int:
             "require_struct": True,
         },
         require_target=True,
-        allow_implicit_target=True,
         text_renderer=_render_type_info_text,
         stem="struct-show",
     )
@@ -139,8 +129,7 @@ def _struct_show(args: argparse.Namespace) -> int:
 
 @command("struct", "field", "set", help="Set or replace a field", target=True, fmt="json",
          args=[
-             arg("--preview", action="store_true",
-                 help="Apply, capture diffs, then revert without committing"),
+             preview_arg(),
              arg("--no-overwrite", action="store_true"),
              arg("struct_name"),
              arg("offset"),
@@ -148,7 +137,7 @@ def _struct_show(args: argparse.Namespace) -> int:
              arg("field_type"),
          ])
 def _struct_field_set(args: argparse.Namespace) -> int:
-    return _call(
+    return _mutate(
         args,
         "struct_field_set",
         {
@@ -157,61 +146,47 @@ def _struct_field_set(args: argparse.Namespace) -> int:
             "field_name": args.field_name,
             "field_type": args.field_type,
             "overwrite_existing": not args.no_overwrite,
-            "preview": bool(args.preview),
         },
-        require_target=True,
-        allow_implicit_target=True,
-        text_renderer=_render_mutation_text,
+        preview=bool(args.preview),
         stem="struct-field-set",
-        result_exit_code=_mutation_exit_code,
     )
 
 
 @command("struct", "field", "rename", help="Rename a field", target=True, fmt="json",
          args=[
-             arg("--preview", action="store_true",
-                 help="Apply, capture diffs, then revert without committing"),
+             preview_arg(),
              arg("struct_name"),
              arg("old_name", help="Field name or offset (e.g. count or 0x8)"),
              arg("new_name"),
          ])
 def _struct_field_rename(args: argparse.Namespace) -> int:
-    return _call(
+    return _mutate(
         args,
         "struct_field_rename",
         {
             "struct_name": args.struct_name,
             "old_name": args.old_name,
             "new_name": args.new_name,
-            "preview": bool(args.preview),
         },
-        require_target=True,
-        allow_implicit_target=True,
-        text_renderer=_render_mutation_text,
+        preview=bool(args.preview),
         stem="struct-field-rename",
-        result_exit_code=_mutation_exit_code,
     )
 
 
 @command("struct", "field", "delete", help="Delete a field", target=True, fmt="json",
          args=[
-             arg("--preview", action="store_true",
-                 help="Apply, capture diffs, then revert without committing"),
+             preview_arg(),
              arg("struct_name"),
              arg("field_name", help="Field name or offset (e.g. count or 0x8)"),
          ])
 def _struct_field_delete(args: argparse.Namespace) -> int:
-    return _call(
+    return _mutate(
         args,
         "struct_field_delete",
         {
             "struct_name": args.struct_name,
             "field_name": args.field_name,
-            "preview": bool(args.preview),
         },
-        require_target=True,
-        allow_implicit_target=True,
-        text_renderer=_render_mutation_text,
+        preview=bool(args.preview),
         stem="struct-field-delete",
-        result_exit_code=_mutation_exit_code,
     )

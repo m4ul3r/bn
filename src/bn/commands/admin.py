@@ -126,9 +126,7 @@ def _doctor(args: argparse.Namespace) -> int:
         "engine_install_build_id": install_engine_id,
         "instances": instances,
     }
-    if args.format == "text":
-        result = _render_doctor_text(result)
-    cli._render_result(result, fmt=args.format, out_path=args.out, stem="doctor")
+    cli._emit_result(args, result, text_renderer=_render_doctor_text, stem="doctor")
     return 0
 
 
@@ -143,15 +141,14 @@ def _plugin_install(args: argparse.Namespace) -> int:
     dest = args.dest or cli.plugin_install_dir()
     _install_tree(source, dest, mode=args.mode, force=args.force)
 
-    cli._render_result(
+    cli._emit_result(
+        args,
         {
             "installed": True,
             "mode": args.mode,
             "source": str(source),
             "destination": str(dest),
         },
-        fmt=args.format,
-        out_path=args.out,
         stem="plugin-install",
     )
     return 0
@@ -232,9 +229,7 @@ def _skill_install(args: argparse.Namespace) -> int:
         "skipped_destinations": skipped_destinations,
         "skills": results,
     }
-    if args.format == "text":
-        result = _render_skill_install_text(result)
-    cli._render_result(result, fmt=args.format, out_path=args.out, stem="skill-install")
+    cli._emit_result(args, result, text_renderer=_render_skill_install_text, stem="skill-install")
     return 0
 
 
@@ -295,9 +290,7 @@ def _session_start(args: argparse.Namespace) -> int:
             pass
         result["stopped"] = True
 
-    if args.format == "text":
-        result = _render_session_start_text(result)
-    cli._render_result(result, fmt=args.format, out_path=args.out, stem="session-start")
+    cli._emit_result(args, result, text_renderer=_render_session_start_text, stem="session-start")
     return 1 if failures else 0
 
 
@@ -350,15 +343,11 @@ def _session_stop(args: argparse.Namespace) -> int:
                     f"bridge instance {target_id} (pid {inst.pid}) did not fully "
                     "tear down; registry/socket may be stale."
                 )
-                if args.format == "text":
-                    result = _render_session_stop_text(result)
-                cli._render_result(result, fmt=args.format, out_path=args.out, stem="session-stop")
+                cli._emit_result(args, result, text_renderer=_render_session_stop_text, stem="session-stop")
                 return 1
             result["method"] = "sigkill"
 
-    if args.format == "text":
-        result = _render_session_stop_text(result)
-    cli._render_result(result, fmt=args.format, out_path=args.out, stem="session-stop")
+    cli._emit_result(args, result, text_renderer=_render_session_stop_text, stem="session-stop")
     return 0
 
 
@@ -432,9 +421,7 @@ def _session_restart(args: argparse.Namespace) -> int:
         # Rendered by the session-start text renderer under "loaded".
         "loaded": reloaded,
     }
-    if args.format == "text":
-        result = _render_session_start_text(result)
-    cli._render_result(result, fmt=args.format, out_path=args.out, stem="session-restart")
+    cli._emit_result(args, result, text_renderer=_render_session_start_text, stem="session-restart")
     return 1 if failures else 0
 
 
@@ -477,18 +464,14 @@ def _running_instances_result() -> dict[str, Any]:
 @command("session", "list", help="List running bridge sessions")
 def _session_list(args: argparse.Namespace) -> int:
     result: Any = _running_instances_result()
-    if args.format == "text":
-        result = _render_session_list_text(result)
-    cli._render_result(result, fmt=args.format, out_path=args.out, stem="session-list")
+    cli._emit_result(args, result, text_renderer=_render_session_list_text, stem="session-list")
     return 0
 
 
 @command("instance", "list", help="List running bridge instances (alias for `session list`)")
 def _instance_list(args: argparse.Namespace) -> int:
     result: Any = _running_instances_result()
-    if args.format == "text":
-        result = _render_session_list_text(result)
-    cli._render_result(result, fmt=args.format, out_path=args.out, stem="instance-list")
+    cli._emit_result(args, result, text_renderer=_render_session_list_text, stem="instance-list")
     return 0
 
 
@@ -511,9 +494,7 @@ def _instance_use(args: argparse.Namespace) -> int:
     resolved = cli.instance_selector(matches[0])
     cli.session_state.update(instance_id=resolved)
     result: Any = {"instance_id": resolved, "set": True}
-    if args.format == "text":
-        result = _render_instance_use_text(result)
-    cli._render_result(result, fmt=args.format, out_path=args.out, stem="instance-use")
+    cli._emit_result(args, result, text_renderer=_render_instance_use_text, stem="instance-use")
     return 0
 
 
@@ -521,9 +502,7 @@ def _instance_use(args: argparse.Namespace) -> int:
 def _instance_clear(args: argparse.Namespace) -> int:
     cli.session_state.update(instance_id=None)
     result: Any = {"instance_id": None, "set": False}
-    if args.format == "text":
-        result = _render_pin_clear_text(result)
-    cli._render_result(result, fmt=args.format, out_path=args.out, stem="instance-clear")
+    cli._emit_result(args, result, text_renderer=_render_pin_clear_text, stem="instance-clear")
     return 0
 
 
@@ -540,9 +519,7 @@ def _target_list(args: argparse.Namespace) -> int:
         for item in result:
             if isinstance(item, dict) and _target_matches(item, sticky):
                 item["sticky"] = True
-    if args.format == "text":
-        result = _render_target_list_text(result)
-    cli._render_result(result, fmt=args.format, out_path=args.out, stem="targets")
+    cli._emit_result(args, result, text_renderer=_render_target_list_text, stem="targets")
     return 0
 
 
@@ -587,9 +564,7 @@ def _target_use(args: argparse.Namespace) -> int:
         )
     cli.session_state.update(target=args.selector)
     result: Any = {"target": args.selector, "set": True}
-    if args.format == "text":
-        result = _render_target_use_text(result)
-    cli._render_result(result, fmt=args.format, out_path=args.out, stem="target-use")
+    cli._emit_result(args, result, text_renderer=_render_target_use_text, stem="target-use")
     return 0
 
 
@@ -597,7 +572,5 @@ def _target_use(args: argparse.Namespace) -> int:
 def _target_clear(args: argparse.Namespace) -> int:
     cli.session_state.update(target=None)
     result: Any = {"target": None, "set": False}
-    if args.format == "text":
-        result = _render_pin_clear_text(result)
-    cli._render_result(result, fmt=args.format, out_path=args.out, stem="target-clear")
+    cli._emit_result(args, result, text_renderer=_render_pin_clear_text, stem="target-clear")
     return 0
