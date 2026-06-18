@@ -432,6 +432,36 @@ def _render_result(
     sys.stdout.write(result.rendered)
 
 
+def _emit_result(
+    args: argparse.Namespace,
+    result: Any,
+    *,
+    text_renderer: Callable[[Any], str] | None = None,
+    stem: str,
+) -> None:
+    """Render a locally-built result for handlers that can't go through :func:`_call`.
+
+    The admin commands (doctor, session/instance/target management) orchestrate
+    several bridge requests, so they assemble the result themselves instead of
+    making one ``_call``. This is ``_call``'s rendering tail factored out so they
+    share it: under ``--format text`` it applies *text_renderer* behind the same
+    malformed-result guard ``_call`` uses (a renderer crash on a malformed/newer
+    bridge response becomes a clean :class:`BridgeError` pointing at ``--format
+    json``, never a raw traceback), then writes via :func:`_render_result`. With no
+    *text_renderer* the value renders as-is in every format.
+    """
+    if text_renderer is not None and args.format == "text":
+        try:
+            result = text_renderer(result)
+        except (AttributeError, TypeError, KeyError, IndexError, ValueError) as exc:
+            raise BridgeError(
+                f"could not render the {stem} result as text -- the bridge response was "
+                f"malformed or newer than this CLI. Rerun with --format json to see the "
+                f"raw result. ({type(exc).__name__}: {exc})"
+            ) from exc
+    _render_result(result, fmt=args.format, out_path=args.out, stem=stem)
+
+
 # Regex metacharacters that make a literal substring query silently match
 # nothing without --regex. Deliberately EXCLUDES '.' -- it is too common in
 # legitimate literal names/strings (std::x, a.b.c) to flag (#122).

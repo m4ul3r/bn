@@ -5376,3 +5376,24 @@ def test_class_show_invokes_op(monkeypatch):
     assert args.handler(args) == 0
     assert captured["op"] == "class_show"
     assert captured["params"]["name"] == "net::Session"
+
+
+def test_admin_text_renderer_failure_becomes_clean_error(monkeypatch, capsys):
+    # Admin commands build their result locally and render it WITHOUT going
+    # through _call, so they must apply the SAME malformed-result guard _call has
+    # (#101): a text renderer that raises must surface a clean BridgeError
+    # (exit 2) pointing at --format json, never a raw traceback.
+    import bn.commands.admin as admin
+
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [])
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    def _boom(_value):
+        raise ValueError("simulated malformed bridge result")
+
+    monkeypatch.setattr(admin, "_render_session_list_text", _boom)
+
+    rc = bn.cli.main(["session", "list"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "--format json" in err
