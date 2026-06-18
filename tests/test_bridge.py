@@ -7921,6 +7921,21 @@ def test_struct_snapshot_tolerates_unresolvable_name(monkeypatch):
     assert instance._capture_type_snapshots(bv, ops) == {}
 
 
+def test_diff_type_snapshots_populates_name(monkeypatch):
+    """affected_types entries carry `name` (= the qualified type name), not just
+    `type_name`, so an agent keying off .name doesn't read a real type change as
+    anonymous/failed (#211)."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    before: dict = {}
+    after = {"Config": {"decl": "struct Config", "layout": "struct Config {\n  int a;\n}"}}
+    diffs = me._diff_type_snapshots(None, before, after)
+    assert len(diffs) == 1
+    assert diffs[0]["name"] == "Config"
+    assert diffs[0]["type_name"] == "Config"   # back-compat alias retained
+    assert diffs[0]["changed"] is True
+
+
 # ---------------------------------------------------------------------------
 # Batch 5: bridge-side validation (#94 comment guard, #100 count validation)
 # ---------------------------------------------------------------------------
