@@ -102,44 +102,45 @@ def _split_qualified_method(demangled: str) -> tuple[str | None, str]:
     return head[:split], name[split + 2:].strip()
 
 
-# Itanium RTTI data symbols, keyed by their mangled prefix (the prefix alone
-# identifies the kind -- no demangling needed for that).
-_RTTI_TAGS = (
-    ("_ZTV", "vtable"),
-    ("_ZTI", "typeinfo"),
-    ("_ZTS", "typeinfo_name"),
-)
-
-# The CLASS NAME comes from the demangled short_name, whose marker punctuation
-# varies by BN version/platform: spaces ("vtable for X") or underscores
-# ("_vtable_for_X", "typeinfo_for_X", "typeinfo_name_for_X"), with an optional
-# leading underscore. Confirmed on real targets: the vtable form carries a
-# leading underscore but typeinfo / typeinfo-name do NOT -- so a fixed marker
-# list silently misses typeinfo (and RTTI bases never resolve). Match all forms.
+# RTTI data symbols are identified by the DEMANGLED marker on the symbol's
+# short_name -- group(1) = kind marker, group(2) = class name. The marker
+# punctuation varies by BN version/platform: spaces ("vtable for X") or
+# underscores ("_vtable_for_X", "typeinfo_for_X", "typeinfo_name_for_X"), with an
+# optional leading underscore. Crucially, do NOT gate on the mangled raw-name
+# prefix (`_ZTV`/`_ZTI`/`_ZTS`): on real targets BN sets a typeinfo symbol's
+# raw_name to the demangled form (`_typeinfo_for_X`) and creates no `_ZTI...`
+# symbol, so a raw-prefix gate silently drops typeinfo (and all RTTI bases).
 # Order matters: "typeinfo name" must precede "typeinfo" in the alternation.
-_RTTI_MARKER_RE = re.compile(r"^_?(?:vtable|typeinfo[ _]name|typeinfo)[ _]for[ _](.+)$")
+_RTTI_MARKER_RE = re.compile(r"^_?(vtable|typeinfo[ _]name|typeinfo)[ _]for[ _](.+)$")
+
+
+def _rtti_kind_and_class(sym) -> tuple[str | None, str | None]:
+    """(kind, class_name) for an RTTI data symbol -- kind is ``vtable`` /
+    ``typeinfo`` / ``typeinfo_name`` -- else (None, None). Identified by the
+    demangled marker on short_name, independent of the raw-name spelling."""
+    short = str(getattr(sym, "short_name", "") or "")
+    m = _RTTI_MARKER_RE.match(short)
+    if not m:
+        return None, None
+    marker = m.group(1)
+    kind = ("typeinfo_name" if "name" in marker
+            else "typeinfo" if marker.startswith("typeinfo")
+            else "vtable")
+    return kind, m.group(2).strip()
 
 
 def _class_of_rtti_symbol(sym) -> str | None:
-    """Class name for an RTTI symbol: strip the demangled marker, else None.
-    Handles both the space and underscore marker spellings BN emits."""
-    short = str(getattr(sym, "short_name", "") or "")
-    m = _RTTI_MARKER_RE.match(short)
-    return m.group(1).strip() if m else None
+    """Class name for an RTTI symbol (demangled marker stripped), else None."""
+    return _rtti_kind_and_class(sym)[1]
 
 
 def _rtti_symbol_maps(bv) -> dict[str, dict[str, Any]]:
     """{class_name: {"vtable": sym, "typeinfo": sym, "typeinfo_name": sym}}."""
     maps: dict[str, dict[str, Any]] = {}
     for sym in bv.get_symbols():
-        raw = str(getattr(sym, "raw_name", "") or getattr(sym, "name", "") or "")
-        for prefix, key in _RTTI_TAGS:
-            if not raw.startswith(prefix):
-                continue
-            cls = _class_of_rtti_symbol(sym)
-            if cls:
-                maps.setdefault(cls, {}).setdefault(key, sym)
-            break
+        kind, cls = _rtti_kind_and_class(sym)
+        if kind and cls:
+            maps.setdefault(cls, {}).setdefault(kind, sym)
     return maps
 
 

@@ -138,6 +138,23 @@ def test_registry_handles_underscore_rtti_markers():
     assert rec["confidence"] == "rtti"
 
 
+def test_registry_matches_demangled_raw_rtti_symbols():
+    # On real targets BN can set a typeinfo symbol's RAW name to the DEMANGLED
+    # form (`_typeinfo_for_X`) and create no `_ZTI...` symbol at all (45 vtables
+    # vs 16 `_ZTI` raws was observed). Identifying RTTI by the mangled raw prefix
+    # dropped these, so typeinfo -- and every RTTI base class -- silently never
+    # resolved. Identify by the demangled marker instead. (#205 dogfood regression.)
+    fns = [_Fn(0x1000, "_ZN1XC1Ev", "X::X()")]
+    syms = [
+        _Sym("_vtable_for_X", "_vtable_for_X", 0x9000),       # raw IS the demangled form
+        _Sym("_typeinfo_for_X", "_typeinfo_for_X", 0x9100),   # no `_ZTI` raw anywhere
+    ]
+    rec = read_class._build_class_registry(None, _RegistryBV(fns, syms))["X"]
+    assert rec["vtable"]["address"] == "0x9000"
+    assert rec["typeinfo"]["address"] == "0x9100"        # was None before the fix
+    assert rec["confidence"] == "rtti"
+
+
 class _SlotCtx:
     """ctx for _vtable_layout slot-scan tests. Supplies a valid Itanium typeinfo
     header (word[1] resolves to a typeinfo) so the layout gate passes and the
