@@ -2806,10 +2806,30 @@ class TaintEngine:
                     # A ret: source on a function whose model also fills an
                     # output-pointer buffer would silently miss those bytes;
                     # point the user at call: instead of a false all-clear (#157).
+                    # But if the user ALSO passed a sibling arg:<callee>:<n> or
+                    # call:<callee> source for the SAME callee that actually
+                    # seeds that buffer, the nudge is redundant and misleading,
+                    # so suppress it.
                     _, _hm = lookup_model(self.models, callee)
                     _outs = [str(s.get("to")) for s in (_hm or {}).get("sources") or []
                              if str(s.get("to", "")).startswith("*arg:")]
-                    if _outs:
+                    # Indices of the callee's modeled output buffers (*arg:N).
+                    _out_idxs = {i for i in (_try_arg_index(o) for o in _outs)
+                                 if i is not None}
+                    # A sibling covers the output ONLY if it seeds one: call:<callee>
+                    # presets every modeled output, but arg:<callee>:N covers it just
+                    # when N is a modeled *arg:N index. A non-output arg sibling
+                    # (e.g. arg:read:0 while read fills *arg:1) leaves the buffer
+                    # unseeded, so the nudge must still fire.
+                    sibling_covers_output = any(
+                        s is not src
+                        and s.get("callee") == callee
+                        and (s.get("kind") == "call"
+                             or (s.get("kind") == "arg"
+                                 and s.get("index") in _out_idxs))
+                        for s in sources
+                    )
+                    if _outs and not sibling_covers_output:
                         add_assumption(
                             f"{callee} also writes tainted data to {', '.join(_outs)} per its "
                             f"model; --source ret:{callee} seeds only the return -- try "

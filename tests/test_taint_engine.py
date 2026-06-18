@@ -535,6 +535,65 @@ def test_forward_arg_source_indirect_pointer_warns(models):
     assert any("indirectly" in a and "param:N" in a for a in result["assumptions"])
 
 
+def _read_callsite_func():
+    # r#1 = read(fd, &buf, 0x100); return r#1  -- a read whose return is consumed
+    # and whose model also fills the *arg:1 output buffer.
+    fd = FVar("fd"); buf = FVar("buf", typ="char[0x100]"); r = FVar("r")
+    r1 = FSSA(r, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "r#1 = read(fd, &buf, 0x100)",
+               writes=[r1],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[FSSA(fd, 0)]),
+                       FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       FExpr("MLIL_CONST", "0x100", constant=0x100)]),
+        FInstr(1, 0x14, "MLIL_RET", "return r#1", reads=[r1]),
+    ]
+    return FFunc("recv_handler", 0x10, FSSAFunc(instrs), params=[fd])
+
+
+def test_forward_ret_source_emits_call_nudge_when_alone(models):
+    # ret:read seeds only the return value, but read's model also fills the
+    # *arg:1 output buffer -- so a ret:-only source legitimately nudges the user
+    # toward call:read to also taint that buffer (#157).
+    engine = te.TaintEngine(FBV({0x900: "read"}), models)
+    result = engine.forward(_read_callsite_func(), [te.parse_locator("ret:read")])
+    assert any("call:read" in a for a in result["assumptions"])
+
+
+def test_forward_ret_source_suppresses_call_nudge_with_arg_sibling(models):
+    # When the user ALSO passes arg:read:1 (which already seeds the *arg:1 output
+    # buffer), the "try call:read to also taint the output buffer(s)" nudge is
+    # redundant and misleading -- it must be suppressed.
+    engine = te.TaintEngine(FBV({0x900: "read"}), models)
+    result = engine.forward(_read_callsite_func(),
+                            [te.parse_locator("ret:read"),
+                             te.parse_locator("arg:read:1")])
+    assert not any("call:read" in a for a in result["assumptions"])
+
+
+def test_forward_ret_source_suppresses_call_nudge_with_call_sibling(models):
+    # A call:read sibling already presets every model output, so the ret: nudge
+    # toward call:read is equally redundant there.
+    engine = te.TaintEngine(FBV({0x900: "read"}), models)
+    result = engine.forward(_read_callsite_func(),
+                            [te.parse_locator("ret:read"),
+                             te.parse_locator("call:read")])
+    assert not any("call:read" in a for a in result["assumptions"])
+
+
+def test_forward_ret_source_keeps_call_nudge_with_non_output_arg_sibling(models):
+    # A sibling arg:read:0 seeds read's FIRST arg (fd) -- NOT the *arg:1 output
+    # buffer. That buffer is still unseeded, so the call:read nudge must STILL
+    # fire. Suppressing it on any same-callee arg sibling regardless of index
+    # would hide a real gap (Codex review on #242).
+    engine = te.TaintEngine(FBV({0x900: "read"}), models)
+    result = engine.forward(_read_callsite_func(),
+                            [te.parse_locator("ret:read"),
+                             te.parse_locator("arg:read:0")])
+    assert any("call:read" in a for a in result["assumptions"])
+
+
 def test_find_callsites_matches_demangled_callee(models):
     # A callsite to a function whose fn.name BN kept mangled must be found by its
     # demangled short_name, so arg:<demangled>:N seeds it the same way xrefs

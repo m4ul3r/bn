@@ -6108,6 +6108,27 @@ def test_backward_slice_arg_label_and_output_pointer_hint(monkeypatch):
     assert "pointer" in result["hints"][0]
 
 
+def test_backward_slice_constant_arg_reports_value_hint(monkeypatch):
+    """A constant/immediate arg (e.g. read(fd, buf, 0x1fff)'s count) has no SSA
+    definition to trace. Instead of a renderer-only "constant or immediate" line
+    with no value and an empty JSON `hints`, the bridge surfaces a structured
+    hint naming the constant -- so text AND JSON consumers both see it."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    const_arg = _FakeMLILInsn(0x4010, operation="MLIL_CONST", vars_read=[], constant=0x1fff)
+    other = _FakeMLILInsn(0x4010, operation="MLIL_VAR_SSA", vars_read=[])
+    call_insn = _FakeMLILInsn(0x4010, operation="MLIL_CALL_SSA", params=[other, const_arg], vars_read=[])
+    fn = _FakeFunction(0x4000, "f")
+    fn.medium_level_il = _FakeMLILFunction([call_insn])
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._backward_slice("active", "f", "0x4010", arg_index=1)
+    assert result["trace"] == []
+    assert result["hints"]
+    assert "0x1fff" in result["hints"][0]
+    assert "constant" in result["hints"][0].lower()
+
+
 def test_backward_slice_no_call_at_address(monkeypatch):
     """Address with no call instruction should raise."""
     bridge = _load_bridge(monkeypatch)

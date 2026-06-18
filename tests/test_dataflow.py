@@ -128,6 +128,17 @@ def test_taint_forward_requires_source(monkeypatch, capsys):
     assert rc != 0
 
 
+def test_taint_forward_source_help_documents_call_locator(capsys):
+    # call:<callee> is a first-class source kind (#157) but was missing from the
+    # --source help, so it only surfaced in parse-error text. The locator help
+    # must list it alongside param:/var:/ret:/arg:.
+    parser = bn.cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["taint", "forward", "--help"])
+    help_text = capsys.readouterr().out
+    assert "call:" in help_text
+
+
 # --------------------------------------------------------------------------
 # formatter rendering
 # --------------------------------------------------------------------------
