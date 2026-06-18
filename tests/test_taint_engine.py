@@ -582,6 +582,18 @@ def test_forward_ret_source_suppresses_call_nudge_with_call_sibling(models):
     assert not any("call:read" in a for a in result["assumptions"])
 
 
+def test_forward_ret_source_keeps_call_nudge_with_non_output_arg_sibling(models):
+    # A sibling arg:read:0 seeds read's FIRST arg (fd) -- NOT the *arg:1 output
+    # buffer. That buffer is still unseeded, so the call:read nudge must STILL
+    # fire. Suppressing it on any same-callee arg sibling regardless of index
+    # would hide a real gap (Codex review on #242).
+    engine = te.TaintEngine(FBV({0x900: "read"}), models)
+    result = engine.forward(_read_callsite_func(),
+                            [te.parse_locator("ret:read"),
+                             te.parse_locator("arg:read:0")])
+    assert any("call:read" in a for a in result["assumptions"])
+
+
 def test_find_callsites_matches_demangled_callee(models):
     # A callsite to a function whose fn.name BN kept mangled must be found by its
     # demangled short_name, so arg:<demangled>:N seeds it the same way xrefs
