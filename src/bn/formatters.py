@@ -2017,5 +2017,55 @@ def _render_class_list_text(value: Any) -> str:
 
 
 def _render_class_show_text(value: Any) -> str:
-    # Filled in by Task 8; fallback keeps the import valid meanwhile.
-    return _render_fallback_text(value)
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    if value.get("ambiguous"):
+        out = [f"ambiguous class {value.get('query', '')!r}: {len(value.get('matches') or [])} matches"]
+        for rec in value.get("matches") or []:
+            out.append("")
+            out.append(_render_one_class(rec))
+        return "\n".join(out)
+    return _render_one_class(value)
+
+
+def _render_one_class(rec: Any) -> str:
+    if not isinstance(rec, dict):
+        return _render_fallback_text(rec)
+    size = rec.get("size")
+    size_s = size.get("value") if isinstance(size, dict) else None
+    vt = rec.get("vtable") if isinstance(rec.get("vtable"), dict) else None
+    vt_addr = vt.get("address") if vt else None
+    bases = ", ".join(b.get("name") or "?" for b in (rec.get("bases") or []))
+    head = f"class {rec.get('name', '<unknown>')}"
+    bits = []
+    if size_s:
+        bits.append(f"size {size_s}")
+    if vt_addr:
+        bits.append(f"vtable @ {vt_addr}")
+    if bases:
+        bits.append(f"base: {bases}")
+    if bits:
+        head += "  (" + ", ".join(bits) + ")"
+    lines = [head, f"  [{rec.get('confidence', '?')}]"]
+    for m in rec.get("methods") or []:
+        if m.get("kind") in ("ctor", "dtor"):
+            lines.append(f"  {m['kind']:<6} {m.get('address', '?')}  {m.get('demangled', '')}")
+    if vt and vt.get("slots"):
+        for s in vt["slots"]:
+            method = s.get("method") or {}
+            label = (
+                "__cxa_pure_virtual" if s.get("pure_virtual")
+                else method.get("name") if isinstance(method, dict) and method.get("name")
+                else "<unnamed>"
+            )
+            lines.append(f"  vtable [{s.get('index')}] {s.get('address', '?')}  {label}")
+    inst = rec.get("instances") if isinstance(rec.get("instances"), dict) else {}
+    parts = []
+    for site in inst.get("construction_sites") or []:
+        sz = f" (size {site['size']})" if site.get("size") else ""
+        parts.append(f"{site.get('kind', '?')} @ {site.get('address', '?')}{sz}")
+    for g in inst.get("stored_globals") or []:
+        parts.append(f"stored -> {g.get('symbol') or '?'} @ {g.get('address', '?')}")
+    if parts:
+        lines.append("  instances: " + " ; ".join(parts))
+    return "\n".join(lines)

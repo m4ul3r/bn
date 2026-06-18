@@ -734,6 +734,25 @@ class BridgeContext:
         the operator-new size. Returns [] for now (honest "none recovered yet")."""
         return []
 
+    def _vtable_layout_for(self, bv, addr):
+        from . import read_class
+        return read_class._vtable_layout(self, bv, addr)
+
+    def _object_size_for(self, bv, record):
+        from . import read_class
+        return read_class._object_size(self, bv, record)
+
+    def _bases_for(self, bv, record):
+        from . import read_class
+        ti = record.get("typeinfo")
+        if not ti:
+            return []
+        return read_class._rtti_bases(self, bv, int(ti["address"], 16))
+
+    def _instances_for(self, bv, record):
+        from . import read_class
+        return read_class._instances(self, bv, record)
+
     # ---- relocated cycle-breakers (design spec §3.2): both state-free ----
 
     def _find_type(self, bv, type_name: str):

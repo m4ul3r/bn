@@ -299,3 +299,87 @@ def test_instances_collects_construction_and_global_stores():
     out = read_class._instances(ctx, object(), rec)
     assert out["construction_sites"][0]["kind"] == "new"
     assert out["stored_globals"][0]["symbol"] == "g_session"
+
+
+def test_class_show_assembles_full_record():
+    bv = _make_registry_bv()
+
+    class _ShowCtx:
+        def _resolve_view(self, sel):
+            return bv
+        def _pointer_size(self, b):
+            return 8
+        def _vtable_layout_for(self, b, addr):
+            return {"address": hex(addr), "slots": [
+                {"index": 0, "address": "0x40e8b0", "method": {"name": "onData"},
+                 "pure_virtual": False, "unnamed": False}]}
+        def _object_size_for(self, b, rec):
+            return {"value": "0xd0", "source": "operator_new", "at": "0x443abc"}
+        def _bases_for(self, b, rec):
+            return [{"name": "net::Endpoint", "address": "0x9200", "kind": "public"}]
+        def _instances_for(self, b, rec):
+            return {"construction_sites": [], "stored_globals": []}
+
+    out = read_class._class_show(_ShowCtx(), None, "net::Session")
+    assert out["name"] == "net::Session"
+    assert out["size"]["value"] == "0xd0"
+    assert out["bases"][0]["name"] == "net::Endpoint"
+    assert out["vtable"]["slots"][0]["method"]["name"] == "onData"
+
+
+def test_class_show_unknown_name_errors_with_hint():
+    bv = _make_registry_bv()
+
+    class _Ctx:
+        def _resolve_view(self, sel):
+            return bv
+
+    import pytest
+    with pytest.raises(read_class.OperationFailure) as exc:
+        read_class._class_show(_Ctx(), None, "net::Nope")
+    assert "class list" in str(exc.value).lower()
+
+
+def test_class_show_ambiguous_returns_all_matches():
+    # Two classes share a leaf name across namespaces.
+    fns = [
+        _Fn(0x1000, "_ZN1a3FooC1Ev", "a::Foo::Foo()"),
+        _Fn(0x2000, "_ZN1b3FooC1Ev", "b::Foo::Foo()"),
+    ]
+    bv = _RegistryBV(fns, [])
+
+    class _Ctx:
+        def _resolve_view(self, sel):
+            return bv
+        def _vtable_layout_for(self, b, a):
+            return None
+        def _object_size_for(self, b, r):
+            return None
+        def _bases_for(self, b, r):
+            return []
+        def _instances_for(self, b, r):
+            return {"construction_sites": [], "stored_globals": []}
+
+    out = read_class._class_show(_Ctx(), None, "Foo")
+    assert out["ambiguous"] is True
+    assert {m["name"] for m in out["matches"]} == {"a::Foo", "b::Foo"}
+
+
+def test_render_class_show_text_matches_mock_shape():
+    from bn.formatters import _render_class_show_text
+    rec = {
+        "name": "net::Session", "confidence": "rtti",
+        "size": {"value": "0xd0", "source": "operator_new"},
+        "vtable": {"address": "0x4e0000", "slots": [
+            {"index": 0, "address": "0x40e8b0", "method": {"name": "onData"}, "pure_virtual": False, "unnamed": False},
+            {"index": 1, "address": "0x0", "method": None, "pure_virtual": True, "unnamed": False}]},
+        "bases": [{"name": "net::Endpoint"}],
+        "methods": [{"kind": "ctor", "address": "0x40abc0", "demangled": "net::Session::Session()"}],
+        "instances": {"construction_sites": [{"kind": "new", "address": "0x443abc", "size": "0xd0"}],
+                      "stored_globals": [{"symbol": "g_session", "address": "0x4cabcd"}]},
+    }
+    text = _render_class_show_text(rec)
+    assert "class net::Session" in text and "size 0xd0" in text and "base: net::Endpoint" in text
+    assert "vtable [0] 0x40e8b0  onData" in text
+    assert "vtable [1] 0x0  __cxa_pure_virtual" in text
+    assert "instances: new @ 0x443abc (size 0xd0) ; stored -> g_session @ 0x4cabcd" in text

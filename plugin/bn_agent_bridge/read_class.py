@@ -365,3 +365,36 @@ def _instances(ctx, bv, record: dict[str, Any], *, cap: int = 128) -> dict[str, 
     sites = ctx._ctor_construction_sites(bv, record)[:cap]
     stored = ctx._global_vtable_stores(bv, record)[:cap] if record.get("vtable") else []
     return {"construction_sites": sites, "stored_globals": stored}
+
+
+def _resolve_class_names(registry: dict[str, dict], name: str) -> list[str]:
+    """Exact match, else all classes whose leaf component equals *name*."""
+    if name in registry:
+        return [name]
+    leaf = _last_component(name) if "::" in name else name
+    return sorted(k for k in registry if _last_component(k) == leaf)
+
+
+def _enrich(ctx, bv, rec: dict[str, Any]) -> dict[str, Any]:
+    if rec.get("vtable"):
+        rec["vtable"] = ctx._vtable_layout_for(bv, int(rec["vtable"]["address"], 16)) or rec["vtable"]
+    rec["size"] = ctx._object_size_for(bv, rec)
+    rec["bases"] = ctx._bases_for(bv, rec)
+    rec["instances"] = ctx._instances_for(bv, rec)
+    return rec
+
+
+def _class_show(ctx, selector: str | None, name: str) -> dict[str, Any]:
+    bv = ctx._resolve_view(selector)
+    registry = _build_class_registry(ctx, bv)
+    matches = _resolve_class_names(registry, name)
+    if not matches:
+        raise OperationFailure(
+            "unknown_class",
+            f"No class named {name!r}. Run `bn class list` (add --all for "
+            f"name-only clusters) to discover available classes.",
+        )
+    enriched = [_enrich(ctx, bv, registry[m]) for m in matches]
+    if len(enriched) == 1:
+        return enriched[0]
+    return {"ambiguous": True, "query": name, "matches": enriched}
