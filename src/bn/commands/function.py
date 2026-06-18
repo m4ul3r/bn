@@ -459,6 +459,9 @@ def _evidence_xrefs(args: argparse.Namespace) -> int:
                  help="Number of pointer entries to read"),
              arg("--stride", default=None,
                  help="Byte stride between entries (default: target pointer size)"),
+             arg("--width", default=None,
+                 help="Bytes read per entry (default: min(stride, pointer size); "
+                      "use 4 for a uint32[] table at --stride 4)"),
          ])
 def _evidence_table(args: argparse.Namespace) -> int:
     return _call(
@@ -468,6 +471,7 @@ def _evidence_table(args: argparse.Namespace) -> int:
             "address": args.address,
             "entries": args.entries,
             "stride": args.stride,
+            "width": args.width,
         },
         require_target=True,
         allow_implicit_target=True,

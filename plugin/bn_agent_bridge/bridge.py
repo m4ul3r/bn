@@ -1794,6 +1794,7 @@ def _bind_pointer_table(bridge, params, target):
         params["address"],
         entries=int(params.get("entries", 16)),
         stride=params.get("stride"),
+        width=params.get("width"),
     )
 
 

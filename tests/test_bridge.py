@@ -3144,6 +3144,74 @@ def test_pointer_table_normalizes_thumb_function_pointers(monkeypatch):
     assert result["entries"][1]["target"]["plausible"] is False
 
 
+def test_pointer_table_read_width_tracks_substride(monkeypatch):
+    """`evidence table --stride 4` on 8-byte-aligned data must read 4 bytes wide,
+    so odd slots read the (zero) high half instead of an 8-byte window overlapping
+    the next pointer -> 0x40018000000000 garbage flagged [implausible] (#225)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    table = ((0x40c370).to_bytes(8, "little")
+             + (0x400180).to_bytes(8, "little")
+             + (0x40ca80).to_bytes(8, "little"))
+    bv = _FakeBV(arch=_FakeArch(name="x86_64", address_size=8), memory={0x40b580: table})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._pointer_table("active", "0x40b580", entries=6, stride="4")
+    assert result["read_width"] == 4
+    vals = [e.get("value") for e in result["entries"]]
+    assert vals[0] == "0x40c370" and vals[2] == "0x400180" and vals[4] == "0x40ca80"
+    assert vals[1] == "0x0" and vals[3] == "0x0"            # zero high halves, not garbage
+    assert "0x40018000000000" not in vals                   # no overlapping read
+
+    # default (stride == pointer size) still reads 8-byte pointers
+    r8 = instance._pointer_table("active", "0x40b580", entries=3, stride="8")
+    assert r8["read_width"] == 8
+    assert [e.get("value") for e in r8["entries"]] == ["0x40c370", "0x400180", "0x40ca80"]
+
+    # explicit --width overrides the stride-derived width
+    rw = instance._pointer_table("active", "0x40b580", entries=2, stride="8", width="4")
+    assert rw["read_width"] == 4
+    assert rw["entries"][0]["value"] == "0x40c370"
+
+
+def test_message_lens_excludes_dynstr_and_resolves_rtti(monkeypatch):
+    """On a symbol-retaining binary, evidence message must exclude the noisy
+    .dynstr symbol-name matches and instead resolve the real RTTI data symbols
+    (_ZTV/_ZTI/_ZTS<type>) with xrefs + a hint (#194)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+
+    # the only string match is a .dynstr symbol-name string (noise)
+    dynstr_str = _FakeStringRef(0x9000, 16, "_ZTVN5TCLAP3ArgE")
+    # the real RTTI vtable data symbol the lens should surface
+    vtable_sym = fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0xA000, "_ZTVN5TCLAP3ArgE")
+    vtable_sym.raw_name = "_ZTVN5TCLAP3ArgE"
+    user = _FakeFunction(0x401000, "user")
+    bv = _FakeBV(
+        functions=[user],
+        strings=[dynstr_str],
+        symbols=[vtable_sym],
+        sections={".dynstr": _FakeSection(".dynstr", 0x9000, 0x9100),
+                  ".data.rel.ro": _FakeSection(".data.rel.ro", 0xA000, 0xB000)},
+        code_refs={0xA000: [_FakeCodeRef(0x401010, user)]},
+        segments={0x401010: _FakeSegment(readable=True, executable=True),
+                  0xA000: _FakeSegment(readable=True, writable=True)},
+        memory={0xA000: (0).to_bytes(8, "little") + (0xB100).to_bytes(8, "little")},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._message_lens("active", "N5TCLAP3ArgE", limit=5, table_entries=2)
+    assert result["dynstr_excluded"] == 1
+    assert result["count"] == 0                       # the lone .dynstr match was excluded
+    rtti = result["rtti_symbols"]
+    assert any(s["kind"] == "vtable" and s["symbol"] == "_ZTVN5TCLAP3ArgE" for s in rtti)
+    vt = next(s for s in rtti if s["kind"] == "vtable")
+    assert vt["address"] == "0xa000"
+    assert len(vt["xrefs"]["code_refs"]) == 1
+    assert result["hints"]                            # dynstr + rtti hints present
+
+
 def test_pointer_table_does_not_thumb_normalize_non_arm_pointers(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

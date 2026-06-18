@@ -319,6 +319,7 @@ def _pointer_table_for_view(
     *,
     entries: int,
     stride_size: int,
+    read_width: int | None = None,
     stop_after_invalid: int | None = None,
     error_on_unmapped: bool = False,
 ) -> dict[str, Any]:
@@ -339,6 +340,15 @@ def _pointer_table_for_view(
     if base_unmapped and error_on_unmapped:
         raise RuntimeError(f"Address 0x{start:x} is not mapped (no bytes available)")
     pointer_size = ctx._pointer_size(bv)
+    # Read width tracks the stride for sub-pointer strides: at `--stride 4` a
+    # uint32[] table must be read 4 bytes wide, else an 8-byte read overlaps the
+    # next slot and every entry decodes to garbage flagged [implausible] (#225).
+    # Default = min(stride, pointer_size): stride 4 -> 4-byte reads; stride 8 ->
+    # 8; stride 16 (a record with an 8-byte pointer per slot) -> 8. An explicit
+    # read_width overrides.
+    if read_width is None:
+        read_width = min(stride_size, pointer_size) if stride_size > 0 else pointer_size
+    read_width = max(1, int(read_width))
     # A non-null value below the lowest mapped address can't be a pointer into
     # the image -- at a fixed --stride it's almost always an inline scalar field
     # (a uint8/uint16 flag/enum in a mixed record), not a failed pointer slot.
@@ -353,7 +363,7 @@ def _pointer_table_for_view(
     invalid_run = 0
     for index in range(entries):
         entry_address = start + index * stride_size
-        value = ctx._read_pointer_value(bv, entry_address, size=pointer_size)
+        value = ctx._read_pointer_value(bv, entry_address, size=read_width)
         if value is None:
             rows.append(
                 {
@@ -448,13 +458,14 @@ def _pointer_table_for_view(
         "address": hex(start),
         "pointer_size": pointer_size,
         "stride": stride_size,
+        "read_width": read_width,
         "context": table_context,
         "entries": rows,
         "warnings": warnings,
     }
 
 
-def _pointer_table(ctx, selector: str | None, address, *, entries: int = 16, stride=None):
+def _pointer_table(ctx, selector: str | None, address, *, entries: int = 16, stride=None, width=None):
     if entries < 0:
         raise OperationFailure("invalid_entries", f"Invalid table entry count: {entries}")
     bv = ctx._resolve_view(selector)
@@ -463,14 +474,85 @@ def _pointer_table(ctx, selector: str | None, address, *, entries: int = 16, str
     stride_size = _parse_address(stride) if stride not in (None, "") else pointer_size
     if stride_size <= 0:
         raise OperationFailure("invalid_stride", f"Invalid table stride: {stride_size}")
+    # Explicit --width overrides the stride-derived read width (#225).
+    read_width = _parse_address(width) if width not in (None, "") else None
+    if read_width is not None and read_width <= 0:
+        raise OperationFailure("invalid_width", f"Invalid read width: {read_width}")
     return _pointer_table_for_view(
         ctx,
         bv,
         start,
         entries=entries,
         stride_size=stride_size,
+        read_width=read_width,
         error_on_unmapped=True,
     )
+
+
+def _section_names_at(context) -> set[str]:
+    return {
+        str(s.get("name", "")).lower()
+        for s in (context.get("sections") or [])
+        if isinstance(s, dict) and s.get("name")
+    }
+
+
+def _symbol_by_any_name(bv, name: str):
+    """A symbol matching *name* by raw (mangled) name, then by display name."""
+    graw = getattr(bv, "get_symbol_by_raw_name", None)
+    if callable(graw):
+        try:
+            s = graw(name)
+            if s is not None:
+                return s
+        except Exception:
+            pass
+    gbn = getattr(bv, "get_symbols_by_name", None)
+    if callable(gbn):
+        try:
+            ss = list(gbn(name) or [])
+            if ss:
+                return ss[0]
+        except Exception:
+            pass
+    return None
+
+
+# RTTI data-symbol tags (Itanium ABI): vtable / typeinfo / typeinfo-name. For a
+# mangled type fragment `N5TCLAP3ArgE`, the symbols are `_ZTVN5TCLAP3ArgE`, etc.
+_RTTI_PREFIXES = (("_ZTV", "vtable"), ("_ZTI", "typeinfo"), ("_ZTS", "typeinfo-name"))
+
+
+def _resolve_rtti_symbols(ctx, bv, query: str, table_entries: int) -> list[dict[str, Any]]:
+    """Resolve a (mangled) type-name to its RTTI DATA symbols -- the vtable /
+    typeinfo / typeinfo-name objects that actually carry the metadata, in
+    .rodata/.data.rel.ro with real xrefs -- which is what the lens is meant to
+    find but a .dynstr name-string match never reaches (#194). Best-effort: only
+    fires when the query is the mangled fragment (`_ZTV`+query resolves)."""
+    out: list[dict[str, Any]] = []
+    q = query.strip()
+    if not q:
+        return out
+    for prefix, kind in _RTTI_PREFIXES:
+        sym = _symbol_by_any_name(bv, prefix + q)
+        if sym is None or getattr(sym, "address", None) is None:
+            continue
+        addr = int(sym.address)
+        entry: dict[str, Any] = {
+            "kind": kind,
+            "symbol": prefix + q,
+            "address": hex(addr),
+            "xrefs": read_xrefs._xrefs_to_address(ctx, bv, addr),
+        }
+        # The vtable's slots (typeinfo pointer + virtual methods) are the payload;
+        # show the table window so the lens directly surfaces them.
+        if kind == "vtable" and table_entries:
+            entry["table_window"] = _pointer_table_for_view(
+                ctx, bv, addr, entries=table_entries,
+                stride_size=ctx._pointer_size(bv), stop_after_invalid=2,
+            )
+        out.append(entry)
+    return out
 
 
 def _message_lens(ctx, selector: str | None, query: str, *, limit: int = 20, table_entries: int = 6):
@@ -480,17 +562,26 @@ def _message_lens(ctx, selector: str | None, query: str, *, limit: int = 20, tab
     needle = query.lower()
     matches = []
     total_matched = 0
+    dynstr_excluded = 0
     for item in list(getattr(bv, "strings", [])):
         value = str(getattr(item, "value", ""))
         if needle and needle not in value.lower():
             continue
-        # Count every match so the reported total is honest, but only build
-        # the expensive per-match evidence (xrefs + pointer tables) for the
-        # first `limit` matches that are actually returned.
+        address = int(getattr(item, "start", 0))
+        context = ctx._address_context(bv, address)
+        # `.dynstr` matches are mangled SYMBOL-NAME strings, never the RTTI
+        # metadata this lens targets; on a symbol-retaining binary they drown the
+        # real result in 0-xref noise. Exclude them (a stripped binary has no
+        # .dynstr, so this is safe there too) -- count for an honest total + hint
+        # (#194).
+        if ".dynstr" in _section_names_at(context):
+            dynstr_excluded += 1
+            continue
+        # Count every (non-.dynstr) match so the reported total is honest, but
+        # only build the expensive per-match evidence for the first `limit`.
         total_matched += 1
         if len(matches) >= limit:
             continue
-        address = int(getattr(item, "start", 0))
         xrefs = read_xrefs._xrefs_to_address(ctx, bv, address)
         metadata_tables = []
         for ref in list(xrefs.get("data_refs") or [])[:3]:
@@ -516,18 +607,40 @@ def _message_lens(ctx, selector: str | None, query: str, *, limit: int = 20, tab
                     "address": hex(address),
                     "value": value,
                     "length": int(getattr(item, "length", len(value))),
-                    "context": ctx._address_context(bv, address),
+                    "context": context,
                 },
                 "xrefs": xrefs,
                 "metadata_table_windows": metadata_tables,
             }
         )
+
+    # Surface the real RTTI metadata directly (vtable/typeinfo/typeinfo-name data
+    # symbols), the structures a .dynstr name match can never reach (#194).
+    rtti_symbols = _resolve_rtti_symbols(ctx, bv, query, table_entries)
+
+    hints: list[str] = []
+    if dynstr_excluded:
+        hints.append(
+            f"excluded {dynstr_excluded} match(es) in .dynstr (mangled symbol-name "
+            f"strings, never RTTI metadata). This binary retains its symbol table; "
+            f"resolve the _ZTV/_ZTI/_ZTS<type> data symbols directly, or run "
+            f"`bn evidence table <vtable-addr>`."
+        )
+    if rtti_symbols:
+        hints.append(
+            f"resolved {len(rtti_symbols)} RTTI data symbol(s) for the type "
+            f"(vtable/typeinfo/typeinfo-name) -- see rtti_symbols."
+        )
+
     return {
         "query": query,
         "matches": matches,
         "count": len(matches),
         "total": total_matched,
         "truncated": total_matched > len(matches),
+        "dynstr_excluded": dynstr_excluded,
+        "rtti_symbols": rtti_symbols,
+        "hints": hints,
     }
 
 
