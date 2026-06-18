@@ -111,10 +111,7 @@ class BridgeContext:
 
         available: list[str] = []
         for fn in list(bv.functions):
-            available.append(str(fn.name))
-            raw = str(getattr(fn, "raw_name", fn.name))
-            if raw != str(fn.name):
-                available.append(raw)
+            available.extend(self._function_name_forms(fn))
         suggestions = difflib.get_close_matches(text, available, n=5, cutoff=0.5)
         if suggestions:
             raise RuntimeError(
@@ -135,13 +132,36 @@ class BridgeContext:
         ]
         return impls[0] if len(impls) == 1 else None
 
+    @staticmethod
+    def _function_name_forms(fn) -> list[str]:
+        """Every spelling a function can be addressed by: its display name, its
+        raw (mangled) name, and -- crucially for stripped C++ where BN keeps the
+        mangled name as ``fn.name`` -- the symbol's demangled ``short_name`` /
+        ``full_name``. Lets ``foo::bar::recv`` resolve a function whose
+        ``fn.name`` is the mangled ``_ZN3foo3bar4recvEi`` (#224a), uniformly
+        across xrefs / callsites / decompile (all route through here)."""
+        forms: list[str] = []
+        for v in (getattr(fn, "name", None), getattr(fn, "raw_name", None)):
+            if v:
+                forms.append(str(v))
+        sym = getattr(fn, "symbol", None)
+        if sym is not None:
+            for v in (getattr(sym, "short_name", None), getattr(sym, "full_name", None)):
+                if v:
+                    forms.append(str(v))
+        out: list[str] = []
+        for f in forms:
+            if f and f not in out:
+                out.append(f)
+        return out
+
     def _find_functions_by_name(self, bv, text: str, *, case_sensitive: bool) -> list[Any]:
         matches = []
         needle = text if case_sensitive else text.lower()
         seen: set[int] = set()
         for fn in list(bv.functions):
-            names = [str(fn.name), str(getattr(fn, "raw_name", fn.name))]
-            haystacks = names if case_sensitive else [name.lower() for name in names]
+            forms = self._function_name_forms(fn)
+            haystacks = forms if case_sensitive else [name.lower() for name in forms]
             if needle not in haystacks:
                 continue
             marker = int(fn.start)

@@ -734,6 +734,17 @@ def _render_xrefs_text(value: Any, limit: int | None = None) -> str:
     if import_label:
         lines.insert(0, import_label)
         lines.insert(1, "")
+    # Ambiguous same-name collision (thunk/real): surface the note so a zero-caller
+    # member is never mistaken for dead code (#220).
+    amb = value.get("ambiguous_symbol")
+    if isinstance(amb, dict) and amb.get("note"):
+        lines.insert(0, f"note: {amb['note']}")
+        lines.insert(1, "")
+    # Data-symbol resolution fallback (#224b).
+    rsym = value.get("resolved_symbol")
+    if isinstance(rsym, dict) and rsym.get("kind") == "data":
+        lines.insert(0, f"note: resolved '{rsym.get('name')}' as a data symbol @ {rsym.get('address')}")
+        lines.insert(1, "")
     lines.extend(_render_group(code_refs, total_code, "code refs"))
     lines.append("")
     lines.extend(_render_group(data_refs, total_data, "data refs"))

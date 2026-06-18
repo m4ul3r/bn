@@ -27,6 +27,7 @@ from typing import Any
 import binaryninja as bn
 
 from . import il_format
+from . import taint_engine as _taint
 from ._shared import _parse_address, _validate_count
 from .bridge_state import require_analysis
 
@@ -49,6 +50,37 @@ def _xrefs(ctx, selector: str | None, identifier, *, offset: int = 0, limit: int
     try:
         address = _parse_address(identifier)
     except Exception:
+        # NAME path. A bare name can resolve to >=2 functions -- GCC emits a
+        # 16-byte PLT-style thunk AND the real body under the same name in shared
+        # libs. The thunk usually carries all the call traffic while the real body
+        # shows zero callers, so silently resolving to one member reads a hot
+        # utility as dead code (#220). Detect the collision and surface it -- but
+        # only when it's a thunk/real group (resolvable); two genuine real bodies
+        # stay an ambiguous error (#122).
+        bodies = ctx._find_functions_by_name(bv, str(identifier), case_sensitive=True)
+        if not bodies:
+            bodies = ctx._find_functions_by_name(bv, str(identifier), case_sensitive=False)
+        if len(bodies) >= 2:
+            # An import/extern STUB shadowing exactly one real body is the #201
+            # PIC self-reference case (a demangled name matching both a PLT veneer
+            # and the local definition): resolve to the DEFINITION and never report
+            # the stub over it -- the stub usually carries the call traffic, so a
+            # pure ref-count tiebreak would pick it (regressing #201). Reuse the
+            # same impl-over-stub chokepoint _find_function uses. Only a genuine
+            # same-name group with NO stub-typed member (a GCC thunk/real pair,
+            # both FunctionSymbol) reaches the collision surfacing (#220).
+            impl = ctx._resolve_impl_over_stub(bodies)
+            if impl is not None:
+                result = _xrefs_to_address(ctx, bv, int(impl.start), offset=offset, limit=limit)
+                if any(int(getattr(f, "start", -1)) != int(impl.start) for f in bodies):
+                    result["resolved_to_definition"] = hex(int(impl.start))
+                return _drop_legacy_ref_arrays(result)
+            reals = [f for f in bodies if not _is_thunk_like(bv, f)]
+            if len(reals) <= 1:
+                return _drop_legacy_ref_arrays(
+                    _xrefs_ambiguous(ctx, bv, str(identifier), bodies, offset=offset, limit=limit)
+                )
+            # else: >=2 genuine non-thunk bodies -> let _find_function raise ambiguous.
         try:
             address = ctx._find_function(bv, identifier).start
         except RuntimeError as exc:
@@ -63,6 +95,65 @@ def _xrefs(ctx, selector: str | None, identifier, *, offset: int = 0, limit: int
     return _drop_legacy_ref_arrays(
         _xrefs_to_address(ctx, bv, address, offset=offset, limit=limit)
     )
+
+
+def _is_thunk_like(bv, fn) -> bool:
+    """A function that forwards to another (a PLT-style veneer / GCC same-name
+    thunk): BN's ``is_thunk`` flag, or a single-tailcall body that ``follow_thunk``
+    resolves to a different target. Used to tell a thunk/real same-name pair
+    (resolvable, #220) from two genuine implementations (ambiguous, #122)."""
+    if bool(getattr(fn, "is_thunk", False)):
+        return True
+    try:
+        resolved = _taint.follow_thunk(bv, fn)
+    except Exception:
+        resolved = None
+    return resolved is not None and int(getattr(resolved, "start", -1)) != int(getattr(fn, "start", -2))
+
+
+def _code_ref_count(bv, address: int) -> int:
+    get_code_refs = getattr(bv, "get_code_refs", None)
+    if not callable(get_code_refs):
+        return 0
+    try:
+        return len(list(get_code_refs(int(address))))
+    except Exception:
+        return 0
+
+
+def _xrefs_ambiguous(ctx, bv, identifier: str, bodies, *, offset: int = 0, limit: int | None = None) -> dict[str, Any]:
+    """Report xrefs for a same-name collision (#220): pick the member carrying the
+    most code refs (the thunk usually holds the traffic; the real body shows
+    zero), and surface every member under ``ambiguous_symbol`` so an analyst never
+    mistakes a hot utility for dead code."""
+    members = []
+    for fn in bodies:
+        addr = int(fn.start)
+        members.append({
+            "address": hex(addr),
+            "name": str(fn.name),
+            "size": il_format._function_size(fn),
+            "code_ref_count": _code_ref_count(bv, addr),
+            "is_thunk": _is_thunk_like(bv, fn),
+        })
+    members.sort(key=lambda m: (-m["code_ref_count"], int(m["address"], 16)))
+    chosen = members[0]
+    chosen_addr = int(chosen["address"], 16)
+    result = _xrefs_to_address(ctx, bv, chosen_addr, offset=offset, limit=limit)
+    others = ", ".join(
+        f"{m['address']} ({m['code_ref_count']} refs)" for m in members if m["address"] != chosen["address"]
+    )
+    result["ambiguous_symbol"] = {
+        "identifier": identifier,
+        "members": members,
+        "resolved_to": chosen["address"],
+        "note": (
+            f"'{identifier}' resolves to {len(members)} functions under the same name "
+            f"(thunk + real body); reporting xrefs for {chosen['address']} "
+            f"(most code refs: {chosen['code_ref_count']}). Other members: {others}"
+        ),
+    }
+    return result
 
 
 def _drop_legacy_ref_arrays(envelope: dict[str, Any]) -> dict[str, Any]:
@@ -199,9 +290,50 @@ def _find_import_symbol(ctx, bv, name: str):
     return None
 
 
+def _find_data_symbol(ctx, bv, name: str):
+    """A non-function symbol (DataSymbol, etc.) by name -- demangled or raw -- or
+    None. Lets `xrefs g_state_table` resolve a global/data symbol instead of
+    failing with a misleading 'use bn imports' (#224b)."""
+    cands: list[Any] = []
+    getbn = getattr(bv, "get_symbols_by_name", None)
+    if callable(getbn):
+        try:
+            cands = list(getbn(name) or [])
+        except Exception:
+            cands = []
+    if not cands:
+        graw = getattr(bv, "get_symbol_by_raw_name", None)
+        if callable(graw):
+            try:
+                s = graw(name)
+                if s is not None:
+                    cands = [s]
+            except Exception:
+                cands = []
+    for s in cands:
+        st = str(getattr(getattr(s, "type", None), "name", "") or "")
+        if "Function" in st:
+            continue  # functions are handled by _find_function; we want data here
+        if getattr(s, "address", None) is not None:
+            return s
+    return None
+
+
 def _xrefs_import_symbol(ctx, bv, identifier: str, *, offset: int = 0, limit: int | None = None) -> dict[str, Any]:
     sym = _find_import_symbol(ctx, bv, identifier)
     if sym is None:
+        # #224b: not a function or import -- try a data symbol (a global table,
+        # state struct, ...) and xref its address before erroring, so the result
+        # matches `xrefs <address>` instead of a misleading import-only error.
+        data_sym = _find_data_symbol(ctx, bv, identifier)
+        if data_sym is not None:
+            result = _xrefs_to_address(ctx, bv, int(data_sym.address), offset=offset, limit=limit)
+            result["resolved_symbol"] = {
+                "name": str(identifier),
+                "kind": "data",
+                "address": hex(int(data_sym.address)),
+            }
+            return result
         available: list[str] = []
         for attr_name, kind in _IMPORT_SYMBOL_TYPES:
             sym_type = getattr(bn.SymbolType, attr_name, None)
@@ -213,7 +345,8 @@ def _xrefs_import_symbol(ctx, bv, identifier: str, *, offset: int = 0, limit: in
         msg = f"Function not found: {identifier}."
         if suggestions:
             msg += f" Did you mean: {', '.join(suggestions)}"
-        msg += " Not found as an import symbol either. Use 'bn imports' to see available imports."
+        msg += (" Not found as an import or data symbol either. "
+                "Use 'bn imports' for imports, or pass the address directly.")
         raise RuntimeError(msg)
 
     # #201: a demangled C++ name matches an import veneer (PLT stub) via its
