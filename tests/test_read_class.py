@@ -117,6 +117,26 @@ def test_registry_attaches_vtable_and_typeinfo():
     assert reg["net::Pool"]["vtable"] is None
 
 
+def test_registry_handles_underscore_rtti_markers():
+    # Real BN renders RTTI markers with UNDERSCORES, and -- crucially -- the
+    # vtable form carries a leading underscore (_vtable_for_X) while typeinfo /
+    # typeinfo-name do NOT (typeinfo_for_X, typeinfo_name_for_X). A fixed marker
+    # list keyed on "typeinfo for "/"_typeinfo_for_" silently missed typeinfo, so
+    # RTTI bases never resolved on real targets. Regression for that fix.
+    fns = [_Fn(0x1000, "_ZN3net7SessionC1Ev", "net::Session::Session()")]
+    syms = [
+        _Sym("_ZTVN3net7SessionE", "_vtable_for_net::Session", 0x9000),
+        _Sym("_ZTIN3net7SessionE", "typeinfo_for_net::Session", 0x9100),
+        _Sym("_ZTSN3net7SessionE", "typeinfo_name_for_net::Session", 0x9200),
+    ]
+    reg = read_class._build_class_registry(None, _RegistryBV(fns, syms))
+    rec = reg["net::Session"]
+    assert rec["vtable"]["address"] == "0x9000"
+    assert rec["typeinfo"]["address"] == "0x9100"        # was None before the fix
+    assert rec["typeinfo_name"]["address"] == "0x9200"
+    assert rec["confidence"] == "rtti"
+
+
 def test_class_list_envelope_filters_and_pages():
     bv = _make_registry_bv()
 

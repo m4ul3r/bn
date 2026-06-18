@@ -6,6 +6,7 @@ All functions are read-only and take the BridgeContext seam (``ctx``); this
 module never imports ``bridge`` or ``mutation_engine``."""
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from . import il_format
@@ -101,23 +102,30 @@ def _split_qualified_method(demangled: str) -> tuple[str | None, str]:
     return head[:split], name[split + 2:].strip()
 
 
-# Itanium RTTI data-symbol tags. BN renders the demangled short_name with a
-# leading "vtable for " / "typeinfo for " / "typeinfo name for " marker (older
-# BN uses an underscored "_vtable_for_" form); strip either to get the class.
+# Itanium RTTI data symbols, keyed by their mangled prefix (the prefix alone
+# identifies the kind -- no demangling needed for that).
 _RTTI_TAGS = (
-    ("_ZTV", "vtable", ("vtable for ", "_vtable_for_")),
-    ("_ZTI", "typeinfo", ("typeinfo for ", "_typeinfo_for_")),
-    ("_ZTS", "typeinfo_name", ("typeinfo name for ", "_typeinfo_name_for_")),
+    ("_ZTV", "vtable"),
+    ("_ZTI", "typeinfo"),
+    ("_ZTS", "typeinfo_name"),
 )
 
+# The CLASS NAME comes from the demangled short_name, whose marker punctuation
+# varies by BN version/platform: spaces ("vtable for X") or underscores
+# ("_vtable_for_X", "typeinfo_for_X", "typeinfo_name_for_X"), with an optional
+# leading underscore. Confirmed on real targets: the vtable form carries a
+# leading underscore but typeinfo / typeinfo-name do NOT -- so a fixed marker
+# list silently misses typeinfo (and RTTI bases never resolve). Match all forms.
+# Order matters: "typeinfo name" must precede "typeinfo" in the alternation.
+_RTTI_MARKER_RE = re.compile(r"^_?(?:vtable|typeinfo[ _]name|typeinfo)[ _]for[ _](.+)$")
 
-def _class_of_rtti_symbol(sym, prefixes) -> str | None:
-    """Class name for an RTTI symbol: strip the demangled marker, else None."""
+
+def _class_of_rtti_symbol(sym) -> str | None:
+    """Class name for an RTTI symbol: strip the demangled marker, else None.
+    Handles both the space and underscore marker spellings BN emits."""
     short = str(getattr(sym, "short_name", "") or "")
-    for marker in prefixes:
-        if short.startswith(marker):
-            return short[len(marker):].strip()
-    return None
+    m = _RTTI_MARKER_RE.match(short)
+    return m.group(1).strip() if m else None
 
 
 def _rtti_symbol_maps(bv) -> dict[str, dict[str, Any]]:
@@ -125,10 +133,10 @@ def _rtti_symbol_maps(bv) -> dict[str, dict[str, Any]]:
     maps: dict[str, dict[str, Any]] = {}
     for sym in bv.get_symbols():
         raw = str(getattr(sym, "raw_name", "") or getattr(sym, "name", "") or "")
-        for prefix, key, markers in _RTTI_TAGS:
+        for prefix, key in _RTTI_TAGS:
             if not raw.startswith(prefix):
                 continue
-            cls = _class_of_rtti_symbol(sym, markers)
+            cls = _class_of_rtti_symbol(sym)
             if cls:
                 maps.setdefault(cls, {}).setdefault(key, sym)
             break

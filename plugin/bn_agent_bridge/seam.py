@@ -700,16 +700,14 @@ class BridgeContext:
         return int.from_bytes(data, self._byteorder(bv), signed=False) if len(data) == 4 else None
 
     def _typeinfo_name_at(self, bv, address):
-        """Class name for a _ZTI object address: prefer its data symbol's
-        demangled 'typeinfo for X' marker; None if unresolved."""
+        """Class name for a _ZTI object address from its data symbol's demangled
+        RTTI marker; None if unresolved. Reuses read_class's marker matcher so
+        the space/underscore spelling variants are handled in one place."""
         sym = bv.get_symbol_at(address) if hasattr(bv, "get_symbol_at") else None
         if sym is None:
             return None
-        short = str(getattr(sym, "short_name", "") or "")
-        for marker in ("typeinfo for ", "_typeinfo_for_"):
-            if short.startswith(marker):
-                return short[len(marker):].strip()
-        return None
+        from . import read_class
+        return read_class._class_of_rtti_symbol(sym)
 
     def _global_vtable_stores(self, bv, record):
         """Global data symbols whose stored value is this class's vtable addr."""
