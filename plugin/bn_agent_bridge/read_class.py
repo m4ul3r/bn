@@ -357,3 +357,11 @@ def _object_size(ctx, bv, record: dict[str, Any]) -> dict[str, Any] | None:
         size, at = new
         return {"value": hex(int(size)), "source": "operator_new", "at": hex(int(at))}
     return None
+
+
+def _instances(ctx, bv, record: dict[str, Any], *, cap: int = 128) -> dict[str, Any]:
+    """Best-effort: where objects of this class are constructed and which
+    globals hold one. Empty (not an error) when nothing is found."""
+    sites = ctx._ctor_construction_sites(bv, record)[:cap]
+    stored = ctx._global_vtable_stores(bv, record)[:cap] if record.get("vtable") else []
+    return {"construction_sites": sites, "stored_globals": stored}

@@ -711,6 +711,29 @@ class BridgeContext:
                 return short[len(marker):].strip()
         return None
 
+    def _global_vtable_stores(self, bv, record):
+        """Global data symbols whose stored value is this class's vtable addr."""
+        vt = record.get("vtable")
+        if not vt:
+            return []
+        addr = int(vt["address"], 16)
+        out = []
+        getter = getattr(bv, "get_data_refs", None)
+        for ref in (getter(addr) if callable(getter) else []):
+            sym = bv.get_symbol_at(int(ref)) if hasattr(bv, "get_symbol_at") else None
+            out.append({
+                "symbol": str(getattr(sym, "short_name", "") or getattr(sym, "name", "")) if sym else None,
+                "address": hex(int(ref)),
+            })
+        return out
+
+    def _ctor_construction_sites(self, bv, record):
+        """Construction sites of this class, classified new/stack/global with
+        operator-new size. TODO(#205 Task 9): implement against live BN — walk
+        each ctor's inbound call sites, classify the `this` storage, and recover
+        the operator-new size. Returns [] for now (honest "none recovered yet")."""
+        return []
+
     # ---- relocated cycle-breakers (design spec §3.2): both state-free ----
 
     def _find_type(self, bv, type_name: str):

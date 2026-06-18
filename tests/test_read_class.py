@@ -274,3 +274,28 @@ def test_rtti_infers_no_base_without_hint():
     words = {0x9100: 0xAB20, 0x9108: 0x9300, 0x9110: 0x0, 0x9114: 0}
     ctx = _RttiCtx(words, {})
     assert read_class._rtti_bases(ctx, object(), 0x9100) == []
+
+
+class _InstCtx:
+    def __init__(self, ctor_sites, vtable_data_refs):
+        self._ctor_sites = ctor_sites          # list of dicts
+        self._vtable_data_refs = vtable_data_refs
+
+    def _ctor_construction_sites(self, bv, record):
+        return list(self._ctor_sites)
+
+    def _global_vtable_stores(self, bv, record):
+        return list(self._vtable_data_refs)
+
+
+def test_instances_collects_construction_and_global_stores():
+    sites = [
+        {"address": "0x443abc", "function": "net::open", "kind": "new", "size": "0xd0"},
+        {"address": "0x4500a0", "function": "main", "kind": "stack", "size": None},
+    ]
+    globals_ = [{"symbol": "g_session", "address": "0x4cabcd"}]
+    ctx = _InstCtx(sites, globals_)
+    rec = {"name": "net::Session", "vtable": {"address": "0x9000"}, "methods": []}
+    out = read_class._instances(ctx, object(), rec)
+    assert out["construction_sites"][0]["kind"] == "new"
+    assert out["stored_globals"][0]["symbol"] == "g_session"
