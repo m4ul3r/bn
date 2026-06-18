@@ -226,6 +226,7 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
     self_defined_excluded = 0
     got_collapsed = 0
     func_data_names: set[str] = set()
+    emitted_names: set[str] = set()
     for attr_name, kind in _IMPORT_PLUS_EXTERNAL:
         sym_type = getattr(bn.SymbolType, attr_name, None)
         if sym_type is None:
@@ -249,9 +250,13 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
             if kind == "address" and not include_got and raw_name in func_data_names:
                 got_collapsed += 1
                 continue
-            # An ET_REL external that ALSO appeared as a PLT import on a regular
-            # ELF is the same dependency -- dedup so #213 doesn't double-list.
-            if kind == "external" and raw_name in func_data_names:
+            # An ET_REL external that ALSO appeared as an import on a regular ELF
+            # is the same dependency. Dedup against EVERY already-emitted import
+            # name -- not just function/data -- because on a standard ELF most
+            # imports are GOT-only (ImportAddressSymbol, kind=address) with no PLT
+            # function entry, and those same names reappear as ExternalSymbol;
+            # checking only func_data_names would double-list them (#213 review).
+            if kind == "external" and raw_name in emitted_names:
                 continue
             namespace = str(getattr(sym, "namespace", "") or "")
             # Only surface `library` when it's a real per-library namespace;
@@ -268,6 +273,7 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
                     "kind": kind,
                 }
             )
+            emitted_names.add(raw_name)
             if kind in ("function", "data"):
                 func_data_names.add(raw_name)
     if count_only:
