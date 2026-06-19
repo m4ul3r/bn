@@ -6860,6 +6860,98 @@ def test_bridge_handler_rejects_non_dict_json(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_bridge_handler_serialization_failure_returns_clean_error(monkeypatch):
+    """A response that fails to serialize -- the 'dictionary changed size during
+    iteration' race when a response aliases a live mapping mutated by a concurrent
+    read (serialization runs OUTSIDE the dispatch lock and its try/except) -- must
+    return a clean {ok: false} error to the client, NOT escape handle() and
+    silently kill the handler thread with no response at all (#250)."""
+    bridge = _load_bridge(monkeypatch)
+    errors = []
+    monkeypatch.setattr(bridge.bn, "log_error", lambda message: errors.append(message))
+
+    class _Unserializable:
+        # default=str is json's fallback for non-native types; a __str__ that
+        # always raises deterministically reproduces a mid-encode failure.
+        def __str__(self):
+            raise RuntimeError("dictionary changed size during iteration")
+
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.rfile = io.BytesIO(b'{"op": "decompile", "id": "req-9"}\n')
+    handler.server = types.SimpleNamespace(
+        bridge=types.SimpleNamespace(
+            dispatch=lambda payload: {"ok": True, "result": _Unserializable(), "error": None}))
+    writer = _RecordingWriter()
+    handler.wfile = writer
+
+    handler.handle()  # must NOT raise
+
+    response = json.loads(writer.data.decode("utf-8"))
+    assert response["ok"] is False
+    assert "serializ" in response["error"].lower()
+    assert errors, "the serialization failure should be logged for operators"
+
+
+def test_bridge_handler_retries_transient_serialization_race(monkeypatch):
+    """The dict-size race is transient: by the time a retry runs, the concurrent
+    mutation has usually completed. A single re-encode preserves the REAL response
+    instead of degrading every racy read to an error (#250)."""
+    bridge = _load_bridge(monkeypatch)
+
+    class _FlakyValue:
+        calls = 0
+
+        def __str__(self):
+            type(self).calls += 1
+            if type(self).calls == 1:
+                raise RuntimeError("dictionary changed size during iteration")
+            return "recovered"
+
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.rfile = io.BytesIO(b'{"op": "decompile", "id": "req-9"}\n')
+    handler.server = types.SimpleNamespace(
+        bridge=types.SimpleNamespace(
+            dispatch=lambda payload: {"ok": True, "result": _FlakyValue(), "error": None}))
+    writer = _RecordingWriter()
+    handler.wfile = writer
+
+    handler.handle()
+
+    response = json.loads(writer.data.decode("utf-8"))
+    assert response["ok"] is True
+    assert response["result"] == "recovered"
+
+
+def test_bridge_handler_serialization_fallback_survives_logging_failure(monkeypatch):
+    """Even if logging the serialization failure itself raises, handle() must still
+    write a clean error and never let the handler thread die silently -- the
+    fallback path must not reintroduce the exact silent-death it eliminates (#250)."""
+    bridge = _load_bridge(monkeypatch)
+
+    def _boom(*a, **k):
+        raise RuntimeError("log sink down")
+
+    monkeypatch.setattr(bridge.bn, "log_error", _boom)
+
+    class _Unserializable:
+        def __str__(self):
+            raise RuntimeError("dictionary changed size during iteration")
+
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.rfile = io.BytesIO(b'{"op": "decompile", "id": "req-9"}\n')
+    handler.server = types.SimpleNamespace(
+        bridge=types.SimpleNamespace(
+            dispatch=lambda payload: {"ok": True, "result": _Unserializable(), "error": None}))
+    writer = _RecordingWriter()
+    handler.wfile = writer
+
+    handler.handle()  # must NOT raise even though log_error raises
+
+    response = json.loads(writer.data.decode("utf-8"))
+    assert response["ok"] is False
+    assert "serializ" in response["error"].lower()
+
+
 def test_batch_apply_passes_none_target_through(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
