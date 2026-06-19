@@ -562,13 +562,14 @@ def test_evidence_table_routes_and_renders_targets(fake_transport, capsys):
     calls = fake_transport({"pointer_table": {
         "ok": True,
         "result": {
+            "kind": "pointer_table",
             "address": "0x64ea0",
                 "pointer_size": 4,
                 "stride": 4,
                 "warnings": [
                     "table start is in an executable segment; this may be code, not a pointer table"
                 ],
-                "entries": [
+                "items": [
                     {
                         "index": 0,
                         "entry_address": "0x64ea0",
@@ -602,11 +603,12 @@ def test_evidence_table_renders_interior_function_targets(fake_transport, capsys
     fake_transport({"pointer_table": {
         "ok": True,
         "result": {
+            "kind": "pointer_table",
             "address": "0x402000",
                 "pointer_size": 8,
                 "stride": 8,
                 "warnings": ["1 entries resolve inside functions but not at function starts"],
-                "entries": [
+                "items": [
                     {
                         "index": 0,
                         "entry_address": "0x402000",
@@ -642,9 +644,10 @@ def test_evidence_message_routes_and_renders_lens(fake_transport, capsys):
     calls = fake_transport({"message_lens": {
         "ok": True,
         "result": {
+            "kind": "messages",
             "query": "HeadUnitInfo",
                 "count": 1,
-                "matches": [
+                "items": [
                     {
                         "type_string": {
                             "address": "0x175b20",

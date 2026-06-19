@@ -1108,7 +1108,7 @@ def _render_pointer_table_text(value: Any) -> str:
     for warning in list(value.get("warnings") or []):
         lines.append(f"warning: {warning}")
     lines.append("")
-    for item in list(value.get("entries") or []):
+    for item in list(value.get("items") or []):  # #275: was `entries`
         if not isinstance(item, dict):
             lines.append(_render_fallback_text(item))
             continue
@@ -1131,7 +1131,7 @@ def _render_message_lens_text(value: Any) -> str:
         header += f"; showing first {shown}, increase --limit for the rest"
     header += ")"
     lines = [header]
-    for match in list(value.get("matches") or []):
+    for match in list(value.get("items") or []):  # #275: was `matches`
         if not isinstance(match, dict):
             lines.append(_render_fallback_text(match))
             continue
@@ -1181,7 +1181,7 @@ def _render_message_lens_text(value: Any) -> str:
 def _render_init_arrays_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    sections = list(value.get("sections") or [])
+    sections = list(value.get("items") or [])  # #275: was `sections`
     if not sections:
         return "init arrays: none"
     lines = [f"init arrays: {len(sections)} section(s), pointer-size={value.get('pointer_size', '<unknown>')}"]

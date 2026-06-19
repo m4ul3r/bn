@@ -212,7 +212,8 @@ def test_message_lens_summarizes_type_string_xrefs_and_metadata_window(monkeypat
     result = instance._message_lens("active", "HeadUnitInfo", limit=5, table_entries=2)
 
     assert result["count"] == 1
-    match = result["matches"][0]
+    assert result["kind"] == "messages"  # #275
+    match = result["items"][0]
     assert match["type_string"]["value"] == "common.HeadUnitInfo"
     assert match["xrefs"]["code_refs"][0]["function"] == "build_type_name"
     assert match["metadata_table_windows"][0]["address"] == "0x6000"

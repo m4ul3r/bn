@@ -478,7 +478,10 @@ def _pointer_table(ctx, selector: str | None, address, *, entries: int = 16, str
     read_width = _parse_address(width) if width not in (None, "") else None
     if read_width is not None and read_width <= 0:
         raise OperationFailure("invalid_width", f"Invalid read width: {read_width}")
-    return _pointer_table_for_view(
+    # #275: present the canonical collection envelope at the op level (items +
+    # kind), while the reusable _pointer_table_for_view helper keeps its `entries`
+    # key for the nested table windows embedded by message-lens / init-arrays.
+    view = _pointer_table_for_view(
         ctx,
         bv,
         start,
@@ -487,6 +490,8 @@ def _pointer_table(ctx, selector: str | None, address, *, entries: int = 16, str
         read_width=read_width,
         error_on_unmapped=True,
     )
+    rows = view.pop("entries", [])
+    return {"kind": "pointer_table", **view, "items": rows, "total": len(rows)}
 
 
 def _section_names_at(context) -> set[str]:
@@ -633,8 +638,9 @@ def _message_lens(ctx, selector: str | None, query: str, *, limit: int = 20, tab
         )
 
     return {
+        "kind": "messages",
         "query": query,
-        "matches": matches,
+        "items": matches,
         "count": len(matches),
         "total": total_matched,
         "truncated": total_matched > len(matches),
@@ -688,7 +694,11 @@ def _init_arrays(ctx, selector: str | None, *, limit: int = 64):
             }
         )
     sections.sort(key=lambda item: int(item["start"], 16))
+    # #275: `items` are the init/ctor sections (each retains its nested `entries`
+    # table); `kind` discriminates the envelope.
     return {
+        "kind": "init_arrays",
         "pointer_size": pointer_size,
-        "sections": sections,
+        "items": sections,
+        "total": len(sections),
     }

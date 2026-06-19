@@ -14,8 +14,9 @@ def test_evidence_init_routes_and_renders_sections(fake_transport, capsys):
         "init_arrays": {
             "ok": True,
             "result": {
+                "kind": "init_arrays",
                 "pointer_size": 4,
-                "sections": [
+                "items": [
                     {
                         "name": ".init_array",
                         "start": "0x5000",
