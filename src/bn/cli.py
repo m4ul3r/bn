@@ -342,9 +342,24 @@ def _build_from_commands(root: BnArgumentParser) -> None:
             _ensure_intermediate(path[:-1])
         sub = _get_subparsers(path[:-1])
         parser = sub.add_parser(path[-1], help=_GROUP_HELP.get(path, ""))
+        # Carry -t/--instance on the intermediate group parser so they can appear
+        # BEFORE the leaf (`bn bundle -t X function F`), at parity with
+        # single-level commands and root-level -t. Both helpers use SUPPRESS
+        # defaults on non-root parsers, so (a) an absent flag never lands in the
+        # namespace and (b) the leaf subparser never clobbers a value set here.
+        # --format/--out are deliberately left off: their real (non-SUPPRESS)
+        # leaf defaults WOULD overwrite an intermediate-level value (#251).
+        _instance_option(parser)
+        _target_option(parser, required=False)
         node_parsers[path] = parser
         return parser
 
+    # Shorter paths first: a node that is BOTH a leaf command and a parent group
+    # (e.g. `('types',)` has handler `_types` and children `types show`/`types
+    # declare`) is leaf-processed into node_parsers before _ensure_intermediate
+    # is ever called for it as a parent, so the early `if path in node_parsers`
+    # return prevents a second -t/--instance add (argparse "conflicting option
+    # string"). Keep this sort if the registry/dual-role nodes are refactored.
     for spec in sorted(_COMMANDS, key=lambda s: len(s["path"])):
         path = spec["path"]
         parent = path[:-1]
