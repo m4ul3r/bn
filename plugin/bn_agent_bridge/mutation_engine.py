@@ -806,7 +806,18 @@ def _prototype_matches_ignoring_param_names(bv, observed_type, expected_str: str
         return False
     if len(observed_params) != len(expected_params):
         return False
-    return all(str(o.type) == str(e.type) for o, e in zip(observed_params, expected_params))
+    for o, e in zip(observed_params, expected_params):
+        if str(o.type) != str(e.type):
+            return False
+        # Only ignore the name when the request OMITTED it: BN auto-names an
+        # unnamed param arg1/arg2/... on readback, which is the #254 false-negative
+        # we tolerate. But when the request EXPLICITLY named a param and it reads
+        # back under a different name, the name did NOT land -- that's a partial
+        # application, not a verified one, so reject it (#263 review).
+        expected_name = str(getattr(e, "name", "") or "")
+        if expected_name and str(getattr(o, "name", "") or "") != expected_name:
+            return False
+    return True
 
 
 def _verify_set_prototype(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
