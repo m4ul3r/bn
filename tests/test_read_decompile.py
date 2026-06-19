@@ -1368,3 +1368,82 @@ def test_search_functions_count_only_returns_total(monkeypatch):
 
     assert res["count"] == 2 and res["total"] == 2
     assert "functions" not in res and "items" not in res
+
+
+# --- #193 Part 4: resolve a mid-function (contained) address ----------------
+#
+# taint/trace report sinks at instruction addresses, frequently mid-callee. The
+# function-scoped READ verbs must resolve such an address to its containing
+# function so the sink feeds straight back into the next command -- while the
+# strict (mutation) path keeps erroring, so a stray address can't rename/retype
+# the wrong function.
+
+def _mid_function_bv():
+    fn = _FakeFunction(0x401000, "parse_packet")
+    fn.basic_blocks = [_FakeBasicBlock(0x401000, 0x401040)]  # spans 0x401000..0x401040
+    return _FakeBV(functions=[fn]), fn
+
+
+def test_find_function_resolves_contained_address_only_when_opted_in(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, fn = _mid_function_bv()
+
+    # Strict by default (the mutation contract): a mid-function address errors.
+    with pytest.raises(RuntimeError, match="No function found at address 0x401010"):
+        instance._find_function(bv, "0x401010")
+
+    # contained=True (the read contract): resolves to the containing function.
+    resolved = instance._find_function(bv, "0x401010", contained=True)
+    assert resolved is fn
+
+    # An exact start still resolves with contained=True (no behavior change).
+    assert instance._find_function(bv, "0x401000", contained=True) is fn
+
+
+def test_find_function_contained_address_outside_any_function_still_errors(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _ = _mid_function_bv()
+
+    # An address in no function (e.g. .data) errors even with contained=True --
+    # "nothing found" must stay distinct from "resolved to a container".
+    with pytest.raises(RuntimeError, match="No function found at address 0xdeadbeef"):
+        instance._find_function(bv, "0xdeadbeef", contained=True)
+
+
+@pytest.mark.parametrize("call", [
+    pytest.param(lambda inst: inst._decompile("active", "0x401010"), id="decompile"),
+    pytest.param(lambda inst: inst._function_info("active", "0x401010"), id="function_info"),
+    pytest.param(lambda inst: inst._il("active", "0x401010", "mlil", False), id="il"),
+    pytest.param(lambda inst: inst._disasm("active", "0x401010"), id="disasm"),
+    # proto get and local list describe the same function as `function info`
+    # (proto is a strict subset), so they tolerate an interior address too.
+    pytest.param(lambda inst: inst._get_prototype("active", "0x401010"), id="proto_get"),
+    pytest.param(lambda inst: inst._list_locals_for_function("active", "0x401010"), id="local_list"),
+])
+def test_read_verbs_resolve_mid_function_address(monkeypatch, call):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _ = _mid_function_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = call(instance)
+
+    # Resolved to the container, reported by its real start (not the typed addr).
+    assert result["function"]["name"] == "parse_packet"
+    assert result["function"]["address"] == "0x401000"
+    # ...and annotated so the agent knows the sink was mid-function, not the start.
+    assert result["resolved_from"] == {"requested_address": "0x401010", "offset": "+0x10"}
+
+
+def test_read_verb_exact_start_has_no_resolved_from(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _ = _mid_function_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._decompile("active", "0x401000")
+
+    assert result["function"]["address"] == "0x401000"
+    assert "resolved_from" not in result

@@ -92,6 +92,28 @@ def _slice_text_lines(
     return header + "\n" + "\n".join(sliced)
 
 
+def _resolution_note(value: Any) -> str:
+    """A leading note when a function-scoped read resolved an interior address
+    to its containing function (#193 Part 4).
+
+    Without it, text-mode output for a mid-function address (e.g. a taint/trace
+    sink) silently shows a function whose start differs from what was asked,
+    which reads like the wrong answer. Returns '' when not applicable.
+    """
+    if not isinstance(value, dict):
+        return ""
+    resolved_from = value.get("resolved_from")
+    if not isinstance(resolved_from, dict):
+        return ""
+    function = _as_dict(value.get("function"))
+    name = function.get("name", "?")
+    address = function.get("address", "?")
+    return (
+        f"// bn: {resolved_from.get('requested_address')} is inside {name} "
+        f"@ {address} ({resolved_from.get('offset')}); showing the containing function\n"
+    )
+
+
 def _render_function_info_text(value: Any, verbose: bool = False, demangle: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -140,7 +162,7 @@ def _render_function_info_text(value: Any, verbose: bool = False, demangle: bool
         else:
             lines.append("locals: none")
 
-    return "\n".join(lines)
+    return _resolution_note(value) + "\n".join(lines)
 
 
 def _render_proto_text(value: Any) -> str:
@@ -151,6 +173,7 @@ def _render_proto_text(value: Any) -> str:
         return _render_fallback_text(value)
     # BN renders the prototype anonymously (`uint64_t (int32_t arg1)`); splice in
     # the function name so the output is a copy-pasteable C declaration (#222).
+    note = _resolution_note(value)
     fn = value.get("function")
     name = fn.get("name") if isinstance(fn, dict) else None
     head, sep, rest = prototype.partition("(")
@@ -162,8 +185,8 @@ def _render_proto_text(value: Any) -> str:
         # return type (e.g. name "t" in "uint64_t") (#222 review).
         already_named = head.split()[-1:] == [name] if head else False
         if not already_named:
-            return f"{head} {name}({rest}"
-    return prototype
+            return note + f"{head} {name}({rest}"
+    return note + prototype
 
 
 def _render_local_list_text(value: Any) -> str:
@@ -188,7 +211,7 @@ def _render_local_list_text(value: Any) -> str:
             lines.append(_format_local_entry(item))
     if not params and not locals_only:
         lines.extend(["", "no locals"])
-    return "\n".join(lines)
+    return _resolution_note(value) + "\n".join(lines)
 
 
 def _render_type_info_text(value: Any) -> str:

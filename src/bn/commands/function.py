@@ -20,6 +20,7 @@ from ..formatters import (
     _render_trace_text,
     _render_xrefs_any_text,
     _render_xrefs_text,
+    _resolution_note,
     _slice_text_lines,
     _text_field,
 )
@@ -212,7 +213,7 @@ def _decompile(args: argparse.Namespace) -> int:
         warnings = value.get("warnings") if isinstance(value, dict) else None
         if warnings:
             text = text + "\n\n" + "\n".join(f"warning: {warning}" for warning in warnings)
-        return text
+        return _resolution_note(value) + text
 
     return _call(
         args,
@@ -248,7 +249,7 @@ def _il(args: argparse.Namespace) -> int:
         "il",
         {"identifier": args.identifier, "view": args.view, "ssa": bool(args.ssa)},
         require_target=True,
-        text_renderer=lambda value: _slice_text_lines(base(value), lines_range),
+        text_renderer=lambda value: _resolution_note(value) + _slice_text_lines(base(value), lines_range),
         stem="il",
     )
 
@@ -295,7 +296,7 @@ def _disasm(args: argparse.Namespace) -> int:
         "disasm",
         {"identifier": args.identifier},
         require_target=True,
-        text_renderer=lambda value: _slice_text_lines(base(value), lines_range),
+        text_renderer=lambda value: _resolution_note(value) + _slice_text_lines(base(value), lines_range),
         stem="disasm",
     )
 
