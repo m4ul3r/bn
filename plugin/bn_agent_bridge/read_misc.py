@@ -377,6 +377,9 @@ def _imports_build_summary(
         kind = str(item.get("kind", "unknown"))
         by_kind[kind] = by_kind.get(kind, 0) + 1
     return {
+        # #275: a keyed aggregate, not a flat collection -- keeps its namespaces/
+        # by_kind maps but carries a `kind` discriminator like every other read.
+        "kind": "imports_summary",
         "total_symbols": len(items),
         "needed_libraries": needed_libraries or [],
         "namespaces": dict(sorted(namespaces.items(), key=lambda x: -x[1])),
