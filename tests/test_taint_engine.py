@@ -535,6 +535,154 @@ def test_forward_arg_source_indirect_pointer_warns(models):
     assert any("indirectly" in a and "param:N" in a for a in result["assumptions"])
 
 
+# --------------------------------------------------------------------------
+# #193 Part 1: recv buffer re-loaded across a global/struct-field pointer slot
+# --------------------------------------------------------------------------
+
+# Common firmware idiom: a daemon context pointer lives in a global slot; the
+# buffer pointer is `*(ctx + off)`. recvfrom fills that buffer, then the handler
+# RE-LOADS the same slot and parses it. The seed anchors to the pointer value at
+# the recv site, so without slot correlation the re-loaded pointer is never
+# tainted and the recv->parse flow reports 0 sinks.
+_G = 0x466d90   # constant global holding the context pointer
+_OFF = 0x418    # buffer-pointer slot offset within the context struct
+
+
+def _slot_recv_func(*, intervening_store=False, different_offset=False, base_repoint=False):
+    fd = FVar("fd")
+    ctx = FVar("ctx"); ctx2 = FVar("ctx2"); bufp = FVar("bufp"); bufp2 = FVar("bufp2")
+    ctx1 = FSSA(ctx, 1); ctx2_1 = FSSA(ctx2, 1); bufp1 = FSSA(bufp, 1); bufp2_1 = FSSA(bufp2, 1)
+
+    def load_global():
+        return FExpr("MLIL_LOAD_SSA", "[0x466d90]", src=FExpr("MLIL_CONST_PTR", "0x466d90", constant=_G))
+
+    def load_slot(base_ssa, base_name, off):
+        addr = FExpr("MLIL_ADD", f"{base_name} + {hex(off)}",
+                     left=FExpr("MLIL_VAR_SSA", base_name, reads=[base_ssa]),
+                     right=FExpr("MLIL_CONST", hex(off), constant=off))
+        return FExpr("MLIL_LOAD_SSA", f"[{base_name} + {hex(off)}]", reads=[base_ssa], src=addr)
+
+    reload_off = (_OFF + 0x10) if different_offset else _OFF
+    instrs = [
+        FInstr(0, 0x100, "MLIL_SET_VAR_SSA", "ctx#1 = [0x466d90]", writes=[ctx1], src=load_global()),
+        FInstr(1, 0x104, "MLIL_SET_VAR_SSA", "bufp#1 = [ctx#1 + 0x418]", reads=[ctx1], writes=[bufp1],
+               src=load_slot(ctx1, "ctx#1", _OFF)),
+        FInstr(2, 0x108, "MLIL_CALL_SSA", "recvfrom(fd, bufp#1, 0x100)", reads=[bufp1],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[FSSA(fd, 0)]),
+                       FExpr("MLIL_VAR_SSA", "bufp#1", reads=[bufp1]),
+                       FExpr("MLIL_CONST", "0x100", constant=0x100)]),
+    ]
+    if intervening_store:
+        # Re-point the slot between recv and re-load -> the re-load no longer
+        # aliases the received buffer, so correlation MUST NOT fire.
+        store_addr = FExpr("MLIL_ADD", "ctx#1 + 0x418",
+                           left=FExpr("MLIL_VAR_SSA", "ctx#1", reads=[ctx1]),
+                           right=FExpr("MLIL_CONST", "0x418", constant=_OFF))
+        instrs.append(FInstr(3, 0x10c, "MLIL_STORE_SSA", "[ctx#1 + 0x418] = 0", reads=[ctx1], dest=store_addr))
+    if base_repoint:
+        # Re-point the BASE global itself ([0xG] = newctx): the re-load then reads a
+        # DIFFERENT context's slot, so the gload slot identity is invalidated and
+        # correlation MUST NOT fire (else a different context's buffer is tainted).
+        instrs.append(FInstr(3, 0x10c, "MLIL_STORE_SSA", "[0x466d90] = 0",
+                             dest=FExpr("MLIL_CONST_PTR", "0x466d90", constant=_G)))
+    instrs += [
+        FInstr(4, 0x110, "MLIL_SET_VAR_SSA", "ctx2#1 = [0x466d90]", writes=[ctx2_1], src=load_global()),
+        FInstr(5, 0x114, "MLIL_SET_VAR_SSA", f"bufp2#1 = [ctx2#1 + {hex(reload_off)}]",
+               reads=[ctx2_1], writes=[bufp2_1], src=load_slot(ctx2_1, "ctx2#1", reload_off)),
+        FInstr(6, 0x118, "MLIL_CALL_SSA", "system(bufp2#1)", reads=[bufp2_1],
+               dest=FExpr("MLIL_CONST_PTR", "0x901", constant=0x901),
+               params=[FExpr("MLIL_VAR_SSA", "bufp2#1", reads=[bufp2_1])]),
+    ]
+    return FFunc("recv_handler", 0x100, FSSAFunc(instrs), params=[fd])
+
+
+def _slot_engine(models):
+    return te.TaintEngine(FBV({0x900: "recvfrom", 0x901: "system"}), models)
+
+
+def test_forward_correlates_recv_buffer_across_global_slot(models):
+    # The re-load of the same slot must inherit taint so the parse sink is reached.
+    result = _slot_engine(models).forward(_slot_recv_func(), [te.parse_locator("arg:recvfrom:1")])
+    assert len(result["reached_sinks"]) == 1
+    assert result["reached_sinks"][0]["sink"]["class"] == "command_injection"
+    # honesty: a positive correlation note, and the "may be missed" caveat is gone
+    assert any("slot" in a and "correlat" in a.lower() for a in result["assumptions"])
+    assert not any("may be missed" in a for a in result["assumptions"])
+
+
+def test_forward_slot_correlation_blocked_by_intervening_store(models):
+    # A store re-points the slot between recv and re-load: correlation must NOT
+    # fire (would taint the wrong buffer), and the honest caveat stays.
+    result = _slot_engine(models).forward(_slot_recv_func(intervening_store=True),
+                                          [te.parse_locator("arg:recvfrom:1")])
+    assert result["reached_sinks"] == []
+    assert any("indirectly" in a and "param:N" in a for a in result["assumptions"])
+
+
+def test_forward_slot_correlation_requires_same_offset(models):
+    # A load of a DIFFERENT offset in the same struct is a different slot -> no
+    # correlation (no offset-only / base-only over-tainting).
+    result = _slot_engine(models).forward(_slot_recv_func(different_offset=True),
+                                          [te.parse_locator("arg:recvfrom:1")])
+    assert result["reached_sinks"] == []
+
+
+_GSTRUCT = 0x6d08c0   # a fixed-address global struct (e.g. redis `server`)
+
+
+def _slot_recv_func_const_base():
+    # recv into `*(GSTRUCT + off)` where the slot base is the FIXED address of a
+    # global struct (CONST_PTR), not a loaded pointer -- redis `rdbPipeReadHandler`
+    # shape: read(fd, server.rdb_pipe_buff, n) then re-load + parse the same slot.
+    fd = FVar("fd"); bufp = FVar("bufp"); bufp2 = FVar("bufp2")
+    bufp1 = FSSA(bufp, 1); bufp2_1 = FSSA(bufp2, 1)
+
+    def load_fixed_slot():
+        addr = FExpr("MLIL_ADD", "server + 0x1080",
+                     left=FExpr("MLIL_CONST_PTR", "server", constant=_GSTRUCT),
+                     right=FExpr("MLIL_CONST", "0x1080", constant=0x1080))
+        return FExpr("MLIL_LOAD_SSA", "[server + 0x1080]", src=addr)
+
+    instrs = [
+        FInstr(0, 0x100, "MLIL_SET_VAR_SSA", "bufp#1 = [server + 0x1080]", writes=[bufp1],
+               src=load_fixed_slot()),
+        FInstr(1, 0x108, "MLIL_CALL_SSA", "recvfrom(fd, bufp#1, 0x100)", reads=[bufp1],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[FSSA(fd, 0)]),
+                       FExpr("MLIL_VAR_SSA", "bufp#1", reads=[bufp1]),
+                       FExpr("MLIL_CONST", "0x100", constant=0x100)]),
+        FInstr(2, 0x110, "MLIL_SET_VAR_SSA", "bufp2#1 = [server + 0x1080]", writes=[bufp2_1],
+               src=load_fixed_slot()),
+        FInstr(3, 0x118, "MLIL_CALL_SSA", "system(bufp2#1)", reads=[bufp2_1],
+               dest=FExpr("MLIL_CONST_PTR", "0x901", constant=0x901),
+               params=[FExpr("MLIL_VAR_SSA", "bufp2#1", reads=[bufp2_1])]),
+    ]
+    return FFunc("rdb_pipe_read", 0x100, FSSAFunc(instrs), params=[fd])
+
+
+def test_forward_correlates_recv_buffer_across_fixed_global_struct_slot(models):
+    # Slot base is a fixed-address global struct (CONST_PTR), not a loaded pointer
+    # -- the redis-style idiom the first dogfood found uncovered. Must correlate.
+    result = _slot_engine(models).forward(_slot_recv_func_const_base(),
+                                          [te.parse_locator("arg:recvfrom:1")])
+    assert len(result["reached_sinks"]) == 1
+    assert any("slot" in a and "correlat" in a.lower() for a in result["assumptions"])
+    assert not any("may be missed" in a for a in result["assumptions"])
+
+
+def test_forward_slot_correlation_blocked_by_base_global_repoint(models):
+    # A store to the BASE global ([0xG] = newctx) between recv and re-load means
+    # the re-load reads a different context's slot. Correlating would taint the
+    # WRONG buffer with the caveat suppressed -- the worst VR failure mode. The
+    # guard must reject it and keep the honest caveat (adversarial-review #2).
+    result = _slot_engine(models).forward(_slot_recv_func(base_repoint=True),
+                                          [te.parse_locator("arg:recvfrom:1")])
+    assert result["reached_sinks"] == []
+    assert any("indirectly" in a and "param:N" in a for a in result["assumptions"])
+    assert not any("correlated forward" in a for a in result["assumptions"])
+
+
 def _read_callsite_func():
     # r#1 = read(fd, &buf, 0x100); return r#1  -- a read whose return is consumed
     # and whose model also fills the *arg:1 output buffer.

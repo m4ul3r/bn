@@ -1120,6 +1120,38 @@ class TaintEngine:
         if "ADDRESS_OF" in op:
             v = getattr(expr, "src", None) or getattr(expr, "var", None)
             return (var_key(v), 0) if v is not None else None
+        if "LOAD" in op:
+            # A load of a constant address is a stable memory identity: two loads
+            # of the same global pointer alias the same value, so `[*0xG + off]`
+            # used at a recv site and a later re-load resolve to one slot key
+            # (`("gload", 0xG)`, off) (#193 Part 1). Only a *constant* address
+            # qualifies -- a load through a non-constant pointer is not a stable id.
+            a = getattr(expr, "src", None)
+            if a is not None and "CONST_PTR" in op_name(a):
+                c = getattr(a, "constant", None)
+                if c is None:
+                    val = getattr(a, "value", None)
+                    c = getattr(val, "value", val)
+                try:
+                    return (("gload", int(c)), 0)
+                except (TypeError, ValueError):
+                    return None
+            return None
+        if "CONST_PTR" in op:
+            # A fixed-address global (struct) base: `*(G_struct + off)` where the
+            # base is the literal address of a global struct, not a loaded pointer
+            # (#193 redis `server.rdb_pipe_buff` shape). The address is constant, so
+            # two loads of the same slot alias -- a stable identity like gload, and
+            # SAFER: a literal base can't be re-pointed, so only the leaf-slot guard
+            # is needed (no base-global re-point to check).
+            c = getattr(expr, "constant", None)
+            if c is None:
+                val = getattr(expr, "value", None)
+                c = getattr(val, "value", val)
+            try:
+                return (("gconst", int(c)), 0)
+            except (TypeError, ValueError):
+                return None
         if op in ("MLIL_ADD", "MLIL_SUB"):
             left = getattr(expr, "left", None)
             right = getattr(expr, "right", None)
@@ -1719,6 +1751,121 @@ class TaintEngine:
             return True
         return self._arg_ptr_is_indirect_load(ssaf, src, depth + 1)
 
+    def _buffer_slot_key(self, ssaf: Any, expr: Any, depth: int = 0):
+        """The memory slot a buffer pointer was *loaded from*: for ``bufp = [base
+        + off]`` return ``slotkey(base + off)`` = ``(base_key, off)``. None when the
+        pointer is not an indirect load or the slot address can't be resolved to a
+        stable key. Pairs with `_arg_ptr_is_indirect_load` -- that says "indirect",
+        this names the slot so a recv store and a later re-load compare equal
+        (#193 Part 1)."""
+        if expr is None or depth > 6:
+            return None
+        if "LOAD" in op_name(expr):
+            return self._addr_base_offset(ssaf, getattr(expr, "src", None))
+        v = self._as_single_ssa_var(expr)
+        if v is None:
+            reads = expr_reads(expr)
+            v = reads[0] if len(reads) == 1 else None
+        if v is None:
+            return None
+        try:
+            d = ssaf.get_ssa_var_definition(v)
+        except Exception:
+            d = None
+        if d is None:
+            return None
+        src = getattr(d, "src", None)
+        if src is None:
+            return None
+        if "LOAD" in op_name(src):
+            return self._addr_base_offset(ssaf, getattr(src, "src", None))
+        return self._buffer_slot_key(ssaf, src, depth + 1)
+
+    def _store_to_slot_between(self, ssaf: Any, instrs: Any, key: tuple, lo_idx: int, hi_idx: int) -> bool:
+        """True if a store between *lo_idx* (the recv) and *hi_idx* (the re-load)
+        invalidates slot *key*'s identity -- either a store to the slot itself
+        (re-pointing the buffer), OR, for a ``("gload", G)`` base, a store to the
+        base global G (re-pointing the context pointer, so the re-load reads a
+        DIFFERENT object's slot). Missing the latter taints the wrong buffer with
+        the caveat suppressed -- the worst VR failure mode (adversarial-review #2).
+        Conservative and CFG-insensitive: considers every store on any path, so it
+        never *under*-blocks; an unprovable case stays uncorrelated (honest)."""
+        base = key[0] if key else None
+        base_global = base[1] if isinstance(base, tuple) and base and base[0] == "gload" else None
+        for ins in instrs:
+            idx = getattr(ins, "instr_index", None)
+            if idx is None or not (lo_idx < idx < hi_idx):
+                continue
+            if "STORE" not in op_name(ins):
+                continue
+            dest = getattr(ins, "dest", None)
+            sk = self._addr_base_offset(ssaf, dest)
+            if sk is not None and sk == key:
+                return True
+            if base_global is not None and self._store_addr_const(ssaf, dest) == base_global:
+                return True
+        return False
+
+    def _store_addr_const(self, ssaf: Any, expr: Any, depth: int = 0) -> int | None:
+        """The constant address a store writes *to* (``[0xG] = v`` -> ``0xG``),
+        following SSA copies to a CONST_PTR. Used to detect a re-point of a
+        ``("gload", G)`` slot's base global. None if the destination isn't a
+        constant address."""
+        if expr is None or depth > 6:
+            return None
+        if "CONST_PTR" in op_name(expr):
+            c = getattr(expr, "constant", None)
+            if c is None:
+                v = getattr(expr, "value", None)
+                c = getattr(v, "value", v)
+            try:
+                return int(c)
+            except (TypeError, ValueError):
+                return None
+        if is_ssa_var(expr):
+            try:
+                d = ssaf.get_ssa_var_definition(expr)
+            except Exception:
+                d = None
+            return self._store_addr_const(ssaf, getattr(d, "src", None), depth + 1) if d is not None else None
+        reads = expr_reads(expr)
+        if len(reads) == 1:
+            try:
+                d = ssaf.get_ssa_var_definition(reads[0])
+            except Exception:
+                d = None
+            if d is not None:
+                return self._store_addr_const(ssaf, getattr(d, "src", None), depth + 1)
+        return None
+
+    def _register_indirect_buffer_slot(self, ssaf, ptr_expr, callsite, callee, idx,
+                                       buffer_slots, add_assumption) -> None:
+        """When a buffer source's pointer is an indirect load `[slot]`, register the
+        slot so a later re-load of it can be correlated forward (#193 Part 1). If the
+        slot can't be named, fall back to today's honest "may be missed" caveat. When
+        it can, defer that caveat -- `_forward_run` decides post-fixpoint whether the
+        slot actually correlated (positive note) or not (the caveat)."""
+        if not self._arg_ptr_is_indirect_load(ssaf, ptr_expr):
+            return
+        pending = (
+            f"source {callee} arg{idx} buffer pointer is loaded indirectly (from a "
+            f"global/struct slot); the seed anchors to the pointer value, not the "
+            f"pointee, and is not correlated with later re-loads of the same slot -- a "
+            f"flow that re-loads the pointer and parses it may be missed. Consider "
+            f"seeding the parser entry directly with param:N")
+        key = self._buffer_slot_key(ssaf, ptr_expr)
+        if key is None:
+            add_assumption(pending)
+            return
+        recv_node = None
+        for r in expr_reads(ptr_expr):
+            recv_node = (var_key(r), getattr(r, "version", None))
+            break
+        buffer_slots[key] = {
+            "recv_idx": getattr(callsite, "instr_index", None),
+            "callee": callee, "idx": idx, "recv_node": recv_node, "pending": pending,
+        }
+
     def _as_single_ssa_var(self, expr: Any) -> Any | None:
         """The lone SSA variable an expression reads, but ONLY when the
         expression is a bare var read (MLIL_VAR_SSA / an SSAVariable) -- not
@@ -2126,7 +2273,12 @@ class TaintEngine:
             why[node] = {"label": label, "instr": ins, "reason": reason, "parents": list(parents)}
             return True
 
-        seeded = self._seed_forward(func, ssaf, instrs, locators, taint_node, add_assumption)
+        # #193 Part 1: recv-buffer slots registered by the seed (slot key -> info)
+        # and the subset that actually correlated to a forward re-load. Both are
+        # local to this run, so a descended callee's run keeps its own.
+        buffer_slots: dict = {}
+        correlated_slots: set = set()
+        seeded = self._seed_forward(func, ssaf, instrs, locators, taint_node, add_assumption, buffer_slots)
         if not seeded:
             if top:
                 raise TaintError("no taint sources resolved; check --source locator")
@@ -2574,6 +2726,28 @@ class TaintEngine:
                                 msrc = (("global", ga), None)
                                 reason = "loads from a tainted global buffer (global_approx)"
                                 assume = "global buffer modeled coarsely as one taint location (global_approx)"
+                        if msrc is None and buffer_slots:
+                            # #193 Part 1: this load reads a global/struct slot that a
+                            # recv buffer pointer was loaded from -- so it re-loads the
+                            # SAME (filled) buffer pointer. Correlate it, unless the slot
+                            # was provably re-pointed between the recv and here.
+                            sk = self._addr_base_offset(ssaf, getattr(src_expr, "src", None))
+                            slot = buffer_slots.get(sk) if sk is not None else None
+                            if slot is not None:
+                                lo = slot.get("recv_idx")
+                                hi = getattr(ins, "instr_index", None)
+                                # Only a load AFTER the recv is a re-load; the recv's own
+                                # buffer-pointer load (at/before recv_idx) is the seed, not
+                                # a re-load, and must not self-correlate. Then require no
+                                # intervening store re-pointed the slot.
+                                is_reload = lo is not None and hi is not None and hi > lo
+                                if is_reload and not self._store_to_slot_between(ssaf, instrs, sk, lo, hi):
+                                    msrc = slot.get("recv_node") or (("bufslot", sk), None)
+                                    reason = ("recv buffer pointer re-loaded from the same "
+                                              "global/struct slot (slot-correlated, #193)")
+                                    assume = (f"recv buffer pointer re-loaded via slot {sk}; "
+                                              f"correlated forward into the re-load (#193)")
+                                    correlated_slots.add(sk)
                         if msrc is not None:
                             for w in ssa_writes(ins):
                                 node = (var_key(w), getattr(w, "version", None))
@@ -2704,6 +2878,14 @@ class TaintEngine:
             if not changed:
                 break
 
+        # #193 Part 1 honesty: for each registered recv-buffer slot that the fixpoint
+        # did NOT correlate to a re-load, emit the deferred "may be missed" caveat --
+        # the flow really wasn't followed. Slots that DID correlate already carry their
+        # positive note (added at the re-load), so the misleading caveat is suppressed.
+        for sk, slot in buffer_slots.items():
+            if sk not in correlated_slots:
+                add_assumption(slot["pending"])
+
         return {"reached_return": reached_return, "out_params": frozenset(out_params),
                 "findings": findings, "leaves": leaves, "assumptions": assumptions}
 
@@ -2780,7 +2962,9 @@ class TaintEngine:
             return done
         return False
 
-    def _seed_forward(self, func, ssaf, instrs, sources, taint_node, add_assumption) -> bool:
+    def _seed_forward(self, func, ssaf, instrs, sources, taint_node, add_assumption, buffer_slots=None) -> bool:
+        if buffer_slots is None:
+            buffer_slots = {}
         seeded = False
         for src in sources:
             kind = src.get("kind")
@@ -2871,20 +3055,12 @@ class TaintEngine:
                                         seeded = True
                                 # The buffer couldn't be anchored to a stack var or
                                 # writable global. If the pointer is itself loaded
-                                # from a global/struct slot, the seed rides the
-                                # pointer value, not the pointee, and won't correlate
-                                # with a later re-load of the same slot -- a recv->
-                                # parse flow can be missed. Say so instead of a
-                                # silent 0-propagation clear (#193).
-                                if self._arg_ptr_is_indirect_load(ssaf, params[idx]):
-                                    add_assumption(
-                                        f"source {callee} arg{idx} buffer pointer is loaded "
-                                        f"indirectly (from a global/struct slot); the seed "
-                                        f"anchors to the pointer value, not the pointee, and "
-                                        f"is not correlated with later re-loads of the same "
-                                        f"slot -- a flow that re-loads the pointer and parses "
-                                        f"it may be missed. Consider seeding the parser entry "
-                                        f"directly with param:N")
+                                # from a global/struct slot, register the slot so a
+                                # later re-load correlates forward (#193 Part 1); the
+                                # helper falls back to today's honest caveat when the
+                                # slot can't be named.
+                                self._register_indirect_buffer_slot(
+                                    ssaf, params[idx], c, callee, idx, buffer_slots, add_assumption)
                 if kind == "ret" and not ret_seeded:
                     # T3: callsites of `callee` exist but NONE consume its return
                     # value (a void or discarded return), so a ret: source has
@@ -2947,15 +3123,8 @@ class TaintEngine:
                                         if taint_node((var_key(r), getattr(r, "version", None)), var_label(r), c,
                                                       f"source: {callee} arg{idx} (call: preset)", []):
                                             seeded = True
-                                    if self._arg_ptr_is_indirect_load(ssaf, params[idx]):
-                                        add_assumption(
-                                            f"source {callee} arg{idx} buffer pointer is loaded "
-                                            f"indirectly (from a global/struct slot); the seed "
-                                            f"anchors to the pointer value, not the pointee, and "
-                                            f"is not correlated with later re-loads of the same "
-                                            f"slot -- a flow that re-loads the pointer and parses "
-                                            f"it may be missed. Consider seeding the parser entry "
-                                            f"directly with param:N")
+                                    self._register_indirect_buffer_slot(
+                                        ssaf, params[idx], c, callee, idx, buffer_slots, add_assumption)
                         elif to.startswith("arg:"):
                             idx = _try_arg_index(to)
                             if idx is not None and idx < len(params):
