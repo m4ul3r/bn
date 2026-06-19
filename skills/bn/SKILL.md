@@ -7,7 +7,10 @@ description: Use the local bn CLI for Binary Ninja reversing through the bn brid
 
 Use this skill when the user wants reverse-engineering work against a Binary Ninja database and the local `bn` CLI is available. The bridge runs as a GUI plugin (attached to an open Binary Ninja window) or as a headless process. The CLI auto-spawns a headless instance on first use if none is running.
 
-> **Methodology skills:** for structured RE workflows see `bn-re`; for vulnerability research see `bn-vr`. Both delegate command syntax back here.
+> **Route to a methodology first — this skill is the HOW; the methodology is the WHAT.**
+> - **Open-ended understanding / mapping a binary** → invoke the **`bn-re`** skill first. For a *long* survey spanning many functions, **dispatch the `bn-re` subagent** instead of running inline — it keeps the decompiler/xref token-flood out of your context and returns a distilled map (recovered state persists in the BNDB, read it back via `bn`).
+> - **Finding bugs / security audit / attack surface** → invoke the **`bn-vr`** skill first; likewise **dispatch the `bn-vr` subagent** for a long audit spanning many sinks.
+> - Then come back here for command syntax — both methodology skills delegate syntax to this skill.
 
 ## 1. Workflow & target selection
 
