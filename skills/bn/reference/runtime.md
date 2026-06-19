@@ -15,11 +15,12 @@ Target selection, sticky pins, instance/target resolution order, sessions/headle
 2. Pick a target:
    - Single open BinaryView: omit `-t`.
    - Multiple open: pass `-t <selector>` from `bn target list`. Selectors match against `selector`, `target_id`, `view_id`, full filename, or basename.
-   - `-t` works **before or after** the subcommand. Use the pre-subcommand form to disambiguate selectors that collide with subcommand names like `session` or `pam_qnx.so.2`:
+   - `-t` / `--instance` work **before or after** the subcommand, and for two-level commands they are also accepted **between the group and the leaf**. Use a pre-subcommand form to disambiguate selectors that collide with subcommand names like `session` or `pam_qnx.so.2`:
 
      ```bash
-     bn -t pam_qnx.so.2 decompile main
-     bn decompile main -t pam_qnx.so.2
+     bn -t pam_qnx.so.2 decompile main      # at root
+     bn decompile main -t pam_qnx.so.2      # after the leaf
+     bn bundle -t pam_qnx.so.2 function main  # between group and leaf (two-level)
      ```
 
    - Use `-t active` only when you explicitly want to follow the GUI selection.
