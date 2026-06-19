@@ -1,6 +1,6 @@
 ---
 name: bn
-description: Use the local bn CLI for Binary Ninja reversing through the bn bridge, in a live GUI session or headless mode. Triggers include decompilation, function search, xrefs, callsites and exact caller_static mapping, IL/disassembly, type recovery, struct field edits, previewed mutations, stable local IDs, batch apply, BNDB save/load, evidence helpers (vtable/pointer-table and .init_array walking, protobuf/RTTI type lensing, raw-ABI call evidence), and inline BN Python.
+description: "Use the local bn CLI for Binary Ninja reversing through the bn bridge, in a live GUI session or headless mode. Triggers include decompilation, function search, xrefs, callsites and exact caller_static mapping, IL/disassembly, type recovery, struct field edits, previewed mutations, stable local IDs, batch apply, BNDB save/load, evidence helpers (vtable/pointer-table and .init_array walking, protobuf/RTTI type lensing, raw-ABI call evidence), and inline BN Python."
 ---
 
 # bn

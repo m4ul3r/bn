@@ -1,6 +1,6 @@
 ---
 name: bn-vr
-description: Vulnerability-research methodology for finding security bugs in binaries via the bn CLI. Core discipline — exhaustive sink enumeration plus source→sink tracing — is what stops a fast false all-clear: when the import table looks empty or bounded, it forces the audit onto the binary's own copy/format/dispatch sinks and (on C++) the class lens to the directive/parse handlers, then taint/trace to prove or refute attacker control. Covers attack-surface mapping, the stripped/static lane, common bug patterns, the taint engine, and reporting.
+description: "Vulnerability-research methodology for finding security bugs in binaries via the bn CLI. Core discipline — exhaustive sink enumeration plus source→sink tracing — is what stops a fast false all-clear: when the import table looks empty or bounded, it forces the audit onto the binary's own copy/format/dispatch sinks and (on C++) the class lens to the directive/parse handlers, then taint/trace to prove or refute attacker control. Covers attack-surface mapping, the stripped/static lane, common bug patterns, the taint engine, and reporting."
 ---
 
 # bn-vr — Vulnerability Research Methodology
@@ -77,7 +77,7 @@ On stripped static firmware (busybox, embedded ARM/MIPS), `bn imports` is empty 
    bn evidence table <addr>     # applet / dispatch / fuse_operations tables as fn pointers
    ```
 
-5. **Confirm widths in disasm.** Stripped + ARM means the decompiler's width/sign story is frequently wrong — confirm field loads (`ldrb` vs `ldr`) in `bn disasm` before concluding off-by-one / truncation (see the width note in the bn skill, §4).
+5. **Confirm widths in disasm.** Stripped + ARM means the decompiler's width/sign story is frequently wrong — confirm field loads (`ldrb` vs `ldr`) in `bn disasm` before concluding off-by-one / truncation (see the width-sensitive-reads note in the `bn` skill).
 
 **Worked example — busybox.** BusyBox is an applet multiplexer: `main` dispatches on `argv[0]`/`argv[1]` to applet handlers, so its real attack surface is the applet table plus the strings that name applets:
 ```bash
@@ -137,13 +137,13 @@ Scope of `--interprocedural`: it follows a value *into* a callee only when that 
 The walk requires MLIL SSA, so use `--view mlil` (the default; `--view hlil` exists but often can't locate calls nested in assignment statements). IP mode works best on self-contained code (static binaries, kernel modules); for shared-library PLT/import calls the callee has no MLIL body, so IP mode correctly falls back to intraprocedural behavior. Use `--format json` to get structured step-by-step SSA variable information.
 
 ### When the trail is indirect or the args are unclear
-Plain `bn xrefs`/`decompile` thin out when dispatch is indirect or the decompiler's argument story is incomplete (common in C++/IPC services). Three evidence helpers (syntax in the bn skill, §4) pick up the trail:
+Plain `bn xrefs`/`decompile` thin out when dispatch is indirect or the decompiler's argument story is incomplete (common in C++/IPC services). Three evidence helpers (syntax in the bn skill — `reference/reading.md`) pick up the trail:
 
 - `bn evidence xrefs <sink-or-string>` — like `bn xrefs` but each ref carries section/segment/symbol + the referencing disassembly, so you can tell a real code caller from a vtable/RTTI/descriptor slot, and spot a sink that's reachable **only** through a vtable (no direct call).
 - `bn evidence function <caller>` — shows the raw ABI arguments (registers + LLIL/MLIL/HLIL) next to the pseudo-C at each call, including the vtable offset for an indirect/virtual call. Use it to recover a sink's real arguments without dropping to disasm, and to see through `j_*`/PLT thunks to the true callee.
 - `bn evidence message <TypeName>` — for protobuf/IPC message handlers, maps a message type-name string to its serializer/handler pointers, giving you the receive→parse→dispatch entry points to trace forward from.
 
-Reminder: HLIL can hide the real access/operand width — confirm the size in `bn disasm` before concluding on a truncation/off-by-one (see the width note in the bn skill, §4).
+Reminder: HLIL can hide the real access/operand width — confirm the size in `bn disasm` before concluding on a truncation/off-by-one (see the width-sensitive-reads note in the `bn` skill).
 
 ## Systematic Audit Workflow
 
