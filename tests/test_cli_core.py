@@ -285,6 +285,24 @@ def test_missing_nested_subcommand_prints_exact_help(capsys):
     assert stderr == ""
 
 
+def test_root_help_includes_capability_map():
+    # #276 Option 1: `bn --help` carries a "which command when" map for the
+    # overlapping groups, so an agent routes deterministically instead of
+    # re-deriving it. Assert on map-only phrases (the bare verb names already
+    # appear in the subcommand listing).
+    help_text = bn.cli.build_parser().format_help()
+
+    assert "Picking between overlapping commands:" in help_text
+    assert "exact caller -> callsite address mapping" in help_text   # callsites vs xrefs
+    assert "follow data source -> sink across calls" in help_text    # taint vs dataflow vs evidence
+    assert "backward-slice one call argument" in help_text           # trace vs taint backward
+    assert "C++ class hierarchy" in help_text                        # class (RTTI lens) vs evidence
+    assert "match by name or regex" in help_text                     # function list vs search
+    # The pre-existing spill-envelope note must survive (RawDescription must not
+    # drop it).
+    assert "spills to disk" in help_text
+
+
 def test_help_full_prints_recursive_root_help(capsys):
     with pytest.raises(SystemExit) as exc_info:
         bn.cli.main(["--help-full"])
