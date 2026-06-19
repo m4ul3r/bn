@@ -228,7 +228,7 @@ def _list_functions(
     if count_only:
         # `total` mirrors the list envelope's key for the same number; `count`
         # kept for back-compat.
-        return {"count": len(functions), "total": len(functions)}
+        return {"kind": "functions", "count": len(functions), "total": len(functions)}
     items = [
         {
             "name": fn.name,
@@ -244,25 +244,22 @@ def _list_functions(
 
 
 def _paged_function_result(ctx, items: list[dict[str, Any]], *, offset: int,
-                           limit: int | None) -> dict[str, Any]:
+                           limit: int | None, kind: str = "functions") -> dict[str, Any]:
     """Return a function-listing page WITH paging metadata.
 
     The CLI can't compute the true total itself -- it fetches a bounded page
     -- so the bridge, which has the full filtered set, returns total/offset/
     limit/returned/has_more alongside the page. This lets `function list`
     state the real total + remainder (text) and expose paging in JSON, the
-    same honesty convention as evidence xrefs (#59)."""
+    same honesty convention as evidence xrefs (#59). `kind` is the envelope
+    discriminator (#275); `items` is the sole data container (the legacy
+    `functions` alias was dropped in the #275 clean break)."""
     total = len(items)
     page = items[offset:]
     if limit is not None:
         page = page[:limit]
     return {
-        # DEPRECATED: `functions` duplicates `items` byte-for-byte, kept only for
-        # back-compat since #139. `items` is the universal paged-array key
-        # (imports/strings/sections/types/xrefs/comment-list/callsites all use
-        # it) -- new consumers should read `items`; `functions` will be dropped on
-        # the next breaking (feat(json)!) bump (#165).
-        "functions": page,
+        "kind": kind,
         "items": page,
         "total": total,
         "offset": offset,
@@ -329,6 +326,6 @@ def _search_functions(
     if count_only:
         # Mirror `_list_functions` count_only: `total` matches the list envelope
         # key, `count` kept for back-compat (#252).
-        return {"count": len(items), "total": len(items)}
+        return {"kind": "functions", "count": len(items), "total": len(items)}
     _sort_function_items(items, sort, reverse)
     return _paged_function_result(ctx, items, offset=offset, limit=limit)
