@@ -503,9 +503,9 @@ def _maybe_regex_hint(args: argparse.Namespace, result: Any, query: str | None) 
     Suppressed when --regex/--exact is set or the query is plain text."""
     if not query or getattr(args, "regex", False) or getattr(args, "exact", False):
         return
-    empty = (isinstance(result, list) and not result) or (
-        isinstance(result, dict) and result.get("total") == 0
-    )
+    # Every collection read is now a {kind, items, total, ...} envelope (#275),
+    # so "empty" is just total == 0 -- no bare-list special-case.
+    empty = isinstance(result, dict) and result.get("total") == 0
     if not empty or not any(ch in query for ch in _REGEX_METACHARS):
         return
     print(
@@ -528,16 +528,9 @@ def _maybe_offset_hint(args: argparse.Namespace, result: Any, identifier: str | 
         value = int(text, 16) if text.lower().startswith("0x") else int(text, 10)
     except ValueError:
         return
-    # Key off the full-set `total` (the canonical envelope count): the xrefs op no
-    # longer ships the code_refs/data_refs arrays (#184), so checking them alone
-    # would read as "empty" even when refs exist. Keep the array checks as a
-    # back-compat fallback for the field-xrefs / function-info shapes.
-    empty = (
-        isinstance(result, dict)
-        and not result.get("total")
-        and not result.get("code_refs")
-        and not result.get("data_refs")
-    )
+    # Key off the canonical envelope `total`: the xrefs op ships items + total,
+    # not the legacy code_refs/data_refs arrays (#184/#275).
+    empty = isinstance(result, dict) and not result.get("total")
     if not empty or value >= 0x10000:
         return
     print(
@@ -713,15 +706,8 @@ def _call(
     )
     result = response["result"]
     exit_code = result_exit_code(result) if result_exit_code is not None else 0
-    if effective_page_limit is not None and isinstance(result, list) and len(result) > effective_page_limit:
-        result = result[:effective_page_limit]
-        label = page_label or op
-        next_offset = page_offset + effective_page_limit
-        item_word = "item" if effective_page_limit == 1 else "items"
-        print(
-            f"warning: {label} output truncated to {effective_page_limit} {item_word}; rerun with --offset {next_offset} or a larger --limit",
-            file=sys.stderr,
-        )
+    # No bare-list CLI-side truncation: every paged read returns a {items, total,
+    # offset, limit, returned, has_more} envelope and pages bridge-side (#275).
     _maybe_regex_hint(args, result, regex_hint_query)
     _maybe_offset_hint(args, result, offset_hint_identifier)
     spill_context = result

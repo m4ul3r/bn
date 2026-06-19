@@ -291,7 +291,7 @@ def test_class_list_envelope_filters_and_pages():
             return bv
 
     out = read_class._class_list(_Ctx(), None, include_all=True)
-    assert out["items"] == out["classes"]
+    assert out["kind"] == "classes" and "classes" not in out  # #275: items-only
     assert out["returned"] == len(out["items"])
     assert out["has_more"] is False
     names = [c["name"] for c in out["items"]]
@@ -310,7 +310,7 @@ def test_class_list_envelope_has_more_when_paged():
             return bv
 
     out = read_class._class_list(_Ctx(), None, include_all=True, limit=1)
-    assert out["items"] == out["classes"]
+    assert out["kind"] == "classes" and "classes" not in out
     assert out["limit"] == 1
     assert out["returned"] == 1
     assert out["has_more"] is True

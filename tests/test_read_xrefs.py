@@ -110,6 +110,7 @@ def test_xrefs_op_drops_deprecated_arrays(monkeypatch):
 
     result = instance._xrefs(None, "0x5000", limit=1)
 
+    assert result["kind"] == "xrefs"
     # deprecated dual arrays are gone -> --limit truly bounds the payload
     assert "code_refs" not in result
     assert "data_refs" not in result
@@ -211,11 +212,13 @@ def test_message_lens_summarizes_type_string_xrefs_and_metadata_window(monkeypat
     result = instance._message_lens("active", "HeadUnitInfo", limit=5, table_entries=2)
 
     assert result["count"] == 1
-    match = result["matches"][0]
+    assert result["kind"] == "messages"  # #275
+    match = result["items"][0]
     assert match["type_string"]["value"] == "common.HeadUnitInfo"
     assert match["xrefs"]["code_refs"][0]["function"] == "build_type_name"
     assert match["metadata_table_windows"][0]["address"] == "0x6000"
-    assert match["metadata_table_windows"][0]["entries"][0]["target"]["thumb_adjusted"] is True
+    assert match["metadata_table_windows"][0]["kind"] == "pointer_table"  # #275: embedded table canonical
+    assert match["metadata_table_windows"][0]["items"][0]["target"]["thumb_adjusted"] is True
     # single match under the limit: honest total, not truncated
     assert result["total"] == 1
     assert result["truncated"] is False
@@ -336,9 +339,15 @@ def test_field_xrefs_resolves_data_var_type(monkeypatch):
     # Must not raise (the old get_type_at call would AttributeError here).
     result = instance._field_xrefs("active", "Foo.bar")
 
-    assert result["code_refs"][0]["function"] == "use_field"
-    assert result["code_refs"][0]["disasm"] == "ldr r0, [r1, #4]"
-    assert result["data_refs"] == [
+    # #275: unified items envelope (each ref tagged code|data); legacy
+    # code_refs/data_refs arrays dropped; `field` metadata retained.
+    assert result["kind"] == "field_xrefs"
+    assert "code_refs" not in result and "data_refs" not in result
+    code_items = [it for it in result["items"] if it["kind"] == "code"]
+    data_items = [it for it in result["items"] if it["kind"] == "data"]
+    assert code_items[0]["function"] == "use_field"
+    assert code_items[0]["disasm"] == "ldr r0, [r1, #4]"
+    assert [{"address": d["address"], "symbol": d["symbol"], "type": d["type"]} for d in data_items] == [
         {"address": "0x2000", "symbol": "g_foo", "type": "struct Foo"},
         {"address": "0x3000", "symbol": None, "type": None},
     ]
@@ -368,7 +377,8 @@ def test_xrefs_any_marks_ambiguous_symbol_present(monkeypatch):
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     res = instance._xrefs_any(None, ["dup", "nope"])
-    syms = {s["symbol"]: s for s in res["symbols"]}
+    assert res["kind"] == "symbol_presence" and "symbols" not in res
+    syms = {s["symbol"]: s for s in res["items"]}
     assert syms["dup"]["present"] is True and syms["dup"].get("ambiguous") is True
     assert syms["nope"]["present"] is False
     assert res["present"] == 1

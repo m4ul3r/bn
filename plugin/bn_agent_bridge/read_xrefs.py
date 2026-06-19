@@ -192,7 +192,7 @@ def _xrefs_any(ctx, selector: str | None, symbols: list[Any]) -> dict[str, Any]:
             "data_ref_count": res.get("data_ref_count", 0),
             "caller_function_count": res.get("caller_function_count", 0),
         })
-    return {"symbols": results, "count": len(results), "present": present}
+    return {"kind": "symbol_presence", "items": results, "count": len(results), "present": present}
 
 
 def _drop_legacy_ref_arrays(envelope: dict[str, Any]) -> dict[str, Any]:
@@ -232,12 +232,15 @@ def _xref_envelope(address, target_context, code_refs, data_refs, *,
     if limit is not None:
         page = page[:limit]
     out: dict[str, Any] = {
+        "kind": "xrefs",
         "address": hex(address) if isinstance(address, int) else address,
         "target_context": target_context,
         "code_ref_count": len(code_refs),
         "data_ref_count": len(data_refs),
         "caller_function_count": len(caller_addrs),
-        # Deprecated dual shape (kept for back-compat + function-info embedding).
+        # Internal dual shape: the top-level `xrefs` op strips these via
+        # _drop_legacy_ref_arrays (#184); they survive only where function info /
+        # evidence message-lensing embed this envelope and read the full set.
         "code_refs": code_refs,
         "data_refs": data_refs,
         # Canonical paging envelope.
@@ -548,8 +551,14 @@ def _field_xrefs(ctx, selector: str | None, field_spec: str):
             }
         )
 
+    # #275: unified items envelope -- code refs first then data refs, each row
+    # tagged with its `kind` (code|data) -- with the `field` descriptor as
+    # top-level metadata. The legacy code_refs/data_refs arrays are dropped.
+    items = ([{**ref, "kind": "code"} for ref in code_refs]
+             + [{**ref, "kind": "data"} for ref in data_refs])
     return {
+        "kind": "field_xrefs",
         "field": field,
-        "code_refs": code_refs,
-        "data_refs": data_refs,
+        "items": items,
+        "total": len(items),
     }

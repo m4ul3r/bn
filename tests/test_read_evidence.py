@@ -634,14 +634,15 @@ def test_pointer_table_normalizes_thumb_function_pointers(monkeypatch):
 
     result = instance._pointer_table("active", "0x3000", entries=2)
 
-    assert result["entries"][0]["value"] == "0x401001"
-    assert result["entries"][0]["target"]["normalized"] == "0x401000"
-    assert result["entries"][0]["target"]["thumb_adjusted"] is True
-    assert result["entries"][0]["target"]["function"]["name"] == "handler"
-    assert result["entries"][0]["target"]["function"]["exact_start"] is True
-    assert result["entries"][0]["target"]["context"]["address"] == "0x401000"
-    assert result["entries"][1]["target"]["function"] is None
-    assert result["entries"][1]["target"]["plausible"] is False
+    assert result["kind"] == "pointer_table" and result["total"] == 2  # #275
+    assert result["items"][0]["value"] == "0x401001"
+    assert result["items"][0]["target"]["normalized"] == "0x401000"
+    assert result["items"][0]["target"]["thumb_adjusted"] is True
+    assert result["items"][0]["target"]["function"]["name"] == "handler"
+    assert result["items"][0]["target"]["function"]["exact_start"] is True
+    assert result["items"][0]["target"]["context"]["address"] == "0x401000"
+    assert result["items"][1]["target"]["function"] is None
+    assert result["items"][1]["target"]["plausible"] is False
 
 
 def test_pointer_table_does_not_thumb_normalize_non_arm_pointers(monkeypatch):
@@ -662,7 +663,7 @@ def test_pointer_table_does_not_thumb_normalize_non_arm_pointers(monkeypatch):
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._pointer_table("active", "0x3000", entries=1)
-    target_info = result["entries"][0]["target"]
+    target_info = result["items"][0]["target"]
 
     assert target_info["raw"] == "0x401001"
     assert target_info["normalized"] == "0x401001"
@@ -694,7 +695,7 @@ def test_pointer_table_downgrades_inline_scalar_fields(monkeypatch):
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._pointer_table("active", "0x3000", entries=3)
-    rows = result["entries"]
+    rows = result["items"]
     assert rows[0]["plausible"] is True
     assert rows[1]["likely_scalar"] is True and rows[1]["plausible"] is False
     assert rows[2]["likely_scalar"] is False and rows[2]["plausible"] is False
@@ -740,7 +741,7 @@ def test_pointer_table_warns_when_start_looks_like_code_not_table(monkeypatch):
 
     result = instance._pointer_table("active", "0x64ea0", entries=2)
 
-    assert all(entry["plausible"] is False for entry in result["entries"])
+    assert all(entry["plausible"] is False for entry in result["items"])
     assert any("executable segment" in warning for warning in result["warnings"])
     assert any("low confidence" in warning for warning in result["warnings"])
 
@@ -790,8 +791,9 @@ def test_message_lens_reports_true_total_and_flags_truncation(monkeypatch):
 
     result = instance._message_lens("active", "token", limit=2)
 
+    assert result["kind"] == "messages"  # #275
     assert result["count"] == 2          # only `limit` rich matches returned
-    assert len(result["matches"]) == 2
+    assert len(result["items"]) == 2
     assert result["total"] == 5          # but the count reported is honest
     assert result["truncated"] is True
 
@@ -836,10 +838,11 @@ def test_message_lens_metadata_window_stops_at_obvious_non_pointer(monkeypatch):
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._message_lens("active", "HeadUnitInfo", limit=5, table_entries=8)
-    table = result["matches"][0]["metadata_table_windows"][0]
+    table = result["items"][0]["metadata_table_windows"][0]
 
-    assert len(table["entries"]) == 2
-    assert table["entries"][1]["target"]["status"] == "unmapped"
+    assert table["kind"] == "pointer_table"  # #275: embedded table is canonical
+    assert len(table["items"]) == 2
+    assert table["items"][1]["target"]["status"] == "unmapped"
     assert any("stopped after" in warning for warning in table["warnings"])
 
 
@@ -863,12 +866,14 @@ def test_init_arrays_summarizes_constructor_pointer_sections(monkeypatch):
 
     result = instance._init_arrays("active", limit=4)
 
+    assert result["kind"] == "init_arrays" and result["total"] == 1  # #275
     assert result["pointer_size"] == 4
-    assert len(result["sections"]) == 1
-    section = result["sections"][0]
+    assert len(result["items"]) == 1
+    section = result["items"][0]
     assert section["name"] == ".init_array"
     assert section["total_entries"] == 2
-    assert section["table"]["entries"][0]["target"]["function"]["name"] == "global_ctor"
+    assert section["table"]["kind"] == "pointer_table"  # #275: embedded table canonical
+    assert section["table"]["items"][0]["target"]["function"]["name"] == "global_ctor"
 
 
 def test_scan_for_calls_to_finds_llil_calls(monkeypatch):
@@ -945,7 +950,7 @@ def test_pointer_table_read_width_tracks_substride(monkeypatch):
 
     result = instance._pointer_table("active", "0x40b580", entries=6, stride="4")
     assert result["read_width"] == 4
-    vals = [e.get("value") for e in result["entries"]]
+    vals = [e.get("value") for e in result["items"]]
     assert vals[0] == "0x40c370" and vals[2] == "0x400180" and vals[4] == "0x40ca80"
     assert vals[1] == "0x0" and vals[3] == "0x0"            # zero high halves, not garbage
     assert "0x40018000000000" not in vals                   # no overlapping read
@@ -953,12 +958,12 @@ def test_pointer_table_read_width_tracks_substride(monkeypatch):
     # default (stride == pointer size) still reads 8-byte pointers
     r8 = instance._pointer_table("active", "0x40b580", entries=3, stride="8")
     assert r8["read_width"] == 8
-    assert [e.get("value") for e in r8["entries"]] == ["0x40c370", "0x400180", "0x40ca80"]
+    assert [e.get("value") for e in r8["items"]] == ["0x40c370", "0x400180", "0x40ca80"]
 
     # explicit --width overrides the stride-derived width
     rw = instance._pointer_table("active", "0x40b580", entries=2, stride="8", width="4")
     assert rw["read_width"] == 4
-    assert rw["entries"][0]["value"] == "0x40c370"
+    assert rw["items"][0]["value"] == "0x40c370"
 
 
 def test_message_lens_excludes_dynstr_and_resolves_rtti(monkeypatch):

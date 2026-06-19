@@ -59,7 +59,8 @@ def test_function_list_requires_target_when_multiple_targets_are_open(fake_trans
 def test_function_list_returns_full_result_set(fake_transport, capsys):
     calls = fake_transport({"list_functions": {
         "ok": True,
-        "result": {"functions": [{"name": f"sub_{index:06x}", "address": hex(index)} for index in range(150)],
+        "result": {"kind": "functions",
+                   "items": [{"name": f"sub_{index:06x}", "address": hex(index)} for index in range(150)],
                    "total": 150, "offset": 0, "limit": 200, "returned": 150, "has_more": False},
     }})
 
@@ -70,7 +71,7 @@ def test_function_list_returns_full_result_set(fake_transport, capsys):
     assert calls[-1]["params"] == {"limit": 200}
     stdout, stderr = capsys.readouterr()
     payload = json.loads(stdout)
-    assert len(payload["functions"]) == 150
+    assert len(payload["items"]) == 150
     assert payload["total"] == 150 and payload["has_more"] is False
     assert stderr == ""
 
@@ -561,13 +562,14 @@ def test_evidence_table_routes_and_renders_targets(fake_transport, capsys):
     calls = fake_transport({"pointer_table": {
         "ok": True,
         "result": {
+            "kind": "pointer_table",
             "address": "0x64ea0",
                 "pointer_size": 4,
                 "stride": 4,
                 "warnings": [
                     "table start is in an executable segment; this may be code, not a pointer table"
                 ],
-                "entries": [
+                "items": [
                     {
                         "index": 0,
                         "entry_address": "0x64ea0",
@@ -601,11 +603,12 @@ def test_evidence_table_renders_interior_function_targets(fake_transport, capsys
     fake_transport({"pointer_table": {
         "ok": True,
         "result": {
+            "kind": "pointer_table",
             "address": "0x402000",
                 "pointer_size": 8,
                 "stride": 8,
                 "warnings": ["1 entries resolve inside functions but not at function starts"],
-                "entries": [
+                "items": [
                     {
                         "index": 0,
                         "entry_address": "0x402000",
@@ -641,9 +644,10 @@ def test_evidence_message_routes_and_renders_lens(fake_transport, capsys):
     calls = fake_transport({"message_lens": {
         "ok": True,
         "result": {
+            "kind": "messages",
             "query": "HeadUnitInfo",
                 "count": 1,
-                "matches": [
+                "items": [
                     {
                         "type_string": {
                             "address": "0x175b20",
@@ -1401,8 +1405,8 @@ def test_xrefs_any_batch_probes_symbols(monkeypatch, capsys):
         assert op == "xrefs_any"
         assert params["symbols"] == ["memcpy", "strcpy", "system"]
         return {"ok": True, "result": {
-            "count": 3, "present": 2,
-            "symbols": [
+            "kind": "symbol_presence", "count": 3, "present": 2,
+            "items": [
                 {"symbol": "memcpy", "present": True, "code_ref_count": 12,
                  "caller_function_count": 4, "address": "0x1000"},
                 {"symbol": "strcpy", "present": False, "note": "Function not found: strcpy"},

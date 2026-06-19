@@ -1034,11 +1034,13 @@ def test_list_ops_return_paged_envelope_with_true_total(monkeypatch):
     bv = _FakeBV(strings=strings, sections=secs, symbols=syms)
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
-    envelope_keys = {"items", "total", "offset", "limit", "returned", "has_more"}
+    # #275: the canonical envelope now carries a `kind` discriminator too.
+    envelope_keys = {"kind", "items", "total", "offset", "limit", "returned", "has_more"}
 
     # A limit that truncates: 2 of 5 come back, but the total stays honest.
     strings_page = instance._strings(None, query=None, offset=0, limit=2)
     assert set(strings_page) == envelope_keys
+    assert strings_page["kind"] == "strings"
     assert strings_page["total"] == 5
     assert strings_page["returned"] == 2
     assert len(strings_page["items"]) == 2
@@ -1046,11 +1048,13 @@ def test_list_ops_return_paged_envelope_with_true_total(monkeypatch):
 
     imports_page = instance._imports(None, offset=0, limit=2)
     assert set(imports_page) == envelope_keys
+    assert imports_page["kind"] == "imports"
     assert imports_page["total"] == 5 and imports_page["returned"] == 2
     assert imports_page["has_more"] is True
 
     sections_page = instance._sections(None, offset=0, limit=2)
     assert set(sections_page) == envelope_keys
+    assert sections_page["kind"] == "sections"
     assert sections_page["total"] == 5 and sections_page["returned"] == 2
     assert sections_page["has_more"] is True
 

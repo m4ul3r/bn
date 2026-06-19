@@ -14,8 +14,9 @@ def test_evidence_init_routes_and_renders_sections(fake_transport, capsys):
         "init_arrays": {
             "ok": True,
             "result": {
+                "kind": "init_arrays",
                 "pointer_size": 4,
-                "sections": [
+                "items": [
                     {
                         "name": ".init_array",
                         "start": "0x5000",
@@ -24,7 +25,8 @@ def test_evidence_init_routes_and_renders_sections(fake_transport, capsys):
                         "shown_entries": 2,
                         "truncated": False,
                         "table": {
-                            "entries": [
+                            "kind": "pointer_table",
+                            "items": [
                                 {
                                     "index": 0,
                                     "entry_address": "0x5000",
@@ -123,9 +125,11 @@ def test_py_exec_text_format_renders_stdout_and_result(fake_transport, capsys):
 
 
 def test_strings_hints_regex_on_zero_matches_with_metachars(fake_transport, capsys):
-    """strings (a bare list today) with a metacharacter query and 0 matches also
-    suggests --regex (#122)."""
-    fake_transport({"strings": {"ok": True, "result": []}})
+    """strings with a metacharacter query and 0 matches suggests --regex (#122);
+    the empty canonical envelope (total 0) drives the nudge (#275)."""
+    fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings", "items": [], "total": 0, "offset": 0,
+        "limit": None, "returned": 0, "has_more": False}}})
     rc = bn.cli.main(["strings", "--query", "foo(bar", "--target", "active"])
     assert rc == 0
     _, err = capsys.readouterr()

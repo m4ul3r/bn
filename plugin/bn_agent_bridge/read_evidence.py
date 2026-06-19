@@ -454,13 +454,18 @@ def _pointer_table_for_view(
         warnings.append(
             f"{len(interior_function_rows)} entries resolve inside functions but not at function starts"
         )
+    # #275: canonical envelope at the helper level, so an embedded table window
+    # (evidence init/message) looks identical to the standalone `evidence table`
+    # op -- one `.items[]` path everywhere, no `entries`/`items` divergence.
     return {
+        "kind": "pointer_table",
         "address": hex(start),
         "pointer_size": pointer_size,
         "stride": stride_size,
         "read_width": read_width,
         "context": table_context,
-        "entries": rows,
+        "items": rows,
+        "total": len(rows),
         "warnings": warnings,
     }
 
@@ -478,6 +483,8 @@ def _pointer_table(ctx, selector: str | None, address, *, entries: int = 16, str
     read_width = _parse_address(width) if width not in (None, "") else None
     if read_width is not None and read_width <= 0:
         raise OperationFailure("invalid_width", f"Invalid read width: {read_width}")
+    # #275: _pointer_table_for_view already returns the canonical {kind, items,
+    # total, ...} envelope -- identical standalone and embedded.
     return _pointer_table_for_view(
         ctx,
         bv,
@@ -633,8 +640,9 @@ def _message_lens(ctx, selector: str | None, query: str, *, limit: int = 20, tab
         )
 
     return {
+        "kind": "messages",
         "query": query,
-        "matches": matches,
+        "items": matches,
         "count": len(matches),
         "total": total_matched,
         "truncated": total_matched > len(matches),
@@ -688,7 +696,11 @@ def _init_arrays(ctx, selector: str | None, *, limit: int = 64):
             }
         )
     sections.sort(key=lambda item: int(item["start"], 16))
+    # #275: `items` are the init/ctor sections (each retains its nested `entries`
+    # table); `kind` discriminates the envelope.
     return {
+        "kind": "init_arrays",
         "pointer_size": pointer_size,
-        "sections": sections,
+        "items": sections,
+        "total": len(sections),
     }

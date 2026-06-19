@@ -313,8 +313,29 @@ def test_list_functions_is_sorted_by_address(monkeypatch):
 
     result = instance._list_functions("active")
 
-    assert [item["address"] for item in result["functions"]] == ["0x401000", "0x402000"]
+    assert [item["address"] for item in result["items"]] == ["0x401000", "0x402000"]
     assert result["total"] == 2 and result["has_more"] is False
+
+
+def test_function_list_envelope_kind_and_no_functions_alias(monkeypatch):
+    # #275: the canonical envelope carries a `kind` discriminator and drops the
+    # deprecated `functions` alias (items is the universal container).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[_FakeFunction(0x401000, "sub_401000")])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    listed = instance._list_functions("active")
+    assert listed["kind"] == "functions"
+    assert "functions" not in listed
+    assert isinstance(listed["items"], list)
+
+    searched = instance._search_functions("active", "sub")
+    assert searched["kind"] == "functions"
+    assert "functions" not in searched
+
+    counted = instance._list_functions("active", count_only=True)
+    assert counted["kind"] == "functions" and counted["count"] == 1
 
 
 def test_function_list_rows_carry_size_and_sort_by_size(monkeypatch):
@@ -330,12 +351,12 @@ def test_function_list_rows_carry_size_and_sort_by_size(monkeypatch):
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     res = instance._list_functions("active")
-    by_name = {r["name"]: r for r in res["functions"]}
+    by_name = {r["name"]: r for r in res["items"]}
     assert by_name["small_fn"]["size"] == 16
     assert by_name["big_fn"]["size"] == 4096
 
     ranked = instance._list_functions("active", sort="size")
-    assert [r["name"] for r in ranked["functions"]] == ["big_fn", "mid_fn", "small_fn"]
+    assert [r["name"] for r in ranked["items"]] == ["big_fn", "mid_fn", "small_fn"]
 
 
 def test_function_search_rows_carry_size(monkeypatch):
@@ -346,7 +367,7 @@ def test_function_search_rows_carry_size(monkeypatch):
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     res = instance._search_functions("active", "parse")
-    assert res["functions"][0]["size"] == 512
+    assert res["items"][0]["size"] == 512
 
 
 def test_list_functions_binder_forwards_sort(monkeypatch):
@@ -361,9 +382,9 @@ def test_list_functions_binder_forwards_sort(monkeypatch):
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     res = bridge._bind_list_functions(instance, {"sort": "size"}, "active")
-    assert [r["name"] for r in res["functions"]] == ["big_fn", "small_fn"]
+    assert [r["name"] for r in res["items"]] == ["big_fn", "small_fn"]
     res2 = bridge._bind_search_functions(instance, {"query": "_fn", "sort": "size"}, "active")
-    assert [r["name"] for r in res2["functions"]] == ["big_fn", "small_fn"]
+    assert [r["name"] for r in res2["items"]] == ["big_fn", "small_fn"]
 
 
 def test_function_binders_tolerate_none_limit(monkeypatch):
@@ -378,24 +399,26 @@ def test_function_binders_tolerate_none_limit(monkeypatch):
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     res = bridge._bind_list_functions(instance, {"limit": None, "offset": 0}, "active")
-    assert len(res["functions"]) == 2
+    assert len(res["items"]) == 2
     res2 = bridge._bind_search_functions(instance, {"query": "alpha", "limit": None, "offset": 0}, "active")
-    assert len(res2["functions"]) == 1
+    assert len(res2["items"]) == 1
 
 
-def test_function_list_envelope_exposes_items_alias_and_count_total(monkeypatch):
-    # JSON-consistency: function list/search expose the universal `items` key
-    # (alias of `functions`) so `data["items"]` works across every list command;
-    # and --count carries `total` to match the list envelope's key.
+def test_function_list_envelope_uses_items_and_count_total(monkeypatch):
+    # JSON-consistency (#275): function list/search expose the universal `items`
+    # key (no `functions` alias) so `data["items"]` works across every list
+    # command; --count carries `total` to match the list envelope's key.
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV(functions=[_FakeFunction(0x1000, "a"), _FakeFunction(0x2000, "b")])
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     res = instance._list_functions("active")
-    assert res["items"] == res["functions"]
+    assert len(res["items"]) == 2 and "functions" not in res
     sres = instance._search_functions("active", "a")
-    assert sres["items"] == sres["functions"]
+    assert isinstance(sres["items"], list) and "functions" not in sres
+    counted = instance._list_functions("active", count_only=True)
+    assert counted["count"] == 2 and counted["total"] == 2
 
     count = instance._list_functions("active", count_only=True)
     assert count["count"] == 2 and count["total"] == 2
@@ -415,7 +438,7 @@ def test_list_functions_can_filter_by_address_range(monkeypatch):
 
     result = instance._list_functions("active", min_address="0x401800", max_address="0x402fff")
 
-    assert [item["address"] for item in result["functions"]] == ["0x402000"]
+    assert [item["address"] for item in result["items"]] == ["0x402000"]
     assert result["total"] == 1
 
 
@@ -433,7 +456,7 @@ def test_search_functions_supports_regex(monkeypatch):
 
     result = instance._search_functions("active", "attach|detach", regex=True)
 
-    assert [item["name"] for item in result["functions"]] == ["load_attachment", "detach_player"]
+    assert [item["name"] for item in result["items"]] == ["load_attachment", "detach_player"]
 
 
 def test_search_functions_rejects_invalid_regex(monkeypatch):
@@ -580,13 +603,14 @@ def test_list_functions_count_only_returns_count(monkeypatch):
     ])
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
-    # count_only now carries `total` (matching the list envelope's key) alongside
-    # the back-compat `count`.
-    assert instance._list_functions(None, count_only=True) == {"count": 3, "total": 3}
+    # count_only carries `kind` + `total` (matching the list envelope's key)
+    # alongside the back-compat `count` (#275).
+    assert instance._list_functions(None, count_only=True) == {
+        "kind": "functions", "count": 3, "total": 3}
     # count must match the full listing's reported total
     listing = instance._list_functions(None)
-    assert listing["total"] == 3 and listing["returned"] == 3 and len(listing["functions"]) == 3
-    assert listing["items"] == listing["functions"]  # universal items alias
+    assert listing["total"] == 3 and listing["returned"] == 3 and len(listing["items"]) == 3
+    assert "functions" not in listing  # no legacy alias
 
 
 def test_backward_slice_simple_chain(monkeypatch):
@@ -965,8 +989,8 @@ def test_search_functions_exact_match(monkeypatch):
     result = instance._search_functions("active", "system", exact=True)
 
     assert result["returned"] == 1 and result["total"] == 1
-    assert result["functions"][0]["name"] == "system"
-    assert result["functions"][0]["address"] == "0x401000"
+    assert result["items"][0]["name"] == "system"
+    assert result["items"][0]["address"] == "0x401000"
 
 
 def test_search_functions_exact_case_insensitive(monkeypatch):
@@ -983,7 +1007,7 @@ def test_search_functions_exact_case_insensitive(monkeypatch):
     result = instance._search_functions("active", "system", exact=True)
 
     assert result["returned"] == 1
-    assert result["functions"][0]["name"] == "System"
+    assert result["items"][0]["name"] == "System"
 
 
 def test_search_functions_exact_no_match(monkeypatch):
@@ -999,7 +1023,7 @@ def test_search_functions_exact_no_match(monkeypatch):
 
     result = instance._search_functions("active", "system", exact=True)
 
-    assert result["functions"] == [] and result["total"] == 0
+    assert result["items"] == [] and result["total"] == 0
 
 
 # ---------------------------------------------------------------------------

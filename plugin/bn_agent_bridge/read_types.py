@@ -39,11 +39,11 @@ def _types(ctx, selector: str | None, *, query, offset: int, limit: int | None,
             continue
         items.append(entry)
     if count_only:
-        return {"count": len(items), "total": len(items)}
+        return {"kind": "types", "count": len(items), "total": len(items)}
     items.sort(key=lambda item: item["name"].lower())
-    # Honest paging envelope ({items,total,offset,limit,returned,has_more}),
+    # Honest paging envelope ({kind,items,total,offset,limit,returned,has_more}),
     # matching strings/imports/sections/function-list (#122/#131).
-    return read_misc._paged_list_result(items, offset=offset, limit=limit)
+    return read_misc._paged_list_result(items, offset=offset, limit=limit, kind="types")
 
 
 def _type_info(ctx, selector: str | None, type_name: str, *, require_struct: bool = False):
