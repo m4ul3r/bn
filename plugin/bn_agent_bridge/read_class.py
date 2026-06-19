@@ -319,10 +319,8 @@ def _class_list(
         rows.append(_list_row(rec))
     returned = len(rows)
     return {
+        "kind": "classes",
         "items": rows,
-        # Back-compat alias for early #205 builds. New consumers should use
-        # `items`, matching the rest of the paged list-command surface.
-        "classes": rows,
         "total": total,
         "offset": offset,
         "limit": limit,
