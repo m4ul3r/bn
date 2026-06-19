@@ -7143,6 +7143,95 @@ def test_save_path_preserves_target_identity(monkeypatch, tmp_path):
     assert bv.file.filename == orig                # ...but identity is preserved
 
 
+class _RehomingFailSaveBV:
+    """create_database re-homes the live view's filename BEFORE failing (no file
+    lands) -- BN can rebind bv.file.filename even on a save that doesn't
+    complete, so the explicit-failure path must still restore identity (#256)."""
+
+    def __init__(self, filename: str):
+        self.file = types.SimpleNamespace(filename=filename)
+        self.created_with = None
+
+    def create_database(self, out: str):
+        self.created_with = out
+        self.file.filename = out  # re-home happens...
+        return False              # ...but the save fails (nothing written)
+
+
+def test_save_path_failure_restores_target_identity(monkeypatch, tmp_path):
+    """#256 review: if create_database re-homes the live view and THEN the
+    explicit --path save fails, the original filename must still be restored --
+    otherwise a failed save silently strands the selector at a path that was
+    never written."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    orig = str(tmp_path / "origbin")
+    bv = _RehomingFailSaveBV(orig)
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(instance.targets, "clear_dirty", lambda b: None)
+
+    out = tmp_path / "copy.bndb"
+    with pytest.raises(RuntimeError, match="no file was written"):
+        instance._save_database("origbin", str(out))
+    assert bv.file.filename == orig  # identity restored despite the failure
+
+
+class _RestoreFailFile:
+    """A bv.file whose filename can be re-homed once (by create_database) but then
+    refuses to be set back -- to exercise a restore that itself fails."""
+
+    def __init__(self, name: str):
+        self._name = name
+        self.block = False
+
+    @property
+    def filename(self):
+        return self._name
+
+    @filename.setter
+    def filename(self, value):
+        if self.block:
+            raise RuntimeError("cannot rebind filename")
+        self._name = value
+
+
+class _RestoreFailSaveBV:
+    """create_database succeeds and re-homes the view, but restoring the original
+    filename afterward raises -- the live view stays re-homed to the copy."""
+
+    def __init__(self, filename: str):
+        self.file = _RestoreFailFile(filename)
+        self.created_with = None
+
+    def create_database(self, out: str):
+        self.created_with = out
+        Path(out).write_text("bndb")
+        self.file.filename = out  # re-home (allowed)
+        self.file.block = True    # block the subsequent restore
+        return True
+
+
+def test_save_path_restore_failure_reports_degraded_not_clean_success(monkeypatch, tmp_path):
+    """#256 review: if the post-save restore of the original filename FAILS, the
+    save did land on disk but the live view is still re-homed to the copy. That
+    must surface as a degraded result (rehomed=True), not a clean success that
+    hides the lost identity."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    orig = str(tmp_path / "origbin")
+    bv = _RestoreFailSaveBV(orig)
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(instance.targets, "clear_dirty", lambda b: None)
+
+    out = tmp_path / "copy.bndb"
+    result = instance._save_database("origbin", str(out))
+
+    assert result["saved"] is True
+    assert result.get("rehomed") is True
+    assert out.exists()
+    assert bv.file.filename == str(out.resolve())  # still re-homed (restore failed)
+
+
 def test_save_database_fails_when_create_database_returns_false(monkeypatch, tmp_path):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
