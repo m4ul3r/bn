@@ -60,11 +60,18 @@ class BridgeContext:
     def _resolve_view(self, selector: str | None):
         return self.targets.resolve(selector)
 
-    def _find_function(self, bv, identifier):
+    def _find_function(self, bv, identifier, *, contained: bool = False):
         # A 0x-prefixed identifier is unambiguously an address attempt (function
         # names never start with 0x), so a parse failure or a miss should report
         # the address problem rather than silently degrading to a name search
         # that ends in a misleading "Function not found".
+        #
+        # `contained` opts into resolving a mid-function (interior) address to its
+        # containing function (#193 Part 4): taint/trace report sinks at
+        # instruction addresses, usually inside a callee, and the function-scoped
+        # READ verbs should accept them so a sink address feeds straight into the
+        # next command. It stays strict by default so a mutation can't rename or
+        # retype the wrong (containing) function from a stray interior address.
         looks_like_address = str(identifier).strip().lower().startswith("0x")
         addr = None
         try:
@@ -81,6 +88,18 @@ class BridgeContext:
                 fn = None
             if fn is not None:
                 return fn
+            if contained and looks_like_address:
+                try:
+                    containers = self._functions_containing(bv, addr)
+                except Exception:
+                    containers = []
+                if len(containers) == 1:
+                    return containers[0]
+                if len(containers) > 1:
+                    raise RuntimeError(
+                        f"Address {hex(addr)} lies inside multiple overlapping functions; "
+                        "pass an exact function start or a name"
+                    )
             if looks_like_address:
                 raise RuntimeError(f"No function found at address {hex(addr)}")
 
@@ -335,6 +354,30 @@ class BridgeContext:
         except Exception:
             fn = bv.get_function_at(address)
             return [fn] if fn is not None else []
+
+    def _containment_meta(self, identifier, func):
+        """Describe a READ resolved via the `contained` address fallback.
+
+        Returns ``{"requested_address", "offset"}`` when ``identifier`` is a
+        0x address that landed *inside* ``func`` rather than at its start, so a
+        caller (e.g. a taint/trace sink address) is told it hit a mid-function
+        point instead of silently treating it as the entry. Returns None for an
+        exact start or a non-address identifier (no annotation needed).
+        """
+        if not str(identifier).strip().lower().startswith("0x"):
+            return None
+        try:
+            addr = _parse_address(identifier)
+        except ValueError:
+            return None
+        if addr is None:
+            return None
+        start = int(func.start)
+        if int(addr) == start:
+            return None
+        delta = int(addr) - start
+        sign = "+" if delta >= 0 else "-"
+        return {"requested_address": hex(int(addr)), "offset": f"{sign}{hex(abs(delta))}"}
 
     def _sections_at(self, bv, address: int) -> list[dict[str, Any]]:
         try:

@@ -285,8 +285,9 @@ class _FakeSegment:
 
 class _FakeBV:
     def __init__(self, *, functions=None, symbols=None, types_=None, qualified_types_=None, arch=None, disassembly=None, instruction_lengths=None,
-                 strings=None, sections=None, segments=None, memory=None, code_refs=None, data_refs=None):
+                 strings=None, sections=None, segments=None, memory=None, code_refs=None, data_refs=None, comments=None):
         self.functions = list(functions or [])
+        self._comments = dict(comments or {})
         self._symbols = list(symbols or [])
         self.types = dict(types_ or {})
         # Types registered under a multi-component QualifiedName (keyed by the
@@ -354,6 +355,9 @@ class _FakeBV:
 
     def get_disassembly(self, address: int, arch=None):
         return self._disassembly.get(int(address), "")
+
+    def get_comment_at(self, address: int):
+        return self._comments.get(int(address), "")
 
     def get_functions_containing(self, address: int):
         result = []

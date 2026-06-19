@@ -169,6 +169,83 @@ def test_decompile_json_spill_warning_does_not_suggest_lines(fake_transport, mon
     assert "--out" in stderr
 
 
+def test_decompile_text_notes_mid_function_resolution(fake_transport, capsys):
+    # #193 Part 4: a mid-function address resolves to its container. Text output
+    # must say so -- otherwise it looks like decompile silently answered for a
+    # different function than the address the agent (or a taint sink) named.
+    fake_transport({"decompile": {"ok": True, "result": {
+        "text": "int parse_packet(void* arg1)\n{\n    ...\n}",
+        "function": {"name": "parse_packet", "address": "0x401000"},
+        "resolved_from": {"requested_address": "0x401010", "offset": "+0x10"},
+    }}})
+
+    rc = bn.cli.main(["decompile", "0x401010", "--target", "active"])
+
+    assert rc == 0
+    out, _ = capsys.readouterr()
+    assert "0x401010 is inside parse_packet @ 0x401000 (+0x10)" in out
+    assert "int parse_packet(void* arg1)" in out  # body still rendered below the note
+
+
+def test_decompile_text_has_no_note_for_exact_start(fake_transport, capsys):
+    fake_transport({"decompile": {"ok": True, "result": {
+        "text": "int parse_packet(void* arg1)\n{\n    ...\n}",
+        "function": {"name": "parse_packet", "address": "0x401000"},
+    }}})
+
+    rc = bn.cli.main(["decompile", "0x401000", "--target", "active"])
+
+    assert rc == 0
+    out, _ = capsys.readouterr()
+    assert "is inside" not in out
+
+
+def test_function_info_text_notes_mid_function_resolution(fake_transport, capsys):
+    fake_transport({"function_info": {"ok": True, "result": {
+        "function": {"name": "parse_packet", "address": "0x401000"},
+        "prototype": "int parse_packet(void* arg1)",
+        "resolved_from": {"requested_address": "0x401010", "offset": "+0x10"},
+    }}})
+
+    rc = bn.cli.main(["function", "info", "0x401010", "--target", "active"])
+
+    assert rc == 0
+    out, _ = capsys.readouterr()
+    assert "0x401010 is inside parse_packet @ 0x401000 (+0x10)" in out
+    assert "parse_packet @ 0x401000" in out  # the normal info header still renders
+
+
+def test_proto_get_text_notes_mid_function_resolution(fake_transport, capsys):
+    # proto get is a strict subset of function info, so it tolerates an interior
+    # address too -- and text mode flags the resolution like the other reads.
+    fake_transport({"get_prototype": {"ok": True, "result": {
+        "function": {"name": "parse_packet", "address": "0x401000"},
+        "prototype": "int64_t (void* arg1)",
+        "resolved_from": {"requested_address": "0x401010", "offset": "+0x10"},
+    }}})
+
+    rc = bn.cli.main(["proto", "get", "0x401010", "--target", "active"])
+
+    assert rc == 0
+    out, _ = capsys.readouterr()
+    assert "0x401010 is inside parse_packet @ 0x401000 (+0x10)" in out
+    assert "parse_packet(void* arg1)" in out  # name spliced into the anonymous proto
+
+
+def test_local_list_text_notes_mid_function_resolution(fake_transport, capsys):
+    fake_transport({"list_locals": {"ok": True, "result": {
+        "function": {"name": "parse_packet", "address": "0x401000"},
+        "locals": [],
+        "resolved_from": {"requested_address": "0x401010", "offset": "+0x10"},
+    }}})
+
+    rc = bn.cli.main(["local", "list", "0x401010", "--target", "active"])
+
+    assert rc == 0
+    out, _ = capsys.readouterr()
+    assert "0x401010 is inside parse_packet @ 0x401000 (+0x10)" in out
+
+
 def test_function_list_forwards_address_filters(fake_transport, capsys):
     calls = fake_transport({"list_functions": {"ok": True, "result": []}})
 

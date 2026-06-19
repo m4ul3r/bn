@@ -59,9 +59,21 @@ def _force_function_analysis(ctx, bv, func):
     return bv.get_function_at(start) or func
 
 
+def _annotate_containment(ctx, result, identifier, func) -> None:
+    """Tag a function-scoped READ result when the request resolved to a
+    containing function rather than an exact start (#193 Part 4).
+
+    No-op for an exact start or a name; otherwise adds ``resolved_from`` so an
+    agent feeding a taint/trace sink address knows the hit was mid-function.
+    """
+    meta = ctx._containment_meta(identifier, func)
+    if meta:
+        result["resolved_from"] = meta
+
+
 def _decompile(ctx, selector: str | None, identifier, *, addresses: bool = False, force_analysis: bool = False):
     bv = ctx._resolve_view(selector)
-    func = ctx._find_function(bv, identifier)
+    func = ctx._find_function(bv, identifier, contained=True)
     forced = False
     if force_analysis and bool(getattr(func, "analysis_skipped", False)):
         func = _force_function_analysis(ctx, bv, func)
@@ -72,7 +84,7 @@ def _decompile(ctx, selector: str | None, identifier, *, addresses: bool = False
     if stub:
         warnings.append(stub)
     comments = il_format._comment_map(bv, func)
-    return {
+    result = {
         "function": {"name": func.name, "address": hex(func.start)},
         "text": text,
         "comments": comments,
@@ -85,18 +97,20 @@ def _decompile(ctx, selector: str | None, identifier, *, addresses: bool = False
         "analysis_force_requested": bool(force_analysis),
         "analysis_forced": forced,
     }
+    _annotate_containment(ctx, result, identifier, func)
+    return result
 
 
 def _function_info(ctx, selector: str | None, identifier):
     bv = ctx._resolve_view(selector)
     require_analysis(bv, "Function info")
-    func = ctx._find_function(bv, identifier)
+    func = ctx._find_function(bv, identifier, contained=True)
     metadata = il_format._function_metadata(func)
     variables = vars_mod._list_locals(func)
     parameters = [item for item in variables if item["is_parameter"]]
     locals_only = [item for item in variables if not item["is_parameter"]]
     code_ref_count = len(list(bv.get_code_refs(func.start)))
-    return {
+    result = {
         "function": {
             "name": func.name,
             "address": hex(func.start),
@@ -112,12 +126,14 @@ def _function_info(ctx, selector: str | None, identifier):
         # (#206). count:0 means no unlifted instruction was found.
         "unimplemented_instructions": il_format._unimplemented_instructions(func),
     }
+    _annotate_containment(ctx, result, identifier, func)
+    return result
 
 
 def _get_prototype(ctx, selector: str | None, identifier):
     bv = ctx._resolve_view(selector)
-    func = ctx._find_function(bv, identifier)
-    return {
+    func = ctx._find_function(bv, identifier, contained=True)
+    result = {
         "function": {
             "name": func.name,
             "address": hex(func.start),
@@ -125,13 +141,15 @@ def _get_prototype(ctx, selector: str | None, identifier):
         },
         **il_format._function_metadata(func),
     }
+    _annotate_containment(ctx, result, identifier, func)
+    return result
 
 
 def _list_locals_for_function(ctx, selector: str | None, identifier):
     bv = ctx._resolve_view(selector)
-    func = ctx._find_function(bv, identifier)
+    func = ctx._find_function(bv, identifier, contained=True)
     variables = vars_mod._list_locals(func)
-    return {
+    result = {
         "function": {
             "name": func.name,
             "address": hex(func.start),
@@ -139,28 +157,34 @@ def _list_locals_for_function(ctx, selector: str | None, identifier):
         },
         "locals": variables,
     }
+    _annotate_containment(ctx, result, identifier, func)
+    return result
 
 
 def _il(ctx, selector: str | None, identifier, view: str, ssa: bool):
     bv = ctx._resolve_view(selector)
-    func = ctx._find_function(bv, identifier)
+    func = ctx._find_function(bv, identifier, contained=True)
     text = il_format._function_text(bv, func, view=view, ssa=ssa)
-    return {
+    result = {
         "function": {"name": func.name, "address": hex(func.start)},
         "view": view,
         "ssa": ssa,
         "text": text,
         "warnings": il_format._render_warnings(text),
     }
+    _annotate_containment(ctx, result, identifier, func)
+    return result
 
 
 def _disasm(ctx, selector: str | None, identifier):
     bv = ctx._resolve_view(selector)
-    func = ctx._find_function(bv, identifier)
-    return {
+    func = ctx._find_function(bv, identifier, contained=True)
+    result = {
         "function": {"name": func.name, "address": hex(func.start)},
         "text": il_format._disasm_text(bv, func),
     }
+    _annotate_containment(ctx, result, identifier, func)
+    return result
 
 
 def _structured_il(ctx, selector, identifier, *, view: str = "mlil", ssa: bool = True):
