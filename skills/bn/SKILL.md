@@ -1,401 +1,44 @@
 ---
 name: bn
-description: Use the local bn CLI for Binary Ninja reversing through the bn bridge, in a live GUI session or headless mode. Triggers include decompilation, function search, xrefs, callsites and exact caller_static mapping, IL/disassembly, type recovery, struct field edits, previewed mutations, stable local IDs, batch apply, BNDB save/load, evidence helpers (vtable/pointer-table and .init_array walking, protobuf/RTTI type lensing, raw-ABI call evidence), and inline BN Python.
+description: "Use the local bn CLI for Binary Ninja reversing through the bn bridge, in a live GUI session or headless mode. Triggers include decompilation, function search, xrefs, callsites and exact caller_static mapping, IL/disassembly, type recovery, struct field edits, previewed mutations, stable local IDs, batch apply, BNDB save/load, evidence helpers (vtable/pointer-table and .init_array walking, protobuf/RTTI type lensing, raw-ABI call evidence), and inline BN Python."
 ---
 
 # bn
 
-Use this skill when the user wants reverse-engineering work against a Binary Ninja database and the local `bn` CLI is available. The bridge runs as a GUI plugin (attached to an open Binary Ninja window) or as a headless process. The CLI auto-spawns a headless instance on first use if none is running.
+Use this skill for reverse-engineering work against a Binary Ninja database via the local `bn` CLI. The bridge runs as a GUI plugin or a headless process; the CLI auto-spawns a headless instance on first use.
 
 > **Route to a methodology first — this skill is the HOW; the methodology is the WHAT.**
 > - **Open-ended understanding / mapping a binary** → invoke the **`bn-re`** skill first. For a *long* survey spanning many functions, **dispatch the `bn-re` subagent** instead of running inline — it keeps the decompiler/xref token-flood out of your context and returns a distilled map (recovered state persists in the BNDB, read it back via `bn`).
 > - **Finding bugs / security audit / attack surface** → invoke the **`bn-vr`** skill first; likewise **dispatch the `bn-vr` subagent** for a long audit spanning many sinks.
-> - Then come back here for command syntax — both methodology skills delegate syntax to this skill.
+> - Then come back here for command syntax.
 
-## 1. Workflow & target selection
+## Reference (load on demand)
 
-1. Discover targets:
+The full command catalog lives in three files **in this skill's directory** — open the one for what you're doing (resolve against the base dir shown when this skill loads; e.g. `<skill-dir>/reference/reading.md`):
 
-   ```bash
-   bn target list
-   ```
+- **`reference/reading.md`** — every read command (decompile, il, disasm, xrefs, callsites, the `evidence` family, trace, proto, types/struct/class, strings, imports, sections, comments) + the JSON `.items[]` field map.
+- **`reference/mutating.md`** — the preview→verify→save mutation surface (rename, proto set, locals, struct fields, comments, batch apply) + bundles.
+- **`reference/runtime.md`** — sessions/headless (load/save, quick-load boundary), output/spill envelopes, `py exec`, `doctor`, known quirks, skill install.
 
-   The `[N]` prefix is the view id; you can pass `-t N`. If no bridge is running, any command auto-starts one.
+## Target selection
 
-2. Pick a target:
-   - Single open BinaryView: omit `-t`.
-   - Multiple open: pass `-t <selector>` from `bn target list`. Selectors match against `selector`, `target_id`, `view_id`, full filename, or basename.
-   - `-t` works **before or after** the subcommand. Use the pre-subcommand form to disambiguate selectors that collide with subcommand names like `session` or `pam_qnx.so.2`:
+One open target: omit `-t`. Multiple open: pass `-t <selector>` (from `bn target list`; matches selector / target_id / view_id / filename / basename), before *or* after the subcommand.
 
-     ```bash
-     bn -t pam_qnx.so.2 decompile main
-     bn decompile main -t pam_qnx.so.2
-     ```
+> **Parallel / fan-out agents — HARD rule.** Sticky pins (`instance use` / `target use`) are one shared file per git repo, so concurrent agents clobber each other. Fan-out agents **MUST** pass `--instance` and `-t` explicitly on every command and **MUST NOT** call `instance use` / `target use` / `*clear`. Prefer one dedicated instance per agent: `bn session start <bin> --instance-id <id>`, then thread `--instance <id>` everywhere. (Detail → `reference/runtime.md`.)
 
-   - Use `-t active` only when you explicitly want to follow the GUI selection.
+## Two gotchas that cause wrong answers
 
-3. (Optional) Pin sticky defaults — useful when you'll run many commands against the same instance/target:
+- **Spill / pipe-trap.** Output over ~10k tokens spills to disk; stdout carries only a small envelope. A piped `grep`/`jq`/`rg` then reads the *envelope*, not the data — a no-match misreads as "absent" (`bn decompile f | grep memcpy` finding nothing ≠ no memcpy). Write to a file first (`bn decompile f --out /tmp/f.txt && grep memcpy /tmp/f.txt`) or slice with `--lines` / `--limit`. (Envelope keys → `reference/runtime.md`.)
+- **Width-sensitive reads — trust `bn disasm`.** Pseudo-C / HLIL hide the real access width: a byte compare can render full-width, and a `zx.d` on a deref need not mean a 4-byte load. For off-by-one / OOB / signedness, confirm the operand size in `bn disasm` before concluding.
 
-   ```bash
-   bn instance use <id>          # pin --instance for this project
-   bn target use <selector>       # pin -t for this project
-   bn instance clear              # clear pinned instance
-   bn target clear                # clear pinned target
-   ```
+## Command index (what exists — flags live in reference)
 
-   Resolution order:
-   - **Instance:** CLI `--instance` > env `BN_INSTANCE` > sticky > auto-pick / auto-spawn.
-   - **Target:** CLI `-t/--target` > sticky > single-open auto-pick. **`BN_TARGET` does not exist** — target selection is the CLI flag or `bn target use`, nothing else.
+- **Read** — `target info/list`, `function list/search/info`, `decompile`, `il`, `disasm`, `xrefs`, `callsites`, `evidence function/xrefs/table/message/init`, `trace`, `proto get`, `local list`, `read`, `types [show]`, `struct show`, `class list/show`, `strings`, `imports`, `sections`, `comment list/get` → **`reference/reading.md`**
+- **Mutate** (verified; preview first) — `symbol rename`, `proto set`, `local rename/retype`, `comment set/delete`, `struct field set/rename/delete`, `types declare`, `function create`, `batch apply`, `bundle` → **`reference/mutating.md`**
+- **Session** — `load`, `save`, `close`, `refresh`, `session start/list/stop` → **`reference/runtime.md`**
+- **Escape hatch** — `py exec` (only when a built-in won't do; exclusive write lock) → **`reference/runtime.md`**
 
-   State lives at `~/.cache/bn/sessions/<sha256(project_root)[:16]>.json`. Project root walks up to the nearest `.git` (cwd as fallback). `bn session list` and `bn target list` mark matching entries with `[sticky]`. When a sticky instance points at a dead bridge, errors append `Clear it with bn instance clear`.
+## Mutation safety (the loop)
 
-   > **HARD rule for parallel / fan-out agents.** Sticky pins are **one shared file per git repo** — every agent rooted in the same repo reads and writes the same `instance_id` / `target`. If multiple agents run concurrently against that repo, one agent's `bn instance use` / `bn target use` / `bn instance clear` / `bn target clear` silently changes the target for *all* of them, causing cross-talk and commands hitting the wrong binary. Parallel/fan-out agents **MUST** pass `-t/--target` and `--instance` explicitly on **every** command and **MUST NOT** call `instance use` / `target use` / `instance clear` / `target clear`. Prefer one dedicated headless instance per agent: `bn session start <binary> --instance-id <unique-id>`, then thread that `--instance <unique-id>` (and an explicit `-t`) through every subsequent call.
+Every mutation runs **preview → live-verify → readback → save**: `--preview` applies → diffs → reverts; live writes return `verified` / `noop` / `unsupported` / `verification_failed` (a failed batch fully reverts); read back with `proto get` / `struct show` / `decompile`; then **`bn save`** before close — annotations live in the `.bndb`. Full detail (statuses, `local_id`, batch manifest) → **`reference/mutating.md`**.
 
-## 2. Sessions & headless
-
-The bridge runs as a GUI plugin or as a headless process; both speak the same protocol.
-
-```bash
-bn load /path/to/binary.bndb           # auto-spawns a headless bridge if none is running
-bn session start /path/to/binary [--instance-id <id>]
-bn session list                         # running instances + RSS + sticky marker
-bn session stop <id>                    # shut one down
-bn close [<path>]                       # close one (omit path → close all)
-```
-
-`bn close` reports each closed view as `{path, unsaved}`. If a view had unsaved mutations, stdout warns — run `bn save` *first* if you care about annotations:
-
-```bash
-bn save                                  # saves to <filename>.bndb
-bn save /path/to/output.bndb             # explicit path (positional)
-bn save --path /path/to/output.bndb      # --path is an accepted alias for the positional
-```
-
-> **Selector rebind after save.** `bn save` / `bn save <path>` rebinds the in-memory view's filename, so its basename / filename selector changes (e.g. `foo` becomes `foo.bndb`). A `-t foo` that worked before the save can stop resolving afterward. Post-save commands should target the **stable** `view_id` / `target_id` (the `[N]` prefix from `bn target list`), not the basename, to avoid `Unknown target selector` after a save.
-
-`bn load <raw>` and `bn session start <raw> [...]` auto-prefer a sibling `<raw>.bndb` when one exists, so saved annotations come back without you having to retype the `.bndb` suffix. The CLI prints which file was actually opened:
-
-```bash
-$ bn load /path/to/foo.so
-loaded: /path/to/foo.so.bndb
-note: loaded /path/to/foo.so.bndb instead of /path/to/foo.so (use --no-bndb to skip)
-```
-
-Pass `--no-bndb` to force loading the raw binary even when a sibling `.bndb` exists. Passing a path that already ends in `.bndb` skips the lookup. The same `--no-bndb` flag works on `bn session start`.
-
-`bn load` blocks until analysis completes (the bridge runs `update_analysis_and_wait()` and the CLI socket has no timeout). Plan for it on large binaries.
-
-**Quick load (`--quick` / `--no-analysis`).** `bn load --quick` and `bn session start --quick` skip that analysis pass (~1s instead of waiting for the full function set), at the cost of a **capability boundary** — the container is parsed but the code is not yet analyzed:
-
-- Ready immediately: `bn sections`, `bn imports`, the symbol table, `bn target list` / `bn target info` (flagged `[not analyzed]`, JSON `analysis_state: "quick"`).
-- `bn strings` **errors** until `bn refresh` (it refuses with a "Strings are not available … Run `bn refresh`" directive rather than return an empty list that reads as "no strings").
-- **Partial** until `bn refresh`: `bn function list` / `bn function search` (only entry-point + symbol functions exist pre-analysis; the count grows after refresh), and `bn decompile` / `bn il` / `bn disasm` / `bn xrefs` across the binary.
-
-Run `bn refresh` once to promote the view to full analysis (`analysis_state` flips to `"full"`), or `bn decompile <fn> --force-analysis` to analyze a single function without the full pass. Branch on `analysis_state` rather than guessing from empty results. Loading a `.bndb` ignores `--quick` (the database already carries its analysis).
-
-`--instance` is accepted on every subcommand (env `BN_INSTANCE`).
-
-Requests time out after 600s by default so a wedged bridge can't hang the CLI; override with `BN_REQUEST_TIMEOUT=<seconds>` (`0` disables).
-
-## 3. Output & context
-
-Defaults:
-
-- Read commands → `--format text`.
-- Mutation, preview, setup, and export commands → `--format json`.
-- `--format ndjson` is available where it makes sense.
-- `--out <path>` writes the full body to disk and returns an envelope on stdout.
-
-**Spill envelopes.** When output exceeds **10 000 estimated tokens** (~3 bytes/token heuristic), the body is written to disk and stdout carries a compact envelope; stderr carries a one-line warning. Envelope keys:
-
-- `ok` — request status.
-- `spilled` — `true` when the body was written to disk because of the threshold; `false` when `--out` was used.
-- `path` (text envelope) / `artifact_path` (JSON) — location on disk: `<cache>/spills/YYYYMMDD/<stem>-HHMMSS-<pid>-<rand>.<json|ndjson|txt>` (cache dir defaults to `~/.cache/bn`, override with `BN_CACHE_DIR`).
-- `format` — `json`, `ndjson`, or `text`.
-- `bytes`, `tokens` (estimate), `tokenizer` (`estimate`), `sha256` — size + integrity.
-- `summary` — shape hint with `kind` and `count` / `chars` / `keys`.
-
-**Pipe trap (correctness).** When output spills, a downstream `grep`/`jq`/`awk`/`rg` reads only the small envelope, **not** the data — so a no-match silently reads as "absent" (e.g. `bn decompile <fn> | grep memcpy` finding nothing does *not* mean there's no `memcpy`). `bn` now prints an extra `note:` on stderr when stdout is a pipe and output spilled, but don't rely on noticing it. Instead, write to a file first and process that: `bn decompile <fn> --out /tmp/f.txt && grep memcpy /tmp/f.txt`, or slice with `--lines`/`--limit` so it doesn't spill.
-
-Slicing knobs to avoid spilling in the first place:
-
-```bash
-bn decompile <fn> --lines 40:80         # 1-indexed inclusive; prints "// lines 40-80 of N"
-bn xrefs <fn-or-addr> --limit 20        # cap text output
-bn function info <fn>                    # compact by default
-bn function info <fn> --verbose          # full params + locals
-```
-
-Pagination: `--limit` / `--offset` on list commands.
-
-## 4. Read flow
-
-```bash
-bn target info
-bn function list [--count] [--min-address 0x401000 --max-address 0x40ffff]
-bn function search attachment
-bn function search --regex 'attach|detach|follow'
-bn function info <fn> [--verbose]
-bn decompile <fn> [--addresses] [--lines 40:80] [--force-analysis]
-bn il <fn> [--view {hlil|mlil|llil}] [--ssa]
-bn disasm <fn>
-bn xrefs <fn-or-addr> [--limit 20]
-bn xrefs --field <Struct.field>
-bn callsites <callee> --within <fn>
-bn callsites <callee> --within-file <path>
-bn evidence function <fn> [--context 2]              # per-call ABI args (LLIL/MLIL/HLIL + raw disasm) + thunk detection
-bn evidence xrefs <fn-or-addr> [--limit N]           # inbound refs annotated with section/segment/symbol/disasm
-bn evidence table <addr> [--entries N] [--stride N]  # interpret memory as a pointer/vtable table (Thumb-normalized)
-bn evidence message <type-string> [--limit N]        # protobuf/RTTI type-name -> xrefs -> nearby metadata table windows
-bn evidence init [--limit N]                         # .init_array/.ctors constructor-pointer summary
-bn trace <fn> <addr> [--arg N] [--interprocedural]   # backward SSA slice: trace where a call argument originates
-bn proto get <fn>
-bn local list <fn>
-bn read 0x... --length N [--encoding {hex|bytes}]   # address is positional; --address 0x... is an accepted alias
-bn function create <address> [--preview]
-bn types [--query <q>]
-bn types show <name>
-bn struct show <name>
-bn class list [--all] [--no-stl] [--query <substr>]   # C++ classes from demangled symbols + RTTI
-bn class show <Name>                                  # one class: methods, vtable, size, bases, instances
-bn strings [--query <q>] [--regex] [--min-length 5] [--section .rodata] [--no-crt]
-bn imports
-bn sections [--query <q>]
-bn comment list [--query <q>]
-bn comment get   --address 0x... | --function <fn>
-```
-
-Notes:
-
-- `bn function search` is case-insensitive substring; add `--regex` for regular expressions. `function list` and `function search` both accept `--min-address` / `--max-address`. `bn function list --count` returns just the total function count (fast binary sizing) instead of the listing.
-- `bn xrefs` accepts a function name *or* a hex/decimal address. Text groups refs by caller (`code refs: 12 sites across 4 functions`); JSON adds `caller_function: {address, name}` so an `xrefs → --within-file` pipeline survives duplicate symbol names. Use `bn xrefs` for inbound references; reach for `bn callsites` when you need exact return-address recovery and local context.
-- `bn decompile` renders Binary Ninja's **Pseudo C** (the same text the GUI shows), comments inline. It omits the address gutter by default — add `--addresses` when you need it (e.g. for `bn comment set --address`). For the underlying IL instead, use `bn il --view {hlil|mlil|llil}`.
-- **Skipped (oversize) functions.** Binary Ninja skips analysis on functions that exceed its size/time limits and renders only a stub ("…taking too long to analyze… Loading…"). `bn decompile` detects this (`func.analysis_skipped`) and appends a `warning:` (and sets `analysis_skipped: true` in JSON) so you never mistake a stub for a real body. Pass `--force-analysis` to override the skip and reanalyze just that function before decompiling — it returns the full body and sets `analysis_forced: true`. It can be slow on very large functions and takes the **write lock** (it mutates analysis state), so avoid it on a bridge other agents are actively reading.
-- **Width-sensitive reads — trust `bn disasm`, not the decompiler.** Pseudo C and HLIL share the same analysis and can hide the real access width. A byte compare (`cmp al, ...`) renders as a full-width equality, and a `zx.d` on a dereference does **not** imply a 4-byte load (it can be a 1-byte load zero-extended to 4). When the exact comparison width or memory-read size matters (off-by-one, OOB, signedness bugs), treat `bn disasm <fn>` as authoritative and confirm the operand size there before reasoning about the bug.
-- `bn class` is the **C++ object-model lens** (#205): a correlation layer over data BN already recovers (demangled symbols, RTTI data symbols, vtables). `bn class list` clusters the binary's functions by demangled class and shows method count, vtable presence, and a confidence tag (`rtti` = has vtable/typeinfo, `ctor` = has a ctor/dtor, `name-only` = could be a namespace); it defaults to `rtti`+`ctor`-confirmed classes, with `--all` to include `name-only` clusters, `--query` to filter, and `--no-stl` to fold out standard-library / ABI-runtime classes (`std::`, `__gnu_cxx::`, `__cxxabiv1::`, reserved-id internals) so domain classes surface (it reports how many it hid). `bn class show <Name>` resolves one class (exact, or by leaf name across namespaces — ambiguous names list every match) and reports: methods grouped ctor/dtor + non-virtual members; the vtable layout (Itanium header-skipped, `__cxa_pure_virtual`/unnamed-`sub_*` slots marked); object size (from a defined BN type when present); RTTI base classes (Itanium `__si`/`__vmi` decode); and instances (ctor construction sites from code xrefs + globals that store the vtable). Best-effort gaps to know: vtables in `.data.rel.ro` on PIE targets read as empty (pointers applied at load time via relocations — the output says so), `operator new` object-size and per-site new/stack/global classification are not yet recovered (size falls back to a defined type; sites are reported as `ctor-call`). `--format json` carries the full record.
-- `bn imports` JSON tags each entry with `kind` (`function`, `data`, `address`) and includes `library` + `raw_name`. Text marks data/address imports with `(data)` / `(address)`.
-- `bn sections` exposes start/end, length, semantics, and segment-derived `r/w/x` permission flags.
-- `bn strings`: `--no-crt` is a heuristic — drops single-character repetitions and strings sitting in `.text`. Combine with `--min-length` and `--section`. Add `--regex` to treat `--query` as a case-insensitive regex (use it for OR patterns like `'%s|%n|/bin/'` — plain `--query` is literal substring, so `\|` does **not** mean OR). A `--query` value that looks like a flag (e.g. `-h`) is preserved as the query, but a known sibling flag right after `--query` (e.g. `--regex`) still errors — put flags before `--query` or use `--query=<value>`. JSON is a paged `{items, total, ...}` envelope where each item is `{address, length, chars, type, value}` — the string text is in **`value`**, not `string`. Extract it with `bn strings --query foo --format json | jq -r '.items[].value'`. (A wall of `null` from `jq '.items[].string'` means the wrong field name, not "no match" — a true no-match returns an empty `items` array.)
-- **JSON list-command field map (the `.items[]` idiom and its exceptions).** Most list/search read commands share one paged envelope — `{items, total, offset, limit, returned, has_more}` — so `jq '.items[]...'` is the near-universal extractor (`strings`, `imports`, `exports`, `sections`, `types`, `function list`/`search`, `callsites`, `comment list`, `class list`). The catch: the *leaf* field holding the payload is **not always named after the command**, and selecting a wrong/missing key yields `null` (a wall of which reads like "no results"), never an error. Per-command leaves:
-  - `strings` → `.items[].value` (the string text — **not** `.string`)
-  - `types` → `.items[].decl` (the C declaration text) + `.items[].layout`, alongside `.name`/`.kind` (**not** `.definition`/`.type`)
-  - `comment list` → `.items[].comment` (**not** `.text`); each item also carries `.address` and `.function`
-  - `callsites` → the payload is **nested**, with no flat `.name`/`.address`: use `.items[].caller_static`, `.items[].callee.name`, `.items[].containing_function.name`
-  - `function list`/`search`, `imports`, `exports` → `.items[].name` + `.items[].address` (plus `raw_name`/`display_name`, and `kind` on imports/exports)
-  - `class list` → `.items[].name`, `.method_count`, `.has_vtable`, `.size`, `.bases`, `.confidence`
-  - **Exception — `xrefs` does NOT use `items`.** Its JSON is `{address, code_refs: [...], data_refs: [...], code_ref_count, ...}`; extract with `jq '.code_refs[]'`. Each ref carries `.function` (containing-function name) and `.caller_function.{address,name}`. Applying the `.items[]` idiom here returns empty and misreads as "no refs".
-- `bn evidence ...` is a read-locked family that surfaces the **raw material** behind a call/table/type so you don't have to hand-roll `py exec` — built for stripped C++/firmware. `evidence function <fn>` pairs each call's raw disasm with LLIL/MLIL/HLIL argument evidence and flags thunks (including PLT/import trampolines); `evidence xrefs` annotates each ref with section/segment/symbol + the referencing disassembly; `evidence table <addr>` reads a pointer/vtable table, is **ARM/Thumb-aware** (clears the T bit and resolves the even entry, marked `[thumb-adjusted]`), and tags each slot with `status` (`function`/`mapped`/`null`/`unmapped`) + `plausible` plus low-confidence `warnings` when the address doesn't look like a table; `evidence message <type-string>` is a protobuf/RTTI lens (type-name → xrefs → nearby metadata windows, e.g. the serializer slot); `evidence init` summarizes `.init_array`/`.ctors` constructor pointers. Large results spill to disk like other read ops.
-- `bn trace <fn> <addr> [--arg N] [--interprocedural]` walks **MLIL SSA use-def chains backward** from a call-site argument to trace where it originates. It shows each intermediate SSA variable with its defining instruction and address, terminating at a function parameter, global, memory load, or call boundary. Add `--interprocedural` (with `--ip-depth N`, default 2) to follow **return values** across call boundaries into callee functions when the callee has a real MLIL body — this works best for self-contained code (static binaries, kernel modules). IP mode follows a value into a callee only when it is that callee's return value, and stops at the callee's own parameters (it does not map callee params back to caller args, nor walk up the caller chain — step up with `bn xrefs` + re-run for those). For dynamically-linked PLT/import calls, `--interprocedural` correctly falls through (no callee body to enter), producing identical output to intraprocedural mode. JSON output includes `interprocedural` and `ip_depth` fields. Example:
-  ```bash
-  bn trace main 0x27e1a --arg 1                              # intra: stops at call boundary
-  bn trace main 0x27e1a --arg 1 --interprocedural            # IP: follows into callee if possible
-  bn trace handle_l2cap_con_req 0x1c2bc --arg 2 --format json # structured JSON output
-  ```
-- `bn read --address <addr> --length <N>` returns raw bytes from the mapped view — the parallel-safe alternative to a `py exec` `bv.read(...)` (it runs under the shared read lock). Text mode prints an offset/hex/ASCII hexdump; JSON returns `{address, length, hex, ascii}`. A read that runs past mapped memory comes back **short** with `short_read: true`, `requested_length`, and a `note` (it does **not** error). An entirely unmapped address *does* error (`Address 0x... is not mapped`). Add `--encoding bytes` to stream the raw bytes to stdout (or to `--out <path>`) instead of a hexdump — useful for piping a blob into another tool or saving it to disk. Note that `--encoding bytes` emits only the raw stream, so the `short_read`/`note` marker is **not** visible in that mode — use the default hex mode (or JSON) when you need to know whether a read ran short.
-- `bn function create <address> [--preview]` forces Binary Ninja to create and analyze a function at `<address>` when auto-analysis missed it. **When to reach for it:** a code entry point that BN never disassembled because it is reachable only through a **data pointer** (a vtable slot, a function-pointer table, a handler/dispatch array) and has no direct `call`. Point `bn read` / `bn xrefs` at the pointer table to recover the target address, then `bn function create` it so `decompile` / `xrefs` / `callsites` work on it. It is a verified mutation, so it honors the same `--preview` (create → verify → revert) and live-verify loop as the other mutations: it returns `noop` if a function already starts there, errors if the address is unmapped or not inside an executable segment, and rolls back with `verification_failed` if analysis produces no function. Save afterward (§6 step 4) to persist the new function.
-
-## 5. Caller-static mapping
-
-Prefer `bn callsites` over ad-hoc `py exec` whenever the task is "find the exact native return-address callers" or any direct-call mapping workflow.
-
-`bn callsites` reports:
-
-- `call_addr` — the native `call ...` instruction address.
-- `caller_static` — the post-call return address (`call_addr + instruction_length`).
-- `call_index` within the containing function, `within_query`, previous/next instructions, a local-or-null `hlil_statement`, and a best-effort `pre_branch_condition`.
-
-```bash
-bn callsites crt_rand --within bonus_pick_random_type --caller-static
-bn callsites crt_rand --within fx_queue_add_random   --caller-static
-bn callsites crt_rand --within-file /tmp/rng-functions.txt --format json
-```
-
-`--within-file` accepts one identifier (name or hex address) per non-empty line; lines beginning with `#` are ignored.
-
-`hlil_statement` is intentionally local-or-null — when Binary Ninja only exposes a coarse enclosing region, expect `null` instead of a noisy whole-function blob. `pre_branch_condition` is the nearest enclosing pre-call HLIL condition when it can be recovered confidently; `null` is normal.
-
-If you call `bn callsites <callee>` without `--within` / `--within-file`, the CLI prints a 3-option help block (`single caller`, `many callers`, `list callers`) instead of erroring.
-
-## 6. Mutation flow
-
-The mutation surface is built around a four-step safety loop: **preview → live-verify → read back → save**.
-
-### Step 1 — preview first
-
-```bash
-bn types declare "typedef struct Player { int hp; } Player;" --preview
-bn types declare --file /path/to/win32_min.h --preview
-bn struct field set Player 0x308 movement_flag_selector uint32_t --preview
-bn symbol rename sub_401000 player_update --preview   # `bn rename sub_401000 player_update` is a top-level alias (locals: `bn local rename`; struct fields: `bn struct field rename`)
-bn proto set sub_401000 "int __cdecl player_update(Player* self)" --preview
-bn comment set --address 0x401000 "explain this" --preview
-bn function create 0x401000 --preview
-```
-
-Preview applies → refreshes analysis → captures decompile diffs → reverts. Inspect:
-
-- `results` — per-op outcome and observed state.
-- `affected_types` — type-level layout diffs.
-- `affected_functions` — for the first few changed functions, also includes `before_excerpt` / `after_excerpt` HLIL snippets near the first change.
-
-A no-op edit reports `changed: false` ("No effective change detected").
-
-### Step 2 — live writes are verified
-
-Per-op statuses:
-
-- `verified` — change applied and read back as requested.
-- `noop` — already in the requested state.
-- `unsupported` — operation not supported on this object.
-- `verification_failed` — readback disagrees; the whole mutation/batch is reverted, and JSON also returns the requested vs observed state.
-
-### Step 3 — read back
-
-```bash
-bn proto get <fn>
-bn struct show <name>
-bn types show <name>
-bn decompile <fn>
-bn refresh                                # if BN still shows stale presentation
-```
-
-### Locals — prefer `local_id` over names
-
-```bash
-bn local list <fn>
-bn local rename <fn> <local_id|name> <new_name>
-bn local retype <fn> <local_id|name> <new_type>
-```
-
-`bn local list` text output splits params and locals into compact `name  type` rows. JSON entries carry `name`, `type`, `storage`, `index`, `identifier`, `source_type`, `is_parameter`, and **`local_id`** — a stable handle that survives re-analysis. Reach for `local_id` whenever Binary Ninja might rebuild the variable list.
-
-`bn local list` includes the register/flag locals HLIL actually renders (`rsi_1`, `rdx_3`, loop counters, the success flag), so they can be renamed and retyped like stack vars. Their **auto-generated names drift** across re-analysis — a `proto set` or `local retype` can re-render `rcx` as `result` — while the `local_id` is invariant. So for these especially, capture the `local_id` from `bn local list --format json` and pass **that** (not the on-screen name) to `local rename` / `local retype`; a name you saw earlier may no longer resolve after an intervening re-analysis.
-
-### Comments
-
-```bash
-bn comment set --address 0x401000 "explain this"
-bn comment set --function player_update "explain this"
-bn comment delete --address 0x401000
-bn comment delete --function player_update
-```
-
-### Struct field edits
-
-```bash
-bn struct field set Player 0x308 flags uint32_t [--no-overwrite]
-bn struct field rename Player old_name new_name
-bn struct field delete Player <field_name>     # NOTE: takes the field name, not an offset
-```
-
-### Bulk mutations — batch manifest
-
-For large rename/retype/comment runs, use `bn batch apply` with a JSON manifest. Significantly faster than firing individual commands.
-
-**Primary form — pipe the manifest on stdin with a quoted heredoc** (`-` means "read stdin"). The quoted delimiter (`<<'BN_EOF'`) makes the whole payload literal, so comments with quotes, apostrophes, `$`, backticks, or parens need no escaping — and there is no temp file to write or clean up:
-
-```bash
-bn batch apply - <<'BN_EOF'
-{"target": "active", "ops": [
-  {"op": "rename_symbol", "identifier": "sub_401000", "new_name": "player_update"},
-  {"op": "rename_symbol", "identifier": "sub_402000", "new_name": "player_init"},
-  {"op": "set_comment", "address": "0x401040", "comment": "len isn't checked; attacker-controlled (see $r0)"}
-]}
-BN_EOF
-```
-
-Add `--preview` before the `-` to diff without committing: `bn batch apply --preview - <<'BN_EOF' ... BN_EOF`.
-
-The file-path form is also accepted (`bn batch apply /tmp/manifest.json`) — use it when the manifest already exists on disk.
-
-Rules:
-
-- The manifest must be a dict with an `"ops"` key (not a bare list).
-- Include `"target"` in the manifest or it fails with `Unknown target selector: None`.
-- All ops are verified — a single failure reverts the entire batch.
-- `--preview` shows diffs without committing.
-- Use a unique heredoc sentinel (`BN_EOF`) so a line in a comment can't accidentally close the payload. Empty or malformed stdin yields a clean error, not a traceback.
-
-### Step 4 — save before close
-
-Annotations live in the `.bndb`. Always save before closing — `bn close` warns when unsaved mutations are about to be discarded (see §2).
-
-## 7. Bundles
-
-Use bundles when you want a reusable artifact instead of pasting long output into context:
-
-```bash
-bn bundle function sample_track_floor_height_at_position --out /tmp/floor.json
-```
-
-With `--out`, the CLI returns a JSON envelope for the written artifact instead of dumping the bundle to stdout.
-
-## 8. Python escape hatch
-
-Reach for `bn py exec` only when built-in commands are awkward — arbitrary BinaryView introspection or operations the bridge does not expose. Built-ins are preferred because they are verified, cache-friendly, and integrate with the preview/verify loop.
-
-```bash
-bn py exec --code "print(hex(bv.entry_point)); result = {'functions': len(list(bv.functions))}"
-```
-
-Multiline snippets via stdin with a quoted heredoc:
-
-```bash
-bn py exec --stdin <<'PY'
-out = []
-for f in bv.functions:
-    if 0x416000 <= f.start < 0x41C000:
-        out.append((f.start, f.symbol.short_name))
-out.sort()
-print("\n".join(f"{addr:#x} {name}" for addr, name in out))
-PY
-```
-
-Shell rules:
-
-- Quote the delimiter as `<<'PY'` so the shell does not expand `$vars`, backticks, or backslashes before Binary Ninja sees the Python.
-- Keep the closing `PY` on its own line with no indentation or trailing whitespace.
-- `--script <file>` for code on disk; `--code` for true one-liners.
-- Materialize Binary Ninja iterators (`f.hlil.instructions`, etc.) with `list(...)` instead of assuming random-access behavior.
-
-The exec environment includes `bn`, `binaryninja`, `bv`, and `result`.
-
-`py exec` always returns `stdout` and `result`. `result` is JSON-serialized when possible; if not, the CLI returns `repr(result)` and a non-fatal entry in `warnings`. If your script writes a JSON artifact, it is surfaced under `artifact`.
-
-> **Exclusive write lock + unsandboxed.** `py exec` runs under the bridge's **exclusive write lock**, so a long-running snippet blocks **every** other op (reads and writes) on a shared bridge until it returns — don't park slow scripts on a bridge other agents are using. It also runs **unsandboxed** with full `bv` / `binaryninja` access (it can mutate or write to disk). Keep snippets short on shared bridges, and for raw byte reads prefer the dedicated `bn read` (read-locked, parallel-safe) instead of a `py exec` that calls `bv.read(...)`.
-
-## 9. Troubleshooting
-
-Run `bn doctor` only when something is wrong — commands fail unexpectedly, targets don't appear, or the bridge seems unresponsive:
-
-```bash
-bn doctor
-```
-
-It checks CLI version, plugin staleness (`stale_plugin_version`, `stale_plugin_code`), and instance connectivity. Don't run it as part of normal workflow.
-
-## 10. Known quirks
-
-- **`types declare` verification failures.** The source-parser path handles most declarations, but a stubborn one may roll back with `verification_failed`. Workaround: define the struct directly via `bn py exec` using `StructureBuilder`, then re-run `bn types show`:
-
-  ```bash
-  bn py exec --stdin <<'PY'
-  from binaryninja import types as bntypes
-  s = bntypes.StructureBuilder.create()
-  s.append(bntypes.Type.pointer(bv.arch, bntypes.Type.void()), "vtable")
-  s.append(bntypes.Type.array(bntypes.Type.int(1, sign=False), 0x20), "pad_04")
-  s.append(bntypes.Type.int(4, sign=False), "m_bLoad")
-  s.append(bntypes.Type.pointer(bv.arch, bntypes.Type.int(1, sign=False)), "m_fileBuf")
-  s.append(bntypes.Type.int(4, sign=False), "m_fileBufSize")
-  bv.define_user_type("MyStruct", bntypes.Type.structure_type(s))
-  print("defined MyStruct")
-  PY
-  ```
-
-- **Stale bridge.** If `bn doctor` reports `stale: loaded plugin code does not match installed plugin file`, restart Binary Ninja (GUI or headless) to pick up the updated bridge. Commands behave unpredictably with stale code.
-
-- **No targets ⇒ no `py exec`.** `bn py exec` requires at least one open BinaryView. If `bn load` is still running or the target isn't ready yet, `py exec` errors with "No BinaryView targets are open".
-
-## 11. Skill install
-
-`bn skill install` is idempotent. It links/copies the bundled skills into `~/.claude/skills/` and, when `~/.codex/` exists, also into `~/.codex/skills/`. Honors `CLAUDE_HOME` / `CODEX_HOME`. Use `--mode copy` for standalone copies, `--dest <path>` for a single explicit destination, and `--force` to overwrite. Restart your agent to pick up renamed or newly added skills.
