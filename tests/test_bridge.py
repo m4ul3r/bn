@@ -1089,6 +1089,90 @@ def test_op_set_prototype_uses_string_user_type_for_bn_compat(monkeypatch):
     assert verified["observed"]["prototype"] == "void* __thiscall(struct GarbageHazardRuntime* self)"
 
 
+def test_prototype_matches_ignoring_param_names(monkeypatch):
+    """The proto-set verifier accepts a name-omitted prototype whose parameter
+    TYPES and return type match BN's auto-named readback, but still rejects a real
+    type / arity / return mismatch, and falls back (returns False) when the types
+    lack the BN function-type shape or the expected string won't parse (#254)."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+
+    def fn_type(ret, *param_types):
+        return types.SimpleNamespace(
+            return_value=ret,
+            parameters=[types.SimpleNamespace(type=t, name=f"arg{i + 1}")
+                        for i, t in enumerate(param_types)])
+
+    observed = fn_type("void", "int32_t", "char**", "char**")  # BN auto-named readback
+
+    def bv_returning(expected):
+        return types.SimpleNamespace(parse_type_string=lambda s: (expected, None))
+
+    # identical types, names differ/absent -> match (the #254 case)
+    assert me._prototype_matches_ignoring_param_names(
+        bv_returning(fn_type("void", "int32_t", "char**", "char**")),
+        observed, "void(int32_t, char**, char**)")
+    # a wrong param type -> reject
+    assert not me._prototype_matches_ignoring_param_names(
+        bv_returning(fn_type("void", "int32_t", "char*", "char**")),
+        observed, "void(int32_t, char*, char**)")
+    # wrong arity -> reject
+    assert not me._prototype_matches_ignoring_param_names(
+        bv_returning(fn_type("void", "int32_t", "char**")),
+        observed, "void(int32_t, char**)")
+    # wrong return type -> reject
+    assert not me._prototype_matches_ignoring_param_names(
+        bv_returning(fn_type("int32_t", "int32_t", "char**", "char**")),
+        observed, "int32_t(int32_t, char**, char**)")
+    # varargs mismatch -> reject (a non-vararg readback must not match a `...`
+    # request just because the fixed params line up)
+    observed_va = fn_type("int32_t", "char const*")
+    observed_va.has_variable_arguments = False
+    expected_va = fn_type("int32_t", "char const*")
+    expected_va.has_variable_arguments = True
+    assert not me._prototype_matches_ignoring_param_names(
+        bv_returning(expected_va), observed_va, "int32_t(char const*, ...)")
+    # unparseable expected -> False (caller falls back to the string compare)
+    def _boom(s):
+        raise ValueError("bad")
+    assert not me._prototype_matches_ignoring_param_names(
+        types.SimpleNamespace(parse_type_string=_boom), observed, "garbage")
+    # observed lacking the BN function-type shape (a mocked string type) -> False,
+    # so the existing string-compare tests keep their behavior unchanged
+    assert not me._prototype_matches_ignoring_param_names(
+        bv_returning(fn_type("void", "int32_t")), "void(int32_t arg1)", "void(int32_t)")
+
+
+def test_prototype_matches_rejects_named_param_that_did_not_land(monkeypatch):
+    """#263 review: the name-insensitive acceptance must only tolerate names the
+    request OMITTED (BN auto-names those arg1/arg2 on readback -- the #254 case).
+    When the request EXPLICITLY named a param and BN read it back as arg1, the
+    name did NOT land -- a partial application that must not be reported verified."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+
+    def fn_type(ret, *params):
+        # params are (type, name) pairs so the test can set explicit names
+        return types.SimpleNamespace(
+            return_value=ret,
+            parameters=[types.SimpleNamespace(type=t, name=n) for t, n in params])
+
+    def bv_returning(expected):
+        return types.SimpleNamespace(parse_type_string=lambda s: (expected, None))
+
+    observed = fn_type("int32_t", ("int32_t", "arg1"))  # BN readback: requested name absent
+
+    # request explicitly named the param `fd` -> name did not land -> reject
+    assert not me._prototype_matches_ignoring_param_names(
+        bv_returning(fn_type("int32_t", ("int32_t", "fd"))),
+        observed, "int32_t(int32_t fd)")
+
+    # request OMITTED the name (parses to empty) -> BN auto-named it -> tolerate (#254)
+    assert me._prototype_matches_ignoring_param_names(
+        bv_returning(fn_type("int32_t", ("int32_t", ""))),
+        observed, "int32_t(int32_t)")
+
+
 def test_apply_operation_user_error_message_has_no_class_name(monkeypatch):
     """A handler raising a user-facing RuntimeError (e.g. a mistyped function
     name -> 'Function not found') must surface a clean, actionable message --
