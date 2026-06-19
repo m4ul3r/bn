@@ -85,7 +85,7 @@ Run `bn refresh` once to promote the view to full analysis (`analysis_state` fli
 
 `--instance` is accepted on every subcommand (env `BN_INSTANCE`).
 
-Requests time out after 600s by default so a wedged bridge can't hang the CLI; override with `BN_REQUEST_TIMEOUT=<seconds>` (`0` disables).
+Requests time out after 600s by default so a wedged bridge can't hang the CLI; override with `BN_REQUEST_TIMEOUT=<seconds>` (`0`/`none`/`off`/empty disable). A non-numeric, negative, non-finite, or underflow-to-zero value (e.g. `1e-325`) is rejected with a clear error rather than silently falling back to the default or silently disabling the timeout.
 
 ## 3. Output & context
 

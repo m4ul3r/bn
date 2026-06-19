@@ -4,6 +4,7 @@ import contextlib
 import errno
 import fcntl
 import json
+import math
 import os
 import re
 import secrets
@@ -32,7 +33,7 @@ TRANSIENT_SOCKET_ERRNOS = {
 # CLI gives up, so a wedged bridge (e.g. a py_exec stuck under the write lock)
 # can't hang every CLI invocation forever. Generous because legitimate ops
 # (load/refresh with update_analysis_and_wait) can run for minutes. Override
-# with BN_REQUEST_TIMEOUT=<seconds>; 0/none disables the timeout entirely.
+# with BN_REQUEST_TIMEOUT=<seconds>; 0/none/off/empty disables the timeout entirely.
 DEFAULT_REQUEST_TIMEOUT = 600.0
 
 
@@ -40,15 +41,41 @@ def _resolve_timeout(timeout: float | None) -> float | None:
     if timeout is not None:
         return timeout
     raw = os.environ.get("BN_REQUEST_TIMEOUT")
-    if raw is not None:
-        text = raw.strip().lower()
-        if text in ("", "0", "none", "off"):
-            return None
-        try:
-            return float(text)
-        except ValueError:
-            pass
-    return DEFAULT_REQUEST_TIMEOUT
+    if raw is None:
+        return DEFAULT_REQUEST_TIMEOUT
+    text = raw.strip().lower()
+
+    def _reject() -> BridgeError:
+        # Fail loud: a typo'd / out-of-range value silently falling back to the
+        # 600s default (or silently disabling) left the user believing they'd set
+        # a short timeout when they hadn't (#255).
+        return BridgeError(
+            f"BN_REQUEST_TIMEOUT={raw!r} is not a valid timeout: expected a "
+            f"positive number of seconds, or one of 0/none/off/empty to disable it."
+        )
+
+    # Empty/whitespace-only and the explicit sentinels disable the timeout entirely.
+    if text in ("", "none", "off"):
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        raise _reject() from None
+    if not math.isfinite(value):  # inf / nan parse as floats but aren't timeouts
+        raise _reject()
+    # Reject negatives -- including a value that underflowed to -0.0 (e.g.
+    # -1e-325), where `value < 0` is False but the sign bit is still set.
+    if value < 0 or math.copysign(1.0, value) < 0:
+        raise _reject()
+    if value == 0.0:
+        # A literal 0 disables (a 0-second socket timeout would make every request
+        # fail non-blocking), matching the documented sentinel. But a positive
+        # magnitude that underflowed to 0.0 (e.g. 1e-325) is not a "disable"
+        # request -- reject it so it can't silently turn the timeout off.
+        if any(d in text for d in "123456789"):
+            raise _reject()
+        return None
+    return value
 
 
 @dataclass(slots=True)
@@ -548,6 +575,12 @@ def send_request(
     instance_id: str | None = None,
     spawn_missing_named: bool = False,
 ) -> dict[str, Any]:
+    # Validate/resolve the timeout BEFORE choosing an instance: choose_instance()
+    # auto-spawns a headless bridge when none is running, so a bad
+    # BN_REQUEST_TIMEOUT must fail here -- not after a stray random instance has
+    # already been spawned into the cache (#255 review). _resolve_timeout is
+    # idempotent, so the resolved value re-resolves to itself downstream.
+    timeout = _resolve_timeout(timeout)
     instance = choose_instance(instance_id, spawn_missing_named=spawn_missing_named)
     return _send_request_to_instance(
         instance,

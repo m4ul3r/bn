@@ -389,6 +389,94 @@ def test_send_request_timeout_env_zero_disables(tmp_path, monkeypatch):
     assert fake_socket.timeouts == []
 
 
+def test_resolve_timeout_rejects_non_numeric(monkeypatch):
+    """A typo'd BN_REQUEST_TIMEOUT must fail loud, not silently fall back to the
+    600s default (the user believes they set a short timeout but didn't) (#255)."""
+    from bn.transport import _resolve_timeout, BridgeError
+
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "abc")
+    with pytest.raises(BridgeError) as exc:
+        _resolve_timeout(None)
+    assert "BN_REQUEST_TIMEOUT" in str(exc.value)
+
+
+def test_resolve_timeout_rejects_negative(monkeypatch):
+    """A negative value is not a valid socket timeout -- reject it instead of
+    passing -1.0 through unvalidated (#255)."""
+    from bn.transport import _resolve_timeout, BridgeError
+
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "-1")
+    with pytest.raises(BridgeError) as exc:
+        _resolve_timeout(None)
+    assert "BN_REQUEST_TIMEOUT" in str(exc.value)
+
+
+def test_resolve_timeout_rejects_non_finite(monkeypatch):
+    """inf/nan parse as floats but aren't valid socket timeouts -- reject them
+    like negatives rather than passing them to settimeout (#255)."""
+    from bn.transport import _resolve_timeout, BridgeError
+
+    for val in ("inf", "-inf", "nan"):
+        monkeypatch.setenv("BN_REQUEST_TIMEOUT", val)
+        with pytest.raises(BridgeError):
+            _resolve_timeout(None)
+
+
+def test_resolve_timeout_zero_and_sentinels_disable(monkeypatch):
+    """0 / 0.0 / none / off / empty all disable the timeout (return None)."""
+    from bn.transport import _resolve_timeout
+
+    for val in ("0", "0.0", "none", "off", "", "  Off  "):
+        monkeypatch.setenv("BN_REQUEST_TIMEOUT", val)
+        assert _resolve_timeout(None) is None, val
+
+
+def test_resolve_timeout_rejects_float_underflow(monkeypatch):
+    """A tiny magnitude that underflows to +/-0.0 (e.g. 1e-325, -1e-325) is NOT a
+    real 0/disable request: a positive value the user set shouldn't silently turn
+    the timeout off, and a negative one must be rejected like any other negative.
+    `value < 0` misses -0.0, and `value or None` collapses +0.0 to disable, so
+    both slipped through before (#255 review)."""
+    from bn.transport import _resolve_timeout, BridgeError
+
+    for val in ("1e-325", "-1e-325", "-0.0"):
+        monkeypatch.setenv("BN_REQUEST_TIMEOUT", val)
+        with pytest.raises(BridgeError):
+            _resolve_timeout(None)
+
+
+def test_resolve_timeout_positive_default_and_explicit(monkeypatch):
+    from bn.transport import _resolve_timeout, DEFAULT_REQUEST_TIMEOUT
+
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "42.5")
+    assert _resolve_timeout(None) == 42.5
+    monkeypatch.delenv("BN_REQUEST_TIMEOUT", raising=False)
+    assert _resolve_timeout(None) == DEFAULT_REQUEST_TIMEOUT
+    # an explicit timeout arg always wins and is never re-validated against the env
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "abc")
+    assert _resolve_timeout(12.0) == 12.0
+
+
+def test_invalid_timeout_is_rejected_before_choosing_an_instance(monkeypatch, tmp_path):
+    # #265 review: an invalid BN_REQUEST_TIMEOUT must be rejected BEFORE
+    # send_request() calls choose_instance() -- which auto-spawns a headless
+    # bridge. Otherwise `BN_REQUEST_TIMEOUT=abc bn target list` errors out but
+    # leaves a stray random instance behind in a fresh cache.
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "abc")
+
+    def _must_not_spawn(*a, **k):
+        raise AssertionError("choose_instance reached before timeout validation")
+
+    monkeypatch.setattr("bn.transport.choose_instance", _must_not_spawn)
+
+    with pytest.raises(BridgeError, match="BN_REQUEST_TIMEOUT"):
+        send_request("list_targets")
+
+    # Fresh cache stays empty: nothing was spawned.
+    assert list_instances() == []
+
+
 def test_send_request_partial_response_reports_real_error(tmp_path, monkeypatch):
     from bn.transport import BridgeError
 
