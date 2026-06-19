@@ -4,6 +4,8 @@ import json
 import re
 from typing import Any, Callable
 
+from .transport import BridgeError
+
 # "rollback_failed" = an op succeeded but the batch revert that should have
 # undone it failed, so the view may be left modified -- a real failure. A
 # cleanly rolled-back sibling ("reverted") is NOT a failure and is omitted (#118).
@@ -66,9 +68,9 @@ def _slice_text_lines(
 ) -> str:
     """Return only lines START..END (1-indexed, inclusive) with a count header.
 
-    Shared by `decompile`, `il`, and `disasm` so every line-oriented view slices
-    the same way. Slicing happens before the spill check, so `--lines` also keeps
-    large functions inline.
+    Shared by `decompile`, `il`, `disasm`, and `structured-il` so every
+    line-oriented view slices the same way. Slicing happens before the spill
+    check, so `--lines` also keeps large functions inline.
     """
     if lines_range is None:
         return text
@@ -76,7 +78,15 @@ def _slice_text_lines(
     total = len(all_lines)
     start, end = lines_range
     if start > total:
-        return f"{marker} lines 0 of {total} (start {start} is beyond the last line)"
+        # A start past the last line is a user error, not a result. Raising keeps
+        # it from rendering as a `//` line (mistakable for code) and exiting 0:
+        # BridgeError propagates to main() -> stderr diagnostic, non-zero exit, no
+        # stdout a scripted consumer could read as a real slice (#253).
+        raise BridgeError(
+            f"--lines start {start} is beyond the last line "
+            f"(output has {total} line{'s' if total != 1 else ''}); "
+            f"omit --lines or choose a start within range"
+        )
     sliced = all_lines[start - 1 : end]
     header = f"{marker} lines {start}-{min(end, total)} of {total}"
     return header + "\n" + "\n".join(sliced)

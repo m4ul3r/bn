@@ -247,14 +247,19 @@ def _il(args: argparse.Namespace) -> int:
                  help="IL level (default: mlil)"),
              arg("--no-ssa", dest="ssa", action="store_false", default=True,
                  help="Emit non-SSA form (default: SSA)"),
+             arg("--lines", type=_parse_line_range, default=None, metavar="START:END",
+                 help="Show only lines START through END (1-indexed, inclusive)"),
          ])
 def _function_structured_il(args: argparse.Namespace) -> int:
+    lines_range = getattr(args, "lines", None)
+    if lines_range is not None:
+        _require_text_format(args, "--lines")
     return _call(
         args,
         "structured_il",
         {"identifier": args.identifier, "view": args.view, "ssa": bool(args.ssa)},
         require_target=True,
-        text_renderer=_render_structured_il_text,
+        text_renderer=lambda value: _slice_text_lines(_render_structured_il_text(value), lines_range),
         stem="structured-il",
     )
 
