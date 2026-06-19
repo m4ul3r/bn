@@ -1308,3 +1308,43 @@ def test_evidence_xrefs_text_reports_truncation_total():
     # uncapped render shows the plain header (no truncation marker)
     out_full = formatters._render_evidence_xrefs_text(value)
     assert "code refs:" in out_full and "total, showing" not in out_full
+
+
+def test_function_list_reverse_threads_to_op(monkeypatch):
+    """--reverse threads a reverse param so the bridge flips the sort order (#221)."""
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        captured["params"] = params
+        return {"ok": True, "result": {"items": [], "total": 0, "offset": 0,
+                                       "limit": None, "returned": 0, "has_more": False}}
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["function", "list", "--target", "active", "--sort", "size", "--reverse"])
+    assert rc == 0
+    assert captured["params"].get("reverse") is True
+    assert captured["params"].get("sort") == "size"
+
+
+def test_xrefs_any_batch_probes_symbols(monkeypatch, capsys):
+    """`xrefs --any` probes several symbols in one call; absent ones are reported,
+    not errors, and the command exits 0 (#218)."""
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        assert op == "xrefs_any"
+        assert params["symbols"] == ["memcpy", "strcpy", "system"]
+        return {"ok": True, "result": {
+            "count": 3, "present": 2,
+            "symbols": [
+                {"symbol": "memcpy", "present": True, "code_ref_count": 12,
+                 "caller_function_count": 4, "address": "0x1000"},
+                {"symbol": "strcpy", "present": False, "note": "Function not found: strcpy"},
+                {"symbol": "system", "present": True, "code_ref_count": 1,
+                 "caller_function_count": 1, "address": "0x2000"},
+            ]}}
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["xrefs", "--target", "active", "--any", "memcpy", "strcpy", "system"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "memcpy: 12 code refs across 4 fn(s)" in out
+    assert "strcpy: absent" in out
+
+

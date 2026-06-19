@@ -81,3 +81,32 @@ def test_types_declare_rejects_multiple_sources(fake_transport, capsys, tmp_path
     rc = bn.cli.main(["types", "declare", "--target", "active", "--file", str(f), "struct T { int b; };"])
     assert rc == 2  # BridgeError -> exit 2
     assert "exactly one declaration source" in capsys.readouterr().err
+
+
+def test_proto_get_splices_function_name_into_anonymous_prototype(monkeypatch, capsys):
+    """BN renders the prototype anonymously; the renderer splices in the function
+    name so it's a copy-pasteable C declaration (#222)."""
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": {
+            "function": {"name": "parse_image", "address": "0x401000"},
+            "prototype": "uint64_t (int32_t arg1, char* arg2)",
+        }}
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["proto", "get", "--format", "text", "--target", "active", "parse_image"])
+    assert rc == 0
+    assert capsys.readouterr().out == "uint64_t parse_image(int32_t arg1, char* arg2)\n"
+
+
+def test_proto_get_splices_name_that_is_substring_of_return_type(monkeypatch, capsys):
+    """A function name that is a substring of the return type must still be
+    spliced (the naive `name in head` guard wrongly skipped it) (#222 review)."""
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": {
+            "function": {"name": "t", "address": "0x1000"},
+            "prototype": "uint64_t (int32_t a)"}}
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["proto", "get", "--format", "text", "--target", "active", "t"])
+    assert rc == 0
+    assert capsys.readouterr().out == "uint64_t t(int32_t a)\n"
+
+

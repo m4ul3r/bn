@@ -159,7 +159,7 @@ def test_skill_install_json_output_remains_available(tmp_path, monkeypatch, caps
 
     assert rc == 0
     output = capsys.readouterr().out
-    assert '"installed": true' in output
+    assert '"installed":true' in output          # compact json (#215)
     assert '"installed_destinations"' in output
 
 
@@ -975,3 +975,66 @@ def test_session_stop_sigterm_fallback_reports_method(monkeypatch, capsys):
     parsed = json.loads(capsys.readouterr().out)
     assert parsed["stopped"] is True
     assert parsed["method"] == "sigterm"
+
+
+def test_class_list_invokes_op(monkeypatch):
+    captured = {}
+
+    def fake_call(args, op, params, **kwargs):
+        captured["op"] = op
+        captured["params"] = params
+        return 0
+
+    import bn.commands.cpp_class as cpp_class
+    monkeypatch.setattr(cpp_class, "_call", fake_call)
+    from bn.cli import build_parser
+    args = build_parser().parse_args(["class", "list", "--all", "--query", "Session"])
+    assert args.handler(args) == 0
+    assert captured["op"] == "class_list"
+    assert captured["params"]["include_all"] is True
+    assert captured["params"]["query"] == "Session"
+    assert "no_stl" not in captured["params"]   # flag absent unless passed
+
+    args = build_parser().parse_args(["class", "list", "--no-stl"])
+    assert args.handler(args) == 0
+    assert captured["params"]["no_stl"] is True
+
+
+def test_class_show_invokes_op(monkeypatch):
+    captured = {}
+
+    def fake_call(args, op, params, **kwargs):
+        captured["op"] = op
+        captured["params"] = params
+        return 0
+
+    import bn.commands.cpp_class as cpp_class
+    monkeypatch.setattr(cpp_class, "_call", fake_call)
+    from bn.cli import build_parser
+    args = build_parser().parse_args(["class", "show", "net::Session"])
+    assert args.handler(args) == 0
+    assert captured["op"] == "class_show"
+    assert captured["params"]["name"] == "net::Session"
+
+
+def test_admin_text_renderer_failure_becomes_clean_error(monkeypatch, capsys):
+    # Admin commands build their result locally and render it WITHOUT going
+    # through _call, so they must apply the SAME malformed-result guard _call has
+    # (#101): a text renderer that raises must surface a clean BridgeError
+    # (exit 2) pointing at --format json, never a raw traceback.
+    import bn.commands.admin as admin
+
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [])
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    def _boom(_value):
+        raise ValueError("simulated malformed bridge result")
+
+    monkeypatch.setattr(admin, "_render_session_list_text", _boom)
+
+    rc = bn.cli.main(["session", "list"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "--format json" in err
+
+

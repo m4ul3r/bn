@@ -1091,3 +1091,140 @@ def test_load_binary_corrupt_file_raises_clean_error(monkeypatch, tmp_path):
     with pytest.raises(RuntimeError, match="may be corrupt"):
         instance._load_binary(str(raw))
     bridge._headless_views.clear()
+
+
+def test_save_database_falls_back_to_writable_cache(monkeypatch, tmp_path):
+    """A default-path save whose directory is unwritable (read-only firmware
+    mount) falls back to a writable cache dir instead of losing annotations;
+    an EXPLICIT --path failure stays a hard error (#214)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(bridge, "cache_home", lambda: tmp_path / "cache")
+
+    ro_dir = tmp_path / "ro"
+    ro_dir.mkdir()
+    ro_file = str(ro_dir / "firmware.bin")
+    ro_bndb = ro_file + ".bndb"
+    created: list[str] = []
+
+    class _SaveBV:
+        class file:
+            filename = ro_file
+
+        def create_database(self, dest):
+            if str(dest) == ro_bndb:
+                return False                       # simulate an unwritable default dir
+            from pathlib import Path as _P
+            _P(dest).parent.mkdir(parents=True, exist_ok=True)
+            _P(dest).write_bytes(b"BNDB")
+            created.append(str(dest))
+            return True
+
+    bv = _SaveBV()
+    monkeypatch.setattr(instance.targets, "resolve", lambda sel: bv)
+    monkeypatch.setattr(instance.targets, "clear_dirty", lambda b: None)
+
+    result = instance._save_database(None)
+    assert result["saved"] is True
+    assert result["fallback"] is True
+    assert result["requested_path"] == ro_bndb
+    assert "cache" in result["path"] and result["path"].endswith(".bndb")
+    assert created == [result["path"]]
+
+    # explicit --path failure must NOT silently relocate
+    with pytest.raises(RuntimeError, match="no file was written"):
+        instance._save_database(None, path=ro_bndb)
+
+
+def test_bridge_handler_serialization_failure_returns_clean_error(monkeypatch):
+    """A response that fails to serialize -- the 'dictionary changed size during
+    iteration' race when a response aliases a live mapping mutated by a concurrent
+    read (serialization runs OUTSIDE the dispatch lock and its try/except) -- must
+    return a clean {ok: false} error to the client, NOT escape handle() and
+    silently kill the handler thread with no response at all (#250)."""
+    bridge = _load_bridge(monkeypatch)
+    errors = []
+    monkeypatch.setattr(bridge.bn, "log_error", lambda message: errors.append(message))
+
+    class _Unserializable:
+        # default=str is json's fallback for non-native types; a __str__ that
+        # always raises deterministically reproduces a mid-encode failure.
+        def __str__(self):
+            raise RuntimeError("dictionary changed size during iteration")
+
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.rfile = io.BytesIO(b'{"op": "decompile", "id": "req-9"}\n')
+    handler.server = types.SimpleNamespace(
+        bridge=types.SimpleNamespace(
+            dispatch=lambda payload: {"ok": True, "result": _Unserializable(), "error": None}))
+    writer = _RecordingWriter()
+    handler.wfile = writer
+
+    handler.handle()  # must NOT raise
+
+    response = json.loads(writer.data.decode("utf-8"))
+    assert response["ok"] is False
+    assert "serializ" in response["error"].lower()
+    assert errors, "the serialization failure should be logged for operators"
+
+
+def test_bridge_handler_retries_transient_serialization_race(monkeypatch):
+    """The dict-size race is transient: by the time a retry runs, the concurrent
+    mutation has usually completed. A single re-encode preserves the REAL response
+    instead of degrading every racy read to an error (#250)."""
+    bridge = _load_bridge(monkeypatch)
+
+    class _FlakyValue:
+        calls = 0
+
+        def __str__(self):
+            type(self).calls += 1
+            if type(self).calls == 1:
+                raise RuntimeError("dictionary changed size during iteration")
+            return "recovered"
+
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.rfile = io.BytesIO(b'{"op": "decompile", "id": "req-9"}\n')
+    handler.server = types.SimpleNamespace(
+        bridge=types.SimpleNamespace(
+            dispatch=lambda payload: {"ok": True, "result": _FlakyValue(), "error": None}))
+    writer = _RecordingWriter()
+    handler.wfile = writer
+
+    handler.handle()
+
+    response = json.loads(writer.data.decode("utf-8"))
+    assert response["ok"] is True
+    assert response["result"] == "recovered"
+
+
+def test_bridge_handler_serialization_fallback_survives_logging_failure(monkeypatch):
+    """Even if logging the serialization failure itself raises, handle() must still
+    write a clean error and never let the handler thread die silently -- the
+    fallback path must not reintroduce the exact silent-death it eliminates (#250)."""
+    bridge = _load_bridge(monkeypatch)
+
+    def _boom(*a, **k):
+        raise RuntimeError("log sink down")
+
+    monkeypatch.setattr(bridge.bn, "log_error", _boom)
+
+    class _Unserializable:
+        def __str__(self):
+            raise RuntimeError("dictionary changed size during iteration")
+
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.rfile = io.BytesIO(b'{"op": "decompile", "id": "req-9"}\n')
+    handler.server = types.SimpleNamespace(
+        bridge=types.SimpleNamespace(
+            dispatch=lambda payload: {"ok": True, "result": _Unserializable(), "error": None}))
+    writer = _RecordingWriter()
+    handler.wfile = writer
+
+    handler.handle()  # must NOT raise even though log_error raises
+
+    response = json.loads(writer.data.decode("utf-8"))
+    assert response["ok"] is False
+    assert "serializ" in response["error"].lower()
+
+

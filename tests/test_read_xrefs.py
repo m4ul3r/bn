@@ -356,3 +356,127 @@ def test_xrefs_requires_refresh_when_quick_loaded(monkeypatch):
     with pytest.raises(RuntimeError, match="loaded with --quick"):
         instance._xrefs(None, "main")
     bridge._quick_loaded_views.discard(bv)
+
+
+def test_xrefs_any_marks_ambiguous_symbol_present(monkeypatch):
+    """In a sink sweep an AMBIGUOUS symbol (resolves to >=2 bodies) must be
+    reported present (it exists), not absent -- otherwise a real sink reads as
+    unlinked (#218 review)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[_FakeFunction(0x401000, "dup"), _FakeFunction(0x402000, "dup")])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    res = instance._xrefs_any(None, ["dup", "nope"])
+    syms = {s["symbol"]: s for s in res["symbols"]}
+    assert syms["dup"]["present"] is True and syms["dup"].get("ambiguous") is True
+    assert syms["nope"]["present"] is False
+    assert res["present"] == 1
+
+
+def test_xrefs_thunk_real_collision_surfaces_ambiguity_and_picks_hot(monkeypatch):
+    """A bare name that resolves to a 16-byte thunk AND the real body must not
+    silently pick the zero-caller member: surface both under `ambiguous_symbol`
+    and report xrefs for the member carrying the call traffic (#220)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    caller = _FakeFunction(0x500000, "caller")
+    thunk = _FakeFunction(0x440030, "util_free")    # PLT-style thunk: hot
+    thunk.is_thunk = True
+    real = _FakeFunction(0x4d2e70, "util_free")     # real body: zero direct callers
+    real.symbol = _FakeSymbol("FunctionSymbol")
+    bv = _FakeBV(
+        functions=[caller, thunk, real],
+        code_refs={0x440030: [_FakeCodeRef(0x500010, caller), _FakeCodeRef(0x500020, caller)],
+                   0x4d2e70: []},
+        sections={".text": _FakeSection(".text", 0x400000, 0x500000)},
+        segments={0x500010: _FakeSegment(readable=True, executable=True),
+                  0x500020: _FakeSegment(readable=True, executable=True)},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._xrefs(None, "util_free")
+    amb = result["ambiguous_symbol"]
+    assert amb["resolved_to"] == "0x440030"                       # the hot member
+    assert {m["address"] for m in amb["members"]} == {"0x440030", "0x4d2e70"}
+    assert result["address"] == "0x440030"
+    assert result["code_ref_count"] == 2
+
+
+def test_xrefs_demangled_collision_prefers_definition_over_import_veneer(monkeypatch):
+    """The #201 ⊕ #220 intersection: a demangled name matches BOTH the real body
+    (FunctionSymbol) and a PIC import veneer (ImportedFunctionSymbol, is_thunk) --
+    both present in bv.functions with the demangled short_name. xrefs must resolve
+    to the DEFINITION, not the ref-carrying stub (the #220 ref-count tiebreak must
+    not regress #201)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    DEMANGLED = "proto::Msg::handle"
+    caller = _FakeFunction(0x500000, "caller")
+
+    veneer = _FakeFunction(0x401050, "_ZN5proto3Msg6handleEv")   # PLT veneer: hot
+    veneer.is_thunk = True
+    vsym = _FakeSymbol("ImportedFunctionSymbol")
+    vsym.short_name = DEMANGLED
+    veneer.symbol = vsym
+
+    impl = _FakeFunction(0x40114a, "_ZN5proto3Msg6handleEv")     # real body: 0 direct callers
+    isym = _FakeSymbol("FunctionSymbol")
+    isym.short_name = DEMANGLED
+    impl.symbol = isym
+
+    bv = _FakeBV(
+        functions=[caller, veneer, impl],
+        code_refs={0x401050: [_FakeCodeRef(0x500010, caller)], 0x40114a: []},
+        sections={".text": _FakeSection(".text", 0x400000, 0x500000)},
+        segments={0x500010: _FakeSegment(readable=True, executable=True)},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._xrefs(None, DEMANGLED)
+    assert result["address"] == "0x40114a"               # the definition, NOT the stub
+    assert result["resolved_to_definition"] == "0x40114a"
+    assert "ambiguous_symbol" not in result              # stub-vs-impl, not a thunk/real collision
+
+
+def test_find_function_resolves_demangled_via_symbol_short_name(monkeypatch):
+    """A function whose `fn.name` BN kept mangled resolves by its demangled
+    `symbol.short_name`/`full_name`, so callsites/decompile/xrefs all accept the
+    same C++ name (#224a)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x405250, "_ZN3foo3bar4recvEi")   # BN kept fn.name mangled
+    sym = _FakeSymbol("FunctionSymbol")
+    sym.short_name = "foo::bar::recv"
+    sym.full_name = "foo::bar::recv(int32_t)"
+    fn.symbol = sym
+    bv = _FakeBV(functions=[fn])
+
+    assert int(instance._find_function(bv, "foo::bar::recv").start) == 0x405250
+    assert int(instance._find_function(bv, "foo::bar::recv(int32_t)").start) == 0x405250
+    assert int(instance._find_function(bv, "_ZN3foo3bar4recvEi").start) == 0x405250
+
+
+def test_xrefs_resolves_data_symbol_by_name(monkeypatch):
+    """`xrefs <data-symbol>` resolves a non-function symbol (a global table) to
+    its address instead of failing with a misleading import-only error (#224b)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    data_sym = fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x56b688, "g_state_table")
+    caller = _FakeFunction(0x401000, "user")
+    bv = _FakeBV(
+        functions=[caller],
+        symbols=[data_sym],
+        code_refs={0x56b688: [_FakeCodeRef(0x401010, caller)]},
+        sections={".text": _FakeSection(".text", 0x400000, 0x410000)},
+        segments={0x401010: _FakeSegment(readable=True, executable=True)},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._xrefs(None, "g_state_table")
+    assert result["address"] == "0x56b688"
+    assert result["resolved_symbol"]["kind"] == "data"
+    assert result["code_ref_count"] == 1
+
+

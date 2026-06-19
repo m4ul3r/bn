@@ -500,3 +500,49 @@ def test_struct_snapshot_tolerates_unresolvable_name(monkeypatch):
 
     assert instance._affected_type_names(bv, ops) == ["NoSuchStruct"]
     assert instance._capture_type_snapshots(bv, ops) == {}
+
+
+def test_slim_type_result_drops_redundant_layouts(monkeypatch):
+    """A verified types_declare result echoes the layout under defined_type_layouts
+    AND observed.defined_type_layouts, duplicating affected_types[].after_layout.
+    The output slim drops both heavy copies but keeps the short decl strings."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    layout = "struct Widget // size=0x4\n0x0000: int32_t x"
+    result = {
+        "op": "types_declare",
+        "defined_types": {"Widget": "struct Widget"},
+        "defined_type_layouts": {"Widget": layout},
+        "observed": {"defined_types": {"Widget": "struct Widget"}, "defined_type_layouts": {"Widget": layout}},
+    }
+    slim = me._slim_type_result_for_output(result)
+    assert "defined_type_layouts" not in slim
+    assert "defined_type_layouts" not in slim["observed"]
+    assert slim["defined_types"] == {"Widget": "struct Widget"}  # short decl kept
+    assert slim["observed"]["defined_types"] == {"Widget": "struct Widget"}
+    assert "defined_type_layouts" in result  # original untouched (copy, not mutate)
+
+    other = {"op": "set_prototype", "observed": {"prototype": "void()"}}
+    assert me._slim_type_result_for_output(other) is other  # non-type op passes through
+
+
+def test_diff_type_snapshots_populates_name(monkeypatch):
+    """affected_types entries carry `name` (= the qualified type name), not just
+    `type_name`, so an agent keying off .name doesn't read a real type change as
+    anonymous/failed (#211)."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    before: dict = {}
+    after = {"Config": {"decl": "struct Config", "layout": "struct Config {\n  int a;\n}"}}
+    diffs = me._diff_type_snapshots(None, before, after)
+    assert len(diffs) == 1
+    assert diffs[0]["name"] == "Config"
+    assert diffs[0]["type_name"] == "Config"   # back-compat alias retained
+    assert diffs[0]["changed"] is True
+
+
+# ---------------------------------------------------------------------------
+# Batch 5: bridge-side validation (#94 comment guard, #100 count validation)
+# ---------------------------------------------------------------------------
+
+

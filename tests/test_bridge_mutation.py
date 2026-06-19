@@ -1657,3 +1657,191 @@ def test_unsupported_op_kind_uses_neutral_wording(monkeypatch):
         instance._apply_operation(bv, {"op": "nonsuch_op"})
     assert e.value.status == "unsupported"
     assert "batch" not in str(e.value).lower()
+
+
+def test_mutation_mixed_batch_scopes_blast_radius_and_tags_direct(monkeypatch):
+    """A mixed batch (types_declare + set_prototype) scopes the blast radius to
+    the TYPE op and tags the direct op's affected function `direct`, so the
+    set_prototype target is excluded from the type's referenced/reflowed counts
+    and the formatter can keep the two apart (Codex review on #240)."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+
+    uses_ep = _FakeFunction(0x10, "uses_ep", "void()")      # references the type
+    handler = _FakeFunction(0x401000, "handler", "void()")  # set_prototype target
+
+    def _fns_for_op(ctx, b, op, *, type_limit):
+        return [uses_ep] if me._is_type_op(op) else [handler]
+
+    diffs = [
+        {"address": "0x10", "before_name": "uses_ep", "after_name": "uses_ep", "changed": True, "diff": ""},
+        {"address": "0x401000", "before_name": "handler", "after_name": "handler", "changed": True, "diff": ""},
+    ]
+
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(me, "_functions_for_op", _fns_for_op)
+    monkeypatch.setattr(me, "_guess_affected_functions", lambda ctx, b, ops: [])
+    monkeypatch.setattr(me, "_capture_function_snapshots", lambda ctx, b, fns: {})
+    monkeypatch.setattr(me, "_capture_type_snapshots", lambda ctx, b, ops: {})
+    monkeypatch.setattr(me, "_diff_snapshots", lambda ctx, before, after: [dict(d) for d in diffs])
+    monkeypatch.setattr(me, "_diff_type_snapshots", lambda ctx, before, after: [{"type_name": "Ep", "changed": True}])
+    monkeypatch.setattr(me, "_apply_operation", lambda ctx, b, op, restores=None: {"op": op.get("op")})
+    monkeypatch.setattr(me, "_verify_operation", lambda ctx, b, result: {**result, "status": "verified"})
+    monkeypatch.setattr(me, "_annotate_operation_results", lambda ctx, results, type_diffs: results)
+
+    result = instance._mutation("active", False,
+                                [{"op": "types_declare"}, {"op": "set_prototype"}])
+
+    assert result["success"] is True
+    assert ("commit", "state") in bv.events
+    # Blast radius counts the type's reach only -- handler (direct) is excluded.
+    assert result["affected_summary"] == {"referenced": 1, "reflowed": 1}
+    tags = {d["address"]: d["direct"] for d in result["affected_functions"]}
+    assert tags == {"0x10": False, "0x401000": True}
+
+
+def test_count_referenced_functions_is_uncapped_past_snapshot_cap(monkeypatch):
+    """affected_functions is capped at 10 for snapshotting, but the reported
+    blast radius (affected_summary.referenced) must be the true total -- a struct
+    used by 200 functions previously surfaced as "10" with no hint of real scope."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    ctx = bridge.BinaryNinjaBridge().ctx
+    funcs = [_FakeFunction(0x1000 + i * 4, f"f{i}", "void(struct Widget* w)") for i in range(15)]
+    bv = _FakeBV(functions=funcs)
+    # Sidestep the C parser: the type resolution is exercised elsewhere.
+    monkeypatch.setattr(me, "_operation_type_names", lambda c, b, op: ["Widget"])
+    ops = [{"op": "types_declare", "declaration": "struct Widget { int x; };"}]
+
+    assert len(me._guess_affected_functions(ctx, bv, ops)) == 10  # snapshot set, capped
+    assert me._count_referenced_functions(ctx, bv, ops, fallback=10) == 15  # true total
+
+
+def test_count_referenced_functions_falls_back_on_scan_error(monkeypatch):
+    """A stubbed/odd view must never crash a mutation: the count degrades to the
+    capped fallback rather than raising."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    ctx = bridge.BinaryNinjaBridge().ctx
+
+    def _boom(*a, **k):
+        raise RuntimeError("view scan blew up")
+
+    monkeypatch.setattr(me, "_functions_for_op", _boom)
+    assert me._count_referenced_functions(ctx, _FakeBV(), [{"op": "set_prototype"}], fallback=4) == 4
+
+
+def test_diff_snapshots_omits_excerpt_when_full_diff_fits(monkeypatch):
+    """A small real body change: the full unified diff fits inline, so the focused
+    before/after_excerpt would only duplicate it. The excerpt is reserved for the
+    large-function case where the diff gets truncated (see the M14 test above)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    diffs = instance._diff_snapshots(
+        {0x1000: {"text": "x = 1;\ny = prev;\nz = 3;", "name": "f"}},
+        {0x1000: {"text": "x = 1;\ny = next;\nz = 3;", "name": "f"}},
+    )
+    d = diffs[0]
+    assert d["changed"] is True
+    assert "prev" in d["diff"] and "next" in d["diff"]  # change visible inline
+    assert "before_excerpt" not in d and "after_excerpt" not in d
+
+
+def _typedef_alias_bv(*, alias_name="AliasRec", tag="InnerRec"):
+    """A fake BV mirroring real BN's typedef-of-struct shape (#246): *alias_name*
+    resolves to a NamedTypeReference whose ``.target(bv)`` is the underlying
+    registered struct (`tag`), and ``get_type_by_name(tag)`` returns that struct.
+    The alias's own ``mutable_copy()`` raises -- exactly as BN's
+    NamedTypeReferenceBuilder does on ``add_member_at_offset`` -- so a fix that
+    fails to follow the reference reproduces the original crash."""
+    underlying = _FakeType(f"struct {tag}", type_class="StructureTypeClass",
+                           members=[_FakeMember(0, "x", "uint32_t")])
+    builder = _AddableStructBuilder()
+    underlying.mutable_copy = lambda: builder
+    underlying.registered_name = types.SimpleNamespace(name=tag)
+
+    alias = _FakeType(f"struct {tag} {alias_name}", type_class="NamedTypeReferenceClass")
+
+    def _alias_mutable_copy():
+        raise AttributeError(
+            "'NamedTypeReferenceBuilder' object has no attribute 'add_member_at_offset'")
+
+    alias.mutable_copy = _alias_mutable_copy
+    alias.target = lambda _bv: underlying
+
+    class _BV:
+        def __init__(self):
+            self.defined = []
+
+        def get_type_by_name(self, n):
+            return {alias_name: alias, tag: underlying}.get(n)
+
+        def parse_type_string(self, s):
+            return _FakeType("uint32_t", width=4), None
+
+        def define_user_type(self, name, b):
+            self.defined.append((name, b))
+
+    return alias, underlying, builder, _BV()
+
+
+def test_struct_builder_follows_typedef_alias_to_underlying_struct(monkeypatch):
+    """`struct field set/rename/delete` on a typedef (the idiomatic
+    `typedef struct {..} X;`) must follow the alias (a NamedTypeReference) to the
+    underlying registered struct tag and build from THAT -- not crash calling
+    add_member_at_offset on a NamedTypeReferenceBuilder (#246). All three field
+    ops route through _struct_builder, so fixing it here fixes set/rename/delete."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _alias, _under, builder, bv = _typedef_alias_bv()
+    resolved_name, got = bridge.mutation_engine._struct_builder(instance, bv, "AliasRec")
+    assert resolved_name == "InnerRec"    # commit to the tag, not the alias
+    assert got is builder                 # a real StructureBuilder, not an NTR builder
+
+
+def test_struct_builder_follows_anonymous_typedef_struct(monkeypatch):
+    """`typedef struct {..} AnonRec;` registers the body under an auto-named tag
+    (`_AnonRec`); the alias is a NamedTypeReference to it. The follow must land on
+    `_AnonRec` -- the most common C struct idiom, not an edge case (#246)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _alias, _under, builder, bv = _typedef_alias_bv(alias_name="AnonRec", tag="_AnonRec")
+    resolved_name, got = bridge.mutation_engine._struct_builder(instance, bv, "AnonRec")
+    assert resolved_name == "_AnonRec"
+    assert got is builder
+
+
+def test_struct_builder_typedef_to_nonstruct_is_invalid_request(monkeypatch):
+    """A name that resolves to a non-aggregate (`typedef uint32_t Foo;` resolves
+    straight to the integer type in BN) must raise a clean invalid_request, not a
+    raw AttributeError from add_member_at_offset (#246)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    prim = _FakeType("uint32_t", type_class="IntegerTypeClass")
+
+    class _BV:
+        def get_type_by_name(self, n):
+            return prim if n == "MyU32" else None
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        bridge.mutation_engine._struct_builder(instance, _BV(), "MyU32")
+    assert exc.value.status == "invalid_request"
+
+
+def test_op_struct_field_set_through_typedef_alias_commits_to_tag(monkeypatch):
+    """End-to-end through the op handler: a set on the typedef alias must add the
+    field to the underlying struct builder and commit it to the TAG name, with the
+    result reporting the tag (so the caller learns where the body lives) (#246)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _alias, _under, builder, bv = _typedef_alias_bv()
+    res = instance._op_struct_field_set(bv, {
+        "struct_name": "AliasRec", "offset": "0x4", "field_name": "added",
+        "field_type": "uint32_t", "overwrite_existing": True})
+    assert res["struct_name"] == "InnerRec"          # reported as the tag
+    assert builder.added and builder.added[0][0] == "added"
+    assert ("InnerRec", builder) in bv.defined       # committed to the tag
+
+

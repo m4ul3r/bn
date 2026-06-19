@@ -707,3 +707,36 @@ def test_read_bytes_out_bad_dir_is_clean_error(fake_transport, capsys, tmp_path)
                       "--target", "active", "--out", str(out)])
     assert rc == 2  # OutputWriteError is a BridgeError -> exit 2
     assert "Failed to write --out file" in capsys.readouterr().err
+
+
+def test_py_exec_accepts_positional_code(monkeypatch):
+    """`bn py exec '<code>'` positional works, matching the skill examples (#197)."""
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        captured["params"] = params
+        return {"ok": True, "result": {"stdout": "", "result": None}}
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["py", "exec", "--target", "active", "print('hi')"])
+    assert rc == 0
+    assert captured["params"]["script"] == "print('hi')"
+
+
+def test_batch_apply_drops_instance_id_target(monkeypatch):
+    """A fan-out agent putting the --instance id in the manifest target has it
+    dropped, so the instance's single open target resolves (#227)."""
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        captured["params"] = params
+        captured["instance_id"] = instance_id
+        return {"ok": True, "result": {"results": [], "status": "verified"}}
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    import io
+    manifest = '{"target": "my_inst", "ops": []}'
+    monkeypatch.setattr("sys.stdin", io.StringIO(manifest))
+    rc = bn.cli.main(["--instance", "my_inst", "batch", "apply", "-"])
+    assert rc == 0
+    assert "target" not in captured["params"]      # instance-id target was dropped
+
+

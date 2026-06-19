@@ -625,3 +625,110 @@ def test_sections_rejects_negative_count(monkeypatch):
     with pytest.raises(bridge.OperationFailure) as exc:
         instance._sections("active", offset=-1)
     assert exc.value.status == "invalid_request"
+
+
+def test_imports_collapses_got_slot_duplicates(monkeypatch):
+    """Each import appears as a function/data PLT entry AND an (address) GOT slot
+    of the same name -- ~half the list is dups. Collapse the GOT slots by default;
+    --include-got shows them (#212)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+
+    fn = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x1000, "memcpy")
+    fn.short_name = "memcpy"; fn.namespace = ""
+    got = fake_bn.Symbol(fake_bn.SymbolType.ImportAddressSymbol, 0x2000, "memcpy")  # GOT slot dup
+    got.short_name = "memcpy"; got.namespace = ""
+    uniq = fake_bn.Symbol(fake_bn.SymbolType.ImportAddressSymbol, 0x3000, "__gmon_start__")
+    uniq.short_name = "__gmon_start__"; uniq.namespace = ""
+    bv = _FakeBV(symbols=[fn, got, uniq])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._imports(None)
+    names = [(it["name"], it["kind"]) for it in result["items"]]
+    assert ("memcpy", "function") in names
+    assert ("memcpy", "address") not in names         # GOT dup collapsed
+    assert ("__gmon_start__", "address") in names     # genuinely-unique address kept
+    assert result["got_collapsed"] == 1
+
+    full = instance._imports(None, include_got=True)
+    assert ("memcpy", "address") in [(it["name"], it["kind"]) for it in full["items"]]
+    assert "got_collapsed" not in full
+
+
+def test_imports_surfaces_et_rel_external_symbols(monkeypatch):
+    """An ET_REL .ko has no Imported* symbols; its kernel-API refs are
+    ExternalSymbols (.extern). `bn imports` must surface them (#213)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+
+    printk = fake_bn.Symbol(fake_bn.SymbolType.ExternalSymbol, 0x0, "printk")
+    printk.short_name = "printk"; printk.namespace = ""
+    kmalloc = fake_bn.Symbol(fake_bn.SymbolType.ExternalSymbol, 0x8, "__kmalloc")
+    kmalloc.short_name = "__kmalloc"; kmalloc.namespace = ""
+    bv = _FakeBV(symbols=[printk, kmalloc])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._imports(None)
+    names = {it["name"]: it["kind"] for it in result["items"]}
+    assert names == {"printk": "external", "__kmalloc": "external"}
+
+
+def test_imports_external_dedups_against_got_only_imports(monkeypatch):
+    """On a standard ELF most imports are GOT-only (ImportAddressSymbol, no PLT
+    function entry) and the SAME names reappear as ExternalSymbol. The external
+    dedup must skip them so they aren't double-listed (address + external) --
+    reintroducing #212. The dedup is against ALL emitted names, not just
+    function/data (#213 review)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+
+    # memcpy: GOT-only import (address kind, no function twin) + an external dup
+    got = fake_bn.Symbol(fake_bn.SymbolType.ImportAddressSymbol, 0x1000, "memcpy")
+    got.short_name = "memcpy"; got.namespace = ""
+    ext = fake_bn.Symbol(fake_bn.SymbolType.ExternalSymbol, 0x0, "memcpy")
+    ext.short_name = "memcpy"; ext.namespace = ""
+    # a genuinely .ko-style external with no import twin -> must still appear
+    only_ext = fake_bn.Symbol(fake_bn.SymbolType.ExternalSymbol, 0x8, "printk")
+    only_ext.short_name = "printk"; only_ext.namespace = ""
+    bv = _FakeBV(symbols=[got, ext, only_ext])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._imports(None)
+    rows = [(it["name"], it["kind"]) for it in result["items"]]
+    assert ("memcpy", "address") in rows
+    assert ("memcpy", "external") not in rows         # deduped against the address entry
+    assert ("printk", "external") in rows             # unique external still listed
+    assert result["total"] == 2                        # not 3 (no double-list)
+
+
+def test_exports_lists_global_weak_definitions_only(monkeypatch):
+    """`bn exports` lists the global/weak DEFINITIONS (the public API); local
+    definitions are internal and excluded (#198)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+
+    pub = fake_bn.Symbol(fake_bn.SymbolType.FunctionSymbol, 0x1000, "_ZN3foo3bar4recvEi",
+                         binding=fake_bn.SymbolBinding.GlobalBinding)
+    pub.short_name = "foo::bar::recv"
+    weak = fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x2000, "g_table",
+                          binding=fake_bn.SymbolBinding.WeakBinding)
+    weak.short_name = "g_table"
+    local = fake_bn.Symbol(fake_bn.SymbolType.FunctionSymbol, 0x3000, "helper",
+                           binding=fake_bn.SymbolBinding.LocalBinding)
+    local.short_name = "helper"
+    bv = _FakeBV(symbols=[pub, weak, local])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._exports(None)
+    names = {it["name"]: it for it in result["items"]}
+    assert set(names) == {"_ZN3foo3bar4recvEi", "g_table"}       # local excluded
+    assert names["_ZN3foo3bar4recvEi"]["display_name"] == "foo::bar::recv"  # demangled
+    assert names["_ZN3foo3bar4recvEi"]["kind"] == "function"
+    assert names["g_table"]["kind"] == "data"
+    assert instance._exports(None, count_only=True)["count"] == 2
+
+

@@ -29,13 +29,21 @@ def _load_bridge(monkeypatch):
         ImportedFunctionSymbol = "SymbolType.ImportedFunctionSymbol"
         ImportedDataSymbol = "SymbolType.ImportedDataSymbol"
         ImportAddressSymbol = "SymbolType.ImportAddressSymbol"
+        ExternalSymbol = "SymbolType.ExternalSymbol"
+
+    class SymbolBinding:
+        NoBinding = "SymbolBinding.NoBinding"
+        LocalBinding = "SymbolBinding.LocalBinding"
+        GlobalBinding = "SymbolBinding.GlobalBinding"
+        WeakBinding = "SymbolBinding.WeakBinding"
 
     class Symbol:
-        def __init__(self, symbol_type, address, name):
+        def __init__(self, symbol_type, address, name, binding=None):
             self.type = symbol_type
             self.address = address
             self.name = name
             self.raw_name = name
+            self.binding = binding
 
     class Type:
         # Minimal stand-ins for the BN class methods the namespaced-type
@@ -65,6 +73,7 @@ def _load_bridge(monkeypatch):
             return "::".join(self.name)
 
     fake_bn.SymbolType = SymbolType
+    fake_bn.SymbolBinding = SymbolBinding
     fake_bn.Symbol = Symbol
     fake_bn.QualifiedName = QualifiedName
     fake_bn.Type = Type
