@@ -224,6 +224,62 @@ def list_instances() -> list[BridgeInstance]:
     return instances
 
 
+def gc_instances() -> dict[str, Any]:
+    """Reap dead instances' leftovers from ``instances_dir()``.
+
+    ``list_instances()`` purges a dead registry + its orphaned socket lazily,
+    but deliberately keeps the ``.log`` breadcrumb (the empty-response
+    diagnostic). A host that spawns many short-lived bridges therefore
+    accumulates hundreds of zero-byte logs for instances that are long gone
+    (#80). This sweeps the logs -- and any registry-less orphan sockets -- of
+    every instance that no longer has a live registry, leaving live instances
+    and the shared spawn lock untouched.
+
+    Returns a summary: ``live_instances``, ``registries_purged`` (dead
+    registries the liveness sweep removed), ``logs_removed``, ``sockets_removed``,
+    and ``removed`` (the list of removed paths).
+    """
+    inst_dir = instances_dir()
+    summary: dict[str, Any] = {
+        "live_instances": 0,
+        "registries_purged": 0,
+        "logs_removed": 0,
+        "sockets_removed": 0,
+        "removed": [],
+    }
+    # Serialize against spawns. A spawn creates ``<id>.log`` + ``<id>.sock``
+    # BEFORE it writes ``<id>.json`` (the registry), so without the spawn lock gc
+    # could see an in-flight spawn's live socket/log as a registry-less orphan
+    # and unlink it mid-spawn -- a live file deleted (#80 review). The lock window
+    # is exactly the spawn-and-register interval, so holding it makes the
+    # glob/iterdir snapshot unable to straddle a registration. ``_spawn_lock()``
+    # also mkdir's ``instances_dir()``, so it always exists inside this block.
+    with _spawn_lock():
+        registries_before = set(inst_dir.glob("*.json"))
+        # Triggers the lazy liveness sweep: dead registries + their sockets are
+        # unlinked as a side effect, leaving only live registries behind.
+        summary["live_instances"] = len(list_instances())
+        registries_after = set(inst_dir.glob("*.json"))
+        summary["registries_purged"] = len(registries_before - registries_after)
+        live_stems = {p.stem for p in registries_after}
+        for entry in sorted(inst_dir.iterdir()):
+            # Never touch the shared spawn lock or any surviving (live) registry.
+            if entry.name == ".spawn.lock" or entry.suffix == ".json":
+                continue
+            # A .log/.sock whose registry is gone belongs to a dead/long-gone
+            # instance -- the registry was purged (now or earlier) or never
+            # existed (and, under the lock, is not a spawn in flight).
+            if entry.suffix in (".log", ".sock") and entry.stem not in live_stems:
+                with contextlib.suppress(OSError):
+                    entry.unlink()
+                    summary["removed"].append(str(entry))
+                    if entry.suffix == ".log":
+                        summary["logs_removed"] += 1
+                    else:
+                        summary["sockets_removed"] += 1
+    return summary
+
+
 def _multiple_instances_error(instances: list[BridgeInstance]) -> BridgeError:
     return BridgeError(
         "Multiple Binary Ninja bridge instances are running; pass --instance <id> "

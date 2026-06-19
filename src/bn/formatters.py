@@ -530,6 +530,25 @@ def _render_pin_clear_text(value: Any) -> str:
     return "cleared"
 
 
+def _render_instance_gc_text(value: Any) -> str:
+    """Render the `instance gc` cache-cleanup summary."""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    logs = value.get("logs_removed", 0)
+    socks = value.get("sockets_removed", 0)
+    regs = value.get("registries_purged", 0)
+    live = value.get("live_instances", 0)
+    reaped = logs + socks + regs
+    if reaped == 0:
+        return f"gc: nothing to reap ({live} live instance{'' if live == 1 else 's'})"
+    return (
+        f"gc: reaped {logs} log{'' if logs == 1 else 's'}, "
+        f"{socks} orphan socket{'' if socks == 1 else 's'}, "
+        f"{regs} dead registr{'y' if regs == 1 else 'ies'} "
+        f"({live} live instance{'' if live == 1 else 's'} kept)"
+    )
+
+
 def _render_name_address_rows(value: Any, *, demangle: bool = False) -> str:
     """Render a BARE list of name/address rows (imports, function pages). With
     ``demangle``, show the demangled ``display_name`` instead of the raw name so

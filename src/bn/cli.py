@@ -31,6 +31,7 @@ from .paths import (  # noqa: F401
 from .transport import (  # noqa: F401
     BridgeError,
     _send_request_to_instance,
+    gc_instances,
     instance_selector,
     list_instances,
     send_request,
