@@ -4,6 +4,7 @@ import contextlib
 import errno
 import fcntl
 import json
+import math
 import os
 import re
 import secrets
@@ -32,7 +33,7 @@ TRANSIENT_SOCKET_ERRNOS = {
 # CLI gives up, so a wedged bridge (e.g. a py_exec stuck under the write lock)
 # can't hang every CLI invocation forever. Generous because legitimate ops
 # (load/refresh with update_analysis_and_wait) can run for minutes. Override
-# with BN_REQUEST_TIMEOUT=<seconds>; 0/none disables the timeout entirely.
+# with BN_REQUEST_TIMEOUT=<seconds>; 0/none/off/empty disables the timeout entirely.
 DEFAULT_REQUEST_TIMEOUT = 600.0
 
 
@@ -40,15 +41,41 @@ def _resolve_timeout(timeout: float | None) -> float | None:
     if timeout is not None:
         return timeout
     raw = os.environ.get("BN_REQUEST_TIMEOUT")
-    if raw is not None:
-        text = raw.strip().lower()
-        if text in ("", "0", "none", "off"):
-            return None
-        try:
-            return float(text)
-        except ValueError:
-            pass
-    return DEFAULT_REQUEST_TIMEOUT
+    if raw is None:
+        return DEFAULT_REQUEST_TIMEOUT
+    text = raw.strip().lower()
+
+    def _reject() -> BridgeError:
+        # Fail loud: a typo'd / out-of-range value silently falling back to the
+        # 600s default (or silently disabling) left the user believing they'd set
+        # a short timeout when they hadn't (#255).
+        return BridgeError(
+            f"BN_REQUEST_TIMEOUT={raw!r} is not a valid timeout: expected a "
+            f"positive number of seconds, or one of 0/none/off/empty to disable it."
+        )
+
+    # Empty/whitespace-only and the explicit sentinels disable the timeout entirely.
+    if text in ("", "none", "off"):
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        raise _reject() from None
+    if not math.isfinite(value):  # inf / nan parse as floats but aren't timeouts
+        raise _reject()
+    # Reject negatives -- including a value that underflowed to -0.0 (e.g.
+    # -1e-325), where `value < 0` is False but the sign bit is still set.
+    if value < 0 or math.copysign(1.0, value) < 0:
+        raise _reject()
+    if value == 0.0:
+        # A literal 0 disables (a 0-second socket timeout would make every request
+        # fail non-blocking), matching the documented sentinel. But a positive
+        # magnitude that underflowed to 0.0 (e.g. 1e-325) is not a "disable"
+        # request -- reject it so it can't silently turn the timeout off.
+        if any(d in text for d in "123456789"):
+            raise _reject()
+        return None
+    return value
 
 
 @dataclass(slots=True)
@@ -222,6 +249,62 @@ def list_instances() -> list[BridgeInstance]:
                 instances.append(instance)
 
     return instances
+
+
+def gc_instances() -> dict[str, Any]:
+    """Reap dead instances' leftovers from ``instances_dir()``.
+
+    ``list_instances()`` purges a dead registry + its orphaned socket lazily,
+    but deliberately keeps the ``.log`` breadcrumb (the empty-response
+    diagnostic). A host that spawns many short-lived bridges therefore
+    accumulates hundreds of zero-byte logs for instances that are long gone
+    (#80). This sweeps the logs -- and any registry-less orphan sockets -- of
+    every instance that no longer has a live registry, leaving live instances
+    and the shared spawn lock untouched.
+
+    Returns a summary: ``live_instances``, ``registries_purged`` (dead
+    registries the liveness sweep removed), ``logs_removed``, ``sockets_removed``,
+    and ``removed`` (the list of removed paths).
+    """
+    inst_dir = instances_dir()
+    summary: dict[str, Any] = {
+        "live_instances": 0,
+        "registries_purged": 0,
+        "logs_removed": 0,
+        "sockets_removed": 0,
+        "removed": [],
+    }
+    # Serialize against spawns. A spawn creates ``<id>.log`` + ``<id>.sock``
+    # BEFORE it writes ``<id>.json`` (the registry), so without the spawn lock gc
+    # could see an in-flight spawn's live socket/log as a registry-less orphan
+    # and unlink it mid-spawn -- a live file deleted (#80 review). The lock window
+    # is exactly the spawn-and-register interval, so holding it makes the
+    # glob/iterdir snapshot unable to straddle a registration. ``_spawn_lock()``
+    # also mkdir's ``instances_dir()``, so it always exists inside this block.
+    with _spawn_lock():
+        registries_before = set(inst_dir.glob("*.json"))
+        # Triggers the lazy liveness sweep: dead registries + their sockets are
+        # unlinked as a side effect, leaving only live registries behind.
+        summary["live_instances"] = len(list_instances())
+        registries_after = set(inst_dir.glob("*.json"))
+        summary["registries_purged"] = len(registries_before - registries_after)
+        live_stems = {p.stem for p in registries_after}
+        for entry in sorted(inst_dir.iterdir()):
+            # Never touch the shared spawn lock or any surviving (live) registry.
+            if entry.name == ".spawn.lock" or entry.suffix == ".json":
+                continue
+            # A .log/.sock whose registry is gone belongs to a dead/long-gone
+            # instance -- the registry was purged (now or earlier) or never
+            # existed (and, under the lock, is not a spawn in flight).
+            if entry.suffix in (".log", ".sock") and entry.stem not in live_stems:
+                with contextlib.suppress(OSError):
+                    entry.unlink()
+                    summary["removed"].append(str(entry))
+                    if entry.suffix == ".log":
+                        summary["logs_removed"] += 1
+                    else:
+                        summary["sockets_removed"] += 1
+    return summary
 
 
 def _multiple_instances_error(instances: list[BridgeInstance]) -> BridgeError:
@@ -548,6 +631,12 @@ def send_request(
     instance_id: str | None = None,
     spawn_missing_named: bool = False,
 ) -> dict[str, Any]:
+    # Validate/resolve the timeout BEFORE choosing an instance: choose_instance()
+    # auto-spawns a headless bridge when none is running, so a bad
+    # BN_REQUEST_TIMEOUT must fail here -- not after a stray random instance has
+    # already been spawned into the cache (#255 review). _resolve_timeout is
+    # idempotent, so the resolved value re-resolves to itself downstream.
+    timeout = _resolve_timeout(timeout)
     instance = choose_instance(instance_id, spawn_missing_named=spawn_missing_named)
     return _send_request_to_instance(
         instance,

@@ -2051,6 +2051,21 @@ def test_function_search_no_regex_hint_for_plain_query(monkeypatch, capsys):
     assert "add --regex" not in err
 
 
+def _zero_function_search_count(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+    return {"ok": True, "result": {"count": 0, "total": 0}}
+
+
+def test_function_search_count_hints_regex_on_zero_matches(monkeypatch, capsys):
+    """#252 review: --count is the 'is my query matching anything?' path, so a
+    0-match query with regex metacharacters must still nudge toward --regex.
+    The hint keys off total==0, which the count envelope carries."""
+    monkeypatch.setattr(bn.cli, "send_request", _zero_function_search_count)
+    rc = bn.cli.main(["function", "search", "init|fini", "--count", "--target", "active"])
+    assert rc == 0
+    _, err = capsys.readouterr()
+    assert "add --regex" in err
+
+
 def test_strings_hints_regex_on_zero_matches_with_metachars(monkeypatch, capsys):
     """strings (a bare list today) with a metacharacter query and 0 matches also
     suggests --regex (#122)."""
@@ -2145,6 +2160,37 @@ def test_count_flags_accept_hex_literals():
         ["function", "list", "--target", "active", "--limit", "0x10", "--offset", "0x4"])
     assert ns.limit == 16
     assert ns.offset == 4
+
+
+def test_target_accepted_before_two_level_subcommand():
+    # #251: -t/--target works BEFORE the leaf of a two-level command (after the
+    # group name), not only after the leaf -- parity with single-level commands
+    # and root-level -t. The intermediate group parser must carry -t.
+    parser = bn.cli.build_parser()
+
+    pre = parser.parse_args(["bundle", "-t", "mytarget", "function", "_init"])
+    assert pre.target == "mytarget"
+    assert pre.identifier == "_init"
+
+    # Post-leaf form must still resolve identically (SUPPRESS default = no clobber).
+    post = parser.parse_args(["bundle", "function", "_init", "-t", "mytarget"])
+    assert post.target == "mytarget"
+    assert post.identifier == "_init"
+
+
+def test_instance_accepted_before_two_level_subcommand():
+    # --instance is likewise carried by intermediate group parsers (#251).
+    parser = bn.cli.build_parser()
+    ns = parser.parse_args(["bundle", "--instance", "inst9", "function", "_init"])
+    assert ns.instance == "inst9"
+
+
+def test_target_before_three_level_subcommand():
+    # Three-level commands (struct field set) accept -t at any intermediate level.
+    parser = bn.cli.build_parser()
+    ns = parser.parse_args(
+        ["struct", "-t", "tgt", "field", "set", "MyStruct", "0", "field0", "int32_t"])
+    assert ns.target == "tgt"
 
 
 @pytest.mark.parametrize(
@@ -2305,8 +2351,12 @@ def test_missing_subcommand_prints_exact_help(capsys):
 
     assert rc == 1
     stdout, stderr = capsys.readouterr()
-    assert "usage: bn struct [-h] [--help-full] {show,field} ..." in stdout
-    assert "--help-full   Show help for this command and all subcommands" in stdout
+    # #251: intermediate group parsers now carry -t/--instance so they can be
+    # passed before the leaf; the usage advertises them (and wraps).
+    assert "usage: bn struct [-h] [--help-full] [--instance INSTANCE] [-t TARGET]" in stdout
+    assert "{show,field} ..." in stdout
+    assert "--help-full" in stdout
+    assert "Show help for this command and all subcommands" in stdout
     assert "usage: bn [-h]" not in stdout
     assert stderr == ""
 
@@ -2316,8 +2366,10 @@ def test_missing_nested_subcommand_prints_exact_help(capsys):
 
     assert rc == 1
     stdout, stderr = capsys.readouterr()
-    assert "usage: bn struct field [-h] [--help-full] {set,rename,delete} ..." in stdout
-    assert "--help-full          Show help for this command and all subcommands" in stdout
+    assert "usage: bn struct field [-h] [--help-full] [--instance INSTANCE] [-t TARGET]" in stdout
+    assert "{set,rename,delete} ..." in stdout
+    assert "--help-full" in stdout
+    assert "Show help for this command and all subcommands" in stdout
     assert "usage: bn [-h]" not in stdout
     assert stderr == ""
 
@@ -2329,7 +2381,9 @@ def test_help_full_prints_recursive_root_help(capsys):
     assert exc_info.value.code == 0
     stdout, stderr = capsys.readouterr()
     assert "usage: bn" in stdout
-    assert "usage: bn struct {show,field} ..." in stdout
+    # The recursive formatter strips -h/--help-full but keeps the now-present
+    # -t/--instance on intermediate group nodes (#251).
+    assert "usage: bn struct [--instance INSTANCE] [-t TARGET] {show,field} ..." in stdout
     assert "usage: bn struct field set" in stdout
     assert "-h, --help" not in stdout
     assert "--help-full" not in stdout
@@ -2342,7 +2396,8 @@ def test_help_full_prints_recursive_subtree_help(capsys):
 
     assert exc_info.value.code == 0
     stdout, stderr = capsys.readouterr()
-    assert "usage: bn struct field {set,rename,delete} ..." in stdout
+    assert "usage: bn struct field [--instance INSTANCE] [-t TARGET]" in stdout
+    assert "{set,rename,delete} ..." in stdout
     assert "usage: bn struct field set" in stdout
     assert "usage: bn struct field rename" in stdout
     assert "usage: bn\n" not in stdout
@@ -3347,6 +3402,34 @@ def test_disasm_lines_slices_output_with_header(monkeypatch, capsys):
     assert "ccc" not in out and "ddd" not in out
 
 
+def test_structured_il_lines_slices_output_with_header(monkeypatch, capsys):
+    # #253: structured-il gains --lines, mirroring decompile/il/disasm.
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        if op == "structured_il":
+            return {"ok": True, "result": {
+                "function": {"name": "main", "address": "0x1000"},
+                "view": "mlil", "ssa": True,
+                "instructions": [
+                    {"il_index": 0, "address": "0x1000", "op": "MLIL_SET_VAR", "text": "a = 1"},
+                    {"il_index": 1, "address": "0x1004", "op": "MLIL_SET_VAR", "text": "b = 2"},
+                    {"il_index": 2, "address": "0x1008", "op": "MLIL_RET", "text": "return"},
+                ],
+            }}
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["function", "structured-il", "main", "--target", "active", "--lines", "2:3"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    # 4 rendered lines: header + 3 instruction rows. Slice keeps rows 2-3.
+    assert "// lines 2-3 of 4" in out
+    assert "a = 1" in out and "b = 2" in out
+    assert "return" not in out  # row 4 excluded
+    assert "main @ 0x1000" not in out  # header row (1) excluded
+
+
 def test_lines_range_rejects_zero_index_with_helpful_error(monkeypatch, capsys):
     # argparse type errors exit via SystemExit(2)
     with pytest.raises(SystemExit):
@@ -3878,6 +3961,27 @@ def test_function_list_count_prints_total(monkeypatch, capsys):
     assert "Total functions: 4242" in capsys.readouterr().out
 
 
+def test_function_search_count_prints_total(monkeypatch, capsys):
+    # #252: `function search --count` mirrors `list --count` -- forwards
+    # count_only to search_functions and renders the match total only.
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "x"}]}
+        if op == "search_functions":
+            assert params.get("count_only") is True
+            assert params.get("query") == "parse"
+            return {"ok": True, "result": {"count": 17, "total": 17}}
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    rc = bn.cli.main(["function", "search", "parse", "--count"])
+
+    assert rc == 0
+    assert "Total functions: 17" in capsys.readouterr().out
+
+
 # --- Sticky instance/target ---
 
 
@@ -3915,6 +4019,37 @@ def test_instance_use_writes_state(tmp_session, monkeypatch, capsys):
     state = bn.session_state.read()
     assert state["instance_id"] == "abc123"
     assert capsys.readouterr().out.strip() == "instance: abc123"
+
+
+def test_instance_gc_reports_summary_text(monkeypatch, capsys):
+    # #80: `bn instance gc` reaps dead-instance cache litter and reports counts.
+    monkeypatch.setattr(bn.cli, "gc_instances", lambda: {
+        "live_instances": 2, "registries_purged": 1,
+        "logs_removed": 147, "sockets_removed": 3, "removed": ["x"],
+    })
+
+    rc = bn.cli.main(["instance", "gc"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "147" in out          # logs reaped (the headline pain)
+    assert "2" in out            # live instances kept
+    assert "Traceback" not in out
+
+
+def test_instance_gc_json_carries_counts(monkeypatch, capsys):
+    summary = {
+        "live_instances": 0, "registries_purged": 0,
+        "logs_removed": 0, "sockets_removed": 0, "removed": [],
+    }
+    monkeypatch.setattr(bn.cli, "gc_instances", lambda: summary)
+
+    rc = bn.cli.main(["instance", "gc", "--format", "json"])
+
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["logs_removed"] == 0
+    assert data["live_instances"] == 0
 
 
 def test_instance_use_default_pins_gui_bridge(tmp_session, monkeypatch, capsys):
@@ -4691,6 +4826,7 @@ def _assert_no_bridge_call(monkeypatch):
         ["decompile", "sub_401000", "--format", "ndjson", "--lines", "1:5"],
         ["il", "sub_401000", "--format", "json", "--lines", "1:5"],
         ["disasm", "sub_401000", "--format", "json", "--lines", "1:5"],
+        ["function", "structured-il", "sub_401000", "--format", "json", "--lines", "1:5"],
     ],
 )
 def test_lines_flag_rejected_outside_text_mode(monkeypatch, capsys, argv):
@@ -4931,12 +5067,42 @@ def test_unpaged_list_spill_hint_points_at_out_flag(monkeypatch, capsys):
     assert "rerun with --out <path>" in stderr
 
 
-def test_slice_text_lines_start_beyond_end_keeps_header_sane():
+def test_slice_text_lines_start_beyond_end_raises(monkeypatch):
+    # #253: an out-of-range --lines start is a user error, not a result. It must
+    # NOT return a `//` line (mistakable for code) with exit 0 -- it raises a
+    # BridgeError so the CLI exits non-zero with a stderr diagnostic.
+    from bn import formatters
+    from bn.transport import BridgeError
+
+    with pytest.raises(BridgeError, match="beyond the last line"):
+        formatters._slice_text_lines("a\nb\nc", (10, 12))
+
+
+def test_slice_text_lines_in_range_still_slices():
+    # In-range slicing (incl. end past the last line, which clamps) is unchanged.
     from bn import formatters
 
-    out = formatters._slice_text_lines("a\nb\nc", (10, 12))
+    assert formatters._slice_text_lines("a\nb\nc", (2, 99)) == "// lines 2-3 of 3\nb\nc"
 
-    assert out == "// lines 0 of 3 (start 10 is beyond the last line)"
+
+def test_decompile_lines_out_of_range_exits_nonzero(monkeypatch, capsys):
+    # End-to-end: an out-of-range --lines start exits non-zero with a stderr
+    # diagnostic and NO code-like stdout, so a scripted consumer can tell it
+    # apart from a real slice (#253).
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        if op == "decompile":
+            return {"ok": True, "result": {"text": "int main() {\n  return 0;\n}"}}
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["decompile", "main", "--target", "active", "--lines", "99999:100000"])
+
+    assert rc == 2
+    out, err = capsys.readouterr()
+    assert out.strip() == ""           # nothing that looks like decompiled output
+    assert "beyond the last line" in err
+    assert "Traceback" not in err
 
 
 def test_read_bytes_malformed_response_clean_error(monkeypatch, capsys):
@@ -4975,6 +5141,46 @@ def test_load_opts_into_spawn_missing_named(monkeypatch, tmp_path):
     assert captured["op"] == "load_binary"
     assert captured["instance_id"] == "brandnew"
     assert captured["spawn_missing_named"] is True
+
+
+def test_load_accepts_instance_id_alias_for_spawn_name(monkeypatch, tmp_path):
+    # #258: `bn load --instance-id <new-id>` is an alias for `--instance <new-id>`,
+    # so the spawn-name flag is consistent with `bn session start --instance-id`.
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        captured["op"] = op
+        captured["instance_id"] = instance_id
+        captured["spawn_missing_named"] = spawn_missing_named
+        return {"ok": True, "result": {"loaded": True, "path": str(raw), "notes": [], "targets": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["load", str(raw), "--instance-id", "brandnew"])
+
+    assert rc == 0
+    assert captured["op"] == "load_binary"
+    assert captured["instance_id"] == "brandnew"
+    assert captured["spawn_missing_named"] is True
+
+
+def test_load_instance_id_does_not_clobber_env_instance(monkeypatch, tmp_path):
+    # The --instance-id alias defaults to SUPPRESS, so when it is NOT passed it
+    # must not overwrite a root-level --instance / BN_INSTANCE selection.
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        captured["instance_id"] = instance_id
+        return {"ok": True, "result": {"loaded": True, "path": str(raw), "notes": [], "targets": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["--instance", "fromroot", "load", str(raw)])
+
+    assert rc == 0
+    assert captured["instance_id"] == "fromroot"
 
 
 def test_non_load_command_does_not_spawn_missing_named(monkeypatch):

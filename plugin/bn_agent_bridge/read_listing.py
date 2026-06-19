@@ -283,6 +283,7 @@ def _search_functions(
     max_address: Any = None,
     offset: int = 0,
     limit: int | None = None,
+    count_only: bool = False,
     sort: str = "address",
     reverse: bool = False,
 ):
@@ -325,5 +326,9 @@ def _search_functions(
                 "display_name": display,
                 "size": il_format._function_size(fn),
             })
+    if count_only:
+        # Mirror `_list_functions` count_only: `total` matches the list envelope
+        # key, `count` kept for back-compat (#252).
+        return {"count": len(items), "total": len(items)}
     _sort_function_items(items, sort, reverse)
     return _paged_function_result(ctx, items, offset=offset, limit=limit)

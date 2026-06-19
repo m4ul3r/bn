@@ -1089,6 +1089,90 @@ def test_op_set_prototype_uses_string_user_type_for_bn_compat(monkeypatch):
     assert verified["observed"]["prototype"] == "void* __thiscall(struct GarbageHazardRuntime* self)"
 
 
+def test_prototype_matches_ignoring_param_names(monkeypatch):
+    """The proto-set verifier accepts a name-omitted prototype whose parameter
+    TYPES and return type match BN's auto-named readback, but still rejects a real
+    type / arity / return mismatch, and falls back (returns False) when the types
+    lack the BN function-type shape or the expected string won't parse (#254)."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+
+    def fn_type(ret, *param_types):
+        return types.SimpleNamespace(
+            return_value=ret,
+            parameters=[types.SimpleNamespace(type=t, name=f"arg{i + 1}")
+                        for i, t in enumerate(param_types)])
+
+    observed = fn_type("void", "int32_t", "char**", "char**")  # BN auto-named readback
+
+    def bv_returning(expected):
+        return types.SimpleNamespace(parse_type_string=lambda s: (expected, None))
+
+    # identical types, names differ/absent -> match (the #254 case)
+    assert me._prototype_matches_ignoring_param_names(
+        bv_returning(fn_type("void", "int32_t", "char**", "char**")),
+        observed, "void(int32_t, char**, char**)")
+    # a wrong param type -> reject
+    assert not me._prototype_matches_ignoring_param_names(
+        bv_returning(fn_type("void", "int32_t", "char*", "char**")),
+        observed, "void(int32_t, char*, char**)")
+    # wrong arity -> reject
+    assert not me._prototype_matches_ignoring_param_names(
+        bv_returning(fn_type("void", "int32_t", "char**")),
+        observed, "void(int32_t, char**)")
+    # wrong return type -> reject
+    assert not me._prototype_matches_ignoring_param_names(
+        bv_returning(fn_type("int32_t", "int32_t", "char**", "char**")),
+        observed, "int32_t(int32_t, char**, char**)")
+    # varargs mismatch -> reject (a non-vararg readback must not match a `...`
+    # request just because the fixed params line up)
+    observed_va = fn_type("int32_t", "char const*")
+    observed_va.has_variable_arguments = False
+    expected_va = fn_type("int32_t", "char const*")
+    expected_va.has_variable_arguments = True
+    assert not me._prototype_matches_ignoring_param_names(
+        bv_returning(expected_va), observed_va, "int32_t(char const*, ...)")
+    # unparseable expected -> False (caller falls back to the string compare)
+    def _boom(s):
+        raise ValueError("bad")
+    assert not me._prototype_matches_ignoring_param_names(
+        types.SimpleNamespace(parse_type_string=_boom), observed, "garbage")
+    # observed lacking the BN function-type shape (a mocked string type) -> False,
+    # so the existing string-compare tests keep their behavior unchanged
+    assert not me._prototype_matches_ignoring_param_names(
+        bv_returning(fn_type("void", "int32_t")), "void(int32_t arg1)", "void(int32_t)")
+
+
+def test_prototype_matches_rejects_named_param_that_did_not_land(monkeypatch):
+    """#263 review: the name-insensitive acceptance must only tolerate names the
+    request OMITTED (BN auto-names those arg1/arg2 on readback -- the #254 case).
+    When the request EXPLICITLY named a param and BN read it back as arg1, the
+    name did NOT land -- a partial application that must not be reported verified."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+
+    def fn_type(ret, *params):
+        # params are (type, name) pairs so the test can set explicit names
+        return types.SimpleNamespace(
+            return_value=ret,
+            parameters=[types.SimpleNamespace(type=t, name=n) for t, n in params])
+
+    def bv_returning(expected):
+        return types.SimpleNamespace(parse_type_string=lambda s: (expected, None))
+
+    observed = fn_type("int32_t", ("int32_t", "arg1"))  # BN readback: requested name absent
+
+    # request explicitly named the param `fd` -> name did not land -> reject
+    assert not me._prototype_matches_ignoring_param_names(
+        bv_returning(fn_type("int32_t", ("int32_t", "fd"))),
+        observed, "int32_t(int32_t fd)")
+
+    # request OMITTED the name (parses to empty) -> BN auto-named it -> tolerate (#254)
+    assert me._prototype_matches_ignoring_param_names(
+        bv_returning(fn_type("int32_t", ("int32_t", ""))),
+        observed, "int32_t(int32_t)")
+
+
 def test_apply_operation_user_error_message_has_no_class_name(monkeypatch):
     """A handler raising a user-facing RuntimeError (e.g. a mistyped function
     name -> 'Function not found') must surface a clean, actionable message --
@@ -2376,6 +2460,56 @@ def test_function_list_envelope_exposes_items_alias_and_count_total(monkeypatch)
 
     count = instance._list_functions("active", count_only=True)
     assert count["count"] == 2 and count["total"] == 2
+
+
+def test_search_functions_count_only_returns_total(monkeypatch):
+    # Parity with `list_functions` count_only (#252): `search_functions` returns
+    # just the match total, not the (paged) list, so an agent can size a query.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[
+        _FakeFunction(0x1000, "parse_a"),
+        _FakeFunction(0x2000, "parse_b"),
+        _FakeFunction(0x3000, "unrelated"),
+    ])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    res = instance._search_functions("active", "parse", count_only=True)
+
+    assert res["count"] == 2 and res["total"] == 2
+    assert "functions" not in res and "items" not in res
+
+
+def test_search_functions_count_only_binder_forwards(monkeypatch):
+    # The op binder must forward count_only so the CLI's `--count` reaches the
+    # handler (regression guard against a CLI flag that never wires through).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[_FakeFunction(0x1000, "parse_a"), _FakeFunction(0x2000, "parse_b")])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    res = bridge._bind_search_functions(
+        instance, {"query": "parse", "count_only": True}, "active",
+    )
+
+    assert res["count"] == 2 and res["total"] == 2
+
+
+def test_search_functions_count_only_honors_address_filter(monkeypatch):
+    # count_only reflects --min-address/--max-address: the count is computed
+    # after match+address filtering, before paging -- parity with the listing.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[
+        _FakeFunction(0x1000, "parse_a"),
+        _FakeFunction(0x2000, "parse_b"),
+        _FakeFunction(0x3000, "parse_c"),
+    ])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    res = instance._search_functions("active", "parse", min_address="0x2000", count_only=True)
+
+    assert res["count"] == 2 and res["total"] == 2
 
 
 def test_list_functions_can_filter_by_address_range(monkeypatch):
@@ -4132,6 +4266,73 @@ def test_sections_query_filters_by_name(monkeypatch):
     names = [s["name"] for s in items]
     assert ".rodata" in names
     assert ".data" in names
+
+
+def test_sections_query_matches_semantics_not_just_name(monkeypatch):
+    # #257: --query should match the semantics label too, so `--query code`
+    # finds executable sections (.text = ReadOnlyCode) even though "code" is
+    # not in the section name. Match is case-insensitive.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        sections={
+            ".text": _FakeSection(".text", 0x1000, 0x5000, semantics=1),     # ReadOnlyCode
+            ".rodata": _FakeSection(".rodata", 0x5000, 0x6000, semantics=2),  # ReadOnlyData
+            ".data": _FakeSection(".data", 0x6000, 0x7000, semantics=3),      # ReadWriteData
+        },
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._sections(None, query="code")
+
+    names = [s["name"] for s in result["items"]]
+    assert names == [".text"]
+
+
+def test_sections_query_semantics_match_is_case_insensitive(monkeypatch):
+    # An uppercase query still matches the (CamelCase) semantics label.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(sections={".text": _FakeSection(".text", 0x1000, 0x5000, semantics=1)})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._sections(None, query="CODE")
+
+    assert [s["name"] for s in result["items"]] == [".text"]
+
+
+def test_sections_query_count_only_reflects_semantics_match(monkeypatch):
+    # The count_only path must reflect the broader name-or-semantics match, not
+    # the old name-only filter.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(sections={
+        ".text": _FakeSection(".text", 0x1000, 0x5000, semantics=1),     # ReadOnlyCode
+        ".rodata": _FakeSection(".rodata", 0x5000, 0x6000, semantics=2),  # ReadOnlyData
+    })
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._sections(None, query="code", count_only=True)
+
+    assert result["count"] == 1 and result["total"] == 1
+
+
+def test_sections_query_semantics_broadens_beyond_name(monkeypatch):
+    # Intentional #257 behavior change (pinned so it isn't read as a no-side-
+    # effect bugfix): `--query data` now matches any section whose SEMANTICS is
+    # ReadOnlyData/ReadWriteData even when "data" is absent from the name.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(sections={
+        ".text": _FakeSection(".text", 0x1000, 0x5000, semantics=1),    # ReadOnlyCode
+        ".roseg": _FakeSection(".roseg", 0x5000, 0x6000, semantics=2),  # ReadOnlyData, no "data" in name
+        ".rwseg": _FakeSection(".rwseg", 0x6000, 0x7000, semantics=3),  # ReadWriteData, no "data" in name
+    })
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._sections(None, query="data")
+
+    assert sorted(s["name"] for s in result["items"]) == [".roseg", ".rwseg"]
 
 
 def test_sections_null_segment_omits_rwx(monkeypatch):

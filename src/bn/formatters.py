@@ -4,6 +4,8 @@ import json
 import re
 from typing import Any, Callable
 
+from .transport import BridgeError
+
 # "rollback_failed" = an op succeeded but the batch revert that should have
 # undone it failed, so the view may be left modified -- a real failure. A
 # cleanly rolled-back sibling ("reverted") is NOT a failure and is omitted (#118).
@@ -66,9 +68,9 @@ def _slice_text_lines(
 ) -> str:
     """Return only lines START..END (1-indexed, inclusive) with a count header.
 
-    Shared by `decompile`, `il`, and `disasm` so every line-oriented view slices
-    the same way. Slicing happens before the spill check, so `--lines` also keeps
-    large functions inline.
+    Shared by `decompile`, `il`, `disasm`, and `structured-il` so every
+    line-oriented view slices the same way. Slicing happens before the spill
+    check, so `--lines` also keeps large functions inline.
     """
     if lines_range is None:
         return text
@@ -76,7 +78,15 @@ def _slice_text_lines(
     total = len(all_lines)
     start, end = lines_range
     if start > total:
-        return f"{marker} lines 0 of {total} (start {start} is beyond the last line)"
+        # A start past the last line is a user error, not a result. Raising keeps
+        # it from rendering as a `//` line (mistakable for code) and exiting 0:
+        # BridgeError propagates to main() -> stderr diagnostic, non-zero exit, no
+        # stdout a scripted consumer could read as a real slice (#253).
+        raise BridgeError(
+            f"--lines start {start} is beyond the last line "
+            f"(output has {total} line{'s' if total != 1 else ''}); "
+            f"omit --lines or choose a start within range"
+        )
     sliced = all_lines[start - 1 : end]
     header = f"{marker} lines {start}-{min(end, total)} of {total}"
     return header + "\n" + "\n".join(sliced)
@@ -528,6 +538,25 @@ def _render_target_use_text(value: Any) -> str:
 def _render_pin_clear_text(value: Any) -> str:
     """Render `instance clear` / `target clear` confirmations."""
     return "cleared"
+
+
+def _render_instance_gc_text(value: Any) -> str:
+    """Render the `instance gc` cache-cleanup summary."""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    logs = value.get("logs_removed", 0)
+    socks = value.get("sockets_removed", 0)
+    regs = value.get("registries_purged", 0)
+    live = value.get("live_instances", 0)
+    reaped = logs + socks + regs
+    if reaped == 0:
+        return f"gc: nothing to reap ({live} live instance{'' if live == 1 else 's'})"
+    return (
+        f"gc: reaped {logs} log{'' if logs == 1 else 's'}, "
+        f"{socks} orphan socket{'' if socks == 1 else 's'}, "
+        f"{regs} dead registr{'y' if regs == 1 else 'ies'} "
+        f"({live} live instance{'' if live == 1 else 's'} kept)"
+    )
 
 
 def _render_name_address_rows(value: Any, *, demangle: bool = False) -> str:

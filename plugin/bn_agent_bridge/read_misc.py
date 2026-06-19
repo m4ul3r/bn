@@ -394,8 +394,6 @@ def _sections(ctx, selector: str | None, *, query: str | None = None,
     sections = getattr(bv, "sections", {})
     needle = str(query).lower() if query else None
     for name, sec in sections.items():
-        if needle and needle not in name.lower():
-            continue
         start = int(getattr(sec, "start", 0))
         end = int(getattr(sec, "end", 0))
         length = end - start
@@ -406,6 +404,12 @@ def _sections(ctx, selector: str | None, *, query: str | None = None,
         except (TypeError, ValueError):
             semantics_int = 0
         semantics = _SECTION_SEMANTICS_NAMES.get(semantics_int, str(raw_semantics))
+
+        # Match the query against the section name OR its semantics label, so
+        # `--query code` finds executable sections (.text = ReadOnlyCode) even
+        # though "code" is not in the name (#257).
+        if needle and needle not in name.lower() and needle not in semantics.lower():
+            continue
 
         entry: dict[str, Any] = {
             "name": name,
