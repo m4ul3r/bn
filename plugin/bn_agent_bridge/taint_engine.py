@@ -959,6 +959,58 @@ class TaintEngine:
             return False  # buffer contents tainted -> a real overflow operand
         return self._taint_operand_roles(ssaf, expr, tainted, pointer_arg=pointer_arg) == {"index"}
 
+    def _store_dest_tainted_index(self, ssaf: Any, expr: Any, tainted: set, depth: int = 0) -> bool:
+        """True iff a store DESTINATION address *expr* is attacker-influenced via a
+        non-constant INDEX/OFFSET -- a tainted value added to a base pointer
+        (`base + i`, `base + i*stride`) -- as opposed to a tainted BASE pointer
+        combined only with compile-time-constant displacements (`p + 0x18`, `*p`).
+
+        The distinction is what keeps `oob_write` from flooding: seeding a pointer
+        parameter taints the pointer itself, so a fixed-offset field write
+        (`obj->field = v`, `str x,[x21,#imm]`) reads the tainted base and would
+        otherwise promote. Only a tainted *offset* means the attacker controls
+        WHERE the store lands; a constant offset off a tainted base is ordinary
+        struct-field/cursor population, not an out-of-bounds index (#287 dogfood)."""
+        if expr is None or depth > 8:
+            return False
+        # follow an address computed into a temp: `t = base + i; *t = v`
+        sv = self._as_single_ssa_var(expr)
+        if sv is not None:
+            try:
+                d = ssaf.get_ssa_var_definition(sv)
+            except Exception:
+                d = None
+            if d is not None and op_name(d) == "MLIL_SET_VAR_SSA":
+                return self._store_dest_tainted_index(ssaf, getattr(d, "src", None), tainted, depth + 1)
+            return False  # a bare (tainted) base var, no offset -> not an index
+        op = op_name(expr)
+        if op in ("MLIL_ADD", "MLIL_SUB"):
+            left = getattr(expr, "left", None)
+            right = getattr(expr, "right", None)
+            # a stride-scaled tainted operand is unambiguously an array index
+            if self._is_scaled_taint(left, tainted) or self._is_scaled_taint(right, tainted):
+                return True
+            l_const = self._int_const(left) is not None
+            r_const = self._int_const(right) is not None
+            # tainted operand added to ANOTHER variable (the base): the tainted
+            # side is an attacker-controlled offset/index, not a fixed field.
+            if not l_const and not r_const:
+                if self._expr_has_taint(left, tainted) or self._expr_has_taint(right, tainted):
+                    return True
+            # tainted variable + CONSTANT displacement: the variable is the base
+            # at a fixed offset (struct field / cursor). Recurse into the base in
+            # case it is itself `base2 + index2`.
+            base_side = right if l_const else left
+            return self._store_dest_tainted_index(ssaf, base_side, tainted, depth + 1)
+        # unwrap a cast/extension wrapping a deeper address computation
+        subs = list(getattr(expr, "operands", None) or [])
+        if not subs:
+            subs = [s for s in (getattr(expr, "left", None), getattr(expr, "right", None)) if s is not None]
+        for s in subs:
+            if self._store_dest_tainted_index(ssaf, s, tainted, depth + 1):
+                return True
+        return False
+
     # -- global/static buffers as taint locations -------------------------
     # A global buffer is referenced by an absolute address (MLIL_CONST_PTR), which
     # _pointee_var (stack-only) misses. We make it a single coarse taint location
@@ -2258,6 +2310,7 @@ class TaintEngine:
         leaves: list[dict[str, Any]] = []
         findings: list[dict[str, Any]] = []
         recorded_sinks: set[tuple] = set()
+        oob_store_addrs: set[str] = set()    # store addrs promoted to oob_write (#287 dedup)
         processed_calls: set[tuple] = set()  # (call_addr, tainted-arg-set) already descended
         out_params: set[int] = set()         # this func's params whose pointee got tainted
         reached_return = False
@@ -2779,17 +2832,20 @@ class TaintEngine:
                                 out_params.add(pidx)
                                 changed = True
                             saddr = hex(int(getattr(ins, "address", 0)))
-                            # #287: distinguish a tainted DESTINATION ADDRESS from a
-                            # merely tainted stored VALUE. When the index/offset (or
-                            # base) of the store address is attacker-influenced, the
-                            # write can land out of bounds -- a possible OOB WRITE --
-                            # even though _pointee_var could not bound the buffer.
-                            # Surfacing this only as a coarse_memory_store leaf reads
-                            # as "0 sinks" (a false all-clear on real overflows), so
-                            # promote it to an `oob_write` finding instead. A
-                            # value-only-tainted store (fixed offset off an untainted
-                            # base) is data propagation, not an OOB write, and stays a
-                            # coarse leaf below -- so this does not over-report.
+                            # #287: promote to an `oob_write` finding only when the
+                            # store DESTINATION address is attacker-influenced via a
+                            # non-constant INDEX/OFFSET (`base + i`, `base + i*stride`)
+                            # -- then the attacker controls WHERE the write lands, a
+                            # possible OOB write the engine could not bound, and
+                            # surfacing it only as a coarse_memory_store leaf reads as
+                            # a false all-clear. A tainted value at a merely CONSTANT
+                            # offset off a base -- a struct-field/cursor write
+                            # (`obj->field = v`) or a value-only store -- is NOT an
+                            # attacker-indexed write and stays a coarse leaf below.
+                            # Seeding a pointer param taints the base pointer itself,
+                            # so without the index discriminant every field write
+                            # would promote and flood the result (#287 dogfood: 73-95%
+                            # FPs on struct-populating parsers).
                             dest_hits = []
                             for r in expr_reads(dest):
                                 k = var_key(r); ver = getattr(r, "version", None)
@@ -2797,10 +2853,17 @@ class TaintEngine:
                                     dest_hits.append((k, ver))
                                 elif (k, None) in tainted:
                                     dest_hits.append((k, None))
-                            if dest_hits:
+                            if dest_hits and self._store_dest_tainted_index(ssaf, dest, tainted):
                                 sig = (saddr, "oob_write")
                                 if sig not in recorded_sinks:
                                     recorded_sinks.add(sig)
+                                    oob_store_addrs.add(saddr)
+                                    # this store is now a finding; drop any redundant
+                                    # coarse_memory_store leaf recorded for it via a
+                                    # value-only path on an earlier pass (#287 dedup).
+                                    leaves[:] = [lf for lf in leaves if not (
+                                        lf.get("kind") == "coarse_memory_store"
+                                        and lf.get("address") == saddr)]
                                     path = self._reconstruct_path(dest_hits[0], why)
                                     path.append(_instr_dict(
                                         ins,
@@ -2848,24 +2911,28 @@ class TaintEngine:
                                 # leaves+assumptions on a function that DID propagate
                                 # taint into a store is exactly the honesty gap the
                                 # soundness disclaimer promises not to produce.
-                                leaf = {
-                                    "kind": "coarse_memory_store",
-                                    "address": saddr,
-                                    "dest_expr": str(dest),
-                                    "il_text": str(ins),
-                                    "detail": (
-                                        "tainted value stored through a pointer the engine "
-                                        "could not correlate to a tracked buffer (field-derived "
-                                        "and/or non-constant index); downstream reads of these "
-                                        "bytes are not followed"
-                                    ),
-                                }
-                                if leaf not in leaves:
-                                    leaves.append(leaf)
-                                add_assumption(
-                                    f"coarse memory store at {saddr}: tainted bytes written "
-                                    "through an uncorrelated pointer; downstream reads not tracked"
-                                )
+                                # already promoted to an oob_write finding via an
+                                # attacker-indexed path? then don't also emit a
+                                # contradictory coarse leaf for the same store (#287).
+                                if saddr not in oob_store_addrs:
+                                    leaf = {
+                                        "kind": "coarse_memory_store",
+                                        "address": saddr,
+                                        "dest_expr": str(dest),
+                                        "il_text": str(ins),
+                                        "detail": (
+                                            "tainted value stored through a pointer the engine "
+                                            "could not correlate to a tracked buffer (field-derived "
+                                            "and/or non-constant index); downstream reads of these "
+                                            "bytes are not followed"
+                                        ),
+                                    }
+                                    if leaf not in leaves:
+                                        leaves.append(leaf)
+                                    add_assumption(
+                                        f"coarse memory store at {saddr}: tainted bytes written "
+                                        "through an uncorrelated pointer; downstream reads not tracked"
+                                    )
 
                 # Address-of-tainted escape (#228): an assignment or store whose
                 # VALUE is a POINTER to a tainted buffer (`stack_local = &buf`,

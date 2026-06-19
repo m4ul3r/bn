@@ -526,9 +526,12 @@ def test_forward_tainted_index_store_is_an_oob_write_sink(models):
     load = FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "base#1 = [obj + 0x10]",
                   reads=[], writes=[base1],
                   src=FExpr("MLIL_LOAD_SSA", "[obj + 0x10]", reads=[]))
+    # `base + idx`: a tainted INDEX added to a (distinct, untainted) base pointer.
     store = FInstr(1, 0x14, "MLIL_STORE_SSA", "[base#1 + idx#0] = 0",
                    reads=[base1, idx0], writes=[],
-                   dest=FExpr("MLIL_ADD", "base#1 + idx#0", reads=[base1, idx0]),
+                   dest=FExpr("MLIL_ADD", "base#1 + idx#0", reads=[base1, idx0],
+                              left=FExpr("MLIL_VAR_SSA", "base#1", reads=[base1]),
+                              right=FExpr("MLIL_VAR_SSA", "idx#0", reads=[idx0])),
                    src=FExpr("MLIL_CONST", "0", constant=0))
     func = FFunc("parse", 0x10, FSSAFunc([load, store]), params=[idx])
     engine = te.TaintEngine(FBV({}), models)
@@ -539,6 +542,66 @@ def test_forward_tainted_index_store_is_an_oob_write_sink(models):
     sink = next(s["sink"] for s in result["reached_sinks"]
                 if s["sink"]["class"] == "oob_write")
     assert sink["address"] == "0x14"
+
+
+def test_forward_tainted_base_constant_offset_store_is_not_oob_write(models):
+    # #287 dogfood regression: seeding a POINTER param taints the base pointer
+    # itself, so a store at a COMPILE-TIME CONSTANT offset off it -- `obj->field
+    # = v` (disasm `str x,[x21,#imm]`) -- used to flood `oob_write`. That is
+    # struct-field population, NOT an attacker-indexed write: the offset is a
+    # constant, so the attacker controls neither WHERE the write lands. It must
+    # stay a coarse_memory_store leaf. (Real parsers produced 73-95% FPs this way.)
+    obj = FVar("obj", ident=60)     # param 0: a struct pointer (seeded source)
+    obj0 = FSSA(obj, 0)
+    store = FInstr(0, 0x10, "MLIL_STORE_SSA", "[obj#0 + 0x18] = 0",
+                   reads=[obj0], writes=[],
+                   dest=FExpr("MLIL_ADD", "obj#0 + 0x18", reads=[obj0],
+                              left=FExpr("MLIL_VAR_SSA", "obj#0", reads=[obj0]),
+                              right=FExpr("MLIL_CONST", "0x18", constant=0x18)),
+                   src=FExpr("MLIL_CONST", "0", constant=0))
+    func = FFunc("fill_struct", 0x10, FSSAFunc([store]), params=[obj])
+    engine = te.TaintEngine(FBV({}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    classes = [s["sink"]["class"] for s in result["reached_sinks"]]
+    assert "oob_write" not in classes       # not flooded by struct-field writes
+    assert "coarse_memory_store" in [l.get("kind") for l in result["leaves"]]
+
+
+def test_forward_bare_deref_tainted_pointer_is_not_oob_write(models):
+    # `*param = v` (offset 0) through the seeded pointer is a plain deref store,
+    # not an attacker-indexed write -- must not promote to oob_write (#287 dogfood).
+    p = FVar("p", ident=61); p0 = FSSA(p, 0)
+    store = FInstr(0, 0x10, "MLIL_STORE_SSA", "[p#0] = 0", reads=[p0], writes=[],
+                   dest=FExpr("MLIL_VAR_SSA", "p#0", reads=[p0]),
+                   src=FExpr("MLIL_CONST", "0", constant=0))
+    func = FFunc("write0", 0x10, FSSAFunc([store]), params=[p])
+    engine = te.TaintEngine(FBV({}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    classes = [s["sink"]["class"] for s in result["reached_sinks"]]
+    assert "oob_write" not in classes
+
+
+def test_forward_scaled_tainted_index_store_is_an_oob_write_sink(models):
+    # `output[i] = 0` lowered as `str w,[base, i, lsl#2]` -- a stride-scaled
+    # tainted index is unambiguously an attacker offset -> oob_write (#287).
+    base = FVar("base", ident=62); i = FVar("i", ident=63)
+    base1 = FSSA(base, 1); i0 = FSSA(i, 0)
+    load = FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "base#1 = [g]",
+                  reads=[], writes=[base1],
+                  src=FExpr("MLIL_LOAD_SSA", "[g]", reads=[]))
+    store = FInstr(1, 0x14, "MLIL_STORE_SSA", "[base#1 + (i#0 << 2)] = 0",
+                   reads=[base1, i0], writes=[],
+                   dest=FExpr("MLIL_ADD", "base#1 + (i#0 << 2)", reads=[base1, i0],
+                              left=FExpr("MLIL_VAR_SSA", "base#1", reads=[base1]),
+                              right=FExpr("MLIL_LSL", "i#0 << 2", reads=[i0],
+                                          left=FExpr("MLIL_VAR_SSA", "i#0", reads=[i0]),
+                                          right=FExpr("MLIL_CONST", "2", constant=2))),
+                   src=FExpr("MLIL_CONST", "0", constant=0))
+    func = FFunc("idx_store", 0x10, FSSAFunc([load, store]), params=[i])
+    engine = te.TaintEngine(FBV({}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    classes = [s["sink"]["class"] for s in result["reached_sinks"]]
+    assert "oob_write" in classes
 
 
 def test_forward_value_only_store_stays_a_coarse_leaf(models):
