@@ -513,6 +513,57 @@ def test_forward_register_buffer_setup_is_not_a_false_escape(models):
     assert "pointer_escape" not in [l.get("kind") for l in result["leaves"]]
 
 
+def test_forward_tainted_index_store_is_an_oob_write_sink(models):
+    # parse(idx): a field-derived destination pointer indexed by an
+    # attacker-controlled value -- `base = obj->buf; *(base + idx) = 0`.
+    # _pointee_var cannot correlate `base` to a tracked buffer, so the engine
+    # used to record only a coarse_memory_store leaf and report 0 reached sinks
+    # -- a false all-clear over a possible out-of-bounds WRITE. A tainted
+    # destination ADDRESS must surface as an `oob_write` sink (#287).
+    idx = FVar("idx", ident=40)     # param 0: attacker-controlled index
+    base = FVar("base", ident=41)   # an uncorrelated, field-derived pointer
+    idx0 = FSSA(idx, 0); base1 = FSSA(base, 1)
+    load = FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "base#1 = [obj + 0x10]",
+                  reads=[], writes=[base1],
+                  src=FExpr("MLIL_LOAD_SSA", "[obj + 0x10]", reads=[]))
+    store = FInstr(1, 0x14, "MLIL_STORE_SSA", "[base#1 + idx#0] = 0",
+                   reads=[base1, idx0], writes=[],
+                   dest=FExpr("MLIL_ADD", "base#1 + idx#0", reads=[base1, idx0]),
+                   src=FExpr("MLIL_CONST", "0", constant=0))
+    func = FFunc("parse", 0x10, FSSAFunc([load, store]), params=[idx])
+    engine = te.TaintEngine(FBV({}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    classes = [s["sink"]["class"] for s in result["reached_sinks"]]
+    assert "oob_write" in classes           # not a silent false all-clear
+    assert result["stats"]["sinks"] >= 1
+    sink = next(s["sink"] for s in result["reached_sinks"]
+                if s["sink"]["class"] == "oob_write")
+    assert sink["address"] == "0x14"
+
+
+def test_forward_value_only_store_stays_a_coarse_leaf(models):
+    # `base = obj->buf; *(base + 0x10) = val` -- the VALUE is attacker-controlled
+    # but the destination address is a fixed offset off an untainted base. That
+    # is data propagation, not an OOB write: it must remain a coarse_memory_store
+    # leaf and must NOT be over-reported as an `oob_write` sink (#287).
+    val = FVar("val", ident=50)     # param 0: attacker-controlled value
+    base = FVar("base", ident=51)
+    val0 = FSSA(val, 0); base1 = FSSA(base, 1)
+    load = FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "base#1 = [obj + 0x10]",
+                  reads=[], writes=[base1],
+                  src=FExpr("MLIL_LOAD_SSA", "[obj + 0x10]", reads=[]))
+    store = FInstr(1, 0x14, "MLIL_STORE_SSA", "[base#1 + 0x10] = val#0",
+                   reads=[base1, val0], writes=[],
+                   dest=FExpr("MLIL_ADD", "base#1 + 0x10", reads=[base1]),
+                   src=FExpr("MLIL_VAR_SSA", "val#0", reads=[val0]))
+    func = FFunc("store_val", 0x10, FSSAFunc([load, store]), params=[val])
+    engine = te.TaintEngine(FBV({}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    classes = [s["sink"]["class"] for s in result["reached_sinks"]]
+    assert "oob_write" not in classes       # no over-report on value-only taint
+    assert "coarse_memory_store" in [l.get("kind") for l in result["leaves"]]
+
+
 def test_forward_arg_source_indirect_pointer_warns(models):
     # recvfrom(fd, G.pkt, n) where the dest buffer pointer is loaded from a global
     # slot: the seed can't anchor the pointee and won't correlate later re-loads,

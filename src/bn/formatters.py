@@ -1502,9 +1502,13 @@ def _render_taint_text(value: Any) -> str:
             for f in findings:
                 sink = f.get("sink") or {}
                 lines.append("")
+                # A raw-store sink (e.g. oob_write) has no call-arg index; only
+                # show "(arg N)" for the modeled-call sinks that have one.
+                _ai = sink.get("tainted_arg_index")
+                _arg = f"(arg {_ai}) " if _ai is not None else ""
                 lines.append(
                     f"[{sink.get('class', '?')}] {sink.get('callee', '?')} @ {sink.get('address')} "
-                    f"(arg {sink.get('tainted_arg_index')}) -- {sink.get('detail', '')}".rstrip()
+                    f"{_arg}-- {sink.get('detail', '')}".rstrip()
                 )
                 lines.extend(_render_taint_path(f.get("path") or []))
     else:

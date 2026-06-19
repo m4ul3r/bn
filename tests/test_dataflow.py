@@ -169,6 +169,32 @@ def test_render_taint_forward_text():
     assert "soundness:" in text
 
 
+def test_render_taint_forward_oob_write_sink_has_no_arg_clause():
+    # A raw-store oob_write sink (#287) has no call-arg index; the renderer must
+    # not emit a bogus "(arg None)" clause for it.
+    value = {
+        "direction": "forward",
+        "function": {"name": "parse", "address": "0x10"},
+        "sources": [{"kind": "param", "index": 0}],
+        "reached_sinks": [{
+            "sink": {"callee": "<memory store>", "address": "0x14",
+                     "tainted_arg_index": None, "class": "oob_write", "via": "index",
+                     "detail": "attacker-influenced index in the destination address"},
+            "path": [
+                {"address": "0x14", "op": "MLIL_STORE_SSA", "il_text": "[base + idx] = 0",
+                 "reason": "tainted index/offset reaches an out-of-bounds-capable store"},
+            ],
+        }],
+        "leaves": [],
+        "assumptions": [],
+        "soundness": "may-analysis",
+    }
+    text = _render_taint_text(value)
+    assert "[oob_write] <memory store> @ 0x14" in text
+    assert "(arg None)" not in text
+    assert "attacker-influenced index" in text
+
+
 def test_render_taint_forward_frontier_message():
     # reached_sinks empty BUT an unmodeled_callee frontier leaf -> the terminal
     # line must be frontier-aware, not the bare "no sinks reached" (#8).

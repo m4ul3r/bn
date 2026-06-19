@@ -2778,36 +2778,94 @@ class TaintEngine:
                             if pidx is not None and pidx not in out_params:
                                 out_params.add(pidx)
                                 changed = True
-                            # T1: _pointee_var could not correlate the store
-                            # destination to a tracked buffer (a struct-field
-                            # pointer and/or a non-constant index), so the engine
-                            # cannot follow downstream reads of these bytes. An
-                            # out-param write is at best a coarse caller-side
-                            # approximation (and at the analysis root it goes
-                            # nowhere). Record a frontier leaf + assumption rather
-                            # than dropping the flow silently -- an empty
-                            # leaves+assumptions on a function that DID propagate
-                            # taint into a store is exactly the honesty gap the
-                            # soundness disclaimer promises not to produce.
                             saddr = hex(int(getattr(ins, "address", 0)))
-                            leaf = {
-                                "kind": "coarse_memory_store",
-                                "address": saddr,
-                                "dest_expr": str(dest),
-                                "il_text": str(ins),
-                                "detail": (
-                                    "tainted value stored through a pointer the engine "
-                                    "could not correlate to a tracked buffer (field-derived "
-                                    "and/or non-constant index); downstream reads of these "
-                                    "bytes are not followed"
-                                ),
-                            }
-                            if leaf not in leaves:
-                                leaves.append(leaf)
-                            add_assumption(
-                                f"coarse memory store at {saddr}: tainted bytes written "
-                                "through an uncorrelated pointer; downstream reads not tracked"
-                            )
+                            # #287: distinguish a tainted DESTINATION ADDRESS from a
+                            # merely tainted stored VALUE. When the index/offset (or
+                            # base) of the store address is attacker-influenced, the
+                            # write can land out of bounds -- a possible OOB WRITE --
+                            # even though _pointee_var could not bound the buffer.
+                            # Surfacing this only as a coarse_memory_store leaf reads
+                            # as "0 sinks" (a false all-clear on real overflows), so
+                            # promote it to an `oob_write` finding instead. A
+                            # value-only-tainted store (fixed offset off an untainted
+                            # base) is data propagation, not an OOB write, and stays a
+                            # coarse leaf below -- so this does not over-report.
+                            dest_hits = []
+                            for r in expr_reads(dest):
+                                k = var_key(r); ver = getattr(r, "version", None)
+                                if (k, ver) in tainted:
+                                    dest_hits.append((k, ver))
+                                elif (k, None) in tainted:
+                                    dest_hits.append((k, None))
+                            if dest_hits:
+                                sig = (saddr, "oob_write")
+                                if sig not in recorded_sinks:
+                                    recorded_sinks.add(sig)
+                                    path = self._reconstruct_path(dest_hits[0], why)
+                                    path.append(_instr_dict(
+                                        ins,
+                                        reason="tainted value reaches the destination address of an out-of-bounds-capable store",
+                                        tainted=[node_label(n, why) for n in dest_hits]))
+                                    findings.append({
+                                        "sink": {
+                                            "callee": "<memory store>",
+                                            "address": saddr,
+                                            "tainted_arg_index": None,
+                                            "class": "oob_write",
+                                            # The attacker-influenced read can be an
+                                            # array index/offset OR the base pointer
+                                            # itself; the engine does not reliably
+                                            # distinguish unscaled byte indexing from a
+                                            # tainted base, so it does not claim a
+                                            # specific channel (`via`).
+                                            "detail": (
+                                                "the destination address of this store is "
+                                                "attacker-influenced and the engine could not "
+                                                "correlate it to a bounded buffer (e.g. a "
+                                                "field-derived or cursor pointer, a dynamically-"
+                                                "indexed local, or an attacker-controlled base "
+                                                "pointer); the write target is not bounded here, "
+                                                "so this is a possible out-of-bounds write -- "
+                                                "verify the index/length is range-checked"
+                                            ),
+                                        },
+                                        "path": path,
+                                    })
+                                    add_assumption(
+                                        f"possible OOB write at {saddr}: the destination address "
+                                        "of a store is attacker-influenced and the engine cannot "
+                                        "bound the write target (uncorrelated field-derived/cursor/"
+                                        "local/base pointer); verify range checks")
+                            else:
+                                # T1: _pointee_var could not correlate the store
+                                # destination to a tracked buffer (a struct-field
+                                # pointer and/or a non-constant index), so the engine
+                                # cannot follow downstream reads of these bytes. An
+                                # out-param write is at best a coarse caller-side
+                                # approximation (and at the analysis root it goes
+                                # nowhere). Record a frontier leaf + assumption rather
+                                # than dropping the flow silently -- an empty
+                                # leaves+assumptions on a function that DID propagate
+                                # taint into a store is exactly the honesty gap the
+                                # soundness disclaimer promises not to produce.
+                                leaf = {
+                                    "kind": "coarse_memory_store",
+                                    "address": saddr,
+                                    "dest_expr": str(dest),
+                                    "il_text": str(ins),
+                                    "detail": (
+                                        "tainted value stored through a pointer the engine "
+                                        "could not correlate to a tracked buffer (field-derived "
+                                        "and/or non-constant index); downstream reads of these "
+                                        "bytes are not followed"
+                                    ),
+                                }
+                                if leaf not in leaves:
+                                    leaves.append(leaf)
+                                add_assumption(
+                                    f"coarse memory store at {saddr}: tainted bytes written "
+                                    "through an uncorrelated pointer; downstream reads not tracked"
+                                )
 
                 # Address-of-tainted escape (#228): an assignment or store whose
                 # VALUE is a POINTER to a tainted buffer (`stack_local = &buf`,
