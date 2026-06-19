@@ -124,9 +124,11 @@ def test_py_exec_text_format_renders_stdout_and_result(fake_transport, capsys):
 
 
 def test_strings_hints_regex_on_zero_matches_with_metachars(fake_transport, capsys):
-    """strings (a bare list today) with a metacharacter query and 0 matches also
-    suggests --regex (#122)."""
-    fake_transport({"strings": {"ok": True, "result": []}})
+    """strings with a metacharacter query and 0 matches suggests --regex (#122);
+    the empty canonical envelope (total 0) drives the nudge (#275)."""
+    fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings", "items": [], "total": 0, "offset": 0,
+        "limit": None, "returned": 0, "has_more": False}}})
     rc = bn.cli.main(["strings", "--query", "foo(bar", "--target", "active"])
     assert rc == 0
     _, err = capsys.readouterr()
