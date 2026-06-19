@@ -575,6 +575,12 @@ def send_request(
     instance_id: str | None = None,
     spawn_missing_named: bool = False,
 ) -> dict[str, Any]:
+    # Validate/resolve the timeout BEFORE choosing an instance: choose_instance()
+    # auto-spawns a headless bridge when none is running, so a bad
+    # BN_REQUEST_TIMEOUT must fail here -- not after a stray random instance has
+    # already been spawned into the cache (#255 review). _resolve_timeout is
+    # idempotent, so the resolved value re-resolves to itself downstream.
+    timeout = _resolve_timeout(timeout)
     instance = choose_instance(instance_id, spawn_missing_named=spawn_missing_named)
     return _send_request_to_instance(
         instance,

@@ -457,6 +457,26 @@ def test_resolve_timeout_positive_default_and_explicit(monkeypatch):
     assert _resolve_timeout(12.0) == 12.0
 
 
+def test_invalid_timeout_is_rejected_before_choosing_an_instance(monkeypatch, tmp_path):
+    # #265 review: an invalid BN_REQUEST_TIMEOUT must be rejected BEFORE
+    # send_request() calls choose_instance() -- which auto-spawns a headless
+    # bridge. Otherwise `BN_REQUEST_TIMEOUT=abc bn target list` errors out but
+    # leaves a stray random instance behind in a fresh cache.
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "abc")
+
+    def _must_not_spawn(*a, **k):
+        raise AssertionError("choose_instance reached before timeout validation")
+
+    monkeypatch.setattr("bn.transport.choose_instance", _must_not_spawn)
+
+    with pytest.raises(BridgeError, match="BN_REQUEST_TIMEOUT"):
+        send_request("list_targets")
+
+    # Fresh cache stays empty: nothing was spawned.
+    assert list_instances() == []
+
+
 def test_send_request_partial_response_reports_real_error(tmp_path, monkeypatch):
     from bn.transport import BridgeError
 
