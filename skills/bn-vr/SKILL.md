@@ -177,6 +177,18 @@ bn taint forward -f <handler> --source param:0
 Reports each reached sink with its bug class (`overflow_len`,
 `command_injection`, `format_string`, …) and the full SSA path.
 
+> **Global / struct-field buffer source → seed the parser entry instead.** When the
+> recv destination is a long-lived pointer in a global or daemon struct
+> (`recvfrom(fd, G.pkt, …)`, then later `p = G.pkt; parse(p, n)`), seeding
+> `--source arg:recvfrom:1` (or `arg:read:1`) can report **zero propagation** —
+> the buffer-pointee taint isn't anchored across the global/struct-field pointer
+> *load* that re-derives the parser's argument, so the recv store and the parser
+> load aren't correlated. Seed the parser directly instead —
+> `bn taint forward -f parse_packet --source param:0` — which surfaces the
+> byte-copy / option-extraction loops honestly as `coarse_memory_store` leaves.
+> The same indirect-load caveat is what bites whenever the recv destination is
+> reached through a pointer load rather than a direct local buffer.
+
 **Backward — slice a sink's argument back to its origin:**
 ```bash
 bn taint backward -f <handler> --sink arg:memcpy:2   # where does the length come from?
@@ -193,6 +205,14 @@ and ascends into *callers* to find where a value originates, while `bn trace`
 pins an exact call argument at a specific address and descends into *callees*
 for return-value provenance. Reach for `trace` when interrogating a concrete
 callsite, `taint backward` when hunting origins across the caller chain.
+
+> **JSON: the findings live under a different key per direction.** `taint forward`
+> puts the discovered sinks in **`reached_sinks`** (top-level array; `stats.sinks`
+> is just its count). `taint backward` puts the discovered slices in **`slices`** —
+> its top-level **`sinks`** key echoes the *input* sink locators you passed, **not**
+> the findings. So extract with `jq '.reached_sinks[]'` (forward) vs `jq '.slices[]'`
+> (backward); reading backward `.sinks` as results misreports a real slice as "0
+> sinks".
 
 **Source/sink locator grammar:** `param:<n>` · `var:<selector>` ·
 `ret:<callee>` (forward only) · `arg:<callee>:<n>` (the buffer arg `n` points at).
