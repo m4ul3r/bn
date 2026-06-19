@@ -769,6 +769,46 @@ def _verify_delete_comment(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
 
 
 
+def _prototype_matches_ignoring_param_names(bv, observed_type, expected_str: str) -> bool:
+    """True if *observed_type* matches the requested prototype string when
+    parameter NAMES are ignored -- only the return type and the per-parameter
+    types are compared.
+
+    BN auto-names unnamed parameters on readback (``arg1``, ``arg2``, ...), so a
+    valid ``proto set`` whose requested string omits names reads back carrying
+    names it never asked for. That is a pure textual mismatch which wrongly trips
+    ``verification_failed`` + revert -- the same false-negative class #199 fixed
+    for ``__convention``/``__pure``, here for parameter names (#254). Comparing the
+    parsed parameter *types* (each rendered canonically by BN, so function
+    pointers / arrays survive) is name-insensitive and robust.
+
+    Best-effort: returns False (so the caller falls back to the string compare and
+    its existing behavior) when the expected string won't parse or either type
+    lacks the BN function-type shape -- e.g. the mocked unit suite, where
+    ``fn.type`` is a plain string."""
+    try:
+        expected_type, _ = bv.parse_type_string(str(expected_str))
+    except Exception:  # noqa: BLE001 - unparseable expected -> fall back, never raise
+        return False
+    try:
+        if str(observed_type.return_value) != str(expected_type.return_value):
+            return False
+        # Varargs are part of the signature but not a named parameter, so don't let
+        # the name-insensitive compare silently accept a `...` mismatch. getattr
+        # default keeps this a no-op for the mocked unit types that lack the field.
+        if bool(getattr(observed_type, "has_variable_arguments", False)) != bool(
+            getattr(expected_type, "has_variable_arguments", False)
+        ):
+            return False
+        observed_params = list(observed_type.parameters or [])
+        expected_params = list(expected_type.parameters or [])
+    except AttributeError:
+        return False
+    if len(observed_params) != len(expected_params):
+        return False
+    return all(str(o.type) == str(e.type) for o, e in zip(observed_params, expected_params))
+
+
 def _verify_set_prototype(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     item = dict(result)
     address = _parse_address(item["address"])
@@ -788,12 +828,16 @@ def _verify_set_prototype(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
         # __convention("cdecl")) that wasn't present in the parsed
         # expected type.  Normalize both before rejecting.
         if _normalize_prototype(observed) != _normalize_prototype(expected):
-            raise OperationFailure(
-                "verification_failed",
-                f"Live prototype verification failed at {item['address']}",
-                requested=item.get("requested"),
-                observed=item["observed"],
-            )
+            # ...and it auto-names unnamed parameters on readback, so a prototype
+            # requested without parameter names reads back with arg1/arg2/...; accept
+            # when the return type and all parameter TYPES still match (#254).
+            if not _prototype_matches_ignoring_param_names(bv, fn.type, expected):
+                raise OperationFailure(
+                    "verification_failed",
+                    f"Live prototype verification failed at {item['address']}",
+                    requested=item.get("requested"),
+                    observed=item["observed"],
+                )
     item["status"] = "noop" if item.get("before_prototype") == expected else "verified"
     return item
 

@@ -123,3 +123,47 @@ class TestMultiInstance:
             assert Path(save_path).exists()
         finally:
             _session_stop(inst_id)
+
+
+class TestProtoSetUnnamedParams:
+    """Regression for #254: a `proto set` whose prototype omits parameter names
+    must verify, not be reported verification_failed and reverted. BN auto-names
+    unnamed params on readback (arg1, arg2, ...), so the readback text never
+    matches the requested string -- only a real BN readback reproduces this, so
+    the mocked suite can't cover it."""
+
+    def _first_fn(self, inst_id):
+        out = _bn("--instance", inst_id, "function", "list", "--format", "json")
+        return json.loads(out.stdout)["items"][0]["name"]
+
+    def test_unnamed_params_verify_via_preview(self):
+        info = _session_start(str(HELLO_BINARY))
+        inst_id = info["instance_id"]
+        try:
+            fn = self._first_fn(inst_id)
+            res = _bn("--instance", inst_id, "proto", "set", fn,
+                      f"void {fn}(int32_t, char**, char**)", "--preview", "--format", "json")
+            parsed = json.loads(res.stdout)
+            statuses = [r.get("status") for r in parsed["results"]]
+            assert statuses == ["verified"], parsed
+            assert res.returncode == 0, res.stdout
+        finally:
+            _session_stop(inst_id)
+
+    def test_named_params_also_verify(self):
+        """Contrast case: a fully NAMED prototype still verifies through the same
+        path -- the name-insensitive acceptance must not perturb the normal,
+        string-matching case. (The rejection of a genuine type/arity/return
+        mismatch can't be forced through real BN, which applies valid prototypes
+        verbatim, so that is covered by the mocked unit test
+        test_prototype_matches_ignoring_param_names.)"""
+        info = _session_start(str(HELLO_BINARY))
+        inst_id = info["instance_id"]
+        try:
+            fn = self._first_fn(inst_id)
+            res = _bn("--instance", inst_id, "proto", "set", fn,
+                      f"int32_t {fn}(int64_t argc, char** argv)", "--preview", "--format", "json")
+            parsed = json.loads(res.stdout)
+            assert [r.get("status") for r in parsed["results"]] == ["verified"], parsed
+        finally:
+            _session_stop(inst_id)
