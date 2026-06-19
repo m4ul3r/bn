@@ -7106,6 +7106,43 @@ def test_save_database_succeeds_when_file_is_written(monkeypatch, tmp_path):
     assert bv.created_with == str(out.resolve())
 
 
+class _RehomingSaveBV:
+    """Like _SaveBV, but mimics BN's create_database RE-HOMING the view's filename
+    to the new .bndb -- the behavior _SaveBV omits and the cause of #256."""
+
+    def __init__(self, filename: str):
+        self.file = types.SimpleNamespace(filename=filename)
+        self.created_with = None
+
+    def create_database(self, out: str):
+        self.created_with = out
+        Path(out).write_text("bndb")
+        self.file.filename = out  # real BN rebinds the live view to the new file
+        return True
+
+
+def test_save_path_preserves_target_identity(monkeypatch, tmp_path):
+    """An explicit `save --path` writes a COPY; it must NOT re-home the live target.
+    BN's create_database rebinds bv.file.filename to the new .bndb -- the basis for
+    selector resolution -- so the original selector (and `bn close <name>`) would
+    stop resolving. The fix restores the original filename after an explicit --path
+    save, so the copy is written but the live target keeps its identity (#256)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    orig = str(tmp_path / "origbin")
+    bv = _RehomingSaveBV(orig)
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(instance.targets, "clear_dirty", lambda b: None)
+
+    out = tmp_path / "copy.bndb"
+    result = instance._save_database("origbin", str(out))
+
+    assert result == {"saved": True, "path": str(out.resolve())}
+    assert out.exists()
+    assert bv.created_with == str(out.resolve())   # the copy WAS written
+    assert bv.file.filename == orig                # ...but identity is preserved
+
+
 def test_save_database_fails_when_create_database_returns_false(monkeypatch, tmp_path):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

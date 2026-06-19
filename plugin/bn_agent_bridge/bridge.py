@@ -928,6 +928,16 @@ class BinaryNinjaBridge:
             self.targets.clear_dirty(bv)
             return {"saved": True, "path": saved, "fallback": True, "requested_path": out}
 
+        if explicit and filename:
+            # `bv.create_database(--path)` re-homes the live view to the copy, so the
+            # ORIGINAL selector (and `bn close <name>`) would stop resolving. A
+            # --path save is a copy, not a move: restore the original filename so the
+            # live target keeps its identity (#256). The default (no --path) save
+            # legitimately persists into the target's own .bndb, so it is left alone.
+            try:
+                bv.file.filename = filename
+            except Exception:  # noqa: BLE001 - never fail a successful save over this
+                pass
         self.targets.clear_dirty(bv)  # mutations are now persisted (L15)
         return {"saved": True, "path": saved}
 
