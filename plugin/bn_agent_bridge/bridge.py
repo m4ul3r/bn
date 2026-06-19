@@ -953,6 +953,19 @@ class BinaryNinjaBridge:
                 )
             return dest
 
+        def _restore_filename() -> bool:
+            """Undo create_database's re-home of the live view back to the original
+            file (#256). Returns True if the view's filename is (or already was)
+            the original; False if the restore could not be applied -- the caller
+            must then surface a degraded result instead of claiming a clean save."""
+            if not (explicit and filename):
+                return True
+            try:
+                bv.file.filename = filename
+            except Exception:  # noqa: BLE001 - report degraded, never crash the save
+                return False
+            return str(getattr(bv.file, "filename", "")) == filename
+
         try:
             saved = _attempt(out)
         except RuntimeError as exc:
@@ -962,6 +975,10 @@ class BinaryNinjaBridge:
             # landed (#214). An EXPLICIT --path failure stays a hard error -- the
             # user chose that location, so a silent relocation would be wrong.
             if explicit:
+                # create_database may have re-homed bv.file.filename to the failed
+                # copy path before raising; restore the original identity so a
+                # failed --path save never strands the live selector (#256 review).
+                _restore_filename()
                 raise
             stem = Path(filename or out).name or "target"
             digest = hashlib.sha256((filename or out).encode("utf-8")).hexdigest()[:16]
@@ -976,6 +993,28 @@ class BinaryNinjaBridge:
             self.targets.clear_dirty(bv)
             return {"saved": True, "path": saved, "fallback": True, "requested_path": out}
 
+        # `bv.create_database(--path)` re-homes the live view to the copy, so the
+        # ORIGINAL selector (and `bn close <name>`) would stop resolving. A --path
+        # save is a copy, not a move: restore the original filename so the live
+        # target keeps its identity (#256). The default (no --path) save legitimately
+        # persists into the target's own .bndb, so _restore_filename is a no-op there.
+        if not _restore_filename():
+            # The save landed on disk, but the live view is still re-homed to the
+            # copy and we could not undo it. Surface a degraded success (rehomed)
+            # rather than a clean one so callers know the original identity moved and
+            # `bn close <selector>` may no longer resolve it (#256 review).
+            self.targets.clear_dirty(bv)  # the bytes are persisted regardless
+            return {
+                "saved": True,
+                "path": saved,
+                "rehomed": True,
+                "note": (
+                    f"Saved to {saved}, but could not restore the live target's "
+                    f"original filename ({filename!r}); the in-memory view is now "
+                    f"homed at {str(getattr(bv.file, 'filename', ''))!r}. Re-open the "
+                    "original path to restore its selector."
+                ),
+            }
         self.targets.clear_dirty(bv)  # mutations are now persisted (L15)
         return {"saved": True, "path": saved}
 

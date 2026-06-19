@@ -125,6 +125,40 @@ class TestMultiInstance:
             _session_stop(inst_id)
 
 
+class TestSavePathIdentity:
+    """Regression for #256: `save --path` writes a COPY and must not re-home the
+    live target, so the original selector keeps resolving afterward. Needs real BN
+    -- only `bv.create_database` actually rebinds the view's filename."""
+
+    def test_save_path_keeps_original_selector(self, tmp_path):
+        # Two targets in one instance so the selector is REQUIRED and name-based.
+        info = _session_start(str(HELLO_BINARY), str(ADD_BINARY))
+        inst = info["instance_id"]
+        try:
+            listing = json.loads(
+                _bn("--instance", inst, "target", "list", "--format", "json").stdout)
+            hello = next(t for t in listing
+                         if "hello" in (t.get("filename", "") + t.get("basename", "")))
+            sel = hello.get("selector") or hello.get("basename")
+
+            copy = str(tmp_path / "copy.bndb")
+            saved = _bn("--instance", inst, "save", "--target", sel, "--path", copy,
+                        "--format", "json")
+            assert saved.returncode == 0, saved.stderr
+            assert json.loads(saved.stdout).get("saved") is True
+            assert Path(copy).exists()
+
+            # The original selector must STILL resolve -- before the fix the live
+            # target was rebound to copy.bndb and `sel` raised "not found".
+            after = _bn("--instance", inst, "target", "info", "--target", sel,
+                        "--format", "json")
+            assert after.returncode == 0, (
+                f"original selector {sel!r} stopped resolving after save --path: "
+                f"{after.stdout} {after.stderr}")
+        finally:
+            _session_stop(inst)
+
+
 class TestProtoSetUnnamedParams:
     """Regression for #254: a `proto set` whose prototype omits parameter names
     must verify, not be reported verification_failed and reverted. BN auto-names
