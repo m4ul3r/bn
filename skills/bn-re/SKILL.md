@@ -170,71 +170,18 @@ Understanding relationships between functions reveals architecture:
 
 - **Build a mental call tree** — for key functions, trace both up and down 2-3 layers. This reveals the flow: entry -> dispatch -> handler -> utility.
 
-## Naming Conventions
-
-Consistency helps both you and the user:
-
-- Use `snake_case` for functions and locals (matches C convention and Binary Ninja defaults).
-- Prefix with module/subsystem when apparent: `net_send_packet`, `ui_draw_button`, `crypto_decrypt_block`.
-- Name by *what it does*, not implementation: `validate_input` not `check_and_branch_if_less`.
-- For unknown purpose, use descriptive placeholders: `process_buffer_0x4010a0` is better than `sub_4010a0`, but only rename when you're reasonably confident.
-- Preview before committing:
-  ```bash
-  bn symbol rename sub_401000 process_buffer_0x4010a0 --preview
-  ```
-
 ## Commenting
 
-Good names carry most of the meaning, but comments fill the gaps:
-
-- **Explain non-obvious behavior** — if a function's purpose or mechanism isn't clear from its name and types alone, add a comment at its entry address:
-  ```bash
-  bn decompile <function> --addresses
-  bn comment set --address 0x401000 "Walks the linked list of active sessions and frees expired ones"
-  ```
-
-- **Use TODO comments for deferred work** — when you identify something that needs further analysis but isn't the current focus, leave a TODO so future passes can pick it up:
-  ```bash
-  bn comment set --address 0x402000 "TODO: second argument looks like a callback — trace callers to confirm signature"
-  bn comment set --address 0x403000 "TODO: this allocation is never freed in the error path — possible leak"
-  ```
-
-- **When to comment vs. when to rename** — if you can express it in a name, rename instead. Comments are for *why* and *context* that a name can't carry: edge cases, assumptions, relationships to other functions, deferred questions.
-
-- **Review outstanding TODOs** — on subsequent passes, check for deferred work:
-  ```bash
-  bn comment list --query TODO
-  ```
+Comment the *why* a name can't carry (assumptions, edge cases, cross-function relationships), and drop `TODO:` markers for deferred work so later passes resume via `bn comment list --query TODO`. If it fits in a name, rename instead.
+```bash
+bn comment set --address 0x401000 "len isn't bounds-checked; attacker-controlled"
+bn comment set --address 0x402000 "TODO: arg2 looks like a callback — confirm signature"
+```
 
 ## Struct Reconstruction
 
-When decompiled code shows repeated offset accesses from a pointer (e.g., `*(arg1 + 0x10)`, `*(arg1 + 0x18)`), that pointer is likely a struct.
-
-### Workflow
-
-1. **Collect evidence** — decompile functions that use the pointer and note all accessed offsets and their apparent types:
-   ```bash
-   bn decompile <function> --addresses
-   ```
-
-2. **Check if a struct already exists** — it may be partially defined:
-   ```bash
-   bn struct show <TypeName>
-   ```
-
-3. **Create or extend the struct** — set fields at observed offsets:
-   ```bash
-   bn struct field set Player 0x0 vtable "void*" --preview
-   bn struct field set Player 0x8 name "char*" --preview
-   bn struct field set Player 0x10 health int32_t --preview
-   ```
-
-4. **Apply and verify** — retype the parameter to use the struct, then re-decompile to confirm the output improves:
-   ```bash
-   bn local retype <function> arg1 "Player*"
-   bn decompile <function>
-   ```
-
-5. **Iterate** — new field names in decompilation often reveal more structure. Repeat until the code reads naturally.
-
-For complex structs, use `bn types declare` or `bn py exec` with `StructureBuilder` (see the `bn` skill for examples).
+Repeated fixed-offset accesses off a pointer (`*(arg1 + 0x10)`, `*(arg1 + 0x18)`) mean it's a struct. Collect the offsets from decompilation, check for an existing type (`bn struct show <T>`), set fields at the observed offsets, retype the param, and re-decompile — iterate until it reads naturally. Complex structs: `bn types declare` or `bn py exec` + `StructureBuilder` (see the `bn` skill).
+```bash
+bn struct field set Player 0x10 health int32_t --preview
+bn local retype <function> arg1 "Player*"
+```
