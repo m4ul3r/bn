@@ -82,6 +82,8 @@ def _function_list(args: argparse.Namespace) -> int:
          target=True, paged=True, address_filter=True,
          args=[
              arg("query"),
+             arg("--count", action="store_true", default=False,
+                 help="Show match count instead of listing"),
              arg("--sort", choices=["address", "size", "name"], default="address",
                  help="Order results: address (default), size (largest first), or name"),
              arg("--reverse", "--desc", action="store_true", default=False, dest="reverse",
@@ -107,6 +109,19 @@ def _function_search(args: argparse.Namespace) -> int:
         params["min_address"] = args.min_address
     if args.max_address is not None:
         params["max_address"] = args.max_address
+    if args.count:
+        params["count_only"] = True
+        return _call(
+            args,
+            "search_functions",
+            params,
+            require_target=True,
+            text_renderer=lambda value: f"Total functions: {value.get('count', 0)}",
+            stem="function-search-count",
+            # --count is the "is my query matching anything?" use case, so the
+            # 0-result `add --regex` nudge is most useful here too (#252 review).
+            regex_hint_query=args.query,
+        )
     if args.offset:
         params["offset"] = args.offset
     limit = _effective_limit(args)

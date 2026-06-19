@@ -1770,6 +1770,7 @@ def _bind_search_functions(bridge, params, target):
         max_address=params.get("max_address"),
         offset=int(params.get("offset", 0)),
         limit=int(params["limit"]) if params.get("limit") is not None else None,
+        count_only=_validate_bool(params.get("count_only"), label="count_only", default=False),
         sort=str(params.get("sort", "address")),
         reverse=_validate_bool(params.get("reverse"), label="reverse", default=False),
     )
