@@ -29,6 +29,10 @@ def _zero_function_search(op, *, params=None, target=None, timeout=30.0, instanc
                                    "limit": None, "returned": 0, "has_more": False}}
 
 
+def _zero_function_search_count(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+    return {"ok": True, "result": {"count": 0, "total": 0}}
+
+
 def _empty_xrefs(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
     return {"ok": True, "result": {"address": "0x308", "code_refs": [], "data_refs": []}}
 
@@ -103,4 +107,4 @@ def _capture_xrefs_call(monkeypatch):
     return captured
 
 
-__all__ = ['_spill_artifact_namespace', '_zero_function_search', '_empty_xrefs', 'tmp_session', '_fake_bridge_instance', '_load_capture', '_assert_no_bridge_call', '_capture_xrefs_call']
+__all__ = ['_spill_artifact_namespace', '_zero_function_search', '_zero_function_search_count', '_empty_xrefs', 'tmp_session', '_fake_bridge_instance', '_load_capture', '_assert_no_bridge_call', '_capture_xrefs_call']

@@ -1228,3 +1228,62 @@ def test_bridge_handler_serialization_fallback_survives_logging_failure(monkeypa
     assert "serializ" in response["error"].lower()
 
 
+
+
+def test_save_path_failure_restores_target_identity(monkeypatch, tmp_path):
+    """#256 review: if create_database re-homes the live view and THEN the
+    explicit --path save fails, the original filename must still be restored --
+    otherwise a failed save silently strands the selector at a path that was
+    never written."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    orig = str(tmp_path / "origbin")
+    bv = _RehomingFailSaveBV(orig)
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(instance.targets, "clear_dirty", lambda b: None)
+
+    out = tmp_path / "copy.bndb"
+    with pytest.raises(RuntimeError, match="no file was written"):
+        instance._save_database("origbin", str(out))
+    assert bv.file.filename == orig  # identity restored despite the failure
+
+def test_save_path_preserves_target_identity(monkeypatch, tmp_path):
+    """An explicit `save --path` writes a COPY; it must NOT re-home the live target.
+    BN's create_database rebinds bv.file.filename to the new .bndb -- the basis for
+    selector resolution -- so the original selector (and `bn close <name>`) would
+    stop resolving. The fix restores the original filename after an explicit --path
+    save, so the copy is written but the live target keeps its identity (#256)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    orig = str(tmp_path / "origbin")
+    bv = _RehomingSaveBV(orig)
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(instance.targets, "clear_dirty", lambda b: None)
+
+    out = tmp_path / "copy.bndb"
+    result = instance._save_database("origbin", str(out))
+
+    assert result == {"saved": True, "path": str(out.resolve())}
+    assert out.exists()
+    assert bv.created_with == str(out.resolve())   # the copy WAS written
+    assert bv.file.filename == orig                # ...but identity is preserved
+
+def test_save_path_restore_failure_reports_degraded_not_clean_success(monkeypatch, tmp_path):
+    """#256 review: if the post-save restore of the original filename FAILS, the
+    save did land on disk but the live view is still re-homed to the copy. That
+    must surface as a degraded result (rehomed=True), not a clean success that
+    hides the lost identity."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    orig = str(tmp_path / "origbin")
+    bv = _RestoreFailSaveBV(orig)
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(instance.targets, "clear_dirty", lambda b: None)
+
+    out = tmp_path / "copy.bndb"
+    result = instance._save_database("origbin", str(out))
+
+    assert result["saved"] is True
+    assert result.get("rehomed") is True
+    assert out.exists()
+    assert bv.file.filename == str(out.resolve())  # still re-homed (restore failed)

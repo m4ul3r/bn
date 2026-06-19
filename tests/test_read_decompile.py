@@ -1320,3 +1320,51 @@ def test_backward_slice_call_boundary_names_callee(monkeypatch):
 # --- imports --summary ---
 
 
+
+
+def test_search_functions_count_only_binder_forwards(monkeypatch):
+    # The op binder must forward count_only so the CLI's `--count` reaches the
+    # handler (regression guard against a CLI flag that never wires through).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[_FakeFunction(0x1000, "parse_a"), _FakeFunction(0x2000, "parse_b")])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    res = bridge._bind_search_functions(
+        instance, {"query": "parse", "count_only": True}, "active",
+    )
+
+    assert res["count"] == 2 and res["total"] == 2
+
+def test_search_functions_count_only_honors_address_filter(monkeypatch):
+    # count_only reflects --min-address/--max-address: the count is computed
+    # after match+address filtering, before paging -- parity with the listing.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[
+        _FakeFunction(0x1000, "parse_a"),
+        _FakeFunction(0x2000, "parse_b"),
+        _FakeFunction(0x3000, "parse_c"),
+    ])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    res = instance._search_functions("active", "parse", min_address="0x2000", count_only=True)
+
+    assert res["count"] == 2 and res["total"] == 2
+
+def test_search_functions_count_only_returns_total(monkeypatch):
+    # Parity with `list_functions` count_only (#252): `search_functions` returns
+    # just the match total, not the (paged) list, so an agent can size a query.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[
+        _FakeFunction(0x1000, "parse_a"),
+        _FakeFunction(0x2000, "parse_b"),
+        _FakeFunction(0x3000, "unrelated"),
+    ])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    res = instance._search_functions("active", "parse", count_only=True)
+
+    assert res["count"] == 2 and res["total"] == 2
+    assert "functions" not in res and "items" not in res

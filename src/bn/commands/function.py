@@ -82,6 +82,8 @@ def _function_list(args: argparse.Namespace) -> int:
          target=True, paged=True, address_filter=True,
          args=[
              arg("query"),
+             arg("--count", action="store_true", default=False,
+                 help="Show match count instead of listing"),
              arg("--sort", choices=["address", "size", "name"], default="address",
                  help="Order results: address (default), size (largest first), or name"),
              arg("--reverse", "--desc", action="store_true", default=False, dest="reverse",
@@ -107,6 +109,19 @@ def _function_search(args: argparse.Namespace) -> int:
         params["min_address"] = args.min_address
     if args.max_address is not None:
         params["max_address"] = args.max_address
+    if args.count:
+        params["count_only"] = True
+        return _call(
+            args,
+            "search_functions",
+            params,
+            require_target=True,
+            text_renderer=lambda value: f"Total functions: {value.get('count', 0)}",
+            stem="function-search-count",
+            # --count is the "is my query matching anything?" use case, so the
+            # 0-result `add --regex` nudge is most useful here too (#252 review).
+            regex_hint_query=args.query,
+        )
     if args.offset:
         params["offset"] = args.offset
     limit = _effective_limit(args)
@@ -247,14 +262,19 @@ def _il(args: argparse.Namespace) -> int:
                  help="IL level (default: mlil)"),
              arg("--no-ssa", dest="ssa", action="store_false", default=True,
                  help="Emit non-SSA form (default: SSA)"),
+             arg("--lines", type=_parse_line_range, default=None, metavar="START:END",
+                 help="Show only lines START through END (1-indexed, inclusive)"),
          ])
 def _function_structured_il(args: argparse.Namespace) -> int:
+    lines_range = getattr(args, "lines", None)
+    if lines_range is not None:
+        _require_text_format(args, "--lines")
     return _call(
         args,
         "structured_il",
         {"identifier": args.identifier, "view": args.view, "ssa": bool(args.ssa)},
         require_target=True,
-        text_renderer=_render_structured_il_text,
+        text_renderer=lambda value: _slice_text_lines(_render_structured_il_text(value), lines_range),
         stem="structured-il",
     )
 

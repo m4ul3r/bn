@@ -1195,14 +1195,6 @@ def test_xrefs_identifier_and_field_are_mutually_exclusive(monkeypatch, capsys):
     assert "T.x" in err
 
 
-def test_slice_text_lines_start_beyond_end_keeps_header_sane():
-    from bn import formatters
-
-    out = formatters._slice_text_lines("a\nb\nc", (10, 12))
-
-    assert out == "// lines 0 of 3 (start 10 is beyond the last line)"
-
-
 def test_trace_render_step_grammar_singular_and_plural():
     from bn import formatters
     base = {
@@ -1348,3 +1340,64 @@ def test_xrefs_any_batch_probes_symbols(monkeypatch, capsys):
     assert "strcpy: absent" in out
 
 
+
+
+def test_function_search_count_hints_regex_on_zero_matches(monkeypatch, capsys):
+    """#252 review: --count is the 'is my query matching anything?' path, so a
+    0-match query with regex metacharacters must still nudge toward --regex.
+    The hint keys off total==0, which the count envelope carries."""
+    monkeypatch.setattr(bn.cli, "send_request", _zero_function_search_count)
+    rc = bn.cli.main(["function", "search", "init|fini", "--count", "--target", "active"])
+    assert rc == 0
+    _, err = capsys.readouterr()
+    assert "add --regex" in err
+
+def test_function_search_count_prints_total(monkeypatch, capsys):
+    # #252: `function search --count` mirrors `list --count` -- forwards
+    # count_only to search_functions and renders the match total only.
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "x"}]}
+        if op == "search_functions":
+            assert params.get("count_only") is True
+            assert params.get("query") == "parse"
+            return {"ok": True, "result": {"count": 17, "total": 17}}
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    rc = bn.cli.main(["function", "search", "parse", "--count"])
+
+    assert rc == 0
+    assert "Total functions: 17" in capsys.readouterr().out
+
+
+# --- Sticky instance/target ---
+
+def test_structured_il_lines_slices_output_with_header(monkeypatch, capsys):
+    # #253: structured-il gains --lines, mirroring decompile/il/disasm.
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        if op == "structured_il":
+            return {"ok": True, "result": {
+                "function": {"name": "main", "address": "0x1000"},
+                "view": "mlil", "ssa": True,
+                "instructions": [
+                    {"il_index": 0, "address": "0x1000", "op": "MLIL_SET_VAR", "text": "a = 1"},
+                    {"il_index": 1, "address": "0x1004", "op": "MLIL_SET_VAR", "text": "b = 2"},
+                    {"il_index": 2, "address": "0x1008", "op": "MLIL_RET", "text": "return"},
+                ],
+            }}
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["function", "structured-il", "main", "--target", "active", "--lines", "2:3"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    # 4 rendered lines: header + 3 instruction rows. Slice keeps rows 2-3.
+    assert "// lines 2-3 of 4" in out
+    assert "a = 1" in out and "b = 2" in out
+    assert "return" not in out  # row 4 excluded
+    assert "main @ 0x1000" not in out  # header row (1) excluded

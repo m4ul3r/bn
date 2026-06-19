@@ -854,6 +854,71 @@ class _SaveBV:
         return self._result
 
 
+class _RehomingSaveBV:
+    """Like _SaveBV, but mimics BN's create_database RE-HOMING the view's filename
+    to the new .bndb -- the behavior _SaveBV omits and the cause of #256."""
+
+    def __init__(self, filename: str):
+        self.file = types.SimpleNamespace(filename=filename)
+        self.created_with = None
+
+    def create_database(self, out: str):
+        self.created_with = out
+        Path(out).write_text("bndb")
+        self.file.filename = out  # real BN rebinds the live view to the new file
+        return True
+
+
+class _RehomingFailSaveBV:
+    """create_database re-homes the live view's filename BEFORE failing (no file
+    lands) -- BN can rebind bv.file.filename even on a save that doesn't
+    complete, so the explicit-failure path must still restore identity (#256)."""
+
+    def __init__(self, filename: str):
+        self.file = types.SimpleNamespace(filename=filename)
+        self.created_with = None
+
+    def create_database(self, out: str):
+        self.created_with = out
+        self.file.filename = out  # re-home happens...
+        return False              # ...but the save fails (nothing written)
+
+
+class _RestoreFailFile:
+    """A bv.file whose filename can be re-homed once (by create_database) but then
+    refuses to be set back -- to exercise a restore that itself fails."""
+
+    def __init__(self, name: str):
+        self._name = name
+        self.block = False
+
+    @property
+    def filename(self):
+        return self._name
+
+    @filename.setter
+    def filename(self, value):
+        if self.block:
+            raise RuntimeError("cannot rebind filename")
+        self._name = value
+
+
+class _RestoreFailSaveBV:
+    """create_database succeeds and re-homes the view, but restoring the original
+    filename afterward raises -- the live view stays re-homed to the copy."""
+
+    def __init__(self, filename: str):
+        self.file = _RestoreFailFile(filename)
+        self.created_with = None
+
+    def create_database(self, out: str):
+        self.created_with = out
+        Path(out).write_text("bndb")
+        self.file.filename = out  # re-home (allowed)
+        self.file.block = True    # block the subsequent restore
+        return True
+
+
 # --- field_xrefs: resolve data-ref types without the nonexistent get_type_at --
 
 
@@ -980,4 +1045,4 @@ def _stub_code_context(monkeypatch, instance, function_entry):
     monkeypatch.setattr(instance.ctx, "_address_is_code", lambda bv, a: True)
 
 
-__all__ = ['_load_bridge', '_FakeFunction', '_FakeBasicBlock', '_FakeInstructionInfo', '_FakeArch', '_FakeOperation', '_FakeConstPtr', '_FakeReg', '_FakeHLILInstructionNode', '_FAKE_HLIL_TYPES', '_FakeHLILInstruction', '_FakeLLILInstruction', '_FakeVariable', '_FakeStringRef', '_FakeCodeRef', '_FakeSection', '_FakeSegment', '_FakeBV', '_FakeType', '_FakeMember', '_FakeMutationBV', '_ParseResult', '_FakeSymbol', '_mutation_with_stubs', '_BATCH_OP_PARITY', '_minimal_valid_op', '_FakeCommentMutationBV', '_install_fake_pseudo_c', '_callsites_items', '_FakeFunctionCreateBV', '_local_retype_result', '_LoadBV', '_setup_load_test', '_FakeFileBV', '_register_views', '_ClosableBV', 'SSAVariable', '_FakeSSAVariable', '_FakeMLILInsn', '_FakeSSAFunction', '_FakeBlock', '_FakeMLILFunction', '_RecordingWriter', '_SaveBV', '_FieldRefBV', '_FakeStructMember', '_FakeStructBuilder', '_struct_instance', '_AddableStructBuilder', '_struct_set_instance', '_pvs', '_dataflow_values_instance', '_stub_code_context']
+__all__ = ['_load_bridge', '_FakeFunction', '_FakeBasicBlock', '_FakeInstructionInfo', '_FakeArch', '_FakeOperation', '_FakeConstPtr', '_FakeReg', '_FakeHLILInstructionNode', '_FAKE_HLIL_TYPES', '_FakeHLILInstruction', '_FakeLLILInstruction', '_FakeVariable', '_FakeStringRef', '_FakeCodeRef', '_FakeSection', '_FakeSegment', '_FakeBV', '_FakeType', '_FakeMember', '_FakeMutationBV', '_ParseResult', '_FakeSymbol', '_mutation_with_stubs', '_BATCH_OP_PARITY', '_minimal_valid_op', '_FakeCommentMutationBV', '_install_fake_pseudo_c', '_callsites_items', '_FakeFunctionCreateBV', '_local_retype_result', '_LoadBV', '_setup_load_test', '_FakeFileBV', '_register_views', '_ClosableBV', 'SSAVariable', '_FakeSSAVariable', '_FakeMLILInsn', '_FakeSSAFunction', '_FakeBlock', '_FakeMLILFunction', '_RecordingWriter', '_SaveBV', '_RehomingSaveBV', '_RehomingFailSaveBV', '_RestoreFailFile', '_RestoreFailSaveBV', '_FieldRefBV', '_FakeStructMember', '_FakeStructBuilder', '_struct_instance', '_AddableStructBuilder', '_struct_set_instance', '_pvs', '_dataflow_values_instance', '_stub_code_context']

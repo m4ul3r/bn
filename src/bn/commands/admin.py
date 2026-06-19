@@ -21,6 +21,7 @@ from .. import cli
 from ..cli import arg, command
 from ..formatters import (
     _render_doctor_text,
+    _render_instance_gc_text,
     _render_instance_use_text,
     _render_pin_clear_text,
     _render_session_list_text,
@@ -503,6 +504,17 @@ def _instance_clear(args: argparse.Namespace) -> int:
     cli.session_state.update(instance_id=None)
     result: Any = {"instance_id": None, "set": False}
     cli._emit_result(args, result, text_renderer=_render_pin_clear_text, stem="instance-clear")
+    return 0
+
+
+@command("instance", "gc",
+         help="Reap dead instances' leftover logs/sockets from ~/.cache/bn", fmt="text")
+def _instance_gc(args: argparse.Namespace) -> int:
+    # CLI-side maintenance: purge cache litter left by crashed/long-gone bridges
+    # (the lazy liveness sweep keeps .log breadcrumbs forever) without touching
+    # any live instance or the shared spawn lock (#80).
+    result: Any = cli.gc_instances()
+    cli._emit_result(args, result, text_renderer=_render_instance_gc_text, stem="instance-gc")
     return 0
 
 

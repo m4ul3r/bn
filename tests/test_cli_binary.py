@@ -399,3 +399,42 @@ def test_non_load_command_does_not_spawn_missing_named(monkeypatch):
 
     assert rc == 0
     assert captured["spawn_missing_named"] is False
+
+
+def test_load_accepts_instance_id_alias_for_spawn_name(monkeypatch, tmp_path):
+    # #258: `bn load --instance-id <new-id>` is an alias for `--instance <new-id>`,
+    # so the spawn-name flag is consistent with `bn session start --instance-id`.
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        captured["op"] = op
+        captured["instance_id"] = instance_id
+        captured["spawn_missing_named"] = spawn_missing_named
+        return {"ok": True, "result": {"loaded": True, "path": str(raw), "notes": [], "targets": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["load", str(raw), "--instance-id", "brandnew"])
+
+    assert rc == 0
+    assert captured["op"] == "load_binary"
+    assert captured["instance_id"] == "brandnew"
+    assert captured["spawn_missing_named"] is True
+
+def test_load_instance_id_does_not_clobber_env_instance(monkeypatch, tmp_path):
+    # The --instance-id alias defaults to SUPPRESS, so when it is NOT passed it
+    # must not overwrite a root-level --instance / BN_INSTANCE selection.
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        captured["instance_id"] = instance_id
+        return {"ok": True, "result": {"loaded": True, "path": str(raw), "notes": [], "targets": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["--instance", "fromroot", "load", str(raw)])
+
+    assert rc == 0
+    assert captured["instance_id"] == "fromroot"

@@ -15,6 +15,7 @@ from bn.paths import bridge_registry_path, instances_dir
 from bn.transport import (
     BridgeError,
     choose_instance,
+    gc_instances,
     list_instances,
     send_request,
     spawn_instance,
@@ -169,6 +170,133 @@ def test_purge_keeps_log_sibling_for_diagnostics(tmp_path, monkeypatch):
     assert not socket_path.exists()  # orphan socket swept
     assert log_path.exists()  # log preserved for diagnosis
     assert log_path.read_text(encoding="utf-8") == "native crash output\n"
+
+
+def test_gc_instances_removes_dead_logs_and_orphans_keeps_live(tmp_path, monkeypatch):
+    # #80 cache hygiene: the lazy purge keeps dead instances' .log breadcrumbs
+    # forever (147 zero-byte logs measured on a real host). `gc_instances()`
+    # reaps logs + orphan sockets of dead/gone instances while leaving a live
+    # instance and the spawn lock untouched.
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+
+    # Dead instance: registry+socket present but the socket refuses connections.
+    dead_reg = inst_dir / "dead.json"
+    dead_sock = inst_dir / "dead.sock"
+    dead_log = inst_dir / "dead.log"
+    dead = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    dead.bind(str(dead_sock)); dead.listen(1); dead.close()
+    dead_log.write_text("crash output\n", encoding="utf-8")
+    dead_reg.write_text(json.dumps({
+        "pid": os.getpid(), "socket_path": str(dead_sock), "instance_id": "dead",
+        "plugin_name": "bn_agent_bridge", "plugin_version": "0",
+    }), encoding="utf-8")
+
+    # Orphans with no registry at all (the long-dead zero-byte log + stale sock).
+    orphan_log = inst_dir / "longgone.log"
+    orphan_log.write_text("", encoding="utf-8")
+    orphan_sock = inst_dir / "longgone.sock"
+    orphan_sock.write_text("", encoding="utf-8")
+
+    # Live instance: a real listening socket kept open across the gc call.
+    live_reg = inst_dir / "live.json"
+    live_sock = inst_dir / "live.sock"
+    live_log = inst_dir / "live.log"
+    live_server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    live_server.bind(str(live_sock)); live_server.listen(1)
+    live_log.write_text("serving\n", encoding="utf-8")
+    live_reg.write_text(json.dumps({
+        "pid": os.getpid(), "socket_path": str(live_sock), "instance_id": "live",
+        "plugin_name": "bn_agent_bridge", "plugin_version": "0",
+    }), encoding="utf-8")
+
+    # The active spawn lock must never be reaped.
+    spawn_lock = inst_dir / ".spawn.lock"
+    spawn_lock.write_text("", encoding="utf-8")
+
+    try:
+        result = gc_instances()
+    finally:
+        live_server.close()
+
+    # Live instance fully preserved.
+    assert live_reg.exists() and live_sock.exists() and live_log.exists()
+    assert live_log.read_text(encoding="utf-8") == "serving\n"
+    # Dead instance fully reaped (registry+socket by the liveness sweep, log by gc).
+    assert not dead_reg.exists() and not dead_sock.exists() and not dead_log.exists()
+    # Registry-less orphans reaped.
+    assert not orphan_log.exists() and not orphan_sock.exists()
+    # Spawn lock preserved.
+    assert spawn_lock.exists()
+    # Honest report.
+    assert result["live_instances"] == 1
+    assert result["registries_purged"] == 1          # dead.json
+    assert result["logs_removed"] == 2               # dead.log + longgone.log
+    assert result["sockets_removed"] == 1            # longgone.sock (dead.sock swept by liveness)
+
+
+def test_gc_instances_on_empty_or_missing_dir_is_noop(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "fresh"))
+    result = gc_instances()
+    assert result == {
+        "live_instances": 0, "registries_purged": 0, "logs_removed": 0,
+        "sockets_removed": 0, "removed": [],
+    }
+
+
+def test_gc_instances_keeps_siblings_of_unparseable_registry(tmp_path, monkeypatch):
+    # A registry that fails to parse is NOT purged by the liveness sweep, so its
+    # stem stays "live"; gc must keep its .log/.sock (err toward keeping rather
+    # than reaping an instance we simply couldn't read).
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    bad_reg = inst_dir / "weird.json"
+    bad_reg.write_text("{ not valid json", encoding="utf-8")
+    bad_log = inst_dir / "weird.log"
+    bad_log.write_text("x", encoding="utf-8")
+    bad_sock = inst_dir / "weird.sock"
+    bad_sock.write_text("", encoding="utf-8")
+
+    result = gc_instances()
+
+    assert bad_reg.exists() and bad_log.exists() and bad_sock.exists()
+    assert result["logs_removed"] == 0 and result["sockets_removed"] == 0
+
+
+def test_gc_holds_spawn_lock_so_it_cannot_reap_an_in_flight_spawn(tmp_path, monkeypatch):
+    # #80 review: a spawn creates <id>.log + <id>.sock BEFORE it writes the
+    # registry. gc must hold _spawn_lock so it can't reap those live files
+    # mid-spawn. Hold the lock (simulating an in-flight spawn) and assert gc
+    # blocks and leaves the in-flight files untouched while the lock is held.
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    from bn.transport import _spawn_lock
+
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    spawning_log = inst_dir / "spawning.log"
+    spawning_log.write_text("", encoding="utf-8")
+    spawning_sock = inst_dir / "spawning.sock"
+    spawning_sock.write_text("", encoding="utf-8")
+
+    box: dict = {}
+
+    def run_gc():
+        box["result"] = gc_instances()
+
+    worker = threading.Thread(target=run_gc)
+    with _spawn_lock():
+        worker.start()
+        worker.join(timeout=0.5)
+        # gc is blocked on the spawn lock -> the in-flight files survive.
+        assert worker.is_alive()
+        assert spawning_log.exists() and spawning_sock.exists()
+    # Lock released: gc proceeds and completes (now safely reaping the orphans,
+    # since no spawn is in flight once the lock is free).
+    worker.join(timeout=5.0)
+    assert not worker.is_alive()
+    assert "result" in box
 
 
 def _empty_reply_socket():
@@ -387,6 +515,94 @@ def test_send_request_timeout_env_zero_disables(tmp_path, monkeypatch):
     send_request("ping")
 
     assert fake_socket.timeouts == []
+
+
+def test_resolve_timeout_rejects_non_numeric(monkeypatch):
+    """A typo'd BN_REQUEST_TIMEOUT must fail loud, not silently fall back to the
+    600s default (the user believes they set a short timeout but didn't) (#255)."""
+    from bn.transport import _resolve_timeout, BridgeError
+
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "abc")
+    with pytest.raises(BridgeError) as exc:
+        _resolve_timeout(None)
+    assert "BN_REQUEST_TIMEOUT" in str(exc.value)
+
+
+def test_resolve_timeout_rejects_negative(monkeypatch):
+    """A negative value is not a valid socket timeout -- reject it instead of
+    passing -1.0 through unvalidated (#255)."""
+    from bn.transport import _resolve_timeout, BridgeError
+
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "-1")
+    with pytest.raises(BridgeError) as exc:
+        _resolve_timeout(None)
+    assert "BN_REQUEST_TIMEOUT" in str(exc.value)
+
+
+def test_resolve_timeout_rejects_non_finite(monkeypatch):
+    """inf/nan parse as floats but aren't valid socket timeouts -- reject them
+    like negatives rather than passing them to settimeout (#255)."""
+    from bn.transport import _resolve_timeout, BridgeError
+
+    for val in ("inf", "-inf", "nan"):
+        monkeypatch.setenv("BN_REQUEST_TIMEOUT", val)
+        with pytest.raises(BridgeError):
+            _resolve_timeout(None)
+
+
+def test_resolve_timeout_zero_and_sentinels_disable(monkeypatch):
+    """0 / 0.0 / none / off / empty all disable the timeout (return None)."""
+    from bn.transport import _resolve_timeout
+
+    for val in ("0", "0.0", "none", "off", "", "  Off  "):
+        monkeypatch.setenv("BN_REQUEST_TIMEOUT", val)
+        assert _resolve_timeout(None) is None, val
+
+
+def test_resolve_timeout_rejects_float_underflow(monkeypatch):
+    """A tiny magnitude that underflows to +/-0.0 (e.g. 1e-325, -1e-325) is NOT a
+    real 0/disable request: a positive value the user set shouldn't silently turn
+    the timeout off, and a negative one must be rejected like any other negative.
+    `value < 0` misses -0.0, and `value or None` collapses +0.0 to disable, so
+    both slipped through before (#255 review)."""
+    from bn.transport import _resolve_timeout, BridgeError
+
+    for val in ("1e-325", "-1e-325", "-0.0"):
+        monkeypatch.setenv("BN_REQUEST_TIMEOUT", val)
+        with pytest.raises(BridgeError):
+            _resolve_timeout(None)
+
+
+def test_resolve_timeout_positive_default_and_explicit(monkeypatch):
+    from bn.transport import _resolve_timeout, DEFAULT_REQUEST_TIMEOUT
+
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "42.5")
+    assert _resolve_timeout(None) == 42.5
+    monkeypatch.delenv("BN_REQUEST_TIMEOUT", raising=False)
+    assert _resolve_timeout(None) == DEFAULT_REQUEST_TIMEOUT
+    # an explicit timeout arg always wins and is never re-validated against the env
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "abc")
+    assert _resolve_timeout(12.0) == 12.0
+
+
+def test_invalid_timeout_is_rejected_before_choosing_an_instance(monkeypatch, tmp_path):
+    # #265 review: an invalid BN_REQUEST_TIMEOUT must be rejected BEFORE
+    # send_request() calls choose_instance() -- which auto-spawns a headless
+    # bridge. Otherwise `BN_REQUEST_TIMEOUT=abc bn target list` errors out but
+    # leaves a stray random instance behind in a fresh cache.
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "abc")
+
+    def _must_not_spawn(*a, **k):
+        raise AssertionError("choose_instance reached before timeout validation")
+
+    monkeypatch.setattr("bn.transport.choose_instance", _must_not_spawn)
+
+    with pytest.raises(BridgeError, match="BN_REQUEST_TIMEOUT"):
+        send_request("list_targets")
+
+    # Fresh cache stays empty: nothing was spawned.
+    assert list_instances() == []
 
 
 def test_send_request_partial_response_reports_real_error(tmp_path, monkeypatch):

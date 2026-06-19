@@ -15,11 +15,12 @@ Target selection, sticky pins, instance/target resolution order, sessions/headle
 2. Pick a target:
    - Single open BinaryView: omit `-t`.
    - Multiple open: pass `-t <selector>` from `bn target list`. Selectors match against `selector`, `target_id`, `view_id`, full filename, or basename.
-   - `-t` works **before or after** the subcommand. Use the pre-subcommand form to disambiguate selectors that collide with subcommand names like `session` or `pam_qnx.so.2`:
+   - `-t` / `--instance` work **before or after** the subcommand, and for two-level commands they are also accepted **between the group and the leaf**. Use a pre-subcommand form to disambiguate selectors that collide with subcommand names like `session` or `pam_qnx.so.2`:
 
      ```bash
-     bn -t pam_qnx.so.2 decompile main
-     bn decompile main -t pam_qnx.so.2
+     bn -t pam_qnx.so.2 decompile main      # at root
+     bn decompile main -t pam_qnx.so.2      # after the leaf
+     bn bundle -t pam_qnx.so.2 function main  # between group and leaf (two-level)
      ```
 
    - Use `-t active` only when you explicitly want to follow the GUI selection.
@@ -46,12 +47,15 @@ Target selection, sticky pins, instance/target resolution order, sessions/headle
 The bridge runs as a GUI plugin or as a headless process; both speak the same protocol.
 
 ```bash
-bn load /path/to/binary.bndb           # auto-spawns a headless bridge if none is running
+bn load /path/to/binary.bndb [--instance-id <id>]   # auto-spawns a headless bridge if none is running
 bn session start /path/to/binary [--instance-id <id>]
 bn session list                         # running instances + RSS + sticky marker
 bn session stop <id>                    # shut one down
 bn close [<path>]                       # close one (omit path → close all)
+bn instance gc                          # reap dead instances' leftover logs/sockets in ~/.cache/bn
 ```
+
+`bn instance gc` is housekeeping: a crashed/SIGKILLed bridge leaves its `.log` (and sometimes its socket) behind in `~/.cache/bn/instances/`, and the lazy liveness sweep keeps those breadcrumbs forever, so the directory accumulates dead logs over time. `bn instance gc` removes the logs and orphan sockets of instances that no longer have a live registry — it never touches a running instance or the shared spawn lock — and reports what it reaped (`--format json` for the counts).
 
 `bn close` reports each closed view as `{path, unsaved}`. If a view had unsaved mutations, stdout warns — run `bn save` *first* if you care about annotations:
 
@@ -83,9 +87,9 @@ Pass `--no-bndb` to force loading the raw binary even when a sibling `.bndb` exi
 
 Run `bn refresh` once to promote the view to full analysis (`analysis_state` flips to `"full"`), or `bn decompile <fn> --force-analysis` to analyze a single function without the full pass. Branch on `analysis_state` rather than guessing from empty results. Loading a `.bndb` ignores `--quick` (the database already carries its analysis).
 
-`--instance` is accepted on every subcommand (env `BN_INSTANCE`).
+`--instance` is accepted on every subcommand (env `BN_INSTANCE`). On `bn load`, `--instance-id` is an accepted alias that names the bridge instance to auto-spawn — the same spelling as `bn session start --instance-id`, so you can use `--instance-id <id>` consistently across both.
 
-Requests time out after 600s by default so a wedged bridge can't hang the CLI; override with `BN_REQUEST_TIMEOUT=<seconds>` (`0` disables).
+Requests time out after 600s by default so a wedged bridge can't hang the CLI; override with `BN_REQUEST_TIMEOUT=<seconds>` (`0`/`none`/`off`/empty disable). A non-numeric, negative, non-finite, or underflow-to-zero value (e.g. `1e-325`) is rejected with a clear error rather than silently falling back to the default or silently disabling the timeout.
 
 ## 3. Output & context
 
@@ -115,6 +119,8 @@ bn xrefs <fn-or-addr> --limit 20        # cap text output
 bn function info <fn>                    # compact by default
 bn function info <fn> --verbose          # full params + locals
 ```
+
+`--lines START:END` works on `decompile`, `il`, `disasm`, and `function structured-il` (text mode only — it errors on `--format json`). A `START` past the last line is treated as an error: the command exits non-zero with a stderr diagnostic (not a `//` comment on stdout), so a scripted consumer can tell an out-of-range slice apart from a real result.
 
 Pagination: `--limit` / `--offset` on list commands.
 

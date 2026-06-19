@@ -262,8 +262,12 @@ def test_missing_subcommand_prints_exact_help(capsys):
 
     assert rc == 1
     stdout, stderr = capsys.readouterr()
-    assert "usage: bn struct [-h] [--help-full] {show,field} ..." in stdout
-    assert "--help-full   Show help for this command and all subcommands" in stdout
+    # #251: intermediate group parsers now carry -t/--instance so they can be
+    # passed before the leaf; the usage advertises them (and wraps).
+    assert "usage: bn struct [-h] [--help-full] [--instance INSTANCE] [-t TARGET]" in stdout
+    assert "{show,field} ..." in stdout
+    assert "--help-full" in stdout
+    assert "Show help for this command and all subcommands" in stdout
     assert "usage: bn [-h]" not in stdout
     assert stderr == ""
 
@@ -273,8 +277,10 @@ def test_missing_nested_subcommand_prints_exact_help(capsys):
 
     assert rc == 1
     stdout, stderr = capsys.readouterr()
-    assert "usage: bn struct field [-h] [--help-full] {set,rename,delete} ..." in stdout
-    assert "--help-full          Show help for this command and all subcommands" in stdout
+    assert "usage: bn struct field [-h] [--help-full] [--instance INSTANCE] [-t TARGET]" in stdout
+    assert "{set,rename,delete} ..." in stdout
+    assert "--help-full" in stdout
+    assert "Show help for this command and all subcommands" in stdout
     assert "usage: bn [-h]" not in stdout
     assert stderr == ""
 
@@ -286,7 +292,9 @@ def test_help_full_prints_recursive_root_help(capsys):
     assert exc_info.value.code == 0
     stdout, stderr = capsys.readouterr()
     assert "usage: bn" in stdout
-    assert "usage: bn struct {show,field} ..." in stdout
+    # The recursive formatter strips -h/--help-full but keeps the now-present
+    # -t/--instance on intermediate group nodes (#251).
+    assert "usage: bn struct [--instance INSTANCE] [-t TARGET] {show,field} ..." in stdout
     assert "usage: bn struct field set" in stdout
     assert "-h, --help" not in stdout
     assert "--help-full" not in stdout
@@ -299,7 +307,8 @@ def test_help_full_prints_recursive_subtree_help(capsys):
 
     assert exc_info.value.code == 0
     stdout, stderr = capsys.readouterr()
-    assert "usage: bn struct field {set,rename,delete} ..." in stdout
+    assert "usage: bn struct field [--instance INSTANCE] [-t TARGET]" in stdout
+    assert "{set,rename,delete} ..." in stdout
     assert "usage: bn struct field set" in stdout
     assert "usage: bn struct field rename" in stdout
     assert "usage: bn\n" not in stdout
@@ -498,3 +507,67 @@ def test_spill_no_marker_when_not_piped(monkeypatch, capsys):
     assert "__BN_SPILLED__" not in stdout
 
 
+
+
+def test_decompile_lines_out_of_range_exits_nonzero(monkeypatch, capsys):
+    # End-to-end: an out-of-range --lines start exits non-zero with a stderr
+    # diagnostic and NO code-like stdout, so a scripted consumer can tell it
+    # apart from a real slice (#253).
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        if op == "decompile":
+            return {"ok": True, "result": {"text": "int main() {\n  return 0;\n}"}}
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["decompile", "main", "--target", "active", "--lines", "99999:100000"])
+
+    assert rc == 2
+    out, err = capsys.readouterr()
+    assert out.strip() == ""           # nothing that looks like decompiled output
+    assert "beyond the last line" in err
+    assert "Traceback" not in err
+
+def test_slice_text_lines_in_range_still_slices():
+    # In-range slicing (incl. end past the last line, which clamps) is unchanged.
+    from bn import formatters
+
+    assert formatters._slice_text_lines("a\nb\nc", (2, 99)) == "// lines 2-3 of 3\nb\nc"
+
+def test_slice_text_lines_start_beyond_end_raises(monkeypatch):
+    # #253: an out-of-range --lines start is a user error, not a result. It must
+    # NOT return a `//` line (mistakable for code) with exit 0 -- it raises a
+    # BridgeError so the CLI exits non-zero with a stderr diagnostic.
+    from bn import formatters
+    from bn.transport import BridgeError
+
+    with pytest.raises(BridgeError, match="beyond the last line"):
+        formatters._slice_text_lines("a\nb\nc", (10, 12))
+
+def test_instance_accepted_before_two_level_subcommand():
+    # --instance is likewise carried by intermediate group parsers (#251).
+    parser = bn.cli.build_parser()
+    ns = parser.parse_args(["bundle", "--instance", "inst9", "function", "_init"])
+    assert ns.instance == "inst9"
+
+def test_target_accepted_before_two_level_subcommand():
+    # #251: -t/--target works BEFORE the leaf of a two-level command (after the
+    # group name), not only after the leaf -- parity with single-level commands
+    # and root-level -t. The intermediate group parser must carry -t.
+    parser = bn.cli.build_parser()
+
+    pre = parser.parse_args(["bundle", "-t", "mytarget", "function", "_init"])
+    assert pre.target == "mytarget"
+    assert pre.identifier == "_init"
+
+    # Post-leaf form must still resolve identically (SUPPRESS default = no clobber).
+    post = parser.parse_args(["bundle", "function", "_init", "-t", "mytarget"])
+    assert post.target == "mytarget"
+    assert post.identifier == "_init"
+
+def test_target_before_three_level_subcommand():
+    # Three-level commands (struct field set) accept -t at any intermediate level.
+    parser = bn.cli.build_parser()
+    ns = parser.parse_args(
+        ["struct", "-t", "tgt", "field", "set", "MyStruct", "0", "field0", "int32_t"])
+    assert ns.target == "tgt"
