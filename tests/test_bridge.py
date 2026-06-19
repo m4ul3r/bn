@@ -6860,6 +6860,98 @@ def test_bridge_handler_rejects_non_dict_json(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_bridge_handler_serialization_failure_returns_clean_error(monkeypatch):
+    """A response that fails to serialize -- the 'dictionary changed size during
+    iteration' race when a response aliases a live mapping mutated by a concurrent
+    read (serialization runs OUTSIDE the dispatch lock and its try/except) -- must
+    return a clean {ok: false} error to the client, NOT escape handle() and
+    silently kill the handler thread with no response at all (#250)."""
+    bridge = _load_bridge(monkeypatch)
+    errors = []
+    monkeypatch.setattr(bridge.bn, "log_error", lambda message: errors.append(message))
+
+    class _Unserializable:
+        # default=str is json's fallback for non-native types; a __str__ that
+        # always raises deterministically reproduces a mid-encode failure.
+        def __str__(self):
+            raise RuntimeError("dictionary changed size during iteration")
+
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.rfile = io.BytesIO(b'{"op": "decompile", "id": "req-9"}\n')
+    handler.server = types.SimpleNamespace(
+        bridge=types.SimpleNamespace(
+            dispatch=lambda payload: {"ok": True, "result": _Unserializable(), "error": None}))
+    writer = _RecordingWriter()
+    handler.wfile = writer
+
+    handler.handle()  # must NOT raise
+
+    response = json.loads(writer.data.decode("utf-8"))
+    assert response["ok"] is False
+    assert "serializ" in response["error"].lower()
+    assert errors, "the serialization failure should be logged for operators"
+
+
+def test_bridge_handler_retries_transient_serialization_race(monkeypatch):
+    """The dict-size race is transient: by the time a retry runs, the concurrent
+    mutation has usually completed. A single re-encode preserves the REAL response
+    instead of degrading every racy read to an error (#250)."""
+    bridge = _load_bridge(monkeypatch)
+
+    class _FlakyValue:
+        calls = 0
+
+        def __str__(self):
+            type(self).calls += 1
+            if type(self).calls == 1:
+                raise RuntimeError("dictionary changed size during iteration")
+            return "recovered"
+
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.rfile = io.BytesIO(b'{"op": "decompile", "id": "req-9"}\n')
+    handler.server = types.SimpleNamespace(
+        bridge=types.SimpleNamespace(
+            dispatch=lambda payload: {"ok": True, "result": _FlakyValue(), "error": None}))
+    writer = _RecordingWriter()
+    handler.wfile = writer
+
+    handler.handle()
+
+    response = json.loads(writer.data.decode("utf-8"))
+    assert response["ok"] is True
+    assert response["result"] == "recovered"
+
+
+def test_bridge_handler_serialization_fallback_survives_logging_failure(monkeypatch):
+    """Even if logging the serialization failure itself raises, handle() must still
+    write a clean error and never let the handler thread die silently -- the
+    fallback path must not reintroduce the exact silent-death it eliminates (#250)."""
+    bridge = _load_bridge(monkeypatch)
+
+    def _boom(*a, **k):
+        raise RuntimeError("log sink down")
+
+    monkeypatch.setattr(bridge.bn, "log_error", _boom)
+
+    class _Unserializable:
+        def __str__(self):
+            raise RuntimeError("dictionary changed size during iteration")
+
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.rfile = io.BytesIO(b'{"op": "decompile", "id": "req-9"}\n')
+    handler.server = types.SimpleNamespace(
+        bridge=types.SimpleNamespace(
+            dispatch=lambda payload: {"ok": True, "result": _Unserializable(), "error": None}))
+    writer = _RecordingWriter()
+    handler.wfile = writer
+
+    handler.handle()  # must NOT raise even though log_error raises
+
+    response = json.loads(writer.data.decode("utf-8"))
+    assert response["ok"] is False
+    assert "serializ" in response["error"].lower()
+
+
 def test_batch_apply_passes_none_target_through(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -7905,6 +7997,102 @@ def test_struct_field_set_overwrite_at_occupied_offset_replaces(monkeypatch):
         "field_type": "int32_t", "overwrite_existing": True})
     assert res["before_member"]["field_name"] == "x"
     assert builder.added and builder.added[0] == ("replfld", 0, True)
+
+
+def _typedef_alias_bv(*, alias_name="AliasRec", tag="InnerRec"):
+    """A fake BV mirroring real BN's typedef-of-struct shape (#246): *alias_name*
+    resolves to a NamedTypeReference whose ``.target(bv)`` is the underlying
+    registered struct (`tag`), and ``get_type_by_name(tag)`` returns that struct.
+    The alias's own ``mutable_copy()`` raises -- exactly as BN's
+    NamedTypeReferenceBuilder does on ``add_member_at_offset`` -- so a fix that
+    fails to follow the reference reproduces the original crash."""
+    underlying = _FakeType(f"struct {tag}", type_class="StructureTypeClass",
+                           members=[_FakeMember(0, "x", "uint32_t")])
+    builder = _AddableStructBuilder()
+    underlying.mutable_copy = lambda: builder
+    underlying.registered_name = types.SimpleNamespace(name=tag)
+
+    alias = _FakeType(f"struct {tag} {alias_name}", type_class="NamedTypeReferenceClass")
+
+    def _alias_mutable_copy():
+        raise AttributeError(
+            "'NamedTypeReferenceBuilder' object has no attribute 'add_member_at_offset'")
+
+    alias.mutable_copy = _alias_mutable_copy
+    alias.target = lambda _bv: underlying
+
+    class _BV:
+        def __init__(self):
+            self.defined = []
+
+        def get_type_by_name(self, n):
+            return {alias_name: alias, tag: underlying}.get(n)
+
+        def parse_type_string(self, s):
+            return _FakeType("uint32_t", width=4), None
+
+        def define_user_type(self, name, b):
+            self.defined.append((name, b))
+
+    return alias, underlying, builder, _BV()
+
+
+def test_struct_builder_follows_typedef_alias_to_underlying_struct(monkeypatch):
+    """`struct field set/rename/delete` on a typedef (the idiomatic
+    `typedef struct {..} X;`) must follow the alias (a NamedTypeReference) to the
+    underlying registered struct tag and build from THAT -- not crash calling
+    add_member_at_offset on a NamedTypeReferenceBuilder (#246). All three field
+    ops route through _struct_builder, so fixing it here fixes set/rename/delete."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _alias, _under, builder, bv = _typedef_alias_bv()
+    resolved_name, got = bridge.mutation_engine._struct_builder(instance, bv, "AliasRec")
+    assert resolved_name == "InnerRec"    # commit to the tag, not the alias
+    assert got is builder                 # a real StructureBuilder, not an NTR builder
+
+
+def test_struct_builder_follows_anonymous_typedef_struct(monkeypatch):
+    """`typedef struct {..} AnonRec;` registers the body under an auto-named tag
+    (`_AnonRec`); the alias is a NamedTypeReference to it. The follow must land on
+    `_AnonRec` -- the most common C struct idiom, not an edge case (#246)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _alias, _under, builder, bv = _typedef_alias_bv(alias_name="AnonRec", tag="_AnonRec")
+    resolved_name, got = bridge.mutation_engine._struct_builder(instance, bv, "AnonRec")
+    assert resolved_name == "_AnonRec"
+    assert got is builder
+
+
+def test_struct_builder_typedef_to_nonstruct_is_invalid_request(monkeypatch):
+    """A name that resolves to a non-aggregate (`typedef uint32_t Foo;` resolves
+    straight to the integer type in BN) must raise a clean invalid_request, not a
+    raw AttributeError from add_member_at_offset (#246)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    prim = _FakeType("uint32_t", type_class="IntegerTypeClass")
+
+    class _BV:
+        def get_type_by_name(self, n):
+            return prim if n == "MyU32" else None
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        bridge.mutation_engine._struct_builder(instance, _BV(), "MyU32")
+    assert exc.value.status == "invalid_request"
+
+
+def test_op_struct_field_set_through_typedef_alias_commits_to_tag(monkeypatch):
+    """End-to-end through the op handler: a set on the typedef alias must add the
+    field to the underlying struct builder and commit it to the TAG name, with the
+    result reporting the tag (so the caller learns where the body lives) (#246)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _alias, _under, builder, bv = _typedef_alias_bv()
+    res = instance._op_struct_field_set(bv, {
+        "struct_name": "AliasRec", "offset": "0x4", "field_name": "added",
+        "field_type": "uint32_t", "overwrite_existing": True})
+    assert res["struct_name"] == "InnerRec"          # reported as the tag
+    assert builder.added and builder.added[0][0] == "added"
+    assert ("InnerRec", builder) in bv.defined       # committed to the tag
 
 
 def test_annotate_types_declare_verified_when_layout_changed(monkeypatch):

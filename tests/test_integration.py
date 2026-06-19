@@ -157,3 +157,96 @@ class TestSavePathIdentity:
                 f"{after.stdout} {after.stderr}")
         finally:
             _session_stop(inst)
+
+
+class TestStructFieldTypedef:
+    """Regression for #246: field ops on a typedef'd (NamedTypeReference) struct
+    must follow the alias to the underlying tag instead of crashing in
+    add_member_at_offset. The mocked suite cannot reproduce mutable_copy()
+    returning an NTR builder, so this drives the real BN type system end-to-end.
+    """
+
+    def _declare_and_set(self, inst_id, decl, struct_name):
+        declared = _bn("--instance", inst_id, "types", "declare", decl, "--format", "json")
+        assert declared.returncode == 0, declared.stderr
+        return _bn("--instance", inst_id, "struct", "field", "set",
+                   struct_name, "0x4", "newfield", "uint32_t", "--format", "json")
+
+    def test_set_field_on_named_typedef_struct(self):
+        """typedef of a named struct: `typedef struct InnerRec AliasRec;`. The
+        report must key on the underlying TAG, not the alias: affected_types names
+        the tag (so it carries members and a real layout diff) and agrees with
+        results[].struct_name (#246, incl. the reporting-path follow-up)."""
+        info = _session_start(str(HELLO_BINARY))
+        inst_id = info["instance_id"]
+        try:
+            res = self._declare_and_set(
+                inst_id,
+                "struct InnerRec { uint32_t x; }; typedef struct InnerRec AliasRec;",
+                "AliasRec")
+            assert res.returncode == 0, f"set crashed: {res.stdout}\n{res.stderr}"
+            parsed = json.loads(res.stdout)
+            affected = parsed["affected_types"]
+            assert affected and affected[0]["name"] == "InnerRec", affected
+            assert affected[0]["changed"] is True, affected
+            # the member-level layout (not just the alias header) is in the diff
+            assert "newfield" in affected[0]["after_layout"], affected[0]["after_layout"]
+            assert parsed["results"][0]["struct_name"] == "InnerRec"
+            # the field landed on the underlying tag, and the typedef sees it
+            shown = _bn("--instance", inst_id, "struct", "show", "InnerRec")
+            assert "newfield" in shown.stdout, shown.stdout
+        finally:
+            _session_stop(inst_id)
+
+    def test_rename_field_through_typedef_reports_change(self):
+        """Regression for the reporting follow-up: a field rename through a typedef
+        must report the real change against the TAG -- before the fix it keyed the
+        diff on the members-less alias and falsely said 'No effective change
+        detected' even though the op verified (#246)."""
+        info = _session_start(str(HELLO_BINARY))
+        inst_id = info["instance_id"]
+        try:
+            self._declare_and_set(
+                inst_id,
+                "struct InnerRec { uint32_t x; }; typedef struct InnerRec AliasRec;",
+                "AliasRec")
+            res = _bn("--instance", inst_id, "struct", "field", "rename",
+                      "AliasRec", "newfield", "renamed", "--format", "json")
+            assert res.returncode == 0, f"rename failed: {res.stdout}\n{res.stderr}"
+            parsed = json.loads(res.stdout)
+            assert parsed["results"][0]["status"] == "verified", parsed["results"]
+            affected = parsed["affected_types"]
+            assert affected and affected[0]["name"] == "InnerRec", affected
+            assert affected[0]["changed"] is True, affected
+            assert "No effective change" not in (affected[0].get("message") or "")
+        finally:
+            _session_stop(inst_id)
+
+    def test_set_field_on_anonymous_typedef_struct(self):
+        """The idiomatic `typedef struct { ... } AnonRec;` -- body is registered
+        under the auto-named tag `_AnonRec`, alias is an NTR to it."""
+        info = _session_start(str(HELLO_BINARY))
+        inst_id = info["instance_id"]
+        try:
+            res = self._declare_and_set(
+                inst_id,
+                "typedef struct { uint32_t m; } AnonRec;",
+                "AnonRec")
+            assert res.returncode == 0, f"set crashed: {res.stdout}\n{res.stderr}"
+            shown = _bn("--instance", inst_id, "struct", "show", "_AnonRec")
+            assert "newfield" in shown.stdout, shown.stdout
+        finally:
+            _session_stop(inst_id)
+
+    def test_set_field_on_typedef_to_nonstruct_is_clean_error(self):
+        """`typedef uint32_t Foo;` resolves to a non-aggregate: a field set must
+        fail cleanly (not exit 0, not an internal AttributeError crash)."""
+        info = _session_start(str(HELLO_BINARY))
+        inst_id = info["instance_id"]
+        try:
+            res = self._declare_and_set(
+                inst_id, "typedef uint32_t NotAStruct;", "NotAStruct")
+            assert res.returncode != 0, f"expected a clean failure, got: {res.stdout}"
+            assert "AttributeError" not in res.stdout + res.stderr
+        finally:
+            _session_stop(inst_id)

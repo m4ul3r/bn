@@ -162,7 +162,16 @@ def _operation_type_names(ctx, bv, op: dict[str, Any]) -> list[str]:
         # _apply_operation surfaces the precise error.
         raw_name = str(op["struct_name"])
         try:
-            resolved_name, _ = ctx._find_type(bv, raw_name)
+            resolved_name, type_obj = ctx._find_type(bv, raw_name)
+            # Follow a typedef (NamedTypeReference) to the underlying struct tag,
+            # the SAME name _struct_builder commits under (#246). Without this the
+            # snapshot/diff keys on the alias -- which has no members -- so a
+            # field rename through a typedef renders an identical header line and
+            # is falsely reported "No effective change detected", and affected_types
+            # names the alias while results[].struct_name names the tag. Guard so
+            # this pre-apply pass still can't raise (a non-struct typedef returns
+            # the raw name; _apply_operation surfaces the precise error).
+            resolved_name, _ = _resolve_to_structure(bv, resolved_name, type_obj, raw_name)
         except Exception:
             return [raw_name]
         return [resolved_name]
@@ -1833,11 +1842,57 @@ def _op_local_retype(ctx, bv, op: dict[str, Any], restores: list | None = None):
 
 
 
+def _type_class_name(t: Any) -> str:
+    """String name of a BN ``Type.type_class`` (enum on real BN, plain string on
+    the unit fakes), so callers can duck-type without importing ``TypeClass``."""
+    tc = getattr(t, "type_class", None)
+    return str(getattr(tc, "name", None) or (str(tc) if tc is not None else ""))
+
+
+def _resolve_to_structure(bv, resolved_name: str, type_obj, requested: str):
+    """Follow a typedef (a ``NamedTypeReference``) to the underlying registered
+    struct so field edits land on the body, not the alias.
+
+    ``typedef struct { ... } Foo;`` is the idiomatic C struct declaration, so the
+    alias path is the common case, not an edge: BN registers the body under a tag
+    (`Foo` -> `InnerRec`, or an auto-named `_Foo` for an anonymous struct) and
+    makes ``Foo`` a ``NamedTypeReference`` to it. ``mutable_copy()`` on that
+    reference returns a ``NamedTypeReferenceBuilder`` with no
+    ``add_member_at_offset`` -- so we must resolve to the tag first and edit/commit
+    THAT; the typedef keeps pointing at it. Raises a clean ``invalid_request`` when
+    the name resolves to a non-aggregate (e.g. ``typedef uint32_t Foo;``) instead
+    of crashing in ``add_member_at_offset`` (#246)."""
+    seen: set[str] = set()
+    while "NamedTypeReference" in _type_class_name(type_obj):
+        if resolved_name in seen:        # defend against a pathological self-cycle
+            break
+        seen.add(resolved_name)
+        try:
+            target = type_obj.target(bv)
+        except Exception:
+            target = None
+        if target is None or target is type_obj:
+            break
+        reg_name = getattr(getattr(target, "registered_name", None), "name", None)
+        if reg_name is not None:
+            resolved_name = str(reg_name)
+        type_obj = target
+    if "Structure" not in _type_class_name(type_obj):
+        raise OperationFailure(
+            "invalid_request",
+            f"{requested!r} resolves to a non-struct type "
+            f"({_type_class_name(type_obj) or 'unknown'}); struct field ops require "
+            f"a struct or union. Declare it as a struct, or target the right type.",
+        )
+    return resolved_name, type_obj
+
+
 def _struct_builder(ctx, bv, struct_name: str):
     try:
         resolved_name, type_obj = ctx._find_type(bv, struct_name)
     except RuntimeError:
         raise RuntimeError(f"Struct not found: {struct_name}")
+    resolved_name, type_obj = _resolve_to_structure(bv, resolved_name, type_obj, struct_name)
     return resolved_name, type_obj.mutable_copy()
 
 

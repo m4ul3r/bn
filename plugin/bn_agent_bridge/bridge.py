@@ -493,6 +493,54 @@ class BridgeHandler(socketserver.StreamRequestHandler):
             suffix = f" ({', '.join(details)})" if details else ""
             bn.log_warn(f"BN Agent Bridge client disconnected before response could be delivered{suffix}")
 
+    def _encode_response(
+        self,
+        response: dict[str, Any],
+        *,
+        op: str | None = None,
+        request_id: str | None = None,
+    ) -> bytes:
+        """Serialize a response, never letting a failure escape and silently kill
+        the handler thread (#250).
+
+        Serialization runs outside the dispatch lock and outside dispatch's
+        try/except, so a response that aliases a live BN/shared mapping mutated by
+        a concurrent read can raise ``RuntimeError: dictionary changed size during
+        iteration`` mid-encode (``sort_keys=True`` iterates every nested dict).
+        That race is transient, so retry once -- the racing mutation has usually
+        completed by then -- and only if it still fails, degrade to a clean
+        ``{ok: false}`` error instead of dropping the connection with no response.
+        """
+        for attempt in (1, 2):
+            try:
+                return json.dumps(response, sort_keys=True, default=str).encode("utf-8")
+            except Exception as exc:  # noqa: BLE001 - any encode failure must not kill the thread
+                if attempt == 1:
+                    continue
+                # The fallback path must itself be exception-proof: if computing the
+                # detail or logging it raised, the thread would die silently -- the
+                # exact failure mode this method exists to prevent (#250).
+                try:
+                    detail = _serialize_error(exc)
+                except Exception:  # noqa: BLE001
+                    detail = "unserializable error"
+                try:
+                    ident = ", ".join(
+                        p for p in (f"op={op}" if op else "", f"id={request_id}" if request_id else "") if p
+                    )
+                    bn.log_error(
+                        f"BN Agent Bridge could not serialize a response ({ident}): {detail}"
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                return json.dumps(
+                    _json_response(ok=False, error=f"response serialization failed: {detail}"),
+                    sort_keys=True,
+                    default=str,
+                ).encode("utf-8")
+        # Unreachable (the loop returns on both attempts); a static last resort.
+        return b'{"error": "response serialization failed", "ok": false}'
+
     def handle(self):  # pragma: no cover - exercised from CLI
         raw = self.rfile.readline(MAX_REQUEST_BYTES)
         if not raw:
@@ -515,7 +563,7 @@ class BridgeHandler(socketserver.StreamRequestHandler):
                     op = payload.get("op")
                     request_id = payload.get("id")
                     response = self.server.bridge.dispatch(payload)
-        encoded = json.dumps(response, sort_keys=True, default=str).encode("utf-8")
+        encoded = self._encode_response(response, op=op, request_id=request_id)
         self._write_response(encoded, op=op, request_id=request_id)
 
 
