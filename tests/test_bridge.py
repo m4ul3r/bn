@@ -4134,6 +4134,73 @@ def test_sections_query_filters_by_name(monkeypatch):
     assert ".data" in names
 
 
+def test_sections_query_matches_semantics_not_just_name(monkeypatch):
+    # #257: --query should match the semantics label too, so `--query code`
+    # finds executable sections (.text = ReadOnlyCode) even though "code" is
+    # not in the section name. Match is case-insensitive.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        sections={
+            ".text": _FakeSection(".text", 0x1000, 0x5000, semantics=1),     # ReadOnlyCode
+            ".rodata": _FakeSection(".rodata", 0x5000, 0x6000, semantics=2),  # ReadOnlyData
+            ".data": _FakeSection(".data", 0x6000, 0x7000, semantics=3),      # ReadWriteData
+        },
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._sections(None, query="code")
+
+    names = [s["name"] for s in result["items"]]
+    assert names == [".text"]
+
+
+def test_sections_query_semantics_match_is_case_insensitive(monkeypatch):
+    # An uppercase query still matches the (CamelCase) semantics label.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(sections={".text": _FakeSection(".text", 0x1000, 0x5000, semantics=1)})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._sections(None, query="CODE")
+
+    assert [s["name"] for s in result["items"]] == [".text"]
+
+
+def test_sections_query_count_only_reflects_semantics_match(monkeypatch):
+    # The count_only path must reflect the broader name-or-semantics match, not
+    # the old name-only filter.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(sections={
+        ".text": _FakeSection(".text", 0x1000, 0x5000, semantics=1),     # ReadOnlyCode
+        ".rodata": _FakeSection(".rodata", 0x5000, 0x6000, semantics=2),  # ReadOnlyData
+    })
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._sections(None, query="code", count_only=True)
+
+    assert result["count"] == 1 and result["total"] == 1
+
+
+def test_sections_query_semantics_broadens_beyond_name(monkeypatch):
+    # Intentional #257 behavior change (pinned so it isn't read as a no-side-
+    # effect bugfix): `--query data` now matches any section whose SEMANTICS is
+    # ReadOnlyData/ReadWriteData even when "data" is absent from the name.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(sections={
+        ".text": _FakeSection(".text", 0x1000, 0x5000, semantics=1),    # ReadOnlyCode
+        ".roseg": _FakeSection(".roseg", 0x5000, 0x6000, semantics=2),  # ReadOnlyData, no "data" in name
+        ".rwseg": _FakeSection(".rwseg", 0x6000, 0x7000, semantics=3),  # ReadWriteData, no "data" in name
+    })
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._sections(None, query="data")
+
+    assert sorted(s["name"] for s in result["items"]) == [".roseg", ".rwseg"]
+
+
 def test_sections_null_segment_omits_rwx(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
