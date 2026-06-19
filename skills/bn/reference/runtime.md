@@ -46,7 +46,7 @@ Target selection, sticky pins, instance/target resolution order, sessions/headle
 The bridge runs as a GUI plugin or as a headless process; both speak the same protocol.
 
 ```bash
-bn load /path/to/binary.bndb           # auto-spawns a headless bridge if none is running
+bn load /path/to/binary.bndb [--instance-id <id>]   # auto-spawns a headless bridge if none is running
 bn session start /path/to/binary [--instance-id <id>]
 bn session list                         # running instances + RSS + sticky marker
 bn session stop <id>                    # shut one down
@@ -83,7 +83,7 @@ Pass `--no-bndb` to force loading the raw binary even when a sibling `.bndb` exi
 
 Run `bn refresh` once to promote the view to full analysis (`analysis_state` flips to `"full"`), or `bn decompile <fn> --force-analysis` to analyze a single function without the full pass. Branch on `analysis_state` rather than guessing from empty results. Loading a `.bndb` ignores `--quick` (the database already carries its analysis).
 
-`--instance` is accepted on every subcommand (env `BN_INSTANCE`).
+`--instance` is accepted on every subcommand (env `BN_INSTANCE`). On `bn load`, `--instance-id` is an accepted alias that names the bridge instance to auto-spawn — the same spelling as `bn session start --instance-id`, so you can use `--instance-id <id>` consistently across both.
 
 Requests time out after 600s by default so a wedged bridge can't hang the CLI; override with `BN_REQUEST_TIMEOUT=<seconds>` (`0` disables).
 

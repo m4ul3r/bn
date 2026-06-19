@@ -18,6 +18,13 @@ from ..formatters import (
 @command("load", help="Load a binary into headless bridge",
          args=[
              arg("path", help="Path to binary or BNDB file"),
+             # `--instance-id` is an alias for the global `--instance` spawn name,
+             # matching `bn session start --instance-id` so the auto-spawn flag is
+             # spelled the same across both entry points (#258). SUPPRESS default
+             # so an unset alias never clobbers a root --instance / BN_INSTANCE.
+             arg("--instance-id", dest="instance", default=argparse.SUPPRESS,
+                 metavar="INSTANCE",
+                 help="ID for the bridge instance to auto-spawn (alias of --instance)"),
              arg("--no-bndb", action="store_true",
                  help="Don't auto-prefer a sibling .bndb file"),
              arg("--quick", "--no-analysis", action="store_true",
