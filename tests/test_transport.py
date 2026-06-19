@@ -431,6 +431,20 @@ def test_resolve_timeout_zero_and_sentinels_disable(monkeypatch):
         assert _resolve_timeout(None) is None, val
 
 
+def test_resolve_timeout_rejects_float_underflow(monkeypatch):
+    """A tiny magnitude that underflows to +/-0.0 (e.g. 1e-325, -1e-325) is NOT a
+    real 0/disable request: a positive value the user set shouldn't silently turn
+    the timeout off, and a negative one must be rejected like any other negative.
+    `value < 0` misses -0.0, and `value or None` collapses +0.0 to disable, so
+    both slipped through before (#255 review)."""
+    from bn.transport import _resolve_timeout, BridgeError
+
+    for val in ("1e-325", "-1e-325", "-0.0"):
+        monkeypatch.setenv("BN_REQUEST_TIMEOUT", val)
+        with pytest.raises(BridgeError):
+            _resolve_timeout(None)
+
+
 def test_resolve_timeout_positive_default_and_explicit(monkeypatch):
     from bn.transport import _resolve_timeout, DEFAULT_REQUEST_TIMEOUT
 
