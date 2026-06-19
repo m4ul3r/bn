@@ -264,7 +264,7 @@ def test_missing_subcommand_prints_exact_help(capsys):
     stdout, stderr = capsys.readouterr()
     # #251: intermediate group parsers now carry -t/--instance so they can be
     # passed before the leaf; the usage advertises them (and wraps).
-    assert "usage: bn struct [-h] [--help-full] [--instance INSTANCE] [-t TARGET]" in stdout
+    assert "usage: bn struct [-h] [--help-full] [-i INSTANCE] [-t TARGET]" in stdout
     assert "{show,field} ..." in stdout
     assert "--help-full" in stdout
     assert "Show help for this command and all subcommands" in stdout
@@ -277,7 +277,7 @@ def test_missing_nested_subcommand_prints_exact_help(capsys):
 
     assert rc == 1
     stdout, stderr = capsys.readouterr()
-    assert "usage: bn struct field [-h] [--help-full] [--instance INSTANCE] [-t TARGET]" in stdout
+    assert "usage: bn struct field [-h] [--help-full] [-i INSTANCE] [-t TARGET]" in stdout
     assert "{set,rename,delete} ..." in stdout
     assert "--help-full" in stdout
     assert "Show help for this command and all subcommands" in stdout
@@ -294,7 +294,7 @@ def test_help_full_prints_recursive_root_help(capsys):
     assert "usage: bn" in stdout
     # The recursive formatter strips -h/--help-full but keeps the now-present
     # -t/--instance on intermediate group nodes (#251).
-    assert "usage: bn struct [--instance INSTANCE] [-t TARGET] {show,field} ..." in stdout
+    assert "usage: bn struct [-i INSTANCE] [-t TARGET] {show,field} ..." in stdout
     assert "usage: bn struct field set" in stdout
     assert "-h, --help" not in stdout
     assert "--help-full" not in stdout
@@ -307,7 +307,7 @@ def test_help_full_prints_recursive_subtree_help(capsys):
 
     assert exc_info.value.code == 0
     stdout, stderr = capsys.readouterr()
-    assert "usage: bn struct field [--instance INSTANCE] [-t TARGET]" in stdout
+    assert "usage: bn struct field [-i INSTANCE] [-t TARGET]" in stdout
     assert "{set,rename,delete} ..." in stdout
     assert "usage: bn struct field set" in stdout
     assert "usage: bn struct field rename" in stdout

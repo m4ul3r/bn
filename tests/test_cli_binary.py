@@ -28,6 +28,51 @@ def test_target_flag_accepted_before_subcommand():
         assert args.instance == expected_instance, argv
 
 
+def test_instance_short_flag_accepted():
+    parser = bn.cli.build_parser()
+
+    # -i is the short alias for --instance, symmetric with -t/--target. It must
+    # parse to args.instance before and after the subcommand, at root and leaf,
+    # interleaved with -t, and the long --instance must keep working.
+    cases = [
+        (["-i", "abc123", "function", "list"], "abc123"),
+        (["function", "list", "-i", "abc123"], "abc123"),
+        (["--instance", "abc123", "function", "list"], "abc123"),
+        (["-t", "libfoo.so", "-i", "abc123", "function", "list"], "abc123"),
+        (["-i", "abc123", "-t", "libfoo.so", "function", "list"], "abc123"),
+    ]
+    for argv, expected_instance in cases:
+        args = parser.parse_args(argv)
+        assert args.instance == expected_instance, argv
+
+
+def test_instance_short_flag_does_not_collide_with_instance_id():
+    parser = bn.cli.build_parser()
+
+    # `session start --instance-id` (auto-spawn naming) and the `instance use`
+    # positional both bind to args.instance_id and must be unaffected by -i.
+    start = parser.parse_args(["session", "start", "/bin/ls", "--instance-id", "named"])
+    assert start.instance_id == "named"
+
+    use = parser.parse_args(["instance", "use", "pinme"])
+    assert use.instance_id == "pinme"
+
+    # -i still binds only to the global selector (args.instance), distinct from
+    # --instance-id; argparse short-flag matching is exact, no abbreviation clash.
+    both = parser.parse_args(["session", "start", "/bin/ls", "-i", "sel", "--instance-id", "named"])
+    assert both.instance == "sel"
+    assert both.instance_id == "named"
+
+
+def test_instance_short_flag_shown_in_help(capsys):
+    parser = bn.cli.build_parser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(["function", "list", "--help"])
+    out = capsys.readouterr().out
+    assert "-i, --instance" in out
+
+
 def test_target_flag_after_subcommand_still_works():
     parser = bn.cli.build_parser()
 

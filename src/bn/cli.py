@@ -216,6 +216,7 @@ def _common_io_options(
 
 def _instance_option(parser: argparse.ArgumentParser, *, is_root: bool = False) -> None:
     parser.add_argument(
+        "-i",
         "--instance",
         default=os.environ.get("BN_INSTANCE") if is_root else argparse.SUPPRESS,
         help="Target a specific bridge instance by ID (env: BN_INSTANCE)",
