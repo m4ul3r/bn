@@ -840,8 +840,9 @@ def test_message_lens_metadata_window_stops_at_obvious_non_pointer(monkeypatch):
     result = instance._message_lens("active", "HeadUnitInfo", limit=5, table_entries=8)
     table = result["items"][0]["metadata_table_windows"][0]
 
-    assert len(table["entries"]) == 2
-    assert table["entries"][1]["target"]["status"] == "unmapped"
+    assert table["kind"] == "pointer_table"  # #275: embedded table is canonical
+    assert len(table["items"]) == 2
+    assert table["items"][1]["target"]["status"] == "unmapped"
     assert any("stopped after" in warning for warning in table["warnings"])
 
 
@@ -871,7 +872,8 @@ def test_init_arrays_summarizes_constructor_pointer_sections(monkeypatch):
     section = result["items"][0]
     assert section["name"] == ".init_array"
     assert section["total_entries"] == 2
-    assert section["table"]["entries"][0]["target"]["function"]["name"] == "global_ctor"
+    assert section["table"]["kind"] == "pointer_table"  # #275: embedded table canonical
+    assert section["table"]["items"][0]["target"]["function"]["name"] == "global_ctor"
 
 
 def test_scan_for_calls_to_finds_llil_calls(monkeypatch):

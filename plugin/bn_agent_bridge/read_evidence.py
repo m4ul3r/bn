@@ -454,13 +454,18 @@ def _pointer_table_for_view(
         warnings.append(
             f"{len(interior_function_rows)} entries resolve inside functions but not at function starts"
         )
+    # #275: canonical envelope at the helper level, so an embedded table window
+    # (evidence init/message) looks identical to the standalone `evidence table`
+    # op -- one `.items[]` path everywhere, no `entries`/`items` divergence.
     return {
+        "kind": "pointer_table",
         "address": hex(start),
         "pointer_size": pointer_size,
         "stride": stride_size,
         "read_width": read_width,
         "context": table_context,
-        "entries": rows,
+        "items": rows,
+        "total": len(rows),
         "warnings": warnings,
     }
 
@@ -478,10 +483,9 @@ def _pointer_table(ctx, selector: str | None, address, *, entries: int = 16, str
     read_width = _parse_address(width) if width not in (None, "") else None
     if read_width is not None and read_width <= 0:
         raise OperationFailure("invalid_width", f"Invalid read width: {read_width}")
-    # #275: present the canonical collection envelope at the op level (items +
-    # kind), while the reusable _pointer_table_for_view helper keeps its `entries`
-    # key for the nested table windows embedded by message-lens / init-arrays.
-    view = _pointer_table_for_view(
+    # #275: _pointer_table_for_view already returns the canonical {kind, items,
+    # total, ...} envelope -- identical standalone and embedded.
+    return _pointer_table_for_view(
         ctx,
         bv,
         start,
@@ -490,8 +494,6 @@ def _pointer_table(ctx, selector: str | None, address, *, entries: int = 16, str
         read_width=read_width,
         error_on_unmapped=True,
     )
-    rows = view.pop("entries", [])
-    return {"kind": "pointer_table", **view, "items": rows, "total": len(rows)}
 
 
 def _section_names_at(context) -> set[str]:

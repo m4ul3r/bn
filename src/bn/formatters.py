@@ -1200,7 +1200,7 @@ def _render_init_arrays_text(value: Any) -> str:
         table = section.get("table") if isinstance(section.get("table"), dict) else {}
         for warning in list(table.get("warnings") or []):
             lines.append(f"  warning: {warning}")
-        for item in list(table.get("entries") or []):
+        for item in list(table.get("items") or []):  # #275: embedded table is canonical too
             if not isinstance(item, dict):
                 continue
             prefix = f"  [{item.get('index', '?'):>2}] {item.get('entry_address', '<unknown>')}"

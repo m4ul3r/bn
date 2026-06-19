@@ -25,7 +25,8 @@ def test_evidence_init_routes_and_renders_sections(fake_transport, capsys):
                         "shown_entries": 2,
                         "truncated": False,
                         "table": {
-                            "entries": [
+                            "kind": "pointer_table",
+                            "items": [
                                 {
                                     "index": 0,
                                     "entry_address": "0x5000",

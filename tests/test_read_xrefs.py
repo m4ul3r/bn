@@ -217,7 +217,8 @@ def test_message_lens_summarizes_type_string_xrefs_and_metadata_window(monkeypat
     assert match["type_string"]["value"] == "common.HeadUnitInfo"
     assert match["xrefs"]["code_refs"][0]["function"] == "build_type_name"
     assert match["metadata_table_windows"][0]["address"] == "0x6000"
-    assert match["metadata_table_windows"][0]["entries"][0]["target"]["thumb_adjusted"] is True
+    assert match["metadata_table_windows"][0]["kind"] == "pointer_table"  # #275: embedded table canonical
+    assert match["metadata_table_windows"][0]["items"][0]["target"]["thumb_adjusted"] is True
     # single match under the limit: honest total, not truncated
     assert result["total"] == 1
     assert result["truncated"] is False
