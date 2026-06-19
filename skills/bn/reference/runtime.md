@@ -51,7 +51,10 @@ bn session start /path/to/binary [--instance-id <id>]
 bn session list                         # running instances + RSS + sticky marker
 bn session stop <id>                    # shut one down
 bn close [<path>]                       # close one (omit path → close all)
+bn instance gc                          # reap dead instances' leftover logs/sockets in ~/.cache/bn
 ```
+
+`bn instance gc` is housekeeping: a crashed/SIGKILLed bridge leaves its `.log` (and sometimes its socket) behind in `~/.cache/bn/instances/`, and the lazy liveness sweep keeps those breadcrumbs forever, so the directory accumulates dead logs over time. `bn instance gc` removes the logs and orphan sockets of instances that no longer have a live registry — it never touches a running instance or the shared spawn lock — and reports what it reaped (`--format json` for the counts).
 
 `bn close` reports each closed view as `{path, unsaved}`. If a view had unsaved mutations, stdout warns — run `bn save` *first* if you care about annotations:
 

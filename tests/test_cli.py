@@ -3917,6 +3917,37 @@ def test_instance_use_writes_state(tmp_session, monkeypatch, capsys):
     assert capsys.readouterr().out.strip() == "instance: abc123"
 
 
+def test_instance_gc_reports_summary_text(monkeypatch, capsys):
+    # #80: `bn instance gc` reaps dead-instance cache litter and reports counts.
+    monkeypatch.setattr(bn.cli, "gc_instances", lambda: {
+        "live_instances": 2, "registries_purged": 1,
+        "logs_removed": 147, "sockets_removed": 3, "removed": ["x"],
+    })
+
+    rc = bn.cli.main(["instance", "gc"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "147" in out          # logs reaped (the headline pain)
+    assert "2" in out            # live instances kept
+    assert "Traceback" not in out
+
+
+def test_instance_gc_json_carries_counts(monkeypatch, capsys):
+    summary = {
+        "live_instances": 0, "registries_purged": 0,
+        "logs_removed": 0, "sockets_removed": 0, "removed": [],
+    }
+    monkeypatch.setattr(bn.cli, "gc_instances", lambda: summary)
+
+    rc = bn.cli.main(["instance", "gc", "--format", "json"])
+
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["logs_removed"] == 0
+    assert data["live_instances"] == 0
+
+
 def test_instance_use_default_pins_gui_bridge(tmp_session, monkeypatch, capsys):
     # The fixed GUI bridge has instance_id=None and selector "default". Storing
     # the raw None made session_state.update() DELETE the pin, so the pin
