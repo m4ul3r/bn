@@ -263,7 +263,10 @@ def _render_field_xrefs_text(value: Any) -> str:
         "",
         "code refs:",
     ]
-    code_refs = list(value.get("code_refs") or [])
+    # #275: refs come as a unified `items` list, each tagged with its `kind`.
+    items = list(value.get("items") or [])
+    code_refs = [it for it in items if it.get("kind") == "code"]
+    data_refs = [it for it in items if it.get("kind") == "data"]
     if code_refs:
         for ref in code_refs:
             details = [ref.get("address", "<unknown>")]
@@ -278,7 +281,6 @@ def _render_field_xrefs_text(value: Any) -> str:
         lines.append("- none")
 
     lines.extend(["", "data refs:"])
-    data_refs = list(value.get("data_refs") or [])
     if data_refs:
         for ref in data_refs:
             details = [ref.get("address", "<unknown>")]
@@ -796,7 +798,7 @@ def _render_xrefs_any_text(value: Any) -> str:
     present (with counts) or absent (#218)."""
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    syms = list(value.get("symbols") or [])
+    syms = list(value.get("items") or [])  # #275: was `symbols`
     lines = [f"xrefs --any: {value.get('present', 0)}/{value.get('count', len(syms))} symbol(s) present"]
     for s in syms:
         if not isinstance(s, dict):

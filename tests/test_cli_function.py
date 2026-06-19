@@ -1402,8 +1402,8 @@ def test_xrefs_any_batch_probes_symbols(monkeypatch, capsys):
         assert op == "xrefs_any"
         assert params["symbols"] == ["memcpy", "strcpy", "system"]
         return {"ok": True, "result": {
-            "count": 3, "present": 2,
-            "symbols": [
+            "kind": "symbol_presence", "count": 3, "present": 2,
+            "items": [
                 {"symbol": "memcpy", "present": True, "code_ref_count": 12,
                  "caller_function_count": 4, "address": "0x1000"},
                 {"symbol": "strcpy", "present": False, "note": "Function not found: strcpy"},
