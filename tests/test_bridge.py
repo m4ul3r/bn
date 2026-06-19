@@ -7781,6 +7781,102 @@ def test_struct_field_set_overwrite_at_occupied_offset_replaces(monkeypatch):
     assert builder.added and builder.added[0] == ("replfld", 0, True)
 
 
+def _typedef_alias_bv(*, alias_name="AliasRec", tag="InnerRec"):
+    """A fake BV mirroring real BN's typedef-of-struct shape (#246): *alias_name*
+    resolves to a NamedTypeReference whose ``.target(bv)`` is the underlying
+    registered struct (`tag`), and ``get_type_by_name(tag)`` returns that struct.
+    The alias's own ``mutable_copy()`` raises -- exactly as BN's
+    NamedTypeReferenceBuilder does on ``add_member_at_offset`` -- so a fix that
+    fails to follow the reference reproduces the original crash."""
+    underlying = _FakeType(f"struct {tag}", type_class="StructureTypeClass",
+                           members=[_FakeMember(0, "x", "uint32_t")])
+    builder = _AddableStructBuilder()
+    underlying.mutable_copy = lambda: builder
+    underlying.registered_name = types.SimpleNamespace(name=tag)
+
+    alias = _FakeType(f"struct {tag} {alias_name}", type_class="NamedTypeReferenceClass")
+
+    def _alias_mutable_copy():
+        raise AttributeError(
+            "'NamedTypeReferenceBuilder' object has no attribute 'add_member_at_offset'")
+
+    alias.mutable_copy = _alias_mutable_copy
+    alias.target = lambda _bv: underlying
+
+    class _BV:
+        def __init__(self):
+            self.defined = []
+
+        def get_type_by_name(self, n):
+            return {alias_name: alias, tag: underlying}.get(n)
+
+        def parse_type_string(self, s):
+            return _FakeType("uint32_t", width=4), None
+
+        def define_user_type(self, name, b):
+            self.defined.append((name, b))
+
+    return alias, underlying, builder, _BV()
+
+
+def test_struct_builder_follows_typedef_alias_to_underlying_struct(monkeypatch):
+    """`struct field set/rename/delete` on a typedef (the idiomatic
+    `typedef struct {..} X;`) must follow the alias (a NamedTypeReference) to the
+    underlying registered struct tag and build from THAT -- not crash calling
+    add_member_at_offset on a NamedTypeReferenceBuilder (#246). All three field
+    ops route through _struct_builder, so fixing it here fixes set/rename/delete."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _alias, _under, builder, bv = _typedef_alias_bv()
+    resolved_name, got = bridge.mutation_engine._struct_builder(instance, bv, "AliasRec")
+    assert resolved_name == "InnerRec"    # commit to the tag, not the alias
+    assert got is builder                 # a real StructureBuilder, not an NTR builder
+
+
+def test_struct_builder_follows_anonymous_typedef_struct(monkeypatch):
+    """`typedef struct {..} AnonRec;` registers the body under an auto-named tag
+    (`_AnonRec`); the alias is a NamedTypeReference to it. The follow must land on
+    `_AnonRec` -- the most common C struct idiom, not an edge case (#246)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _alias, _under, builder, bv = _typedef_alias_bv(alias_name="AnonRec", tag="_AnonRec")
+    resolved_name, got = bridge.mutation_engine._struct_builder(instance, bv, "AnonRec")
+    assert resolved_name == "_AnonRec"
+    assert got is builder
+
+
+def test_struct_builder_typedef_to_nonstruct_is_invalid_request(monkeypatch):
+    """A name that resolves to a non-aggregate (`typedef uint32_t Foo;` resolves
+    straight to the integer type in BN) must raise a clean invalid_request, not a
+    raw AttributeError from add_member_at_offset (#246)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    prim = _FakeType("uint32_t", type_class="IntegerTypeClass")
+
+    class _BV:
+        def get_type_by_name(self, n):
+            return prim if n == "MyU32" else None
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        bridge.mutation_engine._struct_builder(instance, _BV(), "MyU32")
+    assert exc.value.status == "invalid_request"
+
+
+def test_op_struct_field_set_through_typedef_alias_commits_to_tag(monkeypatch):
+    """End-to-end through the op handler: a set on the typedef alias must add the
+    field to the underlying struct builder and commit it to the TAG name, with the
+    result reporting the tag (so the caller learns where the body lives) (#246)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _alias, _under, builder, bv = _typedef_alias_bv()
+    res = instance._op_struct_field_set(bv, {
+        "struct_name": "AliasRec", "offset": "0x4", "field_name": "added",
+        "field_type": "uint32_t", "overwrite_existing": True})
+    assert res["struct_name"] == "InnerRec"          # reported as the tag
+    assert builder.added and builder.added[0][0] == "added"
+    assert ("InnerRec", builder) in bv.defined       # committed to the tag
+
+
 def test_annotate_types_declare_verified_when_layout_changed(monkeypatch):
     # A redeclaration of an existing type NAME with a real layout change must be
     # 'verified', not 'noop' -- the authoritative signal is the layout diff, not
