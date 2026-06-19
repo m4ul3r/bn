@@ -20,6 +20,21 @@ from _bridge_fakes import *  # noqa: F401,F403
 # --- I2: strings filtering ---
 
 
+def test_list_envelopes_carry_kind(monkeypatch):
+    # #275: every generic-list read carries a `kind` discriminator (strings shown
+    # here; the registry-driven conformance test covers the rest).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(strings=[_FakeStringRef(0x1000, 5, "hello")])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    listed = instance._strings(None, query=None, offset=0, limit=100, min_length=4)
+    assert listed["kind"] == "strings" and isinstance(listed["items"], list)
+
+    counted = instance._strings(None, query=None, offset=0, limit=100, count_only=True)
+    assert counted["kind"] == "strings" and "count" in counted
+
+
 def test_strings_min_length_excludes_short_strings(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

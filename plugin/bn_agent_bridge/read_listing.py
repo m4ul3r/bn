@@ -145,7 +145,7 @@ def _callsites(
     # Honest paging envelope for JSON parity (#131 / item 11): callsites is a
     # flat row list, so wrap it like the sibling list ops. --limit stays a
     # text-only renderer cap (no bridge-side paging), hence offset=0/limit=None.
-    return read_misc._paged_list_result(rows, offset=0, limit=None)
+    return read_misc._paged_list_result(rows, offset=0, limit=None, kind="callsites")
 
 
 def _parse_function_address_bounds(

@@ -82,22 +82,24 @@ _SECTION_SEMANTICS_NAMES: dict[int, str] = {
 
 
 def _paged_list_result(items: list[dict[str, Any]], *, offset: int,
-                       limit: int | None) -> dict[str, Any]:
+                       limit: int | None, kind: str) -> dict[str, Any]:
     """Return a list page WITH paging metadata (the strings/imports/sections
     envelope).
 
     Mirrors ``read_listing._paged_function_result`` so the simple list ops
     expose the same honest paging contract -- the true total plus the remainder
-    -- as ``function list``/``function search`` (#122). The only difference is
-    the page key: this returns ``items`` (a generic list) where the function
-    listing returns ``functions``. The CLI can't compute the true total itself
-    (it asks for a bounded page), so the bridge, which has the full filtered
-    set, returns total/offset/limit/returned/has_more alongside the page."""
+    -- as ``function list``/``function search`` (#122). `items` is the universal
+    data container and `kind` the envelope discriminator (#275); every caller
+    passes its own `kind` (required, so a new list read can't omit it). The CLI
+    can't compute the true total itself (it asks for a bounded page), so the
+    bridge, which has the full filtered set, returns total/offset/limit/
+    returned/has_more alongside the page."""
     total = len(items)
     page = items[offset:]
     if limit is not None:
         page = page[:limit]
     return {
+        "kind": kind,
         "items": page,
         "total": total,
         "offset": offset,
@@ -173,9 +175,9 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
         items.append(entry)
     if count_only:
         # `total` mirrors the list envelope key for the same number (#165).
-        return {"count": len(items), "total": len(items)}
+        return {"kind": "strings", "count": len(items), "total": len(items)}
     items.sort(key=lambda item: (int(item["address"], 16), item["value"]))
-    return _paged_list_result(items, offset=offset, limit=limit)
+    return _paged_list_result(items, offset=offset, limit=limit, kind="strings")
 
 
 def _needed_libraries(bv) -> list[str]:
@@ -277,7 +279,7 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
             if kind in ("function", "data"):
                 func_data_names.add(raw_name)
     if count_only:
-        result = {"count": len(items), "total": len(items)}
+        result = {"kind": "imports", "count": len(items), "total": len(items)}
         if self_defined_excluded:
             result["self_defined_excluded"] = self_defined_excluded
         if got_collapsed:
@@ -303,7 +305,7 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
         item["name"],
         int(item["address"], 16),
     ))
-    result = _paged_list_result(items, offset=offset, limit=limit)
+    result = _paged_list_result(items, offset=offset, limit=limit, kind="imports")
     # Only present when there's something to report, so the common case keeps the
     # standard paged-list envelope shared with strings/sections (#202).
     if self_defined_excluded:
@@ -352,13 +354,13 @@ def _exports(ctx, selector: str | None, *, offset: int = 0, limit: int | None = 
                 }
             )
     if count_only:
-        return {"count": len(items), "total": len(items)}
+        return {"kind": "exports", "count": len(items), "total": len(items)}
     items.sort(key=lambda item: (
         0 if item["kind"] == "function" else 1,
         item["name"],
         int(item["address"], 16),
     ))
-    return _paged_list_result(items, offset=offset, limit=limit)
+    return _paged_list_result(items, offset=offset, limit=limit, kind="exports")
 
 
 def _imports_build_summary(
@@ -428,9 +430,9 @@ def _sections(ctx, selector: str | None, *, query: str | None = None,
 
         items.append(entry)
     if count_only:
-        return {"count": len(items), "total": len(items)}
+        return {"kind": "sections", "count": len(items), "total": len(items)}
     items.sort(key=lambda item: int(item["start"], 16))
-    return _paged_list_result(items, offset=offset, limit=limit)
+    return _paged_list_result(items, offset=offset, limit=limit, kind="sections")
 
 
 def _ascii_render(data: bytes) -> str:

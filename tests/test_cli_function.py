@@ -59,7 +59,8 @@ def test_function_list_requires_target_when_multiple_targets_are_open(fake_trans
 def test_function_list_returns_full_result_set(fake_transport, capsys):
     calls = fake_transport({"list_functions": {
         "ok": True,
-        "result": {"functions": [{"name": f"sub_{index:06x}", "address": hex(index)} for index in range(150)],
+        "result": {"kind": "functions",
+                   "items": [{"name": f"sub_{index:06x}", "address": hex(index)} for index in range(150)],
                    "total": 150, "offset": 0, "limit": 200, "returned": 150, "has_more": False},
     }})
 
@@ -70,7 +71,7 @@ def test_function_list_returns_full_result_set(fake_transport, capsys):
     assert calls[-1]["params"] == {"limit": 200}
     stdout, stderr = capsys.readouterr()
     payload = json.loads(stdout)
-    assert len(payload["functions"]) == 150
+    assert len(payload["items"]) == 150
     assert payload["total"] == 150 and payload["has_more"] is False
     assert stderr == ""
 

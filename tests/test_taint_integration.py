@@ -61,10 +61,10 @@ def _compile(src: Path, out: Path, extra_cflags: list[str] | None = None) -> Non
 
 def _resolve_addr(inst: str, name: str) -> str:
     data = _bn_json(inst, "function", "search", name)
-    # function search returns a paged envelope {functions, total, ...} (#59);
-    # tolerate the older bare-list shape too.
+    # function search returns a paged envelope {kind, items, total, ...} (#59/#275);
+    # tolerate the legacy `functions` key and the older bare-list shape too.
     if isinstance(data, dict):
-        matches = data.get("functions") or []
+        matches = data.get("items") or data.get("functions") or []
     else:
         matches = data if isinstance(data, list) else []
     exact = [m for m in matches if str(m.get("name", "")).split("(")[0] == name]
