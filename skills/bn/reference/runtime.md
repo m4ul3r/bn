@@ -1,6 +1,45 @@
 # bn reference — runtime
 
-Sessions/headless, output & spill, py exec, troubleshooting, quirks, install for the `bn` skill. See `../SKILL.md` for the map.
+Target selection, sticky pins, instance/target resolution order, sessions/headless, output & spill, py exec, troubleshooting, quirks, install for the `bn` skill. See `../SKILL.md` for the map.
+
+## 1. Workflow & target selection
+
+1. Discover targets:
+
+   ```bash
+   bn target list
+   ```
+
+   The `[N]` prefix is the view id; you can pass `-t N`. If no bridge is running, any command auto-starts one.
+
+2. Pick a target:
+   - Single open BinaryView: omit `-t`.
+   - Multiple open: pass `-t <selector>` from `bn target list`. Selectors match against `selector`, `target_id`, `view_id`, full filename, or basename.
+   - `-t` works **before or after** the subcommand. Use the pre-subcommand form to disambiguate selectors that collide with subcommand names like `session` or `pam_qnx.so.2`:
+
+     ```bash
+     bn -t pam_qnx.so.2 decompile main
+     bn decompile main -t pam_qnx.so.2
+     ```
+
+   - Use `-t active` only when you explicitly want to follow the GUI selection.
+
+3. (Optional) Pin sticky defaults — useful when you'll run many commands against the same instance/target:
+
+   ```bash
+   bn instance use <id>          # pin --instance for this project
+   bn target use <selector>       # pin -t for this project
+   bn instance clear              # clear pinned instance
+   bn target clear                # clear pinned target
+   ```
+
+   Resolution order:
+   - **Instance:** CLI `--instance` > env `BN_INSTANCE` > sticky > auto-pick / auto-spawn.
+   - **Target:** CLI `-t/--target` > sticky > single-open auto-pick. **`BN_TARGET` does not exist** — target selection is the CLI flag or `bn target use`, nothing else.
+
+   State lives at `~/.cache/bn/sessions/<sha256(project_root)[:16]>.json`. Project root walks up to the nearest `.git` (cwd as fallback). `bn session list` and `bn target list` mark matching entries with `[sticky]`. When a sticky instance points at a dead bridge, errors append `Clear it with bn instance clear`.
+
+   > **HARD rule for parallel / fan-out agents.** Sticky pins are **one shared file per git repo** — every agent rooted in the same repo reads and writes the same `instance_id` / `target`. If multiple agents run concurrently against that repo, one agent's `bn instance use` / `bn target use` / `bn instance clear` / `bn target clear` silently changes the target for *all* of them, causing cross-talk and commands hitting the wrong binary. Parallel/fan-out agents **MUST** pass `-t/--target` and `--instance` explicitly on **every** command and **MUST NOT** call `instance use` / `target use` / `instance clear` / `target clear`. Prefer one dedicated headless instance per agent: `bn session start <binary> --instance-id <unique-id>`, then thread that `--instance <unique-id>` (and an explicit `-t`) through every subsequent call.
 
 ## 2. Sessions & headless
 
