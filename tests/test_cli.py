@@ -2051,6 +2051,21 @@ def test_function_search_no_regex_hint_for_plain_query(monkeypatch, capsys):
     assert "add --regex" not in err
 
 
+def _zero_function_search_count(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+    return {"ok": True, "result": {"count": 0, "total": 0}}
+
+
+def test_function_search_count_hints_regex_on_zero_matches(monkeypatch, capsys):
+    """#252 review: --count is the 'is my query matching anything?' path, so a
+    0-match query with regex metacharacters must still nudge toward --regex.
+    The hint keys off total==0, which the count envelope carries."""
+    monkeypatch.setattr(bn.cli, "send_request", _zero_function_search_count)
+    rc = bn.cli.main(["function", "search", "init|fini", "--count", "--target", "active"])
+    assert rc == 0
+    _, err = capsys.readouterr()
+    assert "add --regex" in err
+
+
 def test_strings_hints_regex_on_zero_matches_with_metachars(monkeypatch, capsys):
     """strings (a bare list today) with a metacharacter query and 0 matches also
     suggests --regex (#122)."""
@@ -3876,6 +3891,27 @@ def test_function_list_count_prints_total(monkeypatch, capsys):
 
     assert rc == 0
     assert "Total functions: 4242" in capsys.readouterr().out
+
+
+def test_function_search_count_prints_total(monkeypatch, capsys):
+    # #252: `function search --count` mirrors `list --count` -- forwards
+    # count_only to search_functions and renders the match total only.
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "x"}]}
+        if op == "search_functions":
+            assert params.get("count_only") is True
+            assert params.get("query") == "parse"
+            return {"ok": True, "result": {"count": 17, "total": 17}}
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    rc = bn.cli.main(["function", "search", "parse", "--count"])
+
+    assert rc == 0
+    assert "Total functions: 17" in capsys.readouterr().out
 
 
 # --- Sticky instance/target ---
