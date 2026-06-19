@@ -874,8 +874,32 @@ def build_parser() -> argparse.ArgumentParser:
     parser = BnArgumentParser(
         prog="bn",
         description="Agent-friendly Binary Ninja CLI",
+        # RawDescription so the capability map below keeps its line breaks --
+        # the default formatter reflows the epilog into one wrapped blob, which
+        # destroys a "which command when" table. It only affects description /
+        # epilog text; argument and subcommand formatting is unchanged.
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Output over ~10k estimated tokens spills to disk; the command prints an "
+            "Picking between overlapping commands:\n"
+            "\n"
+            "  Who calls this function?\n"
+            "    callsites  exact caller -> callsite address mapping\n"
+            "    xrefs      general cross-references (code and data, plus symbol presence)\n"
+            "\n"
+            "  Where does a value come from or go?\n"
+            "    taint      follow data source -> sink across calls (forward / backward)\n"
+            "    trace      backward-slice one call argument to its origin\n"
+            "    dataflow   per-function def/use, possible values, and local call graph\n"
+            "\n"
+            "  C++ classes and raw structure?\n"
+            "    class      C++ class hierarchy: vtables, bases, methods (from RTTI/symbols)\n"
+            "    evidence   raw vtable/pointer tables, protobuf, .init_array\n"
+            "\n"
+            "  Finding a function?\n"
+            "    function list    enumerate, filter, or count functions\n"
+            "    function search  match by name or regex\n"
+            "\n"
+            "Output over ~10k estimated tokens spills to disk; the command prints an\n"
             "envelope with the artifact path. Read that file directly -- do not pipe to grep."
         ),
     )
