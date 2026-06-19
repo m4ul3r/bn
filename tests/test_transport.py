@@ -389,6 +389,60 @@ def test_send_request_timeout_env_zero_disables(tmp_path, monkeypatch):
     assert fake_socket.timeouts == []
 
 
+def test_resolve_timeout_rejects_non_numeric(monkeypatch):
+    """A typo'd BN_REQUEST_TIMEOUT must fail loud, not silently fall back to the
+    600s default (the user believes they set a short timeout but didn't) (#255)."""
+    from bn.transport import _resolve_timeout, BridgeError
+
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "abc")
+    with pytest.raises(BridgeError) as exc:
+        _resolve_timeout(None)
+    assert "BN_REQUEST_TIMEOUT" in str(exc.value)
+
+
+def test_resolve_timeout_rejects_negative(monkeypatch):
+    """A negative value is not a valid socket timeout -- reject it instead of
+    passing -1.0 through unvalidated (#255)."""
+    from bn.transport import _resolve_timeout, BridgeError
+
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "-1")
+    with pytest.raises(BridgeError) as exc:
+        _resolve_timeout(None)
+    assert "BN_REQUEST_TIMEOUT" in str(exc.value)
+
+
+def test_resolve_timeout_rejects_non_finite(monkeypatch):
+    """inf/nan parse as floats but aren't valid socket timeouts -- reject them
+    like negatives rather than passing them to settimeout (#255)."""
+    from bn.transport import _resolve_timeout, BridgeError
+
+    for val in ("inf", "-inf", "nan"):
+        monkeypatch.setenv("BN_REQUEST_TIMEOUT", val)
+        with pytest.raises(BridgeError):
+            _resolve_timeout(None)
+
+
+def test_resolve_timeout_zero_and_sentinels_disable(monkeypatch):
+    """0 / 0.0 / none / off / empty all disable the timeout (return None)."""
+    from bn.transport import _resolve_timeout
+
+    for val in ("0", "0.0", "none", "off", "", "  Off  "):
+        monkeypatch.setenv("BN_REQUEST_TIMEOUT", val)
+        assert _resolve_timeout(None) is None, val
+
+
+def test_resolve_timeout_positive_default_and_explicit(monkeypatch):
+    from bn.transport import _resolve_timeout, DEFAULT_REQUEST_TIMEOUT
+
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "42.5")
+    assert _resolve_timeout(None) == 42.5
+    monkeypatch.delenv("BN_REQUEST_TIMEOUT", raising=False)
+    assert _resolve_timeout(None) == DEFAULT_REQUEST_TIMEOUT
+    # an explicit timeout arg always wins and is never re-validated against the env
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "abc")
+    assert _resolve_timeout(12.0) == 12.0
+
+
 def test_send_request_partial_response_reports_real_error(tmp_path, monkeypatch):
     from bn.transport import BridgeError
 

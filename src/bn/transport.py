@@ -4,6 +4,7 @@ import contextlib
 import errno
 import fcntl
 import json
+import math
 import os
 import re
 import secrets
@@ -40,15 +41,29 @@ def _resolve_timeout(timeout: float | None) -> float | None:
     if timeout is not None:
         return timeout
     raw = os.environ.get("BN_REQUEST_TIMEOUT")
-    if raw is not None:
-        text = raw.strip().lower()
-        if text in ("", "0", "none", "off"):
-            return None
-        try:
-            return float(text)
-        except ValueError:
-            pass
-    return DEFAULT_REQUEST_TIMEOUT
+    if raw is None:
+        return DEFAULT_REQUEST_TIMEOUT
+    text = raw.strip().lower()
+    # Sentinels (and 0, handled below) disable the timeout entirely.
+    if text in ("", "none", "off"):
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        # Fail loud: a typo'd value silently falling back to the 600s default left
+        # the user believing they'd set a short timeout when they hadn't (#255).
+        raise BridgeError(
+            f"BN_REQUEST_TIMEOUT={raw!r} is not a valid timeout: expected a "
+            f"positive number of seconds, or one of 0/none/off to disable it."
+        ) from None
+    if value < 0 or not math.isfinite(value):
+        raise BridgeError(
+            f"BN_REQUEST_TIMEOUT={raw!r} is not a valid timeout: expected a "
+            f"positive number of seconds, or one of 0/none/off to disable it."
+        )
+    # 0 / 0.0 disables (a 0-second socket timeout would make every request fail
+    # non-blocking), matching the documented 0 sentinel.
+    return value or None
 
 
 @dataclass(slots=True)
