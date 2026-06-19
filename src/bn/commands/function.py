@@ -28,6 +28,9 @@ from ..transport import BridgeError
 
 
 @command("function", "list", help="List functions", target=True, paged=True, address_filter=True,
+         prefer_when="enumerate, filter, or count functions; "
+                     "use function search to match by name or regex",
+         see_also=("function search",),
          args=[
              arg("--count", action="store_true", default=False,
                  help="Show total function count instead of listing"),
@@ -81,6 +84,9 @@ def _function_list(args: argparse.Namespace) -> int:
 
 @command("function", "search", help="Search functions by substring or regex",
          target=True, paged=True, address_filter=True,
+         prefer_when="match functions by name or regex; "
+                     "use function list to enumerate, filter, or count",
+         see_also=("function list",),
          args=[
              arg("query"),
              arg("--count", action="store_true", default=False,
@@ -303,6 +309,9 @@ def _disasm(args: argparse.Namespace) -> int:
 
 @command("xrefs", help="List xrefs to an address or function; use --field for struct field xrefs",
          target=True, paged=True,
+         prefer_when="general cross-references -- code and data refs, plus symbol presence; "
+                     "use callsites for an exact caller->callsite address mapping",
+         see_also=("callsites",),
          args=[
              arg("identifier", nargs="?",
                  help="Function name or address (hex 0x.. or decimal) to find inbound refs to"),
@@ -382,6 +391,9 @@ def _load_within_identifiers(path: Path) -> list[str]:
 
 @command("callsites", help="Find direct native callsites and exact caller_static addresses",
          target=True,
+         prefer_when="exact caller->callsite address mapping; "
+                     "use xrefs for general or data cross-references",
+         see_also=("xrefs",),
          args=[
              arg("callee", help="Callee function name or address whose callsites to locate"),
              arg("--context", type=_non_negative_int, default=3,
@@ -484,6 +496,9 @@ def _evidence_xrefs(args: argparse.Namespace) -> int:
 @command("evidence", "table",
          help="Interpret memory at an address as a pointer table or vtable-like table",
          target=True,
+         prefer_when="walk a raw vtable / pointer table as data; "
+                     "use class show for a recovered C++ class's vtable and hierarchy",
+         see_also=("class show",),
          args=[
              arg("address", help="Table start address (hex 0x.. or decimal)"),
              arg("--entries", type=_positive_int, default=16,
@@ -557,6 +572,9 @@ def _evidence_init(args: argparse.Namespace) -> int:
 @command("trace",
          help="Backward slice: trace a call argument through SSA use-def chains to its origin",
          target=True,
+         prefer_when="backward-slice a single call argument to its origin; "
+                     "use taint backward for general sink-to-source slicing",
+         see_also=("taint backward",),
          args=[
              arg("identifier", help="Function name or entry address containing the call"),
              arg("address", help="Address of the call instruction to trace from (hex 0x.. or decimal)"),

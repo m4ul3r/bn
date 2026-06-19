@@ -114,6 +114,32 @@ def _resolution_note(value: Any) -> str:
     )
 
 
+def _render_capabilities_text(value: Any) -> str:
+    """Render the #276 capability index as a grouped, scannable catalog: each
+    top-level group, its commands with one-line help, and the prefer-when /
+    see-also routing hints where a command overlaps a neighbor."""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    items = value.get("items") or []
+    lines: list[str] = []
+    current_group: str | None = None
+    for item in items:
+        group = item.get("group", "")
+        if group != current_group:
+            if lines:
+                lines.append("")
+            lines.append(f"{group}:")
+            current_group = group
+        command = item.get("command", "")
+        help_text = item.get("help", "")
+        lines.append(f"  {command}  --  {help_text}" if help_text else f"  {command}")
+        if item.get("prefer_when"):
+            lines.append(f"      prefer when: {item['prefer_when']}")
+        if item.get("see_also"):
+            lines.append(f"      see also: {', '.join(item['see_also'])}")
+    return "\n".join(lines)
+
+
 def _render_function_info_text(value: Any, verbose: bool = False, demangle: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)

@@ -17,6 +17,9 @@ from ..transport import BridgeError
 
 @command("dataflow", "defuse", help="Show the SSA definition site and use sites of a variable",
          target=True,
+         prefer_when="per-function SSA def/use of one variable; "
+                     "use taint to follow a value across calls source->sink",
+         see_also=("taint forward", "taint backward"),
          args=[
              arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
              arg("--var", dest="var", required=True,
@@ -88,6 +91,9 @@ _SINK_LOCATOR_HELP = (
 
 @command("taint", "forward", help="Forward taint: trace untrusted data from sources to sinks",
          target=True,
+         prefer_when="follow untrusted data forward source->sink across calls; "
+                     "use dataflow for per-function def/use, evidence for raw structure",
+         see_also=("taint backward", "trace", "dataflow defuse"),
          args=[
              arg("--function", "-f", dest="function", required=True,
                  help="Function to analyze (name or address)"),
@@ -135,6 +141,9 @@ def _taint_forward(args: argparse.Namespace) -> int:
 
 @command("taint", "backward", help="Backward taint: slice a sink's arguments back to their origin",
          target=True,
+         prefer_when="slice a sink backward to its sources across calls; "
+                     "use trace for a single argument's origin",
+         see_also=("taint forward", "trace"),
          args=[
              arg("--function", "-f", dest="function", required=True,
                  help="Function to analyze (name or address)"),
