@@ -155,7 +155,10 @@ def _exports(args: argparse.Namespace) -> int:
 
 
 @command("sections", help="List binary sections with address ranges and permissions", target=True,
-         paged=True, args=[arg("--query", help="Filter sections by name substring"),
+         paged=True, args=[arg("--query",
+                               help="Filter by a substring of the section name OR its semantics "
+                                    "label (e.g. 'code' matches .text=ReadOnlyCode); broadens to "
+                                    "all matching-semantics sections, not just name matches"),
                            arg("--count", action="store_true", default=False,
                                help="Show the section count instead of listing")])
 def _sections(args: argparse.Namespace) -> int:
