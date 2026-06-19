@@ -1068,3 +1068,49 @@ def test_instance_gc_reports_summary_text(monkeypatch, capsys):
     assert "147" in out          # logs reaped (the headline pain)
     assert "2" in out            # live instances kept
     assert "Traceback" not in out
+
+
+# --- #276 Option 2: machine-readable capability index -----------------------
+
+def test_capabilities_json_index_is_registry_derived(capsys):
+    # A structured, registry-derived command->purpose->prefer-when index an
+    # agent reads once to route. Local command -- no bridge/target required.
+    rc = bn.cli.main(["capabilities", "--format", "json"])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+
+    assert data["kind"] == "capabilities"
+    items = data["items"]
+    assert items and data["count"] == len(items)
+    for it in items:
+        assert {"command", "group", "help", "requires_target",
+                "default_format", "prefer_when", "see_also"} <= set(it.keys())
+
+    by_cmd = {it["command"]: it for it in items}
+    # the overlaps the issue calls out are present and cross-linked
+    assert "exact" in by_cmd["callsites"]["prefer_when"].lower()
+    assert "xrefs" in by_cmd["callsites"]["see_also"]
+    assert "callsites" in by_cmd["xrefs"]["see_also"]
+    assert "function search" in by_cmd["function list"]["see_also"]
+    assert "function list" in by_cmd["function search"]["see_also"]
+
+
+def test_capabilities_see_also_references_are_valid_commands(capsys):
+    # Integrity: every see_also points at a real registered command (the index
+    # is registry-derived, so a stale/typo'd cross-link must fail loudly).
+    rc = bn.cli.main(["capabilities", "--format", "json"])
+    assert rc == 0
+    items = json.loads(capsys.readouterr().out)["items"]
+    commands = {it["command"] for it in items}
+    for it in items:
+        for ref in it["see_also"]:
+            assert ref in commands, f"{it['command']} see_also -> unknown command {ref!r}"
+
+
+def test_capabilities_text_groups_commands_with_routing_hints(capsys):
+    rc = bn.cli.main(["capabilities"])  # text is the default
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "callsites" in out and "xrefs" in out
+    assert "prefer when:" in out
+    assert "see also:" in out

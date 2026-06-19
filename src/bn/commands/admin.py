@@ -20,6 +20,7 @@ from typing import Any
 from .. import cli
 from ..cli import arg, command
 from ..formatters import (
+    _render_capabilities_text,
     _render_doctor_text,
     _render_instance_gc_text,
     _render_instance_use_text,
@@ -32,6 +33,29 @@ from ..formatters import (
     _render_target_use_text,
 )
 from ..transport import BridgeError
+
+
+@command("capabilities",
+         help="Index of every command, what it's for, and when to pick it over a neighbor "
+              "(JSON for agents; no target needed)")
+def _capabilities(args: argparse.Namespace) -> int:
+    # Derived entirely from the @command registry -- no hand-maintained second
+    # list -- so the index can't drift from the actual command surface (#276).
+    items = [
+        {
+            "command": " ".join(spec["path"]),
+            "group": spec["path"][0],
+            "help": spec.get("help", ""),
+            "requires_target": bool(spec.get("target", False)),
+            "default_format": spec.get("fmt", "text"),
+            "prefer_when": spec.get("prefer_when", ""),
+            "see_also": list(spec.get("see_also", ())),
+        }
+        for spec in sorted(cli._COMMANDS, key=lambda spec: spec["path"])
+    ]
+    result = {"kind": "capabilities", "items": items, "count": len(items)}
+    cli._emit_result(args, result, text_renderer=_render_capabilities_text, stem="capabilities")
+    return 0
 
 
 @command("doctor", help="Validate bridge discovery and installation")

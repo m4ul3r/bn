@@ -9,6 +9,9 @@ from ..formatters import _render_class_list_text, _render_class_show_text
 
 @command("class", "list", help="List C++ classes recovered from symbols/RTTI",
          target=True, paged=True,
+         prefer_when="recover the C++ class hierarchy (vtables, bases, methods) from RTTI/symbols; "
+                     "use evidence table to walk a raw vtable/pointer table as data",
+         see_also=("class show", "evidence table"),
          args=[arg("--all", action="store_true", default=False, dest="all_clusters",
                    help="Include name-only clusters (possible namespaces), not just RTTI/ctor-confirmed classes"),
                arg("--no-stl", action="store_true", default=False, dest="no_stl",

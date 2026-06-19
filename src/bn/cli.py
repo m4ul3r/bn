@@ -299,8 +299,17 @@ def command(
     address_filter: bool = False,
     args: list[tuple[tuple[str, ...], dict[str, Any]]] | None = None,
     mutex_groups: list[tuple[bool, list[tuple[tuple[str, ...], dict[str, Any]]]]] | None = None,
+    prefer_when: str = "",
+    see_also: tuple[str, ...] = (),
 ) -> Callable:
-    """Register a CLI command declaratively."""
+    """Register a CLI command declaratively.
+
+    ``prefer_when`` / ``see_also`` are the agent-routing hints surfaced by
+    ``bn capabilities`` (#276): when a command overlaps a neighbor, ``prefer_when``
+    says when to reach for this one and ``see_also`` names the neighbors (by their
+    space-joined command path, e.g. ``"function search"``). They live on the
+    command so the index stays registry-derived -- no hand-maintained second list.
+    """
 
     def decorator(fn: Callable[[argparse.Namespace], int]) -> Callable[[argparse.Namespace], int]:
         for spec in _COMMANDS:
@@ -319,6 +328,8 @@ def command(
             "address_filter": address_filter,
             "args": args or [],
             "mutex_groups": mutex_groups or [],
+            "prefer_when": prefer_when,
+            "see_also": tuple(see_also),
         })
         return fn
 
