@@ -3387,6 +3387,34 @@ def test_disasm_lines_slices_output_with_header(monkeypatch, capsys):
     assert "ccc" not in out and "ddd" not in out
 
 
+def test_structured_il_lines_slices_output_with_header(monkeypatch, capsys):
+    # #253: structured-il gains --lines, mirroring decompile/il/disasm.
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        if op == "structured_il":
+            return {"ok": True, "result": {
+                "function": {"name": "main", "address": "0x1000"},
+                "view": "mlil", "ssa": True,
+                "instructions": [
+                    {"il_index": 0, "address": "0x1000", "op": "MLIL_SET_VAR", "text": "a = 1"},
+                    {"il_index": 1, "address": "0x1004", "op": "MLIL_SET_VAR", "text": "b = 2"},
+                    {"il_index": 2, "address": "0x1008", "op": "MLIL_RET", "text": "return"},
+                ],
+            }}
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["function", "structured-il", "main", "--target", "active", "--lines", "2:3"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    # 4 rendered lines: header + 3 instruction rows. Slice keeps rows 2-3.
+    assert "// lines 2-3 of 4" in out
+    assert "a = 1" in out and "b = 2" in out
+    assert "return" not in out  # row 4 excluded
+    assert "main @ 0x1000" not in out  # header row (1) excluded
+
+
 def test_lines_range_rejects_zero_index_with_helpful_error(monkeypatch, capsys):
     # argparse type errors exit via SystemExit(2)
     with pytest.raises(SystemExit):
@@ -4762,6 +4790,7 @@ def _assert_no_bridge_call(monkeypatch):
         ["decompile", "sub_401000", "--format", "ndjson", "--lines", "1:5"],
         ["il", "sub_401000", "--format", "json", "--lines", "1:5"],
         ["disasm", "sub_401000", "--format", "json", "--lines", "1:5"],
+        ["function", "structured-il", "sub_401000", "--format", "json", "--lines", "1:5"],
     ],
 )
 def test_lines_flag_rejected_outside_text_mode(monkeypatch, capsys, argv):
@@ -5002,12 +5031,42 @@ def test_unpaged_list_spill_hint_points_at_out_flag(monkeypatch, capsys):
     assert "rerun with --out <path>" in stderr
 
 
-def test_slice_text_lines_start_beyond_end_keeps_header_sane():
+def test_slice_text_lines_start_beyond_end_raises(monkeypatch):
+    # #253: an out-of-range --lines start is a user error, not a result. It must
+    # NOT return a `//` line (mistakable for code) with exit 0 -- it raises a
+    # BridgeError so the CLI exits non-zero with a stderr diagnostic.
+    from bn import formatters
+    from bn.transport import BridgeError
+
+    with pytest.raises(BridgeError, match="beyond the last line"):
+        formatters._slice_text_lines("a\nb\nc", (10, 12))
+
+
+def test_slice_text_lines_in_range_still_slices():
+    # In-range slicing (incl. end past the last line, which clamps) is unchanged.
     from bn import formatters
 
-    out = formatters._slice_text_lines("a\nb\nc", (10, 12))
+    assert formatters._slice_text_lines("a\nb\nc", (2, 99)) == "// lines 2-3 of 3\nb\nc"
 
-    assert out == "// lines 0 of 3 (start 10 is beyond the last line)"
+
+def test_decompile_lines_out_of_range_exits_nonzero(monkeypatch, capsys):
+    # End-to-end: an out-of-range --lines start exits non-zero with a stderr
+    # diagnostic and NO code-like stdout, so a scripted consumer can tell it
+    # apart from a real slice (#253).
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        if op == "decompile":
+            return {"ok": True, "result": {"text": "int main() {\n  return 0;\n}"}}
+        raise AssertionError(f"unexpected op: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["decompile", "main", "--target", "active", "--lines", "99999:100000"])
+
+    assert rc == 2
+    out, err = capsys.readouterr()
+    assert out.strip() == ""           # nothing that looks like decompiled output
+    assert "beyond the last line" in err
+    assert "Traceback" not in err
 
 
 def test_read_bytes_malformed_response_clean_error(monkeypatch, capsys):

@@ -120,6 +120,8 @@ bn function info <fn>                    # compact by default
 bn function info <fn> --verbose          # full params + locals
 ```
 
+`--lines START:END` works on `decompile`, `il`, `disasm`, and `function structured-il` (text mode only — it errors on `--format json`). A `START` past the last line is treated as an error: the command exits non-zero with a stderr diagnostic (not a `//` comment on stdout), so a scripted consumer can tell an out-of-range slice apart from a real result.
+
 Pagination: `--limit` / `--offset` on list commands.
 
 
