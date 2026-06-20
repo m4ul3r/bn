@@ -536,6 +536,71 @@ def test_forward_arg_source_indirect_pointer_warns(models):
 
 
 # --------------------------------------------------------------------------
+# #282: anchor a recv/read source at an INDIRECT (vtable) call resolved via
+# value-set / --resolve-map -- the dominant real-server I/O shape.
+# --------------------------------------------------------------------------
+
+def _indirect_recv_program(*, recv_addr=0x900, with_pvs=True):
+    """read_handler(fd): `call [conn->read](fd, &buf, 0x40)` (indirect/vtable),
+    then `len = buf[0]; memcpy(dst, &buf, len)`. The recv buffer must propagate
+    from the indirect site to the memcpy length sink once the source anchors."""
+    fd = FVar("fd"); slot = FVar("slot"); buf = FVar("buf", typ="char[0x40]")
+    length = FVar("len")
+    fd0 = FSSA(fd, 0); slot1 = FSSA(slot, 1); buf1 = FSSA(buf, 1); len1 = FSSA(length, 1)
+    dest = FExpr("MLIL_VAR_SSA", "slot#1", reads=[slot1],
+                 possible_values=(FPVS("ConstantPointerValue", value=recv_addr) if with_pvs else None))
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "[slot#1](fd, &buf, 0x40)", reads=[slot1],
+               dest=dest,
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[fd0]),
+                       FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+        FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "len#1 = buf[0]", reads=[buf1], writes=[len1]),
+        FInstr(2, 0x18, "MLIL_CALL_SSA", "memcpy(dst, &buf, len#1)", reads=[len1],
+               dest=FExpr("MLIL_CONST_PTR", "0x901", constant=0x901),
+               params=[FExpr("MLIL_VAR_SSA", "dst", reads=[]),
+                       FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       FExpr("MLIL_VAR_SSA", "len#1", reads=[len1])]),
+    ]
+    return FFunc("read_handler", 0x10, FSSAFunc(instrs), params=[fd])
+
+
+def test_forward_seeds_recv_through_indirect_call_via_value_set(models):
+    # The recv is `call [slot]` whose value-set pins the target to recv; an
+    # `arg:recv:1` source must anchor there so the buffer reaches the memcpy
+    # length sink, instead of "no callsite of recv found" (#282).
+    func = _indirect_recv_program(with_pvs=True)
+    bv = FBV({0x900: "recv", 0x901: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:recv:1")])
+    assert any(s["sink"]["class"] == "overflow_len" for s in result["reached_sinks"])
+    assert any("anchored at indirect callsite" in a for a in result["assumptions"])
+
+
+def test_forward_seeds_recv_through_indirect_call_via_resolve_map(models):
+    # No value-set; an agent pins the vtable slot with --resolve-map. Same anchor.
+    func = _indirect_recv_program(with_pvs=False)
+    bv = FBV({0x900: "recv", 0x901: "memcpy"})
+    engine = te.TaintEngine(bv, models, resolve_map={"0x10": ["0x900"]})
+    result = engine.forward(func, [te.parse_locator("arg:recv:1")])
+    assert any(s["sink"]["class"] == "overflow_len" for s in result["reached_sinks"])
+    assert any("anchored at indirect callsite" in a for a in result["assumptions"])
+
+
+def test_forward_unresolved_indirect_recv_reports_explicitly(models):
+    # An indirect call exists but neither value-set nor a --resolve-map pins it to
+    # recv, and there is no direct recv callsite: the error must name the indirect
+    # dispatch + point at --resolve-map, not a bare "no callsite found" (#282).
+    func = _indirect_recv_program(with_pvs=False)   # no PVS, no resolve_map
+    bv = FBV({0x901: "memcpy"})                      # 0x900 not even named recv
+    engine = te.TaintEngine(bv, models)
+    with pytest.raises(te.TaintError) as ei:
+        engine.forward(func, [te.parse_locator("arg:recv:1")])
+    msg = str(ei.value)
+    assert "indirect" in msg.lower() and "resolve-map" in msg.lower()
+
+
+# --------------------------------------------------------------------------
 # #193 Part 1: recv buffer re-loaded across a global/struct-field pointer slot
 # --------------------------------------------------------------------------
 
