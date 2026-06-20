@@ -3545,10 +3545,20 @@ class TaintEngine:
                 raise TaintError(
                     f"--sink arg index {idx} is invalid: argument indices are "
                     f"0-based and must be >= 0")
-            sites = self._find_callsites(instrs, callee)
+            sites = self._find_callsites(instrs, callee, resolve_indirect=True)
             if not sites:
+                # If the function dispatches through unresolved indirect calls,
+                # name them and point at --resolve-map instead of a bare not-found
+                # -- an indirectly-dispatched sink is not a silent dead end (#282).
+                if any(self._is_call(ins)
+                       and const_target(getattr(ins, "dest", None)) is None
+                       for ins in instrs):
+                    raise self._no_callsite_error(instrs, callee, func)
                 raise TaintError(
                     f"no call to {callee!r} found in {func.name}; check the --sink callee name")
+            # Disclose an indirect (vtable/fn-ptr) anchor + value-set multiplicity,
+            # mirroring the forward seed path (#282).
+            self._note_indirect_anchors(sites, callee, self._bw_assume)
             saw_in_range = False
             for c in sites:
                 params = self._call_params(c)

@@ -621,6 +621,77 @@ def test_forward_unresolved_indirect_recv_reports_explicitly(models):
 
 
 # --------------------------------------------------------------------------
+# #282 (backward): anchor an arg: SINK at an INDIRECT (vtable) call resolved
+# via value-set / --resolve-map -- the mirror of the forward recv anchoring.
+# --------------------------------------------------------------------------
+
+def _indirect_sink_program(*, sink_addr=0x900, with_pvs=True, pvs=None):
+    """emit(n): `len = n + 1; call [slot](&dst, len)` (indirect/vtable) whose
+    slot resolves to a copy/emit sink. A backward `arg:<sink>:1` must anchor at
+    the indirect site and slice len back to the `n` parameter origin."""
+    n = FVar("n"); slot = FVar("slot"); length = FVar("len"); dst = FVar("dst")
+    n0 = FSSA(n, 0); slot1 = FSSA(slot, 1); len1 = FSSA(length, 1); dst1 = FSSA(dst, 1)
+    if pvs is None and with_pvs:
+        pvs = FPVS("ConstantPointerValue", value=sink_addr)
+    dest = FExpr("MLIL_VAR_SSA", "slot#1", reads=[slot1], possible_values=pvs)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "len#1 = n#0 + 1", reads=[n0], writes=[len1]),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "[slot#1](&dst, len#1)", reads=[slot1, len1],
+               dest=dest,
+               params=[FExpr("MLIL_VAR_SSA", "&dst", reads=[dst1]),
+                       FExpr("MLIL_VAR_SSA", "len#1", reads=[len1])]),
+    ]
+    return FFunc("emit", 0x10, FSSAFunc(instrs), params=[n])
+
+
+def test_backward_seeds_sink_through_indirect_call_via_value_set(models):
+    # `call [slot]` whose value-set pins the target to send; a backward
+    # arg:send:1 must anchor there and slice len back to its origin (#282).
+    func = _indirect_sink_program(with_pvs=True)
+    bv = FBV({0x900: "send"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.backward(func, [te.parse_locator("arg:send:1")])
+    assert result["slices"], result
+    assert any("anchored at indirect callsite" in a for a in result["assumptions"])
+
+
+def test_backward_seeds_sink_through_indirect_call_via_resolve_map(models):
+    # No value-set; an agent pins the vtable slot with --resolve-map. Same anchor.
+    func = _indirect_sink_program(with_pvs=False)
+    bv = FBV({0x900: "send"})
+    engine = te.TaintEngine(bv, models, resolve_map={"0x14": ["0x900"]})
+    result = engine.backward(func, [te.parse_locator("arg:send:1")])
+    assert result["slices"], result
+    assert any("anchored at indirect callsite" in a for a in result["assumptions"])
+
+
+def test_backward_indirect_value_set_anchor_discloses_candidate_count(models):
+    # value-set resolves the slot to MULTIPLE candidates; the anchor disclosure
+    # must report the 1-of-N multiplicity so it doesn't read like a precise pin.
+    pvs = FPVS("InSetOfValues", values=[0x800, 0x900, 0xa00])
+    func = _indirect_sink_program(pvs=pvs)
+    bv = FBV({0x900: "send"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.backward(func, [te.parse_locator("arg:send:1")])
+    anchor = [a for a in result["assumptions"] if "anchored at indirect callsite" in a]
+    assert anchor
+    assert any("value-set" in a and "3" in a and "candidate" in a for a in anchor)
+
+
+def test_backward_unresolved_indirect_sink_reports_explicitly(models):
+    # An indirect call exists but nothing pins it to send, and there is no direct
+    # send callsite: the error must name the indirect dispatch + point at
+    # --resolve-map, not a bare "no call ... found" (#282).
+    func = _indirect_sink_program(with_pvs=False)   # no PVS, no resolve_map
+    bv = FBV({})                                     # 0x900 not even named send
+    engine = te.TaintEngine(bv, models)
+    with pytest.raises(te.TaintError) as ei:
+        engine.backward(func, [te.parse_locator("arg:send:1")])
+    msg = str(ei.value)
+    assert "indirect" in msg.lower() and "resolve-map" in msg.lower()
+
+
+# --------------------------------------------------------------------------
 # #193 Part 1: recv buffer re-loaded across a global/struct-field pointer slot
 # --------------------------------------------------------------------------
 
