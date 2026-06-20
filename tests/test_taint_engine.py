@@ -675,7 +675,7 @@ def test_backward_indirect_value_set_anchor_discloses_candidate_count(models):
     result = engine.backward(func, [te.parse_locator("arg:send:1")])
     anchor = [a for a in result["assumptions"] if "anchored at indirect callsite" in a]
     assert anchor
-    assert any("value-set" in a and "3" in a and "candidate" in a for a in anchor)
+    assert any("value-set" in a and "1 of 3 candidate targets" in a for a in anchor)
 
 
 def test_backward_unresolved_indirect_sink_reports_explicitly(models):

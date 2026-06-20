@@ -1546,7 +1546,7 @@ class TaintEngine:
             if via == "value-set" and len(cands) > 1:
                 detail = f"value-set ({callee} is 1 of {len(cands)} candidate targets)"
             add_assumption(
-                f"source {callee} anchored at indirect callsite "
+                f"{callee} anchored at indirect callsite "
                 f"{hex(int(getattr(c, 'address', 0)))} (resolved via {detail})")
 
     def _no_callsite_error(self, instrs: list[Any], callee: str, func: Any) -> "TaintError":
