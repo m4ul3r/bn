@@ -16,6 +16,8 @@ brittle across compilers/optimisation.
 | `command_injection.c`  | tainted buffer -> system() pointer arg (external model)|
 | `indirect_call.c`      | tainted data into a function-pointer call (leaf, not dropped) |
 | `indirect_resolve.c`   | const function-pointer table resolved by value-set; taint follows into both targets |
+| `conn_recv_vtable.c`   | connection-object vtable: recv SOURCE anchored at `conn->ops->recv` (an indirect call value-set can't pin) via `--resolve-map`; tainted length reaches a memcpy sink (#282) |
+| `conn_send_vtable.c`   | backward mirror: send SINK anchored at `conn->ops->send` via `--resolve-map`; slice reaches the length parameter origin (#282) |
 | `interproc.c`          | tainted buffer crosses a call boundary; sink lives in the callee (interprocedural descent) |
 | `outparam.c`           | helper fills an output buffer through a pointer param; taint flows back to the caller |
 | `multihop.c`           | input -> snprintf propagator -> system (command injection); mirrors DVRF socket_cmd |
@@ -35,6 +37,8 @@ brittle across compilers/optimisation.
   "lang": "c" | "cpp",
   "cflags": ["-O2", "-D_FORTIFY_SOURCE=2"],   // optional: extra compiler flags (e.g. to emit __*_chk)
   "forward":  [{"function","source","sink_classes":[...],"sinks":[{"callee","class","arg"}],"leaves":[{"kind"}]}],
+  // "resolve_map": {"in_function": <fn>, "target": <callee>},  // optional: pin the lone indirect call in <fn> to <callee> via --resolve-map (addresses resolved at test time)
+  // "assumptions_contain": ["substr", ...],                    // optional: each substring must appear in an assumptions entry
   "backward": [{"function","sink","origin_kinds":[...]}],
   "negative": [{"function","source","sink_classes":[...],"forbid_sink_classes":[...]}],
   "callgraph":[{"function","expect_indirect": true}]

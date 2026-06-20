@@ -1,0 +1,13 @@
+{
+  "description": "connection-object vtable send sink anchored at an indirect call via --resolve-map; backward slice reaches the length parameter origin",
+  "lang": "c",
+  "backward": [
+    {"function": "emit", "sink": "arg:sock_send:2",
+     "resolve_map": {"in_function": "emit", "target": "sock_send"},
+     "origin_kinds": ["parameter"],
+     "assumptions_contain": ["anchored at indirect callsite"]}
+  ],
+  "callgraph": [
+    {"function": "emit", "expect_indirect": true}
+  ]
+}
