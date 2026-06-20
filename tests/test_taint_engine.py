@@ -540,15 +540,16 @@ def test_forward_arg_source_indirect_pointer_warns(models):
 # value-set / --resolve-map -- the dominant real-server I/O shape.
 # --------------------------------------------------------------------------
 
-def _indirect_recv_program(*, recv_addr=0x900, with_pvs=True):
+def _indirect_recv_program(*, recv_addr=0x900, with_pvs=True, pvs=None):
     """read_handler(fd): `call [conn->read](fd, &buf, 0x40)` (indirect/vtable),
     then `len = buf[0]; memcpy(dst, &buf, len)`. The recv buffer must propagate
     from the indirect site to the memcpy length sink once the source anchors."""
     fd = FVar("fd"); slot = FVar("slot"); buf = FVar("buf", typ="char[0x40]")
     length = FVar("len")
     fd0 = FSSA(fd, 0); slot1 = FSSA(slot, 1); buf1 = FSSA(buf, 1); len1 = FSSA(length, 1)
-    dest = FExpr("MLIL_VAR_SSA", "slot#1", reads=[slot1],
-                 possible_values=(FPVS("ConstantPointerValue", value=recv_addr) if with_pvs else None))
+    if pvs is None and with_pvs:
+        pvs = FPVS("ConstantPointerValue", value=recv_addr)
+    dest = FExpr("MLIL_VAR_SSA", "slot#1", reads=[slot1], possible_values=pvs)
     instrs = [
         FInstr(0, 0x10, "MLIL_CALL_SSA", "[slot#1](fd, &buf, 0x40)", reads=[slot1],
                dest=dest,
@@ -585,6 +586,21 @@ def test_forward_seeds_recv_through_indirect_call_via_resolve_map(models):
     result = engine.forward(func, [te.parse_locator("arg:recv:1")])
     assert any(s["sink"]["class"] == "overflow_len" for s in result["reached_sinks"])
     assert any("anchored at indirect callsite" in a for a in result["assumptions"])
+
+
+def test_forward_indirect_value_set_anchor_discloses_candidate_count(models):
+    # When value-set resolves the vtable slot to MULTIPLE candidates (send/recv/
+    # close), anchoring arg:recv:1 is a best-effort 1-of-N match; the anchor
+    # assumption must disclose the multiplicity so it doesn't read like a precise
+    # pin (#282 review nit).
+    pvs = FPVS("InSetOfValues", values=[0x800, 0x900, 0xa00])   # send, recv, close
+    func = _indirect_recv_program(pvs=pvs)
+    bv = FBV({0x900: "recv", 0x901: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:recv:1")])
+    anchor = [a for a in result["assumptions"] if "anchored at indirect callsite" in a]
+    assert anchor
+    assert any("value-set" in a and "3" in a and "candidate" in a for a in anchor)
 
 
 def test_forward_unresolved_indirect_recv_reports_explicitly(models):

@@ -1530,14 +1530,24 @@ class TaintEngine:
 
     def _note_indirect_anchors(self, calls: list[Any], callee: str, add_assumption) -> None:
         """Record an honesty assumption for each seeded callsite that is an
-        indirect call resolved to *callee* -- the anchor is best-effort (value-set)
-        or agent-pinned (--resolve-map), not a direct symbol match (#282)."""
+        indirect call resolved to *callee* by map/value-set -- the anchor is
+        best-effort (value-set) or agent-pinned (--resolve-map), not a direct
+        symbol match (#282). A value-set match among several candidates discloses
+        the multiplicity so it doesn't read like a precise pin."""
         for c in calls:
-            if const_target(getattr(c, "dest", None)) is None:
-                _, via = self._indirect_call_resolution(c)
-                add_assumption(
-                    f"source {callee} anchored at indirect callsite "
-                    f"{hex(int(getattr(c, 'address', 0)))} (resolved via {via or 'value-set'})")
+            if const_target(getattr(c, "dest", None)) is not None:
+                continue
+            cands, via = self._indirect_call_resolution(c)
+            if via is None:
+                # matched by an address-form locator / import resolution, not by
+                # indirect map/value-set resolution -- nothing to disclose here.
+                continue
+            detail = via
+            if via == "value-set" and len(cands) > 1:
+                detail = f"value-set ({callee} is 1 of {len(cands)} candidate targets)"
+            add_assumption(
+                f"source {callee} anchored at indirect callsite "
+                f"{hex(int(getattr(c, 'address', 0)))} (resolved via {detail})")
 
     def _no_callsite_error(self, instrs: list[Any], callee: str, func: Any) -> "TaintError":
         """A `no callsite of <callee>` TaintError that, when the function dispatches
