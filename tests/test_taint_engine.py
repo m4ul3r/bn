@@ -458,7 +458,8 @@ def test_forward_pointer_escape_into_stack_descriptor_is_not_silent(models):
     assert result["reached_sinks"] == []                      # no false sink
     assert "pointer_escape" in [l.get("kind") for l in result["leaves"]]
     assert result["stats"]["leaves"] >= 1                     # NOT a silent clear
-    assert any("escapes" in a for a in result["assumptions"])
+    # the frontier lives in leaves only, no longer duplicated into assumptions
+    assert not any("escapes at" in a for a in result["assumptions"])
 
 
 def test_forward_pointer_escape_single_var_descriptor_propagates(models):
@@ -1266,7 +1267,8 @@ def test_forward_indirect_call_is_a_leaf_not_dropped(models):
     engine = te.TaintEngine(FBV({}), models)
     result = engine.forward(func, [te.parse_locator("param:0")])
     assert any(l["kind"] == "indirect_call_unresolved" for l in result["leaves"])
-    assert any("indirect call" in a for a in result["assumptions"])
+    # the frontier lives in leaves only, no longer duplicated into assumptions
+    assert not any("indirect call" in a for a in result["assumptions"])
 
 
 def _two_indirect_leaf_program():

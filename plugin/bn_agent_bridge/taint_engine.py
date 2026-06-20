@@ -2674,7 +2674,6 @@ class TaintEngine:
                         }
                         if leaf not in leaves:
                             leaves.append(leaf)
-                        add_assumption(f"indirect call at {leaf['address']} reached by taint; target unresolved")
                         continue
 
                     ret_tainted = False
@@ -2887,10 +2886,6 @@ class TaintEngine:
                             }
                             if leaf not in leaves:
                                 leaves.append(leaf)
-                            add_assumption(
-                                f"coarse memory store at {saddr}: tainted bytes written "
-                                "through an uncorrelated pointer; downstream reads not tracked"
-                            )
 
                 # Address-of-tainted escape (#228): an assignment or store whose
                 # VALUE is a POINTER to a tainted buffer (`stack_local = &buf`,
@@ -2954,10 +2949,6 @@ class TaintEngine:
                         }
                         if leaf not in leaves:
                             leaves.append(leaf)
-                        add_assumption(
-                            f"pointer to tainted buffer {buf_lbl} escapes at {saddr} "
-                            f"({dest_desc}); downstream uses through the captured pointer "
-                            f"are not tracked")
             if not changed:
                 break
 
