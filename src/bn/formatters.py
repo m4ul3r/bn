@@ -1475,6 +1475,23 @@ def _render_taint_path(steps: list[Any]) -> list[str]:
     return out
 
 
+def _taint_forward_verdict(value: dict[str, Any]) -> str:
+    """One-line verdict for a forward-taint result, derived from existing fields."""
+    findings = value.get("reached_sinks") or []
+    leaves = value.get("leaves") or []
+    stats = value.get("stats") or {}
+    fns = stats.get("functions_visited")
+    fns_part = f" · taint crossed {fns} fn(s)" if fns else ""
+    trunc = f" · truncated @depth {stats.get('max_depth')}" if stats.get("truncated") else ""
+    if findings:
+        classes = ", ".join(sorted({(f.get("sink") or {}).get("class", "?") for f in findings}))
+        return f"verdict: {len(findings)} sink(s) reached ({classes}){fns_part}{trunc}"
+    if leaves:
+        return (f"verdict: NO modeled sink reached — {len(leaves)} tainted frontier(s) "
+                f"(NOT an all-clear){fns_part}{trunc}")
+    return "verdict: no taint reached any sink or frontier"
+
+
 def _render_taint_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -1486,19 +1503,10 @@ def _render_taint_text(value: Any) -> str:
         srcs = value.get("sources") or []
         lines.append("sources: " + (", ".join(_describe_loc(s) for s in srcs) or "<none>"))
         findings = list(value.get("reached_sinks") or [])
-        lines.append("")
-        if not findings:
-            # Distinguish "no flow at all" from "flow stopped at an unmodeled
-            # frontier" -- a bare "no sinks reached" over a non-empty leaves[]
-            # is a dangerous false all-clear (#8).
-            fwd_leaves = list(value.get("leaves") or [])
-            if fwd_leaves:
-                lines.append(
-                    f"no modeled sink reached; {len(fwd_leaves)} tainted frontier(s) -- see leaves")
-            else:
-                lines.append("no sinks reached by tainted data")
-        else:
-            lines.append(f"reached {len(findings)} sink(s):")
+        lines.append(_taint_forward_verdict(value))
+        if findings:
+            lines.append("")
+            lines.append(f"sinks ({len(findings)}):")
             for f in findings:
                 sink = f.get("sink") or {}
                 lines.append("")

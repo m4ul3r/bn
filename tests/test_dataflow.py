@@ -16,6 +16,7 @@ from bn.formatters import (
     _render_structured_il_text,
     _render_taint_text,
     _render_values_text,
+    _taint_forward_verdict,
 )
 
 
@@ -200,8 +201,8 @@ def test_render_taint_forward_frontier_message():
     }
     text = _render_taint_text(value)
     assert "no sinks reached by tainted data" not in text
-    assert "no modeled sink reached" in text
-    assert "1 tainted frontier" in text
+    assert "NO modeled sink reached" in text
+    assert "1 tainted frontier" in text and "NOT an all-clear" in text
     # the call -> callee hand-off line for the frontier leaf
     assert "parse_event @ 0x3000" in text
     assert "0x1008" in text
@@ -325,3 +326,22 @@ def test_render_values_text_constant():
     text = _render_values_text(value)
     assert "ConstantValue" in text
     assert "0x40" in text
+
+
+def test_taint_forward_verdict_sinks():
+    v = {"reached_sinks": [{"sink": {"class": "overflow_len"}}],
+         "leaves": [], "stats": {"functions_visited": 8, "truncated": True, "max_depth": 8}}
+    assert _taint_forward_verdict(v) == (
+        "verdict: 1 sink(s) reached (overflow_len) · taint crossed 8 fn(s) · truncated @depth 8")
+
+
+def test_taint_forward_verdict_frontiers_not_all_clear():
+    v = {"reached_sinks": [], "leaves": [{"kind": "coarse_memory_store"}] * 12,
+         "stats": {"functions_visited": 1}}
+    out = _taint_forward_verdict(v)
+    assert "NO modeled sink reached" in out and "12 tainted frontier" in out and "NOT an all-clear" in out
+
+
+def test_taint_forward_verdict_clean():
+    v = {"reached_sinks": [], "leaves": [], "stats": {"functions_visited": 1}}
+    assert _taint_forward_verdict(v) == "verdict: no taint reached any sink or frontier"
