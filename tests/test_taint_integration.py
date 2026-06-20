@@ -73,6 +73,35 @@ def _resolve_addr(inst: str, name: str) -> str:
     return chosen[0]["address"]
 
 
+def _indirect_call_addr(inst, function: str, stem: str) -> str:
+    """Address of the single indirect call inside *function*, via dataflow
+    callgraph. The resolve-map fixtures are built with exactly one indirect call
+    so this is unambiguous."""
+    fn_addr = _resolve_addr(inst, function)
+    cg = _bn_json(inst, "dataflow", "callgraph", fn_addr, "--direction", "callees")
+    indirect = [c for c in cg.get("callees", []) if c.get("kind") == "indirect"]
+    assert len(indirect) == 1, \
+        f"{stem}: expected exactly one indirect call in {function}, got {indirect}"
+    return indirect[0]["call_addr"]
+
+
+def _materialize_resolve_map(inst, directive, tmp_path, stem: str) -> str:
+    """Turn a symbolic {"in_function","target"} directive into a concrete
+    --resolve-map JSON file: {<indirect_call_addr>: [<target_addr>]}."""
+    call_addr = _indirect_call_addr(inst, directive["in_function"], stem)
+    target_addr = _resolve_addr(inst, directive["target"])
+    rmap = tmp_path / f"{stem}_rmap.json"
+    rmap.write_text(json.dumps({call_addr: [target_addr]}))
+    return str(rmap)
+
+
+def _assert_assumptions_contain(result, wanted, stem: str) -> None:
+    assumptions = result.get("assumptions", [])
+    for sub in wanted or []:
+        assert any(sub in a for a in assumptions), \
+            f"{stem}: assumption containing {sub!r} not in {assumptions}"
+
+
 def _expected_files():
     if not CORPUS.is_dir():
         return []
@@ -97,7 +126,11 @@ def test_corpus_target(expected_path, tmp_path):
             fwd = ["taint", "forward", "-f", addr, "--source", case["source"]]
             for sc in case.get("sink_classes", []) or []:
                 fwd += ["--sink-class", sc]
+            if case.get("resolve_map"):
+                fwd += ["--resolve-map",
+                        _materialize_resolve_map(inst, case["resolve_map"], tmp_path, stem)]
             result = _bn_json(inst, *fwd)
+            _assert_assumptions_contain(result, case.get("assumptions_contain"), stem)
             got = result["reached_sinks"]
             for want in case.get("sinks", []):
                 assert any(
@@ -113,7 +146,12 @@ def test_corpus_target(expected_path, tmp_path):
 
         for case in spec.get("backward", []):
             addr = _resolve_addr(inst, case["function"])
-            result = _bn_json(inst, "taint", "backward", "-f", addr, "--sink", case["sink"])
+            bwd = ["taint", "backward", "-f", addr, "--sink", case["sink"]]
+            if case.get("resolve_map"):
+                bwd += ["--resolve-map",
+                        _materialize_resolve_map(inst, case["resolve_map"], tmp_path, stem)]
+            result = _bn_json(inst, *bwd)
+            _assert_assumptions_contain(result, case.get("assumptions_contain"), stem)
             assert result["slices"], f"{stem}: backward produced no slices"
             kinds = {sl["origin"]["kind"] for sl in result["slices"]}
             assert kinds & set(case["origin_kinds"]), \
