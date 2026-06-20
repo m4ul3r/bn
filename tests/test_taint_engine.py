@@ -689,6 +689,11 @@ def test_backward_unresolved_indirect_sink_reports_explicitly(models):
         engine.backward(func, [te.parse_locator("arg:send:1")])
     msg = str(ei.value)
     assert "indirect" in msg.lower() and "resolve-map" in msg.lower()
+    # The shared _no_callsite_error is reused across both directions; for a SINK
+    # the guidance must be role-correct -- it instructs --sink, never --source,
+    # while still surfacing the pinned-target coupling (#282).
+    assert "--sink" in msg and "--source" not in msg
+    assert "pinned target" in msg.lower()
 
 
 # --------------------------------------------------------------------------

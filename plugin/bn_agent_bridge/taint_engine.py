@@ -1549,11 +1549,15 @@ class TaintEngine:
                 f"{callee} anchored at indirect callsite "
                 f"{hex(int(getattr(c, 'address', 0)))} (resolved via {detail})")
 
-    def _no_callsite_error(self, instrs: list[Any], callee: str, func: Any) -> "TaintError":
+    def _no_callsite_error(self, instrs: list[Any], callee: str, func: Any,
+                           *, seed_kind: str = "source") -> "TaintError":
         """A `no callsite of <callee>` TaintError that, when the function dispatches
         through unresolved indirect calls, names them and points at --resolve-map
         instead of a bare not-found -- so an indirectly-routed recv/read is not a
-        silent dead end (#282)."""
+        silent dead end (#282). Shared by the forward source seed and the backward
+        sink seed; *seed_kind* (``"source"``/``"sink"``) keeps the locator guidance
+        role-correct (a sink seed must not be told to use ``--source``)."""
+        flag = f"--{seed_kind}"
         indirect = [ins for ins in instrs if self._is_call(ins)
                     and const_target(getattr(ins, "dest", None)) is None]
         if indirect:
@@ -1565,7 +1569,7 @@ class TaintEngine:
                 f"value-set nor a --resolve-map pin resolved to {callee} -- if {callee} "
                 f"is dispatched indirectly (vtable/fn-ptr), pin the call to its target "
                 f"with --resolve-map <call_addr>=<target_addr> and seed "
-                f"--source arg:<target>:<n>. The source callee must name the pinned "
+                f"{flag} arg:<target>:<n>. The {seed_kind} callee must name the pinned "
                 f"target: pin to {callee} itself to keep its model, or to the in-binary "
                 f"wrapper that calls {callee} and seed arg:<wrapper>:<n>")
         return TaintError(f"no callsite of {callee} found in {func.name}")
@@ -3553,7 +3557,7 @@ class TaintEngine:
                 if any(self._is_call(ins)
                        and const_target(getattr(ins, "dest", None)) is None
                        for ins in instrs):
-                    raise self._no_callsite_error(instrs, callee, func)
+                    raise self._no_callsite_error(instrs, callee, func, seed_kind="sink")
                 raise TaintError(
                     f"no call to {callee!r} found in {func.name}; check the --sink callee name")
             # Disclose an indirect (vtable/fn-ptr) anchor + value-set multiplicity,
