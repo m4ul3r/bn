@@ -1563,8 +1563,11 @@ class TaintEngine:
                 f"no callsite of {callee} found in {func.name}; the function has "
                 f"{len(indirect)} indirect call(s) (e.g. {addrs}{more}) that neither "
                 f"value-set nor a --resolve-map pin resolved to {callee} -- if {callee} "
-                f"is dispatched indirectly (vtable/fn-ptr), pin it with "
-                f"--resolve-map <call_addr>=<{callee}_addr> and re-run")
+                f"is dispatched indirectly (vtable/fn-ptr), pin the call to its target "
+                f"with --resolve-map <call_addr>=<target_addr> and seed "
+                f"--source arg:<target>:<n>. The source callee must name the pinned "
+                f"target: pin to {callee} itself to keep its model, or to the in-binary "
+                f"wrapper that calls {callee} and seed arg:<wrapper>:<n>")
         return TaintError(f"no callsite of {callee} found in {func.name}")
 
     # -- forward ----------------------------------------------------------

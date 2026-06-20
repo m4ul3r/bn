@@ -614,6 +614,10 @@ def test_forward_unresolved_indirect_recv_reports_explicitly(models):
         engine.forward(func, [te.parse_locator("arg:recv:1")])
     msg = str(ei.value)
     assert "indirect" in msg.lower() and "resolve-map" in msg.lower()
+    # The source callee must NAME the pinned target -- a dogfood found that
+    # pinning the call to the in-binary wrapper while still seeding arg:recv:1
+    # silently dead-ends. The guidance must surface that coupling (#282).
+    assert "pinned target" in msg.lower()
 
 
 # --------------------------------------------------------------------------
