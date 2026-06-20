@@ -37,7 +37,7 @@ brittle across compilers/optimisation.
   "lang": "c" | "cpp",
   "cflags": ["-O2", "-D_FORTIFY_SOURCE=2"],   // optional: extra compiler flags (e.g. to emit __*_chk)
   "forward":  [{"function","source","sink_classes":[...],"sinks":[{"callee","class","arg"}],"leaves":[{"kind"}]}],
-  // "resolve_map": {"in_function": <fn>, "target": <callee>},  // optional: pin the lone indirect call in <fn> to <callee> via --resolve-map (addresses resolved at test time)
+  // "resolve_map": {"in_function": <fn>, "target": <callee>},  // optional: pin the lone indirect call in <fn> to <callee> via --resolve-map (addresses resolved at test time). <fn> must contain EXACTLY ONE indirect call so the harness can resolve it unambiguously.
   // "assumptions_contain": ["substr", ...],                    // optional: each substring must appear in an assumptions entry
   "backward": [{"function","sink","origin_kinds":[...]}],
   "negative": [{"function","source","sink_classes":[...],"forbid_sink_classes":[...]}],
