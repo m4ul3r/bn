@@ -193,3 +193,21 @@ def test_corpus_target(expected_path, tmp_path):
                     f"{stem}: expected direct callee {want}, got {names}"
     finally:
         _session_stop(inst)
+
+
+def test_trace_slices_an_indirect_call_site(tmp_path):
+    """`trace` takes an explicit call address, so it already slices an argument at
+    an INDIRECT (vtable) call site intraprocedurally -- characterize that the
+    conn_send_vtable `conn->ops->send(conn, dst, n)` length arg traces back."""
+    src = CORPUS / "conn_send_vtable.c"
+    binary = tmp_path / "conn_send_vtable"
+    _compile(src, binary)
+    inst = _session_start(binary)
+    try:
+        call_addr = _indirect_call_addr(inst, "emit", "conn_send_vtable")
+        result = _bn_json(inst, "trace", "emit", call_addr, "--arg", "2")
+        # the length argument (arg 2) has a non-empty backward slice; real key is "trace"
+        steps = result["trace"]
+        assert steps, f"trace produced no slice at indirect call {call_addr}: {result}"
+    finally:
+        _session_stop(inst)
