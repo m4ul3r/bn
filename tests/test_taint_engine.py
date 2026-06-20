@@ -581,6 +581,31 @@ def test_forward_bare_deref_tainted_pointer_is_not_oob_write(models):
     assert "oob_write" not in classes
 
 
+def test_forward_tainted_pointer_base_with_clean_index_is_not_oob_write(models):
+    # #287 dogfood regression (bzip2 BZ2_decompress): seeding a struct POINTER
+    # param taints the base pointer; `*(seed_ptr + i)` where `i` is a CLEAN
+    # (untainted) induction index is struct/buffer access, NOT an attacker-indexed
+    # write -- the attacker controls neither the index nor (this analysis) the loop
+    # bound. The tainted operand is a POINTER (base), so it must not promote to
+    # oob_write even though both addends are variables.
+    ptr_t = type("T", (), {"type_class": type("TC", (), {"name": "PointerTypeClass"})()})()
+    s = FVar("s", ident=70, typ=ptr_t)   # param 0: a struct pointer (seed)
+    i = FVar("i", ident=71)              # a clean induction index (untainted)
+    s0 = FSSA(s, 0); i1 = FSSA(i, 1)
+    store = FInstr(0, 0x10, "MLIL_STORE_SSA", "[s#0 + i#1] = 0",
+                   reads=[s0, i1], writes=[],
+                   dest=FExpr("MLIL_ADD", "s#0 + i#1", reads=[s0, i1],
+                              left=FExpr("MLIL_VAR_SSA", "s#0", reads=[s0]),
+                              right=FExpr("MLIL_VAR_SSA", "i#1", reads=[i1])),
+                   src=FExpr("MLIL_CONST", "0", constant=0))
+    func = FFunc("loop_fill", 0x10, FSSAFunc([store]), params=[s])
+    engine = te.TaintEngine(FBV({}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    classes = [x["sink"]["class"] for x in result["reached_sinks"]]
+    assert "oob_write" not in classes        # tainted base, not a tainted index
+    assert "coarse_memory_store" in [l.get("kind") for l in result["leaves"]]
+
+
 def test_forward_scaled_tainted_index_store_is_an_oob_write_sink(models):
     # `output[i] = 0` lowered as `str w,[base, i, lsl#2]` -- a stride-scaled
     # tainted index is unambiguously an attacker offset -> oob_write (#287).

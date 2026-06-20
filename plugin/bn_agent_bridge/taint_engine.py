@@ -959,18 +959,32 @@ class TaintEngine:
             return False  # buffer contents tainted -> a real overflow operand
         return self._taint_operand_roles(ssaf, expr, tainted, pointer_arg=pointer_arg) == {"index"}
 
+    def _is_pointer_typed(self, expr: Any) -> bool:
+        """*expr* resolves to an SSA variable whose recovered type is a pointer --
+        i.e. it is a base/address operand, not an integer offset. Best-effort over
+        the BN ``Type`` API; a string/None type (the unit fakes) is treated as
+        non-pointer so an integer-modelled index still counts."""
+        sv = self._as_single_ssa_var(expr)
+        if sv is None:
+            return False
+        t = getattr(getattr(sv, "var", None), "type", None)
+        return "Pointer" in self._type_class_name(t)
+
     def _store_dest_tainted_index(self, ssaf: Any, expr: Any, tainted: set, depth: int = 0) -> bool:
         """True iff a store DESTINATION address *expr* is attacker-influenced via a
-        non-constant INDEX/OFFSET -- a tainted value added to a base pointer
+        non-constant INDEX/OFFSET -- a tainted INTEGER added to a base pointer
         (`base + i`, `base + i*stride`) -- as opposed to a tainted BASE pointer
-        combined only with compile-time-constant displacements (`p + 0x18`, `*p`).
+        combined with constant displacements (`p + 0x18`, `*p`) or with a clean
+        (untainted) induction index (`seed_ptr + i`).
 
         The distinction is what keeps `oob_write` from flooding: seeding a pointer
-        parameter taints the pointer itself, so a fixed-offset field write
-        (`obj->field = v`, `str x,[x21,#imm]`) reads the tainted base and would
-        otherwise promote. Only a tainted *offset* means the attacker controls
-        WHERE the store lands; a constant offset off a tainted base is ordinary
-        struct-field/cursor population, not an out-of-bounds index (#287 dogfood)."""
+        parameter taints the POINTER itself, so a fixed-offset field write
+        (`obj->field = v`) OR a loop body over a clean induction index
+        (`buf[i] = v` where only the base struct is tainted) reads the tainted base
+        and would otherwise promote. Only a tainted *integer offset* means the
+        attacker controls WHERE the store lands; a tainted base pointer is just
+        "points to attacker data", which is ordinary buffer access (#287 dogfood:
+        bzip2 BZ2_decompress produced 38 spurious sinks this way)."""
         if expr is None or depth > 8:
             return False
         # follow an address computed into a temp: `t = base + i; *t = v`
@@ -988,15 +1002,19 @@ class TaintEngine:
             left = getattr(expr, "left", None)
             right = getattr(expr, "right", None)
             # a stride-scaled tainted operand is unambiguously an array index
+            # (a base pointer is never multiplied by a stride)
             if self._is_scaled_taint(left, tainted) or self._is_scaled_taint(right, tainted):
                 return True
             l_const = self._int_const(left) is not None
             r_const = self._int_const(right) is not None
-            # tainted operand added to ANOTHER variable (the base): the tainted
-            # side is an attacker-controlled offset/index, not a fixed field.
+            # tainted INTEGER operand added to a base: the attacker controls the
+            # offset. A tainted POINTER operand is the base ("points to attacker
+            # data"), not an index, so it does NOT qualify -- this is what stops
+            # the seed-struct-pointer flood.
             if not l_const and not r_const:
-                if self._expr_has_taint(left, tainted) or self._expr_has_taint(right, tainted):
-                    return True
+                for operand in (left, right):
+                    if self._expr_has_taint(operand, tainted) and not self._is_pointer_typed(operand):
+                        return True
             # tainted variable + CONSTANT displacement: the variable is the base
             # at a fixed offset (struct field / cursor). Recurse into the base in
             # case it is itself `base2 + index2`.
