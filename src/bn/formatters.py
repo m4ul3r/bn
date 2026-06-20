@@ -1440,7 +1440,7 @@ def _render_grouped_leaves(leaves: list[dict[str, Any]], *, top_n: int = 12) -> 
     order.sort(key=lambda gk: groups[gk]["count"], reverse=True)
     total = len(leaves)
     ngroups = len(order)
-    hdr = f"UNRESOLVED LEAVES ({total}"
+    hdr = f"frontiers ({total}"
     if ngroups != total:
         hdr += f" in {ngroups} group(s)"
     hdr += "):"
@@ -1475,6 +1475,44 @@ def _render_taint_path(steps: list[Any]) -> list[str]:
     return out
 
 
+def _taint_forward_verdict(value: dict[str, Any]) -> str:
+    """One-line verdict for a forward-taint result, derived from existing fields."""
+    findings = value.get("reached_sinks") or []
+    leaves = value.get("leaves") or []
+    stats = value.get("stats") or {}
+    fns = stats.get("functions_visited")
+    fns_part = f" · taint crossed {fns} fn(s)" if fns else ""
+    trunc = f" · truncated @depth {stats.get('max_depth')}" if stats.get("truncated") else ""
+    if findings:
+        classes = ", ".join(sorted({(f.get("sink") or {}).get("class", "?") for f in findings}))
+        return f"verdict: {len(findings)} sink(s) reached ({classes}){fns_part}{trunc}"
+    if leaves:
+        return (f"verdict: NO modeled sink reached — {len(leaves)} tainted frontier(s) "
+                f"(NOT an all-clear){fns_part}{trunc}")
+    return "verdict: no taint reached any sink or frontier"
+
+
+def _taint_via_trail(value: dict[str, Any], finding: dict[str, Any]) -> str | None:
+    """Compact callee trail for a sink, parsed from its path-step reasons:
+    `<analyzed fn> → <callee> → … → <sink callee>`. None if no callees parse."""
+    chain: list[str] = []
+    fn = (value.get("function") or {}).get("name")
+    if fn:
+        chain.append(str(fn))
+    for step in finding.get("path") or []:
+        if not isinstance(step, dict):
+            continue
+        reason = str(step.get("reason") or "")
+        m = re.search(r"calls (\S+) with tainted", reason)
+        if not m:
+            m = re.search(r"tainted arg\d+ reaches (\S+)", reason)
+        if m:
+            name = m.group(1)
+            if not chain or chain[-1] != name:
+                chain.append(name)
+    return ("via: " + " → ".join(chain)) if len(chain) >= 2 else None
+
+
 def _render_taint_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -1486,26 +1524,22 @@ def _render_taint_text(value: Any) -> str:
         srcs = value.get("sources") or []
         lines.append("sources: " + (", ".join(_describe_loc(s) for s in srcs) or "<none>"))
         findings = list(value.get("reached_sinks") or [])
-        lines.append("")
-        if not findings:
-            # Distinguish "no flow at all" from "flow stopped at an unmodeled
-            # frontier" -- a bare "no sinks reached" over a non-empty leaves[]
-            # is a dangerous false all-clear (#8).
-            fwd_leaves = list(value.get("leaves") or [])
-            if fwd_leaves:
-                lines.append(
-                    f"no modeled sink reached; {len(fwd_leaves)} tainted frontier(s) -- see leaves")
-            else:
-                lines.append("no sinks reached by tainted data")
-        else:
-            lines.append(f"reached {len(findings)} sink(s):")
+        lines.append(_taint_forward_verdict(value))
+        if findings:
+            lines.append("")
+            lines.append(f"sinks ({len(findings)}):")
             for f in findings:
                 sink = f.get("sink") or {}
                 lines.append("")
+                _ai = sink.get("tainted_arg_index")
+                _arg = f"(arg {_ai}) " if _ai is not None else ""
                 lines.append(
                     f"[{sink.get('class', '?')}] {sink.get('callee', '?')} @ {sink.get('address')} "
-                    f"(arg {sink.get('tainted_arg_index')}) -- {sink.get('detail', '')}".rstrip()
+                    f"{_arg}-- {sink.get('detail', '')}".rstrip()
                 )
+                _via = _taint_via_trail(value, f)
+                if _via:
+                    lines.append(f"    {_via}")
                 lines.extend(_render_taint_path(f.get("path") or []))
     else:
         sinks = value.get("sinks") or []
@@ -1564,7 +1598,7 @@ def _render_taint_text(value: Any) -> str:
     assumptions = list(value.get("assumptions") or [])
     if assumptions:
         lines.append("")
-        lines.append("ASSUMPTIONS:")
+        lines.append(f"caveats ({len(assumptions)}):")
         for a in assumptions:
             lines.append(f"  - {a}")
     if value.get("soundness"):

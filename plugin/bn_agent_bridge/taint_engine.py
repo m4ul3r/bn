@@ -1460,7 +1460,8 @@ class TaintEngine:
             return None
         return None
 
-    def _find_callsites(self, instrs: list[Any], callee: str) -> list[Any]:
+    def _find_callsites(self, instrs: list[Any], callee: str, *,
+                        resolve_indirect: bool = False) -> list[Any]:
         callee_addr = self._callee_as_addr(callee)
 
         def addr_match(a: Any) -> bool:
@@ -1489,7 +1490,89 @@ class TaintEngine:
                 if (rt.via == "thunk" and self._callee_matches(int(rt.address), callee)) \
                         or addr_match(rt.address):
                     hits.append(ins)
+                    continue
+            # #282: an INDIRECT (vtable/fn-ptr) call whose target resolves to the
+            # callee via an agent --resolve-map pin or value-set analysis. The
+            # dominant real-server I/O shape routes recv/read through a slot
+            # (`conn->type->read`), so the recv source must be anchorable there --
+            # the same resolution the forward descent already performs for the call.
+            if resolve_indirect and target is None and self._indirect_target_matches(ins, callee):
+                hits.append(ins)
         return hits
+
+    def _indirect_call_resolution(self, ins: Any) -> tuple[list[int], str | None]:
+        """Resolve an indirect call *ins* to candidate target addresses and the
+        provenance (`agent-map` / `value-set`), mirroring the forward-descent
+        resolution. Returns ``([], None)`` for a direct call or no resolution."""
+        if const_target(getattr(ins, "dest", None)) is not None:
+            return [], None
+        mapped = self.resolve_map.get(hex(int(getattr(ins, "address", 0))))
+        if mapped:
+            return [int(x, 16) if isinstance(x, str) else int(x) for x in mapped], "agent-map"
+        cands = self._call_targets_from_pvs(
+            getattr(getattr(ins, "dest", None), "possible_values", None))
+        return (cands, "value-set") if cands else ([], None)
+
+    def _indirect_target_matches(self, ins: Any, callee: str) -> bool:
+        """True if indirect call *ins* resolves (map/value-set) to a target whose
+        name matches *callee*, directly or through a thunk veneer (#282)."""
+        cands, _ = self._indirect_call_resolution(ins)
+        for taddr in cands:
+            if self._callee_matches(taddr, callee):
+                return True
+            cfn = function_at(self.bv, taddr)
+            if cfn is not None:
+                resolved = self._follow_thunk_cached(cfn)
+                if resolved is not None and resolved is not cfn \
+                        and self._callee_matches(int(getattr(resolved, "start", 0)), callee):
+                    return True
+        return False
+
+    def _note_indirect_anchors(self, calls: list[Any], callee: str, add_assumption) -> None:
+        """Record an honesty assumption for each seeded callsite that is an
+        indirect call resolved to *callee* by map/value-set -- the anchor is
+        best-effort (value-set) or agent-pinned (--resolve-map), not a direct
+        symbol match (#282). A value-set match among several candidates discloses
+        the multiplicity so it doesn't read like a precise pin."""
+        for c in calls:
+            if const_target(getattr(c, "dest", None)) is not None:
+                continue
+            cands, via = self._indirect_call_resolution(c)
+            if via is None:
+                # matched by an address-form locator / import resolution, not by
+                # indirect map/value-set resolution -- nothing to disclose here.
+                continue
+            detail = via
+            if via == "value-set" and len(cands) > 1:
+                detail = f"value-set ({callee} is 1 of {len(cands)} candidate targets)"
+            add_assumption(
+                f"{callee} anchored at indirect callsite "
+                f"{hex(int(getattr(c, 'address', 0)))} (resolved via {detail})")
+
+    def _no_callsite_error(self, instrs: list[Any], callee: str, func: Any,
+                           *, seed_kind: str = "source") -> "TaintError":
+        """A `no callsite of <callee>` TaintError that, when the function dispatches
+        through unresolved indirect calls, names them and points at --resolve-map
+        instead of a bare not-found -- so an indirectly-routed recv/read is not a
+        silent dead end (#282). Shared by the forward source seed and the backward
+        sink seed; *seed_kind* (``"source"``/``"sink"``) keeps the locator guidance
+        role-correct (a sink seed must not be told to use ``--source``)."""
+        flag = f"--{seed_kind}"
+        indirect = [ins for ins in instrs if self._is_call(ins)
+                    and const_target(getattr(ins, "dest", None)) is None]
+        if indirect:
+            addrs = ", ".join(hex(int(getattr(i, "address", 0))) for i in indirect[:4])
+            more = "" if len(indirect) <= 4 else f", +{len(indirect) - 4} more"
+            return TaintError(
+                f"no callsite of {callee} found in {func.name}; the function has "
+                f"{len(indirect)} indirect call(s) (e.g. {addrs}{more}) that neither "
+                f"value-set nor a --resolve-map pin resolved to {callee} -- if {callee} "
+                f"is dispatched indirectly (vtable/fn-ptr), pin the call to its target "
+                f"with --resolve-map <call_addr>=<target_addr> and seed "
+                f"{flag} arg:<target>:<n>. The {seed_kind} callee must name the pinned "
+                f"target: pin to {callee} itself to keep its model, or to the in-binary "
+                f"wrapper that calls {callee} and seed arg:<wrapper>:<n>")
+        return TaintError(f"no callsite of {callee} found in {func.name}")
 
     # -- forward ----------------------------------------------------------
 
@@ -1586,7 +1669,7 @@ class TaintEngine:
         except TaintError:
             return []
         addrs: list[int] = []
-        for c in self._find_callsites(instrs, callee):
+        for c in self._find_callsites(instrs, callee, resolve_indirect=True):
             a = int(getattr(c, "address", 0))
             if a not in addrs:
                 addrs.append(a)
@@ -2591,7 +2674,6 @@ class TaintEngine:
                         }
                         if leaf not in leaves:
                             leaves.append(leaf)
-                        add_assumption(f"indirect call at {leaf['address']} reached by taint; target unresolved")
                         continue
 
                     ret_tainted = False
@@ -2804,10 +2886,6 @@ class TaintEngine:
                             }
                             if leaf not in leaves:
                                 leaves.append(leaf)
-                            add_assumption(
-                                f"coarse memory store at {saddr}: tainted bytes written "
-                                "through an uncorrelated pointer; downstream reads not tracked"
-                            )
 
                 # Address-of-tainted escape (#228): an assignment or store whose
                 # VALUE is a POINTER to a tainted buffer (`stack_local = &buf`,
@@ -2871,10 +2949,6 @@ class TaintEngine:
                         }
                         if leaf not in leaves:
                             leaves.append(leaf)
-                        add_assumption(
-                            f"pointer to tainted buffer {buf_lbl} escapes at {saddr} "
-                            f"({dest_desc}); downstream uses through the captured pointer "
-                            f"are not tracked")
             if not changed:
                 break
 
@@ -2983,9 +3057,10 @@ class TaintEngine:
                     seeded = True
             elif kind in ("ret", "arg"):
                 callee = src["callee"]
-                calls = self._find_callsites(instrs, callee)
+                calls = self._find_callsites(instrs, callee, resolve_indirect=True)
                 if not calls:
-                    raise TaintError(f"no callsite of {callee} found in {func.name}")
+                    raise self._no_callsite_error(instrs, callee, func)
+                self._note_indirect_anchors(calls, callee, add_assumption)
                 if kind == "ret":
                     # A ret: source on a function whose model also fills an
                     # output-pointer buffer would silently miss those bytes;
@@ -3080,9 +3155,10 @@ class TaintEngine:
                 # receive/fill API like read/recv/recvfrom taints the buffer it
                 # writes, not just (or instead of) its return value (#157).
                 callee = src["callee"]
-                calls = self._find_callsites(instrs, callee)
+                calls = self._find_callsites(instrs, callee, resolve_indirect=True)
                 if not calls:
-                    raise TaintError(f"no callsite of {callee} found in {func.name}")
+                    raise self._no_callsite_error(instrs, callee, func)
+                self._note_indirect_anchors(calls, callee, add_assumption)
                 only = getattr(self, "_only_callsite_addr", None)
                 if only is not None:
                     calls = [c for c in calls
@@ -3464,10 +3540,20 @@ class TaintEngine:
                 raise TaintError(
                     f"--sink arg index {idx} is invalid: argument indices are "
                     f"0-based and must be >= 0")
-            sites = self._find_callsites(instrs, callee)
+            sites = self._find_callsites(instrs, callee, resolve_indirect=True)
             if not sites:
+                # If the function dispatches through unresolved indirect calls,
+                # name them and point at --resolve-map instead of a bare not-found
+                # -- an indirectly-dispatched sink is not a silent dead end (#282).
+                if any(self._is_call(ins)
+                       and const_target(getattr(ins, "dest", None)) is None
+                       for ins in instrs):
+                    raise self._no_callsite_error(instrs, callee, func, seed_kind="sink")
                 raise TaintError(
                     f"no call to {callee!r} found in {func.name}; check the --sink callee name")
+            # Disclose an indirect (vtable/fn-ptr) anchor + value-set multiplicity,
+            # mirroring the forward seed path (#282).
+            self._note_indirect_anchors(sites, callee, self._bw_assume)
             saw_in_range = False
             for c in sites:
                 params = self._call_params(c)

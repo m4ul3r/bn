@@ -458,7 +458,8 @@ def test_forward_pointer_escape_into_stack_descriptor_is_not_silent(models):
     assert result["reached_sinks"] == []                      # no false sink
     assert "pointer_escape" in [l.get("kind") for l in result["leaves"]]
     assert result["stats"]["leaves"] >= 1                     # NOT a silent clear
-    assert any("escapes" in a for a in result["assumptions"])
+    # the frontier lives in leaves only, no longer duplicated into assumptions
+    assert not any("escapes at" in a for a in result["assumptions"])
 
 
 def test_forward_pointer_escape_single_var_descriptor_propagates(models):
@@ -533,6 +534,167 @@ def test_forward_arg_source_indirect_pointer_warns(models):
     engine = te.TaintEngine(bv, models)
     result = engine.forward(func, [te.parse_locator("arg:recvfrom:1")])
     assert any("indirectly" in a and "param:N" in a for a in result["assumptions"])
+
+
+# --------------------------------------------------------------------------
+# #282: anchor a recv/read source at an INDIRECT (vtable) call resolved via
+# value-set / --resolve-map -- the dominant real-server I/O shape.
+# --------------------------------------------------------------------------
+
+def _indirect_recv_program(*, recv_addr=0x900, with_pvs=True, pvs=None):
+    """read_handler(fd): `call [conn->read](fd, &buf, 0x40)` (indirect/vtable),
+    then `len = buf[0]; memcpy(dst, &buf, len)`. The recv buffer must propagate
+    from the indirect site to the memcpy length sink once the source anchors."""
+    fd = FVar("fd"); slot = FVar("slot"); buf = FVar("buf", typ="char[0x40]")
+    length = FVar("len")
+    fd0 = FSSA(fd, 0); slot1 = FSSA(slot, 1); buf1 = FSSA(buf, 1); len1 = FSSA(length, 1)
+    if pvs is None and with_pvs:
+        pvs = FPVS("ConstantPointerValue", value=recv_addr)
+    dest = FExpr("MLIL_VAR_SSA", "slot#1", reads=[slot1], possible_values=pvs)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "[slot#1](fd, &buf, 0x40)", reads=[slot1],
+               dest=dest,
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[fd0]),
+                       FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+        FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "len#1 = buf[0]", reads=[buf1], writes=[len1]),
+        FInstr(2, 0x18, "MLIL_CALL_SSA", "memcpy(dst, &buf, len#1)", reads=[len1],
+               dest=FExpr("MLIL_CONST_PTR", "0x901", constant=0x901),
+               params=[FExpr("MLIL_VAR_SSA", "dst", reads=[]),
+                       FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       FExpr("MLIL_VAR_SSA", "len#1", reads=[len1])]),
+    ]
+    return FFunc("read_handler", 0x10, FSSAFunc(instrs), params=[fd])
+
+
+def test_forward_seeds_recv_through_indirect_call_via_value_set(models):
+    # The recv is `call [slot]` whose value-set pins the target to recv; an
+    # `arg:recv:1` source must anchor there so the buffer reaches the memcpy
+    # length sink, instead of "no callsite of recv found" (#282).
+    func = _indirect_recv_program(with_pvs=True)
+    bv = FBV({0x900: "recv", 0x901: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:recv:1")])
+    assert any(s["sink"]["class"] == "overflow_len" for s in result["reached_sinks"])
+    assert any("anchored at indirect callsite" in a for a in result["assumptions"])
+
+
+def test_forward_seeds_recv_through_indirect_call_via_resolve_map(models):
+    # No value-set; an agent pins the vtable slot with --resolve-map. Same anchor.
+    func = _indirect_recv_program(with_pvs=False)
+    bv = FBV({0x900: "recv", 0x901: "memcpy"})
+    engine = te.TaintEngine(bv, models, resolve_map={"0x10": ["0x900"]})
+    result = engine.forward(func, [te.parse_locator("arg:recv:1")])
+    assert any(s["sink"]["class"] == "overflow_len" for s in result["reached_sinks"])
+    assert any("anchored at indirect callsite" in a for a in result["assumptions"])
+
+
+def test_forward_indirect_value_set_anchor_discloses_candidate_count(models):
+    # When value-set resolves the vtable slot to MULTIPLE candidates (send/recv/
+    # close), anchoring arg:recv:1 is a best-effort 1-of-N match; the anchor
+    # assumption must disclose the multiplicity so it doesn't read like a precise
+    # pin (#282 review nit).
+    pvs = FPVS("InSetOfValues", values=[0x800, 0x900, 0xa00])   # send, recv, close
+    func = _indirect_recv_program(pvs=pvs)
+    bv = FBV({0x900: "recv", 0x901: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:recv:1")])
+    anchor = [a for a in result["assumptions"] if "anchored at indirect callsite" in a]
+    assert anchor
+    assert any("value-set" in a and "3" in a and "candidate" in a for a in anchor)
+
+
+def test_forward_unresolved_indirect_recv_reports_explicitly(models):
+    # An indirect call exists but neither value-set nor a --resolve-map pins it to
+    # recv, and there is no direct recv callsite: the error must name the indirect
+    # dispatch + point at --resolve-map, not a bare "no callsite found" (#282).
+    func = _indirect_recv_program(with_pvs=False)   # no PVS, no resolve_map
+    bv = FBV({0x901: "memcpy"})                      # 0x900 not even named recv
+    engine = te.TaintEngine(bv, models)
+    with pytest.raises(te.TaintError) as ei:
+        engine.forward(func, [te.parse_locator("arg:recv:1")])
+    msg = str(ei.value)
+    assert "indirect" in msg.lower() and "resolve-map" in msg.lower()
+    # The source callee must NAME the pinned target -- a dogfood found that
+    # pinning the call to the in-binary wrapper while still seeding arg:recv:1
+    # silently dead-ends. The guidance must surface that coupling (#282).
+    assert "pinned target" in msg.lower()
+
+
+# --------------------------------------------------------------------------
+# #282 (backward): anchor an arg: SINK at an INDIRECT (vtable) call resolved
+# via value-set / --resolve-map -- the mirror of the forward recv anchoring.
+# --------------------------------------------------------------------------
+
+def _indirect_sink_program(*, sink_addr=0x900, with_pvs=True, pvs=None):
+    """emit(n): `len = n + 1; call [slot](&dst, len)` (indirect/vtable) whose
+    slot resolves to a copy/emit sink. A backward `arg:<sink>:1` must anchor at
+    the indirect site and slice len back to the `n` parameter origin."""
+    n = FVar("n"); slot = FVar("slot"); length = FVar("len"); dst = FVar("dst")
+    n0 = FSSA(n, 0); slot1 = FSSA(slot, 1); len1 = FSSA(length, 1); dst1 = FSSA(dst, 1)
+    if pvs is None and with_pvs:
+        pvs = FPVS("ConstantPointerValue", value=sink_addr)
+    dest = FExpr("MLIL_VAR_SSA", "slot#1", reads=[slot1], possible_values=pvs)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "len#1 = n#0 + 1", reads=[n0], writes=[len1]),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "[slot#1](&dst, len#1)", reads=[slot1, len1],
+               dest=dest,
+               params=[FExpr("MLIL_VAR_SSA", "&dst", reads=[dst1]),
+                       FExpr("MLIL_VAR_SSA", "len#1", reads=[len1])]),
+    ]
+    return FFunc("emit", 0x10, FSSAFunc(instrs), params=[n])
+
+
+def test_backward_seeds_sink_through_indirect_call_via_value_set(models):
+    # `call [slot]` whose value-set pins the target to send; a backward
+    # arg:send:1 must anchor there and slice len back to its origin (#282).
+    func = _indirect_sink_program(with_pvs=True)
+    bv = FBV({0x900: "send"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.backward(func, [te.parse_locator("arg:send:1")])
+    assert result["slices"], result
+    assert any("anchored at indirect callsite" in a for a in result["assumptions"])
+
+
+def test_backward_seeds_sink_through_indirect_call_via_resolve_map(models):
+    # No value-set; an agent pins the vtable slot with --resolve-map. Same anchor.
+    func = _indirect_sink_program(with_pvs=False)
+    bv = FBV({0x900: "send"})
+    engine = te.TaintEngine(bv, models, resolve_map={"0x14": ["0x900"]})
+    result = engine.backward(func, [te.parse_locator("arg:send:1")])
+    assert result["slices"], result
+    assert any("anchored at indirect callsite" in a for a in result["assumptions"])
+
+
+def test_backward_indirect_value_set_anchor_discloses_candidate_count(models):
+    # value-set resolves the slot to MULTIPLE candidates; the anchor disclosure
+    # must report the 1-of-N multiplicity so it doesn't read like a precise pin.
+    pvs = FPVS("InSetOfValues", values=[0x800, 0x900, 0xa00])
+    func = _indirect_sink_program(pvs=pvs)
+    bv = FBV({0x900: "send"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.backward(func, [te.parse_locator("arg:send:1")])
+    anchor = [a for a in result["assumptions"] if "anchored at indirect callsite" in a]
+    assert anchor
+    assert any("value-set" in a and "1 of 3 candidate targets" in a for a in anchor)
+
+
+def test_backward_unresolved_indirect_sink_reports_explicitly(models):
+    # An indirect call exists but nothing pins it to send, and there is no direct
+    # send callsite: the error must name the indirect dispatch + point at
+    # --resolve-map, not a bare "no call ... found" (#282).
+    func = _indirect_sink_program(with_pvs=False)   # no PVS, no resolve_map
+    bv = FBV({})                                     # 0x900 not even named send
+    engine = te.TaintEngine(bv, models)
+    with pytest.raises(te.TaintError) as ei:
+        engine.backward(func, [te.parse_locator("arg:send:1")])
+    msg = str(ei.value)
+    assert "indirect" in msg.lower() and "resolve-map" in msg.lower()
+    # The shared _no_callsite_error is reused across both directions; for a SINK
+    # the guidance must be role-correct -- it instructs --sink, never --source,
+    # while still surfacing the pinned-target coupling (#282).
+    assert "--sink" in msg and "--source" not in msg
+    assert "pinned target" in msg.lower()
 
 
 # --------------------------------------------------------------------------
@@ -1105,7 +1267,8 @@ def test_forward_indirect_call_is_a_leaf_not_dropped(models):
     engine = te.TaintEngine(FBV({}), models)
     result = engine.forward(func, [te.parse_locator("param:0")])
     assert any(l["kind"] == "indirect_call_unresolved" for l in result["leaves"])
-    assert any("indirect call" in a for a in result["assumptions"])
+    # the frontier lives in leaves only, no longer duplicated into assumptions
+    assert not any("indirect call" in a for a in result["assumptions"])
 
 
 def _two_indirect_leaf_program():

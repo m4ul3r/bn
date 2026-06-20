@@ -16,6 +16,8 @@ from bn.formatters import (
     _render_structured_il_text,
     _render_taint_text,
     _render_values_text,
+    _taint_forward_verdict,
+    _taint_via_trail,
 )
 
 
@@ -121,6 +123,20 @@ def test_taint_backward_forwards_sinks(monkeypatch, capsys):
     assert call["params"]["sinks"] == ["arg:memcpy:2"]
 
 
+def test_taint_backward_reads_and_forwards_resolve_map(monkeypatch, capsys, tmp_path):
+    rmap = tmp_path / "rmap.json"
+    rmap.write_text(json.dumps({"0x401200": ["0x401050"]}))
+    fake, calls = _fake({"taint": {"direction": "backward", "function": {"name": "p", "address": "0x1"},
+                                   "sinks": [], "slices": [], "leaves": [],
+                                   "assumptions": [], "soundness": "x"}})
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    rc = bn.cli.main(["taint", "backward", "-f", "emit", "--sink", "arg:send:1",
+                      "--resolve-map", str(rmap), "--target", "active"])
+    assert rc == 0
+    call = [c for c in calls if c["op"] == "taint"][0]
+    assert call["params"]["resolve_map"] == {"0x401200": ["0x401050"]}
+
+
 def test_taint_forward_requires_source(monkeypatch, capsys):
     fake, _ = _fake({})
     monkeypatch.setattr(bn.cli, "send_request", fake)
@@ -164,8 +180,8 @@ def test_render_taint_forward_text():
     assert "forward taint in process @ 0x401189" in text
     assert "[overflow_len] memcpy @ 0x4011db (arg 2)" in text
     assert "source: read fills arg1 buffer" in text
-    assert "UNRESOLVED LEAVES (1)" in text
-    assert "ASSUMPTIONS:" in text
+    assert "frontiers (1)" in text
+    assert "caveats (" in text
     assert "soundness:" in text
 
 
@@ -186,8 +202,8 @@ def test_render_taint_forward_frontier_message():
     }
     text = _render_taint_text(value)
     assert "no sinks reached by tainted data" not in text
-    assert "no modeled sink reached" in text
-    assert "1 tainted frontier" in text
+    assert "NO modeled sink reached" in text
+    assert "1 tainted frontier" in text and "NOT an all-clear" in text
     # the call -> callee hand-off line for the frontier leaf
     assert "parse_event @ 0x3000" in text
     assert "0x1008" in text
@@ -246,7 +262,7 @@ def test_render_taint_groups_repeated_leaves():
              "sources": [], "reached_sinks": [], "leaves": leaves,
              "assumptions": [], "soundness": "x"}
     text = _render_taint_text(value)
-    assert "UNRESOLVED LEAVES (38 in 2 group(s))" in text
+    assert "frontiers (38 in 2 group(s))" in text
     assert "g_free" in text and "(x37)" in text
     assert "g_slist_append" in text
     # the 38 leaves collapse to exactly two rendered leaf lines
@@ -262,7 +278,7 @@ def test_render_taint_grouped_leaves_top_n_cap():
              "sources": [], "reached_sinks": [], "leaves": leaves,
              "assumptions": [], "soundness": "x"}
     text = _render_taint_text(value)
-    assert "UNRESOLVED LEAVES (20)" in text
+    assert "frontiers (20)" in text
     assert "... and 8 more group(s)" in text
     assert "see --format json" in text
 
@@ -279,9 +295,22 @@ def test_render_taint_field_load_unresolved_leaf():
                          "offset": "0x8", "width": 4, "il_text": "x#1 = [obj#1 + 8]"}],
              "assumptions": [], "soundness": "x"}
     text = _render_taint_text(value)
+    assert "frontiers (" in text
     assert "field_load_unresolved @ 0x30" in text
     assert "base=obj#1" in text and "offset=0x8" in text and "width=4" in text
     assert "origin: field_load_unresolved" in text
+
+
+def test_render_taint_forward_sink_without_arg_index_has_no_arg_none():
+    value = {"direction": "forward", "function": {"name": "f", "address": "0x1"},
+             "sources": [], "reached_sinks": [{
+                 "sink": {"callee": "<memory store>", "address": "0x14",
+                          "tainted_arg_index": None, "class": "tainted_index",
+                          "detail": "d"}, "path": []}],
+             "leaves": [], "assumptions": [], "stats": {}, "soundness": "x"}
+    text = _render_taint_text(value)
+    assert "(arg None)" not in text
+    assert "[tainted_index] <memory store> @ 0x14" in text
 
 
 def test_render_callgraph_indirect_unresolved():
@@ -311,3 +340,37 @@ def test_render_values_text_constant():
     text = _render_values_text(value)
     assert "ConstantValue" in text
     assert "0x40" in text
+
+
+def test_taint_forward_verdict_sinks():
+    v = {"reached_sinks": [{"sink": {"class": "overflow_len"}}],
+         "leaves": [], "stats": {"functions_visited": 8, "truncated": True, "max_depth": 8}}
+    assert _taint_forward_verdict(v) == (
+        "verdict: 1 sink(s) reached (overflow_len) · taint crossed 8 fn(s) · truncated @depth 8")
+
+
+def test_taint_forward_verdict_frontiers_not_all_clear():
+    v = {"reached_sinks": [], "leaves": [{"kind": "coarse_memory_store"}] * 12,
+         "stats": {"functions_visited": 1}}
+    out = _taint_forward_verdict(v)
+    assert "NO modeled sink reached" in out and "12 tainted frontier" in out and "NOT an all-clear" in out
+
+
+def test_taint_forward_verdict_clean():
+    v = {"reached_sinks": [], "leaves": [], "stats": {"functions_visited": 1}}
+    assert _taint_forward_verdict(v) == "verdict: no taint reached any sink or frontier"
+
+
+def test_taint_via_trail_from_path_reasons():
+    value = {"function": {"name": "ip_input"}}
+    finding = {"sink": {"callee": "memcpy"}, "path": [
+        {"reason": "[agent-map-resolved] calls tcp_input with tainted arg(s) [0, 1]"},
+        {"reason": "calls m_pullup with tainted arg(s) [0]"},
+        {"reason": "tainted arg2 reaches memcpy"},
+    ]}
+    assert _taint_via_trail(value, finding) == "via: ip_input → tcp_input → m_pullup → memcpy"
+
+
+def test_taint_via_trail_none_when_no_callees():
+    assert _taint_via_trail({"function": {"name": "f"}},
+                            {"sink": {"callee": "x"}, "path": [{"reason": "assignment/copy of tainted value"}]}) is None

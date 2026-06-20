@@ -1,0 +1,13 @@
+{
+  "description": "connection-object vtable recv source anchored at an indirect call via --resolve-map; tainted length reaches a memcpy sink",
+  "lang": "c",
+  "forward": [
+    {"function": "handle", "source": "arg:sock_recv:1",
+     "resolve_map": {"in_function": "handle", "target": "sock_recv"},
+     "sinks": [{"callee": "memcpy", "class": "overflow_len", "arg": 2}],
+     "assumptions_contain": ["anchored at indirect callsite"]}
+  ],
+  "callgraph": [
+    {"function": "handle", "expect_indirect": true}
+  ]
+}

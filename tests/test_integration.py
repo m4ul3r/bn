@@ -17,6 +17,7 @@ import pytest
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 HELLO_BINARY = FIXTURES_DIR / "hello_x86_64"
 ADD_BINARY = FIXTURES_DIR / "add_x86_64"
+DISPATCH_BINARY = FIXTURES_DIR / "dispatch_table_x86_64"
 
 try:
     # Try a cheap check: can bn-agent even start?
@@ -292,5 +293,49 @@ class TestStructFieldTypedef:
                 inst_id, "typedef uint32_t NotAStruct;", "NotAStruct")
             assert res.returncode != 0, f"expected a clean failure, got: {res.stdout}"
             assert "AttributeError" not in res.stdout + res.stderr
+        finally:
+            _session_stop(inst_id)
+
+
+class TestTaintIndirectValueSetAnchor:
+    """Regression for #282: a recv/read-style source must anchor at an INDIRECT
+    call whose target Binary Ninja's *value-set* resolves to the callee. The
+    mocked unit suite drives this with a synthetic PossibleValueSet; only a real
+    BN run over a const function-pointer dispatch table produces a genuine
+    LookupTableValue on the call dest, so this is the sole real-BN coverage of
+    the value-set anchoring branch. The dispatch_table fixture is a non-PIE C
+    `static const handler_t table[3]; table[cmd](buf, n)` -- the one shape BN VSA
+    pins (C++ vtables / data-indexed tables / PIE GOT do not)."""
+
+    def _ensure_fixture(self):
+        if not DISPATCH_BINARY.exists():
+            subprocess.run(["make", "-C", str(FIXTURES_DIR), DISPATCH_BINARY.name],
+                           capture_output=True, text=True, timeout=60)
+        if not DISPATCH_BINARY.exists():
+            pytest.skip("dispatch_table fixture could not be built")
+
+    def test_value_set_resolved_indirect_call_anchors_source(self):
+        self._ensure_fixture()
+        info = _session_start(str(DISPATCH_BINARY))
+        inst_id = info["instance_id"]
+        try:
+            # arg:h_copy:1 with NO --resolve-map: the source must anchor at the
+            # indirect `table[cmd](buf, n)` call because value-set resolves it to
+            # {h_copy, h_noop, h_log}, and the attacker length must reach h_copy's
+            # copy sink.
+            res = _bn("--instance", inst_id, "taint", "forward", "-f", "dispatch",
+                      "--source", "arg:h_copy:1", "--format", "json")
+            assert res.returncode == 0, res.stderr
+            out = json.loads(res.stdout)
+            result = out.get("result", out)
+            assumptions = result.get("assumptions", [])
+            # anchored via value-set (not a map), with the multiplicity disclosure
+            anchor = [a for a in assumptions
+                      if "anchored at indirect callsite" in a and "value-set" in a]
+            assert anchor, f"no value-set anchor assumption: {assumptions}"
+            assert any("candidate target" in a for a in anchor), anchor
+            # the seeded length propagated through the resolved callee to a copy sink
+            classes = [s.get("sink", {}).get("class") for s in result.get("reached_sinks", [])]
+            assert any(c in ("overflow_len", "fortified_overflow") for c in classes), result
         finally:
             _session_stop(inst_id)

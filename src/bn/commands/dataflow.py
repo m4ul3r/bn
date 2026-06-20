@@ -153,19 +153,28 @@ def _taint_forward(args: argparse.Namespace) -> int:
                  help="Max interprocedural depth to follow slices up into callers (default: 8; "
                       "0 = intraprocedural only). The in-function def-chain walk caps at 64 "
                       "steps; truncation is recorded under assumptions."),
+             arg("--resolve-map", dest="resolve_map", default=None, metavar="FILE",
+                 help="JSON file mapping indirect call addresses to target lists: "
+                      '{"0x4011f0": ["0x401176", "0x401195"]}'),
          ])
 def _taint_backward(args: argparse.Namespace) -> int:
     if not args.sinks:
         raise BridgeError("taint backward requires at least one --sink")
+    params: dict[str, Any] = {
+        "direction": "backward",
+        "function": args.function,
+        "sinks": list(args.sinks),
+        "max_depth": int(args.max_depth),
+    }
+    if args.resolve_map:
+        try:
+            params["resolve_map"] = json.loads(Path(args.resolve_map).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise BridgeError(f"could not read --resolve-map {args.resolve_map}: {exc}")
     return _call(
         args,
         "taint",
-        {
-            "direction": "backward",
-            "function": args.function,
-            "sinks": list(args.sinks),
-            "max_depth": int(args.max_depth),
-        },
+        params,
         require_target=True,
         text_renderer=_render_taint_text,
         stem="taint-backward",
