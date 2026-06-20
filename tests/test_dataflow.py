@@ -121,6 +121,20 @@ def test_taint_backward_forwards_sinks(monkeypatch, capsys):
     assert call["params"]["sinks"] == ["arg:memcpy:2"]
 
 
+def test_taint_backward_reads_and_forwards_resolve_map(monkeypatch, capsys, tmp_path):
+    rmap = tmp_path / "rmap.json"
+    rmap.write_text(json.dumps({"0x401200": ["0x401050"]}))
+    fake, calls = _fake({"taint": {"direction": "backward", "function": {"name": "p", "address": "0x1"},
+                                   "sinks": [], "slices": [], "leaves": [],
+                                   "assumptions": [], "soundness": "x"}})
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    rc = bn.cli.main(["taint", "backward", "-f", "emit", "--sink", "arg:send:1",
+                      "--resolve-map", str(rmap), "--target", "active"])
+    assert rc == 0
+    call = [c for c in calls if c["op"] == "taint"][0]
+    assert call["params"]["resolve_map"] == {"0x401200": ["0x401050"]}
+
+
 def test_taint_forward_requires_source(monkeypatch, capsys):
     fake, _ = _fake({})
     monkeypatch.setattr(bn.cli, "send_request", fake)
