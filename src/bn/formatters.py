@@ -1598,7 +1598,7 @@ def _render_taint_text(value: Any) -> str:
     assumptions = list(value.get("assumptions") or [])
     if assumptions:
         lines.append("")
-        lines.append("ASSUMPTIONS:")
+        lines.append(f"caveats ({len(assumptions)}):")
         for a in assumptions:
             lines.append(f"  - {a}")
     if value.get("soundness"):

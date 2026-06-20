@@ -181,7 +181,7 @@ def test_render_taint_forward_text():
     assert "[overflow_len] memcpy @ 0x4011db (arg 2)" in text
     assert "source: read fills arg1 buffer" in text
     assert "frontiers (1)" in text
-    assert "ASSUMPTIONS:" in text
+    assert "caveats (" in text
     assert "soundness:" in text
 
 
