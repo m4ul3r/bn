@@ -1440,7 +1440,7 @@ def _render_grouped_leaves(leaves: list[dict[str, Any]], *, top_n: int = 12) -> 
     order.sort(key=lambda gk: groups[gk]["count"], reverse=True)
     total = len(leaves)
     ngroups = len(order)
-    hdr = f"UNRESOLVED LEAVES ({total}"
+    hdr = f"frontiers ({total}"
     if ngroups != total:
         hdr += f" in {ngroups} group(s)"
     hdr += "):"
@@ -1510,9 +1510,11 @@ def _render_taint_text(value: Any) -> str:
             for f in findings:
                 sink = f.get("sink") or {}
                 lines.append("")
+                _ai = sink.get("tainted_arg_index")
+                _arg = f"(arg {_ai}) " if _ai is not None else ""
                 lines.append(
                     f"[{sink.get('class', '?')}] {sink.get('callee', '?')} @ {sink.get('address')} "
-                    f"(arg {sink.get('tainted_arg_index')}) -- {sink.get('detail', '')}".rstrip()
+                    f"{_arg}-- {sink.get('detail', '')}".rstrip()
                 )
                 lines.extend(_render_taint_path(f.get("path") or []))
     else:

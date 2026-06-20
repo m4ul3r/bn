@@ -179,7 +179,7 @@ def test_render_taint_forward_text():
     assert "forward taint in process @ 0x401189" in text
     assert "[overflow_len] memcpy @ 0x4011db (arg 2)" in text
     assert "source: read fills arg1 buffer" in text
-    assert "UNRESOLVED LEAVES (1)" in text
+    assert "frontiers (1)" in text
     assert "ASSUMPTIONS:" in text
     assert "soundness:" in text
 
@@ -261,7 +261,7 @@ def test_render_taint_groups_repeated_leaves():
              "sources": [], "reached_sinks": [], "leaves": leaves,
              "assumptions": [], "soundness": "x"}
     text = _render_taint_text(value)
-    assert "UNRESOLVED LEAVES (38 in 2 group(s))" in text
+    assert "frontiers (38 in 2 group(s))" in text
     assert "g_free" in text and "(x37)" in text
     assert "g_slist_append" in text
     # the 38 leaves collapse to exactly two rendered leaf lines
@@ -277,7 +277,7 @@ def test_render_taint_grouped_leaves_top_n_cap():
              "sources": [], "reached_sinks": [], "leaves": leaves,
              "assumptions": [], "soundness": "x"}
     text = _render_taint_text(value)
-    assert "UNRESOLVED LEAVES (20)" in text
+    assert "frontiers (20)" in text
     assert "... and 8 more group(s)" in text
     assert "see --format json" in text
 
@@ -294,9 +294,22 @@ def test_render_taint_field_load_unresolved_leaf():
                          "offset": "0x8", "width": 4, "il_text": "x#1 = [obj#1 + 8]"}],
              "assumptions": [], "soundness": "x"}
     text = _render_taint_text(value)
+    assert "frontiers (" in text
     assert "field_load_unresolved @ 0x30" in text
     assert "base=obj#1" in text and "offset=0x8" in text and "width=4" in text
     assert "origin: field_load_unresolved" in text
+
+
+def test_render_taint_forward_sink_without_arg_index_has_no_arg_none():
+    value = {"direction": "forward", "function": {"name": "f", "address": "0x1"},
+             "sources": [], "reached_sinks": [{
+                 "sink": {"callee": "<memory store>", "address": "0x14",
+                          "tainted_arg_index": None, "class": "tainted_index",
+                          "detail": "d"}, "path": []}],
+             "leaves": [], "assumptions": [], "stats": {}, "soundness": "x"}
+    text = _render_taint_text(value)
+    assert "(arg None)" not in text
+    assert "[tainted_index] <memory store> @ 0x14" in text
 
 
 def test_render_callgraph_indirect_unresolved():
