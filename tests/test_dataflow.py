@@ -17,6 +17,7 @@ from bn.formatters import (
     _render_taint_text,
     _render_values_text,
     _taint_forward_verdict,
+    _taint_via_trail,
 )
 
 
@@ -358,3 +359,18 @@ def test_taint_forward_verdict_frontiers_not_all_clear():
 def test_taint_forward_verdict_clean():
     v = {"reached_sinks": [], "leaves": [], "stats": {"functions_visited": 1}}
     assert _taint_forward_verdict(v) == "verdict: no taint reached any sink or frontier"
+
+
+def test_taint_via_trail_from_path_reasons():
+    value = {"function": {"name": "ip_input"}}
+    finding = {"sink": {"callee": "memcpy"}, "path": [
+        {"reason": "[agent-map-resolved] calls tcp_input with tainted arg(s) [0, 1]"},
+        {"reason": "calls m_pullup with tainted arg(s) [0]"},
+        {"reason": "tainted arg2 reaches memcpy"},
+    ]}
+    assert _taint_via_trail(value, finding) == "via: ip_input → tcp_input → m_pullup → memcpy"
+
+
+def test_taint_via_trail_none_when_no_callees():
+    assert _taint_via_trail({"function": {"name": "f"}},
+                            {"sink": {"callee": "x"}, "path": [{"reason": "assignment/copy of tainted value"}]}) is None

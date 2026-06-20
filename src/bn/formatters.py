@@ -1492,6 +1492,27 @@ def _taint_forward_verdict(value: dict[str, Any]) -> str:
     return "verdict: no taint reached any sink or frontier"
 
 
+def _taint_via_trail(value: dict[str, Any], finding: dict[str, Any]) -> str | None:
+    """Compact callee trail for a sink, parsed from its path-step reasons:
+    `<analyzed fn> → <callee> → … → <sink callee>`. None if no callees parse."""
+    chain: list[str] = []
+    fn = (value.get("function") or {}).get("name")
+    if fn:
+        chain.append(str(fn))
+    for step in finding.get("path") or []:
+        if not isinstance(step, dict):
+            continue
+        reason = str(step.get("reason") or "")
+        m = re.search(r"calls (\S+) with tainted", reason)
+        if not m:
+            m = re.search(r"tainted arg\d+ reaches (\S+)", reason)
+        if m:
+            name = m.group(1)
+            if not chain or chain[-1] != name:
+                chain.append(name)
+    return ("via: " + " → ".join(chain)) if len(chain) >= 2 else None
+
+
 def _render_taint_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -1516,6 +1537,9 @@ def _render_taint_text(value: Any) -> str:
                     f"[{sink.get('class', '?')}] {sink.get('callee', '?')} @ {sink.get('address')} "
                     f"{_arg}-- {sink.get('detail', '')}".rstrip()
                 )
+                _via = _taint_via_trail(value, f)
+                if _via:
+                    lines.append(f"    {_via}")
                 lines.extend(_render_taint_path(f.get("path") or []))
     else:
         sinks = value.get("sinks") or []
