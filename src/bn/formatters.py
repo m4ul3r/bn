@@ -483,6 +483,20 @@ def _render_session_list_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+def _render_instance_find_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    items = list(value.get("items") or [])
+    if not items:
+        return f"no instance has a binary matching {value.get('query')!r}"
+    lines = []
+    for item in items:
+        selector = str(item.get("selector") or item.get("instance_id") or "<unknown>")
+        lines.append(f"{selector}  (instance {item.get('instance_id')})")
+        lines.append(f"  {item.get('binary')}")
+    return "\n".join(lines)
+
+
 def _render_target_summary(value: dict[str, Any]) -> str:
     view_id = value.get("view_id")
     label = value.get("selector") or value.get("target_id") or "<unknown>"

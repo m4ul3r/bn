@@ -1158,3 +1158,46 @@ def test_instance_list_no_binaries_key_when_empty(monkeypatch, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "binaries" not in out
+
+
+def test_instance_find_locates_binary_by_basename(monkeypatch, capsys):
+    # #80: `bn instance find <name>` answers "which instance has this binary?"
+    # from the registry (no per-instance round-trip), matching by basename.
+    inst = _inst_with_binaries(["/fw/lib64/libfoo.so", "/fw/bin/daemon"])
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [inst])
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    rc = bn.cli.main(["instance", "find", "libfoo.so"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "abc123" in out and "libfoo.so" in out
+
+
+def test_instance_find_by_exact_path(monkeypatch, capsys):
+    inst = _inst_with_binaries(["/fw/lib64/libfoo.so"])
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [inst])
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    rc = bn.cli.main(["instance", "find", "/fw/lib64/libfoo.so", "--format", "json"])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["count"] == 1
+    assert data["items"][0]["instance_id"] == "abc123"
+    assert data["items"][0]["binary"] == "/fw/lib64/libfoo.so"
+
+
+def test_instance_find_no_match(monkeypatch, capsys):
+    inst = _inst_with_binaries(["/fw/lib64/libfoo.so"])
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [inst])
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    rc = bn.cli.main(["instance", "find", "nope.so"])
+    assert rc == 0
+    assert "no instance" in capsys.readouterr().out.lower()
+
+
+def test_instance_find_substring_of_basename(monkeypatch, capsys):
+    # a bare query is a basename substring, so "libfoo" finds "libfoo.so.1.2.11"
+    inst = _inst_with_binaries(["/fw/lib64/libfoo.so.1.2.11"])
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [inst])
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    rc = bn.cli.main(["instance", "find", "libfoo"])
+    assert rc == 0
+    assert "abc123" in capsys.readouterr().out
