@@ -667,3 +667,106 @@ def test_xrefs_to_address_no_filter_when_not_page_aligned(monkeypatch):
     )
     result = instance._xrefs_to_address(bv, A)
     assert result["code_ref_count"] == 1
+
+
+# ===================================================================
+# #286: union same-name PLT/extern stub callers into the real body's xrefs
+# ===================================================================
+#
+# For an exported function in a shared object, intra-library calls route through
+# a same-name PLT stub (an ImportedFunctionSymbol) while the real body (a
+# FunctionSymbol) shows zero code callers. xrefs of the body must union the
+# stub's callers. The stub is identified by symbol type -- the stable signal
+# _resolve_impl_over_stub already trusts (BN's is_thunk flag is analysis-timing
+# dependent and unreliable).
+
+
+def _impl_stub_bv(*, impl_ref_addrs=(), stub_ref_addrs=()):
+    caller = _FakeFunction(0x500000, "caller")
+    stub = _FakeFunction(0x40f1a0, "get_param")
+    stub.symbol = _FakeSymbol("ImportedFunctionSymbol")
+    impl = _FakeFunction(0x5c40, "get_param")
+    impl.symbol = _FakeSymbol("FunctionSymbol")
+    bv = _FakeBV(
+        functions=[caller, stub, impl],
+        code_refs={0x40f1a0: [_FakeCodeRef(a, caller) for a in stub_ref_addrs],
+                   0x5c40: [_FakeCodeRef(a, caller) for a in impl_ref_addrs]},
+        segments={0x500010: _FakeSegment(readable=True, executable=True),
+                  0x500020: _FakeSegment(readable=True, executable=True)},
+    )
+    return bv, caller, stub, impl
+
+
+def test_same_name_stub_functions_identifies_import_stub(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, caller, stub, impl = _impl_stub_bv()
+    stubs = instance.ctx._same_name_stub_functions(bv, impl)
+    assert [int(f.start) for f in stubs] == [0x40f1a0]
+    # querying the stub itself yields no stub-typed sibling (impl is FunctionSymbol)
+    assert instance.ctx._same_name_stub_functions(bv, stub) == []
+
+
+def test_same_name_stub_functions_skips_ambiguous_multi_impl(monkeypatch):
+    # Two real bodies share a name plus an import stub: the stub's target is
+    # ambiguous, so neither body should absorb the stub's callers (the existing
+    # ambiguous-symbol disclosure handles the collision instead).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    stub = _FakeFunction(0x40f1a0, "init"); stub.symbol = _FakeSymbol("ImportedFunctionSymbol")
+    a = _FakeFunction(0x5000, "init"); a.symbol = _FakeSymbol("FunctionSymbol")
+    b = _FakeFunction(0x6000, "init"); b.symbol = _FakeSymbol("FunctionSymbol")
+    bv = _FakeBV(functions=[stub, a, b])
+    assert instance.ctx._same_name_stub_functions(bv, a) == []
+    assert instance.ctx._same_name_stub_functions(bv, b) == []
+
+
+def test_xrefs_by_name_unions_stub_callers(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, caller, stub, impl = _impl_stub_bv(stub_ref_addrs=[0x500010])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._xrefs(None, "get_param")
+    assert result["address"] == "0x5c40"                  # resolves to the body
+    assert result["resolved_to_definition"] == "0x5c40"
+    assert result["code_ref_count"] == 1                  # the stub-routed caller
+    assert "0x40f1a0" in result.get("stub_callers_via", [])
+    assert [it["address"] for it in result["items"] if it["kind"] == "code"] == ["0x500010"]
+
+
+def test_xrefs_by_body_address_unions_stub_callers(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, caller, stub, impl = _impl_stub_bv(stub_ref_addrs=[0x500010])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._xrefs(None, "0x5c40")              # by body address
+    assert result["code_ref_count"] == 1
+    assert "0x40f1a0" in result.get("stub_callers_via", [])
+
+
+def test_xrefs_dedups_when_caller_hits_both_body_and_stub(monkeypatch):
+    # A caller that references both the body directly and the stub is counted once.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, caller, stub, impl = _impl_stub_bv(
+        impl_ref_addrs=[0x500010], stub_ref_addrs=[0x500010, 0x500020])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._xrefs(None, "0x5c40")
+    addrs = sorted(it["address"] for it in result["items"] if it["kind"] == "code")
+    assert addrs == ["0x500010", "0x500020"]             # 0x500010 not double-counted
+
+
+def test_xrefs_no_stub_union_for_plain_function(monkeypatch):
+    # A normal function with no same-name stub is completely unaffected.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    caller = _FakeFunction(0x500000, "caller")
+    fn = _FakeFunction(0x6000, "solo")
+    fn.symbol = _FakeSymbol("FunctionSymbol")
+    bv = _FakeBV(functions=[caller, fn],
+                 code_refs={0x6000: [_FakeCodeRef(0x500010, caller)]},
+                 segments={0x500010: _FakeSegment(readable=True, executable=True)})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._xrefs(None, "0x6000")
+    assert result["code_ref_count"] == 1
+    assert "stub_callers_via" not in result

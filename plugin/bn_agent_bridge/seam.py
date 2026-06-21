@@ -151,6 +151,39 @@ class BridgeContext:
         ]
         return impls[0] if len(impls) == 1 else None
 
+    def _same_name_stub_functions(self, bv, fn) -> list[Any]:
+        """Same-name PLT/extern stub functions that shadow real body *fn*.
+
+        For an exported function in a shared object, intra-library calls route
+        through a same-name PLT stub (an ``ImportedFunctionSymbol``/``ExternalSymbol``)
+        while the real body shows zero code callers; xrefs and callsites must
+        union the stub's callers into the body's (#286). The stub is identified by
+        SYMBOL TYPE -- the same stable signal :meth:`_resolve_impl_over_stub`
+        trusts. (BN's ``is_thunk`` flag is analysis-timing dependent: it reads
+        False before analysis settles, so it must NOT be the criterion here.)
+        Returns the stub functions (empty when *fn* is itself the stub, has no
+        name, or has no same-name stub sibling)."""
+        name = getattr(fn, "name", None)
+        if not name:
+            return []
+        try:
+            group = self._find_functions_by_name(bv, str(name), case_sensitive=True)
+        except Exception:
+            return []
+        fn_start = int(getattr(fn, "start", -1))
+        # Only union when *fn* is the UNIQUE real definition for this name. With
+        # two or more real bodies the stub's forwarding target is ambiguous, so
+        # absorbing its callers into one of them would misattribute -- leave that
+        # to the existing ambiguous-symbol surfacing (#122) instead.
+        impls = [g for g in group if _symbol_type_name(g) not in _STUB_SYMBOL_TYPE_NAMES]
+        if len(impls) != 1 or int(getattr(impls[0], "start", -2)) != fn_start:
+            return []
+        return [
+            g for g in group
+            if int(getattr(g, "start", -2)) != fn_start
+            and _symbol_type_name(g) in _STUB_SYMBOL_TYPE_NAMES
+        ]
+
     @staticmethod
     def _function_name_forms(fn) -> list[str]:
         """Every spelling a function can be addressed by: its display name, its

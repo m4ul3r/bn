@@ -392,6 +392,10 @@ def _xrefs_to_address(ctx, bv, address: int, *, offset: int = 0, limit: int | No
     # Drop spurious adrp page-base materializations for a page-aligned target
     # (#284); non-page-aligned targets pass through unchanged.
     raw_code_refs = _genuine_code_refs(bv, address)
+    # #286: an exported function's intra-lib callers reference its same-name PLT
+    # stub, not the body. Union the stub(s)' callers into the body's xrefs so a
+    # hot exported function isn't reported as having zero code callers.
+    raw_code_refs, stub_starts = _union_stub_code_refs(ctx, bv, address, raw_code_refs)
     for ref in sorted(raw_code_refs, key=lambda item: int(item.address)):
         fn = getattr(ref, "function", None)
         caller = (
@@ -432,7 +436,7 @@ def _xrefs_to_address(ctx, bv, address: int, *, offset: int = 0, limit: int | No
                 "context": ctx._address_context(bv, ref_addr),
             }
         )
-    return _xref_envelope(
+    envelope = _xref_envelope(
         address,
         ctx._address_context(bv, address, include_disasm=True),
         code_refs,
@@ -440,6 +444,42 @@ def _xrefs_to_address(ctx, bv, address: int, *, offset: int = 0, limit: int | No
         offset=offset,
         limit=limit,
     )
+    if stub_starts:
+        # Disclose that some callers were reached through a same-name PLT stub,
+        # so the unioned count is self-documenting rather than surprising (#286).
+        envelope["stub_callers_via"] = [hex(s) for s in stub_starts]
+    return envelope
+
+
+def _union_stub_code_refs(ctx, bv, address: int, code_refs: list):
+    """Append code refs to same-name PLT/extern stubs that forward to the
+    function at *address* (#286), de-duped by ref address. Returns
+    ``(merged_refs, [stub_start, ...])``; the stub list is empty when there is no
+    function at *address* or it has no same-name stub sibling."""
+    get_fn_at = getattr(bv, "get_function_at", None)
+    impl = get_fn_at(int(address)) if callable(get_fn_at) else None
+    if impl is None:
+        return code_refs, []
+    try:
+        stubs = ctx._same_name_stub_functions(bv, impl)
+    except Exception:
+        stubs = []
+    if not stubs:
+        return code_refs, []
+    merged = list(code_refs)
+    seen = {int(getattr(r, "address", -1)) for r in merged}
+    stub_starts = []
+    for stub in stubs:
+        stub_start = int(getattr(stub, "start", -1))
+        if stub_start < 0:
+            continue  # robustness: never query refs to a sentinel address
+        stub_starts.append(stub_start)
+        for ref in _genuine_code_refs(bv, stub_start):
+            ra = int(getattr(ref, "address", -1))
+            if ra not in seen:
+                merged.append(ref)
+                seen.add(ra)
+    return merged, stub_starts
 
 
 def _import_symbol_name(sym) -> str:
