@@ -955,10 +955,16 @@ class BinaryNinjaBridge:
 
         def _restore_filename() -> bool:
             """Undo create_database's re-home of the live view back to the original
-            file (#256). Returns True if the view's filename is (or already was)
-            the original; False if the restore could not be applied -- the caller
-            must then surface a degraded result instead of claiming a clean save."""
-            if not (explicit and filename):
+            file. BN rebinds bv.file.filename to whatever .bndb it just wrote, and
+            the target selector is derived live from that filename -- so without
+            this restore a save (explicit --path #256, default <binary>.bndb, OR
+            the RO->cache fallback #285) silently rekeys the -t <basename> selector
+            a caller is already using. Every save is persistence, not an identity
+            move, so the live target keeps its original filename. Returns True if
+            the view's filename is (or already was) the original; False if the
+            restore could not be applied -- the caller then surfaces a degraded
+            result instead of claiming a clean save."""
+            if not filename:
                 return True
             try:
                 bv.file.filename = filename
@@ -991,13 +997,28 @@ class BinaryNinjaBridge:
                 # error -- that's the actionable message, not the fallback's.
                 raise exc
             self.targets.clear_dirty(bv)
-            return {"saved": True, "path": saved, "fallback": True, "requested_path": out}
+            result = {"saved": True, "path": saved, "fallback": True, "requested_path": out}
+            # The cache write re-homed the live view to the copy; the RO original
+            # is intact, so restore the original filename -- otherwise the
+            # -t <basename> selector silently rekeys to <basename>.<hash>.bndb (#285).
+            if not _restore_filename():
+                result["rehomed"] = True
+                result["note"] = (
+                    f"Saved to {saved}, but could not restore the live target's "
+                    f"original filename ({filename!r}); the in-memory view is now "
+                    f"homed at {str(getattr(bv.file, 'filename', ''))!r}. The saved "
+                    f"annotations are in the cache at {saved} -- load that to resume "
+                    "(the original mount is read-only, so it has no adjacent .bndb)."
+                )
+            return result
 
-        # `bv.create_database(--path)` re-homes the live view to the copy, so the
-        # ORIGINAL selector (and `bn close <name>`) would stop resolving. A --path
-        # save is a copy, not a move: restore the original filename so the live
-        # target keeps its identity (#256). The default (no --path) save legitimately
-        # persists into the target's own .bndb, so _restore_filename is a no-op there.
+        # `bv.create_database` re-homes the live view to whatever .bndb it wrote,
+        # so the ORIGINAL selector (and `bn close <name>`) would stop resolving --
+        # for an explicit --path copy (#256) AND for a default <binary>.bndb save,
+        # which equally rekeys -t <basename> to <basename>.bndb (#285). A save is
+        # persistence, not an identity move, so restore the original filename in
+        # both cases. (When the target was loaded from a .bndb already, out == the
+        # same file and the restore is a no-op.)
         if not _restore_filename():
             # The save landed on disk, but the live view is still re-homed to the
             # copy and we could not undo it. Surface a degraded success (rehomed)
