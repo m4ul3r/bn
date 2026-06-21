@@ -3555,8 +3555,10 @@ class TaintEngine:
             # mirroring the forward seed path (#282).
             self._note_indirect_anchors(sites, callee, self._bw_assume)
             saw_in_range = False
+            max_params = 0
             for c in sites:
                 params = self._call_params(c)
+                max_params = max(max_params, len(params))
                 if idx < len(params):
                     saw_in_range = True
                     for r in expr_reads(params[idx]):
@@ -3565,9 +3567,17 @@ class TaintEngine:
                 # The locator was fine; the arg itself can't be sliced. Say so
                 # precisely instead of blaming the --sink locator.
                 if not saw_in_range:
+                    # State the recovered arg count and the valid 0-based range so
+                    # the off-by-one is obvious -- e.g. memcpy(dst, src, len) has 3
+                    # args, so the length is index 2, not 3 (#291.4).
+                    if max_params == 0:
+                        detail = "its call site(s) expose no arguments in the recovered IL"
+                    else:
+                        detail = (
+                            f"its call site(s) expose {max_params} argument(s), so valid "
+                            f"indices are 0..{max_params - 1} (arg indices are 0-based)")
                     raise TaintError(
-                        f"--sink arg index {idx} is out of range for {callee}: its call "
-                        f"site(s) have fewer arguments in the recovered IL")
+                        f"--sink arg index {idx} is out of range for {callee}: {detail}")
                 raise TaintError(
                     f"--sink arg {idx} of {callee} reads no variable in the recovered IL "
                     f"(it is a constant or address expression) -- there is no def-chain "

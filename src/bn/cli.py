@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import stat
 import sys
 from pathlib import Path
@@ -515,6 +516,28 @@ def _maybe_regex_hint(args: argparse.Namespace, result: Any, query: str | None) 
     )
 
 
+def _should_retry_as_regex(args: argparse.Namespace, result: Any, query: str) -> bool:
+    """True when a literal search of *query* found nothing and the query looks like
+    a regex that compiles -- the caller should re-run it as a pattern (#291.3).
+
+    A first-pass alternation like `Parse|Process|Decode` is taken literally and
+    returns a confident (misleading) `none`; auto-retrying it as a regex removes
+    the trap. Guarded so we never change a search that DID match, and never turn a
+    clean 0-result into a regex-compile error: only an explicit-literal query with
+    unescaped metacharacters that both matched nothing and compiles is retried."""
+    if getattr(args, "regex", False) or getattr(args, "exact", False):
+        return False
+    if not isinstance(result, dict) or result.get("total") != 0:
+        return False
+    if not any(ch in query for ch in _REGEX_METACHARS):
+        return False
+    try:
+        re.compile(query)
+    except re.error:
+        return False
+    return True
+
+
 def _maybe_offset_hint(args: argparse.Namespace, result: Any, identifier: str | None) -> None:
     """When `xrefs <bare-number>` matched nothing and the value is small enough to
     look like a struct-field offset (< 0x10000), nudge toward --field: a bare value
@@ -684,6 +707,7 @@ def _call(
     bridge_writes_output: bool = False,
     spawn_missing_named: bool = False,
     regex_hint_query: str | None = None,
+    regex_fallback_query: str | None = None,
     offset_hint_identifier: str | None = None,
 ) -> int:
     request_params = dict(params or {})
@@ -705,6 +729,33 @@ def _call(
         spawn_missing_named=spawn_missing_named,
     )
     result = response["result"]
+    # Auto-regex fallback (#291.3): a metacharacter query that matched nothing
+    # literally is almost always meant as a pattern. Retry it once as a regex and
+    # disclose the switch, instead of returning a confident literal `none`. Only
+    # re-sends when the literal pass came back empty, so a query that DID match is
+    # untouched.
+    if regex_fallback_query is not None and _should_retry_as_regex(args, result, regex_fallback_query):
+        retry_params = dict(request_params)
+        retry_params["regex"] = True
+        response = send_request(
+            op,
+            params=retry_params,
+            target=target,
+            instance_id=getattr(args, "instance", None),
+            spawn_missing_named=spawn_missing_named,
+        )
+        result = response["result"]
+        # An in-band marker so a --format json consumer (which reads stdout, not
+        # the stderr note below) can tell the result set came from a regex
+        # fallback rather than a literal match (#291.3 review).
+        if isinstance(result, dict):
+            result["regex_fallback"] = True
+        print(
+            f'note: "{regex_fallback_query}" matched no function literally; retried as '
+            f"a regex (it contains metacharacters). Add --exact for a literal match.",
+            file=sys.stderr,
+        )
+        regex_hint_query = None  # the retry supersedes the add-`--regex` nudge
     exit_code = result_exit_code(result) if result_exit_code is not None else 0
     # No bare-list CLI-side truncation: every paged read returns a {items, total,
     # offset, limit, returned, has_more} envelope and pages bridge-side (#275).

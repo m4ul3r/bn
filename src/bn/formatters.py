@@ -64,13 +64,15 @@ def _text_field(field: str) -> Callable[[Any], str]:
 
 
 def _slice_text_lines(
-    text: str, lines_range: tuple[int, int] | None, *, marker: str = "//"
+    text: str, lines_range: tuple[int, int] | None, *, marker: str = "//", flag: str = "--lines"
 ) -> str:
     """Return only lines START..END (1-indexed, inclusive) with a count header.
 
     Shared by `decompile`, `il`, `disasm`, and `structured-il` so every
     line-oriented view slices the same way. Slicing happens before the spill
-    check, so `--lines` also keeps large functions inline.
+    check, so `--lines` also keeps large functions inline. *flag* names the
+    caller's flag in the out-of-range error so a `disasm --count N` failure
+    reads `--count`, not `--lines` (#291.2 review).
     """
     if lines_range is None:
         return text
@@ -83,9 +85,9 @@ def _slice_text_lines(
         # BridgeError propagates to main() -> stderr diagnostic, non-zero exit, no
         # stdout a scripted consumer could read as a real slice (#253).
         raise BridgeError(
-            f"--lines start {start} is beyond the last line "
+            f"{flag} start {start} is beyond the last line "
             f"(output has {total} line{'s' if total != 1 else ''}); "
-            f"omit --lines or choose a start within range"
+            f"omit {flag} or choose a start within range"
         )
     sliced = all_lines[start - 1 : end]
     header = f"{marker} lines {start}-{min(end, total)} of {total}"

@@ -11,7 +11,7 @@ bn function search --regex 'attach|detach|follow'
 bn function info <fn> [--verbose]
 bn decompile <fn> [--addresses] [--lines 40:80] [--force-analysis]
 bn il <fn> [--view {hlil|mlil|llil}] [--ssa]
-bn disasm <fn>
+bn disasm <fn> [--lines 40:80 | --count 20]
 bn xrefs <fn-or-addr> [--limit 20]
 bn xrefs --field <Struct.field>
 bn callsites <callee> --within <fn>
@@ -40,7 +40,7 @@ bn comment get   --address 0x... | --function <fn>
 
 Notes:
 
-- `bn function search` is case-insensitive substring; add `--regex` for regular expressions. `function list` and `function search` both accept `--min-address` / `--max-address`. Both also accept `--count`, which returns just the total (`function list --count` = whole-binary function count for fast sizing; `function search <q> --count` = number of matches for a query) instead of the listing.
+- `bn function search` is case-insensitive substring; add `--regex` for regular expressions. A query with unescaped regex metacharacters (`|()[]{}*+?^$\`) that matches **nothing literally** is auto-retried as a regex, so `bn function search 'Parse|Process|Decode'` finds the alternation instead of a confident (misleading) `none`; the switch is disclosed on stderr and, in `--format json`, with a top-level `"regex_fallback": true` (add `--exact` to force a literal match). `function list` and `function search` both accept `--min-address` / `--max-address`. Both also accept `--count`, which returns just the total (`function list --count` = whole-binary function count for fast sizing; `function search <q> --count` = number of matches for a query) instead of the listing.
 - `bn xrefs` accepts a function name *or* a hex/decimal address. Text groups refs by caller (`code refs: 12 sites across 4 functions`); JSON adds `caller_function: {address, name}` so an `xrefs → --within-file` pipeline survives duplicate symbol names. Use `bn xrefs` for inbound references; reach for `bn callsites` when you need exact return-address recovery and local context.
 - `bn decompile` renders Binary Ninja's **Pseudo C** (the same text the GUI shows), comments inline. It omits the address gutter by default — add `--addresses` when you need it (e.g. for `bn comment set --address`). For the underlying IL instead, use `bn il --view {hlil|mlil|llil}`.
 - **Skipped (oversize) functions.** Binary Ninja skips analysis on functions that exceed its size/time limits and renders only a stub ("…taking too long to analyze… Loading…"). `bn decompile` detects this (`func.analysis_skipped`) and appends a `warning:` (and sets `analysis_skipped: true` in JSON) so you never mistake a stub for a real body. Pass `--force-analysis` to override the skip and reanalyze just that function before decompiling — it returns the full body and sets `analysis_forced: true`. It can be slow on very large functions and takes the **write lock** (it mutates analysis state), so avoid it on a bridge other agents are actively reading.

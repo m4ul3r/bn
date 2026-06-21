@@ -2366,6 +2366,23 @@ def test_backward_arg_index_out_of_range_says_so(process_func, models):
         engine.backward(process_func, [te.parse_locator("arg:memcpy:9")])
 
 
+def test_backward_arg_index_out_of_range_states_count_and_zero_based(process_func, models):
+    # #291.4: the off-by-one (memcpy len is arg 2, not 3) isn't obvious from a
+    # bare "out of range". The error should state the recovered arg count and the
+    # valid 0-based index range so the convention is self-explanatory.
+    bv = FBV({0x401070: "read", 0x401080: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    with pytest.raises(te.TaintError) as ei:
+        # memcpy(dst, src, len) recovers 3 args -> valid indices 0..2; arg 3 is
+        # the classic 1-based mistake for the length.
+        engine.backward(process_func, [te.parse_locator("arg:memcpy:3")])
+    msg = str(ei.value)
+    assert "out of range for memcpy" in msg
+    assert "3 argument" in msg   # recovered arg count is disclosed
+    assert "0..2" in msg         # valid 0-based index range
+    assert "0-based" in msg      # names the convention
+
+
 def test_backward_arg_with_no_variable_reads_says_so(process_func, models):
     bv = FBV({0x401070: "read", 0x401080: "memcpy"})
     engine = te.TaintEngine(bv, models)

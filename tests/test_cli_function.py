@@ -794,14 +794,16 @@ def test_target_summary_text_shows_function_counts():
     assert "12 imported" in out
 
 
-def test_function_search_hints_regex_on_zero_matches_with_metachars(monkeypatch, capsys):
+def test_function_search_auto_retries_regex_then_discloses_when_still_empty(monkeypatch, capsys):
     """A non-regex search whose query has regex metacharacters and matches
-    nothing should suggest --regex instead of a bare 'none' (#122)."""
+    nothing is auto-retried as a regex; even when the retry also finds nothing,
+    the switch is disclosed so the result isn't a silent literal 'none' (#291.3,
+    supersedes the #122 'add --regex' hint)."""
     monkeypatch.setattr(bn.cli, "send_request", _zero_function_search)
     rc = bn.cli.main(["function", "search", "init|fini", "--target", "active"])
     assert rc == 0
     _, err = capsys.readouterr()
-    assert "--regex" in err
+    assert "regex" in err.lower()
     assert "init|fini" in err
 
 
@@ -1423,15 +1425,17 @@ def test_xrefs_any_batch_probes_symbols(monkeypatch, capsys):
 
 
 
-def test_function_search_count_hints_regex_on_zero_matches(monkeypatch, capsys):
-    """#252 review: --count is the 'is my query matching anything?' path, so a
-    0-match query with regex metacharacters must still nudge toward --regex.
-    The hint keys off total==0, which the count envelope carries."""
+def test_function_search_count_auto_retries_regex_on_zero_matches(monkeypatch, capsys):
+    """#252 review + #291.3: --count is the 'is my query matching anything?' path,
+    so a 0-match metacharacter query is auto-retried as a regex (and the switch is
+    disclosed) rather than left as a confident literal zero. The retry keys off
+    total==0, which the count envelope carries."""
     monkeypatch.setattr(bn.cli, "send_request", _zero_function_search_count)
     rc = bn.cli.main(["function", "search", "init|fini", "--count", "--target", "active"])
     assert rc == 0
     _, err = capsys.readouterr()
-    assert "add --regex" in err
+    assert "regex" in err.lower()
+    assert "init|fini" in err
 
 def test_function_search_count_prints_total(monkeypatch, capsys):
     # #252: `function search --count` mirrors `list --count` -- forwards
@@ -1482,3 +1486,172 @@ def test_structured_il_lines_slices_output_with_header(monkeypatch, capsys):
     assert "a = 1" in out and "b = 2" in out
     assert "return" not in out  # row 4 excluded
     assert "main @ 0x1000" not in out  # header row (1) excluded
+
+
+# --- #291.2: disasm --count N (first N instructions) ---
+
+
+def test_disasm_count_shows_first_n_instructions(fake_transport, capsys):
+    # disasm text is one instruction per line, so `--count 2` is the first two.
+    fake_transport({"disasm": {"ok": True, "result": {"text": "aaa\nbbb\nccc\nddd"}}})
+    rc = bn.cli.main(["disasm", "0x1000", "--target", "active", "--count", "2"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "// lines 1-2 of 4" in out
+    assert "aaa" in out and "bbb" in out
+    assert "ccc" not in out and "ddd" not in out
+
+
+def test_disasm_count_caps_at_total(fake_transport, capsys):
+    fake_transport({"disasm": {"ok": True, "result": {"text": "aaa\nbbb"}}})
+    rc = bn.cli.main(["disasm", "0x1000", "--target", "active", "--count", "9"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "// lines 1-2 of 2" in out
+    assert "aaa" in out and "bbb" in out
+
+
+def test_disasm_count_and_lines_mutually_exclusive(capsys):
+    with pytest.raises(SystemExit) as exc:
+        bn.cli.main(["disasm", "0x1000", "--target", "active", "--count", "2", "--lines", "1:3"])
+    assert exc.value.code == 2
+    assert "not allowed with" in capsys.readouterr().err
+
+
+def test_disasm_count_rejects_non_positive(capsys):
+    with pytest.raises(SystemExit) as exc:
+        bn.cli.main(["disasm", "0x1000", "--target", "active", "--count", "0"])
+    assert exc.value.code == 2
+
+
+# --- #291.3: function search auto-retries a metacharacter query as regex ---
+
+
+def _literal_zero_regex_match(op, *, params=None, target=None, timeout=30.0,
+                              instance_id=None, spawn_missing_named=False):
+    """A fake search backend: a literal (regex=False) search of an alternation
+    matches nothing; the same query as a regex matches three functions."""
+    if op == "list_targets":
+        return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "a.bndb"}]}
+    if op == "search_functions":
+        if params.get("regex"):
+            fns = [{"name": n, "address": a} for n, a in
+                   (("Parse", "0x1000"), ("Process", "0x2000"), ("Decode", "0x3000"))]
+            return {"ok": True, "result": {"kind": "functions", "items": fns,
+                                           "total": 3, "offset": 0, "limit": 100,
+                                           "returned": 3, "has_more": False}}
+        return {"ok": True, "result": {"kind": "functions", "items": [], "total": 0,
+                                       "offset": 0, "limit": 100, "returned": 0,
+                                       "has_more": False}}
+    raise AssertionError(f"unexpected op: {op}")
+
+
+def test_function_search_auto_retries_as_regex_when_literal_empty(monkeypatch, capsys):
+    monkeypatch.setattr(bn.cli, "send_request", _literal_zero_regex_match)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    rc = bn.cli.main(["function", "search", "Parse|Process|Decode"])
+    assert rc == 0
+    out, err = capsys.readouterr()
+    # the regex matches are shown...
+    assert "Parse" in out and "Process" in out and "Decode" in out
+    # ...and the auto-retry is disclosed on stderr so it isn't a silent switch.
+    assert "Parse|Process|Decode" in err
+    assert "regex" in err.lower()
+
+
+def test_function_search_no_retry_when_literal_matches(monkeypatch, capsys):
+    """A metachar query that DOES match literally must not be re-run as regex."""
+    seen = []
+
+    def fake(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "a.bndb"}]}
+        if op == "search_functions":
+            seen.append(bool(params.get("regex")))
+            return {"ok": True, "result": {"kind": "functions",
+                                           "items": [{"name": "a(b)", "address": "0x10"}],
+                                           "total": 1, "offset": 0, "limit": 100,
+                                           "returned": 1, "has_more": False}}
+        raise AssertionError(op)
+
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    rc = bn.cli.main(["function", "search", "a(b)"])
+    assert rc == 0
+    assert seen == [False]  # literal only; no regex retry
+    _, err = capsys.readouterr()
+    assert "retried" not in err.lower()
+
+
+def test_function_search_no_retry_for_invalid_regex(monkeypatch, capsys):
+    """An unbalanced metachar query can't compile as a regex; don't retry (the
+    plain 'add --regex' hint still fires)."""
+    seen = []
+
+    def fake(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "a.bndb"}]}
+        if op == "search_functions":
+            seen.append(bool(params.get("regex")))
+            return {"ok": True, "result": {"kind": "functions", "items": [], "total": 0,
+                                           "offset": 0, "limit": 100, "returned": 0,
+                                           "has_more": False}}
+        raise AssertionError(op)
+
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    rc = bn.cli.main(["function", "search", "func[("])
+    assert rc == 0
+    assert seen == [False]  # invalid regex -> no retry attempted
+    _, err = capsys.readouterr()
+    assert "--regex" in err  # the plain hint still fires as the fallback
+
+
+# --- #291.3 review (M1): JSON consumers get an in-band regex-fallback marker ---
+
+
+def test_function_search_json_marks_regex_fallback(monkeypatch, capsys):
+    """An agent reading --format json on stdout (and not stderr) must be able to
+    tell the result set came from a regex fallback, not a literal match -- so the
+    retry adds an in-band `regex_fallback` marker (#291.3 review M1)."""
+    monkeypatch.setattr(bn.cli, "send_request", _literal_zero_regex_match)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    rc = bn.cli.main(["function", "search", "Parse|Process|Decode", "--format", "json"])
+    assert rc == 0
+    out, _ = capsys.readouterr()
+    data = json.loads(out)
+    assert data.get("regex_fallback") is True
+    assert data.get("total") == 3
+
+
+def test_function_search_json_no_marker_when_literal_matches(monkeypatch, capsys):
+    """No retry -> no marker; a normal literal search stays a clean envelope."""
+    def fake(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "a.bndb"}]}
+        if op == "search_functions":
+            return {"ok": True, "result": {"kind": "functions",
+                                           "items": [{"name": "plain", "address": "0x10"}],
+                                           "total": 1, "offset": 0, "limit": 100,
+                                           "returned": 1, "has_more": False}}
+        raise AssertionError(op)
+
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    rc = bn.cli.main(["function", "search", "plain", "--format", "json"])
+    assert rc == 0
+    out, _ = capsys.readouterr()
+    data = json.loads(out)
+    assert "regex_fallback" not in data
+
+
+# --- #291.2 review (m2): --count error names --count, not --lines ---
+
+
+def test_disasm_count_on_empty_disasm_names_count_flag(fake_transport, capsys):
+    fake_transport({"disasm": {"ok": True, "result": {"text": ""}}})
+    rc = bn.cli.main(["disasm", "0x1000", "--target", "active", "--count", "5"])
+    assert rc == 2
+    _, err = capsys.readouterr()
+    assert "--count" in err
+    assert "--lines" not in err

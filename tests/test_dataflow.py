@@ -374,3 +374,12 @@ def test_taint_via_trail_from_path_reasons():
 def test_taint_via_trail_none_when_no_callees():
     assert _taint_via_trail({"function": {"name": "f"}},
                             {"sink": {"callee": "x"}, "path": [{"reason": "assignment/copy of tainted value"}]}) is None
+
+
+def test_locator_help_states_zero_based_indices():
+    # #291.4: the arg:<callee>:<n> / param:<n> grammar is 0-based; make that
+    # explicit in the locator help so a user reading pseudo-C doesn't reach for
+    # the 1-based index.
+    from bn.commands import dataflow
+    assert "0-based" in dataflow._LOCATOR_HELP
+    assert "0-based" in dataflow._SINK_LOCATOR_HELP

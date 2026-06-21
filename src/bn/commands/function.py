@@ -126,8 +126,10 @@ def _function_search(args: argparse.Namespace) -> int:
             text_renderer=lambda value: f"Total functions: {value.get('count', 0)}",
             stem="function-search-count",
             # --count is the "is my query matching anything?" use case, so the
-            # 0-result `add --regex` nudge is most useful here too (#252 review).
+            # auto-regex retry (and its 0-result fallback hint) is most useful
+            # here too (#252 review, #291.3).
             regex_hint_query=args.query,
+            regex_fallback_query=args.query,
         )
     if args.offset:
         params["offset"] = args.offset
@@ -148,6 +150,7 @@ def _function_search(args: argparse.Namespace) -> int:
         paged_spill=True,
         stem="function-search",
         regex_hint_query=args.query,
+        regex_fallback_query=args.query,
     )
 
 
@@ -286,23 +289,39 @@ def _function_structured_il(args: argparse.Namespace) -> int:
     )
 
 
-@command("disasm", help="Disassemble a function", target=True,
+@command("disasm", help="Disassemble a function (slice with --lines or --count)", target=True,
          args=[
              arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
-             arg("--lines", type=_parse_line_range, default=None, metavar="START:END",
-                 help="Show only lines START through END (1-indexed, inclusive)"),
+         ],
+         # --lines and --count are two spellings of the same slice; one disasm
+         # line is one instruction, so --count N is the first N instructions
+         # (#291.2). Mutually exclusive -- combining a window and a count is
+         # ambiguous.
+         mutex_groups=[
+             mutex(False,
+                   arg("--lines", type=_parse_line_range, default=None, metavar="START:END",
+                       help="Show only lines START through END (1-indexed, inclusive)"),
+                   arg("--count", type=_positive_int, default=None, metavar="N",
+                       help="Show only the first N instructions (one instruction per line)")),
          ])
 def _disasm(args: argparse.Namespace) -> int:
+    count = getattr(args, "count", None)
     lines_range = getattr(args, "lines", None)
+    if count is not None:
+        # disasm is one instruction per line, so "first N instructions" is the
+        # 1-indexed window 1..N -- reuse the shared slicer (header + spill).
+        lines_range = (1, count)
+    slice_flag = "--count" if count is not None else "--lines"
     if lines_range is not None:
-        _require_text_format(args, "--lines")
+        _require_text_format(args, slice_flag)
     base = _text_field("text")
     return _call(
         args,
         "disasm",
         {"identifier": args.identifier},
         require_target=True,
-        text_renderer=lambda value: _resolution_note(value) + _slice_text_lines(base(value), lines_range),
+        text_renderer=lambda value: _resolution_note(value)
+        + _slice_text_lines(base(value), lines_range, flag=slice_flag),
         stem="disasm",
     )
 
