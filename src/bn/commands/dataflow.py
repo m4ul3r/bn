@@ -78,14 +78,17 @@ def _dataflow_values(args: argparse.Namespace) -> int:
     )
 
 
+# param:/arg: indices are 0-based -- for memcpy(dst, src, len) the length is
+# arg:memcpy:2, not :3 (#291.4).
 _LOCATOR_HELP = (
     "Locator: param:<n> | var:<selector> | ret:<callee> | arg:<callee>:<n> | "
     "call:<callee> (seeds every output the callee's model declares -- return "
-    "value AND output-pointer buffers)"
+    "value AND output-pointer buffers). param/arg indices are 0-based."
 )
 
 _SINK_LOCATOR_HELP = (
-    "Locator: param:<n> | var:<selector> | arg:<callee>:<n> (ret: is forward-only)"
+    "Locator: param:<n> | var:<selector> | arg:<callee>:<n> (ret: is forward-only). "
+    "param/arg indices are 0-based (e.g. memcpy length is arg:memcpy:2)."
 )
 
 

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import argparse
 
-from ..cli import _call, _mutate, arg, command, mutex, preview_arg
+from ..cli import _call, _mutate, _pick, arg, command, preview_arg
 from ..formatters import (
     _render_comment_list_text,
     _render_comment_text,
     _render_local_list_text,
     _render_proto_text,
 )
+from ..transport import BridgeError
 
 
 _RENAME_ARGS = [
@@ -57,21 +58,55 @@ def _comment_list(args: argparse.Namespace) -> int:
     )
 
 
+# A positional address mirrors `bn read 0x..` so the natural first guess
+# `bn comment <verb> 0x1234 ...` works instead of erroring with the value
+# silently dropped (#291.1). --address keeps working as the flag alias; both
+# target a different location than --function.
+def _comment_locator_args() -> list:
+    return [
+        arg("address", nargs="?",
+            help="Address to comment (hex 0x.. or decimal); alias for --address"),
+        arg("--address", dest="address_flag", default=None,
+            help="Address to comment (alias for the positional)"),
+        arg("--function", default=None,
+            help="Attach the comment to a function (name or address) instead of an address"),
+    ]
+
+
+def _comment_locator(args: argparse.Namespace, verb: str) -> tuple[str | None, str | None]:
+    """Reconcile the positional address with --address, then enforce exactly one of
+    address / function. --address and --function target different locations and the
+    bridge checks function first, so accepting both silently dropped the address
+    (#94); a missing locator is a clear error rather than a dropped value (#291.1)."""
+    address = _pick(args.address, args.address_flag, "comment address", required=False)
+    function = args.function
+    if address is not None and function is not None:
+        raise BridgeError(f"comment {verb} takes an address or --function, not both")
+    if address is None and function is None:
+        raise BridgeError(
+            f"comment {verb} needs a location: an address (positional or --address) or --function")
+    return address, function
+
+
 @command("comment", "set", help="Set a comment", target=True, fmt="json",
          args=[
              preview_arg(),
-             arg("comment"),
-         ],
-         # --address and --function target different locations; the bridge checks
-         # function first, so accepting both silently dropped the address (#94).
-         mutex_groups=[mutex(True, arg("--address"), arg("--function"))])
+             arg("address", nargs="?",
+                 help="Address to comment (hex 0x.. or decimal); alias for --address"),
+             arg("comment", help="Comment text"),
+             arg("--address", dest="address_flag", default=None,
+                 help="Address to comment (alias for the positional)"),
+             arg("--function", default=None,
+                 help="Attach the comment to a function (name or address) instead of an address"),
+         ])
 def _comment_set(args: argparse.Namespace) -> int:
+    address, function = _comment_locator(args, "set")
     return _mutate(
         args,
         "set_comment",
         {
-            "address": args.address,
-            "function": args.function,
+            "address": address,
+            "function": function,
             "comment": args.comment,
         },
         preview=bool(args.preview),
@@ -80,14 +115,15 @@ def _comment_set(args: argparse.Namespace) -> int:
 
 
 @command("comment", "get", help="Get a comment", target=True,
-         mutex_groups=[mutex(True, arg("--address"), arg("--function"))])
+         args=_comment_locator_args())
 def _comment_get(args: argparse.Namespace) -> int:
+    address, function = _comment_locator(args, "get")
     return _call(
         args,
         "get_comment",
         {
-            "address": args.address,
-            "function": args.function,
+            "address": address,
+            "function": function,
         },
         require_target=True,
         text_renderer=_render_comment_text,
@@ -96,15 +132,15 @@ def _comment_get(args: argparse.Namespace) -> int:
 
 
 @command("comment", "delete", help="Delete a comment", target=True, fmt="json",
-         args=[preview_arg()],
-         mutex_groups=[mutex(True, arg("--address"), arg("--function"))])
+         args=[preview_arg(), *_comment_locator_args()])
 def _comment_delete(args: argparse.Namespace) -> int:
+    address, function = _comment_locator(args, "delete")
     return _mutate(
         args,
         "delete_comment",
         {
-            "address": args.address,
-            "function": args.function,
+            "address": address,
+            "function": function,
         },
         preview=bool(args.preview),
         stem="comment-delete",

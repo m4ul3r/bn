@@ -60,11 +60,14 @@ bn local retype <fn> <local_id|name> <new_type>
 ### Comments
 
 ```bash
+bn comment set 0x401000 "explain this"            # positional address = alias for --address
 bn comment set --address 0x401000 "explain this"
 bn comment set --function player_update "explain this"
-bn comment delete --address 0x401000
+bn comment delete 0x401000
 bn comment delete --function player_update
 ```
+
+`comment set/get/delete` take the address either positionally (`bn comment set 0x401000 "..."`) or via `--address`; `--function` attaches a function-level comment instead. Exactly one of address / `--function` is required.
 
 ### Struct field edits
 

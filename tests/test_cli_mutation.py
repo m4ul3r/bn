@@ -538,18 +538,19 @@ def test_xrefs_data_ref_labels_unknown_caller_by_section_or_symbol():
 
 
 def test_comment_get_rejects_both_address_and_function(capsys):
-    # #94: --address and --function are mutually exclusive (the bridge checks
-    # function first, so accepting both silently dropped the address).
-    with pytest.raises(SystemExit) as exc:
-        bn.cli.main(["comment", "get", "--target", "active", "--address", "0x1000", "--function", "main"])
-    assert exc.value.code == 2
-    assert "not allowed with" in capsys.readouterr().err
+    # #94: an address and --function are mutually exclusive (the bridge checks
+    # function first, so accepting both silently dropped the address). Since the
+    # positional-address alias (#291.1) replaced the argparse mutex with a handler
+    # check, this is now a BridgeError (exit 2), not an argparse usage error.
+    rc = bn.cli.main(["comment", "get", "--target", "active", "--address", "0x1000", "--function", "main"])
+    assert rc == 2
+    assert "not both" in capsys.readouterr().err
 
 
 def test_comment_get_requires_a_locator(capsys):
-    with pytest.raises(SystemExit) as exc:
-        bn.cli.main(["comment", "get", "--target", "active"])
-    assert exc.value.code == 2  # required mutex group: exactly one
+    rc = bn.cli.main(["comment", "get", "--target", "active"])
+    assert rc == 2  # neither address nor --function -> a clear error
+    assert "needs a location" in capsys.readouterr().err
 
 
 def test_render_mutation_text_set_prototype_shows_landed_signature():
@@ -700,3 +701,123 @@ def test_blast_radius_line_caps_names_and_orders_reflowed_first():
     assert "(+7 more)" in line  # 12 referenced - 5 shown
 
 
+
+
+# --- #291.1: comment set accepts a positional address (alias for --address) ---
+
+
+_COMMENT_SET_OK = {"ok": True, "result": {
+    "success": True, "committed": True,
+    "results": [{"op": "set_comment", "status": "verified", "address": "0x1234"}],
+    "affected_functions": [], "affected_types": [],
+}}
+
+
+def test_comment_set_accepts_positional_address(fake_transport):
+    # The natural first guess `bn comment set 0x1234 "note"` should work as an
+    # alias for `--address 0x1234`, mirroring `bn read 0x.. ` (#291.1).
+    calls = fake_transport({"set_comment": _COMMENT_SET_OK})
+    rc = bn.cli.main(["comment", "set", "0x1234", "a note", "--target", "active"])
+    assert rc == 0
+    assert calls[0]["op"] == "set_comment"
+    assert calls[0]["params"]["address"] == "0x1234"
+    assert calls[0]["params"]["function"] is None
+    assert calls[0]["params"]["comment"] == "a note"
+
+
+def test_comment_set_address_flag_still_works(fake_transport):
+    # The original `--address` form must keep working unchanged.
+    calls = fake_transport({"set_comment": _COMMENT_SET_OK})
+    rc = bn.cli.main(["comment", "set", "--address", "0x1234", "a note", "--target", "active"])
+    assert rc == 0
+    assert calls[0]["params"]["address"] == "0x1234"
+    assert calls[0]["params"]["comment"] == "a note"
+
+
+def test_comment_set_function_form_still_works(fake_transport):
+    calls = fake_transport({"set_comment": _COMMENT_SET_OK})
+    rc = bn.cli.main(["comment", "set", "--function", "main", "a note", "--target", "active"])
+    assert rc == 0
+    assert calls[0]["params"]["function"] == "main"
+    assert calls[0]["params"]["address"] is None
+
+
+def test_comment_set_positional_address_conflicts_with_function(fake_transport, capsys):
+    # A positional address AND --function name two different locations -- reject,
+    # don't silently drop one.
+    calls = fake_transport({"set_comment": _COMMENT_SET_OK})
+    rc = bn.cli.main(["comment", "set", "0x1234", "a note", "--function", "main", "--target", "active"])
+    assert rc == 2
+    assert not calls  # errored before reaching the bridge
+
+
+def test_comment_set_positional_and_flag_address_differ_conflicts(fake_transport):
+    calls = fake_transport({"set_comment": _COMMENT_SET_OK})
+    rc = bn.cli.main(["comment", "set", "0x1", "a note", "--address", "0x2", "--target", "active"])
+    assert rc == 2
+    assert not calls
+
+
+def test_comment_set_requires_address_or_function(fake_transport):
+    # Neither a positional/`--address` nor `--function` -> a clear error, not a
+    # silently dropped value.
+    calls = fake_transport({"set_comment": _COMMENT_SET_OK})
+    rc = bn.cli.main(["comment", "set", "a note", "--target", "active"])
+    assert rc == 2
+    assert not calls
+
+
+# --- #291.1 review (m1): comment get/delete also accept a positional address ---
+
+
+def test_comment_get_accepts_positional_address(monkeypatch):
+    captured = {}
+
+    def fake(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        captured["op"] = op
+        captured["params"] = params
+        return {"ok": True, "result": {"address": "0x1234", "comment": "x", "has_comment": True}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    rc = bn.cli.main(["comment", "get", "0x1234", "--target", "active"])
+    assert rc == 0
+    assert captured["op"] == "get_comment"
+    assert captured["params"]["address"] == "0x1234"
+    assert captured["params"]["function"] is None
+
+
+def test_comment_get_positional_conflicts_with_function(monkeypatch):
+    def fake(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        raise AssertionError("should not reach the bridge")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    rc = bn.cli.main(["comment", "get", "0x1234", "--function", "main", "--target", "active"])
+    assert rc == 2
+
+
+def test_comment_get_requires_a_locator_after_positional_alias(monkeypatch):
+    def fake(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        raise AssertionError("should not reach the bridge")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    rc = bn.cli.main(["comment", "get", "--target", "active"])
+    assert rc == 2
+
+
+def test_comment_delete_accepts_positional_address(monkeypatch):
+    captured = {}
+
+    def fake(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        captured["op"] = op
+        captured["params"] = params
+        return {"ok": True, "result": {"success": True, "committed": True,
+                                       "results": [{"op": "delete_comment", "status": "verified",
+                                                    "address": "0x1234"}],
+                                       "affected_functions": [], "affected_types": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    rc = bn.cli.main(["comment", "delete", "0x1234", "--target", "active"])
+    assert rc == 0
+    assert captured["op"] == "delete_comment"
+    assert captured["params"]["address"] == "0x1234"
+    assert captured["params"]["function"] is None
