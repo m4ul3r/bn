@@ -510,20 +510,24 @@ def _instance_list(args: argparse.Namespace) -> int:
 def _binary_query_matches(binary: str, query: str) -> bool:
     """Whether *binary* (an open binary's path) satisfies a `find` *query*: the
     exact path, the exact basename, or a substring of the basename (so `libfoo`
-    finds `libfoo.so.1.2.11`). A path-form query (with a separator) also matches
-    by resolved-path equality and as a path suffix (#80)."""
-    if not binary:
+    finds `libfoo.so.1.2.11`). A path-form query (with a separator) also matches as
+    a path-component-aligned suffix, and -- only for an ABSOLUTE query -- by
+    resolved-path equality (a relative query would resolve against the CLI's cwd,
+    not the bridge's, so resolving it would be misleading) (#80)."""
+    if not binary or not query:
         return False
     if binary == query:
         return True
-    from pathlib import Path
     if "/" in query:
-        try:
-            if Path(binary).resolve() == Path(query).resolve():
-                return True
-        except Exception:
-            pass
-        return binary.endswith(query)
+        if Path(query).is_absolute():
+            try:
+                if Path(binary).resolve() == Path(query).resolve():
+                    return True
+            except Exception:
+                pass
+        # Anchor the suffix at a separator so `bar/libfoo.so` does NOT match
+        # `/foobar/libfoo.so` (a mid-component byte suffix is a wrong answer).
+        return binary.endswith("/" + query)
     base = Path(binary).name
     return base == query or query in base
 
