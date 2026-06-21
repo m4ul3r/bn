@@ -2685,6 +2685,16 @@ class TaintEngine:
                         # (#89 Problem B).
                         cfn = function_at(self.bv, taddr)
                         nm = self._callee_name(taddr)
+                        # Canonical name for the "resolved via ... to:" assumption:
+                        # the function/symbol AT the resolved address, captured
+                        # BEFORE any thunk re-model reassigns `nm`/`descend_fn`. The
+                        # descent branches below reported the followed target in one
+                        # path and the veneer's own symbol in another, which flipped
+                        # non-deterministically for a tail-call thunk (#290). Pinning
+                        # the reported name to taddr makes it deterministic and means
+                        # exactly what it says: the indirect call resolved to this
+                        # address (whose symbol is `report_name`).
+                        report_name = nm or hex(taddr)
                         mk, md = lookup_model(self.models, nm)
                         cfn_internal = self._is_internal(cfn)
                         # A .plt/veneer thunk must be resolved to its real target,
@@ -2728,7 +2738,7 @@ class TaintEngine:
                             mchanged, _ = apply_model(ins, params, md, mk, nm, site_taddr=taddr)
                             if mchanged:
                                 changed = True
-                            resolved_names.append(nm or hex(taddr))
+                            resolved_names.append(report_name)
                         elif descend_internal:
                             d = self._descend(ins, descend_fn, tainted_args, why, depth, max_depth, via=via)
                             findings.extend(d["findings"])
@@ -2739,12 +2749,12 @@ class TaintEngine:
                                 add_assumption(a)
                             ret_tainted = ret_tainted or d["reached_return"]
                             descend_outparams |= set(d.get("out_params") or ())
-                            resolved_names.append(str(descend_fn.name))
+                            resolved_names.append(report_name)
                         else:
                             if self.unknown_call_policy != "stop":
                                 ret_tainted = True
                                 add_assumption(f"external {nm or hex(taddr)} has no model; return conservatively tainted")
-                            resolved_names.append(nm or hex(taddr))
+                            resolved_names.append(report_name)
 
                     if ret_tainted and cons_return(ins, "return of resolved call propagates taint"):
                         changed = True

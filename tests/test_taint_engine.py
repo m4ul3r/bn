@@ -3443,3 +3443,36 @@ def test_forward_ret_source_void_return_gives_honest_error(process_func, models)
     assert "not consumed" in msg
     assert "memcpy" in msg
     assert "check --source locator" not in msg
+
+
+def test_forward_indirect_thunk_resolution_name_is_deterministic(models):
+    # #290: an indirect call resolved (via --resolve-map) to a tail-call veneer
+    # (cp_veneer -> memcpy) must report a DETERMINISTIC callee name in the
+    # "resolved via ... to:" assumption. The canonical name is the function AT the
+    # resolved address (the veneer), not the followed target -- so it never flips
+    # between the veneer symbol and the followed name across runs/map order. The
+    # re-modeled memcpy sink still fires (correctness preserved).
+    n = FVar("n", ident=40); n1 = FSSA(n, 1)
+    slot = FVar("slot"); slot1 = FSSA(slot, 1)
+    veneer = FFunc("cp_veneer", 0x2100, FSSAFunc([
+        FInstr(0, 0x2100, "MLIL_TAILCALL_SSA", "tailcall(0x1080)",
+               dest=FExpr("MLIL_CONST_PTR", "0x1080", constant=0x1080)),
+    ]), is_thunk=True)
+    handler = FFunc("handler", 0x3000, FSSAFunc([
+        FInstr(0, 0x3008, "MLIL_CALL_SSA", "[slot#1](d, s, n#1)", reads=[slot1, n1], writes=[],
+               dest=FExpr("MLIL_VAR_SSA", "slot#1", reads=[slot1]),     # indirect (no const dest)
+               params=[FExpr("MLIL_VAR_SSA", "d", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "s", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "n#1", reads=[n1])]),
+    ]), params=[n])
+    bv = FBV({0x1080: "memcpy"}, funcs={0x2100: veneer})
+    engine = te.TaintEngine(bv, models, resolve_map={"0x3008": ["0x2100"]})
+    result = engine.forward(handler, [te.parse_locator("param:0")])
+
+    via = [a for a in result["assumptions"] if "resolved via" in a and " to: " in a]
+    assert via, result["assumptions"]
+    # canonical = the symbol at the resolved address (the veneer), deterministic
+    assert via[0].endswith("to: cp_veneer"), via[0]
+    assert "memcpy" not in via[0]
+    # re-modeled memcpy sink still fires (the descent correctness is unchanged)
+    assert any(s["sink"]["callee"] == "memcpy" for s in result["reached_sinks"])
