@@ -111,12 +111,142 @@ def _is_thunk_like(bv, fn) -> bool:
     return resolved is not None and int(getattr(resolved, "start", -1)) != int(getattr(fn, "start", -2))
 
 
-def _code_ref_count(bv, address: int) -> int:
+def _reg_name(obj) -> str:
+    """Register name from an ILRegister (``SET_REG.dest``), an ``LLIL_REG`` expr,
+    or a test fake -- robust across real BN and the unit fakes."""
+    if obj is None:
+        return ""
+    name = getattr(obj, "name", None)
+    if isinstance(name, str):
+        return name
+    src = getattr(obj, "src", None)  # LLIL_REG expr -> ILRegister
+    if src is not None:
+        return _reg_name(src) or str(src)
+    return str(obj)
+
+
+def _expr_contains_reg(expr, reg: str) -> bool:
+    """True if *expr* (recursively) reads register *reg* via an ``LLIL_REG``."""
+    if expr is None or getattr(expr, "operation", None) is None:
+        return False
+    if il_format._il_op_name(expr) == "LLIL_REG" and _reg_name(expr) == reg:
+        return True
+    for operand in getattr(expr, "operands", None) or []:
+        if _expr_contains_reg(operand, reg):
+            return True
+    return False
+
+
+def _expr_reg_offset(expr, reg: str):
+    """The constant in-page offset *k* if *expr* contains ``ADD(REG(reg), CONST(k))``
+    (either operand order, at any depth), else ``None``. Captures both an explicit
+    ``add xN, xN, #k`` and a ``[xN, #k]`` load/store address expression."""
+    if expr is None or getattr(expr, "operation", None) is None:
+        return None
+    if il_format._il_op_name(expr) == "LLIL_ADD":
+        operands = list(getattr(expr, "operands", None) or [])
+        if len(operands) == 2:
+            for maybe_reg, maybe_const in (operands, operands[::-1]):
+                if (getattr(maybe_reg, "operation", None) is not None
+                        and il_format._il_op_name(maybe_reg) == "LLIL_REG"
+                        and _reg_name(maybe_reg) == reg):
+                    k = il_format._llil_constant_value(maybe_const)
+                    if k is not None:
+                        return k
+    for operand in getattr(expr, "operands", None) or []:
+        found = _expr_reg_offset(operand, reg)
+        if found is not None:
+            return found
+    return None
+
+
+def _adrp_pagebase_is_spurious(adrp_il, following_ils, page_base: int) -> bool:
+    """Decide whether an adrp that materializes *page_base* is a spurious xref to
+    a function starting at that page base (#284).
+
+    An ``adrp xN, <page>`` produces the 4 KB page base; the real referent is
+    ``page + offset`` from the paired ``add``/``ldr``/``str``. Given the adrp's
+    LLIL instruction and the LLIL instructions that follow it in the same basic
+    block, the page base is *spurious* iff the first consumer of the destination
+    register offsets it by a NONZERO constant (so the true target is elsewhere in
+    the page). A zero offset, a direct use (function-pointer take), a redefinition
+    before use, or a non-``SET_REG`` ref (a call/branch) are all genuine -- the
+    rule only ever drops on positive nonzero-offset evidence, so it can never hide
+    a real caller."""
+    if il_format._il_op_name(adrp_il) != "LLIL_SET_REG":
+        return False
+    if il_format._llil_constant_value(getattr(adrp_il, "src", None)) != int(page_base):
+        return False
+    dest = _reg_name(getattr(adrp_il, "dest", None))
+    if not dest:
+        return False
+    for nxt in following_ils:
+        body = getattr(nxt, "src", None) if il_format._il_op_name(nxt) == "LLIL_SET_REG" else nxt
+        offset = _expr_reg_offset(body, dest)
+        if offset is not None:
+            return offset != 0
+        if _expr_contains_reg(body, dest):
+            return False  # pointer used as-is -> genuine &fn
+        if il_format._il_op_name(nxt) == "LLIL_SET_REG" and _reg_name(getattr(nxt, "dest", None)) == dest:
+            return False  # page base redefined before use -> not a ref
+    return False
+
+
+def _is_spurious_adrp_pagebase(bv, ref, address: int) -> bool:
+    """BV glue around :func:`_adrp_pagebase_is_spurious` for one code ref."""
+    a = int(getattr(ref, "address", 0))
+    disasm = ""
+    get_disassembly = getattr(bv, "get_disassembly", None)
+    if callable(get_disassembly):
+        try:
+            disasm = get_disassembly(a) or ""
+        except Exception:
+            disasm = ""
+    # adrp is the only AArch64 op that materializes a page base; gating on the
+    # mnemonic keeps the filter from ever touching x86/other-arch refs.
+    if disasm.split()[:1] != ["adrp"]:
+        return False
+    fn = getattr(ref, "function", None)
+    get_llil_at = getattr(fn, "get_low_level_il_at", None)
+    if not callable(get_llil_at):
+        return False
+    try:
+        il = get_llil_at(a)
+    except Exception:
+        il = None
+    if il is None:
+        return False
+    bb = getattr(il, "il_basic_block", None)
+    following = []
+    if bb is not None:
+        idx = int(getattr(il, "instr_index", -1))
+        try:
+            following = [j for j in bb if int(getattr(j, "instr_index", -1)) > idx]
+            following.sort(key=lambda j: int(getattr(j, "instr_index", 0)))
+        except Exception:
+            following = []
+    return _adrp_pagebase_is_spurious(il, following, int(address))
+
+
+def _genuine_code_refs(bv, address: int) -> list:
+    """Code refs to *address*, with spurious adrp page-base materializations
+    dropped when *address* is page-aligned (#284). Non-page-aligned targets
+    cannot be an adrp page base, so their refs pass through untouched."""
     get_code_refs = getattr(bv, "get_code_refs", None)
     if not callable(get_code_refs):
-        return 0
+        return []
     try:
-        return len(list(get_code_refs(int(address))))
+        raw = list(get_code_refs(int(address)))
+    except Exception:
+        return []
+    if int(address) & 0xFFF:
+        return raw
+    return [ref for ref in raw if not _is_spurious_adrp_pagebase(bv, ref, int(address))]
+
+
+def _code_ref_count(bv, address: int) -> int:
+    try:
+        return len(_genuine_code_refs(bv, int(address)))
     except Exception:
         return 0
 
@@ -259,8 +389,9 @@ def _xref_envelope(address, target_context, code_refs, data_refs, *,
 def _xrefs_to_address(ctx, bv, address: int, *, offset: int = 0, limit: int | None = None) -> dict[str, Any]:
     code_refs = []
     data_refs = []
-    get_code_refs = getattr(bv, "get_code_refs", None)
-    raw_code_refs = list(get_code_refs(address)) if callable(get_code_refs) else []
+    # Drop spurious adrp page-base materializations for a page-aligned target
+    # (#284); non-page-aligned targets pass through unchanged.
+    raw_code_refs = _genuine_code_refs(bv, address)
     for ref in sorted(raw_code_refs, key=lambda item: int(item.address)):
         fn = getattr(ref, "function", None)
         caller = (
