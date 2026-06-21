@@ -1461,7 +1461,8 @@ class TaintEngine:
         return None
 
     def _find_callsites(self, instrs: list[Any], callee: str, *,
-                        resolve_indirect: bool = False) -> list[Any]:
+                        resolve_indirect: bool = False,
+                        wrapper_arg: int | None = None) -> list[Any]:
         callee_addr = self._callee_as_addr(callee)
 
         def addr_match(a: Any) -> bool:
@@ -1496,7 +1497,8 @@ class TaintEngine:
             # dominant real-server I/O shape routes recv/read through a slot
             # (`conn->type->read`), so the recv source must be anchorable there --
             # the same resolution the forward descent already performs for the call.
-            if resolve_indirect and target is None and self._indirect_target_matches(ins, callee):
+            if resolve_indirect and target is None \
+                    and self._indirect_target_matches(ins, callee, wrapper_arg=wrapper_arg):
                 hits.append(ins)
         return hits
 
@@ -1513,9 +1515,12 @@ class TaintEngine:
             getattr(getattr(ins, "dest", None), "possible_values", None))
         return (cands, "value-set") if cands else ([], None)
 
-    def _indirect_target_matches(self, ins: Any, callee: str) -> bool:
+    def _indirect_target_matches(self, ins: Any, callee: str, *,
+                                 wrapper_arg: int | None = None) -> bool:
         """True if indirect call *ins* resolves (map/value-set) to a target whose
-        name matches *callee*, directly or through a thunk veneer (#282)."""
+        name matches *callee*, directly or through a thunk veneer (#282), or --
+        when *wrapper_arg* is given -- through a THIN WRAPPER that forwards its
+        ``wrapper_arg`` parameter to *callee* (#292)."""
         cands, _ = self._indirect_call_resolution(ins)
         for taddr in cands:
             if self._callee_matches(taddr, callee):
@@ -1526,14 +1531,58 @@ class TaintEngine:
                 if resolved is not None and resolved is not cfn \
                         and self._callee_matches(int(getattr(resolved, "start", 0)), callee):
                     return True
+                if wrapper_arg is not None and self._is_thin_wrapper_forwarding(cfn, callee, wrapper_arg):
+                    return True
         return False
 
-    def _note_indirect_anchors(self, calls: list[Any], callee: str, add_assumption) -> None:
+    def _thin_wrapper_for(self, ins: Any, callee: str, wrapper_arg: int) -> Any | None:
+        """If indirect call *ins* resolves to a thin wrapper that forwards its
+        ``wrapper_arg`` to *callee*, return that wrapper function; else None. Used
+        to name the wrapper in the anchor honesty assumption (#292)."""
+        if wrapper_arg is None:
+            return None
+        cands, _ = self._indirect_call_resolution(ins)
+        for taddr in cands:
+            if self._callee_matches(taddr, callee):
+                return None  # direct name match -- not a wrapper anchor
+            cfn = function_at(self.bv, taddr)
+            if cfn is not None and self._is_thin_wrapper_forwarding(cfn, callee, wrapper_arg):
+                return cfn
+        return None
+
+    def _is_thin_wrapper_forwarding(self, fn: Any, callee: str, arg: int) -> bool:
+        """True if in-binary *fn* is a THIN WRAPPER that forwards its parameter
+        *arg* to *callee* (#292): it calls *callee* exactly once (directly or
+        through a thunk) and the argument at *callee*'s position *arg* is a read of
+        *fn*'s own parameter *arg* (positional forward). This keeps the
+        ``arg:<callee>:<arg>`` model semantics intact at the wrapper-dispatched
+        indirect call, while a function that merely calls *callee* with a local
+        buffer (its *arg* is not the wrapper's param *arg*) or calls it more than
+        once does NOT match -- no over-anchoring."""
+        if not self._is_internal(fn):
+            return False
+        ssaf = _mlil_ssa(fn)
+        if ssaf is None:
+            return False
+        # Direct/thunk callsites of `callee` inside the wrapper body only
+        # (resolve_indirect=False avoids recursing back through this resolver).
+        sites = self._find_callsites(_ssa_instructions(ssaf), callee, resolve_indirect=False)
+        if len(sites) != 1:
+            return False
+        cparams = self._call_params(sites[0])
+        if arg < 0 or arg >= len(cparams):
+            return False
+        return self._resolve_to_param_index(fn, ssaf, cparams[arg]) == arg
+
+    def _note_indirect_anchors(self, calls: list[Any], callee: str, add_assumption,
+                               *, wrapper_arg: int | None = None) -> None:
         """Record an honesty assumption for each seeded callsite that is an
         indirect call resolved to *callee* by map/value-set -- the anchor is
         best-effort (value-set) or agent-pinned (--resolve-map), not a direct
         symbol match (#282). A value-set match among several candidates discloses
-        the multiplicity so it doesn't read like a precise pin."""
+        the multiplicity so it doesn't read like a precise pin. When the target is
+        a thin wrapper that forwards to *callee* (#292), the assumption names the
+        wrapper so the indirection is explicit."""
         for c in calls:
             if const_target(getattr(c, "dest", None)) is not None:
                 continue
@@ -1545,9 +1594,17 @@ class TaintEngine:
             detail = via
             if via == "value-set" and len(cands) > 1:
                 detail = f"value-set ({callee} is 1 of {len(cands)} candidate targets)"
-            add_assumption(
-                f"{callee} anchored at indirect callsite "
-                f"{hex(int(getattr(c, 'address', 0)))} (resolved via {detail})")
+            wrapper = self._thin_wrapper_for(c, callee, wrapper_arg) if wrapper_arg is not None else None
+            if wrapper is not None:
+                add_assumption(
+                    f"{callee} anchored at indirect callsite "
+                    f"{hex(int(getattr(c, 'address', 0)))} via thin wrapper "
+                    f"{getattr(wrapper, 'name', '?')} (forwards arg{wrapper_arg} to {callee}; "
+                    f"resolved via {detail})")
+            else:
+                add_assumption(
+                    f"{callee} anchored at indirect callsite "
+                    f"{hex(int(getattr(c, 'address', 0)))} (resolved via {detail})")
 
     def _no_callsite_error(self, instrs: list[Any], callee: str, func: Any,
                            *, seed_kind: str = "source") -> "TaintError":
@@ -3067,10 +3124,15 @@ class TaintEngine:
                     seeded = True
             elif kind in ("ret", "arg"):
                 callee = src["callee"]
-                calls = self._find_callsites(instrs, callee, resolve_indirect=True)
+                # For an arg:<callee>:<n> source, allow anchoring at an indirect
+                # call resolved to a thin wrapper that forwards its arg n to callee
+                # (#292); ret: has no such arg to forward.
+                wrapper_arg = int(src["index"]) if kind == "arg" else None
+                calls = self._find_callsites(instrs, callee, resolve_indirect=True,
+                                             wrapper_arg=wrapper_arg)
                 if not calls:
                     raise self._no_callsite_error(instrs, callee, func)
-                self._note_indirect_anchors(calls, callee, add_assumption)
+                self._note_indirect_anchors(calls, callee, add_assumption, wrapper_arg=wrapper_arg)
                 if kind == "ret":
                     # A ret: source on a function whose model also fills an
                     # output-pointer buffer would silently miss those bytes;
