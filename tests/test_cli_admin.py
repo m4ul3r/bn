@@ -1114,3 +1114,47 @@ def test_capabilities_text_groups_commands_with_routing_hints(capsys):
     assert "callsites" in out and "xrefs" in out
     assert "prefer when:" in out
     assert "see also:" in out
+
+
+def _inst_with_binaries(binaries):
+    from pathlib import Path as _P
+    from bn.transport import BridgeInstance
+    return BridgeInstance(
+        pid=111, socket_path=_P("/tmp/x.sock"), registry_path=_P("/tmp/x.json"),
+        plugin_name="bn_agent_bridge", plugin_version="0.1.0",
+        started_at="2026-01-01T00:00:00Z",
+        meta={"binaries": list(binaries)}, instance_id="abc123")
+
+
+def test_instance_list_shows_open_binaries(monkeypatch, capsys):
+    # #80: `bn instance list` surfaces each instance's open binaries from the
+    # registry, so "which instance has libfoo.so?" needs no per-instance round-trip.
+    inst = _inst_with_binaries(["/fw/lib64/libfoo.so", "/fw/bin/daemon"])
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [inst])
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    rc = bn.cli.main(["instance", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "libfoo.so" in out and "daemon" in out
+
+
+def test_instance_list_json_includes_binaries(monkeypatch, capsys):
+    inst = _inst_with_binaries(["/fw/lib64/libfoo.so"])
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [inst])
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    rc = bn.cli.main(["instance", "list", "--format", "json"])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["instances"][0]["binaries"] == ["/fw/lib64/libfoo.so"]
+
+
+def test_instance_list_no_binaries_key_when_empty(monkeypatch, capsys):
+    # An instance with nothing open (or an older registry without the field) renders
+    # cleanly without a binaries line.
+    inst = _inst_with_binaries([])
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [inst])
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    rc = bn.cli.main(["instance", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "binaries" not in out

@@ -722,6 +722,22 @@ class BinaryNinjaBridge:
         }
         if self.instance_id is not None:
             payload["instance_id"] = self.instance_id
+        # #80: record the open binaries so `bn instance list` can show what each
+        # instance holds without an N-instance `target list` round-trip -- the
+        # biggest usability win for the many-bridges case. Best-effort: a registry
+        # write must never fail because target enumeration hiccuped.
+        binaries: list[str] = []
+        try:
+            seen: set[str] = set()
+            for rec in self.targets.refresh():
+                fn = rec.get("filename") if isinstance(rec, dict) else None
+                if fn and fn not in seen:
+                    seen.add(fn)
+                    binaries.append(str(fn))
+            binaries.sort()
+        except Exception:
+            binaries = []
+        payload["binaries"] = binaries
         # Write atomically (temp file + rename) so a concurrent reader never
         # sees a half-written registry and concludes no instance exists.
         self.registry_path.parent.mkdir(parents=True, exist_ok=True)
@@ -840,6 +856,8 @@ class BinaryNinjaBridge:
                 _headless_views.append(bv)
             targets = self.targets.refresh()
 
+        # Keep the registry's open-binaries list current after a load (#80).
+        self._write_registry()
         return {
             "loaded": True,
             "path": str(load_path),
@@ -886,6 +904,10 @@ class BinaryNinjaBridge:
             _run_on_main_thread(lambda: target_bv.file.close())
             with _headless_views_lock:
                 _headless_views[:] = [v for v in _headless_views if v is not target_bv]
+            # Refresh the registry's open-binaries list after a close (#80).
+            # Outside _headless_views_lock: _write_registry -> refresh re-acquires
+            # that non-reentrant lock, so writing inside it would deadlock.
+            self._write_registry()
             return {"closed": closed}
 
         with _headless_views_lock:
@@ -899,24 +921,26 @@ class BinaryNinjaBridge:
                     closed.append(_snapshot(bv))
                     _run_on_main_thread(lambda v=bv: v.file.close())
                 _headless_views.clear()
-                return {"closed": closed}
+            else:
+                resolved = str(Path(path).expanduser().resolve())
+                to_remove = []
+                for i, bv in enumerate(_headless_views):
+                    filename = str(getattr(bv.file, "filename", ""))
+                    if filename == resolved or str(Path(filename).resolve()) == resolved:
+                        to_remove.append(i)
 
-            resolved = str(Path(path).expanduser().resolve())
-            to_remove = []
-            for i, bv in enumerate(_headless_views):
-                filename = str(getattr(bv.file, "filename", ""))
-                if filename == resolved or str(Path(filename).resolve()) == resolved:
-                    to_remove.append(i)
+                if not to_remove:
+                    raise RuntimeError(f"No loaded binary matches path: {path}")
 
-            if not to_remove:
-                raise RuntimeError(f"No loaded binary matches path: {path}")
+                closed = []
+                for i in reversed(to_remove):
+                    bv = _headless_views.pop(i)
+                    closed.append(_snapshot(bv))
+                    _run_on_main_thread(lambda v=bv: v.file.close())
 
-            closed = []
-            for i in reversed(to_remove):
-                bv = _headless_views.pop(i)
-                closed.append(_snapshot(bv))
-                _run_on_main_thread(lambda v=bv: v.file.close())
-
+        # Single post-lock registry refresh + return for both the --all and the
+        # by-path close paths (must be OUTSIDE the lock; see the note above) (#80).
+        self._write_registry()
         return {"closed": closed}
 
     def _save_database(self, target: str | None, path: str | None = None):

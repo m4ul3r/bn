@@ -478,6 +478,12 @@ def _running_instances_result() -> dict[str, Any]:
             "started_at": inst.started_at,
             "rss_mb": round(rss, 1) if rss is not None else None,
         }
+        # #80: the registry now records each instance's open binaries, so list them
+        # here without an N-instance `target list` round-trip. Absent (older bridge
+        # or nothing open) -> omit, so the entry stays clean.
+        binaries = inst.meta.get("binaries") if isinstance(inst.meta, dict) else None
+        if binaries:
+            entry["binaries"] = list(binaries)
         if sticky_id and (inst.instance_id == sticky_id or selector == sticky_id):
             entry["sticky"] = True
         entries.append(entry)
