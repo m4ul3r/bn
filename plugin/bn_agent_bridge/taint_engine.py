@@ -1536,25 +1536,38 @@ class TaintEngine:
         return False
 
     def _thin_wrapper_for(self, ins: Any, callee: str, wrapper_arg: int) -> Any | None:
-        """If indirect call *ins* resolves to a thin wrapper that forwards its
-        ``wrapper_arg`` to *callee*, return that wrapper function; else None. Used
-        to name the wrapper in the anchor honesty assumption (#292)."""
+        """If indirect call *ins* resolves to *callee* SOLELY through a thin wrapper
+        that forwards its ``wrapper_arg``, return that wrapper function; else None.
+        Used to name the wrapper in the anchor honesty assumption (#292).
+
+        A direct name/thunk match anywhere in the candidate set is the cleaner
+        disclosure (the #282 plain note), so this returns None whenever any
+        candidate matches *callee* directly -- independent of candidate ORDER, so
+        the disclosure wording never flips with --resolve-map/value-set order."""
         if wrapper_arg is None:
             return None
         cands, _ = self._indirect_call_resolution(ins)
+        wrapper = None
         for taddr in cands:
             if self._callee_matches(taddr, callee):
-                return None  # direct name match -- not a wrapper anchor
+                return None  # a direct name match exists -> plain #282 disclosure
             cfn = function_at(self.bv, taddr)
-            if cfn is not None and self._is_thin_wrapper_forwarding(cfn, callee, wrapper_arg):
-                return cfn
-        return None
+            if cfn is None:
+                continue
+            resolved = self._follow_thunk_cached(cfn)
+            if resolved is not None and resolved is not cfn \
+                    and self._callee_matches(int(getattr(resolved, "start", 0)), callee):
+                return None  # a thunk match exists -> plain disclosure
+            if wrapper is None and self._is_thin_wrapper_forwarding(cfn, callee, wrapper_arg):
+                wrapper = cfn
+        return wrapper
 
     def _is_thin_wrapper_forwarding(self, fn: Any, callee: str, arg: int) -> bool:
         """True if in-binary *fn* is a THIN WRAPPER that forwards its parameter
         *arg* to *callee* (#292): it calls *callee* exactly once (directly or
-        through a thunk) and the argument at *callee*'s position *arg* is a read of
-        *fn*'s own parameter *arg* (positional forward). This keeps the
+        through a thunk) and the argument at *callee*'s position *arg* is derived
+        from *fn*'s own parameter *arg* (a positional forward -- an identity read
+        or a param-derived expression like ``param+off``). This keeps the
         ``arg:<callee>:<arg>`` model semantics intact at the wrapper-dispatched
         indirect call, while a function that merely calls *callee* with a local
         buffer (its *arg* is not the wrapper's param *arg*) or calls it more than

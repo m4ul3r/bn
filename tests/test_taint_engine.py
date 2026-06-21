@@ -3535,3 +3535,18 @@ def test_forward_thin_wrapper_no_overmatch_for_local_buffer(models):
     engine = te.TaintEngine(bv, models, resolve_map={"0x10": ["0x2000"]})
     with pytest.raises(te.TaintError):
         engine.forward(handler, [te.parse_locator("arg:read:1")])
+
+
+def test_forward_wrapper_disclosure_is_order_independent(models):
+    # #292 review: when an indirect call resolves to BOTH a direct match (read) and
+    # a thin wrapper of read, the anchor disclosure must be the plain #282 note
+    # (the direct match is the cleaner justification) regardless of candidate order
+    # -- the wrapper wording must not flip with --resolve-map entry order.
+    handler, read_impl = _wrapper_dispatch_program(forward_param=True)
+    bv = FBV({0x900: "read", 0x901: "memcpy"}, funcs={0x2000: read_impl})
+    for cands in (["0x900", "0x2000"], ["0x2000", "0x900"]):
+        engine = te.TaintEngine(bv, models, resolve_map={"0x10": cands})
+        result = engine.forward(handler, [te.parse_locator("arg:read:1")])
+        anchors = [a for a in result["assumptions"] if "anchored at indirect" in a]
+        assert anchors, result["assumptions"]
+        assert not any("thin wrapper" in a for a in anchors), (cands, anchors)
