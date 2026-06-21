@@ -35,26 +35,30 @@ from ._shared import OperationFailure, _parse_address, _validate_count
 from .bridge_state import require_analysis
 
 
-def _callsites_within_function(ctx, bv, callee, func, *, context: int) -> list[dict[str, Any]]:
+def _callsites_within_function(ctx, bv, callee, func, *, context: int,
+                               stub_addrs: frozenset[int] = frozenset()) -> list[dict[str, Any]]:
     func_arch = getattr(func, "arch", None)
     disasm_entries = il_format._structured_disasm_entries(bv, func)
     index_by_addr = {
         int(item["_address_int"]): index for index, item in enumerate(disasm_entries)
     }
     callee_address = int(callee.start)
+    # An exported function's intra-lib callers reach it through a same-name PLT
+    # stub; treat a call to the stub as a call to the callee so `callsites
+    # --within` sees through it (#286), mirroring the xrefs union.
+    callee_addresses = {callee_address} | {int(a) for a in stub_addrs}
     # Align callsites' edge set with xrefs. The LLIL `dest` is a literal const
     # only on statically-resolved calls; on stripped/kernel/register-resolved
     # calls BN records the edge in the code-ref DB (the same source xrefs reads)
     # while the LLIL dest is a register/computed value. Union the two so
     # callsites never silently drops an edge xrefs/dataflow-callgraph confirm.
-    # A code-ref addr is specific to THIS callee and we only inspect this
-    # function's call insns, so matching on it stays correctly scoped.
+    # A code-ref addr is specific to THIS callee (and its stub) and we only
+    # inspect this function's call insns, so matching on it stays correctly scoped.
     _get_code_refs = getattr(bv, "get_code_refs", None)
-    code_ref_addrs = (
-        {int(getattr(ref, "address", -1)) for ref in _get_code_refs(callee_address)}
-        if callable(_get_code_refs)
-        else set()
-    )
+    code_ref_addrs: set[int] = set()
+    if callable(_get_code_refs):
+        for target in callee_addresses:
+            code_ref_addrs |= {int(getattr(ref, "address", -1)) for ref in _get_code_refs(target)}
     rows = []
     for insn in il_format._iter_llil_instructions(func):
         op_name = il_format._il_op_name(insn)
@@ -66,7 +70,7 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int) -> list[d
             continue
         call_addr = int(getattr(insn, "address", 0))
         dest_value = il_format._llil_constant_value(getattr(insn, "dest", None))
-        if dest_value != callee_address and call_addr not in code_ref_addrs:
+        if dest_value not in callee_addresses and call_addr not in code_ref_addrs:
             continue
         call_kind = "tailcall" if "TAILCALL" in op_name else "call"
 
@@ -133,11 +137,18 @@ def _callsites(
     bv = ctx._resolve_view(selector)
     require_analysis(bv, "Callsites")
     callee = ctx._find_function(bv, callee_identifier)
+    # #286: an exported callee's intra-lib callers route through its same-name PLT
+    # stub, so a call targeting the stub must count as a call to the callee.
+    try:
+        stub_addrs = frozenset(int(s.start) for s in ctx._same_name_stub_functions(bv, callee))
+    except Exception:
+        stub_addrs = frozenset()
     scope_functions = ctx._resolve_scope_functions(bv, within_identifiers)
 
     rows = []
     for within_query, func in scope_functions:
-        function_rows = _callsites_within_function(ctx, bv, callee, func, context=context)
+        function_rows = _callsites_within_function(
+            ctx, bv, callee, func, context=context, stub_addrs=stub_addrs)
         for call_index, row in enumerate(function_rows):
             row["call_index"] = call_index
             row["within_query"] = str(within_query)
