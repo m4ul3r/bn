@@ -1291,3 +1291,79 @@ def test_save_path_restore_failure_reports_degraded_not_clean_success(monkeypatc
     assert result.get("rehomed") is True
     assert out.exists()
     assert bv.file.filename == str(out.resolve())  # still re-homed (restore failed)
+
+
+def test_save_default_preserves_target_identity(monkeypatch, tmp_path):
+    """#285: a DEFAULT save writes <binary>.bndb, but BN's create_database re-homes
+    the live view to it -- which rekeys the -t <basename> selector (derived live
+    from bv.file.filename). A save must not change the selector a caller is using,
+    so the original filename is restored afterward (same shape as #256's --path)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    orig = str(tmp_path / "libfoo.so")
+    Path(orig).write_text("elf")
+    bv = _RehomingSaveBV(orig)
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(instance.targets, "clear_dirty", lambda b: None)
+
+    result = instance._save_database(None)               # default save (no --path)
+
+    assert result == {"saved": True, "path": orig + ".bndb"}
+    assert bv.created_with == orig + ".bndb"             # the .bndb WAS written
+    assert bv.file.filename == orig                       # ...selector identity preserved
+
+
+def test_save_ro_fallback_preserves_target_identity(monkeypatch, tmp_path):
+    """#285: the RO->cache fallback re-homes the live view to the cache copy, which
+    rekeys the -t <basename> selector to <basename>.<hash>.bndb. The fallback is a
+    copy (the RO original is intact), so the original filename is restored after the
+    cache write -- the basename selector keeps resolving."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(bridge, "cache_home", lambda: tmp_path / "cache")
+    orig = str(tmp_path / "ro" / "libfoo.so")
+    Path(orig).parent.mkdir()
+    Path(orig).write_text("elf")
+    ro_bndb = orig + ".bndb"
+
+    class _RoFallbackRehomeBV:
+        def __init__(self):
+            self.file = types.SimpleNamespace(filename=orig)
+            self.created_with = None
+
+        def create_database(self, out):
+            if str(out) == ro_bndb:
+                return False                              # RO default dir: write fails
+            Path(out).parent.mkdir(parents=True, exist_ok=True)
+            Path(out).write_text("bndb")
+            self.file.filename = str(out)                # cache write re-homes the view
+            self.created_with = str(out)
+            return True
+
+    bv = _RoFallbackRehomeBV()
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(instance.targets, "clear_dirty", lambda b: None)
+
+    result = instance._save_database(None)
+
+    assert result["saved"] is True
+    assert result["fallback"] is True
+    assert "cache" in result["path"] and result["path"].endswith(".bndb")
+    assert bv.file.filename == orig                       # identity preserved across the rehome
+
+
+def test_save_default_restore_failure_reports_degraded(monkeypatch, tmp_path):
+    """If the post-default-save restore of the original filename fails, surface a
+    degraded (rehomed) result rather than a clean success that hides the rekey."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    orig = str(tmp_path / "libfoo.so")
+    Path(orig).write_text("elf")
+    bv = _RestoreFailSaveBV(orig)
+    monkeypatch.setattr(instance.targets, "resolve", lambda target: bv)
+    monkeypatch.setattr(instance.targets, "clear_dirty", lambda b: None)
+
+    result = instance._save_database(None)
+
+    assert result["saved"] is True
+    assert result.get("rehomed") is True
