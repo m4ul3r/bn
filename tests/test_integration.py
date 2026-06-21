@@ -339,3 +339,44 @@ class TestTaintIndirectValueSetAnchor:
             assert any(c in ("overflow_len", "fortified_overflow") for c in classes), result
         finally:
             _session_stop(inst_id)
+
+
+class TestTypesDeclareBitfield:
+    """Regression for #322: BN's headless C parser silently drops bitfield `:N`
+    widths and emits an overlapping, oversized layout reported as `verified`. The
+    declaration must instead be rejected cleanly, and the corrupt type must NOT
+    be registered. Drives the real BN parser end-to-end.
+    """
+
+    def test_bitfield_declaration_is_rejected(self):
+        info = _session_start(str(HELLO_BINARY))
+        inst_id = info["instance_id"]
+        try:
+            res = _bn("--instance", inst_id, "types", "declare",
+                      "struct BF322 { unsigned a:3; unsigned b:5; unsigned c:1; unsigned d:23; };",
+                      "--format", "json")
+            assert res.returncode != 0, f"expected rejection, got: {res.stdout}"
+            parsed = json.loads(res.stdout)
+            results = parsed.get("results") or [parsed]
+            assert results[0].get("status") == "invalid_request", parsed
+            assert "bitfield" in (results[0].get("message") or "").lower(), parsed
+            # the corrupt type must not have been registered
+            shown = _bn("--instance", inst_id, "struct", "show", "BF322")
+            assert "BF322" not in shown.stdout or "size=0x4" not in shown.stdout, shown.stdout
+        finally:
+            _session_stop(inst_id)
+
+    def test_plain_struct_still_declares(self):
+        # The contrast: a bitfield-free struct (incl. a comment containing a
+        # colon-number) still declares cleanly -- no false rejection.
+        info = _session_start(str(HELLO_BINARY))
+        inst_id = info["instance_id"]
+        try:
+            res = _bn("--instance", inst_id, "types", "declare",
+                      "struct OK322 { int a; /* note:32 */ char b; long c; };",
+                      "--format", "json")
+            assert res.returncode == 0, f"unexpected rejection: {res.stdout}\n{res.stderr}"
+            parsed = json.loads(res.stdout)
+            assert parsed["results"][0]["status"] == "verified", parsed["results"]
+        finally:
+            _session_stop(inst_id)

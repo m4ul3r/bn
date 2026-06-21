@@ -26,6 +26,7 @@ imports it), and ``read_types`` no longer reaches into it -- the cycle-breakers
 from __future__ import annotations
 
 import difflib
+import re
 from pathlib import Path
 from typing import Any
 
@@ -2086,7 +2087,95 @@ def _op_struct_field_delete(ctx, bv, op: dict[str, Any]):
 
 
 
+# A C bitfield member: an identifier, a colon, an integer width (decimal OR hex),
+# then a member terminator (`;`/`,`/`}`). BN's headless C parser silently DROPS
+# the `:N` width and lays each bitfield out as a full-width integer at the BYTE
+# offset of its bit position, producing overlapping/oversized members -- and
+# reports it `verified` (#322). We reject such declarations instead. Anchoring on
+# an integer literal after the colon avoids C++ inheritance (`: public Base`),
+# and the literal must be immediately followed by a terminator so a stray
+# `width:32` in a comment (stripped first) or other text doesn't match.
+_BITFIELD_MEMBER_RE = re.compile(r"[A-Za-z_]\w*\s*:\s*(?:0[xX][0-9A-Fa-f]+|\d+)\s*[;,}]")
+# Match a block OR line comment in a SINGLE left-to-right pass: a `/*` inside a
+# `//` line is consumed as part of the line comment (and vice versa), so
+# stripping can't span across a comment of the other kind and swallow a real
+# bitfield between them.
+_C_COMMENT_RE = re.compile(r"/\*.*?\*/|//[^\n]*", re.S)
+# Member/segment separators: scanning back from a candidate colon to the nearest
+# of these bounds the expression it belongs to, so a `?` in that window marks a
+# ternary's `:` rather than a bitfield width.
+_SEGMENT_BOUNDS = "{};,"
+
+
+def _strip_c_comments(source: str) -> str:
+    """Remove /* block */ and // line comments so a colon-number inside a comment
+    isn't mistaken for a bitfield."""
+    return _C_COMMENT_RE.sub(" ", source)
+
+
+def _declaration_has_bitfield(declaration: str) -> bool:
+    text = _strip_c_comments(declaration)
+    for match in _BITFIELD_MEMBER_RE.finditer(text):
+        colon = text.find(":", match.start(), match.end())
+        if colon < 0:
+            continue
+        # A `?` between the enclosing segment boundary and the colon means this
+        # colon is the `:` of a ternary expression (e.g. an enum value
+        # `B = cond ? A : 3` or a default initializer), which BN parses fine --
+        # not a bitfield. Don't reject those.
+        seg_start = max((text.rfind(ch, 0, colon) for ch in _SEGMENT_BOUNDS), default=-1)
+        if "?" in text[seg_start + 1:colon]:
+            continue
+        return True
+    return False
+
+
+def _bitfield_member_width(member) -> int:
+    """The declared byte width of a struct member's type, or 0 when unknown."""
+    try:
+        return int(getattr(getattr(member, "type", None), "width", 0) or 0)
+    except Exception:
+        return 0
+
+
+def _struct_overflow_member(type_obj):
+    """The first member of a structure whose declared byte range extends past the
+    struct's own width (a corrupt layout BN should never produce for a valid
+    declaration), else None. Only the OVERFLOW direction is checked: unions are
+    parsed as a struct variant with members overlapping at offset 0, which is
+    legitimate and must not be flagged, but no member of a valid struct or union
+    ever extends beyond the type width."""
+    if "Structure" not in _type_class_name(type_obj):
+        return None
+    try:
+        width = int(getattr(type_obj, "width", 0) or 0)
+    except Exception:
+        return None
+    if width <= 0:  # opaque / forward-declared: nothing to check
+        return None
+    for member in getattr(type_obj, "members", None) or []:
+        end = int(getattr(member, "offset", 0)) + _bitfield_member_width(member)
+        if end > width:
+            return member
+    return None
+
+
 def _op_types_declare(ctx, bv, op: dict[str, Any]):
+    declaration = str(op["declaration"])
+    # Reject C bitfield syntax up front: BN's parser corrupts it (see
+    # _BITFIELD_MEMBER_RE) and would otherwise return a malformed, overlapping
+    # layout reported as `verified` (#322). Nothing is applied.
+    if _declaration_has_bitfield(declaration):
+        raise OperationFailure(
+            "invalid_request",
+            "C bitfield syntax (`name : N`) is not supported: the type parser "
+            "silently drops the bit width and lays each bitfield out as a "
+            "full-width integer at the byte offset of its bit position, producing "
+            "an overlapping, oversized layout. Declare the storage unit as a plain "
+            "integer (e.g. `uint32_t flags;`) and extract the bits in your "
+            "analysis, or split it into separate byte/half-word fields.",
+            requested=_operation_requested(ctx, op),
+        )
     try:
         parsed = _parse_declaration_source(ctx,
             bv,
@@ -2107,6 +2196,22 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
             requested=_operation_requested(ctx, op),
         ) from exc
     named_types = list(parsed["types"])
+    # Backstop for any OTHER malformed layout the parser might emit (beyond the
+    # bitfield case caught above): a member extending past the struct width is a
+    # corrupt layout that must not be applied and reported `verified` (#322).
+    # Checked before defining anything, so nothing is applied on rejection.
+    for name, type_obj in named_types:
+        bad = _struct_overflow_member(type_obj)
+        if bad is not None:
+            end = int(getattr(bad, "offset", 0)) + _bitfield_member_width(bad)
+            raise OperationFailure(
+                "invalid_request",
+                f"declared type {str(name)!r} has a corrupt layout: member "
+                f"{str(getattr(bad, 'name', '')) or '<unnamed>'!r} extends to "
+                f"{hex(end)}, past the type width {hex(int(getattr(type_obj, 'width', 0) or 0))}. "
+                f"The parser produced an inconsistent struct; refusing to apply it.",
+                requested=_operation_requested(ctx, op),
+            )
     defined_types = {}
     defined_type_layouts = {}
     before_defined_types = {}
