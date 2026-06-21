@@ -3476,3 +3476,77 @@ def test_forward_indirect_thunk_resolution_name_is_deterministic(models):
     assert "memcpy" not in via[0]
     # re-modeled memcpy sink still fires (the descent correctness is unchanged)
     assert any(s["sink"]["callee"] == "memcpy" for s in result["reached_sinks"])
+
+
+def _wrapper_dispatch_program(*, forward_param=True):
+    """handler dispatches an indirect call resolved to read_impl(fd, buf, n), a
+    thin wrapper that calls read(fd, buf, n). With forward_param=False the wrapper
+    instead reads into a LOCAL buffer (read's arg 1 is NOT the wrapper's param 1),
+    so it must NOT be treated as a thin wrapper for arg:read:1 (#292 no-overmatch)."""
+    fd_w = FVar("fd_w", ident=70); buf_w = FVar("buf_w", ident=71); n_w = FVar("n_w", ident=72)
+    lbuf = FVar("lbuf", ident=73, typ="char[0x40]")
+    fd_w0 = FSSA(fd_w, 0); buf_w0 = FSSA(buf_w, 0); n_w0 = FSSA(n_w, 0)
+    arg1 = (FExpr("MLIL_VAR_SSA", "buf_w#0", reads=[buf_w0]) if forward_param
+            else FExpr("MLIL_ADDRESS_OF", "&lbuf", src=lbuf))   # local, not a param
+    read_impl = FFunc("read_impl", 0x2000, FSSAFunc([
+        FInstr(0, 0x2004, "MLIL_CALL_SSA", "0x900(fd_w#0, <arg1>, n_w#0)", reads=[fd_w0, n_w0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_VAR_SSA", "fd_w#0", reads=[fd_w0]),
+                       arg1,
+                       FExpr("MLIL_VAR_SSA", "n_w#0", reads=[n_w0])]),
+    ]), params=[fd_w, buf_w, n_w])
+
+    fd = FVar("fd"); slot = FVar("slot"); buf = FVar("buf", typ="char[0x40]"); length = FVar("len")
+    fd0 = FSSA(fd, 0); slot1 = FSSA(slot, 1); buf1 = FSSA(buf, 1); len1 = FSSA(length, 1)
+    handler = FFunc("handler", 0x10, FSSAFunc([
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "[slot#1](fd, &buf, 0x40)", reads=[slot1],
+               dest=FExpr("MLIL_VAR_SSA", "slot#1", reads=[slot1]),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[fd0]),
+                       FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+        FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "len#1 = buf[0]", reads=[buf1], writes=[len1]),
+        FInstr(2, 0x18, "MLIL_CALL_SSA", "memcpy(dst, &buf, len#1)", reads=[len1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x901", constant=0x901),
+               params=[FExpr("MLIL_VAR_SSA", "dst", reads=[]),
+                       FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       FExpr("MLIL_VAR_SSA", "len#1", reads=[len1])]),
+    ]), params=[fd])
+    return handler, read_impl
+
+
+def test_forward_anchors_arg_source_through_thin_wrapper(models):
+    # #292: an indirect call resolved (via --resolve-map) to a thin wrapper that
+    # forwards its arg to read must anchor `arg:read:1` there, so the recv buffer
+    # reaches the memcpy length sink -- with an honest assumption naming the wrapper.
+    handler, read_impl = _wrapper_dispatch_program(forward_param=True)
+    bv = FBV({0x900: "read", 0x901: "memcpy"}, funcs={0x2000: read_impl})
+    engine = te.TaintEngine(bv, models, resolve_map={"0x10": ["0x2000"]})
+    result = engine.forward(handler, [te.parse_locator("arg:read:1")])
+    assert any(s["sink"]["class"] == "overflow_len" for s in result["reached_sinks"])
+    assert any("wrapper" in a.lower() and "read_impl" in a for a in result["assumptions"]), result["assumptions"]
+
+
+def test_forward_thin_wrapper_no_overmatch_for_local_buffer(models):
+    # No over-match: the resolved target calls read into its OWN local buffer (read's
+    # arg 1 is not the target's param 1), so it is not a thin wrapper for arg:read:1
+    # -- the source must NOT anchor there (it dead-ends as an unresolved indirect).
+    handler, read_local = _wrapper_dispatch_program(forward_param=False)
+    bv = FBV({0x900: "read", 0x901: "memcpy"}, funcs={0x2000: read_local})
+    engine = te.TaintEngine(bv, models, resolve_map={"0x10": ["0x2000"]})
+    with pytest.raises(te.TaintError):
+        engine.forward(handler, [te.parse_locator("arg:read:1")])
+
+
+def test_forward_wrapper_disclosure_is_order_independent(models):
+    # #292 review: when an indirect call resolves to BOTH a direct match (read) and
+    # a thin wrapper of read, the anchor disclosure must be the plain #282 note
+    # (the direct match is the cleaner justification) regardless of candidate order
+    # -- the wrapper wording must not flip with --resolve-map entry order.
+    handler, read_impl = _wrapper_dispatch_program(forward_param=True)
+    bv = FBV({0x900: "read", 0x901: "memcpy"}, funcs={0x2000: read_impl})
+    for cands in (["0x900", "0x2000"], ["0x2000", "0x900"]):
+        engine = te.TaintEngine(bv, models, resolve_map={"0x10": cands})
+        result = engine.forward(handler, [te.parse_locator("arg:read:1")])
+        anchors = [a for a in result["assumptions"] if "anchored at indirect" in a]
+        assert anchors, result["assumptions"]
+        assert not any("thin wrapper" in a for a in anchors), (cands, anchors)
