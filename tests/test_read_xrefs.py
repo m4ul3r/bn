@@ -490,3 +490,180 @@ def test_xrefs_resolves_data_symbol_by_name(monkeypatch):
     assert result["code_ref_count"] == 1
 
 
+# ===================================================================
+# #284: adrp page-base over-report filter (AArch64)
+# ===================================================================
+#
+# On AArch64 `adrp xN, <page>` materializes a 4 KB page base. When a function
+# starts at a page-aligned address A, BN records every such adrp as a code ref
+# to A even though the real target is A + <add/ldr offset>. The filter drops an
+# adrp ref iff its paired in-page offset is nonzero; calls/branches/data refs
+# and genuine function-pointer takes (offset 0) are always kept.
+
+
+class _LOp:
+    """Minimal LLIL expression node: an operation name + operands."""
+    def __init__(self, op, operands=(), **kw):
+        self.operation = types.SimpleNamespace(name=op)
+        self.operands = list(operands)
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
+def _reg(name):
+    return _LOp("LLIL_REG", name=name)
+
+
+def _const(v):
+    return _LOp("LLIL_CONST", constant=v)
+
+
+def _const_ptr(v):
+    return _LOp("LLIL_CONST_PTR", constant=v)
+
+
+def _set_reg(dest, src, idx):
+    n = _LOp("LLIL_SET_REG", operands=[types.SimpleNamespace(name=dest), src],
+             instr_index=idx)
+    n.dest = types.SimpleNamespace(name=dest)
+    n.src = src
+    return n
+
+
+def _adrp(dest, page_base, idx=0):
+    return _set_reg(dest, _const_ptr(page_base), idx)
+
+
+def _spurious(monkeypatch, adrp_il, following, page_base):
+    bridge = _load_bridge(monkeypatch)
+    return bridge.read_xrefs._adrp_pagebase_is_spurious(adrp_il, following, page_base)
+
+
+def test_adrp_pagebase_add_nonzero_offset_is_spurious(monkeypatch):
+    A = 0x438000
+    adrp = _adrp("x0", A, 0)
+    add = _set_reg("x0", _LOp("LLIL_ADD", [_reg("x0"), _const(0x350)]), 1)
+    assert _spurious(monkeypatch, adrp, [add], A) is True
+
+
+def test_adrp_pagebase_add_zero_offset_is_genuine(monkeypatch):
+    A = 0x438000
+    adrp = _adrp("x0", A, 0)
+    add = _set_reg("x0", _LOp("LLIL_ADD", [_reg("x0"), _const(0)]), 1)
+    assert _spurious(monkeypatch, adrp, [add], A) is False
+
+
+def test_adrp_pagebase_used_directly_is_genuine(monkeypatch):
+    # `adrp x0, A` then the pointer is used as-is (e.g. stored / passed) -> &fn.
+    A = 0x438000
+    adrp = _adrp("x0", A, 0)
+    use = _set_reg("x1", _reg("x0"), 1)
+    assert _spurious(monkeypatch, adrp, [use], A) is False
+
+
+def test_adrp_pagebase_redefined_before_use_is_genuine(monkeypatch):
+    A = 0x438000
+    adrp = _adrp("x0", A, 0)
+    redef = _set_reg("x0", _reg("x5"), 1)
+    assert _spurious(monkeypatch, adrp, [redef], A) is False
+
+
+def test_adrp_pagebase_register_offset_addend_is_genuine(monkeypatch):
+    # `adrp x3, A` then `add x3, x3, x4` (a register, not a const) computes a
+    # dynamic in-page target (a table index); the offset can't be resolved
+    # statically, so it is conservatively KEPT -- never a false-negative drop.
+    A = 0x438000
+    adrp = _adrp("x3", A, 0)
+    add = _set_reg("x3", _LOp("LLIL_ADD", [_reg("x3"), _reg("x4")]), 1)
+    assert _spurious(monkeypatch, adrp, [add], A) is False
+
+
+def test_adrp_pagebase_load_with_offset_is_spurious(monkeypatch):
+    # `adrp x0, A` then `ldr x1, [x0, #0x40]` -> reads A+0x40, not A.
+    A = 0x438000
+    adrp = _adrp("x0", A, 0)
+    ld = _set_reg("x1", _LOp("LLIL_LOAD", [_LOp("LLIL_ADD", [_reg("x0"), _const(0x40)])]), 1)
+    assert _spurious(monkeypatch, adrp, [ld], A) is True
+
+
+def test_adrp_pagebase_offset_after_unrelated_instr_is_spurious(monkeypatch):
+    # The paired add can be a couple instructions later (an unrelated mov between).
+    A = 0x438000
+    adrp = _adrp("x3", A, 0)
+    mov = _set_reg("x4", _reg("x22"), 1)
+    add = _set_reg("x3", _LOp("LLIL_ADD", [_reg("x3"), _const(0x350)]), 2)
+    assert _spurious(monkeypatch, adrp, [mov, add], A) is True
+
+
+def test_non_setreg_ref_is_never_spurious(monkeypatch):
+    # A bl/call to a page-aligned address is a genuine reference, not an adrp.
+    A = 0x438000
+    call = _LOp("LLIL_CALL", [_const_ptr(A)], instr_index=0)
+    assert _spurious(monkeypatch, call, [], A) is False
+
+
+def test_setreg_const_not_pagebase_is_not_spurious(monkeypatch):
+    # SET_REG to a constant that isn't the queried page base -> not our pattern.
+    adrp = _adrp("x0", 0x439000, 0)
+    add = _set_reg("x0", _LOp("LLIL_ADD", [_reg("x0"), _const(0x350)]), 1)
+    assert _spurious(monkeypatch, adrp, [add], 0x438000) is False
+
+
+def _adrp_caller_fn(adrp_addr, add_addr, page_base, call_addr):
+    """A fake function exposing get_low_level_il_at for one adrp+add pair (a
+    spurious page-base ref) and one direct call (a genuine ref)."""
+    adrp = _adrp("x0", page_base, 0)
+    adrp.address = adrp_addr
+    add = _set_reg("x0", _LOp("LLIL_ADD", [_reg("x0"), _const(0xc00)]), 1)
+    add.address = add_addr
+    adrp.il_basic_block = [adrp, add]
+    add.il_basic_block = [adrp, add]
+    call = _LOp("LLIL_CALL", [_const_ptr(page_base)], instr_index=0)
+    call.address = call_addr
+    call.il_basic_block = [call]
+    by_addr = {adrp_addr: adrp, add_addr: add, call_addr: call}
+
+    class _Fn:
+        start = 0x43f000
+        name = "caller"
+        def get_low_level_il_at(self, addr):
+            return by_addr.get(int(addr))
+
+    return _Fn()
+
+
+def test_xrefs_to_address_drops_spurious_adrp_pagebase(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    A = 0x438000  # page-aligned function start
+    fn = _adrp_caller_fn(0x43f1a0, 0x43f1a4, A, 0x440e28)
+    bv = _FakeBV(
+        code_refs={A: [_FakeCodeRef(0x43f1a0, fn), _FakeCodeRef(0x440e28, fn)]},
+        disassembly={0x43f1a0: "adrp    x0, 0x438000",
+                     0x440e28: "bl      0x438000",
+                     A: "stp     x29, x30, [sp, #-0x10]!"},
+        segments={0x43f1a0: _FakeSegment(readable=True, executable=True),
+                  0x440e28: _FakeSegment(readable=True, executable=True),
+                  A: _FakeSegment(readable=True, executable=True)},
+    )
+    result = instance._xrefs_to_address(bv, A)
+    # the spurious adrp page-base ref is dropped; only the real bl call survives
+    assert result["code_ref_count"] == 1
+    addrs = [r["address"] for r in result["code_refs"]]
+    assert addrs == ["0x440e28"]
+
+
+def test_xrefs_to_address_no_filter_when_not_page_aligned(monkeypatch):
+    # A non-page-aligned target can't be an adrp page base -> no filtering runs,
+    # even for an adrp-disassembled ref.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    A = 0x438010  # NOT page-aligned
+    bv = _FakeBV(
+        code_refs={A: [_FakeCodeRef(0x43f1a0, None)]},
+        disassembly={0x43f1a0: "adrp    x0, 0x438000", A: "nop"},
+        segments={0x43f1a0: _FakeSegment(readable=True, executable=True),
+                  A: _FakeSegment(readable=True)},
+    )
+    result = instance._xrefs_to_address(bv, A)
+    assert result["code_ref_count"] == 1

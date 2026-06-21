@@ -34,6 +34,7 @@ from typing import Any
 import binaryninja as bn  # noqa: F401  (kept for parity / future use)
 
 from . import il_format
+from . import read_xrefs
 from . import taint_engine as _taint
 from . import vars as vars_mod
 from ._shared import OperationFailure, _parse_address  # noqa: F401
@@ -109,7 +110,9 @@ def _function_info(ctx, selector: str | None, identifier):
     variables = vars_mod._list_locals(func)
     parameters = [item for item in variables if item["is_parameter"]]
     locals_only = [item for item in variables if not item["is_parameter"]]
-    code_ref_count = len(list(bv.get_code_refs(func.start)))
+    # Use the genuine code-ref count so a page-aligned function isn't credited
+    # with spurious adrp page-base materializations (#284).
+    code_ref_count = read_xrefs._code_ref_count(bv, func.start)
     result = {
         "function": {
             "name": func.name,
