@@ -629,6 +629,14 @@ def _has_failed_results(ctx, results: list[dict[str, Any]]) -> bool:
 
 
 
+def _member_byte_width(member) -> int:
+    """The declared byte width of a struct member's type, or 0 when unknown."""
+    try:
+        return int(getattr(getattr(member, "type", None), "width", 0) or 0)
+    except Exception:
+        return 0
+
+
 def _first_overlapping_member(ctx, type_obj, offset: int, width: int):
     """The first existing member whose byte range intersects the range a new
     field of *width* bytes at *offset* would occupy, else None. Width 0/unknown
@@ -1091,15 +1099,35 @@ def _verify_struct_field_delete(ctx, bv, result: dict[str, Any]) -> dict[str, An
     # specific member that was removed must be gone from its offset.
     offset = int(item.get("member_offset", -1))
     member = _find_member(ctx, type_obj, offset=offset, name=item["field_name"])
+    live_width = None
+    try:
+        live_width = int(getattr(type_obj, "width", -1))
+    except Exception:
+        live_width = None
     item["observed"] = {
         "type_name": item["struct_name"],
         "offset": hex(offset) if offset >= 0 else None,
         "field_present": member is not None,
+        "width": live_width,
     }
     if member is not None:
         raise OperationFailure(
             "verification_failed",
             f"Live struct field delete verification failed for {item['struct_name']}",
+            requested=item.get("requested"),
+            observed=item["observed"],
+        )
+    # The width must actually have shrunk to the intended value: a delete of the
+    # trailing field that left the width stale would otherwise still report
+    # `verified` (the original #320 false-positive). Only assert when the op
+    # intended a shrink and BN reported a width back.
+    expected_width = item.get("expected_width")
+    if expected_width is not None and live_width is not None and live_width >= 0 and live_width != int(expected_width):
+        raise OperationFailure(
+            "verification_failed",
+            f"Struct {item['struct_name']} width is {live_width} after deleting the "
+            f"trailing field {item['field_name']!r}; expected {int(expected_width)} "
+            f"(the end of the new last field). The delete left phantom trailing bytes.",
             requested=item.get("requested"),
             observed=item["observed"],
         )
@@ -2074,13 +2102,39 @@ def _op_struct_field_delete(ctx, bv, op: dict[str, Any]):
     index, member = _resolve_struct_field(ctx, builder, resolved_name, op["field_name"])
     field_name = str(getattr(member, "name", ""))
     member_offset = int(getattr(member, "offset", -1))
+    old_width = int(getattr(builder, "width", 0) or 0)
+    deleted_end = member_offset + _member_byte_width(member)
     builder.remove(index)
+    # BN's StructureBuilder.remove() leaves the struct width untouched, so
+    # deleting the field that reached the struct end would keep phantom trailing
+    # bytes (a stale width that still verifies) (#320). Shrink the width to the
+    # end of the new last field ONLY when the deleted field actually defined the
+    # struct's end -- a field that stops short of the width (e.g. an early field
+    # in a partially-recovered struct sized larger than its mapped members) must
+    # leave the intentional width alone.
+    expected_width = None
+    if old_width > 0 and deleted_end >= old_width:
+        new_end = 0
+        for remaining in getattr(builder, "members", []) or []:
+            new_end = max(new_end, int(getattr(remaining, "offset", 0)) + _member_byte_width(remaining))
+        if new_end < old_width:
+            # The intended post-delete width. Recorded so the verifier can
+            # confirm the shrink actually LANDED -- if the assignment below
+            # silently fails (the except: pass) or BN ignores it, a width-blind
+            # verifier would still report `verified` on a stale width, the very
+            # false-positive #320 is about.
+            expected_width = new_end
+            try:
+                builder.width = new_end
+            except Exception:
+                pass
     _commit_struct_builder(ctx, bv, resolved_name, builder)
     return {
         "op": "struct_field_delete",
         "struct_name": resolved_name,
         "field_name": field_name,
         "member_offset": member_offset,
+        "expected_width": expected_width,
         "requested": _operation_requested(ctx, op),
     }
 

@@ -339,3 +339,57 @@ class TestTaintIndirectValueSetAnchor:
             assert any(c in ("overflow_len", "fortified_overflow") for c in classes), result
         finally:
             _session_stop(inst_id)
+
+
+class TestStructFieldDeleteWidth:
+    """Regression for #320: deleting the trailing field of a struct must shrink
+    the struct width (BN's StructureBuilder.remove() leaves it stale), and a
+    --preview of that delete must restore the original width on revert. The
+    mocked suite cannot model BN's real width bookkeeping, so this drives it
+    end-to-end.
+    """
+
+    def _declare(self, inst_id, decl):
+        res = _bn("--instance", inst_id, "types", "declare", decl, "--format", "json")
+        assert res.returncode == 0, res.stderr
+        return res
+
+    def test_delete_trailing_field_shrinks_width(self):
+        info = _session_start(str(HELLO_BINARY))
+        inst_id = info["instance_id"]
+        try:
+            self._declare(inst_id, "struct WTd320 { unsigned char pad[24]; };")
+            setres = _bn("--instance", inst_id, "struct", "field", "set",
+                         "WTd320", "0x18", "extra", "int32_t", "--format", "json")
+            assert setres.returncode == 0, setres.stderr
+            shown = _bn("--instance", inst_id, "struct", "show", "WTd320")
+            assert "0x1c" in shown.stdout, shown.stdout  # width grew to 0x1c
+
+            res = _bn("--instance", inst_id, "struct", "field", "delete",
+                      "WTd320", "extra", "--format", "json")
+            assert res.returncode == 0, f"delete failed: {res.stdout}\n{res.stderr}"
+            parsed = json.loads(res.stdout)
+            assert parsed["results"][0]["status"] == "verified", parsed["results"]
+            after = _bn("--instance", inst_id, "struct", "show", "WTd320")
+            assert "0x18" in after.stdout, after.stdout   # shrank back to 0x18
+            assert "0x1c" not in after.stdout, after.stdout
+        finally:
+            _session_stop(inst_id)
+
+    def test_preview_delete_restores_width(self):
+        info = _session_start(str(HELLO_BINARY))
+        inst_id = info["instance_id"]
+        try:
+            self._declare(inst_id, "struct WTp320 { unsigned char pad[24]; };")
+            _bn("--instance", inst_id, "struct", "field", "set",
+                "WTp320", "0x18", "extra", "int32_t", "--format", "json")
+            res = _bn("--instance", inst_id, "struct", "field", "delete",
+                      "WTp320", "extra", "--preview", "--format", "json")
+            assert res.returncode == 0, f"preview failed: {res.stdout}\n{res.stderr}"
+            # after a preview revert, the struct must be unchanged: extra still
+            # present and width still 0x1c (preview restored the shrink too).
+            after = _bn("--instance", inst_id, "struct", "show", "WTp320")
+            assert "extra" in after.stdout, after.stdout
+            assert "0x1c" in after.stdout, after.stdout
+        finally:
+            _session_stop(inst_id)
