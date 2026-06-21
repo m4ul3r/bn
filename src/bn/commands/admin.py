@@ -22,6 +22,7 @@ from ..cli import arg, command
 from ..formatters import (
     _render_capabilities_text,
     _render_doctor_text,
+    _render_instance_find_text,
     _render_instance_gc_text,
     _render_instance_use_text,
     _render_pin_clear_text,
@@ -503,6 +504,51 @@ def _session_list(args: argparse.Namespace) -> int:
 def _instance_list(args: argparse.Namespace) -> int:
     result: Any = _running_instances_result()
     cli._emit_result(args, result, text_renderer=_render_session_list_text, stem="instance-list")
+    return 0
+
+
+def _binary_query_matches(binary: str, query: str) -> bool:
+    """Whether *binary* (an open binary's path) satisfies a `find` *query*: the
+    exact path, the exact basename, or a substring of the basename (so `libfoo`
+    finds `libfoo.so.1.2.11`). A path-form query (with a separator) also matches as
+    a path-component-aligned suffix, and -- only for an ABSOLUTE query -- by
+    resolved-path equality (a relative query would resolve against the CLI's cwd,
+    not the bridge's, so resolving it would be misleading) (#80)."""
+    if not binary or not query:
+        return False
+    if binary == query:
+        return True
+    if "/" in query:
+        if Path(query).is_absolute():
+            try:
+                if Path(binary).resolve() == Path(query).resolve():
+                    return True
+            except Exception:
+                pass
+        # Anchor the suffix at a separator so `bar/libfoo.so` does NOT match
+        # `/foobar/libfoo.so` (a mid-component byte suffix is a wrong answer).
+        return binary.endswith("/" + query)
+    base = Path(binary).name
+    return base == query or query in base
+
+
+@command("instance", "find", help="Find which running instance has a binary open (by path or name)",
+         args=[arg("query", help="Binary path or (sub)name to locate among open binaries")])
+def _instance_find(args: argparse.Namespace) -> int:
+    snapshot = _running_instances_result()
+    query = args.query
+    items = []
+    for entry in snapshot.get("instances", []):
+        for binary in entry.get("binaries") or []:
+            if _binary_query_matches(str(binary), query):
+                items.append({
+                    "instance_id": entry.get("instance_id"),
+                    "selector": entry.get("selector"),
+                    "socket_path": entry.get("socket_path"),
+                    "binary": binary,
+                })
+    result: Any = {"kind": "instance_matches", "query": query, "items": items, "count": len(items)}
+    cli._emit_result(args, result, text_renderer=_render_instance_find_text, stem="instance-find")
     return 0
 
 

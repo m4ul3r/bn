@@ -1158,3 +1158,87 @@ def test_instance_list_no_binaries_key_when_empty(monkeypatch, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "binaries" not in out
+
+
+def test_instance_find_locates_binary_by_basename(monkeypatch, capsys):
+    # #80: `bn instance find <name>` answers "which instance has this binary?"
+    # from the registry (no per-instance round-trip), matching by basename.
+    inst = _inst_with_binaries(["/fw/lib64/libfoo.so", "/fw/bin/daemon"])
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [inst])
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    rc = bn.cli.main(["instance", "find", "libfoo.so"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "abc123" in out and "libfoo.so" in out
+
+
+def test_instance_find_by_exact_path(monkeypatch, capsys):
+    inst = _inst_with_binaries(["/fw/lib64/libfoo.so"])
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [inst])
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    rc = bn.cli.main(["instance", "find", "/fw/lib64/libfoo.so", "--format", "json"])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["count"] == 1
+    assert data["items"][0]["instance_id"] == "abc123"
+    assert data["items"][0]["binary"] == "/fw/lib64/libfoo.so"
+
+
+def test_instance_find_no_match(monkeypatch, capsys):
+    inst = _inst_with_binaries(["/fw/lib64/libfoo.so"])
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [inst])
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    rc = bn.cli.main(["instance", "find", "nope.so"])
+    assert rc == 0
+    assert "no instance" in capsys.readouterr().out.lower()
+
+
+def test_instance_find_substring_of_basename(monkeypatch, capsys):
+    # a bare query is a basename substring, so "libfoo" finds "libfoo.so.1.2.11"
+    inst = _inst_with_binaries(["/fw/lib64/libfoo.so.1.2.11"])
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [inst])
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    rc = bn.cli.main(["instance", "find", "libfoo"])
+    assert rc == 0
+    assert "abc123" in capsys.readouterr().out
+
+
+def test_instance_find_path_suffix_is_component_aligned(monkeypatch, capsys):
+    # A path-form query matches as a component-aligned suffix: `lib64/libfoo.so`
+    # matches `/fw/lib64/libfoo.so` but a mid-component byte suffix must NOT
+    # (`bar/libfoo.so` must not match `/foobar/libfoo.so`) (#80 review M1).
+    inst = _inst_with_binaries(["/fw/lib64/libfoo.so", "/foobar/libqux.so"])
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [inst])
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    rc = bn.cli.main(["instance", "find", "lib64/libfoo.so", "--format", "json"])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert [i["binary"] for i in data["items"]] == ["/fw/lib64/libfoo.so"]
+    # mid-component suffix does not match
+    rc = bn.cli.main(["instance", "find", "bar/libqux.so", "--format", "json"])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["count"] == 0
+
+
+def test_instance_find_empty_query_matches_nothing(monkeypatch, capsys):
+    inst = _inst_with_binaries(["/fw/lib64/libfoo.so"])
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [inst])
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    rc = bn.cli.main(["instance", "find", "", "--format", "json"])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["count"] == 0
+
+
+def test_instance_find_across_multiple_instances_and_old_bridge(monkeypatch, capsys):
+    # A query matching binaries in TWO instances lists both; an older bridge whose
+    # registry has no `binaries` key is skipped without error.
+    a = _inst_with_binaries(["/fw/lib64/libfoo.so"]); a.instance_id = "inst_a"
+    b = _inst_with_binaries(["/other/libfoo.so"]); b.instance_id = "inst_b"
+    old = _inst_with_binaries([]); old.instance_id = "old"; old.meta.pop("binaries", None)
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [a, b, old])
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    rc = bn.cli.main(["instance", "find", "libfoo.so", "--format", "json"])
+    assert rc == 0
+    data = json.loads(capsys.readouterr().out)
+    assert {i["instance_id"] for i in data["items"]} == {"inst_a", "inst_b"}
+    assert data["count"] == 2
