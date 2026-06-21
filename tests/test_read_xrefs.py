@@ -770,3 +770,85 @@ def test_xrefs_no_stub_union_for_plain_function(monkeypatch):
     result = instance._xrefs(None, "0x6000")
     assert result["code_ref_count"] == 1
     assert "stub_callers_via" not in result
+
+
+# ===================================================================
+# #286 (callsites half): callsites see through a same-name PLT stub
+# ===================================================================
+
+
+def _callsites_caller_with_stub_call():
+    """A caller function whose single call targets the stub at 0x40f1a0."""
+    caller = _FakeFunction(0x500000, "caller")
+    caller.basic_blocks = [_FakeBasicBlock(0x500010, 0x500014)]
+    caller.arch = _FakeArch(lengths={0x500010: 4})
+    call = _FakeLLILInstruction(0x500010, _FakeConstPtr(0x40f1a0), operation="LLIL_CALL")
+    caller.low_level_il = [[call]]
+    return caller
+
+
+def test_callsites_within_function_matches_stub_target(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    caller = _callsites_caller_with_stub_call()
+    impl = _FakeFunction(0x5c40, "get_param"); impl.symbol = _FakeSymbol("FunctionSymbol")
+    stub = _FakeFunction(0x40f1a0, "get_param"); stub.symbol = _FakeSymbol("ImportedFunctionSymbol")
+    bv = _FakeBV(
+        functions=[caller, impl, stub],
+        disassembly={0x500010: "bl 0x40f1a0"},
+        code_refs={0x5c40: [], 0x40f1a0: [_FakeCodeRef(0x500010, caller)]},
+    )
+    rows = bridge.read_listing._callsites_within_function(
+        None, bv, impl, caller, context=1, stub_addrs={0x40f1a0})
+    assert [r["call_addr"] for r in rows] == ["0x500010"]
+
+
+def test_callsites_within_function_misses_stub_without_union(monkeypatch):
+    # Baseline (the #286 bug): with no stub addresses, a call that targets the
+    # stub is not matched against the body -> no callsites found.
+    bridge = _load_bridge(monkeypatch)
+    caller = _callsites_caller_with_stub_call()
+    impl = _FakeFunction(0x5c40, "get_param"); impl.symbol = _FakeSymbol("FunctionSymbol")
+    bv = _FakeBV(
+        functions=[caller, impl],
+        disassembly={0x500010: "bl 0x40f1a0"},
+        code_refs={0x5c40: []},
+    )
+    rows = bridge.read_listing._callsites_within_function(None, bv, impl, caller, context=1)
+    assert rows == []
+
+
+def _stub_call_fn(start, name, call_addr, target):
+    fn = _FakeFunction(start, name)
+    fn.basic_blocks = [_FakeBasicBlock(call_addr, call_addr + 4)]
+    fn.arch = _FakeArch(lengths={call_addr: 4})
+    fn.low_level_il = [[_FakeLLILInstruction(call_addr, _FakeConstPtr(target), operation="LLIL_CALL")]]
+    return fn
+
+
+def test_callsites_full_path_sees_through_stub_and_no_cross_stub_fp(monkeypatch):
+    # End-to-end through _callsites: the wiring (_same_name_stub_functions ->
+    # stub_addrs) must find a stub-routed call AND must not match a call that
+    # targets a DIFFERENT exported function's stub (the critical no-false-positive
+    # property -- #286 review).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    impl = _FakeFunction(0x5c40, "get_param"); impl.symbol = _FakeSymbol("FunctionSymbol")
+    stub = _FakeFunction(0x40f1a0, "get_param"); stub.symbol = _FakeSymbol("ImportedFunctionSymbol")
+    impl2 = _FakeFunction(0x6c40, "other_fn"); impl2.symbol = _FakeSymbol("FunctionSymbol")
+    stub2 = _FakeFunction(0x40f1f0, "other_fn"); stub2.symbol = _FakeSymbol("ImportedFunctionSymbol")
+    caller = _stub_call_fn(0x500000, "caller", 0x500010, 0x40f1a0)    # calls get_param's stub
+    caller2 = _stub_call_fn(0x600000, "caller2", 0x600010, 0x40f1f0)  # calls other_fn's stub
+    bv = _FakeBV(
+        functions=[impl, stub, impl2, stub2, caller, caller2],
+        disassembly={0x500010: "bl 0x40f1a0", 0x600010: "bl 0x40f1f0"},
+        code_refs={0x5c40: [], 0x6c40: [],
+                   0x40f1a0: [_FakeCodeRef(0x500010, caller)],
+                   0x40f1f0: [_FakeCodeRef(0x600010, caller2)]},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    # caller calls get_param (via its stub) -> found
+    hit = instance._callsites(None, "get_param", within_identifiers=["caller"])
+    assert [r["call_addr"] for r in hit["items"]] == ["0x500010"]
+    # caller2 calls a DIFFERENT function's stub -> no match for get_param
+    miss = instance._callsites(None, "get_param", within_identifiers=["caller2"])
+    assert miss["items"] == []
