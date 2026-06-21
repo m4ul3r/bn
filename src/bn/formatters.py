@@ -473,6 +473,9 @@ def _render_session_list_text(value: Any) -> str:
         lines.append("  ".join(parts))
         if item.get("socket_path"):
             lines.append(f"  socket: {item['socket_path']}")
+        binaries = item.get("binaries")
+        if binaries:
+            lines.append(f"  open: {', '.join(str(b) for b in binaries)}")
     total_rss = value.get("total_rss_mb")
     if total_rss is not None and instances:
         lines.append("")

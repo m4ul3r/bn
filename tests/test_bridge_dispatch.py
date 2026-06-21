@@ -529,56 +529,76 @@ def test_resolve_accepts_path_suffix_selector(monkeypatch):
     bridge._headless_views.clear()
 
 
-def test_close_binary_by_target_selector_does_not_deadlock(monkeypatch):
-    # Regression: _close_binary used to resolve() the selector *while holding*
-    # the non-reentrant _headless_views_lock, and resolve() re-acquires it ->
-    # permanent deadlock. Run it on a watchdog thread so a regression fails the
-    # test instead of hanging the suite.
+def _close_on_watchdog(instance, *, timeout: float = 5.0, **kwargs):
+    """Run _close_binary on a watchdog thread so a deadlock regression (e.g. a
+    _write_registry()/resolve() call re-acquiring the non-reentrant
+    _headless_views_lock) fails the test instead of hanging the suite."""
     import threading
-
-    bridge = _load_bridge(monkeypatch)
-    instance = bridge.BinaryNinjaBridge()
-    bv_a = _ClosableBV("/proj/alpha.so", session_id="11")
-    bv_b = _ClosableBV("/proj/beta.so", session_id="22")
-    _register_views(bridge, bv_a, bv_b)
 
     out: dict = {}
 
     def go():
-        out["result"] = instance._close_binary(target="alpha.so")
+        out["result"] = instance._close_binary(**kwargs)
 
     t = threading.Thread(target=go, daemon=True)
     t.start()
-    t.join(timeout=5)
+    t.join(timeout=timeout)
+    assert not t.is_alive(), f"_close_binary({kwargs}) deadlocked (lock re-acquired under views lock?)"
+    return out["result"]
 
-    assert not t.is_alive(), "close by target deadlocked (resolve under views lock)"
+
+def _hermetic_registry(instance, tmp_path):
+    """Point an instance's registry/socket at a tmp dir so _write_registry (now
+    called on load/close, #80) never scribbles the real ~/.cache/bn registry."""
+    instance.registry_path = tmp_path / "reg.json"
+    instance.socket_path = tmp_path / "reg.sock"
+
+
+def test_close_binary_by_target_selector_does_not_deadlock(monkeypatch, tmp_path):
+    # Regression: _close_binary used to resolve() the selector *while holding*
+    # the non-reentrant _headless_views_lock, and resolve() re-acquires it ->
+    # permanent deadlock. Run it on a watchdog thread so a regression fails the
+    # test instead of hanging the suite.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    bv_a = _ClosableBV("/proj/alpha.so", session_id="11")
+    bv_b = _ClosableBV("/proj/beta.so", session_id="22")
+    _register_views(bridge, bv_a, bv_b)
+
+    _close_on_watchdog(instance, target="alpha.so")
+
     assert bv_a.closed and not bv_b.closed
     assert bv_a not in bridge._headless_views and bv_b in bridge._headless_views
     bridge._headless_views.clear()
 
 
-def test_close_binary_all_flag_closes_everything(monkeypatch):
+def test_close_binary_all_flag_closes_everything(monkeypatch, tmp_path):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
     bv_a = _ClosableBV("/proj/alpha.so")
     bv_b = _ClosableBV("/proj/beta.so")
     _register_views(bridge, bv_a, bv_b)
 
-    result = instance._close_binary(all_=True)
+    # Watchdog: the post-#80 close path writes the registry; a regression that did
+    # so under _headless_views_lock would deadlock the all-branch.
+    result = _close_on_watchdog(instance, all_=True)
 
     assert len(result["closed"]) == 2
     assert bv_a.closed and bv_b.closed
     assert bridge._headless_views == []
 
 
-def test_close_binary_by_path_still_matches(monkeypatch):
+def test_close_binary_by_path_still_matches(monkeypatch, tmp_path):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
     bv_a = _ClosableBV("/proj/alpha.so")
     bv_b = _ClosableBV("/proj/beta.so")
     _register_views(bridge, bv_a, bv_b)
 
-    result = instance._close_binary(path="/proj/beta.so")
+    result = _close_on_watchdog(instance, path="/proj/beta.so")
 
     assert [c["path"] for c in result["closed"]] == ["/proj/beta.so"]
     assert bv_b.closed and not bv_a.closed
@@ -1367,3 +1387,37 @@ def test_save_default_restore_failure_reports_degraded(monkeypatch, tmp_path):
 
     assert result["saved"] is True
     assert result.get("rehomed") is True
+
+
+def test_write_registry_records_open_binaries(monkeypatch, tmp_path):
+    # #80: the registry carries the instance's open binaries (sorted, deduped,
+    # blanks dropped) so listing them needs no target-list round-trip.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    instance.registry_path = tmp_path / "inst.json"
+    instance.socket_path = tmp_path / "inst.sock"
+    instance.instance_id = "abc123"
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [
+        {"filename": "/fw/lib64/libfoo.so"},
+        {"filename": "/fw/bin/daemon"},
+        {"filename": "/fw/lib64/libfoo.so"},   # dup
+        {"filename": ""},                        # blank -> dropped
+    ])
+    instance._write_registry()
+    payload = json.loads((tmp_path / "inst.json").read_text())
+    assert payload["binaries"] == ["/fw/bin/daemon", "/fw/lib64/libfoo.so"]
+
+
+def test_write_registry_binaries_best_effort_on_refresh_error(monkeypatch, tmp_path):
+    # A registry write must never fail because target enumeration raised.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    instance.registry_path = tmp_path / "inst.json"
+    instance.socket_path = tmp_path / "inst.sock"
+    instance.instance_id = "abc123"
+    def boom():
+        raise RuntimeError("enumeration failed")
+    monkeypatch.setattr(instance.targets, "refresh", boom)
+    instance._write_registry()   # must not raise
+    payload = json.loads((tmp_path / "inst.json").read_text())
+    assert payload["binaries"] == []   # degrades to empty, registry still written
