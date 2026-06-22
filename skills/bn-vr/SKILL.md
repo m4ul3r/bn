@@ -21,6 +21,8 @@ Start by mapping what the binary does and where untrusted data enters:
    ```bash
    bn imports
    ```
+   > **Shortcut:** `bash scripts/sink-sweep.sh -t <target>` (in this skill) enumerates the **copy / format-string / exec / input** sinks below **and** runs `bn xrefs` on each, printing every call site to trace back to a source — the sink-enumeration step that's easy to skip. Forward the usual `-i`/`-t` selectors. (It skips the malloc family by design — heap bugs aren't found by xref'ing the allocator. Falls back cleanly: prints "no dangerous-sink imports" on a static/stripped target — then use the lane below.)
+
    Flag these categories:
    - **Unbounded copies**: `strcpy`, `strcat`, `sprintf`, `gets`, `scanf` (no length limit)
    - **Bounded but misusable**: `strncpy`, `snprintf`, `memcpy`, `memmove` (length may be attacker-controlled)

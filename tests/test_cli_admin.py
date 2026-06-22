@@ -79,6 +79,11 @@ def test_skill_install_copy_mode(tmp_path):
     assert (destination / "bn" / "agents" / "openai.yaml").exists()
     assert (destination / "bn-re" / "SKILL.md").exists()
     assert (destination / "bn-vr" / "SKILL.md").exists()
+    # #169 Layer 3: a methodology script is installed AND made executable in copy
+    # mode (copy loses the source bit; symlink mode follows it).
+    sink_sweep = destination / "bn-vr" / "scripts" / "sink-sweep.sh"
+    assert sink_sweep.exists()
+    assert sink_sweep.stat().st_mode & 0o111, "copy-installed script must be executable"
 
 
 def test_skill_install_defaults_to_claude_only_without_codex_home(tmp_path, monkeypatch):
@@ -1242,3 +1247,24 @@ def test_instance_find_across_multiple_instances_and_old_bridge(monkeypatch, cap
     data = json.loads(capsys.readouterr().out)
     assert {i["instance_id"] for i in data["items"]} == {"inst_a", "inst_b"}
     assert data["count"] == 2
+
+
+def test_ensure_scripts_executable_sets_bit_directly(tmp_path):
+    # #169 L3 (review): prove the helper's own job -- copytree preserves the
+    # committed +x bit, so test_skill_install_copy_mode would pass even without the
+    # helper. This drives it directly on a non-exec script.
+    from bn.commands import admin
+    dest = tmp_path / "skill"
+    scripts = dest / "scripts"
+    scripts.mkdir(parents=True)
+    s = scripts / "foo.sh"
+    s.write_text("#!/usr/bin/env bash\necho hi\n")
+    s.chmod(0o644)
+    assert not (s.stat().st_mode & 0o111)
+    admin._ensure_scripts_executable(dest)
+    assert s.stat().st_mode & 0o111                    # helper added the bit
+    # no-ops: a non-.sh file is untouched, a missing scripts/ dir doesn't crash
+    (scripts / "data.txt").write_text("x"); (scripts / "data.txt").chmod(0o644)
+    admin._ensure_scripts_executable(dest)
+    assert not ((scripts / "data.txt").stat().st_mode & 0o111)
+    admin._ensure_scripts_executable(tmp_path / "absent")   # no scripts/ -> no-op
