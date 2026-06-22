@@ -16,6 +16,7 @@ from ..formatters import (
     _render_function_list_text,
     _render_name_address_list_text,
     _render_message_lens_text,
+    _render_orient_text,
     _render_pointer_table_text,
     _render_structured_il_text,
     _render_trace_text,
@@ -594,6 +595,28 @@ def _evidence_message(args: argparse.Namespace) -> int:
         require_target=True,
         text_renderer=_render_message_lens_text,
         stem="message-lens",
+    )
+
+
+@command("evidence", "orient",
+         help="One-shot orientation digest: target+analysis state, imports summary, a strings "
+              "sample, function count, and sections — an internally-consistent triage card",
+         target=True,
+         prefer_when="first look at an unknown target — one consistent triage card instead of "
+                     "running target info + imports + strings + function list + sections separately",
+         see_also=("target info", "imports", "sections"),
+         args=[
+             arg("--strings-limit", type=_positive_int, default=20, dest="strings_limit",
+                 help="Max strings in the bounded sample (default: 20)"),
+         ])
+def _evidence_orient(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "orient_digest",
+        {"strings_limit": args.strings_limit},
+        require_target=True,
+        text_renderer=_render_orient_text,
+        stem="orient",
     )
 
 

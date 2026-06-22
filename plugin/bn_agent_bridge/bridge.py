@@ -1615,6 +1615,43 @@ class BinaryNinjaBridge:
         artifact = _write_json_artifact(out_path, bundle)
         return artifact or bundle
 
+    def _orient_digest(self, selector: str | None, *, strings_limit: int = 20):
+        """One internally-consistent orientation/triage digest (#169 Layer 2):
+        target + analysis state, imports summary, a bounded strings sample,
+        function count, and sections -- composed under a single read lock so no
+        writer interleaves between the sub-reads (the guarantee a shell loop of
+        the same commands can't give). Surfaces ``analyzed`` up front and degrades
+        the strings sample honestly on a --quick view rather than erroring the
+        whole digest."""
+        target = self._target_info(selector)
+        analyzed = bool(target.get("analyzed", True))
+        imports_summary = read_misc._imports(self.ctx, selector, summary=True)
+        if analyzed:
+            try:
+                strings_sample = read_misc._strings(
+                    self.ctx, selector, query=None, offset=0,
+                    limit=strings_limit, min_length=6,
+                )
+            except RuntimeError as exc:
+                strings_sample = {"unavailable": str(exc)}
+        else:
+            strings_sample = {
+                "unavailable": "target loaded with --quick (no analysis); run "
+                               "`bn refresh` for strings"
+            }
+        func_count = read_listing._list_functions(self.ctx, selector, count_only=True)
+        sections = read_misc._sections(self.ctx, selector)
+        return {
+            "kind": "orient_digest",
+            "target": target,
+            "analyzed": analyzed,
+            "analysis_state": target.get("analysis_state"),
+            "imports_summary": imports_summary,
+            "strings_sample": strings_sample,
+            "function_count": func_count.get("total", func_count.get("count")),
+            "sections": sections,
+        }
+
     def _normalize_py_result(self, *a, **k):
         return create_comments._normalize_py_result(self.ctx, *a, **k)
 
@@ -2167,6 +2204,14 @@ def _bind_function_create(bridge, params, target):
 @op("bundle_function", lock="read")
 def _bind_bundle_function(bridge, params, target):
     return bridge._bundle_function(target, params["identifier"], params.get("out_path"))
+
+
+@op("orient_digest", lock="read")
+def _bind_orient_digest(bridge, params, target):
+    return bridge._orient_digest(
+        target,
+        strings_limit=int(params["strings_limit"]) if params.get("strings_limit") is not None else 20,
+    )
 
 
 @op("py_exec", lock="write")

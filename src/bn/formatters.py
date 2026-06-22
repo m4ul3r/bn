@@ -1248,6 +1248,46 @@ def _render_message_lens_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+def _render_orient_text(value: Any) -> str:
+    """Render the orientation digest (#169 L2) as a compact triage card: analysis
+    state up front (so an empty strings/function set from a --quick view isn't
+    trusted), then function count, imports summary, sections, and the bounded
+    strings sample."""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    target = value.get("target") or {}
+    name = target.get("basename") or target.get("filename") or target.get("name") or "<target>"
+    state = value.get("analysis_state") or ("full" if value.get("analyzed") else "?")
+    lines = [f"orientation: {name}  [analysis: {state}]"]
+    if not value.get("analyzed", True):
+        lines.append("  ! loaded with --quick — run `bn refresh` before trusting strings/functions")
+    fc = value.get("function_count")
+    if fc is not None:
+        lines.append(f"  functions: {fc}")
+    imp = value.get("imports_summary") or {}
+    if isinstance(imp, dict):
+        total = imp.get("total_symbols", imp.get("total"))
+        by_kind = imp.get("by_kind") or {}
+        kinds = ", ".join(f"{k}={v}" for k, v in list(by_kind.items())[:6])
+        lines.append(f"  imports: {total if total is not None else '?'}" + (f" ({kinds})" if kinds else ""))
+    secs = value.get("sections") or {}
+    sec_items = secs.get("items") if isinstance(secs, dict) else None
+    if isinstance(sec_items, list):
+        names = " ".join(str(s.get("name", "?")) for s in sec_items[:12] if isinstance(s, dict))
+        lines.append(f"  sections: {secs.get('total', len(sec_items))}  {names}")
+    ss = value.get("strings_sample") or {}
+    if isinstance(ss, dict) and ss.get("unavailable"):
+        lines.append(f"  strings: unavailable — {ss['unavailable']}")
+    elif isinstance(ss, dict):
+        items = ss.get("items") or []
+        lines.append(f"  strings (sample {len(items)} of {ss.get('total', len(items))}):")
+        for s in items[:15]:
+            if isinstance(s, dict):
+                # `or ''` (not just the .get default) guards an explicit value:None.
+                lines.append(f"    {s.get('address', '?')}  {(s.get('value') or '')[:80]!r}")
+    return "\n".join(lines)
+
+
 def _render_init_arrays_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)

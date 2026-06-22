@@ -1131,3 +1131,60 @@ def test_message_lens_fragment_hint_only_on_qualified_match(monkeypatch):
     assert not any(frag_hint in h for h in r2["hints"])      # qualified but 0 matches
     r3 = instance._message_lens("active", "JsonCodec", limit=5, table_entries=0)
     assert not any(frag_hint in h for h in r3["hints"])      # bare leaf (plain needle matched)
+
+
+def test_orient_digest_composes_subreads_and_handles_quick(monkeypatch):
+    # #169 L2: the orient digest assembles target + imports + strings + function
+    # count + sections, and degrades the strings sample honestly on a --quick view
+    # instead of erroring the whole digest.
+    bridge = _load_bridge(monkeypatch)
+    inst = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(inst, "_target_info",
+                        lambda sel: {"basename": "x", "analyzed": True, "analysis_state": "full"})
+    monkeypatch.setattr(bridge.read_misc, "_imports",
+                        lambda ctx, sel, **k: {"kind": "imports_summary", "total_symbols": 3,
+                                               "by_kind": {"function": 3}})
+    monkeypatch.setattr(bridge.read_misc, "_strings",
+                        lambda ctx, sel, **k: {"kind": "strings",
+                                               "items": [{"address": "0x1", "value": "hi"}], "total": 1})
+    monkeypatch.setattr(bridge.read_misc, "_sections",
+                        lambda ctx, sel, **k: {"items": [{"name": ".text"}], "total": 1})
+    monkeypatch.setattr(bridge.read_listing, "_list_functions",
+                        lambda ctx, sel, **k: {"total": 42})
+
+    d = inst._orient_digest(None)
+    assert d["kind"] == "orient_digest"
+    assert d["function_count"] == 42
+    assert d["imports_summary"]["total_symbols"] == 3
+    assert d["strings_sample"]["items"][0]["value"] == "hi"
+
+    # --quick: no strings call, honest unavailable marker
+    monkeypatch.setattr(inst, "_target_info",
+                        lambda sel: {"basename": "x", "analyzed": False, "analysis_state": "quick"})
+    d2 = inst._orient_digest(None)
+    assert "unavailable" in d2["strings_sample"]
+
+    # analyzed but strings refuses (RuntimeError) -> caught, not propagated
+    monkeypatch.setattr(inst, "_target_info",
+                        lambda sel: {"basename": "x", "analyzed": True, "analysis_state": "full"})
+    def _raise(ctx, sel, **k):
+        raise RuntimeError("strings not available")
+    monkeypatch.setattr(bridge.read_misc, "_strings", _raise)
+    d3 = inst._orient_digest(None)
+    assert "unavailable" in d3["strings_sample"]
+
+
+def test_render_orient_text_card(monkeypatch):
+    from bn.formatters import _render_orient_text
+    d = {"kind": "orient_digest", "target": {"basename": "foo"}, "analyzed": True,
+         "analysis_state": "full", "function_count": 42,
+         "imports_summary": {"total_symbols": 3, "by_kind": {"function": 3}},
+         "sections": {"items": [{"name": ".text"}], "total": 1},
+         "strings_sample": {"items": [{"address": "0x1", "value": "hello"}], "total": 1}}
+    out = _render_orient_text(d)
+    assert "foo" in out and "analysis: full" in out and "functions: 42" in out and "hello" in out
+    # --quick view: the warning fires and strings shows unavailable
+    d2 = {**d, "analyzed": False, "analysis_state": "quick",
+          "strings_sample": {"unavailable": "run refresh"}}
+    out2 = _render_orient_text(d2)
+    assert "--quick" in out2 and "unavailable" in out2
