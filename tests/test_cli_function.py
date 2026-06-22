@@ -1524,6 +1524,59 @@ def test_disasm_count_rejects_non_positive(capsys):
     assert exc.value.code == 2
 
 
+# --- #314: disasm --linear (arbitrary mapped address) ---
+
+
+def test_disasm_linear_passes_count_to_bridge_and_renders_note(fake_transport, capsys):
+    calls = fake_transport({"disasm": {"ok": True, "result": {
+        "linear": True, "function": None, "address": "0x402020",
+        "note": "linear disassembly of 2 instructions from 0x402020 (not function-bounded)",
+        "text": "00402020  48 89 e5         mov rbp, rsp\n00402023  c3               ret",
+    }}})
+    rc = bn.cli.main(["disasm", "0x402020", "--target", "active", "--linear", "2"])
+    assert rc == 0
+    # the count reaches the bridge (linear walk happens bridge-side)
+    assert calls[-1]["params"] == {"identifier": "0x402020", "linear": 2}
+    out = capsys.readouterr().out
+    assert "// bn: linear disassembly of 2 instructions" in out
+    assert "mov rbp, rsp" in out and "ret" in out
+
+
+def test_disasm_linear_defaults_count_when_flag_given_alone(fake_transport):
+    calls = fake_transport({"disasm": {"ok": True, "result": {
+        "linear": True, "function": None, "address": "0x402020", "note": "n", "text": "t"}}})
+    rc = bn.cli.main(["disasm", "0x402020", "--target", "active", "--linear"])
+    assert rc == 0
+    assert calls[-1]["params"] == {"identifier": "0x402020", "linear": 32}
+
+
+def test_disasm_linear_works_in_json_format(fake_transport, capsys):
+    # unlike --count/--lines (text-only client slicing), --linear is a bridge mode
+    # and must work in JSON.
+    fake_transport({"disasm": {"ok": True, "result": {
+        "linear": True, "function": None, "address": "0x402020", "note": "n",
+        "text": "t", "instructions": [{"address": "0x402020", "text": "ret"}]}}})
+    rc = bn.cli.main(["disasm", "0x402020", "--target", "active", "--linear", "2", "--format", "json"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    result = payload.get("result", payload)
+    assert result["linear"] is True
+    assert result["instructions"][0]["text"] == "ret"
+
+
+def test_disasm_linear_and_count_mutually_exclusive(capsys):
+    with pytest.raises(SystemExit) as exc:
+        bn.cli.main(["disasm", "0x1000", "--target", "active", "--linear", "4", "--count", "2"])
+    assert exc.value.code == 2
+    assert "not allowed with" in capsys.readouterr().err
+
+
+def test_disasm_linear_rejects_non_positive(capsys):
+    with pytest.raises(SystemExit) as exc:
+        bn.cli.main(["disasm", "0x1000", "--target", "active", "--linear", "0"])
+    assert exc.value.code == 2
+
+
 # --- #291.3: function search auto-retries a metacharacter query as regex ---
 
 

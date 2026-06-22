@@ -179,15 +179,158 @@ def _il(ctx, selector: str | None, identifier, view: str, ssa: bool):
     return result
 
 
-def _disasm(ctx, selector: str | None, identifier):
+def _disasm(ctx, selector: str | None, identifier, linear=None):
     bv = ctx._resolve_view(selector)
-    func = ctx._find_function(bv, identifier, contained=True)
+    if linear is not None:
+        return _disasm_linear(ctx, bv, identifier, int(linear))
+    try:
+        func = ctx._find_function(bv, identifier, contained=True)
+    except Exception as exc:
+        # An address BN never made part of a function is exactly the stripped-lane
+        # case --linear exists for: point there instead of at a dead end (#314).
+        # Fire ONLY for that specific "no function here" dead end at an address
+        # (hex or decimal) -- not for an ambiguous overlap, a bad selector, or a
+        # name-not-found, where the --linear hint would mislead. A fresh
+        # RuntimeError (not type(exc)(...)) avoids assuming the original
+        # exception's constructor takes a single string.
+        looks_like_address = True
+        try:
+            _parse_address(identifier)
+        except ValueError:
+            looks_like_address = False
+        if looks_like_address and "No function found" in str(exc):
+            raise RuntimeError(
+                f"{exc}. To inspect the raw bytes there regardless of function "
+                f"membership, use `disasm {identifier} --linear N`."
+            ) from exc
+        raise
     result = {
         "function": {"name": func.name, "address": hex(func.start)},
         "text": il_format._disasm_text(bv, func),
     }
     _annotate_containment(ctx, result, identifier, func)
     return result
+
+
+# Hard ceiling on a single linear-disassembly request so a pathological count
+# can't walk the whole address space; the output spill already handles large
+# (but bounded) dumps.
+_LINEAR_DISASM_MAX = 100_000
+
+
+def _resolve_linear_address(ctx, bv, identifier) -> int:
+    """Resolve a linear-disasm target to a concrete address: a literal address as
+    given, else a function/symbol NAME to its start. Raises a clear error when it
+    resolves to nothing."""
+    try:
+        return _parse_address(identifier)
+    except ValueError:
+        pass
+    try:
+        func = ctx._find_function(bv, identifier)
+        if func is not None:
+            return int(func.start)
+    except Exception:
+        pass
+    try:
+        symbol = bv.get_symbol_by_raw_name(str(identifier))
+    except Exception:
+        symbol = None
+    if symbol is not None:
+        return int(symbol.address)
+    raise ValueError(
+        f"could not resolve {identifier!r} to an address; pass a 0x-prefixed "
+        f"address or a known function/symbol name for --linear disassembly"
+    )
+
+
+def _disasm_linear(ctx, bv, identifier, count: int) -> dict[str, Any]:
+    """Linear disassembly of *count* instructions from an arbitrary MAPPED address,
+    independent of function membership (#314). The stripped/static lane needs to
+    read the bytes at a suspected missed handler -- a dispatch/vtable slot BN left
+    as data -- before deciding whether to `function create` it; the
+    function-scoped path refuses such addresses outright."""
+    address = _resolve_linear_address(ctx, bv, identifier)
+    if count <= 0:
+        raise ValueError("--linear count must be a positive number of instructions")
+    requested_count = int(count)
+    count = min(requested_count, _LINEAR_DISASM_MAX)
+    if not _address_is_mapped(bv, address):
+        raise ValueError(
+            f"address {hex(address)} is not mapped in this binary; nothing to "
+            f"disassemble there"
+        )
+    arch = getattr(bv, "arch", None)
+    entries: list[dict[str, Any]] = []
+    lines: list[str] = []
+    addr = int(address)
+    for _ in range(count):
+        if not _address_is_mapped(bv, addr):
+            break
+        length = max(1, il_format._instruction_length(bv, addr, arch=arch))
+        entry = il_format._disasm_entry(bv, addr, arch=arch)
+        text = entry.get("text") or ""
+        if not text:
+            # Mapped, but no valid instruction decodes here (data / an invalid
+            # opcode -- the very thing you point --linear at to confirm). Surface
+            # the raw byte and advance one byte so the window keeps moving and
+            # the caller sees these bytes aren't code, instead of silently
+            # stopping at zero instructions.
+            one = bv.read(addr, 1)
+            if not one:
+                break
+            text = f".byte 0x{one.hex()}"
+            length = 1
+        raw = bv.read(addr, length)
+        hex_bytes = raw.hex(" ") if raw else ""
+        entries.append({
+            "address": hex(addr),
+            "bytes": hex_bytes,
+            "length": int(length),
+            "text": text,
+        })
+        lines.append(f"{addr:08x}  {hex_bytes:<16} {text}")
+        addr += length
+    in_function = None
+    try:
+        containers = ctx._functions_containing(bv, int(address))
+        if containers:
+            fn = containers[0]
+            in_function = {"name": fn.name, "address": hex(int(fn.start))}
+    except Exception:
+        in_function = None
+    note = (
+        f"linear disassembly of {len(entries)} instruction"
+        f"{'' if len(entries) == 1 else 's'} from {hex(address)} "
+        f"(not function-bounded)"
+    )
+    if in_function is not None:
+        note += f"; this address is inside {in_function['name']} @ {in_function['address']}"
+    if requested_count > _LINEAR_DISASM_MAX:
+        note += f"; capped at {_LINEAR_DISASM_MAX} (requested {requested_count})"
+    return {
+        "linear": True,
+        "function": in_function,
+        "address": hex(address),
+        "requested_count": requested_count,
+        "capped": requested_count > _LINEAR_DISASM_MAX,
+        "instruction_count": len(entries),
+        "instructions": entries,
+        "text": "\n".join(lines),
+        "note": note,
+    }
+
+
+def _address_is_mapped(bv, address: int) -> bool:
+    try:
+        if hasattr(bv, "is_valid_offset"):
+            return bool(bv.is_valid_offset(int(address)))
+    except Exception:
+        pass
+    try:
+        return bool(bv.read(int(address), 1))
+    except Exception:
+        return False
 
 
 def _structured_il(ctx, selector, identifier, *, view: str = "mlil", ssa: bool = True):

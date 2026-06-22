@@ -116,6 +116,19 @@ def _resolution_note(value: Any) -> str:
     )
 
 
+def _render_disasm_linear_text(value: Any) -> str:
+    """Render a linear (non-function-bounded) disassembly: a leading `// bn:` note
+    so it's clearly NOT a function listing, then the address/bytes/mnemonic lines
+    (#314)."""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    note = value.get("note")
+    body = _text_field("text")(value)
+    if note:
+        return f"// bn: {note}\n{body}" if body else f"// bn: {note}"
+    return body
+
+
 def _render_capabilities_text(value: Any) -> str:
     """Render the #276 capability index as a grouped, scannable catalog: each
     top-level group, its commands with one-line help, and the prefer-when /

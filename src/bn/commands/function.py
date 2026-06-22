@@ -7,6 +7,7 @@ from typing import Any
 from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _positive_depth_int, _positive_int, arg, command, mutex, preview_arg
 from ..formatters import (
     _render_callsites_text,
+    _render_disasm_linear_text,
     _render_evidence_xrefs_text,
     _render_field_xrefs_text,
     _render_function_evidence_text,
@@ -302,9 +303,29 @@ def _function_structured_il(args: argparse.Namespace) -> int:
                    arg("--lines", type=_parse_line_range, default=None, metavar="START:END",
                        help="Show only lines START through END (1-indexed, inclusive)"),
                    arg("--count", type=_positive_int, default=None, metavar="N",
-                       help="Show only the first N instructions (one instruction per line)")),
+                       help="Show only the first N instructions (one instruction per line)"),
+                   # --linear is a different MODE, not a slice of a function: it
+                   # linearly disassembles N instructions from any mapped address,
+                   # even one BN left as data (a missed handler / vtable slot), so
+                   # you can inspect the bytes before `function create` (#314).
+                   arg("--linear", nargs="?", const=32, type=_positive_int, default=None, metavar="N",
+                       help="Linear-disassemble N instructions (default 32) from any mapped "
+                            "address, independent of function membership")),
          ])
 def _disasm(args: argparse.Namespace) -> int:
+    linear = getattr(args, "linear", None)
+    if linear is not None:
+        # Linear mode: the bridge walks N instructions from the address and
+        # returns exactly that window, so there is no client-side slice and no
+        # text-only restriction -- it works in JSON too.
+        return _call(
+            args,
+            "disasm",
+            {"identifier": args.identifier, "linear": int(linear)},
+            require_target=True,
+            text_renderer=_render_disasm_linear_text,
+            stem="disasm",
+        )
     count = getattr(args, "count", None)
     lines_range = getattr(args, "lines", None)
     if count is not None:

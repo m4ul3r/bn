@@ -339,3 +339,67 @@ class TestTaintIndirectValueSetAnchor:
             assert any(c in ("overflow_len", "fortified_overflow") for c in classes), result
         finally:
             _session_stop(inst_id)
+
+
+class TestDisasmLinear:
+    """Regression for #314: `disasm` must be able to linearly disassemble an
+    arbitrary MAPPED address (a missed handler / vtable slot BN left as data),
+    not only addresses already inside a function. Drives real BN.
+    """
+
+    @staticmethod
+    def _unwrap(payload):
+        # The CLI prints the bare result; collection reads put the envelope
+        # (items/kind/...) at top level. Tolerate a {result: ...} wrapper too.
+        return payload.get("result", payload) if isinstance(payload, dict) else payload
+
+    @classmethod
+    def _items(cls, payload):
+        d = cls._unwrap(payload)
+        return d.get("items", []) if isinstance(d, dict) else (d or [])
+
+    def _a_data_address(self, inst_id) -> str:
+        """The start of a non-executable data section -- a mapped address BN did
+        not make part of a function."""
+        res = _bn("--instance", inst_id, "sections", "--format", "json")
+        assert res.returncode == 0, res.stderr
+        for sec in self._items(json.loads(res.stdout)):
+            if not sec.get("executable") and sec.get("start"):
+                return sec["start"]
+        raise AssertionError("no non-executable section found")
+
+    def test_linear_disasm_at_non_function_address(self):
+        info = _session_start(str(HELLO_BINARY))
+        inst_id = info["instance_id"]
+        try:
+            addr = self._a_data_address(inst_id)
+            # plain disasm refuses it, but points at --linear
+            plain = _bn("--instance", inst_id, "disasm", addr)
+            assert plain.returncode != 0, plain.stdout
+            assert "--linear" in (plain.stdout + plain.stderr)
+            # --linear disassembles N instructions there
+            res = _bn("--instance", inst_id, "disasm", addr, "--linear", "4", "--format", "json")
+            assert res.returncode == 0, f"{res.stdout}\n{res.stderr}"
+            result = self._unwrap(json.loads(res.stdout))
+            assert result.get("linear") is True, result
+            assert result.get("function") is None, result
+            assert 1 <= result.get("instruction_count", 0) <= 4, result
+            assert result["instructions"], result
+            assert result["instructions"][0]["address"].lower().startswith("0x")
+        finally:
+            _session_stop(inst_id)
+
+    def test_linear_disasm_from_function_name(self):
+        # --linear also accepts a function name, anchoring at its start.
+        info = _session_start(str(HELLO_BINARY))
+        inst_id = info["instance_id"]
+        try:
+            listing = _bn("--instance", inst_id, "function", "list", "--format", "json")
+            name = self._items(json.loads(listing.stdout))[0]["name"]
+            res = _bn("--instance", inst_id, "disasm", name, "--linear", "3", "--format", "json")
+            assert res.returncode == 0, f"{res.stdout}\n{res.stderr}"
+            result = self._unwrap(json.loads(res.stdout))
+            assert result.get("linear") is True
+            assert result.get("instruction_count", 0) >= 1
+        finally:
+            _session_stop(inst_id)
