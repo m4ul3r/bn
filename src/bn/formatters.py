@@ -693,6 +693,29 @@ def _render_name_address_list_text(value: Any) -> str:
     return body
 
 
+def _render_go_functions_text(value: Any) -> str:
+    """Render the Go pcln function lens (#217): a header with the detected Go
+    version + how many recovered addresses already map to a BN function, the
+    optional PIE-rebase note, then the name/address rows + paging footer."""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    head = "go functions"
+    if value.get("go_version"):
+        head += f" ({value['go_version']})"
+    parts = []
+    if isinstance(value.get("total"), int):
+        parts.append(f"{value['total']} recovered")
+    if isinstance(value.get("defined_count"), int):
+        parts.append(f"{value['defined_count']} mapped to a BN function")
+    if parts:
+        head += ": " + ", ".join(parts)
+    lines = [head]
+    if value.get("note"):
+        lines.append(f"note: {value['note']}")
+    lines.append(_render_paged_list_text(value, "items", _render_name_address_rows))
+    return "\n".join(lines)
+
+
 def _paging_footer(value: dict[str, Any], items: list[Any]) -> str | None:
     """Build the "// showing N of TOTAL" footer for a paged-list envelope.
 

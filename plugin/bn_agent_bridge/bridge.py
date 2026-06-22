@@ -25,6 +25,7 @@ from . import mutation_engine
 from . import read_decompile
 from . import read_class
 from . import read_evidence
+from . import read_go
 from . import read_listing
 from . import read_misc
 from . import read_taint_slice
@@ -1563,6 +1564,9 @@ class BinaryNinjaBridge:
     def _sections(self, *a, **k):
         return read_misc._sections(self.ctx, *a, **k)
 
+    def _go_functions(self, *a, **k):
+        return read_go._go_functions(self.ctx, *a, **k)
+
     def _ascii_render(self, *a, **k):
         return read_misc._ascii_render(*a, **k)
 
@@ -2138,6 +2142,15 @@ def _bind_sections(bridge, params, target):
         offset=int(params.get("offset", 0)),
         limit=int(params["limit"]) if params.get("limit") is not None else None,
         count_only=_validate_bool(params.get("count_only"), label="count_only", default=False),
+    )
+
+
+@op("go_functions", lock="read")
+def _bind_go_functions(bridge, params, target):
+    return bridge._go_functions(
+        target,
+        offset=int(params.get("offset", 0)),
+        limit=int(params["limit"]) if params.get("limit") is not None else None,
     )
 
 

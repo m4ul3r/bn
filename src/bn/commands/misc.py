@@ -8,6 +8,7 @@ from typing import Any
 
 from ..cli import _call, _effective_limit, _int_or_hex, _mutate, _non_negative_int, _pick, arg, command, mutex, preview_arg
 from ..formatters import (
+    _render_go_functions_text,
     _render_imports_summary_text,
     _render_name_address_list_text,
     _render_py_exec_text,
@@ -182,6 +183,25 @@ def _sections(args: argparse.Namespace) -> int:
         page_label="sections",
         paged_spill=True,
         stem="sections",
+    )
+
+
+@command("go", "functions",
+         help="Recover Go function names from .gopclntab (Go 1.18/1.20+) — names the wall of sub_*",
+         target=True, paged=True,
+         prefer_when="a Go-compiled binary loads as a wall of sub_* (.gopclntab present); recover "
+                     "the real pkg.Func names BN's default analysis doesn't consume",
+         see_also=("function list", "sections"))
+def _go_functions(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "go_functions",
+        {"offset": args.offset, "limit": _effective_limit(args)},
+        require_target=True,
+        text_renderer=_render_go_functions_text,
+        page_label="go_functions",
+        paged_spill=True,
+        stem="go-functions",
     )
 
 
