@@ -12,6 +12,7 @@ bn function info <fn> [--verbose]
 bn decompile <fn> [--addresses] [--lines 40:80] [--force-analysis]
 bn il <fn> [--view {hlil|mlil|llil}] [--ssa]
 bn disasm <fn> [--lines 40:80 | --count 20]
+bn disasm <addr> --linear [N]                        # linear disasm of N (default 32) insns from ANY mapped address, even one BN left as data
 bn xrefs <fn-or-addr> [--limit 20]
 bn xrefs --field <Struct.field>
 bn callsites <callee> --within <fn>

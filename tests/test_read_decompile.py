@@ -143,6 +143,118 @@ def test_function_info_includes_metadata(monkeypatch):
     assert result["size"] is None
 
 
+def test_disasm_linear_walks_arbitrary_non_function_address(monkeypatch):
+    # #314: linear disasm reads N instructions from a MAPPED address that BN never
+    # made part of a function (a missed handler / vtable slot left as data), which
+    # the function-scoped path refuses.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        memory={0x1000: b"\x90" * 16},  # mapped, no function here
+        disassembly={0x1000: "nop", 0x1002: "nop", 0x1004: "nop"},
+        instruction_lengths={0x1000: 2, 0x1002: 2, 0x1004: 2},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    res = instance._disasm(None, "0x1000", linear=3)
+    assert res["linear"] is True
+    assert res["function"] is None  # not function-bounded
+    assert res["instruction_count"] == 3
+    assert [e["address"] for e in res["instructions"]] == ["0x1000", "0x1002", "0x1004"]
+    assert all(e["text"] == "nop" for e in res["instructions"])
+    assert "00001000" in res["text"] and "nop" in res["text"]
+    assert "not function-bounded" in res["note"]
+
+
+def test_disasm_linear_stops_at_unmapped_tail(monkeypatch):
+    # The walk stops when it runs off the end of the mapped region instead of
+    # reading garbage / raising.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        memory={0x1000: b"\x90" * 4},  # only two 2-byte instructions fit
+        disassembly={0x1000: "nop", 0x1002: "nop"},
+        instruction_lengths={0x1000: 2, 0x1002: 2},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    res = instance._disasm(None, "0x1000", linear=10)
+    assert res["instruction_count"] == 2  # stopped at the mapped tail
+
+
+def test_disasm_linear_unmapped_start_errors(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(memory={0x1000: b"\x90" * 4})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    with pytest.raises(Exception) as exc:
+        instance._disasm(None, "0x9999", linear=4)
+    assert "not mapped" in str(exc.value)
+
+
+def test_disasm_linear_resolves_function_name(monkeypatch):
+    # --linear accepts a function/symbol name too, anchoring at its start.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x1000, "handler")
+    bv = _FakeBV(
+        functions=[fn],
+        memory={0x1000: b"\x90" * 8},
+        disassembly={0x1000: "nop", 0x1002: "nop"},
+        instruction_lengths={0x1000: 2, 0x1002: 2},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    res = instance._disasm(None, "handler", linear=2)
+    assert res["address"] == "0x1000"
+    assert res["instruction_count"] == 2
+
+
+def test_disasm_linear_byte_fallback_on_undecodable(monkeypatch):
+    # A mapped address with no decodable instruction (data / invalid opcode) must
+    # surface a `.byte 0xNN` and advance one byte, not silently stop -- pointing
+    # --linear at data is a primary use.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    # No disassembly entries -> _disasm_entry returns "" (the fake _FakeArch has
+    # no get_instruction_text), so every byte trips the .byte fallback.
+    bv = _FakeBV(memory={0x1000: b"\xff\xfe\xfd"})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    res = instance._disasm(None, "0x1000", linear=3)
+    assert res["instruction_count"] == 3
+    assert [e["text"] for e in res["instructions"]] == [".byte 0xff", ".byte 0xfe", ".byte 0xfd"]
+    assert [e["length"] for e in res["instructions"]] == [1, 1, 1]
+
+
+def test_disasm_linear_caps_requested_count(monkeypatch):
+    # A request beyond the cap is clamped, but requested_count reports the
+    # ORIGINAL request and the result is flagged capped.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(bridge.read_decompile, "_LINEAR_DISASM_MAX", 2)
+    bv = _FakeBV(
+        memory={0x1000: b"\x90" * 32},
+        disassembly={a: "nop" for a in range(0x1000, 0x1020)},
+        instruction_lengths={a: 1 for a in range(0x1000, 0x1020)},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    res = instance._disasm(None, "0x1000", linear=10)
+    assert res["instruction_count"] == 2          # clamped to the cap
+    assert res["requested_count"] == 10           # original request preserved
+    assert res["capped"] is True
+    assert "capped" in res["note"]
+
+
+def test_disasm_non_function_address_hints_at_linear(monkeypatch):
+    # Without --linear, a bare address not in a function still errors -- but the
+    # disasm-specific message now points at --linear (the generic _find_function
+    # error other commands share is untouched).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(memory={0x1000: b"\x90" * 4})  # mapped but no function
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    with pytest.raises(Exception) as exc:
+        instance._disasm(None, "0x1000")
+    assert "--linear" in str(exc.value)
+
+
 def test_decompile_renders_pseudo_c(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
