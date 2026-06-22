@@ -470,12 +470,63 @@ def _pointer_table_for_view(
     }
 
 
+def _got_alias_target(ctx, bv, start: int, pointer_size: int):
+    """If *start* is a ``.got``/``ImportAddressSymbol`` slot -- a single
+    pointer-TO-a-table (e.g. a cross-module ``_ZTV`` vtable BN aliases into the
+    local GOT) -- return ``(symbol_name, deref_target)``; else None.
+
+    Walking such a slot as a pointer table fabricates the adjacent, UNRELATED GOT
+    entries as bogus vtable slots: only slot[0] is the real pointer (#313). The
+    caller refuses and names the real target so the analyst doesn't chase the
+    fabricated slots."""
+    sym = bv.get_symbol_at(start) if hasattr(bv, "get_symbol_at") else None
+    is_alias = False
+    if sym is not None:
+        iat_type = getattr(bn.SymbolType, "ImportAddressSymbol", None)
+        if iat_type is not None and getattr(sym, "type", None) == iat_type:
+            is_alias = True
+    if not is_alias:
+        # Fallback: a .got/.got.plt slot even where BN didn't tag the symbol
+        # type (some PIE layouts), via the address context's section names.
+        names = _section_names_at(ctx._address_context(bv, start))
+        if any(n.startswith(".got") for n in names):
+            is_alias = True
+    if not is_alias:
+        return None
+    try:
+        deref = ctx._read_pointer_value(bv, start, size=pointer_size)
+    except Exception:
+        deref = None
+    return (str(getattr(sym, "name", "")) if sym is not None else "", deref)
+
+
 def _pointer_table(ctx, selector: str | None, address, *, entries: int = 16, stride=None, width=None):
     if entries < 0:
         raise OperationFailure("invalid_entries", f"Invalid table entry count: {entries}")
     bv = ctx._resolve_view(selector)
     start = _parse_address(address)
     pointer_size = ctx._pointer_size(bv)
+    # A GOT/import-address slot is a pointer TO a table, not a table; walking it
+    # would fabricate adjacent unrelated GOT entries as bogus slots (#313).
+    # Refuse and point at the real table (*slot[0]) instead.
+    alias = _got_alias_target(ctx, bv, start, pointer_size)
+    if alias is not None:
+        sym_name, deref = alias
+        name_part = f" ({sym_name})" if sym_name else ""
+        if deref:
+            target_part = (
+                f". It is a single {pointer_size}-byte pointer whose value is "
+                f"{hex(deref)} (its real target); run `evidence table {hex(deref)}` "
+                f"to walk that."
+            )
+        else:
+            target_part = " and its slot[0] pointer is unreadable."
+        raise OperationFailure(
+            "got_alias",
+            f"{hex(start)} is a GOT/import-address slot{name_part}, not a pointer "
+            f"table: walking it would present adjacent unrelated GOT entries as "
+            f"bogus slots{target_part}",
+        )
     stride_size = _parse_address(stride) if stride not in (None, "") else pointer_size
     if stride_size <= 0:
         raise OperationFailure("invalid_stride", f"Invalid table stride: {stride_size}")

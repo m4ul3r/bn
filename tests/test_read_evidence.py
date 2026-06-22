@@ -1004,3 +1004,59 @@ def test_message_lens_excludes_dynstr_and_resolves_rtti(monkeypatch):
     assert result["hints"]                            # dynstr + rtti hints present
 
 
+
+
+def test_pointer_table_refuses_got_alias_import_address_slot(monkeypatch):
+    # #313: evidence table on a .got/ImportAddressSymbol slot must REFUSE (never
+    # fabricate adjacent unrelated GOT entries as bogus vtable slots) and name the
+    # real table at *slot[0].
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    got_slot = 0x4a000
+    real_vtable = 0x402000
+    sym = fake_bn.Symbol(fake_bn.SymbolType.ImportAddressSymbol, got_slot, "_ZTV3Foo")
+    bv = _FakeBV(symbols=[sym], arch=_FakeArch(name="x86_64", address_size=8),
+                 memory={got_slot: real_vtable.to_bytes(8, "little") + b"\xaa" * 24})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._pointer_table("active", hex(got_slot), entries=8)
+    assert exc.value.status == "got_alias"
+    msg = str(exc.value)
+    assert "GOT" in msg
+    assert hex(real_vtable) in msg          # names the real table (*slot[0])
+    assert "_ZTV3Foo" in msg                # names the alias symbol
+    assert "evidence table" in msg          # actionable next command
+
+
+def test_pointer_table_normal_table_unaffected_by_got_guard(monkeypatch):
+    # The contrast: a normal (non-GOT) pointer table with no ImportAddressSymbol
+    # still walks normally -- the guard only fires on a GOT-alias slot.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    target = _FakeFunction(0x401000, "handler")
+    table = (0x401000).to_bytes(8, "little") + (0x401000).to_bytes(8, "little")
+    bv = _FakeBV(functions=[target], arch=_FakeArch(name="x86_64", address_size=8),
+                 memory={0x3000: table})  # no symbol at 0x3000
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._pointer_table("active", "0x3000", entries=2)
+    assert result["kind"] == "pointer_table" and result["total"] == 2
+
+
+def test_pointer_table_got_alias_unreadable_slot0(monkeypatch):
+    # The slot0-unreadable branch: an IAT slot whose pointer can't be read still
+    # refuses (got_alias) with the "unreadable" wording (#313).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    addr = 0x4b000
+    sym = fake_bn.Symbol(fake_bn.SymbolType.ImportAddressSymbol, addr, "_ZTV3Bar")
+    # memory set elsewhere so read(addr, 8) returns b"" -> _read_pointer_value None
+    bv = _FakeBV(symbols=[sym], arch=_FakeArch(name="x86_64", address_size=8),
+                 memory={0x99999: b"\x00" * 8})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._pointer_table("active", hex(addr), entries=8)
+    assert exc.value.status == "got_alias"
+    assert "unreadable" in str(exc.value)
