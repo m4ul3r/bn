@@ -589,3 +589,80 @@ def test_target_before_three_level_subcommand():
     ns = parser.parse_args(
         ["struct", "-t", "tgt", "field", "set", "MyStruct", "0", "field0", "int32_t"])
     assert ns.target == "tgt"
+
+
+# --- #315: infer --format from the --out extension ---
+
+from pathlib import Path as _Path
+from bn.cli import _resolve_output_format as _rof
+
+
+def _fmt_ns(**kw):
+    base = {"format": "text", "out": None, "_format_explicit": False}
+    base.update(kw)
+    return types.SimpleNamespace(**base)
+
+
+def test_resolve_output_format_infers_json_from_extension(capsys):
+    assert _rof(_fmt_ns(out=_Path("x.json"))) == "json"
+    assert "inferring --format json" in capsys.readouterr().err
+
+
+def test_resolve_output_format_infers_ndjson_from_extension(capsys):
+    assert _rof(_fmt_ns(out=_Path("x.ndjson"))) == "ndjson"
+    assert "inferring --format ndjson" in capsys.readouterr().err
+
+
+def test_resolve_output_format_uppercase_extension(capsys):
+    assert _rof(_fmt_ns(out=_Path("REPORT.JSON"))) == "json"
+
+
+def test_resolve_output_format_no_inference_for_plain_extension(capsys):
+    assert _rof(_fmt_ns(out=_Path("x.txt"))) == "text"
+    assert capsys.readouterr().err == ""
+
+
+def test_resolve_output_format_no_out_is_unchanged(capsys):
+    assert _rof(_fmt_ns(out=None)) == "text"
+    assert capsys.readouterr().err == ""
+
+
+def test_resolve_output_format_explicit_format_wins_with_warning(capsys):
+    # An explicit --format text to a .json file is honored, but warned about.
+    assert _rof(_fmt_ns(out=_Path("x.json"), format="text", _format_explicit=True)) == "text"
+    err = capsys.readouterr().err.lower()
+    assert "warning" in err and ".json" in err
+
+
+def test_resolve_output_format_matching_explicit_json_is_silent(capsys):
+    assert _rof(_fmt_ns(out=_Path("x.json"), format="json", _format_explicit=True)) == "json"
+    assert capsys.readouterr().err == ""
+
+
+def test_out_json_extension_writes_valid_json_end_to_end(fake_transport, tmp_path, capsys):
+    # The real footgun: `--out x.json` without --format json used to write the
+    # human TEXT renderer into the .json file, breaking a downstream json.load.
+    fake_transport({"list_functions": {"ok": True, "result": {
+        "kind": "functions",
+        "items": [{"address": "0x1000", "name": "f", "size": 10}],
+        "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False,
+    }}})
+    out = tmp_path / "fns.json"
+    rc = bn.cli.main(["function", "list", "--target", "active", "--out", str(out)])
+    assert rc == 0
+    data = json.loads(out.read_text())  # must parse as JSON, not text
+    assert data["items"][0]["name"] == "f"
+
+
+def test_out_json_with_explicit_text_writes_text_and_warns(fake_transport, tmp_path, capsys):
+    fake_transport({"list_functions": {"ok": True, "result": {
+        "kind": "functions",
+        "items": [{"address": "0x1000", "name": "f", "size": 10}],
+        "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False,
+    }}})
+    out = tmp_path / "fns.json"
+    rc = bn.cli.main(["function", "list", "--target", "active", "--out", str(out), "--format", "text"])
+    assert rc == 0
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(out.read_text())  # honored explicit text
+    assert "warning" in capsys.readouterr().err.lower()

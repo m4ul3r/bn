@@ -103,6 +103,51 @@ def _requested_output_format(argv: list[str]) -> str | None:
     return fmt if fmt in ("json", "ndjson") else None
 
 
+_OUT_FORMAT_BY_SUFFIX = {".json": "json", ".ndjson": "ndjson"}
+
+
+class _RecordExplicitFormat(argparse.Action):
+    """Set ``--format`` AND record that the user gave it explicitly, so a later
+    ``--out x.json`` only infers a format when none was chosen (#315)."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        setattr(namespace, "_format_explicit", True)
+
+
+def _resolve_output_format(args: argparse.Namespace) -> str:
+    """The effective output format, inferring json/ndjson from an ``--out`` path's
+    extension when the user did not choose a format explicitly (#315).
+
+    ``--out foo.json`` without ``--format json`` previously wrote the human TEXT
+    renderer into a ``.json`` file (reads default to text), so a downstream
+    ``jq``/``json.load`` silently broke. Infer the format from the extension when
+    none was given; when an explicit ``--format`` disagrees with the extension,
+    honor the explicit choice but warn so it is not a silent footgun.
+    """
+    fmt = getattr(args, "format", "text")
+    out = getattr(args, "out", None)
+    if out is None:
+        return fmt
+    inferred = _OUT_FORMAT_BY_SUFFIX.get(Path(str(out)).suffix.lower())
+    if inferred is None or inferred == fmt:
+        return fmt
+    suffix = Path(str(out)).suffix
+    if getattr(args, "_format_explicit", False):
+        print(
+            f"warning: --out {out} ends in {suffix} but --format {fmt} was given; "
+            f"writing {fmt}. Pass --format {inferred} to write {inferred}.",
+            file=sys.stderr,
+        )
+        return fmt
+    print(
+        f"note: inferring --format {inferred} from the {suffix} --out path; "
+        f"pass an explicit --format to override.",
+        file=sys.stderr,
+    )
+    return inferred
+
+
 class BnArgumentParser(argparse.ArgumentParser):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -210,9 +255,14 @@ def _common_io_options(
         "--format",
         choices=("json", "text", "ndjson"),
         default=default_format,
+        action=_RecordExplicitFormat,
         help="Output format",
     )
-    parser.add_argument("--out", type=Path, help="Write output to a file instead of stdout")
+    parser.add_argument(
+        "--out", type=Path,
+        help="Write output to a file instead of stdout (a .json/.ndjson path "
+             "infers --format unless one is given)",
+    )
 
 
 def _instance_option(parser: argparse.ArgumentParser, *, is_root: bool = False) -> None:
@@ -479,7 +529,8 @@ def _emit_result(
     json``, never a raw traceback), then writes via :func:`_render_result`. With no
     *text_renderer* the value renders as-is in every format.
     """
-    if text_renderer is not None and args.format == "text":
+    fmt = _resolve_output_format(args)
+    if text_renderer is not None and fmt == "text":
         try:
             result = text_renderer(result)
         except (AttributeError, TypeError, KeyError, IndexError, ValueError) as exc:
@@ -488,7 +539,7 @@ def _emit_result(
                 f"malformed or newer than this CLI. Rerun with --format json to see the "
                 f"raw result. ({type(exc).__name__}: {exc})"
             ) from exc
-    _render_result(result, fmt=args.format, out_path=args.out, stem=stem)
+    _render_result(result, fmt=fmt, out_path=args.out, stem=stem)
 
 
 # Regex metacharacters that make a literal substring query silently match
@@ -762,7 +813,8 @@ def _call(
     _maybe_regex_hint(args, result, regex_hint_query)
     _maybe_offset_hint(args, result, offset_hint_identifier)
     spill_context = result
-    if text_renderer is not None and args.format == "text":
+    fmt = _resolve_output_format(args)
+    if text_renderer is not None and fmt == "text":
         try:
             result = text_renderer(result)
         except (AttributeError, TypeError, KeyError, IndexError, ValueError) as exc:
@@ -777,7 +829,7 @@ def _call(
             ) from exc
     _render_result(
         result,
-        fmt=args.format,
+        fmt=fmt,
         out_path=None if bridge_writes_output else args.out,
         stem=stem,
         spill_label=page_label or op.replace("_", " "),
