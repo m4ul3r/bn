@@ -835,6 +835,23 @@ class BinaryNinjaBridge:
             raise RuntimeError(f"Failed to open binary: {load_path}")
 
         quick_effective = quick and load_path.suffix != ".bndb"
+        if quick and not quick_effective:
+            # --quick was requested but the loaded artifact is a .bndb, whose
+            # saved analysis is already full -- so --quick can't apply. Say so
+            # instead of silently dropping it (#316). Distinguish a sidecar
+            # substitution (the surprising case: the user named the raw binary)
+            # from a directly-named .bndb.
+            if sibling is not None:
+                notes.append(
+                    f"--quick ignored: opened the analyzed database {load_path.name} "
+                    f"(already fully analyzed) instead of {resolved.name}; pass "
+                    "--no-bndb to load the raw bytes with --quick"
+                )
+            else:
+                notes.append(
+                    f"--quick ignored: {load_path.name} is an analyzed database, not "
+                    "raw bytes; its saved analysis is already loaded"
+                )
         if quick_effective:
             notes.append(
                 "loaded without analysis (--quick): sections/imports/symbols are ready; "

@@ -355,6 +355,61 @@ def test_load_binary_no_sibling(monkeypatch, tmp_path):
     bridge._headless_views.clear()
 
 
+def test_load_binary_quick_with_sibling_bndb_notes_quick_ignored(monkeypatch, tmp_path):
+    # #316: `load <raw> --quick` when an adjacent .bndb is substituted opened the
+    # already-analyzed database and silently dropped --quick. Say so explicitly.
+    bridge, instance, loaded_paths = _setup_load_test(monkeypatch)
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+    bndb = tmp_path / "foo.so.bndb"
+    bndb.write_bytes(b"")
+
+    result = instance._load_binary(str(raw), quick=True)
+
+    assert loaded_paths == [str(bndb)]              # opened the .bndb
+    assert result["analyzed"] is True              # --quick did NOT apply
+    notes = " ".join(result["notes"])
+    assert "--quick ignored" in notes
+    assert "--no-bndb" in notes                    # the actionable escape hatch
+    assert "foo.so.bndb" in notes
+    bridge._headless_views.clear()
+
+
+def test_load_binary_quick_with_no_bndb_honors_quick(monkeypatch, tmp_path):
+    # The contrast: --no-bndb loads the raw bytes, so --quick is honored and there
+    # is no "--quick ignored" note.
+    bridge, instance, loaded_paths = _setup_load_test(monkeypatch)
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+    bndb = tmp_path / "foo.so.bndb"
+    bndb.write_bytes(b"")
+
+    result = instance._load_binary(str(raw), prefer_bndb=False, quick=True)
+
+    assert loaded_paths == [str(raw)]
+    assert result["analyzed"] is False             # --quick honored
+    notes = " ".join(result["notes"])
+    assert "--quick ignored" not in notes
+    bridge._headless_views.clear()
+
+
+def test_load_binary_quick_on_named_bndb_notes_ignored(monkeypatch, tmp_path):
+    # Directly naming a .bndb with --quick: distinct, clearer message (no sidecar
+    # substitution happened).
+    bridge, instance, loaded_paths = _setup_load_test(monkeypatch)
+    bndb = tmp_path / "foo.bndb"
+    bndb.write_bytes(b"")
+
+    result = instance._load_binary(str(bndb), quick=True)
+
+    assert loaded_paths == [str(bndb)]
+    assert result["analyzed"] is True
+    notes = " ".join(result["notes"])
+    assert "--quick ignored" in notes
+    assert "analyzed database" in notes
+    bridge._headless_views.clear()
+
+
 def test_load_binary_full_runs_analysis(monkeypatch, tmp_path):
     bridge, instance, loaded_paths = _setup_load_test(monkeypatch)
     raw = tmp_path / "foo.so"
