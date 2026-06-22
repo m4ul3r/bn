@@ -15,6 +15,29 @@ from ..formatters import (
 from ..transport import BridgeError
 
 
+def _models_arg() -> tuple[tuple[str, ...], dict[str, Any]]:
+    """The shared `--models FILE` option for taint commands (#317): load
+    additional, project-specific taint models so taint follows flows through a
+    target's own (non-libc-named) copy/format/exec wrappers."""
+    return arg("--models", dest="models", default=None, metavar="FILE",
+               help="JSON file of extra taint models (same schema as the builtin DB: "
+                    'a {name: model} map) for project-internal copy/format/exec wrappers, '
+                    "merged over the builtins so taint follows flows through your own "
+                    "wrappers (#317). Persist them globally instead via BN_TAINT_MODELS.")
+
+
+def _add_user_models(args: argparse.Namespace, params: dict[str, Any]) -> None:
+    """Read `--models <file>` into ``params['user_models']`` (loud on a bad file,
+    mirroring --resolve-map and the #97 no-silent-model-failure rule)."""
+    path = getattr(args, "models", None)
+    if not path:
+        return
+    try:
+        params["user_models"] = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise BridgeError(f"could not read --models {path}: {exc}")
+
+
 @command("dataflow", "defuse", help="Show the SSA definition site and use sites of a variable",
          target=True,
          prefer_when="per-function SSA def/use of one variable; "
@@ -115,6 +138,7 @@ _SINK_LOCATOR_HELP = (
                  help="Enable an opt-in sink class (repeatable). Off by default: "
                       "file_write (fwrite/write/fputs), net_write (send/sendto). "
                       "Use when auditing persistence / file-corruption / exfiltration paths."),
+             _models_arg(),
          ])
 def _taint_forward(args: argparse.Namespace) -> int:
     if not args.sources:
@@ -132,6 +156,7 @@ def _taint_forward(args: argparse.Namespace) -> int:
             params["resolve_map"] = json.loads(Path(args.resolve_map).read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             raise BridgeError(f"could not read --resolve-map {args.resolve_map}: {exc}")
+    _add_user_models(args, params)
     return _call(
         args,
         "taint",
@@ -159,6 +184,7 @@ def _taint_forward(args: argparse.Namespace) -> int:
              arg("--resolve-map", dest="resolve_map", default=None, metavar="FILE",
                  help="JSON file mapping indirect call addresses to target lists: "
                       '{"0x4011f0": ["0x401176", "0x401195"]}'),
+             _models_arg(),
          ])
 def _taint_backward(args: argparse.Namespace) -> int:
     if not args.sinks:
@@ -174,6 +200,7 @@ def _taint_backward(args: argparse.Namespace) -> int:
             params["resolve_map"] = json.loads(Path(args.resolve_map).read_text(encoding="utf-8"))
         except (OSError, ValueError) as exc:
             raise BridgeError(f"could not read --resolve-map {args.resolve_map}: {exc}")
+    _add_user_models(args, params)
     return _call(
         args,
         "taint",

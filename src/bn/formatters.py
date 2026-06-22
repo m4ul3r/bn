@@ -1627,7 +1627,7 @@ def _taint_forward_verdict(value: dict[str, Any]) -> str:
     fns_part = f" · taint crossed {fns} fn(s)" if fns else ""
     trunc = f" · truncated @depth {stats.get('max_depth')}" if stats.get("truncated") else ""
     if findings:
-        classes = ", ".join(sorted({(f.get("sink") or {}).get("class", "?") for f in findings}))
+        classes = ", ".join(sorted({(f.get("sink") or {}).get("class") or "?" for f in findings}))
         return f"verdict: {len(findings)} sink(s) reached ({classes}){fns_part}{trunc}"
     if leaves:
         return (f"verdict: NO modeled sink reached — {len(leaves)} tainted frontier(s) "
@@ -1684,10 +1684,16 @@ def _render_taint_text(value: Any) -> str:
                 lines.append("")
                 _ai = sink.get("tainted_arg_index")
                 _arg = f"(arg {_ai}) " if _ai is not None else ""
-                lines.append(
-                    f"[{sink.get('class', '?')}] {sink.get('callee', '?')} @ {sink.get('address')} "
-                    f"{_arg}-- {sink.get('detail', '')}".rstrip()
-                )
+                # `or '?'`/`or ''` guard an explicit None (a user-modeled sink, #317,
+                # usually carries no detail). Append ` -- {detail}` CONDITIONALLY
+                # rather than stripping a trailing separator back off, so a detail
+                # that itself ends in a dash isn't mangled (#317 review).
+                _detail = sink.get('detail') or ''
+                _sline = (f"[{sink.get('class') or '?'}] {sink.get('callee', '?')} "
+                          f"@ {sink.get('address')} {_arg}").rstrip()
+                if _detail:
+                    _sline += f" -- {_detail}"
+                lines.append(_sline)
                 _via = _taint_via_trail(value, f)
                 if _via:
                     lines.append(f"    {_via}")

@@ -409,3 +409,48 @@ def test_locator_help_states_zero_based_indices():
     from bn.commands import dataflow
     assert "0-based" in dataflow._LOCATOR_HELP
     assert "0-based" in dataflow._SINK_LOCATOR_HELP
+
+
+def test_taint_forward_reads_and_forwards_user_models(monkeypatch, capsys, tmp_path):
+    # #317: --models loads project-internal wrapper models and forwards them as
+    # `user_models` so the bridge merges them over the builtin DB.
+    mfile = tmp_path / "models.json"
+    mfile.write_text(json.dumps({"app_copy": {"sink": {"class": "overflow_len", "tainted_args": [1]},
+                                              "propagates": [{"from": "*arg:1", "to": "*arg:0"}]}}))
+    fake, calls = _fake({"taint": {"direction": "forward", "function": {"name": "p", "address": "0x1"},
+                                   "sources": [], "reached_sinks": [], "leaves": [],
+                                   "assumptions": [], "soundness": "x"}})
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    rc = bn.cli.main(["taint", "forward", "-f", "h", "--source", "param:0",
+                      "--models", str(mfile), "--target", "active"])
+    assert rc == 0
+    call = [c for c in calls if c["op"] == "taint"][0]
+    assert call["params"]["user_models"]["app_copy"]["sink"]["class"] == "overflow_len"
+
+
+def test_taint_backward_reads_and_forwards_user_models(monkeypatch, capsys, tmp_path):
+    mfile = tmp_path / "models.json"
+    mfile.write_text(json.dumps({"app_fmt": {"sink": {"class": "format_string", "tainted_args": [0]}}}))
+    fake, calls = _fake({"taint": {"direction": "backward", "function": {"name": "p", "address": "0x1"},
+                                   "sinks": [], "slices": [], "leaves": [], "assumptions": [], "soundness": "x"}})
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    rc = bn.cli.main(["taint", "backward", "-f", "h", "--sink", "arg:app_fmt:0",
+                      "--models", str(mfile), "--target", "active"])
+    assert rc == 0
+    call = [c for c in calls if c["op"] == "taint"][0]
+    assert call["params"]["user_models"]["app_fmt"]["sink"]["class"] == "format_string"
+
+
+def test_taint_models_bad_file_is_loud(monkeypatch, capsys, tmp_path):
+    # A broken --models file is a clean error, not a silent skip (#97/#317).
+    bad = tmp_path / "bad.json"
+    bad.write_text("{not valid json")
+    fake, _ = _fake({"taint": {}})
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    rc = bn.cli.main(["taint", "forward", "-f", "h", "--source", "param:0",
+                      "--models", str(bad), "--target", "active"])
+    assert rc != 0   # BridgeError -> non-zero
+    # a nonexistent file is likewise loud
+    rc2 = bn.cli.main(["taint", "forward", "-f", "h", "--source", "param:0",
+                       "--models", str(tmp_path / "nope.json"), "--target", "active"])
+    assert rc2 != 0

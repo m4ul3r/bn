@@ -3752,3 +3752,72 @@ def test_forward_non_recvmsg_arg_seed_has_no_nudge_306(models):
     engine = te.TaintEngine(bv, models)
     result = engine.forward(func, [te.parse_locator("arg:memcpy:1")])
     assert not any("msg_iov" in a for a in result["assumptions"])
+
+
+# --------------------------------------------------------------------------
+# #317: user-supplied models for project-internal wrappers (`taint --models`)
+# --------------------------------------------------------------------------
+
+def test_load_models_merges_and_validates_user_extra():
+    import pytest
+    base = te.load_models()
+    assert "my_app_copy" not in base and "memcpy" in base
+
+    merged = te.load_models(extra={
+        "my_app_copy": {"sink": {"class": "overflow_len", "tainted_args": [1]},
+                        "propagates": [{"from": "*arg:1", "to": "*arg:0"}]},
+    })
+    name, model = te.lookup_model(merged, "my_app_copy")
+    assert name == "my_app_copy" and model["sink"]["class"] == "overflow_len"
+    assert "memcpy" in merged                      # builtins preserved
+    # decoration-stripping still applies to user entries (e.g. PLT/underscore)
+    assert te.lookup_model(merged, "my_app_copy@plt")[0] == "my_app_copy"
+
+    # the {"models": {...}} wrapper shape is accepted too
+    merged2 = te.load_models(extra={"models": {"wrap_fmt": {"sink": {"class": "format_string",
+                                                                     "tainted_args": [0]}}}})
+    assert "wrap_fmt" in merged2
+
+    # user entry wins a name clash (most specific to the target)
+    over = te.load_models(extra={"memcpy": {"sink": {"class": "overflow_len", "tainted_args": [9]}}})
+    assert over["memcpy"]["sink"]["tainted_args"] == [9]
+
+    # a malformed user file is LOUD, not a silent merge-to-nothing (#97/#317)
+    with pytest.raises(te.TaintError):
+        te.load_models(extra="not a model map")
+    with pytest.raises(te.TaintError):
+        te.load_models(extra=[1, 2, 3])
+
+
+def test_load_models_validates_user_model_interiors():
+    # #317 review (HIGH): a structurally-malformed user model must be a clean,
+    # attributable TaintError naming the model+field -- not an unhandled
+    # AttributeError/TypeError deep in apply_model (a misleading `internal error:`).
+    import pytest
+    bad_models = [
+        {"app": {"sink": 42}},                                   # sink not an object
+        {"app": {"sink": {"tainted_args": [0]}}},                # sink without a class
+        {"app": {"sink": {"class": 7, "tainted_args": [0]}}},    # class not a string
+        {"app": {"sink": {"class": "x", "tainted_args": ["0"]}}},# tainted_args not ints
+        {"app": {"sink": {"class": "x", "tainted_args": 0}}},    # tainted_args not a list
+        {"app": {"propagates": 5}},                              # propagates not a list
+        {"app": {"propagates": [42]}},                           # propagates not list of objects
+        {"app": {"sources": [1, 2]}},                            # sources not list of objects
+        {"app": {"varargs": 7}},                                 # varargs not an object
+        {"app": {"varargs": {"first_index": "3"}}},             # first_index not an int
+    ]
+    for bad in bad_models:
+        with pytest.raises(te.TaintError) as ei:
+            te.load_models(extra=bad)
+        assert "app" in str(ei.value)   # the offending model is named
+
+    # a fully-valid model still loads (sink + tainted_args + propagates + varargs)
+    good = {"app_copy": {"sink": {"class": "overflow_len", "tainted_args": [1, 2]},
+                         "propagates": [{"from": "*arg:1", "to": "*arg:0"}],
+                         "sources": [{"to": "*arg:0"}],
+                         "varargs": {"first_index": 3}}}
+    merged = te.load_models(extra=good)
+    assert merged["app_copy"]["sink"]["class"] == "overflow_len"
+    # bool is not an int for tainted_args (bool is an int subclass in Python)
+    with pytest.raises(te.TaintError):
+        te.load_models(extra={"app": {"sink": {"class": "x", "tainted_args": [True]}}})

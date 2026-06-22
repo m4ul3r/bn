@@ -44,7 +44,9 @@ def _taint_op(ctx, selector, params: dict[str, Any]):
     direction = str(params.get("direction", "forward"))
     func = ctx._find_function(bv, params["function"])
     try:
-        models = _taint.load_models()
+        # `user_models` carries project-internal wrapper models supplied via
+        # `taint --models <file>` (#317); merged over the builtin/override DB.
+        models = _taint.load_models(extra=params.get("user_models"))
     except _taint.TaintError as exc:
         # A broken builtin DB or BN_TAINT_MODELS override is now loud instead
         # of silently producing false negatives (#97).

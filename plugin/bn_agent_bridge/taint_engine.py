@@ -125,7 +125,43 @@ def _coerce_model_map(raw: Any, *, source: str) -> dict[str, Any]:
             raise TaintError(
                 f"{source}: model {name!r} must be a JSON object, got {type(model).__name__}"
             )
+        _validate_model_interior(name, model, source)
     return raw
+
+
+def _validate_model_interior(name: str, model: dict[str, Any], source: str) -> None:
+    """Validate the interior shape of a single model so a structurally-malformed
+    USER model (`taint --models`, #317) is a clean, attributable error naming the
+    model+field -- not an unhandled AttributeError/TypeError deep in apply_model
+    that surfaces as a misleading `internal error:` (#317 review). Only the fields
+    the engine indexes are checked; unknown keys are left alone for forward-compat."""
+    def _fail(msg: str) -> None:
+        raise TaintError(f"{source}: model {name!r} {msg}")
+
+    def _is_int(v: Any) -> bool:
+        return isinstance(v, int) and not isinstance(v, bool)
+
+    if "sink" in model:
+        sink = model["sink"]
+        if not isinstance(sink, dict):
+            _fail(f"`sink` must be an object, got {type(sink).__name__}")
+        if not isinstance(sink.get("class"), str):
+            _fail("`sink` requires a string `class`")
+        ta = sink.get("tainted_args")
+        if ta is not None and not (isinstance(ta, list) and all(_is_int(i) for i in ta)):
+            _fail("`sink.tainted_args` must be a list of integers")
+    for key in ("sources", "propagates"):
+        if key in model:
+            seq = model[key]
+            if not isinstance(seq, list) or not all(isinstance(e, dict) for e in seq):
+                _fail(f"`{key}` must be a list of objects")
+    if "varargs" in model:
+        va = model["varargs"]
+        if not isinstance(va, dict):
+            _fail(f"`varargs` must be an object, got {type(va).__name__}")
+        fi = va.get("first_index")
+        if fi is not None and not _is_int(fi):
+            _fail("`varargs.first_index` must be an integer")
 
 
 def load_models(extra: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -158,7 +194,12 @@ def load_models(extra: dict[str, Any] | None = None) -> dict[str, Any]:
                 ) from exc
             models.update(_coerce_model_map(raw, source=f"BN_TAINT_MODELS override ({override_path})"))
     if extra:
-        models.update(extra)
+        # User-supplied models (e.g. `taint --models project.json` for
+        # project-internal copy/format wrappers, #317) are validated through the
+        # same coercion as the builtin/override DBs, so a malformed user file is
+        # a loud error, not a silent merge-to-nothing (#97). User entries win on
+        # a name clash -- they're the most specific to the target.
+        models.update(_coerce_model_map(extra, source="user-provided models (--models / extra)"))
     return models
 
 
