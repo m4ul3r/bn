@@ -3206,6 +3206,91 @@ def test_forward_keeps_overflow_when_alloc_size_differs_from_length(models):
     assert memcpy_sinks[0]["class"] == "overflow_len"          # NOT downgraded
 
 
+def _copy_via_wrapper(wrapper_addr, size_var, length_var, *, param):
+    # dst = wrap(<size_var>); memcpy(dst, src, <length_var>) -- the allocator is an
+    # in-binary wrapper at wrapper_addr, not a direct libc malloc.
+    dst = FVar("dst"); src = FVar("src")
+    dst1 = FSSA(dst, 1); src0 = FSSA(src, 0)
+    size_arg = FExpr("MLIL_VAR_SSA", "size", reads=[size_var])
+    dst_param = FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1])
+    src_param = FExpr("MLIL_VAR_SSA", "src#0", reads=[src0])
+    len_param = FExpr("MLIL_VAR_SSA", "len", reads=[length_var])
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "dst#1 = wrap(size)",
+               reads=[size_var], writes=[dst1],
+               dest=FExpr("MLIL_CONST_PTR", hex(wrapper_addr), constant=wrapper_addr),
+               params=[size_arg]),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "memcpy(dst#1, src#0, len)",
+               reads=[dst1, src0, length_var],
+               dest=FExpr("MLIL_CONST_PTR", "0x2010", constant=0x2010),
+               params=[dst_param, src_param, len_param]),
+    ]
+    return FFunc("copy", 0x10, FSSAFunc(instrs), params=[param])
+
+
+def test_forward_downgrades_overflow_through_opaque_allocator_wrapper_307(models):
+    # #307: dst = acquire(n); memcpy(dst, src, n) where `acquire` is an OPAQUE
+    # allocator wrapper (stripped: name has no alloc hint, no recovered pointer
+    # return type) whose body is `malloc(its param0)`. Corroborated by its BODY
+    # (#229's name/return-type heuristics miss it), so the provably-bounded copy
+    # downgrades to bounded_len instead of a false overflow_len.
+    n = FVar("n"); n0 = FSSA(n, 0)
+    na = FVar("na", ident=1); na0 = FSSA(na, 0)   # param identifier so it resolves to param 0 (as real BN)
+    acquire = FFunc("acquire", 0x3000, FSSAFunc([
+        FInstr(0, 0x3000, "MLIL_CALL_SSA", "rax = malloc(na#0)", reads=[na0],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_VAR_SSA", "na#0", reads=[na0])])]),
+        params=[na])
+    func = _copy_via_wrapper(0x3000, n0, n0, param=n)
+    bv = FBV({0x2000: "malloc", 0x2010: "memcpy"}, funcs={0x3000: acquire})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    memcpy_sinks = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(memcpy_sinks) == 1
+    assert memcpy_sinks[0]["class"] == "bounded_len"           # downgraded via body corroboration
+    assert "provably bounded" in memcpy_sinks[0]["detail"]
+
+
+def test_forward_keeps_overflow_through_non_allocator_wrapper_307(models):
+    # #307 safety: a one-arg helper that returns a FIXED buffer (no allocator call
+    # in its body) must NOT be mistaken for an allocator -- a real overflow into
+    # the fixed buffer still flags. `dst = get_scratch(n); memcpy(dst, src, n)`.
+    n = FVar("n"); n0 = FSSA(n, 0)
+    rax = FVar("rax"); rax1 = FSSA(rax, 1)
+    get_scratch = FFunc("get_scratch", 0x3000, FSSAFunc([
+        FInstr(0, 0x3000, "MLIL_SET_VAR_SSA", "rax#1 = 0x404020", writes=[rax1],
+               src=FExpr("MLIL_CONST_PTR", "0x404020", constant=0x404020))]),
+        params=[FVar("ns")])
+    func = _copy_via_wrapper(0x3000, n0, n0, param=n)
+    bv = FBV({0x2010: "memcpy"}, funcs={0x3000: get_scratch})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    memcpy_sinks = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(memcpy_sinks) == 1
+    assert memcpy_sinks[0]["class"] == "overflow_len"          # NOT downgraded (no allocator call)
+
+
+def test_forward_keeps_overflow_through_single_call_non_allocator_wrapper_307(models):
+    # #307 safety (review): a wrapper that makes EXACTLY ONE call but to a
+    # NON-allocator (not in _ALLOC_SIZE_ARG) must NOT be corroborated -- exercises
+    # the size_idx-None branch (the zero-call get_scratch test only covered
+    # len(calls)!=1, so its teeth were weaker than they looked).
+    n = FVar("n"); n0 = FSSA(n, 0)
+    na = FVar("na", ident=1); na0 = FSSA(na, 0)
+    log_wrap = FFunc("log_event", 0x3000, FSSAFunc([
+        FInstr(0, 0x3000, "MLIL_CALL_SSA", "rax = do_log(na#0)", reads=[na0],
+               dest=FExpr("MLIL_CONST_PTR", "0x2020", constant=0x2020),
+               params=[FExpr("MLIL_VAR_SSA", "na#0", reads=[na0])])]),
+        params=[na])
+    func = _copy_via_wrapper(0x3000, n0, n0, param=n)
+    bv = FBV({0x2010: "memcpy", 0x2020: "do_log"}, funcs={0x3000: log_wrap})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    memcpy_sinks = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(memcpy_sinks) == 1
+    assert memcpy_sinks[0]["class"] == "overflow_len"          # do_log is not an allocator -> no downgrade
+
+
 def _copy_func_alloc_offset(*, alloc_const, dest_off, alloc_addr=0x2000,
                             alloc_name_addr=0x2000, len_const=0, param=None):
     # dst = alloc(len + alloc_const); memcpy(dst + dest_off, src, len + len_const)

@@ -2124,9 +2124,11 @@ class TaintEngine:
 
     def _looks_like_allocator(self, call_ins: Any) -> bool:
         """Corroborate that a call is plausibly an allocator wrapper: its name
-        contains an allocator hint (malloc/calloc/realloc/xalloc/.../strdup), or
-        the resolved callee returns a pointer. Conservative -- an opaque-named,
-        unknown-return wrapper is NOT downgraded (#229 review Finding 2)."""
+        contains an allocator hint (malloc/calloc/realloc/xalloc/.../strdup), the
+        resolved callee returns a pointer, or its BODY provably forwards the size
+        arg to a known allocator (#307). Conservative -- an opaque-named,
+        unknown-return wrapper with no allocator call is NOT downgraded (#229
+        review Finding 2)."""
         addr = self._resolve_direct_target(call_ins)
         name = (self._callee_name(addr) or "").split("@", 1)[0].lstrip("_").lower()
         if any(tok in name for tok in self._ALLOC_NAME_HINTS):
@@ -2137,7 +2139,41 @@ class TaintEngine:
             tcn = self._type_class_name(rt)
             if "Pointer" in tcn or str(rt).rstrip().endswith("*"):
                 return True
-        return False
+        # Body-level corroboration: a STRIPPED allocator wrapper (sub_XXXX, no
+        # recovered pointer return type) that provably forwards its sole arg to a
+        # known allocator's size position -- common in firmware, the case the
+        # name/return-type heuristics miss (#307). A non-allocator one-arg helper
+        # (e.g. one that returns a fixed scratch buffer, with no allocator call)
+        # does NOT match, so a real overflow into a fixed buffer still flags.
+        return self._is_allocator_wrapper_body(fn)
+
+    def _is_allocator_wrapper_body(self, fn: Any) -> bool:
+        """True if in-binary single-call thin wrapper *fn* forwards its first
+        parameter to a KNOWN allocator's SIZE argument (#307). Strict: exactly one
+        call in the body, to a known allocator, with the wrapper's param 0 at the
+        allocator's size position -- so `acquire(n){ return malloc(n); }` is
+        recognized even when stripped of name and return type, while a helper with
+        no allocator call (or that passes a local, not its param) is not."""
+        if fn is None or not self._is_internal(fn):
+            return False
+        ssaf = _mlil_ssa(fn)
+        if ssaf is None:
+            return False
+        calls = [i for i in _ssa_instructions(ssaf) if "CALL" in op_name(i)]
+        if len(calls) != 1:
+            return False
+        call = calls[0]
+        base = (self._callee_name(self._resolve_direct_target(call)) or "").split("@", 1)[0].lstrip("_")
+        size_idx = self._ALLOC_SIZE_ARG.get(base)
+        if size_idx is None:
+            canon = _canonical_cxx_alloc(base)
+            size_idx = self._ALLOC_SIZE_ARG.get(canon) if canon else None
+        if size_idx is None:
+            return False
+        cparams = self._call_params(call)
+        if size_idx >= len(cparams):
+            return False
+        return self._resolve_to_param_index(fn, ssaf, cparams[size_idx]) == 0
 
     def _linear_in_var(self, ssaf: Any, expr: Any, depth: int = 0):
         """Decompose *expr* into ``(canonical_ssa_var, const)`` when it is ``v``,
