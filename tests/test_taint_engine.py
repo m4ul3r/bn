@@ -3718,3 +3718,37 @@ def test_plain_vprintf_family_format_models_present_and_shaped():
     assert models["dprintf"]["sink"]["tainted_args"] == [1]
     # decorated/PLT forms still resolve to the plain key
     assert te.lookup_model(models, "vsnprintf@plt")[0] == "vsnprintf"
+
+
+def test_forward_recvmsg_arg_seed_nudges_to_buffer_306(models):
+    # #306: seeding recvmsg's msghdr arg taints the header, not the scatter-gather
+    # payload (msghdr->msg_iov[i].iov_base) -> a nudge points the user at the
+    # filled buffer var instead of letting the silent miss read as all-clear.
+    mh = FVar("mh", ident=1); mh1 = FSSA(mh, 1)
+    func = FFunc("handler", 0x10, FSSAFunc([
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "recvmsg(fd, &mh, 0)", reads=[mh1],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_CONST", "0", constant=0),
+                       FExpr("MLIL_VAR_SSA", "mh#1", reads=[mh1]),
+                       FExpr("MLIL_CONST", "0", constant=0)])]),
+        params=[])
+    bv = FBV({0x2000: "recvmsg"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:recvmsg:1")])
+    assert any("msg_iov" in a and "var:<buf>" in a for a in result["assumptions"])
+
+
+def test_forward_non_recvmsg_arg_seed_has_no_nudge_306(models):
+    # control: a normal callee arg seed must NOT get the recvmsg scatter-gather note.
+    p = FVar("p", ident=1); p1 = FSSA(p, 1)
+    func = FFunc("handler", 0x10, FSSAFunc([
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "memcpy(dst, p, n)", reads=[p1],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_CONST", "0", constant=0),
+                       FExpr("MLIL_VAR_SSA", "p#1", reads=[p1]),
+                       FExpr("MLIL_CONST", "0", constant=0)])]),
+        params=[])
+    bv = FBV({0x2000: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:memcpy:1")])
+    assert not any("msg_iov" in a for a in result["assumptions"])

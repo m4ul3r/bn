@@ -53,6 +53,11 @@ SOUNDNESS = (
 # resolved separately from the model's buffer-propagation rules, not the class.
 _OVERFLOW_INDEX_CLASSES = frozenset({"overflow_unbounded", "overflow_len", "fortified_overflow"})
 
+# Scatter-gather receive calls: the received bytes land in msghdr->msg_iov[i].
+# iov_base, not the msghdr pointer arg, so seeding the arg taints the header, not
+# the payload (#306). Names compared after stripping leading underscores / @plt.
+_RECVMSG_FAMILY = frozenset({"recvmsg", "recvmmsg"})
+
 # A param: source that is a pointer to an aggregate at least this large (by byte
 # size OR member count) is flagged as a "broad source" -- the whole struct is
 # treated as one tainted location, which over-taints into unrelated code (#219).
@@ -3190,6 +3195,20 @@ class TaintEngine:
                 if not calls:
                     raise self._no_callsite_error(instrs, callee, func)
                 self._note_indirect_anchors(calls, callee, add_assumption, wrapper_arg=wrapper_arg)
+                # #306: recvmsg/recvmmsg write the received bytes into the
+                # scatter-gather buffers at msghdr->msg_iov[i].iov_base, NOT the
+                # msghdr pointer (arg 1) or fd (arg 0). Seeding the msghdr arg
+                # therefore taints the header, not the payload, and reads as a
+                # false all-clear. Nudge the user to seed the filled buffer var so
+                # the silent miss becomes actionable.
+                if kind == "arg" and (callee or "").split("@", 1)[0].lstrip("_") in _RECVMSG_FAMILY:
+                    add_assumption(
+                        f"{callee} writes the received bytes to the scatter-gather iov "
+                        f"buffer(s) (msghdr->msg_iov[i].iov_base; for recvmmsg, per msgvec "
+                        f"entry), not the header pointer this --source seeds; the payload "
+                        f"taint is NOT followed from here. Seed the filled buffer directly "
+                        f"(--source var:<buf>) to trace the received data."
+                    )
                 if kind == "ret":
                     # A ret: source on a function whose model also fills an
                     # output-pointer buffer would silently miss those bytes;
