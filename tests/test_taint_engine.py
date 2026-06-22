@@ -3611,3 +3611,25 @@ def test_forward_wrapper_disclosure_is_order_independent(models):
         anchors = [a for a in result["assumptions"] if "anchored at indirect" in a]
         assert anchors, result["assumptions"]
         assert not any("thin wrapper" in a for a in anchors), (cands, anchors)
+
+
+def test_plain_vprintf_family_format_models_present_and_shaped():
+    # #317: the unfortified v-printf family (+ asprintf/dprintf) are format sinks --
+    # previously only the _chk/_s variants were modeled, so a tainted format routed
+    # through an internal wrapper that bottomed out at plain vsnprintf passed through
+    # forward taint unflagged (a false negative).
+    models = te.load_models()
+    # buffer-writing formatters -> format_or_overflow, format arg is the sink
+    assert models["vsnprintf"]["sink"]["tainted_args"] == [2]
+    assert models["vsnprintf"]["sink"]["class"] == "format_or_overflow"
+    assert models["vsnprintf"]["propagates"] == [{"from": "*arg:2", "to": "*arg:0"}]
+    assert models["asprintf"]["sink"]["tainted_args"] == [1]
+    assert models["vasprintf"]["sink"]["tainted_args"] == [1]
+    # stream formatters -> format_string
+    assert models["vprintf"]["sink"]["tainted_args"] == [0]
+    assert models["vprintf"]["sink"]["class"] == "format_string"
+    assert models["vfprintf"]["sink"]["tainted_args"] == [1]
+    assert models["vdprintf"]["sink"]["tainted_args"] == [1]
+    assert models["dprintf"]["sink"]["tainted_args"] == [1]
+    # decorated/PLT forms still resolve to the plain key
+    assert te.lookup_model(models, "vsnprintf@plt")[0] == "vsnprintf"
