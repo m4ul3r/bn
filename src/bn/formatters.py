@@ -1521,7 +1521,15 @@ def _taint_forward_verdict(value: dict[str, Any]) -> str:
     if leaves:
         return (f"verdict: NO modeled sink reached — {len(leaves)} tainted frontier(s) "
                 f"(NOT an all-clear){fns_part}{trunc}")
-    return "verdict: no taint reached any sink or frontier"
+    # Genuinely empty: no sink AND no frontier. This is the MOST caveated case, not
+    # the least -- the engine reaching nothing does not mean the function is safe;
+    # it is exactly the shape a structurally-invisible bug (use-after-free,
+    # temporal, or an unmodeled source) produces. Carry the same "NOT an
+    # all-clear" qualifier the partial-coverage paths do (#310).
+    visited = f"visited {fns} fn(s)" if fns else "shallow coverage"
+    return (f"verdict: no taint reached any sink or frontier — NOT an all-clear "
+            f"({visited}; no modeled sink or tainted frontier found — also how a bug "
+            f"the engine can't structurally see appears){trunc}")
 
 
 def _taint_via_trail(value: dict[str, Any], finding: dict[str, Any]) -> str | None:
@@ -1598,7 +1606,16 @@ def _render_taint_text(value: Any) -> str:
             for step in sl.get("slice") or []:
                 if isinstance(step, dict):
                     lines.append(f"  {step.get('address')}  {step.get('op')}  {step.get('il_text', '')}".rstrip())
-        unseeded = [s for s in (value.get("sink_status") or []) if not s.get("seeded", True)]
+        status = value.get("sink_status") or []
+        # A constant-length sink is "provably bounded" -- a SUCCESS, not a failed
+        # seed -- so report it apart from genuinely-unseeded sinks (#310).
+        bounded = [s for s in status if s.get("bounded")]
+        unseeded = [s for s in status if not s.get("seeded", True) and not s.get("bounded")]
+        if bounded:
+            lines.append("")
+            lines.append(f"provably bounded ({len(bounded)}):")
+            for s in bounded:
+                lines.append(f"  {_describe_loc(s)} -- {s.get('note', 'constant length, nothing to slice')}")
         if unseeded:
             lines.append("")
             lines.append(f"UNSEEDED SINKS ({len(unseeded)}):")

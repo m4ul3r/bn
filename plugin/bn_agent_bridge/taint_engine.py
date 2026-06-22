@@ -84,6 +84,14 @@ class TaintError(RuntimeError):
     """User-facing taint configuration/resolution error."""
 
 
+class BoundedSink(Exception):
+    """A backward sink whose argument is a compile-time constant (e.g. a fixed
+    copy length): provably bounded, with no def-chain to slice. This is a
+    SUCCESSFUL conclusion, not a seed failure -- it must NOT count toward the
+    all-sinks-failed hard error, so a bounded sink returns a clean result
+    (exit 0, --out written) instead of looking like a crash (#310)."""
+
+
 # --------------------------------------------------------------------------
 # model database
 # --------------------------------------------------------------------------
@@ -3352,6 +3360,14 @@ class TaintEngine:
             desc = self._describe_locator(sink)
             try:
                 seeds = self._seed_backward(func, ssaf, instrs, sink)
+            except BoundedSink as exc:
+                # A constant-length sink is a SUCCESSFUL "provably bounded"
+                # conclusion, not a seed failure: record it as such and do NOT
+                # add it to `errors`, so an all-bounded slice returns a clean
+                # result (exit 0, --out written) instead of the all-failed hard
+                # error (#310).
+                sink_status.append({**desc, "seeded": False, "bounded": True, "note": str(exc)})
+                continue
             except TaintError as exc:
                 errors.append((sink, str(exc)))
                 sink_status.append({**desc, "seeded": False, "note": str(exc)})
@@ -3663,9 +3679,25 @@ class TaintEngine:
                             f"indices are 0..{max_params - 1} (arg indices are 0-based)")
                     raise TaintError(
                         f"--sink arg index {idx} is out of range for {callee}: {detail}")
+                # Nothing to slice. A scalar CONSTANT literal (e.g. a fixed copy
+                # length) is a provably-bounded SUCCESS (#310). Gate on the
+                # operation being MLIL_CONST specifically -- NOT MLIL_CONST_PTR,
+                # which is a constant ADDRESS (a global dest/src pointer): that's
+                # an address expression with no def-chain, which must stay a seed
+                # error, not a misleading "bounded length" verdict.
+                arg_is_const = any(
+                    op_name(params[idx]) == "MLIL_CONST"
+                    for c in sites
+                    for params in (self._call_params(c),)
+                    if idx < len(params)
+                )
+                if arg_is_const:
+                    raise BoundedSink(
+                        f"--sink arg {idx} of {callee} is a compile-time constant in the "
+                        f"recovered IL -- provably bounded, with no def-chain to slice backward")
                 raise TaintError(
                     f"--sink arg {idx} of {callee} reads no variable in the recovered IL "
-                    f"(it is a constant or address expression) -- there is no def-chain "
+                    f"(it is an address or fixed expression) -- there is no def-chain "
                     f"to slice backward")
         elif kind == "var":
             v = self._resolve_var(func, sink["selector"])

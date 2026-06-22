@@ -659,3 +659,34 @@ class TestBatchFunctionCreate:
             assert _bn("--instance", inst, "function", "info", addr).returncode == 0  # now a function
         finally:
             _session_stop(inst)
+
+
+class TestTaintEmptyVerdictHonesty:
+    """Regression for #310.1: a genuinely empty forward-taint result (no sink, no
+    frontier) must carry the same loud 'NOT an all-clear' caveat the
+    partial-coverage paths do -- it's exactly the shape a structurally-invisible
+    bug produces, so it must be the most caveated case, not the least."""
+
+    def test_empty_forward_verdict_is_caveated(self):
+        info = _session_start(str(HELLO_BINARY))
+        inst = info["instance_id"]
+        try:
+            fns = json.loads(_bn("--instance", inst, "function", "list", "--format", "json").stdout)
+            names = [f["name"] for f in (fns.get("items") if isinstance(fns, dict) else fns)]
+            saw_empty = False
+            for name in names[:30]:
+                out = _bn("--instance", inst, "taint", "forward", "-f", name, "--source", "param:0")
+                # Only reason about a clean, non-spilled text result: a spilled
+                # (truncated) render can cut the verdict line mid-string, which is
+                # not a real "bare phrase without caveat". (No break: the caveat
+                # invariant must hold for EVERY empty verdict, not just the first.)
+                if out.returncode != 0 or "__BN_SPILLED__" in out.stdout:
+                    continue
+                if "no taint reached any sink or frontier" in out.stdout:
+                    saw_empty = True
+                    assert "NOT an all-clear" in out.stdout, out.stdout
+                    assert "structurally see" in out.stdout, out.stdout
+            if not saw_empty:
+                pytest.skip("no empty-verdict function found in this fixture")
+        finally:
+            _session_stop(inst)

@@ -2250,6 +2250,67 @@ def test_backward_slices_from_memcpy_length(process_func, models):
     assert "0x4011bc" in slice_addrs  # len#2 = len#1 + 4 is on the slice
 
 
+def test_backward_constant_length_sink_is_bounded_not_error(models):
+    # #310: memcpy(&dst, &src, 0x40) -- the length is a compile-time constant, so
+    # there is no def-chain to slice. That is a SUCCESSFUL "provably bounded"
+    # conclusion (the op returns a result; exit 0, --out written), NOT the
+    # all-sinks-failed hard error that looks like a crash to a scripted sweep.
+    bv = FBV({0x401080: "memcpy"})
+    instrs = [
+        FInstr(0, 0x4011db, "MLIL_CALL_SSA", "0x401080(&dst, &src, 0x40)",
+               reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401080", constant=0x401080),
+               params=[FExpr("MLIL_VAR_SSA", "&dst", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "&src", reads=[]),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+    ]
+    func = FFunc("copyfixed", 0x401189, FSSAFunc(instrs), params=[])
+    engine = te.TaintEngine(bv, models)
+    result = engine.backward(func, [te.parse_locator("arg:memcpy:2")])  # must NOT raise
+    assert result["direction"] == "backward"
+    assert result["slices"] == []
+    status = result["sink_status"]
+    assert len(status) == 1
+    assert status[0]["bounded"] is True
+    assert status[0]["seeded"] is False
+
+
+def test_backward_constant_pointer_arg_is_seed_error_not_bounded(models):
+    # #310 review (MEDIUM): a constant ADDRESS arg (MLIL_CONST_PTR, e.g. a global
+    # dest/src pointer) is NOT "provably bounded" -- it's an address expression
+    # with no def-chain, which must stay a genuine seed error, not a misleading
+    # bounded-length success. Only a scalar MLIL_CONST is bounded.
+    bv = FBV({0x401080: "memcpy"})
+    instrs = [
+        FInstr(0, 0x4011db, "MLIL_CALL_SSA", "0x401080(g_dst, g_src, n)",
+               reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401080", constant=0x401080),
+               params=[FExpr("MLIL_CONST_PTR", "g_dst", constant=0x500000),
+                       FExpr("MLIL_CONST_PTR", "g_src", constant=0x600000),
+                       FExpr("MLIL_VAR_SSA", "n#1", reads=[])]),
+    ]
+    func = FFunc("copy_globals", 0x401189, FSSAFunc(instrs), params=[])
+    engine = te.TaintEngine(bv, models)
+    with pytest.raises(te.TaintError, match=r"address or fixed expression"):
+        engine.backward(func, [te.parse_locator("arg:memcpy:0")])  # arg0 = const ptr
+
+
+def test_backward_all_genuinely_unseeded_still_hard_errors(models):
+    # The contrast: a real seed failure (a callee that isn't called at all) is
+    # still a hard error -- the bounded carve-out must not swallow real failures.
+    bv = FBV({0x401080: "memcpy"})
+    instrs = [
+        FInstr(0, 0x4011db, "MLIL_CALL_SSA", "0x401080(&dst, &src, 0x40)",
+               reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401080", constant=0x401080),
+               params=[FExpr("MLIL_VAR_SSA", "&dst", reads=[])]),
+    ]
+    func = FFunc("f", 0x401189, FSSAFunc(instrs), params=[])
+    engine = te.TaintEngine(bv, models)
+    with pytest.raises(te.TaintError):
+        engine.backward(func, [te.parse_locator("arg:strcpy:1")])  # strcpy never called
+
+
 def test_backward_param_seed_ascends_into_caller(models):
     # use_len(dst, src, n): memcpy(dst, src, n). Backward from param:2 (n)
     # seeds at n's earliest read and continues into the caller, reaching the

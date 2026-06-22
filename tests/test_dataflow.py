@@ -250,6 +250,24 @@ def test_render_taint_backward_text():
     assert "len#2 = len#1 + 4" in text
 
 
+def test_render_taint_backward_bounded_sink_is_success_not_unseeded():
+    # #310: a provably-bounded (constant-length) sink renders under "provably
+    # bounded", NOT "UNSEEDED SINKS" -- it's a successful conclusion.
+    value = {
+        "direction": "backward",
+        "function": {"name": "f", "address": "0x401189"},
+        "sinks": [{"kind": "arg", "callee": "memcpy", "index": 2}],
+        "slices": [],
+        "sink_status": [{"kind": "arg", "callee": "memcpy", "index": 2,
+                         "seeded": False, "bounded": True,
+                         "note": "arg 2 of memcpy is a compile-time constant -- provably bounded"}],
+        "leaves": [], "assumptions": [], "soundness": "x",
+    }
+    text = _render_taint_text(value)
+    assert "provably bounded (1)" in text
+    assert "UNSEEDED SINKS" not in text
+
+
 def test_render_taint_groups_repeated_leaves():
     # many near-identical frontier leaves must collapse to one grouped line with
     # a count, not a wall of per-leaf lines (#160).
@@ -356,9 +374,17 @@ def test_taint_forward_verdict_frontiers_not_all_clear():
     assert "NO modeled sink reached" in out and "12 tainted frontier" in out and "NOT an all-clear" in out
 
 
-def test_taint_forward_verdict_clean():
-    v = {"reached_sinks": [], "leaves": [], "stats": {"functions_visited": 1}}
-    assert _taint_forward_verdict(v) == "verdict: no taint reached any sink or frontier"
+def test_taint_forward_verdict_empty_is_loudly_caveated():
+    # #310: a genuinely empty forward result (no sink, no frontier) is the MOST
+    # caveated case -- it must carry the same "NOT an all-clear" qualifier as the
+    # partial-coverage paths and note the coverage, since it's also how a bug the
+    # engine can't structurally see appears.
+    v = {"reached_sinks": [], "leaves": [], "stats": {"functions_visited": 3}}
+    out = _taint_forward_verdict(v)
+    assert "no taint reached any sink or frontier" in out
+    assert "NOT an all-clear" in out
+    assert "visited 3 fn(s)" in out
+    assert "can't structurally see" in out
 
 
 def test_taint_via_trail_from_path_reasons():
