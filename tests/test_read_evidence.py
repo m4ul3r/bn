@@ -1060,3 +1060,74 @@ def test_pointer_table_got_alias_unreadable_slot0(monkeypatch):
         instance._pointer_table("active", hex(addr), entries=8)
     assert exc.value.status == "got_alias"
     assert "unreadable" in str(exc.value)
+
+
+def test_itanium_typeinfo_fragment_mangles_qualified_names(monkeypatch):
+    # #305 defect 1: a demangled C++ name -> its Itanium typeinfo-string fragment.
+    bridge = _load_bridge(monkeypatch)
+    f = bridge.read_evidence._itanium_typeinfo_fragment
+    assert f("media::codec::JsonCodec") == "N5media5codec9JsonCodecE"
+    assert f("Codec") == "5Codec"
+    assert f("a::B") == "N1a1BE"
+    assert f("Foo<int>") is None       # templates out of scope (return None)
+    assert f("operator++") is None     # operators out of scope
+    assert f("") is None
+
+
+def test_message_lens_matches_demangled_qualified_name(monkeypatch):
+    # #305 defect 1: the DEMANGLED fully-qualified name `class list`/`class show`
+    # print matches the RTTI typeinfo string -- not only the hand-stripped leaf.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    ts = _FakeStringRef(0x402020, 24, "N5media5codec9JsonCodecE")
+    bv = _FakeBV(
+        strings=[ts],
+        sections={".rodata": _FakeSection(".rodata", 0x402000, 0x403000)},
+        segments={0x402020: _FakeSegment(readable=True)},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._message_lens("active", "media::codec::JsonCodec", limit=5, table_entries=0)
+    assert result["count"] == 1
+    assert result["items"][0]["type_string"]["value"] == "N5media5codec9JsonCodecE"
+
+
+def test_best_rtti_symbol_prefers_definition_over_got_alias(monkeypatch):
+    # #305 defect 2: an _ZTV<T> name resolving to BOTH a .data.rel.ro definition
+    # and a .got import alias must pick the DEFINITION (the real vtable object),
+    # not the alias (whose neighbors would render as bogus slots).
+    bridge = _load_bridge(monkeypatch)
+    fake_bn = sys.modules["binaryninja"]
+    name = "_ZTVN5media5codec9JsonCodecE"
+    definition = fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x403dc8, name)
+    alias = fake_bn.Symbol(fake_bn.SymbolType.ImportAddressSymbol, 0x403fe0, name)
+    bv = _FakeBV(
+        symbols=[alias, definition],   # alias FIRST -> proves it's not order luck
+        sections={".data.rel.ro": _FakeSection(".data.rel.ro", 0x403d00, 0x404000),
+                  ".got": _FakeSection(".got", 0x403f00, 0x404100)},
+    )
+    best = bridge.read_evidence._best_rtti_symbol(bv, name)
+    assert int(best.address) == 0x403dc8   # the .data.rel.ro definition
+
+    # alias-only: falls back to it (the caller then refuses the window honestly)
+    bv2 = _FakeBV(symbols=[alias], sections={".got": _FakeSection(".got", 0x403f00, 0x404100)})
+    assert int(bridge.read_evidence._best_rtti_symbol(bv2, name).address) == 0x403fe0
+
+
+def test_message_lens_fragment_hint_only_on_qualified_match(monkeypatch):
+    # #305 review #5: the "matched via Itanium fragment" hint must only fire when
+    # the query is ::-qualified (the fragment is genuinely the matcher) AND
+    # something matched -- not on a bare-leaf or zero-match query.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    ts = _FakeStringRef(0x402020, 24, "N5media5codec9JsonCodecE")
+    bv = _FakeBV(strings=[ts],
+                 sections={".rodata": _FakeSection(".rodata", 0x402000, 0x403000)},
+                 segments={0x402020: _FakeSegment(readable=True)})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    frag_hint = "Itanium typeinfo fragment"
+    r1 = instance._message_lens("active", "media::codec::JsonCodec", limit=5, table_entries=0)
+    assert any(frag_hint in h for h in r1["hints"])          # qualified + matched
+    r2 = instance._message_lens("active", "media::codec::Nope", limit=5, table_entries=0)
+    assert not any(frag_hint in h for h in r2["hints"])      # qualified but 0 matches
+    r3 = instance._message_lens("active", "JsonCodec", limit=5, table_entries=0)
+    assert not any(frag_hint in h for h in r3["hints"])      # bare leaf (plain needle matched)

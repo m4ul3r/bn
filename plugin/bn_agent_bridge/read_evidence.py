@@ -581,35 +581,114 @@ def _symbol_by_any_name(bv, name: str):
 _RTTI_PREFIXES = (("_ZTV", "vtable"), ("_ZTI", "typeinfo"), ("_ZTS", "typeinfo-name"))
 
 
-def _resolve_rtti_symbols(ctx, bv, query: str, table_entries: int) -> list[dict[str, Any]]:
-    """Resolve a (mangled) type-name to its RTTI DATA symbols -- the vtable /
-    typeinfo / typeinfo-name objects that actually carry the metadata, in
-    .rodata/.data.rel.ro with real xrefs -- which is what the lens is meant to
-    find but a .dynstr name-string match never reaches (#194). Best-effort: only
-    fires when the query is the mangled fragment (`_ZTV`+query resolves)."""
-    out: list[dict[str, Any]] = []
+_CXX_IDENT_RE = re.compile(r"[A-Za-z_]\w*")
+
+
+def _itanium_typeinfo_fragment(name: str) -> str | None:
+    """The Itanium RTTI type-string fragment for a DEMANGLED C++ name -- the form
+    the class lens prints -- or None if *name* isn't a plain (possibly nested)
+    identifier we can length-encode. ``media::codec::JsonCodec`` ->
+    ``N5media5codec9JsonCodecE``; ``Codec`` -> ``5Codec`` (#305).
+
+    Length-prefix mangling only: each ``::`` component is encoded ``<len><name>``,
+    nested names wrap in ``N..E``. Templates / operators / anonymous namespaces
+    are out of scope (return None) -- they need full Itanium mangling, and they
+    already fail today; this strictly adds the common namespaced-class case so the
+    name `class list`/`class show` print resolves in `evidence message`."""
+    parts = [p for p in name.split("::") if p]
+    if not parts or not all(_CXX_IDENT_RE.fullmatch(p) for p in parts):
+        return None
+    body = "".join(f"{len(p)}{p}" for p in parts)
+    return f"N{body}E" if len(parts) > 1 else body
+
+
+def _rtti_name_candidates(query: str) -> list[str]:
+    """Type-name forms to try for RTTI resolution: the query as given, plus its
+    Itanium typeinfo-string fragment when the query is a demangled name (so the
+    fully-qualified name the lens prints resolves, not just the bare leaf) (#305)."""
     q = query.strip()
-    if not q:
-        return out
-    for prefix, kind in _RTTI_PREFIXES:
-        sym = _symbol_by_any_name(bv, prefix + q)
-        if sym is None or getattr(sym, "address", None) is None:
-            continue
-        addr = int(sym.address)
-        entry: dict[str, Any] = {
-            "kind": kind,
-            "symbol": prefix + q,
-            "address": hex(addr),
-            "xrefs": read_xrefs._xrefs_to_address(ctx, bv, addr),
-        }
-        # The vtable's slots (typeinfo pointer + virtual methods) are the payload;
-        # show the table window so the lens directly surfaces them.
-        if kind == "vtable" and table_entries:
-            entry["table_window"] = _pointer_table_for_view(
-                ctx, bv, addr, entries=table_entries,
-                stride_size=ctx._pointer_size(bv), stop_after_invalid=2,
-            )
-        out.append(entry)
+    candidates = [q] if q else []
+    frag = _itanium_typeinfo_fragment(q) if q else None
+    if frag and frag not in candidates:
+        candidates.append(frag)
+    return candidates
+
+
+def _best_rtti_symbol(bv, name: str):
+    """The best symbol for an RTTI name, preferring a real DATA definition over a
+    `.got`/import-address ALIAS. An `_ZTV<T>` name commonly resolves to both a
+    `.data.rel.ro` vtable OBJECT and a `.got` pointer-TO-it alias; walking the
+    alias renders adjacent GOT entries as bogus slots, so pick the definition so
+    the lens surfaces the real vtable (#305). Falls back to ``_symbol_by_any_name``
+    when the view doesn't expose name->symbols enumeration (test fakes)."""
+    gb = getattr(bv, "get_symbols_by_name", None)
+    syms = list(gb(name)) if callable(gb) else []
+    if not syms:
+        return _symbol_by_any_name(bv, name)
+
+    def _is_got_alias(sym) -> bool:
+        addr = getattr(sym, "address", None)
+        if addr is None:
+            return True
+        iat = getattr(bn.SymbolType, "ImportAddressSymbol", None)
+        if iat is not None and getattr(sym, "type", None) == iat:
+            return True
+        secs = bv.get_sections_at(int(addr)) if hasattr(bv, "get_sections_at") else []
+        return any(str(getattr(s, "name", "")).startswith(".got") for s in (secs or []))
+
+    definitions = [s for s in syms if getattr(s, "address", None) is not None and not _is_got_alias(s)]
+    if definitions:
+        return definitions[0]
+    return syms[0]
+
+
+def _resolve_rtti_symbols(ctx, bv, query: str, table_entries: int) -> list[dict[str, Any]]:
+    """Resolve a type-name to its RTTI DATA symbols -- the vtable / typeinfo /
+    typeinfo-name objects that actually carry the metadata, in .rodata/.data.rel.ro
+    with real xrefs -- which is what the lens is meant to find but a .dynstr
+    name-string match never reaches (#194). Accepts the DEMANGLED fully-qualified
+    name the class lens prints (mangled to the typeinfo fragment, #305) as well as
+    the raw mangled fragment."""
+    out: list[dict[str, Any]] = []
+    seen_addrs: set[int] = set()
+    ptr = ctx._pointer_size(bv)
+    for q in _rtti_name_candidates(query):
+        for prefix, kind in _RTTI_PREFIXES:
+            sym = _best_rtti_symbol(bv, prefix + q)
+            if sym is None or getattr(sym, "address", None) is None:
+                continue
+            addr = int(sym.address)
+            if addr in seen_addrs:
+                continue
+            seen_addrs.add(addr)
+            entry: dict[str, Any] = {
+                "kind": kind,
+                "symbol": prefix + q,
+                "address": hex(addr),
+                "xrefs": read_xrefs._xrefs_to_address(ctx, bv, addr),
+            }
+            # The vtable's slots (typeinfo pointer + virtual methods) are the
+            # payload; show the table window so the lens directly surfaces them.
+            if kind == "vtable" and table_entries:
+                # #305: an `_ZTV<T>` name often resolves to BOTH a `.data.rel.ro`
+                # vtable-object DEFINITION and a `.got` import ALIAS (a pointer TO
+                # it). `_best_rtti_symbol` already prefers the definition; if only
+                # the GOT alias resolved, walking it (or its unrelocated slot)
+                # would fabricate adjacent GOT entries as bogus slots, so refuse
+                # the window and say so honestly rather than lie (#305/#313).
+                if _got_alias_target(ctx, bv, addr, ptr) is None:
+                    entry["table_window"] = _pointer_table_for_view(
+                        ctx, bv, addr, entries=table_entries,
+                        stride_size=ptr, stop_after_invalid=2,
+                    )
+                else:
+                    entry["vtable_is_got_alias"] = True
+                    entry["note"] = (
+                        "this _ZTV symbol is a GOT/import alias, not the vtable "
+                        "object, and the .data.rel.ro definition was not found as a "
+                        "symbol; run `evidence table` on the real vtable address"
+                    )
+            out.append(entry)
     return out
 
 
@@ -617,13 +696,20 @@ def _message_lens(ctx, selector: str | None, query: str, *, limit: int = 20, tab
     limit = _validate_count(limit, label="limit", minimum=1)
     table_entries = _validate_count(table_entries, label="table_entries", minimum=0)
     bv = ctx._resolve_view(selector)
-    needle = query.lower()
+    # Match the query as given AND its Itanium typeinfo-string fragment, so the
+    # DEMANGLED fully-qualified name the class lens prints
+    # (`media::codec::JsonCodec`) finds the RTTI string (`N5media5codec9JsonCodecE`),
+    # not just the hand-stripped bare leaf (#305).
+    needles = [query.lower()] if query else []
+    name_fragment = _itanium_typeinfo_fragment(query) if query else None
+    if name_fragment and name_fragment.lower() not in needles:
+        needles.append(name_fragment.lower())
     matches = []
     total_matched = 0
     dynstr_excluded = 0
     for item in list(getattr(bv, "strings", [])):
         value = str(getattr(item, "value", ""))
-        if needle and needle not in value.lower():
+        if needles and not any(n in value.lower() for n in needles):
             continue
         address = int(getattr(item, "start", 0))
         context = ctx._address_context(bv, address)
@@ -677,6 +763,16 @@ def _message_lens(ctx, selector: str | None, query: str, *, limit: int = 20, tab
     rtti_symbols = _resolve_rtti_symbols(ctx, bv, query, table_entries)
 
     hints: list[str] = []
+    if name_fragment and "::" in (query or "") and (total_matched or rtti_symbols):
+        # #305: be explicit that the demangled name was mangled to its Itanium
+        # typeinfo-string form for the search (the form RTTI metadata carries).
+        # Only when the query is actually ::-qualified (so the fragment, not the
+        # plain needle, is the matcher) AND something matched -- else the hint
+        # would over-claim on a bare-leaf or zero-match query (review #5).
+        hints.append(
+            f"matched the demangled name '{query}' via its Itanium typeinfo "
+            f"fragment '{name_fragment}'."
+        )
     if dynstr_excluded:
         hints.append(
             f"excluded {dynstr_excluded} match(es) in .dynstr (mangled symbol-name "
