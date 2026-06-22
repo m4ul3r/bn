@@ -80,6 +80,38 @@ def test_write_output_spills_large_payload(tmp_path, monkeypatch):
     assert re.fullmatch(rf"large-\d{{6}}-{os.getpid()}-[0-9a-f]{{4}}\.json", name)
 
 
+def test_spilled_paged_envelope_hoists_canonical_total(tmp_path, monkeypatch):
+    # #311: a spilled JSON envelope must expose the logical `total` at the TOP
+    # LEVEL so `jq '.total'` returns the real count whether or not the read
+    # spilled -- `jq '.items'` reads null on a spill (data is on disk), which
+    # otherwise misreads a 209-result read as "0".
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    payload = {
+        "kind": "xrefs",
+        "items": [{"address": f"0x{i:x}"} for i in range(120)],
+        "total": 209, "offset": 0, "limit": 120, "returned": 120, "has_more": True,
+    }
+    envelope = json.loads(write_output(payload, fmt="json", out_path=None,
+                                       stem="xrefs", spill_token_limit=64))
+    assert envelope["spilled"] is True
+    assert "items" not in envelope          # the trap: items are on disk
+    assert envelope["total"] == 209         # canonical count, spill-stable
+    assert envelope["summary"]["total"] == 209
+    assert envelope["summary"]["count"] == 120  # the on-disk page size, not the total
+
+
+def test_spilled_non_paged_value_has_no_spurious_total(tmp_path, monkeypatch):
+    # The negative: a non-paged spill (no items/functions page -- e.g. a big
+    # decompile string or a plain dict) must NOT get a spurious top-level total;
+    # only paged collections carry a logical total (#311).
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    envelope = json.loads(write_output({"text": "x" * 5000, "warnings": ["w"]},
+                                       fmt="json", out_path=None, stem="decompile",
+                                       spill_token_limit=64))
+    assert envelope["spilled"] is True
+    assert "total" not in envelope
+
+
 def test_write_output_spills_text_payload_with_txt_suffix(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     payload = "\n".join(f"line {index} with distinctive content" for index in range(1000))

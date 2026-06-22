@@ -138,7 +138,7 @@ def _artifact_payload(
     value: Any,
     spilled: bool,
 ) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "ok": True,
         "spilled": spilled,
         "artifact_path": str(artifact_path),
@@ -149,6 +149,15 @@ def _artifact_payload(
         "sha256": hashlib.sha256(encoded).hexdigest(),
         "summary": _summary(value),
     }
+    # Hoist the canonical logical total to the TOP LEVEL so `jq '.total'` returns
+    # the real count whether or not the read spilled (#311). On a spilled
+    # envelope the items live on disk at artifact_path, so `jq '.items'` reads
+    # null and a sink with 120 callers misreads as "0"; `.total` (and the
+    # `spilled: true` flag) are the canonical, spill-stable signals.
+    summary = payload["summary"]
+    if isinstance(summary, dict) and isinstance(summary.get("total"), int):
+        payload["total"] = summary["total"]
+    return payload
 
 
 def _format_envelope_value(value: Any) -> str:
