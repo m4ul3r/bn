@@ -1754,3 +1754,21 @@ def test_disasm_count_on_empty_disasm_names_count_flag(fake_transport, capsys):
     _, err = capsys.readouterr()
     assert "--count" in err
     assert "--lines" not in err
+
+
+def test_render_message_lens_text_counts_table_window_items_303():
+    # #303 straggler: the RTTI vtable-window slot count must read the #275 `items`
+    # envelope, not the pre-#275 `entries` key -- which always rendered "(0 slots)"
+    # for a resolved vtable while the JSON carried the real slots.
+    from bn import formatters
+    value = {
+        "kind": "messages", "query": "Codec", "count": 0, "items": [],
+        "rtti_symbols": [
+            {"kind": "vtable", "symbol": "_ZTV5Codec", "address": "0x403dc8",
+             "xrefs": {"code_refs": [], "data_refs": []},
+             "table_window": {"address": "0x403dc8",
+                              "items": [{"index": 0}, {"index": 1}, {"index": 2}]}},
+        ],
+    }
+    out = formatters._render_message_lens_text(value)
+    assert "vtable window @ 0x403dc8 (3 slots)" in out

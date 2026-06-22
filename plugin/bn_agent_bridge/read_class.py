@@ -366,7 +366,12 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
     start = vtable_addr + 2 * ptr
     table = ctx._pointer_table_layout(bv, start, entries=max_slots, stride=ptr)
     slots: list[dict[str, Any]] = []
-    for i, row in enumerate(table.get("entries") or []):
+    # #303: the pointer-table reader (`_pointer_table_for_view`) returns the
+    # canonical #275 envelope, whose rows live under `items`. This loop read the
+    # pre-#275 `entries` key, so every vtable resolved to ZERO slots and
+    # `class show` declared a recoverable dispatch table unrecoverable. Read
+    # `items` (with an `entries` fallback for any legacy producer / test fake).
+    for i, row in enumerate(table.get("items") or table.get("entries") or []):
         target = row.get("target") or {}
         fn = target.get("function") if isinstance(target, dict) else None
         # A null/unmapped/non-code slot ends the vtable (next object / padding /

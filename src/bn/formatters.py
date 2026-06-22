@@ -1213,8 +1213,13 @@ def _render_message_lens_text(value: Any) -> str:
                      f"  xrefs: {cc} code, {dc} data")
         tw = sym.get("table_window")
         if isinstance(tw, dict):
+            # #303: the table window is the #275 envelope keyed on `items`; the
+            # pre-#275 `entries` key always read 0, so a resolved RTTI vtable
+            # window falsely rendered "(0 slots)" in text while the JSON carried
+            # the real slots. (entries fallback for any legacy producer.)
+            slot_count = len(list(tw.get("items") or tw.get("entries") or []))
             lines.append(f"    vtable window @ {tw.get('address', '?')} "
-                         f"({len(list(tw.get('entries') or []))} slots)")
+                         f"({slot_count} slots)")
     for hint in list(value.get("hints") or []):
         lines.append(f"hint: {hint}")
     return "\n".join(lines)

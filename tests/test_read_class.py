@@ -173,7 +173,8 @@ class _SlotCtx:
         return "net::Klass" if self._ti_ok else None
 
     def _pointer_table_layout(self, bv, start, *, entries, stride):
-        return {"entries": self._rows}
+        # #303: the real reader returns the #275 envelope keyed on `items`.
+        return {"kind": "pointer_table", "items": self._rows}
 
 
 def test_vtable_layout_skips_when_header_not_typeinfo():
@@ -209,7 +210,7 @@ def test_vtable_layout_demangles_slot_name():
             return "net::Session"
 
         def _pointer_table_layout(self, bv, start, *, entries, stride):
-            return {"entries": [
+            return {"kind": "pointer_table", "items": [
                 {"index": 0, "value": "0x41eeb0", "readable": True,
                  "target": {"status": "function",
                             "function": {"name": "_ZN3net7Session6onDataEv", "address": "0x41eeb0"}}}]}
@@ -268,6 +269,26 @@ def test_vtable_layout_rejects_data_in_executable_segment():
     ]
     layout = read_class._vtable_layout(_SlotCtx(rows), object(), 0x9000)
     assert layout["slots"] == []   # stops at the data-in-r-x slot, no fake method
+
+
+def test_vtable_layout_reads_items_envelope_not_legacy_entries():
+    # #303 regression: the pointer-table reader returns the canonical #275
+    # envelope keyed on `items`. _vtable_layout read the pre-#275 `entries` key,
+    # so EVERY vtable resolved to zero slots and `class show` falsely reported a
+    # recoverable dispatch table as unrecoverable ("no slots resolved"). A table
+    # that supplies ONLY `items` (no `entries`) must resolve its slots.
+    class _ItemsOnlyCtx(_SlotCtx):
+        def _pointer_table_layout(self, bv, start, *, entries, stride):
+            return {"kind": "pointer_table", "items": self._rows}  # no `entries` key
+
+    rows = [
+        {"index": 0, "value": "0x1238", "readable": True,
+         "target": {"status": "function", "function": {"name": "JsonCodecD1Ev"}}},
+        {"index": 1, "value": "0x1258", "readable": True,
+         "target": {"status": "function", "function": {"name": "JsonCodecD0Ev"}}},
+    ]
+    layout = read_class._vtable_layout(_ItemsOnlyCtx(rows), object(), 0x9000)
+    assert [s["index"] for s in layout["slots"]] == [0, 1]   # slots resolved from `items`
 
 
 def test_resolve_class_names_template_query_not_collapsed():
