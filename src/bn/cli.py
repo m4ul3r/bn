@@ -760,8 +760,15 @@ def _call(
     regex_hint_query: str | None = None,
     regex_fallback_query: str | None = None,
     offset_hint_identifier: str | None = None,
+    op_default_timeout: float | None = None,
 ) -> int:
     request_params = dict(params or {})
+    # A long one-time op (load/refresh full analysis) raises its no-env default
+    # client timeout so it isn't abandoned at the 600s read-op default on a very
+    # large binary; BN_REQUEST_TIMEOUT still overrides it (#321).
+    timeout_kwargs = (
+        {"default_timeout": op_default_timeout} if op_default_timeout is not None else {}
+    )
     effective_page_limit = None
     if page_limit is not None and page_limit >= 0:
         effective_page_limit = page_limit
@@ -778,6 +785,7 @@ def _call(
         target=target,
         instance_id=getattr(args, "instance", None),
         spawn_missing_named=spawn_missing_named,
+        **timeout_kwargs,
     )
     result = response["result"]
     # Auto-regex fallback (#291.3): a metacharacter query that matched nothing
@@ -794,6 +802,7 @@ def _call(
             target=target,
             instance_id=getattr(args, "instance", None),
             spawn_missing_named=spawn_missing_named,
+            **timeout_kwargs,
         )
         result = response["result"]
         # An in-band marker so a --format json consumer (which reads stdout, not

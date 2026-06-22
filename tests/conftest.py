@@ -20,7 +20,7 @@ def fake_transport(monkeypatch):
         calls = []
 
         def fake_send_request(op, *, params=None, target=None, timeout=30.0,
-                              instance_id=None, spawn_missing_named=False):
+                              instance_id=None, spawn_missing_named=False, **kwargs):
             calls.append({"op": op, "params": params, "target": target})
             if op in results:
                 return results[op]

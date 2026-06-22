@@ -183,7 +183,7 @@ def test_target_info_verbose_renders_segments():
 def test_save_accepts_path_flag(monkeypatch, tmp_path):
     captured_params = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False, **kwargs):
         assert op == "save_database"
         captured_params.update(params or {})
         return {"ok": True, "result": {"path": params.get("path"), "saved": True}}
@@ -263,7 +263,7 @@ def test_close_rejects_path_and_all_together(monkeypatch, capsys):
     # any request is sent (#85).
     sent = {"called": False}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False, **kwargs):
         sent["called"] = True
         return {"ok": True, "result": {"closed": []}}
 
@@ -416,7 +416,7 @@ def test_load_opts_into_spawn_missing_named(monkeypatch, tmp_path):
     raw.write_bytes(b"")
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False, **kwargs):
         captured["op"] = op
         captured["instance_id"] = instance_id
         captured["spawn_missing_named"] = spawn_missing_named
@@ -435,7 +435,7 @@ def test_non_load_command_does_not_spawn_missing_named(monkeypatch):
     # Read commands must not silently spawn a process for a typo'd --instance.
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False, **kwargs):
         captured["spawn_missing_named"] = spawn_missing_named
         return {"ok": True, "result": []}
 
@@ -453,7 +453,7 @@ def test_load_accepts_instance_id_alias_for_spawn_name(monkeypatch, tmp_path):
     raw.write_bytes(b"")
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False, **kwargs):
         captured["op"] = op
         captured["instance_id"] = instance_id
         captured["spawn_missing_named"] = spawn_missing_named
@@ -474,7 +474,7 @@ def test_load_instance_id_does_not_clobber_env_instance(monkeypatch, tmp_path):
     raw.write_bytes(b"")
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False, **kwargs):
         captured["instance_id"] = instance_id
         return {"ok": True, "result": {"loaded": True, "path": str(raw), "notes": [], "targets": []}}
 

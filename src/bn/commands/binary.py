@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from ..cli import _call, _pick, arg, command
-from ..transport import BridgeError
+from ..transport import BridgeError, REFRESH_REQUEST_TIMEOUT
 from ..formatters import (
     _render_close_text,
     _render_load_text,
@@ -46,6 +46,11 @@ def _load(args: argparse.Namespace) -> int:
         # `bn load --instance <new-id>` auto-spawns that named bridge instead of
         # erroring, so a fresh isolated instance is one command, not two.
         spawn_missing_named=True,
+        # A full (non-quick) initial analysis of a very large binary can exceed
+        # the 600s read-op default; give the one-time load an hour by default
+        # (BN_REQUEST_TIMEOUT still overrides), so it isn't abandoned mid-analysis
+        # (#321). `--quick` returns fast and isn't affected.
+        op_default_timeout=REFRESH_REQUEST_TIMEOUT,
     )
 
 
@@ -115,6 +120,10 @@ def _refresh(args: argparse.Namespace) -> int:
         require_target=True,
         text_renderer=_render_refresh_text,
         stem="refresh",
+        # The one-time full re-analysis can run far past the 600s read-op default
+        # on a very large binary; give it an hour by default (#321). Users still
+        # override (or disable) via BN_REQUEST_TIMEOUT for the truly huge case.
+        op_default_timeout=REFRESH_REQUEST_TIMEOUT,
     )
 
 

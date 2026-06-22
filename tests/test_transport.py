@@ -1214,3 +1214,40 @@ def test_wait_for_teardown_times_out_while_live(tmp_path, monkeypatch):
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_resolve_timeout_per_op_default_applies_only_without_env(monkeypatch):
+    """#321: load/refresh raise their no-env default client timeout so a long
+    one-time analysis isn't abandoned at the 600s read-op default -- but an
+    explicit BN_REQUEST_TIMEOUT still wins, and the disable sentinels still
+    disable."""
+    from bn.transport import _resolve_timeout, REFRESH_REQUEST_TIMEOUT, DEFAULT_REQUEST_TIMEOUT
+
+    # no env -> the per-op default applies (the larger refresh value), not 600s
+    monkeypatch.delenv("BN_REQUEST_TIMEOUT", raising=False)
+    assert _resolve_timeout(None, default=REFRESH_REQUEST_TIMEOUT) == REFRESH_REQUEST_TIMEOUT
+    assert _resolve_timeout(None) == DEFAULT_REQUEST_TIMEOUT          # unchanged for normal ops
+    # explicit env wins over the per-op default
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "42.5")
+    assert _resolve_timeout(None, default=REFRESH_REQUEST_TIMEOUT) == 42.5
+    # disable sentinel still disables, regardless of the per-op default
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "0")
+    assert _resolve_timeout(None, default=REFRESH_REQUEST_TIMEOUT) is None
+    # an explicit per-call timeout overrides everything
+    monkeypatch.delenv("BN_REQUEST_TIMEOUT", raising=False)
+    assert _resolve_timeout(5.0, default=REFRESH_REQUEST_TIMEOUT) == 5.0
+
+
+def test_send_request_load_refresh_use_larger_default(tmp_path, monkeypatch):
+    """#321: send_request with a larger default_timeout (the load/refresh path)
+    applies it to the socket when BN_REQUEST_TIMEOUT is unset."""
+    from bn.transport import REFRESH_REQUEST_TIMEOUT
+
+    monkeypatch.delenv("BN_REQUEST_TIMEOUT", raising=False)
+    instance = _make_instance(tmp_path)
+    monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None, **kw: instance)
+    fake_socket = _make_timeout_probe_socket()
+    monkeypatch.setattr("bn.transport.socket.socket", lambda *args, **kwargs: fake_socket())
+
+    send_request("refresh", default_timeout=REFRESH_REQUEST_TIMEOUT)
+    assert fake_socket.timeouts == [REFRESH_REQUEST_TIMEOUT]

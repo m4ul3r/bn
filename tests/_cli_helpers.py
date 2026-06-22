@@ -68,7 +68,7 @@ def _fake_bridge_instance(instance_id="abc123", pid=111):
 def _load_capture(monkeypatch, raw, analyzed):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False, **kwargs):
         assert op == "load_binary"
         captured.update(params)
         return {"ok": True, "result": {
@@ -85,7 +85,7 @@ def _load_capture(monkeypatch, raw, analyzed):
 
 
 def _assert_no_bridge_call(monkeypatch):
-    def fail_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+    def fail_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, **kwargs):
         raise AssertionError(f"bridge should not be called (got op {op!r})")
 
     monkeypatch.setattr(bn.cli, "send_request", fail_send_request)
@@ -94,7 +94,7 @@ def _assert_no_bridge_call(monkeypatch):
 def _capture_xrefs_call(monkeypatch):
     captured = {}
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False, **kwargs):
         captured["op"] = op
         captured["params"] = params or {}
         return {"ok": True, "result": {

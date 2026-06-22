@@ -35,14 +35,20 @@ TRANSIENT_SOCKET_ERRNOS = {
 # (load/refresh with update_analysis_and_wait) can run for minutes. Override
 # with BN_REQUEST_TIMEOUT=<seconds>; 0/none/off/empty disables the timeout entirely.
 DEFAULT_REQUEST_TIMEOUT = 600.0
+# The one-time full analysis (load/refresh -> update_analysis_and_wait) on a very
+# large binary (~180k functions) can run far past the 600s read-op default, and
+# hitting the client timeout there abandons a still-running analysis (#321). Give
+# those ops a much larger default client timeout; BN_REQUEST_TIMEOUT still wins
+# when the user sets it (including 0/none to disable entirely for a huge load).
+REFRESH_REQUEST_TIMEOUT = 3600.0
 
 
-def _resolve_timeout(timeout: float | None) -> float | None:
+def _resolve_timeout(timeout: float | None, *, default: float | None = DEFAULT_REQUEST_TIMEOUT) -> float | None:
     if timeout is not None:
         return timeout
     raw = os.environ.get("BN_REQUEST_TIMEOUT")
     if raw is None:
-        return DEFAULT_REQUEST_TIMEOUT
+        return default
     text = raw.strip().lower()
 
     def _reject() -> BridgeError:
@@ -393,6 +399,7 @@ def _send_request_to_instance(
     params: dict[str, Any] | None = None,
     target: str | None = None,
     timeout: float | None = None,
+    default_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
     connect_retries: int = 4,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
@@ -404,7 +411,7 @@ def _send_request_to_instance(
         payload["target"] = target
 
     encoded = (json.dumps(payload) + "\n").encode("utf-8")
-    timeout = _resolve_timeout(timeout)
+    timeout = _resolve_timeout(timeout, default=default_timeout)
 
     chunks: list[bytes] = []
     last_error: OSError | None = None
@@ -627,6 +634,7 @@ def send_request(
     params: dict[str, Any] | None = None,
     target: str | None = None,
     timeout: float | None = None,
+    default_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
     connect_retries: int = 4,
     instance_id: str | None = None,
     spawn_missing_named: bool = False,
@@ -636,7 +644,9 @@ def send_request(
     # BN_REQUEST_TIMEOUT must fail here -- not after a stray random instance has
     # already been spawned into the cache (#255 review). _resolve_timeout is
     # idempotent, so the resolved value re-resolves to itself downstream.
-    timeout = _resolve_timeout(timeout)
+    # default_timeout lets a long one-time op (load/refresh) raise the no-env
+    # default without overriding an explicit BN_REQUEST_TIMEOUT (#321).
+    timeout = _resolve_timeout(timeout, default=default_timeout)
     instance = choose_instance(instance_id, spawn_missing_named=spawn_missing_named)
     return _send_request_to_instance(
         instance,
@@ -644,5 +654,6 @@ def send_request(
         params=params,
         target=target,
         timeout=timeout,
+        default_timeout=default_timeout,
         connect_retries=connect_retries,
     )
