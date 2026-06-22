@@ -1567,6 +1567,91 @@ class BinaryNinjaBridge:
     def _go_functions(self, *a, **k):
         return read_go._go_functions(self.ctx, *a, **k)
 
+    def _go_rename(self, selector, *, preview: bool = False):
+        """Apply recovered Go function names from `.gopclntab` (#217). Composes the
+        go_functions recovery with the batch-rename pipeline, renaming ONLY
+        auto-named (``sub_``/``nullsub_``) functions BN already has at the
+        pcln-derived address -- so a user's manual names are never clobbered and a
+        PIE/rebase mismatch (no BN function at the address) is skipped, not
+        mis-renamed. Goes through `_mutation` so every rename is verified (and the
+        whole batch reverted on failure / under --preview)."""
+        recovered = read_go._go_functions(self.ctx, selector)
+        items = recovered.get("items") or []
+        bv = self._resolve_view(selector)
+        get_fn = getattr(bv, "get_function_at", None)
+        ops: list[dict[str, Any]] = []
+        skipped_user_named = 0
+        for it in items:
+            if not it.get("defined") or not callable(get_fn):
+                continue
+            try:
+                addr = int(it["address"], 16)
+            except (KeyError, ValueError, TypeError):
+                continue
+            fn = get_fn(addr)
+            if fn is None:
+                continue
+            current = str(getattr(fn, "name", "") or "")
+            new_name = str(it.get("name") or "")
+            if not new_name or current == new_name:
+                continue
+            # Match BN's EXACT auto-name form (`sub_<lowercase-hex-of-start-addr>`),
+            # not a `sub_` prefix -- a prefix would clobber a real/user symbol that
+            # merely starts with `sub_` (e.g. `sub_handler`). fn is start-anchored
+            # (get_function_at), so fn.start == addr. `nullsub_<counter>` stays a
+            # prefix (the counter isn't predictable). Fail-safe: an unrecognized
+            # form is SKIPPED (never renamed), never clobbered (#217 review).
+            if not (current == f"sub_{addr:x}" or current.startswith("nullsub_")):
+                skipped_user_named += 1            # never clobber a real/user symbol
+                continue
+            ops.append({"op": "rename_symbol", "kind": "function",
+                        "identifier": hex(addr), "new_name": new_name})
+        if not ops:
+            return {"kind": "go_rename", "success": True, "committed": False,
+                    "preview": preview, "results": [],
+                    "go_renamed_candidates": 0, "skipped_user_named": skipped_user_named,
+                    "defined_count": recovered.get("defined_count", 0)}
+        result = self._mutation(selector, preview, ops)
+        if isinstance(result, dict):
+            result["kind"] = "go_rename"
+            result["go_renamed_candidates"] = len(ops)
+            result["skipped_user_named"] = skipped_user_named
+            # A bulk auto-name application renames hundreds/thousands of functions;
+            # the per-function blast-radius graphs (affected_*) balloon the result
+            # to MBs and a full per-success row list is a 61k-token wall/spill -- all
+            # noise at this scale. Drop the blast radius and keep only FAILED rows
+            # (the actionable detail) plus verified/failed counts; the exit-code
+            # check still sees failures via `results[].status`. The applied names
+            # are in the database -- `function list`/`go functions` show them.
+            for heavy in ("affected_functions", "affected_types", "affected_summary"):
+                result.pop(heavy, None)
+            verified_count = 0
+            failed_rows = []
+            for r in (result.get("results") or []):
+                if not isinstance(r, dict):
+                    continue
+                if r.get("status") == "verified":
+                    verified_count += 1
+                    continue
+                req = r.get("requested") if isinstance(r.get("requested"), dict) else {}
+                failed_rows.append({
+                    "op": r.get("op", "rename_symbol"),
+                    "address": r.get("address") or req.get("identifier"),
+                    "new_name": r.get("new_name") or req.get("new_name"),
+                    "status": r.get("status"),
+                    "message": r.get("message"),
+                })
+            result["results"] = failed_rows
+            # `go_verified_count` = renames that passed readback BEFORE any revert.
+            # The pipeline is all-or-nothing: on ANY failure it reverts the whole
+            # batch (committed=False), so nothing actually landed. `go_committed_count`
+            # is the honest "how many names are now in the database" -- 0 on a
+            # rolled-back batch, else the verified count (#217 review).
+            result["go_verified_count"] = verified_count
+            result["go_failed_count"] = len(failed_rows)
+            result["go_committed_count"] = verified_count if result.get("committed") else 0
+        return result
+
     def _ascii_render(self, *a, **k):
         return read_misc._ascii_render(*a, **k)
 
@@ -2188,6 +2273,14 @@ def _bind_go_functions(bridge, params, target):
         target,
         offset=int(params.get("offset", 0)),
         limit=int(params["limit"]) if params.get("limit") is not None else None,
+    )
+
+
+@op("go_rename", lock="write")
+def _bind_go_rename(bridge, params, target):
+    return bridge._go_rename(
+        target,
+        preview=_validate_bool(params.get("preview"), label="preview", default=False),
     )
 
 

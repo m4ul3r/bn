@@ -693,6 +693,49 @@ def _render_name_address_list_text(value: Any) -> str:
     return body
 
 
+def _render_go_rename_text(value: Any) -> str:
+    """Render `go rename` (#217): a compact summary (verified / failed / skipped
+    counts) with the preview/rollback banner and a capped FAILED list -- never a
+    per-success wall, since a bulk auto-name renames hundreds/thousands at once.
+    `results` carries only failures; the applied names are in the database."""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    skipped = value.get("skipped_user_named", 0)
+    targeted = value.get("go_renamed_candidates", 0)
+    if not targeted:
+        return ("go rename: nothing to do — no auto-named (sub_*) Go functions to rename "
+                f"({value.get('defined_count', 0)} defined at pcln addresses, "
+                f"{skipped} already user-named)")
+    failed = [r for r in (value.get("results") or []) if isinstance(r, dict)]
+    verified = value.get("go_verified_count", targeted - len(failed))
+    preview = bool(value.get("preview"))
+    committed = bool(value.get("committed", True))
+    lines: list[str] = []
+    if preview:
+        lines.append("preview: renames applied + reverted (nothing committed)")
+        lines.append(f"go rename (preview): {verified} would rename, {len(failed)} failed, "
+                     f"{skipped} skipped (already user-named)")
+    elif not committed and (value.get("success") is False or failed):
+        # All-or-nothing: a failure reverted the WHOLE batch, so NOTHING landed --
+        # don't claim "N renamed" for rows that passed readback before the revert.
+        if value.get("rolled_back") is False:
+            lines.append("rollback failed: the view may be left modified")
+        else:
+            lines.append("rolled back: the batch was reverted because a rename failed — "
+                         "NOTHING was committed")
+        lines.append(f"go rename: 0 renamed ({verified} would have, {len(failed)} failed, "
+                     f"{skipped} skipped); fix the failure(s) below and re-run")
+    else:
+        lines.append(f"go rename: {verified} renamed, {len(failed)} failed, "
+                     f"{skipped} skipped (already user-named)")
+    for r in failed[:50]:
+        lines.append(f"  failed: {r.get('new_name', '?')} @ {r.get('address', '?')} "
+                     f"({r.get('status', '?')})")
+    if len(failed) > 50:
+        lines.append(f"  ... and {len(failed) - 50} more failed")
+    return "\n".join(lines)
+
+
 def _render_go_functions_text(value: Any) -> str:
     """Render the Go pcln function lens (#217): a header with the detected Go
     version + how many recovered addresses already map to a BN function, the

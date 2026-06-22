@@ -136,3 +136,134 @@ def test_go_functions_declines_32bit(monkeypatch):
     with pytest.raises(bridge.OperationFailure) as exc:
         inst._go_functions(None)
     assert exc.value.status == "unsupported_ptr_size"
+
+
+class _FakeFn:
+    def __init__(self, name):
+        self.name = name
+
+
+def test_go_rename_applies_recovered_names_auto_only(monkeypatch):
+    # #217: go rename applies recovered Go names to AUTO-named (sub_) functions
+    # only -- never clobbering a user/symbol name -- and compacts the bulk result.
+    blob = _build_pclntab()                       # main.foo @0x401000, main.bar @0x402000
+    bv = _GoBV(blob, defined={0x401000, 0x402000})
+    names = {0x401000: "sub_401000", 0x402000: "MyHandler"}   # foo=auto, bar=user-named
+    monkeypatch.setattr(bv, "get_function_at",
+                        lambda a: _FakeFn(names[a]) if a in names else None)
+    bridge, inst = _ctx(monkeypatch, bv)
+
+    captured = {}
+    def fake_mutation(sel, preview, ops):
+        captured["ops"] = ops
+        return {"success": True, "committed": not preview, "preview": preview,
+                "results": [{"op": "rename_symbol", "status": "verified",
+                             "requested": {"identifier": o["identifier"], "new_name": o["new_name"]}}
+                            for o in ops],
+                "affected_functions": [{"x": 1}] * 5}     # heavy -> must be dropped
+    monkeypatch.setattr(inst, "_mutation", fake_mutation)
+
+    out = inst._go_rename(None)
+    assert out["kind"] == "go_rename"
+    assert out["go_renamed_candidates"] == 1 and out["skipped_user_named"] == 1
+    assert captured["ops"][0]["new_name"] == "main.foo"
+    assert captured["ops"][0]["identifier"] == hex(0x401000)
+    # compacted: blast radius dropped, failures-only results, counts present
+    assert "affected_functions" not in out
+    assert out["go_verified_count"] == 1 and out["go_failed_count"] == 0
+    assert out["results"] == []
+
+
+def test_go_rename_noop_when_already_named(monkeypatch):
+    blob = _build_pclntab()
+    bv = _GoBV(blob, defined={0x401000})
+    monkeypatch.setattr(bv, "get_function_at",
+                        lambda a: _FakeFn("main.foo") if a == 0x401000 else None)  # already the Go name
+    bridge, inst = _ctx(monkeypatch, bv)
+    monkeypatch.setattr(inst, "_mutation",
+                        lambda *a, **k: pytest.fail("mutation must not run on a noop"))
+    out = inst._go_rename(None)
+    assert out["go_renamed_candidates"] == 0 and out["success"] is True and out["results"] == []
+
+
+def test_go_rename_skips_undefined_pcln_addresses(monkeypatch):
+    blob = _build_pclntab()
+    bv = _GoBV(blob, defined=set())                # no BN function at any pcln address
+    bridge, inst = _ctx(monkeypatch, bv)
+    monkeypatch.setattr(inst, "_mutation",
+                        lambda *a, **k: pytest.fail("must not rename undefined addresses"))
+    out = inst._go_rename(None)
+    assert out["go_renamed_candidates"] == 0
+
+
+def test_render_go_rename_text_is_compact():
+    from bn.formatters import _render_go_rename_text
+    assert "nothing to do" in _render_go_rename_text(
+        {"go_renamed_candidates": 0, "defined_count": 10, "skipped_user_named": 3})
+    # bulk success is ONE summary line, never a per-success wall
+    out = _render_go_rename_text({"go_renamed_candidates": 1782, "go_verified_count": 1782,
+                                  "skipped_user_named": 1, "results": [], "committed": True})
+    assert out.count("\n") == 0 and "1782 renamed" in out and "0 failed" in out
+    # #217 review: a failure reverts the WHOLE batch (committed=False), so the
+    # output must NOT claim the readback-passing rows as "renamed" -- nothing
+    # landed. Honest wording: 0 renamed, N would have, M failed (listed).
+    out2 = _render_go_rename_text({"go_renamed_candidates": 1789, "go_verified_count": 1788,
+                                   "go_committed_count": 0, "skipped_user_named": 1,
+                                   "success": False, "committed": False, "rolled_back": True,
+                                   "results": [{"new_name": "main.x", "address": "0x1",
+                                                "status": "verification_failed"}]})
+    assert "0 renamed" in out2 and "1788 would have" in out2 and "main.x" in out2
+    assert "1788 renamed" not in out2          # the dishonest claim is gone
+    assert "NOTHING was committed" in out2
+
+    # preview: "would rename", nothing committed
+    pv = _render_go_rename_text({"go_renamed_candidates": 5, "go_verified_count": 5,
+                                 "skipped_user_named": 0, "preview": True, "committed": False,
+                                 "results": []})
+    assert "would rename" in pv and "reverted" in pv
+
+
+def test_go_rename_guard_is_exact_not_prefix(monkeypatch):
+    # #217 review (paramount): the guard matches BN's EXACT `sub_<addr>` form, not a
+    # `sub_` PREFIX -- so a user name like `sub_handler` is NOT clobbered.
+    blob = _build_pclntab()                       # main.foo @0x401000, main.bar @0x402000
+    bv = _GoBV(blob, defined={0x401000, 0x402000})
+    names = {0x401000: "sub_401000", 0x402000: "sub_handler"}   # exact vs sub_-prefixed user name
+    monkeypatch.setattr(bv, "get_function_at",
+                        lambda a: _FakeFn(names[a]) if a in names else None)
+    bridge, inst = _ctx(monkeypatch, bv)
+    captured = {}
+    def fake_mutation(sel, preview, ops):
+        captured["ops"] = ops
+        return {"success": True, "committed": True,
+                "results": [{"op": "rename_symbol", "status": "verified",
+                             "requested": {"identifier": o["identifier"], "new_name": o["new_name"]}}
+                            for o in ops]}
+    monkeypatch.setattr(inst, "_mutation", fake_mutation)
+    out = inst._go_rename(None)
+    assert out["go_renamed_candidates"] == 1            # only exact sub_401000
+    assert out["skipped_user_named"] == 1               # sub_handler NOT clobbered
+    assert captured["ops"][0]["identifier"] == hex(0x401000)
+    assert out["go_committed_count"] == 1               # committed -> landed count == verified
+
+
+def test_go_rename_committed_count_zero_on_rollback(monkeypatch):
+    # #217 review: when the all-or-nothing batch reverts (committed=False),
+    # go_committed_count must be 0 even though rows passed readback pre-revert.
+    blob = _build_pclntab()
+    bv = _GoBV(blob, defined={0x401000})
+    monkeypatch.setattr(bv, "get_function_at",
+                        lambda a: _FakeFn("sub_401000") if a == 0x401000 else None)
+    bridge, inst = _ctx(monkeypatch, bv)
+    def fake_mutation(sel, preview, ops):
+        return {"success": False, "committed": False, "rolled_back": True,
+                "results": [{"op": "rename_symbol", "status": "verified",
+                             "requested": {"identifier": ops[0]["identifier"],
+                                           "new_name": ops[0]["new_name"]}},
+                            {"op": "rename_symbol", "status": "verification_failed",
+                             "requested": {"identifier": "0x402000", "new_name": "main.bar"}}]}
+    monkeypatch.setattr(inst, "_mutation", fake_mutation)
+    out = inst._go_rename(None)
+    assert out["go_verified_count"] == 1                # passed readback before revert
+    assert out["go_committed_count"] == 0               # but nothing landed (reverted)
+    assert out["go_failed_count"] == 1

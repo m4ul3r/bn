@@ -6,9 +6,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ..cli import _call, _effective_limit, _int_or_hex, _mutate, _non_negative_int, _pick, arg, command, mutex, preview_arg
+from ..cli import _call, _effective_limit, _int_or_hex, _mutate, _mutation_exit_code, _non_negative_int, _pick, arg, command, mutex, preview_arg
 from ..formatters import (
     _render_go_functions_text,
+    _render_go_rename_text,
     _render_imports_summary_text,
     _render_name_address_list_text,
     _render_py_exec_text,
@@ -207,6 +208,26 @@ def _go_functions(args: argparse.Namespace) -> int:
         page_label="go_functions",
         paged_spill=True,
         stem="go-functions",
+    )
+
+
+@command("go", "rename",
+         help="Apply recovered Go names from .gopclntab to the database "
+              "(renames auto-named sub_*/nullsub_* only — never your manual names)",
+         target=True, fmt="json",
+         prefer_when="after `go functions` shows the recovered names, apply them so the "
+                     "Go binary is navigable; safe to re-run (idempotent, skips named functions)",
+         see_also=("go functions",),
+         args=[preview_arg("Apply the renames, capture diffs, then revert without committing")])
+def _go_rename(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "go_rename",
+        {"preview": bool(args.preview)},
+        require_target=True,
+        text_renderer=_render_go_rename_text,
+        result_exit_code=_mutation_exit_code,
+        stem="go-rename",
     )
 
 

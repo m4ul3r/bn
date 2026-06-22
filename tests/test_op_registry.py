@@ -22,7 +22,7 @@ EXPECTED_WRITE = {
     "py_exec", "function_create", "rename_symbol", "set_comment", "delete_comment",
     "set_prototype", "local_rename", "local_retype", "struct_field_set",
     "struct_field_rename", "struct_field_delete", "types_declare", "batch_apply",
-    "refresh", "close_binary", "save_database",
+    "refresh", "close_binary", "save_database", "go_rename",
 }
 
 
