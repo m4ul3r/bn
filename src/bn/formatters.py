@@ -1257,7 +1257,7 @@ def _render_fanout_text(value: Any, inner_renderer: Callable[[Any], str] | None 
         return _render_fallback_text(value)
     rows = value.get("instances") or []
     ok = sum(1 for r in rows if isinstance(r, dict) and r.get("ok"))
-    lines = [f"fan-out: {value.get('command', '?')} across {len(rows)} instance(s) "
+    lines = [f"fan-out: {value.get('command', '?')} — {len(rows)} result(s) "
              f"({ok} ok, {len(rows) - ok} failed)"]
     for r in rows:
         if not isinstance(r, dict):

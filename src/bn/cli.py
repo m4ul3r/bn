@@ -276,16 +276,26 @@ def _instance_option(parser: argparse.ArgumentParser, *, is_root: bool = False) 
 
 
 def _fanout_option(parser: argparse.ArgumentParser) -> None:
-    """`--all-instances`: run a READ across every running bridge instance and
-    aggregate the per-instance results (#169 Layer 1). Attached only to read
-    commands (default-format text) -- never mutations -- so it can't fan a write.
-    SUPPRESS default so the flag is absent from the namespace unless passed."""
+    """`--all-instances` / `--all-targets`: run a READ across every running bridge
+    instance and/or every target in an instance, aggregating the per-(instance,
+    target) results (#169 Layer 1). Attached only to commands the registry marks
+    `fanout=True` (whole-target read surveys) -- never mutations -- so a write
+    can't be fanned. SUPPRESS default so a flag is absent from the namespace
+    unless passed."""
     parser.add_argument(
         "--all-instances",
         action="store_true",
         default=argparse.SUPPRESS,
         dest="all_instances",
         help="Run this read across every running bridge instance and aggregate the results",
+    )
+    parser.add_argument(
+        "--all-targets",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        dest="all_targets",
+        help="Run this read across every target open in the instance (combine with "
+             "--all-instances for every instance x target)",
     )
 
 
@@ -803,10 +813,11 @@ def _call(
         effective_page_limit = page_limit
         request_params["limit"] = page_limit + 1
 
-    # #169 L1: --all-instances fans this read across every running instance and
-    # aggregates. Gated branch -- the normal single-target path below is untouched
-    # when the flag is absent (every existing command/test stays on it).
-    if getattr(args, "all_instances", False):
+    # #169 L1: --all-instances / --all-targets fan this read across instances
+    # and/or targets and aggregate. Gated branch -- the normal single-target path
+    # below is untouched when neither flag is set (every existing command/test
+    # stays on it).
+    if getattr(args, "all_instances", False) or getattr(args, "all_targets", False):
         return _fanout_call(
             args, op, request_params,
             require_target=require_target,
@@ -904,37 +915,67 @@ def _fanout_call(
     timeout_kwargs: dict[str, Any],
     stem: str,
 ) -> int:
-    """Run *op* across every running bridge instance and aggregate (#169 L1).
+    """Run *op* across every running bridge instance (``--all-instances``) and/or
+    every open target in each instance (``--all-targets``), and aggregate (#169 L1).
 
-    Each instance resolves its own target via the normal rule (an explicit -t
-    applies to all; otherwise the per-instance implicit single target, ambiguous
-    or none -> a per-instance ``ok:false`` row, not a hard failure). The aggregate
-    is one ``{kind: fanout, instances: [...]}`` value rendered per-instance (text
-    via the command's own renderer) or as JSON, through the normal spill path."""
-    instances = list_instances()
-    if not instances:
-        raise BridgeError("--all-instances: no bridge instances are running")
+    Without ``--all-targets`` each instance resolves its single target by the
+    normal rule (an explicit -t applies to all; else the implicit single target;
+    ambiguous/none -> a per-instance ``ok:false`` row, not a hard failure). With
+    ``--all-targets`` each instance's open targets are enumerated and fanned. The
+    aggregate is one ``{kind: fanout, instances: [...]}`` value rendered
+    per-(instance,target) (text via the command's own renderer) or JSON, through
+    the normal spill path."""
+    fan_instances = getattr(args, "all_instances", False)
+    fan_targets = getattr(args, "all_targets", False)
+    if fan_instances:
+        instance_ids = [instance_selector(inst) for inst in list_instances()]
+        if not instance_ids:
+            raise BridgeError("--all-instances: no bridge instances are running")
+    else:
+        # --all-targets alone: just the resolved/explicit/default instance.
+        instance_ids = [getattr(args, "instance", None)]
+
     rows: list[dict[str, Any]] = []
-    # An explicit -t in args.target is carried into each per-instance clone below,
-    # so it applies to every instance; otherwise each resolves its own implicit
-    # single target.
-    for inst in instances:
-        iid = instance_selector(inst)
-        row: dict[str, Any] = {"instance": iid}
-        try:
-            sub = argparse.Namespace(**vars(args))
-            sub.instance = iid
-            sub.all_instances = False  # the per-instance call is a normal single call
-            target = _resolve_target(
-                sub, require_target=require_target, allow_implicit_target=allow_implicit_target
-            )
-            response = send_request(
-                op, params=request_params, target=target, instance_id=iid, **timeout_kwargs
-            )
-            row.update({"target": target, "ok": True, "result": response["result"]})
-        except BridgeError as exc:
-            row.update({"ok": False, "error": str(exc)})
-        rows.append(row)
+    for iid in instance_ids:
+        # Per-instance target set: every open target (--all-targets) or the single
+        # resolved one. A failure to enumerate an instance's targets is its own row.
+        if fan_targets:
+            try:
+                tresp = send_request("list_targets", params={}, instance_id=iid, **timeout_kwargs)
+                titems = tresp["result"]
+                tlist = titems.get("items") if isinstance(titems, dict) else titems
+                target_selectors = [t.get("target_id") or t.get("selector")
+                                    for t in (tlist or []) if isinstance(t, dict)]
+            except BridgeError as exc:
+                rows.append({"instance": iid, "ok": False, "error": f"list targets: {exc}"})
+                continue
+            if not target_selectors:
+                rows.append({"instance": iid, "ok": False, "error": "no targets open"})
+                continue
+        else:
+            target_selectors = [None]  # resolve the single target normally below
+
+        for tsel in target_selectors:
+            row: dict[str, Any] = {"instance": iid}
+            try:
+                if tsel is None:
+                    sub = argparse.Namespace(**vars(args))
+                    sub.instance = iid
+                    sub.all_instances = False  # per-(instance,target) call is a normal single call
+                    sub.all_targets = False
+                    target = _resolve_target(
+                        sub, require_target=require_target,
+                        allow_implicit_target=allow_implicit_target,
+                    )
+                else:
+                    target = tsel
+                response = send_request(
+                    op, params=request_params, target=target, instance_id=iid, **timeout_kwargs
+                )
+                row.update({"target": target, "ok": True, "result": response["result"]})
+            except BridgeError as exc:
+                row.update({"target": tsel, "ok": False, "error": str(exc)})
+            rows.append(row)
 
     ok_count = sum(1 for r in rows if r.get("ok"))
     result = {"kind": "fanout", "command": op, "count": len(rows),

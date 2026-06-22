@@ -768,3 +768,81 @@ def test_fanout_no_instances_is_clean_error(monkeypatch):
     monkeypatch.setattr(cli, "list_instances", lambda: [])
     rc = cli.main(["function", "list", "--all-instances"])
     assert rc == 2   # BridgeError -> exit 2
+
+
+def test_fanout_all_targets_within_instance(monkeypatch, capsys):
+    # #169 L1: --all-targets fans every open target IN one instance (no
+    # --all-instances), one row per target, via list_targets.
+    import json as _json
+    import bn.cli as cli
+
+    def fake_send(op, *, params=None, target=None, instance_id=None, **k):
+        if op == "list_targets":
+            # production list_targets returns a BARE list (no {"items":...} envelope)
+            return {"result": [{"target_id": "t1"}, {"target_id": "t2"}]}
+        return {"result": {"kind": "sections", "items": [{"name": ".text"}], "total": 1,
+                           "_t": target}}
+    monkeypatch.setattr(cli, "send_request", fake_send)
+    # no --all-instances -> single (default) instance, fan its targets
+    rc = cli.main(["sections", "--all-targets", "--format", "json"])
+    assert rc == 0
+    out = _json.loads(capsys.readouterr().out)
+    assert out["kind"] == "fanout" and out["count"] == 2
+    seen_targets = {r["target"] for r in out["instances"]}
+    assert seen_targets == {"t1", "t2"}
+    assert all(r["ok"] for r in out["instances"])
+
+
+def test_fanout_all_targets_no_targets_open_is_row_not_crash(monkeypatch, capsys):
+    import json as _json
+    import bn.cli as cli
+
+    def fake_send(op, *, params=None, target=None, instance_id=None, **k):
+        if op == "list_targets":
+            return {"result": []}                # instance with nothing open (bare list, production shape)
+        raise AssertionError("op should not run when no targets")
+    monkeypatch.setattr(cli, "send_request", fake_send)
+    rc = cli.main(["imports", "--all-targets", "--format", "json"])
+    assert rc == 2   # the only "instance" produced an ok:false row -> all failed
+    out = _json.loads(capsys.readouterr().out)
+    assert out["instances"][0]["ok"] is False and "no targets" in out["instances"][0]["error"]
+
+
+def test_fanout_instances_x_targets_matrix(monkeypatch, capsys):
+    # #169 L1: --all-instances --all-targets fans every (instance, target) pair.
+    import json as _json
+    import types as _types
+    import bn.cli as cli
+    insts = [_types.SimpleNamespace(instance_id="A"), _types.SimpleNamespace(instance_id="B")]
+    monkeypatch.setattr(cli, "list_instances", lambda: insts)
+    monkeypatch.setattr(cli, "instance_selector", lambda i: i.instance_id)
+
+    def fake_send(op, *, params=None, target=None, instance_id=None, **k):
+        if op == "list_targets":
+            return {"result": [{"target_id": instance_id + "-t1"},
+                                {"target_id": instance_id + "-t2"}]}
+        return {"result": {"kind": "sections", "items": [], "total": 0}}
+    monkeypatch.setattr(cli, "send_request", fake_send)
+    rc = cli.main(["sections", "--all-instances", "--all-targets", "--format", "json"])
+    assert rc == 0
+    out = _json.loads(capsys.readouterr().out)
+    assert out["count"] == 4   # 2 instances x 2 targets
+    pairs = {(r["instance"], r["target"]) for r in out["instances"]}
+    assert pairs == {("A", "A-t1"), ("A", "A-t2"), ("B", "B-t1"), ("B", "B-t2")}
+
+
+def test_all_targets_flag_only_on_fanout_commands():
+    # --all-targets, like --all-instances, is allow-listed (not on writes/per-fn).
+    import contextlib, io
+    import bn.cli as cli
+    for argv, present in (
+        (["imports", "--help"], True),
+        (["sections", "--help"], True),
+        (["save", "--help"], False),
+        (["decompile", "--help"], False),
+        (["rename", "--help"], False),
+    ):
+        buf = io.StringIO()
+        with contextlib.suppress(SystemExit), contextlib.redirect_stdout(buf):
+            cli.main(argv)
+        assert ("--all-targets" in buf.getvalue()) is present, argv
