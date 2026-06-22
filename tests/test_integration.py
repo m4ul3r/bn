@@ -339,3 +339,51 @@ class TestTaintIndirectValueSetAnchor:
             assert any(c in ("overflow_len", "fortified_overflow") for c in classes), result
         finally:
             _session_stop(inst_id)
+
+
+class TestLoadCacheBndbRestore:
+    """Regression for #318: a binary on a read-only mount has no writable adjacent
+    .bndb, so `save` falls back to the writable cache. A later load of the same
+    binary must RESTORE that cache copy (annotations preserved) instead of
+    re-analyzing blank, which looked like total annotation loss. Only real BN
+    exercises create_database's RO failure + the cache fallback round-trip."""
+
+    def test_ro_mount_save_then_reload_restores_annotations(self, tmp_path):
+        ro = tmp_path / "romnt"
+        ro.mkdir()
+        prog = ro / "prog"
+        prog.write_bytes(Path(HELLO_BINARY).read_bytes())
+        prog.chmod(0o755)
+        inst = None
+        cache_file = None
+        try:
+            info = _session_start(str(prog))  # raw load (no adjacent .bndb)
+            inst = info["instance_id"]
+            fns = json.loads(_bn("--instance", inst, "function", "list", "--format", "json").stdout)
+            name = (fns.get("items") if isinstance(fns, dict) else fns)[0]["name"]
+            renamed = _bn("--instance", inst, "rename", name, "RO318_MARKER", "--format", "json")
+            assert renamed.returncode == 0, renamed.stderr
+
+            ro.chmod(0o500)  # read-only mount: adjacent .bndb write will fail
+            saved = _bn("--instance", inst, "save", "--format", "json")
+            assert saved.returncode == 0, f"{saved.stdout}\n{saved.stderr}"
+            sd = json.loads(saved.stdout)
+            assert sd.get("fallback") is True, sd  # landed in the cache
+            cache_file = Path(sd["path"])
+            assert cache_file.exists()
+
+            _session_stop(inst)
+            inst = None
+
+            # Reload from the still-read-only mount: must restore the cache copy.
+            info2 = _session_start(str(prog))
+            inst = info2["instance_id"]
+            search = _bn("--instance", inst, "function", "search", "RO318_MARKER", "--format", "json")
+            names = [i["name"] for i in json.loads(search.stdout).get("items", [])]
+            assert "RO318_MARKER" in names, f"annotation lost on reload (blank): {names}"
+        finally:
+            if inst:
+                _session_stop(inst)
+            ro.chmod(0o700)
+            if cache_file is not None and cache_file.exists():
+                cache_file.unlink()

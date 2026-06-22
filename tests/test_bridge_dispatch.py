@@ -355,6 +355,83 @@ def test_load_binary_no_sibling(monkeypatch, tmp_path):
     bridge._headless_views.clear()
 
 
+def test_load_binary_restores_cache_bndb_when_no_adjacent(monkeypatch, tmp_path):
+    # #318: a binary on a read-only mount has no adjacent .bndb, but `save` wrote
+    # the annotations to the writable cache. A later load must restore THAT,
+    # instead of silently re-analyzing blank ("total annotation loss").
+    bridge, instance, loaded_paths = _setup_load_test(monkeypatch)
+    cache_root = tmp_path / "cache"
+    monkeypatch.setattr(bridge, "cache_home", lambda: cache_root)
+    raw = tmp_path / "ro" / "foo.so"
+    raw.parent.mkdir(parents=True)
+    raw.write_bytes(b"")  # no adjacent foo.so.bndb
+    cache_bndb = bridge._cache_bndb_path(str(raw.resolve()))
+    cache_bndb.parent.mkdir(parents=True, exist_ok=True)
+    cache_bndb.write_bytes(b"")
+
+    result = instance._load_binary(str(raw))
+
+    assert loaded_paths == [str(cache_bndb)]            # restored the cache copy
+    notes = " ".join(result["notes"])
+    assert "restored cached database" in notes
+    assert "--no-bndb" in notes
+    bridge._headless_views.clear()
+
+
+def test_load_binary_no_bndb_skips_cache(monkeypatch, tmp_path):
+    # --no-bndb must load the raw bytes even when a cache copy exists.
+    bridge, instance, loaded_paths = _setup_load_test(monkeypatch)
+    cache_root = tmp_path / "cache"
+    monkeypatch.setattr(bridge, "cache_home", lambda: cache_root)
+    raw = tmp_path / "ro" / "foo.so"
+    raw.parent.mkdir(parents=True)
+    raw.write_bytes(b"")
+    cache_bndb = bridge._cache_bndb_path(str(raw.resolve()))
+    cache_bndb.parent.mkdir(parents=True, exist_ok=True)
+    cache_bndb.write_bytes(b"")
+
+    result = instance._load_binary(str(raw), prefer_bndb=False)
+
+    assert loaded_paths == [str(raw)]
+    assert result["notes"] == []
+    bridge._headless_views.clear()
+
+
+def test_load_binary_adjacent_bndb_preferred_over_cache(monkeypatch, tmp_path):
+    # When BOTH an adjacent .bndb and a cache copy exist, the adjacent one wins
+    # (it's next to the binary, the canonical location).
+    bridge, instance, loaded_paths = _setup_load_test(monkeypatch)
+    cache_root = tmp_path / "cache"
+    monkeypatch.setattr(bridge, "cache_home", lambda: cache_root)
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+    adjacent = tmp_path / "foo.so.bndb"
+    adjacent.write_bytes(b"")
+    cache_bndb = bridge._cache_bndb_path(str(raw.resolve()))
+    cache_bndb.parent.mkdir(parents=True, exist_ok=True)
+    cache_bndb.write_bytes(b"")
+
+    result = instance._load_binary(str(raw))
+
+    assert loaded_paths == [str(adjacent)]
+    assert "instead of" in " ".join(result["notes"])
+    assert "restored cached" not in " ".join(result["notes"])
+    bridge._headless_views.clear()
+
+
+def test_cache_bndb_path_is_deterministic_and_path_keyed(monkeypatch, tmp_path):
+    # The save and load sides must agree on the cache location for the same path,
+    # and two binaries with the same basename must not collide.
+    bridge = _load_bridge(monkeypatch)
+    monkeypatch.setattr(bridge, "cache_home", lambda: tmp_path)
+    a1 = bridge._cache_bndb_path("/ro/dirA/foo")
+    a2 = bridge._cache_bndb_path("/ro/dirA/foo")
+    b = bridge._cache_bndb_path("/ro/dirB/foo")
+    assert a1 == a2                       # deterministic (save==load)
+    assert a1 != b                        # same basename, different path -> distinct
+    assert a1.name.startswith("foo.") and a1.suffix == ".bndb"
+
+
 def test_load_binary_full_runs_analysis(monkeypatch, tmp_path):
     bridge, instance, loaded_paths = _setup_load_test(monkeypatch)
     raw = tmp_path / "foo.so"

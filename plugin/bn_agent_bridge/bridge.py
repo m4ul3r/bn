@@ -800,12 +800,23 @@ class BinaryNinjaBridge:
 
         load_path = resolved
         notes: list[str] = []
-        sibling = _resolve_bndb_sidecar(resolved, prefer_bndb)
-        if sibling is not None:
-            load_path = sibling
-            notes.append(
-                f"loaded {sibling} instead of {resolved} (use --no-bndb to skip)"
-            )
+        substitute = _resolve_bndb_sidecar(resolved, prefer_bndb)
+        if substitute is not None:
+            load_path, source = substitute
+            if source == "cache":
+                # The binary's own mount had no writable adjacent .bndb (a
+                # read-only firmware image), so the annotations were saved to the
+                # writable cache. Restore them instead of silently re-analyzing
+                # blank, which looked like total annotation loss (#318).
+                notes.append(
+                    f"restored cached database {load_path} (saved when "
+                    f"{resolved.name}'s mount had no writable adjacent .bndb -- "
+                    f"annotations preserved); pass --no-bndb to load the raw bytes"
+                )
+            else:
+                notes.append(
+                    f"loaded {load_path} instead of {resolved} (use --no-bndb to skip)"
+                )
 
         # Always open without auto-analysis, then analyze explicitly unless
         # --quick. Quick load skips update_analysis_and_wait() entirely -- the
@@ -1010,9 +1021,9 @@ class BinaryNinjaBridge:
                 # failed --path save never strands the live selector (#256 review).
                 _restore_filename()
                 raise
-            stem = Path(filename or out).name or "target"
-            digest = hashlib.sha256((filename or out).encode("utf-8")).hexdigest()[:16]
-            fallback = cache_home() / "bndb" / f"{stem}.{digest}.bndb"
+            # Shared with the load path (`_resolve_bndb_sidecar`) so a later load
+            # of the same binary finds this copy and restores the annotations (#318).
+            fallback = _cache_bndb_path(filename or out)
             try:
                 saved = _attempt(str(fallback), make_parent=True)
             except Exception:
@@ -2222,20 +2233,40 @@ READ_LOCKED_OPS = frozenset(REGISTRY.read_locked_ops())
 WRITE_LOCKED_OPS = frozenset(REGISTRY.write_locked_ops())
 
 
-def _resolve_bndb_sidecar(resolved: Path, prefer_bndb: bool) -> Path | None:
-    """Adjacent ``<path>.bndb`` to load instead of ``resolved``, or None.
+def _cache_bndb_path(binary_path: str) -> Path:
+    """The writable-cache .bndb location for *binary_path*.
+
+    The single source of truth for the cache fallback: `_save_database` writes
+    here when a binary's own mount is read-only (no adjacent .bndb possible), and
+    `_resolve_bndb_sidecar` reads here so a later load of the same binary restores
+    those annotations instead of re-analyzing blank (#214 save / #318 load). The
+    digest keys on the binary's path so two binaries with the same basename don't
+    collide, and so save and load agree as long as the same path is used.
+    """
+    stem = Path(binary_path).name or "target"
+    digest = hashlib.sha256(binary_path.encode("utf-8")).hexdigest()[:16]
+    return cache_home() / "bndb" / f"{stem}.{digest}.bndb"
+
+
+def _resolve_bndb_sidecar(resolved: Path, prefer_bndb: bool) -> tuple[Path, str] | None:
+    """The saved database to load instead of ``resolved``, as ``(path, source)``
+    where source is ``"adjacent"`` or ``"cache"``; or None to load the path as given.
 
     Shared by the runtime ``bn load`` path (`_load_binary`) and the headless
-    preload path (`_preload_binary`) so both honor a saved database sitting next
-    to the binary -- otherwise `bn-agent foo` silently re-analyzes from scratch
-    and drops the saved work that `bn load foo` would have picked up (#178). A
-    request that already points at a ``.bndb`` (or prefer_bndb=False) resolves to
-    None: load the path as given.
+    preload path (`_preload_binary`) so both honor a saved database -- otherwise
+    `bn-agent foo` silently re-analyzes from scratch and drops the saved work that
+    `bn load foo` would have picked up (#178). Prefers an adjacent
+    ``<path>.bndb``; if none (e.g. the binary is on a read-only mount), falls back
+    to the writable-cache copy `_save_database` wrote there (#318). A request that
+    already points at a ``.bndb`` (or prefer_bndb=False) resolves to None.
     """
     if prefer_bndb and resolved.suffix != ".bndb":
         sibling = Path(str(resolved) + ".bndb")
         if sibling.exists():
-            return sibling
+            return sibling, "adjacent"
+        cached = _cache_bndb_path(str(resolved))
+        if cached.exists():
+            return cached, "cache"
     return None
 
 
@@ -2254,10 +2285,16 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
     import binaryninja
 
     resolved = Path(path).expanduser().resolve()
-    sibling = _resolve_bndb_sidecar(resolved, prefer_bndb)
-    if sibling is not None:
-        bn.log_info(f"loaded {sibling} instead of {resolved} (use --no-bndb to skip)")
-        load_path = sibling
+    substitute = _resolve_bndb_sidecar(resolved, prefer_bndb)
+    if substitute is not None:
+        load_path, source = substitute
+        if source == "cache":
+            bn.log_info(
+                f"restored cached database {load_path} for {resolved} "
+                "(mount has no writable adjacent .bndb); pass --no-bndb to skip"
+            )
+        else:
+            bn.log_info(f"loaded {load_path} instead of {resolved} (use --no-bndb to skip)")
     else:
         load_path = resolved
     bv = binaryninja.load(str(load_path), update_analysis=False)
