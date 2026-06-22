@@ -310,6 +310,27 @@ def test_batch_apply_reads_manifest_from_stdin(monkeypatch, fake_transport, caps
     assert calls[-1]["op"] == "batch_apply"
     # The free-text comment reached the bridge byte-for-byte.
     assert calls[-1]["params"]["ops"][0]["comment"] == comment
+
+
+def test_batch_apply_accepts_target_flag(monkeypatch, fake_transport):
+    # #308: batch apply now accepts -t like every other mutate command; the flag
+    # supplies the manifest target when the manifest itself omits one.
+    import io
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"ops": [{"op": "set_comment", "address": "0x1", "comment": "c"}]}'))
+    calls = fake_transport({"batch_apply": {"ok": True, "result": {"success": True, "results": []}}})
+    rc = bn.cli.main(["batch", "apply", "-", "-t", "foo.bndb", "-i", "inst"])
+    assert rc == 0
+    assert calls[-1]["params"].get("target") == "foo.bndb"
+
+
+def test_batch_apply_manifest_target_overrides_flag(monkeypatch, fake_transport):
+    # When both are given, the in-payload manifest "target" wins.
+    import io
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"target": "explicit", "ops": []}'))
+    calls = fake_transport({"batch_apply": {"ok": True, "result": {"success": True, "results": []}}})
+    rc = bn.cli.main(["batch", "apply", "-", "-t", "fromflag", "-i", "inst"])
+    assert rc == 0
+    assert calls[-1]["params"].get("target") == "explicit"
 @pytest.mark.parametrize("argv, expected", [
     pytest.param(["--min-length", "5"], {"min_length": 5}, id="min-length"),
     pytest.param(["--section", ".rodata", "--no-crt"], {"section": ".rodata", "no_crt": True}, id="section-no-crt"),

@@ -602,3 +602,60 @@ class TestLoadCacheBndbRestore:
             ro.chmod(0o700)
             if cache_file is not None and cache_file.exists():
                 cache_file.unlink()
+
+
+class TestBatchFunctionCreate:
+    """Regression for #308: function_create works as a batch op -- N missed
+    slots can be recovered atomically alongside other mutations, --preview
+    reverts the whole batch, and the batch revert doesn't poison the address
+    (uses the non-poisoning remove_function). Drives real BN."""
+
+    @staticmethod
+    def _gaps(inst):
+        listing = _bn("--instance", inst, "function", "list", "--format", "json")
+        items = json.loads(listing.stdout)
+        items = items.get("items", items) if isinstance(items, dict) else items
+        fns = sorted(((int(f["address"], 16), int(f.get("size") or 0)) for f in items),
+                     key=lambda t: t[0])
+        return [start + size for (start, size), (nxt, _) in zip(fns, fns[1:])
+                if size > 0 and start + size < nxt]
+
+    def test_batch_function_create_preview_then_live_atomic(self, tmp_path):
+        info = _session_start(str(HELLO_BINARY))
+        inst = info["instance_id"]
+        try:
+            addr = None
+            for cand in self._gaps(inst)[:20]:
+                mf = tmp_path / "probe.json"
+                mf.write_text(json.dumps({"ops": [{"op": "function_create", "address": hex(cand)}]}))
+                prev = _bn("--instance", inst, "batch", "apply", str(mf), "--preview", "--format", "json")
+                if prev.returncode == 0 and json.loads(prev.stdout)["results"][0]["status"] == "verified":
+                    addr = hex(cand)
+                    break
+            if addr is None:
+                pytest.skip("no creatable gap address found in this fixture")
+
+            mf = tmp_path / "batch.json"
+            mf.write_text(json.dumps({"ops": [
+                {"op": "function_create", "address": addr},
+                {"op": "set_comment", "address": addr, "comment": "BATCH308"},
+            ]}))
+
+            # --preview: both ops verify, nothing commits, and the function is
+            # reverted (not left behind).
+            prev = _bn("--instance", inst, "batch", "apply", str(mf), "--preview", "--format", "json")
+            assert prev.returncode == 0, f"{prev.stdout}\n{prev.stderr}"
+            pj = json.loads(prev.stdout)
+            assert [r["status"] for r in pj["results"]] == ["verified", "verified"], pj
+            assert pj["committed"] is False
+            assert _bn("--instance", inst, "function", "info", addr).returncode != 0  # reverted
+
+            # live: the batch commits atomically -- function AND comment persist.
+            live = _bn("--instance", inst, "batch", "apply", str(mf), "--format", "json")
+            assert live.returncode == 0, f"{live.stdout}\n{live.stderr}"
+            lj = json.loads(live.stdout)
+            assert [r["status"] for r in lj["results"]] == ["verified", "verified"], lj
+            assert lj["committed"] is True
+            assert _bn("--instance", inst, "function", "info", addr).returncode == 0  # now a function
+        finally:
+            _session_stop(inst)

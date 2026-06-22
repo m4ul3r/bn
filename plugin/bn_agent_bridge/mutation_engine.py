@@ -59,6 +59,7 @@ REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "struct_field_rename": ("struct_name", "old_name", "new_name"),
     "struct_field_delete": ("struct_name", "field_name"),
     "types_declare": ("declaration",),
+    "function_create": ("address",),
 }
 
 # Ops that accept one of several alternative locator fields. set_comment /
@@ -700,6 +701,8 @@ def _verify_operation(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
             return _verify_struct_field_delete(ctx, bv, result)
         if op == "types_declare":
             return _verify_declared_types(ctx, bv, result)
+        if op == "function_create":
+            return _verify_function_create(ctx, bv, result)
         raise OperationFailure("unsupported", f"Unsupported verification path: {op}", requested=result.get("requested"))
     except OperationFailure as exc:
         item = dict(result)
@@ -1246,6 +1249,8 @@ def _apply_operation(ctx, bv, op: dict[str, Any], restores: list | None = None):
             return _op_struct_field_delete(ctx, bv, op)
         if kind == "types_declare":
             return _op_types_declare(ctx, bv, op)
+        if kind == "function_create":
+            return _op_function_create(ctx, bv, op, restores)
         raise OperationFailure("unsupported", f"Unsupported operation: {kind}", requested=_operation_requested(ctx, op))
     except OperationFailure:
         raise
@@ -2289,3 +2294,85 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
         "parsed_variable_count": len(parsed["variables"]),
         "requested": _operation_requested(ctx, op),
     }
+
+
+def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = None):
+    """Create (and analyze) a function at an address inside a BATCH (#308).
+
+    Unlike the standalone ``function create`` op (create_comments._function_create,
+    which manages its own undo bracket), this runs inside the batch's single
+    transaction: it creates + verifies, and registers a restore that removes the
+    created function on revert. ``bv.add_function`` is NOT journaled by BN's undo
+    buffer, so ``revert_undo_actions`` alone would leave it -- the restore uses
+    the non-poisoning ``remove_function`` (#304) so a later create still works.
+    read_misc / create_comments are imported locally to keep this module's
+    one-way import direction (create_comments imports mutation_engine, not the
+    reverse)."""
+    from . import create_comments, read_misc
+
+    addr = _parse_address(op["address"])
+    requested = _operation_requested(ctx, op)
+    existing = bv.get_function_at(addr)
+    if existing is not None:
+        return {
+            "op": "function_create",
+            "status": "noop",
+            "address": hex(addr),
+            "function": str(existing.name),
+            "message": "A function already starts at this address.",
+            "requested": requested,
+        }
+    if len(bytes(bv.read(addr, 1))) == 0:
+        raise OperationFailure(
+            "invalid_request",
+            f"Cannot create function: address {hex(addr)} is not mapped",
+            requested=requested,
+        )
+    if not read_misc._is_executable_address(ctx, bv, addr):
+        raise OperationFailure(
+            "invalid_request",
+            f"Cannot create function: address {hex(addr)} is not inside an executable segment",
+            requested=requested,
+        )
+    bv.add_function(addr)
+    bv.update_analysis_and_wait()
+    created = bv.get_function_at(addr)
+    if created is None:
+        # BN's analysis declined to keep a function here. add_function is not
+        # journaled, so drop the stray (non-poisoning) before failing the op.
+        create_comments._remove_created_function(ctx, bv, addr)
+        raise OperationFailure(
+            "verification_failed",
+            f"No function starts at {hex(addr)} after analysis.",
+            requested=requested,
+            observed={"address": hex(addr), "function": None},
+        )
+    if restores is not None:
+        restores.append(lambda: create_comments._remove_created_function(ctx, bv, addr))
+    return {
+        "op": "function_create",
+        "status": "verified",
+        "address": hex(addr),
+        "function": str(created.name),
+        "requested": requested,
+    }
+
+
+def _verify_function_create(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
+    item = dict(result)
+    if item.get("status") == "noop":
+        return item
+    addr = _parse_address(item["address"])
+    fn = bv.get_function_at(addr)
+    item["observed"] = {"address": hex(addr), "function": str(fn.name) if fn is not None else None}
+    if fn is None:
+        # The batch's post-apply reanalysis dropped the function (a borderline
+        # address BN won't keep): fail honestly instead of reporting verified.
+        raise OperationFailure(
+            "verification_failed",
+            f"No function starts at {hex(addr)} after analysis.",
+            requested=item.get("requested"),
+            observed=item["observed"],
+        )
+    item["status"] = "verified"
+    return item

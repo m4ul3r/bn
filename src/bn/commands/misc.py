@@ -303,7 +303,7 @@ def _py_exec(args: argparse.Namespace) -> int:
     )
 
 
-@command("batch", "apply", help="Apply a JSON manifest", fmt="json",
+@command("batch", "apply", help="Apply a JSON manifest", fmt="json", target=True,
          args=[
              preview_arg("Apply the whole batch, capture diffs, then revert without committing"),
              arg("manifest", type=Path,
@@ -379,6 +379,12 @@ def _batch_apply(args: argparse.Namespace) -> int:
     inst = getattr(args, "instance", None)
     if inst and manifest.get("target") == inst:
         manifest.pop("target", None)
+    # Accept -t/--target like every other target-required mutate command (#308);
+    # the manifest "target" wins if both are given (it's the in-payload, explicit
+    # choice), otherwise -t supplies it.
+    cli_target = getattr(args, "target", None)
+    if cli_target and not manifest.get("target"):
+        manifest["target"] = cli_target
     if args.preview:
         manifest["preview"] = True
     # preview is already set on the manifest above, so it is not passed through

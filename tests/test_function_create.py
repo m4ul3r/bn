@@ -191,3 +191,95 @@ def test_function_create_preview_revert_failure_is_not_success(monkeypatch):
     assert result["results"][0]["status"] == "rollback_failed"
     from bn.formatters import FAILED_MUTATION_STATUSES
     assert "rollback_failed" in FAILED_MUTATION_STATUSES
+
+
+def test_batch_op_function_create_verified_and_restore_no_poison(monkeypatch):
+    # #308: function_create is a batch op. It creates+verifies and registers a
+    # restore that removes the function on revert via the non-poisoning
+    # remove_function (#304), so a later create still works.
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    ctx = bridge.BinaryNinjaBridge().ctx
+    bv = _FakeFunctionCreateBV(
+        segments={0x1000: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x55\x48\x89\xe5"},
+    )
+    restores = []
+    res = me._op_function_create(ctx, bv, {"op": "function_create", "address": "0x1000"}, restores)
+    assert res["status"] == "verified"
+    assert res["function"] == "sub_1000"
+    assert bv.get_function_at(0x1000) is not None
+    assert len(restores) == 1
+    restores[0]()                                   # batch revert
+    assert bv.get_function_at(0x1000) is None        # removed
+    assert ("remove_function", 0x1000) in bv.events  # non-poisoning removal
+    # re-create after the revert still works (not poisoned)
+    res2 = me._op_function_create(ctx, bv, {"op": "function_create", "address": "0x1000"}, [])
+    assert res2["status"] == "verified"
+    assert bv.get_function_at(0x1000) is not None
+
+
+def test_batch_op_function_create_existing_is_noop(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    ctx = bridge.BinaryNinjaBridge().ctx
+    bv = _FakeFunctionCreateBV(
+        functions=[_FakeFunction(0x1000, "already_here")],
+        segments={0x1000: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x55\x48\x89\xe5"},
+    )
+    res = me._op_function_create(ctx, bv, {"op": "function_create", "address": "0x1000"}, [])
+    assert res["status"] == "noop"
+    assert res["function"] == "already_here"
+    assert bv.added == []
+
+
+def test_batch_op_function_create_rejects_non_executable(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    ctx = bridge.BinaryNinjaBridge().ctx
+    bv = _FakeFunctionCreateBV(
+        segments={0x5000: _FakeSegment(readable=True, writable=True, executable=False)},
+        memory={0x5000: b"\x01\x02\x03\x04"},
+    )
+    with pytest.raises(bridge.OperationFailure) as exc:
+        me._op_function_create(ctx, bv, {"op": "function_create", "address": "0x5000"}, [])
+    assert exc.value.status == "invalid_request"
+    assert "executable" in str(exc.value)
+    assert bv.added == []
+
+
+def test_apply_operation_dispatches_function_create(monkeypatch):
+    # Teeth for the _apply_operation dispatch ARM (#308): a function_create op
+    # must route to _op_function_create, not the "unsupported" fallthrough.
+    # (Reverting the dispatch line makes this fail.)
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    ctx = bridge.BinaryNinjaBridge().ctx
+    bv = _FakeFunctionCreateBV(
+        segments={0x1000: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x55\x48\x89\xe5"},
+    )
+    restores = []
+    res = me._apply_operation(ctx, bv, {"op": "function_create", "address": "0x1000"}, restores)
+    assert res["op"] == "function_create"
+    assert res["status"] == "verified"
+    assert len(restores) == 1  # the remove-on-revert restore was registered
+
+
+def test_verify_operation_dispatches_function_create(monkeypatch):
+    # Teeth for the _verify_operation ARM: a function_create result must route to
+    # _verify_function_create, not the "Unsupported verification path" raise (which
+    # _verify_operation would catch and stamp status="unsupported").
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    ctx = bridge.BinaryNinjaBridge().ctx
+    bv = _FakeFunctionCreateBV(
+        functions=[_FakeFunction(0x1000, "sub_1000")],
+        segments={0x1000: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x55\x48\x89\xe5"},
+    )
+    out = me._verify_operation(
+        ctx, bv,
+        {"op": "function_create", "address": "0x1000", "status": "verified", "function": "sub_1000"})
+    assert out["status"] == "verified"  # would be "unsupported" without the arm
