@@ -13,6 +13,7 @@ from ..transport import BridgeError
 
 
 @command("types", help="List or search types", target=True, paged=True,
+         fanout=True,
          args=[arg("--query"),
                arg("--count", action="store_true", default=False,
                    help="Show the total type count instead of listing")])

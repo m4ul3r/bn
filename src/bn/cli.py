@@ -12,6 +12,7 @@ from . import session_state
 from .formatters import (
     FAILED_MUTATION_STATUSES,
     _format_operation_result,  # noqa: F401  -- re-exported for tests/scripts that monkeypatch bn.cli
+    _render_fanout_text,
     _render_mutation_text,
     _render_target_choices,
 )
@@ -274,6 +275,20 @@ def _instance_option(parser: argparse.ArgumentParser, *, is_root: bool = False) 
     )
 
 
+def _fanout_option(parser: argparse.ArgumentParser) -> None:
+    """`--all-instances`: run a READ across every running bridge instance and
+    aggregate the per-instance results (#169 Layer 1). Attached only to read
+    commands (default-format text) -- never mutations -- so it can't fan a write.
+    SUPPRESS default so the flag is absent from the namespace unless passed."""
+    parser.add_argument(
+        "--all-instances",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        dest="all_instances",
+        help="Run this read across every running bridge instance and aggregate the results",
+    )
+
+
 def _target_option(
     parser: argparse.ArgumentParser,
     *,
@@ -352,6 +367,7 @@ def command(
     mutex_groups: list[tuple[bool, list[tuple[tuple[str, ...], dict[str, Any]]]]] | None = None,
     prefer_when: str = "",
     see_also: tuple[str, ...] = (),
+    fanout: bool = False,
 ) -> Callable:
     """Register a CLI command declaratively.
 
@@ -360,6 +376,12 @@ def command(
     says when to reach for this one and ``see_also`` names the neighbors (by their
     space-joined command path, e.g. ``"function search"``). They live on the
     command so the index stays registry-derived -- no hand-maintained second list.
+
+    ``fanout`` opts a command into ``--all-instances`` (#169 L1). It is an explicit
+    allow-list, NOT inferred from ``fmt``: only genuine whole-target READ surveys
+    (no per-function/address identifier) set it, so a write or side-effecting
+    command -- several of which default to ``fmt="text"`` (save/close/refresh/py
+    exec/load) -- can never be fanned across every instance.
     """
 
     def decorator(fn: Callable[[argparse.Namespace], int]) -> Callable[[argparse.Namespace], int]:
@@ -381,6 +403,7 @@ def command(
             "mutex_groups": mutex_groups or [],
             "prefer_when": prefer_when,
             "see_also": tuple(see_also),
+            "fanout": fanout,
         })
         return fn
 
@@ -438,6 +461,12 @@ def _build_from_commands(root: BnArgumentParser) -> None:
 
         _common_io_options(cmd, default_format=spec["fmt"])
         _instance_option(cmd)
+        # Fan-out is an EXPLICIT allow-list (`fanout=True` on genuine whole-target
+        # read surveys), not inferred from fmt -- several write/side-effecting
+        # commands (save/close/refresh/py exec/load) also default to text, so a
+        # format gate would fan a WRITE across every instance (#169 L1 review).
+        if spec.get("fanout"):
+            _fanout_option(cmd)
         if spec["target"]:
             _target_option(cmd, required=False)
         if spec["address_filter"]:
@@ -774,6 +803,19 @@ def _call(
         effective_page_limit = page_limit
         request_params["limit"] = page_limit + 1
 
+    # #169 L1: --all-instances fans this read across every running instance and
+    # aggregates. Gated branch -- the normal single-target path below is untouched
+    # when the flag is absent (every existing command/test stays on it).
+    if getattr(args, "all_instances", False):
+        return _fanout_call(
+            args, op, request_params,
+            require_target=require_target,
+            allow_implicit_target=allow_implicit_target,
+            text_renderer=text_renderer,
+            timeout_kwargs=timeout_kwargs,
+            stem=stem,
+        )
+
     target = _resolve_target(
         args,
         require_target=require_target,
@@ -849,6 +891,66 @@ def _call(
         paged=(page_limit is not None) or paged_spill,
     )
     return exit_code
+
+
+def _fanout_call(
+    args: argparse.Namespace,
+    op: str,
+    request_params: dict[str, Any],
+    *,
+    require_target: bool,
+    allow_implicit_target: bool,
+    text_renderer: Callable[[Any], str] | None,
+    timeout_kwargs: dict[str, Any],
+    stem: str,
+) -> int:
+    """Run *op* across every running bridge instance and aggregate (#169 L1).
+
+    Each instance resolves its own target via the normal rule (an explicit -t
+    applies to all; otherwise the per-instance implicit single target, ambiguous
+    or none -> a per-instance ``ok:false`` row, not a hard failure). The aggregate
+    is one ``{kind: fanout, instances: [...]}`` value rendered per-instance (text
+    via the command's own renderer) or as JSON, through the normal spill path."""
+    instances = list_instances()
+    if not instances:
+        raise BridgeError("--all-instances: no bridge instances are running")
+    rows: list[dict[str, Any]] = []
+    # An explicit -t in args.target is carried into each per-instance clone below,
+    # so it applies to every instance; otherwise each resolves its own implicit
+    # single target.
+    for inst in instances:
+        iid = instance_selector(inst)
+        row: dict[str, Any] = {"instance": iid}
+        try:
+            sub = argparse.Namespace(**vars(args))
+            sub.instance = iid
+            sub.all_instances = False  # the per-instance call is a normal single call
+            target = _resolve_target(
+                sub, require_target=require_target, allow_implicit_target=allow_implicit_target
+            )
+            response = send_request(
+                op, params=request_params, target=target, instance_id=iid, **timeout_kwargs
+            )
+            row.update({"target": target, "ok": True, "result": response["result"]})
+        except BridgeError as exc:
+            row.update({"ok": False, "error": str(exc)})
+        rows.append(row)
+
+    ok_count = sum(1 for r in rows if r.get("ok"))
+    result = {"kind": "fanout", "command": op, "count": len(rows),
+              "ok_count": ok_count, "instances": rows}
+    fmt = _resolve_output_format(args)
+    rendered: Any = result
+    if fmt == "text":
+        rendered = _render_fanout_text(result, inner_renderer=text_renderer)
+    _render_result(
+        rendered, fmt=fmt, out_path=args.out, stem=stem or "fanout",
+        spill_label="fanout", spill_context=result, paged=True,
+    )
+    # Exit non-zero when EVERY instance failed, so a scripted consumer keying on
+    # the exit code doesn't read a total failure as success (#169 L1 review). A
+    # partial success stays 0; callers inspect the per-instance `ok` rows.
+    return 0 if ok_count else 2
 
 
 def _int_or_hex(value: str) -> int:

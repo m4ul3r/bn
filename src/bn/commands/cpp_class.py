@@ -8,6 +8,7 @@ from ..formatters import _render_class_list_text, _render_class_show_text
 
 
 @command("class", "list", help="List C++ classes recovered from symbols/RTTI",
+         fanout=True,
          target=True, paged=True,
          prefer_when="recover the C++ class hierarchy (vtables, bases, methods) from RTTI/symbols; "
                      "use evidence table to walk a raw vtable/pointer table as data",

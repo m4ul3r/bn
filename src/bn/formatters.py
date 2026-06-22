@@ -1248,6 +1248,39 @@ def _render_message_lens_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+def _render_fanout_text(value: Any, inner_renderer: Callable[[Any], str] | None = None) -> str:
+    """Render an --all-instances fan-out (#169 L1): a header per instance, then
+    that instance's result rendered by the command's own text renderer (or a
+    fallback), and an ``error:`` line for instances that couldn't be reached/
+    resolved. Failures are per-instance rows, not a hard failure."""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    rows = value.get("instances") or []
+    ok = sum(1 for r in rows if isinstance(r, dict) and r.get("ok"))
+    lines = [f"fan-out: {value.get('command', '?')} across {len(rows)} instance(s) "
+             f"({ok} ok, {len(rows) - ok} failed)"]
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        header = f"\n== instance {r.get('instance', '?')}"
+        if r.get("target"):
+            header += f"  (target {r['target']})"
+        header += " =="
+        lines.append(header)
+        if r.get("ok"):
+            inner = r.get("result")
+            if inner_renderer is not None:
+                try:
+                    lines.append(inner_renderer(inner))
+                except Exception:
+                    lines.append(_render_fallback_text(inner))
+            else:
+                lines.append(_render_fallback_text(inner))
+        else:
+            lines.append(f"  error: {r.get('error', '<unknown>')}")
+    return "\n".join(lines)
+
+
 def _render_orient_text(value: Any) -> str:
     """Render the orientation digest (#169 L2) as a compact triage card: analysis
     state up front (so an empty strings/function set from a --quick view isn't

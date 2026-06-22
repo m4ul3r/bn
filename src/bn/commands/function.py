@@ -30,6 +30,7 @@ from ..transport import BridgeError
 
 
 @command("function", "list", help="List functions", target=True, paged=True, address_filter=True,
+         fanout=True,
          prefer_when="enumerate, filter, or count functions; "
                      "use function search to match by name or regex",
          see_also=("function search",),
@@ -85,6 +86,7 @@ def _function_list(args: argparse.Namespace) -> int:
 
 
 @command("function", "search", help="Search functions by substring or regex",
+         fanout=True,
          target=True, paged=True, address_filter=True,
          prefer_when="match functions by name or regex; "
                      "use function list to enumerate, filter, or count",
@@ -599,6 +601,7 @@ def _evidence_message(args: argparse.Namespace) -> int:
 
 
 @command("evidence", "orient",
+         fanout=True,
          help="One-shot orientation digest: target+analysis state, imports summary, a strings "
               "sample, function count, and sections — an internally-consistent triage card",
          target=True,

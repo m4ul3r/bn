@@ -20,6 +20,7 @@ from ..transport import BridgeError
 
 
 @command("strings", help="List or search strings", target=True, paged=True,
+         fanout=True,
          args=[
              arg("--query"),
              arg("--regex", action="store_true", default=False,
@@ -91,6 +92,7 @@ def _imports_count_text(value: Any) -> str:
 
 
 @command("imports", help="List imports", target=True, paged=True,
+         fanout=True,
          args=[arg("--summary", action="store_true", default=False,
                    help="Show aggregate counts by namespace and kind instead of the full list"),
                arg("--count", action="store_true", default=False,
@@ -130,6 +132,7 @@ def _imports(args: argparse.Namespace) -> int:
 
 
 @command("exports", help="List exported symbols (a binary's public API)", target=True, paged=True,
+         fanout=True,
          args=[arg("--count", action="store_true", default=False,
                    help="Show the total export count instead of listing")])
 def _exports(args: argparse.Namespace) -> int:
@@ -156,6 +159,7 @@ def _exports(args: argparse.Namespace) -> int:
 
 
 @command("sections", help="List binary sections with address ranges and permissions", target=True,
+         fanout=True,
          paged=True, args=[arg("--query",
                                help="Filter by a substring of the section name OR its semantics "
                                     "label (e.g. 'code' matches .text=ReadOnlyCode); broadens to "
@@ -187,6 +191,7 @@ def _sections(args: argparse.Namespace) -> int:
 
 
 @command("go", "functions",
+         fanout=True,
          help="Recover Go function names from .gopclntab (Go 1.18/1.20+) — names the wall of sub_*",
          target=True, paged=True,
          prefer_when="a Go-compiled binary loads as a wall of sub_* (.gopclntab present); recover "

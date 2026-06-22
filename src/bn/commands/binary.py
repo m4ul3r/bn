@@ -128,6 +128,7 @@ def _refresh(args: argparse.Namespace) -> int:
 
 
 @command("target", "info", help="Show one target", target=True,
+         fanout=True,
          args=[
              arg("--verbose", "-v", action="store_true",
                  help="Include the segment map (r/w/x address ranges)"),

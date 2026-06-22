@@ -666,3 +666,105 @@ def test_out_json_with_explicit_text_writes_text_and_warns(fake_transport, tmp_p
     with pytest.raises(json.JSONDecodeError):
         json.loads(out.read_text())  # honored explicit text
     assert "warning" in capsys.readouterr().err.lower()
+
+
+def test_fanout_all_instances_aggregates_and_isolates_errors(monkeypatch, capsys):
+    # #169 L1: --all-instances runs the read across every instance and aggregates;
+    # a per-instance failure (e.g. ambiguous target) is an ok:false row, not a
+    # hard failure of the whole command.
+    import json as _json
+    import types as _types
+    import bn.cli as cli
+    from bn.transport import BridgeError
+
+    insts = [_types.SimpleNamespace(instance_id="a"), _types.SimpleNamespace(instance_id="b")]
+    monkeypatch.setattr(cli, "list_instances", lambda: insts)
+    monkeypatch.setattr(cli, "instance_selector", lambda i: i.instance_id)
+    monkeypatch.setattr(cli, "_resolve_target", lambda args, **k: "active")
+    seen = []
+
+    def fake_send(op, *, params=None, target=None, instance_id=None, **k):
+        seen.append(instance_id)
+        if instance_id == "b":
+            raise BridgeError("multiple targets open")
+        return {"result": {"kind": "functions", "items": [{"name": "f", "address": "0x1"}],
+                           "total": 1, "count": 1}}
+    monkeypatch.setattr(cli, "send_request", fake_send)
+
+    rc = cli.main(["function", "list", "--all-instances", "--format", "json"])
+    assert rc == 0
+    out = _json.loads(capsys.readouterr().out)
+    assert out["kind"] == "fanout" and out["count"] == 2
+    by = {r["instance"]: r for r in out["instances"]}
+    assert by["a"]["ok"] is True and by["a"]["result"]["total"] == 1
+    assert by["b"]["ok"] is False and "multiple targets" in by["b"]["error"]
+    assert set(seen) == {"a", "b"}
+
+
+def test_fanout_all_instances_text_renders_per_instance(monkeypatch, capsys):
+    # #169 L1: text mode renders each instance with the command's own renderer
+    # and an error line for failed instances.
+    import types as _types
+    import bn.cli as cli
+    from bn.transport import BridgeError
+
+    insts = [_types.SimpleNamespace(instance_id="a"), _types.SimpleNamespace(instance_id="b")]
+    monkeypatch.setattr(cli, "list_instances", lambda: insts)
+    monkeypatch.setattr(cli, "instance_selector", lambda i: i.instance_id)
+    monkeypatch.setattr(cli, "_resolve_target", lambda args, **k: "active")
+
+    def fake_send(op, *, params=None, target=None, instance_id=None, **k):
+        if instance_id == "b":
+            raise BridgeError("no targets open")
+        return {"result": {"kind": "functions", "items": [{"name": "alpha", "address": "0x1000"}],
+                           "total": 1, "count": 1}}
+    monkeypatch.setattr(cli, "send_request", fake_send)
+
+    rc = cli.main(["function", "list", "--all-instances"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "fan-out:" in out and "== instance a" in out and "== instance b" in out
+    # Assert the function-list RENDERER ran (its `0xADDR  name` row form), not just
+    # that "alpha" appears (the JSON fallback would also contain it) -- real teeth
+    # on the "command's own renderer" claim (#169 L1 review).
+    assert "0x1000  alpha" in out
+    assert "error: no targets open" in out      # per-instance failure surfaced
+
+
+def test_fanout_all_instances_exits_nonzero_when_all_fail(monkeypatch, capsys):
+    # #169 L1 review: a fan-out where EVERY instance fails must exit non-zero, so a
+    # scripted consumer doesn't read total failure as success.
+    import types as _types
+    import bn.cli as cli
+    from bn.transport import BridgeError
+    insts = [_types.SimpleNamespace(instance_id="a"), _types.SimpleNamespace(instance_id="b")]
+    monkeypatch.setattr(cli, "list_instances", lambda: insts)
+    monkeypatch.setattr(cli, "instance_selector", lambda i: i.instance_id)
+    monkeypatch.setattr(cli, "_resolve_target", lambda args, **k: "active")
+    def fail_send(op, *, params=None, target=None, instance_id=None, **k):
+        raise BridgeError("down")
+    monkeypatch.setattr(cli, "send_request", fail_send)
+    rc = cli.main(["function", "list", "--all-instances", "--format", "json"])
+    assert rc == 2   # all failed -> non-zero
+
+
+def test_fanout_flag_not_on_write_or_per_function_commands():
+    # #169 L1 review (CRITICAL guard): --all-instances must NOT be attached to any
+    # write/side-effecting command (it could fan a write across every instance) or
+    # to per-function reads (their identifier wouldn't resolve elsewhere).
+    import argparse, contextlib, io
+    import bn.cli as cli
+    for argv in (["save", "--help"], ["close", "--help"], ["refresh", "--help"],
+                 ["py", "exec", "--help"], ["decompile", "--help"], ["xrefs", "--help"],
+                 ["rename", "--help"]):
+        buf = io.StringIO()
+        with contextlib.suppress(SystemExit), contextlib.redirect_stdout(buf):
+            cli.main(argv)
+        assert "--all-instances" not in buf.getvalue(), f"{argv[0]} must not be fannable"
+
+
+def test_fanout_no_instances_is_clean_error(monkeypatch):
+    import bn.cli as cli
+    monkeypatch.setattr(cli, "list_instances", lambda: [])
+    rc = cli.main(["function", "list", "--all-instances"])
+    assert rc == 2   # BridgeError -> exit 2
