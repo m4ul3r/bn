@@ -70,6 +70,26 @@ def test_py_exec_accepts_inline_code(fake_transport):
     assert "out_path" not in calls[-1]["params"]
 
 
+def test_py_exec_dash_reads_stdin(monkeypatch, fake_transport):
+    # #312: standardize the stdin idiom with `batch apply -`: a positional "-"
+    # reads the script from stdin (alongside the explicit --stdin flag).
+    import io
+    monkeypatch.setattr("sys.stdin", io.StringIO("print('from stdin')"))
+    calls = fake_transport({"py_exec": {"ok": True, "result": {"stdout": "", "result": None}}})
+    rc = bn.cli.main(["py", "exec", "-", "--target", "active"])
+    assert rc == 0
+    assert calls[-1]["params"]["script"] == "print('from stdin')"
+
+
+def test_py_exec_stdin_flag_still_works(monkeypatch, fake_transport):
+    import io
+    monkeypatch.setattr("sys.stdin", io.StringIO("print('via flag')"))
+    calls = fake_transport({"py_exec": {"ok": True, "result": {"stdout": "", "result": None}}})
+    rc = bn.cli.main(["py", "exec", "--stdin", "--target", "active"])
+    assert rc == 0
+    assert calls[-1]["params"]["script"] == "print('via flag')"
+
+
 def test_py_exec_missing_script_mentions_code(capsys):
     rc = bn.cli.main(["py", "exec", "--target", "active", "--script", "missing.py"])
 
@@ -551,6 +571,17 @@ def test_read_length_accepts_hex(fake_transport):
 
     assert rc == 0
     assert calls[-1]["params"]["length"] == 194
+
+
+def test_read_defaults_length_when_omitted(fake_transport):
+    # #312: a bare `bn read <addr>` reads a small default window instead of
+    # erroring "the following arguments are required: --length".
+    calls = fake_transport({
+        "read": {"ok": True, "result": {"address": "0x1000", "length": 16, "hex": "00" * 16, "ascii": "." * 16}},
+    })
+    rc = bn.cli.main(["read", "--target", "active", "0x1000"])
+    assert rc == 0
+    assert calls[-1]["params"] == {"address": "0x1000", "length": 16}
 
 
 def test_read_conflicting_address_errors(fake_transport, capsys):

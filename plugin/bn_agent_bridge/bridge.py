@@ -332,11 +332,20 @@ class TargetManager:
             record.basename,
         ):
             return True
+        # A .bndb corpus loads <binary>.bndb, but the obvious selector is
+        # <binary>; match a candidate against the basename / path tail with a
+        # trailing .bndb stripped so `-t foo` resolves `foo.bndb` (#312).
+        if record.basename.endswith(".bndb") and candidate == record.basename[: -len(".bndb")]:
+            return True
         suffix = _path_components(candidate)
         if suffix:
             parts = _path_components(record.filename)
             if len(parts) >= len(suffix) and parts[-len(suffix):] == suffix:
                 return True
+            if parts and parts[-1].endswith(".bndb"):
+                stripped = tuple(parts[:-1]) + (parts[-1][: -len(".bndb")],)
+                if len(stripped) >= len(suffix) and tuple(stripped[-len(suffix):]) == tuple(suffix):
+                    return True
         return False
 
     def matches_target(self, target_id: str, selector: str | None) -> bool:

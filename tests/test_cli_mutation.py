@@ -751,6 +751,19 @@ def test_comment_set_positional_address_conflicts_with_function(fake_transport, 
     assert not calls  # errored before reaching the bridge
 
 
+def test_comment_set_too_many_positionals_gives_clear_error(fake_transport, capsys):
+    # #312: `comment set <fn> <addr> "text"` (3 positionals) used to error on the
+    # comment text as "unrecognized arguments". Now it's a clear arity error that
+    # names the right form, and never reaches the bridge.
+    calls = fake_transport({"set_comment": _COMMENT_SET_OK})
+    rc = bn.cli.main(["comment", "set", "DoCommand", "0x403b69", "test note", "--target", "active"])
+    assert rc == 2
+    assert not calls
+    err = capsys.readouterr().err.lower()
+    assert "comment set" in err and ("single address" in err or "--function" in err)
+    assert "test note" in err  # the message echoes the extra argument(s)
+
+
 def test_comment_set_positional_and_flag_address_differ_conflicts(fake_transport):
     calls = fake_transport({"set_comment": _COMMENT_SET_OK})
     rc = bn.cli.main(["comment", "set", "0x1", "a note", "--address", "0x2", "--target", "active"])

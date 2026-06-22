@@ -94,12 +94,25 @@ def _comment_locator(args: argparse.Namespace, verb: str) -> tuple[str | None, s
              arg("address", nargs="?",
                  help="Address to comment (hex 0x.. or decimal); alias for --address"),
              arg("comment", help="Comment text"),
+             # Catch the over-specified `comment set <fn> <addr> "text"` form so it
+             # gets a clear arity error instead of argparse blaming the comment
+             # text as "unrecognized arguments" (#312).
+             arg("extra", nargs="*", help=argparse.SUPPRESS),
              arg("--address", dest="address_flag", default=None,
                  help="Address to comment (alias for the positional)"),
              arg("--function", default=None,
                  help="Attach the comment to a function (name or address) instead of an address"),
          ])
 def _comment_set(args: argparse.Namespace) -> int:
+    if getattr(args, "extra", None):
+        raise BridgeError(
+            "comment set takes one address and one (quoted) comment: "
+            "`comment set <addr> \"<text>\"`, or attach to a function with "
+            "`comment set --function <name> \"<text>\"`. A comment is set at a "
+            "single address, not at both a function and an address positionally; "
+            f"got extra argument(s): {' '.join(args.extra)!r}. "
+            "If the comment text has spaces, quote it as one argument."
+        )
     address, function = _comment_locator(args, "set")
     return _mutate(
         args,

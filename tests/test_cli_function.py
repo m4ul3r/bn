@@ -1577,6 +1577,28 @@ def test_disasm_linear_rejects_non_positive(capsys):
     assert exc.value.code == 2
 
 
+def test_disasm_limit_is_alias_for_count(fake_transport, capsys):
+    # #312: disasm accepts --limit as an alias for --count (first N instructions),
+    # matching xrefs/strings/function list.
+    fake_transport({"disasm": {"ok": True, "result": {"text": "aaa\nbbb\nccc\nddd"}}})
+    rc = bn.cli.main(["disasm", "0x1000", "--target", "active", "--limit", "2"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "// lines 1-2 of 4" in out
+    assert "aaa" in out and "bbb" in out
+    assert "ccc" not in out and "ddd" not in out
+
+
+def test_disasm_limit_and_lines_are_mutually_exclusive(capsys):
+    # --limit aliases --count, which is mutually exclusive with --lines. Assert
+    # the mutex message names --count/--limit -- proves --limit actually joined
+    # the group (a bare "exit 2" would also pass if --limit were unrecognized).
+    with pytest.raises(SystemExit) as exc:
+        bn.cli.main(["disasm", "0x1000", "--target", "active", "--limit", "2", "--lines", "1:3"])
+    assert exc.value.code == 2
+    assert "not allowed with argument --count/--limit" in capsys.readouterr().err
+
+
 # --- #291.3: function search auto-retries a metacharacter query as regex ---
 
 

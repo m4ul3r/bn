@@ -204,8 +204,8 @@ def _bundle_function(args: argparse.Namespace) -> int:
                  help="Address to read from (hex 0x.. or decimal)"),
              arg("--address", dest="address_flag", default=None,
                  help="Address to read from (alias for the positional)"),
-             arg("--length", required=True, type=_int_or_hex,
-                 help="Number of bytes to read (decimal or hex 0x..)"),
+             arg("--length", default=16, type=_int_or_hex,
+                 help="Number of bytes to read (decimal or hex 0x..; default 16)"),
              arg("--encoding", choices=("hex", "bytes"), default="hex",
                  help="Byte payload encoding: hex hexdump (default) or raw bytes"),
          ])
@@ -274,7 +274,12 @@ def _py_exec(args: argparse.Namespace) -> int:
     if pos is not None and flag is not None:
         raise BridgeError("py exec: pass code positionally OR with --code, not both")
     inline = flag if flag is not None else pos
-    if inline is not None:
+    if inline == "-":
+        # Standardize the stdin idiom with `batch apply -`: a positional/`--code`
+        # value of "-" reads the script from stdin, alongside the explicit
+        # --stdin flag (#312).
+        script = sys.stdin.read()
+    elif inline is not None:
         script = inline
     elif args.script:
         if not args.script.exists():

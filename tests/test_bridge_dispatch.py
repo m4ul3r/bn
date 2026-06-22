@@ -660,6 +660,58 @@ def test_resolve_accepts_path_suffix_selector(monkeypatch):
     bridge._headless_views.clear()
 
 
+def test_resolve_strips_bndb_extension_from_selector(monkeypatch):
+    # #312: a .bndb corpus loads <binary>.bndb; the obvious selector is <binary>.
+    bridge = _load_bridge(monkeypatch)
+    bv1 = _FakeFileBV("/corpus/agrep.bndb", session_id="1")
+    bv2 = _FakeFileBV("/corpus/cpio.bndb", session_id="2")
+    _register_views(bridge, bv1, bv2)
+    manager = bridge.TargetManager()
+    assert manager.resolve("agrep") is bv1        # strips .bndb, disambiguates
+    assert manager.resolve("cpio.bndb") is bv2    # exact basename still works
+    bridge._headless_views.clear()
+
+
+def test_resolve_strips_bndb_in_path_suffix_selector(monkeypatch):
+    # The same tolerance with a disambiguating parent-dir path suffix.
+    bridge = _load_bridge(monkeypatch)
+    bv1 = _FakeFileBV("/work/a/target.bndb", session_id="1")
+    bv2 = _FakeFileBV("/work/b/target.bndb", session_id="2")
+    _register_views(bridge, bv1, bv2)
+    manager = bridge.TargetManager()
+    assert manager.resolve("b/target") is bv2     # .bndb stripped on the tail
+    assert manager.resolve("b/target.bndb") is bv2
+    bridge._headless_views.clear()
+
+
+def test_resolve_bndb_strip_does_not_silently_pick_on_ambiguity(monkeypatch):
+    # The high-risk case for the .bndb strip: a raw `foo` AND a `foo.bndb` both
+    # open -> `-t foo` matches both. resolve() must raise ambiguous, never
+    # silently pick one.
+    bridge = _load_bridge(monkeypatch)
+    raw = _FakeFileBV("/x/foo", session_id="1")
+    db = _FakeFileBV("/x/foo.bndb", session_id="2")
+    _register_views(bridge, raw, db)
+    manager = bridge.TargetManager()
+    with pytest.raises(Exception) as exc:
+        manager.resolve("foo")
+    assert "mbiguous" in str(exc.value)
+    bridge._headless_views.clear()
+
+
+def test_resolve_bndb_strip_is_exact_not_prefix(monkeypatch):
+    # `-t foo` must NOT over-match `foobar.bndb` (strip is exact-equality).
+    bridge = _load_bridge(monkeypatch)
+    bv = _FakeFileBV("/x/foobar.bndb", session_id="1")
+    other = _FakeFileBV("/x/baz.bndb", session_id="2")
+    _register_views(bridge, bv, other)
+    manager = bridge.TargetManager()
+    with pytest.raises(Exception) as exc:
+        manager.resolve("foo")
+    assert "nknown target selector" in str(exc.value)  # no over-match
+    bridge._headless_views.clear()
+
+
 def _close_on_watchdog(instance, *, timeout: float = 5.0, **kwargs):
     """Run _close_binary on a watchdog thread so a deadlock regression (e.g. a
     _write_registry()/resolve() call re-acquiring the non-reentrant

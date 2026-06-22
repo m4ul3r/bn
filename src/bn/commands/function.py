@@ -302,8 +302,10 @@ def _function_structured_il(args: argparse.Namespace) -> int:
              mutex(False,
                    arg("--lines", type=_parse_line_range, default=None, metavar="START:END",
                        help="Show only lines START through END (1-indexed, inclusive)"),
-                   arg("--count", type=_positive_int, default=None, metavar="N",
-                       help="Show only the first N instructions (one instruction per line)"),
+                   arg("--count", "--limit", type=_positive_int, default=None, metavar="N",
+                       dest="count",
+                       help="Show only the first N instructions (one instruction per line; "
+                            "--limit is an accepted alias)"),
                    # --linear is a different MODE, not a slice of a function: it
                    # linearly disassembles N instructions from any mapped address,
                    # even one BN left as data (a missed handler / vtable slot), so
