@@ -42,7 +42,8 @@ _IMPORT_SYMBOL_TYPES: list[tuple[str, str]] = [
 ]
 
 
-def _xrefs(ctx, selector: str | None, identifier, *, offset: int = 0, limit: int | None = None):
+def _xrefs(ctx, selector: str | None, identifier, *, offset: int = 0, limit: int | None = None,
+           fn_pointer_scan: bool = False):
     bv = ctx._resolve_view(selector)
     require_analysis(bv, "Cross-references")
     offset = _validate_count(offset, label="offset", minimum=0)
@@ -71,7 +72,8 @@ def _xrefs(ctx, selector: str | None, identifier, *, offset: int = 0, limit: int
             # both FunctionSymbol) reaches the collision surfacing (#220).
             impl = ctx._resolve_impl_over_stub(bodies)
             if impl is not None:
-                result = _xrefs_to_address(ctx, bv, int(impl.start), offset=offset, limit=limit)
+                result = _xrefs_to_address(ctx, bv, int(impl.start), offset=offset, limit=limit,
+                                           fn_pointer_scan=fn_pointer_scan)
                 if any(int(getattr(f, "start", -1)) != int(impl.start) for f in bodies):
                     result["resolved_to_definition"] = hex(int(impl.start))
                 return _drop_legacy_ref_arrays(result)
@@ -93,7 +95,8 @@ def _xrefs(ctx, selector: str | None, identifier, *, offset: int = 0, limit: int
                 _xrefs_import_symbol(ctx, bv, identifier, offset=offset, limit=limit)
             )
     return _drop_legacy_ref_arrays(
-        _xrefs_to_address(ctx, bv, address, offset=offset, limit=limit)
+        _xrefs_to_address(ctx, bv, address, offset=offset, limit=limit,
+                          fn_pointer_scan=fn_pointer_scan)
     )
 
 
@@ -386,7 +389,119 @@ def _xref_envelope(address, target_context, code_refs, data_refs, *,
     return out
 
 
-def _xrefs_to_address(ctx, bv, address: int, *, offset: int = 0, limit: int | None = None) -> dict[str, Any]:
+# Cap the bytes scanned for stored function pointers so the back-link scan can't
+# blow up on a huge data segment; if hit, the result flags it as truncated.
+_FN_PTR_SCAN_BYTE_BUDGET = 32 * 1024 * 1024
+
+# Section-name PREFIXES to SKIP: relocation/symbol/string/unwind/note metadata
+# are not pointer-table homes -- scanning them only widens the false-positive
+# surface (a reloc addend equals the target address) and wastes budget (#323
+# review). Matched by prefix so `.data.rel.ro` (a genuine pointer table) is NOT
+# caught by the relocation-table `.rela`/`.rel.` prefixes. Kept as a deny-list
+# (not an allow-list) so a firmware blob's custom-named data sections are still
+# scanned -- the firmware case is the whole point.
+_FN_PTR_SCAN_DENY_PREFIXES = (
+    ".rela", ".rel.", ".dynamic", ".dynsym", ".dynstr", ".symtab", ".strtab",
+    ".hash", ".gnu.hash", ".gnu.version", ".eh_frame", ".gcc_except", ".note",
+    ".comment", ".interp", ".plt", ".got.plt", ".debug",
+)
+
+
+def _data_section_ranges(bv) -> list[tuple[str, int, int]]:
+    """Readable, initialized, non-code data sections to scan for stored function
+    pointers (``.data``, ``.data.rel.ro``, ``.rodata``, ``.init_array``, ...).
+    Code, relocation/symbol/unwind metadata, and uninitialized (NOBITS/.bss)
+    sections are skipped -- a pointer-sized match there is noise, not a
+    function-pointer table slot (#323)."""
+    out: list[tuple[str, int, int]] = []
+    sections = getattr(bv, "sections", None) or {}
+    try:
+        values = list(sections.values())
+    except Exception:
+        return out
+    for sec in values:
+        name = str(getattr(sec, "name", ""))
+        lname = name.lower()
+        sem = str(getattr(getattr(sec, "semantics", None), "name", getattr(sec, "semantics", "")))
+        if "Code" in sem:
+            continue
+        # .bss / NOBITS hold no file data (zero-fill); scanning wastes budget and
+        # trips the short-read truncation check.
+        if "bss" in lname or "NoBackedSection" in sem or "External" in sem:
+            continue
+        if any(lname.startswith(p) for p in _FN_PTR_SCAN_DENY_PREFIXES):
+            continue
+        if "extern" in lname or "synthetic" in lname:
+            continue
+        start = int(getattr(sec, "start", 0) or 0)
+        length = int(getattr(sec, "length", 0) or 0)
+        if length <= 0:  # some Section objects expose end, not length
+            length = max(0, int(getattr(sec, "end", 0) or 0) - start)
+        if length <= 0:
+            continue
+        out.append((name, start, length))
+    return out
+
+
+def _function_pointer_data_refs(ctx, bv, address: int, existing_addrs: set[int]):
+    """Scan data sections for pointer-sized words equal to *address* -- a function
+    stored in a dispatch/vtable/codec table (#323). BN often does not model these
+    as data refs (especially reloc-applied PIE pointers, which read all-zero
+    until relocated), so a callback-only function otherwise reads as dead. Returns
+    ``([(slot, section_name, thumb), ...], truncated)`` for slots BN missed,
+    pointer-aligned only (a fn-ptr table is aligned; an unaligned hit is almost
+    always a coincidental byte run)."""
+    # Never scan for the image-base / a body-less pseudo-function (e.g. an ELF
+    # header BN models as a function at bv.start): its address is a common
+    # constant (the load base) that recurs throughout .rodata/headers, producing
+    # only false positives, never a real callback table slot (#323 review).
+    if int(address) == int(getattr(bv, "start", -1)):
+        return [], False
+    fn = bv.get_function_at(int(address)) if hasattr(bv, "get_function_at") else None
+    if fn is not None:
+        blocks = getattr(fn, "basic_blocks", None)
+        if blocks is not None and len(list(blocks)) == 0:
+            return [], False  # body-less synthetic/data pseudo-function
+    pointer_size = ctx._pointer_size(bv)
+    order = ctx._byteorder(bv)
+    needles: dict[bytes, bool] = {int(address).to_bytes(pointer_size, order): False}
+    arch_name = str(getattr(getattr(bv, "arch", None), "name", "")).lower()
+    if "arm" in arch_name or "thumb" in arch_name:  # a fn ptr may be stored as addr|1
+        needles[(int(address) | 1).to_bytes(pointer_size, order)] = True
+    refs: list[tuple[int, str, bool]] = []
+    seen = set(existing_addrs)
+    budget = _FN_PTR_SCAN_BYTE_BUDGET
+    truncated = False
+    for name, start, length in _data_section_ranges(bv):
+        if budget <= 0:
+            truncated = True
+            break
+        read_len = min(length, budget)
+        if read_len < length:  # the byte budget (not a short read) clipped this section
+            truncated = True
+        try:
+            data = bytes(bv.read(start, read_len) or b"")
+        except Exception:
+            continue
+        budget -= len(data)
+        for needle, thumb in needles.items():
+            pos = 0
+            while True:
+                i = data.find(needle, pos)
+                if i < 0:
+                    break
+                pos = i + 1
+                slot = start + i
+                if slot % pointer_size != 0 or slot in seen:
+                    continue
+                seen.add(slot)
+                refs.append((slot, name, thumb))
+    refs.sort(key=lambda t: t[0])
+    return refs, truncated
+
+
+def _xrefs_to_address(ctx, bv, address: int, *, offset: int = 0, limit: int | None = None,
+                      fn_pointer_scan: bool = False) -> dict[str, Any]:
     code_refs = []
     data_refs = []
     # Drop spurious adrp page-base materializations for a page-aligned target
@@ -436,6 +551,33 @@ def _xrefs_to_address(ctx, bv, address: int, *, offset: int = 0, limit: int | No
                 "context": ctx._address_context(bv, ref_addr),
             }
         )
+    fn_pointer_truncated = False
+    if fn_pointer_scan:
+        # Back-link a function reached only through a stored function pointer
+        # (vtable / codec table / fuse_operations / plugin registry) that BN did
+        # not model as a data ref, so it isn't falsely reported as dead (#323).
+        existing = {int(r["address"], 16) for r in data_refs}
+        fp_refs, fn_pointer_truncated = _function_pointer_data_refs(ctx, bv, address, existing)
+        for slot, _section_name, thumb in fp_refs:
+            functions = ctx._functions_containing(bv, slot)
+            fn = functions[0] if functions else None
+            caller = (
+                {"address": hex(int(fn.start)), "name": str(fn.name)}
+                if fn is not None
+                else None
+            )
+            entry = {
+                "function": fn.name if fn is not None else None,
+                "address": hex(slot),
+                "caller_function": caller,
+                "kind": "data",
+                "function_pointer": True,
+                "context": ctx._address_context(bv, slot),
+            }
+            if thumb:
+                entry["thumb_pointer"] = True
+            data_refs.append(entry)
+        data_refs.sort(key=lambda r: int(r["address"], 16))
     envelope = _xref_envelope(
         address,
         ctx._address_context(bv, address, include_disasm=True),
@@ -444,6 +586,8 @@ def _xrefs_to_address(ctx, bv, address: int, *, offset: int = 0, limit: int | No
         offset=offset,
         limit=limit,
     )
+    if fn_pointer_truncated:
+        envelope["fn_pointer_scan_truncated"] = True
     if stub_starts:
         # Disclose that some callers were reached through a same-name PLT stub,
         # so the unioned count is self-documenting rather than surprising (#286).

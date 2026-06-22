@@ -2011,6 +2011,7 @@ def _bind_xrefs(bridge, params, target):
         params["identifier"],
         offset=int(params.get("offset", 0)),
         limit=int(params["limit"]) if params.get("limit") is not None else None,
+        fn_pointer_scan=bool(params.get("fn_pointer_scan", False)),
     )
 
 

@@ -507,6 +507,30 @@ def test_render_evidence_xrefs_text_from_items_when_arrays_dropped():
     assert "- none" in out
 
 
+def test_render_evidence_xrefs_text_marks_function_pointer_and_truncation():
+    # #323: a scan-discovered stored function pointer is marked [function pointer]
+    # in the evidence-xrefs renderer (NOT the field-xrefs one), and a truncated
+    # scan surfaces an honesty note.
+    from bn import formatters
+    value = {
+        "address": "0x401000",
+        "target_context": {},
+        "code_ref_count": 0,
+        "data_ref_count": 1,
+        "items": [
+            {"address": "0x420040", "function": None, "kind": "data",
+             "function_pointer": True,
+             "context": {"sections": [{"name": ".data.rel.ro"}]}},
+        ],
+        "total": 1, "offset": 0, "limit": None, "returned": 1, "has_more": False,
+        "fn_pointer_scan_truncated": True,
+    }
+    out = formatters._render_evidence_xrefs_text(value)
+    assert "[function pointer]" in out          # the scan marker (was dead code in #323 v1)
+    assert ".data.rel.ro" in out                # section context
+    assert "back-link" in out and "truncated" in out  # the honesty note
+
+
 def test_evidence_function_routes_and_renders_calls(fake_transport, capsys):
     calls = fake_transport({"function_evidence": {
         "ok": True,

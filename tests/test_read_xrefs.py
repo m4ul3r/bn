@@ -852,3 +852,93 @@ def test_callsites_full_path_sees_through_stub_and_no_cross_stub_fp(monkeypatch)
     # caller2 calls a DIFFERENT function's stub -> no match for get_param
     miss = instance._callsites(None, "get_param", within_identifiers=["caller2"])
     assert miss["items"] == []
+
+
+def test_function_pointer_data_refs_alignment_and_dedup(monkeypatch):
+    # #323 core scan: finds a pointer-aligned stored function pointer, skips an
+    # unaligned coincidental byte run, and dedups against already-known slots.
+    bridge = _load_bridge(monkeypatch)
+    rx = bridge.read_xrefs
+    ctx = bridge.BinaryNinjaBridge().ctx
+    func_addr = 0x401000
+    blob = bytearray(0x100)
+    blob[0x40:0x48] = func_addr.to_bytes(8, "little")   # aligned slot -> found
+    blob[0x51:0x59] = func_addr.to_bytes(8, "little")   # unaligned -> skipped
+    bv = _FakeBV(arch=_FakeArch(name="x86_64", address_size=8),
+                 sections={".data": _FakeSection(".data", 0x420000, 0x420100)},
+                 memory={0x420000: bytes(blob)})
+    refs, truncated = rx._function_pointer_data_refs(ctx, bv, func_addr, set())
+    slots = [s for s, _name, _thumb in refs]
+    assert truncated is False
+    assert 0x420040 in slots
+    assert 0x420051 not in slots
+    refs2, _ = rx._function_pointer_data_refs(ctx, bv, func_addr, {0x420040})
+    assert 0x420040 not in [s for s, _n, _t in refs2]   # dedup vs known
+
+
+def test_evidence_xrefs_backlinks_stored_function_pointer(monkeypatch):
+    # #323: a function reached ONLY via a stored function pointer (a data-table
+    # slot BN didn't model as a data ref) is back-linked by the fn-pointer scan
+    # (fn_pointer_scan=True), so a callback-only function isn't reported as dead.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    func_addr = 0x401000
+    target = _FakeFunction(func_addr, "callback_only")
+    target.basic_blocks = [_FakeBasicBlock(func_addr, func_addr + 0x10)]  # real body
+    blob = bytearray(0x100)
+    blob[0x40:0x48] = func_addr.to_bytes(8, "little")
+    bv = _FakeBV(
+        functions=[target],
+        arch=_FakeArch(name="x86_64", address_size=8),
+        code_refs={func_addr: []},
+        data_refs={func_addr: []},        # BN modeled NO ref -> looks dead
+        sections={".data.rel.ro": _FakeSection(".data.rel.ro", 0x420000, 0x420100)},
+        segments={0x420040: _FakeSegment(readable=True)},
+        memory={0x420000: bytes(blob)},
+    )
+    plain = instance._xrefs_to_address(bv, func_addr)
+    assert plain["data_ref_count"] == 0                 # the bug: looks dead
+
+    scanned = instance._xrefs_to_address(bv, func_addr, fn_pointer_scan=True)
+    fp = [r for r in scanned["data_refs"] if r.get("function_pointer")]
+    assert len(fp) == 1
+    assert fp[0]["address"] == "0x420040"
+    assert fp[0]["kind"] == "data"
+    assert fp[0]["context"]["sections"][0]["name"] == ".data.rel.ro"
+
+
+def test_function_pointer_scan_skips_image_base_pseudo_function(monkeypatch):
+    # #323 review (FP): the image-base / body-less pseudo-function (e.g. an ELF
+    # header BN models as a function at bv.start) must NOT be scanned -- its
+    # address is a common .rodata constant (the load base) that would produce
+    # only false positives, never a real callback-table slot.
+    bridge = _load_bridge(monkeypatch)
+    rx = bridge.read_xrefs
+    ctx = bridge.BinaryNinjaBridge().ctx
+    base = 0x400000
+    blob = bytearray(0x80)
+    blob[0x10:0x18] = base.to_bytes(8, "little")  # the base word recurs in data
+    bv = _FakeBV(arch=_FakeArch(name="x86_64", address_size=8),
+                 sections={".rodata": _FakeSection(".rodata", 0x420000, 0x420080)},
+                 memory={0x420000: bytes(blob)})
+    bv.start = base
+    refs, _trunc = rx._function_pointer_data_refs(ctx, bv, base, set())
+    assert refs == []  # image-base needle skipped, no FPs
+
+
+def test_data_section_ranges_skips_metadata_and_bss(monkeypatch):
+    # #323 review (LOW): relocation/symbol/unwind metadata and .bss are not
+    # pointer-table homes -- skip them (firmware-friendly deny-list, not an
+    # allow-list, so custom data section names are still scanned).
+    bridge = _load_bridge(monkeypatch)
+    rx = bridge.read_xrefs
+    bv = _FakeBV(sections={
+        ".data.rel.ro": _FakeSection(".data.rel.ro", 0x1000, 0x1100),
+        ".rela.dyn": _FakeSection(".rela.dyn", 0x2000, 0x2100),
+        ".eh_frame": _FakeSection(".eh_frame", 0x3000, 0x3100),
+        ".bss": _FakeSection(".bss", 0x4000, 0x4100),
+        ".dynsym": _FakeSection(".dynsym", 0x5000, 0x5100),
+        "fw_table": _FakeSection("fw_table", 0x6000, 0x6100),  # custom -> kept
+    })
+    names = {n for n, _s, _l in rx._data_section_ranges(bv)}
+    assert names == {".data.rel.ro", "fw_table"}

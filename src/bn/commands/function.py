@@ -517,7 +517,11 @@ def _evidence_xrefs(args: argparse.Namespace) -> int:
     # pages the items (and the op drops the deprecated full arrays). Text fetches
     # the full set and uses `limit` as a per-bucket display cap, so don't forward
     # offset/limit to the op in text mode.
-    params: dict[str, Any] = {"identifier": args.identifier}
+    # evidence xrefs is the deep/contextual reverse-link command: it also scans
+    # data sections for stored function pointers so a callback-only function
+    # (vtable/dispatch-table slot) isn't reported as dead (#323). Plain `xrefs`
+    # stays fast and does not scan.
+    params: dict[str, Any] = {"identifier": args.identifier, "fn_pointer_scan": True}
     limit = _effective_limit(args)
     if args.format != "text":
         if args.offset:

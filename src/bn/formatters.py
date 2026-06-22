@@ -985,9 +985,19 @@ def _render_evidence_xrefs_text(value: Any, limit: int | None = None) -> str:
             address = ref.get("address", "<unknown>")
             function = ref.get("function") or "<unknown>"
             ref_kind = ref.get("kind") or kind
+            # A stored function pointer the back-link scan discovered (#323): mark
+            # it [function pointer] so an analyst sees it's a scan-found callback
+            # table slot, distinct from a BN-modeled data ref (the section is in
+            # the context suffix).
+            fp = " [function pointer]" if ref.get("function_pointer") else ""
             lines.append(
-                f"- {address}  {ref_kind}  {function}{_context_suffix(ref.get('context'))}"
+                f"- {address}  {ref_kind}  {function}{_context_suffix(ref.get('context'))}{fp}"
             )
+    if value.get("fn_pointer_scan_truncated"):
+        lines.append(
+            "\nnote: the function-pointer back-link scan was truncated (data "
+            "sections exceeded the scan budget); some table references may be missing"
+        )
     return "\n".join(lines)
 
 
