@@ -492,5 +492,59 @@ class TestDisasmLinear:
             result = self._unwrap(json.loads(res.stdout))
             assert result.get("linear") is True
             assert result.get("instruction_count", 0) >= 1
+
+
+class TestFunctionCreatePreviewHonesty:
+    """Regression for #304: `function create <addr> --preview` reported `verified`
+    while the follow-up live `function create <addr>` reported
+    `verification_failed`. The preview's revert used remove_user_function, which
+    records a persistent user "no function here" override that poisoned the
+    address. The non-poisoning remove_function makes preview and live agree.
+    Needs real BN -- only BN's analysis reproduces the suppression behavior.
+    """
+
+    def _gap_addresses(self, inst_id):
+        """Candidate executable addresses that are NOT function starts: the byte
+        just past a function when a gap precedes the next function."""
+        listing = _bn("--instance", inst_id, "function", "list", "--format", "json")
+        items = json.loads(listing.stdout)
+        items = items.get("items", items) if isinstance(items, dict) else items
+        fns = sorted(
+            ((int(f["address"], 16), int(f.get("size") or 0)) for f in items),
+            key=lambda t: t[0],
+        )
+        gaps = []
+        for (start, size), (nxt, _) in zip(fns, fns[1:]):
+            end = start + size
+            if size > 0 and end < nxt:
+                gaps.append(end)
+        return gaps
+
+    def test_preview_then_live_agree(self):
+        info = _session_start(str(HELLO_BINARY))
+        inst_id = info["instance_id"]
+        try:
+            chosen = None
+            for addr in self._gap_addresses(inst_id)[:20]:
+                hexaddr = hex(addr)
+                prev = _bn("--instance", inst_id, "function", "create", hexaddr,
+                           "--preview", "--format", "json")
+                if prev.returncode != 0:
+                    continue
+                status = json.loads(prev.stdout)["results"][0]["status"]
+                if status == "verified":
+                    chosen = hexaddr
+                    break
+            if chosen is None:
+                pytest.skip("no creatable gap address found in this fixture")
+
+            # The live create at the SAME address must ALSO verify -- before the
+            # fix the preview's remove_user_function suppressed it and this
+            # returned verification_failed.
+            live = _bn("--instance", inst_id, "function", "create", chosen, "--format", "json")
+            assert live.returncode == 0, f"{chosen}: {live.stdout}\n{live.stderr}"
+            parsed = json.loads(live.stdout)
+            assert parsed["results"][0]["status"] == "verified", parsed
+            assert parsed["committed"] is True, parsed
         finally:
             _session_stop(inst_id)

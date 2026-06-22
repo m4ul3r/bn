@@ -45,19 +45,45 @@ def _remove_created_function(ctx, bv, addr: int) -> bool:
     ``bv.add_function`` is NOT journaled in BN's undo buffer, so the preview /
     rollback revert (which relies on ``revert_undo_actions``) is a silent no-op
     for function creation -- the function persists in the view. Explicitly
-    remove it via ``remove_user_function``, reanalyze, and read back that no
-    function starts at the address. Returns True only when the function is
-    actually gone, so callers never report a revert they did not verify (#117).
+    remove it, reanalyze, and read back that no function starts at the address.
+    Returns True only when the function is actually gone, so callers never report
+    a revert they did not verify (#117).
+
+    Use ``remove_function``, NOT ``remove_user_function``: the latter records a
+    persistent user "do not create a function here" override that POISONS the
+    address, so a SUBSEQUENT real ``function create`` at the same address is then
+    declined by analysis ("No function starts at ... after analysis"). That is
+    what made a ``--preview`` (which reverts) report ``verified`` while the
+    follow-up live commit reported ``verification_failed`` -- the preview's
+    cleanup sabotaged the next run (#304). ``remove_function`` reverts cleanly:
+    a later ``add_function`` re-creates the function normally.
     """
     fn = bv.get_function_at(addr)
     if fn is None:
         return True
+    remove_clean = getattr(bv, "remove_function", None)
     try:
-        bv.remove_user_function(fn)
+        if remove_clean is not None:
+            remove_clean(fn)
+        else:  # older BN without remove_function: accept the poison over a no-op
+            bv.remove_user_function(fn)
         bv.update_analysis_and_wait()
     except Exception as exc:  # noqa: BLE001 - report the revert as failed, don't raise
         bn.log_error(
             f"BN Agent Bridge: failed to remove created function at 0x{addr:x} on revert: {exc!r}"
+        )
+        return False
+    if bv.get_function_at(addr) is None:
+        return True
+    # remove_function did not take (rare). Fall back to remove_user_function so
+    # the preview is still reverted -- a left-behind function is worse than the
+    # address-suppression side-effect.
+    try:
+        bv.remove_user_function(bv.get_function_at(addr))
+        bv.update_analysis_and_wait()
+    except Exception as exc:  # noqa: BLE001
+        bn.log_error(
+            f"BN Agent Bridge: fallback removal of created function at 0x{addr:x} failed: {exc!r}"
         )
         return False
     return bv.get_function_at(addr) is None

@@ -625,19 +625,35 @@ class _FakeFunctionCreateBV(_FakeMutationBV):
         self._segments = dict(segments or {})
         self._memory = dict(memory or {})
         self.added: list[int] = []
+        # Addresses BN has been told (via remove_user_function) the user does not
+        # want a function at: a subsequent add_function there is dropped by
+        # analysis. Modeling this is what gives the #304 regression test teeth.
+        self._suppressed: set[int] = set()
 
     def add_function(self, addr: int):
         self.events.append(("add_function", addr))
         self.added.append(int(addr))
+        if int(addr) in self._suppressed:
+            # Poisoned by a prior remove_user_function: analysis declines to keep
+            # it, so get_function_at stays None (the live verification_failed).
+            return None
         fn = _FakeFunction(int(addr), f"sub_{addr:x}")
         self.functions.append(fn)
         return fn
 
     def remove_user_function(self, fn):
         # Model BN faithfully: add_function is NOT journaled by the undo buffer,
-        # so revert_undo_actions never removes it -- only remove_user_function
-        # does. The preview/rollback revert must call this explicitly (#117).
+        # so revert_undo_actions never removes it -- only an explicit removal
+        # does (#117). remove_user_function additionally records a persistent
+        # user override that SUPPRESSES the address (#304 poison).
         self.events.append(("remove_user_function", int(fn.start)))
+        self.functions = [f for f in self.functions if int(f.start) != int(fn.start)]
+        self._suppressed.add(int(fn.start))
+
+    def remove_function(self, fn):
+        # The non-poisoning removal: drops the function WITHOUT suppressing the
+        # address, so a later add_function re-creates it (the #304 fix).
+        self.events.append(("remove_function", int(fn.start)))
         self.functions = [f for f in self.functions if int(f.start) != int(fn.start)]
 
     def is_offset_executable(self, addr: int) -> bool:

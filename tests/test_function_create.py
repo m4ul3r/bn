@@ -129,9 +129,38 @@ def test_function_create_preview_actually_removes_function(monkeypatch):
     assert result["success"] is True
     assert result["rolled_back"] is True
     assert result["results"][0]["status"] == "verified"
-    assert ("remove_user_function", 0x1000) in bv.events
+    # The revert uses the non-poisoning remove_function (#304), not
+    # remove_user_function (which would suppress the address).
+    assert ("remove_function", 0x1000) in bv.events
+    assert ("remove_user_function", 0x1000) not in bv.events
     # The crux: no function may persist at the address after a preview.
     assert bv.get_function_at(0x1000) is None
+
+
+def test_function_create_preview_does_not_poison_subsequent_live_create(monkeypatch):
+    """#304: a --preview must not sabotage the follow-up live `function create`
+    at the same address. The old revert used remove_user_function, which records
+    a persistent user "no function here" override -- so the preview reported
+    `verified` but the live commit then reported `verification_failed`. The
+    non-poisoning remove_function makes preview and live agree."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFunctionCreateBV(
+        segments={0x1000: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x55\x48\x89\xe5"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    preview = instance._function_create(None, "0x1000", True)
+    assert preview["success"] is True
+    assert preview["results"][0]["status"] == "verified"
+    assert bv.get_function_at(0x1000) is None  # reverted
+
+    # The follow-up live create at the SAME address must still succeed -- the
+    # preview's revert must not have suppressed the address.
+    live = instance._function_create(None, "0x1000", False)
+    assert live["committed"] is True, live
+    assert live["results"][0]["status"] == "verified", live
 
 
 def test_function_create_preview_revert_failure_is_not_success(monkeypatch):
@@ -144,8 +173,11 @@ def test_function_create_preview_revert_failure_is_not_success(monkeypatch):
         segments={0x1000: _FakeSegment(readable=True, executable=True)},
         memory={0x1000: b"\x55\x48\x89\xe5"},
     )
-    # Removal silently does nothing, so the function persists past the revert.
-    bv.remove_user_function = lambda fn: bv.events.append(("remove_attempt", int(fn.start)))
+    # BOTH removal paths silently do nothing, so the function persists past the
+    # revert (remove_function is tried first now, with remove_user_function as
+    # the fallback).
+    bv.remove_function = lambda fn: bv.events.append(("remove_attempt", int(fn.start)))
+    bv.remove_user_function = lambda fn: bv.events.append(("remove_attempt_user", int(fn.start)))
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._function_create(None, "0x1000", True)
