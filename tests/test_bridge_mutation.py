@@ -1538,6 +1538,103 @@ def test_struct_field_offset_delete_targets_right_field_on_duplicate_names(monke
     assert [(m.offset, m.name) for m in builder.members] == [(0, "dup")]  # 0x8 gone, 0x0 kept
 
 
+def test_struct_field_delete_trailing_shrinks_struct_width(monkeypatch):
+    # #320: removing the field that reaches the struct end must shrink the width.
+    # BN's builder.remove() leaves the width stale, so the delete would otherwise
+    # keep phantom trailing bytes (size still 0x1c) and still report verified.
+    pad = _FakeStructMember(0x0, "pad", types.SimpleNamespace(width=24))
+    extra = _FakeStructMember(0x18, "extra", types.SimpleNamespace(width=4))
+    bridge, instance, builder = _struct_instance(monkeypatch, [pad, extra])
+    builder.width = 0x1c
+    instance._op_struct_field_delete(None, {"struct_name": "S", "field_name": "extra"})
+    assert [m.name for m in builder.members] == ["pad"]
+    assert builder.width == 0x18  # shrank to the end of the new last field
+
+
+def test_struct_field_delete_only_member_zeroes_width(monkeypatch):
+    # Deleting the sole member leaves an empty struct of width 0 (not the stale
+    # old width).
+    only = _FakeStructMember(0x0, "pad", types.SimpleNamespace(width=24))
+    bridge, instance, builder = _struct_instance(monkeypatch, [only])
+    builder.width = 0x18
+    instance._op_struct_field_delete(None, {"struct_name": "S", "field_name": "pad"})
+    assert builder.members == []
+    assert builder.width == 0
+
+
+def test_struct_field_delete_trailing_tie_keeps_width(monkeypatch):
+    # Two members both reach the struct end (an overlay at 0x0): deleting one must
+    # NOT shrink, because the other still defines the end. Guards the
+    # `new_end < old_width` boundary.
+    a = _FakeStructMember(0x0, "a", types.SimpleNamespace(width=8))
+    b = _FakeStructMember(0x0, "b", types.SimpleNamespace(width=8))
+    bridge, instance, builder = _struct_instance(monkeypatch, [a, b])
+    builder.width = 0x8
+    res = instance._op_struct_field_delete(None, {"struct_name": "S", "field_name": "a"})
+    assert builder.width == 0x8           # 'b' still reaches the end
+    assert res["expected_width"] is None  # no shrink intended
+
+
+def test_struct_field_delete_overlapping_trailing_shrinks_to_remaining(monkeypatch):
+    # A big member at 0x0 overlapping a smaller later one defines the end; deleting
+    # it shrinks the width down to the remaining member's end (not to 0).
+    big = _FakeStructMember(0x0, "big", types.SimpleNamespace(width=0x20))
+    small = _FakeStructMember(0x4, "small", types.SimpleNamespace(width=4))
+    bridge, instance, builder = _struct_instance(monkeypatch, [big, small])
+    builder.width = 0x20
+    res = instance._op_struct_field_delete(None, {"struct_name": "S", "field_name": "big"})
+    assert builder.width == 0x8          # 'small' ends at 0x8
+    assert res["expected_width"] == 0x8
+
+
+def test_verify_struct_field_delete_flags_stale_width(monkeypatch):
+    # The verifier must REJECT a delete that left the width stale (the op intended
+    # a shrink to 0x18 but the live width is still 0x1c) instead of reporting
+    # verified -- the #320 false-positive class. This is the closed loop: even if
+    # the width assignment silently failed, the readback is checked.
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    live_type = types.SimpleNamespace(width=0x1c, members=[
+        types.SimpleNamespace(offset=0x0, name="pad", type=types.SimpleNamespace(width=0x18)),
+    ])
+    bv = types.SimpleNamespace(get_type_by_name=lambda n: live_type)
+    ctx = bridge.BinaryNinjaBridge().ctx
+    item = {"struct_name": "S", "field_name": "extra", "member_offset": 0x18, "expected_width": 0x18}
+    with pytest.raises(bridge.OperationFailure) as exc:
+        me._verify_struct_field_delete(ctx, bv, item)
+    assert exc.value.status == "verification_failed"
+    assert "width" in str(exc.value).lower()
+
+
+def test_verify_struct_field_delete_passes_when_width_shrank(monkeypatch):
+    # The contrast: when the live width matches the intended shrink, the delete
+    # verifies cleanly.
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    live_type = types.SimpleNamespace(width=0x18, members=[
+        types.SimpleNamespace(offset=0x0, name="pad", type=types.SimpleNamespace(width=0x18)),
+    ])
+    bv = types.SimpleNamespace(get_type_by_name=lambda n: live_type)
+    ctx = bridge.BinaryNinjaBridge().ctx
+    item = {"struct_name": "S", "field_name": "extra", "member_offset": 0x18, "expected_width": 0x18}
+    out = me._verify_struct_field_delete(ctx, bv, item)
+    assert out["status"] == "verified"
+    assert out["observed"]["width"] == 0x18
+
+
+def test_struct_field_delete_interior_keeps_width(monkeypatch):
+    # A field that does NOT reach the struct end must not collapse the width:
+    # in a partially-recovered struct sized larger than its mapped fields, the
+    # explicit width is intentional and deleting an early field must preserve it.
+    a = _FakeStructMember(0x0, "a", types.SimpleNamespace(width=4))
+    b = _FakeStructMember(0x8, "b", types.SimpleNamespace(width=4))
+    bridge, instance, builder = _struct_instance(monkeypatch, [a, b])
+    builder.width = 0x100  # 256-byte struct, only two fields mapped so far
+    instance._op_struct_field_delete(None, {"struct_name": "S", "field_name": "b"})
+    assert [m.name for m in builder.members] == ["a"]
+    assert builder.width == 0x100  # 'b' didn't reach the end -> width unchanged
+
+
 def test_struct_field_offset_rename_targets_right_field_on_duplicate_names(monkeypatch):
     bridge, instance, builder = _struct_instance(
         monkeypatch, [_FakeStructMember(0, "dup"), _FakeStructMember(8, "dup")])
