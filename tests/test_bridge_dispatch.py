@@ -1602,3 +1602,45 @@ def test_write_registry_binaries_best_effort_on_refresh_error(monkeypatch, tmp_p
     instance._write_registry()   # must not raise
     payload = json.loads((tmp_path / "inst.json").read_text())
     assert payload["binaries"] == []   # degrades to empty, registry still written
+
+
+def test_write_project_marker_gated_and_git_excludes(monkeypatch, tmp_path):
+    # #80: the bridge drops a `.bn-<id>` marker in the CLI's project root, adds
+    # `.bn-*` to .git/info/exclude, and is gated (GUI bridge / --no-marker write none).
+    bridge = _load_bridge(monkeypatch)
+    inst = bridge.BinaryNinjaBridge(instance_id="zz99")
+
+    git = tmp_path / ".git" / "info"
+    git.mkdir(parents=True)  # make tmp_path look like a git work tree root
+    assert inst._write_project_marker(str(tmp_path), no_marker=False) is None
+    marker = tmp_path / ".bn-zz99"
+    assert marker.exists()
+    body = json.loads(marker.read_text())
+    assert body["instance_id"] == "zz99" and "socket_path" in body
+    assert ".bn-*" in (tmp_path / ".git" / "info" / "exclude").read_text()
+
+    # opt-out writes nothing
+    other = tmp_path / "other"
+    other.mkdir()
+    assert inst._write_project_marker(str(other), no_marker=True) is None
+    assert not (other / ".bn-zz99").exists()
+
+    # GUI bridge (instance_id None) writes nothing (keeps its legacy fixed registry)
+    gui = bridge.BinaryNinjaBridge()
+    assert gui._write_project_marker(str(other), no_marker=False) is None
+    assert not list(other.glob(".bn-*"))
+
+
+def test_write_project_marker_readonly_dir_is_a_note_not_error(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    inst = bridge.BinaryNinjaBridge(instance_id="ro11")
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    ro.chmod(0o500)
+    try:
+        note = inst._write_project_marker(str(ro), no_marker=False)
+        # best-effort: a one-line note, never a raised error (a missing/locked dir
+        # must not fail the load)
+        assert note is None or "marker" in note
+    finally:
+        ro.chmod(0o700)

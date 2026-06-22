@@ -75,6 +75,40 @@ def session_state_path(start: Path | None = None) -> Path:
     return sessions_dir() / f"{digest}.json"
 
 
+# -- project-local instance markers (#80) ---------------------------------
+# A `.bn-<instance_id>` file dropped in a project root lets a bare `bn` command
+# resolve the right bridge among many by walking up from cwd -- a visible,
+# project-local pointer (vs the hashed sticky-pin). The registry stays the source
+# of truth; the marker is just a pointer, validated against live instances on read.
+MARKER_PREFIX = ".bn-"
+
+
+def marker_name(instance_id: str) -> str:
+    return f"{MARKER_PREFIX}{instance_id}"
+
+
+def find_instance_markers(start: Path | None = None, *, max_depth: int = 40):
+    """Yield ``(instance_id, path)`` for each ``.bn-<id>`` marker found walking up
+    from *start* (default cwd), nearest first (#80)."""
+    try:
+        cwd = (start or Path.cwd()).resolve()
+    except OSError:
+        return
+    for depth, d in enumerate((cwd, *cwd.parents)):
+        if depth >= max_depth:
+            break
+        try:
+            markers = sorted(d.glob(f"{MARKER_PREFIX}*"))
+        except OSError:
+            continue
+        for m in markers:
+            try:
+                if m.is_file():
+                    yield m.name[len(MARKER_PREFIX):], m
+            except OSError:
+                continue
+
+
 def bridge_registry_path(instance_id: str | None = None) -> Path:
     if instance_id is None:
         return cache_home() / f"{PLUGIN_NAME}.json"

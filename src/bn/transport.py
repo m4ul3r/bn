@@ -17,7 +17,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .paths import bridge_registry_path, bridge_socket_path, instances_dir
+from .paths import (
+    bridge_registry_path, bridge_socket_path, find_instance_markers, instances_dir,
+)
 
 
 class BridgeError(RuntimeError):
@@ -313,6 +315,33 @@ def gc_instances() -> dict[str, Any]:
     return summary
 
 
+def _resolve_from_markers(instances: list[BridgeInstance]) -> BridgeInstance | None:
+    """#80: when multiple bridges are running and none was explicitly selected, a
+    `.bn-<id>` marker found walking up from cwd selects that instance -- so a bare
+    `bn` in a project dir resolves the bridge that loaded its binary, instead of
+    erroring with "multiple instances".
+
+    *instances* is the already-resolved LIVE list (``list_instances()`` has run its
+    stale-registry purge). A marker matching a live instance wins; any other marker
+    is for an instance that is no longer live (stopped/crashed/purged) and is
+    unlinked (heal) -- the next ``bn load`` from that dir rewrites it. Markers are a
+    pointer; the live registry is authoritative. Only our own well-formed ``.bn-*``
+    files are touched (an id that isn't a valid instance id is left alone)."""
+    by_id = {inst.instance_id: inst for inst in instances}
+    by_sel = {instance_selector(inst): inst for inst in instances}
+    for marker_id, path in find_instance_markers():
+        if not _INSTANCE_ID_RE.match(marker_id):
+            continue  # not a well-formed bn instance id -> not ours, never touch it
+        inst = by_id.get(marker_id) or by_sel.get(marker_id)
+        if inst is not None:
+            return inst
+        try:
+            path.unlink()  # not live -> heal (recoverable: next `bn load` rewrites it)
+        except OSError:
+            pass
+    return None
+
+
 def _multiple_instances_error(instances: list[BridgeInstance]) -> BridgeError:
     return BridgeError(
         "Multiple Binary Ninja bridge instances are running; pass --instance <id> "
@@ -354,6 +383,9 @@ def _auto_spawn_locked() -> BridgeInstance:
         if len(instances) == 1:
             return instances[0]
         if instances:
+            marked = _resolve_from_markers(instances)   # #80: marker disambiguates a spawn race
+            if marked is not None:
+                return marked
             raise _multiple_instances_error(instances)
         # Already under the spawn lock -- call the unlocked core directly, or a
         # second flock on the same file from this process would deadlock.
@@ -386,6 +418,11 @@ def choose_instance(
     if len(instances) == 1:
         return instances[0]
     if instances:
+        # #80: a project-local marker (walking up from cwd) disambiguates before
+        # erroring -- so `cd project && bn ...` resolves the bridge that loaded it.
+        marked = _resolve_from_markers(instances)
+        if marked is not None:
+            return marked
         raise _multiple_instances_error(instances)
     if auto_start:
         return _auto_spawn_locked()

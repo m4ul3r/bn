@@ -45,7 +45,10 @@ from ._shared import (
     _write_json_artifact,
 )
 from .op_registry import REGISTRY, op
-from .paths import PLUGIN_NAME, bridge_registry_path, bridge_socket_path, cache_home, instances_dir
+from .paths import (
+    PLUGIN_NAME, bridge_registry_path, bridge_socket_path, cache_home, instances_dir,
+    marker_name, project_root,
+)
 from .seam import BridgeContext
 from .version import VERSION, build_id_for_file, build_id_for_package
 
@@ -721,6 +724,49 @@ class BinaryNinjaBridge:
             with contextlib.suppress(OSError):
                 log_path.unlink()
 
+    def _write_project_marker(self, workdir: str | None, no_marker: bool) -> str | None:
+        """Drop a `.bn-<instance_id>` pointer in the CLI's project root so a bare
+        `bn` command there resolves THIS instance among many (#80). Best-effort:
+        a read-only/unwritable dir is a non-fatal one-line note, never an error.
+        Skipped for the GUI bridge (instance_id None keeps its legacy fixed
+        registry) and when the caller opts out (--no-marker / BN_NO_MARKERS).
+        Registry stays the source of truth; the marker is a validated pointer."""
+        if no_marker or not self.instance_id or not workdir:
+            return None
+        try:
+            root = project_root(Path(workdir).expanduser())
+        except Exception:
+            return None
+        marker = root / marker_name(self.instance_id)
+        try:
+            marker.write_text(json.dumps({
+                "instance_id": self.instance_id,
+                "socket_path": str(self.socket_path),
+                "pid": os.getpid(),
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }), encoding="utf-8")
+        except OSError as exc:
+            return f"could not write project marker in {root} ({exc}); resolve with -i"
+        self._git_exclude_marker(root)
+        return None
+
+    def _git_exclude_marker(self, root: Path) -> None:
+        """Add `.bn-*` to `.git/info/exclude` (not .gitignore -- no tracked-tree
+        dirt) so markers don't show up as untracked in `git status` (#80)."""
+        git_dir = root / ".git"
+        if not git_dir.is_dir():
+            return
+        exclude = git_dir / "info" / "exclude"
+        try:
+            existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
+            if any(line.strip() == ".bn-*" for line in existing.splitlines()):
+                return
+            exclude.parent.mkdir(parents=True, exist_ok=True)
+            sep = "" if (not existing or existing.endswith("\n")) else "\n"
+            exclude.write_text(f"{existing}{sep}.bn-*\n", encoding="utf-8")
+        except OSError:
+            pass  # best-effort; a missing exclude just means markers show in git status
+
     def _write_registry(self):
         payload = {
             "pid": os.getpid(),
@@ -801,7 +847,8 @@ class BinaryNinjaBridge:
             "targets": self.targets.refresh(),
         }
 
-    def _load_binary(self, path: str, *, prefer_bndb: bool = True, quick: bool = False):
+    def _load_binary(self, path: str, *, prefer_bndb: bool = True, quick: bool = False,
+                     workdir: str | None = None, no_marker: bool = False):
         import binaryninja
 
         resolved = Path(path).expanduser().resolve()
@@ -896,6 +943,9 @@ class BinaryNinjaBridge:
 
         # Keep the registry's open-binaries list current after a load (#80).
         self._write_registry()
+        marker_note = self._write_project_marker(workdir, no_marker)
+        if marker_note:
+            notes.append(marker_note)
         return {
             "loaded": True,
             "path": str(load_path),
@@ -1975,6 +2025,8 @@ def _bind_load_binary(bridge, params, target):
         str(params["path"]),
         prefer_bndb=_validate_bool(params.get("prefer_bndb"), label="prefer_bndb", default=True),
         quick=_validate_bool(params.get("quick"), label="quick", default=False),
+        workdir=params.get("workdir"),
+        no_marker=_validate_bool(params.get("no_marker"), label="no_marker", default=False),
     )
 
 

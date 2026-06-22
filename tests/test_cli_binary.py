@@ -483,3 +483,41 @@ def test_load_instance_id_does_not_clobber_env_instance(monkeypatch, tmp_path):
 
     assert rc == 0
     assert captured["instance_id"] == "fromroot"
+
+
+def test_load_forwards_workdir_and_marker_optout(monkeypatch, tmp_path):
+    # #80: `bn load` forwards cwd as `workdir` (the marker anchor) and `no_marker`
+    # from --no-marker / BN_NO_MARKERS.
+    captured = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None,
+                          spawn_missing_named=False, **kwargs):
+        assert op == "load_binary"
+        captured.update(params or {})
+        return {"ok": True, "result": {"loaded": True, "targets": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.delenv("BN_NO_MARKERS", raising=False)
+    binpath = tmp_path / "prog"
+    binpath.write_bytes(b"\x7fELF")
+
+    rc = bn.cli.main(["load", str(binpath)])
+    assert rc == 0
+    assert "workdir" in captured and captured["no_marker"] is False
+
+    # --no-marker opts out
+    captured.clear()
+    rc = bn.cli.main(["load", str(binpath), "--no-marker"])
+    assert rc == 0 and captured["no_marker"] is True
+
+    # BN_NO_MARKERS env opts out too
+    captured.clear()
+    monkeypatch.setenv("BN_NO_MARKERS", "1")
+    rc = bn.cli.main(["load", str(binpath)])
+    assert rc == 0 and captured["no_marker"] is True
+
+    # BN_NO_MARKERS=0 does NOT opt out
+    captured.clear()
+    monkeypatch.setenv("BN_NO_MARKERS", "0")
+    rc = bn.cli.main(["load", str(binpath)])
+    assert rc == 0 and captured["no_marker"] is False

@@ -30,8 +30,14 @@ from ..formatters import (
              arg("--quick", "--no-analysis", action="store_true",
                  help="Load without full analysis (fast, ~1s): sections/imports/symbols are ready "
                       "immediately; strings and the full function set need `bn refresh`"),
+             arg("--no-marker", action="store_true", default=False, dest="no_marker",
+                 help="Don't drop a project-local `.bn-<id>` marker (#80); markers let a bare "
+                      "`bn` in this project resolve this instance among many (env: BN_NO_MARKERS)"),
          ])
 def _load(args: argparse.Namespace) -> int:
+    import os
+    _env = (os.environ.get("BN_NO_MARKERS") or "").strip().lower()
+    no_marker = bool(args.no_marker) or (_env not in ("", "0", "false", "no", "off"))
     return _call(
         args,
         "load_binary",
@@ -39,6 +45,11 @@ def _load(args: argparse.Namespace) -> int:
             "path": str(Path(args.path).expanduser().resolve()),
             "prefer_bndb": not args.no_bndb,
             "quick": bool(args.quick),
+            # The bridge drops a `.bn-<id>` marker in this project root (#80) so a
+            # later bare `bn` here resolves this instance; pass our cwd as the
+            # project anchor (the bridge process's cwd is unrelated).
+            "workdir": os.getcwd(),
+            "no_marker": no_marker,
         },
         require_target=False,
         text_renderer=_render_load_text,

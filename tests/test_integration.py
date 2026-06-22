@@ -33,6 +33,10 @@ pytestmark = pytest.mark.skipif(not _has_bn, reason="Binary Ninja or fixtures no
 # Use the bn console-scripts entry point instead of -m bn.cli
 # to avoid Python module shadowing issues with the 'bn' package name.
 _BN_CLI = [str(Path(sys.executable).parent / "bn")]
+# Don't litter the bn repo with `.bn-<id>` project markers (#80) during integration
+# runs (`bn load` from the repo cwd would otherwise drop one here + touch
+# .git/info/exclude). The marker path has its own unit coverage.
+_ENV = {**os.environ, "BN_NO_MARKERS": "1"}
 
 
 def _bn(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
@@ -41,6 +45,7 @@ def _bn(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=_ENV,
     )
 
 
@@ -48,7 +53,7 @@ def _session_start(*binaries: str, timeout: float = 30.0) -> dict:
     # session start defaults to text output; this helper parses JSON.
     cmd = [*_BN_CLI, "session", "start", "--format", "json"]
     cmd.extend(str(b) for b in binaries)
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=_ENV)
     assert result.returncode == 0, f"session start failed: {result.stderr}"
     return json.loads(result.stdout)
 
@@ -59,6 +64,7 @@ def _session_stop(instance_id: str, timeout: float = 10.0) -> None:
         capture_output=True,
         text=True,
         timeout=timeout,
+        env=_ENV,
     )
 
 
