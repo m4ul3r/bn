@@ -1704,6 +1704,96 @@ def test_struct_field_set_overwrite_at_occupied_offset_replaces(monkeypatch):
     assert builder.added and builder.added[0] == ("replfld", 0, True)
 
 
+def test_types_declare_rejects_bitfield(monkeypatch):
+    # #322: BN's parser silently drops `:N` bit widths and lays each bitfield out
+    # as a full-width integer at the byte offset of its bit position -> overlapping,
+    # oversized members reported as `verified`. Reject the declaration up front
+    # (before anything is parsed/applied) with a clear invalid_request.
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    ctx = bridge.BinaryNinjaBridge().ctx
+    op = {"op": "types_declare",
+          "declaration": "struct BF { unsigned a:3; unsigned b:5; unsigned c:1; unsigned d:23; };"}
+    with pytest.raises(bridge.OperationFailure) as exc:
+        me._op_types_declare(ctx, object(), op)
+    assert exc.value.status == "invalid_request"
+    assert "bitfield" in str(exc.value).lower()
+
+
+def test_declaration_has_bitfield_classifies_correctly(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    detect = [
+        "struct BF { unsigned a:3; unsigned b:5; };",
+        "struct R { uint32_t lo : 16, hi : 16; };",   # comma-separated bitfields
+        "struct Z { int x:0; int y:1; };",            # zero-width aligner
+        "struct N { struct { unsigned a:3; } bits; };",  # nested
+        "struct H { unsigned a:0x3; unsigned b:0x5; };",  # HEX widths (overlap-only)
+        "struct U2 { unsigned : 3; unsigned b : 5; };",   # anonymous padding bitfield
+        "struct C { // /*\n unsigned y:3; /* real */ };",  # bitfield after a //-hidden /*
+    ]
+    skip = [
+        "struct Normal { int a; char b; long c; };",
+        "union U { int a; long c; };",
+        "enum E { A = 1, B = 2 };",
+        "struct Arr { int data[16]; };",
+        "struct Cmt { int x; /* width:32 reserved */ char y; };",  # colon-num in comment
+        "struct Px { int a; }; // note: 3 fields",                  # colon-num in line comment
+        "class D : public Base { int x; };",                       # C++ inheritance
+        "struct Ptr { void *fn; int (*cb)(int); };",
+        "enum E8 { A = 5, B = A ? A : 3 };",                        # ternary enum value
+        "enum E9 { X = (1 > 0) ? 5 : 3 };",                        # ternary, parenthesized
+    ]
+    for s in detect:
+        assert me._declaration_has_bitfield(s), s
+    for s in skip:
+        assert not me._declaration_has_bitfield(s), s
+
+
+def test_struct_overflow_member_flags_only_overflow(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+
+    def mk(width, members, cls="StructureTypeClass"):
+        return types.SimpleNamespace(
+            width=width, type_class=cls,
+            members=[types.SimpleNamespace(offset=o, name=n, type=types.SimpleNamespace(width=w))
+                     for o, n, w in members])
+
+    # union-shape (members overlap at 0x0, none past width): legitimate -> None
+    assert me._struct_overflow_member(mk(8, [(0, "a", 4), (0, "c", 8)])) is None
+    # normal struct: no member past width -> None
+    assert me._struct_overflow_member(mk(16, [(0, "a", 4), (4, "b", 1), (8, "c", 8)])) is None
+    # corrupt: member at 0x1 width 4 ends at 0x5, past width 4 -> flagged
+    bad = me._struct_overflow_member(mk(4, [(0, "a", 4), (1, "c", 4)]))
+    assert bad is not None and bad.name == "c"
+    # opaque / forward-declared (width 0): nothing to check
+    assert me._struct_overflow_member(mk(0, [])) is None
+    # non-structure type: never flagged
+    assert me._struct_overflow_member(
+        types.SimpleNamespace(width=4, type_class="EnumerationTypeClass", members=[])) is None
+
+
+def test_types_declare_rejects_overflowing_parsed_struct(monkeypatch):
+    # The non-bitfield backstop: if the parser ever emits a struct whose member
+    # extends past the type width, refuse to apply it (would otherwise report
+    # `verified` on a corrupt layout). Drives _op_types_declare with a stubbed
+    # parser returning such a type.
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    ctx = bridge.BinaryNinjaBridge().ctx
+    corrupt = types.SimpleNamespace(
+        width=4, type_class="StructureTypeClass",
+        members=[types.SimpleNamespace(offset=1, name="c", type=types.SimpleNamespace(width=4))])
+    monkeypatch.setattr(me, "_parse_declaration_source",
+                        lambda *a, **k: {"types": [("Corrupt", corrupt)], "variables": [], "functions": []})
+    op = {"op": "types_declare", "declaration": "struct Corrupt { /* opaque */ };"}
+    with pytest.raises(bridge.OperationFailure) as exc:
+        me._op_types_declare(ctx, object(), op)
+    assert exc.value.status == "invalid_request"
+    assert "corrupt layout" in str(exc.value).lower()
+
+
 def test_struct_field_offset_grammar_matches_set(monkeypatch):
     # A zero-padded offset that `struct field set` accepts (_parse_address) must
     # also resolve in rename/delete; int(text, 0) rejected leading zeros (#25).
