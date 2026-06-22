@@ -170,6 +170,19 @@ def _arg_register(caller_func, arg_index: int) -> str | None:
     return None
 
 
+def _int_arg_reg_count(caller_func) -> int | None:
+    """Number of integer-argument registers in the function's calling convention
+    (6 on x86-64 SysV, 8 on AArch64, 4 on ARM), or None if unrecoverable. An arg
+    at or beyond this index is passed on the STACK, where BN's MLIL/HLIL call
+    model often omits it (#324)."""
+    try:
+        cc = getattr(caller_func, "calling_convention", None)
+        regs = list(getattr(cc, "int_arg_regs", []) or [])
+        return len(regs) if regs else None
+    except Exception:
+        return None
+
+
 def _arg_label(ctx, bv, call_insn, arg_index: int, caller_func) -> dict[str, Any]:
     """{index, [register], [name]} for the traced call argument: its
     calling-convention register plus the callee's C parameter name when the
@@ -543,17 +556,30 @@ def _backward_slice(
     if arg_index < 0 or arg_index >= len(params):
         n = len(params)
         only = " (index 0)" if n == 1 else f" (indices 0..{n - 1})"
-        raise OperationFailure(
-            "invalid_arg_index",
-            # --arg is 0-based against the MLIL call's recovered parameters, which
-            # can differ from the argument positions the decompiler renders (an
-            # implicit/struct-return or coalesced arg shifts the count). State the
-            # convention so a user reading pseudo-C doesn't reach for the wrong
-            # index (#226).
+        # --arg is 0-based against the MLIL call's recovered parameters, which
+        # can differ from the argument positions the decompiler renders (an
+        # implicit/struct-return or coalesced arg shifts the count). State the
+        # convention so a user reading pseudo-C doesn't reach for the wrong
+        # index (#226).
+        msg = (
             f"Argument index {arg_index} out of range: this call has {n} "
             f"MLIL argument(s){only}. --arg is 0-based and indexes the MLIL call "
-            f"parameters, which may differ from the decompiler's displayed args.",
+            f"parameters, which may differ from the decompiler's displayed args."
         )
+        # #324: an index at/beyond the calling convention's integer-arg registers
+        # is passed on the STACK, which BN's MLIL/HLIL call model frequently omits
+        # (the stores are visible only in LLIL). Don't silently treat such an arg
+        # as absent -- say it is likely stack-passed and point at the LLIL view.
+        reg_count = _int_arg_reg_count(func)
+        if reg_count is not None and arg_index >= reg_count:
+            msg += (
+                f" Note: arg {arg_index} is at/beyond the {reg_count} integer-arg "
+                f"register(s) of this calling convention, so it is likely passed on "
+                f"the STACK; BN's MLIL/HLIL call model often omits stack-passed "
+                f"(e.g. variadic) args -- inspect `bn il {func.name} --view llil "
+                f"--ssa` for the stack stores feeding the call (#324)."
+            )
+        raise OperationFailure("invalid_arg_index", msg)
 
     param_expr = params[arg_index]
     initial_vars: list[Any] = _ssa_vars_from(getattr(param_expr, "vars_read", []) or [])

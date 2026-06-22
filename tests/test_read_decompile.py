@@ -1583,3 +1583,32 @@ def test_read_verb_exact_start_has_no_resolved_from(monkeypatch):
 
     assert result["function"]["address"] == "0x401000"
     assert "resolved_from" not in result
+
+
+def test_backward_slice_out_of_range_notes_stack_passed_varargs_324(monkeypatch):
+    # #324: an --arg at/beyond the calling convention's integer-arg registers is
+    # likely STACK-passed (BN's MLIL/HLIL call model omits those); the
+    # out-of-range error must say so and point at the LLIL view, not silently
+    # treat the arg as absent. An out-of-range index BELOW the register count
+    # (a dropped register arg, a different gap) must NOT get the stack note.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    call_insn = _FakeMLILInsn(
+        0x10010, operation="MLIL_CALL_SSA",
+        params=[_FakeMLILInsn(0x10010, operation="MLIL_VAR_SSA"),
+                _FakeMLILInsn(0x10010, operation="MLIL_VAR_SSA")])
+    fn = _FakeFunction(0x10000, "logger_caller")
+    fn.medium_level_il = _FakeMLILFunction(instructions=[call_insn])
+    fn.calling_convention = type("CC", (), {"int_arg_regs": ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]})()
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._backward_slice("active", "logger_caller", "0x10010", arg_index=7)
+    msg = str(exc.value)
+    assert "STACK" in msg and "likely passed on" in msg
+    assert "llil" in msg and "#324" in msg
+
+    with pytest.raises(bridge.OperationFailure) as exc2:
+        instance._backward_slice("active", "logger_caller", "0x10010", arg_index=5)
+    assert "STACK" not in str(exc2.value)   # arg 5 < 6 regs -> not stack-passed, no note
