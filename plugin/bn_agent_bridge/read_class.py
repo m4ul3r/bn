@@ -267,6 +267,41 @@ def _is_library_class(name: str) -> bool:
     return base.startswith("__") or (len(base) >= 2 and base[0] == "_" and base[1].isupper())
 
 
+# Vendored libraries `--no-vendor` folds out -- a vendored/in-tree copy is library
+# noise the same way std is, but isn't STL, so it gets its own opt-in flag (#309).
+_VENDOR_NAMESPACES = frozenset({"boost"})
+
+
+def _is_construction_vtable_artifact(name: str) -> bool:
+    """A construction-vtable RTTI artifact, e.g. ``Derived{for `Base'}`` -- emitted
+    for every class with a base, method_count 0. Not a real class; it inflates the
+    class lens ~N-fold and buries the domain surface (#309)."""
+    return "{for " in name
+
+
+_THUNK_PREFIX_RE = re.compile(r"^_?(non-virtual|virtual)[ _]thunk[ _]to[ _]", re.IGNORECASE)
+
+
+def _is_thunk_artifact(name: str) -> bool:
+    """A thunk symbol (``non-virtual thunk to X`` / ``virtual thunk to X``, which
+    BN may spell with underscores) mis-parsed into a fake class/namespace -- a
+    compiler-generated forwarding stub, never a type (#309).
+
+    Anchored to the leading thunk PREFIX -- a substring match would wrongly drop a
+    real class/namespace that merely contains ``thunk_to`` (e.g. ``Thunk_to_handler``
+    or ``thunk_to_ns::X``), and since thunks are suppressed even under ``--all``
+    that class would be unrecoverable (#309 review)."""
+    return bool(_THUNK_PREFIX_RE.match(name))
+
+
+def _is_vendor_class(name: str) -> bool:
+    """A class from a vendored/in-tree library `--no-vendor` folds out (boost),
+    the same idea as `--no-stl` for std/ABI (#309)."""
+    first = _first_toplevel_component(_strip_signature(name))
+    base = first.split("<", 1)[0]
+    return base in _VENDOR_NAMESPACES
+
+
 def _list_row(rec: dict[str, Any]) -> dict[str, Any]:
     return {
         "name": rec["name"],
@@ -285,6 +320,7 @@ def _class_list(
     query: str | None = None,
     include_all: bool = False,
     no_stl: bool = False,
+    no_vendor: bool = False,
     offset: int = 0,
     limit: int | None = None,
 ) -> dict[str, Any]:
@@ -292,11 +328,28 @@ def _class_list(
     registry = _build_class_registry(ctx, bv, query=query)
     candidates = []
     library_suppressed = 0
+    vendor_suppressed = 0
+    construction_vtables_suppressed = 0
+    thunks_suppressed = 0
     for rec in registry.values():
+        name = rec["name"]
+        # A thunk is never a type -- drop it unconditionally (even under --all),
+        # so it isn't surfaced as a class/namespace (#309).
+        if _is_thunk_artifact(name):
+            thunks_suppressed += 1
+            continue
+        # Construction-vtable artifacts (`X{for `Base'}`) ARE real RTTI objects,
+        # just not classes -- hide by default, reveal under --all (#309).
+        if not include_all and _is_construction_vtable_artifact(name):
+            construction_vtables_suppressed += 1
+            continue
         if not (include_all or rec["confidence"] in ("rtti", "ctor")):
             continue
-        if no_stl and _is_library_class(rec["name"]):
+        if no_stl and _is_library_class(name):
             library_suppressed += 1
+            continue
+        if no_vendor and _is_vendor_class(name):
+            vendor_suppressed += 1
             continue
         candidates.append(rec)
     candidates.sort(key=lambda r: r["name"])
@@ -328,7 +381,11 @@ def _class_list(
         "has_more": offset + returned < total,
         "include_all": include_all,
         "no_stl": no_stl,
+        "no_vendor": no_vendor,
         "library_suppressed": library_suppressed,
+        "vendor_suppressed": vendor_suppressed,
+        "construction_vtables_suppressed": construction_vtables_suppressed,
+        "thunks_suppressed": thunks_suppressed,
     }
 
 

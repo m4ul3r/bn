@@ -747,3 +747,75 @@ def test_render_construction_site_includes_function():
                 "kind": "ctor-call", "size": None}],
                "stored_globals": []}}
     assert "ctor-call @ 0x443abc (in AapGalifStart)" in _render_class_show_text(rec)
+
+
+def test_class_list_artifact_helpers_309():
+    assert read_class._is_construction_vtable_artifact("C{for `A'}")
+    assert read_class._is_construction_vtable_artifact("media::codec::JsonCodec{for `media::codec::Codec'}")
+    assert not read_class._is_construction_vtable_artifact("media::codec::JsonCodec")
+    assert read_class._is_thunk_artifact("non-virtual_thunk_to_C")
+    assert read_class._is_thunk_artifact("virtual thunk to X::f()")
+    assert not read_class._is_thunk_artifact("net::Session")
+    # anchored to the prefix: a real class/namespace that merely CONTAINS
+    # "thunk_to" must NOT be suppressed (#309 review -- substring match dropped them)
+    assert not read_class._is_thunk_artifact("Thunk_to_handler")
+    assert not read_class._is_thunk_artifact("thunk_to_ns::X")
+    assert not read_class._is_thunk_artifact("do_thunk_to_x")
+    assert not read_class._is_thunk_artifact("ThunkTo")
+    assert read_class._is_vendor_class("boost::any")
+    assert read_class._is_vendor_class("boost::asio::ip::tcp")
+    assert not read_class._is_vendor_class("net::Session")
+    assert not read_class._is_vendor_class("boostrap::Thing")   # not a `boost` component
+
+
+def test_class_list_suppresses_construction_vtable_thunk_and_vendor_309(monkeypatch):
+    # #309: construction-vtable artifacts hide by default (revealed by --all);
+    # thunks are NEVER surfaced as classes (even --all); --no-vendor folds boost.
+    def _rec(name, confidence="rtti", methods=0):
+        return {"name": name, "methods": [{} for _ in range(methods)], "vtable": {"a": 1},
+                "typeinfo": None, "typeinfo_name": None, "size": None, "bases": [],
+                "instances": [], "confidence": confidence}
+    registry = {n: _rec(n) for n in ("A", "C", "C{for `A'}", "boost::any")}
+    registry["non-virtual_thunk_to_C"] = _rec("non-virtual_thunk_to_C", confidence="name-only", methods=3)
+    monkeypatch.setattr(read_class, "_build_class_registry", lambda ctx, bv, query=None: registry)
+
+    class _Ctx:
+        def _resolve_view(self, sel):
+            return object()
+        def _bases_for(self, bv, rec):
+            return []
+
+    d = read_class._class_list(_Ctx(), None)
+    names = [c["name"] for c in d["items"]]
+    assert "C{for `A'}" not in names                 # construction vtable hidden by default
+    assert "non-virtual_thunk_to_C" not in names     # thunk hidden
+    assert {"A", "C", "boost::any"} <= set(names)
+    assert d["construction_vtables_suppressed"] == 1
+    assert d["thunks_suppressed"] == 1
+
+    a = read_class._class_list(_Ctx(), None, include_all=True)
+    an = [c["name"] for c in a["items"]]
+    assert "C{for `A'}" in an                         # --all reveals construction vtables
+    assert "non-virtual_thunk_to_C" not in an         # thunks NEVER surfaced
+    assert a["thunks_suppressed"] == 1
+
+    v = read_class._class_list(_Ctx(), None, no_vendor=True)
+    assert "boost::any" not in [c["name"] for c in v["items"]]
+    assert v["vendor_suppressed"] == 1
+
+
+def test_render_class_list_text_shows_suppression_counts_309():
+    from bn.formatters import _render_class_list_text
+    value = {
+        "kind": "classes",
+        "items": [{"name": "A", "method_count": 5, "has_vtable": True,
+                   "size": None, "bases": [], "confidence": "rtti"}],
+        "total": 1, "no_stl": True, "no_vendor": True,
+        "construction_vtables_suppressed": 2, "thunks_suppressed": 1,
+        "library_suppressed": 3, "vendor_suppressed": 1,
+    }
+    out = _render_class_list_text(value)
+    assert "2 construction-vtable artifacts (--all to show)" in out
+    assert "1 thunk" in out
+    assert "3 library/STL" in out
+    assert "1 vendored" in out

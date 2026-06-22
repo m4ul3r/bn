@@ -2317,9 +2317,22 @@ def _render_class_list_text(value: Any) -> str:
     rows = list(value.get("items") or value.get("classes") or [])
     total = value.get("total", len(rows))
     header = f"classes: {len(rows)} shown of {total}"
-    suppressed = value.get("library_suppressed") or 0
-    if value.get("no_stl") and suppressed:
-        header += f" ({suppressed} library/STL classes hidden)"
+    # Surface what was folded out so the count is self-documenting (#205/#309).
+    hidden_parts = []
+    cv = value.get("construction_vtables_suppressed") or 0
+    if cv:
+        hidden_parts.append(f"{cv} construction-vtable artifact{'s' if cv != 1 else ''} (--all to show)")
+    th = value.get("thunks_suppressed") or 0
+    if th:
+        hidden_parts.append(f"{th} thunk{'s' if th != 1 else ''}")
+    lib = value.get("library_suppressed") or 0
+    if value.get("no_stl") and lib:
+        hidden_parts.append(f"{lib} library/STL")
+    ven = value.get("vendor_suppressed") or 0
+    if value.get("no_vendor") and ven:
+        hidden_parts.append(f"{ven} vendored")
+    if hidden_parts:
+        header += " (hidden: " + ", ".join(hidden_parts) + ")"
     lines = [header]
     for rec in rows:
         if not isinstance(rec, dict):

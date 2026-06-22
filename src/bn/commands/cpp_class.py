@@ -16,6 +16,8 @@ from ..formatters import _render_class_list_text, _render_class_show_text
                    help="Include name-only clusters (possible namespaces), not just RTTI/ctor-confirmed classes"),
                arg("--no-stl", action="store_true", default=False, dest="no_stl",
                    help="Hide standard-library / ABI-runtime classes (std::, __gnu_cxx::, __cxxabiv1::, reserved-id internals) so domain classes surface"),
+               arg("--no-vendor", action="store_true", default=False, dest="no_vendor",
+                   help="Hide vendored/in-tree library classes (boost::) the same way --no-stl folds std"),
                arg("--query", help="Filter classes by name substring")])
 def _class_list(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {"offset": args.offset}
@@ -25,6 +27,8 @@ def _class_list(args: argparse.Namespace) -> int:
         params["include_all"] = True
     if args.no_stl:
         params["no_stl"] = True
+    if args.no_vendor:
+        params["no_vendor"] = True
     limit = _effective_limit(args)
     if limit is not None:
         params["limit"] = limit
