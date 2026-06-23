@@ -2483,6 +2483,141 @@ class TaintEngine:
         out["out_params"] = sub.get("out_params", frozenset())
         return out
 
+    def _unrecovered_arg_frontier(self, ins: Any, tainted: set) -> dict[str, Any] | None:
+        """Honest frontier for the #381 silent drop. When a tainted value sits in
+        an ABI argument register that BN did NOT include in this call's recovered
+        params -- the callee's arity was under-recovered (Thumb 0-arity miss /
+        variadic mis-prototype) -- the flow into the callee would otherwise vanish
+        with no breadcrumb (the bare ``continue`` below). Return an
+        ``unmodeled_callee`` frontier leaf when a *missing* arg register (one past
+        the recovered arity) holds a tainted SSA value, else None.
+
+        Block-local + register-passed only: it inspects the last write to each
+        missing arg register within the call's own basic block (the dominant
+        codegen -- args set immediately before the call). Stack-passed varargs
+        (i386 cdecl) are NOT covered here -- that overlaps #324. Degrades to None
+        on any BN-API shortfall, so it never fabricates a frontier."""
+        try:
+            target = self._resolve_direct_target(ins)
+            if target is None:
+                return None
+            callee = function_at(self.bv, target)
+            if not self._is_internal(callee):
+                return None
+            cc = (getattr(callee, "calling_convention", None)
+                  or self.bv.platform.default_calling_convention)
+            arg_regs = list(getattr(cc, "int_arg_regs", []) or [])
+            n = len(list(getattr(callee, "parameter_vars", []) or []))
+            if n >= len(arg_regs):
+                return None  # every ABI arg register is accounted for by a param
+            arch = self.bv.arch
+            # Only the FIRST unrecovered arg slot (register position == recovered
+            # arity n). Checking higher slots too would false-positive on a legit
+            # low-arity callee whose r1..r3 merely hold tainted leftovers; the
+            # first-missing register being SET UP (written) tainted right before
+            # the call in the call's own block is the tight "BN under-recovered an
+            # actual argument" signal (e.g. Thumb 0-arity: r0 = argv[1]; call f()).
+            try:
+                first_missing = arch.get_reg_index(arg_regs[n])
+            except Exception:
+                return None
+            missing = {first_missing: n}
+            blk = getattr(ins, "il_basic_block", None)
+            if blk is None:
+                return None
+            # BN's VariableSourceType.RegisterVariableSourceType == 1 (this module
+            # imports no binaryninja symbols, so compare the stable enum int).
+            REGISTER_SOURCE = 1
+            def _reads_tainted(cur: Any) -> bool:
+                for r in ssa_reads(cur):
+                    if (var_key(r), getattr(r, "version", None)) in tainted \
+                            or (var_key(r), None) in tainted:
+                        return True
+                return False
+
+            # Last write to each missing arg register before the call (a later
+            # write overwrites an earlier dead one, so keep only the reaching def).
+            # The register carries taint if its written SSA var is itself a tainted
+            # node OR its defining instruction reads a tainted value (e.g.
+            # ``r0 = [argv+4]`` -- the load result isn't auto-tainted, but the
+            # argv read is), mirroring the engine's read_taint/arg_taint check.
+            last: dict[int, Any] = {}
+            for cur in blk:
+                if getattr(cur, "instr_index", -1) >= getattr(ins, "instr_index", -1):
+                    break
+                for w in getattr(cur, "vars_written", []) or []:
+                    var = getattr(w, "var", None)
+                    if var is None:
+                        continue
+                    try:
+                        is_reg = int(var.source_type) == REGISTER_SOURCE
+                    except Exception:
+                        is_reg = False
+                    storage = getattr(var, "storage", None)
+                    if is_reg and storage in missing:
+                        last[storage] = (cur, var_key(w), getattr(w, "version", None))
+            for storage, (cur, key, ver) in last.items():
+                if not ((key, ver) in tainted or (key, None) in tainted or _reads_tainted(cur)):
+                    continue
+                pos = missing[storage]
+                # Decisive gate against false frontiers: only flag when the callee
+                # actually READS this register as an input (read-before-write in its
+                # body). A tainted value merely *sitting* in a non-argument register
+                # (a loop-carried phi, a leftover return value, or arg-setup for a
+                # PRIOR call) is not a dropped argument -- the callee never consumes
+                # it. Requiring the callee to use the register as an incoming value
+                # is what separates a genuine under-recovered arg from a leftover.
+                if not self._reg_reads_as_input(callee, arg_regs[pos]):
+                    continue
+                return self._frontier_leaf(
+                    ins, callee, [pos],
+                    f"in-binary callee {getattr(callee, 'name', '?')} reads arg "
+                    f"register {arg_regs[pos]} as an input but BN recovered only "
+                    f"{n} parameter(s), so a tainted value passed there is not in "
+                    f"the call's args and the flow into the callee was not followed "
+                    f"-- the callee's args were under-recovered (taint #381)")
+        except Exception:
+            return None
+        return None
+
+    def _reg_reads_as_input(self, callee: Any, reg_name: str) -> bool:
+        """True if *callee* consumes register *reg_name* as an incoming value --
+        i.e. it reads the register's ENTRY SSA version (``reg#0``), the value the
+        caller passed. This is the discriminator that stops a stale/leftover value
+        in a NON-argument register (a loop-carried phi, a tainted return value, or
+        arg-setup for a PRIOR call) from fabricating a #381 frontier: only a
+        register the callee actually reads as input can be a dropped argument.
+
+        ``reg#0`` is the entry value -- it is only ever READ (SSA writes produce
+        versions >= 1), so finding it anywhere in the SSA operands means the callee
+        uses the register's incoming value. Scans the LLIL-SSA operands directly so
+        this module keeps importing no binaryninja symbols. Degrades to False on
+        any shortfall, so it never *adds* a frontier on uncertainty."""
+        try:
+            lssa = getattr(getattr(callee, "llil", None), "ssa_form", None)
+            if lssa is None:
+                return False
+
+            def _has_entry_read(node: Any, depth: int = 0) -> bool:
+                if depth > 12:
+                    return False
+                for op in getattr(node, "operands", []) or []:
+                    if type(op).__name__ == "SSARegister":
+                        if getattr(op, "version", None) == 0 \
+                                and str(getattr(op, "reg", "")) == reg_name:
+                            return True
+                    elif hasattr(op, "operands"):
+                        if _has_entry_read(op, depth + 1):
+                            return True
+                return False
+
+            for ins in lssa.instructions:
+                if _has_entry_read(ins):
+                    return True
+            return False
+        except Exception:
+            return False
+
     def _call_targets_from_pvs(self, pvs: Any) -> list[int]:
         """Concrete call-target addresses from a PossibleValueSet (delegates to
         the module-level :func:`targets_from_pvs`)."""
@@ -2804,6 +2939,14 @@ class TaintEngine:
                     # 3) no model: resolve the target(s) and descend.
                     tainted_args = {i: arg_taint(p) for i, p in enumerate(params) if arg_taint(p)}
                     if not tainted_args:
+                        # The MLIL call recovered no tainted arg -- but BN may have
+                        # under-recovered the callee's arity (Thumb 0-arity miss /
+                        # variadic), dropping a tainted arg-register value that never
+                        # appears in `params`. Emit an honest frontier instead of a
+                        # silent false-negative (#381).
+                        fr = self._unrecovered_arg_frontier(ins, tainted)
+                        if fr is not None and fr not in leaves:
+                            leaves.append(fr)
                         continue
                     # descend each callsite once per tainted-arg set (the fixpoint
                     # revisits instructions; without this, findings would duplicate)
