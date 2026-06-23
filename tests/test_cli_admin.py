@@ -27,11 +27,11 @@ def test_skills_source_dir_prefers_repo_then_falls_back_to_prefix(monkeypatch, t
 
 
 def test_plugin_source_dir_prefers_repo_then_falls_back_to_installed_module(monkeypatch, tmp_path):
-    # #83: editable checkout uses repo plugin/<name>; a wheel install resolves
+    # #83/#406: editable checkout uses repo src/<name>; a wheel install resolves
     # the bridge packaged into site-packages via find_spec.
     import bn.paths as paths
 
-    repo_plugin = tmp_path / "plugin" / paths.PLUGIN_NAME
+    repo_plugin = tmp_path / "src" / paths.PLUGIN_NAME
     repo_plugin.mkdir(parents=True)
     monkeypatch.setattr(paths, "repo_root", lambda: tmp_path)
     assert paths.plugin_source_dir() == repo_plugin
@@ -230,7 +230,7 @@ def test_bridge_plugin_json_carries_no_version_literal():
 
     repo_root = Path(bn.version.__file__).resolve().parents[2]
     manifest = json.loads(
-        (repo_root / "plugin" / "bn_agent_bridge" / "plugin.json").read_text(encoding="utf-8")
+        (repo_root / "src" / "bn_agent_bridge" / "plugin.json").read_text(encoding="utf-8")
     )
     assert "version" not in manifest
 

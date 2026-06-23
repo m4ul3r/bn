@@ -16,10 +16,8 @@ import pytest
 
 
 def _load_bridge(monkeypatch):
-    # Loading the bridge from its file writes bytecode into
-    # plugin/bn_agent_bridge/__pycache__, which the wheel build then ships as
-    # data files (uv_build can't exclude inside data trees). Don't pollute the
-    # source tree so dev builds stay as clean as a release build (#83).
+    # Loading the bridge from its file should not write bytecode into the source
+    # tree; release builds assert that packaged source roots stay pycache-free.
     sys.dont_write_bytecode = True
     fake_bn = types.ModuleType("binaryninja")
 
@@ -110,7 +108,7 @@ def _load_bridge(monkeypatch):
     for cached in [name for name in sys.modules if name == package_name or name.startswith(f"{package_name}.")]:
         monkeypatch.delitem(sys.modules, cached, raising=False)
 
-    bridge_path = Path(__file__).resolve().parents[1] / "plugin" / "bn_agent_bridge" / "bridge.py"
+    bridge_path = Path(__file__).resolve().parents[1] / "src" / "bn_agent_bridge" / "bridge.py"
     package = types.ModuleType(package_name)
     package.__path__ = [str(bridge_path.parent)]
     monkeypatch.setitem(sys.modules, package_name, package)
@@ -727,6 +725,7 @@ def _setup_load_test(monkeypatch, *, view_type: str = "ELF"):
     instance = bridge.BinaryNinjaBridge()
     monkeypatch.setattr(instance.targets, "refresh", lambda: [])
     bridge._headless_views.clear()
+    bridge._load_in_progress.clear()
 
     binaryninja = sys.modules["binaryninja"]
     loaded_paths: list[str] = []

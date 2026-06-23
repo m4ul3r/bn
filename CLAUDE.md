@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-`bn` is an agent-friendly CLI for Binary Ninja. It has two parts: a Python CLI (`src/bn/`) and a Binary Ninja bridge plugin (`plugin/bn_agent_bridge/`). They communicate over a Unix socket using a JSON request/response protocol.
+`bn` is an agent-friendly CLI for Binary Ninja. It has two parts: a Python CLI (`src/bn/`) and a Binary Ninja bridge plugin package (`src/bn_agent_bridge/`). They communicate over a Unix socket using a JSON request/response protocol.
 
 ## Build & Run
 
@@ -49,7 +49,7 @@ The bridge runs either as a **GUI plugin** (auto-starts when BN loads) or as a *
 - `paths.py` — all on-disk locations (cache, instances, sessions, spills, plugin/skills install dirs).
 - `headless.py` — `bn-agent` entry point.
 
-`plugin/bn_agent_bridge/paths.py` and `version.py` are symlinks to `src/bn/`, so the bridge and CLI agree on filesystem layout and version without duplication.
+`src/bn_agent_bridge/paths.py` and `version.py` are symlinks to `src/bn/`, so the bridge and CLI agree on filesystem layout and version without duplication.
 
 ### Adding a New Command
 
@@ -59,7 +59,7 @@ The bridge runs either as a **GUI plugin** (auto-starts when BN loads) or as a *
 
 `build_parser()` in `cli.py` walks `_COMMANDS` to construct the full argparse tree — no manual parser wiring needed.
 
-### Bridge (`plugin/bn_agent_bridge/`)
+### Bridge (`src/bn_agent_bridge/`)
 
 The bridge is a package, not a monolith. `bridge.py` (~2k LOC) is the coordinator: it owns `TargetManager` (weak-reffed `BinaryView`s, selector resolution), the `BinaryNinjaBridge` facade + `dispatch()`, and the block of `@op` binders. Op *handler logic* lives in sibling modules as free functions that take the `BridgeContext` seam (`ctx`, in `seam.py`) instead of `self`: `read_*.py` (decompile/listing/xrefs/types/evidence/taint-slice/misc), `mutation_engine.py`, `taint_engine.py`, `vars.py`, `create_comments.py`. `BinaryNinjaBridge` keeps thin delegating shims for every handler the op binders and test suite reference, and the seam exists to break import cycles (read modules never import `bridge`/`mutation_engine`).
 

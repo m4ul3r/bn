@@ -68,6 +68,11 @@ ENGINE_BUILD_ID = build_id_for_package(Path(__file__).resolve().parent)
 # rejected with a clean error instead of being buffered without limit.
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
 
+# Same-path load dedupe for the window where a BinaryView is open or analyzing
+# but not published in _headless_views yet (#400).
+_load_in_progress_lock = threading.Lock()
+_load_in_progress: dict[str, threading.Event] = {}
+
 
 def _format_unknown_target_error(selector: Any, targets: list[dict[str, Any]]) -> str:
     lines = [f"Unknown target selector: {selector}"]
@@ -851,22 +856,43 @@ class BinaryNinjaBridge:
         """Return an already-open BinaryView whose backing file resolves to
         *load_path*, or None. Keeps ``load`` idempotent: re-loading an open path
         would otherwise create a second view and make the basename/filename
-        selectors ambiguous (#355)."""
+        selectors ambiguous (#355). Includes GUI-open views as well as bridge-
+        loaded headless views so a GUI bridge does not duplicate an already-open
+        tab (#400)."""
         try:
             target = load_path.resolve()
         except Exception:
             target = load_path
-        with _headless_views_lock:
-            for bv in list(_headless_views):
-                fname = getattr(getattr(bv, "file", None), "filename", None)
-                if not fname:
-                    continue
-                try:
-                    if Path(fname).resolve() == target:
-                        return bv
-                except Exception:
-                    continue
+        for bv in _collect_open_views():
+            fname = getattr(getattr(bv, "file", None), "filename", None)
+            if not fname:
+                continue
+            try:
+                if Path(fname).resolve() == target:
+                    return bv
+            except Exception:
+                continue
         return None
+
+    def _load_existing_result(self, load_path: Path, resolved: Path, notes: list[str], existing):
+        with self._target_lock.write():
+            targets = self.targets.refresh()
+        analyzed = existing not in _quick_loaded_views
+        analysis_state = "full" if analyzed else "quick"
+        notes.append(
+            f"{load_path} is already open; returned the existing target "
+            "instead of opening a duplicate (use `bn close` first to reload)"
+        )
+        return {
+            "loaded": True,
+            "path": str(load_path),
+            "requested_path": str(resolved),
+            "analyzed": analyzed,
+            "analysis_state": analysis_state,
+            "already_open": True,
+            "notes": notes,
+            "targets": targets,
+        }
 
     def _load_binary(self, path: str, *, prefer_bndb: bool = True, quick: bool = False,
                      workdir: str | None = None, no_marker: bool = False):
@@ -896,27 +922,23 @@ class BinaryNinjaBridge:
                     f"loaded {load_path} instead of {resolved} (use --no-bndb to skip)"
                 )
 
-        # #355: if a view for this (post-substitution) path is already open,
-        # return its target instead of opening a duplicate. Re-loading otherwise
-        # spawns a second BinaryView that shares the basename/filename, making
-        # those selectors ambiguous and dropping the friendly basename.
-        existing = self._find_open_view_for_path(load_path)
-        if existing is not None:
-            with self._target_lock.write():
-                targets = self.targets.refresh()
-            notes.append(
-                f"{load_path} is already open; returned the existing target "
-                "instead of opening a duplicate (use `bn close` first to reload)"
-            )
-            return {
-                "loaded": True,
-                "path": str(load_path),
-                "requested_path": str(resolved),
-                "analyzed": True,
-                "already_open": True,
-                "notes": notes,
-                "targets": targets,
-            }
+        # #355/#400: if a view for this (post-substitution) path is already
+        # open, return its target instead of opening a duplicate. Concurrent
+        # same-path loads need an in-flight marker too: full analysis runs
+        # outside the target write lock, so a second loader could otherwise miss
+        # the unpublished first view and open a duplicate.
+        load_key = str(load_path)
+        while True:
+            existing = self._find_open_view_for_path(load_path)
+            if existing is not None:
+                return self._load_existing_result(load_path, resolved, notes, existing)
+            with _load_in_progress_lock:
+                waiter = _load_in_progress.get(load_key)
+                if waiter is None:
+                    waiter = threading.Event()
+                    _load_in_progress[load_key] = waiter
+                    break
+            waiter.wait()
 
         # Always open without auto-analysis, then analyze explicitly unless
         # --quick. Quick load skips update_analysis_and_wait() entirely -- the
@@ -932,84 +954,92 @@ class BinaryNinjaBridge:
         # under the lock at the end, so no reader ever sees a half-analyzed
         # target.
         try:
-            with self._target_lock.write():
-                bv = binaryninja.load(str(load_path), update_analysis=False)
-        except Exception as exc:  # noqa: BLE001 - surface BN open failures cleanly
-            # BN raises a bare Exception ("Unable to create new BinaryView") on a
-            # corrupt/truncated .bndb; without this it reached the caller as
-            # "internal error: Exception: ...". Frame it as a user-facing error.
-            raise RuntimeError(
-                f"Unable to open {load_path}: {exc}. The file may be corrupt, "
-                "truncated, or an unsupported format."
-            ) from exc
-        if bv is None:
-            raise RuntimeError(f"Failed to open binary: {load_path}")
+            try:
+                with self._target_lock.write():
+                    bv = binaryninja.load(str(load_path), update_analysis=False)
+            except Exception as exc:  # noqa: BLE001 - surface BN open failures cleanly
+                # BN raises a bare Exception ("Unable to create new BinaryView") on a
+                # corrupt/truncated .bndb; without this it reached the caller as
+                # "internal error: Exception: ...". Frame it as a user-facing error.
+                raise RuntimeError(
+                    f"Unable to open {load_path}: {exc}. The file may be corrupt, "
+                    "truncated, or an unsupported format."
+                ) from exc
+            if bv is None:
+                raise RuntimeError(f"Failed to open binary: {load_path}")
 
-        # #369 (part 1): BN's format detection failed and fell back to a raw
-        # 'Raw'/'Mapped' view -- an empty/garbage/text file opened this way has
-        # no functions or symbols. Warn so an agent doesn't proceed against a
-        # 0-function phantom target thinking it loaded a real binary.
-        view_type_name = str(getattr(bv, "view_type", "") or "")
-        if view_type_name in ("Raw", "Mapped"):
-            notes.append(
-                f"{resolved.name} was opened as a raw '{view_type_name}' view -- "
-                "its format was not recognized, so it has no functions/symbols to "
-                "analyze. Confirm this is the binary you intended (or pass the "
-                "correct file)."
-            )
-
-        quick_effective = quick and load_path.suffix != ".bndb"
-        if quick and not quick_effective:
-            # --quick was requested but the loaded artifact is a .bndb, whose
-            # saved analysis is already full -- so --quick can't apply. Say so
-            # instead of silently dropping it (#316). Distinguish a sidecar
-            # substitution (the surprising case: the user named the raw binary,
-            # adjacent OR cache) from a directly-named .bndb.
-            if substitute is not None:
+            # #369 (part 1): BN's format detection failed and fell back to a raw
+            # 'Raw'/'Mapped' view -- an empty/garbage/text file opened this way has
+            # no functions or symbols. Warn so an agent doesn't proceed against a
+            # 0-function phantom target thinking it loaded a real binary.
+            view_type_name = str(getattr(bv, "view_type", "") or "")
+            if view_type_name in ("Raw", "Mapped"):
                 notes.append(
-                    f"--quick ignored: opened the analyzed database {load_path.name} "
-                    f"(already fully analyzed) instead of {resolved.name}; pass "
-                    "--no-bndb to load the raw bytes with --quick"
+                    f"{resolved.name} was opened as a raw '{view_type_name}' view -- "
+                    "its format was not recognized, so it has no functions/symbols to "
+                    "analyze. Confirm this is the binary you intended (or pass the "
+                    "correct file)."
                 )
+
+            quick_effective = quick and load_path.suffix != ".bndb"
+            if quick and not quick_effective:
+                # --quick was requested but the loaded artifact is a .bndb, whose
+                # saved analysis is already full -- so --quick can't apply. Say so
+                # instead of silently dropping it (#316). Distinguish a sidecar
+                # substitution (the surprising case: the user named the raw binary,
+                # adjacent OR cache) from a directly-named .bndb.
+                if substitute is not None:
+                    notes.append(
+                        f"--quick ignored: opened the analyzed database {load_path.name} "
+                        f"(already fully analyzed) instead of {resolved.name}; pass "
+                        "--no-bndb to load the raw bytes with --quick"
+                    )
+                else:
+                    notes.append(
+                        f"--quick ignored: {load_path.name} is an analyzed database, not "
+                        "raw bytes; its saved analysis is already loaded"
+                    )
+            if quick_effective:
+                notes.append(
+                    "loaded without analysis (--quick): sections/imports/symbols are ready; "
+                    "strings and the full function set need `bn refresh` (or "
+                    "`bn decompile <fn> --force-analysis` for a single function)"
+                )
+                _quick_loaded_views.add(bv)
             else:
-                notes.append(
-                    f"--quick ignored: {load_path.name} is an analyzed database, not "
-                    "raw bytes; its saved analysis is already loaded"
-                )
-        if quick_effective:
-            notes.append(
-                "loaded without analysis (--quick): sections/imports/symbols are ready; "
-                "strings and the full function set need `bn refresh` (or "
-                "`bn decompile <fn> --force-analysis` for a single function)"
-            )
-            _quick_loaded_views.add(bv)
-        else:
-            # Slow phase, deliberately OUTSIDE the lock. bv is still unpublished
-            # (not in _headless_views), so concurrent reads can't touch it.
-            bv.update_analysis_and_wait()
-            _quick_loaded_views.discard(bv)
+                # Slow phase, deliberately OUTSIDE the lock. bv is still unpublished
+                # (not in _headless_views), so concurrent reads can't touch it.
+                bv.update_analysis_and_wait()
+                _quick_loaded_views.discard(bv)
 
-        # Publish under the exclusive lock so a concurrent target read sees a
-        # consistent set. Append under _headless_views_lock, then refresh
-        # (which re-acquires that non-reentrant lock itself).
-        with self._target_lock.write():
-            with _headless_views_lock:
-                _headless_views.append(bv)
-            targets = self.targets.refresh()
+            # Publish under the exclusive lock so a concurrent target read sees a
+            # consistent set. Append under _headless_views_lock, then refresh
+            # (which re-acquires that non-reentrant lock itself).
+            with self._target_lock.write():
+                with _headless_views_lock:
+                    _headless_views.append(bv)
+                targets = self.targets.refresh()
 
-        # Keep the registry's open-binaries list current after a load (#80).
-        self._write_registry()
-        marker_note = self._write_project_marker(workdir, no_marker)
-        if marker_note:
-            notes.append(marker_note)
-        return {
-            "loaded": True,
-            "path": str(load_path),
-            "requested_path": str(resolved),
-            "analyzed": not quick_effective,
-            "notes": notes,
-            "targets": targets,
-        }
+            # Keep the registry's open-binaries list current after a load (#80).
+            self._write_registry()
+            marker_note = self._write_project_marker(workdir, no_marker)
+            if marker_note:
+                notes.append(marker_note)
+            return {
+                "loaded": True,
+                "path": str(load_path),
+                "requested_path": str(resolved),
+                "analyzed": not quick_effective,
+                "analysis_state": "quick" if quick_effective else "full",
+                "notes": notes,
+                "targets": targets,
+            }
+        finally:
+            with _load_in_progress_lock:
+                current = _load_in_progress.get(load_key)
+                if current is waiter:
+                    _load_in_progress.pop(load_key, None)
+                    waiter.set()
 
     def _close_binary(self, path: str | None = None, target: str | None = None, all_: bool = False):
         def _snapshot(bv) -> dict[str, Any]:
@@ -2252,7 +2282,9 @@ def _bind_xrefs(bridge, params, target):
         params["identifier"],
         offset=int(params.get("offset", 0)),
         limit=int(params["limit"]) if params.get("limit") is not None else None,
-        fn_pointer_scan=bool(params.get("fn_pointer_scan", False)),
+        fn_pointer_scan=_validate_bool(
+            params.get("fn_pointer_scan"), label="fn_pointer_scan", default=False
+        ),
     )
 
 

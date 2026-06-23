@@ -9,8 +9,12 @@ tautology). Bridge-side tests keep using the `_bridge_fakes._load_bridge` seam.
 """
 from __future__ import annotations
 
+import sys
+
 import bn.cli
 import pytest
+
+sys.dont_write_bytecode = True
 
 
 @pytest.fixture

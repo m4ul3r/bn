@@ -374,6 +374,127 @@ def test_load_binary_idempotent_returns_existing_view(monkeypatch, tmp_path):
     bridge._headless_views.clear()
 
 
+def test_load_binary_idempotent_preserves_quick_analysis_state(monkeypatch, tmp_path):
+    """Re-loading a quick-open target must not claim the existing view is fully
+    analyzed just because the duplicate open was skipped (#405)."""
+    bridge, instance, loaded_paths = _setup_load_test(monkeypatch)
+    raw = tmp_path / "quick.bin"
+    raw.write_bytes(b"")
+
+    first = instance._load_binary(str(raw), prefer_bndb=False, quick=True)
+    second = instance._load_binary(str(raw), prefer_bndb=False)
+
+    assert loaded_paths == [str(raw)]
+    assert first["analyzed"] is False
+    assert second["already_open"] is True
+    assert second["analyzed"] is False
+    assert second["analysis_state"] == "quick"
+    assert any("already open" in n.lower() for n in second["notes"])
+    bridge._headless_views.clear()
+    bridge._quick_loaded_views.clear()
+
+
+def test_load_binary_concurrent_same_path_dedupes_inflight(monkeypatch, tmp_path):
+    """Two concurrent loads for the same path should converge on one BinaryView
+    even while the first full analysis has not published the view yet (#400)."""
+    bridge, instance, loaded_paths = _setup_load_test(monkeypatch)
+    raw = tmp_path / "race.bin"
+    raw.write_bytes(b"")
+
+    analysis_started = threading.Event()
+    release_analysis = threading.Event()
+
+    class BlockingBV(_LoadBV):
+        def update_analysis_and_wait(self):
+            analysis_started.set()
+            assert release_analysis.wait(2)
+            super().update_analysis_and_wait()
+
+    binaryninja = sys.modules["binaryninja"]
+
+    def fake_load(path, update_analysis=True):
+        loaded_paths.append(path)
+        return BlockingBV(filename=path)
+
+    binaryninja.load = fake_load
+    results: dict[str, dict] = {}
+    errors: dict[str, BaseException] = {}
+
+    def run(label: str):
+        try:
+            results[label] = instance._load_binary(str(raw), prefer_bndb=False)
+        except BaseException as exc:  # noqa: BLE001 - expose thread failures
+            errors[label] = exc
+
+    leader = threading.Thread(target=run, args=("leader",))
+    follower = threading.Thread(target=run, args=("follower",))
+    leader.start()
+    assert analysis_started.wait(2)
+    follower.start()
+    time.sleep(0.05)
+    assert loaded_paths == [str(raw)]
+
+    release_analysis.set()
+    leader.join(2)
+    follower.join(2)
+
+    assert not leader.is_alive()
+    assert not follower.is_alive()
+    assert errors == {}
+    assert loaded_paths == [str(raw)]
+    assert len(bridge._headless_views) == 1
+    assert results["leader"].get("already_open") is not True
+    assert results["follower"].get("already_open") is True
+    bridge._headless_views.clear()
+    bridge._load_in_progress.clear()
+
+
+def test_load_binary_dedupes_gui_open_view(monkeypatch, tmp_path):
+    """A GUI-open view for the same path should be reused instead of adding a
+    duplicate headless-loaded view (#400)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bridge._headless_views.clear()
+    bridge._load_in_progress.clear()
+    loaded_paths: list[str] = []
+    raw = tmp_path / "gui.bin"
+    raw.write_bytes(b"")
+    gui_bv = _LoadBV(filename=str(raw))
+
+    class FakeFrame:
+        def getCurrentBinaryView(self):
+            return gui_bv
+
+    class FakeContext:
+        def getCurrentViewFrame(self):
+            return FakeFrame()
+
+        def getTabs(self):
+            return []
+
+    fake_context = FakeContext()
+    fake_ui = types.SimpleNamespace(
+        UIContext=types.SimpleNamespace(
+            allContexts=lambda: [fake_context],
+            activeContext=lambda: fake_context,
+        )
+    )
+    monkeypatch.setattr(bridge, "ui", fake_ui)
+    binaryninja = sys.modules["binaryninja"]
+    binaryninja.load = lambda path, update_analysis=True: (
+        loaded_paths.append(path) or _LoadBV(filename=path)
+    )
+
+    result = instance._load_binary(str(raw), prefer_bndb=False)
+
+    assert loaded_paths == []
+    assert result["already_open"] is True
+    assert result["analyzed"] is True
+    assert result["analysis_state"] == "full"
+    assert bridge._headless_views == []
+    monkeypatch.setattr(bridge, "ui", None)
+
+
 def test_load_binary_raw_mapped_view_warns(monkeypatch, tmp_path):
     """A file opened as a raw Mapped/Raw view (unrecognized format) must emit a
     warning so an agent doesn't proceed against a 0-function phantom target
@@ -974,6 +1095,48 @@ def test_dispatch_rejects_non_boolean_all(monkeypatch):
     assert exc.value.status == "invalid_request"
     assert not bv_a.closed  # nothing closed
     bridge._headless_views.clear()
+
+
+def test_dispatch_rejects_non_boolean_fn_pointer_scan(monkeypatch):
+    # Raw JSON params must not coerce strings into enabling the expensive xrefs
+    # function-pointer scan (#407).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    for bad in ("false", "true", 0, 1, "", "yes"):
+        with pytest.raises(bridge.OperationFailure) as exc:
+            instance._dispatch_on_main(
+                "xrefs",
+                {"identifier": "0x401000", "fn_pointer_scan": bad},
+                None,
+            )
+        assert exc.value.status == "invalid_request"
+
+
+def test_dispatch_passes_boolean_fn_pointer_scan_unchanged(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    seen: list[bool] = []
+
+    def fake_xrefs(target, identifier, *, offset=0, limit=None, fn_pointer_scan=False):
+        seen.append(fn_pointer_scan)
+        return {"target": target, "identifier": identifier, "items": []}
+
+    monkeypatch.setattr(instance, "_xrefs", fake_xrefs)
+
+    instance._dispatch_on_main("xrefs", {"identifier": "0x401000"}, None)
+    instance._dispatch_on_main(
+        "xrefs",
+        {"identifier": "0x401000", "fn_pointer_scan": False},
+        None,
+    )
+    instance._dispatch_on_main(
+        "xrefs",
+        {"identifier": "0x401000", "fn_pointer_scan": True},
+        None,
+    )
+
+    assert seen == [False, False, True]
 
 
 def test_validate_bool_accepts_real_booleans_and_default(monkeypatch):

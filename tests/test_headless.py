@@ -2,7 +2,7 @@
 
 Covers the two CLI front-ends that bring a binary into a headless bridge:
 ``bn-agent`` (``src/bn/headless.py``) and ``python -m bn_agent_bridge``
-(``plugin/bn_agent_bridge/__main__.py``). Both must thread ``--no-bndb`` through
+(``src/bn_agent_bridge/__main__.py``). Both must thread ``--no-bndb`` through
 to ``start_headless`` so the sidecar-``.bndb`` opt-out matches ``bn load`` (#178).
 """
 from __future__ import annotations
@@ -19,7 +19,7 @@ from bn import headless
 # stub's own default (which would make the default-prefer test tautological).
 _SENTINEL = object()
 
-_PLUGIN_PKG_DIR = Path(__file__).resolve().parents[1] / "plugin" / "bn_agent_bridge"
+_PLUGIN_PKG_DIR = Path(__file__).resolve().parents[1] / "src" / "bn_agent_bridge"
 
 
 def _fake_start_headless(captured: dict):
@@ -70,7 +70,7 @@ def test_bn_agent_no_bndb_opt_out(monkeypatch):
     assert captured["prefer_bndb"] is False
 
 
-# --- python -m bn_agent_bridge (plugin/bn_agent_bridge/__main__.py) ---------
+# --- python -m bn_agent_bridge (src/bn_agent_bridge/__main__.py) ------------
 
 
 def _load_module_main(monkeypatch, captured: dict):

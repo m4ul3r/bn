@@ -25,7 +25,7 @@ Install the Binary Ninja companion plugin:
 bn plugin install
 ```
 
-That links [`plugin/bn_agent_bridge`](plugin/bn_agent_bridge) into your Binary Ninja plugins directory.
+That links [`src/bn_agent_bridge`](src/bn_agent_bridge) into your Binary Ninja plugins directory.
 
 Install the bundled Claude Code/Codex skills:
 

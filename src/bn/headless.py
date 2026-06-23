@@ -66,11 +66,12 @@ def main(argv: list[str] | None = None) -> int:
     if bn_python is not None and str(bn_python) not in sys.path:
         sys.path.insert(0, str(bn_python))
 
-    # The bridge plugin lives outside the installed package.  Resolve it
-    # relative to the repo so ``uv run bn-agent`` works from a dev install.
-    plugin_dir = Path(__file__).resolve().parents[2] / "plugin"
-    if plugin_dir.is_dir() and str(plugin_dir) not in sys.path:
-        sys.path.insert(0, str(plugin_dir))
+    # When this file is executed directly from a checkout, add the src root so
+    # the sibling bn_agent_bridge package is importable. Console scripts and
+    # wheel installs already have it on sys.path.
+    src_dir = Path(__file__).resolve().parents[1]
+    if (src_dir / "bn_agent_bridge").is_dir() and str(src_dir) not in sys.path:
+        sys.path.insert(0, str(src_dir))
 
     from bn_agent_bridge.bridge import start_headless
 

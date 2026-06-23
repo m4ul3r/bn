@@ -17,14 +17,13 @@ from pathlib import Path
 
 import pytest
 
-_ENGINE_PATH = Path(__file__).resolve().parents[1] / "plugin" / "bn_agent_bridge" / "taint_engine.py"
+_ENGINE_PATH = Path(__file__).resolve().parents[1] / "src" / "bn_agent_bridge" / "taint_engine.py"
 
 
 def _load_engine():
     # Load as a top-level module so the wrapped `from .paths import ...` falls
     # back gracefully (no package context) — load_models still reads the
-    # builtin JSON beside the file. Don't write bytecode into the plugin source
-    # tree (the wheel build ships it as data files; see _load_bridge / #83).
+    # builtin JSON beside the file. Don't write bytecode into the source tree.
     sys.dont_write_bytecode = True
     spec = importlib.util.spec_from_file_location("bn_taint_engine_under_test", _ENGINE_PATH)
     module = importlib.util.module_from_spec(spec)

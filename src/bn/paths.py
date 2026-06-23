@@ -147,11 +147,11 @@ def taint_models_path() -> Path:
 def plugin_source_dir() -> Path:
     """Where ``bn plugin install`` copies/symlinks the bridge from.
 
-    Editable checkout: the plugin lives at the repo root. Wheel install:
+    Editable checkout: the plugin package lives under src/. Wheel install:
     repo_root() points into site-packages and that path doesn't exist, so fall
     back to the bridge packaged into site-packages (importable as the
     PLUGIN_NAME module). repo_root() can't be trusted in a wheel (#83)."""
-    repo_plugin = repo_root() / "plugin" / PLUGIN_NAME
+    repo_plugin = repo_root() / "src" / PLUGIN_NAME
     if repo_plugin.exists():
         return repo_plugin
     try:
@@ -202,4 +202,3 @@ def claude_skills_dir() -> Path:
 
 def codex_skills_dir() -> Path:
     return codex_home() / "skills"
-
