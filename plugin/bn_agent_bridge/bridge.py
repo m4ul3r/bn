@@ -847,6 +847,27 @@ class BinaryNinjaBridge:
             "targets": self.targets.refresh(),
         }
 
+    def _find_open_view_for_path(self, load_path: Path):
+        """Return an already-open BinaryView whose backing file resolves to
+        *load_path*, or None. Keeps ``load`` idempotent: re-loading an open path
+        would otherwise create a second view and make the basename/filename
+        selectors ambiguous (#355)."""
+        try:
+            target = load_path.resolve()
+        except Exception:
+            target = load_path
+        with _headless_views_lock:
+            for bv in list(_headless_views):
+                fname = getattr(getattr(bv, "file", None), "filename", None)
+                if not fname:
+                    continue
+                try:
+                    if Path(fname).resolve() == target:
+                        return bv
+                except Exception:
+                    continue
+        return None
+
     def _load_binary(self, path: str, *, prefer_bndb: bool = True, quick: bool = False,
                      workdir: str | None = None, no_marker: bool = False):
         import binaryninja
@@ -875,6 +896,28 @@ class BinaryNinjaBridge:
                     f"loaded {load_path} instead of {resolved} (use --no-bndb to skip)"
                 )
 
+        # #355: if a view for this (post-substitution) path is already open,
+        # return its target instead of opening a duplicate. Re-loading otherwise
+        # spawns a second BinaryView that shares the basename/filename, making
+        # those selectors ambiguous and dropping the friendly basename.
+        existing = self._find_open_view_for_path(load_path)
+        if existing is not None:
+            with self._target_lock.write():
+                targets = self.targets.refresh()
+            notes.append(
+                f"{load_path} is already open; returned the existing target "
+                "instead of opening a duplicate (use `bn close` first to reload)"
+            )
+            return {
+                "loaded": True,
+                "path": str(load_path),
+                "requested_path": str(resolved),
+                "analyzed": True,
+                "already_open": True,
+                "notes": notes,
+                "targets": targets,
+            }
+
         # Always open without auto-analysis, then analyze explicitly unless
         # --quick. Quick load skips update_analysis_and_wait() entirely -- the
         # expensive, occasionally-crashing/OOMing phase -- so sections, symbols,
@@ -901,6 +944,19 @@ class BinaryNinjaBridge:
             ) from exc
         if bv is None:
             raise RuntimeError(f"Failed to open binary: {load_path}")
+
+        # #369 (part 1): BN's format detection failed and fell back to a raw
+        # 'Raw'/'Mapped' view -- an empty/garbage/text file opened this way has
+        # no functions or symbols. Warn so an agent doesn't proceed against a
+        # 0-function phantom target thinking it loaded a real binary.
+        view_type_name = str(getattr(bv, "view_type", "") or "")
+        if view_type_name in ("Raw", "Mapped"):
+            notes.append(
+                f"{resolved.name} was opened as a raw '{view_type_name}' view -- "
+                "its format was not recognized, so it has no functions/symbols to "
+                "analyze. Confirm this is the binary you intended (or pass the "
+                "correct file)."
+            )
 
         quick_effective = quick and load_path.suffix != ".bndb"
         if quick and not quick_effective:

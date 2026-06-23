@@ -354,6 +354,59 @@ def test_load_binary_no_sibling(monkeypatch, tmp_path):
     bridge._headless_views.clear()
 
 
+def test_load_binary_idempotent_returns_existing_view(monkeypatch, tmp_path):
+    """Re-loading an already-open path must return the existing target, not open a
+    second BinaryView that makes the basename/filename selectors ambiguous (#355)."""
+    bridge, instance, loaded_paths = _setup_load_test(monkeypatch)
+    raw = tmp_path / "app.bin"
+    raw.write_bytes(b"")
+
+    instance._load_binary(str(raw), prefer_bndb=False)
+    assert loaded_paths == [str(raw)]
+    assert len(bridge._headless_views) == 1
+
+    # second load of the SAME path: no duplicate view, no second binaryninja.load
+    result = instance._load_binary(str(raw), prefer_bndb=False)
+    assert loaded_paths == [str(raw)]               # load NOT called again
+    assert len(bridge._headless_views) == 1         # no duplicate view
+    assert result.get("already_open") is True
+    assert any("already open" in n.lower() for n in result["notes"])
+    bridge._headless_views.clear()
+
+
+def test_load_binary_raw_mapped_view_warns(monkeypatch, tmp_path):
+    """A file opened as a raw Mapped/Raw view (unrecognized format) must emit a
+    warning so an agent doesn't proceed against a 0-function phantom target
+    (#369 part 1)."""
+    bridge, instance, loaded_paths = _setup_load_test(monkeypatch, view_type="Mapped")
+    raw = tmp_path / "garbage.elf"
+    raw.write_bytes(b"not a recognized binary")
+
+    result = instance._load_binary(str(raw), prefer_bndb=False)
+
+    assert any(
+        "not recognized" in n.lower() and "raw" in n.lower()
+        for n in result["notes"]
+    ), result["notes"]
+    bridge._headless_views.clear()
+
+
+def test_load_binary_recognized_view_does_not_warn(monkeypatch, tmp_path):
+    """A normally-recognized view (ELF/PE/Mach-O) must NOT get the raw-mapped
+    warning -- only the unrecognized-format fallback does (#369 part 1)."""
+    bridge, instance, loaded_paths = _setup_load_test(monkeypatch, view_type="ELF")
+    raw = tmp_path / "real.elf"
+    raw.write_bytes(b"\x7fELF")
+
+    result = instance._load_binary(str(raw), prefer_bndb=False)
+
+    assert not any(
+        "not recognized" in n.lower() and "raw" in n.lower()
+        for n in result["notes"]
+    ), result["notes"]
+    bridge._headless_views.clear()
+
+
 def test_load_binary_quick_with_sibling_bndb_notes_quick_ignored(monkeypatch, tmp_path):
     # #316: `load <raw> --quick` when an adjacent .bndb is substituted opened the
     # already-analyzed database and silently dropped --quick. Say so explicitly.
