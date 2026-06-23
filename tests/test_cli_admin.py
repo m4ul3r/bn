@@ -581,6 +581,64 @@ def test_session_start_spawns_instance(monkeypatch, capsys):
     assert parsed["pid"] == 999
 
 
+def _fake_instance(instance_id):
+    from bn.transport import BridgeInstance
+    import pathlib
+    return BridgeInstance(
+        pid=999,
+        socket_path=pathlib.Path("/tmp/test.sock"),
+        registry_path=pathlib.Path("/tmp/test.json"),
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at="2026-01-01T00:00:00Z",
+        meta={},
+        instance_id=instance_id,
+    )
+
+
+def test_session_start_passes_workdir_and_no_marker_to_load(monkeypatch, capsys, tmp_path):
+    """session start must pass `workdir` + `no_marker` to load_binary (like load)
+    so the bridge drops the `.bn-<id>` project marker -- the recommended
+    `session start --instance-id X` workflow otherwise silently fails to register
+    it, defeating #80 cwd-resolution (#377)."""
+    import os
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: _fake_instance("m1"))
+    monkeypatch.delenv("BN_NO_MARKERS", raising=False)
+    monkeypatch.chdir(tmp_path)
+    calls = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        calls.append((op, params))
+        return {"ok": True, "result": {"path": params.get("path"), "loaded": True}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["session", "start", str(tmp_path / "x.bndb"), "--format", "json"])
+    assert rc == 0
+    load = next(p for op, p in calls if op == "load_binary")
+    assert load["workdir"] == os.getcwd()
+    assert load["no_marker"] is False
+
+
+def test_session_start_no_marker_flag_suppresses_marker(monkeypatch, capsys, tmp_path):
+    """`session start --no-marker` suppresses the marker, parity with load (#377)."""
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: _fake_instance("m2"))
+    monkeypatch.delenv("BN_NO_MARKERS", raising=False)
+    monkeypatch.chdir(tmp_path)
+    calls = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        calls.append((op, params))
+        return {"ok": True, "result": {"path": params.get("path"), "loaded": True}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["session", "start", str(tmp_path / "x.bndb"), "--no-marker", "--format", "json"])
+    assert rc == 0
+    load = next(p for op, p in calls if op == "load_binary")
+    assert load["no_marker"] is True
+
+
 def test_session_start_partial_failure_keeps_bridge_but_exits_nonzero(monkeypatch, capsys):
     from bn.transport import BridgeError, BridgeInstance
 
