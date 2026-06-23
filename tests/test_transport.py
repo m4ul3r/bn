@@ -684,6 +684,50 @@ def test_send_request_reports_timeout_waiting_for_response(tmp_path, monkeypatch
         send_request("ping", timeout=12.5)
 
 
+def test_timeout_message_shows_subsecond_value(tmp_path, monkeypatch):
+    """A sub-second BN_REQUEST_TIMEOUT must render its real value, not round to
+    'after 0.0s' (#370.3)."""
+    from bn.transport import BridgeError, BridgeInstance, send_request
+
+    instance = BridgeInstance(
+        pid=999,
+        socket_path=tmp_path / "bridge.sock",
+        registry_path=tmp_path / "bridge.json",
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at=None,
+        meta={},
+    )
+    monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None, **kw: instance)
+
+    class _FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def connect(self, path):
+            self.path = path
+
+        def sendall(self, payload):
+            self.payload = payload
+
+        def shutdown(self, how):
+            self.how = how
+
+        def recv(self, size):
+            raise socket.timeout("timed out")
+
+    monkeypatch.setattr("bn.transport.socket.socket", lambda *args, **kwargs: _FakeSocket())
+
+    with pytest.raises(BridgeError, match=r"after 0\.01s"):
+        send_request("ping", timeout=0.01)
+
+
 def test_list_instances_trusts_live_socket_even_with_stale_pid(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     registry_path = bridge_registry_path()

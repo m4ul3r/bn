@@ -484,7 +484,10 @@ def _send_request_to_instance(
         ) from last_error
     if last_error is not None:
         if isinstance(last_error, TimeoutError):
-            timeout_suffix = f" after {timeout:.1f}s" if timeout is not None else ""
+            # `:g` keeps the real value for a sub-second timeout (0.01 -> "0.01s")
+            # instead of rounding to "0.0s" (#370.3), while a whole-second value
+            # still reads cleanly (30.0 -> "30s").
+            timeout_suffix = f" after {timeout:g}s" if timeout is not None else ""
             raise BridgeError(
                 f"Timed out waiting for Binary Ninja bridge pid {instance.pid} at {instance.socket_path}"
                 f"{timeout_suffix} (op '{op}'). The bridge may be busy with a long analysis; "

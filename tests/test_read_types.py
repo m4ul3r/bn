@@ -606,3 +606,33 @@ def test_diff_type_snapshots_populates_name(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+
+
+def test_render_type_layout_expands_anonymous_aggregate(monkeypatch):
+    """An anonymous nested union/struct member rendered a bare `0x0004: union `
+    line, hiding the inner members from the CLI (#370.2). They must be expanded
+    (indented) in the text layout and present in the JSON `members[]`."""
+    bridge = _load_bridge(monkeypatch)
+    ctx = bridge.BinaryNinjaBridge().ctx
+
+    inner = _FakeType("union ", width=4, members=[
+        _FakeMember(0x0, "iv", "int32_t"),
+        _FakeMember(0x0, "fv", "float"),
+    ], type_class="StructureTypeClass")
+    outer = _FakeType("struct Outer", width=0x8, members=[
+        _FakeMember(0x0, "tag", "int32_t"),
+        _FakeMember(0x4, "u", inner),       # anonymous-aggregate-typed member
+    ])
+
+    # text: inner members are visible (indented), not just "0x0004: union u"
+    text = ctx._render_type_layout(outer)
+    assert "iv" in text and "fv" in text, text
+
+    # JSON: a structured members[] with the inner aggregate nested
+    entry = ctx._type_entry("Outer", outer)
+    assert isinstance(entry.get("members"), list)
+    by_name = {m.get("name"): m for m in entry["members"]}
+    assert "tag" in by_name and "u" in by_name
+    inner_members = by_name["u"].get("members")
+    assert isinstance(inner_members, list)
+    assert {m.get("name") for m in inner_members} == {"iv", "fv"}
