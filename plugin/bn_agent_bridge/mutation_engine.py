@@ -1575,6 +1575,16 @@ def _op_rename_symbol(ctx, bv, op: dict[str, Any]):
     kind = str(op.get("kind", "auto"))
     identifier = op["identifier"]
     new_name = str(op["new_name"])
+    # Reject a degenerate empty/whitespace name before touching the view: BN
+    # accepts `fn.name = ""` and leaves the function unnamed, which then "verifies"
+    # against itself (#363). Done here (not just CLI-side) so batch/raw callers
+    # are covered too; pre-resolution so no view state is modified on rejection.
+    if not new_name.strip():
+        raise OperationFailure(
+            "invalid_request",
+            "new name must be non-empty",
+            requested=_operation_requested(ctx, op),
+        )
     target = ctx._resolve_rename_target(bv, identifier, kind)
     requested = _operation_requested(ctx, op)
     if target["kind"] == "function":

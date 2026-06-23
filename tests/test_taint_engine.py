@@ -305,6 +305,29 @@ def test_chk_models_present_and_shaped():
     assert te.lookup_model(models, "__strcpy_chk@plt")[0] == "strcpy_chk"
     assert models["strcpy_chk"]["sink"]["tainted_args"] == [1]
     assert models["strcpy_chk"]["propagates"] == [{"from": "*arg:1", "to": "*arg:0"}]
+
+
+def test_asprintf_chk_models_present_and_shaped():
+    """FORTIFY asprintf/vasprintf (#373). __*asprintf_chk(strp, flags, fmt, ...)
+    shifts the format string to arg2 (the leading flags arg), so a tainted format
+    on a FORTIFY build is classified as a fortified_format sink rather than
+    falling through to an 'unmodeled external' caveat."""
+    models = te.load_models()
+    name, model = te.lookup_model(models, "__asprintf_chk")
+    assert name == "asprintf_chk"
+    assert model["sink"]["tainted_args"] == [2]
+    assert model["sink"]["class"] == "fortified_format"
+    assert model["propagates"] == [{"from": "*arg:2", "to": "*arg:0"}]
+    # asprintf takes real varargs (arg3+) -> a tainted %s arg taints the buffer.
+    assert model["varargs"]["first_index"] == 3
+    assert model["varargs"]["to"] == "*arg:0"
+    # vasprintf takes a va_list: format at arg2, no discoverable varargs.
+    name, model = te.lookup_model(models, "__vasprintf_chk")
+    assert name == "vasprintf_chk"
+    assert model["sink"]["tainted_args"] == [2]
+    assert model["sink"]["class"] == "fortified_format"
+    assert model["propagates"] == [{"from": "*arg:2", "to": "*arg:0"}]
+    assert "varargs" not in model
     # memset_chk's arg1 is the fill byte (int c), so it must NOT propagate
     assert "propagates" not in models["memset_chk"]
     assert models["memset_chk"]["sink"]["tainted_args"] == [2]

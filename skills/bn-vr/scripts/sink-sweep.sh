@@ -15,7 +15,11 @@ command -v jq  >/dev/null || { echo "sink-sweep: 'jq' is required" >&2; exit 2; 
 # worth tracing a tainted argument back to a source. Deliberately NOT the malloc
 # family -- every binary calls it, and heap bugs (UAF/double-free) aren't found
 # by xref'ing the allocator anyway.
-SINK_RE='^(_*)(memcpy|memmove|mempcpy|strcpy|strncpy|stpcpy|strlcpy|strcat|strncat|strlcat|sprintf|vsprintf|snprintf|vsnprintf|printf|fprintf|vprintf|vfprintf|dprintf|asprintf|vasprintf|gets|scanf|sscanf|fscanf|system|popen|execve|execl|execlp|execvp|dlopen|recv|recvfrom|recvmsg|read)(@.*)?$'
+# The leading (_*) absorbs the `__` decoration and the trailing optional
+# (_chk)? matches the FORTIFY_SOURCE variants (__memcpy_chk, __snprintf_chk, ...)
+# -- the default on modern firmware toolchains -- so a fortified target is not a
+# false all-clear (#372). `execv` is listed alongside the rest of the exec family.
+SINK_RE='^(_*)(memcpy|memmove|mempcpy|strcpy|strncpy|stpcpy|strlcpy|strcat|strncat|strlcat|sprintf|vsprintf|snprintf|vsnprintf|printf|fprintf|vprintf|vfprintf|dprintf|asprintf|vasprintf|gets|scanf|sscanf|fscanf|system|popen|execve|execv|execl|execlp|execvp|dlopen|recv|recvfrom|recvmsg|read)(_chk)?(@.*)?$'
 
 tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
 # --out writes the full JSON to a file (no >10k-token spill envelope to parse).

@@ -29,6 +29,30 @@ def test_symbol_rename_builds_preview_payload(fake_transport):
     assert calls[-1]["params"]["preview"] is True
 
 
+def test_symbol_rename_rejects_empty_new_name(fake_transport, capsys):
+    """An empty/whitespace-only new name is rejected client-side (exit 2) before
+    any rename_symbol op is sent -- never accepted as a 'verified' degenerate
+    rename that leaves the function unnamed (#363)."""
+    calls = fake_transport({"rename_symbol": {"ok": True, "result": {"preview": True}}})
+
+    rc = bn.cli.main(["symbol", "rename", "--target", "123:1:7", "mput", ""])
+
+    assert rc == 2
+    assert "new name must be non-empty" in capsys.readouterr().err
+    assert [call["op"] for call in calls] == []
+
+
+def test_symbol_rename_rejects_whitespace_new_name(fake_transport, capsys):
+    """Whitespace-only is as degenerate as empty -- also rejected, no op sent."""
+    calls = fake_transport({"rename_symbol": {"ok": True, "result": {"preview": True}}})
+
+    rc = bn.cli.main(["symbol", "rename", "--target", "123:1:7", "mput", "   "])
+
+    assert rc == 2
+    assert "new name must be non-empty" in capsys.readouterr().err
+    assert [call["op"] for call in calls] == []
+
+
 def test_symbol_rename_uses_implicit_target_when_single_target_is_open(fake_transport):
     calls = fake_transport(
         {

@@ -161,6 +161,21 @@ def test_target_summary_text_marks_quick_view():
     assert "[not analyzed]" not in full
 
 
+def test_target_summary_text_shows_analysis_state():
+    """target info text surfaces analysis_state (full/quick) -- the field the
+    bn-re methodology tells agents to gate their survey on, previously visible
+    only in JSON (#378)."""
+    from bn import formatters
+    full = formatters._render_target_summary({
+        "selector": "active", "view_id": 1, "analyzed": True, "analysis_state": "full",
+    })
+    assert "analysis: full" in full
+    quick = formatters._render_target_summary({
+        "selector": "active", "view_id": 1, "analyzed": False, "analysis_state": "quick",
+    })
+    assert "analysis: quick" in quick
+
+
 def test_target_info_verbose_renders_segments():
     """target info --verbose text appends the segment map with r/w/x perms; the
     block is absent when no segments are present (target list rows). (F21)"""
