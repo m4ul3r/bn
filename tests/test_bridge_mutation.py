@@ -1460,6 +1460,47 @@ def test_struct_field_set_rejects_inline_bitfield_type(monkeypatch):
     assert builder.added == []
 
 
+def test_struct_field_set_rejects_negative_offset(monkeypatch):
+    """A negative offset must give a clear 'offset must be >= 0' error, not the
+    misleading 'No effective change detected' verification_failed that BN's silent
+    add_member_at_offset no-op produced (#369)."""
+    bridge, instance, builder, bv = _struct_set_instance(monkeypatch, [(0, "x")])
+    # both decimal (-8, parses negative) and hex (-0x8, which _parse_address
+    # rejects outright) must hit the same actionable ">= 0" message, and an
+    # int -8 from a raw-socket client too.
+    for bad in ("-8", "-0x8", -8):
+        with pytest.raises(bridge.OperationFailure) as exc:
+            instance._op_struct_field_set(bv, {
+                "struct_name": "S", "offset": bad, "field_name": "f",
+                "field_type": "int"})
+        assert exc.value.status == "invalid_request", bad
+        assert ">= 0" in exc.value.message, bad
+    assert builder.added == []
+
+
+def test_struct_field_set_rejects_absurd_offset(monkeypatch):
+    """An offset that would explode the struct into a multi-GB sparse type is a
+    likely typo and must be soft-rejected, not applied + reported verified with a
+    4GB+ struct width (#369)."""
+    bridge, instance, builder, bv = _struct_set_instance(monkeypatch, [(0, "x")])
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._op_struct_field_set(bv, {
+            "struct_name": "S", "offset": "0xFFFFFFFF", "field_name": "f",
+            "field_type": "int"})
+    assert exc.value.status == "invalid_request"
+    assert builder.added == []
+
+
+def test_struct_field_set_accepts_normal_offset(monkeypatch):
+    """A sane in-range offset still applies -- the new bounds only catch the
+    degenerate negative / absurd cases (#369)."""
+    bridge, instance, builder, bv = _struct_set_instance(monkeypatch, [(0, "x")])
+    instance._op_struct_field_set(bv, {
+        "struct_name": "S", "offset": "0x10", "field_name": "f",
+        "field_type": "int"})
+    assert len(builder.added) == 1
+
+
 # ---------------------------------------------------------------------------
 # batch_apply: missing target must stay None, not become "None"
 # ---------------------------------------------------------------------------
