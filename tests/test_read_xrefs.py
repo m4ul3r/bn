@@ -17,6 +17,38 @@ import pytest
 from _bridge_fakes import *  # noqa: F401,F403
 
 
+def test_xrefs_rejects_unmapped_raw_address(monkeypatch):
+    """A raw address that isn't mapped is a typo/stale value, not a real
+    '0 callers' result; reject it (like read/decompile, exit 2) instead of
+    returning a false-negative empty xref set with exit 0 (#374)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[_FakeFunction(0x401000, "caller")])
+    bv.is_valid_offset = lambda addr: False
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    with pytest.raises(RuntimeError, match="not mapped"):
+        instance._xrefs(None, "0xdeadbeef")
+
+
+def test_xrefs_mapped_address_with_no_refs_stays_clean(monkeypatch):
+    """A MAPPED address with zero refs must remain a clean total:0 result -- only
+    the genuinely-unmapped case is rejected, never a mapped-but-unreferenced
+    address (#374)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        functions=[_FakeFunction(0x401000, "caller")],
+        code_refs={}, data_refs={},
+        sections={".rodata": _FakeSection(".rodata", 0x5000, 0x7000)},
+        segments={0x5000: _FakeSegment(readable=True)},
+    )
+    bv.is_valid_offset = lambda addr: True
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._xrefs(None, "0x5000")
+    assert result["kind"] == "xrefs"
+    assert result["total"] == 0
+
+
 def test_xrefs_include_address_context(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

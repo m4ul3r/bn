@@ -122,6 +122,30 @@ def _validate_count(value: Any, *, label: str, minimum: int, allow_none: bool = 
     return n
 
 
+def _require_mapped_address(bv, address: int) -> None:
+    """Raise if *address* is affirmatively unmapped in *bv*.
+
+    Address-taking reads (``read``/``decompile``) reject an unmapped address, but
+    ``xrefs``/``comment get`` historically accepted one as a benign empty result
+    (exit 0), so a typo'd or stale address silently misread as a real
+    "0 callers" / "no comment" (#374). This restores parity.
+
+    A no-op when the view cannot answer (no ``is_valid_offset``, or it raises):
+    callers must NOT reject on an indeterminate result, so a *mapped* address with
+    zero refs stays a clean ``0`` / exit 0 -- only the genuinely-unmapped case is
+    rejected. Real BN always provides ``is_valid_offset``.
+    """
+    is_valid = getattr(bv, "is_valid_offset", None)
+    if not callable(is_valid):
+        return
+    try:
+        mapped = bool(is_valid(int(address)))
+    except Exception:
+        return
+    if not mapped:
+        raise RuntimeError(f"Address {hex(int(address))} is not mapped in this binary")
+
+
 def _validate_bool(value: Any, *, label: str, default: bool) -> bool:
     """Require a known boolean param to be an actual JSON boolean.
 
