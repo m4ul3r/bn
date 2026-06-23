@@ -684,6 +684,60 @@ def test_send_request_reports_timeout_waiting_for_response(tmp_path, monkeypatch
         send_request("ping", timeout=12.5)
 
 
+def test_send_request_timeout_sends_cancel_request(tmp_path, monkeypatch):
+    from bn.transport import BridgeError, BridgeInstance
+
+    instance = BridgeInstance(
+        pid=999,
+        socket_path=tmp_path / "bridge.sock",
+        registry_path=tmp_path / "bridge.json",
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at=None,
+        meta={},
+    )
+    monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None, **kw: instance)
+    sent_payloads = []
+
+    class _FakeSocket:
+        def __init__(self):
+            self.index = len(sent_payloads)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def connect(self, path):
+            self.path = path
+
+        def sendall(self, payload):
+            sent_payloads.append(json.loads(payload.decode("utf-8")))
+
+        def shutdown(self, how):
+            self.how = how
+
+        def recv(self, size):
+            if self.index == 0:
+                raise socket.timeout("timed out")
+            if not hasattr(self, "_sent"):
+                self._sent = True
+                return b'{"ok": true, "result": {"cancelled": true}}'
+            return b""
+
+    monkeypatch.setattr("bn.transport.socket.socket", lambda *args, **kwargs: _FakeSocket())
+
+    with pytest.raises(BridgeError, match="Timed out waiting for Binary Ninja bridge pid 999"):
+        send_request("ping", timeout=12.5)
+
+    assert [payload["op"] for payload in sent_payloads] == ["ping", "cancel_request"]
+    assert sent_payloads[1]["params"]["request_id"] == sent_payloads[0]["id"]
+
+
 def test_timeout_message_shows_subsecond_value(tmp_path, monkeypatch):
     """A sub-second BN_REQUEST_TIMEOUT must render its real value, not round to
     'after 0.0s' (#370.3)."""

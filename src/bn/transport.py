@@ -43,6 +43,7 @@ DEFAULT_REQUEST_TIMEOUT = 600.0
 # those ops a much larger default client timeout; BN_REQUEST_TIMEOUT still wins
 # when the user sets it (including 0/none to disable entirely for a huge load).
 REFRESH_REQUEST_TIMEOUT = 3600.0
+CANCEL_REQUEST_TIMEOUT = 0.25
 
 
 def _resolve_timeout(timeout: float | None, *, default: float | None = DEFAULT_REQUEST_TIMEOUT) -> float | None:
@@ -429,6 +430,27 @@ def choose_instance(
     raise BridgeError("No running Binary Ninja bridge instances found")
 
 
+def _send_cancel_request(instance: BridgeInstance, request_id: str) -> None:
+    payload = {
+        "id": str(uuid.uuid4()),
+        "op": "cancel_request",
+        "params": {"request_id": request_id},
+    }
+    encoded = (json.dumps(payload) + "\n").encode("utf-8")
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(CANCEL_REQUEST_TIMEOUT)
+            sock.connect(str(instance.socket_path))
+            sock.sendall(encoded)
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_WR)
+            with contextlib.suppress(OSError):
+                while sock.recv(65536):
+                    pass
+    except OSError:
+        pass
+
+
 def _send_request_to_instance(
     instance: BridgeInstance,
     op: str,
@@ -470,6 +492,8 @@ def _send_request_to_instance(
             break
         except OSError as exc:
             last_error = exc
+            if isinstance(exc, TimeoutError):
+                _send_cancel_request(instance, str(payload["id"]))
             if exc.errno not in TRANSIENT_SOCKET_ERRNOS or attempt == connect_retries - 1:
                 break
             time.sleep(0.05 * (attempt + 1))

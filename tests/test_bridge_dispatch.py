@@ -120,6 +120,23 @@ def test_bridge_handler_reraises_unrelated_write_errors(monkeypatch):
         handler._write_response(b"{}", op="xrefs")
 
 
+def test_cancel_request_marks_only_active_requests(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    inactive = instance._cancel_request("missing")
+    assert inactive == {"kind": "cancel_request", "request_id": "missing", "cancelled": False}
+    assert instance._is_request_cancelled("missing") is False
+
+    instance._begin_request("req-1")
+    active = instance._cancel_request("req-1")
+    assert active == {"kind": "cancel_request", "request_id": "req-1", "cancelled": True}
+    assert instance._is_request_cancelled("req-1") is True
+
+    instance._end_request("req-1")
+    assert instance._is_request_cancelled("req-1") is False
+
+
 def test_py_exec_non_serializable_result_falls_back_to_repr(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

@@ -73,6 +73,38 @@ MAX_REQUEST_BYTES = 32 * 1024 * 1024
 _load_in_progress_lock = threading.Lock()
 _load_in_progress: dict[str, threading.Event] = {}
 
+# Set by BridgeHandler while a request is executing. Long operations can poll it
+# to stop work after the CLI sends a cancellation request instead of wedging a
+# bridge instance with abandoned work (#365).
+_request_cancel_checker = threading.local()
+
+
+@contextlib.contextmanager
+def _request_cancel_context(checker):
+    old = getattr(_request_cancel_checker, "checker", None)
+    _request_cancel_checker.checker = checker
+    try:
+        yield
+    finally:
+        if old is None:
+            with contextlib.suppress(AttributeError):
+                delattr(_request_cancel_checker, "checker")
+        else:
+            _request_cancel_checker.checker = old
+
+
+def _request_cancelled() -> bool:
+    checker = getattr(_request_cancel_checker, "checker", None)
+    if checker is None:
+        return False
+    try:
+        return bool(checker())
+    except Exception:
+        return False
+
+
+GO_RENAME_CHUNK_SIZE = 256
+
 
 def _format_unknown_target_error(selector: Any, targets: list[dict[str, Any]]) -> str:
     lines = [f"Unknown target selector: {selector}"]
@@ -580,7 +612,18 @@ class BridgeHandler(socketserver.StreamRequestHandler):
                 else:
                     op = payload.get("op")
                     request_id = payload.get("id")
-                    response = self.server.bridge.dispatch(payload)
+                    bridge = self.server.bridge
+                    begin_request = getattr(bridge, "_begin_request", lambda _request_id: None)
+                    end_request = getattr(bridge, "_end_request", lambda _request_id: None)
+                    is_cancelled = getattr(
+                        bridge, "_is_request_cancelled", lambda _request_id: False,
+                    )
+                    begin_request(request_id)
+                    try:
+                        with _request_cancel_context(lambda: is_cancelled(request_id)):
+                            response = bridge.dispatch(payload)
+                    finally:
+                        end_request(request_id)
         encoded = self._encode_response(response, op=op, request_id=request_id)
         self._write_response(encoded, op=op, request_id=request_id)
 
@@ -607,6 +650,11 @@ def _is_auto_function_name(name: str) -> bool:
         return False
     suffix = core[4:]
     return bool(suffix) and all(c in "0123456789abcdefABCDEF" for c in suffix)
+
+
+def _is_go_rename_auto_name(name: str, address: int) -> bool:
+    """Whether a Go recovered name may replace the current BN name."""
+    return name == f"sub_{address:x}" or name.startswith("nullsub_")
 
 
 # Symbol types whose NAME comes from relocations/imports, not from analysis or a
@@ -674,6 +722,12 @@ class BinaryNinjaBridge:
         self._server: ThreadedUnixServer | None = None
         self._thread: threading.Thread | None = None
         self._target_lock = _ReadWriteLock()
+        # Serializes write operations. Long chunked writers can hold this gate
+        # while releasing _target_lock between chunks so reads stay responsive.
+        self._write_gate = threading.Lock()
+        self._request_state_lock = threading.Lock()
+        self._active_requests: set[str] = set()
+        self._cancelled_requests: set[str] = set()
         self._shutdown_event = threading.Event()
 
     def _socket_is_live(self) -> bool:
@@ -825,7 +879,7 @@ class BinaryNinjaBridge:
                 if spec.lock_escalation is not None and spec.lock_escalation(params):
                     lock_class = "write"
                 if lock_class == "write":
-                    lock = self._target_lock.write()
+                    lock = self._write_operation_lock()
                 elif lock_class == "read":
                     lock = self._target_lock.read()
             with lock:
@@ -833,6 +887,40 @@ class BinaryNinjaBridge:
             return _json_response(ok=True, result=result)
         except Exception as exc:
             return _json_response(ok=False, error=_serialize_error(exc))
+
+    @contextlib.contextmanager
+    def _write_operation_lock(self):
+        with self._write_gate:
+            with self._target_lock.write():
+                yield
+
+    def _begin_request(self, request_id: Any) -> None:
+        if not isinstance(request_id, str) or not request_id:
+            return
+        with self._request_state_lock:
+            self._active_requests.add(request_id)
+
+    def _end_request(self, request_id: Any) -> None:
+        if not isinstance(request_id, str) or not request_id:
+            return
+        with self._request_state_lock:
+            self._active_requests.discard(request_id)
+            self._cancelled_requests.discard(request_id)
+
+    def _is_request_cancelled(self, request_id: Any) -> bool:
+        if not isinstance(request_id, str) or not request_id:
+            return False
+        with self._request_state_lock:
+            return request_id in self._cancelled_requests
+
+    def _cancel_request(self, request_id: Any) -> dict[str, Any]:
+        if not isinstance(request_id, str) or not request_id:
+            raise ValueError("cancel_request requires params.request_id")
+        with self._request_state_lock:
+            active = request_id in self._active_requests
+            if active:
+                self._cancelled_requests.add(request_id)
+        return {"kind": "cancel_request", "request_id": request_id, "cancelled": active}
 
     def _dispatch_on_main(self, op: str, params: dict[str, Any], target: str | None):
         spec = REGISTRY.spec(op)
@@ -1710,83 +1798,209 @@ class BinaryNinjaBridge:
         auto-named (``sub_``/``nullsub_``) functions BN already has at the
         pcln-derived address -- so a user's manual names are never clobbered and a
         PIE/rebase mismatch (no BN function at the address) is skipped, not
-        mis-renamed. Goes through `_mutation` so every rename is verified (and the
-        whole batch reverted on failure / under --preview)."""
-        recovered = read_go._go_functions(self.ctx, selector)
-        items = recovered.get("items") or []
-        bv = self._resolve_view(selector)
+        mis-renamed.
+
+        This intentionally bypasses the generic mutation engine for the
+        homogeneous Go auto-name case. The generic path snapshots, diffs, and
+        verifies thousands of one-function mutations under one exclusive lock,
+        then `_go_rename` discards most of that heavy output. Direct chunked
+        renaming keeps the exact auto-name guard, verifies by readback, rolls
+        back preview/failure/cancel paths, and releases the target write lock
+        between chunks so same-instance reads can answer (#365).
+
+        The anti-wedge benefit is strongest at low read concurrency: a single
+        concurrent reader interleaves in the gap between chunks (~one chunk of
+        write latency, not the whole rename). Under heavy read fan-out the
+        writer-priority lock still convoys -- each chunk re-drains the readers
+        and re-blocks the next wave -- so a busy instance serializes rather than
+        truly parallelizing. It never wedges or corrupts: rename, reads, and a
+        client-timeout cancellation (full rollback) all complete.
+        """
+        with self._write_gate:
+            with self._target_lock.read():
+                recovered = read_go._go_functions(self.ctx, selector)
+                items = recovered.get("items") or []
+                bv = self._resolve_view(selector)
+                get_fn = getattr(bv, "get_function_at", None)
+                candidates: list[dict[str, Any]] = []
+                skipped_user_named = 0
+                for it in items:
+                    if not it.get("defined") or not callable(get_fn):
+                        continue
+                    try:
+                        addr = int(it["address"], 16)
+                    except (KeyError, ValueError, TypeError):
+                        continue
+                    fn = get_fn(addr)
+                    if fn is None:
+                        continue
+                    current = str(getattr(fn, "name", "") or "")
+                    new_name = str(it.get("name") or "")
+                    if not new_name or current == new_name:
+                        continue
+                    if not _is_go_rename_auto_name(current, addr):
+                        skipped_user_named += 1
+                        continue
+                    candidates.append({
+                        "address": addr,
+                        "before_name": current,
+                        "new_name": new_name,
+                    })
+
+            if not candidates:
+                return {"kind": "go_rename", "success": True, "committed": False,
+                        "preview": preview, "results": [],
+                        "go_renamed_candidates": 0, "skipped_user_named": skipped_user_named,
+                        "defined_count": recovered.get("defined_count", 0)}
+
+            return self._apply_go_renames_chunked(
+                bv,
+                candidates,
+                preview=preview,
+                skipped_user_named=skipped_user_named,
+                defined_count=recovered.get("defined_count", 0),
+            )
+
+    def _go_rename_failure_row(
+        self,
+        candidate: dict[str, Any],
+        status: str,
+        message: str,
+    ) -> dict[str, Any]:
+        return {
+            "op": "rename_symbol",
+            "address": hex(int(candidate["address"])),
+            "new_name": candidate.get("new_name"),
+            "status": status,
+            "message": message,
+        }
+
+    def _rollback_go_renames(self, bv, applied: list[dict[str, Any]]) -> bool:
+        ok = True
         get_fn = getattr(bv, "get_function_at", None)
-        ops: list[dict[str, Any]] = []
-        skipped_user_named = 0
-        for it in items:
-            if not it.get("defined") or not callable(get_fn):
-                continue
-            try:
-                addr = int(it["address"], 16)
-            except (KeyError, ValueError, TypeError):
-                continue
-            fn = get_fn(addr)
-            if fn is None:
-                continue
-            current = str(getattr(fn, "name", "") or "")
-            new_name = str(it.get("name") or "")
-            if not new_name or current == new_name:
-                continue
-            # Match BN's EXACT auto-name form (`sub_<lowercase-hex-of-start-addr>`),
-            # not a `sub_` prefix -- a prefix would clobber a real/user symbol that
-            # merely starts with `sub_` (e.g. `sub_handler`). fn is start-anchored
-            # (get_function_at), so fn.start == addr. `nullsub_<counter>` stays a
-            # prefix (the counter isn't predictable). Fail-safe: an unrecognized
-            # form is SKIPPED (never renamed), never clobbered (#217 review).
-            if not (current == f"sub_{addr:x}" or current.startswith("nullsub_")):
-                skipped_user_named += 1            # never clobber a real/user symbol
-                continue
-            ops.append({"op": "rename_symbol", "kind": "function",
-                        "identifier": hex(addr), "new_name": new_name})
-        if not ops:
-            return {"kind": "go_rename", "success": True, "committed": False,
-                    "preview": preview, "results": [],
-                    "go_renamed_candidates": 0, "skipped_user_named": skipped_user_named,
-                    "defined_count": recovered.get("defined_count", 0)}
-        result = self._mutation(selector, preview, ops)
-        if isinstance(result, dict):
-            result["kind"] = "go_rename"
-            result["go_renamed_candidates"] = len(ops)
-            result["skipped_user_named"] = skipped_user_named
-            # A bulk auto-name application renames hundreds/thousands of functions;
-            # the per-function blast-radius graphs (affected_*) balloon the result
-            # to MBs and a full per-success row list is a 61k-token wall/spill -- all
-            # noise at this scale. Drop the blast radius and keep only FAILED rows
-            # (the actionable detail) plus verified/failed counts; the exit-code
-            # check still sees failures via `results[].status`. The applied names
-            # are in the database -- `function list`/`go functions` show them.
-            for heavy in ("affected_functions", "affected_types", "affected_summary"):
-                result.pop(heavy, None)
-            verified_count = 0
-            failed_rows = []
-            for r in (result.get("results") or []):
-                if not isinstance(r, dict):
-                    continue
-                if r.get("status") == "verified":
+        if not callable(get_fn):
+            return False
+        for start in range(len(applied), 0, -GO_RENAME_CHUNK_SIZE):
+            chunk = applied[max(0, start - GO_RENAME_CHUNK_SIZE):start]
+            with self._target_lock.write():
+                for candidate in reversed(chunk):
+                    addr = int(candidate["address"])
+                    fn = get_fn(addr)
+                    if fn is None:
+                        ok = False
+                        continue
+                    current = str(getattr(fn, "name", "") or "")
+                    if current != candidate["before_name"]:
+                        fn.name = candidate["before_name"]
+                        current = str(getattr(fn, "name", "") or "")
+                    if current != candidate["before_name"]:
+                        ok = False
+        return ok
+
+    def _go_rename_cancelled(self, bv, applied: list[dict[str, Any]]) -> None:
+        rolled_back = self._rollback_go_renames(bv, applied)
+        suffix = "" if rolled_back else " (rollback failed; the view may be partially renamed)"
+        raise RuntimeError(f"request cancelled during go rename{suffix}")
+
+    def _apply_go_renames_chunked(
+        self,
+        bv,
+        candidates: list[dict[str, Any]],
+        *,
+        preview: bool,
+        skipped_user_named: int,
+        defined_count: int,
+    ) -> dict[str, Any]:
+        get_fn = getattr(bv, "get_function_at", None)
+        if not callable(get_fn):
+            return {"kind": "go_rename", "success": False, "committed": False,
+                    "preview": preview, "rolled_back": True,
+                    "results": [{"op": "rename_symbol", "status": "unsupported",
+                                 "message": "BinaryView does not support get_function_at"}],
+                    "go_renamed_candidates": len(candidates),
+                    "go_verified_count": 0, "go_failed_count": 1,
+                    "go_committed_count": 0,
+                    "skipped_user_named": skipped_user_named,
+                    "defined_count": defined_count}
+
+        applied: list[dict[str, Any]] = []
+        failed_rows: list[dict[str, Any]] = []
+        verified_count = 0
+        skipped_during_apply = 0
+
+        for start in range(0, len(candidates), GO_RENAME_CHUNK_SIZE):
+            if _request_cancelled():
+                self._go_rename_cancelled(bv, applied)
+            chunk = candidates[start:start + GO_RENAME_CHUNK_SIZE]
+            with self._target_lock.write():
+                for candidate in chunk:
+                    addr = int(candidate["address"])
+                    fn = get_fn(addr)
+                    if fn is None:
+                        failed_rows.append(self._go_rename_failure_row(
+                            candidate, "verification_failed", "Function missing before rename",
+                        ))
+                        break
+                    current = str(getattr(fn, "name", "") or "")
+                    if current == candidate["new_name"]:
+                        continue
+                    if current != candidate["before_name"]:
+                        if _is_go_rename_auto_name(current, addr):
+                            candidate = dict(candidate)
+                            candidate["before_name"] = current
+                        else:
+                            skipped_during_apply += 1
+                            continue
+                    applied.append(candidate)
+                    try:
+                        fn.name = candidate["new_name"]
+                    except Exception as exc:  # noqa: BLE001 - preserve all-or-nothing rename
+                        failed_rows.append(self._go_rename_failure_row(
+                            candidate, "verification_failed",
+                            f"Live rename failed: {_serialize_error(exc)}",
+                        ))
+                        break
+                    observed = str(getattr(fn, "name", "") or "")
+                    if observed != candidate["new_name"]:
+                        failed_rows.append(self._go_rename_failure_row(
+                            candidate, "verification_failed", "Live rename readback disagreed",
+                        ))
+                        break
                     verified_count += 1
-                    continue
-                req = r.get("requested") if isinstance(r.get("requested"), dict) else {}
-                failed_rows.append({
-                    "op": r.get("op", "rename_symbol"),
-                    "address": r.get("address") or req.get("identifier"),
-                    "new_name": r.get("new_name") or req.get("new_name"),
-                    "status": r.get("status"),
-                    "message": r.get("message"),
-                })
-            result["results"] = failed_rows
-            # `go_verified_count` = renames that passed readback BEFORE any revert.
-            # The pipeline is all-or-nothing: on ANY failure it reverts the whole
-            # batch (committed=False), so nothing actually landed. `go_committed_count`
-            # is the honest "how many names are now in the database" -- 0 on a
-            # rolled-back batch, else the verified count (#217 review).
-            result["go_verified_count"] = verified_count
-            result["go_failed_count"] = len(failed_rows)
-            result["go_committed_count"] = verified_count if result.get("committed") else 0
+            if failed_rows:
+                break
+
+        rolled_back = True
+        if preview or failed_rows:
+            rolled_back = self._rollback_go_renames(bv, applied)
+        committed = bool((not preview) and not failed_rows)
+        success = bool(not failed_rows and (not preview or rolled_back))
+        if committed and verified_count:
+            self.targets.mark_dirty(bv)
+
+        skipped_total = skipped_user_named + skipped_during_apply
+        result = {
+            "kind": "go_rename",
+            "success": success,
+            "committed": committed,
+            "preview": preview,
+            "results": failed_rows,
+            "go_renamed_candidates": len(candidates),
+            "go_verified_count": verified_count,
+            "go_failed_count": len(failed_rows),
+            "go_committed_count": verified_count if committed else 0,
+            "skipped_user_named": skipped_total,
+            "defined_count": defined_count,
+            "chunk_size": GO_RENAME_CHUNK_SIZE,
+        }
+        if preview or failed_rows:
+            result["rolled_back"] = rolled_back
+        if skipped_during_apply:
+            result["skipped_changed_during_apply"] = skipped_during_apply
+        if failed_rows and not rolled_back:
+            result["message"] = "Rollback failed; the view may be partially renamed"
+        elif preview and not rolled_back:
+            result["message"] = "Preview rollback failed; the view may be partially renamed"
         return result
 
     def _ascii_render(self, *a, **k):
@@ -2111,6 +2325,11 @@ def _bind_shutdown(bridge, params, target):
     return {"shutting_down": True}
 
 
+@op("cancel_request", lock="none")
+def _bind_cancel_request(bridge, params, target):
+    return bridge._cancel_request(params.get("request_id"))
+
+
 @op("load_binary", lock="none")
 def _bind_load_binary(bridge, params, target):
     return bridge._load_binary(
@@ -2422,7 +2641,7 @@ def _bind_go_functions(bridge, params, target):
     )
 
 
-@op("go_rename", lock="write")
+@op("go_rename", lock="none")
 def _bind_go_rename(bridge, params, target):
     return bridge._go_rename(
         target,

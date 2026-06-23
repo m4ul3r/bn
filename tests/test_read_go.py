@@ -143,42 +143,42 @@ class _FakeFn:
         self.name = name
 
 
+def _fake_functions(names: dict[int, str]):
+    fns = {addr: _FakeFn(name) for addr, name in names.items()}
+    return fns, lambda addr: fns.get(addr)
+
+
 def test_go_rename_applies_recovered_names_auto_only(monkeypatch):
     # #217: go rename applies recovered Go names to AUTO-named (sub_) functions
     # only -- never clobbering a user/symbol name -- and compacts the bulk result.
     blob = _build_pclntab()                       # main.foo @0x401000, main.bar @0x402000
     bv = _GoBV(blob, defined={0x401000, 0x402000})
-    names = {0x401000: "sub_401000", 0x402000: "MyHandler"}   # foo=auto, bar=user-named
-    monkeypatch.setattr(bv, "get_function_at",
-                        lambda a: _FakeFn(names[a]) if a in names else None)
+    fns, get_function_at = _fake_functions({
+        0x401000: "sub_401000",
+        0x402000: "MyHandler",
+    })
+    monkeypatch.setattr(bv, "get_function_at", get_function_at)
     bridge, inst = _ctx(monkeypatch, bv)
-
-    captured = {}
-    def fake_mutation(sel, preview, ops):
-        captured["ops"] = ops
-        return {"success": True, "committed": not preview, "preview": preview,
-                "results": [{"op": "rename_symbol", "status": "verified",
-                             "requested": {"identifier": o["identifier"], "new_name": o["new_name"]}}
-                            for o in ops],
-                "affected_functions": [{"x": 1}] * 5}     # heavy -> must be dropped
-    monkeypatch.setattr(inst, "_mutation", fake_mutation)
+    monkeypatch.setattr(inst, "_mutation",
+                        lambda *a, **k: pytest.fail("go rename must not use generic mutation"))
 
     out = inst._go_rename(None)
     assert out["kind"] == "go_rename"
     assert out["go_renamed_candidates"] == 1 and out["skipped_user_named"] == 1
-    assert captured["ops"][0]["new_name"] == "main.foo"
-    assert captured["ops"][0]["identifier"] == hex(0x401000)
+    assert fns[0x401000].name == "main.foo"
+    assert fns[0x402000].name == "MyHandler"
     # compacted: blast radius dropped, failures-only results, counts present
     assert "affected_functions" not in out
     assert out["go_verified_count"] == 1 and out["go_failed_count"] == 0
+    assert out["go_committed_count"] == 1
     assert out["results"] == []
 
 
 def test_go_rename_noop_when_already_named(monkeypatch):
     blob = _build_pclntab()
     bv = _GoBV(blob, defined={0x401000})
-    monkeypatch.setattr(bv, "get_function_at",
-                        lambda a: _FakeFn("main.foo") if a == 0x401000 else None)  # already the Go name
+    _fns, get_function_at = _fake_functions({0x401000: "main.foo"})
+    monkeypatch.setattr(bv, "get_function_at", get_function_at)
     bridge, inst = _ctx(monkeypatch, bv)
     monkeypatch.setattr(inst, "_mutation",
                         lambda *a, **k: pytest.fail("mutation must not run on a noop"))
@@ -228,42 +228,87 @@ def test_go_rename_guard_is_exact_not_prefix(monkeypatch):
     # `sub_` PREFIX -- so a user name like `sub_handler` is NOT clobbered.
     blob = _build_pclntab()                       # main.foo @0x401000, main.bar @0x402000
     bv = _GoBV(blob, defined={0x401000, 0x402000})
-    names = {0x401000: "sub_401000", 0x402000: "sub_handler"}   # exact vs sub_-prefixed user name
-    monkeypatch.setattr(bv, "get_function_at",
-                        lambda a: _FakeFn(names[a]) if a in names else None)
+    fns, get_function_at = _fake_functions({
+        0x401000: "sub_401000",
+        0x402000: "sub_handler",
+    })
+    monkeypatch.setattr(bv, "get_function_at", get_function_at)
     bridge, inst = _ctx(monkeypatch, bv)
-    captured = {}
-    def fake_mutation(sel, preview, ops):
-        captured["ops"] = ops
-        return {"success": True, "committed": True,
-                "results": [{"op": "rename_symbol", "status": "verified",
-                             "requested": {"identifier": o["identifier"], "new_name": o["new_name"]}}
-                            for o in ops]}
-    monkeypatch.setattr(inst, "_mutation", fake_mutation)
+    monkeypatch.setattr(inst, "_mutation",
+                        lambda *a, **k: pytest.fail("go rename must not use generic mutation"))
     out = inst._go_rename(None)
     assert out["go_renamed_candidates"] == 1            # only exact sub_401000
     assert out["skipped_user_named"] == 1               # sub_handler NOT clobbered
-    assert captured["ops"][0]["identifier"] == hex(0x401000)
+    assert fns[0x401000].name == "main.foo"
+    assert fns[0x402000].name == "sub_handler"
     assert out["go_committed_count"] == 1               # committed -> landed count == verified
 
 
-def test_go_rename_committed_count_zero_on_rollback(monkeypatch):
-    # #217 review: when the all-or-nothing batch reverts (committed=False),
-    # go_committed_count must be 0 even though rows passed readback pre-revert.
+def test_go_rename_preview_applies_and_reverts(monkeypatch):
     blob = _build_pclntab()
     bv = _GoBV(blob, defined={0x401000})
-    monkeypatch.setattr(bv, "get_function_at",
-                        lambda a: _FakeFn("sub_401000") if a == 0x401000 else None)
+    fns, get_function_at = _fake_functions({0x401000: "sub_401000"})
+    monkeypatch.setattr(bv, "get_function_at", get_function_at)
     bridge, inst = _ctx(monkeypatch, bv)
-    def fake_mutation(sel, preview, ops):
-        return {"success": False, "committed": False, "rolled_back": True,
-                "results": [{"op": "rename_symbol", "status": "verified",
-                             "requested": {"identifier": ops[0]["identifier"],
-                                           "new_name": ops[0]["new_name"]}},
-                            {"op": "rename_symbol", "status": "verification_failed",
-                             "requested": {"identifier": "0x402000", "new_name": "main.bar"}}]}
-    monkeypatch.setattr(inst, "_mutation", fake_mutation)
+    out = inst._go_rename(None, preview=True)
+    assert out["success"] is True
+    assert out["preview"] is True
+    assert out["committed"] is False
+    assert out["rolled_back"] is True
+    assert out["go_verified_count"] == 1
+    assert out["go_committed_count"] == 0
+    assert fns[0x401000].name == "sub_401000"
+
+
+def test_go_rename_readback_failure_rolls_back(monkeypatch):
+    class _RejectingFn:
+        def __init__(self):
+            self._name = "sub_401000"
+
+        @property
+        def name(self):
+            return self._name
+
+        @name.setter
+        def name(self, value):
+            self._name = "renamed_elsewhere" if value == "main.foo" else value
+
+    blob = _build_pclntab()
+    bv = _GoBV(blob, defined={0x401000})
+    fn = _RejectingFn()
+    monkeypatch.setattr(bv, "get_function_at", lambda addr: fn if addr == 0x401000 else None)
+    bridge, inst = _ctx(monkeypatch, bv)
+
     out = inst._go_rename(None)
-    assert out["go_verified_count"] == 1                # passed readback before revert
-    assert out["go_committed_count"] == 0               # but nothing landed (reverted)
+    assert out["success"] is False
+    assert out["committed"] is False
+    assert out["rolled_back"] is True
+    assert out["go_verified_count"] == 0
     assert out["go_failed_count"] == 1
+    assert out["go_committed_count"] == 0
+    assert fn.name == "sub_401000"
+
+
+def test_go_rename_cancel_rolls_back(monkeypatch):
+    blob = _build_pclntab()
+    bv = _GoBV(blob, defined={0x401000, 0x402000})
+    fns, get_function_at = _fake_functions({
+        0x401000: "sub_401000",
+        0x402000: "sub_402000",
+    })
+    monkeypatch.setattr(bv, "get_function_at", get_function_at)
+    bridge, inst = _ctx(monkeypatch, bv)
+    calls = {"count": 0}
+
+    def fake_cancelled():
+        calls["count"] += 1
+        return calls["count"] > 1
+
+    monkeypatch.setattr(bridge, "_request_cancelled", fake_cancelled)
+    monkeypatch.setattr(bridge, "GO_RENAME_CHUNK_SIZE", 1)
+
+    with pytest.raises(RuntimeError, match="request cancelled"):
+        inst._go_rename(None)
+
+    assert fns[0x401000].name == "sub_401000"
+    assert fns[0x402000].name == "sub_402000"
