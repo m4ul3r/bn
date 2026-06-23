@@ -20,6 +20,21 @@ def _render_fallback_text(value: Any) -> str:
     return json.dumps(value, indent=2, sort_keys=True)
 
 
+def _render_function_bundle_text(value: Any) -> str:
+    """`bundle function` is a composite JSON artifact (function info + decompile +
+    IL + xrefs + types) with no compact text form. Without a renderer the explicit
+    --format text path emitted a single line of escaped JSON; pretty-print it with
+    a note instead so a text-defaulting agent gets something readable (#362)."""
+    if not isinstance(value, (dict, list)):
+        return _render_fallback_text(value)
+    try:
+        body = json.dumps(value, indent=2, sort_keys=True)
+    except (TypeError, ValueError):
+        return _render_fallback_text(value)
+    return ("# function bundle: composite JSON (use --format json for machine "
+            "consumption)\n" + body)
+
+
 def _as_dict(value: Any) -> dict[str, Any]:
     """Coerce a nested field to a dict for safe ``.get()`` chains.
 
