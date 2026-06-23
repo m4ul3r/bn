@@ -1799,6 +1799,42 @@ def _parse_type_or_hint(ctx, bv, op: dict[str, Any], type_text: Any, *, label: s
         ) from exc
 
 
+def _parse_concrete_type(ctx, bv, op: dict[str, Any], type_text: Any, *, label: str):
+    """``_parse_type_or_hint`` plus the two coercion guards a concrete variable /
+    field type needs so a SILENTLY-coerced type is rejected (``invalid_request``)
+    instead of applied and reported ``verified`` against itself (#367). BN's
+    headless C parser, confirmed on real BN:
+
+    * drops a ``:N`` bitfield width and mis-lays-out the members as full-width
+      integers (the same defect #322 guards for ``types declare``); and
+    * drops the trailing ``*`` of a pointer-to-inline-anonymous-aggregate
+      (``struct{...}*`` parses to a struct VALUE, losing pointer-ness).
+
+    The live verify path compares the applied type against itself, so neither is
+    caught downstream -- they must be rejected here. Named-type pointers
+    (``Foo*``) keep pointer-ness and pass; only the inline-anon drop is caught."""
+    text = str(type_text)
+    if _declaration_has_bitfield(text):
+        raise OperationFailure(
+            "invalid_request",
+            f"{label} {text!r} uses C bitfield syntax (`:N`), which BN's headless "
+            "parser silently drops and mis-lays-out as full-width members (#322/"
+            "#367). Declare the type with explicit-width fields instead.",
+            requested=_operation_requested(ctx, op),
+        )
+    parsed, hint = _parse_type_or_hint(ctx, bv, op, type_text, label=label)
+    if text.rstrip().endswith("*") and "Pointer" not in _type_class_name(parsed):
+        raise OperationFailure(
+            "invalid_request",
+            f"{label} {text!r} requests a pointer, but BN's parser dropped the "
+            "pointer-ness (it does so for inline anonymous aggregates like "
+            "`struct{...}*`). Name the type first (`bn types declare`), then use "
+            "`<Name>*`.",
+            requested=_operation_requested(ctx, op),
+        )
+    return parsed, hint
+
+
 def _op_set_prototype(ctx, bv, op: dict[str, Any], restores: list | None = None):
     fn = ctx._find_function(bv, op["identifier"])
     expected_type, _ = _parse_type_or_hint(ctx, bv, op, op["prototype"], label="prototype")
@@ -1915,7 +1951,7 @@ def _op_local_rename(ctx, bv, op: dict[str, Any], restores: list | None = None):
 def _op_local_retype(ctx, bv, op: dict[str, Any], restores: list | None = None):
     fn = ctx._find_function(bv, op["function"])
     var, is_parameter = vars_mod._find_variable_selector(fn, str(op["variable"]))
-    expected_type, _ = _parse_type_or_hint(ctx, bv, op, op["new_type"], label="type")
+    expected_type, _ = _parse_concrete_type(ctx, bv, op, op["new_type"], label="type")
     # Variable.type is a live property backed by the core: snapshot it
     # before mutating (see _op_local_rename).
     before_type_obj = var.type
@@ -2007,7 +2043,7 @@ def _commit_struct_builder(ctx, bv, struct_name: str, builder):
 def _op_struct_field_set(ctx, bv, op: dict[str, Any]):
     struct_name = str(op["struct_name"])
     resolved_name, builder = _struct_builder(ctx, bv, struct_name)
-    field_type, _ = _parse_type_or_hint(ctx, bv, op, op["field_type"], label="field type")
+    field_type, _ = _parse_concrete_type(ctx, bv, op, op["field_type"], label="field type")
     offset = _parse_address(op["offset"])
     overwrite = _validate_bool(op.get("overwrite_existing"), label="overwrite_existing", default=True)
     before_type = bv.get_type_by_name(resolved_name)
