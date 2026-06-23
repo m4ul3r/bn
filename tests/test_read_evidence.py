@@ -1157,6 +1157,10 @@ def test_orient_digest_composes_subreads_and_handles_quick(monkeypatch):
     assert d["function_count"] == 42
     assert d["imports_summary"]["total_symbols"] == 3
     assert d["strings_sample"]["items"][0]["value"] == "hi"
+    # orient samples strings at a higher min-length (6) than `bn strings` (BN
+    # default ~4), so its total diverges; disclose the filter so the gap is
+    # explained, not a mystery (#357).
+    assert d["strings_min_length"] == 6
 
     # --quick: no strings call, honest unavailable marker
     monkeypatch.setattr(inst, "_target_info",
@@ -1180,9 +1184,13 @@ def test_render_orient_text_card(monkeypatch):
          "analysis_state": "full", "function_count": 42,
          "imports_summary": {"total_symbols": 3, "by_kind": {"function": 3}},
          "sections": {"items": [{"name": ".text"}], "total": 1},
+         "strings_min_length": 6,
          "strings_sample": {"items": [{"address": "0x1", "value": "hello"}], "total": 1}}
     out = _render_orient_text(d)
     assert "foo" in out and "analysis: full" in out and "functions: 42" in out and "hello" in out
+    # the strings line discloses the min-length filter so its total can be
+    # reconciled with `bn strings` (#357).
+    assert "min-length 6" in out
     # --quick view: the warning fires and strings shows unavailable
     d2 = {**d, "analyzed": False, "analysis_state": "quick",
           "strings_sample": {"unavailable": "run refresh"}}

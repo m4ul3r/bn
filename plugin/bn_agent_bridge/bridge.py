@@ -1761,11 +1761,15 @@ class BinaryNinjaBridge:
         target = self._target_info(selector)
         analyzed = bool(target.get("analyzed", True))
         imports_summary = read_misc._imports(self.ctx, selector, summary=True)
+        # Orient samples higher-signal strings (min-length 6) than `bn strings`
+        # (BN default ~4), so its `total` is smaller; surfaced as
+        # `strings_min_length` so the discrepancy is disclosed, not a mystery (#357).
+        strings_min_length = 6
         if analyzed:
             try:
                 strings_sample = read_misc._strings(
                     self.ctx, selector, query=None, offset=0,
-                    limit=strings_limit, min_length=6,
+                    limit=strings_limit, min_length=strings_min_length,
                 )
             except RuntimeError as exc:
                 strings_sample = {"unavailable": str(exc)}
@@ -1783,6 +1787,7 @@ class BinaryNinjaBridge:
             "analysis_state": target.get("analysis_state"),
             "imports_summary": imports_summary,
             "strings_sample": strings_sample,
+            "strings_min_length": strings_min_length,
             "function_count": func_count.get("total", func_count.get("count")),
             "sections": sections,
         }

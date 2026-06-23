@@ -1360,7 +1360,11 @@ def _render_orient_text(value: Any) -> str:
         lines.append(f"  strings: unavailable — {ss['unavailable']}")
     elif isinstance(ss, dict):
         items = ss.get("items") or []
-        lines.append(f"  strings (sample {len(items)} of {ss.get('total', len(items))}):")
+        # Disclose the min-length filter so orient's total reconciles with the
+        # `bn strings` total (which uses a lower default) (#357).
+        mn = value.get("strings_min_length")
+        filt = f"min-length {mn}; " if mn is not None else ""
+        lines.append(f"  strings ({filt}sample {len(items)} of {ss.get('total', len(items))}):")
         for s in items[:15]:
             if isinstance(s, dict):
                 # `or ''` (not just the .get default) guards an explicit value:None.
