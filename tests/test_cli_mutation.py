@@ -295,6 +295,23 @@ def test_callsites_within_file_ignores_comments_and_blank_lines(fake_transport, 
     ]
 
 
+def test_callsites_within_file_binary_gives_clean_error(tmp_path, capsys):
+    # The --within-file flag invites passing a binary path by mistake. A
+    # non-UTF-8 file must surface a clean BridgeError (exit 2), not a raw
+    # UnicodeDecodeError traceback (exit 1). See issue #353.
+    scope_file = tmp_path / "looks_like_a_list.bin"
+    scope_file.write_bytes(b"\x7fELF\x02\x01\x01\x00\xff\xfe\xfd\x00binary")
+
+    rc = bn.cli.main(
+        ["callsites", "--target", "active", "--within-file", str(scope_file), "strcpy"]
+    )
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "UTF-8 text file" in err
+    assert str(scope_file) in err
+
+
 def test_comment_get_uses_implicit_target_when_single_target_is_open(fake_transport, capsys):
     calls = fake_transport(
         {

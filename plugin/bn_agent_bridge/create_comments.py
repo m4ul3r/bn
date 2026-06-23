@@ -351,6 +351,19 @@ def _py_exec(ctx, selector: str | None, script: str):
     with contextlib.redirect_stdout(stdout):
         try:
             exec(script, scope, scope)
+        except (SystemExit, KeyboardInterrupt) as exc:
+            # These are BaseException, not Exception, so the broad handler below
+            # would let them through and unwind the worker thread -- the client
+            # then sees a misleading "empty response / worker faulted" instead of
+            # the real cause. A snippet calling sys.exit()/raising SystemExit (or
+            # a stray KeyboardInterrupt) is the user's own bug, not a bridge
+            # fault, so report it cleanly and keep the worker alive (#387).
+            code = getattr(exc, "code", None)
+            detail = f" (code {code!r})" if isinstance(exc, SystemExit) else ""
+            raise RuntimeError(
+                f"py exec snippet raised {type(exc).__name__}{detail}; "
+                "the worker was protected"
+            ) from exc
         except Exception as exc:  # noqa: BLE001 - user script errors are user-facing
             # Report every script failure the same way -- "TypeName: message".
             # Previously a ValueError surfaced as a bare message while a
