@@ -293,21 +293,37 @@ def _default_skill_install_roots() -> list[Path]:
                  help="Don't auto-prefer a sibling .bndb file"),
              arg("--quick", "--no-analysis", action="store_true",
                  help="Preload without full analysis (fast); run `bn refresh` for full analysis"),
+             arg("--no-marker", action="store_true", default=False, dest="no_marker",
+                 help="Don't drop a project-local `.bn-<id>` marker (#80); markers let a bare "
+                      "`bn` in this project resolve this instance among many (env: BN_NO_MARKERS)"),
          ])
 def _session_start(args: argparse.Namespace) -> int:
+    import os
     instance_id = getattr(args, "instance_id", None)
     instance = cli.spawn_instance(instance_id)
 
     binaries = getattr(args, "binaries", None) or []
     prefer_bndb = not args.no_bndb
     quick = bool(getattr(args, "quick", False))
+    # Mirror `bn load`: pass our cwd + the marker preference so the bridge drops a
+    # `.bn-<id>` project marker (#80) -- the documented `session start
+    # --instance-id X` workflow must register the marker just like `load` (#377).
+    _env = (os.environ.get("BN_NO_MARKERS") or "").strip().lower()
+    no_marker = bool(getattr(args, "no_marker", False)) or (_env not in ("", "0", "false", "no", "off"))
+    workdir = os.getcwd()
     loaded = []
     for binary in binaries:
         resolved = str(Path(binary).expanduser().resolve())
         try:
             resp = cli.send_request(
                 "load_binary",
-                params={"path": resolved, "prefer_bndb": prefer_bndb, "quick": quick},
+                params={
+                    "path": resolved,
+                    "prefer_bndb": prefer_bndb,
+                    "quick": quick,
+                    "workdir": workdir,
+                    "no_marker": no_marker,
+                },
                 instance_id=instance.instance_id,
             )
             loaded.append(resp["result"])
