@@ -481,7 +481,7 @@ def _render_session_stop_text(value: Any) -> str:
 def _render_session_list_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    instances = list(value.get("instances") or [])
+    instances = list(value.get("items") or value.get("instances") or [])
     if not instances:
         return "no sessions"
     lines = []
@@ -587,13 +587,19 @@ def _render_target_summary(value: dict[str, Any]) -> str:
 
 
 def _render_target_list_text(value: Any) -> str:
-    if not isinstance(value, list):
+    # Accept both the {kind, items} envelope (#358) and a bare list (older
+    # callers / raw socket clients).
+    if isinstance(value, dict):
+        items = value.get("items")
+    else:
+        items = value
+    if not isinstance(items, list):
         return _render_fallback_text(value)
-    if not value:
+    if not items:
         return "no targets"
     return "\n\n".join(
         _render_target_summary(item) if isinstance(item, dict) else _render_fallback_text(item)
-        for item in value
+        for item in items
     )
 
 

@@ -532,11 +532,14 @@ def test_session_list_shows_instances(monkeypatch, capsys):
     assert rc == 0
     stdout = capsys.readouterr().out
     parsed = json.loads(stdout)
-    assert len(parsed["instances"]) == 2
-    assert parsed["instances"][0]["selector"] == "aaaa1111"
-    assert parsed["instances"][0]["instance_id"] == "aaaa1111"
-    assert parsed["instances"][1]["instance_id"] == "bbbb2222"
-    assert "rss_mb" in parsed["instances"][0]
+    # #358: session/instance list now uses the {kind, items} envelope (with
+    # total_rss_mb kept as an extra field).
+    assert parsed["kind"] == "instances"
+    assert len(parsed["items"]) == 2
+    assert parsed["items"][0]["selector"] == "aaaa1111"
+    assert parsed["items"][0]["instance_id"] == "aaaa1111"
+    assert parsed["items"][1]["instance_id"] == "bbbb2222"
+    assert "rss_mb" in parsed["items"][0]
     assert "total_rss_mb" in parsed
 
 
@@ -858,7 +861,7 @@ def test_session_list_marks_sticky(tmp_session, monkeypatch, capsys):
     rc = bn.cli.main(["session", "list", "--format", "json"])
     assert rc == 0
     parsed = json.loads(capsys.readouterr().out)
-    by_id = {entry["instance_id"]: entry for entry in parsed["instances"]}
+    by_id = {entry["instance_id"]: entry for entry in parsed["items"]}
     assert by_id["aaaa1111"].get("sticky") is True
     assert "sticky" not in by_id["bbbb2222"]
 
@@ -878,7 +881,9 @@ def test_target_list_marks_sticky(tmp_session, fake_transport, capsys):
     rc = bn.cli.main(["target", "list", "--format", "json"])
     assert rc == 0
     parsed = json.loads(capsys.readouterr().out)
-    by_sel = {entry["selector"]: entry for entry in parsed}
+    # #358: target list now uses the {kind, items} envelope.
+    assert parsed["kind"] == "targets"
+    by_sel = {entry["selector"]: entry for entry in parsed["items"]}
     assert by_sel["foo.so"].get("sticky") is True
     assert "sticky" not in by_sel["bar.so"]
 
@@ -1208,7 +1213,7 @@ def test_instance_list_json_includes_binaries(monkeypatch, capsys):
     rc = bn.cli.main(["instance", "list", "--format", "json"])
     assert rc == 0
     data = json.loads(capsys.readouterr().out)
-    assert data["instances"][0]["binaries"] == ["/fw/lib64/libfoo.so"]
+    assert data["items"][0]["binaries"] == ["/fw/lib64/libfoo.so"]
 
 
 def test_instance_list_no_binaries_key_when_empty(monkeypatch, capsys):
