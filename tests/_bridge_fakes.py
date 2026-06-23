@@ -711,14 +711,18 @@ def _local_retype_result(**overrides):
 
 
 class _LoadBV:
-    def __init__(self):
+    def __init__(self, filename: str | None = None, view_type: str = "ELF"):
         self.analysis_updated = False
+        # _load_binary's #355 idempotency scan reads bv.file.filename, and the
+        # #369 raw-mapped warning reads bv.view_type.
+        self.file = types.SimpleNamespace(filename=filename)
+        self.view_type = view_type
 
     def update_analysis_and_wait(self):
         self.analysis_updated = True
 
 
-def _setup_load_test(monkeypatch):
+def _setup_load_test(monkeypatch, *, view_type: str = "ELF"):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     monkeypatch.setattr(instance.targets, "refresh", lambda: [])
@@ -729,7 +733,7 @@ def _setup_load_test(monkeypatch):
 
     def fake_load(path, update_analysis=True):
         loaded_paths.append(path)
-        return _LoadBV()
+        return _LoadBV(filename=path, view_type=view_type)
 
     binaryninja.load = fake_load
     return bridge, instance, loaded_paths
