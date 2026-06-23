@@ -459,7 +459,12 @@ def _pvs_targets(ctx, bv, pvs) -> list[dict[str, Any]]:
 def _resolved_calls(ctx, selector, identifier, *, direction: str = "both", resolve_indirect: bool = True):
     bv = ctx._resolve_view(selector)
     func = ctx._find_function(bv, identifier)
-    result: dict[str, Any] = {"function": {"name": func.name, "address": hex(func.start)}}
+    # `kind` lets a consumer of the {kind, ...} family identify a callgraph read
+    # (it is a composite callees+callers structure, not a flat items list) (#371.2).
+    result: dict[str, Any] = {
+        "kind": "callgraph",
+        "function": {"name": func.name, "address": hex(func.start)},
+    }
 
     if direction in ("callees", "both"):
         il = il_format._il_function_for(func, "mlil", True)

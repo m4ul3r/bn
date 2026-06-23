@@ -323,12 +323,24 @@ def test_batch_apply_accepts_target_flag(monkeypatch, fake_transport):
     assert calls[-1]["params"].get("target") == "foo.bndb"
 
 
-def test_batch_apply_manifest_target_overrides_flag(monkeypatch, fake_transport):
-    # When both are given, the in-payload manifest "target" wins.
+def test_batch_apply_cli_target_overrides_manifest(monkeypatch, fake_transport):
+    # CLI -t is the explicit per-invocation selector and WINS over a manifest
+    # "target" (#366): a fan-out agent that copies the documented {"target":"active"}
+    # example but passes a correct -t must not be sabotaged by the in-payload value.
+    import io
+    monkeypatch.setattr("sys.stdin", io.StringIO('{"target": "active", "ops": []}'))
+    calls = fake_transport({"batch_apply": {"ok": True, "result": {"success": True, "results": []}}})
+    rc = bn.cli.main(["batch", "apply", "-", "-t", "fromflag", "-i", "inst"])
+    assert rc == 0
+    assert calls[-1]["params"].get("target") == "fromflag"
+
+
+def test_batch_apply_manifest_target_used_when_no_flag(monkeypatch, fake_transport):
+    # Without -t, the manifest "target" is still honored.
     import io
     monkeypatch.setattr("sys.stdin", io.StringIO('{"target": "explicit", "ops": []}'))
     calls = fake_transport({"batch_apply": {"ok": True, "result": {"success": True, "results": []}}})
-    rc = bn.cli.main(["batch", "apply", "-", "-t", "fromflag", "-i", "inst"])
+    rc = bn.cli.main(["batch", "apply", "-", "-i", "inst"])
     assert rc == 0
     assert calls[-1]["params"].get("target") == "explicit"
 @pytest.mark.parametrize("argv, expected", [
