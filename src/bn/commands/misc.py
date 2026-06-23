@@ -8,6 +8,7 @@ from typing import Any
 
 from ..cli import _call, _effective_limit, _int_or_hex, _mutate, _mutation_exit_code, _non_negative_int, _pick, arg, command, mutex, preview_arg
 from ..formatters import (
+    _render_function_bundle_text,
     _render_go_functions_text,
     _render_go_rename_text,
     _render_imports_summary_text,
@@ -239,6 +240,7 @@ def _bundle_function(args: argparse.Namespace) -> int:
         "bundle_function",
         {"identifier": args.identifier, "out_path": str(args.out) if args.out else None},
         require_target=True,
+        text_renderer=_render_function_bundle_text,
         stem="function-bundle",
         bridge_writes_output=bool(args.out),
     )

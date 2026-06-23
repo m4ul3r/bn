@@ -9,6 +9,18 @@ import pytest
 from _cli_helpers import *  # noqa: F401,F403
 
 
+def test_render_function_bundle_text_pretty_prints_not_escaped():
+    """`bundle function --format text` must render readable multi-line JSON with a
+    note, not a single line of escaped JSON like the default fallback (#362)."""
+    from bn.formatters import _render_function_bundle_text
+    value = {"kind": "function_bundle",
+             "function": {"name": "login", "address": "0x401000"}}
+    out = _render_function_bundle_text(value)
+    assert out.count("\n") >= 2              # multi-line, not one escaped blob
+    assert '"name": "login"' in out          # readable, indented JSON
+    assert "function bundle" in out.lower()  # the note
+
+
 def test_parser_default_formats():
     parser = bn.cli.build_parser()
 
