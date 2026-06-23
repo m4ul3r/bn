@@ -751,3 +751,62 @@ class TestTaintEmptyVerdictHonesty:
                 pytest.skip("no empty-verdict function found in this fixture")
         finally:
             _session_stop(inst)
+
+
+class TestTaintUnderRecoveredArgFrontier:
+    """Regression for #381: a tainted caller argument flowing into a callee whose
+    parameters BN under-recovered (Thumb 0-arity miss / variadic) must surface an
+    honest frontier, not silently vanish. Forcing the callee to 0-arity via
+    `proto set` deterministically simulates the recovery miss; needs real BN (and
+    an ARM cross-compiler for the register-passed-arg shape)."""
+
+    _SRC = (
+        "#include <string.h>\n#include <stdio.h>\n"
+        "__attribute__((noinline)) void build_cmd(char *arg){\n"
+        "  char b1[64], b2[64], b3[128];\n"
+        "  memcpy(b1, arg, 48); sprintf(b2, \"%s\", arg); strcpy(b3, arg);\n"
+        "  printf(\"%s %s %s\\n\", b1, b2, b3);\n}\n"
+        "int main(int argc, char **argv){ if (argc > 1) build_cmd(argv[1]); return 0; }\n"
+    )
+
+    def test_under_recovered_callee_arg_emits_frontier(self, tmp_path):
+        import shutil
+        cc = shutil.which("arm-linux-gnueabihf-gcc")
+        if cc is None:
+            pytest.skip("arm-linux-gnueabihf-gcc required for the register-arg shape")
+        src = tmp_path / "vuln.c"
+        src.write_text(self._SRC)
+        binp = tmp_path / "vuln_arm"
+        build = subprocess.run(
+            [cc, "-O1", "-D_FORTIFY_SOURCE=2", "-marm", str(src), "-o", str(binp)],
+            capture_output=True, text=True)
+        if build.returncode != 0:
+            pytest.skip(f"arm build failed: {build.stderr}")
+
+        info = _session_start(str(binp))
+        inst = info["instance_id"]
+        try:
+            def _taint_leaves():
+                out_file = tmp_path / "taint.json"
+                _bn("--instance", inst, "taint", "forward", "-f", "main",
+                    "--source", "param:1", "--format", "json", "--out", str(out_file))
+                return json.loads(out_file.read_text()).get("leaves", [])
+
+            def _frontiers(leaves):
+                return [l for l in leaves if "under-recovered" in str(l.get("note", ""))]
+
+            # Baseline: build_cmd recovered with its arg -> no #381 frontier.
+            assert _frontiers(_taint_leaves()) == []
+
+            # Force the recovery miss: build_cmd as 0-arity.
+            _bn("--instance", inst, "proto", "set", "build_cmd",
+                "void build_cmd(void)", "--format", "json")
+
+            # Now the tainted argv arg into the under-recovered callee must be an
+            # honest frontier, not a silent drop.
+            frontiers = _frontiers(_taint_leaves())
+            assert frontiers, "expected a #381 under-recovered-arg frontier"
+            assert frontiers[0].get("kind") == "unmodeled_callee"
+            assert frontiers[0].get("callee", {}).get("name") == "build_cmd"
+        finally:
+            _session_stop(inst)
