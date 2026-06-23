@@ -3488,6 +3488,145 @@ def test_forward_keeps_overflow_extra_hop_nonconst_index_307(models):
     assert memcpy[0]["class"] == "overflow_len", memcpy[0]
 
 
+def _heap_store_read_func():
+    # dst = malloc(0x40); *dst = p; system(dst) -- a tainted value stored through a
+    # HEAP pointer, then the same heap buffer passed to a sink. Before #319a
+    # heap-keying the store was a coarse_memory_store leaf and system(dst) saw an
+    # untainted buffer (false all-clear).
+    p = FVar("p"); p0 = FSSA(p, 0)
+    dst = FVar("dst"); dst1 = FSSA(dst, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "dst#1 = malloc(0x40)", reads=[], writes=[dst1],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+        FInstr(1, 0x14, "MLIL_STORE_SSA", "*dst#1 = p#0", reads=[p0],
+               dest=FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1]),
+               src=FExpr("MLIL_VAR_SSA", "p#0", reads=[p0])),
+        FInstr(2, 0x18, "MLIL_CALL_SSA", "system(dst#1)", reads=[dst1],
+               dest=FExpr("MLIL_CONST_PTR", "0x2010", constant=0x2010),
+               params=[FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1])]),
+    ]
+    return FFunc("vuln", 0x10, FSSAFunc(instrs), params=[p])
+
+
+def test_forward_heap_buffer_store_read_correlates_319a(models):
+    # A tainted store through a heap pointer must taint the heap buffer (keyed by
+    # alloc site) so a later use of a pointer from the SAME alloc correlates --
+    # system(dst) reached as command_injection, not a silent coarse-store drop (#319a).
+    func = _heap_store_read_func()
+    bv = FBV({0x2000: "malloc", 0x2010: "system"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    sinks = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "system"]
+    assert len(sinks) == 1, result.get("reached_sinks")
+    assert sinks[0]["class"] == "command_injection"
+
+
+def _quote_callee(*, taint_store=True, addr=0x500, alloc_addr=0x900):
+    # quote(s): out = ecalloc(0x40, 1); [*out = s;] return out
+    # The strdup / shell_quote idiom -- fill a heap buffer with the tainted arg and
+    # return it. The returned POINTER's value is the fresh alloc address (not
+    # tainted); only the buffer CONTENT is. taint_store=False models a callee that
+    # ignores its arg and returns a CLEAN buffer (the no-false-positive guard).
+    s = FVar("s"); s0 = FSSA(s, 0)
+    out = FVar("out"); out1 = FSSA(out, 1)
+    instrs = [
+        FInstr(0, addr, "MLIL_CALL_SSA", "out#1 = ecalloc(0x40, 1)", reads=[], writes=[out1],
+               dest=FExpr("MLIL_CONST_PTR", hex(alloc_addr), constant=alloc_addr),
+               params=[FExpr("MLIL_CONST", "0x40", constant=0x40),
+                       FExpr("MLIL_CONST", "1", constant=1)]),
+    ]
+    if taint_store:
+        instrs.append(
+            FInstr(1, addr + 4, "MLIL_STORE_SSA", "*out#1 = s#0", reads=[s0],
+                   dest=FExpr("MLIL_VAR_SSA", "out#1", reads=[out1]),
+                   src=FExpr("MLIL_VAR_SSA", "s#0", reads=[s0])))
+    instrs.append(
+        FInstr(2, addr + 8, "MLIL_RET", "return out#1", reads=[out1],
+               src=[FExpr("MLIL_VAR_SSA", "out#1", reads=[out1])]))
+    return FFunc("quote", addr, FSSAFunc(instrs), params=[s])
+
+
+def _driver_calls_quote(callee_addr=0x500):
+    # driver(filename): q = quote(filename); system(q)
+    fn = FVar("filename"); fn0 = FSSA(fn, 0)
+    q = FVar("q"); q1 = FSSA(q, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "q#1 = quote(filename#0)", reads=[fn0], writes=[q1],
+               dest=FExpr("MLIL_CONST_PTR", hex(callee_addr), constant=callee_addr),
+               params=[FExpr("MLIL_VAR_SSA", "filename#0", reads=[fn0])]),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "system(q#1)", reads=[q1],
+               dest=FExpr("MLIL_CONST_PTR", "0x910", constant=0x910),
+               params=[FExpr("MLIL_VAR_SSA", "q#1", reads=[q1])]),
+    ]
+    return FFunc("driver", 0x10, FSSAFunc(instrs), params=[fn])
+
+
+def test_forward_interproc_return_of_tainted_heap_buffer(models):
+    # A callee that fills a heap buffer with the tainted arg and RETURNS it must
+    # propagate taint to the caller's result, so system(quote(filename)) is reached
+    # as command_injection. The returned pointer's value isn't attacker-derived;
+    # the scalar reached-return check misses it -- the buffer's tainted CONTENT must
+    # carry across the call boundary (#319a/#376 interprocedural return-of-buffer).
+    driver = _driver_calls_quote()
+    bv = FBV({0x900: "ecalloc", 0x910: "system"}, funcs={0x500: _quote_callee()})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(driver, [te.parse_locator("param:0")])
+    sysk = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "system"]
+    assert len(sysk) == 1, result.get("reached_sinks")
+    assert sysk[0]["class"] == "command_injection"
+
+
+def test_forward_interproc_return_clean_buffer_no_false_positive(models):
+    # GUARD: a callee that ignores its arg and returns a CLEAN heap buffer must NOT
+    # taint the caller's result -- no false command_injection. The return-buffer
+    # recognition keys off the buffer actually being tainted, not merely returned.
+    driver = _driver_calls_quote()
+    bv = FBV({0x900: "ecalloc", 0x910: "system"},
+             funcs={0x500: _quote_callee(taint_store=False)})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(driver, [te.parse_locator("param:0")])
+    sysk = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "system"]
+    assert sysk == [], result.get("reached_sinks")
+
+
+def test_forward_interproc_return_phi_divergent_allocs(models):
+    # The less/shell_quote shape: the callee returns ϕ(buf_A, buf_B) where each
+    # branch has its OWN alloc site (escape vs no-escape path). Only buf_A is filled
+    # with the tainted arg. The convergence-required heap key declines the divergent
+    # merge for stable store/read keying, but the RETURN decision must OR over the
+    # branches: a tainted buffer reachable as the result means the caller can carry
+    # taint -> system reached (no-false-all-clear direction).
+    s = FVar("s"); s0 = FSSA(s, 0)
+    a = FVar("out_a"); a1 = FSSA(a, 1)
+    b = FVar("out_b"); b1 = FSSA(b, 1)
+    r = FVar("r"); r3 = FSSA(r, 3)
+    quote_phi = FFunc("quote_phi", 0x500, FSSAFunc([
+        FInstr(0, 0x500, "MLIL_CALL_SSA", "out_a#1 = ecalloc(0x40, 1)", reads=[], writes=[a1],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_CONST", "0x40", constant=0x40),
+                       FExpr("MLIL_CONST", "1", constant=1)]),
+        FInstr(1, 0x504, "MLIL_STORE_SSA", "*out_a#1 = s#0", reads=[s0],
+               dest=FExpr("MLIL_VAR_SSA", "out_a#1", reads=[a1]),
+               src=FExpr("MLIL_VAR_SSA", "s#0", reads=[s0])),
+        FInstr(2, 0x508, "MLIL_CALL_SSA", "out_b#1 = ecalloc(0x10, 1)", reads=[], writes=[b1],
+               dest=FExpr("MLIL_CONST_PTR", "0x901", constant=0x901),
+               params=[FExpr("MLIL_CONST", "0x10", constant=0x10),
+                       FExpr("MLIL_CONST", "1", constant=1)]),
+        FInstr(3, 0x50c, "MLIL_VAR_PHI", "r#3 = ϕ(out_a#1, out_b#1)", writes=[r3],
+               src=[a1, b1]),
+        FInstr(4, 0x510, "MLIL_RET", "return r#3", reads=[r3],
+               src=[FExpr("MLIL_VAR_SSA", "r#3", reads=[r3])]),
+    ]), params=[s])
+    bv = FBV({0x900: "ecalloc", 0x901: "ecalloc", 0x910: "system"},
+             funcs={0x500: quote_phi})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(_driver_calls_quote(), [te.parse_locator("param:0")])
+    sysk = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "system"]
+    assert len(sysk) == 1, result.get("reached_sinks")
+    assert sysk[0]["class"] == "command_injection"
+
+
 def test_forward_downgrades_unmodeled_single_arg_allocator_wrapper(models):
     # dst = my_alloc_wrapper(len); memcpy(dst, src, len): an unmodeled one-arg
     # allocator wrapper whose sole arg is the copy length -> bounded_len (#229).

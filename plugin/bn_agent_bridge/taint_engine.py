@@ -883,6 +883,93 @@ class TaintEngine:
                 return node
         return None
 
+    def _return_buffer_tainted(self, ssaf: Any, ins: Any, tainted: set) -> bool:
+        """True if a RET returns a POINTER to a tainted buffer -- a callee that
+        fills a heap/stack buffer with tainted bytes and returns it (the strdup /
+        shell_quote idiom). ``read_taint`` only catches a tainted scalar return
+        value; the returned *pointer's* value is the fresh allocation address, not
+        attacker-derived, so the scalar check misses it and the caller sees a clean
+        result -- the buffer's tainted CONTENT is dropped at the call boundary.
+        Recognizing it lets the caller treat the result as tainted, so a later
+        ``%s`` / ``strlen`` / copy of the returned buffer keeps propagating
+        (#319a/#376 interprocedural return-of-tainted-buffer). Relies on the buffer
+        being keyable (stack Variable, global, or heap alloc site)."""
+        srcs = getattr(ins, "src", None)
+        if srcs is None:
+            return False
+        if not isinstance(srcs, (list, tuple)):
+            srcs = [srcs]
+        seen: set = set()
+        return any(self._expr_buffer_tainted(ssaf, e, tainted, seen, 0)
+                   for e in srcs if e is not None)
+
+    def _expr_buffer_tainted(self, ssaf: Any, expr: Any, tainted: set, seen: set, depth: int) -> bool:
+        """Whether *expr* (a returned pointer) reaches a tainted buffer. First the
+        convergent/stack/global buffer target; then -- crucially for a RETURN -- OR
+        over a divergent PHI merge. A function may return ``ϕ(buf_A, buf_B)`` where
+        each branch has its own alloc site (e.g. shell_quote's escape vs no-escape
+        path, each its own ecalloc). The convergence-required heap key declines such
+        a merge for STABLE store/read correlation, but for deciding whether the
+        RESULT can carry taint, any reachable tainted buffer suffices -- the
+        conservative, no-false-all-clear direction."""
+        if expr is None or depth > 24:
+            return False
+        if self._pointee_tainted(ssaf, expr, tainted) is not None:
+            return True
+        var = self._as_single_ssa_var(expr)
+        if var is None:
+            reads = expr_reads(expr)
+            var = reads[0] if len(reads) == 1 else None
+        return self._var_buffer_tainted(ssaf, var, tainted, seen, depth + 1)
+
+    def _var_buffer_tainted(self, ssaf: Any, var: Any, tainted: set, seen: set, depth: int) -> bool:
+        if var is None or depth > 24:
+            return False
+        vk = self._ssa_var_key(var)
+        if vk in seen:
+            return False
+        seen.add(vk)
+        try:
+            d = ssaf.get_ssa_var_definition(var)
+        except Exception:
+            d = None
+        if d is None:
+            return False
+        dop = op_name(d)
+        if "CALL" in dop:
+            key = self._recognized_alloc_key(ssaf, var, d)
+            return key is not None and self._key_tainted(key, tainted)
+        if dop == "MLIL_SET_VAR_SSA":
+            return self._expr_buffer_tainted(ssaf, getattr(d, "src", None), tainted, seen, depth)
+        if "PHI" in dop:
+            return any(self._var_buffer_tainted(ssaf, sv, tainted, seen, depth + 1)
+                       for sv in (getattr(d, "src", None) or []))
+        return False
+
+    def _recognized_alloc_key(self, ssaf: Any, var: Any, d: Any):
+        """``("heap", call_addr)`` if call-def *d* defines *var* via a recognized
+        allocator -- a modeled / size-resolvable allocator (malloc, C++ new,
+        single-arg wrapper) OR a callee whose name carries an allocator hint
+        (malloc/calloc/realloc/ecalloc/xmalloc/strdup ...). The name hint catches
+        the 2-arg calloc family (e.g. less's `ecalloc`) the size-focused _dest_alloc
+        misses. Deliberately NOT the bare pointer-return heuristic -- too broad for
+        a STABLE buffer key (it would conflate the returns of distinct non-allocator
+        pointer functions and over-link). None for a non-allocator return pointer."""
+        if d is None or "CALL" not in op_name(d):
+            return None
+        callee_nm = (self._callee_name(self._resolve_direct_target(d))
+                     or "").split("@", 1)[0].lstrip("_").lower()
+        if (any(tok in callee_nm for tok in self._ALLOC_NAME_HINTS)
+                or self._dest_alloc(ssaf, var)[0] is not None):
+            return ("heap", int(getattr(d, "address", 0)))
+        return None
+
+    @staticmethod
+    def _key_tainted(key: Any, tainted: set) -> bool:
+        if (key, None) in tainted:
+            return True
+        return any(n[0] == key for n in tainted)
+
     # -- operand-role classification at a sink (#163) ----------------------
     # A tainted value can reach an overflow sink either as the buffer/length
     # OPERAND (a real overflow) or merely as an array INDEX/offset inside a
@@ -1020,16 +1107,99 @@ class TaintEngine:
     # scope (the domain of a heavyweight whole-program/CPG analyzer); we
     # over-approximate the whole buffer.
 
+    def _heap_buffer_key(self, ssaf: Any, expr: Any):
+        """Key a HEAP buffer by its allocation site: ``("heap", alloc_call_addr)``
+        when *expr* is (or chases through pure copies + CONSTANT pointer arithmetic
+        to) a var that a recognized allocator CALL defines. Lets a store through a
+        heap pointer and a later read of a pointer from the SAME alloc site
+        correlate -- the heap analogue of the stack-Variable / global keys, for the
+        escape/encode-helper (#319a) and heap-output-buffer (#376) idioms. None if
+        not a recognized heap allocation. (The alloc-in-a-loop boundary -- one call
+        address producing distinct buffers per iteration -- is a known over-link
+        risk handled separately if the corpus sweep shows it.)"""
+        return self._heap_key_expr(ssaf, expr, 0, set())
+
+    @staticmethod
+    def _ssa_var_key(var: Any):
+        """A hashable identity for an SSA var (Variable identity + version), so the
+        chaser can break a loop back-edge (`cursor = ϕ(buf, cursor + 1)`) without a
+        str-format dependency."""
+        vv = getattr(var, "var", None)
+        ident = getattr(vv, "identifier", None)
+        base = ident if ident is not None else str(vv)
+        return (base, getattr(var, "version", None))
+
+    def _heap_key_expr(self, ssaf: Any, expr: Any, depth: int, seen: set):
+        if expr is None or depth > 24:
+            return None
+        # `base + index` / `base - off`: the heap buffer is the POINTER operand; the
+        # index (constant OR not) just selects a byte within it, so the whole buffer
+        # is one coarse key (like a stack buffer at `&buf + i`). This is what makes
+        # an indexed escape/encode-copy loop `out[i] = ...` resolve to `out`'s alloc.
+        if op_name(expr) in ("MLIL_ADD", "MLIL_SUB"):
+            for operand in (getattr(expr, "left", None), getattr(expr, "right", None)):
+                k = self._heap_key_expr(ssaf, operand, depth + 1, seen)
+                if k is not None:
+                    return k
+            return None
+        var = self._as_single_ssa_var(expr)
+        if var is None:
+            reads = expr_reads(expr)
+            var = reads[0] if len(reads) == 1 else None
+        return self._heap_key_var(ssaf, var, depth, seen)
+
+    def _heap_key_var(self, ssaf: Any, var: Any, depth: int, seen: set):
+        """Chase an SSA var's definition to a recognized allocator's call site."""
+        if var is None or depth > 24:
+            return None
+        vk = self._ssa_var_key(var)
+        if vk in seen:  # loop back-edge / already on this chase -- stop
+            return None
+        seen.add(vk)
+        try:
+            d = ssaf.get_ssa_var_definition(var)
+        except Exception:
+            d = None
+        if d is None:
+            return None
+        dop = op_name(d)
+        if "CALL" in dop:
+            return self._recognized_alloc_key(ssaf, var, d)
+        # `ptr = base +/- index` / a pure SSA copy: chase the source expr so an
+        # indexed escape/encode loop (`out = ecalloc(...); ...; cursor = out + i;
+        # *cursor = ...`) resolves to `out`'s alloc site.
+        if dop == "MLIL_SET_VAR_SSA":
+            return self._heap_key_expr(ssaf, getattr(d, "src", None), depth + 1, seen)
+        # PHI -- a loop-carried or branch-merged cursor (`cursor = ϕ(buf, cursor+1)`,
+        # the indexed escape-loop idiom in less's shell_quote). Follow EVERY operand;
+        # the back-edge operand re-enters `cursor` and is cut by `seen`, while the
+        # entry operand reaches the buffer's alloc site. Key ONLY if every operand
+        # that resolves agrees on ONE alloc site -- divergent allocs (`p = c ? a : b`
+        # over two DISTINCT buffers) stay unkeyed, so a genuine merge is not
+        # over-linked.
+        if "PHI" in dop:
+            keys = set()
+            for src_var in getattr(d, "src", None) or []:
+                k = self._heap_key_var(ssaf, src_var, depth + 1, seen)
+                if k is not None:
+                    keys.add(k)
+            return next(iter(keys)) if len(keys) == 1 else None
+        return None
+
     def _buffer_target(self, ssaf: Any, expr: Any):
         """Resolve a pointer expr to ``(key, label)`` for the buffer it points at:
-        a stack Variable (preferred — keeps its name) or a writable global. None if
-        neither. The key is what taint nodes are keyed on; label is for provenance."""
+        a stack Variable (preferred — keeps its name), a writable global, or a
+        heap buffer keyed by allocation site. None if none. The key is what taint
+        nodes are keyed on; label is for provenance."""
         pv = self._pointee_var(ssaf, expr)
         if pv is not None:
             return (var_key(pv), var_label(pv))
         ga = self._global_addr(ssaf, expr)
         if ga is not None:
             return (("global", ga), f"glob_{hex(ga)}")
+        hk = self._heap_buffer_key(ssaf, expr)
+        if hk is not None:
+            return (hk, f"heap_{hex(hk[1])}")
         return None
 
     def _global_addr(self, ssaf: Any, expr: Any, depth: int = 0) -> int | None:
@@ -2957,7 +3127,7 @@ class TaintEngine:
                 opn = op_name(ins)
 
                 if opn == "MLIL_RET":
-                    if read_taint(ins):
+                    if read_taint(ins) or self._return_buffer_tainted(ssaf, ins, tainted):
                         reached_return = True
                     continue
 
@@ -3212,6 +3382,16 @@ class TaintEngine:
                             if taint_node(node, var_label(pv), ins, "store into tainted buffer (memory_approx)", reads):
                                 changed = True
                                 add_assumption("memory aliasing modeled coarsely via pointer-base/AddressOf (memory_approx)")
+                        elif self._heap_buffer_key(ssaf, dest) is not None:
+                            # store through a HEAP pointer (an escape/encode helper
+                            # writing a derived buffer): key the buffer by its alloc
+                            # site so a later read of a pointer from the same alloc
+                            # correlates (#319a). Coarse, version-agnostic.
+                            hk = self._heap_buffer_key(ssaf, dest)
+                            if taint_node((hk, None), f"heap_{hex(hk[1])}", ins,
+                                          "store into tainted heap buffer (alloc-site, memory_approx)", reads):
+                                changed = True
+                                add_assumption("heap buffer aliasing modeled coarsely by allocation site (memory_approx)")
                         else:
                             # tainted store through a pointer parameter -> out-param
                             pidx = self._resolve_to_param_index(func, ssaf, dest)
