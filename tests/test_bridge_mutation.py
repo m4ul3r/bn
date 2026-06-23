@@ -1393,6 +1393,73 @@ def test_struct_field_set_rejects_nonboolean_overwrite_existing(monkeypatch):
     assert builder.added == []  # never reached add_member_at_offset
 
 
+def test_parse_concrete_type_rejects_inline_bitfield(monkeypatch):
+    """An inline struct with a `:N` bitfield must be rejected, not silently
+    accepted: BN's headless parser drops the width and mis-lays-out the members
+    yet the verify path (applied-vs-applied) would report it verified -- the same
+    root as #322, but on the retype/field-set ops that lacked the guard (#367)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _BV:
+        def parse_type_string(self, s):
+            raise AssertionError("bitfield must be rejected before parse")
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        bridge.mutation_engine._parse_concrete_type(
+            instance.ctx, _BV(), {"op": "local_retype"},
+            "struct{unsigned a:3;}", label="type")
+    assert exc.value.status == "invalid_request"
+    assert "bitfield" in exc.value.message.lower()
+
+
+def test_parse_concrete_type_rejects_dropped_pointer(monkeypatch):
+    """A pointer-to-inline-anonymous-aggregate (`struct{...}*`) whose trailing `*`
+    BN silently drops -- parsing it to a struct VALUE -- must be rejected, not
+    reported verified against the coerced value type (#367)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _BV:
+        def parse_type_string(self, s):
+            return _FakeType("struct", type_class="StructureTypeClass"), None
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        bridge.mutation_engine._parse_concrete_type(
+            instance.ctx, _BV(), {"op": "local_retype"},
+            "struct{int a;int b;}*", label="type")
+    assert exc.value.status == "invalid_request"
+    assert "pointer" in exc.value.message.lower()
+
+
+def test_parse_concrete_type_accepts_real_pointer(monkeypatch):
+    """A genuine pointer type (the parser keeps pointer-ness) passes unchanged --
+    only a SILENTLY-coerced pointer is rejected."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _BV:
+        def parse_type_string(self, s):
+            return _FakeType("char*", type_class="PointerTypeClass"), None
+
+    parsed, _ = bridge.mutation_engine._parse_concrete_type(
+        instance.ctx, _BV(), {"op": "local_retype"}, "char*", label="type")
+    assert str(parsed) == "char*"
+
+
+def test_struct_field_set_rejects_inline_bitfield_type(monkeypatch):
+    """struct field set must reject a bitfield field type -- the #322 guard was
+    absent on this op, so a mis-laid-out bitfield struct was applied + reported
+    verified (#367)."""
+    bridge, instance, builder, bv = _struct_set_instance(monkeypatch, [(0, "x")])
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._op_struct_field_set(bv, {
+            "struct_name": "S", "offset": "0x8", "field_name": "f",
+            "field_type": "struct{unsigned a:3;}"})
+    assert exc.value.status == "invalid_request"
+    assert builder.added == []
+
+
 # ---------------------------------------------------------------------------
 # batch_apply: missing target must stay None, not become "None"
 # ---------------------------------------------------------------------------
