@@ -269,10 +269,13 @@ def _get_comment(ctx, selector: str | None, address, function):
         raise RuntimeError("comment get requires --address or --function")
 
     comment_address = _parse_address(address)
-    # Reject an unmapped address rather than reporting a false 'no comment' for a
-    # typo'd/stale address -- parity with read/decompile (#374).
-    _require_mapped_address(bv, comment_address)
     comment = bv.get_comment_at(comment_address)
+    # Reject an unmapped address rather than reporting a false 'no comment' for a
+    # typo'd/stale address -- parity with read/decompile (#374). Never suppress a
+    # real comment: only an address that is BOTH unmapped AND comment-less is the
+    # typo case (mirrors the xrefs refs gate).
+    if not comment:
+        _require_mapped_address(bv, comment_address)
     return {
         "address": hex(comment_address),
         "comment": comment or "",

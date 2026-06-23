@@ -30,6 +30,29 @@ def test_xrefs_rejects_unmapped_raw_address(monkeypatch):
         instance._xrefs(None, "0xdeadbeef")
 
 
+def test_xrefs_unmapped_but_referenced_address_returns_refs(monkeypatch):
+    """An address that is unmapped (is_valid_offset False) but that BN holds real
+    refs FOR must still return those refs, never be rejected as 'not mapped'
+    (#374 follow-up). The canonical case is 0x0, the placeholder BN records for
+    unresolved indirect-call sites -- rejecting it would discard the real
+    'where are the unresolved indirect calls' answer."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    caller = _FakeFunction(0x401000, "caller")
+    bv = _FakeBV(
+        functions=[caller],
+        code_refs={0x0: [_FakeCodeRef(0x401010, caller)]},
+        sections={".text": _FakeSection(".text", 0x400000, 0x410000)},
+        segments={0x401010: _FakeSegment(readable=True, executable=True)},
+    )
+    bv.is_valid_offset = lambda addr: False  # 0x0 is never a valid offset
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._xrefs(None, "0x0")
+    assert result["kind"] == "xrefs"
+    assert result["code_ref_count"] == 1
+    assert result["total"] == 1
+
+
 def test_xrefs_mapped_address_with_no_refs_stays_clean(monkeypatch):
     """A MAPPED address with zero refs must remain a clean total:0 result -- only
     the genuinely-unmapped case is rejected, never a mapped-but-unreferenced
