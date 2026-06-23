@@ -124,7 +124,8 @@ def _load_bridge(monkeypatch):
 
 
 class _FakeFunction:
-    def __init__(self, start: int, name: str, type_text: str = "int32_t()"):
+    def __init__(self, start: int, name: str, type_text: str = "int32_t()",
+                 *, arch=None, total_bytes: int | None = None):
         self.start = start
         self.name = name
         self.raw_name = name
@@ -138,6 +139,9 @@ class _FakeFunction:
         self.analysis_skipped = False
         self.analysis_skip_reason = "NoSkipReason"
         self.reanalyzed = False
+        # The #386 "looks like code" guard reads these off the created function.
+        self.arch = arch
+        self.total_bytes = total_bytes
 
     def reanalyze(self, *args, **kwargs):
         self.reanalyzed = True
@@ -155,10 +159,12 @@ class _FakeInstructionInfo:
 
 
 class _FakeArch:
-    def __init__(self, lengths=None, *, name: str = "x86", address_size: int = 4):
+    def __init__(self, lengths=None, *, name: str = "x86", address_size: int = 4,
+                 instr_alignment: int = 1):
         self.name = name
         self.address_size = address_size
         self.max_instr_length = 16
+        self.instr_alignment = instr_alignment
         self.lengths = dict(lengths or {})
 
     def __str__(self):
@@ -350,7 +356,7 @@ class _FakeBV:
         else:
             self.types[str(name)] = type_obj
 
-    def get_instruction_length(self, address: int):
+    def get_instruction_length(self, address: int, arch=None):
         return self._instruction_lengths.get(int(address), 1)
 
     def get_disassembly(self, address: int, arch=None):
@@ -620,11 +626,20 @@ def _callsites_items(instance, *args, **kwargs):
 
 
 class _FakeFunctionCreateBV(_FakeMutationBV):
-    def __init__(self, *, functions=None, segments=None, memory=None):
+    def __init__(self, *, functions=None, segments=None, memory=None,
+                 arch=None, instruction_lengths=None, created_total_bytes=4):
         super().__init__()
         self.functions = list(functions or [])
         self._segments = dict(segments or {})
         self._memory = dict(memory or {})
+        # The #386 guard inspects the created function's arch / instruction
+        # length / body size. Let a test inject a fixed-width arch, a
+        # zero-length (undecodable) address, or an empty body.
+        if arch is not None:
+            self.arch = arch
+        if instruction_lengths is not None:
+            self._instruction_lengths = dict(instruction_lengths)
+        self._created_total_bytes = created_total_bytes
         self.added: list[int] = []
         # Addresses BN has been told (via remove_user_function) the user does not
         # want a function at: a subsequent add_function there is dropped by
@@ -650,7 +665,8 @@ class _FakeFunctionCreateBV(_FakeMutationBV):
         self.events.append(("create_user_function", addr))
         self.added.append(int(addr))
         self._suppressed.discard(int(addr))
-        fn = _FakeFunction(int(addr), f"sub_{addr:x}")
+        fn = _FakeFunction(int(addr), f"sub_{addr:x}", arch=self.arch,
+                           total_bytes=self._created_total_bytes)
         self.functions.append(fn)
         return fn
 

@@ -219,6 +219,95 @@ def test_batch_op_function_create_verified_and_restore_no_poison(monkeypatch):
     assert bv.get_function_at(0x1000) is not None
 
 
+def test_op_function_create_rejects_unaligned_on_fixed_width_isa(monkeypatch):
+    """Forced create_user_function lands a function even on non-code (#386). An
+    unaligned start on a fixed-width ISA (aarch64/MIPS) can't be a real function
+    start -- reject + remove (non-poisoning) instead of reporting it verified."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    ctx = bridge.BinaryNinjaBridge().ctx
+    bv = _FakeFunctionCreateBV(
+        segments={0x1001: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x00\x01\x02\x03\x04\x05\x06\x07"},
+        arch=_FakeArch(name="aarch64", instr_alignment=4),
+    )
+    with pytest.raises(bridge.OperationFailure) as exc:
+        me._op_function_create(ctx, bv, {"op": "function_create", "address": "0x1001"}, [])
+    assert exc.value.status == "verification_failed"
+    assert bv.get_function_at(0x1001) is None              # junk removed
+    assert ("remove_function", 0x1001) in bv.events        # non-poisoning removal
+
+
+def test_op_function_create_rejects_undecodable_start(monkeypatch):
+    """An in-segment, aligned address BN can't decode an instruction at
+    (get_instruction_length == 0) is not code -- reject, don't fabricate."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    ctx = bridge.BinaryNinjaBridge().ctx
+    bv = _FakeFunctionCreateBV(
+        segments={0x2000: _FakeSegment(readable=True, executable=True)},
+        memory={0x2000: b"\xff\xff\xff\xff"},
+        arch=_FakeArch(name="aarch64", instr_alignment=4),
+        instruction_lengths={0x2000: 0},
+    )
+    with pytest.raises(bridge.OperationFailure) as exc:
+        me._op_function_create(ctx, bv, {"op": "function_create", "address": "0x2000"}, [])
+    assert exc.value.status == "verification_failed"
+    assert bv.get_function_at(0x2000) is None
+
+
+def test_op_function_create_rejects_empty_body(monkeypatch):
+    """A created function with an empty body (total_bytes == 0) is not code."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    ctx = bridge.BinaryNinjaBridge().ctx
+    bv = _FakeFunctionCreateBV(
+        segments={0x3000: _FakeSegment(readable=True, executable=True)},
+        memory={0x3000: b"\x00\x00\x00\x00"},
+        created_total_bytes=0,
+    )
+    with pytest.raises(bridge.OperationFailure) as exc:
+        me._op_function_create(ctx, bv, {"op": "function_create", "address": "0x3000"}, [])
+    assert exc.value.status == "verification_failed"
+    assert bv.get_function_at(0x3000) is None
+
+
+def test_op_function_create_accepts_aligned_decodable_code(monkeypatch):
+    """The guard must NOT false-positive on real, aligned, decodable code -- a
+    legitimate missed-handler recovery (the #360 use-case) still verifies."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    ctx = bridge.BinaryNinjaBridge().ctx
+    bv = _FakeFunctionCreateBV(
+        segments={0x4000: _FakeSegment(readable=True, executable=True)},
+        memory={0x4000: b"\x55\x48\x89\xe5"},
+        arch=_FakeArch(name="aarch64", instr_alignment=4),
+    )
+    res = me._op_function_create(ctx, bv, {"op": "function_create", "address": "0x4000"}, [])
+    assert res["status"] == "verified"
+    assert bv.get_function_at(0x4000) is not None
+
+
+def test_function_create_standalone_rejects_unaligned_address(monkeypatch):
+    """The standalone (non-batch) path applies the same #386 guard: reject and
+    roll back instead of returning success:true for a fabricated function."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFunctionCreateBV(
+        segments={0x1001: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x00\x01\x02\x03\x04\x05\x06\x07"},
+        arch=_FakeArch(name="aarch64", instr_alignment=4),
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_create(None, "0x1001", False)
+
+    assert result["success"] is False
+    assert result["committed"] is False
+    assert result["results"][0]["status"] == "verification_failed"
+    assert bv.get_function_at(0x1001) is None
+
+
 def test_batch_op_function_create_existing_is_noop(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     me = bridge.mutation_engine

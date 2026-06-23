@@ -2404,6 +2404,51 @@ def _op_types_declare(ctx, bv, op: dict[str, Any]):
     }
 
 
+def _function_looks_like_code(bv, created, addr: int) -> str | None:
+    """Return a human-readable reason if the just-created function does NOT look
+    like real code (so it must be removed and the op failed), else None.
+
+    Forced ``create_user_function`` always lands *a* function -- even on non-code
+    -- so the post-create ``get_function_at`` can no longer catch a typo/wrong
+    address (#386). Reject the cheaply-detectable non-code cases:
+
+    * an unaligned start on a fixed-width ISA (aarch64/MIPS/ARM) -- impossible for
+      a real function start (uses the created function's own arch so Thumb's
+      2-byte alignment is honored, not the view default);
+    * a start BN can't decode an instruction at (``get_instruction_length`` == 0);
+    * an empty body (``total_bytes`` == 0).
+
+    A *valid-but-wrong* decode -- an x86 mid-instruction, or a jump-table/data word
+    that happens to decode to a plausible instruction -- is NOT detectable cheaply
+    (it is aligned, decodable, non-empty) and stays the caller's responsibility;
+    the op's error notes this limitation."""
+    arch = getattr(created, "arch", None) or getattr(bv, "arch", None)
+    align = int(getattr(arch, "instr_alignment", 0) or 0)
+    arch_name = getattr(arch, "name", "?")
+    if align > 1 and (addr % align) != 0:
+        return (f"address {hex(addr)} is not {align}-byte aligned for {arch_name}, "
+                "so it cannot be a function start")
+    try:
+        ilen = bv.get_instruction_length(addr, arch)
+    except Exception:
+        ilen = None
+    if ilen == 0:
+        return f"no decodable instruction at {hex(addr)} (not code)"
+    if getattr(created, "total_bytes", None) == 0:
+        return f"the created function at {hex(addr)} has an empty body (not code)"
+    return None
+
+
+def _function_create_guard_message(addr: int, reason: str) -> str:
+    return (
+        f"Refused to keep a fabricated function at {hex(addr)}: {reason}. Forcing "
+        "create_user_function past auto-analysis lands a function even on non-code; "
+        "this guard catches an unaligned / undecodable / empty start. A data word "
+        "that happens to decode to a plausible instruction is not detectable here -- "
+        "verify the disassembly before trusting an aligned, decodable result."
+    )
+
+
 def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = None):
     """Create (and analyze) a function at an address inside a BATCH (#308).
 
@@ -2457,6 +2502,18 @@ def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = Non
             f"No function starts at {hex(addr)} after analysis.",
             requested=requested,
             observed={"address": hex(addr), "function": None},
+        )
+    reason = _function_looks_like_code(bv, created, addr)
+    if reason is not None:
+        # The forced create landed a junk function on non-code; drop it
+        # (non-poisoning remove_function) and fail honestly instead of reporting
+        # the fabricated function verified (#386).
+        create_comments._remove_created_function(ctx, bv, addr)
+        raise OperationFailure(
+            "verification_failed",
+            _function_create_guard_message(addr, reason),
+            requested=requested,
+            observed={"address": hex(addr), "function": str(created.name)},
         )
     if restores is not None:
         restores.append(lambda: create_comments._remove_created_function(ctx, bv, addr))

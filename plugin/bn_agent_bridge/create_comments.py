@@ -166,6 +166,34 @@ def _function_create(ctx, selector: str | None, address, preview: bool):
                 "affected_types": [],
             }
 
+        guard_reason = mutation_engine._function_looks_like_code(bv, created, addr)
+        if guard_reason is not None:
+            # The forced create landed a junk function on non-code; revert the
+            # journal and explicitly remove the created function (creation is not
+            # reliably undone), then fail honestly instead of reporting the
+            # fabricated function verified (#386).
+            mutation_engine._revert_undo_safely(ctx, bv, state)
+            removed = _remove_created_function(ctx, bv, addr)
+            return {
+                "preview": preview,
+                "success": False,
+                "committed": False,
+                "rolled_back": removed,
+                "message": mutation_engine._function_create_guard_message(addr, guard_reason),
+                "results": [
+                    {
+                        "op": "function_create",
+                        "status": "verification_failed",
+                        "address": hex(addr),
+                        "message": mutation_engine._function_create_guard_message(addr, guard_reason),
+                        "requested": requested,
+                        "observed": {"address": hex(addr), "function": str(created.name)},
+                    }
+                ],
+                "affected_functions": [],
+                "affected_types": [],
+            }
+
         function_name = str(created.name)
         op_status = "verified"
         if preview:
