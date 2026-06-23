@@ -28,7 +28,7 @@ import binaryninja as bn
 
 from . import il_format
 from . import taint_engine as _taint
-from ._shared import _parse_address, _validate_count
+from ._shared import _parse_address, _require_mapped_address, _validate_count
 from .bridge_state import require_analysis
 
 # Import symbol kinds, in resolution-preference order. Mirrors the literal that
@@ -94,6 +94,21 @@ def _xrefs(ctx, selector: str | None, identifier, *, offset: int = 0, limit: int
             return _drop_legacy_ref_arrays(
                 _xrefs_import_symbol(ctx, bv, identifier, offset=offset, limit=limit)
             )
+    else:
+        # Raw-address path (parse succeeded): reject an unmapped address rather
+        # than returning a false-negative empty xref set (#374). A function start
+        # (the name path above) is always mapped, so only the literal-address
+        # case needs the guard. But NEVER reject an address BN actually holds refs
+        # FOR -- 0x0 is the placeholder for unresolved indirect-call sites (many
+        # real code refs, is_valid_offset False), and a tail-call can target an
+        # out-of-image address; rejecting those would discard a real answer. Only
+        # an address that is BOTH unmapped AND ref-less is the typo case (#374
+        # follow-up).
+        has_refs = bool(
+            list(bv.get_code_refs(int(address))) or list(bv.get_data_refs(int(address)))
+        )
+        if not has_refs:
+            _require_mapped_address(bv, int(address))
     return _drop_legacy_ref_arrays(
         _xrefs_to_address(ctx, bv, address, offset=offset, limit=limit,
                           fn_pointer_scan=fn_pointer_scan)

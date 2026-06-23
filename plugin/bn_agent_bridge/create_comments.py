@@ -36,7 +36,7 @@ import binaryninja as bn
 
 from . import mutation_engine
 from . import read_misc
-from ._shared import _parse_address, _validate_count
+from ._shared import _parse_address, _require_mapped_address, _validate_count
 
 
 def _remove_created_function(ctx, bv, addr: int) -> bool:
@@ -270,6 +270,12 @@ def _get_comment(ctx, selector: str | None, address, function):
 
     comment_address = _parse_address(address)
     comment = bv.get_comment_at(comment_address)
+    # Reject an unmapped address rather than reporting a false 'no comment' for a
+    # typo'd/stale address -- parity with read/decompile (#374). Never suppress a
+    # real comment: only an address that is BOTH unmapped AND comment-less is the
+    # typo case (mirrors the xrefs refs gate).
+    if not comment:
+        _require_mapped_address(bv, comment_address)
     return {
         "address": hex(comment_address),
         "comment": comment or "",

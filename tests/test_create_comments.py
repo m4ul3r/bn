@@ -153,6 +153,46 @@ def test_get_comment_rejects_both_locators(monkeypatch):
         instance._get_comment("active", "0x1000", "main")
 
 
+def test_get_comment_rejects_unmapped_address(monkeypatch):
+    """comment get on an unmapped address must reject (exit 2) like read/decompile,
+    not return a false 'no comment' (exit 0) for a typo'd/stale address (#374)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+    bv.is_valid_offset = lambda addr: False
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    with pytest.raises(RuntimeError, match="not mapped"):
+        instance._get_comment("active", "0xdeadbeef", None)
+
+
+def test_get_comment_unmapped_but_commented_address_returns_comment(monkeypatch):
+    """A real comment must never be suppressed: if the address carries a comment,
+    return it even when is_valid_offset says unmapped -- only a genuinely-empty
+    AND unmapped address is rejected (#374 follow-up, mirrors the xrefs refs
+    gate)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(comments={0x1000: "real comment here"})
+    bv.is_valid_offset = lambda addr: False
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._get_comment("active", "0x1000", None)
+    assert result["has_comment"] is True
+    assert result["comment"] == "real comment here"
+
+
+def test_get_comment_mapped_address_without_comment_stays_clean(monkeypatch):
+    """A MAPPED address with no comment is a clean has_comment:false / exit 0 --
+    only the unmapped case is rejected (#374)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(comments={})
+    bv.is_valid_offset = lambda addr: True
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._get_comment("active", "0x1000", None)
+    assert result["has_comment"] is False
+    assert result["comment"] == ""
+
+
 def test_get_comment_function_aggregates_body_comments(monkeypatch):
     """`comment get --function` must aggregate ALL comments within the function's
     address range (matching `comment list`'s attribution), not just the

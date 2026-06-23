@@ -17,6 +17,61 @@ import pytest
 from _bridge_fakes import *  # noqa: F401,F403
 
 
+def test_xrefs_rejects_unmapped_raw_address(monkeypatch):
+    """A raw address that isn't mapped is a typo/stale value, not a real
+    '0 callers' result; reject it (like read/decompile, exit 2) instead of
+    returning a false-negative empty xref set with exit 0 (#374)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[_FakeFunction(0x401000, "caller")])
+    bv.is_valid_offset = lambda addr: False
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    with pytest.raises(RuntimeError, match="not mapped"):
+        instance._xrefs(None, "0xdeadbeef")
+
+
+def test_xrefs_unmapped_but_referenced_address_returns_refs(monkeypatch):
+    """An address that is unmapped (is_valid_offset False) but that BN holds real
+    refs FOR must still return those refs, never be rejected as 'not mapped'
+    (#374 follow-up). The canonical case is 0x0, the placeholder BN records for
+    unresolved indirect-call sites -- rejecting it would discard the real
+    'where are the unresolved indirect calls' answer."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    caller = _FakeFunction(0x401000, "caller")
+    bv = _FakeBV(
+        functions=[caller],
+        code_refs={0x0: [_FakeCodeRef(0x401010, caller)]},
+        sections={".text": _FakeSection(".text", 0x400000, 0x410000)},
+        segments={0x401010: _FakeSegment(readable=True, executable=True)},
+    )
+    bv.is_valid_offset = lambda addr: False  # 0x0 is never a valid offset
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._xrefs(None, "0x0")
+    assert result["kind"] == "xrefs"
+    assert result["code_ref_count"] == 1
+    assert result["total"] == 1
+
+
+def test_xrefs_mapped_address_with_no_refs_stays_clean(monkeypatch):
+    """A MAPPED address with zero refs must remain a clean total:0 result -- only
+    the genuinely-unmapped case is rejected, never a mapped-but-unreferenced
+    address (#374)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        functions=[_FakeFunction(0x401000, "caller")],
+        code_refs={}, data_refs={},
+        sections={".rodata": _FakeSection(".rodata", 0x5000, 0x7000)},
+        segments={0x5000: _FakeSegment(readable=True)},
+    )
+    bv.is_valid_offset = lambda addr: True
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._xrefs(None, "0x5000")
+    assert result["kind"] == "xrefs"
+    assert result["total"] == 0
+
+
 def test_xrefs_include_address_context(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
