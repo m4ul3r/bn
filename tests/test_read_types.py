@@ -287,6 +287,66 @@ def test_parse_type_or_hint_resolves_namespaced_user_type(monkeypatch):
     assert "declare it first" in excinfo.value.message
 
 
+def test_parse_type_or_hint_resolves_const_qualified_namespaced_pointer(monkeypatch):
+    """A const/volatile-qualified ::-qualified named pointer (common verbatim from
+    the decompiler) must resolve the same as its unqualified form. BN's C parser
+    rejects the ::-name, and the #200 fallback stripped only the trailing '*', so a
+    leading/trailing const made the base-name lookup miss and the whole parse
+    failed-closed with 'could not parse' (#389). A cv-qualifier is layout- and
+    indirection-preserving, so resolving the unqualified type is safe."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    me = bridge.mutation_engine
+
+    class _NsBV(_FakeBV):
+        def parse_type_string(self, decl):
+            raise SyntaxError(
+                "error: <unknown>:1:1 use of undeclared identifier 'ns'\n1 error generated."
+            )
+
+    bv = _NsBV(
+        functions=[],
+        qualified_types_={("ns", "demo", "Foo"): _FakeType("struct ns::demo::Foo")},
+    )
+
+    # every cv-qualified pointer form resolves to the same pointer the
+    # unqualified form would (the const-ness is dropped, not the type).
+    for decl in (
+        "ns::demo::Foo const*",
+        "const ns::demo::Foo*",
+        "ns::demo::Foo const *",
+        "volatile ns::demo::Foo*",
+        "const ns::demo::Foo const*",
+    ):
+        t, name = me._parse_type_or_hint(
+            instance.ctx, bv, {"op": "local_retype"}, decl, label="type"
+        )
+        assert str(t) == "struct ns::demo::Foo*", decl
+        assert name is None, decl
+
+    # a bare cv-qualified value (no pointer) resolves too
+    t2, _ = me._parse_type_or_hint(
+        instance.ctx, bv, {"op": "local_retype"}, "ns::demo::Foo const", label="type"
+    )
+    assert str(t2) == "struct ns::demo::Foo"
+
+    # an interior space in a template name must NOT be mangled by qualifier stripping
+    # (only leading/trailing const/volatile and trailing '*' are stripped)
+    bv2 = _NsBV(
+        functions=[],
+        qualified_types_={
+            ("std", "vector<std::pair<int, long> >", "iterator"): _FakeType(
+                "struct std::vector<std::pair<int, long> >::iterator"
+            )
+        },
+    )
+    t3, _ = me._parse_type_or_hint(
+        instance.ctx, bv2, {"op": "local_retype"},
+        "const std::vector<std::pair<int, long> >::iterator*", label="type",
+    )
+    assert str(t3) == "struct std::vector<std::pair<int, long> >::iterator*"
+
+
 def test_resolve_type_field_accepts_offset_and_suggests_near_match(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

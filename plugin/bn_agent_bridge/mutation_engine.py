@@ -108,6 +108,11 @@ def _normalize_struct_alias(op: dict[str, Any]) -> dict[str, Any]:
 # propagation, not just the targeted variable (see _capture_local_var_snapshots).
 _VAR_DRIFT_OPS = {"local_rename", "local_retype", "set_prototype"}
 
+# Soft upper bound on a struct field offset. A real struct is at most a few KiB;
+# anything past this (256 MiB) is a mistyped/garbage offset that would explode
+# the struct into a multi-GB sparse type, so struct field set refuses it (#369).
+_MAX_STRUCT_FIELD_OFFSET = 0x10000000
+
 
 def _guess_type_affected_functions(ctx, bv, type_name: str, limit: int | None = 10):
     matches = []
@@ -1748,6 +1753,31 @@ def _resolve_named_type_string(bv, text: str):
     while base.endswith("*"):
         base = base[:-1].rstrip()
         depth += 1
+    # A const/volatile qualifier (leading or trailing) is common on a
+    # verbatim-from-the-decompiler C++ field type (`ns::Class const*`,
+    # `const ns::Class*`). The #200 fallback stripped only `*`, so the qualifier
+    # made the base-name lookup miss and the whole parse failed-closed (#389).
+    # Strip leading/trailing cv-qualifiers (word-boundary only, so a template
+    # name's interior spacing is preserved) and resolve the unqualified type:
+    # a cv-qualifier is layout- and indirection-preserving, so dropping it is
+    # safe -- unlike the bitfield / dropped-pointer coercions #367 rejects.
+    # Only the common west-const pointer-to-const forms (`Foo const*`,
+    # `const Foo*`) are normalized; the rarer east-const-on-the-pointer forms
+    # (`Foo *const`) leave a stray mid-string `*` after the qualifier strip and
+    # fail closed (clean "declare it first"), never silently mis-resolve.
+    changed = True
+    while changed:
+        changed = False
+        for q in ("const", "volatile"):
+            if base == q:
+                base = ""
+                changed = True
+            elif base.startswith(q + " "):
+                base = base[len(q) + 1:].lstrip()
+                changed = True
+            elif base.endswith(" " + q):
+                base = base[: -(len(q) + 1)].rstrip()
+                changed = True
     if not base:
         return None
     named = _lookup_named_type(bv, base)
@@ -2044,7 +2074,36 @@ def _op_struct_field_set(ctx, bv, op: dict[str, Any]):
     struct_name = str(op["struct_name"])
     resolved_name, builder = _struct_builder(ctx, bv, struct_name)
     field_type, _ = _parse_concrete_type(ctx, bv, op, op["field_type"], label="field type")
-    offset = _parse_address(op["offset"])
+    # A negative offset silently no-ops in BN's add_member_at_offset, which then
+    # surfaced as a misleading "No effective change detected"; an absurd offset
+    # (e.g. a mistyped 0xFFFFFFFF) explodes the struct into a multi-GB sparse type
+    # that was applied + reported verified. Reject both with an actionable message
+    # instead (#369). A negative *hex* offset ("-0x8") doesn't even parse in
+    # _parse_address (its hex branch only accepts a leading "0x"), so catch the
+    # string sign before parsing so every negative form gets the same message.
+    raw_offset = op["offset"]
+    if isinstance(raw_offset, str) and raw_offset.strip().startswith("-"):
+        raise OperationFailure(
+            "invalid_request",
+            f"offset must be >= 0; got {raw_offset!r}",
+            requested=_operation_requested(ctx, op),
+        )
+    offset = _parse_address(raw_offset)
+    if offset < 0:
+        raise OperationFailure(
+            "invalid_request",
+            f"offset must be >= 0; got {raw_offset!r}",
+            requested=_operation_requested(ctx, op),
+        )
+    if offset > _MAX_STRUCT_FIELD_OFFSET:
+        raise OperationFailure(
+            "invalid_request",
+            f"offset {hex(offset)} would create a struct larger than "
+            f"{_MAX_STRUCT_FIELD_OFFSET >> 20} MiB; refused as a likely typo. If "
+            "you really need a field this far in, declare the struct with an "
+            "explicit large size first.",
+            requested=_operation_requested(ctx, op),
+        )
     overwrite = _validate_bool(op.get("overwrite_existing"), label="overwrite_existing", default=True)
     before_type = bv.get_type_by_name(resolved_name)
     before_member = None
