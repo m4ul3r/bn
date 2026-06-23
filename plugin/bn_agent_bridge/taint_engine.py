@@ -3850,7 +3850,27 @@ class TaintEngine:
     def _resolve_var(self, func, selector: str):
         if self._find_variable is None:
             raise TaintError("variable selectors require a resolver (bridge-only)")
-        return self._find_variable(func, selector)
+        try:
+            return self._find_variable(func, selector)
+        except Exception:
+            # Accept the SSA-versioned form `name#version` that `dataflow defuse
+            # --var` displays and accepts: taint seeds the base variable (it
+            # tracks SSA versions internally), so strip the #version and retry the
+            # base name. Removes the copy-paste trap where a versioned name from
+            # defuse dead-ended in the taint locator (#356).
+            if "#" in selector:
+                base = selector.rsplit("#", 1)[0]
+                if base and base != selector:
+                    try:
+                        return self._find_variable(func, base)
+                    except Exception:
+                        # Neither the versioned form nor its base resolved; report
+                        # what the user actually typed (not the stripped base) so
+                        # the error is actionable.
+                        raise TaintError(
+                            f"Variable not found: {selector} (also tried the base "
+                            f"name {base!r} after dropping the SSA #version)")
+            raise
 
     def _describe_locator(self, loc: dict[str, Any]) -> dict[str, Any]:
         return {k: v for k, v in loc.items() if k != "_resolved"}

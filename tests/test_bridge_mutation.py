@@ -1971,6 +1971,29 @@ def test_unsupported_op_kind_uses_neutral_wording(monkeypatch):
         instance._apply_operation(bv, {"op": "nonsuch_op"})
     assert e.value.status == "unsupported"
     assert "batch" not in str(e.value).lower()
+    # with no close match, the error lists the valid op names so the caller can
+    # pick one (#361).
+    assert "set_prototype" in str(e.value) and "function_create" in str(e.value)
+
+
+def test_unsupported_op_suggests_close_cli_verb(monkeypatch):
+    """A batch op named with the CLI verb (proto_set) instead of the batch op name
+    (set_prototype) must get a did-you-mean suggestion, not a bare unsupported,
+    so an agent reusing CLI verbs doesn't silently waste a batch (#361)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+    for guessed, real in [("proto_set", "set_prototype"),
+                          ("rename_local", "local_rename"),
+                          ("retype_local", "local_retype")]:
+        with pytest.raises(bridge.OperationFailure) as e:
+            instance._apply_operation(bv, {"op": guessed})
+        assert e.value.status == "unsupported", guessed
+        msg = str(e.value).lower()
+        # the SUGGESTION itself must be the right op (not just present in the
+        # always-appended op list) -- a misleading suggestion is worse than none.
+        assert f"did you mean '{real}'" in msg, (guessed, real, msg)
+        assert "batch" not in msg
 
 
 def test_mutation_mixed_batch_scopes_blast_radius_and_tags_direct(monkeypatch):

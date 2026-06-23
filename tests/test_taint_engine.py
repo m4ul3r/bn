@@ -351,6 +351,31 @@ def test_parse_locator_rejects_garbage():
         te.parse_locator("bogus:1")
 
 
+def test_resolve_var_accepts_ssa_versioned_form(models):
+    """The taint `var:` locator must accept the `name#version` SSA form that
+    `dataflow defuse --var` displays and accepts: taint seeds the base variable
+    (it tracks SSA versions internally), so strip the #version and retry the base
+    name instead of dead-ending with "Variable not found" (#356)."""
+    engine = te.TaintEngine(FBV({}), models)
+    seen = []
+
+    def fake_find(func, selector):
+        seen.append(selector)
+        if selector == "ds_length":
+            return ("VAR", False)
+        raise RuntimeError(f"Variable not found: {selector}")
+
+    engine._find_variable = fake_find
+
+    # the versioned form resolves the base variable (full form tried first, then base)
+    assert engine._resolve_var(object(), "ds_length#1") == ("VAR", False)
+    assert seen == ["ds_length#1", "ds_length"]
+
+    # a genuinely-unknown base still raises (not masked)
+    with pytest.raises(RuntimeError, match="Variable not found"):
+        engine._resolve_var(object(), "nope#2")
+
+
 # --------------------------------------------------------------------------
 # forward taint
 # --------------------------------------------------------------------------
