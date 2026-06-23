@@ -679,6 +679,21 @@ def test_backward_seeds_sink_through_indirect_call_via_value_set(models):
     assert any("anchored at indirect callsite" in a for a in result["assumptions"])
 
 
+def test_backward_rejects_call_sink_with_actionable_kinds(models):
+    """A call:/model: locator is a forward-only source seed; backward --sink must
+    reject it with a message that lists the valid backward kinds (param:/var:/arg:),
+    not a bare 'unsupported' that sends an agent in circles after the generic
+    locator error advertised call:/model: (#375)."""
+    func = _indirect_sink_program(with_pvs=True)
+    bv = FBV({0x900: "send"})
+    engine = te.TaintEngine(bv, models)
+    with pytest.raises(te.TaintError) as ei:
+        engine.backward(func, [te.parse_locator("call:send")])
+    msg = str(ei.value)
+    assert "param:" in msg and "var:" in msg and "arg:" in msg
+    assert "forward-only" in msg
+
+
 def test_backward_seeds_sink_through_indirect_call_via_resolve_map(models):
     # No value-set; an agent pins the vtable slot with --resolve-map. Same anchor.
     func = _indirect_sink_program(with_pvs=False)

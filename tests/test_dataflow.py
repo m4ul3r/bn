@@ -138,10 +138,34 @@ def test_taint_backward_reads_and_forwards_resolve_map(monkeypatch, capsys, tmp_
 
 
 def test_taint_forward_requires_source(monkeypatch, capsys):
+    # --source is argparse-required, so the usage is honest (`--source LOCATOR`,
+    # not `[--source LOCATOR]`) and a missing source errors before dispatch (#375).
     fake, _ = _fake({})
     monkeypatch.setattr(bn.cli, "send_request", fake)
-    rc = bn.cli.main(["taint", "forward", "-f", "process", "--target", "active"])
-    assert rc != 0
+    with pytest.raises(SystemExit):
+        bn.cli.main(["taint", "forward", "-f", "process", "--target", "active"])
+
+
+def test_taint_backward_requires_sink(monkeypatch, capsys):
+    # #375: backward `--sink` was bracketed (optional) in usage but required at
+    # runtime. Now argparse-required, so the usage no longer misleads.
+    fake, _ = _fake({})
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    with pytest.raises(SystemExit):
+        bn.cli.main(["taint", "backward", "-f", "process", "--target", "active"])
+    err = capsys.readouterr().err
+    assert "--sink" in err  # argparse names the missing required arg
+
+
+def test_taint_backward_required_sink_usage_not_bracketed(capsys):
+    """The backward usage must present `--sink` as required (no `[ ]`), so an
+    agent doesn't read it as optional (#375)."""
+    parser = bn.cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["taint", "backward", "--help"])
+    usage = capsys.readouterr().out
+    assert "[--sink" not in usage      # not optional
+    assert "--sink LOCATOR" in usage   # shown as a required arg
 
 
 def test_taint_forward_source_help_documents_call_locator(capsys):
