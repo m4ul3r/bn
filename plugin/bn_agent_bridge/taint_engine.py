@@ -3826,7 +3826,12 @@ class TaintEngine:
                 "it (var:<name>), or use 'bn trace <fn> <call_addr> --arg N' for "
                 "callee return-value provenance.")
         else:
-            raise TaintError(f"unsupported backward sink kind: {kind}")
+            raise TaintError(
+                f"unsupported backward sink kind: {kind!r}. backward --sink accepts "
+                "param:<n> | var:<selector> | arg:<callee>:<n>; "
+                "call:/model: are forward-only source seeds (a call's outputs have no "
+                "def-chain to slice in the caller -- slice the variable that receives "
+                "them, var:<name>, or arg:<callee>:<n> for an argument).")
         if not out:
             raise TaintError("no backward seed resolved; check --sink locator")
         return out

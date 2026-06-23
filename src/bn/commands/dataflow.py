@@ -124,7 +124,8 @@ _SINK_LOCATOR_HELP = (
              arg("--function", "-f", dest="function", required=True,
                  help="Function to analyze (name or address)"),
              arg("--source", dest="sources", action="append", default=None, metavar="LOCATOR",
-                 help=f"Taint source (repeatable). {_LOCATOR_HELP}"),
+                 required=True,
+                 help=f"Taint source (repeatable, at least one required). {_LOCATOR_HELP}"),
              arg("--max-depth", dest="max_depth", type=_depth_int, default=8,
                  help="Max interprocedural recursion depth into callees (default: 8; "
                       "0 = intraprocedural only)"),
@@ -141,8 +142,7 @@ _SINK_LOCATOR_HELP = (
              _models_arg(),
          ])
 def _taint_forward(args: argparse.Namespace) -> int:
-    if not args.sources:
-        raise BridgeError("taint forward requires at least one --source")
+    # --source is argparse-required, so an empty list cannot reach here.
     params: dict[str, Any] = {
         "direction": "forward",
         "function": args.function,
@@ -176,7 +176,8 @@ def _taint_forward(args: argparse.Namespace) -> int:
              arg("--function", "-f", dest="function", required=True,
                  help="Function to analyze (name or address)"),
              arg("--sink", dest="sinks", action="append", default=None, metavar="LOCATOR",
-                 help=f"Sink to slice from (repeatable). {_SINK_LOCATOR_HELP}"),
+                 required=True,
+                 help=f"Sink to slice from (repeatable, at least one required). {_SINK_LOCATOR_HELP}"),
              arg("--max-depth", dest="max_depth", type=_depth_int, default=8,
                  help="Max interprocedural depth to follow slices up into callers (default: 8; "
                       "0 = intraprocedural only). The in-function def-chain walk caps at 64 "
@@ -187,8 +188,7 @@ def _taint_forward(args: argparse.Namespace) -> int:
              _models_arg(),
          ])
 def _taint_backward(args: argparse.Namespace) -> int:
-    if not args.sinks:
-        raise BridgeError("taint backward requires at least one --sink")
+    # --sink is argparse-required, so an empty list cannot reach here.
     params: dict[str, Any] = {
         "direction": "backward",
         "function": args.function,
