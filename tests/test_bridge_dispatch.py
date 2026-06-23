@@ -1227,7 +1227,7 @@ def test_save_database_succeeds_when_file_is_written(monkeypatch, tmp_path):
     out = tmp_path / "x.bndb"
     result = instance._save_database(None, str(out))
 
-    assert result == {"saved": True, "path": str(out.resolve())}
+    assert result == {"ok": True, "saved": True, "path": str(out.resolve())}  # #364: top-level ok
     assert out.exists()
     assert bv.created_with == str(out.resolve())
 
@@ -1542,7 +1542,7 @@ def test_save_path_preserves_target_identity(monkeypatch, tmp_path):
     out = tmp_path / "copy.bndb"
     result = instance._save_database("origbin", str(out))
 
-    assert result == {"saved": True, "path": str(out.resolve())}
+    assert result == {"ok": True, "saved": True, "path": str(out.resolve())}  # #364: top-level ok
     assert out.exists()
     assert bv.created_with == str(out.resolve())   # the copy WAS written
     assert bv.file.filename == orig                # ...but identity is preserved
@@ -1583,7 +1583,7 @@ def test_save_default_preserves_target_identity(monkeypatch, tmp_path):
 
     result = instance._save_database(None)               # default save (no --path)
 
-    assert result == {"saved": True, "path": orig + ".bndb"}
+    assert result == {"ok": True, "saved": True, "path": orig + ".bndb"}  # #364: top-level ok
     assert bv.created_with == orig + ".bndb"             # the .bndb WAS written
     assert bv.file.filename == orig                       # ...selector identity preserved
 

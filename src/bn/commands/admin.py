@@ -525,7 +525,9 @@ def _running_instances_result() -> dict[str, Any]:
         entries.append(entry)
         if rss is not None:
             total_rss += rss
-    return {"instances": entries, "total_rss_mb": round(total_rss, 1)}
+    # {kind, items} envelope for cross-command consistency with the rest of the
+    # CLI's collection reads (#358); total_rss_mb stays as an extra field.
+    return {"kind": "instances", "items": entries, "total_rss_mb": round(total_rss, 1)}
 
 
 @command("session", "list", help="List running bridge sessions")
@@ -573,7 +575,7 @@ def _instance_find(args: argparse.Namespace) -> int:
     snapshot = _running_instances_result()
     query = args.query
     items = []
-    for entry in snapshot.get("instances", []):
+    for entry in snapshot.get("items", []):
         for binary in entry.get("binaries") or []:
             if _binary_query_matches(str(binary), query):
                 items.append({
@@ -642,7 +644,10 @@ def _target_list(args: argparse.Namespace) -> int:
         for item in result:
             if isinstance(item, dict) and _target_matches(item, sticky):
                 item["sticky"] = True
-    cli._emit_result(args, result, text_renderer=_render_target_list_text, stem="targets")
+    # Wrap the bare list in the {kind, items} envelope the rest of the CLI's
+    # collection reads use, so an agent doesn't special-case target list (#358).
+    envelope: Any = {"kind": "targets", "items": result if isinstance(result, list) else []}
+    cli._emit_result(args, envelope, text_renderer=_render_target_list_text, stem="targets")
     return 0
 
 

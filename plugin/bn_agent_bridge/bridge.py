@@ -1165,7 +1165,7 @@ class BinaryNinjaBridge:
                 # error -- that's the actionable message, not the fallback's.
                 raise exc
             self.targets.clear_dirty(bv)
-            result = {"saved": True, "path": saved, "fallback": True, "requested_path": out}
+            result = {"ok": True, "saved": True, "path": saved, "fallback": True, "requested_path": out}
             # The cache write re-homed the live view to the copy; the RO original
             # is intact, so restore the original filename -- otherwise the
             # -t <basename> selector silently rekeys to <basename>.<hash>.bndb (#285).
@@ -1194,6 +1194,7 @@ class BinaryNinjaBridge:
             # `bn close <selector>` may no longer resolve it (#256 review).
             self.targets.clear_dirty(bv)  # the bytes are persisted regardless
             return {
+                "ok": True,
                 "saved": True,
                 "path": saved,
                 "rehomed": True,
@@ -1205,7 +1206,7 @@ class BinaryNinjaBridge:
                 ),
             }
         self.targets.clear_dirty(bv)  # mutations are now persisted (L15)
-        return {"saved": True, "path": saved}
+        return {"ok": True, "saved": True, "path": saved}
 
     def _target_info(self, selector: str | None, *, verbose: bool = False):
         bv = self.targets.resolve(selector)

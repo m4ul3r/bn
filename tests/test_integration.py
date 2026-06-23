@@ -83,11 +83,11 @@ class TestMultiInstance:
 
                 # Each session should have exactly 1 target
                 result_a = _bn("--instance", id_a, "target", "list", "--format", "json")
-                targets_a = json.loads(result_a.stdout)
+                targets_a = json.loads(result_a.stdout)["items"]   # #358 {kind, items}
                 assert len(targets_a) == 1
 
                 result_b = _bn("--instance", id_b, "target", "list", "--format", "json")
-                targets_b = json.loads(result_b.stdout)
+                targets_b = json.loads(result_b.stdout)["items"]
                 assert len(targets_b) == 1
 
                 # The basenames should differ
@@ -108,7 +108,7 @@ class TestMultiInstance:
             try:
                 result = _bn("session", "list", "--format", "json")
                 data = json.loads(result.stdout)
-                sessions = data["instances"]
+                sessions = data["items"]   # #358 {kind, items}
                 ids = {s["instance_id"] for s in sessions}
                 assert info_a["instance_id"] in ids
                 assert info_b["instance_id"] in ids
@@ -143,7 +143,7 @@ class TestSavePathIdentity:
         inst = info["instance_id"]
         try:
             listing = json.loads(
-                _bn("--instance", inst, "target", "list", "--format", "json").stdout)
+                _bn("--instance", inst, "target", "list", "--format", "json").stdout)["items"]
             hello = next(t for t in listing
                          if "hello" in (t.get("filename", "") + t.get("basename", "")))
             sel = hello.get("selector") or hello.get("basename")
