@@ -1574,17 +1574,20 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
 def _op_rename_symbol(ctx, bv, op: dict[str, Any]):
     kind = str(op.get("kind", "auto"))
     identifier = op["identifier"]
-    new_name = str(op["new_name"])
-    # Reject a degenerate empty/whitespace name before touching the view: BN
+    # Reject a degenerate empty/whitespace/null name before touching the view: BN
     # accepts `fn.name = ""` and leaves the function unnamed, which then "verifies"
-    # against itself (#363). Done here (not just CLI-side) so batch/raw callers
-    # are covered too; pre-resolution so no view state is modified on rejection.
-    if not new_name.strip():
+    # against itself (#363). Inspect the RAW value first -- a JSON `null` would
+    # otherwise `str()` to the literal "None" and slip the emptiness check. Done
+    # here (not just CLI-side) so batch/raw callers are covered too; pre-resolution
+    # so no view state is modified on rejection.
+    raw_new_name = op["new_name"]
+    if raw_new_name is None or not str(raw_new_name).strip():
         raise OperationFailure(
             "invalid_request",
             "new name must be non-empty",
             requested=_operation_requested(ctx, op),
         )
+    new_name = str(raw_new_name)
     target = ctx._resolve_rename_target(bv, identifier, kind)
     requested = _operation_requested(ctx, op)
     if target["kind"] == "function":

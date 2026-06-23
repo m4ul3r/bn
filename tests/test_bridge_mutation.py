@@ -59,12 +59,14 @@ def test_verify_rename_symbol_reports_noop(monkeypatch):
     assert result["observed"]["name"] == "player_update"
 
 
-@pytest.mark.parametrize("bad_name", ["", "   ", "\t"])
+@pytest.mark.parametrize("bad_name", ["", "   ", "\t", None])
 def test_op_rename_symbol_rejects_empty_new_name(monkeypatch, bad_name):
-    """The bridge rejects an empty/whitespace-only new name as invalid_request,
-    so a batch apply or raw-socket rename_symbol op cannot create a degenerate
-    unnamed function (#363) -- the CLI guard is not the only line of defense.
-    Rejection happens before target resolution, so no view state is touched."""
+    """The bridge rejects an empty/whitespace-only/null new name as
+    invalid_request, so a batch apply or raw-socket rename_symbol op cannot
+    create a degenerate unnamed function (#363) -- the CLI guard is not the only
+    line of defense. JSON ``null`` must NOT stringify to the literal "None" and
+    slip through. Rejection happens before target resolution, so no view state
+    is touched."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV(functions=[_FakeFunction(0x401000, "mput")])
