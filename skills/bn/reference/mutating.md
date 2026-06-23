@@ -84,14 +84,16 @@ For large rename/retype/comment runs, use `bn batch apply` with a JSON manifest.
 **Primary form — pipe the manifest on stdin with a quoted heredoc** (`-` means "read stdin"). The quoted delimiter (`<<'BN_EOF'`) makes the whole payload literal, so comments with quotes, apostrophes, `$`, backticks, or parens need no escaping — and there is no temp file to write or clean up:
 
 ```bash
-bn batch apply - <<'BN_EOF'
-{"target": "active", "ops": [
+bn batch apply -t <selector> - <<'BN_EOF'
+{"ops": [
   {"op": "rename_symbol", "identifier": "sub_401000", "new_name": "player_update"},
   {"op": "rename_symbol", "identifier": "sub_402000", "new_name": "player_init"},
   {"op": "set_comment", "address": "0x401040", "comment": "len isn't checked; attacker-controlled (see $r0)"}
 ]}
 BN_EOF
 ```
+
+Pass the target with `-t <selector>` (the same selector every other command takes). Do **not** put `"target": "active"` in the manifest — `active` does not resolve under multi-target headless (the mode fan-out agents run in). A concrete `"target"` in the manifest is allowed, but a CLI `-t` always wins over it (#366).
 
 Add `--preview` before the `-` to diff without committing: `bn batch apply --preview - <<'BN_EOF' ... BN_EOF`.
 
@@ -100,7 +102,7 @@ The file-path form is also accepted (`bn batch apply /tmp/manifest.json`) — us
 Rules:
 
 - The manifest must be a dict with an `"ops"` key (not a bare list).
-- Include `"target"` in the manifest or it fails with `Unknown target selector: None`.
+- Supply the target with `-t <selector>` (recommended), or a concrete `"target"` in the manifest; a CLI `-t` wins over the manifest value (#366). Without either it fails with `Unknown target selector: None`. Do not use `"target": "active"` — it doesn't resolve under multi-target headless.
 - All ops are verified — a single failure reverts the entire batch.
 - `--preview` shows diffs without committing.
 - Use a unique heredoc sentinel (`BN_EOF`) so a line in a comment can't accidentally close the payload. Empty or malformed stdin yields a clean error, not a traceback.

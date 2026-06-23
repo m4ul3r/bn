@@ -427,11 +427,14 @@ def _batch_apply(args: argparse.Namespace) -> int:
     inst = getattr(args, "instance", None)
     if inst and manifest.get("target") == inst:
         manifest.pop("target", None)
-    # Accept -t/--target like every other target-required mutate command (#308);
-    # the manifest "target" wins if both are given (it's the in-payload, explicit
-    # choice), otherwise -t supplies it.
+    # Accept -t/--target like every other target-required mutate command (#308).
+    # CLI -t WINS over a manifest "target" (#366): it is the explicit per-invocation
+    # selector, so a fan-out agent that copies the documented {"target":"active"}
+    # example but passes a correct -t isn't sabotaged by the in-payload value
+    # ("active" doesn't resolve under multi-target headless). Without -t the
+    # manifest "target" is still honored.
     cli_target = getattr(args, "target", None)
-    if cli_target and not manifest.get("target"):
+    if cli_target:
         manifest["target"] = cli_target
     if args.preview:
         manifest["preview"] = True

@@ -1612,3 +1612,20 @@ def test_backward_slice_out_of_range_notes_stack_passed_varargs_324(monkeypatch)
     with pytest.raises(bridge.OperationFailure) as exc2:
         instance._backward_slice("active", "logger_caller", "0x10010", arg_index=5)
     assert "STACK" not in str(exc2.value)   # arg 5 < 6 regs -> not stack-passed, no note
+
+
+def test_callgraph_result_carries_kind_envelope(monkeypatch):
+    """dataflow callgraph JSON must carry kind:'callgraph' so a consumer of the
+    {kind, ...} family can identify it, instead of a bare {function, callees,
+    callers} off-envelope object (#371.2)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    func = types.SimpleNamespace(name="f", start=0x1000, caller_sites=[])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda sel: object())
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda bv, ident: func)
+
+    result = bridge.read_decompile._resolved_calls(
+        instance.ctx, None, "f", direction="callers")
+    assert result["kind"] == "callgraph"
+    assert result["function"]["name"] == "f"
+    assert "callers" in result
