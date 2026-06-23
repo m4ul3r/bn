@@ -257,6 +257,29 @@ def test_removed_experimental_commands_are_not_present():
         parser.parse_args(["patch", "bytes"])
 
 
+def test_parse_line_range_accepts_colon_and_dash():
+    """--lines accepts both START:END and the natural START-END (which matches the
+    hyphenated range the output header prints), not just the colon form (#359)."""
+    import argparse
+    from bn.cli import _parse_line_range
+    assert _parse_line_range("1:15") == (1, 15)
+    assert _parse_line_range("1-15") == (1, 15)
+    for bad in ("0-5", "5-1", "abc", "1", "1:2:3"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            _parse_line_range(bad)
+
+
+def test_class_and_go_subcommand_groups_have_help():
+    """The `class` and `go` top-level groups must show a one-line help in
+    `bn --help`, like every sibling group -- they were blank (#359)."""
+    from bn.cli import _GROUP_HELP
+    assert _GROUP_HELP.get(("class",))
+    assert _GROUP_HELP.get(("go",))
+    help_text = bn.cli.build_parser().format_help()
+    assert "C++ object-model lens" in help_text
+    assert "Go binary symbol recovery" in help_text
+
+
 def test_missing_subcommand_prints_exact_help(capsys):
     rc = bn.cli.main(["struct"])
 

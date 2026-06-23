@@ -333,6 +333,8 @@ _GROUP_HELP: dict[tuple[str, ...], str] = {
     ("dataflow",): "Structured data-flow primitives (def-use, value-set, call graph)",
     ("taint",): "Taint analysis (forward source->sink, backward sink slicing)",
     ("evidence",): "Evidence-oriented reversing helpers",
+    ("class",): "C++ object-model lens (classes, vtables, RTTI)",
+    ("go",): "Go binary symbol recovery (.gopclntab)",
     ("bundle",): "Export reusable bundles",
     ("py",): "Execute Python inside Binary Ninja",
     ("symbol",): "Rename functions or data",
@@ -1065,16 +1067,23 @@ def _pick(positional: Any, flag: Any, label: str, *, required: bool = True) -> A
 
 
 def _parse_line_range(value: str) -> tuple[int, int]:
-    parts = value.split(":")
+    # Accept both START:END and the natural START-END: the output header prints
+    # the range with a hyphen (`// lines 1-6`), so an agent copying that back as
+    # `--lines 1-6` must work, not just the colon form (#359). --lines is
+    # 1-indexed, so a leading `-` can only be a (rejected) negative START.
+    sep = ":" if ":" in value else "-"
+    parts = value.split(sep)
     if len(parts) != 2:
-        raise argparse.ArgumentTypeError(f"expected START:END, got {value!r}")
+        raise argparse.ArgumentTypeError(f"expected START:END or START-END, got {value!r}")
     try:
         start, end = int(parts[0]), int(parts[1])
     except ValueError:
-        raise argparse.ArgumentTypeError(f"expected START:END with integers, got {value!r}")
+        raise argparse.ArgumentTypeError(
+            f"expected START:END or START-END with integers, got {value!r}"
+        )
     if start < 1 or end < start:
         raise argparse.ArgumentTypeError(
-            f"invalid range {start}:{end}; --lines is 1-indexed (START >= 1, END >= START)"
+            f"invalid range {start}-{end}; --lines is 1-indexed (START >= 1, END >= START)"
         )
     return (start, end)
 
