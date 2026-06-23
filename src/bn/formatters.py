@@ -528,6 +528,10 @@ def _render_target_summary(value: dict[str, Any]) -> str:
         ("target", value.get("target_id")),
         ("view", value.get("view_id")),
         ("kind", value.get("view_name")),
+        # Surface analysis_state (full/quick) in text too -- the bn-re methodology
+        # tells agents to gate their survey on it, and on a quick-loaded view it
+        # explains an apparently-empty result rather than "empty binary" (#378).
+        ("analysis", value.get("analysis_state")),
         ("file", value.get("filename")),
         ("arch", value.get("arch")),
         ("platform", value.get("platform")),

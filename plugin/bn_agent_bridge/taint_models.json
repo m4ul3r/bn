@@ -68,6 +68,12 @@
                      "sink": {"tainted_args": [4], "class": "fortified_format", "detail": "tainted format into __vsnprintf_chk"}},
     "printf_chk":   {"sink": {"tainted_args": [1], "class": "format_string", "detail": "tainted format argument to __printf_chk"}},
     "fprintf_chk":  {"sink": {"tainted_args": [2], "class": "format_string", "detail": "tainted format argument to __fprintf_chk"}},
+    "_comment_asprintf_chk": "FORTIFY asprintf/vasprintf (#373): __asprintf_chk(strp, flags, fmt, ...) and __vasprintf_chk(strp, flags, fmt, va_list). The leading `flags` arg shifts the format string to arg2 (vs arg1 in the plain asprintf/vasprintf above). asprintf has real varargs from arg3; vasprintf takes a va_list (no discoverable varargs).",
+    "asprintf_chk": {"propagates": [{"from": "*arg:2", "to": "*arg:0"}],
+                     "varargs": {"first_index": 3, "to": "*arg:0", "sink": true},
+                     "sink": {"tainted_args": [2], "class": "fortified_format", "detail": "tainted format/args into __asprintf_chk"}},
+    "vasprintf_chk":{"propagates": [{"from": "*arg:2", "to": "*arg:0"}],
+                     "sink": {"tainted_args": [2], "class": "fortified_format", "detail": "tainted format into __vasprintf_chk"}},
 
     "printf":       {"sink": {"tainted_args": [0], "class": "format_string", "detail": "tainted format argument to printf"}},
     "fprintf":      {"sink": {"tainted_args": [1], "class": "format_string", "detail": "tainted format argument to fprintf"}},

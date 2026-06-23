@@ -27,6 +27,12 @@ _RENAME_ARGS = [
          target=True, fmt="json", args=_RENAME_ARGS)
 @command("symbol", "rename", help="Rename a symbol", target=True, fmt="json", args=_RENAME_ARGS)
 def _symbol_rename(args: argparse.Namespace) -> int:
+    # An empty/whitespace-only name is not a usable identifier; reject it before
+    # any op is sent rather than letting the bridge "verify" a degenerate
+    # unnamed function (#363). The bridge enforces the same contract for batch /
+    # raw-socket callers.
+    if not args.new_name.strip():
+        raise BridgeError("new name must be non-empty")
     return _mutate(
         args,
         "rename_symbol",
