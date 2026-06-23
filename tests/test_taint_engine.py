@@ -3415,6 +3415,79 @@ def test_forward_keeps_overflow_when_dest_offset_exceeds_alloc_slack(models):
     assert memcpy[0]["class"] == "overflow_len"
 
 
+def _copy_func_alloc_via_temp(*, alloc_const, dest_off=0, index_var=False,
+                              alloc_addr=0x2000):
+    # dst = alloc(n + alloc_const); d2 = dst + <dest_off | idx>; memcpy(d2, src, n)
+    # -- the dest pointer is materialized into its OWN SSA var first (one extra
+    # SSA hop), the shape real compilers emit. `index_var=True` makes the offset a
+    # NON-constant var (must not be treated as a bounded const offset) (#307 FP-2).
+    n = FVar("n"); n0 = FSSA(n, 0)
+    dst = FVar("dst"); src = FVar("src"); d2 = FVar("d2"); idx = FVar("idx")
+    dst1 = FSSA(dst, 1); src0 = FSSA(src, 0); d2_1 = FSSA(d2, 1); idx0 = FSSA(idx, 0)
+    size_arg = FExpr("MLIL_ADD", f"n#0 + {hex(alloc_const)}", reads=[n0],
+                     left=FExpr("MLIL_VAR_SSA", "n#0", reads=[n0]),
+                     right=FExpr("MLIL_CONST", hex(alloc_const), constant=alloc_const))
+    if index_var:
+        off_operand = FExpr("MLIL_VAR_SSA", "idx#0", reads=[idx0])
+        d2_reads = [dst1, idx0]
+    else:
+        off_operand = FExpr("MLIL_CONST", hex(dest_off), constant=dest_off)
+        d2_reads = [dst1]
+    d2_src = FExpr("MLIL_ADD", "dst#1 + off", reads=d2_reads,
+                   left=FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1]), right=off_operand)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "dst#1 = alloc(n + c)", reads=[n0], writes=[dst1],
+               dest=FExpr("MLIL_CONST_PTR", hex(alloc_addr), constant=alloc_addr),
+               params=[size_arg]),
+        FInstr(1, 0x12, "MLIL_SET_VAR_SSA", "d2#1 = dst#1 + off", reads=d2_reads,
+               writes=[d2_1], src=d2_src),
+        FInstr(2, 0x14, "MLIL_CALL_SSA", "memcpy(d2, src, n)", reads=[d2_1, src0, n0],
+               dest=FExpr("MLIL_CONST_PTR", "0x2010", constant=0x2010),
+               params=[FExpr("MLIL_VAR_SSA", "d2#1", reads=[d2_1]),
+                       FExpr("MLIL_VAR_SSA", "src#0", reads=[src0]),
+                       FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])]),
+    ]
+    return FFunc("copy", 0x10, FSSAFunc(instrs), params=[n])
+
+
+def test_forward_downgrades_dest_offset_through_extra_ssa_hop_307(models):
+    # dst = malloc(n + 0x14); d2 = dst + 0x13; memcpy(d2, src, n): 0x13 + n fits
+    # n + 0x14 -> provably bounded. The extra SSA hop (the dest pointer in its own
+    # var) must NOT defeat allocator recognition (#307 FP-2: was overflow_len).
+    func = _copy_func_alloc_via_temp(alloc_const=0x14, dest_off=0x13)
+    bv = FBV({0x2000: "malloc", 0x2010: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    memcpy = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(memcpy) == 1
+    assert memcpy[0]["class"] == "bounded_len", memcpy[0]
+
+
+def test_forward_keeps_overflow_extra_hop_offset_exceeds_slack_307(models):
+    # Guard: extra-hop dest, but 0x20 offset > 0x10 alloc slack -> still overrunnable,
+    # must STAY overflow_len (the fix must not over-downgrade).
+    func = _copy_func_alloc_via_temp(alloc_const=0x10, dest_off=0x20)
+    bv = FBV({0x2000: "malloc", 0x2010: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    memcpy = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(memcpy) == 1
+    assert memcpy[0]["class"] == "overflow_len", memcpy[0]
+
+
+def test_forward_keeps_overflow_extra_hop_nonconst_index_307(models):
+    # Guard: extra-hop dest with a NON-constant index (d2 = dst + idx). The chain
+    # walk must stop at the non-const arithmetic, so the copy stays overflow_len
+    # (a tainted/unknown dest offset is a real overflow risk, not bounded).
+    func = _copy_func_alloc_via_temp(alloc_const=0x14, index_var=True)
+    bv = FBV({0x2000: "malloc", 0x2010: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    memcpy = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(memcpy) == 1
+    assert memcpy[0]["class"] == "overflow_len", memcpy[0]
+
+
 def test_forward_downgrades_unmodeled_single_arg_allocator_wrapper(models):
     # dst = my_alloc_wrapper(len); memcpy(dst, src, len): an unmodeled one-arg
     # allocator wrapper whose sole arg is the copy length -> bounded_len (#229).

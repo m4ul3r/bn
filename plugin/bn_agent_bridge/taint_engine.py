@@ -1900,6 +1900,43 @@ class TaintEngine:
         "Znwm": 0, "Znam": 0,
     }
 
+    def _pointer_alloc_root(self, ssaf: Any, var: Any, depth: int = 0) -> Any:
+        """Follow a destination pointer through pure SSA copies (``t = s``) and
+        CONSTANT pointer arithmetic (``t = base +/- const``) to the root pointer
+        var -- the one an allocator call defines. Lets ``d2 = dst + 0x13;
+        memcpy(d2, ...)`` still recognize the allocation behind ``dst`` when the
+        compiler materializes the offset pointer into its own SSA var (#307 FP-2);
+        the constant offset itself is independently folded into the bound by
+        ``_addr_base_offset``. Stops at a PHI, a non-constant index, or a multi-read
+        source, so a tainted/unknown-offset dest still flags as a possible
+        overflow (never over-downgrades)."""
+        cur = var
+        seen: set[tuple[Any, Any]] = set()
+        for _ in range(8):
+            marker = (var_key(cur), getattr(cur, "version", None))
+            if marker in seen:
+                break
+            seen.add(marker)
+            try:
+                d = ssaf.get_ssa_var_definition(cur)
+            except Exception:
+                d = None
+            if d is None or op_name(d) != "MLIL_SET_VAR_SSA":
+                break
+            src = getattr(d, "src", None)
+            nxt = self._as_single_ssa_var(src)
+            if nxt is None and op_name(src) in ("MLIL_ADD", "MLIL_SUB"):
+                left = getattr(src, "left", None)
+                right = getattr(src, "right", None)
+                if self._int_const(right) is not None:
+                    nxt = self._as_single_ssa_var(left)
+                elif op_name(src) == "MLIL_ADD" and self._int_const(left) is not None:
+                    nxt = self._as_single_ssa_var(right)
+            if nxt is None:
+                break
+            cur = nxt
+        return cur
+
     def _alloc_size_expr(self, ssaf: Any, ptr_expr: Any) -> Any | None:
         """If *ptr_expr*'s buffer was produced by an allocator call in this
         function, return the allocator's SIZE argument expression, else None."""
@@ -1910,6 +1947,10 @@ class TaintEngine:
                 var = reads[0]
         if var is None:
             return None
+        # Follow copies + constant pointer arithmetic to the allocator-defined
+        # root so an offset pointer held in its own SSA var is still recognized
+        # (#307 FP-2).
+        var = self._pointer_alloc_root(ssaf, var)
         try:
             d = ssaf.get_ssa_var_definition(var)
         except Exception:
@@ -2148,6 +2189,10 @@ class TaintEngine:
                 var = reads[0]
         if var is None:
             return None, False
+        # Same copy + constant-pointer-arithmetic walk as the modeled path, so a
+        # wrapper-allocated buffer reached through an offset pointer var is still
+        # recognized (#307 FP-2).
+        var = self._pointer_alloc_root(ssaf, var)
         try:
             d = ssaf.get_ssa_var_definition(var)
         except Exception:
