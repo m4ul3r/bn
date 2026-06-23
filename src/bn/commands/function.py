@@ -425,8 +425,17 @@ def _xrefs(args: argparse.Namespace) -> int:
 
 
 def _load_within_identifiers(path: Path) -> list[str]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise BridgeError(
+            "--within-file must be a UTF-8 text file with one function "
+            f"identifier per line; got a binary file: {path}"
+        ) from exc
+    except OSError as exc:
+        raise BridgeError(f"could not read --within-file {path}: {exc}") from exc
     identifiers = []
-    for raw in path.read_text(encoding="utf-8").splitlines():
+    for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#"):
             continue

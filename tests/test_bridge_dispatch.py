@@ -1284,6 +1284,27 @@ def test_py_exec_reports_script_error_with_type_prefix(monkeypatch):
         instance._py_exec("active", "raise ValueError('boom')")
 
 
+def test_py_exec_systemexit_reported_not_worker_fault(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    # SystemExit / sys.exit() are BaseException, not Exception, so they used to
+    # slip the `except Exception` guard and unwind the worker thread -- the
+    # client then saw a misleading "empty response / worker faulted" instead of
+    # the real cause. They must be caught and reported as a clean, named error
+    # that the instance survives. See issue #387.
+    with pytest.raises(RuntimeError, match=r"SystemExit.*0"):
+        instance._py_exec("active", "raise SystemExit(0)")
+    with pytest.raises(RuntimeError, match=r"SystemExit.*3"):
+        instance._py_exec("active", "import sys; sys.exit(3)")
+
+    # The instance is still usable afterwards (the worker was protected).
+    ok = instance._py_exec("active", "result = 1 + 1")
+    assert ok["result"] == 2
+
+
 def test_load_binary_corrupt_file_raises_clean_error(monkeypatch, tmp_path):
     bridge, instance, _ = _setup_load_test(monkeypatch)
     raw = tmp_path / "broken.bndb"
