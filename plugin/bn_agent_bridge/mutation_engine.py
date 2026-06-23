@@ -108,6 +108,33 @@ def _normalize_struct_alias(op: dict[str, Any]) -> dict[str, Any]:
 # propagation, not just the targeted variable (see _capture_local_var_snapshots).
 _VAR_DRIFT_OPS = {"local_rename", "local_retype", "set_prototype"}
 
+# Valid batch op `kind` names, in dispatch order (kept in sync with the if-chain
+# in _apply_operation). Used to suggest a close match when an agent reuses a CLI
+# verb spelling like `proto_set`/`rename_local` (#361).
+_BATCH_OP_NAMES = (
+    "rename_symbol", "set_comment", "delete_comment", "set_prototype",
+    "local_rename", "local_retype", "struct_field_set", "struct_field_rename",
+    "struct_field_delete", "types_declare", "function_create",
+)
+
+
+def _suggest_batch_op(kind: str) -> str | None:
+    """Closest valid batch op name for an unknown *kind*, or None (#361).
+
+    The common agent error is a word-SWAPPED spelling (`local rename` -> typed
+    `rename_local` instead of the op `local_rename`). A raw difflib match misleads
+    here (it ranks `rename_local` closer to `rename_symbol` than to `local_rename`),
+    so first map each op's token-reversed form to the op for an EXACT, non-misleading
+    hit, then fall back to difflib for everything else."""
+    reversed_aliases = {
+        "_".join(reversed(op.split("_"))): op
+        for op in _BATCH_OP_NAMES if "_" in op
+    }
+    if kind in reversed_aliases:
+        return reversed_aliases[kind]
+    matches = difflib.get_close_matches(kind, _BATCH_OP_NAMES, n=1, cutoff=0.4)
+    return matches[0] if matches else None
+
 # Soft upper bound on a struct field offset. A real struct is at most a few KiB;
 # anything past this (256 MiB) is a mistyped/garbage offset that would explode
 # the struct into a multi-GB sparse type, so struct field set refuses it (#369).
@@ -1256,7 +1283,18 @@ def _apply_operation(ctx, bv, op: dict[str, Any], restores: list | None = None):
             return _op_types_declare(ctx, bv, op)
         if kind == "function_create":
             return _op_function_create(ctx, bv, op, restores)
-        raise OperationFailure("unsupported", f"Unsupported operation: {kind}", requested=_operation_requested(ctx, op))
+        # The batch op names are a different namespace than the CLI verbs
+        # (`bn proto set` -> op `set_prototype`); an agent reusing the CLI verb
+        # gets a bare "unsupported" and silently wastes a batch. Suggest the
+        # closest valid op name and always list them all (#361).
+        match = _suggest_batch_op(str(kind))
+        hint = f" Did you mean {match!r}?" if match else ""
+        raise OperationFailure(
+            "unsupported",
+            f"Unsupported operation: {kind}.{hint} Valid op names: "
+            f"{', '.join(_BATCH_OP_NAMES)}.",
+            requested=_operation_requested(ctx, op),
+        )
     except OperationFailure:
         raise
     except Exception as exc:
