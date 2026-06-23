@@ -17,6 +17,71 @@ import pytest
 from _bridge_fakes import *  # noqa: F401,F403
 
 
+class _FunctionCreateBV(_FakeBV):
+    """Models the BN reality #360 hinges on: ``add_function`` is an advisory
+    auto-analysis hint that DECLINES an address auto-analysis already chose to
+    skip (a data-table / missed-handler entry), while ``create_user_function``
+    forces a user-defined function there. Only the forced path creates."""
+
+    def __init__(self, addr):
+        super().__init__()
+        self._addr = int(addr)
+        self._created = False
+        self.add_function_called = False
+        self.create_user_function_called = False
+
+    def read(self, addr, length):
+        return b"\x90" * length  # mapped, returns bytes
+
+    def get_function_at(self, addr):
+        if self._created and int(addr) == self._addr:
+            return _FakeFunction(self._addr, f"sub_{self._addr:x}")
+        return None
+
+    def add_function(self, addr, *a, **k):
+        # advisory hint -- a no-op on a skipped address (the #360 failure mode)
+        self.add_function_called = True
+
+    def create_user_function(self, addr, *a, **k):
+        self.create_user_function_called = True
+        self._created = True
+        return _FakeFunction(self._addr, f"sub_{self._addr:x}")
+
+    def begin_undo_actions(self):
+        return "state"
+
+    def commit_undo_actions(self, state):
+        pass
+
+    def revert_undo_actions(self, state):
+        pass
+
+    def update_analysis_and_wait(self):
+        pass
+
+
+def test_function_create_uses_forced_create_on_skipped_address(monkeypatch):
+    """function create must succeed on its documented use-case: an address
+    auto-analysis skipped (data-table / missed-handler entry). It must use the
+    forced ``create_user_function`` -- ``add_function`` is only an advisory hint
+    and declines exactly those addresses, so the op returned verification_failed
+    on the very case it exists for (#360)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    addr = 0x401abc
+    bv = _FunctionCreateBV(addr)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.read_misc, "_is_executable_address",
+                        lambda ctx, _bv, _addr: True)
+
+    result = bridge.create_comments._function_create(instance.ctx, None, hex(addr), False)
+
+    assert result["results"][0]["status"] == "verified"
+    assert result["committed"] is True
+    assert bv.create_user_function_called is True
+    assert bv.add_function_called is False  # the advisory hint must NOT be the path
+
+
 def test_batch_comment_ops_require_one_locator(monkeypatch):
     """set_comment / delete_comment target a function OR an address; a manifest
     op with neither is rejected with a clear invalid_request, not silently

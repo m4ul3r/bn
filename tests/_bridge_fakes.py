@@ -632,28 +632,41 @@ class _FakeFunctionCreateBV(_FakeMutationBV):
         self._suppressed: set[int] = set()
 
     def add_function(self, addr: int):
+        # The advisory auto-analysis hint: it DECLINES an address auto-analysis
+        # already skipped (modeled here as a suppressed address) -- the #360
+        # failure mode. The op no longer uses this for creation; kept so any
+        # stray call is still modeled faithfully.
         self.events.append(("add_function", addr))
-        self.added.append(int(addr))
         if int(addr) in self._suppressed:
-            # Poisoned by a prior remove_user_function: analysis declines to keep
-            # it, so get_function_at stays None (the live verification_failed).
             return None
         fn = _FakeFunction(int(addr), f"sub_{addr:x}")
         self.functions.append(fn)
         return fn
 
+    def create_user_function(self, addr: int):
+        # The FORCED creation the op now uses (#360): it creates a user function
+        # even at an address auto-analysis skipped/suppressed -- empirically the
+        # forced path bypasses the remove_user_function suppression (#304).
+        self.events.append(("create_user_function", addr))
+        self.added.append(int(addr))
+        self._suppressed.discard(int(addr))
+        fn = _FakeFunction(int(addr), f"sub_{addr:x}")
+        self.functions.append(fn)
+        return fn
+
     def remove_user_function(self, fn):
-        # Model BN faithfully: add_function is NOT journaled by the undo buffer,
-        # so revert_undo_actions never removes it -- only an explicit removal
-        # does (#117). remove_user_function additionally records a persistent
-        # user override that SUPPRESSES the address (#304 poison).
+        # Model BN faithfully: function creation is not reliably undone by the
+        # undo buffer, so revert_undo_actions never removes it -- only an explicit
+        # removal does (#117). remove_user_function additionally records a
+        # persistent user override that SUPPRESSES the address (#304 poison),
+        # which only the auto add_function path honors.
         self.events.append(("remove_user_function", int(fn.start)))
         self.functions = [f for f in self.functions if int(f.start) != int(fn.start)]
         self._suppressed.add(int(fn.start))
 
     def remove_function(self, fn):
         # The non-poisoning removal: drops the function WITHOUT suppressing the
-        # address, so a later add_function re-creates it (the #304 fix).
+        # address, so a later create_user_function re-creates it (the #304 fix).
         self.events.append(("remove_function", int(fn.start)))
         self.functions = [f for f in self.functions if int(f.start) != int(fn.start)]
 
