@@ -17,6 +17,7 @@ This module imports ONLY stdlib + binaryninja + ``._shared`` -- never ``bridge``
 from __future__ import annotations
 
 import difflib
+import re
 from typing import Any
 
 import binaryninja as bn
@@ -893,6 +894,20 @@ class BridgeContext:
             f"Type not found: {name}. No similar type names; try {search_hint}."
         )
 
+    @staticmethod
+    def _is_anonymous_aggregate(member_type) -> bool:
+        """True if *member_type* is a nested struct/union with NO tag name (so its
+        inner members are unreachable via a separate `struct show <name>`). A bare
+        `union`/`struct` (optionally `{...}`) is anonymous; `struct Inner` is not
+        (#370.2)."""
+        if not getattr(member_type, "members", None):
+            return False
+        m = re.match(r"^(struct|union|enum)\b(.*)$", str(member_type).strip())
+        if not m:
+            return False
+        rest = m.group(2).strip()
+        return rest == "" or rest.startswith("{")
+
     def _render_type_layout(self, type_obj) -> str:
         header = str(type_obj)
         try:
@@ -905,14 +920,18 @@ class BridgeContext:
         if members is None:
             return header
 
+        tc = str(getattr(getattr(type_obj, "type_class", None), "name", "") or "")
+        lines = [header]
+        self._append_member_lines(lines, members, "Enum" in tc, depth=0)
+        return "\n".join(lines)
+
+    def _append_member_lines(self, lines: list, members, is_enum: bool, *, depth: int) -> None:
         # Enum members carry a .value (the enumerator constant) but no .offset/
         # .type, so the struct-shaped line collapses every one to
         # "0x0000: <unknown> NAME", dropping the only meaningful datum. Render the
-        # value instead for enums (#54).
-        tc = str(getattr(getattr(type_obj, "type_class", None), "name", "") or "")
-        is_enum = "Enum" in tc
-
-        lines = [header]
+        # value instead for enums (#54). An anonymous nested aggregate is expanded
+        # (indented) so its inner members are visible from the CLI (#370.2).
+        pad = "  " * depth
         for member in list(members):
             name = str(getattr(member, "name", "<anonymous>"))
             value = getattr(member, "value", None)
@@ -920,17 +939,49 @@ class BridgeContext:
                 try:
                     ival = int(value)
                     suffix = f" (0x{ival:x})" if ival >= 0 else ""
-                    lines.append(f"{name} = {ival}{suffix}")
+                    lines.append(f"{pad}{name} = {ival}{suffix}")
                 except Exception:
-                    lines.append(f"{name} = {value}")
+                    lines.append(f"{pad}{name} = {value}")
             else:
                 try:
                     offset = int(getattr(member, "offset", 0))
                 except Exception:
                     offset = 0
-                member_type = str(getattr(member, "type", "<unknown>"))
-                lines.append(f"0x{offset:04x}: {member_type} {name}")
-        return "\n".join(lines)
+                member_type = getattr(member, "type", None)
+                lines.append(f"{pad}0x{offset:04x}: {member_type if member_type is not None else '<unknown>'} {name}")
+                if depth < 4 and self._is_anonymous_aggregate(member_type):
+                    itc = str(getattr(getattr(member_type, "type_class", None), "name", "") or "")
+                    self._append_member_lines(
+                        lines, member_type.members, "Enum" in itc, depth=depth + 1)
+
+    def _member_entries(self, type_obj, depth: int = 0) -> list[dict] | None:
+        """Structured members[] for the JSON readback, recursing into anonymous
+        aggregates so their inner members aren't invisible (the JSON counterpart of
+        the text expansion, #370.2). None for a non-aggregate type."""
+        members = getattr(type_obj, "members", None)
+        if members is None:
+            return None
+        out: list[dict] = []
+        for member in list(members):
+            entry: dict = {"name": str(getattr(member, "name", "<anonymous>"))}
+            value = getattr(member, "value", None)
+            offset = getattr(member, "offset", None)
+            if offset is not None:
+                try:
+                    entry["offset"] = hex(int(offset))
+                except Exception:
+                    pass
+            mtype = getattr(member, "type", None)
+            if mtype is not None:
+                entry["type"] = str(mtype)
+            if value is not None and offset is None:
+                entry["value"] = int(value) if isinstance(value, int) else str(value)
+            if depth < 4 and self._is_anonymous_aggregate(mtype):
+                inner = self._member_entries(mtype, depth + 1)
+                if inner:
+                    entry["members"] = inner
+            out.append(entry)
+        return out
 
     def _type_entry(self, type_name, type_obj):
         type_class = getattr(type_obj, "type_class", None)
@@ -940,12 +991,16 @@ class BridgeContext:
                 kind = _TYPE_CLASS_NAMES.get(int(type_class), str(type_class))
             except (TypeError, ValueError):
                 kind = str(type_class)
-        return {
+        entry = {
             "name": str(type_name),
             "kind": kind,
             "decl": str(type_obj),
             "layout": self._render_type_layout(type_obj),
         }
+        members = self._member_entries(type_obj)
+        if members is not None:
+            entry["members"] = members
+        return entry
 
     def _current_type_entry(self, bv, type_name: str):
         type_obj = bv.get_type_by_name(type_name)

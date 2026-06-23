@@ -9,6 +9,21 @@ import pytest
 from _cli_helpers import *  # noqa: F401,F403
 
 
+def test_render_name_address_rows_escapes_control_chars():
+    """A symbol name containing a newline must not break the row across two lines
+    in --format text; control chars are escaped (#370.1). JSON keeps the raw name."""
+    from bn.formatters import _render_name_address_rows
+    out = _render_name_address_rows([
+        {"address": "0x1000", "name": "good_name"},
+        {"address": "0x2000", "name": "evil\nname\twith\x07ctrl"},
+    ])
+    # the malicious row stays on ONE physical line (no raw newline injected)
+    rows = out.splitlines()
+    assert len(rows) == 2, rows
+    assert "evil\\nname\\twith" in out          # escaped, visible
+    assert "\x07" not in out                     # raw control byte gone
+
+
 def test_render_function_bundle_text_pretty_prints_not_escaped():
     """`bundle function --format text` must render readable multi-line JSON with a
     note, not a single line of escaped JSON like the default fallback (#362)."""

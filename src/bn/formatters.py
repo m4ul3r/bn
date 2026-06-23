@@ -13,6 +13,18 @@ from .transport import BridgeError
 # request); still a failure, so exit codes/rendering flag it (#122).
 FAILED_MUTATION_STATUSES = {"unsupported", "verification_failed", "invalid_request", "rollback_failed", "internal_error"}
 
+# Control chars (C0 minus the ones we name, plus DEL) in a symbol name would
+# break a --format text row across lines or corrupt the terminal. Escape them so
+# the row stays on one line and the name is still readable (#370.1). JSON output
+# is untouched -- it round-trips the raw name faithfully.
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+
+def _escape_control_chars(text: Any) -> str:
+    s = str(text)
+    s = s.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+    return _CONTROL_CHAR_RE.sub(lambda m: f"\\x{ord(m.group()):02x}", s)
+
 
 def _render_fallback_text(value: Any) -> str:
     if isinstance(value, str):
@@ -179,7 +191,7 @@ def _render_function_info_text(value: Any, verbose: bool = False, demangle: bool
     if demangle and function.get("display_name"):
         header_name = function["display_name"]
     lines = [
-        f"{header_name} @ {function.get('address', '<unknown>')}",
+        f"{_escape_control_chars(header_name)} @ {function.get('address', '<unknown>')}",
         str(value.get("prototype", "")),
         f"calling convention: {value.get('calling_convention', '<unknown>')}",
         f"size: {value.get('size', '<unknown>')}",
@@ -685,7 +697,7 @@ def _render_name_address_rows(value: Any, *, demangle: bool = False) -> str:
         name = item.get("name") or item.get("function") or "<unknown>"
         if demangle and item.get("display_name"):
             name = item["display_name"]
-        line = f"{address}  {name}"
+        line = f"{address}  {_escape_control_chars(name)}"
         kind = item.get("kind")
         if kind and kind != "function":
             line += f" ({kind})"
