@@ -42,21 +42,20 @@ from ._shared import _parse_address, _require_mapped_address, _validate_count
 def _remove_created_function(ctx, bv, addr: int) -> bool:
     """Remove a just-created function and confirm it is gone.
 
-    ``bv.add_function`` is NOT journaled in BN's undo buffer, so the preview /
-    rollback revert (which relies on ``revert_undo_actions``) is a silent no-op
-    for function creation -- the function persists in the view. Explicitly
-    remove it, reanalyze, and read back that no function starts at the address.
-    Returns True only when the function is actually gone, so callers never report
-    a revert they did not verify (#117).
+    Function creation (``create_user_function``) is not reliably undone by
+    ``revert_undo_actions`` -- the function can persist in the view -- so the
+    preview / rollback revert must explicitly remove it, reanalyze, and read back
+    that no function starts at the address. Returns True only when the function is
+    actually gone, so callers never report a revert they did not verify (#117).
 
     Use ``remove_function``, NOT ``remove_user_function``: the latter records a
-    persistent user "do not create a function here" override that POISONS the
-    address, so a SUBSEQUENT real ``function create`` at the same address is then
-    declined by analysis ("No function starts at ... after analysis"). That is
-    what made a ``--preview`` (which reverts) report ``verified`` while the
-    follow-up live commit reported ``verification_failed`` -- the preview's
-    cleanup sabotaged the next run (#304). ``remove_function`` reverts cleanly:
-    a later ``add_function`` re-creates the function normally.
+    persistent user "do not create a function here" override. Empirically that
+    override does NOT block the forced ``create_user_function`` apply path, but
+    ``remove_function`` is still the cleaner revert (no lingering suppression
+    flag) and is what kept a ``--preview`` (which reverts) from sabotaging a
+    later live commit back when the apply used the advisory ``add_function``
+    (#304). ``remove_function`` removes a ``create_user_function``-created
+    function cleanly, and it can be re-created afterward (verified on real BN).
     """
     fn = bv.get_function_at(addr)
     if fn is None:
@@ -130,7 +129,14 @@ def _function_create(ctx, selector: str | None, address, preview: bool):
 
     state = bv.begin_undo_actions()
     try:
-        bv.add_function(addr)
+        # create_user_function (FORCED), not add_function (an advisory auto hint):
+        # auto-analysis declines exactly the addresses it already skipped -- the
+        # data-table / missed-handler entries this op exists to recover -- so
+        # add_function returned verification_failed on its own documented use-case
+        # (#360). The forced path also bypasses any prior remove_user_function
+        # "no function here" suppression, so a preview's cleanup can't sabotage a
+        # later live create.
+        bv.create_user_function(addr)
         bv.update_analysis_and_wait()
         created = bv.get_function_at(addr)
         if created is None:
@@ -163,11 +169,11 @@ def _function_create(ctx, selector: str | None, address, preview: bool):
         function_name = str(created.name)
         op_status = "verified"
         if preview:
-            # add_function is NOT journaled by BN's undo buffer, so
-            # revert_undo_actions is a silent no-op for function creation (the
-            # same non-journaled class as create_user_var / set_user_type).
-            # Explicitly remove the created function and read back that it is
-            # gone -- never claim a revert we did not verify (#117).
+            # Function creation isn't reliably undone by revert_undo_actions
+            # (the same non-journaled class as create_user_var / set_user_type),
+            # so after reverting the journal explicitly remove the created
+            # function and read back that it is gone -- never claim a revert we
+            # did not verify (#117).
             bv.revert_undo_actions(state)
             reverted = _remove_created_function(ctx, bv, addr)
             committed = False
@@ -219,7 +225,7 @@ def _function_create(ctx, selector: str | None, address, preview: bool):
             result["rolled_back"] = reverted
         return result
     except Exception as exc:
-        # revert_undo_actions cannot remove a non-journaled add_function, so
+        # revert_undo_actions does not reliably remove a just-created function, so
         # also explicitly drop any function left at the address (#117).
         undo_ok = mutation_engine._revert_undo_safely(ctx, bv, state)
         removed = _remove_created_function(ctx, bv, addr)

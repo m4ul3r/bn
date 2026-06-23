@@ -667,6 +667,61 @@ class TestBatchFunctionCreate:
             _session_stop(inst)
 
 
+class TestFunctionCreateSkippedAddress:
+    """Regression for #360: function create must succeed on an address
+    auto-analysis SKIPPED (a data-table / missed-handler entry). The handler
+    uses the forced create_user_function; the advisory add_function declines
+    exactly those addresses, so the op used to return verification_failed on its
+    own documented use-case. Drives real BN."""
+
+    def test_create_on_auto_skipped_address(self):
+        info = _session_start(str(HELLO_BINARY))
+        inst = info["instance_id"]
+        try:
+            # Find a caller-less function (reachable only indirectly -- the
+            # data-table-handler shape), undefine it so the address becomes one
+            # auto-analysis declines to recreate, and return its address.
+            code = (
+                "for f in bv.functions:\n"
+                "    if f.start != bv.entry_point and len(list(bv.get_code_refs(f.start))) == 0:\n"
+                "        a = f.start\n"
+                "        bv.remove_user_function(f); bv.update_analysis_and_wait()\n"
+                "        if bv.get_function_at(a) is None:\n"
+                "            print('ADDR=' + hex(a)); break\n"
+            )
+            probe = _bn("--instance", inst, "py", "exec", code)
+            line = next((l for l in probe.stdout.splitlines() if l.startswith("ADDR=")), None)
+            if line is None:
+                pytest.skip("no caller-less auto-skipped function in this fixture")
+            addr = line.split("=", 1)[1].strip()
+
+            # create on the skipped address: must verify and commit (#360). With
+            # the advisory add_function this returned verification_failed.
+            out = _bn("--instance", inst, "function", "create", addr, "--format", "json")
+            assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+            res = json.loads(out.stdout)
+            assert res["results"][0]["status"] == "verified", res
+            assert res["committed"] is True, res
+            assert _bn("--instance", inst, "function", "info", addr).returncode == 0
+
+            # --preview on another skipped address verifies AND reverts cleanly,
+            # and a subsequent live create still works (the revert must not poison
+            # the address, #304).
+            probe2 = _bn("--instance", inst, "py", "exec", code)
+            line2 = next((l for l in probe2.stdout.splitlines() if l.startswith("ADDR=")), None)
+            if line2 is not None:
+                addr2 = line2.split("=", 1)[1].strip()
+                prev = _bn("--instance", inst, "function", "create", addr2,
+                           "--preview", "--format", "json")
+                assert json.loads(prev.stdout)["results"][0]["status"] == "verified"
+                assert _bn("--instance", inst, "function", "info", addr2).returncode != 0
+                live = _bn("--instance", inst, "function", "create", addr2, "--format", "json")
+                assert json.loads(live.stdout)["results"][0]["status"] == "verified"
+                assert json.loads(live.stdout)["committed"] is True
+        finally:
+            _session_stop(inst)
+
+
 class TestTaintEmptyVerdictHonesty:
     """Regression for #310.1: a genuinely empty forward-taint result (no sink, no
     frontier) must carry the same loud 'NOT an all-clear' caveat the

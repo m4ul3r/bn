@@ -2315,9 +2315,9 @@ def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = Non
     Unlike the standalone ``function create`` op (create_comments._function_create,
     which manages its own undo bracket), this runs inside the batch's single
     transaction: it creates + verifies, and registers a restore that removes the
-    created function on revert. ``bv.add_function`` is NOT journaled by BN's undo
-    buffer, so ``revert_undo_actions`` alone would leave it -- the restore uses
-    the non-poisoning ``remove_function`` (#304) so a later create still works.
+    created function on revert. Function creation is not reliably undone by
+    ``revert_undo_actions`` alone, so the restore uses the non-poisoning
+    ``remove_function`` (#304) so a later create still works.
     read_misc / create_comments are imported locally to keep this module's
     one-way import direction (create_comments imports mutation_engine, not the
     reverse)."""
@@ -2347,12 +2347,15 @@ def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = Non
             f"Cannot create function: address {hex(addr)} is not inside an executable segment",
             requested=requested,
         )
-    bv.add_function(addr)
+    # create_user_function (FORCED), not add_function (an advisory auto hint that
+    # declines exactly the auto-skipped data-table / missed-handler addresses this
+    # op exists to recover -- #360). Mirrors the standalone create_comments path.
+    bv.create_user_function(addr)
     bv.update_analysis_and_wait()
     created = bv.get_function_at(addr)
     if created is None:
-        # BN's analysis declined to keep a function here. add_function is not
-        # journaled, so drop the stray (non-poisoning) before failing the op.
+        # BN's analysis declined to keep a function here; drop the stray
+        # (non-poisoning remove_function) before failing the op.
         create_comments._remove_created_function(ctx, bv, addr)
         raise OperationFailure(
             "verification_failed",
