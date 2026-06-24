@@ -586,6 +586,24 @@ def _resolve_class_names(registry: dict[str, dict], name: str) -> list[str]:
 def _enrich(ctx, bv, rec: dict[str, Any]) -> dict[str, Any]:
     if rec.get("vtable"):
         rec["vtable"] = ctx._vtable_layout_for(bv, int(rec["vtable"]["address"], 16)) or rec["vtable"]
+        # #412 (codex Finding 1): a multiple-inheritance class commonly keeps its
+        # PRIMARY `_ZTV` symbol while the secondary base-subobject vtables are
+        # unsymbolized. The symbolized primary above doesn't surface them, so back-
+        # walk the typeinfo for the secondaries too. Keep the symbolized primary as
+        # `rec["vtable"]`; attach only the recovered tables that are a DIFFERENT
+        # address (the backwalk re-finds the primary via its own typeinfo ref).
+        if rec.get("typeinfo"):
+            recovered = _recover_vtables_from_typeinfo(
+                ctx, bv, int(rec["typeinfo"]["address"], 16))
+            if recovered:
+                primary_addr = (rec["vtable"] or {}).get("address")
+                secondaries = [s for s in recovered["secondary"]
+                               if s.get("address") != primary_addr]
+                if secondaries:
+                    rec["secondary_vtables"] = secondaries
+                    rec.setdefault("notes", []).append(
+                        "secondary (multiple-inheritance) vtables recovered via "
+                        "typeinfo backwalk (no _ZTV symbol for the secondary bases)")
     elif rec.get("typeinfo"):
         # #354: STRIPPED binary -- the `_ZTV` DataSymbol is gone so the registry has
         # no vtable address, but typeinfo survived. Backwalk typeinfo->vtable.
@@ -640,8 +658,18 @@ def _recover_vtables_from_typeinfo(ctx, bv, typeinfo_addr: int) -> dict[str, Any
         groups.append((ott, layout))
     if not groups:
         return None
-    groups.sort(key=lambda g: abs(g[0]))     # primary = offset-to-top nearest 0
-    return {"primary": groups[0][1], "secondary": [g[1] for g in groups[1:]]}
+    # Classify by offset-to-top VALUE, not by sort rank. The primary subobject
+    # sits at offset-to-top 0; a real secondary base subobject is at a NON-ZERO
+    # (negative) offset-to-top. A second ref that resolves to a distinct vtable
+    # whose offset-to-top is ALSO 0 is a construction-vtable / RTTI artifact, not
+    # a secondary -- dropping it avoids emitting a bogus secondary (#412 review).
+    zeros = [layout for ott, layout in groups if ott == 0]
+    if zeros:
+        primary = zeros[0]                            # several ==0 -> take the first
+    else:
+        primary = min(groups, key=lambda g: abs(g[0]))[1]   # none ==0 -> nearest 0
+    secondary = [layout for ott, layout in groups if ott != 0]
+    return {"primary": primary, "secondary": secondary}
 
 
 def _class_show(ctx, selector: str | None, name: str) -> dict[str, Any]:
