@@ -876,6 +876,53 @@ def test_init_arrays_summarizes_constructor_pointer_sections(monkeypatch):
     assert section["table"]["items"][0]["target"]["function"]["name"] == "global_ctor"
 
 
+def test_init_arrays_surfaces_pe_tls_callbacks(monkeypatch):
+    # #380: a PE's pre-entry TLS callbacks (IMAGE_TLS_DIRECTORY.AddressOfCallBacks)
+    # must show in evidence init as pointer-table evidence, not be silently omitted.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    cb1, cb2 = 0x1000, 0x1100
+    f1 = _FakeFunction(cb1, "tls_cb1"); f2 = _FakeFunction(cb2, "tls_cb2")
+    # crafted PE32+ headers at base 0: MZ -> e_lfanew -> "PE\0\0" -> opt magic 0x20b
+    # -> data directory[9] (TLS) RVA -> IMAGE_TLS_DIRECTORY -> AddressOfCallBacks.
+    hdr = bytearray(0x158)
+    hdr[0:2] = b"MZ"
+    hdr[0x3C:0x40] = (0x80).to_bytes(4, "little")          # e_lfanew
+    hdr[0x80:0x84] = b"PE\x00\x00"
+    hdr[0x98:0x9A] = (0x20B).to_bytes(2, "little")         # PE32+ magic (opt = 0x80+24)
+    hdr[0x104:0x108] = (16).to_bytes(4, "little")          # NumberOfRvaAndSizes (opt+108)
+    hdr[0x150:0x154] = (0x2000).to_bytes(4, "little")      # data dir[9] RVA (opt+112+72)
+    hdr[0x154:0x158] = (40).to_bytes(4, "little")          # size
+    tlsdir = bytearray(32)
+    tlsdir[24:32] = (0x3000).to_bytes(8, "little")         # AddressOfCallBacks VA
+    cbarray = cb1.to_bytes(8, "little") + cb2.to_bytes(8, "little") + (0).to_bytes(8, "little")
+    bv = _FakeBV(functions=[f1, f2], sections={},
+                 memory={0: bytes(hdr), 0x2000: bytes(tlsdir), 0x3000: cbarray})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._init_arrays("active", limit=16)
+    tls = [it for it in result["items"] if "TLS callbacks" in it["name"]]
+    assert len(tls) == 1
+    assert tls[0]["total_entries"] == 2     # null-terminated array of 2
+    names = [r["target"]["function"]["name"] for r in tls[0]["table"]["items"]]
+    assert names == ["tls_cb1", "tls_cb2"]
+
+
+def test_init_arrays_no_tls_item_for_non_pe(monkeypatch):
+    # A non-PE target must NOT grow a spurious TLS item. Give the MZ gate direct
+    # teeth: a nonzero e_lfanew @0x3C pointing at a NON-"PE" signature, so only the
+    # "MZ" magic check (not a coincidentally-falsy e_lfanew) stops the parse.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    blob = bytearray(b"\x7fELF" + b"\x00" * 0x200)
+    blob[0x3C:0x40] = (0x40).to_bytes(4, "little")     # nonzero e_lfanew
+    blob[0x40:0x44] = b"ELF\x00"                        # NOT "PE\0\0"
+    bv = _FakeBV(functions=[], sections={}, memory={0: bytes(blob)})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._init_arrays("active")
+    assert not any("TLS callbacks" in it["name"] for it in result["items"])
+
+
 def test_scan_for_calls_to_finds_llil_calls(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
