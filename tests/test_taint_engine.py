@@ -255,6 +255,37 @@ def test_builtin_models_load():
     assert "system" in models and "recv" in models
 
 
+def test_model_overlay_sources_discloses_active_overlays():
+    # #415: the active overlay sources are disclosed (builtin always; user --models
+    # when supplied), so an agent can confirm a model landed without a restart.
+    builtin_only = te.model_overlay_sources(None)
+    assert builtin_only[0]["kind"] == "builtin" and "path" in builtin_only[0]
+    assert all(s["kind"] != "user" for s in builtin_only)
+
+    with_user = te.model_overlay_sources({"xmalloc": {}, "xcalloc": {}})
+    user = [s for s in with_user if s["kind"] == "user"]
+    assert len(user) == 1
+    assert user[0]["via"] == "--models" and user[0]["count"] == 2
+
+
+def test_model_overlay_sources_labels_override_by_env_presence(monkeypatch, tmp_path):
+    # #415 review: an active override file is labeled env_override ONLY when
+    # BN_TAINT_MODELS is set; the default-cache file (env unset) is override_default,
+    # not a false claim that the env var is in effect.
+    override = tmp_path / "models.json"
+    override.write_text("{}")
+    monkeypatch.setattr(te, "taint_models_path", lambda: override)
+
+    monkeypatch.setenv("BN_TAINT_MODELS", str(override))
+    by_env = te.model_overlay_sources(None)
+    assert any(s["kind"] == "env_override" and s["env"] == "BN_TAINT_MODELS" for s in by_env)
+
+    monkeypatch.delenv("BN_TAINT_MODELS", raising=False)
+    by_default = te.model_overlay_sources(None)
+    assert any(s["kind"] == "override_default" for s in by_default)
+    assert not any(s["kind"] == "env_override" for s in by_default)
+
+
 def test_secure_crt_annex_k_models_present_and_shaped():
     models = te.load_models()
     # Copy family: destsz after the dest shifts src->arg2, count->arg3.
