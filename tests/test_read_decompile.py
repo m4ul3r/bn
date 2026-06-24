@@ -429,6 +429,25 @@ def test_list_functions_is_sorted_by_address(monkeypatch):
     assert result["total"] == 2 and result["has_more"] is False
 
 
+def test_function_list_rows_carry_basic_block_count(monkeypatch):
+    # #411: `size` is a raw address span -- agents misread it as complexity. Each
+    # list row carries basic_block_count, a real triage metric, computed for the
+    # returned page only.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    # BN exposes the count as len(fn.basic_blocks), not a basic_block_count attr.
+    f1 = _FakeFunction(0x401000, "sub_401000"); f1.basic_blocks = [object()]
+    f2 = _FakeFunction(0x402000, "parse_loop"); f2.basic_blocks = [object()] * 42
+    bv = _FakeBV(functions=[f1, f2])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._list_functions("active")
+    by = {it["address"]: it for it in result["items"]}
+    assert by["0x401000"]["basic_block_count"] == 1
+    assert by["0x402000"]["basic_block_count"] == 42
+    assert "_fn" not in by["0x401000"]   # transient enrich key is dropped
+
+
 def test_function_list_envelope_kind_and_no_functions_alias(monkeypatch):
     # #275: the canonical envelope carries a `kind` discriminator and drops the
     # deprecated `functions` alias (items is the universal container).

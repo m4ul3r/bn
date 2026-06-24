@@ -247,11 +247,22 @@ def _list_functions(
             "raw_name": getattr(fn, "raw_name", fn.name),
             "display_name": il_format._display_name(fn),
             "size": il_format._function_size(fn),
+            "_fn": fn,   # transient: enrich the returned page only (perf), then drop
         }
         for fn in functions
     ]
     _sort_function_items(items, sort, reverse)
-    return _paged_function_result(ctx, items, offset=offset, limit=limit)
+    result = _paged_function_result(ctx, items, offset=offset, limit=limit)
+    # #411: `size` is a raw address span -- agents misread it as code complexity.
+    # Add a real triage metric (basic_block_count), computed ONLY for the returned
+    # page so a 24k-function list doesn't pay it for every filtered function.
+    for it in result.get("items", []):
+        fn = it.pop("_fn", None)
+        # BN's Function exposes no basic_block_count attribute -- len(basic_blocks)
+        # is the count (materializes the block list, but only for the returned page).
+        bbs = getattr(fn, "basic_blocks", None) if fn is not None else None
+        it["basic_block_count"] = len(bbs) if bbs is not None else None
+    return result
 
 
 def _paged_function_result(ctx, items: list[dict[str, Any]], *, offset: int,
