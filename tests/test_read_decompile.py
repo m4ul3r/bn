@@ -242,6 +242,42 @@ def test_disasm_linear_caps_requested_count(monkeypatch):
     assert "capped" in res["note"]
 
 
+def test_linear_decode_arch_honors_function_and_forces_mode(monkeypatch):
+    # #382: BN defaults a whole ARM binary to one mode (e.g. thumb2), so an ARM
+    # region decodes wrong. _linear_decode_arch honors the containing function's
+    # arch by default and lets --mode force ARM/Thumb for the stripped/missed case.
+    bridge = _load_bridge(monkeypatch)
+    rd = bridge.read_decompile
+    armv7 = type("A", (), {"name": "armv7"})()
+    thumb2 = type("A", (), {"name": "thumb2"})()
+
+    class _Ctx:
+        def _functions_containing(self, bv, addr):
+            return [type("F", (), {"arch": armv7})()] if addr == 0x1000 else []
+
+    bv = type("BV", (), {"arch": thumb2})()
+    ctx = _Ctx()
+    # default: inside an armv7 function -> armv7 (NOT the thumb2 bv default)
+    assert rd._linear_decode_arch(ctx, bv, 0x1000, None).name == "armv7"
+    # default: not in a function -> bv default (thumb2)
+    assert rd._linear_decode_arch(ctx, bv, 0x9999, None).name == "thumb2"
+    # --mode on a non-ARM target is rejected
+    bv_x86 = type("BV", (), {"arch": type("A", (), {"name": "x86_64"})()})()
+    with pytest.raises(ValueError):
+        rd._linear_decode_arch(_Ctx(), bv_x86, 0x1, "arm")
+    # --mode forces the architecture (endianness from the bv arch), overriding fn arch
+    monkeypatch.setattr(rd.bn, "Architecture", {"armv7": armv7, "thumb2": thumb2}, raising=False)
+    assert rd._linear_decode_arch(ctx, bv, 0x9999, "arm").name == "armv7"
+    assert rd._linear_decode_arch(ctx, bv, 0x1000, "thumb").name == "thumb2"
+
+
+def test_disasm_mode_requires_linear(monkeypatch):
+    # #382: --mode is meaningful only for --linear; without it, a clear error.
+    import bn.cli
+    rc = bn.cli.main(["disasm", "sub_1", "--mode", "arm", "--target", "active"])
+    assert rc == 2
+
+
 def test_disasm_non_function_address_hints_at_linear(monkeypatch):
     # Without --linear, a bare address not in a function still errors -- but the
     # disasm-specific message now points at --linear (the generic _find_function
@@ -253,6 +289,103 @@ def test_disasm_non_function_address_hints_at_linear(monkeypatch):
     with pytest.raises(Exception) as exc:
         instance._disasm(None, "0x1000")
     assert "--linear" in str(exc.value)
+
+
+class _ArmModeArch:
+    """An ARM/Thumb arch that NEVER decodes (its forced mode can't model these
+    bytes), so the strict forced-mode path must surface `.byte` instead of
+    silently falling back to the BV-default decode (#382 review Finding 1)."""
+
+    def __init__(self, name: str = "armv7"):
+        self.name = name
+        self.address_size = 4
+        self.max_instr_length = 4
+
+    def __str__(self):
+        return self.name
+
+    def get_instruction_info(self, data, address):
+        return None  # the forced arch can't decode -> length 0
+
+    def get_instruction_text(self, data, address):
+        return ([], 0)  # the forced arch can't decode -> no tokens
+
+
+def test_disasm_linear_forced_mode_no_bv_fallback(monkeypatch):
+    # #382 review Finding 1: under an explicit --mode the decode is FORCED to that
+    # arch. When the forced arch can't decode the bytes, the output must show the
+    # honest `.byte 0x..` form, NOT a BV-default-arch disassembly string that
+    # would contradict the "decoded as armv7 (forced via --mode)" note.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    forced = _ArmModeArch("armv7")
+    # The BV default arch DOES "decode" (get_disassembly returns wrong-mode text);
+    # strict-mode must not reach for it.
+    bv = _FakeBV(
+        arch=_FakeArch(name="thumb2"),
+        memory={0x1000: b"\xff\xfe\xfd"},
+        disassembly={0x1000: "BV_DEFAULT", 0x1001: "BV_DEFAULT", 0x1002: "BV_DEFAULT"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(
+        bridge.read_decompile, "_linear_decode_arch", lambda ctx, bv, addr, mode: forced
+    )
+    res = instance._disasm(None, "0x1000", linear=3, mode="arm")
+    assert [e["text"] for e in res["instructions"]] == [".byte 0xff", ".byte 0xfe", ".byte 0xfd"]
+    assert "BV_DEFAULT" not in res["text"]
+    assert "forced via --mode" in res["note"]
+
+
+def test_disasm_linear_normalizes_thumb_tagged_pointer(monkeypatch):
+    # #382 review Finding 2: an ARM code pointer commonly carries bit 0 as the
+    # Thumb tag. On an ARM/Thumb target, an ODD resolved linear address is masked
+    # to even before decoding, with a disclosure note -- otherwise the walk starts
+    # one byte into the instruction at 0x1000.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        arch=_FakeArch(name="thumb2"),
+        memory={0x1000: b"\x90" * 8},
+        disassembly={0x1000: "nop", 0x1002: "nop"},
+        instruction_lengths={0x1000: 2, 0x1002: 2},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    res = instance._disasm(None, "0x1001", linear=2)
+    assert res["address"] == "0x1000"  # masked even
+    assert res["instructions"][0]["address"] == "0x1000"
+    assert "Thumb" in res["note"] and "0x1001" in res["note"]
+
+
+def test_disasm_linear_no_thumb_mask_on_non_arm(monkeypatch):
+    # The bit-0 normalization is ARM-only: an odd address on a non-ARM target is
+    # left untouched (odd code addresses are legitimate there).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        arch=_FakeArch(name="x86_64"),
+        memory={0x1000: b"\x90" * 8},
+        disassembly={a: "nop" for a in range(0x1000, 0x1008)},
+        instruction_lengths={a: 1 for a in range(0x1000, 0x1008)},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    res = instance._disasm(None, "0x1001", linear=1)
+    assert res["address"] == "0x1001"  # NOT masked
+    assert "Thumb" not in res["note"]
+
+
+def test_linear_decode_arch_rejects_non_arm_mode(monkeypatch):
+    # #382 review Finding 3: a raw JSON caller can send {"mode":"mips"}; the bridge
+    # must reject it with a clean ValueError, not a KeyError on _ARM_MODE_ARCHES.
+    bridge = _load_bridge(monkeypatch)
+    rd = bridge.read_decompile
+
+    class _Ctx:
+        def _functions_containing(self, bv, addr):
+            return []
+
+    bv = type("BV", (), {"arch": type("A", (), {"name": "armv7"})()})()
+    with pytest.raises(ValueError):
+        rd._linear_decode_arch(_Ctx(), bv, 0x1000, "mips")
 
 
 def test_decompile_renders_pseudo_c(monkeypatch):
