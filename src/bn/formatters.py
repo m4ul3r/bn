@@ -1851,10 +1851,37 @@ def _render_taint_text(value: Any) -> str:
         lines.append(f"caveats ({len(assumptions)}):")
         for a in assumptions:
             lines.append(f"  - {a}")
+    msrc = _render_model_sources(value.get("model_sources"))
+    if msrc:
+        lines.append("")
+        lines.append(msrc)
     if value.get("soundness"):
         lines.append("")
         lines.append(f"soundness: {value['soundness']}")
     return "\n".join(lines)
+
+
+def _render_model_sources(sources: Any) -> str:
+    """#415: one-line disclosure of the active taint-model overlays in TEXT mode
+    (the default), so an agent can confirm a ``--models`` / ``BN_TAINT_MODELS``
+    overlay landed without parsing JSON or restarting the bridge."""
+    if not isinstance(sources, list):
+        return ""
+    parts: list[str] = []
+    for s in sources:
+        if not isinstance(s, dict):
+            continue
+        kind = s.get("kind")
+        if kind == "builtin":
+            parts.append("builtin")
+        elif kind == "env_override":
+            parts.append(f"env {s.get('env', 'BN_TAINT_MODELS')} ({s.get('path')})")
+        elif kind == "override_default":
+            parts.append(f"override ({s.get('path')})")
+        elif kind == "user":
+            loc = s.get("path") or s.get("via", "--models")
+            parts.append(f"--models {loc} ({s.get('count', 0)} model(s))")
+    return ("models: " + " + ".join(parts)) if parts else ""
 
 
 def _describe_loc(loc: Any) -> str:

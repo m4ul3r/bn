@@ -204,7 +204,8 @@ def load_models(extra: dict[str, Any] | None = None) -> dict[str, Any]:
     return models
 
 
-def model_overlay_sources(extra: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+def model_overlay_sources(extra: dict[str, Any] | None = None, *,
+                          user_models_path: str | None = None) -> list[dict[str, Any]]:
     """#415: the active taint-model overlay sources (most-specific last), so a
     `taint` run discloses WHICH models are in effect.
 
@@ -212,7 +213,9 @@ def model_overlay_sources(extra: dict[str, Any] | None = None) -> list[dict[str,
     any ``--models`` file on EVERY request, so editing a project-local model file
     (or passing ``--models``) takes effect on the next taint command with no
     bridge restart -- this disclosure makes that visible (and lets a status check
-    confirm an overlay landed)."""
+    confirm an overlay landed). ``user_models_path`` (when known) names the
+    ``--models`` file so the disclosure points at WHICH file landed, not just a
+    count."""
     sources: list[dict[str, Any]] = [{"kind": "builtin", "path": str(_BUILTIN_MODELS)}]
     if taint_models_path is not None:
         try:
@@ -230,7 +233,16 @@ def model_overlay_sources(extra: dict[str, Any] | None = None) -> list[dict[str,
             else:
                 sources.append({"kind": "override_default", "path": str(override)})
     if extra:
-        sources.append({"kind": "user", "via": "--models", "count": len(extra)})
+        # Count the actual models the way load_models()/_coerce_model_map does:
+        # unwrap a ``{"models": {...}}`` envelope and skip ``_comment*`` doc keys,
+        # so the disclosed count matches what was really merged (review: a wrapped
+        # file with two inner models otherwise reported count 1).
+        inner = extra.get("models") if isinstance(extra, dict) and "models" in extra else extra
+        count = sum(1 for k in inner if not str(k).startswith("_comment")) if isinstance(inner, dict) else 0
+        user: dict[str, Any] = {"kind": "user", "via": "--models", "count": count}
+        if user_models_path:
+            user["path"] = str(user_models_path)
+        sources.append(user)
     return sources
 
 

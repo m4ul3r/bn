@@ -36,6 +36,9 @@ def _add_user_models(args: argparse.Namespace, params: dict[str, Any]) -> None:
         params["user_models"] = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise BridgeError(f"could not read --models {path}: {exc}")
+    # #415: pass the file path through so the run's model_sources disclosure can
+    # name WHICH --models file landed, not just a count.
+    params["user_models_path"] = str(path)
 
 
 @command("dataflow", "defuse", help="Show the SSA definition site and use sites of a variable",

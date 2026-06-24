@@ -209,6 +209,25 @@ def test_render_taint_forward_text():
     assert "soundness:" in text
 
 
+def test_render_taint_discloses_model_sources_in_text():
+    # #415 review: TEXT is the default taint output, so the active-overlay
+    # disclosure must appear there -- not only in --format json. A run that loaded
+    # a --models file shows the file and its (correctly unwrapped) model count.
+    value = {
+        "direction": "forward",
+        "function": {"name": "process", "address": "0x401189"},
+        "sources": [{"kind": "param", "index": 0}],
+        "reached_sinks": [],
+        "model_sources": [
+            {"kind": "builtin", "path": "/builtin/models.json"},
+            {"kind": "user", "via": "--models", "count": 2, "path": "proj.json"},
+        ],
+        "soundness": "may-analysis (intraprocedural, MVP)",
+    }
+    text = _render_taint_text(value)
+    assert "models: builtin + --models proj.json (2 model(s))" in text
+
+
 def test_render_taint_forward_frontier_message():
     # reached_sinks empty BUT an unmodeled_callee frontier leaf -> the terminal
     # line must be frontier-aware, not the bare "no sinks reached" (#8).

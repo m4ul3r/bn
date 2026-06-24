@@ -268,6 +268,19 @@ def test_model_overlay_sources_discloses_active_overlays():
     assert user[0]["via"] == "--models" and user[0]["count"] == 2
 
 
+def test_model_overlay_sources_unwraps_models_envelope_and_path():
+    # #415 review: the user file may be a ``{"models": {...}}`` envelope (load_models
+    # unwraps it), so the disclosed count must reflect the INNER models -- and skip
+    # ``_comment*`` doc keys -- not the outer one-key dict. The --models path is
+    # surfaced too so an agent sees WHICH file landed.
+    wrapped = {"models": {"a": {}, "b": {}, "_comment": "doc"}}
+    src = te.model_overlay_sources(wrapped, user_models_path="proj/models.json")
+    user = [s for s in src if s["kind"] == "user"]
+    assert len(user) == 1
+    assert user[0]["count"] == 2                       # inner models, _comment excluded
+    assert user[0]["path"] == "proj/models.json"
+
+
 def test_model_overlay_sources_labels_override_by_env_presence(monkeypatch, tmp_path):
     # #415 review: an active override file is labeled env_override ONLY when
     # BN_TAINT_MODELS is set; the default-cache file (env unset) is override_default,
