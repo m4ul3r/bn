@@ -3179,6 +3179,20 @@ class TaintEngine:
                     done = True
             return done
 
+        # The element-field key for a store dest / load src is purely STRUCTURAL
+        # (depends only on the SSA def graph, not the taint set), but the fixpoint
+        # revisits each instruction every iteration -- so memoize it per instruction
+        # to avoid re-running the recursive address resolution N times (#420).
+        elem_key_cache: dict = {}
+
+        def elem_key(ins: Any, addr: Any):
+            idx = getattr(ins, "instr_index", None)
+            if idx is None:
+                return self._elem_field_key(ssaf, addr)
+            if idx not in elem_key_cache:
+                elem_key_cache[idx] = self._elem_field_key(ssaf, addr)
+            return elem_key_cache[idx]
+
         def apply_model(ins, params, model, mkey, name, *, site_taddr=None):
             """Apply a function model's sink-detection + taint propagation at a call
             site. Shared by the direct-call and resolved-indirect-external branches.
@@ -3621,7 +3635,7 @@ class TaintEngine:
                             # tainted ("elem", base, field) that the array's fill (in
                             # this function or carried from a callee) produced, so the
                             # parser-filled hdr[] reconnects to the per-element copy.
-                            ek = self._elem_field_key(ssaf, getattr(src_expr, "src", None))
+                            ek = elem_key(ins, getattr(src_expr, "src", None))
                             if ek is not None and (ek, None) in tainted:
                                 msrc = (ek, None)
                                 reason = ("loads a tainted descriptor-array element field "
@@ -3662,13 +3676,12 @@ class TaintEngine:
                                           "store into tainted heap buffer (alloc-site, memory_approx)", reads):
                                 changed = True
                                 add_assumption("heap buffer aliasing modeled coarsely by allocation site (memory_approx)")
-                        elif self._elem_field_key(ssaf, dest) is not None:
+                        elif (ek := elem_key(ins, dest)) is not None:
                             # #319b: a tainted store to a descriptor-ARRAY element
                             # field `[base + idx*stride + field]` -- key it by
                             # (array-base, field) so a later read of THAT field at
                             # any index correlates (the parser-fills-output-array
                             # idiom that otherwise drops to a coarse frontier).
-                            ek = self._elem_field_key(ssaf, dest)
                             if taint_node((ek, None), f"elem+{hex(ek[2])}", ins,
                                           "store into tainted descriptor-array element "
                                           "field (elem_approx)", reads):
