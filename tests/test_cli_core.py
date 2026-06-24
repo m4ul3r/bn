@@ -916,6 +916,42 @@ def test_fanout_all_instances_auto_surveys_multi_target_instance(monkeypatch, ca
     assert out["auto_expanded_instances"] == ["multi"]
 
 
+def test_fanout_reports_per_row_duration_and_slow_rows(monkeypatch, capsys):
+    # #417: a fan-out runs per-instance reads concurrently and reports per-row
+    # duration_ms plus a top-level slow_rows summary, so an agent can see WHERE a
+    # broad survey spent its time (and a slow instance does not serialize the rest).
+    import json as _json
+    import time as _time
+    import types as _types
+    import bn.cli as cli
+    from bn.transport import BridgeError
+
+    insts = [_types.SimpleNamespace(instance_id=x) for x in ("a", "b", "c")]
+    monkeypatch.setattr(cli, "list_instances", lambda: insts)
+    monkeypatch.setattr(cli, "instance_selector", lambda i: i.instance_id)
+    monkeypatch.setattr(cli, "_resolve_target", lambda args, **k: "active")
+
+    def fake_send(op, *, params=None, target=None, instance_id=None, **k):
+        if instance_id == "b":
+            _time.sleep(0.05)  # the slow instance
+        if instance_id == "c":
+            raise BridgeError("no targets open")  # error rows still isolated + timed
+        return {"result": {"kind": "functions", "items": [], "total": 0, "count": 0}}
+    monkeypatch.setattr(cli, "send_request", fake_send)
+
+    rc = cli.main(["function", "list", "--all-instances", "--format", "json"])
+    assert rc == 0
+    out = _json.loads(capsys.readouterr().out)
+    assert out["count"] == 3
+    by = {r["instance"]: r for r in out["instances"]}
+    # every row (including the error row) carries a duration.
+    assert all(isinstance(by[i]["duration_ms"], int | float) for i in ("a", "b", "c"))
+    assert by["c"]["ok"] is False  # per-row error isolation preserved
+    # slow_rows surfaces the slowest instance ('b' slept) first.
+    assert out["slow_rows"][0]["instance"] == "b"
+    assert by["b"]["duration_ms"] >= 50  # ~the 50ms sleep
+
+
 def test_fanout_all_instances_auto_surveys_despite_sticky_target_pin(monkeypatch, capsys):
     # #368 review (HIGH): a STICKY target pin must NOT count as an explicit -t.
     # _apply_sticky_defaults fills args.target from session state and marks it

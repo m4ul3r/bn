@@ -1398,6 +1398,18 @@ def _render_fanout_text(value: Any, inner_renderer: Callable[[Any], str] | None 
         # #368: be explicit that a multi-target instance was surveyed in full, so
         # extra rows for one instance read as complete coverage, not a duplicate.
         lines.append(f"  (surveyed all targets of multi-target instance(s): {', '.join(map(str, expanded))})")
+    slow = value.get("slow_rows")
+    if slow:
+        # #417: show where a broad survey spent its time so a long fan-out reads as
+        # progress (which instance was slow), not a wedge.
+        parts = []
+        for s in slow:
+            if not isinstance(s, dict):
+                continue
+            tgt = f"/{s['target']}" if s.get("target") else ""
+            parts.append(f"{s.get('instance', '?')}{tgt} {s.get('duration_ms', '?')}ms")
+        if parts:
+            lines.append(f"  slowest: {', '.join(parts)}")
     for r in rows:
         if not isinstance(r, dict):
             continue

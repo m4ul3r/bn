@@ -5,6 +5,8 @@ import os
 import re
 import stat
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
 
@@ -974,6 +976,7 @@ def _fanout_call(
                 for t in (tlist or []) if isinstance(t, dict)]
 
     rows: list[dict[str, Any]] = []
+    work_items: list[tuple[Any, Any]] = []   # (instance_id, target_selector) to execute (#417)
     auto_expanded: list[Any] = []   # multi-target instances surveyed in full (#368)
     for iid in instance_ids:
         # Per-instance target set: every open target (--all-targets) or the single
@@ -1010,30 +1013,59 @@ def _fanout_call(
             target_selectors = [None]  # resolve the single target normally below
 
         for tsel in target_selectors:
-            row: dict[str, Any] = {"instance": iid}
-            try:
-                if tsel is None:
-                    sub = argparse.Namespace(**vars(args))
-                    sub.instance = iid
-                    sub.all_instances = False  # per-(instance,target) call is a normal single call
-                    sub.all_targets = False
-                    target = _resolve_target(
-                        sub, require_target=require_target,
-                        allow_implicit_target=allow_implicit_target,
-                    )
-                else:
-                    target = tsel
-                response = send_request(
-                    op, params=request_params, target=target, instance_id=iid, **timeout_kwargs
+            work_items.append((iid, tsel))
+
+    def _run_one(item: tuple[Any, Any]) -> dict[str, Any]:
+        iid, tsel = item
+        row: dict[str, Any] = {"instance": iid}
+        start = time.monotonic()
+        try:
+            if tsel is None:
+                sub = argparse.Namespace(**vars(args))
+                sub.instance = iid
+                sub.all_instances = False  # per-(instance,target) call is a normal single call
+                sub.all_targets = False
+                target = _resolve_target(
+                    sub, require_target=require_target,
+                    allow_implicit_target=allow_implicit_target,
                 )
-                row.update({"target": target, "ok": True, "result": response["result"]})
-            except BridgeError as exc:
-                row.update({"target": tsel, "ok": False, "error": str(exc)})
-            rows.append(row)
+            else:
+                target = tsel
+            response = send_request(
+                op, params=request_params, target=target, instance_id=iid, **timeout_kwargs
+            )
+            row.update({"target": target, "ok": True, "result": response["result"]})
+        except BridgeError as exc:
+            row.update({"target": tsel, "ok": False, "error": str(exc)})
+        # Per-row wall-clock so an agent can see WHERE a broad survey spent its
+        # time, not just that it felt slow (#417).
+        row["duration_ms"] = round((time.monotonic() - start) * 1000, 1)
+        return row
+
+    # Run the per-(instance,target) reads CONCURRENTLY with a bounded pool: each
+    # is an independent socket round-trip to a distinct bridge, so a serial sweep
+    # over many instances made broad surveys feel wedged (#417). Order is
+    # preserved (ThreadPoolExecutor.map) so output stays deterministic; a single
+    # item skips the pool entirely. Fan-out is read-only (the @command fanout flag
+    # is rejected on mutating commands), so concurrent execution is safe.
+    if len(work_items) <= 1:
+        rows.extend(_run_one(item) for item in work_items)
+    else:
+        with ThreadPoolExecutor(max_workers=min(8, len(work_items))) as pool:
+            rows.extend(pool.map(_run_one, work_items))
 
     ok_count = sum(1 for r in rows if r.get("ok"))
     result = {"kind": "fanout", "command": op, "count": len(rows),
               "ok_count": ok_count, "instances": rows}
+    # Surface the slowest rows so an agent knows where a long survey went (#417).
+    timed = [r for r in rows if isinstance(r.get("duration_ms"), int | float)]
+    if len(timed) > 1:
+        slowest = sorted(timed, key=lambda r: r["duration_ms"], reverse=True)
+        result["slow_rows"] = [
+            {"instance": r.get("instance"), "target": r.get("target"),
+             "duration_ms": r["duration_ms"]}
+            for r in slowest[:3]
+        ]
     if auto_expanded:
         # #368 facet 1: be explicit that --all-instances surveyed every target of a
         # multi-target instance (so the row count > instance count is understood,
