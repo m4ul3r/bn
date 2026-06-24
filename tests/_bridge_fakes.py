@@ -796,6 +796,7 @@ class _FakeMLILInsn:
         operation: str = "MLIL_SET_VAR_SSA",
         params: list | None = None,
         vars_read: list | None = None,
+        vars_written: list | None = None,
         dest=None,
         src=None,
         size=None,
@@ -807,6 +808,7 @@ class _FakeMLILInsn:
         self._operation_name = operation
         self._params = params or []
         self._vars_read = vars_read or []
+        self._vars_written = vars_written or []
         self.dest = dest
         # Operand attrs for load/address-expr fakes (#162); left unset -> getattr None.
         if src is not None:
@@ -835,6 +837,10 @@ class _FakeMLILInsn:
     @property
     def vars_read(self):
         return list(self._vars_read)
+
+    @property
+    def vars_written(self):
+        return list(self._vars_written)
 
     def __str__(self):
         return f"{self._operation_name} @ 0x{self._address:x}"

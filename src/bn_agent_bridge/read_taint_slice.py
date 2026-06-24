@@ -231,20 +231,26 @@ def _build_backward_trace(
     view: str = "mlil",
     _call_depth: int = 0,
     base_depth: int = 0,
+    seed_addr: int | None = None,
 ) -> list[dict[str, Any]]:
     """Recursively walk SSA use-def chains backward, optionally crossing call boundaries."""
     if _call_depth > 10:
         return []  # Safety: prevent runaway recursion
     trace: list[dict[str, Any]] = []
+    # #416: locals whose address is passed into a call, computed once per
+    # function (not per terminus). Only needed in interprocedural mode.
+    out_param_map = _build_out_param_map(ctx, bv, ssa_func) if interprocedural else {}
     # Each worklist item carries its def-use distance from the seed so the
     # reported "depth" is the real graph depth (operands of one definition
     # share a depth) rather than a sequential append index. base_depth
-    # offsets a callee sub-walk so its depths continue from the call site.
-    worklist: list[tuple[Any, int]] = [(v, 0) for v in initial_vars]
+    # offsets a callee sub-walk so its depths continue from the call site. The
+    # third element is the address at which this var was READ (its consumer), so
+    # the #416 out-param lookup can require the address-taking call to precede it.
+    worklist: list[tuple[Any, int, int | None]] = [(v, 0, seed_addr) for v in initial_vars]
     visited: set[Any] = set()
 
     while worklist and len(trace) < max_depth:
-        ssa_var, node_depth = worklist.pop(0)
+        ssa_var, node_depth, ref_addr = worklist.pop(0)
         depth = base_depth + node_depth
         if not isinstance(ssa_var, SSAVariable):
             trace.append({
@@ -280,11 +286,21 @@ def _build_backward_trace(
             # actually is one; otherwise stay neutral (don't mislead
             # provenance slices).
             entry["terminates"] = True
-            entry["reason"] = (
-                "function_parameter"
-                if _is_parameter_ssa_var(ctx, ssa_func, ssa_var)
-                else "undefined_or_global"
-            )
+            if _is_parameter_ssa_var(ctx, ssa_func, ssa_var):
+                entry["reason"] = "function_parameter"
+            else:
+                entry["reason"] = "undefined_or_global"
+                # #416: a value that bottoms out at a LOCAL whose address was
+                # passed into a call (the common stack-struct out-param form,
+                # `parse(input, &rec); use(rec.len)`) was likely written by that
+                # callee through an out-pointer. Interprocedural tracing follows
+                # only return values, so name the callee instead of leaving an
+                # "undefined" terminus that reads like proof of origin.
+                if interprocedural:
+                    out_callee = _lookup_out_param_callee(out_param_map, ssa_var, ref_addr)
+                    if out_callee:
+                        entry["reason"] = "interprocedural_out_param_not_followed"
+                        entry["out_param_callee"] = out_callee
             trace.append(entry)
             continue
 
@@ -315,6 +331,13 @@ def _build_backward_trace(
                                     view=view,
                                     _call_depth=_call_depth + 1,
                                     base_depth=depth + 1,
+                                    # The callee's seed = its RETURN vars; the
+                                    # caller's call-site address belongs to a
+                                    # different function's address space, so it must
+                                    # NOT be used to order the callee's own calls.
+                                    # Leave the seed ungated (None); intra-callee
+                                    # enqueues still carry callee-local addresses.
+                                    seed_addr=None,
                                 )
                                 for ct in callee_trace:
                                     ct.setdefault("function_context", callee.name)
@@ -343,6 +366,29 @@ def _build_backward_trace(
                 entry["offset"] = hex(offset) if isinstance(offset, int) else offset
             if width is not None:
                 entry["width"] = width
+            # #416: in interprocedural mode, if this load reads from the address
+            # of a local that was passed by-address into a call, the value was
+            # likely written by that callee through an OUT-POINTER -- which
+            # interprocedural tracing follows only for return values. Emit an
+            # honest boundary reason naming the callee instead of letting the
+            # slice stop silently at a `field_load`/`memory_load`.
+            if interprocedural:
+                load_local = _address_of_target(getattr(load_expr, "src", None))
+                out_callee = _lookup_out_param_callee(
+                    out_param_map, load_local, int(getattr(def_insn, "address", 0)))
+                if out_callee:
+                    entry["reason"] = "interprocedural_out_param_not_followed"
+                    entry["out_param_callee"] = out_callee
+                    # The value's true origin is the callee's write through the
+                    # out-pointer; mark the load as a boundary. Index/base
+                    # provenance (`*(&local + idx)`) is still walked below, so a
+                    # tainted index is not dropped.
+                    entry["terminates"] = True
+                    trace.append(entry)
+                    for rv in _ssa_vars_from(getattr(def_insn, "vars_read", []) or []):
+                        if rv not in visited:
+                            worklist.append((rv, node_depth + 1, int(getattr(def_insn, "address", 0))))
+                    continue
             # Preserve prior per-form walk behavior: a top-level load def
             # terminated; a `x = [addr]` SET_VAR continued through its base
             # pointer (so provenance reaches where the struct came from).
@@ -350,7 +396,7 @@ def _build_backward_trace(
             trace.append(entry)
             for rv in _ssa_vars_from(getattr(def_insn, "vars_read", []) or []):
                 if rv not in visited:
-                    worklist.append((rv, node_depth + 1))
+                    worklist.append((rv, node_depth + 1, int(getattr(def_insn, "address", 0))))
             continue
 
         entry["terminates"] = False
@@ -362,7 +408,7 @@ def _build_backward_trace(
 
         for rv in _ssa_vars_from(getattr(def_insn, "vars_read", []) or []):
             if rv not in visited:
-                worklist.append((rv, node_depth + 1))
+                worklist.append((rv, node_depth + 1, int(getattr(def_insn, "address", 0))))
 
     return trace
 
@@ -443,6 +489,97 @@ def _extract_dest_address(bv, dest):
     """Numeric address of a call/tailcall destination expression (delegates
     to ``taint_engine.extract_dest_address``)."""
     return _taint.extract_dest_address(bv, dest)
+
+
+def _address_of_target(expr, depth: int = 0):
+    """The local Variable an address expression takes the address of, handling
+    both ``&local`` (MLIL_ADDRESS_OF) and ``&local + const`` (ADD/SUB of an
+    address-of and a constant). Returns None when the expression is not the
+    address of a stack/local variable. Best-effort, bounded recursion."""
+    if expr is None or depth > 6:
+        return None
+    op = il_format._il_op_name(expr)
+    if "ADDRESS_OF" in op:
+        return getattr(expr, "src", None)
+    if "ADD" in op or "SUB" in op:
+        for side in (getattr(expr, "left", None), getattr(expr, "right", None)):
+            target = _address_of_target(side, depth + 1)
+            if target is not None:
+                return target
+    return None
+
+
+def _var_address_key(v):
+    """Match key for a local Variable: BN's stable ``identifier`` when present,
+    else the variable object itself (its own equality). The same local taken by
+    address in two places must compare equal."""
+    ident = getattr(v, "identifier", None)
+    return ident if ident is not None else v
+
+
+def _build_out_param_map(ctx, bv, ssa_func) -> dict:
+    """Map ``{local var key -> [(call_addr, callee_name), ...]}`` for locals whose
+    address is passed into a call (#416).
+
+    Built ONCE per function so the trace's per-terminus lookups don't rescan the
+    whole function (perf), and so a lookup can require the call to PRECEDE the
+    read (a call that receives ``&local`` after the value was read -- or the sink
+    itself -- is not the source). Handles both the inlined ``f(&local)`` argument
+    and the one-hop ``p = &local; f(p)`` form. Best-effort; ``{}`` on any
+    BN-API shortfall, so it never fabricates a reason."""
+    result: dict = {}
+    try:
+        holders: dict = {}      # SSA var holding &local -> local key
+        calls: list = []
+        for block in getattr(ssa_func, "basic_blocks", []) or []:
+            for ins in block:
+                if "CALL" in il_format._il_op_name(ins):
+                    calls.append(ins)
+                    continue
+                taken = _address_of_target(getattr(ins, "src", None))
+                if taken is not None:
+                    lk = _var_address_key(getattr(taken, "var", None) or taken)
+                    for w in _ssa_vars_from(getattr(ins, "vars_written", []) or []):
+                        holders[w] = lk
+                    dest = getattr(ins, "dest", None)
+                    if isinstance(dest, SSAVariable):
+                        holders[dest] = lk
+        for ins in calls:
+            try:
+                addr = int(getattr(ins, "address", 0))
+            except Exception:
+                addr = 0
+            local_keys: set = set()
+            for param in getattr(ins, "params", []) or []:
+                direct = _address_of_target(param)
+                if direct is not None:
+                    local_keys.add(_var_address_key(getattr(direct, "var", None) or direct))
+                for rv in _ssa_vars_from(getattr(param, "vars_read", []) or []):
+                    if rv in holders:
+                        local_keys.add(holders[rv])
+            if not local_keys:
+                continue
+            callee = _callee_display_name(ctx, bv, ins)
+            if not callee:
+                continue
+            for lk in local_keys:
+                result.setdefault(lk, []).append((addr, callee))
+    except Exception:
+        return {}
+    return result
+
+
+def _lookup_out_param_callee(out_param_map: dict, base_var, before_addr) -> str | None:
+    """Callee that filled *base_var* via an out-pointer at a call PRECEDING
+    *before_addr* (#416), or None. Ordering is load-bearing: a call that takes
+    ``&local`` after the value was read is not its source."""
+    if not out_param_map or base_var is None:
+        return None
+    key = _var_address_key(getattr(base_var, "var", None) or base_var)
+    for addr, callee in out_param_map.get(key, []):
+        if before_addr is None or addr < before_addr:
+            return callee
+    return None
 
 
 def _find_return_vars(ctx, ssa_func, bv=None, _visited=None) -> list[SSAVariable]:
@@ -594,6 +731,24 @@ def _backward_slice(
                 f"(e.g. variadic) args -- inspect `bn il {func.name} --view llil "
                 f"--ssa` for the stack stores feeding the call (#324)."
             )
+        elif reg_count is not None and n < reg_count and arg_index == n:
+            # The requested index is exactly the FIRST register slot BN did not
+            # recover (`arg_index == n`, still within the ABI's integer-arg
+            # registers) -- the tight "BN stopped recovering args right here"
+            # signal. The callee's prototype may be narrower than the actual call
+            # (a variadic mis-typed as fixed-arity, or an indirect call through a
+            # too-narrow function-pointer type). Gating on the first-missing slot
+            # (rather than any index below reg_count) avoids nagging on a
+            # genuinely low-arity call where the index is simply out of range.
+            msg += (
+                f" Note: arg {arg_index} is the first integer-arg register this "
+                f"convention passes that BN did not recover as a param ({n} "
+                f"recovered) -- if the callee's prototype is narrower than the "
+                f"actual call (variadic mis-typed as fixed-arity, or an indirect "
+                f"call through a too-narrow function-pointer type), it may be a "
+                f"real register-passed arg BN dropped; inspect `bn il {func.name} "
+                f"--view llil --ssa` for the args feeding the call (#324)."
+            )
         raise OperationFailure("invalid_arg_index", msg)
 
     param_expr = params[arg_index]
@@ -633,6 +788,9 @@ def _backward_slice(
         interprocedural=interprocedural,
         ip_depth=ip_depth,
         view=view,
+        # The seed args are consumed AT the traced call; an out-param fill must
+        # precede it (#416 ordering).
+        seed_addr=target_addr,
     )
 
     return {

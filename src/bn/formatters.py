@@ -2568,6 +2568,9 @@ _TRACE_REASON_LABELS: dict[str, str] = {
     "definition": "definition",
     "phi_source": "phi source",
     "cross_function": "crosses into callee",
+    # #416: the value was written by a callee through an out-pointer; backward
+    # interprocedural tracing follows return values, not out-parameters.
+    "interprocedural_out_param_not_followed": "out-param fill not followed",
 }
 
 
@@ -2630,6 +2633,8 @@ def _render_trace_text(value: Any) -> str:
             # reads as `call boundary (strlen)` not a bare PLT address (#193).
             if reason == "call_or_jump_boundary" and step.get("callee"):
                 line += f" ({step['callee']})"
+            if reason == "interprocedural_out_param_not_followed" and step.get("out_param_callee"):
+                line += f" (via {step['out_param_callee']})"
             if reason == "field_load":
                 meta = " ".join(
                     f"{k}={step[k]}" for k in ("base", "offset", "width") if step.get(k) is not None)
