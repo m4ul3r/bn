@@ -3627,6 +3627,148 @@ def test_forward_interproc_return_phi_divergent_allocs(models):
     assert sysk[0]["class"] == "command_injection"
 
 
+def _recvmsg_static_iov_func():
+    # iov.iov_base = buf; msg.msg_iov = &iov; recvmsg(fd, &msg, 0); system(buf)
+    # The static single-iovec idiom (dnsmasq receive_query shape). recvmsg fills
+    # the iovec buffer two pointer hops from the msghdr arg; the engine must follow
+    # the typed SET_VAR_ALIASED_FIELD stores (field offset in ins.offset) to taint
+    # `buf` so system(buf) is reached (#306). msg_iov is at 2*ptr (0x10 on 64-bit).
+    buf = FVar("buf"); buf0 = FSSA(buf, 0)
+    iov = FVar("iov"); iov1 = FSSA(iov, 1)
+    msg = FVar("msg"); msg1 = FSSA(msg, 1)
+    rsi = FVar("rsi"); rsi1 = FSSA(rsi, 1)
+    rax = FVar("rax"); rax1 = FSSA(rax, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_ALIASED_FIELD", "iov.iov_base = buf#0",
+               writes=[iov1], reads=[buf0], offset=0, dest=iov1,
+               src=FExpr("MLIL_VAR_SSA", "buf#0", reads=[buf0])),
+        FInstr(1, 0x14, "MLIL_SET_VAR_ALIASED_FIELD", "msg.msg_iov = &iov",
+               writes=[msg1], offset=0x10, dest=msg1,
+               src=FExpr("MLIL_ADDRESS_OF", "&iov", src=iov)),
+        FInstr(2, 0x18, "MLIL_SET_VAR_SSA", "rsi#1 = &msg", writes=[rsi1],
+               src=FExpr("MLIL_ADDRESS_OF", "&msg", src=msg)),
+        FInstr(3, 0x1c, "MLIL_CALL_SSA", "rax#1 = recvmsg(fd, &msg, 0)",
+               reads=[rsi1], writes=[rax1],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_CONST", "3", constant=3),
+                       FExpr("MLIL_VAR_SSA", "rsi#1", reads=[rsi1]),
+                       FExpr("MLIL_CONST", "0", constant=0)]),
+        FInstr(4, 0x20, "MLIL_CALL_SSA", "system(buf#0)", reads=[buf0],
+               dest=FExpr("MLIL_CONST_PTR", "0x910", constant=0x910),
+               params=[FExpr("MLIL_VAR_SSA", "buf#0", reads=[buf0])]),
+    ]
+    return FFunc("handler", 0x10, FSSAFunc(instrs), params=[])
+
+
+def test_forward_recvmsg_taints_static_iovec_buffer_306(models):
+    # --source call:recvmsg must follow msghdr->msg_iov->iov_base to the filled
+    # buffer and reach system(buf) as command_injection -- previously recvmsg had
+    # no model and the payload was a silent false all-clear (#306).
+    func = _recvmsg_static_iov_func()
+    bv = FBV({0x900: "recvmsg", 0x910: "system"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("call:recvmsg")])
+    sysk = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "system"]
+    assert len(sysk) == 1, result.get("reached_sinks")
+    assert sysk[0]["class"] == "command_injection"
+
+
+def test_forward_recvmsg_unresolved_iovec_nudges_306(models):
+    # GUARD: when the msghdr is a PARAM (iovec built in the caller) the in-function
+    # scan can't resolve the buffer; --source call:recvmsg must emit an honest nudge
+    # and NOT fabricate a sink -- no false positive, no silent all-clear.
+    msg = FVar("msg", ident=7); rax = FVar("rax"); rax1 = FSSA(rax, 1)
+    func = FFunc("recv_dhcp", 0x1c, FSSAFunc([
+        FInstr(0, 0x1c, "MLIL_CALL_SSA", "rax#1 = recvmsg(fd, msg, 0)",
+               reads=[FSSA(msg, 0)], writes=[rax1],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_CONST", "3", constant=3),
+                       FExpr("MLIL_VAR_SSA", "msg#0", reads=[FSSA(msg, 0)]),
+                       FExpr("MLIL_CONST", "0", constant=0)])]),
+        params=[msg])
+    bv = FBV({0x900: "recvmsg"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("call:recvmsg")])
+    assert result["reached_sinks"] == [], result.get("reached_sinks")
+    assert any("could not be statically resolved" in a for a in result["assumptions"]), \
+        result.get("assumptions")
+
+
+def test_forward_recvmsg_reordered_iov_uses_address_order_306():
+    # Block-reordered iovec setup (openvpn link_socket_read_udp_posix shape): the
+    # real `iov.iov_base = buf` store has a HIGHER MLIL index than the recvmsg call
+    # but a LOWER address (sibling/back-edge block), while a `iov.iov_base = 0` init
+    # has a lower index but higher address. Index order would pick the =0 init (a
+    # silent false all-clear); address order picks the real buffer -> system reached.
+    models = te.load_models()
+    buf = FVar("buf"); buf0 = FSSA(buf, 0)
+    iov = FVar("iov"); iovz = FSSA(iov, 1); iovb = FSSA(iov, 2)
+    msg = FVar("msg"); msg1 = FSSA(msg, 1)
+    rsi = FVar("rsi"); rsi1 = FSSA(rsi, 1)
+    rax = FVar("rax"); rax1 = FSSA(rax, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_ALIASED_FIELD", "msg.msg_iov = &iov",
+               writes=[msg1], offset=0x10, dest=msg1,
+               src=FExpr("MLIL_ADDRESS_OF", "&iov", src=iov)),
+        FInstr(1, 0x30, "MLIL_SET_VAR_ALIASED_FIELD", "iov.iov_base = 0",  # idx<call, addr>call
+               writes=[iovz], offset=0, dest=iovz,
+               src=FExpr("MLIL_CONST", "0", constant=0)),
+        FInstr(2, 0x18, "MLIL_SET_VAR_SSA", "rsi#1 = &msg", writes=[rsi1],
+               src=FExpr("MLIL_ADDRESS_OF", "&msg", src=msg)),
+        FInstr(3, 0x20, "MLIL_CALL_SSA", "rax#1 = recvmsg(fd, &msg, 0)",
+               reads=[rsi1], writes=[rax1],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_CONST", "3", constant=3),
+                       FExpr("MLIL_VAR_SSA", "rsi#1", reads=[rsi1]),
+                       FExpr("MLIL_CONST", "0", constant=0)]),
+        FInstr(4, 0x14, "MLIL_SET_VAR_ALIASED_FIELD", "iov.iov_base = buf#0",  # idx>call, addr<call
+               writes=[iovb], reads=[buf0], offset=0, dest=iovb,
+               src=FExpr("MLIL_VAR_SSA", "buf#0", reads=[buf0])),
+        FInstr(5, 0x40, "MLIL_CALL_SSA", "system(buf#0)", reads=[buf0],
+               dest=FExpr("MLIL_CONST_PTR", "0x910", constant=0x910),
+               params=[FExpr("MLIL_VAR_SSA", "buf#0", reads=[buf0])]),
+    ]
+    func = FFunc("link_read", 0x10, FSSAFunc(instrs), params=[])
+    bv = FBV({0x900: "recvmsg", 0x910: "system"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("call:recvmsg")])
+    sysk = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "system"]
+    assert len(sysk) == 1, result.get("reached_sinks")
+    assert sysk[0]["class"] == "command_injection"
+
+
+def test_forward_recvmsg_resolved_but_const_iovbase_nudges_306(models):
+    # Honesty backstop: the iovec resolves but its iov_base is a constant (zero-init
+    # / unrecovered) -> nothing can be seeded. This must STILL nudge, not read as a
+    # clean all-clear (the silent-miss the review caught). bufs is non-empty yet no
+    # taint node fires, so the nudge must fire off the "seeded anything" flag.
+    iov = FVar("iov", ident=11); iov1 = FSSA(iov, 1)
+    msg = FVar("msg", ident=12); msg1 = FSSA(msg, 1)
+    rsi = FVar("rsi"); rsi1 = FSSA(rsi, 1); rax = FVar("rax"); rax1 = FSSA(rax, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_ALIASED_FIELD", "msg.msg_iov = &iov",
+               writes=[msg1], offset=0x10, dest=msg1,
+               src=FExpr("MLIL_ADDRESS_OF", "&iov", src=iov)),
+        FInstr(1, 0x14, "MLIL_SET_VAR_ALIASED_FIELD", "iov.iov_base = 0",
+               writes=[iov1], offset=0, dest=iov1,
+               src=FExpr("MLIL_CONST", "0", constant=0)),
+        FInstr(2, 0x18, "MLIL_SET_VAR_SSA", "rsi#1 = &msg", writes=[rsi1],
+               src=FExpr("MLIL_ADDRESS_OF", "&msg", src=msg)),
+        FInstr(3, 0x20, "MLIL_CALL_SSA", "rax#1 = recvmsg(fd, &msg, 0)",
+               reads=[rsi1], writes=[rax1],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_CONST", "3", constant=3),
+                       FExpr("MLIL_VAR_SSA", "rsi#1", reads=[rsi1]),
+                       FExpr("MLIL_CONST", "0", constant=0)]),
+    ]
+    func = FFunc("handler", 0x10, FSSAFunc(instrs), params=[])
+    bv = FBV({0x900: "recvmsg"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("call:recvmsg")])
+    assert any("could not be statically resolved" in a for a in result["assumptions"]), \
+        result.get("assumptions")
+
+
 def test_forward_downgrades_unmodeled_single_arg_allocator_wrapper(models):
     # dst = my_alloc_wrapper(len); memcpy(dst, src, len): an unmodeled one-arg
     # allocator wrapper whose sole arg is the copy length -> bounded_len (#229).

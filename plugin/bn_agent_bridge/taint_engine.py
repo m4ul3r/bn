@@ -1404,6 +1404,89 @@ class TaintEngine:
             return self._addr_base_offset(ssaf, reads[0], depth + 1)
         return None
 
+    def _ptr_size(self) -> int:
+        """Target pointer size in bytes (8 / 4), so the msghdr/iovec field offsets
+        are laid out per the target ABI rather than a hard-coded 64-bit assumption."""
+        sz = getattr(getattr(self.bv, "arch", None), "address_size", None)
+        try:
+            sz = int(sz)
+        except (TypeError, ValueError):
+            sz = 0
+        return sz if sz in (4, 8) else 8
+
+    def _field_store_slot(self, ssaf: Any, ins: Any):
+        """The ``(base, offset)`` slot a store writes, unifying BN's two struct-field
+        store shapes: MLIL_STORE_SSA (dest is an address expr `&v + off`) and
+        MLIL_SET_VAR_(ALIASED_)FIELD (dest is the struct VAR -> `(v, 0)`, with the
+        field byte offset in ``ins.offset``). None when unresolvable."""
+        op = op_name(ins)
+        if "STORE" in op:
+            return self._addr_base_offset(ssaf, getattr(ins, "dest", None))
+        if op in ("MLIL_SET_VAR_FIELD", "MLIL_SET_VAR_ALIASED_FIELD"):
+            ba = self._addr_base_offset(ssaf, getattr(ins, "dest", None))
+            if ba is None:
+                return None
+            return (ba[0], ba[1] + int(getattr(ins, "offset", 0) or 0))
+        return None
+
+    def _value_stored_to_field(self, ssaf: Any, instrs: Any, target_slot: tuple, before_addr: int):
+        """The value (src expr) of the nearest store to *target_slot* at an ADDRESS
+        below *before_addr* (the recv callsite). Keyed on address, not MLIL
+        instr_index: under basic-block reordering the MLIL linear index diverges
+        from execution order, so an index-based "last store" can wrongly pick a
+        not-reaching init (e.g. `iov_base = 0` emitted on a sibling branch) over the
+        real buffer store that sits at a lower address. The msghdr/iovec setup is
+        laid down physically just before the call, so the highest-address store
+        below it is the reaching writer. CFG-insensitive (an unprovable pick is
+        caught by the caller's honesty backstop -- it nudges rather than mis-seed).
+        None if there is no such store."""
+        best, best_addr = None, -1
+        for ins in instrs:
+            addr = getattr(ins, "address", None)
+            if addr is None or addr >= before_addr or addr <= best_addr:
+                continue
+            slot = self._field_store_slot(ssaf, ins)
+            if slot is not None and slot == target_slot:
+                best, best_addr = getattr(ins, "src", None), addr
+        return best
+
+    def _recvmsg_iov_buffers(self, ssaf: Any, instrs: Any, call_ins: Any, hdr_idx: int) -> list:
+        """The scatter-gather buffer pointer expr(s) a recvmsg/recvmmsg call fills,
+        resolved statically: follow the msghdr at arg *hdr_idx* through its msg_iov
+        field to the iovec, then each iovec's iov_base field to the buffer. Returns
+        [] when the setup can't be resolved (dynamically-built iovec, etc.) -- the
+        caller then falls back to the honest nudge, so a miss is never silent.
+
+        Layout (glibc, ptr-size P): msghdr.msg_iov @ 2*P (after msg_name[P] +
+        msg_namelen padded to P); iovec.iov_base @ 0, stride 2*P. recvmmsg's first
+        mmsghdr has msg_hdr at offset 0, so the same offsets apply to its arg1."""
+        params = self._call_params(call_ins)
+        if hdr_idx < 0 or hdr_idx >= len(params):
+            return []
+        before = getattr(call_ins, "address", None)
+        if before is None:
+            return []
+        hdr = self._addr_base_offset(ssaf, params[hdr_idx])
+        if hdr is None:
+            return []
+        ptr = self._ptr_size()
+        iov_ptr = self._value_stored_to_field(ssaf, instrs, (hdr[0], hdr[1] + 2 * ptr), before)
+        if iov_ptr is None:
+            return []
+        iov = self._addr_base_offset(ssaf, iov_ptr)
+        if iov is None:
+            return []
+        bufs = []
+        # Walk consecutive iovec entries set up before the call (handles a single
+        # iovec and a small static array); stop at the first entry with no iov_base
+        # store, capped so a bogus base can't spin.
+        for i in range(8):
+            buf = self._value_stored_to_field(ssaf, instrs, (iov[0], iov[1] + i * 2 * ptr), before)
+            if buf is None:
+                break
+            bufs.append(buf)
+        return bufs
+
     def _mem_phi_sources(self, defn: Any) -> list[int]:
         src = getattr(defn, "src_memory", None)
         if isinstance(src, (list, tuple)):
@@ -3615,8 +3698,10 @@ class TaintEngine:
                         f"{callee} writes the received bytes to the scatter-gather iov "
                         f"buffer(s) (msghdr->msg_iov[i].iov_base; for recvmmsg, per msgvec "
                         f"entry), not the header pointer this --source seeds; the payload "
-                        f"taint is NOT followed from here. Seed the filled buffer directly "
-                        f"(--source var:<buf>) to trace the received data."
+                        f"taint is NOT followed from here. Use --source call:{callee}, which "
+                        f"resolves the iovec buffer from the msg_iov/iov_base setup "
+                        f"automatically, or seed the filled buffer directly (--source "
+                        f"var:<buf>) when the iovec is built dynamically."
                     )
                 if kind == "ret":
                     # A ret: source on a function whose model also fills an
@@ -3742,6 +3827,44 @@ class TaintEngine:
                                 if taint_node((var_key(w), getattr(w, "version", None)), var_label(w), c,
                                               f"source: return of {callee} (call: preset)", []):
                                     seeded = True
+                        elif to.startswith("*iovec:"):
+                            # recvmsg/recvmmsg (#306): the payload lands in the
+                            # iovec buffer(s), two pointer hops from the msghdr arg.
+                            try:
+                                hdr_idx = int(to.split(":")[-1])
+                            except (TypeError, ValueError):
+                                hdr_idx = -1
+                            bufs = self._recvmsg_iov_buffers(ssaf, instrs, c, hdr_idx)
+                            iov_seeded = False
+                            for buf in bufs:
+                                bt = self._buffer_target(ssaf, buf)
+                                if bt is not None:
+                                    key, label = bt
+                                    if taint_node((key, None), label, c,
+                                                  f"source: {callee} fills msg_iov[i].iov_base buffer "
+                                                  f"(call: preset)", []):
+                                        seeded = True
+                                        iov_seeded = True
+                                else:
+                                    for r in expr_reads(buf):
+                                        if taint_node((var_key(r), getattr(r, "version", None)),
+                                                      var_label(r), c,
+                                                      f"source: {callee} iovec buffer (call: preset)", []):
+                                            seeded = True
+                                            iov_seeded = True
+                            # Honesty backstop: a resolved iovec that seeds NOTHING (an
+                            # entry whose iov_base is a constant / unrecovered expr, e.g.
+                            # the reaching store was mis-picked or zero-initialized) must
+                            # still nudge -- otherwise the recv path reads as a clean
+                            # all-clear, the worst failure mode. Covers both the
+                            # no-buffers and the buffers-but-nothing-seeded cases.
+                            if not iov_seeded:
+                                add_assumption(
+                                    f"{callee} fills the scatter-gather buffer(s) at "
+                                    f"msghdr->msg_iov[i].iov_base, but the iovec setup at this "
+                                    f"callsite could not be statically resolved; the payload taint "
+                                    f"is NOT followed -- seed the filled buffer directly "
+                                    f"(--source var:<buf>)")
                         elif to.startswith("*arg:"):
                             idx = _try_arg_index(to)
                             if idx is not None and idx < len(params):
