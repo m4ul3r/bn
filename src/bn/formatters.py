@@ -143,6 +143,28 @@ def _resolution_note(value: Any) -> str:
     )
 
 
+def _disasm_linear_steer_note(value: Any, *, sliced: bool) -> str:
+    """A disasm-only note when a mid-function address was sliced (#371.3).
+
+    `disasm <mid-addr> --count N` (or `--lines`) slices from the function
+    PROLOGUE, not the requested address, so an agent inspecting a call site via
+    an xref address silently gets the prologue. Point at `--linear`, which
+    decodes N instructions from the exact address regardless of function
+    membership. Fires only when a slice is active AND the address resolved
+    mid-function -- an exact start or a whole-function dump has no trap.
+    """
+    if not sliced or not isinstance(value, dict):
+        return ""
+    resolved_from = value.get("resolved_from")
+    if not isinstance(resolved_from, dict):
+        return ""
+    addr = resolved_from.get("requested_address", "?")
+    return (
+        f"// bn: --count/--lines slices from the function start, not {addr}; "
+        f"to disassemble from {addr} itself use `disasm {addr} --linear N`\n"
+    )
+
+
 def _render_disasm_linear_text(value: Any) -> str:
     """Render a linear (non-function-bounded) disassembly: a leading `// bn:` note
     so it's clearly NOT a function listing, then the address/bytes/mnemonic lines

@@ -60,6 +60,39 @@ def _force_function_analysis(ctx, bv, func):
     return bv.get_function_at(start) or func
 
 
+# Forcing analysis on an oversized, uncalled region is the data-as-code trap:
+# BN tentatively made a function on a string/pointer table or packed data, and
+# the forced decode runs away. Only nudge for genuinely large regions so a
+# routine forced reanalysis of a normal function stays quiet.
+_FORCED_DATA_MIN_BYTES = 0x4000
+
+
+def _forced_data_region_warning(bv, func) -> str | None:
+    """A hedged verify-nudge when a force-analyzed function looks like it may be
+    a DATA region BN tentatively typed as code (#371.1).
+
+    The reliable signal common to the observed cases (a pointer/tag table AND
+    high-entropy packed data) is structural, not content-based: an oversized
+    region with zero inbound code refs. Byte/string heuristics miss the
+    high-entropy case, so this stays a *verify* nudge, never a "this is data"
+    verdict. Real oversized code almost always has inbound callers.
+    """
+    try:
+        size = int(getattr(func, "total_bytes", 0) or 0)
+    except Exception:
+        size = 0
+    if size < _FORCED_DATA_MIN_BYTES:
+        return None
+    if read_xrefs._code_ref_count(bv, func.start) != 0:
+        return None
+    return (
+        f"{func.name}: forced analysis decoded {size} bytes with 0 inbound code refs. "
+        "BN sometimes makes a function on a DATA region (string/pointer table or packed "
+        "data) that grows under forced decode; if the body reads as tables/strings/garbage "
+        "rather than coherent code, treat this decode as suspect and verify before acting on it."
+    )
+
+
 def _annotate_containment(ctx, result, identifier, func) -> None:
     """Tag a function-scoped READ result when the request resolved to a
     containing function rather than an exact start (#193 Part 4).
@@ -84,6 +117,10 @@ def _decompile(ctx, selector: str | None, identifier, *, addresses: bool = False
     stub = il_format._analysis_stub_warning(func, text, forced=forced)
     if stub:
         warnings.append(stub)
+    if forced:
+        data_warn = _forced_data_region_warning(bv, func)
+        if data_warn:
+            warnings.append(data_warn)
     comments = il_format._comment_map(bv, func)
     result = {
         "function": {"name": func.name, "address": hex(func.start)},

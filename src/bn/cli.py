@@ -1130,6 +1130,22 @@ def _parse_line_range(value: str) -> tuple[int, int]:
     # 1-indexed, so a leading `-` can only be a (rejected) negative START.
     sep = ":" if ":" in value else "-"
     parts = value.split(sep)
+    if len(parts) == 1:
+        # A bare count `--lines N` means the first N lines (1..N), matching
+        # `--count`/`--limit` N, so `disasm --lines 5` is no longer a dead end
+        # that errors asking for START:END (#371.4). Use base-0 parsing so the
+        # bare form accepts `0x..` exactly like --count/--limit (_positive_int).
+        try:
+            count = int(parts[0], 0)
+        except (TypeError, ValueError):
+            raise argparse.ArgumentTypeError(
+                f"expected START:END, START-END, or a bare line count, got {value!r}"
+            )
+        if count < 1:
+            raise argparse.ArgumentTypeError(
+                f"invalid line count {count}; --lines is 1-indexed (N >= 1)"
+            )
+        return (1, count)
     if len(parts) != 2:
         raise argparse.ArgumentTypeError(f"expected START:END or START-END, got {value!r}")
     try:
