@@ -586,10 +586,62 @@ def _resolve_class_names(registry: dict[str, dict], name: str) -> list[str]:
 def _enrich(ctx, bv, rec: dict[str, Any]) -> dict[str, Any]:
     if rec.get("vtable"):
         rec["vtable"] = ctx._vtable_layout_for(bv, int(rec["vtable"]["address"], 16)) or rec["vtable"]
+    elif rec.get("typeinfo"):
+        # #354: STRIPPED binary -- the `_ZTV` DataSymbol is gone so the registry has
+        # no vtable address, but typeinfo survived. Backwalk typeinfo->vtable.
+        recovered = _recover_vtables_from_typeinfo(ctx, bv, int(rec["typeinfo"]["address"], 16))
+        if recovered:
+            rec["vtable"] = recovered["primary"]
+            if recovered["secondary"]:
+                rec["secondary_vtables"] = recovered["secondary"]   # #412
+            rec.setdefault("notes", []).append(
+                "vtable recovered via typeinfo backwalk (no _ZTV symbol -- stripped binary)")
     rec["size"] = ctx._object_size_for(bv, rec)
     rec["bases"] = ctx._bases_for(bv, rec)
     rec["instances"] = ctx._instances_for(bv, rec)
     return rec
+
+
+def _as_signed(value: int | None, ptr: int) -> int:
+    """Interpret an unsigned ptr-sized word as a signed offset-to-top."""
+    if value is None:
+        return 0
+    bits = ptr * 8
+    return value - (1 << bits) if value >= (1 << (bits - 1)) else value
+
+
+def _recover_vtables_from_typeinfo(ctx, bv, typeinfo_addr: int) -> dict[str, Any] | None:
+    """#354/#412: in a STRIPPED binary the ``_ZTV`` DataSymbol is gone, so the class
+    registry carries no vtable address -- but the typeinfo symbol usually survives.
+    An Itanium vtable's word[1] holds the class typeinfo pointer, so a DATA xref to
+    the typeinfo addr lands at ``vtable_addr + ptr_size``. Backwalk each such ref,
+    validate the candidate as a real vtable via ``_vtable_layout_for`` (word[1] ==
+    typeinfo, slots are CODE -- which filters typeinfo base-pointer refs from other
+    classes' RTTI), and classify primary (offset-to-top 0) vs secondary (#412,
+    non-zero word[0]). Returns ``{"primary": layout, "secondary": [layout, ...]}``
+    or None when nothing resolves."""
+    getter = getattr(bv, "get_data_refs", None)
+    if not callable(getter):
+        return None
+    ptr = ctx._pointer_size(bv)
+    groups: list[tuple[int, dict[str, Any]]] = []
+    seen: set[int] = set()
+    for ref in getter(int(typeinfo_addr)):
+        vt_addr = int(ref) - ptr
+        if vt_addr < 0 or vt_addr in seen:
+            continue
+        seen.add(vt_addr)
+        layout = ctx._vtable_layout_for(bv, vt_addr)
+        if not layout or not layout.get("slots"):
+            continue
+        ott = _as_signed(ctx._read_pointer_value(bv, vt_addr, size=ptr), ptr)
+        layout["offset_to_top"] = ott
+        layout["typeinfo_backwalk"] = True   # provenance: recovered without a _ZTV symbol
+        groups.append((ott, layout))
+    if not groups:
+        return None
+    groups.sort(key=lambda g: abs(g[0]))     # primary = offset-to-top nearest 0
+    return {"primary": groups[0][1], "secondary": [g[1] for g in groups[1:]]}
 
 
 def _class_show(ctx, selector: str | None, name: str) -> dict[str, Any]:

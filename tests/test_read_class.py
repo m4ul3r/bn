@@ -177,6 +177,96 @@ class _SlotCtx:
         return {"kind": "pointer_table", "items": self._rows}
 
 
+class _RecoverCtx:
+    """ctx for the #354 typeinfo->vtable backwalk: _vtable_layout_for returns the
+    prebuilt layout for a known vtable address (None / empty for a non-vtable ref),
+    and _read_pointer_value returns the word[0] offset-to-top."""
+    def __init__(self, layouts, otts):
+        self._layouts = layouts
+        self._otts = otts
+    def _pointer_size(self, bv):
+        return 8
+    def _read_pointer_value(self, bv, addr, *, size=None):
+        return self._otts.get(addr, 0)
+    def _vtable_layout_for(self, bv, addr):
+        return self._layouts.get(addr)
+
+
+class _RecoverBV:
+    def __init__(self, refs):
+        self._refs = refs
+    def get_data_refs(self, addr):
+        return list(self._refs)
+
+
+def test_recover_vtables_from_typeinfo_primary_and_secondary():
+    # #354/#412: stripped binary -- no _ZTV symbol. A data xref to the typeinfo
+    # lands at (vtable_addr + ptr); backwalk -ptr, validate via _vtable_layout_for,
+    # classify primary (offset-to-top 0) vs secondary (non-zero).
+    ti = 0x9100
+    bv = _RecoverBV([0x9008, 0x9028, 0x9050])
+    layouts = {
+        0x9000: {"address": "0x9000", "slots": [{"index": 0, "address": "0xa000"}]},
+        0x9020: {"address": "0x9020", "slots": [{"index": 0, "address": "0xa100"}]},
+        0x9048: {"address": "0x9048", "slots": []},   # not a vtable -> filtered
+    }
+    otts = {0x9000: 0, 0x9020: (1 << 64) - 16, 0x9048: 0}   # secondary offset-to-top = -16
+    ctx = _RecoverCtx(layouts, otts)
+    out = read_class._recover_vtables_from_typeinfo(ctx, bv, ti)
+    assert out is not None
+    assert out["primary"]["address"] == "0x9000"
+    assert out["primary"]["offset_to_top"] == 0
+    assert out["primary"]["typeinfo_backwalk"] is True
+    assert len(out["secondary"]) == 1
+    assert out["secondary"][0]["address"] == "0x9020"
+    assert out["secondary"][0]["offset_to_top"] == -16
+
+
+def test_enrich_backwalks_vtable_for_stripped_class():
+    # #354/#412: a class with typeinfo but NO vtable symbol (stripped) gets its
+    # primary + secondary vtables recovered via the typeinfo backwalk in _enrich.
+    class _EnrichCtx(_RecoverCtx):
+        def _object_size_for(self, bv, rec):
+            return None
+        def _bases_for(self, bv, rec):
+            return []
+        def _instances_for(self, bv, rec):
+            return {"construction_sites": [], "stored_globals": []}
+
+    bv = _RecoverBV([0x9008, 0x9028])
+    layouts = {
+        0x9000: {"address": "0x9000", "slots": [{"index": 0, "address": "0xa000"}]},
+        0x9020: {"address": "0x9020", "slots": [{"index": 0, "address": "0xa100"}]},
+    }
+    otts = {0x9000: 0, 0x9020: (1 << 64) - 16}
+    ctx = _EnrichCtx(layouts, otts)
+    rec = {"name": "Shape", "vtable": None, "typeinfo": {"address": "0x9100"},
+           "methods": [], "bases": []}
+    out = read_class._enrich(ctx, bv, rec)
+    assert out["vtable"]["address"] == "0x9000"          # primary recovered (#354)
+    assert out["vtable"]["typeinfo_backwalk"] is True
+    assert len(out["secondary_vtables"]) == 1            # secondary recovered (#412)
+    assert out["secondary_vtables"][0]["address"] == "0x9020"
+    assert any("typeinfo backwalk" in n for n in out["notes"])
+
+
+def test_render_class_show_text_shows_secondary_vtables():
+    # #412: a multiple-inheritance class renders its secondary (offset-to-top != 0)
+    # vtable group beneath the primary.
+    from bn.formatters import _render_class_show_text
+    rec = {
+        "name": "Shape", "confidence": "rtti", "size": None, "bases": [],
+        "methods": [], "instances": {"construction_sites": [], "stored_globals": []},
+        "vtable": {"address": "0x9000", "offset_to_top": 0,
+                   "slots": [{"index": 0, "address": "0xa000", "method": {"name": "draw"}}]},
+        "secondary_vtables": [{"address": "0x9040", "offset_to_top": -8,
+                               "slots": [{"index": 0, "address": "0xb000", "method": {"name": "name"}}]}],
+    }
+    text = _render_class_show_text(rec)
+    assert "secondary vtable @ 0x9040 (offset-to-top -8)" in text
+    assert "[0] 0xb000  name" in text
+
+
 def test_vtable_layout_skips_when_header_not_typeinfo():
     # The Itanium gate: if word[1] doesn't resolve to a typeinfo, this isn't a
     # real local vtable object (import/GOT slot or relocated-to-zero PIE slot) --
