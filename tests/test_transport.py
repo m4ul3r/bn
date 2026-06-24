@@ -24,6 +24,21 @@ from bn.transport import (
 )
 
 
+def test_choose_instance_multiple_with_no_selector_errors_before_target(monkeypatch):
+    # #368 facet 2: with several live instances and NO selector (no -i/env/sticky/
+    # marker), instance resolution must surface the workspace-level ambiguity --
+    # not narrow to one instance -- BEFORE any target resolution runs.
+    import types
+    import bn.transport as t
+    insts = [types.SimpleNamespace(instance_id="aa11", pid=11, socket_path="/s/aa11", started_at=None),
+             types.SimpleNamespace(instance_id="bb22", pid=22, socket_path="/s/bb22", started_at=None)]
+    monkeypatch.setattr(t, "list_instances", lambda: insts)
+    monkeypatch.setattr(t, "_resolve_from_markers", lambda instances: None)  # no marker
+    with pytest.raises(BridgeError) as exc:
+        choose_instance(auto_start=False)
+    assert "Multiple" in str(exc.value) and "instance" in str(exc.value).lower()
+
+
 class _Handler(socketserver.StreamRequestHandler):
     def handle(self):
         raw = self.rfile.readline()
