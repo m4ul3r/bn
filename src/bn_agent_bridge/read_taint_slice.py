@@ -51,6 +51,11 @@ def _taint_op(ctx, selector, params: dict[str, Any]):
         # A broken builtin DB or BN_TAINT_MODELS override is now loud instead
         # of silently producing false negatives (#97).
         raise OperationFailure("unsupported", str(exc)) from exc
+    # #415: capture the overlay disclosure from the SAME load that produced
+    # `models` (before the long analysis), so a model file created/deleted
+    # mid-run can't desync the reported sources from what was actually used.
+    model_sources = _taint.model_overlay_sources(
+        params.get("user_models"), user_models_path=params.get("user_models_path"))
 
     def _find_variable(fn, sel):
         var, _is_param = vars_mod._find_variable_selector(fn, sel)
@@ -68,19 +73,27 @@ def _taint_op(ctx, selector, params: dict[str, Any]):
             locators = [_taint.parse_locator(s) for s in (params.get("sources") or [])]
             if not locators:
                 raise _taint.TaintError("forward taint needs at least one --source")
-            return engine.forward(
+            result = engine.forward(
                 func, locators,
                 max_depth=int(params.get("max_depth", 8)),
                 enabled_sink_classes=set(params.get("enabled_sink_classes") or []),
             )
-        if direction == "backward":
+        elif direction == "backward":
             locators = [_taint.parse_locator(s) for s in (params.get("sinks") or [])]
             if not locators:
                 raise _taint.TaintError("backward taint needs at least one --sink")
-            return engine.backward(func, locators, max_depth=int(params.get("max_depth", 8)))
+            result = engine.backward(func, locators, max_depth=int(params.get("max_depth", 8)))
+        else:
+            raise OperationFailure("unsupported", f"unknown taint direction: {direction}")
     except _taint.TaintError as exc:
         raise OperationFailure("unsupported", str(exc)) from exc
-    raise OperationFailure("unsupported", f"unknown taint direction: {direction}")
+    # #415: disclose which taint-model overlays were in effect for this run, so an
+    # agent can confirm a project-local --models / BN_TAINT_MODELS file landed
+    # (load_models reads them per request -- no bridge restart needed). Uses the
+    # value captured at load time above so it reflects what was actually merged.
+    if isinstance(result, dict):
+        result["model_sources"] = model_sources
+    return result
 
 
 def _ssa_vars_from(vars_list: list) -> list[SSAVariable]:

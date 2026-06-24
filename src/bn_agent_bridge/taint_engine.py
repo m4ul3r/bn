@@ -27,6 +27,7 @@ API behaviour verified against /opt/binaryninja (see the design's spike):
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -201,6 +202,48 @@ def load_models(extra: dict[str, Any] | None = None) -> dict[str, Any]:
         # a name clash -- they're the most specific to the target.
         models.update(_coerce_model_map(extra, source="user-provided models (--models / extra)"))
     return models
+
+
+def model_overlay_sources(extra: dict[str, Any] | None = None, *,
+                          user_models_path: str | None = None) -> list[dict[str, Any]]:
+    """#415: the active taint-model overlay sources (most-specific last), so a
+    `taint` run discloses WHICH models are in effect.
+
+    load_models() re-reads the builtin DB, the BN_TAINT_MODELS-pointed file, and
+    any ``--models`` file on EVERY request, so editing a project-local model file
+    (or passing ``--models``) takes effect on the next taint command with no
+    bridge restart -- this disclosure makes that visible (and lets a status check
+    confirm an overlay landed). ``user_models_path`` (when known) names the
+    ``--models`` file so the disclosure points at WHICH file landed, not just a
+    count."""
+    sources: list[dict[str, Any]] = [{"kind": "builtin", "path": str(_BUILTIN_MODELS)}]
+    if taint_models_path is not None:
+        try:
+            override = taint_models_path()
+        except Exception:
+            override = None
+        if override is not None and override.exists():
+            # taint_models_path() returns the BN_TAINT_MODELS path when that env
+            # var is set, else the default ~/.cache/bn/taint_models.json -- both of
+            # which load_models honors. Only claim the env var when it's actually
+            # set; otherwise label the default-file override honestly (review).
+            if os.environ.get("BN_TAINT_MODELS"):
+                sources.append({"kind": "env_override", "env": "BN_TAINT_MODELS",
+                                "path": str(override)})
+            else:
+                sources.append({"kind": "override_default", "path": str(override)})
+    if extra:
+        # Count the actual models the way load_models()/_coerce_model_map does:
+        # unwrap a ``{"models": {...}}`` envelope and skip ``_comment*`` doc keys,
+        # so the disclosed count matches what was really merged (review: a wrapped
+        # file with two inner models otherwise reported count 1).
+        inner = extra.get("models") if isinstance(extra, dict) and "models" in extra else extra
+        count = sum(1 for k in inner if not str(k).startswith("_comment")) if isinstance(inner, dict) else 0
+        user: dict[str, Any] = {"kind": "user", "via": "--models", "count": count}
+        if user_models_path:
+            user["path"] = str(user_models_path)
+        sources.append(user)
+    return sources
 
 
 def _canonical_cxx_alloc(name: str) -> str | None:
