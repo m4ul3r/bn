@@ -2591,6 +2591,20 @@ def _render_one_class(rec: Any) -> str:
         # decodable local body; say so rather than render fake or empty virtuals.
         lines.append("  vtable: symbol present but no slots resolved here "
                      "(defined in another module, or applied at load time via relocations)")
+    # #412: secondary (multiple-inheritance) vtables -- shown compactly so a simple
+    # single-inheritance class isn't cluttered (there are none to show there).
+    for sec in rec.get("secondary_vtables") or []:
+        if not isinstance(sec, dict):
+            continue
+        ott = sec.get("offset_to_top")
+        ott_s = f" (offset-to-top {ott})" if ott is not None else ""
+        lines.append(f"  secondary vtable @ {sec.get('address', '?')}{ott_s}:")
+        for s in sec.get("slots") or []:
+            method = s.get("method") or {}
+            slot_name = (method.get("display_name") or method.get("name")) if isinstance(method, dict) else None
+            label = ("__cxa_pure_virtual" if s.get("pure_virtual")
+                     else slot_name if slot_name else "<unnamed>")
+            lines.append(f"    [{s.get('index')}] {s.get('address', '?')}  {label}")
     # Non-virtual member functions (kind=method). Virtual ones already appear as
     # vtable slots above; listing the symbol-side methods makes `class show`
     # useful for classes whose vtable is empty or absent (e.g. Controller).
