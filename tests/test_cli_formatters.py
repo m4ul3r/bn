@@ -24,6 +24,25 @@ def test_render_name_address_rows_escapes_control_chars():
     assert "\x07" not in out                     # raw control byte gone
 
 
+def test_render_name_address_rows_shows_basic_block_count():
+    """#411: text is the DEFAULT read output, so the real complexity metric
+    (basic_block_count) must be visible there, not only in JSON. A row carrying
+    basic_block_count renders it alongside the byte span; a row whose count is
+    None/absent omits the blocks clause and still shows the byte span."""
+    from bn.formatters import _render_name_address_rows
+    out = _render_name_address_rows([
+        {"address": "0x401000", "name": "parse_loop", "size": 256,
+         "basic_block_count": 42},
+        {"address": "0x402000", "name": "tiny", "size": 8,
+         "basic_block_count": None},
+        {"address": "0x403000", "name": "legacy", "size": 16},  # field absent
+    ])
+    rows = out.splitlines()
+    assert rows[0] == "0x401000  parse_loop  (256 bytes, 42 blocks)"
+    assert rows[1] == "0x402000  tiny  (8 bytes)"          # None -> no blocks clause
+    assert rows[2] == "0x403000  legacy  (16 bytes)"       # absent -> no blocks clause
+
+
 def test_render_function_bundle_text_pretty_prints_not_escaped():
     """`bundle function --format text` must render readable multi-line JSON with a
     note, not a single line of escaped JSON like the default fallback (#362)."""

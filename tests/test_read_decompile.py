@@ -448,6 +448,55 @@ def test_function_list_rows_carry_basic_block_count(monkeypatch):
     assert "_fn" not in by["0x401000"]   # transient enrich key is dropped
 
 
+def test_function_search_rows_carry_basic_block_count(monkeypatch):
+    # #411 review: `function search` emits the same triage row shape as
+    # `function list`, so its rows must carry the same page-only basic_block_count
+    # (else search-driven triage falls back to the misleading byte span).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    f1 = _FakeFunction(0x401000, "parse_header"); f1.basic_blocks = [object()] * 7
+    f2 = _FakeFunction(0x402000, "parse_body"); f2.basic_blocks = [object()] * 19
+    other = _FakeFunction(0x403000, "unrelated"); other.basic_blocks = [object()]
+    bv = _FakeBV(functions=[f1, f2, other])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._search_functions("active", "parse")
+    by = {it["address"]: it for it in result["items"]}
+    assert set(by) == {"0x401000", "0x402000"}     # only the matches
+    assert by["0x401000"]["basic_block_count"] == 7
+    assert by["0x402000"]["basic_block_count"] == 19
+    assert "_fn" not in by["0x401000"]             # transient enrich key is dropped
+
+
+def test_function_list_basic_block_count_guards_bad_function(monkeypatch):
+    # #411 review: len(fn.basic_blocks) is unguarded -- a single problematic
+    # function on the returned page would otherwise fail the whole list request.
+    # A function whose basic_blocks access RAISES yields basic_block_count: None
+    # and the request still succeeds (mirrors il_format._function_size's guard).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _ExplodingFunction(_FakeFunction):
+        # Reading basic_blocks raises (analysis artifact). Modeled via
+        # __getattribute__ so __init__'s `self.basic_blocks = []` (a __setattr__)
+        # still succeeds while every READ of the attribute blows up.
+        def __getattribute__(self, attr):
+            if attr == "basic_blocks":
+                raise RuntimeError("analysis artifact: basic_blocks unavailable")
+            return super().__getattribute__(attr)
+
+    good = _FakeFunction(0x401000, "ok_fn"); good.basic_blocks = [object()] * 3
+    bad = _ExplodingFunction(0x402000, "bad_fn")
+    bv = _FakeBV(functions=[good, bad])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._list_functions("active")
+    by = {it["address"]: it for it in result["items"]}
+    assert by["0x401000"]["basic_block_count"] == 3
+    assert by["0x402000"]["basic_block_count"] is None   # guarded, not a crash
+    assert result["total"] == 2                          # whole request succeeded
+
+
 def test_function_list_envelope_kind_and_no_functions_alias(monkeypatch):
     # #275: the canonical envelope carries a `kind` discriminator and drops the
     # deprecated `functions` alias (items is the universal container).
