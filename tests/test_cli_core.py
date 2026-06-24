@@ -264,7 +264,23 @@ def test_parse_line_range_accepts_colon_and_dash():
     from bn.cli import _parse_line_range
     assert _parse_line_range("1:15") == (1, 15)
     assert _parse_line_range("1-15") == (1, 15)
-    for bad in ("0-5", "5-1", "abc", "1", "1:2:3"):
+    for bad in ("0-5", "5-1", "abc", "1:2:3"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            _parse_line_range(bad)
+
+
+def test_parse_line_range_accepts_bare_count():
+    """A bare line count `--lines N` means the first N lines (1..N), matching
+    `--count`/`--limit` N, so `disasm --lines 5` no longer errors asking for
+    START:END (#371.4)."""
+    import argparse
+    from bn.cli import _parse_line_range
+    assert _parse_line_range("5") == (1, 5)
+    assert _parse_line_range("1") == (1, 1)
+    # base-0 parsing matches --count/--limit (_positive_int), so a hex bare
+    # count works too -- `disasm --lines 0x10` == first 16 lines.
+    assert _parse_line_range("0x10") == (1, 16)
+    for bad in ("0", "-3", ""):
         with pytest.raises(argparse.ArgumentTypeError):
             _parse_line_range(bad)
 

@@ -247,6 +247,58 @@ def test_local_list_text_notes_mid_function_resolution(fake_transport, capsys):
     assert "0x401010 is inside parse_packet @ 0x401000 (+0x10)" in out
 
 
+def test_disasm_count_on_mid_function_address_steers_to_linear(fake_transport, capsys):
+    # #371.3: `disasm <mid-addr> --count N` slices from the function prologue, not
+    # the requested address -- an agent inspecting a call site via an xref address
+    # gets the prologue. Steer them to --linear, which decodes from the exact
+    # address regardless of function membership.
+    fake_transport({"disasm": {"ok": True, "result": {
+        "function": {"name": "parse_packet", "address": "0x401000"},
+        "text": "0x401000  push rbp\n0x401001  mov rbp, rsp\n0x401004  sub rsp, 0x20",
+        "resolved_from": {"requested_address": "0x401010", "offset": "+0x10"},
+    }}})
+
+    rc = bn.cli.main(["disasm", "0x401010", "--target", "active", "--count", "1"])
+
+    assert rc == 0
+    out, _ = capsys.readouterr()
+    assert "0x401010 is inside parse_packet @ 0x401000 (+0x10)" in out
+    assert "disasm 0x401010 --linear" in out
+    assert "push rbp" in out  # the (prologue) slice still renders
+
+
+def test_disasm_mid_function_address_without_slice_no_linear_steer(fake_transport, capsys):
+    # Without a slice the whole function renders; the prologue-vs-address trap
+    # does not apply, so do not nag about --linear.
+    fake_transport({"disasm": {"ok": True, "result": {
+        "function": {"name": "parse_packet", "address": "0x401000"},
+        "text": "0x401000  push rbp\n0x401010  call sub_callee",
+        "resolved_from": {"requested_address": "0x401010", "offset": "+0x10"},
+    }}})
+
+    rc = bn.cli.main(["disasm", "0x401010", "--target", "active"])
+
+    assert rc == 0
+    out, _ = capsys.readouterr()
+    assert "is inside parse_packet" in out
+    assert "--linear" not in out
+
+
+def test_disasm_count_exact_start_no_linear_steer(fake_transport, capsys):
+    # An exact function-start address has no resolved_from, so a sliced disasm
+    # there is exactly what was asked for -- no steering note.
+    fake_transport({"disasm": {"ok": True, "result": {
+        "function": {"name": "parse_packet", "address": "0x401000"},
+        "text": "0x401000  push rbp\n0x401001  mov rbp, rsp",
+    }}})
+
+    rc = bn.cli.main(["disasm", "0x401000", "--target", "active", "--count", "1"])
+
+    assert rc == 0
+    out, _ = capsys.readouterr()
+    assert "--linear" not in out
+
+
 def test_function_list_forwards_address_filters(fake_transport, capsys):
     calls = fake_transport({"list_functions": {"ok": True, "result": []}})
 
