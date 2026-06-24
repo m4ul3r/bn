@@ -1144,6 +1144,72 @@ def test_forward_memoizes_buffer_target_across_fixpoint(models):
     assert impl_calls.count(10) == 1, impl_calls
 
 
+def _buffer_target_memo_fixture(start):
+    # f(p): t = &buf; q = &buf2; [q] = p  -- p is the tainted param. The first two
+    # SET_VARs carry no tainted read, so each fixpoint pass reaches the escape check
+    # and resolves `&buf`/`&buf2` structurally; the tainted store forces >=2 passes.
+    # `start` is the function's base address (0 is a valid reset-vector entry).
+    p = FVar("p"); buf = FVar("buf", typ="char[0x40]"); t = FVar("t")
+    q = FVar("q"); buf2 = FVar("buf2", typ="char[0x40]")
+    p1 = FSSA(p, 1); t1 = FSSA(t, 1); q1 = FSSA(q, 1)
+    addr_buf = FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)
+    addr_buf.expr_index = 10  # real BN exprs carry a stable per-function expr_index
+    addr_buf2 = FExpr("MLIL_ADDRESS_OF", "&buf2", src=buf2)
+    addr_buf2.expr_index = 11
+    instrs = [
+        FInstr(0, start + 0x0, "MLIL_SET_VAR_SSA", "t#1 = &buf", writes=[t1], src=addr_buf),
+        FInstr(1, start + 0x4, "MLIL_SET_VAR_SSA", "q#1 = &buf2", writes=[q1], src=addr_buf2),
+        FInstr(2, start + 0x8, "MLIL_STORE_SSA", "[q#1] = p#1", reads=[p1], writes=[],
+               dest=FExpr("MLIL_VAR_SSA", "q#1", reads=[q1])),
+    ]
+    return FFunc("f", start, FSSAFunc(instrs), params=[p])
+
+
+def _instrument_buffer_target(engine, calls):
+    # Count every _buffer_target_impl invocation by the resolved expr's expr_index.
+    orig = engine._buffer_target_impl
+
+    def counting(ssaf, expr):
+        calls.append(getattr(expr, "expr_index", None))
+        return orig(ssaf, expr)
+
+    engine._buffer_target_impl = counting
+
+
+def test_forward_memo_result_equals_unmemoized(models):
+    # #420 teeth: the memo must be output-preserving. Compare a normal memoized run
+    # against an engine whose _buffer_target is forced to recompute on every call
+    # (the memo effectively disabled) -- both forward() results must be identical.
+    memo_engine = te.TaintEngine(FBV({}), models)
+    memoized = memo_engine.forward(_buffer_target_memo_fixture(0x1000),
+                                   [te.parse_locator("param:0")])
+
+    unmemo_engine = te.TaintEngine(FBV({}), models)
+    # Bypass the memo entirely: _buffer_target now always recomputes structurally.
+    unmemo_engine._buffer_target = unmemo_engine._buffer_target_impl
+    unmemoized = unmemo_engine.forward(_buffer_target_memo_fixture(0x1000),
+                                       [te.parse_locator("param:0")])
+
+    assert memoized == unmemoized
+
+
+def test_forward_memoizes_buffer_target_for_base_zero_function(models):
+    # #420 fix: address 0 is a valid function start (a firmware/VxWorks reset-vector
+    # entry). A base-0 function must still be memoized -- a falsy-start guard would
+    # leave the token None and re-resolve `&buf` on every fixpoint pass.
+    engine = te.TaintEngine(FBV({}), models)
+    calls: list[int | None] = []
+    _instrument_buffer_target(engine, calls)
+
+    result = engine.forward(_buffer_target_memo_fixture(0x0),
+                            [te.parse_locator("param:0")])
+    assert isinstance(result, dict)
+    # `&buf` (expr_index 10) is resolved exactly once across the multi-pass fixpoint
+    # even though the function starts at address 0 -- it would be >=2 if base-0
+    # functions bypassed the cache.
+    assert calls.count(10) == 1, calls
+
+
 class FBVStr(FBV):
     """FBV that can also resolve a constant string by address (for format-string
     aware vararg gating)."""

@@ -2134,6 +2134,14 @@ class TaintEngine:
 
     def forward(self, func: Any, sources: list[dict[str, Any]], *,
                 enabled_sink_classes: set[str] | None = None, max_depth: int = 8) -> dict[str, Any]:
+        # Scope the structural _buffer_target memo (#420) to this top-level forward
+        # run: clear it here so a reused engine (e.g. over a re-lifted SSA) can never
+        # return a stale structural result, and so per-(function, expr_index) keys
+        # from a prior run can't survive. The engine is per-request in production --
+        # this is defensive, but it makes the cache lifetime provably one forward run.
+        self._bt_cache = {}
+        self._bt_func_token = None
+
         # optional-sink classes the caller opted into (e.g. file_write); a sink
         # marked "optional" in the model DB fires only if its class is in here.
         # Set once for the whole request and shared by every per-callsite re-run.
@@ -3115,12 +3123,12 @@ class TaintEngine:
         self._max_depth_seen = max(self._max_depth_seen, depth)
         # Scope the structural _buffer_target cache to THIS function so a callee's
         # expr_index can't collide with a caller's (#420). _summarize saves/restores
-        # this token around the one recursive descent call. A falsy start (only
-        # degenerate fakes -- real BN functions have distinct nonzero starts) leaves
-        # the token None so _buffer_target bypasses the cache instead of colliding
-        # every such function on token 0.
+        # this token around the one recursive descent call. Address 0 is a valid
+        # function start (a firmware/VxWorks reset-vector entry), so gate on
+        # `is not None` -- only a genuinely absent start (a degenerate fake) leaves
+        # the token None and makes _buffer_target bypass the cache.
         _start = getattr(func, "start", None)
-        self._bt_func_token = int(_start) if _start else None
+        self._bt_func_token = int(_start) if _start is not None else None
 
         tainted: set[tuple] = set()
         why: dict[tuple, dict[str, Any]] = {}
