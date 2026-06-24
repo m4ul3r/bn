@@ -511,7 +511,7 @@ def _function_text(bv, func, *, view: str = "hlil", ssa: bool = False, addresses
     return str(func)
 
 
-def _instruction_length(bv, address: int, *, arch=None) -> int:
+def _instruction_length(bv, address: int, *, arch=None, strict: bool = False) -> int:
     if arch is None:
         arch = getattr(bv, "arch", None)
     try:
@@ -529,6 +529,14 @@ def _instruction_length(bv, address: int, *, arch=None) -> int:
         except Exception:
             pass
 
+    # In strict mode the decode is FORCED to *arch* (e.g. linear --mode), so a
+    # failed decode must NOT fall back to bv.get_instruction_length(): that uses
+    # the BV-default arch and would return a wrong-mode length, contradicting the
+    # forced-mode note (#382). Return 1 so the caller advances a single byte and
+    # surfaces the honest `.byte` form instead of a mislabeled decode.
+    if strict:
+        return 1
+
     try:
         length = int(bv.get_instruction_length(address))
         if length > 0:
@@ -538,7 +546,7 @@ def _instruction_length(bv, address: int, *, arch=None) -> int:
     return 1
 
 
-def _disasm_entry(bv, address: int, *, arch=None) -> dict[str, Any]:
+def _disasm_entry(bv, address: int, *, arch=None, strict: bool = False) -> dict[str, Any]:
     text = ""
     if arch is not None:
         try:
@@ -549,7 +557,11 @@ def _disasm_entry(bv, address: int, *, arch=None) -> dict[str, Any]:
                 text = "".join(str(t) for t in tokens)
         except Exception:
             pass
-    if not text:
+    # In strict mode (forced linear --mode) a failed forced-arch decode must NOT
+    # fall back to bv.get_disassembly(): that decodes in the BV-default arch and
+    # would print a wrong-mode instruction under a "forced via --mode" note
+    # (#382). Leave text empty so the caller emits the honest `.byte` form.
+    if not text and not strict:
         text = bv.get_disassembly(address) or ""
     return {
         "address": hex(int(address)),

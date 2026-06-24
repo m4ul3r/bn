@@ -263,6 +263,13 @@ def _linear_decode_arch(ctx, bv, address: int, mode):
       3. else the bv default arch (prior behavior)."""
     bv_arch = getattr(bv, "arch", None)
     if mode is not None:
+        # Harden the raw JSON/bridge path: the CLI restricts --mode to arm/thumb,
+        # but a direct {"mode":"mips"} request would otherwise KeyError on
+        # _ARM_MODE_ARCHES below and surface as an internal error (#382 review).
+        if mode not in ("arm", "thumb"):
+            raise ValueError(
+                f"--mode must be 'arm' or 'thumb' (got {mode!r})"
+            )
         cur = str(getattr(bv_arch, "name", "") or "")
         if not (cur.startswith("arm") or cur.startswith("thumb")):
             raise ValueError(
@@ -297,20 +304,37 @@ def _disasm_linear(ctx, bv, identifier, count: int, *, mode=None) -> dict[str, A
         raise ValueError("--linear count must be a positive number of instructions")
     requested_count = int(count)
     count = min(requested_count, _LINEAR_DISASM_MAX)
+    # #382 review Finding 2: an ARM code pointer commonly carries bit 0 as the
+    # Thumb tag, so a value-set/symbol target can be odd while the instruction
+    # lives at addr&~1. Decoding from the odd value starts one byte in. ARM has no
+    # odd instruction addresses, so on an ARM/Thumb target an odd resolved address
+    # is the Thumb tag -- mask it (and disclose) before decoding. Detect ARM-ness
+    # from the bv arch name so this is independent of --mode / function arch, and
+    # NEVER mask on non-ARM targets where odd code addresses are legitimate.
+    thumb_tag_normalized = None
+    bv_arch_name = str(getattr(getattr(bv, "arch", None), "name", "") or "")
+    if (address & 1) and (bv_arch_name.startswith("arm") or bv_arch_name.startswith("thumb")):
+        thumb_tag_normalized = address
+        address &= ~1
     if not _address_is_mapped(bv, address):
         raise ValueError(
             f"address {hex(address)} is not mapped in this binary; nothing to "
             f"disassemble there"
         )
     arch = _linear_decode_arch(ctx, bv, address, mode)
+    # Under an explicit --mode the decode is FORCED to that arch: a byte the forced
+    # mode can't model must surface as `.byte` (the existing path below), NOT a
+    # silent BV-default-arch decode that would contradict the forced-mode note
+    # (#382 review). Without --mode, keep the lenient BV fallback (prior behavior).
+    strict = mode is not None
     entries: list[dict[str, Any]] = []
     lines: list[str] = []
     addr = int(address)
     for _ in range(count):
         if not _address_is_mapped(bv, addr):
             break
-        length = max(1, il_format._instruction_length(bv, addr, arch=arch))
-        entry = il_format._disasm_entry(bv, addr, arch=arch)
+        length = max(1, il_format._instruction_length(bv, addr, arch=arch, strict=strict))
+        entry = il_format._disasm_entry(bv, addr, arch=arch, strict=strict)
         text = entry.get("text") or ""
         if not text:
             # Mapped, but no valid instruction decodes here (data / an invalid
@@ -346,6 +370,11 @@ def _disasm_linear(ctx, bv, identifier, count: int, *, mode=None) -> dict[str, A
         f"{'' if len(entries) == 1 else 's'} from {hex(address)} "
         f"(not function-bounded)"
     )
+    if thumb_tag_normalized is not None:
+        note += (
+            f"; normalized a Thumb function-pointer tag (bit 0) "
+            f"{hex(thumb_tag_normalized)} -> {hex(address)}"
+        )
     if in_function is not None:
         note += f"; this address is inside {in_function['name']} @ {in_function['address']}"
     arch_name = str(getattr(arch, "name", "") or "")
