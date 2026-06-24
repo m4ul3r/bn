@@ -713,7 +713,15 @@ def _render_name_address_rows(value: Any, *, demangle: bool = False) -> str:
             line += f" (raw: {raw_name})"
         size = item.get("size")
         if size is not None:
-            line += f"  ({size} bytes)"
+            # #411: surface basic_block_count (a real complexity metric) here too,
+            # since text is the DEFAULT read output -- otherwise agents only ever
+            # see the misleading byte span. Omit the blocks clause when the count
+            # is absent/None (e.g. an older bridge, or a guarded bad function).
+            blocks = item.get("basic_block_count")
+            if blocks is not None:
+                line += f"  ({size} bytes, {blocks} blocks)"
+            else:
+                line += f"  ({size} bytes)"
         lines.append(line)
     return "\n".join(lines)
 
