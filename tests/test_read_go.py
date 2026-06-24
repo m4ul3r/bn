@@ -79,6 +79,34 @@ def test_go_functions_recovers_names_and_addresses(monkeypatch):
     assert out["total"] == 2 and out["defined_count"] == 1
 
 
+def test_go_functions_count_only_skips_the_list(monkeypatch):
+    # #414: --count returns the recovered count without the full items list.
+    bv = _GoBV(_build_pclntab(), defined={0x401000})
+    bridge, inst = _ctx(monkeypatch, bv)
+    out = inst._go_functions(None, count_only=True)
+    assert out["kind"] == "go_functions"
+    assert out["count"] == 2 and out["total"] == 2
+    assert "items" not in out
+
+
+def test_go_functions_summary_counts_recovered_defined_renamable(monkeypatch):
+    # #414: summary gives recovered/defined/undefined + renamable (what `go rename`
+    # would touch: defined fns still carrying an auto sub_<hex> name).
+    class _NamedGoBV(_GoBV):
+        def get_function_at(self, addr):
+            if addr not in self._defined:
+                return None
+            # main.foo @0x401000 still auto-named sub_401000 -> renamable;
+            return type("F", (), {"name": f"sub_{addr:x}"})()
+    bv = _NamedGoBV(_build_pclntab(), defined={0x401000})
+    bridge, inst = _ctx(monkeypatch, bv)
+    out = inst._go_functions(None, summary=True)
+    assert out["kind"] == "go_functions_summary"
+    assert out["recovered"] == 2 and out["defined"] == 1 and out["undefined"] == 1
+    assert out["renamable"] == 1
+    assert "items" not in out
+
+
 def test_go_functions_rebase_note_when_nothing_maps(monkeypatch):
     # #217: when no recovered address maps to a BN function AND the pcln textStart
     # differs from BN's .text start (PIE), disclose the rebase rather than emitting

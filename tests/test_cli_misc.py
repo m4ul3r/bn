@@ -595,6 +595,16 @@ def test_read_accepts_positional_address(fake_transport):
     assert calls[-1]["params"] == {"address": "0x1000", "length": 8}
 
 
+def test_read_accepts_size_alias_for_length(fake_transport):
+    # #410: --size is an alias for --length.
+    calls = fake_transport({
+        "read": {"ok": True, "result": {"address": "0x1000", "length": 32, "hex": "", "ascii": ""}},
+    })
+    rc = bn.cli.main(["read", "--target", "active", "0x1000", "--size", "32"])
+    assert rc == 0
+    assert calls[-1]["params"]["length"] == 32
+
+
 def test_read_length_accepts_hex(fake_transport):
     calls = fake_transport({
         "read": {"ok": True, "result": {"address": "0x1000", "length": 194, "hex": "", "ascii": ""}},

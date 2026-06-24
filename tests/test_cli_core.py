@@ -280,6 +280,18 @@ def test_class_and_go_subcommand_groups_have_help():
     assert "Go binary symbol recovery" in help_text
 
 
+def test_class_show_ambiguous_exits_nonzero_keeping_matches(fake_transport, capsys):
+    # #413: an ambiguous leaf still returns the informative matches, but with a
+    # NON-zero exit so a shell/agent can't read it as a clean single-class result.
+    fake_transport({"class_show": {"ok": True, "result": {
+        "ambiguous": True, "query": "Foo",
+        "matches": [{"name": "a::Foo"}, {"name": "b::Foo"}]}}})
+    rc = bn.cli.main(["class", "show", "--target", "active", "Foo", "--format", "json"])
+    assert rc == 2
+    out = capsys.readouterr().out
+    assert "a::Foo" in out and "b::Foo" in out
+
+
 def test_missing_subcommand_prints_exact_help(capsys):
     rc = bn.cli.main(["struct"])
 

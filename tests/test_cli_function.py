@@ -285,6 +285,31 @@ def test_function_search_can_request_regex_matching(fake_transport, capsys):
     assert capsys.readouterr().out == "0x401000  load_attachment\n"
 
 
+def test_function_search_accepts_query_flag_alias(fake_transport, capsys):
+    # #410: --query is an alias for the positional query (strings/types muscle memory).
+    calls = fake_transport({"search_functions": {"ok": True, "result": {
+        "functions": [{"name": "parse_hdr", "address": "0x401000"}],
+        "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False}}})
+    rc = bn.cli.main(["function", "search", "--target", "active", "--query", "parse"])
+    assert rc == 0
+    assert calls[-1]["params"]["query"] == "parse"
+
+
+def test_function_search_rejects_conflicting_query(capsys):
+    # both positional and --query, different values -> a clear error, not a silent pick.
+    rc = bn.cli.main(["function", "search", "--target", "active", "foo", "--query", "bar"])
+    assert rc == 2
+    assert "given twice" in capsys.readouterr().err
+
+
+def test_xrefs_any_splits_comma_separated_symbols(fake_transport):
+    # #410: `--any a,b,c` probes three symbols, not one bogus "a,b,c".
+    calls = fake_transport({"xrefs_any": {"ok": True, "result": {"kind": "xrefs_any", "items": []}}})
+    rc = bn.cli.main(["xrefs", "--target", "active", "--any", "read, recv", "memcpy"])
+    assert rc == 0
+    assert calls[-1]["params"]["symbols"] == ["read", "recv", "memcpy"]
+
+
 def test_function_commands_accept_paging_flags():
     parser = bn.cli.build_parser()
 

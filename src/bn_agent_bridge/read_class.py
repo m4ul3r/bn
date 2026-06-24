@@ -6,6 +6,7 @@ All functions are read-only and take the BridgeContext seam (``ctx``); this
 module never imports ``bridge`` or ``mutation_engine``."""
 from __future__ import annotations
 
+import difflib
 import re
 from typing import Any
 
@@ -620,6 +621,24 @@ def _enrich(ctx, bv, rec: dict[str, Any]) -> dict[str, Any]:
     return rec
 
 
+def _class_name_suggestions(registry: dict[str, dict], name: str, *, limit: int = 5) -> str:
+    """#413: a `" Did you mean: A, B?"` fragment for an unresolved class query, or
+    "" when nothing is close. Combines difflib fuzzy matches over the full names
+    with a leaf-prefix pass so both a typo (`Sesion`->`Session`) and a bare leaf
+    (`Handler`->`ns::Handler`) get a useful pointer."""
+    # Skip construction-vtable / thunk artifacts -- they aren't classes an analyst
+    # would query, so they only add noise to a "did you mean" hint (#309).
+    names = [k for k in registry
+             if not _is_construction_vtable_artifact(k) and not _is_thunk_artifact(k)]
+    if not names:
+        return ""
+    close = difflib.get_close_matches(name, names, n=limit, cutoff=0.6)
+    leaf = _query_leaf(name).lower()
+    leaf_hits = [k for k in names if leaf and _query_leaf(k).lower().startswith(leaf)]
+    ordered = list(dict.fromkeys([*close, *leaf_hits]))[:limit]
+    return f" Did you mean: {', '.join(ordered)}?" if ordered else ""
+
+
 def _as_signed(value: int | None, ptr: int) -> int:
     """Interpret an unsigned ptr-sized word as a signed offset-to-top."""
     if value is None:
@@ -679,8 +698,9 @@ def _class_show(ctx, selector: str | None, name: str) -> dict[str, Any]:
     if not matches:
         raise OperationFailure(
             "unknown_class",
-            f"No class named {name!r}. Run `bn class list` (add --all for "
-            f"name-only clusters) to discover available classes.",
+            f"No class named {name!r}.{_class_name_suggestions(registry, name)} "
+            f"Run `bn class list` (add --all for name-only clusters) to discover "
+            f"available classes.",
         )
     enriched = [_enrich(ctx, bv, registry[m]) for m in matches]
     if len(enriched) == 1:

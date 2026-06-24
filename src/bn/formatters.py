@@ -808,6 +808,26 @@ def _render_go_functions_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+def _render_go_functions_summary_text(value: Any) -> str:
+    """#414: compact go-metadata summary -- enough to decide whether to run
+    `go rename` without listing every function."""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    head = "go functions summary"
+    if value.get("go_version"):
+        head += f" ({value['go_version']})"
+    lines = [head]
+    for label, key in (("recovered", "recovered"), ("defined", "defined"),
+                       ("undefined", "undefined"), ("renamable", "renamable")):
+        if isinstance(value.get(key), int):
+            lines.append(f"  {label}: {value[key]}")
+    ts, tsb = value.get("text_start"), value.get("text_start_bv")
+    if ts is not None:
+        rebase = "" if (tsb is None or tsb == ts) else f"  (BN text {tsb} -- rebase needed)"
+        lines.append(f"  text_start: {ts}{rebase}")
+    return "\n".join(lines)
+
+
 def _paging_footer(value: dict[str, Any], items: list[Any]) -> str | None:
     """Build the "// showing N of TOTAL" footer for a paged-list envelope.
 

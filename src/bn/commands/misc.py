@@ -11,6 +11,7 @@ from ..formatters import (
     _mutation_summary,
     _render_function_bundle_text,
     _render_go_functions_text,
+    _render_go_functions_summary_text,
     _render_go_rename_text,
     _render_imports_summary_text,
     _render_mutation_summary_text,
@@ -200,8 +201,29 @@ def _sections(args: argparse.Namespace) -> int:
          target=True, paged=True,
          prefer_when="a Go-compiled binary loads as a wall of sub_* (.gopclntab present); recover "
                      "the real pkg.Func names BN's default analysis doesn't consume",
-         see_also=("function list", "sections"))
+         see_also=("function list", "sections"),
+         mutex_groups=[
+             mutex(False,
+                   arg("--count", action="store_true", default=False,
+                       help="Show the recovered Go function count instead of listing"),
+                   arg("--summary", action="store_true", default=False,
+                       help="Show recovered/defined/renamable counts + pclntab status (decide whether to `go rename`)")),
+         ])
 def _go_functions(args: argparse.Namespace) -> int:
+    if args.count:
+        return _call(
+            args, "go_functions", {"count_only": True},
+            require_target=True,
+            text_renderer=lambda value: f"Go functions: {value.get('count', 0)}",
+            stem="go-functions-count",
+        )
+    if args.summary:
+        return _call(
+            args, "go_functions", {"summary": True},
+            require_target=True,
+            text_renderer=_render_go_functions_summary_text,
+            stem="go-functions-summary",
+        )
     return _call(
         args,
         "go_functions",
@@ -259,8 +281,8 @@ def _bundle_function(args: argparse.Namespace) -> int:
                  help="Address to read from (hex 0x.. or decimal)"),
              arg("--address", dest="address_flag", default=None,
                  help="Address to read from (alias for the positional)"),
-             arg("--length", default=16, type=_int_or_hex,
-                 help="Number of bytes to read (decimal or hex 0x..; default 16)"),
+             arg("--length", "--size", dest="length", default=16, type=_int_or_hex,
+                 help="Number of bytes to read (decimal or hex 0x..; --size is an alias; default 16)"),
              arg("--encoding", choices=("hex", "bytes"), default="hex",
                  help="Byte payload encoding: hex hexdump (default) or raw bytes"),
          ])

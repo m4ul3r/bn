@@ -821,6 +821,22 @@ def test_class_show_unknown_name_errors_with_hint():
     assert "class list" in str(exc.value).lower()
 
 
+def test_class_show_unknown_name_suggests_close_matches():
+    # #413: a near-miss should point at the real class name, not just "run class list".
+    bv = _make_registry_bv()
+
+    class _Ctx:
+        def _resolve_view(self, sel):
+            return bv
+
+    import pytest
+    with pytest.raises(read_class.OperationFailure) as exc:
+        read_class._class_show(_Ctx(), None, "net::Sesion")  # typo of net::Session
+    msg = str(exc.value)
+    assert "did you mean" in msg.lower()
+    assert "net::Session" in msg
+
+
 def test_class_show_ambiguous_returns_all_matches():
     # Two classes share a leaf name across namespaces.
     fns = [

@@ -1156,6 +1156,42 @@ def test_dispatch_passes_boolean_fn_pointer_scan_unchanged(monkeypatch):
     assert seen == [False, False, True]
 
 
+def test_dispatch_rejects_non_boolean_go_functions_flags(monkeypatch):
+    # Raw JSON params must be real booleans: "summary"/"count_only": "false" is
+    # truthy under bool() and would silently return the wrong (summary/count)
+    # shape. Reject string booleans as invalid_request (#413).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    for flag in ("summary", "count_only"):
+        for bad in ("false", "true", 0, 1, "", "yes"):
+            with pytest.raises(bridge.OperationFailure) as exc:
+                instance._dispatch_on_main("go_functions", {flag: bad}, None)
+            assert exc.value.status == "invalid_request"
+
+
+def test_dispatch_passes_boolean_go_functions_flags_unchanged(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    seen: list[tuple[bool, bool]] = []
+
+    def fake_go_functions(target, *, offset=0, limit=None, count_only=False, summary=False):
+        seen.append((count_only, summary))
+        return {"target": target, "items": []}
+
+    monkeypatch.setattr(instance, "_go_functions", fake_go_functions)
+
+    instance._dispatch_on_main("go_functions", {}, None)
+    instance._dispatch_on_main(
+        "go_functions", {"count_only": True, "summary": False}, None
+    )
+    instance._dispatch_on_main(
+        "go_functions", {"count_only": False, "summary": True}, None
+    )
+
+    assert seen == [(False, False), (True, False), (False, True)]
+
+
 def test_validate_bool_accepts_real_booleans_and_default(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     assert bridge._validate_bool(None, label="quick", default=True) is True
@@ -1883,6 +1919,28 @@ def test_write_project_marker_gated_and_git_excludes(monkeypatch, tmp_path):
     gui = bridge.BinaryNinjaBridge()
     assert gui._write_project_marker(str(other), no_marker=False) is None
     assert not list(other.glob(".bn-*"))
+
+
+def test_write_project_marker_refresh_only_does_not_create(monkeypatch, tmp_path):
+    # #391: `session restart` refreshes a marker but must NOT create a new one in
+    # a restart cwd that differs from the original session-start cwd. refresh_only
+    # writes ONLY when a marker already exists there.
+    bridge = _load_bridge(monkeypatch)
+    inst = bridge.BinaryNinjaBridge(instance_id="rs42")
+    git = tmp_path / ".git" / "info"
+    git.mkdir(parents=True)
+
+    # no existing marker -> refresh_only writes nothing
+    assert inst._write_project_marker(str(tmp_path), no_marker=False, refresh_only=True) is None
+    assert not (tmp_path / ".bn-rs42").exists()
+
+    # create one (a prior session start), then refresh_only updates it in place
+    marker = tmp_path / ".bn-rs42"
+    marker.write_text(json.dumps({"instance_id": "rs42", "socket_path": "/old", "pid": 1, "created_at": "old"}))
+    assert inst._write_project_marker(str(tmp_path), no_marker=False, refresh_only=True) is None
+    body = json.loads(marker.read_text())
+    assert body["instance_id"] == "rs42"
+    assert body["created_at"] != "old"  # refreshed
 
 
 def test_write_project_marker_readonly_dir_is_a_note_not_error(monkeypatch, tmp_path):

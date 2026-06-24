@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _positive_depth_int, _positive_int, arg, command, mutex, preview_arg, summary_arg
+from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _pick, _positive_depth_int, _positive_int, arg, command, mutex, preview_arg, summary_arg
 from ..formatters import (
     _render_callsites_text,
     _render_disasm_linear_text,
@@ -92,7 +92,10 @@ def _function_list(args: argparse.Namespace) -> int:
                      "use function list to enumerate, filter, or count",
          see_also=("function list",),
          args=[
-             arg("query"),
+             arg("query", nargs="?",
+                 help="Substring or regex to match function names"),
+             arg("--query", dest="query_flag", default=None,
+                 help="Alias for the positional query (matches `strings --query` / `types --query`)"),
              arg("--count", action="store_true", default=False,
                  help="Show match count instead of listing"),
              arg("--sort", choices=["address", "size", "name"], default="address",
@@ -111,8 +114,11 @@ def _function_list(args: argparse.Namespace) -> int:
                             "false positives in C++ mangled names")),
          ])
 def _function_search(args: argparse.Namespace) -> int:
+    # #410: accept the query positionally OR via --query (matches strings/types
+    # muscle memory). _pick errors on both-different / neither.
+    query = _pick(args.query, getattr(args, "query_flag", None), "function search query")
     params: dict[str, Any] = {
-        "query": args.query,
+        "query": query,
         "regex": bool(args.regex),
         "exact": bool(args.exact),
     }
@@ -132,8 +138,8 @@ def _function_search(args: argparse.Namespace) -> int:
             # --count is the "is my query matching anything?" use case, so the
             # auto-regex retry (and its 0-result fallback hint) is most useful
             # here too (#252 review, #291.3).
-            regex_hint_query=args.query,
-            regex_fallback_query=args.query,
+            regex_hint_query=query,
+            regex_fallback_query=query,
         )
     if args.offset:
         params["offset"] = args.offset
@@ -153,8 +159,8 @@ def _function_search(args: argparse.Namespace) -> int:
         page_label="function search",
         paged_spill=True,
         stem="function-search",
-        regex_hint_query=args.query,
-        regex_fallback_query=args.query,
+        regex_hint_query=query,
+        regex_fallback_query=query,
     )
 
 
@@ -382,6 +388,15 @@ def _xrefs(args: argparse.Namespace) -> int:
     field_spec = getattr(args, "field_spec", None)
     identifier = getattr(args, "identifier", None)
     any_symbols = getattr(args, "any_symbols", None)
+    if any_symbols:
+        # #410: accept comma-separated lists as well as space-separated, so
+        # `--any read,recv,memcpy` (or `read, recv, memcpy`) probes three symbols
+        # instead of one bogus "read,recv,memcpy" symbol (silent miss in a sink
+        # sweep). Strip per-token whitespace so "read, recv" yields "recv", not
+        # " recv" (which the exact-name bridge lookup would report absent).
+        any_symbols = [t for chunk in any_symbols
+                       for s in (chunk.split(",") if "," in chunk else [chunk])
+                       if (t := s.strip())]
     if any_symbols:
         if identifier or field_spec:
             raise BridgeError("xrefs --any takes only the symbol list, not an identifier or --field")

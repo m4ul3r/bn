@@ -783,13 +783,19 @@ class BinaryNinjaBridge:
             with contextlib.suppress(OSError):
                 log_path.unlink()
 
-    def _write_project_marker(self, workdir: str | None, no_marker: bool) -> str | None:
+    def _write_project_marker(self, workdir: str | None, no_marker: bool,
+                              refresh_only: bool = False) -> str | None:
         """Drop a `.bn-<instance_id>` pointer in the CLI's project root so a bare
         `bn` command there resolves THIS instance among many (#80). Best-effort:
         a read-only/unwritable dir is a non-fatal one-line note, never an error.
         Skipped for the GUI bridge (instance_id None keeps its legacy fixed
         registry) and when the caller opts out (--no-marker / BN_NO_MARKERS).
-        Registry stays the source of truth; the marker is a validated pointer."""
+        Registry stays the source of truth; the marker is a validated pointer.
+
+        ``refresh_only`` (used by `session restart`, #391) writes ONLY when a
+        marker already exists in this root -- so a restart from a cwd that differs
+        from the original `session start` cwd refreshes the real marker's stale
+        body without dropping a stray new marker in an unintended directory."""
         if no_marker or not self.instance_id or not workdir:
             return None
         try:
@@ -797,6 +803,8 @@ class BinaryNinjaBridge:
         except Exception:
             return None
         marker = root / marker_name(self.instance_id)
+        if refresh_only and not marker.exists():
+            return None
         try:
             marker.write_text(json.dumps({
                 "instance_id": self.instance_id,
@@ -983,7 +991,8 @@ class BinaryNinjaBridge:
         }
 
     def _load_binary(self, path: str, *, prefer_bndb: bool = True, quick: bool = False,
-                     workdir: str | None = None, no_marker: bool = False):
+                     workdir: str | None = None, no_marker: bool = False,
+                     marker_refresh_only: bool = False):
         import binaryninja
 
         resolved = Path(path).expanduser().resolve()
@@ -1110,7 +1119,8 @@ class BinaryNinjaBridge:
 
             # Keep the registry's open-binaries list current after a load (#80).
             self._write_registry()
-            marker_note = self._write_project_marker(workdir, no_marker)
+            marker_note = self._write_project_marker(workdir, no_marker,
+                                                     refresh_only=marker_refresh_only)
             if marker_note:
                 notes.append(marker_note)
             return {
@@ -2338,6 +2348,8 @@ def _bind_load_binary(bridge, params, target):
         quick=_validate_bool(params.get("quick"), label="quick", default=False),
         workdir=params.get("workdir"),
         no_marker=_validate_bool(params.get("no_marker"), label="no_marker", default=False),
+        marker_refresh_only=_validate_bool(params.get("marker_refresh_only"),
+                                           label="marker_refresh_only", default=False),
     )
 
 
@@ -2639,6 +2651,8 @@ def _bind_go_functions(bridge, params, target):
         target,
         offset=int(params.get("offset", 0)),
         limit=int(params["limit"]) if params.get("limit") is not None else None,
+        count_only=_validate_bool(params.get("count_only"), label="count_only", default=False),
+        summary=_validate_bool(params.get("summary"), label="summary", default=False),
     )
 
 
