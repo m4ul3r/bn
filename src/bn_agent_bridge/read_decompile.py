@@ -31,7 +31,7 @@ from __future__ import annotations
 
 from typing import Any
 
-import binaryninja as bn  # noqa: F401  (kept for parity / future use)
+import binaryninja as bn  # bn.Architecture[...] for the #382 --mode arch lookup
 
 from . import il_format
 from . import read_xrefs
@@ -179,10 +179,10 @@ def _il(ctx, selector: str | None, identifier, view: str, ssa: bool):
     return result
 
 
-def _disasm(ctx, selector: str | None, identifier, linear=None):
+def _disasm(ctx, selector: str | None, identifier, linear=None, mode=None):
     bv = ctx._resolve_view(selector)
     if linear is not None:
-        return _disasm_linear(ctx, bv, identifier, int(linear))
+        return _disasm_linear(ctx, bv, identifier, int(linear), mode=mode)
     try:
         func = ctx._find_function(bv, identifier, contained=True)
     except Exception as exc:
@@ -244,12 +244,54 @@ def _resolve_linear_address(ctx, bv, identifier) -> int:
     )
 
 
-def _disasm_linear(ctx, bv, identifier, count: int) -> dict[str, Any]:
+_ARM_MODE_ARCHES = {
+    ("arm", False): "armv7", ("arm", True): "armv7eb",
+    ("thumb", False): "thumb2", ("thumb", True): "thumb2eb",
+}
+
+
+def _linear_decode_arch(ctx, bv, address: int, mode):
+    """The architecture to linearly decode at *address* (#382).
+
+    BN defaults a whole ARM binary to ONE mode (often thumb2), so an ARM-mode
+    region under a thumb2 default -- or vice versa -- otherwise decodes in the
+    wrong mode. Resolution order:
+      1. an explicit ``mode`` (arm/thumb) forces armv7/thumb2 (endianness taken
+         from the bv arch), for the stripped/missed case with no function;
+      2. else the containing function's own arch (BN's per-function ARM/Thumb
+         mode) when known, so a known ARM function decodes as ARM automatically;
+      3. else the bv default arch (prior behavior)."""
+    bv_arch = getattr(bv, "arch", None)
+    if mode is not None:
+        cur = str(getattr(bv_arch, "name", "") or "")
+        if not (cur.startswith("arm") or cur.startswith("thumb")):
+            raise ValueError(
+                f"--mode {mode} is only for ARM/Thumb targets (this target is "
+                f"{cur or 'unknown'})"
+            )
+        name = _ARM_MODE_ARCHES[(mode, cur.endswith("eb"))]
+        try:
+            return bn.Architecture[name]
+        except Exception as exc:
+            raise ValueError(f"could not load the {name} architecture for --mode {mode}: {exc}")
+    try:
+        containers = ctx._functions_containing(bv, int(address))
+        if containers and getattr(containers[0], "arch", None) is not None:
+            return containers[0].arch
+    except Exception:
+        pass
+    return bv_arch
+
+
+def _disasm_linear(ctx, bv, identifier, count: int, *, mode=None) -> dict[str, Any]:
     """Linear disassembly of *count* instructions from an arbitrary MAPPED address,
     independent of function membership (#314). The stripped/static lane needs to
     read the bytes at a suspected missed handler -- a dispatch/vtable slot BN left
     as data -- before deciding whether to `function create` it; the
-    function-scoped path refuses such addresses outright."""
+    function-scoped path refuses such addresses outright.
+
+    The decode architecture honors the address's function arch (or an explicit
+    ARM/Thumb ``mode``) so an ARM-mode region isn't mis-decoded as Thumb (#382)."""
     address = _resolve_linear_address(ctx, bv, identifier)
     if count <= 0:
         raise ValueError("--linear count must be a positive number of instructions")
@@ -260,7 +302,7 @@ def _disasm_linear(ctx, bv, identifier, count: int) -> dict[str, Any]:
             f"address {hex(address)} is not mapped in this binary; nothing to "
             f"disassemble there"
         )
-    arch = getattr(bv, "arch", None)
+    arch = _linear_decode_arch(ctx, bv, address, mode)
     entries: list[dict[str, Any]] = []
     lines: list[str] = []
     addr = int(address)
@@ -306,12 +348,19 @@ def _disasm_linear(ctx, bv, identifier, count: int) -> dict[str, Any]:
     )
     if in_function is not None:
         note += f"; this address is inside {in_function['name']} @ {in_function['address']}"
+    arch_name = str(getattr(arch, "name", "") or "")
+    if arch_name:
+        # #382: disclose the decode mode so an ARM/Thumb decode isn't silently
+        # trusted in the wrong mode (and so --mode's effect is visible).
+        forced = " (forced via --mode)" if mode is not None else ""
+        note += f"; decoded as {arch_name}{forced}"
     if requested_count > _LINEAR_DISASM_MAX:
         note += f"; capped at {_LINEAR_DISASM_MAX} (requested {requested_count})"
     return {
         "linear": True,
         "function": in_function,
         "address": hex(address),
+        "decode_arch": arch_name or None,
         "requested_count": requested_count,
         "capped": requested_count > _LINEAR_DISASM_MAX,
         "instruction_count": len(entries),

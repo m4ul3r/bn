@@ -242,6 +242,42 @@ def test_disasm_linear_caps_requested_count(monkeypatch):
     assert "capped" in res["note"]
 
 
+def test_linear_decode_arch_honors_function_and_forces_mode(monkeypatch):
+    # #382: BN defaults a whole ARM binary to one mode (e.g. thumb2), so an ARM
+    # region decodes wrong. _linear_decode_arch honors the containing function's
+    # arch by default and lets --mode force ARM/Thumb for the stripped/missed case.
+    bridge = _load_bridge(monkeypatch)
+    rd = bridge.read_decompile
+    armv7 = type("A", (), {"name": "armv7"})()
+    thumb2 = type("A", (), {"name": "thumb2"})()
+
+    class _Ctx:
+        def _functions_containing(self, bv, addr):
+            return [type("F", (), {"arch": armv7})()] if addr == 0x1000 else []
+
+    bv = type("BV", (), {"arch": thumb2})()
+    ctx = _Ctx()
+    # default: inside an armv7 function -> armv7 (NOT the thumb2 bv default)
+    assert rd._linear_decode_arch(ctx, bv, 0x1000, None).name == "armv7"
+    # default: not in a function -> bv default (thumb2)
+    assert rd._linear_decode_arch(ctx, bv, 0x9999, None).name == "thumb2"
+    # --mode on a non-ARM target is rejected
+    bv_x86 = type("BV", (), {"arch": type("A", (), {"name": "x86_64"})()})()
+    with pytest.raises(ValueError):
+        rd._linear_decode_arch(_Ctx(), bv_x86, 0x1, "arm")
+    # --mode forces the architecture (endianness from the bv arch), overriding fn arch
+    monkeypatch.setattr(rd.bn, "Architecture", {"armv7": armv7, "thumb2": thumb2}, raising=False)
+    assert rd._linear_decode_arch(ctx, bv, 0x9999, "arm").name == "armv7"
+    assert rd._linear_decode_arch(ctx, bv, 0x1000, "thumb").name == "thumb2"
+
+
+def test_disasm_mode_requires_linear(monkeypatch):
+    # #382: --mode is meaningful only for --linear; without it, a clear error.
+    import bn.cli
+    rc = bn.cli.main(["disasm", "sub_1", "--mode", "arm", "--target", "active"])
+    assert rc == 2
+
+
 def test_disasm_non_function_address_hints_at_linear(monkeypatch):
     # Without --linear, a bare address not in a function still errors -- but the
     # disasm-specific message now points at --linear (the generic _find_function
