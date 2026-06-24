@@ -2307,6 +2307,72 @@ def _format_op_summary(item: dict[str, Any]) -> str:
     return summary
 
 
+def _mutation_summary(value: Any) -> Any:
+    """#408: collapse a (single or batch) mutation result into a compact,
+    schema-stable status object for an unattended agent control loop -- did
+    anything change, did verification pass, was anything rolled back, what needs
+    attention -- without parsing the full results/affected_functions/diff payload.
+    The detailed result stays available without --summary."""
+    if not isinstance(value, dict):
+        return value
+    results = [r for r in (value.get("results") or []) if isinstance(r, dict)]
+    failed = [r for r in results if r.get("status") in FAILED_MUTATION_STATUSES]
+    verified = sum(1 for r in results if r.get("status") == "verified")
+    noop = sum(1 for r in results if r.get("status") == "noop")
+    committed = bool(value.get("committed", False))
+    rolled_back = value.get("rolled_back")
+    success = bool(value.get("success", True)) and not failed
+    first_error = None
+    if failed:
+        f0 = failed[0]
+        first_error = f0.get("message") or f0.get("status") or "mutation failed"
+    # A failure can carry its only explanation in the top-level `message` -- e.g. a
+    # preview/revert cleanup that failed AFTER every op verified, so no result row
+    # is in FAILED_MUTATION_STATUSES. Surface it so --summary never drops the error.
+    if first_error is None and not success:
+        first_error = value.get("message") or "mutation failed"
+    return {
+        "kind": "mutation_summary",
+        "success": success,
+        "committed": committed,
+        "preview": bool(value.get("preview", False)),
+        "op_count": len(results),
+        "changed_count": verified,        # ops that actually changed + verified
+        "verified_count": verified,
+        "noop_count": noop,
+        "failed_count": len(failed),
+        # True/False when a revert was attempted; None when none was needed.
+        "rolled_back": (bool(rolled_back) if rolled_back is not None else None),
+        "first_error": first_error,
+        # The DB is left modified iff a live mutation actually CHANGED state
+        # (committed AND something verified -- `committed` is True even for an
+        # all-noop mutation, which leaves the DB clean), or a failure's revert
+        # itself failed (rolled_back is explicitly False).
+        "dirty_after": (committed and verified > 0) or rolled_back is False,
+    }
+
+
+def _render_mutation_summary_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    state = ("committed" if value.get("committed")
+             else "preview" if value.get("preview")
+             else "rolled back" if value.get("rolled_back")
+             else "ok" if value.get("success") else "FAILED")
+    parts = [
+        f"mutation: {state}",
+        f"changed={value.get('changed_count', 0)}",
+        f"verified={value.get('verified_count', 0)}",
+        f"noop={value.get('noop_count', 0)}",
+        f"failed={value.get('failed_count', 0)}",
+        f"dirty_after={value.get('dirty_after')}",
+    ]
+    line = "  ".join(parts)
+    if value.get("first_error"):
+        line += f"\nfirst_error: {value['first_error']}"
+    return line
+
+
 def _render_mutation_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)

@@ -4,7 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from ..cli import _call, _effective_limit, _mutate, arg, command, preview_arg
+from ..cli import _call, _effective_limit, _mutate, arg, command, preview_arg, summary_arg
 from ..formatters import (
     _render_type_info_text,
     _render_type_list_text,
@@ -66,7 +66,7 @@ def _types_show(args: argparse.Namespace) -> int:
 
 @command("types", "declare", help="Import C declarations as user types", target=True, fmt="json",
          args=[
-             preview_arg(),
+             preview_arg(), summary_arg(),
              arg("--file", type=Path, help="Read declarations from a file"),
              arg("--stdin", action="store_true", help="Read declarations from stdin"),
              arg("declaration", nargs="?"),
@@ -130,7 +130,7 @@ def _struct_show(args: argparse.Namespace) -> int:
 
 @command("struct", "field", "set", help="Set or replace a field", target=True, fmt="json",
          args=[
-             preview_arg(),
+             preview_arg(), summary_arg(),
              arg("--no-overwrite", action="store_true"),
              arg("struct_name"),
              arg("offset"),
@@ -155,7 +155,7 @@ def _struct_field_set(args: argparse.Namespace) -> int:
 
 @command("struct", "field", "rename", help="Rename a field", target=True, fmt="json",
          args=[
-             preview_arg(),
+             preview_arg(), summary_arg(),
              arg("struct_name"),
              arg("old_name", help="Field name or offset (e.g. count or 0x8)"),
              arg("new_name"),
@@ -176,7 +176,7 @@ def _struct_field_rename(args: argparse.Namespace) -> int:
 
 @command("struct", "field", "delete", help="Delete a field", target=True, fmt="json",
          args=[
-             preview_arg(),
+             preview_arg(), summary_arg(),
              arg("struct_name"),
              arg("field_name", help="Field name or offset (e.g. count or 0x8)"),
          ])

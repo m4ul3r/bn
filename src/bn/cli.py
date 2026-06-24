@@ -12,7 +12,9 @@ from . import session_state
 from .formatters import (
     FAILED_MUTATION_STATUSES,
     _format_operation_result,  # noqa: F401  -- re-exported for tests/scripts that monkeypatch bn.cli
+    _mutation_summary,
     _render_fanout_text,
+    _render_mutation_summary_text,
     _render_mutation_text,
     _render_target_choices,
 )
@@ -366,6 +368,16 @@ def preview_arg(
     says "Create, verify, then revert"); pass *help* to override.
     """
     return arg("--preview", action="store_true", help=help)
+
+
+def summary_arg() -> tuple[tuple[str, ...], dict[str, Any]]:
+    """The shared ``--summary`` flag for mutation commands (#408): emit a compact,
+    schema-stable status object (changed/verified/noop/failed counts + rolled_back
+    + first_error + dirty_after) instead of the full audit payload, for an
+    unattended agent control loop. The detailed output stays the default."""
+    return arg("--summary", action="store_true", default=False,
+               help="Emit a compact status summary (counts, first_error, dirty_after) "
+                    "instead of the full mutation audit payload")
 
 
 def command(
@@ -765,13 +777,18 @@ def _mutate(
     """
     if preview is not None:
         params = {**params, "preview": preview}
+    # #408: --summary collapses the result to a compact, schema-stable status
+    # object for an unattended control loop. The exit code is unchanged (computed
+    # on the full result); only the rendered/returned payload is compacted.
+    summary = bool(getattr(args, "summary", False))
     return _call(
         args,
         op,
         params,
         require_target=require_target,
-        text_renderer=_render_mutation_text,
+        text_renderer=_render_mutation_summary_text if summary else _render_mutation_text,
         result_exit_code=_mutation_exit_code,
+        result_transform=_mutation_summary if summary else None,
         stem=stem,
         **call_kwargs,
     )
@@ -796,6 +813,7 @@ def _call(
     paged_spill: bool = False,
     stem: str,
     result_exit_code: Callable[[Any], int] | None = None,
+    result_transform: Callable[[Any], Any] | None = None,
     bridge_writes_output: bool = False,
     spawn_missing_named: bool = False,
     regex_hint_query: str | None = None,
@@ -871,11 +889,16 @@ def _call(
             file=sys.stderr,
         )
         regex_hint_query = None  # the retry supersedes the add-`--regex` nudge
+    # Exit code is computed on the ORIGINAL result (it reads the full results
+    # list); a result_transform (e.g. #408 --summary) only changes what is
+    # rendered, never the verification-aware exit code.
     exit_code = result_exit_code(result) if result_exit_code is not None else 0
     # No bare-list CLI-side truncation: every paged read returns a {items, total,
     # offset, limit, returned, has_more} envelope and pages bridge-side (#275).
     _maybe_regex_hint(args, result, regex_hint_query)
     _maybe_offset_hint(args, result, offset_hint_identifier)
+    if result_transform is not None:
+        result = result_transform(result)
     spill_context = result
     fmt = _resolve_output_format(args)
     if text_renderer is not None and fmt == "text":
