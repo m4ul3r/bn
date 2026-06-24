@@ -969,11 +969,15 @@ def _fanout_call(
                 ids = _instance_target_ids(iid)
             except BridgeError:
                 ids = None
-            if ids is not None and len(ids) > 1:
+            if ids and all(i is not None for i in ids):
+                # Reuse the peeked target ids directly -- avoids a SECOND
+                # list_targets round-trip via the implicit-target resolve for
+                # single-target instances. Auto-expand discloses only the >1 case.
                 target_selectors = ids
-                auto_expanded.append(iid)
+                if len(ids) > 1:
+                    auto_expanded.append(iid)
             else:
-                target_selectors = [None]
+                target_selectors = [None]   # peek failed / 0 targets -> normal resolve
         else:
             target_selectors = [None]  # resolve the single target normally below
 

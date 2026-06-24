@@ -1343,6 +1343,11 @@ def _render_fanout_text(value: Any, inner_renderer: Callable[[Any], str] | None 
     ok = sum(1 for r in rows if isinstance(r, dict) and r.get("ok"))
     lines = [f"fan-out: {value.get('command', '?')} — {len(rows)} result(s) "
              f"({ok} ok, {len(rows) - ok} failed)"]
+    expanded = value.get("auto_expanded_instances")
+    if expanded:
+        # #368: be explicit that a multi-target instance was surveyed in full, so
+        # extra rows for one instance read as complete coverage, not a duplicate.
+        lines.append(f"  (surveyed all targets of multi-target instance(s): {', '.join(map(str, expanded))})")
     for r in rows:
         if not isinstance(r, dict):
             continue
