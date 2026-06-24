@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _positive_depth_int, _positive_int, arg, command, mutex, preview_arg
+from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _positive_depth_int, _positive_int, arg, command, mutex, preview_arg, summary_arg
 from ..formatters import (
     _render_callsites_text,
     _render_disasm_linear_text,
@@ -181,7 +181,7 @@ def _function_info(args: argparse.Namespace) -> int:
          help="Create and analyze a function at an address auto-analysis missed",
          target=True, fmt="json",
          args=[
-             preview_arg("Create, verify, then revert without committing"),
+             preview_arg("Create, verify, then revert without committing"), summary_arg(),
              arg("address", help="Address of the function entry point (hex or decimal)"),
          ])
 def _function_create(args: argparse.Namespace) -> int:

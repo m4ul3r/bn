@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ..cli import _call, _effective_limit, _int_or_hex, _mutate, _mutation_exit_code, _non_negative_int, _pick, arg, command, mutex, preview_arg
+from ..cli import _call, _effective_limit, _int_or_hex, _mutate, _mutation_exit_code, _non_negative_int, _pick, arg, command, mutex, preview_arg, summary_arg
 from ..formatters import (
     _render_function_bundle_text,
     _render_go_functions_text,
@@ -354,6 +354,7 @@ def _py_exec(args: argparse.Namespace) -> int:
 @command("batch", "apply", help="Apply a JSON manifest", fmt="json", target=True,
          args=[
              preview_arg("Apply the whole batch, capture diffs, then revert without committing"),
+             summary_arg(),
              arg("manifest", type=Path,
                  help=(
                      "JSON manifest source: a file path, or \"-\" to read from stdin. "

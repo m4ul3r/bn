@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from ..cli import _call, _mutate, _pick, arg, command, preview_arg
+from ..cli import _call, _mutate, _pick, arg, command, preview_arg, summary_arg
 from ..formatters import (
     _render_comment_list_text,
     _render_comment_text,
@@ -15,7 +15,7 @@ from ..transport import BridgeError
 _RENAME_ARGS = [
     arg("--kind", choices=("auto", "function", "data"), default="auto",
         help="Symbol kind to rename: auto-detect (default), function, or data"),
-    preview_arg(),
+    preview_arg(), summary_arg(),
     arg("identifier", help="Current symbol name or address (hex 0x.. or decimal)"),
     arg("new_name", help="New symbol name"),
 ]
@@ -96,7 +96,7 @@ def _comment_locator(args: argparse.Namespace, verb: str) -> tuple[str | None, s
 
 @command("comment", "set", help="Set a comment", target=True, fmt="json",
          args=[
-             preview_arg(),
+             preview_arg(), summary_arg(),
              arg("address", nargs="?",
                  help="Address to comment (hex 0x.. or decimal); alias for --address"),
              arg("comment", help="Comment text"),
@@ -151,7 +151,7 @@ def _comment_get(args: argparse.Namespace) -> int:
 
 
 @command("comment", "delete", help="Delete a comment", target=True, fmt="json",
-         args=[preview_arg(), *_comment_locator_args()])
+         args=[preview_arg(), summary_arg(), *_comment_locator_args()])
 def _comment_delete(args: argparse.Namespace) -> int:
     address, function = _comment_locator(args, "delete")
     return _mutate(
@@ -168,7 +168,7 @@ def _comment_delete(args: argparse.Namespace) -> int:
 
 @command("proto", "set", help="Set a prototype", target=True, fmt="json",
          args=[
-             preview_arg(),
+             preview_arg(), summary_arg(),
              arg("identifier", help="Function name or address (hex 0x.. or decimal)"),
              arg("prototype", help="Full C prototype string, e.g. \"int __cdecl f(Player* self)\""),
          ])
@@ -213,7 +213,7 @@ def _local_list(args: argparse.Namespace) -> int:
 
 @command("local", "rename", help="Rename a local", target=True, fmt="json",
          args=[
-             preview_arg(),
+             preview_arg(), summary_arg(),
              arg("function"),
              arg("variable", help="Stable local_id or legacy variable name"),
              arg("new_name"),
@@ -234,7 +234,7 @@ def _local_rename(args: argparse.Namespace) -> int:
 
 @command("local", "retype", help="Retype a local", target=True, fmt="json",
          args=[
-             preview_arg(),
+             preview_arg(), summary_arg(),
              arg("function"),
              arg("variable", help="Stable local_id or legacy variable name"),
              arg("new_type"),

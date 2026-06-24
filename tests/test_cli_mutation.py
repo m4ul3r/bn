@@ -9,6 +9,51 @@ import pytest
 from _cli_helpers import *  # noqa: F401,F403
 
 
+def test_mutation_summary_transform_compacts_result():
+    # #408: the compact status object an unattended loop reads instead of the full
+    # audit payload.
+    from bn.formatters import _mutation_summary
+    ok = _mutation_summary({"success": True, "committed": True, "preview": False,
+                            "rolled_back": None,
+                            "results": [{"status": "verified"}, {"status": "noop"}]})
+    assert ok["kind"] == "mutation_summary"
+    assert ok["success"] is True and ok["committed"] is True
+    assert ok["changed_count"] == 1 and ok["noop_count"] == 1 and ok["failed_count"] == 0
+    assert ok["dirty_after"] is True
+    bad = _mutation_summary({"success": False, "committed": False, "rolled_back": True,
+                             "results": [{"status": "verification_failed", "message": "proto mismatch"}]})
+    assert bad["success"] is False and bad["failed_count"] == 1
+    assert bad["first_error"] == "proto mismatch" and bad["dirty_after"] is False
+
+
+def test_symbol_rename_summary_emits_compact_status(fake_transport, capsys):
+    # #408: --summary returns the compact status object, not the full payload; the
+    # verification-aware exit code is unchanged.
+    fake_transport({"rename_symbol": {"ok": True, "result": {
+        "success": True, "committed": True,
+        "results": [{"status": "verified", "op": "rename_symbol"}],
+        "affected_functions": [{"name": "sub_401000"}] * 20}}})
+    rc = bn.cli.main(["symbol", "rename", "--target", "active", "--summary",
+                      "sub_401000", "player_update", "--format", "json"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["kind"] == "mutation_summary"
+    assert out["changed_count"] == 1 and out["committed"] is True
+    assert "affected_functions" not in out and "results" not in out   # compacted
+
+
+def test_symbol_rename_summary_preserves_failure_exit_code(fake_transport, capsys):
+    # the compact view must NOT mask a verification failure's non-zero exit (3).
+    fake_transport({"rename_symbol": {"ok": True, "result": {
+        "success": False, "committed": False, "rolled_back": True,
+        "results": [{"status": "verification_failed", "message": "name did not land"}]}}})
+    rc = bn.cli.main(["symbol", "rename", "--target", "active", "--summary",
+                      "sub_401000", "x", "--format", "json"])
+    assert rc == 3
+    out = json.loads(capsys.readouterr().out)
+    assert out["failed_count"] == 1 and out["first_error"] == "name did not land"
+
+
 def test_symbol_rename_builds_preview_payload(fake_transport):
     calls = fake_transport({"rename_symbol": {"ok": True, "result": {"preview": True}}})
 
