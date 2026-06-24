@@ -2277,13 +2277,19 @@ def _mutation_summary(value: Any) -> Any:
     noop = sum(1 for r in results if r.get("status") == "noop")
     committed = bool(value.get("committed", False))
     rolled_back = value.get("rolled_back")
+    success = bool(value.get("success", True)) and not failed
     first_error = None
     if failed:
         f0 = failed[0]
         first_error = f0.get("message") or f0.get("status") or "mutation failed"
+    # A failure can carry its only explanation in the top-level `message` -- e.g. a
+    # preview/revert cleanup that failed AFTER every op verified, so no result row
+    # is in FAILED_MUTATION_STATUSES. Surface it so --summary never drops the error.
+    if first_error is None and not success:
+        first_error = value.get("message") or "mutation failed"
     return {
         "kind": "mutation_summary",
-        "success": bool(value.get("success", True)) and not failed,
+        "success": success,
         "committed": committed,
         "preview": bool(value.get("preview", False)),
         "op_count": len(results),
@@ -2294,9 +2300,11 @@ def _mutation_summary(value: Any) -> Any:
         # True/False when a revert was attempted; None when none was needed.
         "rolled_back": (bool(rolled_back) if rolled_back is not None else None),
         "first_error": first_error,
-        # the DB is left modified iff a live mutation committed, or a failure's
-        # revert itself failed (rolled_back is explicitly False).
-        "dirty_after": bool(committed) or rolled_back is False,
+        # The DB is left modified iff a live mutation actually CHANGED state
+        # (committed AND something verified -- `committed` is True even for an
+        # all-noop mutation, which leaves the DB clean), or a failure's revert
+        # itself failed (rolled_back is explicitly False).
+        "dirty_after": (committed and verified > 0) or rolled_back is False,
     }
 
 

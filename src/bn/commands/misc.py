@@ -8,10 +8,12 @@ from typing import Any
 
 from ..cli import _call, _effective_limit, _int_or_hex, _mutate, _mutation_exit_code, _non_negative_int, _pick, arg, command, mutex, preview_arg, summary_arg
 from ..formatters import (
+    _mutation_summary,
     _render_function_bundle_text,
     _render_go_functions_text,
     _render_go_rename_text,
     _render_imports_summary_text,
+    _render_mutation_summary_text,
     _render_name_address_list_text,
     _render_py_exec_text,
     _render_read_text,
@@ -219,15 +221,20 @@ def _go_functions(args: argparse.Namespace) -> int:
          prefer_when="after `go functions` shows the recovered names, apply them so the "
                      "Go binary is navigable; safe to re-run (idempotent, skips named functions)",
          see_also=("go functions",),
-         args=[preview_arg("Apply the renames, capture diffs, then revert without committing")])
+         args=[preview_arg("Apply the renames, capture diffs, then revert without committing"),
+               summary_arg()])
 def _go_rename(args: argparse.Namespace) -> int:
+    # #408 review: go rename is a bulk mutation (success/committed/results +
+    # _mutation_exit_code), so it honors --summary like the other mutations.
+    summary = bool(getattr(args, "summary", False))
     return _call(
         args,
         "go_rename",
         {"preview": bool(args.preview)},
         require_target=True,
-        text_renderer=_render_go_rename_text,
+        text_renderer=_render_mutation_summary_text if summary else _render_go_rename_text,
         result_exit_code=_mutation_exit_code,
+        result_transform=_mutation_summary if summary else None,
         stem="go-rename",
     )
 

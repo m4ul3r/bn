@@ -26,6 +26,44 @@ def test_mutation_summary_transform_compacts_result():
     assert bad["first_error"] == "proto mismatch" and bad["dirty_after"] is False
 
 
+def test_mutation_summary_committed_noop_is_not_dirty():
+    # #408 review: `committed` is True for ANY successful non-preview mutation,
+    # including an all-noop (e.g. rename to the same name). A no-op changes nothing,
+    # so dirty_after must be False -- not True just because it committed.
+    from bn.formatters import _mutation_summary
+    noop = _mutation_summary({"success": True, "committed": True, "rolled_back": None,
+                              "results": [{"status": "noop"}]})
+    assert noop["committed"] is True and noop["changed_count"] == 0
+    assert noop["dirty_after"] is False
+
+
+def test_mutation_summary_surfaces_top_level_message_error():
+    # #408 review: a failure whose only explanation is the top-level `message`
+    # (no result row in FAILED_MUTATION_STATUSES -- e.g. revert cleanup failed
+    # after every op verified) must still surface first_error, not drop it.
+    from bn.formatters import _mutation_summary
+    out = _mutation_summary({"success": False, "committed": False, "rolled_back": None,
+                             "message": "revert failed: database is read-only",
+                             "results": [{"status": "verified"}]})
+    assert out["success"] is False and out["failed_count"] == 0
+    assert out["first_error"] == "revert failed: database is read-only"
+
+
+def test_go_rename_summary_emits_compact_status(fake_transport, capsys):
+    # #408 review: go rename is a bulk mutation, so --summary is accepted and emits
+    # the same compact status object as the single-op mutations.
+    fake_transport({"go_rename": {"ok": True, "result": {
+        "success": True, "committed": True,
+        "results": [{"status": "verified", "op": "rename_symbol"}] * 12,
+        "affected_functions": [{"name": "sub_401000"}] * 12}}})
+    rc = bn.cli.main(["go", "rename", "--target", "active", "--summary", "--format", "json"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["kind"] == "mutation_summary"
+    assert out["changed_count"] == 12 and out["committed"] is True
+    assert "results" not in out and "affected_functions" not in out   # compacted
+
+
 def test_symbol_rename_summary_emits_compact_status(fake_transport, capsys):
     # #408: --summary returns the compact status object, not the full payload; the
     # verification-aware exit code is unchanged.
