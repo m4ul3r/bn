@@ -694,7 +694,11 @@ def _evidence_init(args: argparse.Namespace) -> int:
              arg("--max-depth", type=_positive_depth_int, default=50,
                  help="Maximum trace steps before truncation (>= 1; default: 50)"),
              arg("--interprocedural", action="store_true", default=False,
-                 help="Follow return values across call boundaries into callees"),
+                 help="Follow return values across call boundaries into callees. "
+                      "Out-pointer/output-parameter writes are NOT followed; a value "
+                      "loaded from a local an earlier call filled by-address is "
+                      "reported as `interprocedural_out_param_not_followed` (naming "
+                      "the callee), not traced into the callee (#416)"),
              arg("--ip-depth", type=_depth_int, default=2,
                  help="Max call depth for interprocedural tracing (default: 2; 0 disables crossing)"),
          ])

@@ -280,11 +280,21 @@ def _build_backward_trace(
             # actually is one; otherwise stay neutral (don't mislead
             # provenance slices).
             entry["terminates"] = True
-            entry["reason"] = (
-                "function_parameter"
-                if _is_parameter_ssa_var(ctx, ssa_func, ssa_var)
-                else "undefined_or_global"
-            )
+            if _is_parameter_ssa_var(ctx, ssa_func, ssa_var):
+                entry["reason"] = "function_parameter"
+            else:
+                entry["reason"] = "undefined_or_global"
+                # #416: a value that bottoms out at a LOCAL whose address was
+                # passed into a call (the common stack-struct out-param form,
+                # `parse(input, &rec); use(rec.len)`) was likely written by that
+                # callee through an out-pointer. Interprocedural tracing follows
+                # only return values, so name the callee instead of leaving an
+                # "undefined" terminus that reads like proof of origin.
+                if interprocedural:
+                    out_callee = _addr_taken_callee(ctx, bv, ssa_func, ssa_var)
+                    if out_callee:
+                        entry["reason"] = "interprocedural_out_param_not_followed"
+                        entry["out_param_callee"] = out_callee
             trace.append(entry)
             continue
 
@@ -343,6 +353,24 @@ def _build_backward_trace(
                 entry["offset"] = hex(offset) if isinstance(offset, int) else offset
             if width is not None:
                 entry["width"] = width
+            # #416: in interprocedural mode, if this load reads from the address
+            # of a local that was passed by-address into a call, the value was
+            # likely written by that callee through an OUT-POINTER -- which
+            # interprocedural tracing follows only for return values. Emit an
+            # honest boundary reason naming the callee instead of letting the
+            # slice stop silently at a `field_load`/`memory_load`.
+            if interprocedural:
+                out_callee = _out_param_fill_callee(ctx, bv, ssa_func, load_expr)
+                if out_callee:
+                    entry["reason"] = "interprocedural_out_param_not_followed"
+                    entry["out_param_callee"] = out_callee
+                    # The value's true origin is the callee's write through the
+                    # out-pointer, not where the local's address came from -- stop
+                    # here rather than walking the base into the local's allocation,
+                    # which would mislead the provenance slice.
+                    entry["terminates"] = True
+                    trace.append(entry)
+                    continue
             # Preserve prior per-form walk behavior: a top-level load def
             # terminated; a `x = [addr]` SET_VAR continued through its base
             # pointer (so provenance reaches where the struct came from).
@@ -443,6 +471,88 @@ def _extract_dest_address(bv, dest):
     """Numeric address of a call/tailcall destination expression (delegates
     to ``taint_engine.extract_dest_address``)."""
     return _taint.extract_dest_address(bv, dest)
+
+
+def _address_of_target(expr, depth: int = 0):
+    """The local Variable an address expression takes the address of, handling
+    both ``&local`` (MLIL_ADDRESS_OF) and ``&local + const`` (ADD/SUB of an
+    address-of and a constant). Returns None when the expression is not the
+    address of a stack/local variable. Best-effort, bounded recursion."""
+    if expr is None or depth > 6:
+        return None
+    op = il_format._il_op_name(expr)
+    if "ADDRESS_OF" in op:
+        return getattr(expr, "src", None)
+    if "ADD" in op or "SUB" in op:
+        for side in (getattr(expr, "left", None), getattr(expr, "right", None)):
+            target = _address_of_target(side, depth + 1)
+            if target is not None:
+                return target
+    return None
+
+
+def _var_address_key(v):
+    """Match key for a local Variable: BN's stable ``identifier`` when present,
+    else the variable object itself (its own equality). The same local taken by
+    address in two places must compare equal."""
+    ident = getattr(v, "identifier", None)
+    return ident if ident is not None else v
+
+
+def _addr_taken_callee(ctx, bv, ssa_func, base_var) -> str | None:
+    """Name a callee that this function passes ``&base_var`` into, or None.
+
+    Used for the #416 out-param caveat: when a backward trace's value originates
+    in a LOCAL whose address was handed to a call, the value was probably
+    written by that callee through an out-pointer -- which interprocedural
+    backward tracing follows only for RETURN values, not out-parameters.
+    Best-effort; None on any BN-API shortfall, so it never fabricates a reason."""
+    try:
+        if base_var is None:
+            return None
+        # Normalize an SSA var to its underlying Variable (real BN exposes
+        # ``.var``); fall back to the value itself when it is already a plain
+        # Variable / address-of target.
+        target_key = _var_address_key(getattr(base_var, "var", None) or base_var)
+        # First pass: SSA vars that hold `&base_var` (`rsi#1 = &r`) -- in
+        # unoptimized codegen the address-of is computed into a register one hop
+        # before the call rather than inlined into the call's argument. Also
+        # collect the call sites.
+        addr_holders: set = set()
+        call_insns: list = []
+        for block in getattr(ssa_func, "basic_blocks", []) or []:
+            for ins in block:
+                if "CALL" in il_format._il_op_name(ins):
+                    call_insns.append(ins)
+                    continue
+                taken = _address_of_target(getattr(ins, "src", None))
+                if taken is not None and _var_address_key(taken) == target_key:
+                    addr_holders.update(_ssa_vars_from(getattr(ins, "vars_written", []) or []))
+                    dest = getattr(ins, "dest", None)
+                    if isinstance(dest, SSAVariable):
+                        addr_holders.add(dest)
+        for ins in call_insns:
+            for param in getattr(ins, "params", []) or []:
+                # the call passes `&base_var` directly, or passes an SSA var that
+                # holds `&base_var`.
+                direct = _address_of_target(param)
+                if direct is not None and _var_address_key(direct) == target_key:
+                    return _callee_display_name(ctx, bv, ins)
+                for rv in _ssa_vars_from(getattr(param, "vars_read", []) or []):
+                    if rv in addr_holders:
+                        return _callee_display_name(ctx, bv, ins)
+    except Exception:
+        return None
+    return None
+
+
+def _out_param_fill_callee(ctx, bv, ssa_func, load_expr) -> str | None:
+    """#416 detection for the explicit ``[&local + off]`` load form: the loaded
+    address is the address of a local that was passed into a call. (The common
+    stack-struct form, where BN models the field as a variable and the slice
+    bottoms out at the local itself, is handled at the terminal-variable branch
+    via :func:`_addr_taken_callee`.)"""
+    return _addr_taken_callee(ctx, bv, ssa_func, _address_of_target(getattr(load_expr, "src", None)))
 
 
 def _find_return_vars(ctx, ssa_func, bv=None, _visited=None) -> list[SSAVariable]:
@@ -593,6 +703,23 @@ def _backward_slice(
                 f"the STACK; BN's MLIL/HLIL call model often omits stack-passed "
                 f"(e.g. variadic) args -- inspect `bn il {func.name} --view llil "
                 f"--ssa` for the stack stores feeding the call (#324)."
+            )
+        elif reg_count is not None and n < reg_count:
+            # The requested index is within the ABI's integer-arg registers, but
+            # BN recovered fewer params than the convention can pass in registers
+            # -- the callee's prototype is likely NARROWER than the actual call (a
+            # variadic mis-typed as fixed-arity, or an indirect call through a
+            # too-narrow function-pointer type), so a register-passed arg may be
+            # real-but-unmodeled rather than truly absent (#324). Stay hedged: a
+            # genuinely low-arity callee makes this index simply out of range.
+            msg += (
+                f" Note: BN recovered only {n} param(s) though this convention "
+                f"passes up to {reg_count} args in registers -- if the callee's "
+                f"prototype is narrower than the actual call (variadic mis-typed "
+                f"as fixed-arity, or an indirect call through a too-narrow "
+                f"function-pointer type), arg {arg_index} may be a real "
+                f"register-passed arg BN dropped; inspect `bn il {func.name} "
+                f"--view llil --ssa` for the args feeding the call (#324)."
             )
         raise OperationFailure("invalid_arg_index", msg)
 
