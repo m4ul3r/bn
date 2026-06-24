@@ -646,7 +646,11 @@ def _render_target_choices(value: Any) -> str:
 def _render_instance_use_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    return f"instance: {value.get('instance_id', '<unknown>')}"
+    line = f"instance: {value.get('instance_id', '<unknown>')}"
+    cleared = value.get("cleared_target_pin")
+    if cleared:
+        line += f"\ncleared stale target pin {cleared!r} (belonged to the previous instance)"
+    return line
 
 
 def _render_target_use_text(value: Any) -> str:
