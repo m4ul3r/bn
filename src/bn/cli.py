@@ -929,7 +929,12 @@ def _fanout_call(
     the normal spill path."""
     fan_instances = getattr(args, "all_instances", False)
     fan_targets = getattr(args, "all_targets", False)
-    explicit_target = bool(getattr(args, "target", None))
+    # Only a -t passed on the CLI counts as explicit (applies to every instance). A
+    # STICKY target pin (filled by _apply_sticky_defaults, which sets _sticky_target)
+    # is NOT explicit -- it must not suppress the multi-target auto-survey (#368).
+    explicit_target = bool(getattr(args, "target", None)) and not getattr(
+        args, "_sticky_target", False
+    )
     if fan_instances:
         instance_ids = [instance_selector(inst) for inst in list_instances()]
         if not instance_ids:

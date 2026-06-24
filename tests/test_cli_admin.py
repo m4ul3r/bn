@@ -728,6 +728,24 @@ def test_instance_use_keeps_target_pin_on_same_instance(tmp_session, monkeypatch
     assert bn.session_state.read().get("target") == "recv_daemon"
 
 
+def test_instance_use_keeps_target_pin_when_no_prior_instance(tmp_session, monkeypatch, capsys):
+    # #368 review (MED): with a target pin but NO prior instance pin (prev_instance
+    # is None), pinning an instance must NOT clear the target pin -- that is a first
+    # pin, not a switch FROM a different instance. (None != resolved would wrongly
+    # trip the stale-pin clear.)
+    bn.session_state.update(target="recv_daemon")          # target pin, no instance pin
+    assert bn.session_state.read().get("instance_id") is None
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [_fake_bridge_instance("first1")])
+
+    rc = bn.cli.main(["instance", "use", "first1"])
+
+    assert rc == 0
+    state = bn.session_state.read()
+    assert state["instance_id"] == "first1"
+    assert state.get("target") == "recv_daemon"            # pin kept (not a switch)
+    assert "cleared stale target pin" not in capsys.readouterr().out
+
+
 def test_instance_use_default_pins_gui_bridge(tmp_session, monkeypatch, capsys):
     # The fixed GUI bridge has instance_id=None and selector "default". Storing
     # the raw None made session_state.update() DELETE the pin, so the pin
