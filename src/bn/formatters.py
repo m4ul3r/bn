@@ -646,7 +646,11 @@ def _render_target_choices(value: Any) -> str:
 def _render_instance_use_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    return f"instance: {value.get('instance_id', '<unknown>')}"
+    line = f"instance: {value.get('instance_id', '<unknown>')}"
+    cleared = value.get("cleared_target_pin")
+    if cleared:
+        line += f"\ncleared stale target pin {cleared!r} (belonged to the previous instance)"
+    return line
 
 
 def _render_target_use_text(value: Any) -> str:
@@ -709,7 +713,15 @@ def _render_name_address_rows(value: Any, *, demangle: bool = False) -> str:
             line += f" (raw: {raw_name})"
         size = item.get("size")
         if size is not None:
-            line += f"  ({size} bytes)"
+            # #411: surface basic_block_count (a real complexity metric) here too,
+            # since text is the DEFAULT read output -- otherwise agents only ever
+            # see the misleading byte span. Omit the blocks clause when the count
+            # is absent/None (e.g. an older bridge, or a guarded bad function).
+            blocks = item.get("basic_block_count")
+            if blocks is not None:
+                line += f"  ({size} bytes, {blocks} blocks)"
+            else:
+                line += f"  ({size} bytes)"
         lines.append(line)
     return "\n".join(lines)
 
@@ -1359,6 +1371,11 @@ def _render_fanout_text(value: Any, inner_renderer: Callable[[Any], str] | None 
     ok = sum(1 for r in rows if isinstance(r, dict) and r.get("ok"))
     lines = [f"fan-out: {value.get('command', '?')} — {len(rows)} result(s) "
              f"({ok} ok, {len(rows) - ok} failed)"]
+    expanded = value.get("auto_expanded_instances")
+    if expanded:
+        # #368: be explicit that a multi-target instance was surveyed in full, so
+        # extra rows for one instance read as complete coverage, not a duplicate.
+        lines.append(f"  (surveyed all targets of multi-target instance(s): {', '.join(map(str, expanded))})")
     for r in rows:
         if not isinstance(r, dict):
             continue
@@ -1871,10 +1888,37 @@ def _render_taint_text(value: Any) -> str:
         lines.append(f"caveats ({len(assumptions)}):")
         for a in assumptions:
             lines.append(f"  - {a}")
+    msrc = _render_model_sources(value.get("model_sources"))
+    if msrc:
+        lines.append("")
+        lines.append(msrc)
     if value.get("soundness"):
         lines.append("")
         lines.append(f"soundness: {value['soundness']}")
     return "\n".join(lines)
+
+
+def _render_model_sources(sources: Any) -> str:
+    """#415: one-line disclosure of the active taint-model overlays in TEXT mode
+    (the default), so an agent can confirm a ``--models`` / ``BN_TAINT_MODELS``
+    overlay landed without parsing JSON or restarting the bridge."""
+    if not isinstance(sources, list):
+        return ""
+    parts: list[str] = []
+    for s in sources:
+        if not isinstance(s, dict):
+            continue
+        kind = s.get("kind")
+        if kind == "builtin":
+            parts.append("builtin")
+        elif kind == "env_override":
+            parts.append(f"env {s.get('env', 'BN_TAINT_MODELS')} ({s.get('path')})")
+        elif kind == "override_default":
+            parts.append(f"override ({s.get('path')})")
+        elif kind == "user":
+            loc = s.get("path") or s.get("via", "--models")
+            parts.append(f"--models {loc} ({s.get('count', 0)} model(s))")
+    return ("models: " + " + ".join(parts)) if parts else ""
 
 
 def _describe_loc(loc: Any) -> str:
@@ -2283,6 +2327,72 @@ def _format_op_summary(item: dict[str, Any]) -> str:
     return summary
 
 
+def _mutation_summary(value: Any) -> Any:
+    """#408: collapse a (single or batch) mutation result into a compact,
+    schema-stable status object for an unattended agent control loop -- did
+    anything change, did verification pass, was anything rolled back, what needs
+    attention -- without parsing the full results/affected_functions/diff payload.
+    The detailed result stays available without --summary."""
+    if not isinstance(value, dict):
+        return value
+    results = [r for r in (value.get("results") or []) if isinstance(r, dict)]
+    failed = [r for r in results if r.get("status") in FAILED_MUTATION_STATUSES]
+    verified = sum(1 for r in results if r.get("status") == "verified")
+    noop = sum(1 for r in results if r.get("status") == "noop")
+    committed = bool(value.get("committed", False))
+    rolled_back = value.get("rolled_back")
+    success = bool(value.get("success", True)) and not failed
+    first_error = None
+    if failed:
+        f0 = failed[0]
+        first_error = f0.get("message") or f0.get("status") or "mutation failed"
+    # A failure can carry its only explanation in the top-level `message` -- e.g. a
+    # preview/revert cleanup that failed AFTER every op verified, so no result row
+    # is in FAILED_MUTATION_STATUSES. Surface it so --summary never drops the error.
+    if first_error is None and not success:
+        first_error = value.get("message") or "mutation failed"
+    return {
+        "kind": "mutation_summary",
+        "success": success,
+        "committed": committed,
+        "preview": bool(value.get("preview", False)),
+        "op_count": len(results),
+        "changed_count": verified,        # ops that actually changed + verified
+        "verified_count": verified,
+        "noop_count": noop,
+        "failed_count": len(failed),
+        # True/False when a revert was attempted; None when none was needed.
+        "rolled_back": (bool(rolled_back) if rolled_back is not None else None),
+        "first_error": first_error,
+        # The DB is left modified iff a live mutation actually CHANGED state
+        # (committed AND something verified -- `committed` is True even for an
+        # all-noop mutation, which leaves the DB clean), or a failure's revert
+        # itself failed (rolled_back is explicitly False).
+        "dirty_after": (committed and verified > 0) or rolled_back is False,
+    }
+
+
+def _render_mutation_summary_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    state = ("committed" if value.get("committed")
+             else "preview" if value.get("preview")
+             else "rolled back" if value.get("rolled_back")
+             else "ok" if value.get("success") else "FAILED")
+    parts = [
+        f"mutation: {state}",
+        f"changed={value.get('changed_count', 0)}",
+        f"verified={value.get('verified_count', 0)}",
+        f"noop={value.get('noop_count', 0)}",
+        f"failed={value.get('failed_count', 0)}",
+        f"dirty_after={value.get('dirty_after')}",
+    ]
+    line = "  ".join(parts)
+    if value.get("first_error"):
+        line += f"\nfirst_error: {value['first_error']}"
+    return line
+
+
 def _render_mutation_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -2611,6 +2721,20 @@ def _render_one_class(rec: Any) -> str:
         # decodable local body; say so rather than render fake or empty virtuals.
         lines.append("  vtable: symbol present but no slots resolved here "
                      "(defined in another module, or applied at load time via relocations)")
+    # #412: secondary (multiple-inheritance) vtables -- shown compactly so a simple
+    # single-inheritance class isn't cluttered (there are none to show there).
+    for sec in rec.get("secondary_vtables") or []:
+        if not isinstance(sec, dict):
+            continue
+        ott = sec.get("offset_to_top")
+        ott_s = f" (offset-to-top {ott})" if ott is not None else ""
+        lines.append(f"  secondary vtable @ {sec.get('address', '?')}{ott_s}:")
+        for s in sec.get("slots") or []:
+            method = s.get("method") or {}
+            slot_name = (method.get("display_name") or method.get("name")) if isinstance(method, dict) else None
+            label = ("__cxa_pure_virtual" if s.get("pure_virtual")
+                     else slot_name if slot_name else "<unnamed>")
+            lines.append(f"    [{s.get('index')}] {s.get('address', '?')}  {label}")
     # Non-virtual member functions (kind=method). Virtual ones already appear as
     # vtable slots above; listing the symbol-side methods makes `class show`
     # useful for classes whose vtable is empty or absent (e.g. Controller).

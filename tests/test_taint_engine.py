@@ -255,6 +255,50 @@ def test_builtin_models_load():
     assert "system" in models and "recv" in models
 
 
+def test_model_overlay_sources_discloses_active_overlays():
+    # #415: the active overlay sources are disclosed (builtin always; user --models
+    # when supplied), so an agent can confirm a model landed without a restart.
+    builtin_only = te.model_overlay_sources(None)
+    assert builtin_only[0]["kind"] == "builtin" and "path" in builtin_only[0]
+    assert all(s["kind"] != "user" for s in builtin_only)
+
+    with_user = te.model_overlay_sources({"xmalloc": {}, "xcalloc": {}})
+    user = [s for s in with_user if s["kind"] == "user"]
+    assert len(user) == 1
+    assert user[0]["via"] == "--models" and user[0]["count"] == 2
+
+
+def test_model_overlay_sources_unwraps_models_envelope_and_path():
+    # #415 review: the user file may be a ``{"models": {...}}`` envelope (load_models
+    # unwraps it), so the disclosed count must reflect the INNER models -- and skip
+    # ``_comment*`` doc keys -- not the outer one-key dict. The --models path is
+    # surfaced too so an agent sees WHICH file landed.
+    wrapped = {"models": {"a": {}, "b": {}, "_comment": "doc"}}
+    src = te.model_overlay_sources(wrapped, user_models_path="proj/models.json")
+    user = [s for s in src if s["kind"] == "user"]
+    assert len(user) == 1
+    assert user[0]["count"] == 2                       # inner models, _comment excluded
+    assert user[0]["path"] == "proj/models.json"
+
+
+def test_model_overlay_sources_labels_override_by_env_presence(monkeypatch, tmp_path):
+    # #415 review: an active override file is labeled env_override ONLY when
+    # BN_TAINT_MODELS is set; the default-cache file (env unset) is override_default,
+    # not a false claim that the env var is in effect.
+    override = tmp_path / "models.json"
+    override.write_text("{}")
+    monkeypatch.setattr(te, "taint_models_path", lambda: override)
+
+    monkeypatch.setenv("BN_TAINT_MODELS", str(override))
+    by_env = te.model_overlay_sources(None)
+    assert any(s["kind"] == "env_override" and s["env"] == "BN_TAINT_MODELS" for s in by_env)
+
+    monkeypatch.delenv("BN_TAINT_MODELS", raising=False)
+    by_default = te.model_overlay_sources(None)
+    assert any(s["kind"] == "override_default" for s in by_default)
+    assert not any(s["kind"] == "env_override" for s in by_default)
+
+
 def test_secure_crt_annex_k_models_present_and_shaped():
     models = te.load_models()
     # Copy family: destsz after the dest shifts src->arg2, count->arg3.
@@ -1101,6 +1145,113 @@ def test_forward_vararg_no_double_report(models):
     sprintf_arg2 = [s for s in result["reached_sinks"]
                     if s["sink"]["callee"] == "sprintf" and s["sink"]["tainted_arg_index"] == 2]
     assert len(sprintf_arg2) == 1
+
+
+def test_forward_memoizes_buffer_target_across_fixpoint(models):
+    # #420: _buffer_target is purely STRUCTURAL (it resolves a pointer expr to its
+    # buffer key via the SSA def graph and never reads the taint set), yet the
+    # forward fixpoint reaches it -- through _pointee_tainted's escape check -- on
+    # every instruction with no tainted reads, every pass. It must be resolved once
+    # per (function, expr), not once per pass. The tainted store below forces the
+    # fixpoint to run >=2 passes, so a non-memoized resolver would re-run the
+    # recursive resolution of `&buf` on each pass.
+    p = FVar("p"); buf = FVar("buf", typ="char[0x40]"); t = FVar("t")
+    q = FVar("q"); buf2 = FVar("buf2", typ="char[0x40]")
+    p1 = FSSA(p, 1); t1 = FSSA(t, 1); q1 = FSSA(q, 1)
+    addr_buf = FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)
+    addr_buf.expr_index = 10  # real BN exprs carry a stable per-function expr_index
+    instrs = [
+        # no tainted reads -> hits the escape check -> _buffer_target(&buf) each pass
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "t#1 = &buf", writes=[t1], src=addr_buf),
+        FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "q#1 = &buf2", writes=[q1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf2", src=buf2)),
+        # a tainted store forces the fixpoint to run a second confirming pass
+        FInstr(2, 0x18, "MLIL_STORE_SSA", "[q#1] = p#1", reads=[p1], writes=[],
+               dest=FExpr("MLIL_VAR_SSA", "q#1", reads=[q1])),
+    ]
+    func = FFunc("f", 0x10, FSSAFunc(instrs), params=[p])
+    engine = te.TaintEngine(FBV({}), models)
+
+    impl_calls: list[int] = []
+    orig = engine._buffer_target_impl
+
+    def counting(ssaf, expr):
+        if getattr(expr, "expr_index", None) == 10:
+            impl_calls.append(10)
+        return orig(ssaf, expr)
+
+    engine._buffer_target_impl = counting
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert isinstance(result, dict)
+    # `&buf` is resolved exactly once across the multi-pass fixpoint -- it would be
+    # >=2 without the per-(function, expr) memo.
+    assert impl_calls.count(10) == 1, impl_calls
+
+
+def _buffer_target_memo_fixture(start):
+    # f(p): t = &buf; q = &buf2; [q] = p  -- p is the tainted param. The first two
+    # SET_VARs carry no tainted read, so each fixpoint pass reaches the escape check
+    # and resolves `&buf`/`&buf2` structurally; the tainted store forces >=2 passes.
+    # `start` is the function's base address (0 is a valid reset-vector entry).
+    p = FVar("p"); buf = FVar("buf", typ="char[0x40]"); t = FVar("t")
+    q = FVar("q"); buf2 = FVar("buf2", typ="char[0x40]")
+    p1 = FSSA(p, 1); t1 = FSSA(t, 1); q1 = FSSA(q, 1)
+    addr_buf = FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)
+    addr_buf.expr_index = 10  # real BN exprs carry a stable per-function expr_index
+    addr_buf2 = FExpr("MLIL_ADDRESS_OF", "&buf2", src=buf2)
+    addr_buf2.expr_index = 11
+    instrs = [
+        FInstr(0, start + 0x0, "MLIL_SET_VAR_SSA", "t#1 = &buf", writes=[t1], src=addr_buf),
+        FInstr(1, start + 0x4, "MLIL_SET_VAR_SSA", "q#1 = &buf2", writes=[q1], src=addr_buf2),
+        FInstr(2, start + 0x8, "MLIL_STORE_SSA", "[q#1] = p#1", reads=[p1], writes=[],
+               dest=FExpr("MLIL_VAR_SSA", "q#1", reads=[q1])),
+    ]
+    return FFunc("f", start, FSSAFunc(instrs), params=[p])
+
+
+def _instrument_buffer_target(engine, calls):
+    # Count every _buffer_target_impl invocation by the resolved expr's expr_index.
+    orig = engine._buffer_target_impl
+
+    def counting(ssaf, expr):
+        calls.append(getattr(expr, "expr_index", None))
+        return orig(ssaf, expr)
+
+    engine._buffer_target_impl = counting
+
+
+def test_forward_memo_result_equals_unmemoized(models):
+    # #420 teeth: the memo must be output-preserving. Compare a normal memoized run
+    # against an engine whose _buffer_target is forced to recompute on every call
+    # (the memo effectively disabled) -- both forward() results must be identical.
+    memo_engine = te.TaintEngine(FBV({}), models)
+    memoized = memo_engine.forward(_buffer_target_memo_fixture(0x1000),
+                                   [te.parse_locator("param:0")])
+
+    unmemo_engine = te.TaintEngine(FBV({}), models)
+    # Bypass the memo entirely: _buffer_target now always recomputes structurally.
+    unmemo_engine._buffer_target = unmemo_engine._buffer_target_impl
+    unmemoized = unmemo_engine.forward(_buffer_target_memo_fixture(0x1000),
+                                       [te.parse_locator("param:0")])
+
+    assert memoized == unmemoized
+
+
+def test_forward_memoizes_buffer_target_for_base_zero_function(models):
+    # #420 fix: address 0 is a valid function start (a firmware/VxWorks reset-vector
+    # entry). A base-0 function must still be memoized -- a falsy-start guard would
+    # leave the token None and re-resolve `&buf` on every fixpoint pass.
+    engine = te.TaintEngine(FBV({}), models)
+    calls: list[int | None] = []
+    _instrument_buffer_target(engine, calls)
+
+    result = engine.forward(_buffer_target_memo_fixture(0x0),
+                            [te.parse_locator("param:0")])
+    assert isinstance(result, dict)
+    # `&buf` (expr_index 10) is resolved exactly once across the multi-pass fixpoint
+    # even though the function starts at address 0 -- it would be >=2 if base-0
+    # functions bypassed the cache.
+    assert calls.count(10) == 1, calls
 
 
 class FBVStr(FBV):

@@ -866,6 +866,76 @@ def test_fanout_instances_x_targets_matrix(monkeypatch, capsys):
     assert pairs == {("A", "A-t1"), ("A", "A-t2"), ("B", "B-t1"), ("B", "B-t2")}
 
 
+def test_fanout_all_instances_auto_surveys_multi_target_instance(monkeypatch, capsys):
+    # #368 facet 1: --all-instances (no --all-targets) must NOT drop a multi-target
+    # instance to an "ambiguous target" error row -- it surveys ALL of its targets,
+    # so coverage is complete, and discloses the expansion.
+    import json as _json
+    import types as _types
+    import bn.cli as cli
+    insts = [_types.SimpleNamespace(instance_id="solo"), _types.SimpleNamespace(instance_id="multi")]
+    monkeypatch.setattr(cli, "list_instances", lambda: insts)
+    monkeypatch.setattr(cli, "instance_selector", lambda i: i.instance_id)
+    monkeypatch.setattr(cli, "_resolve_target", lambda args, **k: "active")
+
+    def fake_send(op, *, params=None, target=None, instance_id=None, **k):
+        if op == "list_targets":
+            if instance_id == "multi":
+                return {"result": [{"target_id": "m-t1"}, {"target_id": "m-t2"}]}
+            return {"result": [{"target_id": "solo-t1"}]}   # single target
+        return {"result": {"kind": "sections", "items": [], "total": 0, "_t": target}}
+    monkeypatch.setattr(cli, "send_request", fake_send)
+
+    rc = cli.main(["sections", "--all-instances", "--format", "json"])
+    assert rc == 0
+    out = _json.loads(capsys.readouterr().out)
+    # solo -> 1 row (its single peeked target id reused directly), multi -> 2 rows
+    # (both targets surveyed).
+    assert out["count"] == 3
+    pairs = {(r["instance"], r.get("target")) for r in out["instances"]}
+    # The single-target peek path reuses the peeked id directly (no _resolve_target
+    # for it) -- assert the concrete id so that path actually has teeth.
+    assert ("solo", "solo-t1") in pairs
+    assert ("multi", "m-t1") in pairs and ("multi", "m-t2") in pairs
+    assert out["auto_expanded_instances"] == ["multi"]
+
+
+def test_fanout_all_instances_auto_surveys_despite_sticky_target_pin(monkeypatch, capsys):
+    # #368 review (HIGH): a STICKY target pin must NOT count as an explicit -t.
+    # _apply_sticky_defaults fills args.target from session state and marks it
+    # _sticky_target=True; that must still let --all-instances auto-survey a
+    # multi-target instance (only a -t passed on the CLI applies to every instance).
+    import json as _json
+    import types as _types
+    import bn.cli as cli
+    insts = [_types.SimpleNamespace(instance_id="solo"), _types.SimpleNamespace(instance_id="multi")]
+    monkeypatch.setattr(cli, "list_instances", lambda: insts)
+    monkeypatch.setattr(cli, "instance_selector", lambda i: i.instance_id)
+    monkeypatch.setattr(cli, "_resolve_target", lambda args, **k: "active")
+    # A sticky target pin is present -> _apply_sticky_defaults sets args.target +
+    # args._sticky_target=True before the fan-out handler runs.
+    monkeypatch.setattr(cli.session_state, "read", lambda: {"target": "pinned_tgt"})
+
+    def fake_send(op, *, params=None, target=None, instance_id=None, **k):
+        if op == "list_targets":
+            if instance_id == "multi":
+                return {"result": [{"target_id": "m-t1"}, {"target_id": "m-t2"}]}
+            return {"result": [{"target_id": "solo-t1"}]}
+        return {"result": {"kind": "sections", "items": [], "total": 0, "_t": target}}
+    monkeypatch.setattr(cli, "send_request", fake_send)
+
+    rc = cli.main(["sections", "--all-instances", "--format", "json"])
+    assert rc == 0
+    out = _json.loads(capsys.readouterr().out)
+    # The multi-target instance is still surveyed in full despite the sticky pin.
+    assert out["count"] == 3
+    pairs = {(r["instance"], r.get("target")) for r in out["instances"]}
+    assert ("multi", "m-t1") in pairs and ("multi", "m-t2") in pairs
+    assert out["auto_expanded_instances"] == ["multi"]
+    # The sticky pin was NOT applied to every instance.
+    assert ("multi", "pinned_tgt") not in pairs
+
+
 def test_all_targets_flag_only_on_fanout_commands():
     # --all-targets, like --all-instances, is allow-listed (not on writes/per-fn).
     import contextlib, io

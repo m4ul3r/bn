@@ -247,11 +247,34 @@ def _list_functions(
             "raw_name": getattr(fn, "raw_name", fn.name),
             "display_name": il_format._display_name(fn),
             "size": il_format._function_size(fn),
+            "_fn": fn,   # transient: enrich the returned page only (perf), then drop
         }
         for fn in functions
     ]
     _sort_function_items(items, sort, reverse)
-    return _paged_function_result(ctx, items, offset=offset, limit=limit)
+    result = _paged_function_result(ctx, items, offset=offset, limit=limit)
+    return _enrich_page_with_basic_block_count(result)
+
+
+def _enrich_page_with_basic_block_count(result: dict[str, Any]) -> dict[str, Any]:
+    """#411: `size` is a raw address span -- agents misread it as code complexity.
+    Add a real triage metric (basic_block_count) to each returned row, computed
+    ONLY for the page (the transient `_fn` is dropped) so a 24k-function list/
+    search doesn't pay it for every filtered function. Shared by both the
+    `function list` and `function search` triage paths so each carries the metric.
+    """
+    for it in result.get("items", []):
+        fn = it.pop("_fn", None)
+        # BN's Function exposes no basic_block_count attribute -- len(basic_blocks)
+        # is the count (materializes the block list, but only for the returned page).
+        # Guard the access (mirrors il_format._function_size): one problematic
+        # function on the page must not fail the whole list/search request (#411).
+        try:
+            bbs = getattr(fn, "basic_blocks", None) if fn is not None else None
+            it["basic_block_count"] = len(bbs) if bbs is not None else None
+        except Exception:
+            it["basic_block_count"] = None
+    return result
 
 
 def _paged_function_result(ctx, items: list[dict[str, Any]], *, offset: int,
@@ -333,10 +356,13 @@ def _search_functions(
                 "raw_name": raw,
                 "display_name": display,
                 "size": il_format._function_size(fn),
+                "_fn": fn,   # transient: enrich the returned page only (perf), then drop
             })
     if count_only:
         # Mirror `_list_functions` count_only: `total` matches the list envelope
-        # key, `count` kept for back-compat (#252).
+        # key, `count` kept for back-compat (#252). (`_fn` is never serialized
+        # here -- only the returned page is enriched/cleaned below.)
         return {"kind": "functions", "count": len(items), "total": len(items)}
     _sort_function_items(items, sort, reverse)
-    return _paged_function_result(ctx, items, offset=offset, limit=limit)
+    result = _paged_function_result(ctx, items, offset=offset, limit=limit)
+    return _enrich_page_with_basic_block_count(result)

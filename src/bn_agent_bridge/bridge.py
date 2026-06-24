@@ -2494,7 +2494,8 @@ def _bind_taint(bridge, params, target):
 
 @op("disasm", lock="read")
 def _bind_disasm(bridge, params, target):
-    return bridge._disasm(target, params["identifier"], linear=params.get("linear"))
+    return bridge._disasm(target, params["identifier"], linear=params.get("linear"),
+                          mode=params.get("mode"))
 
 
 @op("function_evidence", lock="read")

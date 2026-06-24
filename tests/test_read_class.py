@@ -177,6 +177,162 @@ class _SlotCtx:
         return {"kind": "pointer_table", "items": self._rows}
 
 
+class _RecoverCtx:
+    """ctx for the #354 typeinfo->vtable backwalk: _vtable_layout_for returns the
+    prebuilt layout for a known vtable address (None / empty for a non-vtable ref),
+    and _read_pointer_value returns the word[0] offset-to-top.
+
+    Like the real ``_vtable_layout`` it returns a FRESH dict per call, so a layout
+    the backwalk mutates (offset_to_top / typeinfo_backwalk provenance) doesn't
+    alias the layout the symbolized-primary path produced for the same address."""
+    def __init__(self, layouts, otts):
+        self._layouts = layouts
+        self._otts = otts
+    def _pointer_size(self, bv):
+        return 8
+    def _read_pointer_value(self, bv, addr, *, size=None):
+        return self._otts.get(addr, 0)
+    def _vtable_layout_for(self, bv, addr):
+        layout = self._layouts.get(addr)
+        return dict(layout) if layout is not None else layout
+
+
+class _RecoverBV:
+    """The crafted refs are returned ONLY for the typeinfo address they were built
+    for; any other queried address yields []. A regression that calls
+    get_data_refs on the wrong address (e.g. the vtable instead of the typeinfo)
+    is then caught instead of silently passing on globally-returned refs."""
+    def __init__(self, ti, refs):
+        self._ti = ti
+        self._refs = refs
+    def get_data_refs(self, addr):
+        return list(self._refs) if addr == self._ti else []
+
+
+def test_recover_vtables_from_typeinfo_primary_and_secondary():
+    # #354/#412: stripped binary -- no _ZTV symbol. A data xref to the typeinfo
+    # lands at (vtable_addr + ptr); backwalk -ptr, validate via _vtable_layout_for,
+    # classify primary (offset-to-top 0) vs secondary (non-zero).
+    ti = 0x9100
+    bv = _RecoverBV(ti, [0x9008, 0x9028, 0x9050])
+    layouts = {
+        0x9000: {"address": "0x9000", "slots": [{"index": 0, "address": "0xa000"}]},
+        0x9020: {"address": "0x9020", "slots": [{"index": 0, "address": "0xa100"}]},
+        0x9048: {"address": "0x9048", "slots": []},   # not a vtable -> filtered
+    }
+    otts = {0x9000: 0, 0x9020: (1 << 64) - 16, 0x9048: 0}   # secondary offset-to-top = -16
+    ctx = _RecoverCtx(layouts, otts)
+    out = read_class._recover_vtables_from_typeinfo(ctx, bv, ti)
+    assert out is not None
+    assert out["primary"]["address"] == "0x9000"
+    assert out["primary"]["offset_to_top"] == 0
+    assert out["primary"]["typeinfo_backwalk"] is True
+    assert len(out["secondary"]) == 1
+    assert out["secondary"][0]["address"] == "0x9020"
+    assert out["secondary"][0]["offset_to_top"] == -16
+
+
+def test_enrich_backwalks_vtable_for_stripped_class():
+    # #354/#412: a class with typeinfo but NO vtable symbol (stripped) gets its
+    # primary + secondary vtables recovered via the typeinfo backwalk in _enrich.
+    class _EnrichCtx(_RecoverCtx):
+        def _object_size_for(self, bv, rec):
+            return None
+        def _bases_for(self, bv, rec):
+            return []
+        def _instances_for(self, bv, rec):
+            return {"construction_sites": [], "stored_globals": []}
+
+    bv = _RecoverBV(0x9100, [0x9008, 0x9028])
+    layouts = {
+        0x9000: {"address": "0x9000", "slots": [{"index": 0, "address": "0xa000"}]},
+        0x9020: {"address": "0x9020", "slots": [{"index": 0, "address": "0xa100"}]},
+    }
+    otts = {0x9000: 0, 0x9020: (1 << 64) - 16}
+    ctx = _EnrichCtx(layouts, otts)
+    rec = {"name": "Shape", "vtable": None, "typeinfo": {"address": "0x9100"},
+           "methods": [], "bases": []}
+    out = read_class._enrich(ctx, bv, rec)
+    assert out["vtable"]["address"] == "0x9000"          # primary recovered (#354)
+    assert out["vtable"]["typeinfo_backwalk"] is True
+    assert len(out["secondary_vtables"]) == 1            # secondary recovered (#412)
+    assert out["secondary_vtables"][0]["address"] == "0x9020"
+    assert any("typeinfo backwalk" in n for n in out["notes"])
+
+
+def test_enrich_recovers_secondary_for_symbolized_primary_class():
+    # #412 (codex Finding 1): the COMMON multiple-inheritance case -- the primary
+    # `_ZTV` symbol SURVIVES (so the registry already carries a vtable address) but
+    # the secondary-base subobject vtables are unsymbolized. _enrich must still
+    # backwalk the typeinfo to recover the secondaries, WITHOUT disturbing the
+    # symbolized primary layout.
+    class _EnrichCtx(_RecoverCtx):
+        def _object_size_for(self, bv, rec):
+            return None
+        def _bases_for(self, bv, rec):
+            return []
+        def _instances_for(self, bv, rec):
+            return {"construction_sites": [], "stored_globals": []}
+
+    bv = _RecoverBV(0x9100, [0x9008, 0x9028])
+    layouts = {
+        # 0x9000 is the symbolized primary (ott 0); 0x9020 is the unsymbolized
+        # secondary base subobject (ott -16).
+        0x9000: {"address": "0x9000", "slots": [{"index": 0, "address": "0xa000"}]},
+        0x9020: {"address": "0x9020", "slots": [{"index": 0, "address": "0xa100"}]},
+    }
+    otts = {0x9000: 0, 0x9020: (1 << 64) - 16}
+    ctx = _EnrichCtx(layouts, otts)
+    rec = {"name": "Shape", "vtable": {"address": "0x9000"},
+           "typeinfo": {"address": "0x9100"}, "methods": [], "bases": []}
+    out = read_class._enrich(ctx, bv, rec)
+    # The symbolized primary is preserved (resolved via _vtable_layout_for), NOT
+    # replaced by a backwalk result.
+    assert out["vtable"]["address"] == "0x9000"
+    assert "typeinfo_backwalk" not in out["vtable"]
+    # ...but the unsymbolized secondary is still recovered and attached, and the
+    # primary's own address is NOT re-emitted as a secondary.
+    assert len(out["secondary_vtables"]) == 1
+    assert out["secondary_vtables"][0]["address"] == "0x9020"
+    assert any("typeinfo backwalk" in n for n in out["notes"])
+
+
+def test_recover_drops_zero_offset_to_top_duplicate():
+    # #412 (codex Finding 2): a second data-ref to the typeinfo that resolves to a
+    # DISTINCT vtable address whose offset-to-top is ALSO 0 (a construction-vtable /
+    # RTTI artifact, not a real secondary base subobject) must NOT be emitted as a
+    # secondary -- only a strictly non-zero offset-to-top is a real secondary.
+    ti = 0x9100
+    bv = _RecoverBV(ti, [0x9008, 0x9028])
+    layouts = {
+        0x9000: {"address": "0x9000", "slots": [{"index": 0, "address": "0xa000"}]},
+        0x9020: {"address": "0x9020", "slots": [{"index": 0, "address": "0xa100"}]},
+    }
+    otts = {0x9000: 0, 0x9020: 0}   # both offset-to-top 0 -> the second is a dup
+    ctx = _RecoverCtx(layouts, otts)
+    out = read_class._recover_vtables_from_typeinfo(ctx, bv, ti)
+    assert out is not None
+    assert out["primary"]["address"] == "0x9000"   # first ott==0 wins as primary
+    assert out["secondary"] == []                  # zero-ott duplicate dropped
+
+
+def test_render_class_show_text_shows_secondary_vtables():
+    # #412: a multiple-inheritance class renders its secondary (offset-to-top != 0)
+    # vtable group beneath the primary.
+    from bn.formatters import _render_class_show_text
+    rec = {
+        "name": "Shape", "confidence": "rtti", "size": None, "bases": [],
+        "methods": [], "instances": {"construction_sites": [], "stored_globals": []},
+        "vtable": {"address": "0x9000", "offset_to_top": 0,
+                   "slots": [{"index": 0, "address": "0xa000", "method": {"name": "draw"}}]},
+        "secondary_vtables": [{"address": "0x9040", "offset_to_top": -8,
+                               "slots": [{"index": 0, "address": "0xb000", "method": {"name": "name"}}]}],
+    }
+    text = _render_class_show_text(rec)
+    assert "secondary vtable @ 0x9040 (offset-to-top -8)" in text
+    assert "[0] 0xb000  name" in text
+
+
 def test_vtable_layout_skips_when_header_not_typeinfo():
     # The Itanium gate: if word[1] doesn't resolve to a typeinfo, this isn't a
     # real local vtable object (import/GOT slot or relocated-to-zero PIE slot) --

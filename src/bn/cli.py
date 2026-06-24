@@ -12,7 +12,9 @@ from . import session_state
 from .formatters import (
     FAILED_MUTATION_STATUSES,
     _format_operation_result,  # noqa: F401  -- re-exported for tests/scripts that monkeypatch bn.cli
+    _mutation_summary,
     _render_fanout_text,
+    _render_mutation_summary_text,
     _render_mutation_text,
     _render_target_choices,
 )
@@ -366,6 +368,16 @@ def preview_arg(
     says "Create, verify, then revert"); pass *help* to override.
     """
     return arg("--preview", action="store_true", help=help)
+
+
+def summary_arg() -> tuple[tuple[str, ...], dict[str, Any]]:
+    """The shared ``--summary`` flag for mutation commands (#408): emit a compact,
+    schema-stable status object (changed/verified/noop/failed counts + rolled_back
+    + first_error + dirty_after) instead of the full audit payload, for an
+    unattended agent control loop. The detailed output stays the default."""
+    return arg("--summary", action="store_true", default=False,
+               help="Emit a compact status summary (counts, first_error, dirty_after) "
+                    "instead of the full mutation audit payload")
 
 
 def command(
@@ -765,13 +777,18 @@ def _mutate(
     """
     if preview is not None:
         params = {**params, "preview": preview}
+    # #408: --summary collapses the result to a compact, schema-stable status
+    # object for an unattended control loop. The exit code is unchanged (computed
+    # on the full result); only the rendered/returned payload is compacted.
+    summary = bool(getattr(args, "summary", False))
     return _call(
         args,
         op,
         params,
         require_target=require_target,
-        text_renderer=_render_mutation_text,
+        text_renderer=_render_mutation_summary_text if summary else _render_mutation_text,
         result_exit_code=_mutation_exit_code,
+        result_transform=_mutation_summary if summary else None,
         stem=stem,
         **call_kwargs,
     )
@@ -796,6 +813,7 @@ def _call(
     paged_spill: bool = False,
     stem: str,
     result_exit_code: Callable[[Any], int] | None = None,
+    result_transform: Callable[[Any], Any] | None = None,
     bridge_writes_output: bool = False,
     spawn_missing_named: bool = False,
     regex_hint_query: str | None = None,
@@ -871,11 +889,16 @@ def _call(
             file=sys.stderr,
         )
         regex_hint_query = None  # the retry supersedes the add-`--regex` nudge
+    # Exit code is computed on the ORIGINAL result (it reads the full results
+    # list); a result_transform (e.g. #408 --summary) only changes what is
+    # rendered, never the verification-aware exit code.
     exit_code = result_exit_code(result) if result_exit_code is not None else 0
     # No bare-list CLI-side truncation: every paged read returns a {items, total,
     # offset, limit, returned, has_more} envelope and pages bridge-side (#275).
     _maybe_regex_hint(args, result, regex_hint_query)
     _maybe_offset_hint(args, result, offset_hint_identifier)
+    if result_transform is not None:
+        result = result_transform(result)
     spill_context = result
     fmt = _resolve_output_format(args)
     if text_renderer is not None and fmt == "text":
@@ -929,6 +952,12 @@ def _fanout_call(
     the normal spill path."""
     fan_instances = getattr(args, "all_instances", False)
     fan_targets = getattr(args, "all_targets", False)
+    # Only a -t passed on the CLI counts as explicit (applies to every instance). A
+    # STICKY target pin (filled by _apply_sticky_defaults, which sets _sticky_target)
+    # is NOT explicit -- it must not suppress the multi-target auto-survey (#368).
+    explicit_target = bool(getattr(args, "target", None)) and not getattr(
+        args, "_sticky_target", False
+    )
     if fan_instances:
         instance_ids = [instance_selector(inst) for inst in list_instances()]
         if not instance_ids:
@@ -937,23 +966,46 @@ def _fanout_call(
         # --all-targets alone: just the resolved/explicit/default instance.
         instance_ids = [getattr(args, "instance", None)]
 
+    def _instance_target_ids(iid: Any) -> list[Any]:
+        tresp = send_request("list_targets", params={}, instance_id=iid, **timeout_kwargs)
+        titems = tresp["result"]
+        tlist = titems.get("items") if isinstance(titems, dict) else titems
+        return [t.get("target_id") or t.get("selector")
+                for t in (tlist or []) if isinstance(t, dict)]
+
     rows: list[dict[str, Any]] = []
+    auto_expanded: list[Any] = []   # multi-target instances surveyed in full (#368)
     for iid in instance_ids:
         # Per-instance target set: every open target (--all-targets) or the single
         # resolved one. A failure to enumerate an instance's targets is its own row.
         if fan_targets:
             try:
-                tresp = send_request("list_targets", params={}, instance_id=iid, **timeout_kwargs)
-                titems = tresp["result"]
-                tlist = titems.get("items") if isinstance(titems, dict) else titems
-                target_selectors = [t.get("target_id") or t.get("selector")
-                                    for t in (tlist or []) if isinstance(t, dict)]
+                target_selectors = _instance_target_ids(iid)
             except BridgeError as exc:
                 rows.append({"instance": iid, "ok": False, "error": f"list targets: {exc}"})
                 continue
             if not target_selectors:
                 rows.append({"instance": iid, "ok": False, "error": "no targets open"})
                 continue
+        elif fan_instances and not explicit_target:
+            # #368 facet 1: a SURVEY across instances must not silently drop a
+            # MULTI-target instance to an "ambiguous target" error row. Peek the
+            # instance's targets: survey ALL of them when there's more than one
+            # (so coverage is complete), else fall back to the normal single
+            # resolve. An explicit -t still applies that selector to every instance.
+            try:
+                ids = _instance_target_ids(iid)
+            except BridgeError:
+                ids = None
+            if ids and all(i is not None for i in ids):
+                # Reuse the peeked target ids directly -- avoids a SECOND
+                # list_targets round-trip via the implicit-target resolve for
+                # single-target instances. Auto-expand discloses only the >1 case.
+                target_selectors = ids
+                if len(ids) > 1:
+                    auto_expanded.append(iid)
+            else:
+                target_selectors = [None]   # peek failed / 0 targets -> normal resolve
         else:
             target_selectors = [None]  # resolve the single target normally below
 
@@ -982,6 +1034,11 @@ def _fanout_call(
     ok_count = sum(1 for r in rows if r.get("ok"))
     result = {"kind": "fanout", "command": op, "count": len(rows),
               "ok_count": ok_count, "instances": rows}
+    if auto_expanded:
+        # #368 facet 1: be explicit that --all-instances surveyed every target of a
+        # multi-target instance (so the row count > instance count is understood,
+        # not read as a duplicate/bug).
+        result["auto_expanded_instances"] = auto_expanded
     fmt = _resolve_output_format(args)
     rendered: Any = result
     if fmt == "text":

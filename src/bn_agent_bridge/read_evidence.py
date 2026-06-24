@@ -810,6 +810,61 @@ _INIT_SECTION_HINTS = (
 )
 
 
+def _pe_tls_callbacks(bv) -> dict[str, int] | None:
+    """#380: locate a PE's TLS callback array via IMAGE_TLS_DIRECTORY.
+    AddressOfCallBacks (data directory[9]). Returns ``{"address", "count",
+    "ptr_size"}`` for the null-terminated callback VA array, or None when the
+    target isn't a PE / has no TLS callbacks. Parsed from the mapped headers (BN
+    exposes no TLS-directory accessor); every read is bounds-checked."""
+    if not callable(getattr(bv, "read", None)):
+        return None
+    base = int(getattr(bv, "start", 0))
+
+    def u(addr: int, n: int) -> int | None:
+        b = bv.read(addr, n)
+        return int.from_bytes(b, "little") if b and len(b) == n else None
+
+    if bv.read(base, 2) != b"MZ":
+        return None
+    e_lfanew = u(base + 0x3C, 4)
+    if not e_lfanew:
+        return None
+    pe = base + e_lfanew
+    if bv.read(pe, 4) != b"PE\x00\x00":
+        return None
+    opt = pe + 4 + 20  # PE signature (4) + COFF file header (20)
+    magic = u(opt, 2)
+    if magic == 0x20B:        # PE32+
+        dd_off, ptr_size, aocb_off = 112, 8, 24
+    elif magic == 0x10B:      # PE32
+        dd_off, ptr_size, aocb_off = 96, 4, 12
+    else:
+        return None
+    # NumberOfRvaAndSizes (the 4 bytes just before the DataDirectory array) must
+    # cover index 9 (TLS); a non-conforming PE with fewer entries would otherwise
+    # read a garbage RVA from the section table beyond the array (review nit).
+    n_dirs = u(opt + dd_off - 4, 4)
+    if n_dirs is None or n_dirs < 10:
+        return None
+    tls_rva = u(opt + dd_off + 9 * 8, 4)   # data directory[9] = TLS
+    if not tls_rva:
+        return None
+    aocb = u(base + tls_rva + aocb_off, ptr_size)   # AddressOfCallBacks (a VA)
+    if not aocb:
+        return None
+    count = 0
+    addr = aocb
+    while count < 4096:
+        v = u(addr, ptr_size)
+        if not v:
+            break
+        count += 1
+        addr += ptr_size
+    if count == 0:
+        return None
+    return {"address": aocb, "count": count, "ptr_size": ptr_size}
+
+
 def _init_arrays(ctx, selector: str | None, *, limit: int = 64):
     if limit < 0:
         raise OperationFailure("invalid_limit", f"Invalid init-array limit: {limit}")
@@ -839,6 +894,30 @@ def _init_arrays(ctx, selector: str | None, *, limit: int = 64):
                 "total_entries": total_entries,
                 "shown_entries": shown_entries,
                 "truncated": total_entries > shown_entries,
+                "table": table,
+            }
+        )
+    # #380: PE targets carry pre-entry code in the TLS callback array, which the
+    # ELF section scan above misses. Surface it with the same pointer-table
+    # evidence so `evidence init` isn't falsely empty on a PE with TLS callbacks.
+    tls = _pe_tls_callbacks(bv)
+    if tls is not None:
+        shown = min(tls["count"], limit)
+        # read_width pinned to the TLS pointer size: on a PE32+ the callbacks are
+        # 8-byte VAs, but bv/arch may report a 4-byte address_size, which would
+        # default read_width to 4 and truncate the high callback VAs (codex review).
+        table = _pointer_table_for_view(
+            ctx, bv, tls["address"], entries=shown, stride_size=tls["ptr_size"],
+            read_width=tls["ptr_size"],
+        )
+        sections.append(
+            {
+                "name": "TLS callbacks (PE IMAGE_TLS_DIRECTORY.AddressOfCallBacks)",
+                "start": hex(tls["address"]),
+                "end": hex(tls["address"] + tls["count"] * tls["ptr_size"]),
+                "total_entries": tls["count"],
+                "shown_entries": shown,
+                "truncated": tls["count"] > shown,
                 "table": table,
             }
         )

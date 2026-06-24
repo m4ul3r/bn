@@ -27,6 +27,7 @@ API behaviour verified against /opt/binaryninja (see the design's spike):
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -201,6 +202,48 @@ def load_models(extra: dict[str, Any] | None = None) -> dict[str, Any]:
         # a name clash -- they're the most specific to the target.
         models.update(_coerce_model_map(extra, source="user-provided models (--models / extra)"))
     return models
+
+
+def model_overlay_sources(extra: dict[str, Any] | None = None, *,
+                          user_models_path: str | None = None) -> list[dict[str, Any]]:
+    """#415: the active taint-model overlay sources (most-specific last), so a
+    `taint` run discloses WHICH models are in effect.
+
+    load_models() re-reads the builtin DB, the BN_TAINT_MODELS-pointed file, and
+    any ``--models`` file on EVERY request, so editing a project-local model file
+    (or passing ``--models``) takes effect on the next taint command with no
+    bridge restart -- this disclosure makes that visible (and lets a status check
+    confirm an overlay landed). ``user_models_path`` (when known) names the
+    ``--models`` file so the disclosure points at WHICH file landed, not just a
+    count."""
+    sources: list[dict[str, Any]] = [{"kind": "builtin", "path": str(_BUILTIN_MODELS)}]
+    if taint_models_path is not None:
+        try:
+            override = taint_models_path()
+        except Exception:
+            override = None
+        if override is not None and override.exists():
+            # taint_models_path() returns the BN_TAINT_MODELS path when that env
+            # var is set, else the default ~/.cache/bn/taint_models.json -- both of
+            # which load_models honors. Only claim the env var when it's actually
+            # set; otherwise label the default-file override honestly (review).
+            if os.environ.get("BN_TAINT_MODELS"):
+                sources.append({"kind": "env_override", "env": "BN_TAINT_MODELS",
+                                "path": str(override)})
+            else:
+                sources.append({"kind": "override_default", "path": str(override)})
+    if extra:
+        # Count the actual models the way load_models()/_coerce_model_map does:
+        # unwrap a ``{"models": {...}}`` envelope and skip ``_comment*`` doc keys,
+        # so the disclosed count matches what was really merged (review: a wrapped
+        # file with two inner models otherwise reported count 1).
+        inner = extra.get("models") if isinstance(extra, dict) and "models" in extra else extra
+        count = sum(1 for k in inner if not str(k).startswith("_comment")) if isinstance(inner, dict) else 0
+        user: dict[str, Any] = {"kind": "user", "via": "--models", "count": count}
+        if user_models_path:
+            user["path"] = str(user_models_path)
+        sources.append(user)
+    return sources
 
 
 def _canonical_cxx_alloc(name: str) -> str | None:
@@ -658,6 +701,15 @@ class TaintEngine:
         self._thunk_cache: dict[int, Any] = {}
         # Per-function unlifted-instruction scan, cached by function start (#206).
         self._unimpl_cache: dict[int, list[int]] = {}
+        # _buffer_target is purely STRUCTURAL (it resolves a pointer expr to its
+        # buffer key via the SSA def graph; it never reads the taint set), but the
+        # forward fixpoint reaches it -- via _pointee_tainted -- on every escape
+        # check every iteration, so it dominates large-function runs (#420).
+        # Memoize it per (function, SSA expr_index): the result is identical on
+        # every pass. Keyed by the function token set on entry to a fixpoint run so
+        # interprocedural descent into a callee can't alias a caller's expr_index.
+        self._bt_cache: dict[Any, Any] = {}
+        self._bt_func_token: Any = None
 
     # -- shared resolution ------------------------------------------------
 
@@ -1342,7 +1394,25 @@ class TaintEngine:
         """Resolve a pointer expr to ``(key, label)`` for the buffer it points at:
         a stack Variable (preferred — keeps its name), a writable global, or a
         heap buffer keyed by allocation site. None if none. The key is what taint
-        nodes are keyed on; label is for provenance."""
+        nodes are keyed on; label is for provenance.
+
+        Memoized per ``(function, SSA expr_index)`` (#420): the resolution is purely
+        structural -- it walks the SSA def graph and never consults the taint set --
+        so it is identical on every fixpoint pass, yet the forward fixpoint reaches
+        it (through ``_pointee_tainted``) on every escape check every iteration,
+        where it dominates large-function runs. The function token is set on entry
+        to each fixpoint run so a callee's expr_index can't alias a caller's."""
+        tok = self._bt_func_token
+        xi = getattr(expr, "expr_index", None)
+        ck = (tok, xi) if (tok is not None and xi is not None) else None
+        if ck is not None and ck in self._bt_cache:
+            return self._bt_cache[ck]
+        result = self._buffer_target_impl(ssaf, expr)
+        if ck is not None:
+            self._bt_cache[ck] = result
+        return result
+
+    def _buffer_target_impl(self, ssaf: Any, expr: Any):
         pv = self._pointee_var(ssaf, expr)
         if pv is not None:
             return (var_key(pv), var_label(pv))
@@ -2107,6 +2177,14 @@ class TaintEngine:
 
     def forward(self, func: Any, sources: list[dict[str, Any]], *,
                 enabled_sink_classes: set[str] | None = None, max_depth: int = 8) -> dict[str, Any]:
+        # Scope the structural _buffer_target memo (#420) to this top-level forward
+        # run: clear it here so a reused engine (e.g. over a re-lifted SSA) can never
+        # return a stale structural result, and so per-(function, expr_index) keys
+        # from a prior run can't survive. The engine is per-request in production --
+        # this is defensive, but it makes the cache lifetime provably one forward run.
+        self._bt_cache = {}
+        self._bt_func_token = None
+
         # optional-sink classes the caller opted into (e.g. file_write); a sink
         # marked "optional" in the model DB fires only if its class is in here.
         # Set once for the whole request and shared by every per-callsite re-run.
@@ -2856,12 +2934,18 @@ class TaintEngine:
             return cached
         self._cache[key] = None  # mark in-progress (cycle guard)
         locators = [{"kind": "param", "index": i} for i in sorted(param_set)]
+        # _run_forward(callee) repoints self._bt_func_token at the callee; restore
+        # the caller's token afterward so its fixpoint keeps hitting its own cache
+        # entries (the #420 _buffer_target memo is keyed by this token).
+        saved_tok = self._bt_func_token
         try:
             sub = self._run_forward(callee, locators, depth, max_depth, top=False)
         except TaintError as exc:
             sub = {"reached_return": True, "out_params": frozenset(), "findings": [], "leaves": [],
                    "assumptions": [f"could not analyze {callee.name}: {exc}; return conservatively tainted"],
                    "frontier": f"body could not be analyzed ({exc})"}
+        finally:
+            self._bt_func_token = saved_tok
         self._cache[key] = sub
         return sub
 
@@ -3080,6 +3164,14 @@ class TaintEngine:
         instrs = self._instrs(ssaf)
         self._funcs_visited.add(int(getattr(func, "start", 0)))
         self._max_depth_seen = max(self._max_depth_seen, depth)
+        # Scope the structural _buffer_target cache to THIS function so a callee's
+        # expr_index can't collide with a caller's (#420). _summarize saves/restores
+        # this token around the one recursive descent call. Address 0 is a valid
+        # function start (a firmware/VxWorks reset-vector entry), so gate on
+        # `is not None` -- only a genuinely absent start (a degenerate fake) leaves
+        # the token None and makes _buffer_target bypass the cache.
+        _start = getattr(func, "start", None)
+        self._bt_func_token = int(_start) if _start is not None else None
 
         tainted: set[tuple] = set()
         why: dict[tuple, dict[str, Any]] = {}

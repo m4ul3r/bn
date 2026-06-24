@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _pick, _positive_depth_int, _positive_int, arg, command, mutex, preview_arg
+from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _pick, _positive_depth_int, _positive_int, arg, command, mutex, preview_arg, summary_arg
 from ..formatters import (
     _render_callsites_text,
     _render_disasm_linear_text,
@@ -187,7 +187,7 @@ def _function_info(args: argparse.Namespace) -> int:
          help="Create and analyze a function at an address auto-analysis missed",
          target=True, fmt="json",
          args=[
-             preview_arg("Create, verify, then revert without committing"),
+             preview_arg("Create, verify, then revert without committing"), summary_arg(),
              arg("address", help="Address of the function entry point (hex or decimal)"),
          ])
 def _function_create(args: argparse.Namespace) -> int:
@@ -302,6 +302,12 @@ def _function_structured_il(args: argparse.Namespace) -> int:
 @command("disasm", help="Disassemble a function (slice with --lines or --count)", target=True,
          args=[
              arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
+             # #382: BN defaults a whole ARM binary to one mode (often thumb2), so
+             # --linear at an ARM-mode region decodes as Thumb (or vice versa).
+             # Force the decode mode for --linear; the address's own function arch
+             # is honored automatically when known.
+             arg("--mode", choices=("arm", "thumb"), default=None,
+                 help="Force ARM or Thumb decode for --linear on an ARM target"),
          ],
          # --lines and --count are two spellings of the same slice; one disasm
          # line is one instruction, so --count N is the first N instructions
@@ -325,14 +331,20 @@ def _function_structured_il(args: argparse.Namespace) -> int:
          ])
 def _disasm(args: argparse.Namespace) -> int:
     linear = getattr(args, "linear", None)
+    mode = getattr(args, "mode", None)
+    if mode is not None and linear is None:
+        raise BridgeError("--mode applies only to --linear disassembly")
     if linear is not None:
         # Linear mode: the bridge walks N instructions from the address and
         # returns exactly that window, so there is no client-side slice and no
         # text-only restriction -- it works in JSON too.
+        params: dict[str, Any] = {"identifier": args.identifier, "linear": int(linear)}
+        if mode is not None:
+            params["mode"] = mode
         return _call(
             args,
             "disasm",
-            {"identifier": args.identifier, "linear": int(linear)},
+            params,
             require_target=True,
             text_renderer=_render_disasm_linear_text,
             stem="disasm",

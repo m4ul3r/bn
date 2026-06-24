@@ -587,6 +587,34 @@ def _resolve_class_names(registry: dict[str, dict], name: str) -> list[str]:
 def _enrich(ctx, bv, rec: dict[str, Any]) -> dict[str, Any]:
     if rec.get("vtable"):
         rec["vtable"] = ctx._vtable_layout_for(bv, int(rec["vtable"]["address"], 16)) or rec["vtable"]
+        # #412 (codex Finding 1): a multiple-inheritance class commonly keeps its
+        # PRIMARY `_ZTV` symbol while the secondary base-subobject vtables are
+        # unsymbolized. The symbolized primary above doesn't surface them, so back-
+        # walk the typeinfo for the secondaries too. Keep the symbolized primary as
+        # `rec["vtable"]`; attach only the recovered tables that are a DIFFERENT
+        # address (the backwalk re-finds the primary via its own typeinfo ref).
+        if rec.get("typeinfo"):
+            recovered = _recover_vtables_from_typeinfo(
+                ctx, bv, int(rec["typeinfo"]["address"], 16))
+            if recovered:
+                primary_addr = (rec["vtable"] or {}).get("address")
+                secondaries = [s for s in recovered["secondary"]
+                               if s.get("address") != primary_addr]
+                if secondaries:
+                    rec["secondary_vtables"] = secondaries
+                    rec.setdefault("notes", []).append(
+                        "secondary (multiple-inheritance) vtables recovered via "
+                        "typeinfo backwalk (no _ZTV symbol for the secondary bases)")
+    elif rec.get("typeinfo"):
+        # #354: STRIPPED binary -- the `_ZTV` DataSymbol is gone so the registry has
+        # no vtable address, but typeinfo survived. Backwalk typeinfo->vtable.
+        recovered = _recover_vtables_from_typeinfo(ctx, bv, int(rec["typeinfo"]["address"], 16))
+        if recovered:
+            rec["vtable"] = recovered["primary"]
+            if recovered["secondary"]:
+                rec["secondary_vtables"] = recovered["secondary"]   # #412
+            rec.setdefault("notes", []).append(
+                "vtable recovered via typeinfo backwalk (no _ZTV symbol -- stripped binary)")
     rec["size"] = ctx._object_size_for(bv, rec)
     rec["bases"] = ctx._bases_for(bv, rec)
     rec["instances"] = ctx._instances_for(bv, rec)
@@ -609,6 +637,58 @@ def _class_name_suggestions(registry: dict[str, dict], name: str, *, limit: int 
     leaf_hits = [k for k in names if leaf and _query_leaf(k).lower().startswith(leaf)]
     ordered = list(dict.fromkeys([*close, *leaf_hits]))[:limit]
     return f" Did you mean: {', '.join(ordered)}?" if ordered else ""
+
+
+def _as_signed(value: int | None, ptr: int) -> int:
+    """Interpret an unsigned ptr-sized word as a signed offset-to-top."""
+    if value is None:
+        return 0
+    bits = ptr * 8
+    return value - (1 << bits) if value >= (1 << (bits - 1)) else value
+
+
+def _recover_vtables_from_typeinfo(ctx, bv, typeinfo_addr: int) -> dict[str, Any] | None:
+    """#354/#412: in a STRIPPED binary the ``_ZTV`` DataSymbol is gone, so the class
+    registry carries no vtable address -- but the typeinfo symbol usually survives.
+    An Itanium vtable's word[1] holds the class typeinfo pointer, so a DATA xref to
+    the typeinfo addr lands at ``vtable_addr + ptr_size``. Backwalk each such ref,
+    validate the candidate as a real vtable via ``_vtable_layout_for`` (word[1] ==
+    typeinfo, slots are CODE -- which filters typeinfo base-pointer refs from other
+    classes' RTTI), and classify primary (offset-to-top 0) vs secondary (#412,
+    non-zero word[0]). Returns ``{"primary": layout, "secondary": [layout, ...]}``
+    or None when nothing resolves."""
+    getter = getattr(bv, "get_data_refs", None)
+    if not callable(getter):
+        return None
+    ptr = ctx._pointer_size(bv)
+    groups: list[tuple[int, dict[str, Any]]] = []
+    seen: set[int] = set()
+    for ref in getter(int(typeinfo_addr)):
+        vt_addr = int(ref) - ptr
+        if vt_addr < 0 or vt_addr in seen:
+            continue
+        seen.add(vt_addr)
+        layout = ctx._vtable_layout_for(bv, vt_addr)
+        if not layout or not layout.get("slots"):
+            continue
+        ott = _as_signed(ctx._read_pointer_value(bv, vt_addr, size=ptr), ptr)
+        layout["offset_to_top"] = ott
+        layout["typeinfo_backwalk"] = True   # provenance: recovered without a _ZTV symbol
+        groups.append((ott, layout))
+    if not groups:
+        return None
+    # Classify by offset-to-top VALUE, not by sort rank. The primary subobject
+    # sits at offset-to-top 0; a real secondary base subobject is at a NON-ZERO
+    # (negative) offset-to-top. A second ref that resolves to a distinct vtable
+    # whose offset-to-top is ALSO 0 is a construction-vtable / RTTI artifact, not
+    # a secondary -- dropping it avoids emitting a bogus secondary (#412 review).
+    zeros = [layout for ott, layout in groups if ott == 0]
+    if zeros:
+        primary = zeros[0]                            # several ==0 -> take the first
+    else:
+        primary = min(groups, key=lambda g: abs(g[0]))[1]   # none ==0 -> nearest 0
+    secondary = [layout for ott, layout in groups if ott != 0]
+    return {"primary": primary, "secondary": secondary}
 
 
 def _class_show(ctx, selector: str | None, name: str) -> dict[str, Any]:

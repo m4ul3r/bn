@@ -189,18 +189,43 @@ def _needed_libraries(bv) -> list[str]:
 
 
 def _defined_symbol_names(bv) -> set[str]:
-    """Raw names of symbols DEFINED in this module (function/data definitions).
+    """Raw names of symbols DEFINED in this module (real function/data definitions).
 
     Used to recognize a PIC shared object's own exports that BN also models as
     import veneers / GOT slots, so those self-references can be dropped from the
     imports survey (#202). Keyed on ``raw_name`` because that's what the import
-    veneer and GOT slot carry too."""
+    veneer and GOT slot carry too.
+
+    A Function/Data symbol that sits AT an import address (an ImportedFunction /
+    ImportedData / ImportAddress symbol address) is an import VENEER -- on PE64 BN
+    co-names the IAT jump-thunk (FunctionSymbol) AND a data veneer
+    (DataSymbol, sharing an ImportedDataSymbol address) with the import at its
+    very address -- NOT a real local
+    definition, so it is excluded here (#379). Otherwise the #202 filter would
+    drop the genuine import and leave a near-empty PE import list. A real #202
+    self-export def sits at its own .text/.data address, distinct from the
+    veneer, so it is kept."""
+    import_addrs: set[int] = set()
+    for attr in ("ImportedFunctionSymbol", "ImportedDataSymbol", "ImportAddressSymbol"):
+        sym_type = getattr(bn.SymbolType, attr, None)
+        if sym_type is None:
+            continue
+        for sym in list(bv.get_symbols_of_type(sym_type)):
+            try:
+                import_addrs.add(int(sym.address))
+            except (TypeError, ValueError):
+                pass
     names: set[str] = set()
     for attr_name in ("FunctionSymbol", "DataSymbol"):
         sym_type = getattr(bn.SymbolType, attr_name, None)
         if sym_type is None:
             continue
         for sym in list(bv.get_symbols_of_type(sym_type)):
+            try:
+                if int(sym.address) in import_addrs:
+                    continue  # import veneer at an IAT address, not a real def (#379)
+            except (TypeError, ValueError):
+                pass
             names.add(str(getattr(sym, "raw_name", sym.name)))
     return names
 
