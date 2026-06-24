@@ -975,45 +975,61 @@ def _fanout_call(
         return [t.get("target_id") or t.get("selector")
                 for t in (tlist or []) if isinstance(t, dict)]
 
-    rows: list[dict[str, Any]] = []
-    work_items: list[tuple[Any, Any]] = []   # (instance_id, target_selector) to execute (#417)
-    auto_expanded: list[Any] = []   # multi-target instances surveyed in full (#368)
-    for iid in instance_ids:
-        # Per-instance target set: every open target (--all-targets) or the single
-        # resolved one. A failure to enumerate an instance's targets is its own row.
+    # Phase 1 -- PLAN each instance: resolve its target set (a list_targets peek
+    # for --all-targets, or the #368 multi-target auto-survey). That peek is itself
+    # a per-instance socket round-trip, so run the planning CONCURRENTLY too --
+    # otherwise one wedged bridge's list_targets would block the whole survey
+    # before any read even starts (#417). Each plan is independent and read-only.
+    def _plan_instance(iid: Any) -> dict[str, Any]:
+        plan: dict[str, Any] = {"iid": iid, "auto": False}
         if fan_targets:
             try:
-                target_selectors = _instance_target_ids(iid)
+                tsels = _instance_target_ids(iid)
             except BridgeError as exc:
-                rows.append({"instance": iid, "ok": False, "error": f"list targets: {exc}"})
-                continue
-            if not target_selectors:
-                rows.append({"instance": iid, "ok": False, "error": "no targets open"})
-                continue
+                plan["error"] = f"list targets: {exc}"
+                return plan
+            if not tsels:
+                plan["error"] = "no targets open"
+                return plan
+            plan["tsels"] = tsels
         elif fan_instances and not explicit_target:
-            # #368 facet 1: a SURVEY across instances must not silently drop a
-            # MULTI-target instance to an "ambiguous target" error row. Peek the
-            # instance's targets: survey ALL of them when there's more than one
-            # (so coverage is complete), else fall back to the normal single
-            # resolve. An explicit -t still applies that selector to every instance.
+            # #368 facet 1: don't drop a MULTI-target instance to an "ambiguous
+            # target" error -- survey ALL its targets when there's more than one,
+            # else fall back to the normal single resolve. An explicit -t still
+            # applies that selector to every instance.
             try:
                 ids = _instance_target_ids(iid)
             except BridgeError:
                 ids = None
             if ids and all(i is not None for i in ids):
-                # Reuse the peeked target ids directly -- avoids a SECOND
-                # list_targets round-trip via the implicit-target resolve for
-                # single-target instances. Auto-expand discloses only the >1 case.
-                target_selectors = ids
-                if len(ids) > 1:
-                    auto_expanded.append(iid)
+                plan["tsels"] = ids
+                plan["auto"] = len(ids) > 1
             else:
-                target_selectors = [None]   # peek failed / 0 targets -> normal resolve
+                plan["tsels"] = [None]   # peek failed / 0 targets -> normal resolve
         else:
-            target_selectors = [None]  # resolve the single target normally below
+            plan["tsels"] = [None]  # resolve the single target normally below
+        return plan
 
-        for tsel in target_selectors:
-            work_items.append((iid, tsel))
+    if len(instance_ids) <= 1:
+        plans = [_plan_instance(iid) for iid in instance_ids]
+    else:
+        with ThreadPoolExecutor(max_workers=min(8, len(instance_ids))) as pool:
+            plans = list(pool.map(_plan_instance, instance_ids))
+
+    # Flatten to ordered units; an enumeration error keeps its slot so the final
+    # row order stays deterministic (instance order), regardless of which reads
+    # finish first under the pool.
+    units: list[tuple[str, Any]] = []   # ("error", row) | ("work", (iid, tsel))
+    auto_expanded: list[Any] = []       # multi-target instances surveyed in full (#368)
+    for plan in plans:
+        iid = plan["iid"]
+        if plan.get("auto"):
+            auto_expanded.append(iid)
+        if "error" in plan:
+            units.append(("error", {"instance": iid, "ok": False, "error": plan["error"]}))
+            continue
+        for tsel in plan["tsels"]:
+            units.append(("work", (iid, tsel)))
 
     def _run_one(item: tuple[Any, Any]) -> dict[str, Any]:
         iid, tsel = item
@@ -1042,17 +1058,25 @@ def _fanout_call(
         row["duration_ms"] = round((time.monotonic() - start) * 1000, 1)
         return row
 
-    # Run the per-(instance,target) reads CONCURRENTLY with a bounded pool: each
-    # is an independent socket round-trip to a distinct bridge, so a serial sweep
-    # over many instances made broad surveys feel wedged (#417). Order is
-    # preserved (ThreadPoolExecutor.map) so output stays deterministic; a single
-    # item skips the pool entirely. Fan-out is read-only (the @command fanout flag
-    # is rejected on mutating commands), so concurrent execution is safe.
+    # Phase 2 -- EXECUTE the reads CONCURRENTLY with a bounded pool: each is an
+    # independent socket round-trip to a distinct bridge, so a serial sweep over
+    # many instances made broad surveys feel wedged (#417). A single item skips
+    # the pool. Fan-out is read-only (the @command fanout flag is rejected on
+    # mutating commands), so concurrent execution is safe.
+    work_items = [payload for kind, payload in units if kind == "work"]
     if len(work_items) <= 1:
-        rows.extend(_run_one(item) for item in work_items)
+        executed = [_run_one(item) for item in work_items]
     else:
         with ThreadPoolExecutor(max_workers=min(8, len(work_items))) as pool:
-            rows.extend(pool.map(_run_one, work_items))
+            executed = list(pool.map(_run_one, work_items))
+
+    # Assemble rows in unit order: enumeration-error rows keep their slot, the
+    # executed reads fill the rest -- so output order is stable (instance order)
+    # even though the reads completed out of order under the pool.
+    rows: list[dict[str, Any]] = []
+    executed_iter = iter(executed)
+    for kind, payload in units:
+        rows.append(payload if kind == "error" else next(executed_iter))
 
     ok_count = sum(1 for r in rows if r.get("ok"))
     result = {"kind": "fanout", "command": op, "count": len(rows),

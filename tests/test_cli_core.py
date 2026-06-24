@@ -952,6 +952,37 @@ def test_fanout_reports_per_row_duration_and_slow_rows(monkeypatch, capsys):
     assert by["b"]["duration_ms"] >= 50  # ~the 50ms sleep
 
 
+def test_fanout_preserves_instance_order_with_enumeration_error(monkeypatch, capsys):
+    # #417 review: an enumeration error (list_targets fails for one instance) must
+    # keep its slot so the rows stay in instance order, even though the successful
+    # reads complete out of order under the concurrent pool.
+    import json as _json
+    import types as _types
+    import bn.cli as cli
+    from bn.transport import BridgeError
+
+    insts = [_types.SimpleNamespace(instance_id=x) for x in ("a", "b", "c")]
+    monkeypatch.setattr(cli, "list_instances", lambda: insts)
+    monkeypatch.setattr(cli, "instance_selector", lambda i: i.instance_id)
+
+    def fake_send(op, *, params=None, target=None, instance_id=None, **k):
+        if op == "list_targets":
+            if instance_id == "b":
+                raise BridgeError("down")  # enumeration fails for b
+            return {"result": [{"target_id": instance_id + "-t"}]}
+        return {"result": {"kind": "sections", "items": [], "total": 0}}
+    monkeypatch.setattr(cli, "send_request", fake_send)
+
+    rc = cli.main(["sections", "--all-instances", "--all-targets", "--format", "json"])
+    assert rc == 0
+    out = _json.loads(capsys.readouterr().out)
+    order = [r["instance"] for r in out["instances"]]
+    assert order == ["a", "b", "c"]           # b's enumeration error kept its slot
+    by = {r["instance"]: r for r in out["instances"]}
+    assert by["b"]["ok"] is False and "down" in by["b"]["error"]
+    assert by["a"]["ok"] is True and by["c"]["ok"] is True
+
+
 def test_fanout_all_instances_auto_surveys_despite_sticky_target_pin(monkeypatch, capsys):
     # #368 review (HIGH): a STICKY target pin must NOT count as an explicit -t.
     # _apply_sticky_defaults fills args.target from session state and marks it
