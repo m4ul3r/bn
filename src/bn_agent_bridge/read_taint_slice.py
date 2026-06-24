@@ -331,7 +331,13 @@ def _build_backward_trace(
                                     view=view,
                                     _call_depth=_call_depth + 1,
                                     base_depth=depth + 1,
-                                    seed_addr=int(getattr(def_insn, "address", 0)),
+                                    # The callee's seed = its RETURN vars; the
+                                    # caller's call-site address belongs to a
+                                    # different function's address space, so it must
+                                    # NOT be used to order the callee's own calls.
+                                    # Leave the seed ungated (None); intra-callee
+                                    # enqueues still carry callee-local addresses.
+                                    seed_addr=None,
                                 )
                                 for ct in callee_trace:
                                     ct.setdefault("function_context", callee.name)
