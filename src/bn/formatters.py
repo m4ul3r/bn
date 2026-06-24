@@ -646,7 +646,11 @@ def _render_target_choices(value: Any) -> str:
 def _render_instance_use_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    return f"instance: {value.get('instance_id', '<unknown>')}"
+    line = f"instance: {value.get('instance_id', '<unknown>')}"
+    cleared = value.get("cleared_target_pin")
+    if cleared:
+        line += f"\ncleared stale target pin {cleared!r} (belonged to the previous instance)"
+    return line
 
 
 def _render_target_use_text(value: Any) -> str:
@@ -1339,6 +1343,11 @@ def _render_fanout_text(value: Any, inner_renderer: Callable[[Any], str] | None 
     ok = sum(1 for r in rows if isinstance(r, dict) and r.get("ok"))
     lines = [f"fan-out: {value.get('command', '?')} — {len(rows)} result(s) "
              f"({ok} ok, {len(rows) - ok} failed)"]
+    expanded = value.get("auto_expanded_instances")
+    if expanded:
+        # #368: be explicit that a multi-target instance was surveyed in full, so
+        # extra rows for one instance read as complete coverage, not a duplicate.
+        lines.append(f"  (surveyed all targets of multi-target instance(s): {', '.join(map(str, expanded))})")
     for r in rows:
         if not isinstance(r, dict):
             continue

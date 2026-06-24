@@ -606,8 +606,20 @@ def _instance_use(args: argparse.Namespace) -> int:
     # left no pin and bare commands kept failing with "Multiple instances".
     # instance_selector() maps None -> "default", which resolution honors (#93).
     resolved = cli.instance_selector(matches[0])
+    state = cli.session_state.read()
+    prev_instance = state.get("instance_id")
+    prev_target = state.get("target")
     cli.session_state.update(instance_id=resolved)
     result: Any = {"instance_id": resolved, "set": True}
+    # #368 facet 3: a sticky target pin belongs to the instance it was set under.
+    # When switching FROM a DIFFERENT pinned instance, clear it -- otherwise a
+    # coincidentally matching selector in the new instance silently resolves a bare
+    # command to a semantically different target. (Same-instance re-pin keeps it;
+    # a first instance pin with no prior pinned instance is not a switch, so keep it
+    # too -- prev_instance is None there, and None != resolved must NOT clear.)
+    if prev_target and prev_instance is not None and prev_instance != resolved:
+        cli.session_state.update(target=None)
+        result["cleared_target_pin"] = prev_target
     cli._emit_result(args, result, text_renderer=_render_instance_use_text, stem="instance-use")
     return 0
 
