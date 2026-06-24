@@ -1156,6 +1156,42 @@ def test_dispatch_passes_boolean_fn_pointer_scan_unchanged(monkeypatch):
     assert seen == [False, False, True]
 
 
+def test_dispatch_rejects_non_boolean_go_functions_flags(monkeypatch):
+    # Raw JSON params must be real booleans: "summary"/"count_only": "false" is
+    # truthy under bool() and would silently return the wrong (summary/count)
+    # shape. Reject string booleans as invalid_request (#413).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    for flag in ("summary", "count_only"):
+        for bad in ("false", "true", 0, 1, "", "yes"):
+            with pytest.raises(bridge.OperationFailure) as exc:
+                instance._dispatch_on_main("go_functions", {flag: bad}, None)
+            assert exc.value.status == "invalid_request"
+
+
+def test_dispatch_passes_boolean_go_functions_flags_unchanged(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    seen: list[tuple[bool, bool]] = []
+
+    def fake_go_functions(target, *, offset=0, limit=None, count_only=False, summary=False):
+        seen.append((count_only, summary))
+        return {"target": target, "items": []}
+
+    monkeypatch.setattr(instance, "_go_functions", fake_go_functions)
+
+    instance._dispatch_on_main("go_functions", {}, None)
+    instance._dispatch_on_main(
+        "go_functions", {"count_only": True, "summary": False}, None
+    )
+    instance._dispatch_on_main(
+        "go_functions", {"count_only": False, "summary": True}, None
+    )
+
+    assert seen == [(False, False), (True, False), (False, True)]
+
+
 def test_validate_bool_accepts_real_booleans_and_default(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     assert bridge._validate_bool(None, label="quick", default=True) is True

@@ -2650,8 +2650,8 @@ def _bind_go_functions(bridge, params, target):
         target,
         offset=int(params.get("offset", 0)),
         limit=int(params["limit"]) if params.get("limit") is not None else None,
-        count_only=bool(params.get("count_only", False)),
-        summary=bool(params.get("summary", False)),
+        count_only=_validate_bool(params.get("count_only"), label="count_only", default=False),
+        summary=_validate_bool(params.get("summary"), label="summary", default=False),
     )
 
 
