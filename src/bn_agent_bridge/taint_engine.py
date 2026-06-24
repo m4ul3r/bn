@@ -658,6 +658,15 @@ class TaintEngine:
         self._thunk_cache: dict[int, Any] = {}
         # Per-function unlifted-instruction scan, cached by function start (#206).
         self._unimpl_cache: dict[int, list[int]] = {}
+        # _buffer_target is purely STRUCTURAL (it resolves a pointer expr to its
+        # buffer key via the SSA def graph; it never reads the taint set), but the
+        # forward fixpoint reaches it -- via _pointee_tainted -- on every escape
+        # check every iteration, so it dominates large-function runs (#420).
+        # Memoize it per (function, SSA expr_index): the result is identical on
+        # every pass. Keyed by the function token set on entry to a fixpoint run so
+        # interprocedural descent into a callee can't alias a caller's expr_index.
+        self._bt_cache: dict[Any, Any] = {}
+        self._bt_func_token: Any = None
 
     # -- shared resolution ------------------------------------------------
 
@@ -1342,7 +1351,25 @@ class TaintEngine:
         """Resolve a pointer expr to ``(key, label)`` for the buffer it points at:
         a stack Variable (preferred — keeps its name), a writable global, or a
         heap buffer keyed by allocation site. None if none. The key is what taint
-        nodes are keyed on; label is for provenance."""
+        nodes are keyed on; label is for provenance.
+
+        Memoized per ``(function, SSA expr_index)`` (#420): the resolution is purely
+        structural -- it walks the SSA def graph and never consults the taint set --
+        so it is identical on every fixpoint pass, yet the forward fixpoint reaches
+        it (through ``_pointee_tainted``) on every escape check every iteration,
+        where it dominates large-function runs. The function token is set on entry
+        to each fixpoint run so a callee's expr_index can't alias a caller's."""
+        tok = self._bt_func_token
+        xi = getattr(expr, "expr_index", None)
+        ck = (tok, xi) if (tok is not None and xi is not None) else None
+        if ck is not None and ck in self._bt_cache:
+            return self._bt_cache[ck]
+        result = self._buffer_target_impl(ssaf, expr)
+        if ck is not None:
+            self._bt_cache[ck] = result
+        return result
+
+    def _buffer_target_impl(self, ssaf: Any, expr: Any):
         pv = self._pointee_var(ssaf, expr)
         if pv is not None:
             return (var_key(pv), var_label(pv))
@@ -2856,12 +2883,18 @@ class TaintEngine:
             return cached
         self._cache[key] = None  # mark in-progress (cycle guard)
         locators = [{"kind": "param", "index": i} for i in sorted(param_set)]
+        # _run_forward(callee) repoints self._bt_func_token at the callee; restore
+        # the caller's token afterward so its fixpoint keeps hitting its own cache
+        # entries (the #420 _buffer_target memo is keyed by this token).
+        saved_tok = self._bt_func_token
         try:
             sub = self._run_forward(callee, locators, depth, max_depth, top=False)
         except TaintError as exc:
             sub = {"reached_return": True, "out_params": frozenset(), "findings": [], "leaves": [],
                    "assumptions": [f"could not analyze {callee.name}: {exc}; return conservatively tainted"],
                    "frontier": f"body could not be analyzed ({exc})"}
+        finally:
+            self._bt_func_token = saved_tok
         self._cache[key] = sub
         return sub
 
@@ -3080,6 +3113,14 @@ class TaintEngine:
         instrs = self._instrs(ssaf)
         self._funcs_visited.add(int(getattr(func, "start", 0)))
         self._max_depth_seen = max(self._max_depth_seen, depth)
+        # Scope the structural _buffer_target cache to THIS function so a callee's
+        # expr_index can't collide with a caller's (#420). _summarize saves/restores
+        # this token around the one recursive descent call. A falsy start (only
+        # degenerate fakes -- real BN functions have distinct nonzero starts) leaves
+        # the token None so _buffer_target bypasses the cache instead of colliding
+        # every such function on token 0.
+        _start = getattr(func, "start", None)
+        self._bt_func_token = int(_start) if _start else None
 
         tainted: set[tuple] = set()
         why: dict[tuple, dict[str, Any]] = {}

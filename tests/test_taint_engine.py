@@ -1103,6 +1103,47 @@ def test_forward_vararg_no_double_report(models):
     assert len(sprintf_arg2) == 1
 
 
+def test_forward_memoizes_buffer_target_across_fixpoint(models):
+    # #420: _buffer_target is purely STRUCTURAL (it resolves a pointer expr to its
+    # buffer key via the SSA def graph and never reads the taint set), yet the
+    # forward fixpoint reaches it -- through _pointee_tainted's escape check -- on
+    # every instruction with no tainted reads, every pass. It must be resolved once
+    # per (function, expr), not once per pass. The tainted store below forces the
+    # fixpoint to run >=2 passes, so a non-memoized resolver would re-run the
+    # recursive resolution of `&buf` on each pass.
+    p = FVar("p"); buf = FVar("buf", typ="char[0x40]"); t = FVar("t")
+    q = FVar("q"); buf2 = FVar("buf2", typ="char[0x40]")
+    p1 = FSSA(p, 1); t1 = FSSA(t, 1); q1 = FSSA(q, 1)
+    addr_buf = FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)
+    addr_buf.expr_index = 10  # real BN exprs carry a stable per-function expr_index
+    instrs = [
+        # no tainted reads -> hits the escape check -> _buffer_target(&buf) each pass
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "t#1 = &buf", writes=[t1], src=addr_buf),
+        FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "q#1 = &buf2", writes=[q1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf2", src=buf2)),
+        # a tainted store forces the fixpoint to run a second confirming pass
+        FInstr(2, 0x18, "MLIL_STORE_SSA", "[q#1] = p#1", reads=[p1], writes=[],
+               dest=FExpr("MLIL_VAR_SSA", "q#1", reads=[q1])),
+    ]
+    func = FFunc("f", 0x10, FSSAFunc(instrs), params=[p])
+    engine = te.TaintEngine(FBV({}), models)
+
+    impl_calls: list[int] = []
+    orig = engine._buffer_target_impl
+
+    def counting(ssaf, expr):
+        if getattr(expr, "expr_index", None) == 10:
+            impl_calls.append(10)
+        return orig(ssaf, expr)
+
+    engine._buffer_target_impl = counting
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert isinstance(result, dict)
+    # `&buf` is resolved exactly once across the multi-pass fixpoint -- it would be
+    # >=2 without the per-(function, expr) memo.
+    assert impl_calls.count(10) == 1, impl_calls
+
+
 class FBVStr(FBV):
     """FBV that can also resolve a constant string by address (for format-string
     aware vararg gating)."""
