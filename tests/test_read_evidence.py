@@ -881,7 +881,10 @@ def test_init_arrays_surfaces_pe_tls_callbacks(monkeypatch):
     # must show in evidence init as pointer-table evidence, not be silently omitted.
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    cb1, cb2 = 0x1000, 0x1100
+    # codex review: HIGH callback VAs (> 0xFFFFFFFF) so a 4-byte misread would
+    # truncate them to their low dword. _FakeBV reports a 4-byte pointer size, so
+    # without an explicit 8-byte read_width the PE32+ pointer table truncates.
+    cb1, cb2 = 0x1_4000_1000, 0x1_4000_2000
     f1 = _FakeFunction(cb1, "tls_cb1"); f2 = _FakeFunction(cb2, "tls_cb2")
     # crafted PE32+ headers at base 0: MZ -> e_lfanew -> "PE\0\0" -> opt magic 0x20b
     # -> data directory[9] (TLS) RVA -> IMAGE_TLS_DIRECTORY -> AddressOfCallBacks.
@@ -906,6 +909,9 @@ def test_init_arrays_surfaces_pe_tls_callbacks(monkeypatch):
     assert tls[0]["total_entries"] == 2     # null-terminated array of 2
     names = [r["target"]["function"]["name"] for r in tls[0]["table"]["items"]]
     assert names == ["tls_cb1", "tls_cb2"]
+    # the full 8-byte VAs must survive (a 4-byte misread would mangle them)
+    targets = [int(r["target"]["normalized"], 16) for r in tls[0]["table"]["items"]]
+    assert targets == [cb1, cb2]
 
 
 def test_init_arrays_no_tls_item_for_non_pe(monkeypatch):

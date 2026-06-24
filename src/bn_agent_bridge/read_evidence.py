@@ -903,8 +903,12 @@ def _init_arrays(ctx, selector: str | None, *, limit: int = 64):
     tls = _pe_tls_callbacks(bv)
     if tls is not None:
         shown = min(tls["count"], limit)
+        # read_width pinned to the TLS pointer size: on a PE32+ the callbacks are
+        # 8-byte VAs, but bv/arch may report a 4-byte address_size, which would
+        # default read_width to 4 and truncate the high callback VAs (codex review).
         table = _pointer_table_for_view(
             ctx, bv, tls["address"], entries=shown, stride_size=tls["ptr_size"],
+            read_width=tls["ptr_size"],
         )
         sections.append(
             {

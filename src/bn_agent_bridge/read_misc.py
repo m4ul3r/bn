@@ -196,16 +196,17 @@ def _defined_symbol_names(bv) -> set[str]:
     imports survey (#202). Keyed on ``raw_name`` because that's what the import
     veneer and GOT slot carry too.
 
-    A Function/Data symbol that sits AT an import address (an
-    ImportedFunctionSymbol / ImportAddressSymbol address) is an import VENEER --
-    on PE64 BN co-names the IAT jump-thunk (FunctionSymbol) AND a data veneer
-    (DataSymbol) with the import at its very address -- NOT a real local
+    A Function/Data symbol that sits AT an import address (an ImportedFunction /
+    ImportedData / ImportAddress symbol address) is an import VENEER -- on PE64 BN
+    co-names the IAT jump-thunk (FunctionSymbol) AND a data veneer
+    (DataSymbol, sharing an ImportedDataSymbol address) with the import at its
+    very address -- NOT a real local
     definition, so it is excluded here (#379). Otherwise the #202 filter would
     drop the genuine import and leave a near-empty PE import list. A real #202
     self-export def sits at its own .text/.data address, distinct from the
     veneer, so it is kept."""
     import_addrs: set[int] = set()
-    for attr in ("ImportedFunctionSymbol", "ImportAddressSymbol"):
+    for attr in ("ImportedFunctionSymbol", "ImportedDataSymbol", "ImportAddressSymbol"):
         sym_type = getattr(bn.SymbolType, attr, None)
         if sym_type is None:
             continue
