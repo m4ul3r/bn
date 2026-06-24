@@ -1196,6 +1196,34 @@ def test_backward_slice_out_param_caveat_stack_struct_one_hop(monkeypatch):
     assert term["out_param_callee"] == "parse_record"
 
 
+def test_backward_slice_out_param_caveat_requires_call_before_read(monkeypatch):
+    """#416 ordering: a call that takes `&local` AFTER the value was read is not its
+    source, so no caveat fires (guards the `use(rec.len); audit(&rec)` and
+    `sink(rec.len, &rec)` false positives)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    rec = _FakeSSAVariable("rec#2")
+    length = _FakeSSAVariable("len#3")
+    len_def = _FakeMLILInsn(0x2020, operation="MLIL_SET_VAR_SSA", vars_read=[rec])
+    sink = _FakeMLILInsn(
+        0x2030, operation="MLIL_CALL_SSA",
+        params=[_FakeMLILInsn(0x2030, operation="MLIL_VAR_SSA", vars_read=[length])],
+        vars_read=[length])
+    audit = _FakeMLILInsn(  # takes &rec, but AFTER the read at 0x2020
+        0x2040, operation="MLIL_CALL_SSA",
+        params=[_FakeMLILInsn(0x2040, operation="MLIL_ADDRESS_OF", src=rec)])
+    fn = _FakeFunction(0x2000, "caller")
+    fn.medium_level_il = _FakeMLILFunction([len_def, sink, audit], definitions={length: len_def})
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.read_taint_slice, "_callee_display_name",
+                        lambda ctx, bv, ins: "audit")
+
+    result = instance._backward_slice("active", "caller", "0x2030", arg_index=0, interprocedural=True)
+
+    assert result["trace"][-1]["reason"] != "interprocedural_out_param_not_followed"
+
+
 def test_backward_slice_out_param_caveat_only_interprocedural(monkeypatch):
     """Without --interprocedural the out-param caveat does not fire; the load reads
     as a plain memory_load, preserving prior behavior."""
@@ -1914,14 +1942,22 @@ def test_backward_slice_out_of_range_notes_stack_passed_varargs_324(monkeypatch)
     assert "STACK" in msg and "likely passed on" in msg
     assert "llil" in msg and "#324" in msg
 
-    # arg 5 is BELOW the 6 register args but BEYOND the 2 recovered params: a
+    # arg 2 is exactly the FIRST register slot BN did not recover (n=2 params): a
     # register arg likely dropped by a narrow prototype, not a stack arg. It gets
     # the (hedged) register-drop note pointing at LLIL, never the STACK note.
     with pytest.raises(bridge.OperationFailure) as exc2:
-        instance._backward_slice("active", "logger_caller", "0x10010", arg_index=5)
+        instance._backward_slice("active", "logger_caller", "0x10010", arg_index=2)
     msg2 = str(exc2.value)
     assert "STACK" not in msg2
     assert "register-passed arg BN dropped" in msg2 and "#324" in msg2 and "llil" in msg2
+
+    # arg 5 is below the 6 register args but BEYOND the first-missing slot -- a
+    # genuinely low-arity call where the index is simply out of range. No note
+    # (gating on arg_index == n avoids nagging on every low-arity call; #324).
+    with pytest.raises(bridge.OperationFailure) as exc3:
+        instance._backward_slice("active", "logger_caller", "0x10010", arg_index=5)
+    msg3 = str(exc3.value)
+    assert "STACK" not in msg3 and "register-passed arg BN dropped" not in msg3
 
 
 def test_callgraph_result_carries_kind_envelope(monkeypatch):
