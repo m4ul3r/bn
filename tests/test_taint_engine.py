@@ -3521,6 +3521,78 @@ def test_forward_heap_buffer_store_read_correlates_319a(models):
     assert sinks[0]["class"] == "command_injection"
 
 
+def _elem_addr(ptr_ssa, idx_ssa, field):
+    # [ptr + idx*0x20 + field] -- a descriptor-array element field at a symbolic
+    # (loop-counter) index, stride 0x20 (the http_hdr / iovec descriptor shape).
+    mul = FExpr("MLIL_MUL", "idx*0x20", reads=[idx_ssa],
+                left=FExpr("MLIL_VAR_SSA", "idx", reads=[idx_ssa]),
+                right=FExpr("MLIL_CONST", "0x20", constant=0x20))
+    base_plus_idx = FExpr("MLIL_ADD", "ptr+idx*0x20", reads=[ptr_ssa, idx_ssa],
+                          left=FExpr("MLIL_VAR_SSA", "ptr", reads=[ptr_ssa]), right=mul)
+    return FExpr("MLIL_ADD", f"ptr+idx*0x20+{hex(field)}", reads=[ptr_ssa, idx_ssa],
+                 left=base_plus_idx, right=FExpr("MLIL_CONST", hex(field), constant=field))
+
+
+def test_forward_descriptor_array_elem_store_read_correlates_319b(models):
+    # arr[i].val = src; ...; x = arr[j].val; system(x). A tainted store into a
+    # descriptor-array element field at a symbolic index, then a read of THAT field
+    # at a (different) symbolic index, must correlate via the (array-base, field)
+    # key so system(x) is reached -- previously the store dropped to a coarse
+    # frontier and the read saw an untainted element (#319b under-reporting).
+    src = FVar("src"); src0 = FSSA(src, 0)
+    arr = FVar("arr")
+    ap = FVar("ap"); ap1 = FSSA(ap, 1)
+    i = FVar("i"); i0 = FSSA(i, 0)
+    j = FVar("j"); j0 = FSSA(j, 0)
+    x = FVar("x"); x1 = FSSA(x, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "ap#1 = &arr", writes=[ap1],
+               src=FExpr("MLIL_ADDRESS_OF", "&arr", src=arr)),
+        FInstr(1, 0x14, "MLIL_STORE_SSA", "[ap + i*0x20 + 0x10] = src#0", reads=[src0],
+               dest=_elem_addr(ap1, i0, 0x10),
+               src=FExpr("MLIL_VAR_SSA", "src#0", reads=[src0])),
+        FInstr(2, 0x18, "MLIL_SET_VAR_SSA", "x#1 = [ap + j*0x20 + 0x10]", writes=[x1],
+               src=FExpr("MLIL_LOAD_SSA", "[ap + j*0x20 + 0x10]", src=_elem_addr(ap1, j0, 0x10))),
+        FInstr(3, 0x1c, "MLIL_CALL_SSA", "system(x#1)", reads=[x1],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_VAR_SSA", "x#1", reads=[x1])]),
+    ]
+    func = FFunc("fill_use", 0x10, FSSAFunc(instrs), params=[src])
+    engine = te.TaintEngine(FBV({0x900: "system"}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    sysk = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "system"]
+    assert len(sysk) == 1, result.get("reached_sinks")
+    assert sysk[0]["class"] == "command_injection"
+
+
+def test_forward_descriptor_array_elem_distinct_field_not_linked_319b(models):
+    # Flood guard: a store to field +0x10 must NOT taint a read of a DIFFERENT
+    # field +0x18 of the same array -- per-field keying keeps disjoint fields apart.
+    src = FVar("src"); src0 = FSSA(src, 0)
+    arr = FVar("arr")
+    ap = FVar("ap"); ap1 = FSSA(ap, 1)
+    i = FVar("i"); i0 = FSSA(i, 0)
+    j = FVar("j"); j0 = FSSA(j, 0)
+    x = FVar("x"); x1 = FSSA(x, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "ap#1 = &arr", writes=[ap1],
+               src=FExpr("MLIL_ADDRESS_OF", "&arr", src=arr)),
+        FInstr(1, 0x14, "MLIL_STORE_SSA", "[ap + i*0x20 + 0x10] = src#0", reads=[src0],
+               dest=_elem_addr(ap1, i0, 0x10),
+               src=FExpr("MLIL_VAR_SSA", "src#0", reads=[src0])),
+        FInstr(2, 0x18, "MLIL_SET_VAR_SSA", "x#1 = [ap + j*0x20 + 0x18]", writes=[x1],
+               src=FExpr("MLIL_LOAD_SSA", "[ap + j*0x20 + 0x18]", src=_elem_addr(ap1, j0, 0x18))),
+        FInstr(3, 0x1c, "MLIL_CALL_SSA", "system(x#1)", reads=[x1],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_VAR_SSA", "x#1", reads=[x1])]),
+    ]
+    func = FFunc("fill_use", 0x10, FSSAFunc(instrs), params=[src])
+    engine = te.TaintEngine(FBV({0x900: "system"}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    sysk = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "system"]
+    assert sysk == [], result.get("reached_sinks")
+
+
 def _quote_callee(*, taint_store=True, addr=0x500, alloc_addr=0x900):
     # quote(s): out = ecalloc(0x40, 1); [*out = s;] return out
     # The strdup / shell_quote idiom -- fill a heap buffer with the tainted arg and

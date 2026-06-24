@@ -1021,6 +1021,158 @@ class TaintEngine:
                 return True
         return False
 
+    def _is_scaled_index(self, ssaf: Any, expr: Any, depth: int = 0) -> bool:
+        """*expr* is a stride-scaled index ``i * const`` / ``i << const`` (taint-
+        AGNOSTIC -- the index of a descriptor-array element is usually a plain loop
+        counter, not tainted). A base pointer is never multiplied/shifted by a
+        stride, so this is the unambiguous array-element-access signal. Follows one
+        SSA copy hop so a `t = idx*0x20` temp is recognized."""
+        if expr is None or depth > 6:
+            return False
+        op = op_name(expr)
+        if op in ("MLIL_MUL", "MLIL_LSL"):
+            if self._int_const(getattr(expr, "right", None)) is not None:
+                return True
+            if op == "MLIL_MUL" and self._int_const(getattr(expr, "left", None)) is not None:
+                return True
+        var = expr if is_ssa_var(expr) else None
+        if var is None:
+            # an MLIL_VAR_SSA expression wrapper (what an ADD operand actually is)
+            reads = expr_reads(expr)
+            var = reads[0] if len(reads) == 1 else None
+        if var is not None:
+            try:
+                d = ssaf.get_ssa_var_definition(var)
+            except Exception:
+                d = None
+            if d is not None and op_name(d) == "MLIL_SET_VAR_SSA":
+                return self._is_scaled_index(ssaf, getattr(d, "src", None), depth + 1)
+        return False
+
+    def _elem_addr_parts(self, ssaf: Any, expr: Any, field: int = 0, seen: set | None = None,
+                         depth: int = 0):
+        """Strip a stride-scaled array index and constant field offset from a
+        DESCRIPTOR-ARRAY element address, returning ``(base_expr, field_offset)``.
+        Recognizes both element-address shapes:
+          - explicit index: ``base + idx*stride (+ field)`` -- one ADD operand is a
+            stride-scaled index (_is_scaled_index), the other is the base;
+          - running pointer: ``p = ϕ(base, p + stride); [p + field]`` -- a loop-
+            carried pointer whose PHI has a self+const stride increment; the base is
+            the PHI's entry operand (back-edge cut by *seen*).
+        Requires the scaled-index / stride signal, so a plain ``base + const`` or
+        ``ptr + offset_var`` does NOT match (those are the existing pointee/buffer
+        cases) -- this keeps element keying off arbitrary `[reg+off]` loads. Returns
+        None when there is no array-element signal."""
+        if expr is None or depth > 12:
+            return None
+        if seen is None:
+            seen = set()
+        op = op_name(expr)
+        if op in ("MLIL_ADD", "MLIL_SUB"):
+            left = getattr(expr, "left", None)
+            right = getattr(expr, "right", None)
+            rc = self._int_const(right)
+            if rc is not None:
+                return self._elem_addr_parts(ssaf, left, field + (rc if op == "MLIL_ADD" else -rc),
+                                             seen, depth + 1)
+            lc = self._int_const(left)
+            if lc is not None and op == "MLIL_ADD":
+                return self._elem_addr_parts(ssaf, right, field + lc, seen, depth + 1)
+            # neither operand constant: one is the stride-scaled index, the other
+            # the base pointer.
+            for base_cand, idx_cand in ((left, right), (right, left)):
+                if self._is_scaled_index(ssaf, idx_cand):
+                    return (base_cand, field)
+            return None
+        if is_ssa_var(expr):
+            vk = self._ssa_var_key(expr)
+            if vk in seen:
+                return None
+            seen.add(vk)
+            try:
+                d = ssaf.get_ssa_var_definition(expr)
+            except Exception:
+                d = None
+            if d is None:
+                return None
+            dop = op_name(d)
+            if dop == "MLIL_SET_VAR_SSA":
+                return self._elem_addr_parts(ssaf, getattr(d, "src", None), field, seen, depth + 1)
+            if "PHI" in dop:
+                # A loop-carried element pointer, in either compiler shape:
+                #   (a) recomputed:  ϕ(base, base + idx*stride) -- one operand is
+                #       itself an element address (base + scaled index);
+                #   (b) running ptr: ϕ(base, self + stride) -- one operand is
+                #       `self ± const`, the other is the entry base.
+                operands = getattr(d, "src", None) or []
+                # (a): an operand that resolves as an element address gives the base.
+                for sv in operands:
+                    if self._ssa_var_key(sv) in seen:
+                        continue
+                    r = self._elem_addr_parts(ssaf, sv, field, seen, depth + 1)
+                    if r is not None:
+                        return r
+                # (b): the stride-bump operand confirms iteration; the OTHER is base.
+                entry = None
+                has_stride = False
+                for sv in operands:
+                    if self._is_self_plus_const(ssaf, sv, expr):
+                        has_stride = True
+                    elif entry is None:
+                        entry = sv
+                if has_stride and entry is not None:
+                    return (entry, field)
+            return None
+        reads = expr_reads(expr)
+        if len(reads) == 1:
+            return self._elem_addr_parts(ssaf, reads[0], field, seen, depth + 1)
+        return None
+
+    def _is_self_plus_const(self, ssaf: Any, sv: Any, phi_var: Any, depth: int = 0) -> bool:
+        """*sv* (a PHI operand) is ``phi_var (+/-) const`` -- the running-pointer
+        stride increment -- so its def chases back through copies/`+const` to
+        phi_var itself."""
+        if sv is None or depth > 8:
+            return False
+        if is_ssa_var(sv) and self._ssa_var_key(sv) == self._ssa_var_key(phi_var):
+            return depth > 0  # reached phi_var THROUGH a +const step, not the bare operand
+        if is_ssa_var(sv):
+            try:
+                d = ssaf.get_ssa_var_definition(sv)
+            except Exception:
+                d = None
+            if d is not None and op_name(d) == "MLIL_SET_VAR_SSA":
+                return self._is_self_plus_const(ssaf, getattr(d, "src", None), phi_var, depth + 1)
+            return False
+        op = op_name(sv)
+        if op in ("MLIL_ADD", "MLIL_SUB"):
+            left = getattr(sv, "left", None)
+            right = getattr(sv, "right", None)
+            if self._int_const(right) is not None:
+                return self._is_self_plus_const(ssaf, left, phi_var, depth + 1)
+            if op == "MLIL_ADD" and self._int_const(left) is not None:
+                return self._is_self_plus_const(ssaf, right, phi_var, depth + 1)
+        return False
+
+    def _elem_field_key(self, ssaf: Any, addr: Any):
+        """Resolve a descriptor-array element-field address ``[base + idx*stride +
+        field]`` to a stable coarse key ``("elem", base_key, base_off + field)``.
+        Uses _addr_base_offset for the base, so an alloca'd / aligned VLA base
+        (``(rsp - n + 7) & ~7`` -- the `struct hdr[hdr_num]` idiom) that
+        _buffer_target cannot name still keys. None if *addr* is not an element
+        address or its base is unresolvable. The key conflates all elements of the
+        array's SAME field (may-analysis: a store to any element's field links a
+        load of that field at any index -- the descriptor-array correlation #319b),
+        but never two distinct arrays (distinct base keys) or two distinct fields."""
+        parts = self._elem_addr_parts(ssaf, addr)
+        if parts is None:
+            return None
+        base_expr, field = parts
+        ba = self._addr_base_offset(ssaf, base_expr)
+        if ba is None:
+            return None
+        return ("elem", ba[0], ba[1] + field)
+
     def _taint_operand_roles(self, ssaf: Any, expr: Any, tainted: set, *,
                              pointer_arg: bool = False, depth: int = 0) -> set[str]:
         """Roles in which tainted reads appear in *expr*: ``{'index'}`` and/or
@@ -2779,6 +2931,7 @@ class TaintEngine:
         out["assumptions"] = list(sub["assumptions"])
         out["reached_return"] = sub["reached_return"]
         out["out_params"] = sub.get("out_params", frozenset())
+        out["out_param_elems"] = sub.get("out_param_elems", frozenset())
         return out
 
     def _unrecovered_arg_frontier(self, ins: Any, tainted: set) -> dict[str, Any] | None:
@@ -2936,6 +3089,7 @@ class TaintEngine:
         recorded_sinks: set[tuple] = set()
         processed_calls: set[tuple] = set()  # (call_addr, tainted-arg-set) already descended
         out_params: set[int] = set()         # this func's params whose pointee got tainted
+        out_param_elems: set = set()         # (param_idx, field) descriptor-array elems filled (#319b)
         reached_return = False
 
         def add_assumption(msg: str) -> None:
@@ -3279,6 +3433,7 @@ class TaintEngine:
 
                     ret_tainted = False
                     descend_outparams: set[int] = set()
+                    descend_outparam_elems: set = set()  # (param_idx, field) #319b
                     resolved_names: list[str] = []
                     for taddr in candidates:
                         # function_at normalizes the Thumb low bit: a value-set
@@ -3350,6 +3505,7 @@ class TaintEngine:
                                 add_assumption(a)
                             ret_tainted = ret_tainted or d["reached_return"]
                             descend_outparams |= set(d.get("out_params") or ())
+                            descend_outparam_elems |= set(d.get("out_param_elems") or ())
                             resolved_names.append(report_name)
                         else:
                             if self.unknown_call_policy != "stop":
@@ -3371,6 +3527,24 @@ class TaintEngine:
                             if pidx is not None and pidx not in out_params:
                                 out_params.add(pidx)
                                 changed = True
+                    # #319b: a callee that filled a descriptor-ARRAY element field of
+                    # an array we passed in -> taint the caller-side ("elem", base,
+                    # field) key (base resolved on OUR side, so an alloca'd VLA's
+                    # alignment offset is folded in correctly), and bubble up if the
+                    # array is itself our own param.
+                    for (j, field) in descend_outparam_elems:
+                        if j < len(params):
+                            ba = self._addr_base_offset(ssaf, params[j])
+                            if ba is not None:
+                                ek = ("elem", ba[0], ba[1] + field)
+                                if taint_node((ek, None), f"elem+{hex(ek[2])}", ins,
+                                              f"descriptor-array element +{hex(field)} written "
+                                              f"by callee (out-param {j})", []):
+                                    changed = True
+                                pidx = self._resolve_to_param_index(func, ssaf, params[j])
+                                if pidx is not None and (pidx, ba[1] + field) not in out_param_elems:
+                                    out_param_elems.add((pidx, ba[1] + field))
+                                    changed = True
                     if via:
                         add_assumption(
                             f"indirect call at {hex(int(getattr(ins, 'address', 0)))} resolved via {via} to: "
@@ -3441,6 +3615,19 @@ class TaintEngine:
                                     assume = (f"recv buffer pointer re-loaded via slot {sk}; "
                                               f"correlated forward into the re-load (#193)")
                                     correlated_slots.add(sk)
+                        if msrc is None:
+                            # #319b: a load of a descriptor-array element field
+                            # `[base + idx*stride + field]` -- correlate it against a
+                            # tainted ("elem", base, field) that the array's fill (in
+                            # this function or carried from a callee) produced, so the
+                            # parser-filled hdr[] reconnects to the per-element copy.
+                            ek = self._elem_field_key(ssaf, getattr(src_expr, "src", None))
+                            if ek is not None and (ek, None) in tainted:
+                                msrc = (ek, None)
+                                reason = ("loads a tainted descriptor-array element field "
+                                          "(elem_approx)")
+                                assume = ("descriptor-array element read correlated by "
+                                          "(array base, field offset) (elem_approx)")
                         if msrc is not None:
                             for w in ssa_writes(ins):
                                 node = (var_key(w), getattr(w, "version", None))
@@ -3475,6 +3662,28 @@ class TaintEngine:
                                           "store into tainted heap buffer (alloc-site, memory_approx)", reads):
                                 changed = True
                                 add_assumption("heap buffer aliasing modeled coarsely by allocation site (memory_approx)")
+                        elif self._elem_field_key(ssaf, dest) is not None:
+                            # #319b: a tainted store to a descriptor-ARRAY element
+                            # field `[base + idx*stride + field]` -- key it by
+                            # (array-base, field) so a later read of THAT field at
+                            # any index correlates (the parser-fills-output-array
+                            # idiom that otherwise drops to a coarse frontier).
+                            ek = self._elem_field_key(ssaf, dest)
+                            if taint_node((ek, None), f"elem+{hex(ek[2])}", ins,
+                                          "store into tainted descriptor-array element "
+                                          "field (elem_approx)", reads):
+                                changed = True
+                                add_assumption("descriptor-array element modeled coarsely "
+                                               "by (array base, field offset) (elem_approx)")
+                            # If the array base is one of THIS function's params, the
+                            # caller owns the array -- carry the element-field taint
+                            # across the return (parser fills caller's hdr[]).
+                            parts = self._elem_addr_parts(ssaf, dest)
+                            if parts is not None:
+                                pidx = self._resolve_to_param_index(func, ssaf, parts[0])
+                                if pidx is not None and (pidx, parts[1]) not in out_param_elems:
+                                    out_param_elems.add((pidx, parts[1]))
+                                    changed = True
                         else:
                             # tainted store through a pointer parameter -> out-param
                             pidx = self._resolve_to_param_index(func, ssaf, dest)
@@ -3582,6 +3791,7 @@ class TaintEngine:
                 add_assumption(slot["pending"])
 
         return {"reached_return": reached_return, "out_params": frozenset(out_params),
+                "out_param_elems": frozenset(out_param_elems),
                 "findings": findings, "leaves": leaves, "assumptions": assumptions}
 
     def _reason_for(self, opn: str) -> str:
