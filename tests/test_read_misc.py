@@ -330,6 +330,36 @@ def test_imports_excludes_pic_self_defined_exports(monkeypatch):
     assert summary["self_defined_excluded"] == 2
 
 
+def test_imports_keeps_import_when_thunk_shares_its_address(monkeypatch):
+    """#379: on PE64 BN co-names the IAT jump-thunk (a FunctionSymbol) with the
+    ImportedFunctionSymbol at the SAME address. That thunk is an import veneer, not
+    a real local definition, so it must NOT suppress the genuine import -- otherwise
+    the #202 self-export filter empties a PE's whole import list."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+
+    imp = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x140007a48, "CreateFileA")
+    imp.short_name = "CreateFileA"; imp.namespace = ""
+    thunk = fake_bn.Symbol(fake_bn.SymbolType.FunctionSymbol, 0x140007a48, "CreateFileA")  # same addr -> thunk
+    thunk.short_name = "CreateFileA"
+    # a REAL local definition still suppresses its self-export veneer (#202): the
+    # def sits at its own .text address, distinct from the veneer.
+    defined = fake_bn.Symbol(fake_bn.SymbolType.FunctionSymbol, 0x401c90, "local_helper")
+    defined.short_name = "local_helper"
+    veneer = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x401980, "local_helper")
+    veneer.short_name = "local_helper"; veneer.namespace = "BNINTERNALNAMESPACE"
+
+    bv = _FakeBV(symbols=[imp, thunk, defined, veneer])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._imports(None)
+    names = [it["name"] for it in result["items"]]
+    assert "CreateFileA" in names              # genuine import kept (#379)
+    assert "local_helper" not in names         # self-export veneer still dropped (#202)
+    assert result.get("self_defined_excluded", 0) == 1   # only the real-def veneer
+
+
 def test_imports_sorts_function_kind_first_then_library_name(monkeypatch):
     # Imports order by kind usefulness (function -> data -> address) first, then
     # library/name (#07). The data symbol here has the alphabetically-EARLIER
