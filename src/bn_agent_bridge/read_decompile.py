@@ -72,10 +72,13 @@ def _forced_data_region_warning(bv, func) -> str | None:
     a DATA region BN tentatively typed as code (#371.1).
 
     The reliable signal common to the observed cases (a pointer/tag table AND
-    high-entropy packed data) is structural, not content-based: an oversized
-    region with zero inbound code refs. Byte/string heuristics miss the
-    high-entropy case, so this stays a *verify* nudge, never a "this is data"
-    verdict. Real oversized code almost always has inbound callers.
+    high-entropy packed data) is structural, not content-based: a large region
+    with zero inbound code refs AND zero inbound data refs. Byte/string
+    heuristics miss the high-entropy case, so this stays a *verify* nudge, never
+    a "this is data" verdict. Real oversized code almost always has inbound
+    callers; requiring zero DATA refs too suppresses the false positive on a
+    large `.init_array`/ctor-dispatched initializer (real code with no direct
+    callers, but pointed at by the init table -- i.e. a data ref to its start).
     """
     try:
         size = int(getattr(func, "total_bytes", 0) or 0)
@@ -84,6 +87,11 @@ def _forced_data_region_warning(bv, func) -> str | None:
     if size < _FORCED_DATA_MIN_BYTES:
         return None
     if read_xrefs._code_ref_count(bv, func.start) != 0:
+        return None
+    try:
+        if len(list(bv.get_data_refs(func.start))) != 0:
+            return None
+    except Exception:
         return None
     return (
         f"{func.name}: forced analysis decoded {size} bytes with 0 inbound code refs. "

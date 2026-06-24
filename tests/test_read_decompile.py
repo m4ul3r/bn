@@ -592,6 +592,31 @@ def test_decompile_force_analysis_no_data_warning_when_referenced(monkeypatch):
     assert not any("data region" in w.lower() for w in result["warnings"])
 
 
+def test_decompile_force_analysis_no_data_warning_for_init_array_initializer(monkeypatch):
+    # #371.1 false-positive guard (found in dogfood): a large `.init_array`/ctor
+    # initializer is real code with 0 direct CALLERS but a DATA ref from the init
+    # table pointing at its start. Requiring 0 data refs too keeps it quiet while
+    # still firing on a truly unreferenced data region (0 code AND 0 data refs).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x402000, "init_array_ctor", total_bytes=46080)
+    fn.analysis_skipped = True
+    fn.analysis_skip_reason = "ExceedFunctionSize"
+    # 0 code refs, but the init_array entry is a DATA ref to the function start.
+    bv = _FakeBV(functions=[fn], data_refs={0x402000: [object()]})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.il_format, "_comment_map", lambda bv, func: {})
+    _install_fake_pseudo_c(
+        monkeypatch, bridge, fn,
+        [[(0x402000, "void init_array_ctor()")], [(0x402000, "{")], [(0x402000, "}")]],
+    )
+
+    result = instance._decompile("active", "init_array_ctor", force_analysis=True)
+
+    assert result["analysis_forced"] is True
+    assert not any("data region" in w.lower() for w in result["warnings"])
+
+
 def test_list_functions_is_sorted_by_address(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
