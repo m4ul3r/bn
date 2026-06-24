@@ -7,6 +7,7 @@ from typing import Any
 from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _pick, _positive_depth_int, _positive_int, arg, command, mutex, preview_arg, summary_arg
 from ..formatters import (
     _render_callsites_text,
+    _disasm_linear_steer_note,
     _render_disasm_linear_text,
     _render_evidence_xrefs_text,
     _render_field_xrefs_text,
@@ -359,12 +360,14 @@ def _disasm(args: argparse.Namespace) -> int:
     if lines_range is not None:
         _require_text_format(args, slice_flag)
     base = _text_field("text")
+    sliced = lines_range is not None
     return _call(
         args,
         "disasm",
         {"identifier": args.identifier},
         require_target=True,
         text_renderer=lambda value: _resolution_note(value)
+        + _disasm_linear_steer_note(value, sliced=sliced)
         + _slice_text_lines(base(value), lines_range, flag=slice_flag),
         stem="disasm",
     )
