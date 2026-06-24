@@ -49,5 +49,8 @@ def _class_show(args: argparse.Namespace) -> int:
         args, "class_show", {"name": args.name},
         require_target=True,
         text_renderer=_render_class_show_text,
+        # #413: an ambiguous leaf still renders its matches, but exits non-zero so
+        # it can't be misread as a clean single-class success.
+        result_exit_code=lambda r: 2 if isinstance(r, dict) and r.get("ambiguous") else 0,
         stem="class-show",
     )

@@ -1885,6 +1885,28 @@ def test_write_project_marker_gated_and_git_excludes(monkeypatch, tmp_path):
     assert not list(other.glob(".bn-*"))
 
 
+def test_write_project_marker_refresh_only_does_not_create(monkeypatch, tmp_path):
+    # #391: `session restart` refreshes a marker but must NOT create a new one in
+    # a restart cwd that differs from the original session-start cwd. refresh_only
+    # writes ONLY when a marker already exists there.
+    bridge = _load_bridge(monkeypatch)
+    inst = bridge.BinaryNinjaBridge(instance_id="rs42")
+    git = tmp_path / ".git" / "info"
+    git.mkdir(parents=True)
+
+    # no existing marker -> refresh_only writes nothing
+    assert inst._write_project_marker(str(tmp_path), no_marker=False, refresh_only=True) is None
+    assert not (tmp_path / ".bn-rs42").exists()
+
+    # create one (a prior session start), then refresh_only updates it in place
+    marker = tmp_path / ".bn-rs42"
+    marker.write_text(json.dumps({"instance_id": "rs42", "socket_path": "/old", "pid": 1, "created_at": "old"}))
+    assert inst._write_project_marker(str(tmp_path), no_marker=False, refresh_only=True) is None
+    body = json.loads(marker.read_text())
+    assert body["instance_id"] == "rs42"
+    assert body["created_at"] != "old"  # refreshed
+
+
 def test_write_project_marker_readonly_dir_is_a_note_not_error(monkeypatch, tmp_path):
     bridge = _load_bridge(monkeypatch)
     inst = bridge.BinaryNinjaBridge(instance_id="ro11")

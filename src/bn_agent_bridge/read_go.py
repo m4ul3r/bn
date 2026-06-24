@@ -45,7 +45,8 @@ def _gopclntab_section(bv):
     return None
 
 
-def _go_functions(ctx, selector: str | None, *, offset: int = 0, limit: int | None = None):
+def _go_functions(ctx, selector: str | None, *, offset: int = 0, limit: int | None = None,
+                  count_only: bool = False, summary: bool = False):
     """Parse ``.gopclntab`` and return ``{name, address, defined}`` per Go
     function (#217). ``defined`` flags whether BN already has a function at the
     pclntab-derived address; when it is mostly false the binary is loaded at a
@@ -132,6 +133,7 @@ def _go_functions(ctx, selector: str | None, *, offset: int = 0, limit: int | No
 
     items: list[dict[str, Any]] = []
     defined_count = 0
+    renamable_count = 0  # #414: defined fns whose current BN name `go rename` would replace
     for i in range(nfunc):
         ent = pcln_off + i * 8
         if ent + 8 > length:
@@ -149,10 +151,30 @@ def _go_functions(ctx, selector: str | None, *, offset: int = 0, limit: int | No
         if not name:
             continue
         addr = text_start + entryoff
-        defined = bool(get_fn(addr)) if callable(get_fn) else None
+        fn_obj = get_fn(addr) if callable(get_fn) else None
+        defined = bool(fn_obj) if callable(get_fn) else None
         if defined:
             defined_count += 1
+            cur = str(getattr(fn_obj, "name", "") or "")
+            # mirror go_rename's auto-name predicate (sub_<hex> / nullsub_*): only
+            # those get renamed, and only when the Go name actually differs.
+            if (cur == f"sub_{addr:x}" or cur.startswith("nullsub_")) and name != cur:
+                renamable_count += 1
         items.append({"name": name, "address": hex(addr), "defined": defined})
+
+    if count_only:
+        # #414: cheap sizing primitive -- recovered count without the full list.
+        return {"kind": "go_functions", "count": len(items), "total": len(items),
+                "go_version": go_version}
+    text_sec = _gopclntab_text_start(bv)
+    if summary:
+        # #414: enough signal to decide whether to run `go rename`.
+        return {"kind": "go_functions_summary", "go_version": go_version,
+                "recovered": len(items), "defined": defined_count,
+                "undefined": len(items) - defined_count, "renamable": renamable_count,
+                "text_start": hex(text_start),
+                "text_start_bv": hex(text_sec) if text_sec is not None else None,
+                "pclntab": True}
 
     items.sort(key=lambda it: int(it["address"], 16))
     result = _paged_list_result(items, offset=offset, limit=limit, kind="go_functions")
@@ -160,8 +182,8 @@ def _go_functions(ctx, selector: str | None, *, offset: int = 0, limit: int | No
     result["text_start"] = hex(text_start)
     # Disclose a likely PIE/rebase mismatch so the addresses aren't trusted blindly:
     # when almost nothing resolves to a BN function, the table's textStart differs
-    # from where BN loaded the text (rebase by bv_text - text_start).
-    text_sec = _gopclntab_text_start(bv)
+    # from where BN loaded the text (rebase by bv_text - text_start). (text_sec is
+    # computed once above.)
     if text_sec is not None:
         result["text_start_bv"] = hex(text_sec)
     result["defined_count"] = defined_count

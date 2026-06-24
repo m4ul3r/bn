@@ -461,12 +461,21 @@ def _session_restart(args: argparse.Namespace) -> int:
             )
 
     instance = cli.spawn_instance(resolved_id)
+    # Refresh the project marker like `session start` does (#377), but REFRESH-ONLY
+    # (#391): a restart may run from a different cwd than the original start, so we
+    # update an existing `.bn-<id>` marker's stale body without dropping a stray new
+    # one. BN_NO_MARKERS still opts out entirely.
+    _env = (os.environ.get("BN_NO_MARKERS") or "").strip().lower()
+    no_marker = _env not in ("", "0", "false", "no", "off")
+    workdir = os.getcwd()
     reloaded: list[Any] = []
     for t in reload_targets:
         try:
             r = cli.send_request(
                 "load_binary",
-                params={"path": t["path"], "prefer_bndb": True, "quick": t["quick"]},
+                params={"path": t["path"], "prefer_bndb": True, "quick": t["quick"],
+                        "workdir": workdir, "no_marker": no_marker,
+                        "marker_refresh_only": True},
                 instance_id=instance.instance_id,
             )
             reloaded.append(r["result"])
