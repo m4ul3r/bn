@@ -886,6 +886,40 @@ def test_backward_does_not_recover_arg_for_unmodeled_callee(models, monkeypatch)
     assert calls["n"] == 0
 
 
+# #433 shared module-level helpers, reused by both `taint backward` and `trace`
+# (read_taint_slice). They are unit-tested here because taint_engine is the
+# binaryninja-import-free module; read_taint_slice (which imports binaryninja at
+# module load) wires the same helpers into trace and is verified live.
+
+def test_model_arg_indices_unions_propagate_sink_and_varargs(models):
+    # The gate: a modeled sink's referenced arg indices = propagate `*arg:N`
+    # operands ∪ sink.tainted_args ∪ varargs.first_index. Empty for an unmodeled
+    # callee, so the register fallback never fabricates an arg.
+    assert te.model_arg_indices(models, "memcpy") == {0, 1, 2}
+    assert te.model_arg_indices(models, "strcpy") == {0, 1}
+    assert te.model_arg_indices(models, "snprintf") == {0, 2, 3}
+    assert te.model_arg_indices(models, "definitely_not_a_sink") == set()
+
+
+def test_reaching_arg_seed_vars_bridges_llil_def_to_mlil_seed(monkeypatch):
+    # Given a call at an address whose arg register has a (monkeypatched)
+    # reaching LLIL def, the extractor returns the def's mapped MLIL SSA var as a
+    # seed -- the LLIL->MLIL bridge the backward walk / trace seed on.
+    seedvar = FSSA(FVar("len"), 1)
+    mssa = type("M", (), {"vars_written": [seedvar]})()
+    fake_def = type("D", (), {"mlil": type("Mapped", (), {"ssa_form": mssa})()})()
+    call_ins = type("C", (), {"address": 0x18, "operation": "CALL_SSA_OP"})()
+    func = type("F", (), {"llil": type("LL", (), {"ssa_form": [[call_ins]]})()})()
+    fake_bn = type("BN", (), {"LowLevelILOperation":
+                              type("Op", (), {"LLIL_CALL_SSA": "CALL_SSA_OP"})()})()
+    monkeypatch.setattr(te, "reaching_reg_def",
+                        lambda ci, reg, bn: fake_def if ci is call_ins else None)
+    seeds = te.reaching_arg_seed_vars(func, 0x18, "r2", fake_bn)
+    assert [v for v, _ in seeds] == [seedvar]
+    # address miss -> nothing recovered
+    assert te.reaching_arg_seed_vars(func, 0x99, "r2", fake_bn) == []
+
+
 # --------------------------------------------------------------------------
 # #193 Part 1: recv buffer re-loaded across a global/struct-field pointer slot
 # --------------------------------------------------------------------------

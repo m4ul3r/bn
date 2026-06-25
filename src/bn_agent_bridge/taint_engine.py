@@ -312,6 +312,115 @@ def _try_arg_index(token: str) -> int | None:
 
 
 # --------------------------------------------------------------------------
+# #433: register fallback for under-recovered copy-sink call args. Shared by
+# `taint backward` (TaintEngine) and `trace` (read_taint_slice) -- both seed on
+# an MLIL SSA var recovered from a calling-convention register when a thunk/
+# import with a too-narrow prototype dropped the arg from the MLIL call.
+# --------------------------------------------------------------------------
+
+def model_arg_indices(models: dict[str, Any], callee: str) -> set[int]:
+    """Argument indices a MODELED sink provably references -- the union of its
+    ``propagates`` ``*arg:N`` operands, its ``sink.tainted_args``, and its
+    ``varargs.first_index``. Empty for an unmodeled callee. Gates the register
+    fallback so it only ever recovers an argument the model proves is actually
+    passed (never fabricates one beyond the sink's real arity)."""
+    _, model = lookup_model(models, callee)
+    if not model:
+        return set()
+    idxs: set[int] = set()
+    for spec in (model.get("propagates") or []):
+        if not isinstance(spec, dict):
+            continue
+        for key in ("from", "to"):
+            tok = _try_arg_index(spec.get(key))
+            if tok is not None:
+                idxs.add(tok)
+    sink = model.get("sink") or {}
+    for a in (sink.get("tainted_args") or []):
+        try:
+            idxs.add(int(a))
+        except (TypeError, ValueError):
+            pass
+    first = (model.get("varargs") or {}).get("first_index")
+    if isinstance(first, int):
+        idxs.add(first)
+    return idxs
+
+
+def reaching_reg_def(call_ins: Any, reg: str, bn: Any) -> Any | None:
+    """Nearest dominating LLIL-SSA definition of register ``reg`` reaching
+    ``call_ins``: walk the immediate-dominator chain from the call's block,
+    taking the latest def of ``reg`` that precedes the call. This is the
+    dominance-correct reaching def (it includes a ``REG_PHI`` when the value
+    joins from multiple paths), so the recovered argument is never seeded from a
+    non-reaching definition. Returns the defining LLIL instruction or None."""
+    Op = bn.LowLevelILOperation
+    call_ops = {getattr(Op, n, None) for n in (
+        "LLIL_CALL_SSA", "LLIL_SYSCALL_SSA", "LLIL_INTRINSIC_SSA",
+        "LLIL_TAILCALL_SSA")} - {None}
+
+    def defines_reg(ins: Any) -> bool:
+        op = getattr(ins, "operation", None)
+        if op in (Op.LLIL_SET_REG_SSA, Op.LLIL_REG_PHI):
+            return str(getattr(getattr(ins, "dest", None), "reg", "")) == reg
+        if op in call_ops:
+            return any(str(getattr(o, "reg", "")) == reg
+                       for o in (getattr(ins, "output", None) or []))
+        return False
+
+    call_bb = getattr(call_ins, "il_basic_block", None)
+    call_idx = int(getattr(call_ins, "instr_index", -1))
+    bb = call_bb
+    seen: set[int] = set()
+    while bb is not None and id(bb) not in seen:
+        seen.add(id(bb))
+        best = None
+        for ins in bb:
+            ii = int(getattr(ins, "instr_index", -1))
+            if bb is call_bb and ii >= call_idx:
+                continue
+            if defines_reg(ins) and (best is None or ii > int(getattr(best, "instr_index", -1))):
+                best = ins
+        if best is not None:
+            return best
+        bb = getattr(bb, "immediate_dominator", None)
+    return None
+
+
+def reaching_arg_seed_vars(func: Any, addr: int, reg: str,
+                           bn: Any) -> list[tuple[Any, Any]]:
+    """Find the call at ``addr`` in *func*'s LLIL-SSA and recover ``reg``'s
+    reaching definition (:func:`reaching_reg_def`), bridged to the MLIL SSA
+    variable(s) that hold it -- the seeds a backward walk / trace can slice.
+    Returns ``[(mlil_ssa_var, mlil_instr), ...]``; ``[]`` when not recoverable
+    (e.g. no LLIL, as in the unit fakes)."""
+    lssa = getattr(getattr(func, "llil", None), "ssa_form", None)
+    if lssa is None:
+        return []
+    seeds: list[tuple[Any, Any]] = []
+    try:
+        for block in lssa:
+            for ins in block:
+                if int(getattr(ins, "address", -1)) != int(addr):
+                    continue
+                if getattr(ins, "operation", None) != bn.LowLevelILOperation.LLIL_CALL_SSA:
+                    continue
+                definition = reaching_reg_def(ins, reg, bn)
+                if definition is None:
+                    continue
+                mapped = getattr(definition, "mlil", None)
+                mssa = getattr(mapped, "ssa_form", None) if mapped is not None else None
+                if mssa is None:
+                    continue
+                for w in (getattr(mssa, "vars_written", None) or []):
+                    if is_ssa_var(w):
+                        seeds.append((w, mssa))
+    except Exception:
+        return seeds
+    return seeds
+
+
+# --------------------------------------------------------------------------
 # small IL helpers (defensive getattr style, matching bridge.py)
 # --------------------------------------------------------------------------
 
@@ -4703,32 +4812,8 @@ class TaintEngine:
     # -- #433: register fallback for under-recovered copy-sink call args -------
 
     def _model_arg_indices(self, callee: str) -> set[int]:
-        """Argument indices a MODELED sink provably references -- the union of its
-        ``propagates`` ``*arg:N`` operands, its ``sink.tainted_args``, and its
-        ``varargs.first_index``. Empty for an unmodeled callee. Used to gate the
-        register fallback so it only ever recovers an argument the model proves is
-        actually passed (never fabricates one beyond the sink's real arity)."""
-        _, model = lookup_model(self.models, callee)
-        if not model:
-            return set()
-        idxs: set[int] = set()
-        for spec in (model.get("propagates") or []):
-            if not isinstance(spec, dict):
-                continue
-            for key in ("from", "to"):
-                tok = _try_arg_index(spec.get(key))
-                if tok is not None:
-                    idxs.add(tok)
-        sink = model.get("sink") or {}
-        for a in (sink.get("tainted_args") or []):
-            try:
-                idxs.add(int(a))
-            except (TypeError, ValueError):
-                pass
-        first = (model.get("varargs") or {}).get("first_index")
-        if isinstance(first, int):
-            idxs.add(first)
-        return idxs
+        """Thin wrapper over the shared :func:`model_arg_indices` gate (#433)."""
+        return model_arg_indices(self.models, callee)
 
     def _arg_register(self, func: Any, idx: int) -> str | None:
         """Calling-convention integer-argument register name for ``idx`` (e.g.
@@ -4745,15 +4830,11 @@ class TaintEngine:
     def _reaching_arg_seeds_via_reg(self, func: Any, sites: list[Any],
                                     idx: int) -> tuple[str | None, list[tuple[Any, Any]]]:
         """Recover a call argument BN dropped from the MLIL call's parameters by
-        reading the calling-convention register for arg ``idx`` from LLIL-SSA and
-        bridging its reaching definition to the MLIL SSA variable that holds it
-        (#433). For each call site, the register's reaching definition is found by
-        walking the immediate-dominator chain (the nearest dominating def before
-        the call -- provably correct, no version arithmetic), and that def's mapped
-        MLIL instruction's written SSA var is the seed the backward walk can slice.
-        Returns ``(reg_name, [(mlil_ssa_var, mlil_instr), ...])``; the seed list is
-        empty when nothing is recoverable (e.g. the unit fakes, which carry no
-        LLIL)."""
+        reading the calling-convention register for arg ``idx`` and bridging its
+        reaching definition to the MLIL SSA var (#433), for each call site.
+        Delegates to the shared :func:`reaching_arg_seed_vars`. Returns
+        ``(reg_name, [(mlil_ssa_var, mlil_instr), ...])``; the seed list is empty
+        when nothing is recoverable (e.g. the unit fakes, which carry no LLIL)."""
         reg = self._arg_register(func, idx)
         if reg is None:
             return (None, [])
@@ -4761,71 +4842,10 @@ class TaintEngine:
             import binaryninja as bn
         except Exception:
             return (reg, [])
-        lssa = getattr(getattr(func, "llil", None), "ssa_form", None)
-        if lssa is None:
-            return (reg, [])
-        addrs = {int(getattr(c, "address", -1)) for c in sites}
         seeds: list[tuple[Any, Any]] = []
-        try:
-            for block in lssa:
-                for ins in block:
-                    if int(getattr(ins, "address", -1)) not in addrs:
-                        continue
-                    if getattr(ins, "operation", None) != bn.LowLevelILOperation.LLIL_CALL_SSA:
-                        continue
-                    definition = self._reaching_reg_def(ins, reg, bn)
-                    if definition is None:
-                        continue
-                    mapped = getattr(definition, "mlil", None)
-                    mssa = getattr(mapped, "ssa_form", None) if mapped is not None else None
-                    if mssa is None:
-                        continue
-                    for w in (getattr(mssa, "vars_written", None) or []):
-                        if is_ssa_var(w):
-                            seeds.append((w, mssa))
-        except Exception:
-            return (reg, seeds)
+        for addr in {int(getattr(c, "address", -1)) for c in sites}:
+            seeds.extend(reaching_arg_seed_vars(func, addr, reg, bn))
         return (reg, seeds)
-
-    @staticmethod
-    def _reaching_reg_def(call_ins: Any, reg: str, bn: Any) -> Any | None:
-        """Nearest dominating LLIL-SSA definition of register ``reg`` reaching
-        ``call_ins``: walk the immediate-dominator chain from the call's block,
-        taking the latest def of ``reg`` that precedes the call. This is the
-        dominance-correct reaching def (it includes a ``REG_PHI`` when the value
-        joins from multiple paths), so the recovered argument is never seeded from
-        a non-reaching definition. Returns the defining LLIL instruction or None."""
-        Op = bn.LowLevelILOperation
-        call_ops = {getattr(Op, n, None) for n in (
-            "LLIL_CALL_SSA", "LLIL_SYSCALL_SSA", "LLIL_INTRINSIC_SSA",
-            "LLIL_TAILCALL_SSA")} - {None}
-
-        def defines_reg(ins: Any) -> bool:
-            op = getattr(ins, "operation", None)
-            if op in (Op.LLIL_SET_REG_SSA, Op.LLIL_REG_PHI):
-                return str(getattr(getattr(ins, "dest", None), "reg", "")) == reg
-            if op in call_ops:
-                return any(str(getattr(o, "reg", "")) == reg
-                           for o in (getattr(ins, "output", None) or []))
-            return False
-
-        call_bb = getattr(call_ins, "il_basic_block", None)
-        call_idx = int(getattr(call_ins, "instr_index", -1))
-        bb = call_bb
-        seen: set[int] = set()
-        while bb is not None and id(bb) not in seen:
-            seen.add(id(bb))
-            best = None
-            for ins in bb:
-                ii = int(getattr(ins, "instr_index", -1))
-                if bb is call_bb and ii >= call_idx:
-                    continue
-                if defines_reg(ins) and (best is None or ii > int(getattr(best, "instr_index", -1))):
-                    best = ins
-            if best is not None:
-                return best
-            bb = getattr(bb, "immediate_dominator", None)
-        return None
 
     def _describe_locator(self, loc: dict[str, Any]) -> dict[str, Any]:
         return {k: v for k, v in loc.items() if k != "_resolved"}
