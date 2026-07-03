@@ -79,7 +79,7 @@ On stripped static firmware (busybox, embedded ARM/MIPS), `bn imports` is empty 
    bn evidence table <addr>     # applet / dispatch / fuse_operations tables as fn pointers
    ```
 
-5. **Confirm widths in disasm.** Stripped + ARM means the decompiler's width/sign story is frequently wrong — confirm field loads (`ldrb` vs `ldr`) in `bn disasm` before concluding off-by-one / truncation (see the width-sensitive-reads note in the `bn` skill).
+5. **Confirm the bound in disasm — not just widths.** Stripped + ARM means the decompiler's story is frequently wrong for more than operand size: confirm field loads (`ldrb` vs `ldr`) **and** the guard/loop shape in `bn disasm` before concluding off-by-one / truncation / overflow. HLIL flattens `ccmp`/`csel` range guards into misleading ternaries, can render a hoisted loop-invariant limit relative to a *moving* pointer (so a real cap looks like it never fires), and hides a missing `<< 4` in a size accumulator — each has faked a critical finding. See the "HLIL can mislead beyond access width" note in the `bn` skill.
 
 **Worked example — busybox.** BusyBox is an applet multiplexer: `main` dispatches on `argv[0]`/`argv[1]` to applet handlers, so its real attack surface is the applet table plus the strings that name applets:
 ```bash
@@ -145,7 +145,7 @@ Plain `bn xrefs`/`decompile` thin out when dispatch is indirect or the decompile
 - `bn evidence function <caller>` — shows the raw ABI arguments (registers + LLIL/MLIL/HLIL) next to the pseudo-C at each call, including the vtable offset for an indirect/virtual call. Use it to recover a sink's real arguments without dropping to disasm, and to see through `j_*`/PLT thunks to the true callee.
 - `bn evidence message <TypeName>` — for protobuf/IPC message handlers, maps a message type-name string to its serializer/handler pointers, giving you the receive→parse→dispatch entry points to trace forward from.
 
-Reminder: HLIL can hide the real access/operand width — confirm the size in `bn disasm` before concluding on a truncation/off-by-one (see the width-sensitive-reads note in the `bn` skill).
+Reminder: HLIL misleads beyond access/operand width — besides field-load size, it flattens `ccmp`/`csel` range guards into ternaries, aliases hoisted loop-invariant bounds to a moving pointer, and can drop a `<< 4` from a size accumulator. Confirm the bound in `bn disasm` before concluding on a truncation/off-by-one/overflow (see the "HLIL can mislead beyond access width" note in the `bn` skill).
 
 ## Systematic Audit Workflow
 

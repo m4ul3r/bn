@@ -29,7 +29,12 @@ One open target: omit `-t`. Multiple open: pass `-t <selector>` (from `bn target
 ## Two gotchas that cause wrong answers
 
 - **Spill / pipe-trap.** Output over ~10k tokens spills to disk; stdout carries only a small envelope. A piped `grep`/`jq`/`rg` then reads the *envelope*, not the data — a no-match misreads as "absent" (`bn decompile f | grep memcpy` finding nothing ≠ no memcpy). Write to a file first (`bn decompile f --out /tmp/f.txt && grep memcpy /tmp/f.txt`) or slice with `--lines` / `--limit`. (Envelope keys → `reference/runtime.md`.)
-- **Width-sensitive reads — trust `bn disasm`.** Pseudo-C / HLIL hide the real access width: a byte compare can render full-width, and a `zx.d` on a deref need not mean a 4-byte load. For off-by-one / OOB / signedness, confirm the operand size in `bn disasm` before concluding.
+- **HLIL can mislead beyond access width — trust `bn disasm`.** Pseudo-C / HLIL distort more than the operand size. Before concluding on a bound / overflow / off-by-one, confirm the shape in `bn disasm`:
+  - **access width** — a byte compare can render full-width, and a `zx.d` on a deref need not mean a 4-byte load (the classic case);
+  - **conditional-compare / `csel` / `ccmn` guards** — AArch64 flattens `cmp x,#hi; ccmp x,#0,#N,le; b.eq` (effectively `if (x >= lo && x <= hi)`) into a misleading ternary like `z = x-1 <= 0xfe ? x == 1 : true; if (!z) …` that reads as flag-munging with no real bound;
+  - **loop-invariant bound pointers** — a hoisted fixed limit (`add x8, base, #0x100` at entry) can render relative to the *moving* write pointer (`if (&p[0x100] <= &p[k+1]) break;`), so a real total-size cap looks like it never fires → phantom overflow;
+  - **accumulator / shift structure** — a size-parse loop that should be `size = (size << 4) | nibble` but *lacks* the `<< 4` renders as a normal accumulate, concealing that it only ever keeps the last nibble.
+  Each of these produced a near-false-positive *critical* finding in dogfooding; the pseudo-C alone is not enough for a bounds claim.
 
 ## Command index (what exists — flags live in reference)
 
