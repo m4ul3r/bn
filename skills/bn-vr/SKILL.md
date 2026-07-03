@@ -180,8 +180,14 @@ bn taint forward -f <handler> --source arg:recv:1
 # a function parameter is tainted on entry:
 bn taint forward -f <handler> --source param:0
 ```
-Reports each reached sink with its bug class (`overflow_len`,
-`command_injection`, `format_string`, …) and the full SSA path.
+Reports **one compact line per flow** by default: the bug class (`overflow_len`,
+`command_injection`, `format_string`, …), the sink address/arg, an address-free
+grouping **signature** (`source → wrapper → [class] sink`), and structural
+`{steps / fns / unresolved}` metrics. Add `--verbose` (`--full`) for the full SSA
+path per flow; `--format json` always carries `path`, `metrics`, and `signature`
+per finding, so you can rank and dedup flows across runs by their signature.
+Distinct sink call-sites always render on their own line — nothing is folded
+behind a count.
 
 > **Global / struct-field buffer source → seed the parser entry instead.** When the
 > recv destination is a long-lived pointer in a global or daemon struct

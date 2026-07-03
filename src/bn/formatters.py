@@ -1896,7 +1896,21 @@ def _taint_via_trail(value: dict[str, Any], finding: dict[str, Any]) -> str | No
     return ("via: " + " → ".join(chain)) if len(chain) >= 2 else None
 
 
-def _render_taint_text(value: Any) -> str:
+def _render_flow_line(f: dict[str, Any]) -> str:
+    """One compact line for a forward finding: sink + address + arg + grouping
+    signature + structural metrics. The full SSA path is shown only under --full."""
+    sink = f.get("sink") or {}
+    ai = sink.get("tainted_arg_index")
+    arg = f" (arg {ai})" if ai is not None else ""
+    m = f.get("metrics") or {}
+    sig = (f.get("signature") or {}).get("rendered", "")
+    unresolved = "y" if m.get("traverses_unresolved") else "n"
+    facts = f"{{steps={m.get('steps', '?')} fns={m.get('fns_spanned', '?')} unresolved={unresolved}}}"
+    head = f"[{sink.get('class') or '?'}] {sink.get('callee', '?')} @ {sink.get('address')}{arg}"
+    return f"  {head}   {sig}   {facts}".rstrip()
+
+
+def _render_taint_text(value: Any, full: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     fn = value.get("function") or {}
@@ -1910,26 +1924,21 @@ def _render_taint_text(value: Any) -> str:
         lines.append(_taint_forward_verdict(value))
         if findings:
             lines.append("")
-            lines.append(f"sinks ({len(findings)}):")
+            lines.append(f"flows ({len(findings)}):")
             for f in findings:
-                sink = f.get("sink") or {}
-                lines.append("")
-                _ai = sink.get("tainted_arg_index")
-                _arg = f"(arg {_ai}) " if _ai is not None else ""
-                # `or '?'`/`or ''` guard an explicit None (a user-modeled sink, #317,
-                # usually carries no detail). Append ` -- {detail}` CONDITIONALLY
-                # rather than stripping a trailing separator back off, so a detail
-                # that itself ends in a dash isn't mangled (#317 review).
-                _detail = sink.get('detail') or ''
-                _sline = (f"[{sink.get('class') or '?'}] {sink.get('callee', '?')} "
-                          f"@ {sink.get('address')} {_arg}").rstrip()
-                if _detail:
-                    _sline += f" -- {_detail}"
-                lines.append(_sline)
-                _via = _taint_via_trail(value, f)
-                if _via:
-                    lines.append(f"    {_via}")
-                lines.extend(_render_taint_path(f.get("path") or []))
+                # One compact line per flow by default (signature + metrics). Same-sink
+                # findings are already unique per (callee,address,arg), so distinct sink
+                # call-sites always render on their own line -- never folded behind a
+                # count. --full appends the sink detail, via: trail, and full SSA path.
+                lines.append(_render_flow_line(f))
+                if full:
+                    _detail = (f.get("sink") or {}).get('detail') or ''
+                    if _detail:
+                        lines.append(f"      -- {_detail}")
+                    _via = _taint_via_trail(value, f)
+                    if _via:
+                        lines.append(f"    {_via}")
+                    lines.extend(_render_taint_path(f.get("path") or []))
     else:
         sinks = value.get("sinks") or []
         lines.append("sinks: " + (", ".join(_describe_loc(s) for s in sinks) or "<none>"))
@@ -1937,24 +1946,38 @@ def _render_taint_text(value: Any) -> str:
         for sl in slices:
             sink = sl.get("sink") or {}
             origin = sl.get("origin") or {}
+            m = sl.get("metrics") or {}
+            sig = (sl.get("signature") or {}).get("rendered", "")
+            n = sl.get("reached_via_call_sites", 1)
+            xn = f"  (x{n} callsites)" if n and n > 1 else ""
+            unresolved = "y" if m.get("traverses_unresolved") else "n"
             lines.append("")
+            # Compact one line per slice by default; (xN) surfaces the engine's existing
+            # per-(seed,sink,origin) call-site count. --full shows origin/crosses/steps.
             lines.append(
-                f"slice for {sink.get('callee') or sink.get('kind') or '?'} @ {sink.get('address')} (seed {sink.get('seed', '?')}):"
-            )
-            _ok = origin.get("kind")
-            if _ok == "constant" and origin.get("value") is not None:
-                _val = origin["value"]
-                _vs = f"{_val:#x}" if isinstance(_val, int) else str(_val)
-                _extra = _vs + (f" ({origin['var']})" if origin.get("var") else "")
-            else:
-                _extra = origin.get("callee") or origin.get("var") or ""
-            lines.append(f"  origin: {_ok} {_extra}".rstrip())
-            crossed = sl.get("crossed_functions") or []
-            if crossed:
-                lines.append(f"  crosses: {' <- '.join(crossed)}")
-            for step in sl.get("slice") or []:
-                if isinstance(step, dict):
-                    lines.append(f"  {step.get('address')}  {step.get('op')}  {step.get('il_text', '')}".rstrip())
+                f"  [{sink.get('class') or sink.get('kind') or '?'}] "
+                f"{sink.get('callee') or sink.get('kind') or '?'} @ {sink.get('address')} "
+                f"(seed {sink.get('seed', '?')})   {sig}   "
+                f"{{steps={m.get('steps', '?')} fns={m.get('fns_spanned', '?')} "
+                f"unresolved={unresolved}}}{xn}".rstrip())
+            if full:
+                lines.append(
+                    f"  slice for {sink.get('callee') or sink.get('kind') or '?'} @ {sink.get('address')} (seed {sink.get('seed', '?')}):"
+                )
+                _ok = origin.get("kind")
+                if _ok == "constant" and origin.get("value") is not None:
+                    _val = origin["value"]
+                    _vs = f"{_val:#x}" if isinstance(_val, int) else str(_val)
+                    _extra = _vs + (f" ({origin['var']})" if origin.get("var") else "")
+                else:
+                    _extra = origin.get("callee") or origin.get("var") or ""
+                lines.append(f"  origin: {_ok} {_extra}".rstrip())
+                crossed = sl.get("crossed_functions") or []
+                if crossed:
+                    lines.append(f"  crosses: {' <- '.join(crossed)}")
+                for step in sl.get("slice") or []:
+                    if isinstance(step, dict):
+                        lines.append(f"  {step.get('address')}  {step.get('op')}  {step.get('il_text', '')}".rstrip())
         status = value.get("sink_status") or []
         # A constant-length sink is "provably bounded" -- a SUCCESS, not a failed
         # seed -- so report it apart from genuinely-unseeded sinks (#310).

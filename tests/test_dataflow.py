@@ -200,7 +200,7 @@ def test_render_taint_forward_text():
         "assumptions": ["memory aliasing modeled coarsely (memory_approx)"],
         "soundness": "may-analysis (intraprocedural, MVP)",
     }
-    text = _render_taint_text(value)
+    text = _render_taint_text(value, full=True)
     assert "forward taint in process @ 0x401189" in text
     assert "[overflow_len] memcpy @ 0x4011db (arg 2)" in text
     assert "source: read fills arg1 buffer" in text
@@ -287,7 +287,7 @@ def test_render_taint_backward_text():
         }],
         "leaves": [], "assumptions": [], "soundness": "x",
     }
-    text = _render_taint_text(value)
+    text = _render_taint_text(value, full=True)
     assert "slice for memcpy @ 0x4011db (seed rdx_1#1)" in text
     assert "origin: parameter_or_entry buf#1" in text
     assert "len#2 = len#1 + 4" in text
@@ -355,7 +355,7 @@ def test_render_taint_field_load_unresolved_leaf():
              "leaves": [{"kind": "field_load_unresolved", "address": "0x30", "base": "obj#1",
                          "offset": "0x8", "width": 4, "il_text": "x#1 = [obj#1 + 8]"}],
              "assumptions": [], "soundness": "x"}
-    text = _render_taint_text(value)
+    text = _render_taint_text(value, full=True)
     assert "frontiers (" in text
     assert "field_load_unresolved @ 0x30" in text
     assert "base=obj#1" in text and "offset=0x8" in text and "width=4" in text

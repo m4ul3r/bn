@@ -143,6 +143,8 @@ _SINK_LOCATOR_HELP = (
                       "file_write (fwrite/write/fputs), net_write (send/sendto). "
                       "Use when auditing persistence / file-corruption / exfiltration paths."),
              _models_arg(),
+             arg("--verbose", "-v", "--full", dest="full", action="store_true", default=False,
+                 help="Show the full SSA path/slice for each flow (default: one compact line per flow)"),
          ])
 def _taint_forward(args: argparse.Namespace) -> int:
     # --source is argparse-required, so an empty list cannot reach here.
@@ -165,7 +167,7 @@ def _taint_forward(args: argparse.Namespace) -> int:
         "taint",
         params,
         require_target=True,
-        text_renderer=_render_taint_text,
+        text_renderer=(lambda v: _render_taint_text(v, full=bool(getattr(args, "full", False)))),
         stem="taint-forward",
     )
 
@@ -189,6 +191,8 @@ def _taint_forward(args: argparse.Namespace) -> int:
                  help="JSON file mapping indirect call addresses to target lists: "
                       '{"0x4011f0": ["0x401176", "0x401195"]}'),
              _models_arg(),
+             arg("--verbose", "-v", "--full", dest="full", action="store_true", default=False,
+                 help="Show the full SSA path/slice for each flow (default: one compact line per flow)"),
          ])
 def _taint_backward(args: argparse.Namespace) -> int:
     # --sink is argparse-required, so an empty list cannot reach here.
@@ -209,6 +213,6 @@ def _taint_backward(args: argparse.Namespace) -> int:
         "taint",
         params,
         require_target=True,
-        text_renderer=_render_taint_text,
+        text_renderer=(lambda v: _render_taint_text(v, full=bool(getattr(args, "full", False)))),
         stem="taint-backward",
     )
