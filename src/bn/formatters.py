@@ -893,14 +893,37 @@ def _render_paged_list_text(
     return footer if body == "none" else f"{body}\n\n{footer}"
 
 
+_QUICK_PARTIAL_WARNING = (
+    "WARNING: target is quick-loaded; function list/count is partial. "
+    "Run `bn refresh` for full analysis."
+)
+
+
+def _quick_partial_prefix(value: Any) -> str:
+    """A leading warning line when the functions envelope is quick-loaded/partial
+    (#437), so a text reader doesn't trust a partial count as the whole binary.
+    Empty for a fully-analyzed view."""
+    if isinstance(value, dict) and value.get("partial"):
+        return _QUICK_PARTIAL_WARNING + "\n"
+    return ""
+
+
+def _render_function_count_text(value: Any) -> str:
+    """Render a `function list/search --count` result, prefixing the quick-load
+    partiality warning when the count is partial (#437)."""
+    count = value.get("count", 0) if isinstance(value, dict) else 0
+    return f"{_quick_partial_prefix(value)}Total functions: {count}"
+
+
 def _render_function_list_text(value: Any, *, demangle: bool = False) -> str:
     """Render a paged function listing, with a footer stating the true total and
     remainder (#59). Prefers the canonical `items` key (every other list command
     uses it), falling back to the deprecated byte-identical `functions` alias for
     an older bridge that emits only the latter (#223). ``demangle`` shows the
-    demangled display_name (#196)."""
+    demangled display_name (#196). A quick-loaded (partial) listing is prefixed
+    with a warning so the page isn't mistaken for the whole binary (#437)."""
     page_key = "items" if isinstance(value, dict) and "items" in value else "functions"
-    return _render_paged_list_text(
+    return _quick_partial_prefix(value) + _render_paged_list_text(
         value, page_key, lambda items: _render_name_address_rows(items, demangle=demangle))
 
 

@@ -32,7 +32,7 @@ import binaryninja as bn  # noqa: F401  (kept for parity / future use)
 from . import il_format
 from . import read_misc
 from ._shared import OperationFailure, _parse_address, _validate_count
-from .bridge_state import require_analysis
+from .bridge_state import require_analysis, _quick_loaded_views
 
 
 def _callsites_within_function(ctx, bv, callee, func, *, context: int,
@@ -174,6 +174,16 @@ def _parse_function_address_bounds(
     return lower, upper
 
 
+def _analysis_state_fields(bv: Any) -> dict[str, Any]:
+    """Envelope fields disclosing whether *bv* is quick-loaded (partial) or fully
+    analyzed. A ``--quick`` function count is partial, but the ``functions``
+    envelope looked complete ({count, total}); thread the same signal the bridge
+    already derives for ``target info`` / the orient digest through the listing
+    paths so a partial count is never mistaken for the whole binary (#437)."""
+    quick = bv in _quick_loaded_views
+    return {"analysis_state": "quick" if quick else "full", "partial": quick}
+
+
 def _filtered_functions(
     ctx,
     bv,
@@ -239,7 +249,8 @@ def _list_functions(
     if count_only:
         # `total` mirrors the list envelope's key for the same number; `count`
         # kept for back-compat.
-        return {"kind": "functions", "count": len(functions), "total": len(functions)}
+        return {"kind": "functions", "count": len(functions), "total": len(functions),
+                **_analysis_state_fields(bv)}
     items = [
         {
             "name": fn.name,
@@ -253,6 +264,7 @@ def _list_functions(
     ]
     _sort_function_items(items, sort, reverse)
     result = _paged_function_result(ctx, items, offset=offset, limit=limit)
+    result.update(_analysis_state_fields(bv))
     return _enrich_page_with_basic_block_count(result)
 
 
@@ -362,7 +374,9 @@ def _search_functions(
         # Mirror `_list_functions` count_only: `total` matches the list envelope
         # key, `count` kept for back-compat (#252). (`_fn` is never serialized
         # here -- only the returned page is enriched/cleaned below.)
-        return {"kind": "functions", "count": len(items), "total": len(items)}
+        return {"kind": "functions", "count": len(items), "total": len(items),
+                **_analysis_state_fields(bv)}
     _sort_function_items(items, sort, reverse)
     result = _paged_function_result(ctx, items, offset=offset, limit=limit)
+    result.update(_analysis_state_fields(bv))
     return _enrich_page_with_basic_block_count(result)

@@ -653,6 +653,36 @@ def test_strings_requires_refresh_when_quick_loaded(monkeypatch):
     assert result["items"] == [] and result["total"] == 0
 
 
+def test_function_list_envelope_discloses_quick_analysis_state(monkeypatch):
+    # #437: a --quick-loaded target's function count is PARTIAL, but the
+    # `functions` envelope looked complete ({count, total} with no state). Thread
+    # the analysis_state the bridge already derives into list/search (count + full).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    bridge._quick_loaded_views.add(bv)
+    for env in (
+        instance._list_functions("active"),
+        instance._list_functions("active", count_only=True),
+        instance._search_functions("active", ""),
+        instance._search_functions("active", "", count_only=True),
+    ):
+        assert env["analysis_state"] == "quick", env
+        assert env["partial"] is True, env
+
+    bridge._quick_loaded_views.discard(bv)
+    for env in (
+        instance._list_functions("active"),
+        instance._list_functions("active", count_only=True),
+        instance._search_functions("active", ""),
+        instance._search_functions("active", "", count_only=True),
+    ):
+        assert env["analysis_state"] == "full", env
+        assert env["partial"] is False, env
+
+
 def test_refresh_clears_quick_state_and_enables_strings(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

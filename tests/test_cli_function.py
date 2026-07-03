@@ -461,6 +461,47 @@ def test_xrefs_field_routes_to_field_xrefs(fake_transport, capsys):
     assert "code refs:" in output
 
 
+def test_function_list_text_warns_when_quick_loaded(fake_transport, capsys):
+    # #437: a quick-loaded (partial) function listing/count is prefixed with a
+    # warning in text mode so the number isn't trusted as the whole binary.
+    fake_transport({"list_functions": {"ok": True, "result": {
+        "kind": "functions",
+        "items": [{"name": "sub_401000", "address": "0x401000"}],
+        "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False,
+        "analysis_state": "quick", "partial": True,
+    }}})
+    rc = bn.cli.main(["function", "list", "--target", "active"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "WARNING: target is quick-loaded" in out
+    assert "bn refresh" in out
+
+
+def test_function_count_text_warns_when_quick_loaded(fake_transport, capsys):
+    fake_transport({"list_functions": {"ok": True, "result": {
+        "kind": "functions", "count": 5, "total": 5,
+        "analysis_state": "quick", "partial": True,
+    }}})
+    rc = bn.cli.main(["function", "list", "--count", "--target", "active"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out.startswith("WARNING: target is quick-loaded")
+    assert "Total functions: 5" in out
+
+
+def test_function_list_text_no_warning_when_full(fake_transport, capsys):
+    fake_transport({"list_functions": {"ok": True, "result": {
+        "kind": "functions",
+        "items": [{"name": "sub_401000", "address": "0x401000"}],
+        "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False,
+        "analysis_state": "full", "partial": False,
+    }}})
+    rc = bn.cli.main(["function", "list", "--target", "active"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "WARNING" not in out
+
+
 def test_xrefs_text_pipe_truncation_note(fake_transport, monkeypatch, capsys):
     # #439: a high-ref symbol truncates the text body to the default 100-group
     # display cap, producing output too small to spill -- so no pipe note fired and

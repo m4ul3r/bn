@@ -11,6 +11,7 @@ from ..formatters import (
     _render_disasm_linear_text,
     _render_evidence_xrefs_text,
     _render_field_xrefs_text,
+    _render_function_count_text,
     _render_function_evidence_text,
     _render_init_arrays_text,
     _render_function_info_text,
@@ -62,7 +63,7 @@ def _function_list(args: argparse.Namespace) -> int:
             "list_functions",
             params,
             require_target=True,
-            text_renderer=lambda value: f"Total functions: {value.get('count', 0)}",
+            text_renderer=_render_function_count_text,
             stem="function-count",
         )
     # Bridge-authoritative paging: send the real limit/offset (not the generic
@@ -136,7 +137,7 @@ def _function_search(args: argparse.Namespace) -> int:
             "search_functions",
             params,
             require_target=True,
-            text_renderer=lambda value: f"Total functions: {value.get('count', 0)}",
+            text_renderer=_render_function_count_text,
             stem="function-search-count",
             # --count is the "is my query matching anything?" use case, so the
             # auto-regex retry (and its 0-result fallback hint) is most useful
