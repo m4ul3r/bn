@@ -250,6 +250,13 @@ continue:
   `bn callsites <callee> --within <caller>` + `bn decompile <caller>`.
 - For an un-modeled external, add a model to the override file
   (`~/.cache/bn/taint_models.json`, or `$BN_TAINT_MODELS`) and re-run.
+- For an `arg_under_recovered` leaf, Binary Ninja under-recovered that callee's
+  parameter list, so a tainted argument was dropped at the boundary (otherwise a
+  silent false-negative). Recover the real prototype from the callee / its call
+  sites and apply it with `bn proto set <callee> "<C prototype>"` — which
+  reanalyzes and reflows every call site — then re-run the taint query; the flow
+  into the callee now follows. This is the concrete fix for the call-arg
+  under-recovery wall, not a dead end.
 
 Then assess exploitability as before: can the attacker control enough of the
 input, are there length/sanitization checks in the path, and what is the memory
