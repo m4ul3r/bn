@@ -79,11 +79,6 @@ def test_skill_install_copy_mode(tmp_path):
     assert (destination / "bn" / "agents" / "openai.yaml").exists()
     assert (destination / "bn-re" / "SKILL.md").exists()
     assert (destination / "bn-vr" / "SKILL.md").exists()
-    # #169 Layer 3: a methodology script is installed AND made executable in copy
-    # mode (copy loses the source bit; symlink mode follows it).
-    sink_sweep = destination / "bn-vr" / "scripts" / "sink-sweep.sh"
-    assert sink_sweep.exists()
-    assert sink_sweep.stat().st_mode & 0o111, "copy-installed script must be executable"
 
 
 def test_skill_install_defaults_to_claude_only_without_codex_home(tmp_path, monkeypatch):

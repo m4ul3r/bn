@@ -91,3 +91,14 @@ def test_taint_models_op_present_intersects_binary():
     for lst in res["sinks_by_class"].values():
         for e in lst:
             assert e["present"] is True
+
+
+def test_builtin_catalog_covers_fortify_and_exec_sinks():
+    # #372 guard, relocated from the retired sink-sweep SINK_RE to the single
+    # source of truth: the model DB must flag the FORTIFY (*_chk) family and bare
+    # execv as sinks, so sink enumeration never silently drops them.
+    from bn_agent_bridge.taint_engine import load_models
+    cat = build_catalog(load_models())
+    sink_syms = {e["symbol"] for lst in cat["sinks_by_class"].values() for e in lst}
+    for name in ("sprintf_chk", "snprintf_chk", "execv"):
+        assert name in sink_syms, f"{name} must be a modeled sink"
