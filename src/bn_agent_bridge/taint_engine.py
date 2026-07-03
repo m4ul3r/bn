@@ -1898,6 +1898,28 @@ class TaintEngine:
                 return i
         return None
 
+    def _param_spill_index(self, func: Any, ssaf: Any, v: Any) -> int | None:
+        """If terminal no-def var *v* is a spill of an incoming parameter -- some
+        definition in *func* writes v's underlying Variable with a value that is
+        itself a recovered parameter -- return that parameter index, else None.
+        Identity-on-stored-value only (the stored value must match parameter_vars),
+        so it never invents a parameter. Degrades to None on any BN-API shortfall
+        (#434)."""
+        try:
+            vk = var_key(v)
+            for ins in self._instrs(ssaf):
+                for w in getattr(ins, "vars_written", []) or []:
+                    if var_key(w) != vk:
+                        continue
+                    # this instruction defines v's slot; is the stored value a param?
+                    for r in expr_reads(getattr(ins, "src", None)):
+                        pidx = self._param_index_of(func, r)
+                        if pidx is not None:
+                            return pidx
+        except Exception:
+            return None
+        return None
+
     def _resolve_to_param_index(self, func: Any, ssaf: Any, expr: Any, depth: int = 0) -> int | None:
         """Trace a pointer-arg expression back to one of *func*'s parameters
         (so we can tell that writing through it taints a caller out-parameter)."""

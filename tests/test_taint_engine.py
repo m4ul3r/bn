@@ -4460,3 +4460,37 @@ def test_load_models_validates_user_model_interiors():
     # bool is not an int for tainted_args (bool is an int subclass in Python)
     with pytest.raises(te.TaintError):
         te.load_models(extra={"app": {"sink": {"class": "x", "tainted_args": [True]}}})
+
+
+# --- _param_spill_index / backward caller-ascent through a spill (#434) -------
+
+def test_param_spill_index_finds_spilled_param(models):
+    n = FVar("n", ident=22); var_n = FVar("var_n", ident=23)
+    n0 = FSSA(n, 0); vn1 = FSSA(var_n, 1); vn5 = FSSA(var_n, 5)
+    ssaf = FSSAFunc([
+        FInstr(0, 0x802, "MLIL_SET_VAR_SSA", "var_n#1 = n#0", writes=[vn1],
+               src=FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])),
+    ])
+    func = FFunc("f", 0x800, ssaf, params=[FVar("a", ident=20), FVar("b", ident=21), n])
+    engine = te.TaintEngine(FBV({}), models)
+    assert engine._param_spill_index(func, ssaf, vn5) == 2      # var_n is a spill of param 2 (n)
+
+
+def test_param_spill_index_rejects_non_param_stored_value(models):
+    x = FVar("x", ident=30); var_n = FVar("var_n", ident=23)
+    x0 = FSSA(x, 0); vn1 = FSSA(var_n, 1); vn5 = FSSA(var_n, 5)
+    ssaf = FSSAFunc([
+        FInstr(0, 0x802, "MLIL_SET_VAR_SSA", "var_n#1 = x#0", writes=[vn1],
+               src=FExpr("MLIL_VAR_SSA", "x#0", reads=[x0])),
+    ])
+    func = FFunc("f", 0x800, ssaf, params=[FVar("a", ident=20)])  # x is not a parameter
+    engine = te.TaintEngine(FBV({}), models)
+    assert engine._param_spill_index(func, ssaf, vn5) is None
+
+
+def test_param_spill_index_none_without_spill_store(models):
+    var_n = FVar("var_n", ident=23); vn5 = FSSA(var_n, 5)
+    ssaf = FSSAFunc([])                                          # nothing writes var_n
+    func = FFunc("f", 0x800, ssaf, params=[FVar("a", ident=20)])
+    engine = te.TaintEngine(FBV({}), models)
+    assert engine._param_spill_index(func, ssaf, vn5) is None
