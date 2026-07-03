@@ -16,6 +16,28 @@ import pytest
 
 from _bridge_fakes import *  # noqa: F401,F403
 
+read_decompile = importlib.import_module("bn_agent_bridge.read_decompile")
+read_evidence = importlib.import_module("bn_agent_bridge.read_evidence")
+
+
+def test_thunk_veneer_warning_names_target_and_is_quiet_for_non_thunks(monkeypatch):
+    # #446: a PLT/GOT veneer decompiles as apparent self-recursion; the warning
+    # names the real trampoline target (or a generic note) instead.
+    monkeypatch.setattr(read_evidence, "_function_thunk_summary",
+                        lambda ctx, bv, func: {"is_candidate": True,
+                                               "target": {"name": "memcpy", "address": "0x1000"}})
+    w = read_decompile._thunk_veneer_warning(None, None, None)
+    assert "thunk/veneer -> memcpy @ 0x1000" in w and "self-recursive" in w
+
+    monkeypatch.setattr(read_evidence, "_function_thunk_summary",
+                        lambda ctx, bv, func: {"is_candidate": True, "target": None})
+    w2 = read_decompile._thunk_veneer_warning(None, None, None)
+    assert "thunk/veneer" in w2 and "trampoline" in w2
+
+    monkeypatch.setattr(read_evidence, "_function_thunk_summary",
+                        lambda ctx, bv, func: {"is_candidate": False})
+    assert read_decompile._thunk_veneer_warning(None, None, None) is None
+
 
 def test_list_locals_returns_stable_ids(monkeypatch):
     bridge = _load_bridge(monkeypatch)
@@ -989,9 +1011,10 @@ def test_list_functions_count_only_returns_count(monkeypatch):
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     # count_only carries `kind` + `total` (matching the list envelope's key)
-    # alongside the back-compat `count` (#275).
+    # alongside the back-compat `count` (#275), plus the analysis-state signal (#437).
     assert instance._list_functions(None, count_only=True) == {
-        "kind": "functions", "count": 3, "total": 3}
+        "kind": "functions", "count": 3, "total": 3,
+        "analysis_state": "full", "partial": False}
     # count must match the full listing's reported total
     listing = instance._list_functions(None)
     assert listing["total"] == 3 and listing["returned"] == 3 and len(listing["items"]) == 3

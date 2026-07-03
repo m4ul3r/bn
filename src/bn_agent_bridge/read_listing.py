@@ -236,6 +236,7 @@ def _list_functions(
     *,
     min_address: Any = None,
     max_address: Any = None,
+    min_size: Any = None,
     offset: int = 0,
     limit: int | None = None,
     count_only: bool = False,
@@ -244,8 +245,13 @@ def _list_functions(
 ):
     offset = _validate_count(offset, label="offset", minimum=0)
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
+    min_size = _validate_count(min_size, label="min_size", minimum=1, allow_none=True)
     bv = ctx._resolve_view(selector)
     functions = list(_filtered_functions(ctx, bv, min_address=min_address, max_address=max_address))
+    if min_size is not None:
+        # #446: drop tiny PLT/GOT thunk veneers (typically <= 16 bytes) that
+        # otherwise list under the same name as the real body.
+        functions = [fn for fn in functions if (il_format._function_size(fn) or 0) >= min_size]
     if count_only:
         # `total` mirrors the list envelope's key for the same number; `count`
         # kept for back-compat.
@@ -324,6 +330,7 @@ def _search_functions(
     exact: bool = False,
     min_address: Any = None,
     max_address: Any = None,
+    min_size: Any = None,
     offset: int = 0,
     limit: int | None = None,
     count_only: bool = False,
@@ -332,6 +339,7 @@ def _search_functions(
 ):
     offset = _validate_count(offset, label="offset", minimum=0)
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
+    min_size = _validate_count(min_size, label="min_size", minimum=1, allow_none=True)
     bv = ctx._resolve_view(selector)
     items = []
     if regex:
@@ -370,6 +378,10 @@ def _search_functions(
                 "size": il_format._function_size(fn),
                 "_fn": fn,   # transient: enrich the returned page only (perf), then drop
             })
+    if min_size is not None:
+        # #446: drop tiny PLT/GOT thunk veneers so a `function search RFCOMM...`
+        # doesn't return each export twice (16-byte veneer + real body).
+        items = [it for it in items if (it.get("size") or 0) >= min_size]
     if count_only:
         # Mirror `_list_functions` count_only: `total` matches the list envelope
         # key, `count` kept for back-compat (#252). (`_fn` is never serialized

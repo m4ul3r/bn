@@ -47,6 +47,9 @@ from ..transport import BridgeError
                  help="Reverse the sort's natural order (e.g. --sort size --reverse = smallest first)"),
              arg("--demangle", action="store_true", default=False,
                  help="Show demangled C++ names in text (JSON always carries display_name)"),
+             arg("--min-size", type=_positive_int, default=None, dest="min_size", metavar="N",
+                 help="Only functions whose byte size is >= N (drop tiny PLT/GOT thunk "
+                      "veneers, typically <= 16 bytes)"),
          ])
 def _function_list(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
@@ -54,6 +57,8 @@ def _function_list(args: argparse.Namespace) -> int:
         params["min_address"] = args.min_address
     if args.max_address is not None:
         params["max_address"] = args.max_address
+    if getattr(args, "min_size", None) is not None:
+        params["min_size"] = args.min_size
     if args.offset:
         params["offset"] = args.offset
     if args.count:
@@ -108,6 +113,9 @@ def _function_list(args: argparse.Namespace) -> int:
                  help="Reverse the sort's natural order (e.g. --sort size --reverse = smallest first)"),
              arg("--demangle", action="store_true", default=False,
                  help="Show demangled C++ names in text (JSON always carries display_name)"),
+             arg("--min-size", type=_positive_int, default=None, dest="min_size", metavar="N",
+                 help="Only functions whose byte size is >= N (drop tiny PLT/GOT thunk "
+                      "veneers, typically <= 16 bytes)"),
          ],
          mutex_groups=[
              mutex(False,
@@ -130,6 +138,8 @@ def _function_search(args: argparse.Namespace) -> int:
         params["min_address"] = args.min_address
     if args.max_address is not None:
         params["max_address"] = args.max_address
+    if getattr(args, "min_size", None) is not None:
+        params["min_size"] = args.min_size
     if args.count:
         params["count_only"] = True
         return _call(

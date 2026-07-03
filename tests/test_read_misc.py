@@ -683,6 +683,30 @@ def test_function_list_envelope_discloses_quick_analysis_state(monkeypatch):
         assert env["partial"] is False, env
 
 
+def test_function_list_search_min_size_drops_thunk_veneers(monkeypatch):
+    # #446: --min-size drops the tiny PLT/GOT thunk veneers (typically <= 16 bytes)
+    # that otherwise list/search under the same name as the real body.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[
+        _FakeFunction(0x1000, "RFCOMM_Recv", total_bytes=16),    # veneer
+        _FakeFunction(0x2000, "RFCOMM_Recv", total_bytes=880),   # real body
+        _FakeFunction(0x3000, "helper", total_bytes=40),
+    ])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    full = instance._list_functions("active")
+    assert full["total"] == 3
+    filtered = instance._list_functions("active", min_size=100)
+    assert [it["address"] for it in filtered["items"]] == ["0x2000"]
+    assert filtered["total"] == 1
+    assert instance._list_functions("active", min_size=100, count_only=True)["count"] == 1
+
+    hits = instance._search_functions("active", "RFCOMM", min_size=100)
+    assert [it["address"] for it in hits["items"]] == ["0x2000"]
+    assert instance._search_functions("active", "RFCOMM", min_size=100, count_only=True)["count"] == 1
+
+
 def test_refresh_clears_quick_state_and_enables_strings(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

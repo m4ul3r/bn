@@ -113,6 +113,24 @@ def _annotate_containment(ctx, result, identifier, func) -> None:
         result["resolved_from"] = meta
 
 
+def _thunk_veneer_warning(ctx, bv, func) -> str | None:
+    """A `thunk/veneer -> <target>` warning when *func* is a PLT/GOT trampoline
+    (#446), reusing `evidence function`'s detector so the signal is consistent.
+    None when it is not a thunk."""
+    from . import read_evidence  # lazy: read_evidence -> il_format, not this module
+    summary = read_evidence._function_thunk_summary(ctx, bv, func)
+    if not summary.get("is_candidate"):
+        return None
+    target = summary.get("target") if isinstance(summary.get("target"), dict) else None
+    if target and (target.get("name") or target.get("address")):
+        name, addr = target.get("name"), target.get("address")
+        dest = f"{name} @ {addr}" if name and addr else (name or addr)
+        return (f"thunk/veneer -> {dest}: this is a PLT/GOT trampoline (a jump to "
+                f"the real body), not a self-recursive function.")
+    return ("thunk/veneer: this is a PLT/GOT trampoline (a small jump stub), not a "
+            "real function body; the apparent self-call is the resolved target.")
+
+
 def _decompile(ctx, selector: str | None, identifier, *, addresses: bool = False, force_analysis: bool = False):
     bv = ctx._resolve_view(selector)
     func = ctx._find_function(bv, identifier, contained=True)
@@ -125,6 +143,16 @@ def _decompile(ctx, selector: str | None, identifier, *, addresses: bool = False
     stub = il_format._analysis_stub_warning(func, text, forced=forced)
     if stub:
         warnings.append(stub)
+    # #446: a PLT/GOT veneer decompiles as an apparent infinite self-recursion
+    # (`return foo();`) because the trampoline resolves back to the same symbol
+    # name. Emit a thunk warning naming the real target instead of leaving the
+    # reader to misread a 4-instruction jump as recursion. Gated on the tailcall
+    # render (the exact confusing case) so a normal decompile pays nothing; the
+    # detector then confirms the small jump-to-target shape.
+    if "/* tailcall */" in text:
+        thunk_warn = _thunk_veneer_warning(ctx, bv, func)
+        if thunk_warn:
+            warnings.append(thunk_warn)
     if forced:
         data_warn = _forced_data_region_warning(bv, func)
         if data_warn:
