@@ -1663,6 +1663,9 @@ class BinaryNinjaBridge:
     def _taint(self, *a, **k):
         return read_taint_slice._taint_op(self.ctx, *a, **k)
 
+    def _taint_models(self, *a, **k):
+        return read_taint_slice._taint_models_op(self.ctx, *a, **k)
+
     def _call_destination_value(self, *a, **k):
         return read_evidence._call_destination_value(self.ctx, *a, **k)
 
@@ -2495,6 +2498,11 @@ def _bind_possible_values(bridge, params, target):
 @op("taint", lock="read")
 def _bind_taint(bridge, params, target):
     return bridge._taint(target, params)
+
+
+@op("taint_models", lock="read")
+def _bind_taint_models(bridge, params, target):
+    return bridge._taint_models(target, params)
 
 
 @op("disasm", lock="read")
