@@ -570,6 +570,34 @@ def test_session_stop_removes_marker(monkeypatch, capsys, tmp_path):
     assert not (tmp_path / ".bn-abc123").exists()
 
 
+def test_session_stop_accepts_instance_flag(monkeypatch, capsys):
+    # #456: after threading --instance through every command, cleanup naturally
+    # tries `session stop --instance <id>`; accept it as an alias for the positional.
+    seen = {}
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, spawn_missing_named=False):
+        seen["op"] = op
+        seen["instance_id"] = instance_id
+        return {"ok": True, "result": {}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [])
+
+    rc = bn.cli.main(["session", "stop", "--instance", "abc123", "--format", "json"])
+    assert rc == 0
+    assert seen["op"] == "shutdown" and seen["instance_id"] == "abc123"
+
+
+def test_session_stop_requires_an_instance_id(monkeypatch, capsys):
+    # Neither positional nor --instance -> a clean error, not a crash.
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [])
+    rc = bn.cli.main(["session", "stop"])
+    assert rc != 0
+    err = capsys.readouterr().err
+    assert "instance id" in err.lower()
+
+
 def test_session_stop_sends_shutdown(monkeypatch, capsys):
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "shutdown"

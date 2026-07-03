@@ -356,9 +356,18 @@ def _session_start(args: argparse.Namespace) -> int:
 
 
 @command("session", "stop", help="Stop a running bridge session",
-         args=[arg("instance", help="Instance ID to stop")])
+         args=[arg("instance_id", nargs="?", metavar="instance",
+                   help="Instance ID to stop (positional, or pass -i/--instance <id>)")])
 def _session_stop(args: argparse.Namespace) -> int:
-    target_id = args.instance
+    # #456: accept the id positionally OR via -i/--instance (every other command is
+    # driven with --instance, so `session stop --instance <id>` is the natural
+    # cleanup shape). The positional wins when both are given.
+    target_id = getattr(args, "instance_id", None) or getattr(args, "instance", None)
+    if not target_id:
+        raise BridgeError(
+            "session stop requires an instance id: `bn session stop <id>` "
+            "(or `bn session stop --instance <id>`). See `bn session list`."
+        )
     # Resolve the instance up front so we can confirm teardown by pid + files
     # after the shutdown, and SIGTERM it if the socket request fails.
     inst = next(
