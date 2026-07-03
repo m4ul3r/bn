@@ -2032,6 +2032,41 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
     return "\n".join(lines)
 
 
+def _render_taint_models_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    lines: list[str] = []
+    srcs = value.get("sources") or []
+    if srcs:
+        lines.append(f"sources ({len(srcs)}):")
+        for s in srcs:
+            p = " [present]" if s.get("present") else (" [absent]" if "present" in s else "")
+            lines.append(f"  {s['symbol']}  ->  {s.get('to', '')}{p}")
+    sbc = value.get("sinks_by_class") or {}
+    if sbc:
+        lines.append("")
+        total = sum(len(v) for v in sbc.values())
+        lines.append(f"sinks ({total} in {len(sbc)} class(es)):")
+        for cls, lst in sbc.items():
+            lines.append(f"  [{cls}]")
+            for e in lst:
+                cs = f" ({e['callsites']} callsites)" if e.get("callsites") is not None else ""
+                p = " [present]" if e.get("present") else (" [absent]" if "present" in e else "")
+                addrs = ("  " + ", ".join(e["addresses"])) if e.get("addresses") else ""
+                lines.append(f"    {e['symbol']} (arg {e.get('tainted_args')}){p}{cs}{addrs}")
+    props = value.get("propagators") or []
+    if props:
+        lines.append("")
+        lines.append(f"propagators ({len(props)}):")
+        for p in props:
+            lines.append(f"  {p['symbol']}  {p.get('from_to', '')}")
+    ov = value.get("overlays") or []
+    if ov:
+        lines.append("")
+        lines.append("overlays: " + ", ".join(o.get("path", o.get("kind", "?")) for o in ov))
+    return "\n".join(lines) if lines else "no models match the filter"
+
+
 def _render_model_sources(sources: Any) -> str:
     """#415: one-line disclosure of the active taint-model overlays in TEXT mode
     (the default), so an agent can confirm a ``--models`` / ``BN_TAINT_MODELS``

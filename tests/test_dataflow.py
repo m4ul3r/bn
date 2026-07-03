@@ -497,3 +497,31 @@ def test_taint_models_bad_file_is_loud(monkeypatch, capsys, tmp_path):
     rc2 = bn.cli.main(["taint", "forward", "-f", "h", "--source", "param:0",
                        "--models", str(tmp_path / "nope.json"), "--target", "active"])
     assert rc2 != 0
+
+
+def test_taint_models_command_dumps_catalog(monkeypatch, capsys):
+    fake, calls = _fake({"taint_models": {
+        "sources": [{"symbol": "recv", "to": "*arg:1, ret"}],
+        "sinks_by_class": {"overflow_len": [{"symbol": "memcpy", "tainted_args": [2],
+                                             "class": "overflow_len", "detail": "len"}]},
+        "propagators": [{"symbol": "strlen", "from_to": "*arg:0->ret"}],
+        "overlays": [{"kind": "builtin", "path": "/x/taint_models.json"}], "items": []}})
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    rc = bn.cli.main(["taint", "models"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "recv" in out and "memcpy" in out and "overflow_len" in out
+    call = [c for c in calls if c["op"] == "taint_models"][0]
+    assert call["params"] == {}                          # no filters -> empty params
+
+
+def test_taint_models_command_forwards_filters(monkeypatch, capsys):
+    fake, calls = _fake({"taint_models": {"sources": [], "sinks_by_class": {}, "propagators": [],
+                                          "overlays": [], "items": []}})
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    rc = bn.cli.main(["taint", "models", "--role", "sink", "--class", "overflow_len",
+                      "--present", "--callsites", "--target", "active"])
+    assert rc == 0
+    call = [c for c in calls if c["op"] == "taint_models"][0]
+    assert call["params"] == {"role": "sink", "class": "overflow_len",
+                              "present": True, "callsites": True}

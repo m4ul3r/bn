@@ -9,6 +9,7 @@ from ..cli import _call, _depth_int, arg, command
 from ..formatters import (
     _render_callgraph_text,
     _render_defuse_text,
+    _render_taint_models_text,
     _render_taint_text,
     _render_values_text,
 )
@@ -215,4 +216,39 @@ def _taint_backward(args: argparse.Namespace) -> int:
         require_target=True,
         text_renderer=(lambda v: _render_taint_text(v, full=bool(getattr(args, "full", False)))),
         stem="taint-backward",
+    )
+
+
+@command("taint", "models",
+         help="List the taint model catalog (sources/sinks/propagators); with a target, which are present",
+         target=True,
+         prefer_when="enumerate known sinks/sources and (with a target) which appear in this binary",
+         see_also=("taint forward", "taint backward"),
+         args=[
+             arg("--role", choices=("source", "sink", "propagator"), default=None,
+                 help="Filter to one role"),
+             arg("--class", dest="sink_class", default=None, metavar="CLASS",
+                 help="Filter sinks to one bug class (e.g. overflow_len); implies --role sink"),
+             arg("--present", action="store_true", default=False,
+                 help="With a target: show only models present in the binary (errors without a target)"),
+             arg("--callsites", action="store_true", default=False,
+                 help="With --present: expand each present sink's callsite addresses"),
+         ])
+def _taint_models(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {}
+    if args.role:
+        params["role"] = args.role
+    if args.sink_class:
+        params["class"] = args.sink_class
+    if args.present:
+        params["present"] = True
+    if args.callsites:
+        params["callsites"] = True
+    return _call(
+        args,
+        "taint_models",
+        params,
+        require_target=False,               # catalog dump works with no target
+        text_renderer=_render_taint_models_text,
+        stem="taint-models",
     )
