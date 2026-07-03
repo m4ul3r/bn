@@ -23,7 +23,7 @@ Start by mapping what the binary does and where untrusted data enters:
    ```bash
    bn imports
    ```
-   > **Shortcut:** `bash scripts/sink-sweep.sh -t <target>` (in this skill) enumerates the **copy / format-string / exec / input** sinks below **and** runs `bn xrefs` on each, printing every call site to trace back to a source — the sink-enumeration step that's easy to skip. Forward the usual `-i`/`-t` selectors. **Do not pass `--out` to it** — the script manages its own output; redirect stdout if you want a file (`... > sinks.txt`). (It skips the malloc family by design — heap bugs aren't found by xref'ing the allocator. Falls back cleanly: prints "no dangerous-sink imports" on a static/stripped target — then use the lane below.)
+   > **Shortcut:** `bash scripts/sink-sweep.sh -t <target>` (resolve `scripts/sink-sweep.sh` against **this skill's base directory** — the path shown when the skill loads; don't `find /` for it, which is slow and hits pytest tmp copies) enumerates the **copy / format-string / exec / input** sinks below **and** runs `bn xrefs` on each, printing every call site to trace back to a source — the sink-enumeration step that's easy to skip. Forward the usual `-i`/`-t` selectors. **Do not pass `--out` to it** — the script manages its own output; redirect stdout if you want a file (`... > sinks.txt`). (It skips the malloc family by design — heap bugs aren't found by xref'ing the allocator. Falls back cleanly: prints "no dangerous-sink imports" on a static/stripped target — then use the lane below.)
 
    Flag these categories:
    - **Unbounded copies**: `strcpy`, `strcat`, `sprintf`, `gets`, `scanf` (no length limit)
@@ -42,7 +42,7 @@ Start by mapping what the binary does and where untrusted data enters:
    ```bash
    bn strings --regex --query '%s|%x|%n|SELECT|INSERT|/bin/' --no-crt --min-length 4
    ```
-   `--regex` makes `--query` a case-insensitive regex so the `|` actually means OR — without it `--query` is a literal substring and `\|` matches nothing. Use `--no-crt` to suppress locale/CRT noise and `--min-length` to skip short fragments; `--section .rodata` restricts to read-only data.
+   `--regex` makes `--query` a case-insensitive regex so the `|` actually means OR — without it `--query` is a literal substring and `\|` matches nothing. Use `--no-crt` to suppress locale/CRT noise and `--min-length` to skip short fragments; `--section .rodata` restricts to read-only data. **On a symbol-rich C++ target, always scope with `--section .rodata`** — `bn strings` scans `.dynstr`, so the real literals are otherwise buried under mangled `_Z...` symbol names (`--no-crt` does *not* drop those).
 
 4. **Memory layout** — understand which regions are writable, executable, or both:
    ```bash

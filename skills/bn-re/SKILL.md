@@ -22,7 +22,7 @@ Start broad, then narrow:
    bn imports
    bn strings
    ```
-   Imports tell you what the binary *does* (network I/O, file ops, crypto, GUI). Strings reveal configuration keys, error messages, format strings, and embedded paths.
+   Imports tell you what the binary *does* (network I/O, file ops, crypto, GUI). Strings reveal configuration keys, error messages, format strings, and embedded paths. On a symbol-rich C++ target, scope with `bn strings --section .rodata` — the unfiltered dump scans `.dynstr` and buries the real literals under mangled `_Z...` symbol names (`bn strings` prints a tip pointing this out when the dump is symbol-noisy).
 
 3. **Scan the function list** — get a sense of scope:
    ```bash

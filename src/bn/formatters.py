@@ -1507,7 +1507,10 @@ def _render_init_arrays_text(value: Any) -> str:
         return _render_fallback_text(value)
     sections = list(value.get("items") or [])  # #275: was `sections`
     if not sections:
-        return "init arrays: none"
+        # #448: on a `.so` you'd expect constructors, so a bare "none" reads like a
+        # possible miss. State the authoritative reason so an empty result is
+        # self-evidently correct, not a suspected gap.
+        return "init arrays: none (no DT_INIT / DT_INIT_ARRAY present)"
     lines = [f"init arrays: {len(sections)} section(s), pointer-size={value.get('pointer_size', '<unknown>')}"]
     for section in sections:
         if not isinstance(section, dict):
