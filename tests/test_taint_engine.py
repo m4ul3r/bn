@@ -4542,3 +4542,15 @@ def test_derive_flow_facts_backward_unresolved_origin():
         origin={"kind": "indirect_call"}, crossed_functions=["copy_field", "parse_hdr"])
     assert metrics["traverses_unresolved"] is True
     assert metrics["fns_spanned"] == 3          # 2 crossed + origin frame
+
+
+def test_forward_result_carries_metrics_and_signature(process_func, models):
+    bv = FBV({0x401070: "read", 0x401080: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(process_func, [te.parse_locator("arg:read:1")])
+    f = result["reached_sinks"][0]
+    assert set(f["metrics"]) == {"steps", "fns_spanned", "traverses_unresolved"}
+    assert f["signature"]["sink_callee"]                      # populated
+    assert "→" in f["signature"]["rendered"]
+    # the sink path step carries a structured callee (no prose-regex needed)
+    assert any(s.get("callee") for s in f["path"])

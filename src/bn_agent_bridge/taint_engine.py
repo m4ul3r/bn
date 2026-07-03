@@ -437,7 +437,8 @@ def const_target(expr: Any) -> int | None:
         return None
 
 
-def _instr_dict(ins: Any, reason: str | None = None, tainted: list[str] | None = None) -> dict[str, Any]:
+def _instr_dict(ins: Any, reason: str | None = None, tainted: list[str] | None = None,
+                callee: str | None = None) -> dict[str, Any]:
     out = {
         "il_index": int(getattr(ins, "instr_index", -1)),
         "address": hex(int(getattr(ins, "address", 0))),
@@ -448,6 +449,8 @@ def _instr_dict(ins: Any, reason: str | None = None, tainted: list[str] | None =
         out["reason"] = reason
     if tainted is not None:
         out["tainted"] = tainted
+    if callee is not None:
+        out["callee"] = str(callee)
     return out
 
 
@@ -2301,10 +2304,17 @@ class TaintEngine:
                 continue
             seen_sink.add(sig)
             unique_findings.append(f)
+        sources_echo = [self._describe_locator(s) for s in sources]
+        for f in unique_findings:
+            fm, fs = derive_flow_facts(
+                direction="forward", path=f.get("path"), sink=f.get("sink"),
+                sources=sources_echo, leaves=sub["leaves"], fn_name=str(func.name))
+            f["metrics"] = fm
+            f["signature"] = fs
         return {
             "direction": "forward",
             "function": {"name": str(func.name), "address": hex(int(func.start))},
-            "sources": [self._describe_locator(s) for s in sources],
+            "sources": sources_echo,
             "reached_sinks": unique_findings,
             "leaves": sub["leaves"],
             "assumptions": sub["assumptions"],
@@ -3066,7 +3076,8 @@ class TaintEngine:
         note = f"calls {callee_fn.name} with tainted arg(s) {sorted(valid)}"
         if via:
             note = f"[{via}-resolved] " + note
-        prefix.append(_instr_dict(ins, reason=note, tainted=[node_label(first_hit, why)]))
+        prefix.append(_instr_dict(ins, reason=note, tainted=[node_label(first_hit, why)],
+                                  callee=getattr(callee_fn, "name", None)))
         for f in sub["findings"]:
             out["findings"].append({"sink": f["sink"], "path": prefix + f["path"]})
         out["leaves"] = list(sub["leaves"])
@@ -4274,7 +4285,8 @@ class TaintEngine:
     def _make_finding(self, ins, callee, argidx, sink, hit_nodes, why) -> dict[str, Any]:
         path = self._reconstruct_path(hit_nodes[0], why)
         path.append(_instr_dict(ins, reason=f"tainted arg{argidx} reaches {callee}",
-                                tainted=[node_label(n, why) for n in hit_nodes]))
+                                tainted=[node_label(n, why) for n in hit_nodes],
+                                callee=callee))
         return {
             "sink": {
                 "callee": callee,
@@ -4394,6 +4406,12 @@ class TaintEngine:
                 "no backward seed resolved for any sink:\n  "
                 + "\n  ".join(f"{format_locator(s)}: {m}" for s, m in errors))
 
+        for sl in slices:
+            sm, ss = derive_flow_facts(
+                direction="backward", path=sl.get("slice"), sink=sl.get("sink"),
+                origin=sl.get("origin"), crossed_functions=sl.get("crossed_functions"))
+            sl["metrics"] = sm
+            sl["signature"] = ss
         return {
             "direction": "backward",
             "function": {"name": str(func.name), "address": hex(int(func.start))},
