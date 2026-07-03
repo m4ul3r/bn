@@ -2964,6 +2964,48 @@ class TaintEngine:
             "note": note,
         }
 
+    def _arg_under_recovered_leaf(self, ins: Any, callee_fn: Any, dropped: list,
+                                  n_params: int) -> dict[str, Any] | None:
+        """Disclose a PARTIAL arg drop: taint DID descend into *callee_fn*, but some
+        tainted arg indices sit beyond its recovered arity (BN under-recovered the
+        callee's signature), so those flows were dropped. Gated by
+        ``_reg_reads_as_input`` -- only args the callee actually consumes -- so it
+        never cries wolf on a leftover value. Register-passed only; stack-passed
+        indices (i386 varargs, #324) are skipped. Returns a leaf or None; degrades
+        to None on any BN-API shortfall so it never fabricates a frontier."""
+        try:
+            cc = (getattr(callee_fn, "calling_convention", None)
+                  or self.bv.platform.default_calling_convention)
+            arg_regs = list(getattr(cc, "int_arg_regs", []) or [])
+        except Exception:
+            return None
+        confirmed: list[int] = []
+        for i in sorted(dropped):
+            if i >= len(arg_regs):
+                continue  # stack-passed -- out of scope (#324)
+            try:
+                if self._reg_reads_as_input(callee_fn, arg_regs[i]):
+                    confirmed.append(i)
+            except Exception:
+                continue
+        if not confirmed:
+            return None
+        name = str(getattr(callee_fn, "name", "?"))
+        return {
+            "kind": "arg_under_recovered",
+            "address": hex(int(getattr(ins, "address", 0))),
+            "callee": {"name": name,
+                       "address": hex(int(getattr(callee_fn, "start", 0)))},
+            "recovered_params": n_params,
+            "dropped_args": confirmed,
+            "note": (f"tainted arg(s) {confirmed} passed to {name} but Binary Ninja "
+                     f"recovered only {n_params} parameter(s) -- the callee's "
+                     f"signature is likely under-recovered, so taint into it was "
+                     f"dropped. Recover the real prototype and apply "
+                     f"`bn proto set {name} \"<prototype>\"`, then re-run this taint "
+                     f"query."),
+        }
+
     def _descend(self, ins: Any, callee_fn: Any, tainted_args: dict, why: dict,
                  depth: int, max_depth: int, *, via: str | None = None) -> dict[str, Any]:
         """Recurse into a (direct or resolved-indirect) internal callee and return
@@ -2983,8 +3025,10 @@ class TaintEngine:
             out["assumptions"].append(f"tainted args to {callee_fn.name} fall beyond its parameters; conservative")
             out["leaves"].append(self._frontier_leaf(
                 ins, callee_fn, tainted_args,
-                "tainted data passed to in-binary callee with no model and no "
-                "mappable parameters; investigate"))
+                "tainted data passed to in-binary callee whose parameters BN did not "
+                "recover, so taint into it was dropped. If it is a real callee with a "
+                "wrong signature, apply `bn proto set <callee> \"<prototype>\"` and "
+                "re-run; otherwise investigate"))
             return out
         if depth + 1 > max_depth:
             self._truncated = True
@@ -3006,6 +3050,15 @@ class TaintEngine:
         for f in sub["findings"]:
             out["findings"].append({"sink": f["sink"], "path": prefix + f["path"]})
         out["leaves"] = list(sub["leaves"])
+        # Disclose a PARTIAL arg drop: taint descended with the in-range args, but
+        # any tainted arg beyond the callee's recovered arity was filtered out of
+        # `valid` above and would otherwise vanish silently (#442-class). Gated so
+        # it only fires on args the callee actually reads.
+        dropped = [i for i in tainted_args if i >= n_params]
+        if dropped:
+            under = self._arg_under_recovered_leaf(ins, callee_fn, dropped, n_params)
+            if under is not None:
+                out["leaves"].append(under)
         frontier = sub.get("frontier")
         if frontier:
             out["leaves"].append(self._frontier_leaf(
