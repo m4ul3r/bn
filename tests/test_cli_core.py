@@ -475,10 +475,9 @@ def test_duplicate_command_path_registration_raises():
         bn.cli.command("xrefs")(lambda args: 0)
 
 
-def test_unpaged_list_spill_hint_points_at_out_flag(monkeypatch, capsys):
-    # callsites returns a list but is not a paged command: the spill hint must
-    # not suggest --limit/--offset (those flags do not exist on `bn callsites`).
-    # (imports/sections used to be the example here, but they are paged now.)
+def test_paged_callsites_spill_hint_suggests_limit_offset(monkeypatch, capsys):
+    # #454: callsites is now a paged command, so its spill hint suggests
+    # --limit/--offset (the unpaged --out-hint branch is covered by types show above).
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         return {"ok": True, "result": [{"call": "0x1000", "caller_static": "0x1004"}]}
 
@@ -493,11 +492,10 @@ def test_unpaged_list_spill_hint_points_at_out_flag(monkeypatch, capsys):
 
     assert rc == 0
     _, stderr = capsys.readouterr()
-    assert "--limit/--offset" not in stderr
+    assert "--limit/--offset" in stderr
     # the path is named once (in "spilled to <path>"); the hint must not repeat it
     assert "spilled to /tmp/callsites.txt" in stderr
     assert stderr.count("/tmp/callsites.txt") == 1
-    assert "rerun with --out <path>" in stderr
 
 
 def test_negative_ip_depth_rejected_with_exit_2():

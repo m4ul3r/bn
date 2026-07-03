@@ -880,6 +880,24 @@ def test_evidence_message_routes_and_renders_lens(fake_transport, capsys):
     assert "metadata table windows: 1" in output
 
 
+def test_render_callsites_text_footer_when_paged():
+    # #454: a truncated high-fan-in survey states the true total + remainder.
+    from bn import formatters
+    row = {
+        "callee": {"name": "memcpy", "address": "0x1000"},
+        "containing_function": {"name": "parse", "address": "0x2000"},
+        "call_addr": "0x2010", "caller_static": "0x2014",
+    }
+    env = {"kind": "callsites", "items": [row], "total": 47,
+           "offset": 0, "limit": 1, "returned": 1, "has_more": True}
+    out = formatters._render_callsites_text(env)
+    assert "... showing 1 of 47 callsites" in out
+    assert "--offset/--limit" in out
+    # No footer when everything fits.
+    env_full = {**env, "total": 1, "has_more": False}
+    assert "showing" not in formatters._render_callsites_text(env_full)
+
+
 def test_callsites_routes_within_scope_and_renders_text(fake_transport, capsys):
     calls = fake_transport({"callsites": {
         "ok": True,

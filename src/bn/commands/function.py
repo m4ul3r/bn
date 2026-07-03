@@ -520,7 +520,7 @@ def _load_within_identifiers(path: Path) -> list[str]:
 
 
 @command("callsites", help="Find direct native callsites and exact caller_static addresses",
-         target=True,
+         target=True, paged=True,
          prefer_when="exact caller->callsite address mapping; "
                      "use xrefs for general or data cross-references",
          see_also=("xrefs",),
@@ -554,20 +554,28 @@ def _callsites(args: argparse.Namespace) -> int:
             f"  list callers:   bn xrefs {args.callee}"
         )
 
+    # #454: page high-fan-in callsite surveys bridge-side, like xrefs/function list.
+    params: dict[str, Any] = {
+        "callee": args.callee,
+        "within_identifiers": within_identifiers,
+        "context": args.context,
+        "caller_static": bool(args.caller_static),
+    }
+    if args.offset:
+        params["offset"] = args.offset
+    limit = _effective_limit(args)
+    if limit is not None:
+        params["limit"] = limit
     return _call(
         args,
         "callsites",
-        {
-            "callee": args.callee,
-            "within_identifiers": within_identifiers,
-            "context": args.context,
-            "caller_static": bool(args.caller_static),
-        },
+        params,
         require_target=True,
         text_renderer=lambda value: _render_callsites_text(
             value,
             prefer_caller_static=bool(args.caller_static),
         ),
+        paged_spill=True,
         stem="callsites",
     )
 

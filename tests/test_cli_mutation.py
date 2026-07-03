@@ -350,6 +350,19 @@ def test_render_target_line_shows_symbol_and_string_for_mapped_targets():
     assert "[.rodata, truncated]" in line
 
 
+def test_callsites_threads_limit_and_offset(fake_transport):
+    # #454: high-fan-in sink surveys page bridge-side like xrefs.
+    calls = fake_transport({"callsites": {"ok": True, "result": {
+        "kind": "callsites", "items": [], "total": 0,
+        "offset": 10, "limit": 5, "returned": 0, "has_more": False}}})
+    rc = bn.cli.main(["callsites", "--target", "active", "--within", "main",
+                      "--limit", "5", "--offset", "10", "memcpy"])
+    assert rc == 0
+    assert calls[-1]["op"] == "callsites"
+    assert calls[-1]["params"]["limit"] == 5
+    assert calls[-1]["params"]["offset"] == 10
+
+
 def test_callsites_within_file_ignores_comments_and_blank_lines(fake_transport, tmp_path):
     scope_file = tmp_path / "functions.txt"
     scope_file.write_text(

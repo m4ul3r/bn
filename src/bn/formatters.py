@@ -1539,10 +1539,14 @@ def _render_init_arrays_text(value: Any) -> str:
 
 
 def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) -> str:
-    # callsites now returns the {items,total,...} envelope (#131 / item 11);
-    # unwrap to the row list. has_more is always false (no bridge-side paging),
-    # so no footer -- the --limit cap below stays a text-only renderer feature.
+    # callsites returns the {items,total,...} envelope (#131 / item 11). Keep the
+    # paging metadata (#454: callsites now pages bridge-side like xrefs) so a
+    # truncated high-fan-in survey states the true total + remainder in a footer.
+    total = None
+    has_more = False
     if isinstance(value, dict) and "items" in value:
+        total = value.get("total")
+        has_more = bool(value.get("has_more"))
         value = value.get("items") or []
     if not isinstance(value, list):
         return _render_fallback_text(value)
@@ -1599,7 +1603,13 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
             if isinstance(item, dict):
                 lines.append(f"  {item.get('address', '<unknown>')}  {item.get('text', '')}".rstrip())
         blocks.append("\n".join(lines))
-    return "\n\n".join(blocks)
+    body = "\n\n".join(blocks)
+    if has_more and isinstance(total, int):
+        body += (
+            f"\n\n... showing {len(value)} of {total} callsites; "
+            "use --offset/--limit to page (or --format json for all)"
+        )
+    return body
 
 
 def _render_structured_il_text(value: Any) -> str:

@@ -2408,6 +2408,8 @@ def _bind_callsites(bridge, params, target):
         str(params["callee"]),
         within_identifiers=list(params.get("within_identifiers") or []),
         context=int(params.get("context", 3)),
+        offset=int(params.get("offset", 0)),
+        limit=int(params["limit"]) if params.get("limit") is not None else None,
     )
 
 

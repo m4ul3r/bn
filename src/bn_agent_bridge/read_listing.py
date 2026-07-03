@@ -130,9 +130,13 @@ def _callsites(
     *,
     within_identifiers: list[Any],
     context: int = 3,
+    offset: int = 0,
+    limit: int | None = None,
 ) -> list[dict[str, Any]]:
     if context < 0:
         raise OperationFailure("invalid_context", f"Invalid callsite context size: {context}")
+    offset = _validate_count(offset, label="offset", minimum=0)
+    limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
 
     bv = ctx._resolve_view(selector)
     require_analysis(bv, "Callsites")
@@ -154,9 +158,10 @@ def _callsites(
             row["within_query"] = str(within_query)
         rows.extend(function_rows)
     # Honest paging envelope for JSON parity (#131 / item 11): callsites is a
-    # flat row list, so wrap it like the sibling list ops. --limit stays a
-    # text-only renderer cap (no bridge-side paging), hence offset=0/limit=None.
-    return read_misc._paged_list_result(rows, offset=0, limit=None, kind="callsites")
+    # flat row list, so wrap it like the sibling list ops. #454: on a high-fan-in
+    # sink, page bridge-side with --limit/--offset (the true total + remainder stay
+    # in the envelope), same contract as xrefs / function list.
+    return read_misc._paged_list_result(rows, offset=offset, limit=limit, kind="callsites")
 
 
 def _parse_function_address_bounds(
