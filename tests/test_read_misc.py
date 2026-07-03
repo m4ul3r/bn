@@ -707,6 +707,34 @@ def test_function_list_search_min_size_drops_thunk_veneers(monkeypatch):
     assert instance._search_functions("active", "RFCOMM", min_size=100, count_only=True)["count"] == 1
 
 
+def test_function_search_word_boundary_excludes_substring_fps(monkeypatch):
+    # #457: plain (substring) `function search popen` matches unrelated symbols like
+    # zipOpenArchive (which contains "popen") -- a sink-survey false positive.
+    # --word matches the query only as a whole identifier token; --exact is stricter.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(functions=[
+        _FakeFunction(0x1000, "popen"),
+        _FakeFunction(0x2000, "popen@plt"),
+        _FakeFunction(0x3000, "zipOpenArchive"),   # contains "popen" as a substring
+        _FakeFunction(0x4000, "my_popen_wrapper"),
+    ])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    def names(res):
+        return sorted(it["name"] for it in res["items"])
+
+    # Plain substring: all four match (the trap).
+    assert names(instance._search_functions("active", "popen")) == \
+        ["my_popen_wrapper", "popen", "popen@plt", "zipOpenArchive"]
+    # --word: only the whole-token matches; the substring FPs are excluded.
+    assert names(instance._search_functions("active", "popen", word=True)) == \
+        ["popen", "popen@plt"]
+    # --exact: only the exact name.
+    assert names(instance._search_functions("active", "popen", exact=True)) == ["popen"]
+    assert instance._search_functions("active", "popen", word=True, count_only=True)["count"] == 2
+
+
 def test_refresh_clears_quick_state_and_enables_strings(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

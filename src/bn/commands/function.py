@@ -123,7 +123,11 @@ def _function_list(args: argparse.Namespace) -> int:
                        help="Interpret query as a case-insensitive regular expression"),
                    arg("--exact", action="store_true", default=False,
                        help="Match function names exactly (case-insensitive); avoids substring "
-                            "false positives in C++ mangled names")),
+                            "false positives in C++ mangled names"),
+                   arg("--word", action="store_true", default=False,
+                       help="Match the query as a whole identifier token (word-boundary): for a "
+                            "sink survey, `--word popen` hits popen/popen@plt but not the "
+                            "substring FPs zipOpenArchive/my_popen_wrapper")),
          ])
 def _function_search(args: argparse.Namespace) -> int:
     # #410: accept the query positionally OR via --query (matches strings/types
@@ -133,6 +137,7 @@ def _function_search(args: argparse.Namespace) -> int:
         "query": query,
         "regex": bool(args.regex),
         "exact": bool(args.exact),
+        "word": bool(getattr(args, "word", False)),
     }
     if args.min_address is not None:
         params["min_address"] = args.min_address

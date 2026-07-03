@@ -328,6 +328,7 @@ def _search_functions(
     *,
     regex: bool = False,
     exact: bool = False,
+    word: bool = False,
     min_address: Any = None,
     max_address: Any = None,
     min_size: Any = None,
@@ -347,6 +348,17 @@ def _search_functions(
             pattern = re.compile(query, re.IGNORECASE)
         except re.error as exc:
             raise OperationFailure("invalid_regex", f"Invalid function regex: {exc}") from exc
+
+        def matches(name: str) -> bool:
+            return bool(pattern.search(name))
+
+    elif word:
+        # #457: match the query as a whole IDENTIFIER TOKEN (word-boundary), so a
+        # sink survey for `popen` hits `popen` / `popen@plt` but NOT the substring
+        # false positives `zipOpenArchive` / `my_popen_wrapper`. Looser than
+        # --exact (still finds `@plt`-decorated and parenthesized forms), tighter
+        # than the default substring match.
+        pattern = re.compile(r"\b" + re.escape(query) + r"\b", re.IGNORECASE)
 
         def matches(name: str) -> bool:
             return bool(pattern.search(name))

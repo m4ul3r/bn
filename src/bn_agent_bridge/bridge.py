@@ -2389,6 +2389,7 @@ def _bind_search_functions(bridge, params, target):
         str(params.get("query", "")),
         regex=_validate_bool(params.get("regex"), label="regex", default=False),
         exact=_validate_bool(params.get("exact"), label="exact", default=False),
+        word=_validate_bool(params.get("word"), label="word", default=False),
         min_address=params.get("min_address"),
         max_address=params.get("max_address"),
         min_size=params.get("min_size"),
