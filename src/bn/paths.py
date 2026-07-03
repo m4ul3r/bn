@@ -109,6 +109,24 @@ def find_instance_markers(start: Path | None = None, *, max_depth: int = 40):
                 continue
 
 
+def remove_instance_markers(instance_id: str, start: Path | None = None) -> list[Path]:
+    """Delete every ``.bn-<instance_id>`` marker found walking up from *start*
+    (default cwd) and return the paths removed (#436). Markers are not cleaned on
+    ``session stop`` otherwise, so they accumulate in the repo root as stray VCS
+    noise. Only markers whose id matches *instance_id* exactly are removed; an
+    unreadable/undeletable marker is skipped rather than raised."""
+    removed: list[Path] = []
+    for found_id, path in find_instance_markers(start):
+        if found_id != instance_id:
+            continue
+        try:
+            path.unlink()
+            removed.append(path)
+        except OSError:
+            continue
+    return removed
+
+
 def bridge_registry_path(instance_id: str | None = None) -> Path:
     if instance_id is None:
         return cache_home() / f"{PLUGIN_NAME}.json"

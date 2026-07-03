@@ -509,6 +509,9 @@ def _render_session_stop_text(value: Any) -> str:
     method = value.get("method")
     if method:
         line += f" ({method})"
+    removed = value.get("marker_removed")
+    if removed:
+        line += f"\nremoved marker(s): {', '.join(str(p) for p in removed)}"
     return line
 
 

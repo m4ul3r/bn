@@ -31,6 +31,7 @@ from .paths import (  # noqa: F401
     codex_skills_dir,
     plugin_install_dir,
     plugin_source_dir,
+    remove_instance_markers,
     repo_root,
     skills_source_dir,
 )

@@ -543,6 +543,33 @@ def test_session_list_shows_instances(monkeypatch, capsys):
     assert "total_rss_mb" in parsed
 
 
+def test_remove_instance_markers_matches_only_the_id(tmp_path):
+    # #436: session stop must clean up the instance's own `.bn-<id>` marker and
+    # leave unrelated markers (other sessions) in place.
+    from bn import paths
+    (tmp_path / ".bn-WorkerA").write_text("")
+    (tmp_path / ".bn-Other").write_text("")
+    removed = paths.remove_instance_markers("WorkerA", start=tmp_path)
+    assert [p.name for p in removed] == [".bn-WorkerA"]
+    assert not (tmp_path / ".bn-WorkerA").exists()
+    assert (tmp_path / ".bn-Other").exists()
+    # Idempotent: a second stop with no marker returns nothing.
+    assert paths.remove_instance_markers("WorkerA", start=tmp_path) == []
+
+
+def test_session_stop_removes_marker(monkeypatch, capsys, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".bn-abc123").write_text("")
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [])
+    monkeypatch.setattr(bn.cli, "send_request",
+                        lambda op, **k: {"ok": True, "result": {}})
+    rc = bn.cli.main(["session", "stop", "abc123", "--format", "json"])
+    assert rc == 0
+    parsed = json.loads(capsys.readouterr().out)
+    assert any(".bn-abc123" in p for p in parsed["marker_removed"])
+    assert not (tmp_path / ".bn-abc123").exists()
+
+
 def test_session_stop_sends_shutdown(monkeypatch, capsys):
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "shutdown"

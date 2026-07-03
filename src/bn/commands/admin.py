@@ -408,6 +408,15 @@ def _session_stop(args: argparse.Namespace) -> int:
                 return 1
             result["method"] = "sigkill"
 
+    # #436: clean up the instance's project-local `.bn-<id>` marker so it doesn't
+    # accumulate as stray VCS noise. Remove by the canonical instance id (the
+    # marker was dropped under it), falling back to the requested selector.
+    marker_id = inst.instance_id if inst is not None else target_id
+    removed = cli.remove_instance_markers(marker_id)
+    if not removed and marker_id != target_id:
+        removed = cli.remove_instance_markers(target_id)
+    result["marker_removed"] = [str(p) for p in removed]
+
     cli._emit_result(args, result, text_renderer=_render_session_stop_text, stem="session-stop")
     return 0
 
