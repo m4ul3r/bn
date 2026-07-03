@@ -1948,7 +1948,8 @@ def _render_taint_text(value: Any) -> str:
                 _extra = _vs + (f" ({origin['var']})" if origin.get("var") else "")
             else:
                 _extra = origin.get("callee") or origin.get("var") or ""
-            lines.append(f"  origin: {_ok} {_extra}".rstrip())
+            _spill = " (via spill)" if origin.get("via_spill") else ""
+            lines.append(f"  origin: {_ok} {_extra}{_spill}".rstrip())
             crossed = sl.get("crossed_functions") or []
             if crossed:
                 lines.append(f"  crosses: {' <- '.join(crossed)}")

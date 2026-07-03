@@ -497,3 +497,14 @@ def test_taint_models_bad_file_is_loud(monkeypatch, capsys, tmp_path):
     rc2 = bn.cli.main(["taint", "forward", "-f", "h", "--source", "param:0",
                        "--models", str(tmp_path / "nope.json"), "--target", "active"])
     assert rc2 != 0
+
+
+def test_render_backward_origin_via_spill():
+    value = {"direction": "backward", "function": {"name": "use_len", "address": "0x800"},
+             "sinks": [{"kind": "arg", "callee": "memcpy", "index": 2}],
+             "slices": [{"sink": {"callee": "memcpy", "address": "0x804", "seed": "var_n#5"},
+                         "origin": {"kind": "parameter", "index": 2, "var": "var_n#5", "via_spill": True},
+                         "slice": []}],
+             "leaves": [], "assumptions": [], "soundness": "x"}
+    text = _render_taint_text(value)
+    assert "origin: parameter var_n#5 (via spill)" in text

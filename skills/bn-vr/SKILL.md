@@ -205,6 +205,13 @@ When a slice bottoms out at a parameter, it continues up into callers
 each call's argument — so a length checked in a helper is traced to the `recv`
 that produced it. Each result lists the `crosses:` chain and an `origin`.
 
+> **Backward now bridges register→stack parameter spills.** When a callee spills an
+> incoming parameter to a stack slot on entry (common on MIPS/ARM), `taint backward`
+> canonicalizes the stack local to `param:N` (shown as `origin: parameter … (via
+> spill)` + a `#434` caveat) so caller-ascent still climbs into the callers. The
+> residual cases where backward stops short — a scalar arg passed as `&local`, or a
+> local filled by a callee through an out-pointer — still favor `bn trace`.
+
 `bn taint backward` and `bn trace` (see "Sink-to-source tracing" above) are
 complementary backward slicers: `taint backward` seeds on a sink/var locator
 and ascends into *callers* to find where a value originates, while `bn trace`
