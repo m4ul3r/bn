@@ -1781,6 +1781,15 @@ def _render_leaf_line(leaf: dict[str, Any]) -> str:
             bits.append(f"width={leaf['width']}")
         meta = ("  " + " ".join(bits)) if bits else ""
         return f"  field_load_unresolved @ {leaf.get('address')}{meta}"
+    if kind == "arg_under_recovered":
+        cal = leaf.get("callee") or {}
+        return (
+            f"  arg_under_recovered @ {leaf.get('address')}"
+            f"  -> {cal.get('name', '?')} @ {cal.get('address', '?')}"
+            f"  (recovered {leaf.get('recovered_params', '?')} param(s); "
+            f"dropped arg(s) {leaf.get('dropped_args', [])})"
+            + (f"  -- {leaf.get('note')}" if leaf.get("note") else "")
+        )
     return (
         f"  {kind} @ {leaf.get('address')}  [{leaf.get('dest_expr', leaf.get('il_text', ''))}]"
         + (f"  -- {leaf.get('detail')}" if leaf.get("detail") else "")
@@ -1795,6 +1804,8 @@ def _leaf_group_key(leaf: dict[str, Any]) -> tuple:
         return (kind, (leaf.get("callee") or {}).get("name", "?"))
     if kind == "field_load_unresolved":
         return (kind, leaf.get("base"), leaf.get("offset"))
+    if kind == "arg_under_recovered":
+        return (kind, (leaf.get("callee") or {}).get("name", "?"))
     return (kind,)
 
 

@@ -180,3 +180,27 @@ def test_text_renderer_failure_becomes_clean_error(fake_transport, capsys):
     rc = bn.cli.main(["function", "info", "main", "--target", "active", "--format", "text"])
     assert rc == 0
     assert "<unknown>" in capsys.readouterr().out
+
+
+# --- arg_under_recovered frontier rendering (Thread A) -----------------------
+
+def test_render_arg_under_recovered_leaf():
+    from bn.formatters import _render_grouped_leaves
+    leaf = {"kind": "arg_under_recovered", "address": "0x40130a",
+            "callee": {"name": "_M_create", "address": "0x3000"},
+            "recovered_params": 1, "dropped_args": [1],
+            "note": 'tainted arg(s) [1] ... apply `bn proto set _M_create "<prototype>"` ...'}
+    out = "\n".join(_render_grouped_leaves([leaf]))
+    assert "arg_under_recovered @ 0x40130a" in out
+    assert "_M_create" in out
+    assert "recovered 1 param" in out
+    assert "proto set _M_create" in out
+
+
+def test_arg_under_recovered_leaves_group_per_callee():
+    from bn.formatters import _render_grouped_leaves
+    mk = lambda addr: {"kind": "arg_under_recovered", "address": addr,
+                       "callee": {"name": "f", "address": "0x3000"},
+                       "recovered_params": 1, "dropped_args": [1], "note": "n"}
+    out = "\n".join(_render_grouped_leaves([mk("0x10"), mk("0x20")]))
+    assert "(x2)" in out                                   # two call sites of f collapse
