@@ -4401,10 +4401,19 @@ class TaintEngine:
                 defn = None
             if defn is None:
                 pidx = self._param_index_of(func, v)
+                via_spill = False
+                if pidx is None:
+                    pidx = self._param_spill_index(func, ssaf, v)
+                    via_spill = pidx is not None
                 if pidx is not None:
                     terminal_params[pidx] = v
                     if origin["kind"] == "unresolved":
-                        origin = {"kind": "parameter", "index": pidx, "var": var_label(v)}
+                        origin = {"kind": "parameter", "index": pidx, "var": var_label(v),
+                                  **({"via_spill": True} if via_spill else {})}
+                    if via_spill:
+                        self._bw_assume(
+                            f"stack local {var_label(v)} is a spill of param {pidx}; "
+                            f"canonicalized to param:{pidx} so caller-ascent continues (#434)")
                 elif origin["kind"] == "unresolved":
                     origin = {"kind": "entry", "var": var_label(v)}
                 return
