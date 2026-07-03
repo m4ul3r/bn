@@ -239,6 +239,7 @@ _IMPORT_PLUS_EXTERNAL: list[tuple[str, str]] = _IMPORT_SYMBOL_TYPES + [("Externa
 
 
 def _imports(ctx, selector: str | None, *, summary: bool = False,
+             query: str | None = None, regex: bool = False,
              offset: int = 0, limit: int | None = None, count_only: bool = False,
              include_got: bool = False):
     # Guard paging the same way the sibling list ops do, so a raw-socket /
@@ -303,6 +304,28 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
             emitted_names.add(raw_name)
             if kind in ("function", "data"):
                 func_data_names.add(raw_name)
+    # #450: filter the survey to matching imports so a sink/source sweep
+    # (`--query 'system|execve|popen' --regex`) doesn't need full paging + external
+    # jq. Matches name / raw_name / library / namespace, mirroring strings/sections.
+    if query:
+        if regex:
+            try:
+                pattern = re.compile(query, re.IGNORECASE)
+            except re.error as exc:
+                raise OperationFailure("invalid_regex", f"Invalid import regex: {exc}") from exc
+
+            def _hit(text: str) -> bool:
+                return bool(pattern.search(text))
+        else:
+            needle = query.lower()
+
+            def _hit(text: str) -> bool:
+                return needle in text.lower()
+
+        items = [
+            it for it in items
+            if any(_hit(str(it.get(f) or "")) for f in ("name", "raw_name", "library", "namespace"))
+        ]
     if count_only:
         result = {"kind": "imports", "count": len(items), "total": len(items)}
         if self_defined_excluded:

@@ -102,15 +102,23 @@ def _imports_count_text(value: Any) -> str:
                    help="Show aggregate counts by namespace and kind instead of the full list"),
                arg("--count", action="store_true", default=False,
                    help="Show the total import count instead of listing"),
+               arg("--query", dest="query", default=None,
+                   help="Filter to imports matching this substring (or regex with --regex) "
+                        "against name/raw_name/library, e.g. a sink sweep"),
+               arg("--regex", action="store_true", default=False,
+                   help="Treat --query as a case-insensitive regex (alternation for sink families)"),
                arg("--include-got", action="store_true", default=False,
                    help="Include GOT-slot (address) entries that duplicate a PLT import "
                         "(collapsed by default)")])
 def _imports(args: argparse.Namespace) -> int:
+    query = getattr(args, "query", None)
+    regex = bool(getattr(args, "regex", False))
     if args.count:
         return _call(
             args,
             "imports",
-            {"count_only": True, "include_got": bool(args.include_got)},
+            {"count_only": True, "include_got": bool(args.include_got),
+             "query": query, "regex": regex},
             require_target=True,
             text_renderer=_imports_count_text,
             stem="imports-count",
@@ -119,7 +127,8 @@ def _imports(args: argparse.Namespace) -> int:
     # Summary is a single aggregate object, so it ignores paging entirely. The
     # full list (often 500+ entries on firmware libs) pages bridge-side like
     # strings/function list, returning a {items, total, ...} envelope (#122).
-    params = {"summary": summary_mode, "offset": args.offset, "include_got": bool(args.include_got)}
+    params = {"summary": summary_mode, "offset": args.offset, "include_got": bool(args.include_got),
+              "query": query, "regex": regex}
     if not summary_mode:
         params["limit"] = _effective_limit(args)
     return _call(

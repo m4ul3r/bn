@@ -289,6 +289,34 @@ def test_imports_includes_function_data_and_address_symbols(monkeypatch):
     assert kinds["iat_entry"] == "address"
 
 
+def test_imports_query_and_regex_filter(monkeypatch):
+    # #450: filter the import survey so a sink sweep doesn't need full paging + jq.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+
+    def imp(addr, name):
+        s = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, addr, name)
+        s.short_name = name
+        s.namespace = "libc"
+        return s
+
+    bv = _FakeBV(symbols=[imp(0x1000, "system"), imp(0x2000, "execve"),
+                          imp(0x3000, "recv"), imp(0x4000, "memcpy")])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    def names(res):
+        return sorted(it["name"] for it in res["items"])
+
+    assert names(instance._imports(None, query="system")) == ["system"]
+    assert names(instance._imports(None, query="system|execve|popen", regex=True)) == \
+        ["execve", "system"]
+    assert instance._imports(None, query="recv", count_only=True)["count"] == 1
+    # No match -> a clean empty result (total 0), not an error.
+    assert instance._imports(None, query="nosuchimport")["items"] == []
+    assert instance._imports(None, query="nosuchimport")["total"] == 0
+
+
 def test_imports_excludes_pic_self_defined_exports(monkeypatch):
     """On a PIC .so BN models the lib's own defined+exported functions as import
     veneers (ImportedFunctionSymbol) plus their GOT slots (ImportAddressSymbol),

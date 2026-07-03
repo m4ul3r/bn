@@ -2620,6 +2620,8 @@ def _bind_imports(bridge, params, target):
     return bridge._imports(
         target,
         summary=_validate_bool(params.get("summary"), label="summary", default=False),
+        query=params.get("query"),
+        regex=_validate_bool(params.get("regex"), label="regex", default=False),
         offset=int(params.get("offset", 0)),
         limit=int(params["limit"]) if params.get("limit") is not None else None,
         count_only=_validate_bool(params.get("count_only"), label="count_only", default=False),
