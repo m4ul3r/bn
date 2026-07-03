@@ -2387,6 +2387,18 @@ def _format_op_summary(item: dict[str, Any]) -> str:
     return summary
 
 
+def _add_mutation_ok(value: Any) -> Any:
+    """Add a top-level ``ok`` boolean to a full mutation/batch result so a uniform
+    ``jq '.ok'`` check works across read and mutation commands (#447). ``ok`` is
+    the verification-aware success: the bridge-reported ``success`` AND no failed
+    op status. Additive -- ``success``/``committed`` are unchanged."""
+    if not isinstance(value, dict) or "ok" in value:
+        return value
+    results = [r for r in (value.get("results") or []) if isinstance(r, dict)]
+    failed = any(r.get("status") in FAILED_MUTATION_STATUSES for r in results)
+    return {"ok": bool(value.get("success", True)) and not failed, **value}
+
+
 def _mutation_summary(value: Any) -> Any:
     """#408: collapse a (single or batch) mutation result into a compact,
     schema-stable status object for an unattended agent control loop -- did
@@ -2413,6 +2425,10 @@ def _mutation_summary(value: Any) -> Any:
         first_error = value.get("message") or "mutation failed"
     return {
         "kind": "mutation_summary",
+        # Top-level `ok` mirrors the read-command envelope so a uniform `jq '.ok'`
+        # works across reads AND mutations (batch/mutation JSON used only
+        # success/committed, so `.ok` read null -- #447).
+        "ok": success,
         "success": success,
         "committed": committed,
         "preview": bool(value.get("preview", False)),

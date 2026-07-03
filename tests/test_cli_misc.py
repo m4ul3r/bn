@@ -312,6 +312,48 @@ def test_batch_apply_reads_manifest_from_stdin(monkeypatch, fake_transport, caps
     assert calls[-1]["params"]["ops"][0]["comment"] == comment
 
 
+def test_batch_apply_full_result_carries_top_level_ok(monkeypatch, fake_transport, capsys):
+    # #447: mutation/batch JSON used only success/committed, so `jq '.ok'` read
+    # null. Add a top-level `ok` mirroring the read-command envelope.
+    import io, json as _json
+    monkeypatch.setattr("sys.stdin", io.StringIO(
+        '{"target": "active", "ops": [{"op": "rename_function", "address": "0x1000", "name": "f"}]}'))
+    fake_transport({"batch_apply": {"ok": True, "result": {
+        "preview": False, "success": True, "committed": True,
+        "results": [{"status": "verified"}]}}})
+    rc = bn.cli.main(["batch", "apply", "-", "--format", "json"])
+    assert rc == 0
+    parsed = _json.loads(capsys.readouterr().out)
+    assert parsed["ok"] is True
+    assert parsed["success"] is True  # unchanged, additive
+
+
+def test_batch_apply_ok_false_on_failed_op(monkeypatch, fake_transport, capsys):
+    import io, json as _json
+    monkeypatch.setattr("sys.stdin", io.StringIO(
+        '{"target": "active", "ops": [{"op": "rename_function", "address": "0x1000", "name": "f"}]}'))
+    fake_transport({"batch_apply": {"ok": True, "result": {
+        "preview": False, "success": False, "committed": False,
+        "results": [{"status": "verification_failed"}]}}})
+    rc = bn.cli.main(["batch", "apply", "-", "--format", "json"])
+    parsed = _json.loads(capsys.readouterr().out)
+    assert parsed["ok"] is False
+
+
+def test_batch_apply_summary_carries_ok(monkeypatch, fake_transport, capsys):
+    import io, json as _json
+    monkeypatch.setattr("sys.stdin", io.StringIO(
+        '{"target": "active", "ops": [{"op": "rename_function", "address": "0x1000", "name": "f"}]}'))
+    fake_transport({"batch_apply": {"ok": True, "result": {
+        "preview": False, "success": True, "committed": True,
+        "results": [{"status": "verified"}]}}})
+    rc = bn.cli.main(["batch", "apply", "-", "--summary", "--format", "json"])
+    assert rc == 0
+    parsed = _json.loads(capsys.readouterr().out)
+    assert parsed["kind"] == "mutation_summary"
+    assert parsed["ok"] is True
+
+
 def test_batch_apply_accepts_target_flag(monkeypatch, fake_transport):
     # #308: batch apply now accepts -t like every other mutate command; the flag
     # supplies the manifest target when the manifest itself omits one.

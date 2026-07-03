@@ -13,6 +13,7 @@ from typing import Any, Callable
 from . import session_state
 from .formatters import (
     FAILED_MUTATION_STATUSES,
+    _add_mutation_ok,
     _format_operation_result,  # noqa: F401  -- re-exported for tests/scripts that monkeypatch bn.cli
     _mutation_summary,
     _render_fanout_text,
@@ -378,9 +379,11 @@ def summary_arg() -> tuple[tuple[str, ...], dict[str, Any]]:
     schema-stable status object (changed/verified/noop/failed counts + rolled_back
     + first_error + dirty_after) instead of the full audit payload, for an
     unattended agent control loop. The detailed output stays the default."""
-    return arg("--summary", action="store_true", default=False,
+    return arg("--summary", "--quiet", action="store_true", default=False,
+               dest="summary",
                help="Emit a compact status summary (counts, first_error, dirty_after) "
-                    "instead of the full mutation audit payload")
+                    "instead of the full mutation audit payload (avoids spilling on a "
+                    "routine rename/comment batch)")
 
 
 def command(
@@ -797,7 +800,7 @@ def _mutate(
         require_target=require_target,
         text_renderer=_render_mutation_summary_text if summary else _render_mutation_text,
         result_exit_code=_mutation_exit_code,
-        result_transform=_mutation_summary if summary else None,
+        result_transform=_mutation_summary if summary else _add_mutation_ok,
         stem=stem,
         **call_kwargs,
     )
