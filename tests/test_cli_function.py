@@ -461,6 +461,57 @@ def test_xrefs_field_routes_to_field_xrefs(fake_transport, capsys):
     assert "code refs:" in output
 
 
+def test_xrefs_text_pipe_truncation_note(fake_transport, monkeypatch, capsys):
+    # #439: a high-ref symbol truncates the text body to the default 100-group
+    # display cap, producing output too small to spill -- so no pipe note fired and
+    # a piped grep/wc/jq silently undercounts. When stdout is a pipe and the body is
+    # display-truncated, an explicit stderr note must fire.
+    items = [
+        {"address": hex(0x500000 + i * 4), "function": f"sub_{i:04x}", "kind": "code",
+         "caller_function": {"address": hex(0x400000 + i * 0x100), "name": f"sub_{i:04x}"}}
+        for i in range(150)
+    ]
+    fake_transport({"xrefs": {"ok": True, "result": {
+        "address": "0x401000",
+        "code_ref_count": 150, "data_ref_count": 0,
+        "items": items,
+        "total": 150, "offset": 0, "limit": None, "returned": 150, "has_more": False,
+    }}})
+    monkeypatch.setattr(bn.cli, "_stdout_is_pipe", lambda: True)
+
+    rc = bn.cli.main(["xrefs", "--format", "text", "--target", "active", "log_printf"])
+
+    assert rc == 0
+    stdout, stderr = capsys.readouterr()
+    # Header total stays honest and first; body is display-capped at 100 groups.
+    assert stdout.splitlines()[0] == "xrefs to 0x401000 (150 code, 0 data)"
+    assert "... 50 more functions" in stdout
+    # The fix: explicit truncation note on stderr naming the pipe + the true totals.
+    assert "note:" in stderr and "pipe" in stderr
+    assert "truncat" in stderr.lower()
+    assert "150" in stderr  # true total refs disclosed
+    assert "--out" in stderr
+
+
+def test_xrefs_text_no_truncation_note_when_under_cap(fake_transport, monkeypatch, capsys):
+    # A small result must NOT emit the truncation note even when piped.
+    items = [
+        {"address": hex(0x500000 + i * 4), "function": f"sub_{i:04x}", "kind": "code",
+         "caller_function": {"address": hex(0x400000 + i * 0x100), "name": f"sub_{i:04x}"}}
+        for i in range(5)
+    ]
+    fake_transport({"xrefs": {"ok": True, "result": {
+        "address": "0x401000", "code_ref_count": 5, "data_ref_count": 0,
+        "items": items, "total": 5, "offset": 0, "limit": None, "returned": 5, "has_more": False,
+    }}})
+    monkeypatch.setattr(bn.cli, "_stdout_is_pipe", lambda: True)
+
+    rc = bn.cli.main(["xrefs", "--format", "text", "--target", "active", "f"])
+    assert rc == 0
+    _, stderr = capsys.readouterr()
+    assert "truncat" not in stderr.lower()
+
+
 def test_xrefs_text_format_renders_summary(fake_transport, capsys):
     fake_transport({"xrefs": {
         "ok": True,

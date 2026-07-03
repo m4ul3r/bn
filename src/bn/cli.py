@@ -520,13 +520,18 @@ def _render_result(
     spill_label: str | None = None,
     spill_context: Any = None,
     paged: bool = False,
-) -> None:
+) -> bool:
+    """Render *value* to stdout; return True iff the output spilled to disk.
+
+    The spilled flag lets the caller decide whether to add a further note (e.g. a
+    display-truncation warning): a spill already prints its own pipe-trap note, so
+    a caller-side note would be redundant when it fires."""
     if out_path is None and isinstance(value, dict) and isinstance(value.get("artifact_path"), str):
         artifact = dict(value)
         artifact.setdefault("ok", True)
         artifact.setdefault("spilled", False)
         sys.stdout.write(render_envelope(artifact, fmt))
-        return
+        return bool(artifact.get("spilled"))
 
     result = write_output_result(value, fmt=fmt, out_path=out_path, stem=stem)
     if result.spilled and result.artifact:
@@ -562,8 +567,9 @@ def _render_result(
                 f"Re-run with --out FILE and search the file (or grep {artifact_path}).",
                 file=sys.stderr,
             )
-        return
+        return True
     sys.stdout.write(result.rendered)
+    return False
 
 
 def _emit_result(
@@ -821,6 +827,7 @@ def _call(
     regex_hint_query: str | None = None,
     regex_fallback_query: str | None = None,
     offset_hint_identifier: str | None = None,
+    truncation_note: Callable[[Any], str | None] | None = None,
     op_default_timeout: float | None = None,
 ) -> int:
     request_params = dict(params or {})
@@ -916,7 +923,7 @@ def _call(
                 f"malformed or newer than this CLI. Rerun with --format json to see the "
                 f"raw result. ({type(exc).__name__}: {exc})"
             ) from exc
-    _render_result(
+    spilled = _render_result(
         result,
         fmt=fmt,
         out_path=None if bridge_writes_output else args.out,
@@ -928,6 +935,15 @@ def _call(
         # the client-side page_limit (#59).
         paged=(page_limit is not None) or paged_spill,
     )
+    # A text renderer that display-truncates (e.g. xrefs capping caller groups)
+    # produces output too small to spill, so the spill pipe-note never fires and a
+    # piped grep/wc/jq silently undercounts (#439). When the body did NOT spill
+    # (which already warns) and stdout is a pipe, let the command surface an
+    # explicit truncation note from the RAW result (spill_context).
+    if truncation_note is not None and not spilled and _stdout_is_pipe():
+        note = truncation_note(spill_context)
+        if note:
+            print(note, file=sys.stderr)
     return exit_code
 
 

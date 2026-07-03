@@ -26,6 +26,8 @@ from ..formatters import (
     _resolution_note,
     _slice_text_lines,
     _text_field,
+    _xref_buckets,
+    _group_refs_by_caller,
 )
 from ..transport import BridgeError
 
@@ -442,6 +444,33 @@ def _xrefs(args: argparse.Namespace) -> int:
             params["offset"] = args.offset
         if limit is not None:
             params["limit"] = limit
+
+    def _xrefs_pipe_truncation_note(result: Any) -> str | None:
+        # Text mode fetches the full ref set and caps the *display* at `limit`
+        # caller groups per section. That capped body is too small to spill, so
+        # the spill pipe-note never fires -- a piped grep/wc/jq then undercounts by
+        # orders of magnitude with no signal (#439). Surface an explicit note when
+        # groups were actually hidden. `limit is None` (--out / explicit no-cap)
+        # renders the full body, so nothing is hidden.
+        if limit is None or not isinstance(result, dict):
+            return None
+        code_refs, data_refs, total_code, total_data = _xref_buckets(result)
+        code_groups = len(_group_refs_by_caller(code_refs))
+        data_groups = len(_group_refs_by_caller(data_refs))
+        hidden = max(0, code_groups - limit) + max(0, data_groups - limit)
+        if hidden <= 0:
+            return None
+        shown = min(code_groups, limit) + min(data_groups, limit)
+        total_groups = code_groups + data_groups
+        total_refs = total_code + total_data
+        return (
+            f"note: stdout is a pipe -- xrefs text body shows only {shown} of "
+            f"{total_groups} caller groups ({total_refs} refs total); {hidden} "
+            f"group(s) are truncated out of the stream, so a piped grep/wc/jq "
+            f"undercounts. Re-run with --out FILE for the full body "
+            f"(or --limit {total_groups} / --format json)."
+        )
+
     return _call(
         args,
         "xrefs",
@@ -449,6 +478,7 @@ def _xrefs(args: argparse.Namespace) -> int:
         require_target=True,
         text_renderer=lambda v: _render_xrefs_text(v, limit=limit),
         offset_hint_identifier=identifier,
+        truncation_note=_xrefs_pipe_truncation_note,
         paged_spill=True,
         stem="xrefs",
     )
