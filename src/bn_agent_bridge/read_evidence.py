@@ -470,6 +470,105 @@ def _pointer_table_for_view(
     }
 
 
+def _scalar_field(ctx, bv, addr: int, offset: int, size: int) -> dict[str, Any]:
+    """A scalar (non-pointer) record field: the little-endian value of up to 8
+    bytes at *addr*, tagged with its record *offset* + byte *size* (#455)."""
+    n = min(int(size), 8)
+    try:
+        data = bytes(bv.read(addr, n) or b"")
+    except Exception:
+        data = b""
+    field: dict[str, Any] = {"offset": int(offset), "kind": "scalar", "size": int(size)}
+    if n > 0 and len(data) == n:
+        field["value"] = hex(int.from_bytes(data, ctx._byteorder(bv), signed=False))
+    else:
+        field["unreadable"] = True
+    return field
+
+
+def _classify_ptr_field(offset: int, value: int, target: dict[str, Any]) -> dict[str, Any]:
+    """Classify a declared record pointer field from its normalized target (#455):
+    function_pointer / data_pointer (with a string preview + symbol when present) /
+    null / unmapped."""
+    status = target.get("status")
+    if status == "function":
+        fn = target.get("function") if isinstance(target.get("function"), dict) else {}
+        return {"offset": int(offset), "kind": "function_pointer",
+                "target": target.get("normalized"), "status": "function", "name": fn.get("name")}
+    if status == "mapped":
+        field: dict[str, Any] = {"offset": int(offset), "kind": "data_pointer",
+                                 "target": target.get("normalized"), "status": "mapped"}
+        context = target.get("context") if isinstance(target.get("context"), dict) else {}
+        string = context.get("string")
+        if isinstance(string, dict) and string.get("value"):
+            field["preview"] = string["value"]
+        symbol = context.get("symbol")
+        if isinstance(symbol, dict) and symbol.get("name"):
+            field["symbol"] = symbol["name"]
+        return field
+    if status == "null":
+        return {"offset": int(offset), "kind": "null", "value": "0x0"}
+    return {"offset": int(offset), "kind": "unmapped", "value": hex(value), "status": status}
+
+
+def _record_table_for_view(ctx, bv, start: int, *, entries: int, record_size: int,
+                           ptr_fields: list[int]) -> dict[str, Any]:
+    """#455: scan a MIXED-record dispatch table (scalar fields interleaved with
+    function/data pointers) rather than a pure pointer table. Each record is
+    ``record_size`` bytes; ``ptr_fields`` are the byte offsets within a record to
+    read and classify as pointers. The bytes between/around the declared pointers
+    are emitted as scalar fields, so an inline opcode/flags value is never misread
+    as a failed pointer slot -- the exact noise a plain pointer-stride scan makes
+    on these tables."""
+    ptr = ctx._pointer_size(bv)
+    fields_sorted = sorted(set(int(o) for o in ptr_fields))
+    for off in fields_sorted:
+        if off < 0 or off + ptr > record_size:
+            raise OperationFailure(
+                "invalid_ptr_field",
+                f"pointer-field offset {hex(off)} + {ptr}-byte pointer exceeds "
+                f"record-size {hex(record_size)}",
+            )
+    rows: list[dict[str, Any]] = []
+    unresolved = 0
+    for i in range(entries):
+        base = start + i * record_size
+        record_fields: list[dict[str, Any]] = []
+        cursor = 0
+        for off in fields_sorted:
+            if off > cursor:  # scalar gap before this pointer field
+                record_fields.append(_scalar_field(ctx, bv, base + cursor, cursor, off - cursor))
+            value = ctx._read_pointer_value(bv, base + off, size=ptr)
+            if value is None:
+                record_fields.append({"offset": off, "kind": "unreadable"})
+                unresolved += 1
+            else:
+                field = _classify_ptr_field(off, value, ctx._normalize_code_pointer(bv, value))
+                if field["kind"] == "unmapped":
+                    unresolved += 1
+                record_fields.append(field)
+            cursor = off + ptr
+        if cursor < record_size:  # trailing scalar gap
+            record_fields.append(_scalar_field(ctx, bv, base + cursor, cursor, record_size - cursor))
+        rows.append({"row": i, "base": hex(base), "fields": record_fields})
+    warnings: list[str] = []
+    if unresolved:
+        warnings.append(
+            f"{unresolved} declared pointer field(s) did not resolve to a mapped address -- "
+            "check --record-size / --ptr-fields (a scalar field mis-declared as a pointer?)"
+        )
+    return {
+        "kind": "record_table",
+        "address": hex(start),
+        "record_size": record_size,
+        "ptr_fields": [hex(o) for o in fields_sorted],
+        "items": rows,
+        "count": len(rows),
+        "total": len(rows),
+        "warnings": warnings,
+    }
+
+
 def _got_alias_target(ctx, bv, start: int, pointer_size: int):
     """If *start* is a ``.got``/``ImportAddressSymbol`` slot -- a single
     pointer-TO-a-table (e.g. a cross-module ``_ZTV`` vtable BN aliases into the
@@ -500,12 +599,29 @@ def _got_alias_target(ctx, bv, start: int, pointer_size: int):
     return (str(getattr(sym, "name", "")) if sym is not None else "", deref)
 
 
-def _pointer_table(ctx, selector: str | None, address, *, entries: int = 16, stride=None, width=None):
+def _pointer_table(ctx, selector: str | None, address, *, entries: int = 16, stride=None,
+                   width=None, record_size=None, ptr_fields=None):
     if entries < 0:
         raise OperationFailure("invalid_entries", f"Invalid table entry count: {entries}")
     bv = ctx._resolve_view(selector)
     start = _parse_address(address)
     pointer_size = ctx._pointer_size(bv)
+    # #455: record-aware mode -- a mixed dispatch descriptor (scalar + pointer
+    # fields), not a pure pointer table. Declared here (before the GOT-alias /
+    # stride handling) since it scans records, not a strided pointer run.
+    if record_size not in (None, ""):
+        rec_size = _parse_address(record_size)
+        if rec_size <= 0:
+            raise OperationFailure("invalid_record_size", f"Invalid record size: {rec_size}")
+        if not ptr_fields:
+            raise OperationFailure(
+                "invalid_ptr_fields",
+                "--record-size needs --ptr-fields: the byte offsets of the pointer field(s) "
+                "within each record, e.g. --record-size 0x18 --ptr-fields 0x8,0x10",
+            )
+        offsets = [_parse_address(o) for o in ptr_fields]
+        return _record_table_for_view(ctx, bv, start, entries=entries,
+                                      record_size=rec_size, ptr_fields=offsets)
     # A GOT/import-address slot is a pointer TO a table, not a table; walking it
     # would fabricate adjacent unrelated GOT entries as bogus slots (#313).
     # Refuse and point at the real table (*slot[0]) instead.

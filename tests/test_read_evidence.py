@@ -1249,3 +1249,108 @@ def test_render_orient_text_card(monkeypatch):
           "strings_sample": {"unavailable": "run refresh"}}
     out2 = _render_orient_text(d2)
     assert "--quick" in out2 and "unavailable" in out2
+
+
+# --- #455: evidence table record-aware (mixed-record) mode ---
+
+class _RecBV:
+    """A bv whose read() serves inline scalar bytes for record fields."""
+    def __init__(self, mem):
+        self._mem = mem  # (addr, size) -> bytes
+
+    def read(self, addr, n):
+        return self._mem.get((int(addr), int(n)), b"\x00" * int(n))
+
+
+class _RecCtx:
+    """ctx stub for _record_table_for_view: pointer reads + classification are
+    injected so the record-scan logic is tested without live BN."""
+    def __init__(self, ptrs, targets):
+        self._ptrs = ptrs        # addr -> pointer value (or None = unreadable)
+        self._targets = targets  # value -> normalized target dict
+
+    def _pointer_size(self, bv):
+        return 8
+
+    def _byteorder(self, bv):
+        return "little"
+
+    def _read_pointer_value(self, bv, addr, *, size=None):
+        return self._ptrs.get(int(addr))
+
+    def _normalize_code_pointer(self, bv, value):
+        return self._targets[value]
+
+
+def _fn_target(addr, name):
+    return {"status": "function", "normalized": hex(addr), "function": {"name": name}, "context": {}}
+
+
+def _data_target(addr, preview):
+    return {"status": "mapped", "normalized": hex(addr), "function": None,
+            "context": {"string": {"value": preview}}}
+
+
+def test_record_table_classifies_mixed_fields():
+    # A dispatch descriptor: opcode/flags (8B scalar) + handler (fn ptr) + name
+    # (data ptr -> string). A plain pointer-stride scan would render the opcode as
+    # a noisy unmapped slot; record mode labels each field.
+    read_evidence = importlib.import_module("bn_agent_bridge.read_evidence")
+    start, rec = 0x500000, 0x18
+    ptrs = {
+        start + 8: 0x401234, start + 0x10: 0x600100,        # record 0
+        start + rec + 8: 0x401300, start + rec + 0x10: 0x600200,  # record 1
+    }
+    targets = {
+        0x401234: _fn_target(0x401234, "handle_foo"),
+        0x600100: _data_target(0x600100, "CMD_FOO"),
+        0x401300: _fn_target(0x401300, "handle_bar"),
+        0x600200: _data_target(0x600200, "CMD_BAR"),
+    }
+    mem = {(start, 8): (0x12).to_bytes(8, "little"), (start + rec, 8): (0x34).to_bytes(8, "little")}
+    out = read_evidence._record_table_for_view(
+        _RecCtx(ptrs, targets), _RecBV(mem), start,
+        entries=2, record_size=rec, ptr_fields=[8, 0x10])
+
+    assert out["kind"] == "record_table" and out["total"] == 2
+    assert out["ptr_fields"] == ["0x8", "0x10"]
+    r0 = out["items"][0]
+    assert r0["base"] == hex(start)
+    fields = {f["offset"]: f for f in r0["fields"]}
+    assert set(fields) == {0, 8, 0x10}  # scalar gap + 2 declared pointers, no phantom slots
+    assert fields[0]["kind"] == "scalar" and fields[0]["value"] == "0x12" and fields[0]["size"] == 8
+    assert fields[8]["kind"] == "function_pointer" and fields[8]["name"] == "handle_foo"
+    assert fields[0x10]["kind"] == "data_pointer" and fields[0x10]["preview"] == "CMD_FOO"
+    assert not out["warnings"]
+
+    # The text renderer labels each field.
+    from bn.formatters import _render_pointer_table_text
+    text = _render_pointer_table_text(out)
+    assert "record table @ 0x500000" in text
+    assert "fn      0x401234  handle_foo" in text
+    assert 'data    0x600100  "CMD_FOO"' in text
+    assert "scalar  0x12" in text
+
+
+def test_record_table_warns_on_unmapped_pointer_field():
+    # A declared pointer field that doesn't resolve is a distinct, warned case --
+    # not silently a scalar.
+    read_evidence = importlib.import_module("bn_agent_bridge.read_evidence")
+    start = 0x500000
+    ptrs = {start + 8: 0x33}  # unmapped-ish value
+    targets = {0x33: {"status": "unmapped", "normalized": "0x33", "function": None, "context": {}}}
+    out = read_evidence._record_table_for_view(
+        _RecCtx(ptrs, targets), _RecBV({}), start,
+        entries=1, record_size=0x10, ptr_fields=[8])
+    field = {f["offset"]: f for f in out["items"][0]["fields"]}[8]
+    assert field["kind"] == "unmapped"
+    assert out["warnings"] and "did not resolve" in out["warnings"][0]
+
+
+def test_record_table_ptr_field_out_of_range_errors():
+    read_evidence = importlib.import_module("bn_agent_bridge.read_evidence")
+    with pytest.raises(Exception) as exc:
+        read_evidence._record_table_for_view(
+            _RecCtx({}, {}), _RecBV({}), 0x500000,
+            entries=1, record_size=0x10, ptr_fields=[0xc])  # 0xc + 8 > 0x10
+    assert "exceeds record-size" in str(exc.value)

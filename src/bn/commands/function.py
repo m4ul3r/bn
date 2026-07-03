@@ -650,8 +650,17 @@ def _evidence_xrefs(args: argparse.Namespace) -> int:
              arg("--width", default=None,
                  help="Bytes read per entry (default: min(stride, pointer size); "
                       "use 4 for a uint32[] table at --stride 4)"),
+             arg("--record-size", dest="record_size", default=None,
+                 help="Record-aware mode: byte size of each MIXED record (scalar + pointer "
+                      "fields), e.g. a dispatch descriptor. Requires --ptr-fields"),
+             arg("--ptr-fields", dest="ptr_fields", default=None,
+                 help="Comma-separated byte offsets of the pointer field(s) within each record "
+                      "(record-aware mode), e.g. --record-size 0x18 --ptr-fields 0x8,0x10"),
          ])
 def _evidence_table(args: argparse.Namespace) -> int:
+    ptr_fields = None
+    if getattr(args, "ptr_fields", None):
+        ptr_fields = [f.strip() for f in str(args.ptr_fields).split(",") if f.strip()]
     return _call(
         args,
         "pointer_table",
@@ -660,6 +669,8 @@ def _evidence_table(args: argparse.Namespace) -> int:
             "entries": args.entries,
             "stride": args.stride,
             "width": args.width,
+            "record_size": getattr(args, "record_size", None),
+            "ptr_fields": ptr_fields,
         },
         require_target=True,
         text_renderer=_render_pointer_table_text,

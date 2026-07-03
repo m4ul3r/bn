@@ -751,6 +751,30 @@ def test_evidence_function_routes_and_renders_calls(fake_transport, capsys):
     assert "r0" not in output
 
 
+def test_evidence_table_record_mode_threads_params_and_renders(fake_transport, capsys):
+    # #455: --record-size/--ptr-fields route to record-aware mode and render the
+    # {row, base, fields} shape.
+    calls = fake_transport({"pointer_table": {"ok": True, "result": {
+        "kind": "record_table", "address": "0x500000", "record_size": 24,
+        "ptr_fields": ["0x8", "0x10"],
+        "items": [{"row": 0, "base": "0x500000", "fields": [
+            {"offset": 0, "kind": "scalar", "value": "0x12", "size": 8},
+            {"offset": 8, "kind": "function_pointer", "target": "0x401234", "name": "handle_foo"},
+            {"offset": 16, "kind": "data_pointer", "target": "0x600100", "preview": "CMD_FOO"},
+        ]}],
+        "count": 1, "total": 1, "warnings": [],
+    }}})
+    rc = bn.cli.main(["evidence", "table", "--target", "active",
+                      "--record-size", "0x18", "--ptr-fields", "0x8,0x10", "0x500000"])
+    assert rc == 0
+    assert calls[-1]["op"] == "pointer_table"
+    assert calls[-1]["params"]["record_size"] == "0x18"
+    assert calls[-1]["params"]["ptr_fields"] == ["0x8", "0x10"]
+    out = capsys.readouterr().out
+    assert "record table @ 0x500000" in out
+    assert "handle_foo" in out and "CMD_FOO" in out
+
+
 def test_evidence_table_routes_and_renders_targets(fake_transport, capsys):
     calls = fake_transport({"pointer_table": {
         "ok": True,

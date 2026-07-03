@@ -1319,9 +1319,47 @@ def _render_resolved_arg(resolved: Any) -> str:
     return ""
 
 
+def _render_record_table_text(value: Any) -> str:
+    """#455: render a mixed-record dispatch table -- one block per record, each
+    field labeled fn / data / scalar / null so a scalar isn't read as a bad slot."""
+    lines = [
+        f"record table @ {value.get('address', '<unknown>')}  "
+        f"record-size: {value.get('record_size', '?')}  "
+        f"ptr-fields: {', '.join(value.get('ptr_fields') or []) or '(none)'}"
+    ]
+    for warning in list(value.get("warnings") or []):
+        lines.append(f"warning: {warning}")
+    for row in list(value.get("items") or []):
+        if not isinstance(row, dict):
+            lines.append(_render_fallback_text(row))
+            continue
+        lines.append("")
+        lines.append(f"[{row.get('row', '?')}] {row.get('base', '<unknown>')}")
+        for f in list(row.get("fields") or []):
+            if not isinstance(f, dict):
+                continue
+            off = f.get("offset", 0)
+            off_s = f"+{off:#x}" if isinstance(off, int) else f"+{off}"
+            kind = f.get("kind")
+            if kind == "function_pointer":
+                lines.append(f"  {off_s:<6} fn      {f.get('target', '?')}  {f.get('name') or ''}".rstrip())
+            elif kind == "data_pointer":
+                note = f'  "{f["preview"]}"' if f.get("preview") else (f"  {f['symbol']}" if f.get("symbol") else "")
+                lines.append(f"  {off_s:<6} data    {f.get('target', '?')}{note}")
+            elif kind == "scalar":
+                lines.append(f"  {off_s:<6} scalar  {f.get('value', '?')}  ({f.get('size', '?')}B)")
+            elif kind == "null":
+                lines.append(f"  {off_s:<6} null")
+            else:  # unmapped / unreadable
+                lines.append(f"  {off_s:<6} {kind:<7} {f.get('value', '')}".rstrip())
+    return "\n".join(lines)
+
+
 def _render_pointer_table_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
+    if value.get("kind") == "record_table":  # #455 mixed-record mode
+        return _render_record_table_text(value)
     lines = [
         f"pointer table @ {value.get('address', '<unknown>')}",
         f"pointer-size: {value.get('pointer_size', '<unknown>')}  stride: {value.get('stride', '<unknown>')}"

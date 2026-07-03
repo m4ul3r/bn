@@ -2543,6 +2543,8 @@ def _bind_pointer_table(bridge, params, target):
         entries=int(params.get("entries", 16)),
         stride=params.get("stride"),
         width=params.get("width"),
+        record_size=params.get("record_size"),
+        ptr_fields=params.get("ptr_fields"),
     )
 
 
