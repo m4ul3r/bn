@@ -15,6 +15,7 @@ Start broad, then narrow:
    ```bash
    bn target info
    ```
+   > **Cache restore ≠ clean slate.** If you loaded the target and it came back with a `note: restored cached database …`, the view was auto-restored from a prior `bn save` (a sibling `.bndb`, or the global `~/.cache/bn/bndb/<stem>.<hash>.bndb` cache used on read-only mounts) and **already carries earlier renames/comments** — so a multi-MB binary that loaded in seconds is a cache hit, not a cold analysis, and the names you see may be a previous run's. Before claiming a from-scratch recovery baseline, re-load with `--no-bndb` for pristine bytes. See "Global BNDB cache" in `reference/runtime.md`.
 
 2. **Survey imports and strings** — these reveal libraries, APIs, and embedded literals that hint at functionality:
    ```bash
@@ -27,7 +28,7 @@ Start broad, then narrow:
    ```bash
    bn function list
    ```
-   Note the total count, address range, and whether symbols are stripped. A stripped binary with 2000 functions requires different tactics than a symbolicated one with 50. For *vulnerability* work on a stripped static target, see the "Stripped / static lane" in `bn-vr`, which inverts the import-first workflow (strings → string-xref → behavioral sink recovery).
+   Note the total count, address range, and whether symbols are stripped. A stripped binary with 2000 functions requires different tactics than a symbolicated one with 50. Beware: `file(1)` says "stripped" whenever `.symtab` is gone, but a binary that kept its `.dynsym` (any shared object, and `-rdynamic`/default-visibility executables) still has real names for most functions — the tell is `bn function list` being *mostly named* (few `sub_XXXX`) and a non-empty `bn imports`, not `file`. Only a target with an empty import table **and** overwhelmingly `sub_XXXX` names is the truly-stripped case. For *vulnerability* work on that truly-stripped static target, see the "Stripped / static lane" in `bn-vr`, which inverts the import-first workflow (strings → string-xref → behavioral sink recovery).
 
 4. **Map the C++ type lattice (RTTI / symbolicated C++ targets)** — when the symbols show C++ (mangled `_Z…` names, RTTI), lead with the class lens instead of grepping symbols by hand:
    ```bash

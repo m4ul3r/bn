@@ -12,6 +12,8 @@ Use this skill when the user wants to find vulnerabilities, audit for bugs, chec
 Start by mapping what the binary does and where untrusted data enters:
 
 > **No imports? (static / stripped firmware.)** If `bn imports` comes back empty or near-empty, the binary is statically linked and the import-first steps below won't bite — `bn xrefs strcpy` / `function search strcpy` return nothing when no function is *named* `strcpy`. Use the **Stripped / static lane** at the end of this section instead.
+>
+> **`file`=stripped ≠ static lane.** `file(1)` reports "stripped" whenever `.symtab` is gone, but a very common middle case still keeps a **fat `.dynsym`**: default-visibility / `-rdynamic` firmware executables (and *every* shared object) export hundreds of `GLOBAL DEFAULT FUNC` symbols plus named PLT imports. There the **import-first lane fully applies** — BN has real names for nearly every function. Pick the lane by the tell, not by `file`: `bn imports` **non-empty** *or* `bn function list` **mostly named** (only a minority of `sub_XXXX`) ⇒ import-first, even when `file` says stripped. Route to the stripped/static lane only when `bn imports` is empty/near-empty **and** `function list` is overwhelmingly `sub_XXXX`.
 
 > **Quick-loaded target?** If the binary was opened with `bn load --quick` / `bn session start --quick`, the code is not analyzed yet: `bn imports` and `bn sections` work, but `bn strings` (step 3) **errors** until `bn refresh` (it refuses rather than return nothing) and `bn function list` / `bn function search` return only a **partial** set — a false "no dangerous strings, no sinks" all-clear. Confirm `analysis_state` is `"full"` (`bn target info`) and `bn refresh` before auditing. See "Quick Load" in the `bn` skill.
 

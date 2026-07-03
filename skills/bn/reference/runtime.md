@@ -77,6 +77,8 @@ note: loaded /path/to/foo.so.bndb instead of /path/to/foo.so (use --no-bndb to s
 
 Pass `--no-bndb` to force loading the raw binary even when a sibling `.bndb` exists. Passing a path that already ends in `.bndb` skips the lookup. The same `--no-bndb` flag works on `bn session start`.
 
+> **Global BNDB cache (read-only mounts).** Auto-prefer isn't limited to a *sibling* `.bndb`. When the target's directory is not writable (a read-only firmware mount), a prior `bn save` falls back to a **global content-hash-keyed cache** at `~/.cache/bn/bndb/<stem>.<hash>.bndb` (override the cache root with `BN_CACHE_DIR`). A later `bn load <raw>` / `bn session start <raw>` **auto-restores from that cache** — carrying every prior rename/comment — and prints `note: restored cached database …; pass --no-bndb to load the raw bytes`. Two consequences for a "recover names on an unknown binary" task: (1) the view can come back **already annotated** from an earlier run, so you can't tell your recovery from a previous one — check the note (or `--no-bndb`) before claiming a clean slate; (2) a multi-MB target that "loads in seconds" is a **cache hit, not a fast cold analysis** — don't read it as a timing/perf observation. Use `--no-bndb` for a pristine, un-annotated analysis.
+
 `bn load` blocks until analysis completes (the bridge runs `update_analysis_and_wait()` and the CLI socket has no timeout). Plan for it on large binaries.
 
 **Quick load (`--quick` / `--no-analysis`).** `bn load --quick` and `bn session start --quick` skip that analysis pass (~1s instead of waiting for the full function set), at the cost of a **capability boundary** — the container is parsed but the code is not yet analyzed:
