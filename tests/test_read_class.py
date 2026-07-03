@@ -383,6 +383,62 @@ def test_vtable_layout_demangles_slot_name():
     assert "_ZN3net7Session6onDataEv" not in _render_class_show_text(rec)
 
 
+class _SymBV:
+    """A bv whose get_symbol_at names the __cxa_pure_virtual extern slot."""
+    def __init__(self, syms=None):
+        self._syms = syms or {}
+
+    def get_symbol_at(self, addr):
+        name = self._syms.get(addr)
+        return _Sym(name, name, addr) if name else None
+
+    def get_function_at(self, addr):
+        return None
+
+
+def test_vtable_layout_includes_null_and_external_slots_pie():
+    # #441: a PIE C++ vtable interleaves null slots (pure-virtual relocated to 0)
+    # and external `__cxa_pure_virtual` slots before/among the real methods. The
+    # old scan broke at the first null and returned ZERO slots even though the
+    # methods below resolve. Include null + external slots; terminate only at a
+    # real boundary (the next object's typeinfo data pointer); trim trailing null.
+    rows = [
+        {"index": 0, "value": "0x0", "readable": True,
+         "target": {"status": "null", "context": {"kind": "null"}}},
+        {"index": 1, "value": "0x108800", "readable": True,
+         "target": {"status": "mapped", "function": None, "context": {"kind": "extern"}}},
+        {"index": 2, "value": "0x201040", "readable": True,
+         "target": {"status": "function",
+                    "function": {"name": "_ZN3net7Session6onDataEv", "address": "0x201040"}}},
+        {"index": 3, "value": "0x0", "readable": True,  # trailing null -> trimmed
+         "target": {"status": "null", "context": {"kind": "null"}}},
+        {"index": 4, "value": "0x108000", "readable": True,  # typeinfo ptr = boundary
+         "target": {"status": "mapped", "function": None, "context": {"kind": "string"}}},
+    ]
+    bv = _SymBV({0x108800: "__cxa_pure_virtual"})
+    layout = read_class._vtable_layout(_SlotCtx(rows), bv, 0x9000)
+    slots = layout["slots"]
+    assert [s["index"] for s in slots] == [0, 1, 2]           # trailing null trimmed
+    assert slots[0].get("null") is True
+    assert slots[1].get("external") is True and slots[1]["pure_virtual"] is True
+    assert slots[2]["method"]["name"] == "_ZN3net7Session6onDataEv"
+
+
+def test_vtable_layout_terminates_at_unmapped_secondary_header():
+    # The next sub-vtable's offset-to-top (a small negative, e.g. -8) reads as an
+    # unmapped word and must end the primary scan (not be rendered as a slot).
+    rows = [
+        {"index": 0, "value": "0x201040", "readable": True,
+         "target": {"status": "function", "function": {"name": "f0", "address": "0x201040"}}},
+        {"index": 1, "value": "0xfffffffffffffff8", "readable": True,
+         "target": {"status": "unmapped", "context": {"kind": "unmapped"}}},
+        {"index": 2, "value": "0x201200", "readable": True,
+         "target": {"status": "function", "function": {"name": "f2", "address": "0x201200"}}},
+    ]
+    layout = read_class._vtable_layout(_SlotCtx(rows), _SymBV(), 0x9000)
+    assert [s["index"] for s in layout["slots"]] == [0]
+
+
 def test_vtable_layout_stops_at_data_slot():
     # A pointer the classifier deems data (kind != "code") is not a slot -- it
     # ends the scan rather than rendering adjacent data as fake slots (#205).

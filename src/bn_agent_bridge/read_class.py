@@ -429,28 +429,80 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
     # pre-#275 `entries` key, so every vtable resolved to ZERO slots and
     # `class show` declared a recoverable dispatch table unrecoverable. Read
     # `items` (with an `entries` fallback for any legacy producer / test fake).
+    #
+    # #441: a real vtable interleaves code slots with NULL slots (a pure-virtual
+    # relocated to 0, or an unresolved relocation) and EXTERNAL slots
+    # (`__cxa_pure_virtual`, or a cross-module virtual method). Terminating at the
+    # first non-code slot (the old behavior) truncated the whole vtable at a
+    # leading null/`__cxa_pure_virtual`, so PIE C++ classes came back with ZERO
+    # slots even though `evidence table` resolved every one. Include null and
+    # external slots as valid entries and terminate only at a genuine boundary --
+    # an unmapped word (the next sub-vtable's offset-to-top, e.g. -8) or a mapped
+    # DATA pointer (the next object's typeinfo). Trailing null slots are trimmed.
     for i, row in enumerate(table.get("items") or table.get("entries") or []):
-        target = row.get("target") or {}
-        fn = target.get("function") if isinstance(target, dict) else None
-        # A null/unmapped/non-code slot ends the vtable (next object / padding /
-        # a misidentified table over data).
-        if not row.get("readable") or not _slot_is_code(target):
+        if not row.get("readable"):
             break
-        name = (fn or {}).get("name") if isinstance(fn, dict) else None
-        method = None
-        if isinstance(fn, dict):
-            # The pointer-table function dict carries the MANGLED fn.name; add the
-            # demangled display name (symbol short_name) so vtable slots read like
-            # the methods list, not raw `_ZN...`. Mangled `name` is kept. (#205)
-            method = {**fn, "display_name": _demangled_slot_name(bv, fn)}
-        slots.append({
-            "index": i,
-            "address": row.get("value"),
-            "method": method,
-            "pure_virtual": name == "__cxa_pure_virtual",
-            "unnamed": (isinstance(name, str) and name.startswith("sub_")) or (fn is None),
-        })
+        target = row.get("target") if isinstance(row.get("target"), dict) else {}
+        value = row.get("value")
+        status = target.get("status")
+        kind = (target.get("context") or {}).get("kind")
+        if _slot_is_code(target):
+            fn = target.get("function")
+            name = (fn or {}).get("name") if isinstance(fn, dict) else None
+            method = None
+            if isinstance(fn, dict):
+                # The pointer-table function dict carries the MANGLED fn.name; add
+                # the demangled display name (symbol short_name) so slots read like
+                # the methods list, not raw `_ZN...`. Mangled `name` is kept. (#205)
+                method = {**fn, "display_name": _demangled_slot_name(bv, fn)}
+            slots.append({
+                "index": i,
+                "address": value,
+                "method": method,
+                "pure_virtual": name == "__cxa_pure_virtual",
+                "unnamed": (isinstance(name, str) and name.startswith("sub_")) or (fn is None),
+            })
+        elif status == "null":
+            # Interior null slot (pure-virtual placeholder / unresolved reloc).
+            # Kept so a leading/interior null doesn't truncate the vtable; a
+            # trailing run of these is trimmed below.
+            slots.append({
+                "index": i, "address": value, "method": None,
+                "pure_virtual": False, "unnamed": True, "null": True,
+            })
+        elif kind == "extern":
+            # External slot: `__cxa_pure_virtual` (a pure-virtual marker) or a
+            # cross-module virtual method. A valid vtable entry -- don't stop.
+            ext_name = _slot_external_name(bv, value)
+            slots.append({
+                "index": i, "address": value, "method": None,
+                "pure_virtual": ext_name == "__cxa_pure_virtual",
+                "external": True, "external_name": ext_name,
+                "unnamed": ext_name is None,
+            })
+        else:
+            # A mapped data pointer / unmapped garbage: the next object
+            # (typeinfo / secondary-vtable header) -- the vtable ends here.
+            break
+    # A vtable ends at a real or pure-virtual method, so a trailing run of null
+    # slots is the next object's zeroed offset-to-top / padding, not a slot.
+    while slots and slots[-1].get("null"):
+        slots.pop()
     return {"address": hex(int(vtable_addr)), "slots": slots}
+
+
+def _slot_external_name(bv, value: Any) -> str | None:
+    """Raw symbol name at an external vtable slot's target address (e.g.
+    ``__cxa_pure_virtual``), or None if unresolved (#441)."""
+    try:
+        addr = int(value, 16) if isinstance(value, str) else int(value)
+    except (TypeError, ValueError):
+        return None
+    getter = getattr(bv, "get_symbol_at", None)
+    sym = getter(addr) if callable(getter) else None
+    if sym is None:
+        return None
+    return getattr(sym, "raw_name", None) or getattr(sym, "name", None)
 
 
 def _demangled_slot_name(bv, fn: dict[str, Any]) -> str | None:

@@ -2730,6 +2730,23 @@ def _render_class_list_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+def _vtable_slot_label(s: dict[str, Any]) -> str:
+    """Label for a vtable slot: the demangled method, `__cxa_pure_virtual`, a
+    named external (cross-module) slot, `<null>`, or `<unnamed>` (#441)."""
+    if s.get("pure_virtual"):
+        return "__cxa_pure_virtual"
+    method = s.get("method") if isinstance(s.get("method"), dict) else {}
+    slot_name = method.get("display_name") or method.get("name")
+    if slot_name:
+        return slot_name
+    if s.get("external"):
+        ext = s.get("external_name")
+        return f"{ext} [external]" if ext else "<external>"
+    if s.get("null"):
+        return "<null>"
+    return "<unnamed>"
+
+
 def _render_class_show_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -2767,14 +2784,7 @@ def _render_one_class(rec: Any) -> str:
             lines.append(f"  {m['kind']:<6} {m.get('address', '?')}  {m.get('demangled', '')}")
     if vt and vt.get("slots"):
         for s in vt["slots"]:
-            method = s.get("method") or {}
-            slot_name = method.get("display_name") or method.get("name") if isinstance(method, dict) else None
-            label = (
-                "__cxa_pure_virtual" if s.get("pure_virtual")
-                else slot_name if slot_name
-                else "<unnamed>"
-            )
-            lines.append(f"  vtable [{s.get('index')}] {s.get('address', '?')}  {label}")
+            lines.append(f"  vtable [{s.get('index')}] {s.get('address', '?')}  {_vtable_slot_label(s)}")
     elif vt_addr:
         # A vtable symbol exists but no slots resolved. Either the vtable is
         # defined in another module (the local symbol is an import/GOT slot) or
@@ -2792,11 +2802,7 @@ def _render_one_class(rec: Any) -> str:
         ott_s = f" (offset-to-top {ott})" if ott is not None else ""
         lines.append(f"  secondary vtable @ {sec.get('address', '?')}{ott_s}:")
         for s in sec.get("slots") or []:
-            method = s.get("method") or {}
-            slot_name = (method.get("display_name") or method.get("name")) if isinstance(method, dict) else None
-            label = ("__cxa_pure_virtual" if s.get("pure_virtual")
-                     else slot_name if slot_name else "<unnamed>")
-            lines.append(f"    [{s.get('index')}] {s.get('address', '?')}  {label}")
+            lines.append(f"    [{s.get('index')}] {s.get('address', '?')}  {_vtable_slot_label(s)}")
     # Non-virtual member functions (kind=method). Virtual ones already appear as
     # vtable slots above; listing the symbol-side methods makes `class show`
     # useful for classes whose vtable is empty or absent (e.g. Controller).
