@@ -2127,8 +2127,16 @@ def _render_sections_rows(value: Any) -> str:
 
 def _render_sections_text(value: Any) -> str:
     """Render sections: the paged {items, total, ...} envelope (with a footer),
-    or a bare list for back-compat / internal callers (#122)."""
-    return _render_paged_list_text(value, "items", _render_sections_rows)
+    or a bare list for back-compat / internal callers (#122). Prefixes a W+X
+    verdict (#453) so the security question ("any writable+executable region?")
+    has a direct answer instead of being inferred from per-row perms."""
+    body = _render_paged_list_text(value, "items", _render_sections_rows)
+    if isinstance(value, dict) and "writable_executable_count" in value:
+        n = value.get("writable_executable_count") or 0
+        names = value.get("writable_executable_items") or []
+        verdict = f"w+x: {n} section(s): {', '.join(names)}" if n else "w+x: none"
+        return verdict + "\n" + body
+    return body
 
 
 def _render_read_text(value: Any) -> str:

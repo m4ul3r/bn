@@ -198,6 +198,46 @@ def test_sections_returns_all_sections_with_permissions(monkeypatch):
     assert rodata_sec["executable"] is False
 
 
+def test_sections_writable_executable_verdict(monkeypatch):
+    # #453: `executable` is segment-derived, so r-x-mapped .rodata reads
+    # executable=true. Give a direct W+X verdict (writable AND executable) so data
+    # in an r-x segment is NOT reported as executable attack surface.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        sections={
+            ".text": _FakeSection(".text", 0x1000, 0x2000, semantics=1),
+            ".rodata": _FakeSection(".rodata", 0x2000, 0x3000, semantics=2),
+            ".jit": _FakeSection(".jit", 0x3000, 0x4000, semantics=3),
+        },
+        segments={
+            0x1000: _FakeSegment(readable=True, writable=False, executable=True),
+            # .rodata mapped into an r-x load segment: executable=true, not writable.
+            0x2000: _FakeSegment(readable=True, writable=False, executable=True),
+            # genuinely writable + executable.
+            0x3000: _FakeSegment(readable=True, writable=True, executable=True),
+        },
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._sections(None)
+    by = {it["name"]: it for it in result["items"]}
+    # The acceptance case: executable from the segment, but not W+X (not writable).
+    assert by[".rodata"]["executable"] is True
+    assert by[".rodata"]["writable_executable"] is False
+    assert by[".rodata"]["permission_source"] == "segment"
+    assert by[".text"]["writable_executable"] is False
+    assert by[".jit"]["writable_executable"] is True
+    # Top-level verdict counts only the genuinely W+X section.
+    assert result["writable_executable_count"] == 1
+    assert result["writable_executable_items"] == [".jit"]
+
+    # Text verdict line.
+    from bn.formatters import _render_sections_text
+    assert _render_sections_text(result).splitlines()[0] == "w+x: 1 section(s): .jit"
+    clean = {**result, "writable_executable_count": 0, "writable_executable_items": []}
+    assert _render_sections_text(clean).splitlines()[0] == "w+x: none"
+
+
 def test_sections_query_filters_by_name(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

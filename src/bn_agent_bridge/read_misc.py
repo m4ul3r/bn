@@ -475,15 +475,38 @@ def _sections(ctx, selector: str | None, *, query: str | None = None,
         if hasattr(bv, "get_segment_at"):
             seg = bv.get_segment_at(start)
             if seg is not None:
+                writable = bool(getattr(seg, "writable", None))
+                executable = bool(getattr(seg, "executable", None))
                 entry["readable"] = bool(getattr(seg, "readable", None))
-                entry["writable"] = bool(getattr(seg, "writable", None))
-                entry["executable"] = bool(getattr(seg, "executable", None))
+                entry["writable"] = writable
+                entry["executable"] = executable
+                # #453: a direct W+X verdict. `executable` is SEGMENT-derived, so
+                # read-only metadata (`.rodata` in an r-x load segment) reads
+                # executable=true -- but it is not W+X unless also writable. Give
+                # the canonical answer (writable AND executable) + where the perms
+                # came from, so agents/fan-out summaries don't re-derive it and
+                # mis-flag data as executable attack surface.
+                entry["writable_executable"] = writable and executable
+                entry["permission_source"] = "segment"
 
         items.append(entry)
+    # W+X summary over the full (post-filter) set -- computed before paging so a
+    # truncated page still reports the true count. Absent when no section carried
+    # segment perms (nothing to verdict on).
+    wx_items = [it["name"] for it in items if it.get("writable_executable")]
+    have_perms = any("writable_executable" in it for it in items)
+    wx_summary: dict[str, Any] = {}
+    if have_perms:
+        wx_summary = {
+            "writable_executable_count": len(wx_items),
+            "writable_executable_items": wx_items,
+        }
     if count_only:
-        return {"kind": "sections", "count": len(items), "total": len(items)}
+        return {"kind": "sections", "count": len(items), "total": len(items), **wx_summary}
     items.sort(key=lambda item: int(item["start"], 16))
-    return _paged_list_result(items, offset=offset, limit=limit, kind="sections")
+    result = _paged_list_result(items, offset=offset, limit=limit, kind="sections")
+    result.update(wx_summary)
+    return result
 
 
 def _ascii_render(data: bytes) -> str:
