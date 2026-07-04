@@ -951,6 +951,60 @@ class TaintEngine:
         except Exception:
             return []
 
+    def _cc_arg_reg(self, func: Any, idx: int) -> str | None:
+        """The calling-convention integer-arg register name for *idx* (r2, x1,
+        rsi, ...), or None if unrecoverable (#433)."""
+        try:
+            cc = (getattr(func, "calling_convention", None)
+                  or self.bv.platform.default_calling_convention)
+            regs = list(getattr(cc, "int_arg_regs", []) or [])
+            return str(regs[idx]) if 0 <= idx < len(regs) else None
+        except Exception:
+            return None
+
+    def _arg_reg_reaching_def(self, func: Any, ins: Any, idx: int) -> Any | None:
+        """#433: recover an under-recovered register argument *idx* at a call site
+        whose MLIL exposes fewer args than the calling convention passes (common on
+        ARM-Thumb / MIPS thunked copy sinks, where BN's IFUNC/veneer model surfaces
+        only the first register arg -- e.g. `memcpy(arg1)` while `r2 = len` is set
+        right before the call and survives MLIL as a register variable).
+
+        Maps *idx* to its calling-convention register and returns the SSA variable
+        of the LAST write to that register in the call's own basic block before the
+        call -- the reaching def to seed a backward slice from. Register-class
+        indices only (idx < int-arg-reg count; stack-passed is #324's domain), and
+        returns None on any BN-API shortfall so it never fabricates a seed."""
+        try:
+            cc = (getattr(func, "calling_convention", None)
+                  or self.bv.platform.default_calling_convention)
+            arg_regs = list(getattr(cc, "int_arg_regs", []) or [])
+            if idx >= len(arg_regs):
+                return None  # stack-passed -- out of scope (#324)
+            reg_index = self.bv.arch.get_reg_index(arg_regs[idx])
+            blk = getattr(ins, "il_basic_block", None)
+            if blk is None:
+                return None
+            # BN's VariableSourceType.RegisterVariableSourceType == 1 (this module
+            # imports no binaryninja symbols, so compare the stable enum int).
+            REGISTER_SOURCE = 1
+            found = None
+            for cur in blk:
+                if getattr(cur, "instr_index", -1) >= getattr(ins, "instr_index", -1):
+                    break
+                for w in getattr(cur, "vars_written", None) or []:
+                    var = getattr(w, "var", None)
+                    if var is None:
+                        continue
+                    try:
+                        is_reg = int(var.source_type) == REGISTER_SOURCE
+                    except Exception:
+                        is_reg = False
+                    if is_reg and getattr(var, "storage", None) == reg_index:
+                        found = w  # keep the last (reaching) write before the call
+            return found
+        except Exception:
+            return None
+
     def _pointee_var(self, ssaf: Any, expr: Any, depth: int = 0) -> Any:
         """Follow a pointer expression to the underlying stack Variable.
 
@@ -4754,6 +4808,7 @@ class TaintEngine:
             self._note_indirect_anchors(sites, callee, self._bw_assume)
             saw_in_range = False
             max_params = 0
+            reg_recovered: list[tuple[int, str, str]] = []
             for c in sites:
                 params = self._call_params(c)
                 max_params = max(max_params, len(params))
@@ -4761,6 +4816,23 @@ class TaintEngine:
                     saw_in_range = True
                     for r in expr_reads(params[idx]):
                         out.append((r, c))
+                else:
+                    # #433: the MLIL call site under-recovered its args (an
+                    # ARM-Thumb/MIPS thunked/IFUNC copy sink surfaces only the first
+                    # register arg). Recover arg idx from its calling-convention
+                    # register's reaching def in the call's block, so the canonical
+                    # `arg:memcpy:2` length seed is no longer a hard dead-end.
+                    rv = self._arg_reg_reaching_def(func, c, idx)
+                    if rv is not None:
+                        out.append((rv, c))
+                        reg_recovered.append(
+                            (idx, self._cc_arg_reg(func, idx) or "?",
+                             hex(int(getattr(c, "address", 0)))))
+            for _i, _reg, _addr in reg_recovered:
+                self._bw_assume(
+                    f"arg {_i} recovered from calling-convention register {_reg} at "
+                    f"{_addr} (the MLIL call site under-recovered its arguments); "
+                    f"slicing the register's reaching def, not the MLIL call model (#433)")
             if not out:
                 # The locator was fine; the arg itself can't be sliced. Say so
                 # precisely instead of blaming the --sink locator.

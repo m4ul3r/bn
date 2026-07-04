@@ -285,6 +285,42 @@ def _int_arg_reg_count(caller_func) -> int | None:
         return None
 
 
+def _arg_reg_reaching_def(bv, caller_func, call_insn, arg_index: int):
+    """#433: recover an under-recovered register argument at a call site whose MLIL
+    exposes fewer args than the calling convention passes (ARM-Thumb/MIPS thunked
+    copy sinks surface only the first register arg). Maps *arg_index* to its
+    calling-convention register and returns ``(ssa_var, reg_name)`` for the LAST
+    write to that register in the call's own basic block before the call -- the
+    reaching def to trace from -- or None. Register-class indices only (stack-passed
+    is #324); None on any BN-API shortfall so it never fabricates a seed."""
+    try:
+        reg_name = _arg_register(caller_func, arg_index)  # None once idx >= reg count
+        if not reg_name:
+            return None
+        reg_index = bv.arch.get_reg_index(reg_name)
+        blk = getattr(call_insn, "il_basic_block", None)
+        if blk is None:
+            return None
+        REGISTER_SOURCE = 1  # VariableSourceType.RegisterVariableSourceType
+        found = None
+        for cur in blk:
+            if getattr(cur, "instr_index", -1) >= getattr(call_insn, "instr_index", -1):
+                break
+            for w in getattr(cur, "vars_written", None) or []:
+                var = getattr(w, "var", None)
+                if var is None:
+                    continue
+                try:
+                    is_reg = int(var.source_type) == REGISTER_SOURCE
+                except Exception:
+                    is_reg = False
+                if is_reg and getattr(var, "storage", None) == reg_index:
+                    found = w  # keep the last (reaching) write before the call
+        return (found, reg_name) if found is not None else None
+    except Exception:
+        return None
+
+
 def _arg_label(ctx, bv, call_insn, arg_index: int, caller_func) -> dict[str, Any]:
     """{index, [register], [name]} for the traced call argument: its
     calling-convention register plus the callee's C parameter name when the
@@ -792,7 +828,12 @@ def _backward_slice(
             "no_params",
             f"Call at {address} has no exposed parameters in {view}",
         )
-    if arg_index < 0 or arg_index >= len(params):
+    # #433: when the MLIL call site under-recovers its args, recover a register-class
+    # index from its calling-convention register's reaching def instead of dead-ending
+    # (the ARM-Thumb/MIPS thunked-copy-sink shape). None for stack-passed / unpinnable.
+    reg_recovered = (_arg_reg_reaching_def(bv, func, call_insn, arg_index)
+                     if arg_index >= len(params) else None)
+    if (arg_index < 0 or arg_index >= len(params)) and reg_recovered is None:
         n = len(params)
         only = " (index 0)" if n == 1 else f" (indices 0..{n - 1})"
         # --arg is 0-based against the MLIL call's recovered parameters, which
@@ -838,37 +879,49 @@ def _backward_slice(
             )
         raise OperationFailure("invalid_arg_index", msg)
 
-    param_expr = params[arg_index]
-    initial_vars: list[Any] = _ssa_vars_from(getattr(param_expr, "vars_read", []) or [])
-
-    arg_label = _arg_label(ctx, bv, call_insn, arg_index, func)
-
-    # An address-of arg with no SSA value reads is an output-pointer dead-end:
-    # tracing it would follow where the *pointer* came from (a local buffer),
-    # not the data the callee writes through it. Surface that instead of the
-    # misleading "constant or immediate -- no SSA trace" (#166).
     hints: list[str] = []
-    if not initial_vars and _is_address_of(param_expr):
-        callee_nm = arg_label.get("name") or "the callee"
+    if reg_recovered is not None:
+        # #433 register fallback: the MLIL call under-recovered its args, so seed
+        # from the calling-convention register's reaching def and disclose it.
+        rv, reg_name = reg_recovered
+        initial_vars: list[Any] = _ssa_vars_from([rv])
+        arg_label = {"index": arg_index, "register": reg_name}
         hints.append(
-            f"arg {arg_index} is a pointer (address-of); this traces where the "
-            f"pointer came from, not the data written through it. To follow data "
-            f"{callee_nm} writes into the pointee, run a forward taint from the "
-            f"call site (e.g. `taint forward --source call:<callee>`) or trace the "
-            f"buffer's later consumers."
+            f"arg {arg_index} recovered from calling-convention register {reg_name} "
+            f"(the MLIL call site under-recovered its arguments), not the MLIL call "
+            f"model; tracing the register's reaching def (#433)."
         )
-    elif not initial_vars:
-        # A constant/immediate arg (e.g. a literal length/flag) has no SSA
-        # definition to trace. Surface the value as a structured hint so both
-        # text and JSON consumers see *which* constant -- not just the renderer's
-        # generic "constant or immediate" line (which carried no value and left
-        # JSON `hints` empty).
-        cval = _const_int(param_expr)
-        if cval is not None:
+    else:
+        param_expr = params[arg_index]
+        initial_vars = _ssa_vars_from(getattr(param_expr, "vars_read", []) or [])
+
+        arg_label = _arg_label(ctx, bv, call_insn, arg_index, func)
+
+        # An address-of arg with no SSA value reads is an output-pointer dead-end:
+        # tracing it would follow where the *pointer* came from (a local buffer),
+        # not the data the callee writes through it. Surface that instead of the
+        # misleading "constant or immediate -- no SSA trace" (#166).
+        if not initial_vars and _is_address_of(param_expr):
+            callee_nm = arg_label.get("name") or "the callee"
             hints.append(
-                f"arg {arg_index} is the constant {hex(cval)} -- a compile-time "
-                f"immediate with no SSA definition to trace back."
+                f"arg {arg_index} is a pointer (address-of); this traces where the "
+                f"pointer came from, not the data written through it. To follow data "
+                f"{callee_nm} writes into the pointee, run a forward taint from the "
+                f"call site (e.g. `taint forward --source call:<callee>`) or trace the "
+                f"buffer's later consumers."
             )
+        elif not initial_vars:
+            # A constant/immediate arg (e.g. a literal length/flag) has no SSA
+            # definition to trace. Surface the value as a structured hint so both
+            # text and JSON consumers see *which* constant -- not just the renderer's
+            # generic "constant or immediate" line (which carried no value and left
+            # JSON `hints` empty).
+            cval = _const_int(param_expr)
+            if cval is not None:
+                hints.append(
+                    f"arg {arg_index} is the constant {hex(cval)} -- a compile-time "
+                    f"immediate with no SSA definition to trace back."
+                )
 
     trace = _build_backward_trace(
         ctx, bv, ssa_func, initial_vars, max_depth,
