@@ -4496,6 +4496,41 @@ def test_param_spill_index_none_without_spill_store(models):
     assert engine._param_spill_index(func, ssaf, vn5) is None
 
 
+def test_param_spill_index_rejects_reused_slot(models):
+    # The slot is spilled from param 2 early (var_n#1 = n#0), then REUSED for an
+    # unrelated non-param value (var_n#3 = x#0). A terminal no-def reload (var_n#7)
+    # must NOT be canonicalized to param 2 -- the slot has >1 store, so which value
+    # reaches the reload is ambiguous. (The version-blind first-match logic used to
+    # misattribute this to the parameter -> false canonicalization.)
+    n = FVar("n", ident=22); x = FVar("x", ident=30); var_n = FVar("var_n", ident=23)
+    n0 = FSSA(n, 0); x0 = FSSA(x, 0)
+    vn1 = FSSA(var_n, 1); vn3 = FSSA(var_n, 3); vn7 = FSSA(var_n, 7)
+    ssaf = FSSAFunc([
+        FInstr(0, 0x802, "MLIL_SET_VAR_SSA", "var_n#1 = n#0", writes=[vn1],
+               src=FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])),
+        FInstr(1, 0x806, "MLIL_SET_VAR_SSA", "var_n#3 = x#0", writes=[vn3],
+               src=FExpr("MLIL_VAR_SSA", "x#0", reads=[x0])),
+    ])
+    func = FFunc("f", 0x800, ssaf, params=[FVar("a", ident=20), FVar("b", ident=21), n])
+    engine = te.TaintEngine(FBV({}), models)
+    assert engine._param_spill_index(func, ssaf, vn7) is None
+
+
+def test_param_spill_index_rejects_derived_store(models):
+    # var_n = n - 4 is a DERIVED value, not a clean copy of the parameter; the
+    # docstring's identity-on-stored-value contract must be enforced (op is
+    # MLIL_SUB, not MLIL_VAR_SSA), so no canonicalization.
+    n = FVar("n", ident=22); var_n = FVar("var_n", ident=23)
+    n0 = FSSA(n, 0); vn1 = FSSA(var_n, 1); vn5 = FSSA(var_n, 5)
+    ssaf = FSSAFunc([
+        FInstr(0, 0x802, "MLIL_SET_VAR_SSA", "var_n#1 = n#0 - 4", writes=[vn1],
+               src=FExpr("MLIL_SUB", "n#0 - 4", reads=[n0])),
+    ])
+    func = FFunc("f", 0x800, ssaf, params=[FVar("a", ident=20), FVar("b", ident=21), n])
+    engine = te.TaintEngine(FBV({}), models)
+    assert engine._param_spill_index(func, ssaf, vn5) is None
+
+
 def test_backward_ascends_through_parameter_spill(models):
     # use_len(dst, src, n): n is SPILLED to stack (var_n#1 = n#0), then memcpy reads
     # the reload var_n#5. Backward from memcpy length must canonicalize var_n -> param 2

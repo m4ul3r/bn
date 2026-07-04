@@ -1899,26 +1899,36 @@ class TaintEngine:
         return None
 
     def _param_spill_index(self, func: Any, ssaf: Any, v: Any) -> int | None:
-        """If terminal no-def var *v* is a spill of an incoming parameter -- some
-        definition in *func* writes v's underlying Variable with a value that is
-        itself a recovered parameter -- return that parameter index, else None.
-        Identity-on-stored-value only (the stored value must match parameter_vars),
-        so it never invents a parameter. Degrades to None on any BN-API shortfall
-        (#434)."""
+        """If terminal no-def var *v* is *provably* a spill of an incoming
+        parameter, return that parameter index, else None (#434).
+
+        Sound-leaning heuristic: fires only when the slot is written by EXACTLY
+        ONE definition in *func* -- so the no-def reload is unambiguously that
+        store -- and that definition is a DIRECT copy of a recovered parameter:
+        a bare ``slot = <param>`` whose src is a single ``MLIL_VAR_SSA`` /
+        ``VAR_ALIASED`` read of one variable that is a real parameter. It
+        deliberately does NOT fire when the slot is written more than once (the
+        slot may be reused for a later, unrelated value) or filled with a derived
+        expression (``slot = param - 4``): the earlier version matched the first
+        param-reading store regardless of SSA version or the src operation, and so
+        misattributed a reused/derived slot to the parameter. Degrades to None on
+        any BN-API shortfall, so it never invents a parameter."""
         try:
             vk = var_key(v)
-            for ins in self._instrs(ssaf):
-                for w in getattr(ins, "vars_written", []) or []:
-                    if var_key(w) != vk:
-                        continue
-                    # this instruction defines v's slot; is the stored value a param?
-                    for r in expr_reads(getattr(ins, "src", None)):
-                        pidx = self._param_index_of(func, r)
-                        if pidx is not None:
-                            return pidx
+            stores = [ins for ins in self._instrs(ssaf)
+                      if any(var_key(w) == vk
+                             for w in (getattr(ins, "vars_written", None) or []))]
+            if len(stores) != 1:
+                return None  # 0 = no spill store; >1 = ambiguous slot (reuse/multi-def)
+            src = getattr(stores[0], "src", None)
+            if op_name(src) not in ("MLIL_VAR_SSA", "MLIL_VAR_ALIASED"):
+                return None  # not a bare var copy -> a derived value, not a clean spill
+            reads = expr_reads(src)
+            if len(reads) != 1:
+                return None
+            return self._param_index_of(func, reads[0])  # None unless it is a real parameter
         except Exception:
             return None
-        return None
 
     def _resolve_to_param_index(self, func: Any, ssaf: Any, expr: Any, depth: int = 0) -> int | None:
         """Trace a pointer-arg expression back to one of *func*'s parameters
@@ -4412,7 +4422,8 @@ class TaintEngine:
                                   **({"via_spill": True} if via_spill else {})}
                     if via_spill:
                         self._bw_assume(
-                            f"stack local {var_label(v)} is a spill of param {pidx}; "
+                            f"stack local {var_label(v)} appears to be a spill of param "
+                            f"{pidx} (its slot has a single store of the incoming parameter); "
                             f"canonicalized to param:{pidx} so caller-ascent continues (#434)")
                 elif origin["kind"] == "unresolved":
                     origin = {"kind": "entry", "var": var_label(v)}
