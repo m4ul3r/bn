@@ -4460,3 +4460,123 @@ def test_load_models_validates_user_model_interiors():
     # bool is not an int for tainted_args (bool is an int subclass in Python)
     with pytest.raises(te.TaintError):
         te.load_models(extra={"app": {"sink": {"class": "x", "tainted_args": [True]}}})
+
+
+# --- _param_spill_index / backward caller-ascent through a spill (#434) -------
+
+def test_param_spill_index_finds_spilled_param(models):
+    n = FVar("n", ident=22); var_n = FVar("var_n", ident=23)
+    n0 = FSSA(n, 0); vn1 = FSSA(var_n, 1); vn5 = FSSA(var_n, 5)
+    ssaf = FSSAFunc([
+        FInstr(0, 0x802, "MLIL_SET_VAR_SSA", "var_n#1 = n#0", writes=[vn1],
+               src=FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])),
+    ])
+    func = FFunc("f", 0x800, ssaf, params=[FVar("a", ident=20), FVar("b", ident=21), n])
+    engine = te.TaintEngine(FBV({}), models)
+    assert engine._param_spill_index(func, ssaf, vn5) == 2      # var_n is a spill of param 2 (n)
+
+
+def test_param_spill_index_rejects_non_param_stored_value(models):
+    x = FVar("x", ident=30); var_n = FVar("var_n", ident=23)
+    x0 = FSSA(x, 0); vn1 = FSSA(var_n, 1); vn5 = FSSA(var_n, 5)
+    ssaf = FSSAFunc([
+        FInstr(0, 0x802, "MLIL_SET_VAR_SSA", "var_n#1 = x#0", writes=[vn1],
+               src=FExpr("MLIL_VAR_SSA", "x#0", reads=[x0])),
+    ])
+    func = FFunc("f", 0x800, ssaf, params=[FVar("a", ident=20)])  # x is not a parameter
+    engine = te.TaintEngine(FBV({}), models)
+    assert engine._param_spill_index(func, ssaf, vn5) is None
+
+
+def test_param_spill_index_none_without_spill_store(models):
+    var_n = FVar("var_n", ident=23); vn5 = FSSA(var_n, 5)
+    ssaf = FSSAFunc([])                                          # nothing writes var_n
+    func = FFunc("f", 0x800, ssaf, params=[FVar("a", ident=20)])
+    engine = te.TaintEngine(FBV({}), models)
+    assert engine._param_spill_index(func, ssaf, vn5) is None
+
+
+def test_param_spill_index_rejects_reused_slot(models):
+    # The slot is spilled from param 2 early (var_n#1 = n#0), then REUSED for an
+    # unrelated non-param value (var_n#3 = x#0). A terminal no-def reload (var_n#7)
+    # must NOT be canonicalized to param 2 -- the slot has >1 store, so which value
+    # reaches the reload is ambiguous. (The version-blind first-match logic used to
+    # misattribute this to the parameter -> false canonicalization.)
+    n = FVar("n", ident=22); x = FVar("x", ident=30); var_n = FVar("var_n", ident=23)
+    n0 = FSSA(n, 0); x0 = FSSA(x, 0)
+    vn1 = FSSA(var_n, 1); vn3 = FSSA(var_n, 3); vn7 = FSSA(var_n, 7)
+    ssaf = FSSAFunc([
+        FInstr(0, 0x802, "MLIL_SET_VAR_SSA", "var_n#1 = n#0", writes=[vn1],
+               src=FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])),
+        FInstr(1, 0x806, "MLIL_SET_VAR_SSA", "var_n#3 = x#0", writes=[vn3],
+               src=FExpr("MLIL_VAR_SSA", "x#0", reads=[x0])),
+    ])
+    func = FFunc("f", 0x800, ssaf, params=[FVar("a", ident=20), FVar("b", ident=21), n])
+    engine = te.TaintEngine(FBV({}), models)
+    assert engine._param_spill_index(func, ssaf, vn7) is None
+
+
+def test_param_spill_index_rejects_derived_store(models):
+    # var_n = n - 4 is a DERIVED value, not a clean copy of the parameter; the
+    # docstring's identity-on-stored-value contract must be enforced (op is
+    # MLIL_SUB, not MLIL_VAR_SSA), so no canonicalization.
+    n = FVar("n", ident=22); var_n = FVar("var_n", ident=23)
+    n0 = FSSA(n, 0); vn1 = FSSA(var_n, 1); vn5 = FSSA(var_n, 5)
+    ssaf = FSSAFunc([
+        FInstr(0, 0x802, "MLIL_SET_VAR_SSA", "var_n#1 = n#0 - 4", writes=[vn1],
+               src=FExpr("MLIL_SUB", "n#0 - 4", reads=[n0])),
+    ])
+    func = FFunc("f", 0x800, ssaf, params=[FVar("a", ident=20), FVar("b", ident=21), n])
+    engine = te.TaintEngine(FBV({}), models)
+    assert engine._param_spill_index(func, ssaf, vn5) is None
+
+
+def test_backward_ascends_through_parameter_spill(models):
+    # use_len(dst, src, n): n is SPILLED to stack (var_n#1 = n#0), then memcpy reads
+    # the reload var_n#5. Backward from memcpy length must canonicalize var_n -> param 2
+    # and cross into the caller (handler) to reach the recv source.
+    dst = FVar("dst", ident=20); src = FVar("src", ident=21); n = FVar("n", ident=22)
+    var_n = FVar("var_n", ident=23)
+    dst0 = FSSA(dst, 0); src0 = FSSA(src, 0); n0 = FSSA(n, 0)
+    vn1 = FSSA(var_n, 1); vn5 = FSSA(var_n, 5)
+    USE_LEN_CALL = 0x920
+    use_len = FFunc("use_len", 0x800, FSSAFunc([
+        FInstr(0, 0x802, "MLIL_SET_VAR_SSA", "var_n#1 = n#0", writes=[vn1],
+               src=FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])),                 # the spill
+        FInstr(1, 0x804, "MLIL_CALL_SSA", "0x940(dst#0, src#0, var_n#5)",
+               reads=[dst0, src0, vn5], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x940", constant=0x940),
+               params=[FExpr("MLIL_VAR_SSA", "dst#0", reads=[dst0]),
+                       FExpr("MLIL_VAR_SSA", "src#0", reads=[src0]),
+                       FExpr("MLIL_VAR_SSA", "var_n#5", reads=[vn5])]),        # reload as length
+    ]), params=[dst, src, n])
+
+    fd = FVar("fd"); buf = FVar("buf"); out = FVar("out"); nh = FVar("nh")
+    nh1 = FSSA(nh, 1); rb = FVar("rb"); rb1 = FSSA(rb, 1)
+    handler = FFunc("handler", 0x900, FSSAFunc([
+        FInstr(0, 0x904, "MLIL_SET_VAR_SSA", "rb#1 = &buf", writes=[rb1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+        FInstr(1, 0x910, "MLIL_CALL_SSA", "nh#1 = 0x930(fd, rb#1, 0x40, 0)", reads=[rb1], writes=[nh1],
+               dest=FExpr("MLIL_CONST_PTR", "0x930", constant=0x930),
+               params=[FExpr("MLIL_VAR_SSA", "fd", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "rb#1", reads=[rb1]),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40),
+                       FExpr("MLIL_CONST", "0", constant=0)]),
+        FInstr(2, USE_LEN_CALL, "MLIL_CALL_SSA", "0x800(out, rb#1, nh#1)", reads=[rb1, nh1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x800", constant=0x800),
+               params=[FExpr("MLIL_VAR_SSA", "out", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "rb#1", reads=[rb1]),
+                       FExpr("MLIL_VAR_SSA", "nh#1", reads=[nh1])]),
+    ]), params=[fd])
+    use_len.caller_sites = [FSite(handler, USE_LEN_CALL)]
+
+    bv = FBV({0x940: "memcpy", 0x930: "recv", 0x800: "use_len"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.backward(use_len, [te.parse_locator("arg:memcpy:2")])
+
+    assert result["slices"]
+    crossed = [c for sl in result["slices"] for c in (sl.get("crossed_functions") or [])]
+    assert "use_len" in crossed                                  # caller-ascent fired via the spill
+    origins = [(sl["origin"]["kind"], sl["origin"].get("callee")) for sl in result["slices"]]
+    assert ("source", "recv") in origins
+    assert any("spill of param 2" in a and "#434" in a for a in result["assumptions"])  # disclosed
