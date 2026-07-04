@@ -9,6 +9,7 @@ from ..cli import _call, _depth_int, arg, command
 from ..formatters import (
     _render_callgraph_text,
     _render_defuse_text,
+    _render_taint_models_text,
     _render_taint_text,
     _render_values_text,
 )
@@ -143,6 +144,8 @@ _SINK_LOCATOR_HELP = (
                       "file_write (fwrite/write/fputs), net_write (send/sendto). "
                       "Use when auditing persistence / file-corruption / exfiltration paths."),
              _models_arg(),
+             arg("--verbose", "-v", "--full", dest="full", action="store_true", default=False,
+                 help="Show the full SSA path/slice for each flow (default: one compact line per flow)"),
          ])
 def _taint_forward(args: argparse.Namespace) -> int:
     # --source is argparse-required, so an empty list cannot reach here.
@@ -165,7 +168,7 @@ def _taint_forward(args: argparse.Namespace) -> int:
         "taint",
         params,
         require_target=True,
-        text_renderer=_render_taint_text,
+        text_renderer=(lambda v: _render_taint_text(v, full=bool(getattr(args, "full", False)))),
         stem="taint-forward",
     )
 
@@ -189,6 +192,8 @@ def _taint_forward(args: argparse.Namespace) -> int:
                  help="JSON file mapping indirect call addresses to target lists: "
                       '{"0x4011f0": ["0x401176", "0x401195"]}'),
              _models_arg(),
+             arg("--verbose", "-v", "--full", dest="full", action="store_true", default=False,
+                 help="Show the full SSA path/slice for each flow (default: one compact line per flow)"),
          ])
 def _taint_backward(args: argparse.Namespace) -> int:
     # --sink is argparse-required, so an empty list cannot reach here.
@@ -209,6 +214,46 @@ def _taint_backward(args: argparse.Namespace) -> int:
         "taint",
         params,
         require_target=True,
-        text_renderer=_render_taint_text,
+        text_renderer=(lambda v: _render_taint_text(v, full=bool(getattr(args, "full", False)))),
         stem="taint-backward",
+    )
+
+
+@command("taint", "models",
+         help="List the taint model catalog (sources/sinks/propagators); with a target, which are present",
+         target=True,
+         prefer_when="enumerate known sinks/sources and (with a target) which appear in this binary",
+         see_also=("taint forward", "taint backward"),
+         args=[
+             arg("--role", choices=("source", "sink", "propagator"), default=None,
+                 help="Filter to one role"),
+             arg("--class", dest="sink_class", default=None, metavar="CLASS",
+                 help="Filter sinks to one bug class (e.g. overflow_len); implies --role sink"),
+             arg("--present", action="store_true", default=False,
+                 help="With a target: show only models present in the binary (errors without a target)"),
+             arg("--callsites", action="store_true", default=False,
+                 help="With --present: expand each present sink's callsite addresses"),
+         ])
+def _taint_models(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {}
+    if args.role:
+        params["role"] = args.role
+    if args.sink_class:
+        params["class"] = args.sink_class
+    if args.present:
+        params["present"] = True
+    if args.callsites:
+        params["callsites"] = True
+    # #473: --present/--callsites are defined against a loaded binary, so require a
+    # target for them -- which lets `_resolve_target` auto-select the single open
+    # target like every other read command (no spurious "need a target" when one is
+    # open and only --instance is given). Catalog-only mode needs no target.
+    needs_target = bool(args.present or args.callsites)
+    return _call(
+        args,
+        "taint_models",
+        params,
+        require_target=needs_target,
+        text_renderer=_render_taint_models_text,
+        stem="taint-models",
     )

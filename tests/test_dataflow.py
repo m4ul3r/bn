@@ -200,7 +200,7 @@ def test_render_taint_forward_text():
         "assumptions": ["memory aliasing modeled coarsely (memory_approx)"],
         "soundness": "may-analysis (intraprocedural, MVP)",
     }
-    text = _render_taint_text(value)
+    text = _render_taint_text(value, full=True)
     assert "forward taint in process @ 0x401189" in text
     assert "[overflow_len] memcpy @ 0x4011db (arg 2)" in text
     assert "source: read fills arg1 buffer" in text
@@ -287,7 +287,7 @@ def test_render_taint_backward_text():
         }],
         "leaves": [], "assumptions": [], "soundness": "x",
     }
-    text = _render_taint_text(value)
+    text = _render_taint_text(value, full=True)
     assert "slice for memcpy @ 0x4011db (seed rdx_1#1)" in text
     assert "origin: parameter_or_entry buf#1" in text
     assert "len#2 = len#1 + 4" in text
@@ -355,7 +355,7 @@ def test_render_taint_field_load_unresolved_leaf():
              "leaves": [{"kind": "field_load_unresolved", "address": "0x30", "base": "obj#1",
                          "offset": "0x8", "width": 4, "il_text": "x#1 = [obj#1 + 8]"}],
              "assumptions": [], "soundness": "x"}
-    text = _render_taint_text(value)
+    text = _render_taint_text(value, full=True)
     assert "frontiers (" in text
     assert "field_load_unresolved @ 0x30" in text
     assert "base=obj#1" in text and "offset=0x8" in text and "width=4" in text
@@ -506,5 +506,60 @@ def test_render_backward_origin_via_spill():
                          "origin": {"kind": "parameter", "index": 2, "var": "var_n#5", "via_spill": True},
                          "slice": []}],
              "leaves": [], "assumptions": [], "soundness": "x"}
-    text = _render_taint_text(value)
+    # #463 moved the origin line behind --full; via_spill still renders there.
+    text = _render_taint_text(value, full=True)
     assert "origin: parameter var_n#5 (via spill)" in text
+
+
+def test_taint_models_command_dumps_catalog(monkeypatch, capsys):
+    fake, calls = _fake({"taint_models": {
+        "sources": [{"symbol": "recv", "to": "*arg:1, ret"}],
+        "sinks_by_class": {"overflow_len": [{"symbol": "memcpy", "tainted_args": [2],
+                                             "class": "overflow_len", "detail": "len"}]},
+        "propagators": [{"symbol": "strlen", "from_to": "*arg:0->ret"}],
+        "overlays": [{"kind": "builtin", "path": "/x/taint_models.json"}], "items": []}})
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    rc = bn.cli.main(["taint", "models"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "recv" in out and "memcpy" in out and "overflow_len" in out
+    call = [c for c in calls if c["op"] == "taint_models"][0]
+    assert call["params"] == {}                          # no filters -> empty params
+
+
+def test_taint_models_command_forwards_filters(monkeypatch, capsys):
+    fake, calls = _fake({"taint_models": {"sources": [], "sinks_by_class": {}, "propagators": [],
+                                          "overlays": [], "items": []}})
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    rc = bn.cli.main(["taint", "models", "--role", "sink", "--class", "overflow_len",
+                      "--present", "--callsites", "--target", "active"])
+    assert rc == 0
+    call = [c for c in calls if c["op"] == "taint_models"][0]
+    assert call["params"] == {"role": "sink", "class": "overflow_len",
+                              "present": True, "callsites": True}
+
+
+def test_taint_models_present_auto_selects_single_target(monkeypatch, capsys):
+    # #473: --present needs a target, and with exactly one open it must be
+    # auto-selected (like every other read command) rather than forwarding
+    # target=None and hitting the bridge's "need a target" error. No --target here.
+    fake, calls = _fake({"taint_models": {"sources": [], "sinks_by_class": {}, "propagators": [],
+                                          "overlays": [], "items": []}})
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    rc = bn.cli.main(["taint", "models", "--present"])
+    assert rc == 0
+    call = [c for c in calls if c["op"] == "taint_models"][0]
+    assert call["target"] == "active"                    # single open target auto-selected
+    assert call["params"] == {"present": True}
+
+
+def test_taint_models_catalog_only_needs_no_target(monkeypatch, capsys):
+    # Regression: catalog-only mode (no --present/--callsites) must NOT require a
+    # target -- it forwards target=None so the whole model DB dumps with none open.
+    fake, calls = _fake({"taint_models": {"sources": [], "sinks_by_class": {}, "propagators": [],
+                                          "overlays": [], "items": []}})
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    rc = bn.cli.main(["taint", "models", "--role", "sink"])
+    assert rc == 0
+    call = [c for c in calls if c["op"] == "taint_models"][0]
+    assert call["target"] is None

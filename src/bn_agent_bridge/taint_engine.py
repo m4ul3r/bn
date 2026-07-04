@@ -437,7 +437,8 @@ def const_target(expr: Any) -> int | None:
         return None
 
 
-def _instr_dict(ins: Any, reason: str | None = None, tainted: list[str] | None = None) -> dict[str, Any]:
+def _instr_dict(ins: Any, reason: str | None = None, tainted: list[str] | None = None,
+                callee: str | None = None) -> dict[str, Any]:
     out = {
         "il_index": int(getattr(ins, "instr_index", -1)),
         "address": hex(int(getattr(ins, "address", 0))),
@@ -448,7 +449,73 @@ def _instr_dict(ins: Any, reason: str | None = None, tainted: list[str] | None =
         out["reason"] = reason
     if tainted is not None:
         out["tainted"] = tainted
+    if callee is not None:
+        out["callee"] = str(callee)
     return out
+
+
+def _make_signature(source: Any, chain: list[str], sink_class: str | None,
+                    sink_callee: str | None) -> dict[str, Any]:
+    cls = f"[{sink_class}] " if sink_class else ""
+    parts = [str(source)] + [str(c) for c in chain] + [f"{cls}{sink_callee}"]
+    return {
+        "source": str(source),
+        "chain": [str(c) for c in chain],
+        "sink_class": sink_class,
+        "sink_callee": sink_callee,
+        "rendered": " → ".join(parts),
+    }
+
+
+def derive_flow_facts(*, direction: str,
+                      path: list[dict[str, Any]] | None = None,
+                      sink: dict[str, Any] | None = None,
+                      sources: list[str] | None = None,
+                      leaves: list[dict[str, Any]] | None = None,
+                      fn_name: str | None = None,
+                      origin: dict[str, Any] | None = None,
+                      crossed_functions: list[str] | None = None,
+                      ) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Structural triage facts + an address-free grouping signature for one flow.
+
+    Pure: derived from the already-assembled result (the flow's reconstructed
+    path/slice, the run's source echo, the run-global leaves). No BN access, no
+    engine state -- unit-testable against fabricated dicts. Returns
+    (metrics, signature). ``traverses_unresolved`` is an honest structural
+    correlation (a leaf address coincides with a path address), NOT causal proof.
+    See design spec 2026-07-03-taint-triage-output.
+    """
+    steps = path or []
+    if direction == "forward":
+        callees = [s.get("callee") for s in steps if s.get("callee")]
+        sink_callee = (sink or {}).get("callee")
+        chain: list[str] = []
+        for c in callees[:-1]:                       # drop trailing sink callee
+            if c and c != sink_callee and c not in chain:
+                chain.append(str(c))
+        srcs = sources or []
+        source = srcs[0] if len(srcs) == 1 else ("multiple" if len(srcs) > 1 else "?")
+        sink_class = (sink or {}).get("class")
+        step_addrs = {s.get("address") for s in steps}
+        traverses = any(lf.get("address") in step_addrs
+                        for lf in (leaves or []) if lf.get("address"))
+        metrics = {"steps": len(steps), "fns_spanned": 1 + len(chain),
+                   "traverses_unresolved": bool(traverses)}
+        return metrics, _make_signature(source, chain, sink_class, sink_callee)
+
+    # backward
+    crossed = [str(c) for c in (crossed_functions or [])]
+    chain = []
+    for c in crossed[1:]:                            # crossed[0] is the sink's fn
+        if c and c not in chain:
+            chain.append(c)
+    o = origin or {}
+    source = o.get("callee") or o.get("kind") or "?"
+    sink_callee = (sink or {}).get("callee") or (sink or {}).get("kind")
+    traverses = o.get("kind") in {"unresolved", "indirect_call", "field_load_unresolved"}
+    metrics = {"steps": len(steps), "fns_spanned": max(1, len(set(crossed)) + 1),
+               "traverses_unresolved": bool(traverses)}
+    return metrics, _make_signature(source, chain, None, sink_callee)
 
 
 # --------------------------------------------------------------------------
@@ -2269,10 +2336,17 @@ class TaintEngine:
                 continue
             seen_sink.add(sig)
             unique_findings.append(f)
+        sources_echo = [self._describe_locator(s) for s in sources]
+        for f in unique_findings:
+            fm, fs = derive_flow_facts(
+                direction="forward", path=f.get("path"), sink=f.get("sink"),
+                sources=sources_echo, leaves=sub["leaves"], fn_name=str(func.name))
+            f["metrics"] = fm
+            f["signature"] = fs
         return {
             "direction": "forward",
             "function": {"name": str(func.name), "address": hex(int(func.start))},
-            "sources": [self._describe_locator(s) for s in sources],
+            "sources": sources_echo,
             "reached_sinks": unique_findings,
             "leaves": sub["leaves"],
             "assumptions": sub["assumptions"],
@@ -3078,7 +3152,8 @@ class TaintEngine:
         note = f"calls {callee_fn.name} with tainted arg(s) {sorted(valid)}"
         if via:
             note = f"[{via}-resolved] " + note
-        prefix.append(_instr_dict(ins, reason=note, tainted=[node_label(first_hit, why)]))
+        prefix.append(_instr_dict(ins, reason=note, tainted=[node_label(first_hit, why)],
+                                  callee=getattr(callee_fn, "name", None)))
         for f in sub["findings"]:
             out["findings"].append({"sink": f["sink"], "path": prefix + f["path"]})
         out["leaves"] = list(sub["leaves"])
@@ -4313,7 +4388,8 @@ class TaintEngine:
     def _make_finding(self, ins, callee, argidx, sink, hit_nodes, why) -> dict[str, Any]:
         path = self._reconstruct_path(hit_nodes[0], why)
         path.append(_instr_dict(ins, reason=f"tainted arg{argidx} reaches {callee}",
-                                tainted=[node_label(n, why) for n in hit_nodes]))
+                                tainted=[node_label(n, why) for n in hit_nodes],
+                                callee=callee))
         return {
             "sink": {
                 "callee": callee,
@@ -4433,6 +4509,12 @@ class TaintEngine:
                 "no backward seed resolved for any sink:\n  "
                 + "\n  ".join(f"{format_locator(s)}: {m}" for s, m in errors))
 
+        for sl in slices:
+            sm, ss = derive_flow_facts(
+                direction="backward", path=sl.get("slice"), sink=sl.get("sink"),
+                origin=sl.get("origin"), crossed_functions=sl.get("crossed_functions"))
+            sl["metrics"] = sm
+            sl["signature"] = ss
         return {
             "direction": "backward",
             "function": {"name": str(func.name), "address": hex(int(func.start))},

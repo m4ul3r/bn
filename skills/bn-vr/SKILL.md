@@ -25,7 +25,7 @@ Start by mapping what the binary does and where untrusted data enters:
    ```bash
    bn imports
    ```
-   > **Shortcut:** `bash scripts/sink-sweep.sh -t <target>` (resolve `scripts/sink-sweep.sh` against **this skill's base directory** — the path shown when the skill loads; don't `find /` for it, which is slow and hits pytest tmp copies) enumerates the **copy / format-string / exec / input** sinks below **and** runs `bn xrefs` on each, printing every call site to trace back to a source — the sink-enumeration step that's easy to skip. Forward the usual `-i`/`-t` selectors. **Do not pass `--out` to it** — the script manages its own output; redirect stdout if you want a file (`... > sinks.txt`). (It skips the malloc family by design — heap bugs aren't found by xref'ing the allocator. Falls back cleanly: prints "no dangerous-sink imports" on a static/stripped target — then use the lane below.)
+   > **Shortcut (step 1 of sink enumeration):** `bn taint models --role sink --present --callsites -t <target>` lists every **modeled** sink actually present in this binary — the *same* catalog the taint engine uses, so the list can't drift — with each present sink's callsite addresses, so you can jump straight to tracing a site back to a source. It sees only *modeled* sinks: on a stripped/static target whose dangerous copy/format sinks are unnamed vendor functions, this list can be short or empty — **that is not an all-clear**; fall through to the "Stripped / static lane" below and recover sinks by shape. (Run `bn taint models` with no target to browse the whole catalog, or `--class overflow_len` to focus one bug class.)
 
    Flag these categories:
    - **Unbounded copies**: `strcpy`, `strcat`, `sprintf`, `gets`, `scanf` (no length limit)
@@ -180,8 +180,14 @@ bn taint forward -f <handler> --source arg:recv:1
 # a function parameter is tainted on entry:
 bn taint forward -f <handler> --source param:0
 ```
-Reports each reached sink with its bug class (`overflow_len`,
-`command_injection`, `format_string`, …) and the full SSA path.
+Reports **one compact line per flow** by default: the bug class (`overflow_len`,
+`command_injection`, `format_string`, …), the sink address/arg, an address-free
+grouping **signature** (`source → wrapper → [class] sink`), and structural
+`{steps / fns / unresolved}` metrics. Add `--verbose` (`--full`) for the full SSA
+path per flow; `--format json` always carries `path`, `metrics`, and `signature`
+per finding, so you can rank and dedup flows across runs by their signature.
+Distinct sink call-sites always render on their own line — nothing is folded
+behind a count.
 
 > **Global / struct-field buffer source → seed the parser entry instead.** When the
 > recv destination is a long-lived pointer in a global or daemon struct

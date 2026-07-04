@@ -36,6 +36,7 @@ from . import taint_engine as _taint
 from . import vars as vars_mod
 from ._shared import OperationFailure, _parse_address
 from .bridge_state import require_analysis
+from .read_taint_models import build_catalog
 
 
 def _taint_op(ctx, selector, params: dict[str, Any]):
@@ -94,6 +95,92 @@ def _taint_op(ctx, selector, params: dict[str, Any]):
     if isinstance(result, dict):
         result["model_sources"] = model_sources
     return result
+
+
+def _taint_models_op(ctx, selector, params: dict[str, Any]):
+    """`taint models`: dump the model catalog; with a target, annotate which
+    modeled symbols are present in the binary (+ callsite counts)."""
+    present_only = bool(params.get("present"))
+    want_callsites = bool(params.get("callsites"))
+    if (present_only or want_callsites) and selector is None:
+        raise OperationFailure(
+            "unsupported",
+            "--present/--callsites need a target: presence is defined against a loaded binary")
+    try:
+        models = _taint.load_models(extra=params.get("user_models"))
+    except _taint.TaintError as exc:
+        raise OperationFailure("unsupported", str(exc)) from exc
+    catalog = build_catalog(models, role=params.get("role"), sink_class=params.get("class"))
+    catalog["overlays"] = _taint.model_overlay_sources(
+        params.get("user_models"), user_models_path=params.get("user_models_path"))
+    catalog["items"] = ([{"role": "source", **s} for s in catalog["sources"]]
+                        + [{"role": "sink", **e}
+                           for lst in catalog["sinks_by_class"].values() for e in lst]
+                        + [{"role": "propagator", **p} for p in catalog["propagators"]])
+    if selector is not None:
+        bv = ctx._resolve_view(selector)
+        present_keys, counts = _present_models(bv, models, want_callsites)
+        _annotate_presence(catalog, present_keys, counts, present_only)
+    return catalog
+
+
+def _present_models(bv, models, want_callsites):
+    """Map the binary's symbols to model keys via the engine's own normalization;
+    return (present model-key set, {model-key: {callsites, addresses?}})."""
+    present: set[str] = set()
+    counts: dict[str, dict[str, Any]] = {}
+    # #472: several distinct binary symbol spellings can normalize to the SAME
+    # model key (memcpy + memcpy@plt -> memcpy; _Znwm + operator new -> Znwm), so
+    # accumulate their callsites into one slot instead of overwriting -- an
+    # assignment let whichever spelling was seen last (set iteration order) clobber
+    # the rest, dropping a present sink to "(0 callsites)". Dedup addresses so an
+    # alias resolving to the same site is not double-counted.
+    seen_addrs: dict[str, set[str]] = {}
+    names: set[str] = set()
+    for fn in getattr(bv, "functions", []) or []:
+        names.add(str(getattr(fn, "name", "")))
+    for sym in (getattr(bv, "get_symbols", lambda: [])() or []):
+        names.add(str(getattr(sym, "name", "")))
+    for nm in names:
+        key, _model = _taint.lookup_model(models, nm)
+        if not key:
+            continue
+        present.add(key)
+        if want_callsites:
+            slot = counts.setdefault(key, {"callsites": 0, "addresses": []})
+            seen = seen_addrs.setdefault(key, set())
+            for sym in (getattr(bv, "get_symbols_by_name", lambda n: [])(nm) or []):
+                for ref in (getattr(bv, "get_code_refs", lambda a: [])(
+                        getattr(sym, "address", 0)) or []):
+                    a = hex(int(getattr(ref, "address", 0)))
+                    if a not in seen:
+                        seen.add(a)
+                        slot["addresses"].append(a)
+            slot["callsites"] = len(slot["addresses"])
+        else:
+            counts.setdefault(key, {"callsites": None})
+    return present, counts
+
+
+def _annotate_presence(catalog, present_keys, counts, present_only):
+    def _mark(entry):
+        key = entry["symbol"]
+        entry["present"] = key in present_keys
+        info = counts.get(key) or {}
+        if info.get("callsites") is not None:
+            entry["callsites"] = info["callsites"]
+            if "addresses" in info:
+                entry["addresses"] = info["addresses"]
+        return entry["present"]
+    catalog["sources"] = [e for e in catalog["sources"] if (_mark(e) or not present_only)]
+    for cls, lst in list(catalog["sinks_by_class"].items()):
+        kept = [e for e in lst if (_mark(e) or not present_only)]
+        if kept:
+            catalog["sinks_by_class"][cls] = kept
+        else:
+            del catalog["sinks_by_class"][cls]
+    catalog["propagators"] = [e for e in catalog["propagators"] if (_mark(e) or not present_only)]
+    catalog["items"] = [e for e in catalog["items"] if (_mark(e) or not present_only)]
 
 
 def _ssa_vars_from(vars_list: list) -> list[SSAVariable]:

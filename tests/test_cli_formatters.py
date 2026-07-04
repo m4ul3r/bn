@@ -204,3 +204,47 @@ def test_arg_under_recovered_leaves_group_per_callee():
                        "recovered_params": 1, "dropped_args": [1], "note": "n"}
     out = "\n".join(_render_grouped_leaves([mk("0x10"), mk("0x20")]))
     assert "(x2)" in out                                   # two call sites of f collapse
+# --- compact-default taint output (Thread C) ---------------------------------
+
+_FWD_FLOW = {
+    "direction": "forward",
+    "function": {"name": "parse_request", "address": "0x401000"},
+    "sources": ["arg:recv:1"],
+    "reached_sinks": [{
+        "sink": {"class": "overflow_len", "callee": "memcpy", "address": "0x401f30",
+                 "tainted_arg_index": 2, "detail": "attacker-controlled length"},
+        "path": [{"address": "0x401f30", "op": "MLIL_CALL_SSA", "il_text": "memcpy(...)"}],
+        "metrics": {"steps": 11, "fns_spanned": 3, "traverses_unresolved": False},
+        "signature": {"source": "arg:recv:1", "chain": ["parse_hdr", "copy_field"],
+                      "sink_class": "overflow_len", "sink_callee": "memcpy",
+                      "rendered": "arg:recv:1 → parse_hdr → copy_field → [overflow_len] memcpy"},
+    }],
+    "leaves": [], "assumptions": [], "soundness": "may-analysis",
+    "stats": {"functions_visited": 3},
+}
+
+
+def test_taint_compact_default_one_line_per_flow():
+    from bn.formatters import _render_taint_text
+    out = _render_taint_text(_FWD_FLOW)                  # full defaults False
+    assert "arg:recv:1 → parse_hdr → copy_field → [overflow_len] memcpy" in out
+    assert "steps=11" in out and "fns=3" in out and "unresolved=n" in out
+    assert "memcpy(...)" not in out                      # SSA path suppressed by default
+    assert "soundness" in out                            # honesty guard kept
+
+
+def test_taint_full_restores_ssa_path():
+    from bn.formatters import _render_taint_text
+    out = _render_taint_text(_FWD_FLOW, full=True)
+    assert "memcpy(...)" in out                          # SSA path shown
+
+
+def test_taint_two_distinct_sink_addresses_never_fold():
+    from bn.formatters import _render_taint_text
+    two = {**_FWD_FLOW, "reached_sinks": [
+        _FWD_FLOW["reached_sinks"][0],
+        {**_FWD_FLOW["reached_sinks"][0],
+         "sink": {**_FWD_FLOW["reached_sinks"][0]["sink"], "address": "0x402a10"}},
+    ]}
+    out = _render_taint_text(two)
+    assert "0x401f30" in out and "0x402a10" in out       # both sinks visible, not folded

@@ -4700,3 +4700,95 @@ def test_forward_fully_unrecovered_note_points_at_proto_set(models):
     result = engine.forward(func, [te.parse_locator("arg:recv:1")])
     leaf = [l for l in result["leaves"] if l.get("kind") == "unmodeled_callee"][0]
     assert "proto set" in leaf["note"]
+# --- derive_flow_facts: per-flow metrics + grouping signature (Thread C) -----
+
+def test_derive_flow_facts_forward_multi_wrapper():
+    path = [
+        {"address": "0x401100", "op": "MLIL_SET_VAR_SSA"},
+        {"address": "0x401120", "op": "MLIL_CALL_SSA", "callee": "parse_hdr"},
+        {"address": "0x401150", "op": "MLIL_CALL_SSA", "callee": "copy_field"},
+        {"address": "0x401180", "op": "MLIL_CALL_SSA", "callee": "memcpy"},
+    ]
+    sink = {"callee": "memcpy", "address": "0x401180", "class": "overflow_len"}
+    metrics, sig = te.derive_flow_facts(
+        direction="forward", path=path, sink=sink, sources=["arg:recv:1"],
+        leaves=[], fn_name="parse_request")
+    assert metrics == {"steps": 4, "fns_spanned": 3, "traverses_unresolved": False}
+    assert sig["source"] == "arg:recv:1"
+    assert sig["chain"] == ["parse_hdr", "copy_field"]
+    assert sig["sink_class"] == "overflow_len"
+    assert sig["sink_callee"] == "memcpy"
+    assert sig["rendered"] == "arg:recv:1 → parse_hdr → copy_field → [overflow_len] memcpy"
+
+
+def test_derive_flow_facts_forward_empty_chain():
+    path = [
+        {"address": "0x401100", "op": "MLIL_SET_VAR_SSA"},
+        {"address": "0x401180", "op": "MLIL_CALL_SSA", "callee": "memcpy"},
+    ]
+    sink = {"callee": "memcpy", "address": "0x401180", "class": "overflow_len"}
+    metrics, sig = te.derive_flow_facts(
+        direction="forward", path=path, sink=sink, sources=["ret:recv"], leaves=[], fn_name="f")
+    assert metrics["fns_spanned"] == 1          # intraprocedural
+    assert sig["chain"] == []
+    assert sig["rendered"] == "ret:recv → [overflow_len] memcpy"
+
+
+def test_derive_flow_facts_forward_param_and_multi_source():
+    path = [{"address": "0x401180", "op": "MLIL_CALL_SSA", "callee": "memcpy"}]
+    sink = {"callee": "memcpy", "address": "0x401180", "class": "overflow_len"}
+    _, sig1 = te.derive_flow_facts(direction="forward", path=path, sink=sink,
+                                   sources=["param:1"], leaves=[], fn_name="f")
+    assert sig1["source"] == "param:1"
+    _, sig2 = te.derive_flow_facts(direction="forward", path=path, sink=sink,
+                                   sources=["ret:recv", "ret:getenv"], leaves=[], fn_name="f")
+    assert sig2["source"] == "multiple"
+
+
+def test_derive_flow_facts_forward_traverses_unresolved():
+    path = [
+        {"address": "0x401120", "op": "MLIL_CALL_SSA", "callee": "parse_hdr"},
+        {"address": "0x401180", "op": "MLIL_CALL_SSA", "callee": "memcpy"},
+    ]
+    sink = {"callee": "memcpy", "address": "0x401180", "class": "overflow_len"}
+    metrics, _ = te.derive_flow_facts(
+        direction="forward", path=path, sink=sink, sources=["arg:recv:1"],
+        leaves=[{"kind": "indirect_call_unresolved", "address": "0x401120"}], fn_name="f")
+    assert metrics["traverses_unresolved"] is True
+    metrics2, _ = te.derive_flow_facts(
+        direction="forward", path=path, sink=sink, sources=["arg:recv:1"],
+        leaves=[{"kind": "indirect_call_unresolved", "address": "0x409999"}], fn_name="f")
+    assert metrics2["traverses_unresolved"] is False
+
+
+def test_derive_flow_facts_backward_intraprocedural_matches_forward():
+    metrics, sig = te.derive_flow_facts(
+        direction="backward",
+        path=[{"address": "0x401180", "op": "MLIL_VAR_SSA"}],
+        sink={"callee": "memcpy", "address": "0x401180", "seed": "n#2"},
+        origin={"kind": "constant", "value": 64}, crossed_functions=[])
+    assert metrics["steps"] == 1
+    assert metrics["fns_spanned"] == 1
+    assert metrics["traverses_unresolved"] is False
+    assert sig["sink_callee"] == "memcpy"
+
+
+def test_derive_flow_facts_backward_unresolved_origin():
+    metrics, _ = te.derive_flow_facts(
+        direction="backward", path=[{"address": "0x401180", "op": "x"}],
+        sink={"callee": "memcpy", "address": "0x401180", "seed": "n#2"},
+        origin={"kind": "indirect_call"}, crossed_functions=["copy_field", "parse_hdr"])
+    assert metrics["traverses_unresolved"] is True
+    assert metrics["fns_spanned"] == 3          # 2 crossed + origin frame
+
+
+def test_forward_result_carries_metrics_and_signature(process_func, models):
+    bv = FBV({0x401070: "read", 0x401080: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(process_func, [te.parse_locator("arg:read:1")])
+    f = result["reached_sinks"][0]
+    assert set(f["metrics"]) == {"steps", "fns_spanned", "traverses_unresolved"}
+    assert f["signature"]["sink_callee"]                      # populated
+    assert "→" in f["signature"]["rendered"]
+    # the sink path step carries a structured callee (no prose-regex needed)
+    assert any(s.get("callee") for s in f["path"])
