@@ -2996,6 +2996,48 @@ class TaintEngine:
             "note": note,
         }
 
+    def _arg_under_recovered_leaf(self, ins: Any, callee_fn: Any, dropped: list,
+                                  n_params: int) -> dict[str, Any] | None:
+        """Disclose a PARTIAL arg drop: taint DID descend into *callee_fn*, but some
+        tainted arg indices sit beyond its recovered arity (BN under-recovered the
+        callee's signature), so those flows were dropped. Gated by
+        ``_reg_reads_as_input`` -- only args the callee actually consumes -- so it
+        never cries wolf on a leftover value. Register-passed only; stack-passed
+        indices (i386 varargs, #324) are skipped. Returns a leaf or None; degrades
+        to None on any BN-API shortfall so it never fabricates a frontier."""
+        try:
+            cc = (getattr(callee_fn, "calling_convention", None)
+                  or self.bv.platform.default_calling_convention)
+            arg_regs = list(getattr(cc, "int_arg_regs", []) or [])
+        except Exception:
+            return None
+        confirmed: list[int] = []
+        for i in sorted(dropped):
+            if i >= len(arg_regs):
+                continue  # stack-passed -- out of scope (#324)
+            try:
+                if self._reg_reads_as_input(callee_fn, arg_regs[i]):
+                    confirmed.append(i)
+            except Exception:
+                continue
+        if not confirmed:
+            return None
+        name = str(getattr(callee_fn, "name", "?"))
+        return {
+            "kind": "arg_under_recovered",
+            "address": hex(int(getattr(ins, "address", 0))),
+            "callee": {"name": name,
+                       "address": hex(int(getattr(callee_fn, "start", 0)))},
+            "recovered_params": n_params,
+            "dropped_args": confirmed,
+            "note": (f"tainted arg(s) {confirmed} passed to {name} but Binary Ninja "
+                     f"recovered only {n_params} parameter(s) -- the callee's "
+                     f"signature is likely under-recovered, so taint into it was "
+                     f"dropped. Recover the real prototype and apply "
+                     f"`bn proto set {name} \"<prototype>\"`, then re-run this taint "
+                     f"query."),
+        }
+
     def _descend(self, ins: Any, callee_fn: Any, tainted_args: dict, why: dict,
                  depth: int, max_depth: int, *, via: str | None = None) -> dict[str, Any]:
         """Recurse into a (direct or resolved-indirect) internal callee and return
@@ -3015,8 +3057,10 @@ class TaintEngine:
             out["assumptions"].append(f"tainted args to {callee_fn.name} fall beyond its parameters; conservative")
             out["leaves"].append(self._frontier_leaf(
                 ins, callee_fn, tainted_args,
-                "tainted data passed to in-binary callee with no model and no "
-                "mappable parameters; investigate"))
+                "tainted data passed to in-binary callee whose parameters BN did not "
+                "recover, so taint into it was dropped. If it is a real callee with a "
+                "wrong signature, apply `bn proto set <callee> \"<prototype>\"` and "
+                "re-run; otherwise investigate"))
             return out
         if depth + 1 > max_depth:
             self._truncated = True
@@ -3038,6 +3082,15 @@ class TaintEngine:
         for f in sub["findings"]:
             out["findings"].append({"sink": f["sink"], "path": prefix + f["path"]})
         out["leaves"] = list(sub["leaves"])
+        # Disclose a PARTIAL arg drop: taint descended with the in-range args, but
+        # any tainted arg beyond the callee's recovered arity was filtered out of
+        # `valid` above and would otherwise vanish silently (#442-class). Gated so
+        # it only fires on args the callee actually reads.
+        dropped = [i for i in tainted_args if i >= n_params]
+        if dropped:
+            under = self._arg_under_recovered_leaf(ins, callee_fn, dropped, n_params)
+            if under is not None:
+                out["leaves"].append(under)
         frontier = sub.get("frontier")
         if frontier:
             out["leaves"].append(self._frontier_leaf(
@@ -4004,6 +4057,24 @@ class TaintEngine:
             return done
         return False
 
+    def _param_not_found_error(self, func: Any, idx: int) -> "TaintError":
+        """#464: seeding/slicing a param index past a function's recovered arity is
+        often BN under-recovering its signature -- e.g. a vtable method whose
+        data/args parameter was DROPPED uniformly across the call chain, so the
+        per-callsite ``arg_under_recovered`` frontier (which needs an arity
+        *mismatch*) can't catch it. Disclose the proto-set remedy rather than a
+        bare not-found, so the disclose -> proto set -> re-run loop still applies."""
+        try:
+            n = len(list(getattr(func, "parameter_vars", []) or []))
+            have = f" (BN recovered {n} parameter(s))"
+        except Exception:
+            have = ""
+        return TaintError(
+            f"parameter {idx} not found on {func.name}{have}. If BN under-recovered "
+            f"this function's signature (a dropped parameter is a common vtable / "
+            f"stripped-proto shape), apply `bn proto set {func.name} \"<prototype>\"` "
+            f"and re-run this taint query")
+
     def _seed_forward(self, func, ssaf, instrs, sources, taint_node, add_assumption, buffer_slots=None) -> bool:
         if buffer_slots is None:
             buffer_slots = {}
@@ -4014,7 +4085,7 @@ class TaintEngine:
                 idx = int(src["index"])
                 pv = self._param_var(func, idx)
                 if pv is None:
-                    raise TaintError(f"parameter {idx} not found on {func.name}")
+                    raise self._param_not_found_error(func, idx)
                 if taint_node((var_key(pv), None), str(getattr(pv, "name", pv)), None,
                               f"source: parameter {idx}", []):
                     seeded = True
@@ -4621,6 +4692,14 @@ class TaintEngine:
                         detail = (
                             f"its call site(s) expose {max_params} argument(s), so valid "
                             f"indices are 0..{max_params - 1} (arg indices are 0-based)")
+                    # #464: an index past the recovered arity is frequently BN
+                    # under-recovering the callee's signature (e.g. an ARM IFUNC libc
+                    # sink typed by its resolver as 0/1 args), which silently drops the
+                    # length/src slice. Name the proto-set remedy, not just "out of range".
+                    detail += (
+                        f". If {callee} is a real sink whose signature BN under-recovered "
+                        f"(a common IFUNC / stripped-proto shape), apply "
+                        f"`bn proto set {callee} \"<prototype>\"` and re-run this slice")
                     raise TaintError(
                         f"--sink arg index {idx} is out of range for {callee}: {detail}")
                 # Nothing to slice. A scalar CONSTANT literal (e.g. a fixed copy

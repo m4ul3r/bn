@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -2657,6 +2658,31 @@ def test_backward_arg_index_out_of_range_states_count_and_zero_based(process_fun
     assert "0-based" in msg      # names the convention
 
 
+def test_backward_arg_out_of_range_discloses_proto_set_remedy(process_func, models):
+    # #464 (Thread A extension): an index past the recovered arity is often BN
+    # under-recovering the callee's signature (e.g. an ARM IFUNC libc sink typed by
+    # its resolver as 0/1 args -- the shape that hid ~half the memcpy sink flows in
+    # dogfooding). The bare "out of range" must name the proto-set remedy.
+    bv = FBV({0x401070: "read", 0x401080: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    with pytest.raises(te.TaintError) as ei:
+        engine.backward(process_func, [te.parse_locator("arg:memcpy:9")])
+    assert 'proto set memcpy' in str(ei.value)
+
+
+def test_forward_param_not_found_discloses_proto_set_remedy(process_func, models):
+    # #464 (Thread A extension): seeding param:N past the recovered arity -- the
+    # uniform-vtable-drop shape where BN dropped a data param across the whole call
+    # chain (no per-callsite arity mismatch for the frontier to catch) -- must name
+    # the proto-set remedy, not a bare not-found.
+    bv = FBV({0x401070: "read", 0x401080: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    with pytest.raises(te.TaintError) as ei:
+        engine.forward(process_func, [te.parse_locator("param:99")])
+    msg = str(ei.value)
+    assert "not found" in msg and "proto set" in msg
+
+
 def test_backward_arg_with_no_variable_reads_says_so(process_func, models):
     bv = FBV({0x401070: "read", 0x401080: "memcpy"})
     engine = te.TaintEngine(bv, models)
@@ -4580,3 +4606,97 @@ def test_backward_ascends_through_parameter_spill(models):
     origins = [(sl["origin"]["kind"], sl["origin"].get("callee")) for sl in result["slices"]]
     assert ("source", "recv") in origins
     assert any("spill of param 2" in a and "#434" in a for a in result["assumptions"])  # disclosed
+# --- arg_under_recovered disclosure (Thread A) -------------------------------
+
+def _fake_under_recovered_callee(name, start, arg_regs):
+    return types.SimpleNamespace(
+        name=name, start=start,
+        calling_convention=types.SimpleNamespace(int_arg_regs=list(arg_regs)),
+    )
+
+
+def test_arg_under_recovered_leaf_gated_positive(models, monkeypatch):
+    monkeypatch.setattr(te.TaintEngine, "_reg_reads_as_input", lambda self, c, r: True)
+    engine = te.TaintEngine(FBV({}), models)
+    callee = _fake_under_recovered_callee("_M_create", 0x3000, ["rdi", "rsi", "rdx", "rcx"])
+    ins = types.SimpleNamespace(address=0x40130a)
+    leaf = engine._arg_under_recovered_leaf(ins, callee, [1], 1)
+    assert leaf is not None
+    assert leaf["kind"] == "arg_under_recovered"
+    assert leaf["callee"] == {"name": "_M_create", "address": "0x3000"}
+    assert leaf["recovered_params"] == 1
+    assert leaf["dropped_args"] == [1]
+    assert leaf["address"] == "0x40130a"
+    assert 'proto set _M_create' in leaf["note"]          # actionable remedy
+
+
+def test_arg_under_recovered_leaf_gate_rejects(models, monkeypatch):
+    # callee does NOT read the dropped register as input -> no false frontier
+    monkeypatch.setattr(te.TaintEngine, "_reg_reads_as_input", lambda self, c, r: False)
+    engine = te.TaintEngine(FBV({}), models)
+    callee = _fake_under_recovered_callee("helper", 0x3000, ["rdi", "rsi", "rdx"])
+    ins = types.SimpleNamespace(address=0x40130a)
+    assert engine._arg_under_recovered_leaf(ins, callee, [1], 1) is None
+
+
+def test_arg_under_recovered_leaf_skips_stack_passed(models, monkeypatch):
+    # dropped index beyond the register slots (i386 stack-passed) is out of scope
+    monkeypatch.setattr(te.TaintEngine, "_reg_reads_as_input", lambda self, c, r: True)
+    engine = te.TaintEngine(FBV({}), models)
+    callee = _fake_under_recovered_callee("helper", 0x3000, ["rdi", "rsi"])  # 2 arg regs
+    ins = types.SimpleNamespace(address=0x40130a)
+    assert engine._arg_under_recovered_leaf(ins, callee, [6], 6) is None
+
+
+def _partial_drop_program():
+    """worker(fd): recv(&buf); rdx = recv_ret; f(&buf, rdx) where in-binary f
+    recovered only ONE parameter, so the tainted rdx at arg index 1 is dropped.
+    Modeled on _frontier_no_params_program."""
+    buf = FVar("buf", typ="char[0x40]")
+    rsi = FVar("rsi"); rdi = FVar("rdi"); rax = FVar("rax")
+    rsi1 = FSSA(rsi, 1); rdi1 = FSSA(rdi, 1); rax2 = FSSA(rax, 2)
+    caller = FSSAFunc([
+        FInstr(0, 0x1000, "MLIL_SET_VAR_SSA", "rsi#1 = &buf", writes=[rsi1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+        FInstr(1, 0x1004, "MLIL_CALL_SSA", "rax#2 = recv(rdi#1, rsi#1, 0x40, 0)",
+               reads=[rdi1, rsi1], writes=[rax2],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_VAR_SSA", "rdi#1", reads=[rdi1]),
+                       FExpr("MLIL_VAR_SSA", "rsi#1", reads=[rsi1]),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40),
+                       FExpr("MLIL_CONST", "0", constant=0)]),
+        # the tainted recv buffer pointer passed as BOTH args; f recovered only
+        # one param, so the tainted arg at index 1 is the dropped one.
+        FInstr(2, 0x1008, "MLIL_CALL_SSA", "f(rsi#1, rsi#1)",
+               reads=[rsi1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x3000", constant=0x3000),
+               params=[FExpr("MLIL_VAR_SSA", "rsi#1", reads=[rsi1]),
+                       FExpr("MLIL_VAR_SSA", "rsi#1", reads=[rsi1])]),
+    ])
+    p = FVar("p")
+    f = FFunc("f", 0x3000, FSSAFunc([FInstr(0, 0x3000, "MLIL_RET", "return", reads=[])]),
+              params=[p])                                   # ONE recovered param
+    f.calling_convention = types.SimpleNamespace(int_arg_regs=["rdi", "rsi", "rdx", "rcx"])
+    bv = FBV({0x2000: "recv"}, funcs={0x3000: f})
+    return FFunc("worker", 0x1000, caller, params=[FVar("fd")]), bv
+
+
+def test_forward_descend_discloses_partial_arg_drop(models, monkeypatch):
+    monkeypatch.setattr(te.TaintEngine, "_reg_reads_as_input", lambda self, c, r: True)
+    func, bv = _partial_drop_program()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:recv:1")])
+    leaves = [l for l in result["leaves"] if l.get("kind") == "arg_under_recovered"]
+    assert len(leaves) == 1, result["leaves"]
+    assert leaves[0]["callee"]["name"] == "f"
+    assert leaves[0]["recovered_params"] == 1
+    assert leaves[0]["dropped_args"] == [1]
+
+
+def test_forward_fully_unrecovered_note_points_at_proto_set(models):
+    # the existing "no mappable parameters" leaf now names the proto set remedy
+    func, bv = _frontier_no_params_program()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:recv:1")])
+    leaf = [l for l in result["leaves"] if l.get("kind") == "unmodeled_callee"][0]
+    assert "proto set" in leaf["note"]
