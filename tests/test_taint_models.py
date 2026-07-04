@@ -96,9 +96,18 @@ def test_taint_models_op_present_intersects_binary():
 def test_builtin_catalog_covers_fortify_and_exec_sinks():
     # #372 guard, relocated from the retired sink-sweep SINK_RE to the single
     # source of truth: the model DB must flag the FORTIFY (*_chk) family and bare
-    # execv as sinks, so sink enumeration never silently drops them.
+    # execv as sinks, so sink enumeration never silently drops them. Widened to
+    # guard every dangerous-copy/exec family the retired SINK_RE matched (bcopy,
+    # mempcpy, strlcpy, strlcat, execvp, dlopen) -- these were unmodeled, so the
+    # model-DB-bounded `bn taint models` enumeration used to omit them.
     from bn_agent_bridge.taint_engine import load_models
-    cat = build_catalog(load_models())
+    models = load_models()
+    cat = build_catalog(models)
     sink_syms = {e["symbol"] for lst in cat["sinks_by_class"].values() for e in lst}
-    for name in ("sprintf_chk", "snprintf_chk", "execv"):
+    for name in ("sprintf_chk", "snprintf_chk", "execv",
+                 "bcopy", "mempcpy", "strlcpy", "strlcat", "execvp", "dlopen"):
         assert name in sink_syms, f"{name} must be a modeled sink"
+    # fscanf is an input SOURCE (like scanf), not a sink; guard it in its own role
+    # so retiring the name-regex net does not silently drop it from enumeration.
+    src_syms = {s["symbol"] for s in build_catalog(models, role="source")["sources"]}
+    assert "fscanf" in src_syms, "fscanf must be a modeled source"
