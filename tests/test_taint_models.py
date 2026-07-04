@@ -93,6 +93,61 @@ def test_taint_models_op_present_intersects_binary():
             assert e["present"] is True
 
 
+class _Ref:
+    def __init__(self, a):
+        self.address = a
+
+
+class _Sym:
+    def __init__(self, name, a):
+        self.name = name
+        self.address = a
+
+
+class _BVSpellings:
+    """memcpy and memcpy@plt both normalize to the model key 'memcpy', with
+    distinct call sites, exercising the #472 aggregation path."""
+    def __init__(self):
+        self.functions = [_FakeFn("memcpy"), _FakeFn("memcpy@plt")]
+        self._syms = {"memcpy": [_Sym("memcpy", 0x1000)],
+                      "memcpy@plt": [_Sym("memcpy@plt", 0x2000)]}
+        self._refs = {0x1000: [_Ref(0x400), _Ref(0x404)], 0x2000: [_Ref(0x408)]}
+
+    def get_symbols(self):
+        return []
+
+    def get_symbols_by_name(self, n):
+        return self._syms.get(n, [])
+
+    def get_code_refs(self, a):
+        return self._refs.get(a, [])
+
+
+def test_present_callsites_aggregates_across_symbol_spellings():
+    # #472: two symbol spellings mapping to one model key must AGGREGATE their
+    # callsites, not clobber -- the old assignment let whichever spelling was seen
+    # last (set iteration order) win, dropping a present sink to (0 callsites).
+    res = rts._taint_models_op(_CtxWithBV(_BVSpellings()), "active",
+                               {"present": True, "callsites": True})
+    mc = [e for lst in res["sinks_by_class"].values() for e in lst if e["symbol"] == "memcpy"]
+    assert len(mc) == 1
+    assert mc[0]["callsites"] == 3                        # 2 + 1 aggregated, not clobbered
+    assert set(mc[0]["addresses"]) == {"0x400", "0x404", "0x408"}
+
+
+def test_present_callsites_dedups_aliased_addresses():
+    # An alias spelling resolving to the SAME site must not double-count.
+    class _BVDup(_BVSpellings):
+        def __init__(self):
+            super().__init__()
+            self._refs = {0x1000: [_Ref(0x400)], 0x2000: [_Ref(0x400)]}  # same site twice
+    res = rts._taint_models_op(_CtxWithBV(_BVDup()), "active",
+                               {"present": True, "callsites": True})
+    mc = [e for lst in res["sinks_by_class"].values() for e in lst if e["symbol"] == "memcpy"]
+    assert mc[0]["callsites"] == 1
+    assert mc[0]["addresses"] == ["0x400"]
+
+
 def test_builtin_catalog_covers_fortify_and_exec_sinks():
     # #372 guard, relocated from the retired sink-sweep SINK_RE to the single
     # source of truth: the model DB must flag the FORTIFY (*_chk) family and bare

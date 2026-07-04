@@ -129,6 +129,13 @@ def _present_models(bv, models, want_callsites):
     return (present model-key set, {model-key: {callsites, addresses?}})."""
     present: set[str] = set()
     counts: dict[str, dict[str, Any]] = {}
+    # #472: several distinct binary symbol spellings can normalize to the SAME
+    # model key (memcpy + memcpy@plt -> memcpy; _Znwm + operator new -> Znwm), so
+    # accumulate their callsites into one slot instead of overwriting -- an
+    # assignment let whichever spelling was seen last (set iteration order) clobber
+    # the rest, dropping a present sink to "(0 callsites)". Dedup addresses so an
+    # alias resolving to the same site is not double-counted.
+    seen_addrs: dict[str, set[str]] = {}
     names: set[str] = set()
     for fn in getattr(bv, "functions", []) or []:
         names.add(str(getattr(fn, "name", "")))
@@ -140,12 +147,16 @@ def _present_models(bv, models, want_callsites):
             continue
         present.add(key)
         if want_callsites:
-            addrs: list[str] = []
+            slot = counts.setdefault(key, {"callsites": 0, "addresses": []})
+            seen = seen_addrs.setdefault(key, set())
             for sym in (getattr(bv, "get_symbols_by_name", lambda n: [])(nm) or []):
                 for ref in (getattr(bv, "get_code_refs", lambda a: [])(
                         getattr(sym, "address", 0)) or []):
-                    addrs.append(hex(int(getattr(ref, "address", 0))))
-            counts[key] = {"callsites": len(addrs), "addresses": addrs}
+                    a = hex(int(getattr(ref, "address", 0)))
+                    if a not in seen:
+                        seen.add(a)
+                        slot["addresses"].append(a)
+            slot["callsites"] = len(slot["addresses"])
         else:
             counts.setdefault(key, {"callsites": None})
     return present, counts
