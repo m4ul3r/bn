@@ -525,3 +525,29 @@ def test_taint_models_command_forwards_filters(monkeypatch, capsys):
     call = [c for c in calls if c["op"] == "taint_models"][0]
     assert call["params"] == {"role": "sink", "class": "overflow_len",
                               "present": True, "callsites": True}
+
+
+def test_taint_models_present_auto_selects_single_target(monkeypatch, capsys):
+    # #473: --present needs a target, and with exactly one open it must be
+    # auto-selected (like every other read command) rather than forwarding
+    # target=None and hitting the bridge's "need a target" error. No --target here.
+    fake, calls = _fake({"taint_models": {"sources": [], "sinks_by_class": {}, "propagators": [],
+                                          "overlays": [], "items": []}})
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    rc = bn.cli.main(["taint", "models", "--present"])
+    assert rc == 0
+    call = [c for c in calls if c["op"] == "taint_models"][0]
+    assert call["target"] == "active"                    # single open target auto-selected
+    assert call["params"] == {"present": True}
+
+
+def test_taint_models_catalog_only_needs_no_target(monkeypatch, capsys):
+    # Regression: catalog-only mode (no --present/--callsites) must NOT require a
+    # target -- it forwards target=None so the whole model DB dumps with none open.
+    fake, calls = _fake({"taint_models": {"sources": [], "sinks_by_class": {}, "propagators": [],
+                                          "overlays": [], "items": []}})
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    rc = bn.cli.main(["taint", "models", "--role", "sink"])
+    assert rc == 0
+    call = [c for c in calls if c["op"] == "taint_models"][0]
+    assert call["target"] is None

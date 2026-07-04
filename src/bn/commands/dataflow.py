@@ -244,11 +244,16 @@ def _taint_models(args: argparse.Namespace) -> int:
         params["present"] = True
     if args.callsites:
         params["callsites"] = True
+    # #473: --present/--callsites are defined against a loaded binary, so require a
+    # target for them -- which lets `_resolve_target` auto-select the single open
+    # target like every other read command (no spurious "need a target" when one is
+    # open and only --instance is given). Catalog-only mode needs no target.
+    needs_target = bool(args.present or args.callsites)
     return _call(
         args,
         "taint_models",
         params,
-        require_target=False,               # catalog dump works with no target
+        require_target=needs_target,
         text_renderer=_render_taint_models_text,
         stem="taint-models",
     )
