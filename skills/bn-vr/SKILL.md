@@ -257,6 +257,12 @@ continue:
   reanalyzes and reflows every call site — then re-run the taint query; the flow
   into the callee now follows. This is the concrete fix for the call-arg
   under-recovery wall, not a dead end.
+- The same remedy applies when a taint locator itself errors on the recovered
+  arity: `--sink arg index N is out of range for <callee>` (e.g. an ARM IFUNC
+  libc sink typed by its resolver as 0/1 args, which silently under-reports its
+  flows) or `parameter N not found on <fn>` (a signature whose data/args
+  parameter BN dropped uniformly across the call chain). Both errors now name
+  `bn proto set <name> "<prototype>"`; apply it and re-run the same query.
 
 Then assess exploitability as before: can the attacker control enough of the
 input, are there length/sanitization checks in the path, and what is the memory

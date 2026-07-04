@@ -2658,6 +2658,31 @@ def test_backward_arg_index_out_of_range_states_count_and_zero_based(process_fun
     assert "0-based" in msg      # names the convention
 
 
+def test_backward_arg_out_of_range_discloses_proto_set_remedy(process_func, models):
+    # #464 (Thread A extension): an index past the recovered arity is often BN
+    # under-recovering the callee's signature (e.g. an ARM IFUNC libc sink typed by
+    # its resolver as 0/1 args -- the shape that hid ~half the memcpy sink flows in
+    # dogfooding). The bare "out of range" must name the proto-set remedy.
+    bv = FBV({0x401070: "read", 0x401080: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    with pytest.raises(te.TaintError) as ei:
+        engine.backward(process_func, [te.parse_locator("arg:memcpy:9")])
+    assert 'proto set memcpy' in str(ei.value)
+
+
+def test_forward_param_not_found_discloses_proto_set_remedy(process_func, models):
+    # #464 (Thread A extension): seeding param:N past the recovered arity -- the
+    # uniform-vtable-drop shape where BN dropped a data param across the whole call
+    # chain (no per-callsite arity mismatch for the frontier to catch) -- must name
+    # the proto-set remedy, not a bare not-found.
+    bv = FBV({0x401070: "read", 0x401080: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    with pytest.raises(te.TaintError) as ei:
+        engine.forward(process_func, [te.parse_locator("param:99")])
+    msg = str(ei.value)
+    assert "not found" in msg and "proto set" in msg
+
+
 def test_backward_arg_with_no_variable_reads_says_so(process_func, models):
     bv = FBV({0x401070: "read", 0x401080: "memcpy"})
     engine = te.TaintEngine(bv, models)

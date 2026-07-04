@@ -4025,6 +4025,24 @@ class TaintEngine:
             return done
         return False
 
+    def _param_not_found_error(self, func: Any, idx: int) -> "TaintError":
+        """#464: seeding/slicing a param index past a function's recovered arity is
+        often BN under-recovering its signature -- e.g. a vtable method whose
+        data/args parameter was DROPPED uniformly across the call chain, so the
+        per-callsite ``arg_under_recovered`` frontier (which needs an arity
+        *mismatch*) can't catch it. Disclose the proto-set remedy rather than a
+        bare not-found, so the disclose -> proto set -> re-run loop still applies."""
+        try:
+            n = len(list(getattr(func, "parameter_vars", []) or []))
+            have = f" (BN recovered {n} parameter(s))"
+        except Exception:
+            have = ""
+        return TaintError(
+            f"parameter {idx} not found on {func.name}{have}. If BN under-recovered "
+            f"this function's signature (a dropped parameter is a common vtable / "
+            f"stripped-proto shape), apply `bn proto set {func.name} \"<prototype>\"` "
+            f"and re-run this taint query")
+
     def _seed_forward(self, func, ssaf, instrs, sources, taint_node, add_assumption, buffer_slots=None) -> bool:
         if buffer_slots is None:
             buffer_slots = {}
@@ -4035,7 +4053,7 @@ class TaintEngine:
                 idx = int(src["index"])
                 pv = self._param_var(func, idx)
                 if pv is None:
-                    raise TaintError(f"parameter {idx} not found on {func.name}")
+                    raise self._param_not_found_error(func, idx)
                 if taint_node((var_key(pv), None), str(getattr(pv, "name", pv)), None,
                               f"source: parameter {idx}", []):
                     seeded = True
@@ -4632,6 +4650,14 @@ class TaintEngine:
                         detail = (
                             f"its call site(s) expose {max_params} argument(s), so valid "
                             f"indices are 0..{max_params - 1} (arg indices are 0-based)")
+                    # #464: an index past the recovered arity is frequently BN
+                    # under-recovering the callee's signature (e.g. an ARM IFUNC libc
+                    # sink typed by its resolver as 0/1 args), which silently drops the
+                    # length/src slice. Name the proto-set remedy, not just "out of range".
+                    detail += (
+                        f". If {callee} is a real sink whose signature BN under-recovered "
+                        f"(a common IFUNC / stripped-proto shape), apply "
+                        f"`bn proto set {callee} \"<prototype>\"` and re-run this slice")
                     raise TaintError(
                         f"--sink arg index {idx} is out of range for {callee}: {detail}")
                 # Nothing to slice. A scalar CONSTANT literal (e.g. a fixed copy
