@@ -810,3 +810,71 @@ class TestTaintUnderRecoveredArgFrontier:
             assert frontiers[0].get("callee", {}).get("name") == "build_cmd"
         finally:
             _session_stop(inst)
+
+
+class TestTaintArgRegisterFallback:
+    """Regression for #433: seeding `arg:memcpy:2` (backward taint) or `trace --arg 2`
+    on a copy sink whose MLIL under-recovered its call args -- an ARM-Thumb IFUNC/
+    veneer copy sink surfaces only the first register arg -- must recover the length
+    from the calling-convention register (r2) instead of a hard "out of range"
+    dead-end. Forcing memcpy to 1-arity via `proto set` deterministically simulates
+    the under-recovery; needs real BN + an ARM cross-compiler."""
+
+    _SRC = (
+        "#include <string.h>\n#include <unistd.h>\n"
+        "__attribute__((noinline)) void do_copy(char *dst, char *src, int n){\n"
+        "  memcpy(dst, src, n - 4);\n}\n"
+        "int main(int argc, char **argv){\n"
+        "  char d[256], s[256];\n"
+        "  int n = read(0, s, 200);\n"
+        "  do_copy(d, s, n);\n  return 0;\n}\n"
+    )
+
+    def test_arg_register_fallback_backward_and_trace(self, tmp_path):
+        import shutil
+        cc = shutil.which("arm-linux-gnueabihf-gcc")
+        if cc is None:
+            pytest.skip("arm-linux-gnueabihf-gcc required for the register-arg shape")
+        src = tmp_path / "argreg.c"
+        src.write_text(self._SRC)
+        binp = tmp_path / "argreg_arm"
+        build = subprocess.run(
+            [cc, "-O1", "-marm", str(src), "-o", str(binp)],
+            capture_output=True, text=True)
+        if build.returncode != 0:
+            pytest.skip(f"arm build failed: {build.stderr}")
+
+        info = _session_start(str(binp))
+        inst = info["instance_id"]
+        try:
+            # Force the recovery miss: memcpy as 1-arity, so arg:memcpy:2 (the length,
+            # in r2) is out of range and only the register fallback can seed it.
+            _bn("--instance", inst, "proto", "set", "memcpy",
+                "void* memcpy(void* dst)", "--format", "json")
+
+            # Backward: the canonical `arg:memcpy:2` length seed resolves to a slice
+            # (register-recovered), not a dead-end, and discloses the #433 caveat.
+            bw = tmp_path / "bw.json"
+            r = _bn("--instance", inst, "taint", "backward", "-f", "do_copy",
+                    "--sink", "arg:memcpy:2", "--format", "json", "--out", str(bw))
+            assert r.returncode == 0, r.stderr
+            res = json.loads(bw.read_text())
+            assert res.get("slices"), "backward: expected a #433 register-recovered slice"
+            assert any("#433" in a for a in res.get("assumptions", [])), \
+                "backward: expected the #433 register-recovery caveat"
+            seeds = " ".join(str(sl.get("sink", {}).get("seed")) for sl in res["slices"])
+            assert "r2" in seeds, f"expected the r2 length register as the seed, got {seeds!r}"
+            call_addr = res["slices"][0]["sink"]["address"]
+
+            # trace --arg 2 at the same call recovers arg 2 from r2 and discloses #433.
+            tr = tmp_path / "tr.json"
+            r2 = _bn("--instance", inst, "trace", "do_copy", str(call_addr), "--arg", "2",
+                     "--format", "json", "--out", str(tr))
+            assert r2.returncode == 0, r2.stderr
+            tres = json.loads(tr.read_text())
+            assert tres.get("step_count", 0) > 0, "trace: expected a #433 register-recovered trace"
+            assert tres.get("arg_label", {}).get("register") == "r2"
+            assert any("#433" in h for h in tres.get("hints", [])), \
+                "trace: expected the #433 register-recovery hint"
+        finally:
+            _session_stop(inst)
