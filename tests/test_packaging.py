@@ -23,7 +23,10 @@ def test_wheel_excludes_python_bytecode_from_bridge_package(tmp_path):
         shutil.copytree(repo / name, tree / name, symlinks=True)
 
     pycache = tree / "src" / "bn_agent_bridge" / "__pycache__"
-    pycache.mkdir()
+    # exist_ok: copytree above may have already carried a __pycache__ from the
+    # repo's working tree (present after any local test run), so don't assume the
+    # copied tree is bytecode-free -- just ensure our sentinel is in it.
+    pycache.mkdir(exist_ok=True)
     (pycache / "sentinel.cpython-314.pyc").write_bytes(b"not real bytecode")
     (tree / "src" / "bn_agent_bridge" / "sentinel.pyo").write_bytes(b"not real bytecode")
 
