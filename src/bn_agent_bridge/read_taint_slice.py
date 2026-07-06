@@ -285,40 +285,81 @@ def _int_arg_reg_count(caller_func) -> int | None:
         return None
 
 
-def _arg_reg_reaching_def(bv, caller_func, call_insn, arg_index: int):
-    """#433: recover an under-recovered register argument at a call site whose MLIL
-    exposes fewer args than the calling convention passes (ARM-Thumb/MIPS thunked
-    copy sinks surface only the first register arg). Maps *arg_index* to its
-    calling-convention register and returns ``(ssa_var, reg_name)`` for the LAST
-    write to that register in the call's own basic block before the call -- the
-    reaching def to trace from -- or None. Register-class indices only (stack-passed
-    is #324); None on any BN-API shortfall so it never fabricates a seed."""
+def _out_of_range_arg_msg(func, arg_index: int, n: int) -> str:
+    """The precise out-of-range message for `trace --arg N`, with the #324 stack-
+    passed / first-missing-register notes. Used when no #433 register fallback
+    applies."""
+    only = " (index 0)" if n == 1 else f" (indices 0..{n - 1})"
+    # --arg is 0-based against the MLIL call's recovered parameters, which can
+    # differ from the argument positions the decompiler renders (an implicit/
+    # struct-return or coalesced arg shifts the count) (#226).
+    msg = (
+        f"Argument index {arg_index} out of range: this call has {n} "
+        f"MLIL argument(s){only}. --arg is 0-based and indexes the MLIL call "
+        f"parameters, which may differ from the decompiler's displayed args."
+    )
+    # #324: an index at/beyond the calling convention's integer-arg registers is
+    # passed on the STACK, which BN's MLIL/HLIL call model frequently omits.
+    reg_count = _int_arg_reg_count(func)
+    if reg_count is not None and arg_index >= reg_count:
+        msg += (
+            f" Note: arg {arg_index} is at/beyond the {reg_count} integer-arg "
+            f"register(s) of this calling convention, so it is likely passed on "
+            f"the STACK; BN's MLIL/HLIL call model often omits stack-passed "
+            f"(e.g. variadic) args -- inspect `bn il {func.name} --view llil "
+            f"--ssa` for the stack stores feeding the call (#324)."
+        )
+    elif reg_count is not None and n < reg_count and arg_index == n:
+        # The requested index is exactly the FIRST register slot BN did not
+        # recover (still within the ABI's integer-arg registers) -- the tight
+        # "BN stopped recovering args right here" signal.
+        msg += (
+            f" Note: arg {arg_index} is the first integer-arg register this "
+            f"convention passes that BN did not recover as a param ({n} "
+            f"recovered) -- if the callee's prototype is narrower than the "
+            f"actual call (variadic mis-typed as fixed-arity, or an indirect "
+            f"call through a too-narrow function-pointer type), it may be a "
+            f"real register-passed arg BN dropped; inspect `bn il {func.name} "
+            f"--view llil --ssa` for the args feeding the call (#324)."
+        )
+    return msg
+
+
+def _modeled_callee_name(bv, call_insn) -> str | None:
+    """Resolved callee name (through thunks) for the #433 model gate, or None."""
     try:
-        reg_name = _arg_register(caller_func, arg_index)  # None once idx >= reg count
-        if not reg_name:
-            return None
-        reg_index = bv.arch.get_reg_index(reg_name)
-        blk = getattr(call_insn, "il_basic_block", None)
-        if blk is None:
-            return None
-        REGISTER_SOURCE = 1  # VariableSourceType.RegisterVariableSourceType
-        found = None
-        for cur in blk:
-            if getattr(cur, "instr_index", -1) >= getattr(call_insn, "instr_index", -1):
-                break
-            for w in getattr(cur, "vars_written", None) or []:
-                var = getattr(w, "var", None)
-                if var is None:
-                    continue
-                try:
-                    is_reg = int(var.source_type) == REGISTER_SOURCE
-                except Exception:
-                    is_reg = False
-                if is_reg and getattr(var, "storage", None) == reg_index:
-                    found = w  # keep the last (reaching) write before the call
-        return (found, reg_name) if found is not None else None
+        rt = _taint.resolve_call_target(bv, call_insn, follow_thunks=True)
     except Exception:
         return None
+    for cand in (getattr(rt, "name", None),
+                 getattr(getattr(rt, "function", None), "name", None)):
+        if cand:
+            return str(cand)
+    return None
+
+
+def _recover_trace_arg_via_reg(ctx, bv, func, call_insn, target_addr, arg_index: int,
+                               view: str) -> tuple[list[Any] | None, str | None, str | None]:
+    """#433: recover an out-of-range trace arg from its calling-convention
+    register when a MODELED copy sink's call under-recovered its params (a thunk/
+    import with a too-narrow prototype dropped r1/r2). MLIL view only. Returns
+    ``(initial_vars, reg, callee)`` or ``(None, None, None)`` -- the latter when
+    not applicable, leaving the precise out-of-range error to stand. Gated on the
+    sink model proving arg ``arg_index`` exists, so it never seeds a fabricated
+    argument. Shares the reaching-def machinery with ``taint backward``."""
+    if view != "mlil" or arg_index < 0:
+        return (None, None, None)
+    reg = _arg_register(func, arg_index)
+    if reg is None:
+        return (None, None, None)
+    callee = _modeled_callee_name(bv, call_insn)
+    if not callee or arg_index not in _taint.model_arg_indices(_taint.load_models(), callee):
+        return (None, None, None)
+    seeds = _taint.reaching_arg_seed_vars(func, target_addr, reg, bn)
+    initial_vars = [v for v, _ in seeds]
+    if not initial_vars:
+        return (None, None, None)
+    return (initial_vars, reg, callee)
 
 
 def _arg_label(ctx, bv, call_insn, arg_index: int, caller_func) -> dict[str, Any]:
@@ -828,100 +869,61 @@ def _backward_slice(
             "no_params",
             f"Call at {address} has no exposed parameters in {view}",
         )
-    # #433: when the MLIL call site under-recovers its args, recover a register-class
-    # index from its calling-convention register's reaching def instead of dead-ending
-    # (the ARM-Thumb/MIPS thunked-copy-sink shape). None for stack-passed / unpinnable.
-    reg_recovered = (_arg_reg_reaching_def(bv, func, call_insn, arg_index)
-                     if arg_index >= len(params) else None)
-    if (arg_index < 0 or arg_index >= len(params)) and reg_recovered is None:
-        n = len(params)
-        only = " (index 0)" if n == 1 else f" (indices 0..{n - 1})"
-        # --arg is 0-based against the MLIL call's recovered parameters, which
-        # can differ from the argument positions the decompiler renders (an
-        # implicit/struct-return or coalesced arg shifts the count). State the
-        # convention so a user reading pseudo-C doesn't reach for the wrong
-        # index (#226).
-        msg = (
-            f"Argument index {arg_index} out of range: this call has {n} "
-            f"MLIL argument(s){only}. --arg is 0-based and indexes the MLIL call "
-            f"parameters, which may differ from the decompiler's displayed args."
-        )
-        # #324: an index at/beyond the calling convention's integer-arg registers
-        # is passed on the STACK, which BN's MLIL/HLIL call model frequently omits
-        # (the stores are visible only in LLIL). Don't silently treat such an arg
-        # as absent -- say it is likely stack-passed and point at the LLIL view.
-        reg_count = _int_arg_reg_count(func)
-        if reg_count is not None and arg_index >= reg_count:
-            msg += (
-                f" Note: arg {arg_index} is at/beyond the {reg_count} integer-arg "
-                f"register(s) of this calling convention, so it is likely passed on "
-                f"the STACK; BN's MLIL/HLIL call model often omits stack-passed "
-                f"(e.g. variadic) args -- inspect `bn il {func.name} --view llil "
-                f"--ssa` for the stack stores feeding the call (#324)."
-            )
-        elif reg_count is not None and n < reg_count and arg_index == n:
-            # The requested index is exactly the FIRST register slot BN did not
-            # recover (`arg_index == n`, still within the ABI's integer-arg
-            # registers) -- the tight "BN stopped recovering args right here"
-            # signal. The callee's prototype may be narrower than the actual call
-            # (a variadic mis-typed as fixed-arity, or an indirect call through a
-            # too-narrow function-pointer type). Gating on the first-missing slot
-            # (rather than any index below reg_count) avoids nagging on a
-            # genuinely low-arity call where the index is simply out of range.
-            msg += (
-                f" Note: arg {arg_index} is the first integer-arg register this "
-                f"convention passes that BN did not recover as a param ({n} "
-                f"recovered) -- if the callee's prototype is narrower than the "
-                f"actual call (variadic mis-typed as fixed-arity, or an indirect "
-                f"call through a too-narrow function-pointer type), it may be a "
-                f"real register-passed arg BN dropped; inspect `bn il {func.name} "
-                f"--view llil --ssa` for the args feeding the call (#324)."
-            )
-        raise OperationFailure("invalid_arg_index", msg)
+    param_expr = None
+    recovered_reg: str | None = None
+    recovered_callee: str | None = None
+    if 0 <= arg_index < len(params):
+        param_expr = params[arg_index]
+        initial_vars: list[Any] = _ssa_vars_from(getattr(param_expr, "vars_read", []) or [])
+    else:
+        # #433: the index is out of range -- but if a MODELED copy sink's call
+        # under-recovered its args (a thunk/import with a too-narrow prototype
+        # dropped r1/r2), recover the value from the calling-convention register's
+        # reaching definition rather than dead-ending. Gated on the sink model so
+        # we never fabricate an arg the call doesn't actually pass.
+        initial_vars, recovered_reg, recovered_callee = _recover_trace_arg_via_reg(
+            ctx, bv, func, call_insn, target_addr, arg_index, view)
+        if not initial_vars:
+            raise OperationFailure(
+                "invalid_arg_index",
+                _out_of_range_arg_msg(func, arg_index, len(params)))
+
+    arg_label = _arg_label(ctx, bv, call_insn, arg_index, func)
 
     hints: list[str] = []
-    if reg_recovered is not None:
-        # #433 register fallback: the MLIL call under-recovered its args, so seed
-        # from the calling-convention register's reaching def and disclose it.
-        rv, reg_name = reg_recovered
-        initial_vars: list[Any] = _ssa_vars_from([rv])
-        arg_label = {"index": arg_index, "register": reg_name}
+    if recovered_reg is not None:
         hints.append(
-            f"arg {arg_index} recovered from calling-convention register {reg_name} "
-            f"(the MLIL call site under-recovered its arguments), not the MLIL call "
-            f"model; tracing the register's reaching def (#433)."
+            f"arg {arg_index} of {recovered_callee} was recovered from calling-"
+            f"convention register {recovered_reg}: this call under-recovered its "
+            f"arguments (a thunk/import with a too-narrow prototype dropped the "
+            f"arg), so the trace seeds from the register's reaching definition "
+            f"rather than the MLIL call's parameter list (#433)."
         )
-    else:
-        param_expr = params[arg_index]
-        initial_vars = _ssa_vars_from(getattr(param_expr, "vars_read", []) or [])
-
-        arg_label = _arg_label(ctx, bv, call_insn, arg_index, func)
-
-        # An address-of arg with no SSA value reads is an output-pointer dead-end:
-        # tracing it would follow where the *pointer* came from (a local buffer),
-        # not the data the callee writes through it. Surface that instead of the
-        # misleading "constant or immediate -- no SSA trace" (#166).
-        if not initial_vars and _is_address_of(param_expr):
-            callee_nm = arg_label.get("name") or "the callee"
+    # An address-of arg with no SSA value reads is an output-pointer dead-end:
+    # tracing it would follow where the *pointer* came from (a local buffer),
+    # not the data the callee writes through it. Surface that instead of the
+    # misleading "constant or immediate -- no SSA trace" (#166).
+    if param_expr is not None and not initial_vars and _is_address_of(param_expr):
+        callee_nm = arg_label.get("name") or "the callee"
+        hints.append(
+            f"arg {arg_index} is a pointer (address-of); this traces where the "
+            f"pointer came from, not the data written through it. To follow data "
+            f"{callee_nm} writes into the pointee, run a forward taint from the "
+            f"call site (e.g. `taint forward --source call:<callee>`) or trace the "
+            f"buffer's later consumers."
+        )
+    elif param_expr is not None and not initial_vars:
+        # A constant/immediate arg (e.g. a literal length/flag) has no SSA
+        # definition to trace. Surface the value as a structured hint so both
+        # text and JSON consumers see *which* constant -- not just the renderer's
+        # generic "constant or immediate" line (which carried no value and left
+        # JSON `hints` empty).
+        cval = _const_int(param_expr)
+        if cval is not None:
             hints.append(
-                f"arg {arg_index} is a pointer (address-of); this traces where the "
-                f"pointer came from, not the data written through it. To follow data "
-                f"{callee_nm} writes into the pointee, run a forward taint from the "
-                f"call site (e.g. `taint forward --source call:<callee>`) or trace the "
-                f"buffer's later consumers."
+                f"arg {arg_index} is the constant {hex(cval)} -- a compile-time "
+                f"immediate with no SSA definition to trace back."
             )
-        elif not initial_vars:
-            # A constant/immediate arg (e.g. a literal length/flag) has no SSA
-            # definition to trace. Surface the value as a structured hint so both
-            # text and JSON consumers see *which* constant -- not just the renderer's
-            # generic "constant or immediate" line (which carried no value and left
-            # JSON `hints` empty).
-            cval = _const_int(param_expr)
-            if cval is not None:
-                hints.append(
-                    f"arg {arg_index} is the constant {hex(cval)} -- a compile-time "
-                    f"immediate with no SSA definition to trace back."
-                )
 
     trace = _build_backward_trace(
         ctx, bv, ssa_func, initial_vars, max_depth,

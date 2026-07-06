@@ -4608,57 +4608,121 @@ def test_backward_ascends_through_parameter_spill(models):
     assert any("spill of param 2" in a and "#434" in a for a in result["assumptions"])  # disclosed
 
 
-# --- #433 register-arg fallback (under-recovered copy-sink call args) ---------
+# --------------------------------------------------------------------------
+# #433 (backward): when BN under-recovers a copy-sink call's arguments (a bad
+# thunk/import prototype drops r1/r2 from the MLIL call), `arg:<sink>:N` can't
+# be seeded by params alone. Fall back to the calling-convention REGISTER for
+# arg N -- but only for a MODELED sink and only for an index the model proves
+# exists, so we never fabricate an argument. The BN LLIL->MLIL reg bridge
+# (`_reaching_arg_seeds_via_reg`) is verified live; here we stub it to test the
+# gating + disclosure orchestration.
+# --------------------------------------------------------------------------
 
-def _under_recovered_memcpy_program():
-    """copy_frag(dst, src, n): the memcpy call site exposes only arg0 (dst) in
-    MLIL (the ARM-Thumb/MIPS under-recovery), while the length lives in a register
-    var r2#1 = n#0 - 4 set right before the call -- the reaching def the #433
-    register fallback recovers."""
-    dst = FVar("dst", ident=20); src = FVar("src", ident=21); n = FVar("n", ident=22)
-    r2 = FVar("r2", ident=99)
-    dst0 = FSSA(dst, 0); n0 = FSSA(n, 0); r2_1 = FSSA(r2, 1)
-    copy_frag = FFunc("copy_frag", 0x800, FSSAFunc([
-        FInstr(0, 0x802, "MLIL_SET_VAR_SSA", "r2#1 = n#0 - 4", writes=[r2_1],
-               src=FExpr("MLIL_SUB", "n#0 - 4", reads=[n0])),
-        FInstr(1, 0x804, "MLIL_CALL_SSA", "0x940(dst#0)", reads=[dst0], writes=[],
-               dest=FExpr("MLIL_CONST_PTR", "0x940", constant=0x940),
-               params=[FExpr("MLIL_VAR_SSA", "dst#0", reads=[dst0])]),  # only arg0 exposed
-    ]), params=[dst, src, n])
-    return copy_frag, FBV({0x940: "memcpy"}), r2_1
+def _underrecovered_copy_program(call_dest=0x900):
+    """process(n): len#1 = n#0 + 1; memcpy(&dst) -- the MLIL call exposes ONLY
+    arg 0 (dst); the length (arg 2) computed in `len#1` is NOT attached to the
+    call, the way an ARM-Thumb thunk under-recovery drops it. Returns (func,
+    len1) so a test can hand `len#1` back as the 'recovered' register seed."""
+    n = FVar("n"); length = FVar("len"); dst = FVar("dst")
+    n0 = FSSA(n, 0); len1 = FSSA(length, 1); dst1 = FSSA(dst, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "len#1 = n#0 + 1", reads=[n0], writes=[len1]),
+        FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "dst#1 = &buf", writes=[dst1]),
+        FInstr(2, 0x18, "MLIL_CALL_SSA", f"{hex(call_dest)}(&dst)", reads=[dst1],
+               dest=FExpr("MLIL_CONST_PTR", hex(call_dest), constant=call_dest),
+               params=[FExpr("MLIL_VAR_SSA", "&dst", reads=[dst1])]),
+    ]
+    return FFunc("process", 0x10, FSSAFunc(instrs), params=[n]), len1
 
 
-def test_backward_arg_reg_fallback_seeds_and_discloses(models, monkeypatch):
-    # #433: arg:memcpy:2 is out of range because MLIL under-recovered the call args;
-    # the register fallback seeds from the CC register's reaching def and discloses
-    # a #433 caveat, instead of the hard "out of range" dead-end.
-    func, bv, r2_1 = _under_recovered_memcpy_program()
-    monkeypatch.setattr(te.TaintEngine, "_arg_reg_reaching_def",
-                        lambda self, f, c, i: r2_1 if i == 2 else None)
-    monkeypatch.setattr(te.TaintEngine, "_cc_arg_reg", lambda self, f, i: "r2")
+def test_backward_recovers_under_recovered_register_arg_for_modeled_sink(models, monkeypatch):
+    # `arg:memcpy:2` is out of range against the 1-param call, but memcpy's model
+    # proves arg 2 (the length) exists. The reg bridge recovers the dropped arg's
+    # MLIL var (`len#1`); the slice must reach the `n` parameter origin and the
+    # recovery must be disclosed as a caveat naming the register + #433.
+    func, len1 = _underrecovered_copy_program()
+    bv = FBV({0x900: "memcpy"})
     engine = te.TaintEngine(bv, models)
+    call_ins = func.mlil.ssa_form.instructions[2]
+    monkeypatch.setattr(engine, "_reaching_arg_seeds_via_reg",
+                        lambda f, sites, idx: ("r2", [(len1, call_ins)]),
+                        raising=False)
     result = engine.backward(func, [te.parse_locator("arg:memcpy:2")])
-    assert result["slices"]                                        # no longer a dead-end
-    assert any("#433" in a and "register r2" in a for a in result["assumptions"])
-    # the slice is seeded from the recovered register var (r2#1), not a param expr
-    assert any("r2" in str(sl["sink"].get("seed")) for sl in result["slices"])
+    assert result["slices"], result
+    # the recovered length seed (`len#1`) slices back to the function input `n`
+    assert any(s["sink"]["seed"] == "len#1" and s["origin"].get("var") == "n#0"
+               for s in result["slices"]), result["slices"]
+    assert any("r2" in a and "#433" in a for a in result["assumptions"]), result["assumptions"]
 
 
-def test_backward_arg_reg_fallback_none_still_errors(models, monkeypatch):
-    # When even the register can't be pinned, the honest out-of-range error stands.
-    func, bv, _ = _under_recovered_memcpy_program()
-    monkeypatch.setattr(te.TaintEngine, "_arg_reg_reaching_def", lambda self, f, c, i: None)
+def test_backward_does_not_recover_arg_beyond_model_arity(models, monkeypatch):
+    # memcpy's model references args {0,1,2}; arg 3 is beyond it. The reg bridge
+    # must NOT be consulted (no fabricating an argument the model can't prove
+    # exists) and the precise out-of-range error stands.
+    func, len1 = _underrecovered_copy_program()
+    bv = FBV({0x900: "memcpy"})
     engine = te.TaintEngine(bv, models)
-    with pytest.raises(te.TaintError, match=r"out of range for memcpy"):
-        engine.backward(func, [te.parse_locator("arg:memcpy:2")])
+    call_ins = func.mlil.ssa_form.instructions[2]
+    calls = {"n": 0}
+    def spy(f, sites, idx):
+        calls["n"] += 1
+        return ("r3", [(len1, call_ins)])
+    monkeypatch.setattr(engine, "_reaching_arg_seeds_via_reg", spy, raising=False)
+    with pytest.raises(te.TaintError) as ei:
+        engine.backward(func, [te.parse_locator("arg:memcpy:3")])
+    assert "out of range" in str(ei.value)
+    assert calls["n"] == 0
 
 
-def test_arg_reg_reaching_def_degrades_without_arch(models):
-    # No calling convention / arch (the synthetic FBV) -> None, never fabricates.
-    engine = te.TaintEngine(FBV({}), models)
-    func = FFunc("f", 0x1, FSSAFunc([]), params=[FVar("a", ident=1)])
-    call = FInstr(0, 0x2, "MLIL_CALL_SSA", "c()", reads=[])
-    assert engine._arg_reg_reaching_def(func, call, 2) is None
+def test_backward_does_not_recover_arg_for_unmodeled_callee(models, monkeypatch):
+    # An unmodeled callee has no model to prove the arg exists -> never recover.
+    func, len1 = _underrecovered_copy_program()
+    bv = FBV({0x900: "frobnicate"})
+    engine = te.TaintEngine(bv, models)
+    call_ins = func.mlil.ssa_form.instructions[2]
+    calls = {"n": 0}
+    def spy(f, sites, idx):
+        calls["n"] += 1
+        return ("r2", [(len1, call_ins)])
+    monkeypatch.setattr(engine, "_reaching_arg_seeds_via_reg", spy, raising=False)
+    with pytest.raises(te.TaintError) as ei:
+        engine.backward(func, [te.parse_locator("arg:frobnicate:2")])
+    assert "out of range" in str(ei.value)
+    assert calls["n"] == 0
+
+
+# #433 shared module-level helpers, reused by both `taint backward` and `trace`
+# (read_taint_slice). They are unit-tested here because taint_engine is the
+# binaryninja-import-free module; read_taint_slice (which imports binaryninja at
+# module load) wires the same helpers into trace and is verified live.
+
+def test_model_arg_indices_unions_propagate_sink_and_varargs(models):
+    # The gate: a modeled sink's referenced arg indices = propagate `*arg:N`
+    # operands ∪ sink.tainted_args ∪ varargs.first_index. Empty for an unmodeled
+    # callee, so the register fallback never fabricates an arg.
+    assert te.model_arg_indices(models, "memcpy") == {0, 1, 2}
+    assert te.model_arg_indices(models, "strcpy") == {0, 1}
+    assert te.model_arg_indices(models, "snprintf") == {0, 2, 3}
+    assert te.model_arg_indices(models, "definitely_not_a_sink") == set()
+
+
+def test_reaching_arg_seed_vars_bridges_llil_def_to_mlil_seed(monkeypatch):
+    # Given a call at an address whose arg register has a (monkeypatched)
+    # reaching LLIL def, the extractor returns the def's mapped MLIL SSA var as a
+    # seed -- the LLIL->MLIL bridge the backward walk / trace seed on.
+    seedvar = FSSA(FVar("len"), 1)
+    mssa = type("M", (), {"vars_written": [seedvar]})()
+    fake_def = type("D", (), {"mlil": type("Mapped", (), {"ssa_form": mssa})()})()
+    call_ins = type("C", (), {"address": 0x18, "operation": "CALL_SSA_OP"})()
+    func = type("F", (), {"llil": type("LL", (), {"ssa_form": [[call_ins]]})()})()
+    fake_bn = type("BN", (), {"LowLevelILOperation":
+                              type("Op", (), {"LLIL_CALL_SSA": "CALL_SSA_OP"})()})()
+    monkeypatch.setattr(te, "reaching_reg_def",
+                        lambda ci, reg, bn: fake_def if ci is call_ins else None)
+    seeds = te.reaching_arg_seed_vars(func, 0x18, "r2", fake_bn)
+    assert [v for v, _ in seeds] == [seedvar]
+    # address miss -> nothing recovered
+    assert te.reaching_arg_seed_vars(func, 0x99, "r2", fake_bn) == []
 
 
 # --- arg_under_recovered disclosure (Thread A) -------------------------------
