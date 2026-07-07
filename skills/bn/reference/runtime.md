@@ -85,9 +85,29 @@ Pass `--no-bndb` to force loading the raw binary even when a sibling `.bndb` exi
 
 - Ready immediately: `bn sections`, `bn imports`, the symbol table, `bn target list` / `bn target info` (flagged `[not analyzed]`, JSON `analysis_state: "quick"`).
 - `bn strings` **errors** until `bn refresh` (it refuses with a "Strings are not available … Run `bn refresh`" directive rather than return an empty list that reads as "no strings").
-- **Partial** until `bn refresh`: `bn function list` / `bn function search` (only entry-point + symbol functions exist pre-analysis; the count grows after refresh), and `bn decompile` / `bn il` / `bn disasm` / `bn xrefs` across the binary.
+- **Partial** until `bn refresh`: `bn function list` / `bn function search` (only entry-point + symbol functions exist pre-analysis; the count grows after refresh), and `bn decompile` / `bn il` / `bn disasm` across the binary.
+- **Hard-error** until `bn refresh` (they refuse rather than return a misleading empty result): `bn xrefs`, `bn callsites`, `bn function info`, `bn taint`.
 
 Run `bn refresh` once to promote the view to full analysis (`analysis_state` flips to `"full"`), or `bn decompile <fn> --force-analysis` to analyze a single function without the full pass. Branch on `analysis_state` rather than guessing from empty results. Loading a `.bndb` ignores `--quick` (the database already carries its analysis).
+
+**Quick-mode capability matrix.** Per-command behavior on a `--quick` / `--no-analysis` view. A **hard-error** row refuses with a `--quick` directive — that is a capability boundary, **NOT** absence of results; never read it as "nothing found." Distinguish `bn decompile <fn> --force-analysis` (analyzes one *existing* function in place — works on a quick view) from `bn function create` (materializes a *missing* function — refused on quick, see #479).
+
+| Command | Quick-mode behavior |
+|---|---|
+| `sections`, `imports` | **quick-safe** — container is parsed at load |
+| `target info` / `target list` | **quick-safe** — flagged `[not analyzed]` / `analysis_state:"quick"` |
+| `strings` | **hard-error until `bn refresh`** (string set isn't built) |
+| `function list` / `search` | **partial** — only entry-point + symbol functions exist; count grows after refresh |
+| `decompile`, `il` | **partial** — render only already-analyzed functions; `bn decompile <fn> --force-analysis` analyzes one function in place (the flag is on `decompile` only), after which `il` works on it |
+| `disasm <fn>` | **partial** (needs the function) · `disasm <addr> --linear N` — **quick-safe** (raw linear decode, no function required) |
+| `xrefs`, `callsites`, `function info`, `taint` | **hard-error until `bn refresh`** (`require_analysis`) |
+| `trace` | **function-specific** — needs the containing function's MLIL; `--force-analysis` that function first, else refresh |
+| `class list` / `show` | **quick-safe** — from demangled symbols + RTTI/defined types present at load (method-body xrefs still need analysis) |
+| `evidence init` / `table` | **quick-safe** — read raw memory / `.init_array` / symbols |
+| `evidence function` | **partial** — reads one function's call ABI; needs that function analyzed |
+| `function create --preview` | **hard-error until `bn refresh`** — refused on quick even in preview (#479); all batch mutations refuse identically |
+
+After `bn refresh` (or `--force-analysis` on a single function) every row promotes to full behavior; branch on `analysis_state`, not on an empty or errored result.
 
 `--instance` is accepted on every subcommand (env `BN_INSTANCE`). On `bn load`, `--instance-id` is an accepted alias that names the bridge instance to auto-spawn — the same spelling as `bn session start --instance-id`, so you can use `--instance-id <id>` consistently across both.
 
