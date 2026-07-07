@@ -1345,6 +1345,67 @@ def _render_resolved_arg(resolved: Any) -> str:
     return ""
 
 
+def _render_surface_text(value: Any) -> str:
+    """#503: render the hidden code surface -- init/ctor pointers, candidate vtable/
+    dispatch tables, and data-referenced code BN did not functionize."""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    s = value.get("summary") or {}
+    lines = [
+        f"hidden surface: {s.get('init_sections', 0)} init section(s), "
+        f"{s.get('candidate_tables', 0)} candidate table(s), "
+        f"{s.get('missing_function_candidates', 0)} missing-function candidate(s)"
+    ]
+    for w in list(value.get("warnings") or []):
+        lines.append(f"warning: {w}")
+
+    init = list(value.get("init_sections") or [])
+    if init:
+        lines.append("")
+        lines.append("init / ctor sections (pre-main code):")
+        for sec in init:
+            if not isinstance(sec, dict):
+                continue
+            lines.append(
+                f"  {sec.get('name', '?')}  {sec.get('start', '?')}..{sec.get('end', '?')}  "
+                f"entries={sec.get('total_entries', '?')}  "
+                f"fn={sec.get('resolved_functions', 0)}  missing={sec.get('missing_functions', 0)}")
+
+    tables = list(value.get("candidate_tables") or [])
+    if tables:
+        lines.append("")
+        lines.append("candidate vtable / dispatch tables (runs of pointers-to-code):")
+        for t in tables:
+            if not isinstance(t, dict):
+                continue
+            lines.append(
+                f"  {t.get('address', '?')} [{t.get('section', '?')}]  "
+                f"entries={t.get('entries', '?')}  fn={t.get('resolved_functions', 0)}  "
+                f"missing={t.get('missing_functions', 0)}")
+
+    cands = list(value.get("missing_function_candidates") or [])
+    if cands:
+        lines.append("")
+        lines.append("missing-function candidates (executable, data-referenced, no BN function):")
+        for c in cands:
+            if not isinstance(c, dict):
+                continue
+            sig = []
+            if not c.get("decodes"):
+                sig.append("no-decode")       # reliable: not code
+            if not c.get("aligned"):
+                sig.append("unaligned")       # weak
+            mark = f"  [{', '.join(sig)}]" if sig else ""
+            lines.append(
+                f"  {c.get('address', '?')}  [{c.get('section') or '?'}]  "
+                f"via {c.get('provenance', '?')}{mark}")
+        lines.append("")
+        lines.append("(candidates -- NOT confirmed functions. `no-decode` reliably means data; "
+                     "a clean row is only a WEAK signal. Verify with `disasm`, then "
+                     "`function create` the real ones.)")
+    return "\n".join(lines)
+
+
 def _render_call_descriptors_text(value: Any) -> str:
     """#469: one line per callsite of a registration API -- the declared descriptor
     field values (constants + resolved callback symbols), with unknown/computed

@@ -7,6 +7,7 @@ from typing import Any
 from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _pick, _positive_depth_int, _positive_int, arg, command, mutex, preview_arg, summary_arg
 from ..formatters import (
     _render_call_descriptors_text,
+    _render_surface_text,
     _render_callsites_text,
     _disasm_linear_steer_note,
     _render_disasm_linear_text,
@@ -723,6 +724,40 @@ def _evidence_calls(args: argparse.Namespace) -> int:
         require_target=True,
         text_renderer=_render_call_descriptors_text,
         stem="call-descriptors",
+    )
+
+
+@command("evidence", "surface",
+         help="Enumerate the hidden code surface (init/ctor pointers, vtable/dispatch tables, "
+              "data-referenced code BN did not functionize) that a passive function list misses",
+         target=True,
+         prefer_when="find code reachable through DATA (constructors, vtable/dispatch slots, "
+                     "pointer-table callbacks) that `function list` misses on a stripped/optimized "
+                     "target; read-only -- it reports addresses, it does not create functions",
+         see_also=("evidence init", "evidence table", "function create"),
+         args=[
+             arg("--table-min-run", dest="table_min_run", type=_positive_int, default=3, metavar="N",
+                 help="Minimum consecutive pointers-to-code to report as a candidate table (default 3)"),
+             arg("--max-tables", dest="max_tables", type=_positive_int, default=64,
+                 help="Cap on reported candidate tables (disclosed when hit)"),
+             arg("--max-candidates", dest="max_candidates", type=_positive_int, default=128,
+                 help="Cap on reported missing-function candidates (disclosed when hit)"),
+             arg("--max-scan-bytes", dest="max_scan_bytes", type=_positive_int, default=4_000_000,
+                 help="Cap on total data bytes scanned for pointer tables (disclosed when hit)"),
+         ])
+def _evidence_surface(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "hidden_surface",
+        {
+            "table_min_run": args.table_min_run,
+            "max_tables": args.max_tables,
+            "max_candidates": args.max_candidates,
+            "max_scan_bytes": args.max_scan_bytes,
+        },
+        require_target=True,
+        text_renderer=_render_surface_text,
+        stem="evidence-surface",
     )
 
 

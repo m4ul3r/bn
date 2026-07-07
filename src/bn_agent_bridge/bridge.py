@@ -1763,6 +1763,9 @@ class BinaryNinjaBridge:
     def _call_descriptor_evidence(self, *a, **k):
         return read_evidence._call_descriptor_evidence(self.ctx, *a, **k)
 
+    def _hidden_surface(self, *a, **k):
+        return read_evidence._hidden_surface(self.ctx, *a, **k)
+
     def _message_lens(self, *a, **k):
         return read_evidence._message_lens(self.ctx, *a, **k)
 
@@ -2644,6 +2647,17 @@ def _bind_call_descriptors(bridge, params, target):
         params["identifier"],
         arg_index=int(params.get("arg_index", 0)),
         field_specs=params.get("fields"),
+    )
+
+
+@op("hidden_surface", lock="read")
+def _bind_hidden_surface(bridge, params, target):
+    return bridge._hidden_surface(
+        target,
+        table_min_run=int(params.get("table_min_run", 3)),
+        max_tables=int(params.get("max_tables", 64)),
+        max_candidates=int(params.get("max_candidates", 128)),
+        max_scan_bytes=int(params.get("max_scan_bytes", 4_000_000)),
     )
 
 

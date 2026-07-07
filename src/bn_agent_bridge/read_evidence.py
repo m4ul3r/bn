@@ -1581,3 +1581,214 @@ def _init_arrays(ctx, selector: str | None, *, limit: int = 64):
         "items": sections,
         "total": len(sections),
     }
+
+
+# Data sections that commonly hold code-pointer tables (vtables, dispatch/ops tables).
+# Scanned by `evidence surface` for the hidden code surface (#503 / #169 L2). `.got`/
+# `.got.plt` are deliberately EXCLUDED: their slots always point at code BN already
+# functionized, so they can never yield a missing-function candidate -- they'd be pure
+# noise that also starves the --max-tables budget (audit).
+_SURFACE_SCAN_HINTS = (".data.rel.ro", ".data", ".rodata")
+
+
+def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
+                    max_tables: int = 64, max_candidates: int = 128,
+                    max_scan_bytes: int = 4_000_000) -> dict[str, Any]:
+    """#503: enumerate the HIDDEN code surface a passive `function list` misses -- code
+    reachable through data, not direct calls. READ-ONLY: it reports addresses BN did not
+    turn into functions, it does NOT create them (that stays the agent's separate write).
+
+    Three composed reports, under one read lock:
+      - ``init_sections``: `.init_array`/`.ctors`/`.fini_array` constructor pointers (pre-
+        main code), each flagged whether BN recovered a function for it.
+      - ``candidate_tables``: runs of >= ``table_min_run`` consecutive pointers-to-executable
+        in `.data`/`.rodata`/`.data.rel.ro`/`.got` -- vtable/dispatch-table candidates, with
+        resolved-vs-missing slot counts.
+      - ``missing_function_candidates``: the deduped executable targets (from init + tables)
+        with NO BN function, each carrying two weak honest signals -- ``aligned`` (target on
+        the arch's code granularity) and ``decodes`` (BN decodes an instruction there).
+        ``decodes=False`` reliably means "not code"; the true cases are weak, so these are
+        candidates to CONFIRM with `disasm`, NOT asserted functions."""
+    if table_min_run < 2:
+        raise OperationFailure("invalid_request", "table-min-run must be >= 2")
+    bv = ctx._resolve_view(selector)
+    ps = ctx._pointer_size(bv)
+    try:
+        thumb_arch = bool(ctx._supports_thumb_pointer_tags(bv))
+    except Exception:
+        thumb_arch = False
+    # Honor the view's endianness -- hardcoding little-endian would silently decode
+    # every pointer to garbage on a big-endian target (MIPS/PPC/ARM-BE firmware, the
+    # primary use case), reading as a false "no hidden surface".
+    order = ctx._byteorder(bv)
+    img_lo = int(getattr(bv, "start", 0) or 0)
+    img_hi = int(getattr(bv, "end", 0) or 0) or (img_lo + (1 << 48))
+    warnings: list[str] = []
+
+    def has_fn(addr: int) -> bool:
+        try:
+            return bool(bv.get_functions_containing(addr))
+        except Exception:
+            return False
+
+    def exec_target(addr: int) -> bool:
+        try:
+            seg = bv.get_segment_at(addr)
+            return bool(seg is not None and getattr(seg, "executable", False))
+        except Exception:
+            return False
+
+    def norm_ptr(addr: int) -> int:
+        # A Thumb function pointer is the even code address with the low bit set; the
+        # code lives at addr & ~1. Normalize so a Thumb candidate is checked/reported
+        # at its real entry, not the odd tagged value (audit: the scan path didn't).
+        return (addr & ~1) if (thumb_arch and (addr & 1)) else addr
+
+    def _code_signals(addr: int) -> tuple[bool, bool]:
+        # Two WEAK, honest sub-signals (reported separately, never gated -- an x86
+        # function entry is not reliably aligned, so gating on alignment would drop
+        # real functions; and `get_disassembly` non-empty is not a code-vs-data signal
+        # on a dense ISA where ~90% of DATA bytes also decode, audit):
+        #   aligned -- target aligned to the arch's code granularity (2 Thumb / 4 else);
+        #   decodes -- BN decodes an instruction there.
+        # `decodes=False` is the RELIABLE half (definitely not code); the true cases
+        # are weak, so the agent confirms a candidate with `disasm` before creating it.
+        thumb = thumb_arch and (addr & 1)
+        norm = addr & ~1 if thumb else addr
+        aligned = (norm % (2 if thumb else 4) == 0)
+        try:
+            decodes = bool(bv.get_disassembly(norm))
+        except Exception:
+            decodes = False
+        return aligned, decodes
+
+    # Deduped executable targets with no function -> the hidden-surface candidates.
+    missing: dict[int, dict[str, Any]] = {}
+
+    def note_missing(addr: int, provenance: str) -> None:
+        norm = norm_ptr(addr)
+        if norm in missing or has_fn(norm):
+            return
+        if len(missing) >= max_candidates:
+            return
+        aligned, decodes = _code_signals(addr)
+        missing[norm] = {
+            "address": hex(norm),
+            "provenance": provenance,
+            "aligned": aligned,
+            "decodes": decodes,
+            "section": _section_name_at(bv, norm),
+        }
+
+    # 1) init/ctor sections (reuse the existing evidence).
+    init_sections: list[dict[str, Any]] = []
+    # A high limit so init/ctor entries aren't silently under-counted vs total_entries
+    # (the default `evidence init` limit of 64 would clip a large .init_array).
+    for sec in (_init_arrays(ctx, selector, limit=4096).get("items") or []):
+        rows = ((sec.get("table") or {}).get("items")) or []
+        resolved = missing_here = 0
+        for r in rows:
+            tgt = r.get("target") or {}
+            val = tgt.get("normalized") or r.get("value")
+            if r.get("status") == "function":
+                resolved += 1
+            elif exec_target(_as_int(val)):
+                missing_here += 1
+                note_missing(_as_int(val), f"init:{sec.get('name')}")
+        init_sections.append({
+            "name": sec.get("name"), "start": sec.get("start"), "end": sec.get("end"),
+            "total_entries": sec.get("total_entries"),
+            "resolved_functions": resolved, "missing_functions": missing_here,
+        })
+
+    # 2) scan data-ish sections for runs of consecutive pointers-to-executable.
+    candidate_tables: list[dict[str, Any]] = []
+    scanned = 0
+    scan_capped = False
+    for name, section in (getattr(bv, "sections", {}) or {}).items():
+        if not any(h in str(name).lower() for h in _SURFACE_SCAN_HINTS):
+            continue
+        start = int(getattr(section, "start", 0))
+        end = int(getattr(section, "end", 0))
+        if scanned >= max_scan_bytes:
+            scan_capped = True
+            break
+        if end - start > max_scan_bytes - scanned:
+            end = start + (max_scan_bytes - scanned)
+            scan_capped = True
+        scanned += max(0, end - start)
+        try:
+            data = bytes(bv.read(start, end - start) or b"")
+        except Exception:
+            continue
+        run: list[int] = []
+
+        def flush(run_addr: int, run_vals: list[int]) -> None:
+            if len(run_vals) < table_min_run:
+                return
+            if len(candidate_tables) >= max_tables:
+                return
+            miss = sum(1 for v in run_vals if not has_fn(v))
+            for v in run_vals:
+                note_missing(v, f"table:{hex(run_addr)}")
+            candidate_tables.append({
+                "address": hex(run_addr),
+                "section": str(name),
+                "entries": len(run_vals),        # the TRUE slot count
+                "resolved_functions": len(run_vals) - miss,
+                "missing_functions": miss,
+                "slots": [hex(v) for v in run_vals[:32]],
+                "slots_truncated": len(run_vals) > 32,   # `slots` shows the first 32
+            })
+
+        run_start = start
+        off = 0
+        while off + ps <= len(data):
+            v = int.from_bytes(data[off:off + ps], order)
+            addr = start + off
+            if img_lo <= v < img_hi and exec_target(v):
+                if not run:
+                    run_start = addr
+                run.append(v)
+            else:
+                flush(run_start, run)
+                run = []
+            off += ps
+        flush(run_start, run)
+
+    if scan_capped:
+        warnings.append(
+            f"data scan capped at {max_scan_bytes} bytes; some sections (or their tails) "
+            "were not scanned -- raise --max-scan-bytes for full coverage")
+    if len(candidate_tables) >= max_tables:
+        warnings.append(f"candidate tables capped at {max_tables} (--max-tables)")
+    if len(missing) >= max_candidates:
+        warnings.append(f"missing-function candidates capped at {max_candidates} (--max-candidates)")
+
+    return {
+        "kind": "hidden_surface",
+        "init_sections": init_sections,
+        "candidate_tables": candidate_tables,
+        "missing_function_candidates": sorted(missing.values(), key=lambda m: m["address"]),
+        "summary": {
+            "init_sections": len(init_sections),
+            "candidate_tables": len(candidate_tables),
+            "missing_function_candidates": len(missing),
+        },
+        "warnings": warnings,
+    }
+
+
+def _as_int(v: Any) -> int:
+    try:
+        return int(str(v), 16) if isinstance(v, str) and v.lower().startswith("0x") else int(v)
+    except (TypeError, ValueError):
+        return -1
+
+
+def _section_name_at(bv, addr: int) -> str | None:
+    try:
+        secs = bv.get_sections_at(addr)
+        return str(secs[0].name) if secs else None
+    except Exception:
+        return None

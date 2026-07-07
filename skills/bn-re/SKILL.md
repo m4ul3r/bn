@@ -69,6 +69,8 @@ Not all functions matter equally. Prioritize:
 
 Binary Ninja's auto-analysis follows direct calls. Two important categories of code don't sit on that graph and will be invisible until you go looking for them.
 
+> **One-shot sweep: `bn evidence surface`.** It composes this whole section — `.init_array`/`.ctors` constructors, candidate vtable/dispatch tables (runs of pointers-into-executable across `.data`/`.rodata`/`.data.rel.ro`/`.got`), and the **missing-function candidates** (executable, data-referenced addresses with no BN function, each tagged `plausible`) — into one read-locked digest. On a fully-analyzed binary it's mostly `missing=0` (BN already found everything); its value is on stripped/optimized firmware, where it hands you the code BN's linear sweep didn't reach. It's **read-only** — confirm a candidate with `bn disasm <addr>` before `bn function create`. Use it to decide whether the manual steps below are even warranted, then drill in with them.
+
 ### Pre-main code (`.init_array`, constructors)
 
 Functions tagged with `__attribute__((constructor))`, C++ static initializers, and any code the linker registers in `.init_array` run *before* `main`. They commonly stage globals, derive keys, or wire up dispatch tables — exactly the kind of setup that breaks an analysis built only from `main`'s call graph.
