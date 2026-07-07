@@ -1868,10 +1868,11 @@ class TaintEngine:
         return sz if sz in (4, 8) else 8
 
     def _field_store_slot(self, ssaf: Any, ins: Any):
-        """The ``(base, offset)`` slot a store writes, unifying BN's two struct-field
-        store shapes: MLIL_STORE_SSA (dest is an address expr `&v + off`) and
-        MLIL_SET_VAR_(ALIASED_)FIELD (dest is the struct VAR -> `(v, 0)`, with the
-        field byte offset in ``ins.offset``). None when unresolvable."""
+        """The ``(base, offset)`` slot a store writes, unifying BN's store shapes:
+        MLIL_STORE_SSA (dest is an address expr `&v + off`), MLIL_SET_VAR_(ALIASED_)FIELD
+        (dest is the struct VAR -> `(v, 0)`, with the field byte offset in ``ins.offset``),
+        and MLIL_SET_VAR_ALIASED (a whole address-taken scalar, e.g. a `size_t& capacity`
+        out-param slot -> `(v, 0)`; #442). None when unresolvable."""
         op = op_name(ins)
         if "STORE" in op:
             return self._addr_base_offset(ssaf, getattr(ins, "dest", None))
@@ -1880,6 +1881,9 @@ class TaintEngine:
             if ba is None:
                 return None
             return (ba[0], ba[1] + int(getattr(ins, "offset", 0) or 0))
+        if op == "MLIL_SET_VAR_ALIASED":
+            dest = getattr(ins, "dest", None)
+            return (var_key(dest), 0) if dest is not None else None
         return None
 
     def _value_stored_to_field(self, ssaf: Any, instrs: Any, target_slot: tuple, before_addr: int):
@@ -2701,6 +2705,68 @@ class TaintEngine:
             cur = nxt
         return cur
 
+    def _m_create_call_via(self, ssaf: Any, d: Any, depth: int = 0) -> Any | None:
+        """The ``basic_string::_M_create`` CALL that produces this destination --
+        directly, or through the range-ctor SSO ``PHI(heap_buf, local_buf)`` and
+        copies -- else None. Only libstdc++'s ``_M_create`` (matched by name across
+        every symbol spelling) qualifies, so a real overflow whose dest is an
+        unrelated PHI is never mistaken for the STL pattern (#442)."""
+        if d is None or depth > 6:
+            return None
+        op = op_name(d)
+        if "CALL" in op:
+            addr = self._resolve_direct_target(d)
+            forms = self._callee_name_forms(addr)
+            nm = self._callee_name(addr)
+            if nm:
+                forms = forms + [nm]
+            # Require the libstdc++ basic_string::_M_create specifically -- the Itanium
+            # mangled component `9_M_createE`, or a demangled form naming basic_string --
+            # so an unrelated user symbol containing the "_M_create" substring can't be
+            # mistaken for the STL allocator (review hardening).
+            if any(f and "_M_create" in f
+                   and ("9_M_createE" in f or "basic_string" in f)
+                   for f in forms):
+                return d
+            return None
+        if "VAR_PHI" in op:
+            for sv in (getattr(d, "src", None) or []):
+                if not is_ssa_var(sv):
+                    continue
+                root = self._pointer_alloc_root(ssaf, sv)
+                try:
+                    sd = ssaf.get_ssa_var_definition(root)
+                except Exception:
+                    sd = None
+                hit = self._m_create_call_via(ssaf, sd, depth + 1)
+                if hit is not None:
+                    return hit
+        return None
+
+    def _m_create_capacity_size(self, ssaf: Any, d: Any) -> Any | None:
+        """The requested-size expr for a destination produced by
+        ``basic_string::_M_create(this, &capacity)`` -- the value stored into the
+        by-reference ``&capacity`` slot just before the call. ``_M_create``
+        allocates exactly that many bytes, so a ``memcpy`` of the same length is
+        provably bounded and downgrades to ``bounded_len`` (#442). None when the
+        dest is not an ``_M_create`` buffer or the capacity store can't be resolved
+        (stays a safe over-report -- never a false downgrade). The post-call reload
+        of the slot (the ROUNDED capacity) is deliberately not used."""
+        call = self._m_create_call_via(ssaf, d)
+        if call is None:
+            return None
+        params = self._call_params(call)
+        if len(params) < 2:
+            return None
+        # arg0 = this, arg1 = &capacity (the in/out size reference).
+        slot = self._addr_base_offset(ssaf, params[1])
+        if slot is None:
+            return None
+        call_addr = getattr(call, "address", None)
+        if call_addr is None:
+            return None
+        return self._value_stored_to_field(ssaf, self._instrs(ssaf), slot, call_addr)
+
     def _alloc_size_expr(self, ssaf: Any, ptr_expr: Any) -> Any | None:
         """If *ptr_expr*'s buffer was produced by an allocator call in this
         function, return the allocator's SIZE argument expression, else None."""
@@ -2719,7 +2785,17 @@ class TaintEngine:
             d = ssaf.get_ssa_var_definition(var)
         except Exception:
             d = None
-        if d is None or "CALL" not in op_name(d):
+        if d is None:
+            return None
+        # #442: std::string/std::vector range ctor -- basic_string::_M_create sizes
+        # the destination via its by-REFERENCE capacity operand (`_M_create(this,
+        # &cap)`), and the copy dest is a PHI of that heap buffer and the SSO local
+        # buffer. Neither the by-ref size nor the PHI is handled by the by-value
+        # allocator path below, so recognize it explicitly.
+        m_create_size = self._m_create_capacity_size(ssaf, d)
+        if m_create_size is not None:
+            return m_create_size
+        if "CALL" not in op_name(d):
             return None
         callee = self._callee_name(self._resolve_direct_target(d))
         base = (callee or "").split("@", 1)[0].lstrip("_")

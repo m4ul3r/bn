@@ -3445,6 +3445,88 @@ def test_forward_keeps_overflow_when_alloc_size_differs_from_length(models):
     assert memcpy_sinks[0]["class"] == "overflow_len"          # NOT downgraded
 
 
+def _m_create_copy_func(cap_size_var, length_var, *, param, sso_phi=False):
+    # cap = <cap_size_var>            (MLIL_SET_VAR_ALIASED -- the by-ref out size slot)
+    # dst_heap#1 = _M_create(&this, &cap)
+    # [sso_phi]  dst = phi(local_buf, dst_heap#1)     (std::string SSO fast-path merge)
+    # memcpy(dst, src, <length_var>)
+    # Models the libstdc++ basic_string(first,last) range-ctor shape (#442).
+    cap = FVar("cap", ident=7)
+    this = FVar("this", ident=8); this0 = FSSA(this, 0)
+    dst_heap = FVar("dst_heap"); dst_heap1 = FSSA(dst_heap, 1)
+    src = FVar("src"); src0 = FSSA(src, 0)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_ALIASED", "cap = size", reads=[cap_size_var],
+               dest=cap, src=FExpr("MLIL_VAR_SSA", "size", reads=[cap_size_var])),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "dst_heap#1 = _M_create(&this, &cap)",
+               reads=[this0], writes=[dst_heap1],
+               dest=FExpr("MLIL_CONST_PTR", "0x3000", constant=0x3000),
+               params=[FExpr("MLIL_ADDRESS_OF", "&this", src=this),
+                       FExpr("MLIL_ADDRESS_OF", "&cap", src=cap)]),
+    ]
+    memcpy_dst_var = dst_heap1
+    if sso_phi:
+        local = FVar("local"); local1 = FSSA(local, 1)
+        dstp = FVar("dstp"); dstp1 = FSSA(dstp, 1)
+        instrs.append(FInstr(2, 0x16, "MLIL_SET_VAR_SSA", "local#1 = &this",
+                             writes=[local1], src=FExpr("MLIL_ADDRESS_OF", "&this", src=this)))
+        phi = FInstr(3, 0x18, "MLIL_VAR_PHI", "dstp#1 = phi(local#1, dst_heap#1)", writes=[dstp1])
+        phi.src = [local1, dst_heap1]
+        instrs.append(phi)
+        memcpy_dst_var = dstp1
+    instrs.append(FInstr(4, 0x1a, "MLIL_CALL_SSA", "memcpy(dst, src#0, len)",
+           reads=[memcpy_dst_var, src0, length_var],
+           dest=FExpr("MLIL_CONST_PTR", "0x2010", constant=0x2010),
+           params=[FExpr("MLIL_VAR_SSA", "dst", reads=[memcpy_dst_var]),
+                   FExpr("MLIL_VAR_SSA", "src#0", reads=[src0]),
+                   FExpr("MLIL_VAR_SSA", "len", reads=[length_var])]))
+    return FFunc("copy", 0x10, FSSAFunc(instrs), params=[param])
+
+
+def _m_create_memcpy_sink(func, models):
+    # Itanium-mangled basic_string::_M_create(unsigned long&, unsigned long) -- the
+    # name form the tightened recognizer requires (basic_string / 9_M_createE).
+    bv = FBV({0x3000: "_ZNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEE9_M_createERmm",
+              0x2010: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    sinks = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(sinks) == 1
+    return sinks[0]
+
+
+def test_forward_downgrades_m_create_range_ctor_442(models):
+    # #442: dst = _M_create(&cap); memcpy(dst, src, n) with cap := n (the by-REFERENCE
+    # capacity operand) -- _M_create allocates exactly n bytes, so the copy of n is
+    # provably bounded. Downgrade the STL range-ctor FP to bounded_len.
+    n = FVar("n"); n0 = FSSA(n, 0)
+    func = _m_create_copy_func(n0, n0, param=n)
+    sink = _m_create_memcpy_sink(func, models)
+    assert sink["class"] == "bounded_len"
+    assert "provably bounded" in sink["detail"]
+
+
+def test_forward_downgrades_m_create_through_sso_phi_442(models):
+    # #442: the real range-ctor routes the memcpy dest through the SSO PHI
+    # phi(local_buf, _M_create_return). The engine must trace THROUGH the phi to the
+    # _M_create arm and still downgrade.
+    n = FVar("n"); n0 = FSSA(n, 0)
+    func = _m_create_copy_func(n0, n0, param=n, sso_phi=True)
+    sink = _m_create_memcpy_sink(func, models)
+    assert sink["class"] == "bounded_len"
+
+
+def test_forward_keeps_overflow_m_create_length_differs_442(models):
+    # #442 no-false-negative: cap := m but memcpy copies n (m != n). The copy length
+    # is NOT provably equal to the _M_create allocation size, so overflow_len stands.
+    n = FVar("n"); m = FVar("m")
+    n0 = FSSA(n, 0); m0 = FSSA(m, 0)
+    func = _m_create_copy_func(m0, n0, param=n)   # cap sized by m, copy length n
+    func.parameter_vars = [n, m]
+    sink = _m_create_memcpy_sink(func, models)
+    assert sink["class"] == "overflow_len"
+
+
 def _copy_via_wrapper(wrapper_addr, size_var, length_var, *, param):
     # dst = wrap(<size_var>); memcpy(dst, src, <length_var>) -- the allocator is an
     # in-binary wrapper at wrapper_addr, not a direct libc malloc.
