@@ -742,7 +742,7 @@ def _evidence_calls(args: argparse.Namespace) -> int:
                  help="Cap on reported candidate tables (disclosed when hit)"),
              arg("--max-candidates", dest="max_candidates", type=_positive_int, default=128,
                  help="Cap on reported missing-function candidates (disclosed when hit)"),
-             arg("--max-scan-bytes", dest="max_scan_bytes", type=_positive_int, default=4_000_000,
+             arg("--max-scan-bytes", dest="max_scan_bytes", type=_positive_int, default=16_000_000,
                  help="Cap on total data bytes scanned for pointer tables (disclosed when hit)"),
          ])
 def _evidence_surface(args: argparse.Namespace) -> int:
