@@ -21,6 +21,8 @@ Start by mapping what the binary does and where untrusted data enters:
 
 > **C++ / symbolicated target? Use the class lens to reach the handlers fast.** On a binary with demangled C++ symbols/RTTI, `bn class list --no-stl` surfaces the domain classes and `bn class show <Name>` lists a class's methods + vtable — the quickest way to locate the directive/parse/dispatch/`handle*`/`onReceive` entry points that take untrusted input, *before* you enumerate sinks. (On stripped/static firmware with no symbols, skip it and use the "Stripped / static lane" below.)
 
+> **C / firmware dispatch registered via a stack descriptor? Map the command→handler surface with `bn evidence calls`.** When handlers register with an ops-table/command primitive by filling a transient stack descriptor and passing `&desc` (`init_cmd(dev, &desc)` with `desc.command`, `desc.type`, `desc.callback = handler`), recovering "which callback processes which command" was a manual per-caller decompile. `bn evidence calls <reg-fn> --arg-struct N --field type:u8@2 --field callback:ptr@16` reports, per registration callsite, the descriptor's constant field values **and the resolved callback symbol** — the attacker-reachable dispatch map (which opcodes reach which handlers) in one command, so you can jump straight to auditing the handlers that parse untrusted fields. `ptr` fields resolve the callback's function symbol; unknown/merged fields and sibling-slot recoveries are marked, so treat `~`-flagged values as heuristic (and a PIE/shared-lib callback reached through the GOT surfaces as `<computed>`, not a wrong symbol — confirm it at the `source_address`). See "`evidence calls`" in the bn skill's `reference/reading.md`.
+
 1. **Dangerous imports** — scan for functions with known vulnerability history:
    ```bash
    bn imports
@@ -337,6 +339,20 @@ continue:
   `bn callsites <callee> --within <caller>` + `bn decompile <caller>`.
 - For an un-modeled external, add a model to the override file
   (`~/.cache/bn/taint_models.json`, or `$BN_TAINT_MODELS`) and re-run.
+- **Length-prefixed `recv`/`read` overflow behind a wrapper** — a wrapper that
+  forwards an attacker-controlled length straight into `recv(fd, buf, len)` /
+  `read` writing into an undersized buffer is a whole bug class the default
+  workflow **misses**: it isn't a copy sink (`arg:memcpy:N` doesn't apply) and the
+  built-in `recv`/`read` model is a taint *source*, not a write *sink*. Declare the
+  wrapper (or raw recv/read) a **bounded-write sink** in `--models` — `len_arg` (the
+  attacker-controlled length) arms it, `buf_arg` (the destination) drives the
+  provably-bounded downgrade:
+  ```json
+  {"app_recv": {"sink": {"class": "overflow_len", "len_arg": 1, "buf_arg": 2}}}
+  ```
+  then `bn taint forward -f <handler> --source call:recv --models <file>` flags the
+  wrapped `recv(len)`-into-undersized-buffer as `overflow_len` (a buffer sized to the
+  length downgrades to `bounded_len`). See "Bounded-WRITE sinks" in the bn skill's `reference/reading.md`.
 - For an `arg_under_recovered` leaf, Binary Ninja under-recovered that callee's
   parameter list, so a tainted argument was dropped at the boundary (otherwise a
   silent false-negative). Recover the real prototype from the callee / its call
