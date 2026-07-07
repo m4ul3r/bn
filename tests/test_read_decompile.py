@@ -992,6 +992,29 @@ def test_preload_binary_quick_is_noop_for_sibling_bndb(monkeypatch, tmp_path):
     bridge._quick_loaded_views.clear()
 
 
+def test_preload_binary_bndb_recovers_analyzed_view(monkeypatch, tmp_path):
+    """#458 parity: `bn-agent <file>.bndb` preloading a .bndb whose load() defaults
+    to the raw container view must recover the analyzed view, not preload a
+    no-symbol target."""
+    bridge = _load_bridge(monkeypatch)
+    bridge._headless_views.clear()
+    bridge._quick_loaded_views.clear()
+
+    bndb = tmp_path / "image.bndb"
+    bndb.write_bytes(b"")
+    analyzed = _LoadBV(filename=str(bndb), view_type="ELF",
+                       functions=[object(), object()])
+    raw = _LoadBV(filename=str(bndb), view_type="Raw", functions=[],
+                  existing_views=["ELF", "Raw"], db_views={"ELF": analyzed})
+    sys.modules["binaryninja"].load = lambda path, update_analysis=True: raw
+
+    bv = bridge._preload_binary(str(bndb), quick=False)
+
+    assert bv is analyzed                    # published the analyzed view
+    assert bridge._headless_views == [analyzed]
+    bridge._headless_views.clear()
+
+
 def test_dispatch_rejects_non_boolean_quick(monkeypatch, tmp_path):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -1650,6 +1673,23 @@ def test_target_info_reports_quick_analysis_state(monkeypatch):
     info2 = instance._target_info("active")
     assert info2["analyzed"] is True
     assert info2["analysis_state"] == "full"
+
+
+def test_target_info_reports_unanalyzed_state_for_raw_bndb(monkeypatch):
+    """#458: a .bndb that restored a raw container with no product view is tracked
+    in _unanalyzed_views; target info must report analysis_state=unanalyzed (not
+    full), so a JSON consumer isn't told a 0-function raw view is fully analyzed."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+
+    bridge._unanalyzed_views.add(bv)
+    info = instance._target_info("active")
+    assert info["analyzed"] is False
+    assert info["analysis_state"] == "unanalyzed"
+    bridge._unanalyzed_views.discard(bv)
 
 
 def test_load_quick_marks_view_full_load_does_not(monkeypatch, tmp_path):
