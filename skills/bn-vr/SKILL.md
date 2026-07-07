@@ -155,6 +155,69 @@ Reminder: HLIL misleads beyond access/operand width — besides field-load size,
 
 Go **pattern-based for breadth** — enumerate sinks (`bn xrefs strcpy`, …), trace each callsite's args backward, skip provably-safe ones, prioritize those fed by input sources — then **switch to line-by-line** on the high-value code (parsers, auth, crypto), tracking what's audited so you don't leave gaps.
 
+## Manual audit lane: parser / fixed-header invariants (taint won't flag these)
+
+Source→sink taint proves *attacker data reaches a modeled sink*. It says nothing about a **loop guard that admits a partial fixed-header read** — a TLV/option parser that checks `remaining > 0` instead of `>= <header-width>` walks off the end of a short buffer with no `memcpy`/`strcpy` in sight. Taint comes back empty and the bug is invisible. **An empty taint result is NOT an all-clear for parser-invariant bugs** — audit these by hand.
+
+Sanitized vulnerable shape (a TLV option loop):
+```c
+while (remaining > 0) {               // BUG: must be `remaining >= 4` (the header width)
+    code    = p[0];                   // 1-byte type
+    opt_len = *(uint16_t *)(p + 2);   // 2-byte length read PAST a <4-byte tail
+    dispatch_option(code, p + 4, opt_len);  // handler runs before the header is proven complete
+    p         += 4 + opt_len;          // advances by an attacker/stale length
+    remaining -= 4 + opt_len;
+}
+```
+
+Checklist:
+- **Loop guard vs fixed-header width** — is the continue condition `>= sizeof(header)`, or a weaker `> 0` / `!= 0` that lets the last field read past the buffer?
+- **Unknown-option skip** — does an unrecognized `code` advance `p` by an attacker- or stale-controlled length (`p += 4 + opt_len`) without bounding it against `remaining`? A single oversized `opt_len` desyncs the walk.
+- **Handler dispatch before complete-header validation** — is `dispatch_option` (or a vtable/table handler) called before all header fields are confirmed in-bounds?
+- **Stale bytes when alloc > received** — if the buffer was allocated larger than the received length, an over-long `opt_len` reads *stale/uninitialized* bytes, not OOB — same info-leak surface, no crash.
+- **Post-parse checks that limit impact** — is there a later length/CRC/bounds check that constrains the damage, or does the parsed value flow straight to a copy/handler?
+
+Command chain:
+```bash
+bn decompile parse_tlv --addresses          # recover the loop + the dispatch call address
+bn disasm 0x401120 --linear 64              # address-linear: confirm ldrb/ldrh widths AND the guard shape (see #460)
+bn evidence function parse_tlv --context 1  # raw ABI args at each dispatch_option call
+bn trace parse_tlv 0x401148 --arg 2         # where opt_len came from (attacker vs constant)
+```
+Confirm the guard and the field-load widths in `bn disasm` (not the decompiler — HLIL flattens the compare), then assess whether one crafted option can drive `p`/`opt_len` past `remaining`.
+
+## Destination-capacity audit (strcpy / strcat / repeated appends)
+
+For an unbounded copy the decisive property is **destination capacity vs the aggregate length written into it** — not whether an explicit length argument is tainted (`strcpy`/`strcat` have none). A tainted-length trace can come back clean and the overflow still be real. Prove capacity, then prove the write bound.
+
+Checklist:
+1. **Trace dest (arg0) to its allocation** — `bn trace <fn> <call> --arg 0` back to the stack slot / global / `malloc` site; recover the concrete capacity from the frame layout or the alloc size.
+2. **Trace source (arg1) to provenance + max NUL-terminated length** — where does the string come from, and what caps its length before the NUL?
+3. **For `strcat`, bound dest length + total appends** — the overflow is `initial_strlen(dest) + Σ(appended lengths)`; a per-append length that looks safe overflows in aggregate across a loop.
+4. **For helper/wrapper APIs, audit EVERY caller** — a `str_append(dst, src)` wrapper is only as safe as its worst caller; classify none of them until all call sites' arg constraints are checked (`bn xrefs <helper>` / `bn callsites`).
+5. **Confirm ABI + alloc sizes in disassembly** — `bn disasm` for the true register args and the stack-frame reservation; the decompiler can misattribute a buffer's size.
+6. **Treat taint output as frontier guidance, not proof** — a `coarse_memory_store` leaf or an empty length-slice is where the manual capacity check begins.
+
+Sanitized shapes:
+```c
+// (a) single copy — capacity is a fixed stack buffer, source is attacker arg
+char tmp[128];
+strcpy(tmp, api_arg);                 // overflow iff strlen(api_arg) >= 128
+
+// (b) aggregate — no single append is huge, the SUM overflows
+char out[2048];
+for_each_chunk(msg, chunk)
+    strcat(out, decrypt(chunk));      // bound = Σ decrypted-chunk lengths vs 2048
+```
+
+Command pattern:
+```bash
+bn callsites strcat --within build_response   # every append site in the sink function
+bn trace build_response 0x40219c --arg 0      # dest -> its allocation + capacity
+bn trace build_response 0x40219c --arg 1      # source -> provenance + max length
+bn disasm 0x402180 --linear 48                # confirm frame size + register args
+```
+
 ## Taint Analysis (`bn taint`)
 
 `bn taint` automates the propagation step over Binary Ninja's MLIL-SSA: it
@@ -200,6 +263,17 @@ behind a count.
 > byte-copy / option-extraction loops honestly as `coarse_memory_store` leaves.
 > The same indirect-load caveat is what bites whenever the recv destination is
 > reached through a pointer load rather than a direct local buffer.
+
+> **Shallow/empty taint through an object parser or a raw decoder is NOT an all-clear — report the frontier type.** Two common shapes bottom out taint without a modeled sink, and each has a name to put in the finding so a reader knows *why* it stopped, not that it's clean:
+> - **`parser_object_frontier`** — taint reached an object/`object_get*` accessor but the field semantics aren't modeled, so per-field flow isn't tracked past the getter.
+> - **`raw_decoder_store_frontier`** — a callee writes destination bytes with **no output-length model** (a `decode_*`/`inflate_*` that fills a buffer), so the written length is unknown to taint.
+> - **`manual_disasm_required`** — the residual action: check by hand whether the destination is a **fixed** stack/global buffer and whether bounds checks happen **before/after** the decode call.
+>
+> Sanitized shape: `handle_request → parse_object → object_get_string → decode_payload(payload, decoded)` — taint dies at `object_get_string`/`decode_payload` with an empty or 1-step slice. Confirm the real risk with:
+> ```bash
+> bn trace parse_object 0x40a1c4 --arg 0   # what payload the decoder reads
+> bn disasm 0x40a190 --linear 48           # is `decoded` a fixed buffer? bounds before/after?
+> ```
 
 **Backward — slice a sink's argument back to its origin:**
 ```bash
