@@ -1385,24 +1385,28 @@ def _render_surface_text(value: Any) -> str:
 
     cands = list(value.get("missing_function_candidates") or [])
     if cands:
+        code_likely = [c for c in cands if isinstance(c, dict) and c.get("code_likely")]
         lines.append("")
-        lines.append("missing-function candidates (executable, data-referenced, no BN function):")
-        for c in cands:
-            if not isinstance(c, dict):
-                continue
-            sig = []
-            if not c.get("decodes"):
-                sig.append("no-decode")       # reliable: not code
+        lines.append(
+            f"missing-function candidates (executable, data-referenced, no BN function): "
+            f"{len(code_likely)} code-likely of {len(cands)}")
+        # Show the high-confidence subset first; then the rest, marked with why.
+        ordered = code_likely + [c for c in cands if isinstance(c, dict) and not c.get("code_likely")]
+        for c in ordered:
+            depth = c.get("decode_depth")
+            why = []
             if not c.get("aligned"):
-                sig.append("unaligned")       # weak
-            mark = f"  [{', '.join(sig)}]" if sig else ""
+                why.append("unaligned")
+            if isinstance(depth, int):
+                why.append(f"decode={depth}")
+            tag = "code-likely" if c.get("code_likely") else "weak"
             lines.append(
                 f"  {c.get('address', '?')}  [{c.get('section') or '?'}]  "
-                f"via {c.get('provenance', '?')}{mark}")
+                f"via {c.get('provenance', '?')}  [{tag}: {', '.join(why)}]")
         lines.append("")
-        lines.append("(candidates -- NOT confirmed functions. `no-decode` reliably means data; "
-                     "a clean row is only a WEAK signal. Verify with `disasm`, then "
-                     "`function create` the real ones.)")
+        lines.append("(candidates -- NOT confirmed functions. `decode` = clean instructions "
+                     "before an undefined one; a low decode reliably means data. Start with the "
+                     "code-likely subset; verify with `disasm`, then `function create`.)")
     return "\n".join(lines)
 
 

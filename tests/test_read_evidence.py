@@ -1634,6 +1634,14 @@ def test_decode_descriptor_field_slice_and_sibling_469(monkeypatch):
 
 class _SurfSeg:
     executable = True
+    readable = True
+    def __init__(self, start=0, end=0):
+        self.start = start; self.end = end
+
+
+class _SurfArch:
+    def get_instruction_info(self, data, addr):
+        return type("_Info", (), {"length": 4})()   # fixed 4-byte insns (RISC)
 
 
 class _SurfSection:
@@ -1642,18 +1650,18 @@ class _SurfSection:
 
 
 class _SurfBV:
-    """A bv exposing one .data.rel.ro table of 4 code-pointers (2 with functions, 2
-    without; one of the missing ones is decodable, one isn't) then a null terminator."""
+    """A bv exposing one .data.rel.ro table of 4 code-pointers: 2 resolve to functions,
+    and 2 don't -- 0x2020 decodes a long clean run (code-likely), 0x4000 hits an
+    undefined instruction at once (data). Then a null terminator ends the run."""
     address_size = 8
     start = 0x1000
-    end = 0x3000
-    _VALS = [0x2000, 0x2010, 0x2020, 0x2030, 0]
+    end = 0x6000
+    _VALS = [0x2000, 0x2010, 0x2020, 0x4000, 0]
 
     def __init__(self):
         self.sections = {".data.rel.ro": _SurfSection(".data.rel.ro", 0x1000, 0x1000 + 8 * len(self._VALS))}
+        self.arch = _SurfArch()
         self._fns = {0x2000, 0x2010}
-        self._exec = {0x2000, 0x2010, 0x2020, 0x2030}
-        self._decodable = {0x2000, 0x2010, 0x2020}   # 0x2030 present but not decodable
 
     def read(self, addr, n):
         if int(addr) == 0x1000:
@@ -1664,10 +1672,11 @@ class _SurfBV:
         return [object()] if int(a) in self._fns else []
 
     def get_segment_at(self, a):
-        return _SurfSeg() if int(a) in self._exec else None
+        return _SurfSeg(0x2000, 0x6000) if 0x2000 <= int(a) < 0x6000 else None
 
     def get_disassembly(self, a):
-        return "mov eax, eax" if int(a) in self._decodable else ""
+        a = int(a)
+        return "mov x0, x0" if 0x2020 <= a < 0x2100 else "undefined"   # code region vs data
 
     def get_sections_at(self, a):
         return [self.sections[".data.rel.ro"]]
@@ -1690,12 +1699,15 @@ def test_hidden_surface_scan_503(monkeypatch):
     assert len(out["candidate_tables"]) == 1
     t = out["candidate_tables"][0]
     assert t["entries"] == 4 and t["resolved_functions"] == 2 and t["missing_functions"] == 2
-    # the two functionless targets surface as candidates, with honest plausibility
+    # the two functionless targets surface as candidates; decode_depth discriminates
+    # 0x2020 (long clean run -> code_likely) from 0x4000 (undefined at once -> data).
     cands = {c["address"]: c for c in out["missing_function_candidates"]}
-    assert set(cands) == {"0x2020", "0x2030"}
-    assert cands["0x2020"]["aligned"] is True and cands["0x2020"]["decodes"] is True
-    assert cands["0x2030"]["aligned"] is True and cands["0x2030"]["decodes"] is False
-    assert out["summary"]["candidate_tables"] == 1 and out["summary"]["missing_function_candidates"] == 2
+    assert set(cands) == {"0x2020", "0x4000"}
+    assert cands["0x2020"]["aligned"] is True and cands["0x2020"]["decode_depth"] >= 8
+    assert cands["0x2020"]["code_likely"] is True
+    assert cands["0x4000"]["decode_depth"] == 0 and cands["0x4000"]["code_likely"] is False
+    assert out["summary"]["missing_function_candidates"] == 2
+    assert out["summary"]["code_likely_candidates"] == 1
     # a run shorter than table-min-run is not reported
     assert re._hidden_surface(_Ctx(), None, table_min_run=5)["candidate_tables"] == []
     with pytest.raises(re.OperationFailure):
@@ -1730,3 +1742,22 @@ def test_hidden_surface_segment_fallback_503(monkeypatch):
     assert out["candidate_tables"][0]["section"].startswith("segment@")
     assert any("no named data sections" in w for w in out["warnings"])   # fallback disclosed
     assert out["summary"]["missing_function_candidates"] == 2
+
+
+def test_hidden_surface_x86_warns_decode_depth_weak_503(monkeypatch):
+    # #503 audit: on a variable-length ISA the code_likely/decode_depth signal is weak;
+    # the warning must ride on the OUTPUT (not just the skill doc).
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_init_arrays", lambda ctx, sel, **kw: {"items": []})
+    bv = _SurfBV()
+    bv.arch = type("_A", (_SurfArch,), {"name": "x86_64"})()
+
+    class _Ctx:
+        def _resolve_view(self, s): return bv
+        def _pointer_size(self, b): return 8
+        def _byteorder(self, b): return "little"
+
+    out = re._hidden_surface(_Ctx(), None)
+    assert out["summary"]["missing_function_candidates"] == 2
+    assert any("variable-length ISA" in w and "code_likely" in w for w in out["warnings"])
