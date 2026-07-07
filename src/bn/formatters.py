@@ -1367,13 +1367,28 @@ def _render_record_table_text(value: Any) -> str:
             off = f.get("offset", 0)
             off_s = f"+{off:#x}" if isinstance(off, int) else f"+{off}"
             kind = f.get("kind")
+            # #467: a DECLARED typed field carries a name; show it so the record reads
+            # as its struct fields (fn fields keep BN's resolved callee in `name`).
+            fname = f.get("name") if kind in ("scalar", "char_array") else None
+            nm = f" {fname}" if fname else ""
             if kind == "function_pointer":
                 lines.append(f"  {off_s:<6} fn      {f.get('target', '?')}  {f.get('name') or ''}".rstrip())
             elif kind == "data_pointer":
                 note = f'  "{f["preview"]}"' if f.get("preview") else (f"  {f['symbol']}" if f.get("symbol") else "")
                 lines.append(f"  {off_s:<6} data    {f.get('target', '?')}{note}")
+            elif kind == "char_array":  # #467 inline string field
+                lines.append(f'  {off_s:<6} char[{f.get("size", "?")}]{nm}  "{f.get("value", "")}"'.rstrip())
             elif kind == "scalar":
-                lines.append(f"  {off_s:<6} scalar  {f.get('value', '?')}  ({f.get('size', '?')}B)")
+                typ = f.get("type")
+                if typ and str(typ).startswith("i") and isinstance(f.get("value"), int):
+                    # #467: a SIGNED (i*) typed field shows its decimal value (+ hex),
+                    # so -100 isn't rendered as 0xff9c and confused with 65436.
+                    val_s = f"{f['value']} ({f.get('hex')})"
+                elif f.get("hex"):
+                    val_s = f["hex"]                       # unsigned typed field
+                else:
+                    val_s = f.get("value", "?")            # auto-scalar gap (hex string)
+                lines.append(f"  {off_s:<6} scalar{nm}  {val_s}  ({f.get('size', '?')}B)")
             elif kind == "null":
                 lines.append(f"  {off_s:<6} null")
             else:  # unmapped / unreadable

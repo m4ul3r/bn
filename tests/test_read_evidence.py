@@ -1480,3 +1480,63 @@ def test_function_evidence_slicing_471(monkeypatch):
     # invalid slicing args are clean errors
     with pytest.raises(bridge.OperationFailure):
         instance._function_evidence("active", "dispatch", limit=0)
+
+
+def test_parse_field_spec_467(monkeypatch):
+    # #467: name:type@offset typed field specs (scalars + char[N]).
+    bridge = _load_bridge(monkeypatch)
+    p = bridge.read_evidence._parse_field_spec
+    assert p("command:u32@0") == {"name": "command", "kind": "scalar", "width": 4, "signed": False, "offset": 0, "type": "u32"}
+    assert p("delta:i16@0x4") == {"name": "delta", "kind": "scalar", "width": 2, "signed": True, "offset": 4, "type": "i16"}
+    assert p("name:char[16]@8") == {"name": "name", "kind": "char_array", "width": 16, "offset": 8, "type": "char[16]"}
+    for bad in ("noatsign", "n:u32", "n:weird@0", "n:u32@notanint", "n:u128@0", "n:char[0]@0"):
+        with pytest.raises(bridge.OperationFailure):
+            p(bad)
+
+
+def test_record_table_typed_fields_and_zero_pointers_467():
+    # #467: a scalar/string-only record (ZERO pointer fields) decoded from typed
+    # field specs -- u32/u16 scalars + an inline char[16].
+    read_evidence = importlib.import_module("bn_agent_bridge.read_evidence")
+    start, rec = 0x500000, 24
+    mem = {
+        (start + 0, 4): (0x1101).to_bytes(4, "little"),
+        (start + 4, 2): (2).to_bytes(2, "little"),
+        (start + 8, 16): b"get_status\x00\x00\x00\x00\x00\x00",
+    }
+    specs = [read_evidence._parse_field_spec(s)
+             for s in ["command:u32@0", "set_args:u16@4", "name:char[16]@8"]]
+    out = read_evidence._record_table_for_view(
+        _RecCtx({}, {}), _RecBV(mem), start,
+        entries=1, record_size=rec, ptr_fields=[], field_specs=specs)  # zero pointer fields
+    assert out["kind"] == "record_table" and out["total"] == 1
+    fields = {f["name"]: f for f in out["items"][0]["fields"] if f.get("name")}
+    assert fields["command"]["value"] == 0x1101 and fields["command"]["hex"] == "0x1101"
+    assert fields["set_args"]["value"] == 2
+    assert fields["name"]["kind"] == "char_array" and fields["name"]["value"] == "get_status"
+    assert [f["name"] for f in out["fields"]] == ["command", "set_args", "name"]
+    # a field exceeding the record size is a clean error (no false decode).
+    with pytest.raises(read_evidence.OperationFailure):
+        read_evidence._record_table_for_view(
+            _RecCtx({}, {}), _RecBV({}), start, entries=1, record_size=8, ptr_fields=[],
+            field_specs=[read_evidence._parse_field_spec("x:char[16]@0")])
+
+
+def test_record_table_text_shows_signed_scalar_467():
+    # #467: a signed (i*) typed field renders its decimal value in text, not the
+    # unsigned hex (so -2 isn't shown as 0xfffe).
+    from bn.formatters import _render_record_table_text
+    value = {
+        "kind": "record_table", "address": "0x1000", "record_size": 8, "ptr_fields": [],
+        "fields": [{"name": "delta", "type": "i16", "offset": "0x0"}],
+        "items": [{"row": 0, "base": "0x1000", "fields": [
+            {"name": "delta", "offset": 0, "kind": "scalar", "size": 2, "type": "i16",
+             "value": -2, "hex": "0xfffe"},
+            {"name": "flags", "offset": 4, "kind": "scalar", "size": 4, "type": "u32",
+             "value": 5, "hex": "0x5"},
+        ]}],
+        "warnings": [],
+    }
+    out = _render_record_table_text(value)
+    assert "delta  -2 (0xfffe)" in out       # signed: decimal + hex
+    assert "flags  0x5" in out                # unsigned: hex

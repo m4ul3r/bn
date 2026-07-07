@@ -666,6 +666,11 @@ def _evidence_xrefs(args: argparse.Namespace) -> int:
              arg("--ptr-fields", dest="ptr_fields", default=None,
                  help="Comma-separated byte offsets of the pointer field(s) within each record "
                       "(record-aware mode), e.g. --record-size 0x18 --ptr-fields 0x8,0x10"),
+             arg("--field", dest="field_specs", action="append", default=None, metavar="NAME:TYPE@OFF",
+                 help="Declare a typed scalar/string record field (repeatable): TYPE is "
+                      "u8/i8/u16/i16/u32/i32/u64/i64 or char[N], OFF is hex/decimal, e.g. "
+                      "--field command:u32@0 --field name:char[16]@8. Makes --ptr-fields "
+                      "optional (scalar-only records)."),
          ])
 def _evidence_table(args: argparse.Namespace) -> int:
     ptr_fields = None
@@ -681,6 +686,7 @@ def _evidence_table(args: argparse.Namespace) -> int:
             "width": args.width,
             "record_size": getattr(args, "record_size", None),
             "ptr_fields": ptr_fields,
+            "fields": getattr(args, "field_specs", None),
         },
         require_target=True,
         text_renderer=_render_pointer_table_text,

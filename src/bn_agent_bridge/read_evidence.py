@@ -626,8 +626,70 @@ def _classify_ptr_field(offset: int, value: int, target: dict[str, Any]) -> dict
     return {"offset": int(offset), "kind": "unmapped", "value": hex(value), "status": status}
 
 
+_SCALAR_KIND_RE = re.compile(r"^([ui])(8|16|32|64)$")
+_CHAR_ARRAY_RE = re.compile(r"^char\[(\d+)\]$")
+_FIELD_SPEC_RE = re.compile(r"^([A-Za-z_]\w*):([^@]+)@(.+)$")
+
+
+def _parse_field_spec(spec: str) -> dict[str, Any]:
+    """#467: parse a ``name:type@offset`` typed record-field spec. ``type`` is a
+    scalar ``u8/i8/u16/i16/u32/i32/u64/i64`` or an inline string ``char[N]``;
+    ``offset`` is hex (``0x..``) or decimal. Raises OperationFailure on a bad spec."""
+    m = _FIELD_SPEC_RE.match(str(spec).strip())
+    if not m:
+        raise OperationFailure("invalid_field",
+                               f"--field must be name:type@offset, got {spec!r}")
+    name, typ, off_s = m.group(1), m.group(2).strip(), m.group(3).strip()
+    try:
+        offset = int(off_s, 0)
+    except ValueError:
+        raise OperationFailure("invalid_field", f"bad offset {off_s!r} in --field {spec!r}")
+    if offset < 0:
+        raise OperationFailure("invalid_field", f"negative offset in --field {spec!r}")
+    ca = _CHAR_ARRAY_RE.match(typ)
+    if ca:
+        width = int(ca.group(1))
+        if width <= 0:
+            raise OperationFailure("invalid_field",
+                                   f"char[N] width must be positive in --field {spec!r}")
+        return {"name": name, "kind": "char_array", "width": width,
+                "offset": offset, "type": typ}
+    sm = _SCALAR_KIND_RE.match(typ)
+    if sm:
+        return {"name": name, "kind": "scalar", "width": int(sm.group(2)) // 8,
+                "signed": sm.group(1) == "i", "offset": offset, "type": typ}
+    raise OperationFailure(
+        "invalid_field",
+        f"unknown --field type {typ!r} in {spec!r} (use u8/i8/u16/i16/u32/i32/u64/i64 or char[N])")
+
+
+def _typed_field(ctx, bv, base: int, spec: dict[str, Any]) -> dict[str, Any]:
+    """#467: decode one DECLARED typed field (scalar or inline char[N]) at
+    ``base + spec['offset']``. A scalar renders both its integer value (honoring
+    signedness) and raw hex; a char[N] renders the NUL-terminated string + raw."""
+    off = spec["offset"]
+    width = spec["width"]
+    field: dict[str, Any] = {"name": spec["name"], "offset": off,
+                             "kind": spec["kind"], "size": width, "type": spec.get("type")}
+    try:
+        data = bytes(bv.read(base + off, width) or b"")
+    except Exception:
+        data = b""
+    if len(data) != width:
+        field["unreadable"] = True
+        return field
+    if spec["kind"] == "char_array":
+        field["value"] = data.split(b"\x00", 1)[0].decode("latin-1", "replace")
+        field["raw"] = data.hex()
+    else:
+        order = ctx._byteorder(bv)
+        field["value"] = int.from_bytes(data, order, signed=spec.get("signed", False))
+        field["hex"] = hex(int.from_bytes(data, order, signed=False))
+    return field
+
+
 def _record_table_for_view(ctx, bv, start: int, *, entries: int, record_size: int,
-                           ptr_fields: list[int]) -> dict[str, Any]:
+                           ptr_fields: list[int], field_specs: list[dict] | None = None) -> dict[str, Any]:
     """#455: scan a MIXED-record dispatch table (scalar fields interleaved with
     function/data pointers) rather than a pure pointer table. Each record is
     ``record_size`` bytes; ``ptr_fields`` are the byte offsets within a record to
@@ -644,26 +706,52 @@ def _record_table_for_view(ctx, bv, start: int, *, entries: int, record_size: in
                 f"pointer-field offset {hex(off)} + {ptr}-byte pointer exceeds "
                 f"record-size {hex(record_size)}",
             )
+    # #467: merge the declared TYPED fields (name:type@off -- scalar or char[N]) with
+    # the pointer fields into one offset-sorted record layout. Zero pointer fields is
+    # allowed (a scalar/string-only record); undeclared gaps stay auto-scalars.
+    specs = list(field_specs or [])
+    declared: list[dict[str, Any]] = [{"offset": o, "width": ptr, "_ptr": True} for o in fields_sorted]
+    for s in specs:
+        if s["offset"] + s["width"] > record_size:
+            raise OperationFailure(
+                "invalid_field",
+                f"field {s['name']!r} at {hex(s['offset'])} + {s['width']} bytes exceeds "
+                f"record-size {hex(record_size)}")
+        declared.append({**s, "_ptr": False})
+    declared.sort(key=lambda d: d["offset"])
+    prev_end = 0
+    for d in declared:
+        if d["offset"] < prev_end:
+            raise OperationFailure(
+                "invalid_field",
+                f"field at {hex(d['offset'])} overlaps the previous field (ends at {hex(prev_end)})")
+        prev_end = d["offset"] + d["width"]
+
     rows: list[dict[str, Any]] = []
     unresolved = 0
     for i in range(entries):
         base = start + i * record_size
         record_fields: list[dict[str, Any]] = []
         cursor = 0
-        for off in fields_sorted:
-            if off > cursor:  # scalar gap before this pointer field
+        for d in declared:
+            off = d["offset"]
+            if off > cursor:  # undeclared gap -> auto-scalar
                 record_fields.append(_scalar_field(ctx, bv, base + cursor, cursor, off - cursor))
-            value = ctx._read_pointer_value(bv, base + off, size=ptr)
-            if value is None:
-                record_fields.append({"offset": off, "kind": "unreadable"})
-                unresolved += 1
-            else:
-                field = _classify_ptr_field(off, value, ctx._normalize_code_pointer(bv, value))
-                if field["kind"] == "unmapped":
+            if d["_ptr"]:
+                value = ctx._read_pointer_value(bv, base + off, size=ptr)
+                if value is None:
+                    record_fields.append({"offset": off, "kind": "unreadable"})
                     unresolved += 1
-                record_fields.append(field)
-            cursor = off + ptr
-        if cursor < record_size:  # trailing scalar gap
+                else:
+                    field = _classify_ptr_field(off, value, ctx._normalize_code_pointer(bv, value))
+                    if field["kind"] == "unmapped":
+                        unresolved += 1
+                    record_fields.append(field)
+                cursor = off + ptr
+            else:
+                record_fields.append(_typed_field(ctx, bv, base, d))
+                cursor = off + d["width"]
+        if cursor < record_size:  # trailing undeclared gap
             record_fields.append(_scalar_field(ctx, bv, base + cursor, cursor, record_size - cursor))
         rows.append({"row": i, "base": hex(base), "fields": record_fields})
     warnings: list[str] = []
@@ -677,6 +765,8 @@ def _record_table_for_view(ctx, bv, start: int, *, entries: int, record_size: in
         "address": hex(start),
         "record_size": record_size,
         "ptr_fields": [hex(o) for o in fields_sorted],
+        "fields": [{"name": s["name"], "type": s.get("type"), "offset": hex(s["offset"])}
+                   for s in specs],
         "items": rows,
         "count": len(rows),
         "total": len(rows),
@@ -715,28 +805,35 @@ def _got_alias_target(ctx, bv, start: int, pointer_size: int):
 
 
 def _pointer_table(ctx, selector: str | None, address, *, entries: int = 16, stride=None,
-                   width=None, record_size=None, ptr_fields=None):
+                   width=None, record_size=None, ptr_fields=None, fields=None):
     if entries < 0:
         raise OperationFailure("invalid_entries", f"Invalid table entry count: {entries}")
     bv = ctx._resolve_view(selector)
     start = _parse_address(address)
     pointer_size = ctx._pointer_size(bv)
-    # #455: record-aware mode -- a mixed dispatch descriptor (scalar + pointer
-    # fields), not a pure pointer table. Declared here (before the GOT-alias /
+    # #455/#467: record-aware mode -- a mixed dispatch descriptor (scalar/string +
+    # pointer fields), not a pure pointer table. Declared here (before the GOT-alias /
     # stride handling) since it scans records, not a strided pointer run.
     if record_size not in (None, ""):
         rec_size = _parse_address(record_size)
         if rec_size <= 0:
             raise OperationFailure("invalid_record_size", f"Invalid record size: {rec_size}")
-        if not ptr_fields:
+        # #467: typed scalar / char[N] fields (name:type@off). A record may be
+        # scalar-only (zero pointer fields), so --ptr-fields is optional when --field
+        # is given.
+        specs = [_parse_field_spec(f) for f in (fields or [])]
+        if not ptr_fields and not specs:
             raise OperationFailure(
                 "invalid_ptr_fields",
-                "--record-size needs --ptr-fields: the byte offsets of the pointer field(s) "
-                "within each record, e.g. --record-size 0x18 --ptr-fields 0x8,0x10",
+                "--record-size needs --ptr-fields and/or --field: the pointer-field byte "
+                "offsets and/or typed scalar/char[N] fields within each record, e.g. "
+                "--record-size 0x18 --ptr-fields 0x8,0x10 or --field command:u32@0 "
+                "--field name:char[16]@8",
             )
-        offsets = [_parse_address(o) for o in ptr_fields]
+        offsets = [_parse_address(o) for o in (ptr_fields or [])]
         return _record_table_for_view(ctx, bv, start, entries=entries,
-                                      record_size=rec_size, ptr_fields=offsets)
+                                      record_size=rec_size, ptr_fields=offsets,
+                                      field_specs=specs)
     # A GOT/import-address slot is a pointer TO a table, not a table; walking it
     # would fabricate adjacent unrelated GOT entries as bogus slots (#313).
     # Refuse and point at the real table (*slot[0]) instead.

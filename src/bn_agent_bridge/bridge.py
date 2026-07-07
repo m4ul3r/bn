@@ -2630,6 +2630,7 @@ def _bind_pointer_table(bridge, params, target):
         width=params.get("width"),
         record_size=params.get("record_size"),
         ptr_fields=params.get("ptr_fields"),
+        fields=params.get("fields"),
     )
 
 
