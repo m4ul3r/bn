@@ -166,3 +166,32 @@ def test_builtin_catalog_covers_fortify_and_exec_sinks():
     # so retiring the name-regex net does not silently drop it from enumeration.
     src_syms = {s["symbol"] for s in build_catalog(models, role="source")["sources"]}
     assert "fscanf" in src_syms, "fscanf must be a modeled source"
+
+
+def test_build_catalog_surfaces_bounded_write_sink_443():
+    # #443: a bounded-write sink declares len_arg/buf_arg; the catalog surfaces them.
+    models = {"app_recv": {"sink": {"class": "overflow_len", "len_arg": 1, "buf_arg": 2,
+                                    "detail": "wrapped recv"}}}
+    cat = build_catalog(models, sink_class="overflow_len")
+    entry = cat["sinks_by_class"]["overflow_len"][0]
+    assert entry["symbol"] == "app_recv"
+    assert entry["len_arg"] == 1 and entry["buf_arg"] == 2
+
+
+def test_validate_bounded_write_sink_schema_443():
+    # #443: len_arg/buf_arg are validated as integer arg indices; a sink must be armed
+    # by tainted_args OR len_arg.
+    from bn_agent_bridge.taint_engine import _coerce_model_map, TaintError
+    ok = {"app_recv": {"sink": {"class": "overflow_len", "len_arg": 1, "buf_arg": 2}}}
+    _coerce_model_map(ok, source="test")  # no raise
+    # len_arg without buf_arg is valid (armed sink, no bounded downgrade).
+    _coerce_model_map({"g": {"sink": {"class": "overflow_len", "len_arg": 2}}}, source="test")
+    for bad in (
+        {"f": {"sink": {"class": "overflow_len", "len_arg": "x"}}},        # len_arg not int
+        {"f": {"sink": {"class": "overflow_len", "len_arg": 1, "buf_arg": "y"}}},  # buf_arg not int
+        {"f": {"sink": {"class": "overflow_len"}}},                        # nothing arms it
+        {"f": {"sink": {"class": "overflow_len", "len_arg": -1}}},         # negative (audit D1)
+        {"f": {"sink": {"class": "overflow_len", "len_arg": 1, "buf_arg": -2}}},  # negative buf_arg
+    ):
+        with pytest.raises(TaintError):
+            _coerce_model_map(bad, source="test")

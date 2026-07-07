@@ -151,6 +151,18 @@ def _validate_model_interior(name: str, model: dict[str, Any], source: str) -> N
         ta = sink.get("tainted_args")
         if ta is not None and not (isinstance(ta, list) and all(_is_int(i) for i in ta)):
             _fail("`sink.tainted_args` must be a list of integers")
+        # #443: a bounded-WRITE sink (a wrapped recv/read that writes len bytes into
+        # buf) is declared with `len_arg` (the attacker-controlled write length that
+        # arms the sink) and optionally `buf_arg` (the destination, for the
+        # provably-bounded downgrade). Both are argument indices.
+        la = sink.get("len_arg")
+        if la is not None and (not _is_int(la) or la < 0):
+            _fail("`sink.len_arg` must be a non-negative integer argument index")
+        ba = sink.get("buf_arg")
+        if ba is not None and (not _is_int(ba) or ba < 0):
+            _fail("`sink.buf_arg` must be a non-negative integer argument index")
+        if ta is None and la is None:
+            _fail("`sink` requires `tainted_args` or `len_arg` (nothing arms the sink)")
     for key in ("sources", "propagates"):
         if key in model:
             seq = model[key]
@@ -3644,7 +3656,13 @@ class TaintEngine:
             if sink is not None and sink.get("optional") and sink.get("class") not in self._enabled_sink_classes:
                 sink = None
             if sink is not None:
-                for argidx in sink.get("tainted_args", []) or []:
+                # #443: a bounded-write sink (wrapped recv/read) is armed by its
+                # `len_arg` -- an attacker-controlled write length -- in addition to
+                # any explicit `tainted_args`.
+                _sink_args = list(sink.get("tainted_args") or [])
+                if sink.get("len_arg") is not None and sink["len_arg"] not in _sink_args:
+                    _sink_args.append(int(sink["len_arg"]))
+                for argidx in _sink_args:
                     if argidx < len(params):
                         ht = arg_taint(params[argidx])
                         if ht:
@@ -3663,8 +3681,23 @@ class TaintEngine:
                                 # attacker-derived but the copy cannot overflow.
                                 # Still reported, just relabeled, so it's not noise
                                 # in the overflow set.
-                                _bnd_reason = (self._bounded_copy_reason(ssaf, params, argidx)
-                                               if sink.get("class") == "overflow_len" else None)
+                                # #443: for a recv-style bounded-write sink the
+                                # destination is `buf_arg` (not memcpy's arg0), so the
+                                # provably-bounded downgrade checks the right buffer.
+                                if argidx == sink.get("len_arg") and sink.get("buf_arg") is None:
+                                    # Armed by len_arg but NO buf_arg declared: do NOT
+                                    # guess arg0 as the destination -- arg0 may be a
+                                    # sibling buffer sized to the length while the real
+                                    # write dest is a different, smaller arg, which would
+                                    # wrongly downgrade a real overflow to bounded_len
+                                    # (audit D2). No declared dest => no bounded downgrade.
+                                    _bnd_reason = None
+                                else:
+                                    _dest_idx = (int(sink["buf_arg"])
+                                                 if (sink.get("buf_arg") is not None
+                                                     and argidx == sink.get("len_arg")) else 0)
+                                    _bnd_reason = (self._bounded_copy_reason(ssaf, params, argidx, dest_idx=_dest_idx)
+                                                   if sink.get("class") == "overflow_len" else None)
                                 if _bnd_reason is not None:
                                     eff_sink = {
                                         **sink,
