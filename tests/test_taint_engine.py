@@ -4111,6 +4111,49 @@ def test_forward_recvmsg_unresolved_iovec_nudges_306(models):
         result.get("assumptions")
 
 
+def _recvmsg_out_param_func():
+    # recv_body(fd, dst, len): iov.iov_base = dst where `dst` is a PARAMETER -- a
+    # receive helper whose CALLER owns the destination buffer. recvmsg fills the
+    # caller's out-buffer; nothing in this function consumes it (#452).
+    fd = FVar("fd", ident=1); dst = FVar("dst", ident=2); ln = FVar("len", ident=3)
+    dst0 = FSSA(dst, 0)
+    iov = FVar("iov"); iov1 = FSSA(iov, 1)
+    msg = FVar("msg"); msg1 = FSSA(msg, 1)
+    rsi = FVar("rsi"); rsi1 = FSSA(rsi, 1)
+    rax = FVar("rax"); rax1 = FSSA(rax, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_ALIASED_FIELD", "iov.iov_base = dst#0",
+               writes=[iov1], reads=[dst0], offset=0, dest=iov1,
+               src=FExpr("MLIL_VAR_SSA", "dst#0", reads=[dst0])),
+        FInstr(1, 0x14, "MLIL_SET_VAR_ALIASED_FIELD", "msg.msg_iov = &iov",
+               writes=[msg1], offset=0x10, dest=msg1,
+               src=FExpr("MLIL_ADDRESS_OF", "&iov", src=iov)),
+        FInstr(2, 0x18, "MLIL_SET_VAR_SSA", "rsi#1 = &msg", writes=[rsi1],
+               src=FExpr("MLIL_ADDRESS_OF", "&msg", src=msg)),
+        FInstr(3, 0x1c, "MLIL_CALL_SSA", "rax#1 = recvmsg(fd, &msg, 0)",
+               reads=[rsi1], writes=[rax1],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[FSSA(fd, 0)]),
+                       FExpr("MLIL_VAR_SSA", "rsi#1", reads=[rsi1]),
+                       FExpr("MLIL_CONST", "0", constant=0)]),
+    ]
+    return FFunc("recv_body", 0x10, FSSAFunc(instrs), params=[fd, dst, ln])
+
+
+def test_forward_recvmsg_out_param_buffer_discloses_452(models):
+    # #452: when the recvmsg iovec buffer resolves to a function PARAMETER (a receive
+    # helper whose caller owns the buffer), the payload lands in the caller's buffer
+    # and nothing here consumes it. Instead of a bare "no taint reached", disclose the
+    # out-param so an agent knows to re-run taint from the caller.
+    func = _recvmsg_out_param_func()
+    bv = FBV({0x900: "recvmsg"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("call:recvmsg")])
+    assert result["reached_sinks"] == []
+    assert any("recvmsg_out_param" in a and "param:1" in a for a in result["assumptions"]), \
+        result.get("assumptions")
+
+
 def test_forward_recvmsg_reordered_iov_uses_address_order_306():
     # Block-reordered iovec setup (openvpn link_socket_read_udp_posix shape): the
     # real `iov.iov_base = buf` store has a HIGHER MLIL index than the recvmsg call
