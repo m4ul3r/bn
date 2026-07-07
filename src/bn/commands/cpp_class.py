@@ -19,7 +19,10 @@ from ..formatters import _render_class_list_text, _render_class_show_text
                    help="Hide standard-library / ABI-runtime classes (std::, __gnu_cxx::, __cxxabiv1::, reserved-id internals) so domain classes surface"),
                arg("--no-vendor", action="store_true", default=False, dest="no_vendor",
                    help="Hide vendored/in-tree library classes (boost::) the same way --no-stl folds std"),
-               arg("--query", help="Filter classes by name substring")])
+               arg("--query", help="Filter classes by name substring"),
+               arg("--count", action="store_true", default=False, dest="count_only",
+                   help="Return just the class count (respects --no-stl/--no-vendor/--query/"
+                        "--all), plus artifact_count -- fast class-lens scale characterization")])
 def _class_list(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {"offset": args.offset}
     if args.query:
@@ -30,6 +33,8 @@ def _class_list(args: argparse.Namespace) -> int:
         params["no_stl"] = True
     if args.no_vendor:
         params["no_vendor"] = True
+    if args.count_only:
+        params["count_only"] = True
     limit = _effective_limit(args)
     if limit is not None:
         params["limit"] = limit

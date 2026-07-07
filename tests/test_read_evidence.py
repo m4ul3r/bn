@@ -1448,3 +1448,35 @@ def test_cpp_method_this_caveat_482(monkeypatch):
     free_fn = _FakeFunction(0x401200, "plain_handler")
     free_fn.parameter_vars = [_FakeVariable(name="arg1", storage=0, var_type="int32_t", identifier=1)]
     assert caveat(free_fn, "*(uint64_t*)(arg1 + 8)") is None   # no '::' -> not a method
+
+
+def test_function_evidence_slicing_471(monkeypatch):
+    # #471: --offset/--limit/--address-window slice the call-evidence set so a large
+    # dispatch function can be inspected in bounded chunks. Monkeypatch the call
+    # builder with a synthetic 5-call set to test the slicing deterministically.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_calls = [{"address": hex(0x402000 + i * 0x10), "callee": f"c{i}"} for i in range(5)]
+    monkeypatch.setattr(bridge.read_evidence, "_function_call_evidence",
+                        lambda ctx, bv, func, context: [dict(c) for c in fake_calls])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda sel: _FakeBV(functions=[_FakeFunction(0x402000, "dispatch")]))
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda bv, ident: _FakeFunction(0x402000, "dispatch"))
+    monkeypatch.setattr(bridge.il_format, "_decompile_text", lambda bv, f: "")
+    monkeypatch.setattr(bridge.il_format, "_render_warnings", lambda t: [])
+    monkeypatch.setattr(bridge.il_format, "_function_metadata", lambda f: {})
+
+    full = instance._function_evidence("active", "dispatch", context=1)
+    assert full["total_calls"] == 5 and full["returned"] == 5 and full["has_more"] is False
+
+    page = instance._function_evidence("active", "dispatch", context=1, offset=1, limit=2)
+    assert [c["callee"] for c in page["calls"]] == ["c1", "c2"]
+    assert page["returned"] == 2 and page["matched_calls"] == 5 and page["has_more"] is True
+
+    win = instance._function_evidence("active", "dispatch", context=1,
+                                      address_window=(0x402010, 0x402030))
+    assert [c["callee"] for c in win["calls"]] == ["c1", "c2"]   # 0x402010, 0x402020
+    assert win["matched_calls"] == 2 and win["total_calls"] == 5
+
+    # invalid slicing args are clean errors
+    with pytest.raises(bridge.OperationFailure):
+        instance._function_evidence("active", "dispatch", limit=0)

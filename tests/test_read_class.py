@@ -1047,3 +1047,66 @@ def test_render_class_list_text_shows_suppression_counts_309():
     assert "1 thunk" in out
     assert "3 library/STL" in out
     assert "1 vendored" in out
+
+
+def test_class_list_count_only_484():
+    # #484: --count returns just the class count (respecting filters), plus the
+    # non-class artifact_count, without building/paging rows.
+    bv = _make_registry_bv()
+
+    class _Ctx:
+        def _resolve_view(self, sel):
+            return bv
+
+    out = read_class._class_list(_Ctx(), None, include_all=True, count_only=True)
+    assert out["kind"] == "classes"
+    assert "items" not in out and "count" in out
+    full = read_class._class_list(_Ctx(), None, include_all=True)
+    assert out["count"] == full["total"]                 # count matches the full listing
+    assert out["total"] == full["total"]
+    assert "artifact_count" in out and out["artifact_count"] >= 0
+
+
+def test_class_list_labels_non_class_rtti_artifacts_481():
+    # #481: an RTTI-confidence row with no methods and no vtable (typeinfo emitted
+    # for a NON-object type -- a function signature / fundamental type) is tagged
+    # `artifact`; a real class (vtable and/or clustered methods) is not.
+    fns = [_Fn(0x1000, "_ZN3net7SessionC1Ev", "net::Session::Session()")]  # real class
+    syms = [
+        _Sym("_ZTVN3net7SessionE", "vtable for net::Session", 0x9000),
+        _Sym("_ZTIN3net7SessionE", "typeinfo for net::Session", 0x9100),
+        # typeinfo for a function type -> a pseudo-class with no vtable, no methods.
+        _Sym("_ZTIFvhE", "typeinfo for void (unsigned char)", 0x9300),
+    ]
+    bv = _RegistryBV(fns, syms)
+
+    class _Ctx:
+        def _resolve_view(self, sel):
+            return bv
+
+    rows = {r["name"]: r for r in read_class._class_list(_Ctx(), None, include_all=True)["items"]}
+    assert rows["net::Session"]["artifact"] is False           # real class (ctor + vtable)
+    artifacts = [r for r in rows.values() if r["artifact"]]
+    assert artifacts                                            # the function-type typeinfo row
+    for r in artifacts:
+        assert r["has_vtable"] is False and r["method_count"] == 0 and r["confidence"] == "rtti"
+
+
+def test_is_type_expression_name_481():
+    # #481: distinguish a non-class TYPE-EXPRESSION typeinfo from a real class name,
+    # incl. the anonymous-namespace / template cases that key-on-missing-vtable got
+    # wrong (they tagged real classes as artifacts).
+    f = read_class._is_type_expression_name
+    # non-class type expressions -> artifact
+    assert f("void (unsigned char)")          # function type
+    assert f("char const*")                    # pointer
+    assert f("Foo&")                           # reference
+    assert f("int [4]")                        # array
+    assert f("unsigned int")                   # multi-token fundamental
+    assert f("int")                            # bare fundamental
+    # real classes -> NOT artifacts (the libstdc++ false-positive class)
+    assert not f("(anonymous namespace)::future_error_category")
+    assert not f("net::Session")
+    assert not f("std::vector<int>")           # template args stripped
+    assert not f("std::__cxx11::basic_string<char, std::char_traits<char> >")
+    assert not f("Outer<Foo, Bar>::Inner")     # template with comma inside <>
