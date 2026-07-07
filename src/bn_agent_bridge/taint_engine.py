@@ -4575,12 +4575,16 @@ class TaintEngine:
                             # all-clear, the worst failure mode. Covers both the
                             # no-buffers and the buffers-but-nothing-seeded cases.
                             if not iov_seeded:
+                                _ca = hex(int(getattr(c, "address", 0)))
                                 add_assumption(
-                                    f"{callee} fills the scatter-gather buffer(s) at "
-                                    f"msghdr->msg_iov[i].iov_base, but the iovec setup at this "
-                                    f"callsite could not be statically resolved; the payload taint "
-                                    f"is NOT followed -- seed the filled buffer directly "
-                                    f"(--source var:<buf>)")
+                                    f"recvmsg_iovec_unresolved @ {_ca}: {callee} fills the "
+                                    f"scatter-gather buffer(s) at msghdr->msg_iov[i].iov_base, but "
+                                    f"the iovec setup (msg_iov -> iov_base) at this callsite could "
+                                    f"not be statically resolved -- likely a dynamically-built "
+                                    f"iovec or a receive-helper whose caller passes the out-buffer "
+                                    f"(#452). The payload taint is NOT followed from here; seed the "
+                                    f"filled buffer directly (--source var:<buf>) or, for a helper, "
+                                    f"seed the buffer the caller passes in.")
                         elif to.startswith("*arg:"):
                             idx = _try_arg_index(to)
                             if idx is not None and idx < len(params):
