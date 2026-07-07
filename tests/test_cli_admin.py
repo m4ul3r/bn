@@ -81,17 +81,6 @@ def test_skill_install_copy_mode(tmp_path):
     assert (destination / "bn-vr" / "SKILL.md").exists()
 
 
-def test_skill_install_copy_mode_orient_script_executable(tmp_path):
-    # #169 L3 / #504: a real copy-mode install ships bn-re/scripts/orient.sh and it is
-    # executable at the destination (copytree preserves the committed bit, and
-    # _ensure_scripts_executable restores it if the source ever loses it).
-    destination = tmp_path / "skill-copy"
-    assert bn.cli.main(["skill", "install", "--mode", "copy", "--dest", str(destination)]) == 0
-    orient = destination / "bn-re" / "scripts" / "orient.sh"
-    assert orient.exists(), "orient.sh should install with the bn-re skill"
-    assert orient.stat().st_mode & 0o111, "installed orient.sh must be executable"
-
-
 def test_skill_install_defaults_to_claude_only_without_codex_home(tmp_path, monkeypatch):
     claude_root = tmp_path / "claude" / "skills"
     codex_home = tmp_path / "codex"
@@ -1416,24 +1405,3 @@ def test_instance_find_across_multiple_instances_and_old_bridge(monkeypatch, cap
     data = json.loads(capsys.readouterr().out)
     assert {i["instance_id"] for i in data["items"]} == {"inst_a", "inst_b"}
     assert data["count"] == 2
-
-
-def test_ensure_scripts_executable_sets_bit_directly(tmp_path):
-    # #169 L3 (review): prove the helper's own job -- copytree preserves the
-    # committed +x bit, so test_skill_install_copy_mode would pass even without the
-    # helper. This drives it directly on a non-exec script.
-    from bn.commands import admin
-    dest = tmp_path / "skill"
-    scripts = dest / "scripts"
-    scripts.mkdir(parents=True)
-    s = scripts / "foo.sh"
-    s.write_text("#!/usr/bin/env bash\necho hi\n")
-    s.chmod(0o644)
-    assert not (s.stat().st_mode & 0o111)
-    admin._ensure_scripts_executable(dest)
-    assert s.stat().st_mode & 0o111                    # helper added the bit
-    # no-ops: a non-.sh file is untouched, a missing scripts/ dir doesn't crash
-    (scripts / "data.txt").write_text("x"); (scripts / "data.txt").chmod(0o644)
-    admin._ensure_scripts_executable(dest)
-    assert not ((scripts / "data.txt").stat().st_mode & 0o111)
-    admin._ensure_scripts_executable(tmp_path / "absent")   # no scripts/ -> no-op

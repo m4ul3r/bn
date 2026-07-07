@@ -247,11 +247,6 @@ def _skill_install(args: argparse.Namespace) -> int:
 
     for source, dest in pending_installs:
         _install_tree(source, dest, mode=args.mode, force=args.force)
-        # Copy-mode installs lose the source executable bit; restore it on any
-        # skill `scripts/*.sh` so methodology scripts are runnable (#169 L3).
-        # Symlink mode follows the source file's bit, so it needs nothing here.
-        if args.mode == "copy":
-            _ensure_scripts_executable(dest)
 
     result = {
         "installed": True,
@@ -262,20 +257,6 @@ def _skill_install(args: argparse.Namespace) -> int:
     }
     cli._emit_result(args, result, text_renderer=_render_skill_install_text, stem="skill-install")
     return 0
-
-
-def _ensure_scripts_executable(dest: Path) -> None:
-    """Set the executable bit (u+g+o x, preserving existing perms) on a freshly
-    copy-installed skill's ``scripts/*.sh`` so the agent can `bash`/run them.
-    Best-effort: a chmod failure must not fail the install (#169 Layer 3)."""
-    scripts_dir = dest / "scripts"
-    if not scripts_dir.is_dir():
-        return
-    for script in sorted(scripts_dir.glob("*.sh")):
-        try:
-            script.chmod(script.stat().st_mode | 0o111)
-        except OSError:
-            pass
 
 
 def _default_skill_install_roots() -> list[Path]:
