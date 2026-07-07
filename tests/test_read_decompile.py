@@ -2095,6 +2095,29 @@ def test_backward_slice_out_of_range_notes_stack_passed_varargs_324(monkeypatch)
     assert "STACK" not in msg3 and "register-passed arg BN dropped" not in msg3
 
 
+def test_backward_slice_out_of_range_stack_note_fires_on_i386_cdecl_324(monkeypatch):
+    # #324: on a pure stack-argument ABI (i386 cdecl, int_arg_regs=[]) EVERY
+    # out-of-range arg is stack-passed. Previously an empty int_arg_regs collapsed to
+    # a None reg-count and the STACK caveat was silently suppressed -- the exact
+    # pure-stack-ABI case the ticket names. It must now fire.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    call_insn = _FakeMLILInsn(
+        0x10010, operation="MLIL_CALL_SSA",
+        params=[_FakeMLILInsn(0x10010, operation="MLIL_VAR_SSA")])
+    fn = _FakeFunction(0x10000, "cdecl_caller")
+    fn.medium_level_il = _FakeMLILFunction(instructions=[call_insn])
+    fn.calling_convention = type("CC", (), {"int_arg_regs": []})()  # pure stack ABI
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._backward_slice("active", "cdecl_caller", "0x10010", arg_index=3)
+    msg = str(exc.value)
+    assert "STACK" in msg and "#324" in msg
+    assert "cdecl" in msg  # names the pure-stack-ABI case explicitly
+
+
 def test_callgraph_result_carries_kind_envelope(monkeypatch):
     """dataflow callgraph JSON must carry kind:'callgraph' so a consumer of the
     {kind, ...} family can identify it, instead of a bare {function, callees,

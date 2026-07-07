@@ -4758,13 +4758,46 @@ def test_arg_under_recovered_leaf_gate_rejects(models, monkeypatch):
     assert engine._arg_under_recovered_leaf(ins, callee, [1], 1) is None
 
 
-def test_arg_under_recovered_leaf_skips_stack_passed(models, monkeypatch):
-    # dropped index beyond the register slots (i386 stack-passed) is out of scope
+def test_arg_under_recovered_leaf_discloses_stack_passed(models, monkeypatch):
+    # #324: a dropped index beyond the register slots (stack-passed vararg) is now
+    # DISCLOSED -- confirmed by the caller-side recovery that placed it in `dropped`,
+    # so the tainted stack arg no longer vanishes silently. It carries a distinct
+    # stack_dropped_args field and a variadic proto-set remedy.
     monkeypatch.setattr(te.TaintEngine, "_reg_reads_as_input", lambda self, c, r: True)
     engine = te.TaintEngine(FBV({}), models)
-    callee = _fake_under_recovered_callee("helper", 0x3000, ["rdi", "rsi"])  # 2 arg regs
+    callee = _fake_under_recovered_callee("logger", 0x3000, ["rdi", "rsi"])  # 2 arg regs
     ins = types.SimpleNamespace(address=0x40130a)
-    assert engine._arg_under_recovered_leaf(ins, callee, [6], 6) is None
+    leaf = engine._arg_under_recovered_leaf(ins, callee, [6], 2)
+    assert leaf is not None
+    assert leaf["kind"] == "arg_under_recovered"
+    assert leaf["dropped_args"] == [6]
+    assert leaf["stack_dropped_args"] == [6]
+    assert "STACK-passed" in leaf["note"]
+    assert "..." in leaf["note"]  # variadic prototype hint
+
+
+def test_arg_under_recovered_leaf_i386_pure_stack_stays_silent(models, monkeypatch):
+    # #324 FP audit: on a pure stack ABI (i386 cdecl, int_arg_regs=[]) the register-
+    # style "does the callee read it" gate cannot apply to ANY index, so the stack
+    # disclosure would be entirely unverified. Stay silent there (BN also clamps i386
+    # direct calls to callee arity, so a real drop rarely reaches here) rather than
+    # emit an unverifiable frontier -- the trace `--arg` caveat still covers i386.
+    engine = te.TaintEngine(FBV({}), models)
+    callee = _fake_under_recovered_callee("cdecl_log", 0x3000, [])  # pure stack ABI
+    ins = types.SimpleNamespace(address=0x40130a)
+    assert engine._arg_under_recovered_leaf(ins, callee, [1, 2], 1) is None
+
+
+def test_arg_under_recovered_leaf_mixed_reg_and_stack(models, monkeypatch):
+    # A drop spanning both a register slot and a stack slot discloses both, gating
+    # the register one through _reg_reads_as_input.
+    monkeypatch.setattr(te.TaintEngine, "_reg_reads_as_input", lambda self, c, r: True)
+    engine = te.TaintEngine(FBV({}), models)
+    callee = _fake_under_recovered_callee("mix", 0x3000, ["rdi", "rsi"])  # 2 arg regs
+    ins = types.SimpleNamespace(address=0x40130a)
+    leaf = engine._arg_under_recovered_leaf(ins, callee, [1, 3], 1)
+    assert leaf["dropped_args"] == [1, 3]       # both disclosed
+    assert leaf["stack_dropped_args"] == [3]    # index 3 is stack (>= 2 regs)
 
 
 def _partial_drop_program():
