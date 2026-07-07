@@ -122,7 +122,11 @@ def _save(args: argparse.Namespace) -> int:
     )
 
 
-@command("refresh", help="Refresh analysis for the selected target", target=True)
+@command("refresh",
+         help="Run full analysis on the selected target (e.g. after a --quick load). "
+              "On a large target this can take minutes; reads stay responsive meanwhile, "
+              "so poll `bn target info` on another connection to watch analysis_progress.",
+         target=True)
 def _refresh(args: argparse.Namespace) -> int:
     return _call(
         args,

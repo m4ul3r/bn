@@ -22,7 +22,10 @@ EXPECTED_WRITE = {
     "py_exec", "function_create", "rename_symbol", "set_comment", "delete_comment",
     "set_prototype", "local_rename", "local_retype", "struct_field_set",
     "struct_field_rename", "struct_field_delete", "types_declare", "batch_apply",
-    "refresh", "close_binary", "save_database",
+    "close_binary", "save_database",
+    # NB: "refresh" is intentionally NOT here -- #321 made it lock="none" so it
+    # self-manages locking (analysis runs under the write GATE only, leaving reads
+    # responsive), mirroring load_binary. See the self-managed set below.
 }
 
 
@@ -61,6 +64,10 @@ def test_self_managed_ops_are_unlocked(bridge):
     assert "go_rename" not in bridge.WRITE_LOCKED_OPS
     assert "shutdown" not in bridge.READ_LOCKED_OPS
     assert "shutdown" not in bridge.WRITE_LOCKED_OPS
+    # #321: refresh self-manages locking (write gate around analysis, not the
+    # exclusive target lock) so reads stay responsive during a long analysis.
+    assert "refresh" not in bridge.READ_LOCKED_OPS
+    assert "refresh" not in bridge.WRITE_LOCKED_OPS
 
 
 def test_op_decorator_registers_and_derives_locks(op_registry):
@@ -109,7 +116,7 @@ def test_escalation_is_stored(op_registry):
 def test_registry_covers_every_dispatch_op(op_registry):
     REGISTRY = op_registry.REGISTRY
     expected = EXPECTED_READ | EXPECTED_WRITE | {
-        "cancel_request", "load_binary", "go_rename", "shutdown",
+        "cancel_request", "load_binary", "go_rename", "shutdown", "refresh",
     }
     assert REGISTRY.names() == expected
 

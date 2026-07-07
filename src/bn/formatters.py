@@ -592,6 +592,15 @@ def _render_target_summary(value: dict[str, Any]) -> str:
     for key, item in details:
         if item not in (None, ""):
             lines.append(f"\t{key}: {item}")
+    # Live analysis phase/counts while a long `bn refresh` runs (#321) -- shown only
+    # when analysis is actively progressing (total > 0), so a text user can watch a
+    # large-target analysis on another connection instead of guessing it's wedged.
+    prog = value.get("analysis_progress")
+    if isinstance(prog, dict) and prog.get("total"):
+        lines.append(
+            f"\tanalysis progress: {prog.get('state') or '?'} "
+            f"{prog.get('count')}/{prog.get('total')}"
+        )
     # Function-count + named-vs-auto-named summary that every agent reaches for
     # first (#122). Counts reflect the current analysis state (a --quick view
     # reports what it has so far; analysis_state already flags that).

@@ -67,6 +67,54 @@ def test_refresh_updates_analysis_and_returns_target_info(monkeypatch):
     assert "refresh" in bv.events
 
 
+def test_refresh_does_not_hold_target_lock_during_analysis(monkeypatch):
+    """#321: refresh must run the (long) analysis holding only the write gate, NOT
+    the exclusive target lock, so concurrent reads stay responsive and an agent can
+    poll progress. Verify a reader can take the read lock while
+    update_analysis_and_wait() runs -- if refresh held the write lock this would
+    block."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    reader_got_lock = {"v": False}
+
+    class _AnalysisBV(_FakeMutationBV):
+        def update_analysis_and_wait(self):
+            super().update_analysis_and_wait()
+
+            def reader():
+                with instance._target_lock.read():
+                    reader_got_lock["v"] = True
+
+            t = threading.Thread(target=reader)
+            t.start()
+            t.join(timeout=2.0)  # bounded so a regression fails instead of hanging
+
+    bv = _AnalysisBV()
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance, "_target_info", lambda selector: {})
+
+    instance._refresh("active")
+
+    assert reader_got_lock["v"] is True  # read lock was grantable mid-analysis
+
+
+def test_target_info_surfaces_analysis_progress(monkeypatch):
+    """#321: target info exposes pollable analysis phase/counts so a large-target
+    analysis can be watched instead of guessing whether the bridge is wedged."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+    bv.analysis_progress = types.SimpleNamespace(
+        state=types.SimpleNamespace(name="AnalyzeState"), count=1112, total=1939
+    )
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+
+    info = instance._target_info("active")
+
+    assert info["analysis_progress"] == {"state": "AnalyzeState", "count": 1112, "total": 1939}
+
+
 def test_validate_count_enforces_minimum(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     # count flags require >= 1
