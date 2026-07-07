@@ -1453,6 +1453,31 @@ def _render_call_descriptors_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+def _render_virtual_call_text(value: Any) -> str:
+    """#466: resolve an imported virtual call to provider vtable method(s)."""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    factory = value.get("factory") or "<unresolved factory>"
+    head = (f"virtual call @ {value.get('callsite', '?')} in {value.get('caller', '?')}: "
+            f"vtable slot {value.get('slot_offset', '?')} (index {value.get('slot_index', '?')}), "
+            f"object from {factory}")
+    lines = [head]
+    cands = list(value.get("candidates") or [])
+    if not cands:
+        lines.append("  no provider class implements this slot "
+                     "(check --providers, or the slot is beyond the recovered vtable)")
+        return "\n".join(lines)
+    if value.get("ambiguous"):
+        lines.append(f"  AMBIGUOUS: {len(cands)} provider classes implement slot "
+                     f"{value.get('slot_offset', '?')}")
+    for c in cands:
+        method = c.get("method") or "<unnamed>"
+        entry = c.get("vtable_entry") or "?"
+        lines.append(f"  {c.get('class', '?')}  ->  {method}"
+                     f"   [{c.get('provider', '?')} vtable {c.get('vtable', '?')} @ {entry}]")
+    return "\n".join(lines)
+
+
 def _render_record_table_text(value: Any) -> str:
     """#455: render a mixed-record dispatch table -- one block per record, each
     field labeled fn / data / scalar / null so a scalar isn't read as a bad slot."""

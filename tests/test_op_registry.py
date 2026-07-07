@@ -14,7 +14,7 @@ EXPECTED_READ = {
     "list_functions", "list_locals", "search_functions", "callsites", "decompile",
     "il", "structured_il", "defuse", "resolved_calls", "possible_values", "taint", "taint_models",
     "disasm", "function_evidence", "xrefs", "xrefs_any", "field_xrefs", "pointer_table",
-    "call_descriptors", "hidden_surface",
+    "call_descriptors", "hidden_surface", "resolve_virtual_call",
     "message_lens", "init_arrays", "backward_slice", "types", "type_info",
     "strings", "imports", "list_exports", "bundle_function", "get_comment", "list_comments",
     "sections", "read", "class_list", "class_show", "go_functions", "orient_digest",

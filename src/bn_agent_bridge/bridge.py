@@ -1776,6 +1776,9 @@ class BinaryNinjaBridge:
     def _call_descriptor_evidence(self, *a, **k):
         return read_evidence._call_descriptor_evidence(self.ctx, *a, **k)
 
+    def _resolve_virtual_call(self, *a, **k):
+        return read_evidence._resolve_virtual_call(self.ctx, *a, **k)
+
     def _hidden_surface(self, *a, **k):
         return read_evidence._hidden_surface(self.ctx, *a, **k)
 
@@ -2660,6 +2663,15 @@ def _bind_call_descriptors(bridge, params, target):
         params["identifier"],
         arg_index=int(params.get("arg_index", 0)),
         field_specs=params.get("fields"),
+    )
+
+
+@op("resolve_virtual_call", lock="read")
+def _bind_resolve_virtual_call(bridge, params, target):
+    return bridge._resolve_virtual_call(
+        target,
+        params["at"],
+        providers=params.get("providers"),
     )
 
 

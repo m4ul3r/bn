@@ -1863,3 +1863,53 @@ def test_hidden_surface_x86_warns_decode_depth_weak_503(monkeypatch):
     out = re._hidden_surface(_Ctx(), None)
     assert out["summary"]["missing_function_candidates"] == 2
     assert any("variable-length ISA" in w and "code_likely" in w for w in out["warnings"])
+
+
+# --- #466 cross-target virtual-call slot extraction --------------------------
+
+def _vc_expr(opname, **kw):
+    return types.SimpleNamespace(operation=types.SimpleNamespace(name=opname), **kw)
+
+
+def _vc_var_expr(name, ident):
+    var = types.SimpleNamespace(identifier=ident, name=name)
+    return _vc_expr("MLIL_VAR", src=var), var
+
+
+def test_virtual_call_slot_extraction_offset_466(monkeypatch):
+    """#466: `[vtable + 0x18](...)` -> slot offset 0x18 extracted from the call's
+    LOAD dest. The factory trace is best-effort (None with no def context here)."""
+    bridge = _load_bridge(monkeypatch)
+    re_mod = bridge.read_evidence
+    base_expr, _ = _vc_var_expr("rax_1", 1)
+    add = _vc_expr("MLIL_ADD", left=base_expr,
+                   right=_vc_expr("MLIL_CONST", constant=0x18))
+    dest = _vc_expr("MLIL_LOAD", src=add)
+    call = _vc_expr("MLIL_CALL", dest=dest, output=[], address=0x40115d)
+    caller = types.SimpleNamespace(mlil=types.SimpleNamespace(instructions=[call]), view=None)
+    off, factory = re_mod._vc_slot_and_factory(caller, call, 8)
+    assert off == 0x18
+    assert factory is None
+
+
+def test_virtual_call_slot_extraction_slot0_466(monkeypatch):
+    """#466: `[vtable](...)` (slot 0, no offset) -> slot offset 0."""
+    bridge = _load_bridge(monkeypatch)
+    re_mod = bridge.read_evidence
+    base_expr, _ = _vc_var_expr("rax_1", 1)
+    dest = _vc_expr("MLIL_LOAD", src=base_expr)
+    call = _vc_expr("MLIL_CALL", dest=dest, output=[], address=0x1000)
+    caller = types.SimpleNamespace(mlil=types.SimpleNamespace(instructions=[call]), view=None)
+    off, _ = re_mod._vc_slot_and_factory(caller, call, 8)
+    assert off == 0
+
+
+def test_virtual_call_not_vtable_dispatch_466(monkeypatch):
+    """#466: a direct call (dest is a CONST_PTR, not a LOAD) has no vtable slot ->
+    the extractor returns None so the handler reports not_virtual."""
+    bridge = _load_bridge(monkeypatch)
+    re_mod = bridge.read_evidence
+    call = _vc_expr("MLIL_CALL", dest=_vc_expr("MLIL_CONST_PTR", constant=0x401050),
+                    output=[], address=0x1000)
+    caller = types.SimpleNamespace(mlil=types.SimpleNamespace(instructions=[call]), view=None)
+    assert re_mod._vc_slot_and_factory(caller, call, 8) is None
