@@ -1399,6 +1399,45 @@ def test_hlil_statement_null_when_no_folded_root_matches_475(monkeypatch):
     assert il_format._hlil_statement_text(insn) is None
 
 
+def test_hlil_statement_recovers_enclosing_stmt_for_nested_cast_call_490(monkeypatch):
+    """#490: for `outer(cast(inner()))` the INNER call's only non-trivial ancestor is
+    the outer call across a trivial width cast (sx.q/zx.q). #475 correctly stopped
+    attaching a NEIGHBOR call's statement, but over-nulled this shape. After the #475
+    address filter every ancestor of the matched root provably CONTAINS this call, so
+    the enclosing statement must be returned, not None. Public repro:
+    `char *str = itos(getpid());` -> the getpid() callsite renders the assignment."""
+    bridge = _load_bridge(monkeypatch)
+    il_format = bridge.il_format
+    stmt = _FakeHLILInstruction("str = itos(sx.q(getpid()))", class_name="HighLevelILVarInit",
+                                parent=None, address=0xA, expr_index=10, instr_index=10)
+    itos_call = _FakeHLILInstruction("itos(sx.q(getpid()))", class_name="HighLevelILCall",
+                                     parent=stmt, address=0xA, expr_index=11, instr_index=11)
+    cast = _FakeHLILInstruction("sx.q(getpid())", class_name="HighLevelILSx",
+                                parent=itos_call, address=0xA, expr_index=12, instr_index=12)
+    getpid_call = _FakeHLILInstruction("getpid()", class_name="HighLevelILCall",
+                                       parent=cast, address=0xA, expr_index=13, instr_index=13)
+    insn = _FakeLLILInstruction(0xA, _FakeConstPtr(0x1000), hlils=[getpid_call])
+    assert il_format._hlil_statement_text(insn) == "str = itos(sx.q(getpid()))"
+
+
+def test_hlil_statement_recovers_outer_call_for_bare_nested_call_490(monkeypatch):
+    """#490: `foo(bar(inner()))` as a bare expression statement -- the enclosing
+    statement is the outermost call, which contains the inner call. Walk through the
+    folded ancestor calls to it rather than nulling."""
+    bridge = _load_bridge(monkeypatch)
+    il_format = bridge.il_format
+    block = _FakeHLILInstruction("{...}", class_name="HighLevelILBlock",
+                                 parent=None, address=0xA, expr_index=9, instr_index=9)
+    outer = _FakeHLILInstruction("foo(bar(getpid()))", class_name="HighLevelILCall",
+                                 parent=block, address=0xA, expr_index=10, instr_index=10)
+    bar = _FakeHLILInstruction("bar(getpid())", class_name="HighLevelILCall",
+                               parent=outer, address=0xA, expr_index=11, instr_index=11)
+    getpid_call = _FakeHLILInstruction("getpid()", class_name="HighLevelILCall",
+                                       parent=bar, address=0xA, expr_index=12, instr_index=12)
+    insn = _FakeLLILInstruction(0xA, _FakeConstPtr(0x1000), hlils=[getpid_call])
+    assert il_format._hlil_statement_text(insn) == "foo(bar(getpid()))"
+
+
 def test_call_arguments_candidates_scoped_to_callsite_476(monkeypatch):
     """#476: a folded NEIGHBOR call's HLIL args must not leak into THIS call's
     candidate list (the primary vector; the mapped-MLIL under-recovery vector is
