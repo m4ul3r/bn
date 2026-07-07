@@ -3226,29 +3226,45 @@ class TaintEngine:
                                   n_params: int) -> dict[str, Any] | None:
         """Disclose a PARTIAL arg drop: taint DID descend into *callee_fn*, but some
         tainted arg indices sit beyond its recovered arity (BN under-recovered the
-        callee's signature), so those flows were dropped. Gated by
-        ``_reg_reads_as_input`` -- only args the callee actually consumes -- so it
-        never cries wolf on a leftover value. Register-passed only; stack-passed
-        indices (i386 varargs, #324) are skipped. Returns a leaf or None; degrades
-        to None on any BN-API shortfall so it never fabricates a frontier."""
+        callee's signature), so those flows were dropped. Returns a leaf or None;
+        degrades to None on any BN-API shortfall so it never fabricates a frontier.
+
+        Two confirmation paths:
+        - Register-passed indices are gated by ``_reg_reads_as_input`` (only args the
+          callee actually consumes), so a leftover register value never cries wolf.
+        - Stack-passed indices (i386 cdecl / MIPS-o32 / x86-64 varargs, #324) are
+          confirmed by the caller-side recovery that placed them in ``dropped``: a
+          store to the outgoing-argument stack slot is a deliberate argument, so the
+          taint into it is disclosed rather than silently dropped (previously these
+          were skipped, the "emit a truncation frontier" half of #324)."""
         try:
             cc = (getattr(callee_fn, "calling_convention", None)
                   or self.bv.platform.default_calling_convention)
             arg_regs = list(getattr(cc, "int_arg_regs", []) or [])
         except Exception:
             return None
-        confirmed: list[int] = []
+        reg_confirmed: list[int] = []
+        stack_confirmed: list[int] = []
         for i in sorted(dropped):
             if i >= len(arg_regs):
-                continue  # stack-passed -- out of scope (#324)
+                stack_confirmed.append(i)  # stack-passed: caller-confirmed (#324)
+                continue
             try:
                 if self._reg_reads_as_input(callee_fn, arg_regs[i]):
-                    confirmed.append(i)
+                    reg_confirmed.append(i)
             except Exception:
                 continue
+        confirmed = sorted(reg_confirmed + stack_confirmed)
         if not confirmed:
             return None
         name = str(getattr(callee_fn, "name", "?"))
+        stack_note = ""
+        if stack_confirmed:
+            stack_note = (
+                f" Arg(s) {stack_confirmed} are STACK-passed (beyond the "
+                f"{len(arg_regs)} integer-arg register(s)) -- most often a variadic "
+                f"callee auto-typed as fixed-arity, so declare it variadic: "
+                f"`bn proto set {name} \"<ret> {name}(<fixed args>, ...)\"`.")
         return {
             "kind": "arg_under_recovered",
             "address": hex(int(getattr(ins, "address", 0))),
@@ -3256,12 +3272,13 @@ class TaintEngine:
                        "address": hex(int(getattr(callee_fn, "start", 0)))},
             "recovered_params": n_params,
             "dropped_args": confirmed,
+            "stack_dropped_args": stack_confirmed,
             "note": (f"tainted arg(s) {confirmed} passed to {name} but Binary Ninja "
                      f"recovered only {n_params} parameter(s) -- the callee's "
                      f"signature is likely under-recovered, so taint into it was "
                      f"dropped. Recover the real prototype and apply "
                      f"`bn proto set {name} \"<prototype>\"`, then re-run this taint "
-                     f"query."),
+                     f"query.{stack_note}"),
         }
 
     def _descend(self, ins: Any, callee_fn: Any, tainted_args: dict, why: dict,

@@ -274,13 +274,17 @@ def _arg_register(caller_func, arg_index: int) -> str | None:
 
 def _int_arg_reg_count(caller_func) -> int | None:
     """Number of integer-argument registers in the function's calling convention
-    (6 on x86-64 SysV, 8 on AArch64, 4 on ARM), or None if unrecoverable. An arg
-    at or beyond this index is passed on the STACK, where BN's MLIL/HLIL call
-    model often omits it (#324)."""
+    (6 on x86-64 SysV, 8 on AArch64, 4 on ARM/MIPS-o32), or None if the convention
+    itself is unrecoverable. An arg at or beyond this index is passed on the STACK,
+    where BN's MLIL/HLIL call model often omits it (#324). Returns **0** for a pure
+    stack-argument ABI (i386 cdecl has no integer-arg registers) -- distinct from
+    None -- so the stack-passed caveat still fires there (previously an empty
+    int_arg_regs collapsed to None and the caveat was silently suppressed on i386)."""
     try:
         cc = getattr(caller_func, "calling_convention", None)
-        regs = list(getattr(cc, "int_arg_regs", []) or [])
-        return len(regs) if regs else None
+        if cc is None:
+            return None
+        return len(list(getattr(cc, "int_arg_regs", []) or []))
     except Exception:
         return None
 
@@ -302,10 +306,14 @@ def _out_of_range_arg_msg(func, arg_index: int, n: int) -> str:
     # passed on the STACK, which BN's MLIL/HLIL call model frequently omits.
     reg_count = _int_arg_reg_count(func)
     if reg_count is not None and arg_index >= reg_count:
+        where = (
+            "this calling convention passes ALL arguments on the STACK (e.g. i386 "
+            "cdecl)" if reg_count == 0 else
+            f"arg {arg_index} is at/beyond the {reg_count} integer-arg register(s) "
+            f"of this calling convention, so it is likely passed on the STACK"
+        )
         msg += (
-            f" Note: arg {arg_index} is at/beyond the {reg_count} integer-arg "
-            f"register(s) of this calling convention, so it is likely passed on "
-            f"the STACK; BN's MLIL/HLIL call model often omits stack-passed "
+            f" Note: {where}; BN's MLIL/HLIL call model often omits stack-passed "
             f"(e.g. variadic) args -- inspect `bn il {func.name} --view llil "
             f"--ssa` for the stack stores feeding the call (#324)."
         )
