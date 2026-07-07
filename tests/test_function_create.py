@@ -219,6 +219,70 @@ def test_batch_op_function_create_verified_and_restore_no_poison(monkeypatch):
     assert bv.get_function_at(0x1000) is not None
 
 
+def test_function_create_refused_on_quick_view_without_analysis(monkeypatch):
+    """#479: on a --quick-loaded view, function create must fail fast (pointing at
+    `bn refresh`) instead of triggering full analysis under the write lock -- which
+    wedged the instance so even later `target info` reads hung. It must NOT start
+    analysis or create anything."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFunctionCreateBV(
+        segments={0x1000: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x55\x48\x89\xe5"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    bridge._quick_loaded_views.add(bv)
+
+    with pytest.raises(RuntimeError, match="--quick"):
+        instance._function_create(None, "0x1000", False)
+
+    # No analysis kicked off, nothing created -> no wedge, no side effects.
+    assert "refresh" not in bv.events
+    assert bv.added == []
+    bridge._quick_loaded_views.discard(bv)
+
+
+def test_function_create_preview_refused_on_quick_view(monkeypatch):
+    """#479: the --preview path must also refuse on a quick view -- a preview that
+    wedges the instance defeats the point of a bounded, revertible probe."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFunctionCreateBV(
+        segments={0x1000: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x55\x48\x89\xe5"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    bridge._quick_loaded_views.add(bv)
+
+    with pytest.raises(RuntimeError, match="bn refresh"):
+        instance._function_create(None, "0x1000", True)
+
+    assert "refresh" not in bv.events
+    assert bv.added == []
+    bridge._quick_loaded_views.discard(bv)
+
+
+def test_op_function_create_refused_on_quick_view(monkeypatch):
+    """#479: the batch function_create op must also refuse on a quick view with a
+    structured invalid_request, not run analysis under the write lock."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    ctx = bridge.BinaryNinjaBridge().ctx
+    bv = _FakeFunctionCreateBV(
+        segments={0x1000: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x55\x48\x89\xe5"},
+    )
+    bridge._quick_loaded_views.add(bv)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        me._op_function_create(ctx, bv, {"op": "function_create", "address": "0x1000"}, [])
+    assert exc.value.status == "invalid_request"
+    assert "--quick" in str(exc.value)
+    assert "refresh" not in bv.events
+    assert bv.added == []
+    bridge._quick_loaded_views.discard(bv)
+
+
 def test_op_function_create_rejects_unaligned_on_fixed_width_isa(monkeypatch):
     """Forced create_user_function lands a function even on non-code (#386). An
     unaligned start on a fixed-width ISA (aarch64/MIPS) can't be a real function

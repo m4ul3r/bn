@@ -34,6 +34,7 @@ import binaryninja as bn
 
 from . import il_format
 from . import vars as vars_mod
+from .bridge_state import _quick_loaded_views
 from ._shared import (
     USER_FACING_ERRORS,
     OperationFailure,
@@ -2503,6 +2504,18 @@ def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = Non
 
     addr = _parse_address(op["address"])
     requested = _operation_requested(ctx, op)
+    # #479: on a --quick-loaded view, create_user_function + update_analysis_and_wait
+    # below would run the full (multi-minute) analysis under the exclusive write lock
+    # and wedge the instance (even later `target info` blocks). Refuse fast and point
+    # at `bn refresh` instead of starting that analysis under the lock.
+    if bv in _quick_loaded_views:
+        raise OperationFailure(
+            "invalid_request",
+            "Cannot create a function: this target was loaded with --quick (no "
+            "analysis). Creating a function would run the full analysis under the "
+            "write lock and wedge the instance. Run `bn refresh` first.",
+            requested=requested,
+        )
     existing = bv.get_function_at(addr)
     if existing is not None:
         return {

@@ -36,6 +36,7 @@ import binaryninja as bn
 
 from . import mutation_engine
 from . import read_misc
+from .bridge_state import require_analysis
 from ._shared import _parse_address, _require_mapped_address, _validate_count
 
 
@@ -90,6 +91,13 @@ def _remove_created_function(ctx, bv, addr: int) -> bool:
 
 def _function_create(ctx, selector: str | None, address, preview: bool):
     bv = ctx._resolve_view(selector)
+    # #479: on a --quick-loaded view the initial analysis never ran, so the
+    # update_analysis_and_wait() below would run the full (multi-minute) analysis
+    # while holding the exclusive write lock -- wedging the instance so even a
+    # later `target info` blocks. Refuse fast and point at `bn refresh` (which is
+    # built to run that analysis once) instead of starting it under the lock. Also
+    # protects --preview, whose whole promise is a bounded, revertible probe.
+    require_analysis(bv, "Creating a function")
     addr = _parse_address(address)
     requested = {"op": "function_create", "address": hex(addr)}
 
