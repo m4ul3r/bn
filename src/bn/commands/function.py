@@ -6,6 +6,7 @@ from typing import Any
 
 from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _pick, _positive_depth_int, _positive_int, arg, command, mutex, preview_arg, summary_arg
 from ..formatters import (
+    _render_call_descriptors_text,
     _render_callsites_text,
     _disasm_linear_steer_note,
     _render_disasm_linear_text,
@@ -691,6 +692,37 @@ def _evidence_table(args: argparse.Namespace) -> int:
         require_target=True,
         text_renderer=_render_pointer_table_text,
         stem="pointer-table",
+    )
+
+
+@command("evidence", "calls",
+         help="Recover stack-descriptor field values passed to a registration API at each callsite",
+         target=True,
+         prefer_when="a callback/ops registration primitive is fed a transient stack descriptor "
+                     "(struct built on the caller's stack) rather than a static table; recover the "
+                     "per-callsite field values + callback symbols",
+         see_also=("evidence table", "callsites"),
+         args=[
+             arg("identifier", help="Registration function name or entry address (the callee)"),
+             arg("--arg-struct", dest="arg_index", type=_non_negative_int, required=True, metavar="N",
+                 help="0-based index of the call argument that is the &descriptor pointer"),
+             arg("--field", dest="field_specs", action="append", default=None, metavar="NAME:TYPE@OFF",
+                 help="Declare a descriptor field (repeatable): TYPE is u8/i8/u16/i16/u32/i32/u64/i64, "
+                      "char[N], or ptr (resolves a callback/data symbol), OFF is hex/decimal, e.g. "
+                      "--field type:u8@2 --field callback:ptr@0x10"),
+         ])
+def _evidence_calls(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "call_descriptors",
+        {
+            "identifier": args.identifier,
+            "arg_index": args.arg_index,
+            "fields": getattr(args, "field_specs", None),
+        },
+        require_target=True,
+        text_renderer=_render_call_descriptors_text,
+        stem="call-descriptors",
     )
 
 

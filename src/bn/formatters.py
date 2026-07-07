@@ -1345,6 +1345,49 @@ def _render_resolved_arg(resolved: Any) -> str:
     return ""
 
 
+def _render_call_descriptors_text(value: Any) -> str:
+    """#469: one line per callsite of a registration API -- the declared descriptor
+    field values (constants + resolved callback symbols), with unknown/computed
+    fields marked explicitly rather than omitted."""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    callee = value.get("callee", "<unknown>")
+    lines = [f"descriptors passed to {callee} (arg {value.get('arg_index', '?')}): "
+             f"{value.get('total', 0)} callsite(s)"]
+    for warning in list(value.get("warnings") or []):
+        lines.append(f"warning: {warning}")
+    for row in list(value.get("items") or []):
+        if not isinstance(row, dict):
+            lines.append(_render_fallback_text(row))
+            continue
+        head = f"caller={row.get('caller', '?')} call={row.get('call_address', '?')}"
+        status = row.get("status")
+        # arg_out_of_range / not_a_local_descriptor: no fields to show. no_field_writes:
+        # the descriptor was filled some other way (memcpy/template) -- still show the
+        # (all-unknown) fields so the layout attempt is visible.
+        if status in ("arg_out_of_range", "not_a_local_descriptor"):
+            lines.append(f"{head} [{status}]")
+            continue
+        parts = []
+        for f in list(row.get("fields") or []):
+            if not isinstance(f, dict):
+                continue
+            name = f.get("name", "?")
+            st = f.get("status")
+            if st == "resolved":
+                sym = f.get("symbol")
+                mark = "~" if f.get("via") == "sibling_slot" else ""   # heuristic recovery
+                val = f"{f.get('value')}" + (f" ({sym})" if sym else "")
+                parts.append(f"{name}={mark}{val}")
+            elif st == "computed":
+                parts.append(f"{name}=<computed>")
+            else:
+                parts.append(f"{name}=<unknown>")
+        suffix = "  [no field writes recovered -- memcpy/template init?]" if status == "no_field_writes" else ""
+        lines.append(f"{head} " + " ".join(parts) + suffix)
+    return "\n".join(lines)
+
+
 def _render_record_table_text(value: Any) -> str:
     """#455: render a mixed-record dispatch table -- one block per record, each
     field labeled fn / data / scalar / null so a scalar isn't read as a bad slot."""

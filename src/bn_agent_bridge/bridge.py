@@ -1760,6 +1760,9 @@ class BinaryNinjaBridge:
     def _pointer_table(self, *a, **k):
         return read_evidence._pointer_table(self.ctx, *a, **k)
 
+    def _call_descriptor_evidence(self, *a, **k):
+        return read_evidence._call_descriptor_evidence(self.ctx, *a, **k)
+
     def _message_lens(self, *a, **k):
         return read_evidence._message_lens(self.ctx, *a, **k)
 
@@ -2631,6 +2634,16 @@ def _bind_pointer_table(bridge, params, target):
         record_size=params.get("record_size"),
         ptr_fields=params.get("ptr_fields"),
         fields=params.get("fields"),
+    )
+
+
+@op("call_descriptors", lock="read")
+def _bind_call_descriptors(bridge, params, target):
+    return bridge._call_descriptor_evidence(
+        target,
+        params["identifier"],
+        arg_index=int(params.get("arg_index", 0)),
+        field_specs=params.get("fields"),
     )
 
 
