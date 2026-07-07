@@ -1852,3 +1852,180 @@ def _section_name_at(bv, addr: int) -> str | None:
         return str(secs[0].name) if secs else None
     except Exception:
         return None
+
+
+# --- #466 cross-target virtual-call resolution -------------------------------
+
+def _vc_const(expr):
+    """Integer constant of a MLIL CONST/CONST_PTR expr, else None."""
+    if expr is None or "CONST" not in _op(expr):
+        return None
+    c = getattr(expr, "constant", None)
+    try:
+        return int(c)
+    except (TypeError, ValueError):
+        return None
+
+
+def _vc_var(expr):
+    """The Variable an MLIL_VAR expr reads (following a lone value), else None."""
+    if expr is None:
+        return None
+    if _op(expr) == "MLIL_VAR":
+        return getattr(expr, "src", None)
+    return None
+
+
+def _vc_vkey(var):
+    return (getattr(var, "identifier", None), str(getattr(var, "name", var)))
+
+
+def _vc_def_ins(instrs, var, before_addr):
+    """The highest-address instruction below *before_addr* that defines *var* -- its
+    reaching definition under physical order -- whether a SET_VAR (dest match) or a
+    CALL (output-register match). None if none."""
+    if var is None:
+        return None
+    vkey = _vc_vkey(var)
+    best, best_addr = None, -1
+    for ins in instrs:
+        a = int(getattr(ins, "address", -1))
+        if a >= before_addr or a <= best_addr:
+            continue
+        d = getattr(ins, "dest", None)
+        is_def = False
+        if _op(ins) in ("MLIL_SET_VAR", "MLIL_SET_VAR_FIELD") and d is not None:
+            is_def = _vc_vkey(d) == vkey
+        elif "CALL" in _op(ins):
+            is_def = any(_vc_vkey(o) == vkey for o in (getattr(ins, "output", None) or []))
+        if is_def:
+            best, best_addr = ins, a
+    return best
+
+
+def _vc_slot_and_factory(caller, call_ins, ptr):
+    """(slot_offset, factory_symbol|None) for a vtable-dispatch MLIL call
+    ``[vtable + off](...)`` where ``vtable = [obj]`` and ``obj = factory()``.
+    None when the call's target is not a vtable-slot load (a direct/register call
+    with no vtable slot). The factory is best-effort provenance; slot_offset is the
+    load-bearing result and is returned even when the factory can't be traced."""
+    dest = getattr(call_ins, "dest", None)
+    if dest is None or "LOAD" not in _op(dest):
+        return None
+    addr_expr = getattr(dest, "src", None)
+    if addr_expr is None:
+        return None
+    off, base = 0, addr_expr
+    if _op(addr_expr) == "MLIL_ADD":
+        rc = _vc_const(getattr(addr_expr, "right", None))
+        if rc is not None:
+            off, base = rc, getattr(addr_expr, "left", None)
+    # Best-effort factory trace: base (the vtable) is `[obj]`; obj is `factory()`.
+    factory = None
+    try:
+        instrs = list(caller.mlil.instructions)
+        call_addr = int(getattr(call_ins, "address", 0))
+        vt_def = _vc_def_ins(instrs, _vc_var(base), call_addr)
+        load_src = getattr(vt_def, "src", None) if vt_def is not None else None
+        if load_src is not None and "LOAD" in _op(load_src):
+            obj_var = _vc_var(getattr(load_src, "src", None))
+            # `obj` is defined either directly by the factory CALL, or via a copy
+            # (`obj = tmp; tmp = factory()`); follow one copy hop.
+            obj_def = _vc_def_ins(instrs, obj_var, call_addr)
+            if obj_def is not None and _op(obj_def) in ("MLIL_SET_VAR", "MLIL_SET_VAR_FIELD"):
+                obj_def = _vc_def_ins(instrs, _vc_var(getattr(obj_def, "src", None)), call_addr)
+            if obj_def is not None and "CALL" in _op(obj_def):
+                faddr = _vc_const(getattr(obj_def, "dest", None))
+                bv = getattr(caller, "view", None)
+                sym = bv.get_symbol_at(int(faddr)) if (faddr is not None and bv is not None) else None
+                if sym is not None:
+                    factory = str(getattr(sym, "short_name", None) or getattr(sym, "name", None))
+    except Exception:
+        factory = None
+    return off, factory
+
+
+def _resolve_virtual_call(ctx, selector, at, providers=None):
+    """#466: resolve an imported abstract/interface virtual call in the CONSUMER at
+    address *at* to the concrete method(s) in a PROVIDER's vtable. Reports the
+    consumer callsite, the factory/singleton the object came from, the vtable slot
+    offset, and each candidate (provider class, vtable entry, target method). Marks
+    ambiguity when multiple provider classes implement the slot. No BNDB mutation."""
+    from . import read_class
+    bv = ctx._resolve_view(selector)
+    at_addr = _parse_address(at)
+    caller = ctx._find_function(bv, hex(at_addr), contained=True)
+    if caller is None:
+        raise OperationFailure("no_function", f"no function contains {hex(at_addr)}")
+    call_ins = _mlil_call_at(caller, at_addr)
+    if call_ins is None:
+        raise OperationFailure(
+            "no_call",
+            f"no call instruction at {hex(at_addr)} -- pass the address of the indirect "
+            f"virtual call itself (the `[*obj + slot](...)` site)")
+    ptr = ctx._pointer_size(bv)
+    info = _vc_slot_and_factory(caller, call_ins, ptr)
+    if info is None:
+        raise OperationFailure(
+            "not_virtual",
+            f"the call at {hex(at_addr)} is not a recognized vtable dispatch "
+            f"(`[*obj + slot](...)`); a direct or plain register-indirect call has no "
+            f"vtable slot to resolve")
+    slot_off, factory = info
+    slot_index = (slot_off // ptr) if ptr else slot_off
+    # Provider views: the --providers selector, else resolve within the consumer.
+    if providers:
+        try:
+            pv = ctx._resolve_view(providers)
+        except Exception as exc:
+            raise OperationFailure("bad_provider", f"could not resolve --providers {providers!r}: {exc}")
+        provider_views = [(pv, str(providers))]
+    else:
+        provider_views = [(bv, str(selector) if selector else "self")]
+    candidates: list[dict[str, Any]] = []
+    for pv, pname in provider_views:
+        try:
+            maps = read_class._rtti_symbol_maps(pv)
+        except Exception:
+            maps = {}
+        for cls_name, syms in maps.items():
+            vt = syms.get("vtable")
+            vt_addr = getattr(vt, "address", None) if vt is not None else None
+            if vt_addr is None:
+                continue
+            try:
+                layout = read_class._vtable_layout(ctx, pv, int(vt_addr))
+            except Exception:
+                continue
+            slot = next((s for s in layout.get("slots", []) if s.get("index") == slot_index), None)
+            if slot is None or not slot.get("method"):
+                continue
+            m = slot["method"]
+            # vtable_entry is the ADDRESS of the slot (where the function pointer is
+            # stored: vtable + 2-word Itanium header + index*ptr); method_address is
+            # the pointer's VALUE (the target method). Keeping them distinct avoids
+            # the "entry == target" ambiguity.
+            pptr = ctx._pointer_size(pv)
+            entry_addr = int(vt_addr) + 2 * pptr + slot_index * pptr
+            candidates.append({
+                "provider": pname,
+                "class": cls_name,
+                "vtable": hex(int(vt_addr)),
+                "vtable_entry": hex(entry_addr),
+                "method": (m.get("display_name") or m.get("name")) if isinstance(m, dict) else None,
+                "method_address": (m.get("address") if isinstance(m, dict) else None),
+            })
+    # If the factory names a class whose candidate is present, surface it first so an
+    # unambiguous provider is obvious even when several classes share the slot shape.
+    candidates.sort(key=lambda c: (factory or "") not in (c.get("class") or ""))
+    return {
+        "kind": "virtual_call",
+        "callsite": hex(at_addr),
+        "caller": str(getattr(caller, "name", "") or ""),
+        "factory": factory,
+        "slot_offset": hex(slot_off),
+        "slot_index": slot_index,
+        "candidates": candidates,
+        "ambiguous": len(candidates) > 1,
+        "resolved": len(candidates) == 1,
+    }

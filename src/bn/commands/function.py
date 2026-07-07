@@ -19,6 +19,7 @@ from ..formatters import (
     _render_function_info_text,
     _render_function_list_text,
     _render_name_address_list_text,
+    _render_virtual_call_text,
     _render_message_lens_text,
     _render_orient_text,
     _render_pointer_table_text,
@@ -724,6 +725,32 @@ def _evidence_calls(args: argparse.Namespace) -> int:
         require_target=True,
         text_renderer=_render_call_descriptors_text,
         stem="call-descriptors",
+    )
+
+
+@command("evidence", "virtual-call",
+         help="Resolve an imported abstract/interface virtual call to a provider vtable method",
+         target=True,
+         prefer_when="a consumer binary dispatches through a virtual slot on an object it got "
+                     "from an imported factory/singleton, and the concrete class + method live in "
+                     "a separate provider binary -- resolve the slot to the provider's method "
+                     "without manual vtable offset arithmetic",
+         see_also=("class show", "evidence table"),
+         args=[
+             arg("--at", required=True, metavar="ADDR",
+                 help="Address of the indirect virtual call site in the consumer (the `[*obj + slot](...)` call)"),
+             arg("--providers", default=None, metavar="SELECTOR",
+                 help="Target selector for the provider binary that defines the class/vtable "
+                      "(name/path/id of another open target); omit to resolve within this binary"),
+         ])
+def _evidence_virtual_call(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "resolve_virtual_call",
+        {"at": args.at, "providers": args.providers},
+        require_target=True,
+        text_renderer=_render_virtual_call_text,
+        stem="virtual-call",
     )
 
 
