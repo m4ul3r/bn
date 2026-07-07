@@ -371,6 +371,9 @@ def _pointer_table_for_view(
                     "entry_address": hex(entry_address),
                     "value": None,
                     "readable": False,
+                    # Keep every row's `status` present so scripts can key on it
+                    # uniformly (#480); the slot itself couldn't be read.
+                    "status": "unreadable",
                 }
             )
             invalid_run += 1
@@ -394,6 +397,12 @@ def _pointer_table_for_view(
                 "entry_address": hex(entry_address),
                 "value": hex(value),
                 "readable": True,
+                # #480: the documented per-slot discriminator (function/mapped/null/
+                # unmapped) lives at the row level, matching reading.md -- previously it
+                # was only reachable at row["target"]["status"], so scripts keying on the
+                # documented `status` field (in standalone AND nested init/message
+                # pointer-table rows, which share this builder) silently got None.
+                "status": target["status"],
                 "plausible": bool(target["plausible"]),
                 "likely_scalar": bool(likely_scalar),
                 "target": target,

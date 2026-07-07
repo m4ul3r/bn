@@ -699,6 +699,11 @@ def test_pointer_table_downgrades_inline_scalar_fields(monkeypatch):
     assert rows[0]["plausible"] is True
     assert rows[1]["likely_scalar"] is True and rows[1]["plausible"] is False
     assert rows[2]["likely_scalar"] is False and rows[2]["plausible"] is False
+    # #480: the documented per-slot discriminator is present at the ROW level (not
+    # only nested under row["target"]), so scripts can key on it uniformly.
+    assert rows[0]["status"] == "function"
+    assert all("status" in r for r in rows)
+    assert rows[0]["status"] == rows[0]["target"]["status"]  # row mirrors target
     warnings = " ".join(result["warnings"])
     assert "1 non-null entries do not resolve to mapped addresses" in warnings  # only entry2
     assert "inline scalar fields" in warnings                                   # entry1 noted
