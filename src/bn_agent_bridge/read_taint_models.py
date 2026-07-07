@@ -31,9 +31,15 @@ def build_catalog(models: dict[str, Any], *, role: str | None = None,
         if sink and want in (None, "sink"):
             cls = sink.get("class") or "?"
             if sink_class is None or cls == sink_class:
-                sinks_by_class.setdefault(cls, []).append({
+                entry = {
                     "symbol": name, "tainted_args": sink.get("tainted_args", []),
-                    "class": cls, "detail": sink.get("detail")})
+                    "class": cls, "detail": sink.get("detail")}
+                # #443: surface a bounded-write sink's length/buffer argument indices.
+                if sink.get("len_arg") is not None:
+                    entry["len_arg"] = sink.get("len_arg")
+                if sink.get("buf_arg") is not None:
+                    entry["buf_arg"] = sink.get("buf_arg")
+                sinks_by_class.setdefault(cls, []).append(entry)
         if model.get("propagates") and want in (None, "propagator"):
             fts = ", ".join(f"{p.get('from')}->{p.get('to')}" for p in model["propagates"])
             propagators.append({"symbol": name, "from_to": fts})
