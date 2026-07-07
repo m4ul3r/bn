@@ -98,6 +98,54 @@ def test_refresh_does_not_hold_target_lock_during_analysis(monkeypatch):
     assert reader_got_lock["v"] is True  # read lock was grantable mid-analysis
 
 
+def test_refresh_tail_read_runs_under_read_lock(monkeypatch):
+    """#321 audit P1: the response-building read at the END of _refresh (after the
+    analysis, after the write gate is released) must run under the read lock, so a
+    queued writer can't mutate the same view concurrently with the read."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+    result_holder = {}
+
+    def fake_target_info(selector):
+        # A writer must be excluded while this tail read runs.
+        acquired = {"v": None}
+
+        def writer():
+            with instance._target_lock.write():
+                acquired["v"] = True
+
+        t = threading.Thread(target=writer, daemon=True)
+        t.start()
+        t.join(timeout=1.0)
+        result_holder["writer_blocked"] = acquired["v"] is None
+        return {}
+
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance, "_target_info", fake_target_info)
+
+    instance._refresh("active")
+
+    assert result_holder["writer_blocked"] is True  # write lock unavailable during tail read
+
+
+def test_refresh_keeps_unanalyzed_flag_when_analysis_yields_no_functions(monkeypatch):
+    """#321 audit P3: refreshing a #458 raw-restore-failed .bndb (no product view,
+    still 0 functions after analysis) must stay analysis_state=unanalyzed rather than
+    being mislabeled 'full' just because refresh ran."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()  # exposes no functions -> _view_function_count == 0
+    monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance, "_target_info", lambda selector: {})
+    bridge._unanalyzed_views.add(bv)
+
+    instance._refresh("active")
+
+    assert bv in bridge._unanalyzed_views  # 0 functions -> stays flagged unanalyzed
+    bridge._unanalyzed_views.discard(bv)
+
+
 def test_target_info_surfaces_analysis_progress(monkeypatch):
     """#321: target info exposes pollable analysis phase/counts so a large-target
     analysis can be watched instead of guessing whether the bridge is wedged."""

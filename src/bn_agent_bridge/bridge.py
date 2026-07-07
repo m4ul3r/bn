@@ -1422,11 +1422,18 @@ class BinaryNinjaBridge:
             bv.update_analysis_and_wait()
             with self._target_lock.write():
                 _quick_loaded_views.discard(bv)
-                _unanalyzed_views.discard(bv)
-        return {
-            "refreshed": True,
-            "target": self._target_info(selector),
-        }
+                # Only clear the #458 unanalyzed flag if analysis actually produced
+                # functions -- a refresh on a raw-only container (no product view)
+                # is a no-op and must stay "unanalyzed", not be mislabeled "full".
+                if _view_function_count(bv) > 0:
+                    _unanalyzed_views.discard(bv)
+        # Build the response under the READ lock: the tail read touches live view
+        # state (bv.functions / arch / analysis_progress), and the instant we drop
+        # the write gate a queued mutation can begin writing the same view -- so
+        # serialize this read against writers like every other read op does.
+        with self._target_lock.read():
+            target = self._target_info(selector)
+        return {"refreshed": True, "target": target}
 
     # ---- BridgeContext seam shims (bodies live in seam.py) --------------
     # Resolution / ABI / address-context helpers were relocated into the
