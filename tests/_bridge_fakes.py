@@ -35,6 +35,14 @@ def _load_bridge(monkeypatch):
         GlobalBinding = "SymbolBinding.GlobalBinding"
         WeakBinding = "SymbolBinding.WeakBinding"
 
+    class RelocationType:
+        # The ELF GOT-slot reloc kinds the import classifier cares about (#478):
+        # JUMP_SLOT (.rela.plt, callable function import) vs GLOB_DAT (.rela.dyn,
+        # data import). Names mirror real BN's enum members (ELFJumpSlot /
+        # ELFGlobal), verified against a live BinaryView.
+        ELFJumpSlotRelocationType = "RelocationType.ELFJumpSlotRelocationType"
+        ELFGlobalRelocationType = "RelocationType.ELFGlobalRelocationType"
+
     class Symbol:
         def __init__(self, symbol_type, address, name, binding=None):
             self.type = symbol_type
@@ -72,6 +80,7 @@ def _load_bridge(monkeypatch):
 
     fake_bn.SymbolType = SymbolType
     fake_bn.SymbolBinding = SymbolBinding
+    fake_bn.RelocationType = RelocationType
     fake_bn.Symbol = Symbol
     fake_bn.QualifiedName = QualifiedName
     fake_bn.Type = Type
@@ -295,12 +304,24 @@ class _FakeSegment:
         self.executable = executable
 
 
+class _FakeReloc:
+    """Stand-in for a BN Relocation: `.info.type` is the RelocationType, `.symbol`
+    the imported symbol it applies to (#478)."""
+    def __init__(self, reloc_type, symbol=None):
+        self.info = types.SimpleNamespace(type=reloc_type)
+        self.type = reloc_type
+        self.symbol = symbol
+
+
 class _FakeBV:
     def __init__(self, *, functions=None, symbols=None, types_=None, qualified_types_=None, arch=None, disassembly=None, instruction_lengths=None,
-                 strings=None, sections=None, segments=None, memory=None, code_refs=None, data_refs=None, comments=None):
+                 strings=None, sections=None, segments=None, memory=None, code_refs=None, data_refs=None, comments=None, relocations=None):
         self.functions = list(functions or [])
         self._comments = dict(comments or {})
         self._symbols = list(symbols or [])
+        # {slot_address: [_FakeReloc, ...]} -- ELF relocations applied at each GOT
+        # slot, keyed by address. Empty for raw/non-ELF views.
+        self._relocations = dict(relocations or {})
         self.types = dict(types_ or {})
         # Types registered under a multi-component QualifiedName (keyed by the
         # component tuple), mirroring how BN registers namespaced C++ types -- a
@@ -392,6 +413,9 @@ class _FakeBV:
 
     def get_symbols_of_type(self, sym_type):
         return [s for s in self._symbols if getattr(s, "type", None) == sym_type]
+
+    def relocations_at(self, address: int):
+        return list(self._relocations.get(int(address), []))
 
     def get_sections_at(self, address: int):
         result = []
@@ -1122,4 +1146,4 @@ def _stub_code_context(monkeypatch, instance, function_entry):
     monkeypatch.setattr(instance.ctx, "_address_is_code", lambda bv, a: True)
 
 
-__all__ = ['_load_bridge', '_FakeFunction', '_FakeBasicBlock', '_FakeInstructionInfo', '_FakeArch', '_FakeOperation', '_FakeConstPtr', '_FakeReg', '_FakeHLILInstructionNode', '_FAKE_HLIL_TYPES', '_FakeHLILInstruction', '_FakeLLILInstruction', '_FakeVariable', '_FakeStringRef', '_FakeCodeRef', '_FakeSection', '_FakeSegment', '_FakeBV', '_FakeType', '_FakeMember', '_FakeMutationBV', '_ParseResult', '_FakeSymbol', '_mutation_with_stubs', '_BATCH_OP_PARITY', '_minimal_valid_op', '_FakeCommentMutationBV', '_install_fake_pseudo_c', '_callsites_items', '_FakeFunctionCreateBV', '_local_retype_result', '_LoadBV', '_setup_load_test', '_FakeFileBV', '_register_views', '_ClosableBV', 'SSAVariable', '_FakeSSAVariable', '_FakeMLILInsn', '_FakeSSAFunction', '_FakeBlock', '_FakeMLILFunction', '_RecordingWriter', '_SaveBV', '_RehomingSaveBV', '_RehomingFailSaveBV', '_RestoreFailFile', '_RestoreFailSaveBV', '_FieldRefBV', '_FakeStructMember', '_FakeStructBuilder', '_struct_instance', '_AddableStructBuilder', '_struct_set_instance', '_pvs', '_dataflow_values_instance', '_stub_code_context']
+__all__ = ['_load_bridge', '_FakeFunction', '_FakeBasicBlock', '_FakeInstructionInfo', '_FakeArch', '_FakeOperation', '_FakeConstPtr', '_FakeReg', '_FakeHLILInstructionNode', '_FAKE_HLIL_TYPES', '_FakeHLILInstruction', '_FakeLLILInstruction', '_FakeVariable', '_FakeStringRef', '_FakeCodeRef', '_FakeSection', '_FakeSegment', '_FakeBV', '_FakeReloc', '_FakeType', '_FakeMember', '_FakeMutationBV', '_ParseResult', '_FakeSymbol', '_mutation_with_stubs', '_BATCH_OP_PARITY', '_minimal_valid_op', '_FakeCommentMutationBV', '_install_fake_pseudo_c', '_callsites_items', '_FakeFunctionCreateBV', '_local_retype_result', '_LoadBV', '_setup_load_test', '_FakeFileBV', '_register_views', '_ClosableBV', 'SSAVariable', '_FakeSSAVariable', '_FakeMLILInsn', '_FakeSSAFunction', '_FakeBlock', '_FakeMLILFunction', '_RecordingWriter', '_SaveBV', '_RehomingSaveBV', '_RehomingFailSaveBV', '_RestoreFailFile', '_RestoreFailSaveBV', '_FieldRefBV', '_FakeStructMember', '_FakeStructBuilder', '_struct_instance', '_AddableStructBuilder', '_struct_set_instance', '_pvs', '_dataflow_values_instance', '_stub_code_context']

@@ -703,18 +703,31 @@ def _function_name_summary(bv) -> dict[str, int]:
     functions = list(getattr(bv, "functions", []) or [])
     total = len(functions)
     named = imported = 0
+    imported_obj_names: set[str] = set()
     for fn in functions:
         if _is_imported_function(fn):
             imported += 1
+            sym = getattr(fn, "symbol", None)
+            raw = str(getattr(sym, "raw_name", "") or "")
+            if raw:
+                imported_obj_names.add(raw)
             continue
         name = str(getattr(fn, "name", "") or "")
         if name and not _is_auto_function_name(name):
             named += 1
+    # #478: callable GOT slots (JUMP_SLOT-relocated) that BN never turned into a
+    # PLT-stub function object still count as imported functions -- otherwise a
+    # target whose PLT recovery failed reports zero imports and reads as
+    # stripped/static, wrongly steering the bn-vr lane away from import-first sink
+    # enumeration. Union by name so a well-analyzed binary (slot + its function
+    # object both present) is not double-counted. The bv.functions partition
+    # (named/unnamed) is unchanged -- those slots have no function object.
+    extra_callable = read_misc._callable_import_slot_names(bv) - imported_obj_names
     return {
         "function_count": total,
         "named_function_count": named,
         "unnamed_function_count": total - named - imported,
-        "imported_function_count": imported,
+        "imported_function_count": imported + len(extra_callable),
     }
 
 

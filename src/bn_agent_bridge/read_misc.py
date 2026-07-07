@@ -238,6 +238,57 @@ def _defined_symbol_names(bv) -> set[str]:
 _IMPORT_PLUS_EXTERNAL: list[tuple[str, str]] = _IMPORT_SYMBOL_TYPES + [("ExternalSymbol", "external")]
 
 
+def _slot_carries_jump_slot_reloc(bv, addr: int) -> bool:
+    """True when the GOT slot at *addr* carries an ELF JUMP_SLOT relocation -- a
+    callable function import from ``.rela.plt``, even when BN recovered no PLT-stub
+    ImportedFunctionSymbol for it. Analysis-independent (relocations are parsed at
+    load), so it holds on the exact target where PLT-stub recovery failed. False for
+    GLOB_DAT data slots and for raw/non-ELF views with no relocation table (#478)."""
+    jump_slot = getattr(getattr(bn, "RelocationType", None), "ELFJumpSlotRelocationType", None)
+    reloc_at = getattr(bv, "relocations_at", None)
+    if jump_slot is None or reloc_at is None:
+        return False
+    try:
+        relocs = reloc_at(int(addr)) or []
+    except Exception:
+        return False
+    for r in relocs:
+        info = getattr(r, "info", None)
+        rtype = getattr(info, "type", None) if info is not None else getattr(r, "type", None)
+        if rtype == jump_slot:
+            return True
+    return False
+
+
+def _callable_import_slot_names(bv) -> set[str]:
+    """Raw names of callable function-import GOT slots -- ImportAddressSymbols whose
+    slot carries a JUMP_SLOT relocation. Keeps `imports` classification and
+    `imported_function_count` honest when BN failed to recover PLT-stub function
+    symbols (#478). Empty on raw/non-ELF views."""
+    names: set[str] = set()
+    sym_type = getattr(bn.SymbolType, "ImportAddressSymbol", None)
+    if sym_type is None:
+        return names
+    try:
+        syms = list(bv.get_symbols_of_type(sym_type))
+    except Exception:
+        return names
+    # Mirror the `_imports` self-reference filter (#202): a PIC .so models its OWN
+    # exported functions as GOT slots too; those are self-references, not genuine
+    # imports, so exclude them here as well to keep imported_function_count
+    # consistent with the `imports` listing (review defense-in-depth).
+    try:
+        defined = _defined_symbol_names(bv)
+    except Exception:
+        defined = set()
+    for sym in syms:
+        if _slot_carries_jump_slot_reloc(bv, getattr(sym, "address", 0)):
+            raw = str(getattr(sym, "raw_name", getattr(sym, "name", "")) or "")
+            if raw and raw not in defined:
+                names.add(raw)
+    return names
+
+
 def _imports(ctx, selector: str | None, *, summary: bool = False,
              query: str | None = None, regex: bool = False,
              offset: int = 0, limit: int | None = None, count_only: bool = False,
@@ -271,11 +322,15 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
             if raw_name in defined_names:
                 self_defined_excluded += 1
                 continue
+            # Per-symbol kind: `kind` is the OUTER loop variable (shared across every
+            # symbol of this type), so never mutate it -- the #478 reclassification
+            # below would otherwise leak into the next symbol's iteration.
+            entry_kind = kind
             # #212: an address-kind entry is the GOT slot for an import already
             # listed as its function/data PLT entry -- ~half of a standard ELF's
             # import list is these duplicates. Collapse them by default; show with
             # --include-got. A genuinely unique address symbol is still listed.
-            if kind == "address" and not include_got and raw_name in func_data_names:
+            if entry_kind == "address" and not include_got and raw_name in func_data_names:
                 got_collapsed += 1
                 continue
             # An ET_REL external that ALSO appeared as an import on a regular ELF
@@ -284,8 +339,19 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
             # imports are GOT-only (ImportAddressSymbol, kind=address) with no PLT
             # function entry, and those same names reappear as ExternalSymbol;
             # checking only func_data_names would double-list them (#213 review).
-            if kind == "external" and raw_name in emitted_names:
+            if entry_kind == "external" and raw_name in emitted_names:
                 continue
+            # #478: a standalone address-kind GOT slot carrying a JUMP_SLOT
+            # relocation is a callable function import BN failed to recover a
+            # PLT-stub symbol for -- reclassify it function-kind so a sink-rich
+            # target isn't misread as stripped/static. Guarded to NON-dup slots
+            # (raw_name absent from the function/data imports emitted above), so a
+            # well-analyzed binary -- where the slot collapses against its PLT
+            # function entry, or is shown as its GOT view under --include-got -- is
+            # unaffected and never double-counted.
+            if (entry_kind == "address" and raw_name not in func_data_names
+                    and _slot_carries_jump_slot_reloc(bv, sym.address)):
+                entry_kind = "function"
             namespace = str(getattr(sym, "namespace", "") or "")
             # Only surface `library` when it's a real per-library namespace;
             # BN's sentinels become None so agents don't read them as a
@@ -298,11 +364,11 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
                     "library": library,
                     "namespace": namespace,
                     "raw_name": raw_name,
-                    "kind": kind,
+                    "kind": entry_kind,
                 }
             )
             emitted_names.add(raw_name)
-            if kind in ("function", "data"):
+            if entry_kind in ("function", "data"):
                 func_data_names.add(raw_name)
     # #450: filter the survey to matching imports so a sink/source sweep
     # (`--query 'system|execve|popen' --regex`) doesn't need full paging + external

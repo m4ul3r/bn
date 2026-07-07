@@ -98,6 +98,69 @@ def test_function_name_summary_counts_named_vs_auto(monkeypatch):
     assert summary["imported_function_count"] == 1     # puts (PLT stub), not "named"
 
 
+def test_function_name_summary_counts_callable_got_slots_478(monkeypatch):
+    """#478: callable GOT slots (JUMP_SLOT-relocated) with no recovered PLT-stub
+    function object still count toward imported_function_count -- otherwise a target
+    whose PLT-stub recovery failed reports zero imports and reads as stripped/static.
+    A slot whose name DOES have an imported function object is unioned by name (not
+    double-counted); GLOB_DAT data slots do not count; the bv.functions partition is
+    unaffected."""
+    bridge = _load_bridge(monkeypatch)
+    fake_bn = sys.modules["binaryninja"]
+    JS = fake_bn.RelocationType.ELFJumpSlotRelocationType
+    GD = fake_bn.RelocationType.ELFGlobalRelocationType
+
+    class _ImpSym:  # faithful imported-function symbol: .type.name + .raw_name
+        def __init__(self, raw):
+            self.type = type("_T", (), {"name": "ImportedFunctionSymbol"})()
+            self.raw_name = raw
+
+    # memcpy has BOTH a recovered PLT-stub function object AND its JUMP_SLOT slot ->
+    # must count once. strcpy/recv are symptom slots (JUMP_SLOT, no function object)
+    # -> count. stdout is a GLOB_DAT data slot -> never counts.
+    memcpy_fn = _FakeFunction(0x1200, "memcpy")
+    memcpy_fn.symbol = _ImpSym("memcpy")
+    memcpy = fake_bn.Symbol(fake_bn.SymbolType.ImportAddressSymbol, 0x3000, "memcpy")
+    strcpy = fake_bn.Symbol(fake_bn.SymbolType.ImportAddressSymbol, 0x3008, "strcpy")
+    recv = fake_bn.Symbol(fake_bn.SymbolType.ImportAddressSymbol, 0x3018, "recv")
+    stdout = fake_bn.Symbol(fake_bn.SymbolType.ImportAddressSymbol, 0x3010, "stdout")
+    bv = _FakeBV(
+        functions=[_FakeFunction(0x1000, "main"), _FakeFunction(0x1100, "sub_1100"), memcpy_fn],
+        symbols=[memcpy, strcpy, recv, stdout],
+        relocations={
+            0x3000: [_FakeReloc(JS, memcpy)],
+            0x3008: [_FakeReloc(JS, strcpy)],
+            0x3018: [_FakeReloc(JS, recv)],
+            0x3010: [_FakeReloc(GD, stdout)],
+        },
+    )
+    summary = bridge._function_name_summary(bv)
+    assert summary["function_count"] == 3
+    assert summary["named_function_count"] == 1        # main (memcpy_fn is imported, not named)
+    assert summary["unnamed_function_count"] == 1      # sub_1100
+    # memcpy (object + slot) counts once; strcpy + recv add 2; stdout (GLOB_DAT) excluded.
+    assert summary["imported_function_count"] == 3
+
+
+def test_callable_import_slot_names_excludes_self_defined_478(monkeypatch):
+    """#478 defense-in-depth: a PIC .so's own exported function can also carry a
+    JUMP_SLOT GOT slot; that self-reference must NOT inflate the callable-import
+    set, mirroring the imports-listing #202 self-reference filter."""
+    bridge = _load_bridge(monkeypatch)
+    read_misc = bridge.read_misc
+    fake_bn = sys.modules["binaryninja"]
+    JS = fake_bn.RelocationType.ELFJumpSlotRelocationType
+
+    own_def = fake_bn.Symbol(fake_bn.SymbolType.FunctionSymbol, 0x1500, "own_api")
+    own_slot = fake_bn.Symbol(fake_bn.SymbolType.ImportAddressSymbol, 0x3000, "own_api")
+    memcpy_slot = fake_bn.Symbol(fake_bn.SymbolType.ImportAddressSymbol, 0x3008, "memcpy")
+    bv = _FakeBV(symbols=[own_def, own_slot, memcpy_slot], relocations={
+        0x3000: [_FakeReloc(JS, own_slot)],
+        0x3008: [_FakeReloc(JS, memcpy_slot)],
+    })
+    assert read_misc._callable_import_slot_names(bv) == {"memcpy"}
+
+
 def test_callsites_returns_local_hlil_assignment_and_pre_branch_condition(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

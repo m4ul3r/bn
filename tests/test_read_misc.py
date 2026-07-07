@@ -357,6 +357,57 @@ def test_imports_includes_function_data_and_address_symbols(monkeypatch):
     assert kinds["iat_entry"] == "address"
 
 
+def test_imports_callable_jump_slot_reclassified_as_function_478(monkeypatch):
+    """#478: on a target where BN failed to recover PLT-stub ImportedFunctionSymbols,
+    callable sinks survive only as ImportAddressSymbol GOT slots. A slot carrying a
+    JUMP_SLOT (.rela.plt) relocation is a callable function import -- reclassify it as
+    function-kind so a sink-rich target isn't misread as stripped/static. A GLOB_DAT
+    data slot stays address-kind."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    JS = fake_bn.RelocationType.ELFJumpSlotRelocationType
+    GD = fake_bn.RelocationType.ELFGlobalRelocationType
+
+    memcpy = fake_bn.Symbol(fake_bn.SymbolType.ImportAddressSymbol, 0x3000, "memcpy")
+    strcpy = fake_bn.Symbol(fake_bn.SymbolType.ImportAddressSymbol, 0x3008, "strcpy")
+    stdout = fake_bn.Symbol(fake_bn.SymbolType.ImportAddressSymbol, 0x3010, "stdout")
+    bv = _FakeBV(symbols=[memcpy, strcpy, stdout], relocations={
+        0x3000: [_FakeReloc(JS, memcpy)],
+        0x3008: [_FakeReloc(JS, strcpy)],
+        0x3010: [_FakeReloc(GD, stdout)],
+    })
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    kinds = {it["name"]: it["kind"] for it in instance._imports(None)["items"]}
+    assert kinds["memcpy"] == "function"
+    assert kinds["strcpy"] == "function"
+    assert kinds["stdout"] == "address"
+    assert instance._imports(None, count_only=True)["count"] == 3
+
+
+def test_imports_healthy_jump_slot_not_reclassified_478(monkeypatch):
+    """#478 safety: when BN DID recover the PLT-stub ImportedFunctionSymbol, the
+    matching JUMP_SLOT GOT slot must NOT be reclassified/double-counted. By default
+    it collapses against the function entry; under --include-got it stays kind=address
+    (a GOT view of an already-listed function), never a second function row."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    JS = fake_bn.RelocationType.ELFJumpSlotRelocationType
+
+    plt = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x1000, "memcpy")
+    got = fake_bn.Symbol(fake_bn.SymbolType.ImportAddressSymbol, 0x3000, "memcpy")
+    bv = _FakeBV(symbols=[plt, got], relocations={0x3000: [_FakeReloc(JS, got)]})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    default = instance._imports(None)
+    assert [(it["name"], it["kind"]) for it in default["items"]] == [("memcpy", "function")]
+    assert default["got_collapsed"] == 1
+    got_kinds = sorted(it["kind"] for it in instance._imports(None, include_got=True)["items"])
+    assert got_kinds == ["address", "function"]
+
+
 def test_imports_query_and_regex_filter(monkeypatch):
     # #450: filter the import survey so a sink sweep doesn't need full paging + jq.
     bridge = _load_bridge(monkeypatch)
