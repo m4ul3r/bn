@@ -78,6 +78,29 @@ def test_op_rename_symbol_rejects_empty_new_name(monkeypatch, bad_name):
     assert "non-empty" in excinfo.value.message
 
 
+def test_mutation_refused_on_quick_view_before_any_analysis(monkeypatch):
+    """#479 (sibling): every write op except function_create routes through
+    _mutation, whose success/revert paths call update_analysis_and_wait(). On a
+    --quick view that wedges the instance under the write lock. The whole batch --
+    including --preview -- must be refused fast (bn type/comment/rename/proto/...),
+    before touching the view."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    bridge._quick_loaded_views.add(bv)
+
+    for preview in (False, True):
+        with pytest.raises(bridge.OperationFailure) as exc:
+            instance._mutation("active", preview, [{"op": "set_comment", "comment": "x"}])
+        assert exc.value.status == "invalid_request"
+        assert "--quick" in str(exc.value)
+    # Refused before any undo bracket / analysis was started -> no wedge.
+    assert "refresh" not in bv.events
+    assert ("begin", "state") not in bv.events
+    bridge._quick_loaded_views.discard(bv)
+
+
 def test_mutation_reverts_on_verification_failure(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
