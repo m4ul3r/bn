@@ -4654,6 +4654,7 @@ class TaintEngine:
                                 hdr_idx = -1
                             bufs = self._recvmsg_iov_buffers(ssaf, instrs, c, hdr_idx)
                             iov_seeded = False
+                            _out_param_seen: set[int] = set()
                             for buf in bufs:
                                 bt = self._buffer_target(ssaf, buf)
                                 if bt is not None:
@@ -4670,6 +4671,25 @@ class TaintEngine:
                                                       f"source: {callee} iovec buffer (call: preset)", []):
                                             seeded = True
                                             iov_seeded = True
+                                # #452: the iovec buffer is this function's PARAMETER --
+                                # a receive helper whose CALLER owns the destination
+                                # (`recv_body(fd, dst, len)` builds a stack iovec around
+                                # `dst`). The payload lands in the caller's buffer, which
+                                # nothing here consumes, so without disclosure the helper
+                                # reads as a bare "no taint reached". Name the out-param so
+                                # an agent re-runs taint from the caller.
+                                pidx = self._resolve_to_param_index(func, ssaf, buf)
+                                if pidx is not None and pidx not in _out_param_seen:
+                                    _out_param_seen.add(pidx)
+                                    _ca = hex(int(getattr(c, "address", 0)))
+                                    add_assumption(
+                                        f"recvmsg_out_param @ {_ca}: {callee} fills the "
+                                        f"caller-provided buffer passed as param:{pidx} "
+                                        f"(msg_iov[i].iov_base is this function's parameter). "
+                                        f"The received payload lands in the CALLER's buffer, "
+                                        f"not a local here -- re-run taint from the caller to "
+                                        f"follow it into the parser, or seed the caller's "
+                                        f"buffer directly (#452).")
                             # Honesty backstop: a resolved iovec that seeds NOTHING (an
                             # entry whose iov_base is a constant / unrecovered expr, e.g.
                             # the reaching store was mis-picked or zero-initialized) must
