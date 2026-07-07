@@ -612,7 +612,10 @@ def test_function_evidence_does_not_merge_unrelated_hlil_call_args(monkeypatch):
     assert call["argument_source"] == "hlil"
     assert [arg["text"] for arg in call["arguments"]] == ["argc", "argv", '"hb:d:"']
     assert all("aa accessory" not in arg["text"] for arg in call["arguments"])
-    assert any(c["text"] == '"aa accessory"' for c in call["argument_candidates"])
+    # #476: the unrelated NEIGHBOR call (address 0x172A0 != this callsite 0x17188) must
+    # NOT leak into the candidate list either -- previously it was quarantined there,
+    # which let an auditor mis-attribute another call's value to this one.
+    assert all("aa accessory" not in c["text"] for c in call["argument_candidates"])
 
 
 def test_pointer_table_normalizes_thumb_function_pointers(monkeypatch):
@@ -699,6 +702,11 @@ def test_pointer_table_downgrades_inline_scalar_fields(monkeypatch):
     assert rows[0]["plausible"] is True
     assert rows[1]["likely_scalar"] is True and rows[1]["plausible"] is False
     assert rows[2]["likely_scalar"] is False and rows[2]["plausible"] is False
+    # #480: the documented per-slot discriminator is present at the ROW level (not
+    # only nested under row["target"]), so scripts can key on it uniformly.
+    assert rows[0]["status"] == "function"
+    assert all("status" in r for r in rows)
+    assert rows[0]["status"] == rows[0]["target"]["status"]  # row mirrors target
     warnings = " ".join(result["warnings"])
     assert "1 non-null entries do not resolve to mapped addresses" in warnings  # only entry2
     assert "inline scalar fields" in warnings                                   # entry1 noted
@@ -1354,3 +1362,89 @@ def test_record_table_ptr_field_out_of_range_errors():
             _RecCtx({}, {}), _RecBV({}), 0x500000,
             entries=1, record_size=0x10, ptr_fields=[0xc])  # 0xc + 8 > 0x10
     assert "exceeds record-size" in str(exc.value)
+
+
+# --- G3 evidence/callsite rendering fidelity (#475/#476/#482) -----------------
+
+def test_hlil_statement_scopes_folded_calls_to_callsite_address_475(monkeypatch):
+    """#475: BN folds adjacent/nested calls into ONE LLIL instruction that maps to
+    multiple HighLevelILCall roots. The statement selector must return the statement
+    for THIS call's address, not a neighbor's (the neighbor could be listed first)."""
+    bridge = _load_bridge(monkeypatch)
+    il_format = bridge.il_format
+    stmt_a = _FakeHLILInstruction("x = sinkA(d, s)", class_name="HighLevelILVarInit",
+                                  address=0xA, expr_index=10, instr_index=10)
+    call_a = _FakeHLILInstruction("sinkA(d, s)", class_name="HighLevelILCall",
+                                  parent=stmt_a, address=0xA, expr_index=11, instr_index=11)
+    stmt_b = _FakeHLILInstruction("y = sinkB(d)", class_name="HighLevelILVarInit",
+                                  address=0xB, expr_index=20, instr_index=20)
+    call_b = _FakeHLILInstruction("sinkB(d)", class_name="HighLevelILCall",
+                                  parent=stmt_b, address=0xB, expr_index=21, instr_index=21)
+    insn = _FakeLLILInstruction(0xA, _FakeConstPtr(0x1000), hlils=[call_b, call_a])  # neighbor first
+    assert il_format._hlil_statement_text(insn) == "x = sinkA(d, s)"
+
+
+def test_hlil_statement_null_when_no_folded_root_matches_475(monkeypatch):
+    """#475: if NO folded root sits at this call's address (ambiguous fold), return
+    None -> null statement, rather than describing another call."""
+    bridge = _load_bridge(monkeypatch)
+    il_format = bridge.il_format
+    stmt_b = _FakeHLILInstruction("y = sinkB(d)", class_name="HighLevelILVarInit",
+                                  address=0xB, expr_index=20, instr_index=20)
+    call_b = _FakeHLILInstruction("sinkB(d)", class_name="HighLevelILCall",
+                                  parent=stmt_b, address=0xB, expr_index=21, instr_index=21)
+    call_c = _FakeHLILInstruction("sinkC()", class_name="HighLevelILCall",
+                                  address=0xC, expr_index=31, instr_index=31)
+    insn = _FakeLLILInstruction(0xA, _FakeConstPtr(0x1000), hlils=[call_b, call_c])  # neither at 0xA
+    assert il_format._hlil_statement_text(insn) is None
+
+
+def test_call_arguments_candidates_scoped_to_callsite_476(monkeypatch):
+    """#476: a folded NEIGHBOR call's HLIL args must not leak into THIS call's
+    candidate list (the primary vector; the mapped-MLIL under-recovery vector is
+    BN-core and stays JSON-only)."""
+    bridge = _load_bridge(monkeypatch)
+    read_evidence = bridge.read_evidence
+    instance = bridge.BinaryNinjaBridge()
+    call_a = _FakeHLILInstruction("sinkA(b, 16)", class_name="HighLevelILCall",
+                                  address=0xA, expr_index=11, instr_index=11)
+    call_a.params = ["b", "16"]
+    call_b = _FakeHLILInstruction("sinkB(a, n)", class_name="HighLevelILCall",
+                                  address=0xB, expr_index=21, instr_index=21)
+    call_b.params = ["a", "n"]
+    insn = _FakeLLILInstruction(0xA, _FakeConstPtr(0x1000), hlils=[call_a, call_b])
+    bv = _FakeBV(functions=[])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    source, primary, candidates = read_evidence._call_arguments(instance.ctx, bv, insn, 0xA)
+    assert source == "hlil"
+    assert [e["text"] for e in primary] == ["b", "16"]        # THIS call's args
+    cand_texts = {c["text"] for c in candidates}
+    assert "a" not in cand_texts and "n" not in cand_texts    # neighbor args excluded
+
+
+def test_cpp_method_this_caveat_482(monkeypatch):
+    """#482: a demangled C++ instance method whose recovered first param is a
+    non-pointer scalar AND is used as a pointer base (this mis-typed, no DWARF) gets
+    an advisory caveat. A pointer first param, a non-method name, or a first formal
+    used only as a plain scalar (static method / namespaced free function) does not."""
+    bridge = _load_bridge(monkeypatch)
+    caveat = bridge.read_evidence._cpp_method_this_caveat
+
+    scalar_this = _FakeFunction(0x401000, "Owner::dispatch")
+    scalar_this.parameter_vars = [_FakeVariable(name="arg1", storage=0, var_type="int32_t", identifier=1)]
+    body = "void Owner::dispatch(int32_t arg1)\n{ return *(uint64_t*)(arg1 + 8); }"
+    note = caveat(scalar_this, body)
+    assert note is not None and "proto set" in note and "this" in note
+
+    # #482 FP audit: same demangled shape but the scalar first formal is used only as
+    # a value (a static method / namespaced free fn) -> NO caveat.
+    assert caveat(scalar_this, "int32_t Owner::make(int32_t arg1) { return arg1 + 1; }") is None
+
+    ptr_this = _FakeFunction(0x401100, "Owner::run")
+    ptr_this.parameter_vars = [_FakeVariable(name="this", storage=0, var_type="Owner*", identifier=1)]
+    assert caveat(ptr_this, "*(uint64_t*)(this + 8)") is None  # pointer this -> no caveat
+
+    free_fn = _FakeFunction(0x401200, "plain_handler")
+    free_fn.parameter_vars = [_FakeVariable(name="arg1", storage=0, var_type="int32_t", identifier=1)]
+    assert caveat(free_fn, "*(uint64_t*)(arg1 + 8)") is None   # no '::' -> not a method
