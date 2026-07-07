@@ -11,6 +11,8 @@ Use this skill when the user wants to understand, reverse engineer, or analyze a
 
 Start broad, then narrow:
 
+> **One-shot triage (steps 1–3 in a single consistent read).** `bn evidence orient` composes target + analysis state, imports summary, a high-signal strings sample, function count, and sections into **one digest under a single read lock** — so nothing interleaves between the sub-reads the way a shell loop of the individual commands would. The `bn-re` skill ships `scripts/orient.sh` (installed alongside this file; requires `bn` and `jq` on PATH) which renders that digest as a compact triage card: `bash scripts/orient.sh -t <selector>` (any `bn` target/instance args pass through). Use it as the very first move on an unknown binary, then drill with the steps below. It samples higher-signal strings (min 6 chars) than `bn strings`, so its strings `total` is intentionally smaller.
+
 1. **Orient** — get architecture, platform, and entry point:
    ```bash
    bn target info
