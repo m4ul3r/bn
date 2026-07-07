@@ -339,6 +339,7 @@ def _select_local_hlil_node(insn) -> Any | None:
         current = root
         best_expression = None
         assignment_candidate = None
+        enclosing_call = None
         seen: set[tuple[str, int]] = set()
         while current is not None:
             marker = _hlil_marker(current)
@@ -357,6 +358,19 @@ def _select_local_hlil_node(insn) -> Any | None:
                     assignment_candidate = parent
                 break
             if _is_hlil_hard_boundary(parent):
+                # #490: a folded ANCESTOR call across a trivial cast (`outer(cast(inner()))`)
+                # is a hard boundary but -- unlike a Ret/Block -- it PROVABLY contains this
+                # call: after #475's address filter every ancestor of the matched root
+                # encloses it, so describing its statement can't leak a neighbor. Walk
+                # THROUGH the ancestor call to its enclosing statement (the pre-#475
+                # behavior), keeping the outermost such call as a fallback for bare
+                # `foo(bar(inner()))` expression statements. Ret/Block still stop the walk.
+                if _hlil_type_name(parent) in ("HighLevelILCall", "HighLevelILTailcall"):
+                    parent_text = str(parent)
+                    if _hlil_text_is_local(parent_text):
+                        enclosing_call = parent
+                    current = parent
+                    continue
                 break
 
             parent_text = str(parent)
@@ -368,6 +382,8 @@ def _select_local_hlil_node(insn) -> Any | None:
             return best_expression
         if assignment_candidate is not None:
             return assignment_candidate
+        if enclosing_call is not None:
+            return enclosing_call
     return None
 
 
