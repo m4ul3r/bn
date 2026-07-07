@@ -1714,7 +1714,13 @@ def test_list_ops_return_paged_envelope_with_true_total(monkeypatch):
     assert imports_page["has_more"] is True
 
     sections_page = instance._sections(None, offset=0, limit=2)
-    assert set(sections_page) == envelope_keys
+    # sections carries the standard envelope PLUS its always-present W+X verdict
+    # (#461) and, when segment perms exist, the W+X count/items (#453).
+    assert envelope_keys <= set(sections_page)
+    assert set(sections_page) - envelope_keys <= {
+        "wx_verdict", "writable_executable_count", "writable_executable_items"}
+    assert sections_page["wx_verdict"] in (
+        "unknown_insufficient_metadata", "no_wx_sections_observed", "wx_sections_present")
     assert sections_page["kind"] == "sections"
     assert sections_page["total"] == 5 and sections_page["returned"] == 2
     assert sections_page["has_more"] is True

@@ -444,6 +444,7 @@ def _sections(ctx, selector: str | None, *, query: str | None = None,
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     bv = ctx._resolve_view(selector)
     items = []
+    all_entries: list[dict[str, Any]] = []
     sections = getattr(bv, "sections", {})
     needle = str(query).lower() if query else None
     for name, sec in sections.items():
@@ -457,12 +458,6 @@ def _sections(ctx, selector: str | None, *, query: str | None = None,
         except (TypeError, ValueError):
             semantics_int = 0
         semantics = _SECTION_SEMANTICS_NAMES.get(semantics_int, str(raw_semantics))
-
-        # Match the query against the section name OR its semantics label, so
-        # `--query code` finds executable sections (.text = ReadOnlyCode) even
-        # though "code" is not in the name (#257).
-        if needle and needle not in name.lower() and needle not in semantics.lower():
-            continue
 
         entry: dict[str, Any] = {
             "name": name,
@@ -489,18 +484,44 @@ def _sections(ctx, selector: str | None, *, query: str | None = None,
                 entry["writable_executable"] = writable and executable
                 entry["permission_source"] = "segment"
 
+        all_entries.append(entry)
+        # The query filters the RETURNED page only. The W+X verdict below is computed
+        # over the FULL section set (all_entries), so scoping `sections --query x` to
+        # unrelated sections can't flip the verdict to a false "no W+X" all-clear on a
+        # genuinely W+X image (#461 audit P1).
+        # Match the query against the section name OR its semantics label, so
+        # `--query code` finds executable sections (.text = ReadOnlyCode) even
+        # though "code" is not in the name (#257).
+        if needle and needle not in name.lower() and needle not in semantics.lower():
+            continue
         items.append(entry)
-    # W+X summary over the full (post-filter) set -- computed before paging so a
-    # truncated page still reports the true count. Absent when no section carried
-    # segment perms (nothing to verdict on).
-    wx_items = [it["name"] for it in items if it.get("writable_executable")]
-    have_perms = any("writable_executable" in it for it in items)
-    wx_summary: dict[str, Any] = {}
+    # W+X verdict over the FULL section set (query-independent), computed before
+    # paging so a truncated page still reports the true verdict/count.
+    wx_items = [e["name"] for e in all_entries if e.get("writable_executable")]
+    # "Have perms" means at least one section carries a REAL permission bit. A
+    # synthetic/external section with all-false perms (no backing segment, or a
+    # segment mapped r/w/x = false) is insufficient metadata, not a verified
+    # not-W+X -- so it must NOT satisfy have_perms (#461).
+    have_perms = any(
+        e.get("readable") or e.get("writable") or e.get("executable")
+        for e in all_entries
+    )
+    # #461: an EXPLICIT top-level verdict, always present. On a mapped/raw embedded
+    # view whose sections carry only synthetic/external metadata (no segment perms),
+    # the writable_executable set is empty -- but that proves the metadata is
+    # insufficient, NOT that there are no executable-writable regions. Say
+    # "unknown_insufficient_metadata" so an agent doesn't read the empty set as a
+    # W+X all-clear. When perms ARE present, distinguish present vs not-observed.
+    if not have_perms:
+        wx_verdict = "unknown_insufficient_metadata"
+    elif wx_items:
+        wx_verdict = "wx_sections_present"
+    else:
+        wx_verdict = "no_wx_sections_observed"
+    wx_summary: dict[str, Any] = {"wx_verdict": wx_verdict}
     if have_perms:
-        wx_summary = {
-            "writable_executable_count": len(wx_items),
-            "writable_executable_items": wx_items,
-        }
+        wx_summary["writable_executable_count"] = len(wx_items)
+        wx_summary["writable_executable_items"] = wx_items
     if count_only:
         return {"kind": "sections", "count": len(items), "total": len(items), **wx_summary}
     items.sort(key=lambda item: int(item["start"], 16))
