@@ -1469,6 +1469,22 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
         _normalize_struct_alias(op)
 
     bv = ctx._resolve_view(selector)
+    # #479: every write op except the standalone function_create routes through
+    # here, and both the success path (bv.update_analysis_and_wait() below) and the
+    # revert paths reanalyze. On a --quick view that runs the full deferred analysis
+    # under the exclusive write lock and wedges the instance -- even a later
+    # `target info` blocks -- so refuse the whole batch fast (including --preview,
+    # whose promise is a bounded probe) and point at `bn refresh`. Subsumes and
+    # generalizes the per-op function_create guard to bn type/comment/rename/proto/
+    # struct-field/batch-apply on a quick view.
+    if bv in _quick_loaded_views:
+        raise OperationFailure(
+            "invalid_request",
+            "Cannot apply mutations: this target was loaded with --quick (no "
+            "analysis). Mutations reanalyze under the write lock, which would wedge "
+            "the instance. Run `bn refresh` first.",
+            requested={"op": "mutation", "operations": len(operations)},
+        )
     affected = _guess_affected_functions(ctx, bv, operations)
     # Partition for blast-radius attribution: a type op's reach is "functions
     # referencing the type"; a direct op targets one function. direct_starts are
