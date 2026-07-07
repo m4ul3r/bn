@@ -38,6 +38,10 @@ class OutputWriteResult:
     rendered: str
     artifact: dict[str, Any] | None = None
     spilled: bool = False
+    # #409: True when output did NOT spill but is within 20% of the threshold -- a
+    # cheap preflight signal that a slightly larger read (next page / bigger fn) will
+    # spill, so an agent can pre-emptively slice. Surfaced by the caller on stderr.
+    near_spill: bool = False
 
 
 def _json_default(value: Any) -> Any:
@@ -129,6 +133,45 @@ def estimate_tokens(encoded: bytes) -> int:
     return -(-len(encoded) // TOKEN_ESTIMATE_BYTES_PER_TOKEN)
 
 
+def resolve_spill_limit(default: int = DEFAULT_SPILL_TOKEN_LIMIT) -> int:
+    """The spill threshold in estimated tokens (#409). Overridable via the
+    ``BN_SPILL_TOKENS`` env var so an agent with a bigger/smaller context window can
+    raise or lower the on-disk-spill point (e.g. ``BN_SPILL_TOKENS=40000``). A
+    non-positive / non-numeric value falls back to the default rather than disabling
+    spill silently (an unbounded read could flood the context)."""
+    raw = os.environ.get("BN_SPILL_TOKENS")
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip(), 0)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+# Per-command rerun/slicing knob named in a spill envelope so an agent bounds the
+# next read instead of guessing (#409). Keyed by the command's output `stem`.
+_LIST_SLICE_STEMS = frozenset({
+    "functions", "function-search", "imports", "exports", "strings", "sections",
+    "class-list", "comments", "callsites", "evidence-xrefs", "go-functions", "xrefs",
+    "types", "taint-models", "field-xrefs",
+})
+
+
+def _rerun_hint(stem: str | None) -> str:
+    s = (stem or "").lower()
+    if s in _LIST_SLICE_STEMS or s.endswith("-list"):
+        return "bound the next read with --limit N (and --offset K to page), or read the spilled file"
+    if s in ("disasm", "il", "structured-il"):
+        return ("bound the next read with --lines START:END (function/CFG order) or "
+                "--linear N at an address, or read the spilled file")
+    if s == "function-evidence":
+        return "bound the next read with --limit N / --address-window A:B, or read the spilled file"
+    if s in ("decompile", "function-bundle"):
+        return "narrow the scope or read the spilled file at artifact_path (no in-line slicing knob)"
+    return "read the spilled file at artifact_path, or re-run with a slicing flag (--limit/--offset/--lines) or --out"
+
+
 def _artifact_payload(
     *,
     artifact_path: Path,
@@ -179,6 +222,12 @@ def render_artifact_envelope(payload: dict[str, Any]) -> str:
     for key in ("format", "bytes", "tokens", "tokenizer", "sha256"):
         if key in payload:
             lines.append(f"{key}: {payload[key]}")
+    # #409: surface the token threshold + the rerun/slicing hint so an agent bounds
+    # the next read (only present on a spilled envelope).
+    if "spill_token_limit" in payload:
+        lines.append(f"spill_token_limit: {payload['spill_token_limit']}")
+    if payload.get("rerun"):
+        lines.append(f"rerun: {payload['rerun']}")
     summary = payload.get("summary")
     if isinstance(summary, dict):
         summary_parts = []
@@ -228,8 +277,11 @@ def write_output_result(
     fmt: str,
     out_path: Path | None,
     stem: str,
-    spill_token_limit: int = DEFAULT_SPILL_TOKEN_LIMIT,
+    spill_token_limit: int | None = None,
 ) -> OutputWriteResult:
+    # #409: resolve the spill threshold from BN_SPILL_TOKENS when not explicitly set.
+    if spill_token_limit is None:
+        spill_token_limit = resolve_spill_limit()
     rendered = render_value(value, fmt)
     encoded = rendered.encode("utf-8")
     token_count = estimate_tokens(encoded)
@@ -257,7 +309,11 @@ def write_output_result(
         )
 
     if token_count <= spill_token_limit:
-        return OutputWriteResult(rendered=rendered)
+        # #409: flag a read that fit but is within 20% of the threshold, so the caller
+        # can warn that a slightly larger next read (next page / bigger function) will
+        # spill -- a preflight signal without a second run.
+        near = token_count >= (spill_token_limit * 4) // 5
+        return OutputWriteResult(rendered=rendered, near_spill=near)
 
     suffix = ".ndjson" if fmt == "ndjson" else ".txt" if fmt == "text" else ".json"
     try:
@@ -279,6 +335,11 @@ def write_output_result(
         value=value,
         spilled=True,
     )
+    # #409: name the command-specific slicing knob + the threshold that tripped, so
+    # the agent bounds the next read instead of re-running blind. BN_SPILL_TOKENS
+    # raises/lowers the threshold.
+    artifact["rerun"] = _rerun_hint(stem)
+    artifact["spill_token_limit"] = spill_token_limit
     return OutputWriteResult(
         rendered=render_envelope(artifact, fmt),
         artifact=artifact,
@@ -330,7 +391,7 @@ def write_output(
     fmt: str,
     out_path: Path | None,
     stem: str,
-    spill_token_limit: int = DEFAULT_SPILL_TOKEN_LIMIT,
+    spill_token_limit: int | None = None,  # #409: None resolves BN_SPILL_TOKENS
 ) -> str:
     return write_output_result(
         value,

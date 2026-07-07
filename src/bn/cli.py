@@ -573,6 +573,16 @@ def _render_result(
             )
         return True
     sys.stdout.write(result.rendered)
+    if result.near_spill:
+        # #409: fit this time, but close to the threshold -- warn so the agent slices
+        # the next (larger) read pre-emptively instead of discovering the spill after
+        # paying for it. Stderr only, so stdout/pipes stay clean.
+        print(
+            "note: output is within 20% of the spill threshold; a slightly larger next "
+            "read (next page / bigger scope) will spill to disk -- bound it with "
+            "--limit/--offset/--lines, or raise BN_SPILL_TOKENS.",
+            file=sys.stderr,
+        )
     return False
 
 
