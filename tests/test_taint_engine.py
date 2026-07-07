@@ -4944,3 +4944,22 @@ def test_forward_result_carries_metrics_and_signature(process_func, models):
     assert "→" in f["signature"]["rendered"]
     # the sink path step carries a structured callee (no prose-regex needed)
     assert any(s.get("callee") for s in f["path"])
+
+
+def test_reclassify_constant_format_sink_477(models):
+    # #477: a printf-family sink whose format operand is a resolved constant carries
+    # a tainted DATA vararg, not format-string control -> reclassify off the format
+    # class to its overflow counterpart with the concrete constant recorded.
+    engine = te.TaintEngine(FBV({}), models)
+    fo = engine._reclassify_constant_format_sink({"class": "format_or_overflow", "detail": "x"}, "%02x")
+    assert fo["class"] == "overflow_unbounded"
+    assert fo["format_constant"] == "%02x"
+    assert "format-string" in fo["detail"].lower()  # says explicitly it is NOT one
+
+    ff = engine._reclassify_constant_format_sink({"class": "fortified_format"}, "%s")
+    assert ff["class"] == "fortified_overflow" and ff["format_constant"] == "%s"
+
+    # A non-format sink class is untouched (never fabricate a reclassification).
+    other = {"class": "overflow_len", "detail": "y"}
+    assert engine._reclassify_constant_format_sink(other, "%d") == other
+    assert engine._reclassify_constant_format_sink(None, "%d") is None

@@ -3769,6 +3769,7 @@ class TaintEngine:
                 base = int(va.get("first_index", 0))
                 vto = va.get("to")
                 vsink = model.get("sink") if va.get("sink") else None
+                eff_vsink = vsink
                 upper = len(params)
                 # When the format string (the arg right before the varargs, for the
                 # printf family) is a compile-time constant, only the varargs its
@@ -3783,6 +3784,16 @@ class TaintEngine:
                         consumed = _count_format_args(fmt)
                         if consumed is not None:  # None -> positional %n$; stay conservative (#69)
                             upper = min(upper, base + consumed)
+                        # #477: a resolvable constant format means the format operand is
+                        # NOT attacker-controlled, so a tainted vararg is formatting
+                        # DATA, not format-string control. Re-headline off the
+                        # format-string class -- keep the finding (tainted data into an
+                        # unbounded printf-family write is a real overflow concern) but
+                        # don't cry format-string-injection. A tainted format doesn't
+                        # resolve to a constant (fmt is None) so it stays the stronger
+                        # class; the genuine tainted-format case is the separate
+                        # sink.tainted_args path.
+                        eff_vsink = self._reclassify_constant_format_sink(eff_vsink, fmt)
                 for i in range(max(base, 0), upper):
                     ht = arg_taint(params[i])
                     if not ht:
@@ -3794,13 +3805,13 @@ class TaintEngine:
                             k = int(vto.split("arg:", 1)[1])
                             if k < len(params):
                                 propagated.add(k)
-                    if vsink is not None:
+                    if eff_vsink is not None:
                         # record under the real param index i so this shares the
                         # recorded_sinks / top-level dedup with any static sink.
                         sig = (addr, i) if site_taddr is None else (addr, i, site_taddr)
                         if sig not in recorded_sinks:
                             recorded_sinks.add(sig)
-                            findings.append(self._make_finding(ins, mkey or name, i, vsink, ht, why))
+                            findings.append(self._make_finding(ins, mkey or name, i, eff_vsink, ht, why))
             return changed, propagated
 
         for _ in range(self.max_iters):
@@ -4564,6 +4575,36 @@ class TaintEngine:
                 raise TaintError(f"unknown source kind: {kind}")
         return seeded
 
+    # printf-family format-implying sink class -> the overflow class that remains
+    # once the format operand is proven a compile-time constant (#477). The dest
+    # buffer write is still unbounded; it is simply not a format-string bug.
+    _CONSTANT_FORMAT_RECLASS = {
+        "format_or_overflow": "overflow_unbounded",
+        "fortified_format": "fortified_overflow",
+    }
+
+    def _reclassify_constant_format_sink(self, sink, fmt):
+        """#477: when a printf-family sink's format operand is a resolved constant,
+        a tainted vararg is formatting DATA, not format-string control. Downgrade the
+        finding's class off the format-string class to its overflow counterpart and
+        record the concrete constant format, so the headline is honest. Leaves
+        non-format-implying sinks (and any class we don't map) untouched."""
+        if sink is None:
+            return sink
+        new_cls = self._CONSTANT_FORMAT_RECLASS.get(sink.get("class"))
+        if new_cls is None:
+            return sink
+        return {
+            **sink,
+            "class": new_cls,
+            "format_constant": fmt,
+            "detail": (
+                f"tainted formatting data with a constant format {fmt!r} -- NOT a "
+                "format-string bug; the concern is the unbounded write into the "
+                "destination buffer"
+            ),
+        }
+
     def _make_finding(self, ins, callee, argidx, sink, hit_nodes, why) -> dict[str, Any]:
         path = self._reconstruct_path(hit_nodes[0], why)
         path.append(_instr_dict(ins, reason=f"tainted arg{argidx} reaches {callee}",
@@ -4576,6 +4617,7 @@ class TaintEngine:
                 "tainted_arg_index": argidx,
                 "class": sink.get("class"),
                 "detail": sink.get("detail"),
+                **({"format_constant": sink["format_constant"]} if sink.get("format_constant") is not None else {}),
                 **({"source_bound": sink["source_bound"]} if sink.get("source_bound") else {}),
                 **({"via": sink["via"]} if sink.get("via") else {}),
             },
