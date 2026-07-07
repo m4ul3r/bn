@@ -3530,6 +3530,93 @@ def test_forward_keeps_overflow_through_single_call_non_allocator_wrapper_307(mo
     assert memcpy_sinks[0]["class"] == "overflow_len"          # do_log is not an allocator -> no downgrade
 
 
+def _copy_func_calloc(nmemb_expr, size_expr, length_var, *, param):
+    # dst = calloc(<nmemb_expr>, <size_expr>); memcpy(dst, src, <length_var>).
+    # calloc's total allocation is nmemb*size (two operands), unlike malloc's
+    # single size arg -- exercises the #500 calloc size-derivation branch.
+    dst = FVar("dst"); src = FVar("src")
+    dst1 = FSSA(dst, 1); src0 = FSSA(src, 0)
+    dst_param = FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1])
+    src_param = FExpr("MLIL_VAR_SSA", "src#0", reads=[src0])
+    len_param = FExpr("MLIL_VAR_SSA", "len", reads=[length_var])
+    calloc_reads = []
+    for e in (nmemb_expr, size_expr):
+        calloc_reads.extend(getattr(e, "vars_read", []) or [])
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "dst#1 = calloc(nmemb, size)",
+               reads=calloc_reads, writes=[dst1],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[nmemb_expr, size_expr]),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "memcpy(dst#1, src#0, len)",
+               reads=[dst1, src0, length_var],
+               dest=FExpr("MLIL_CONST_PTR", "0x2010", constant=0x2010),
+               params=[dst_param, src_param, len_param]),
+    ]
+    return FFunc("copy", 0x10, FSSAFunc(instrs), params=[param])
+
+
+def _calloc_memcpy_sink(func, models):
+    bv = FBV({0x2000: "calloc", 0x2010: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    memcpy_sinks = [s["sink"] for s in result["reached_sinks"]
+                    if s["sink"]["callee"] == "memcpy"]
+    assert len(memcpy_sinks) == 1
+    return memcpy_sinks[0]
+
+
+def test_forward_downgrades_overflow_calloc_nmemb_one_500(models):
+    # #500: dst = calloc(1, n); memcpy(dst, src, n) -- nmemb is the constant 1, so
+    # total == n == the copy length: provably bounded, downgrade to bounded_len.
+    n = FVar("n"); n0 = FSSA(n, 0)
+    nmemb = FExpr("MLIL_CONST", "1", constant=1)
+    size = FExpr("MLIL_VAR_SSA", "size", reads=[n0])
+    func = _copy_func_calloc(nmemb, size, n0, param=n)
+    sink = _calloc_memcpy_sink(func, models)
+    assert sink["class"] == "bounded_len"
+    assert "provably bounded" in sink["detail"]
+
+
+def test_forward_downgrades_overflow_calloc_size_one_500(models):
+    # #500: dst = calloc(n, 1); memcpy(dst, src, n) -- size is the constant 1, so
+    # total == n == the copy length: provably bounded, downgrade to bounded_len.
+    n = FVar("n"); n0 = FSSA(n, 0)
+    nmemb = FExpr("MLIL_VAR_SSA", "nmemb", reads=[n0])
+    size = FExpr("MLIL_CONST", "1", constant=1)
+    func = _copy_func_calloc(nmemb, size, n0, param=n)
+    sink = _calloc_memcpy_sink(func, models)
+    assert sink["class"] == "bounded_len"
+    assert "provably bounded" in sink["detail"]
+
+
+def test_forward_keeps_overflow_calloc_nmemb_one_differing_length_500(models):
+    # #500 no-false-negative: dst = calloc(1, m); memcpy(dst, src, n) with m != n --
+    # the total (m) does NOT equal the copy length (n), so the overflow_len label
+    # must stand. A wrong downgrade here would hide a real overflow.
+    n = FVar("n"); m = FVar("m")
+    n0 = FSSA(n, 0); m0 = FSSA(m, 0)
+    nmemb = FExpr("MLIL_CONST", "1", constant=1)
+    size = FExpr("MLIL_VAR_SSA", "size", reads=[m0])
+    func = _copy_func_calloc(nmemb, size, n0, param=n)
+    func.parameter_vars = [n, m]
+    sink = _calloc_memcpy_sink(func, models)
+    assert sink["class"] == "overflow_len"
+
+
+def test_forward_keeps_overflow_calloc_nonconst_product_500(models):
+    # #500 conservatism: dst = calloc(k, n) with k NON-constant; memcpy(dst, src, n).
+    # The true total is k*n, which the single-expr size machinery can't represent,
+    # so we must NOT downgrade -- a safe over-report (never a false negative).
+    n = FVar("n"); k = FVar("k")
+    n0 = FSSA(n, 0); k0 = FSSA(k, 0)
+    nmemb = FExpr("MLIL_VAR_SSA", "nmemb", reads=[k0])
+    size = FExpr("MLIL_VAR_SSA", "size", reads=[n0])
+    func = _copy_func_calloc(nmemb, size, n0, param=n)
+    func.parameter_vars = [n, k]
+    sink = _calloc_memcpy_sink(func, models)
+    assert sink["class"] == "overflow_len"
+
+
 def _copy_func_alloc_offset(*, alloc_const, dest_off, alloc_addr=0x2000,
                             alloc_name_addr=0x2000, len_const=0, param=None):
     # dst = alloc(len + alloc_const); memcpy(dst + dest_off, src, len + len_const)
