@@ -1630,3 +1630,73 @@ def test_decode_descriptor_field_slice_and_sibling_469(monkeypatch):
     pspec = {"name": "cb", "kind": "ptr", "offset": 2, "type": "ptr", "width": 8}
     sliced = dec(bv, pspec, (0x401000, 0, _FakeExpr("MLIL_CONST_PTR", constant=0x401139), False), 8)
     assert "symbol" not in sliced
+
+
+class _SurfSeg:
+    executable = True
+
+
+class _SurfSection:
+    def __init__(self, name, start, end):
+        self.name = name; self.start = start; self.end = end
+
+
+class _SurfBV:
+    """A bv exposing one .data.rel.ro table of 4 code-pointers (2 with functions, 2
+    without; one of the missing ones is decodable, one isn't) then a null terminator."""
+    address_size = 8
+    start = 0x1000
+    end = 0x3000
+    _VALS = [0x2000, 0x2010, 0x2020, 0x2030, 0]
+
+    def __init__(self):
+        self.sections = {".data.rel.ro": _SurfSection(".data.rel.ro", 0x1000, 0x1000 + 8 * len(self._VALS))}
+        self._fns = {0x2000, 0x2010}
+        self._exec = {0x2000, 0x2010, 0x2020, 0x2030}
+        self._decodable = {0x2000, 0x2010, 0x2020}   # 0x2030 present but not decodable
+
+    def read(self, addr, n):
+        if int(addr) == 0x1000:
+            return b"".join(v.to_bytes(8, "little") for v in self._VALS)[:n]
+        return b"\x00" * int(n)
+
+    def get_functions_containing(self, a):
+        return [object()] if int(a) in self._fns else []
+
+    def get_segment_at(self, a):
+        return _SurfSeg() if int(a) in self._exec else None
+
+    def get_disassembly(self, a):
+        return "mov eax, eax" if int(a) in self._decodable else ""
+
+    def get_sections_at(self, a):
+        return [self.sections[".data.rel.ro"]]
+
+
+def test_hidden_surface_scan_503(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_init_arrays", lambda ctx, sel, **kw: {"items": []})
+    bv = _SurfBV()
+
+    class _Ctx:
+        def _resolve_view(self, s): return bv
+        def _pointer_size(self, b): return 8
+        def _byteorder(self, b): return "little"
+
+    out = re._hidden_surface(_Ctx(), None)
+    assert out["kind"] == "hidden_surface"
+    # the 4 consecutive code pointers form one candidate table (>= default min-run 3)
+    assert len(out["candidate_tables"]) == 1
+    t = out["candidate_tables"][0]
+    assert t["entries"] == 4 and t["resolved_functions"] == 2 and t["missing_functions"] == 2
+    # the two functionless targets surface as candidates, with honest plausibility
+    cands = {c["address"]: c for c in out["missing_function_candidates"]}
+    assert set(cands) == {"0x2020", "0x2030"}
+    assert cands["0x2020"]["aligned"] is True and cands["0x2020"]["decodes"] is True
+    assert cands["0x2030"]["aligned"] is True and cands["0x2030"]["decodes"] is False
+    assert out["summary"]["candidate_tables"] == 1 and out["summary"]["missing_function_candidates"] == 2
+    # a run shorter than table-min-run is not reported
+    assert re._hidden_surface(_Ctx(), None, table_min_run=5)["candidate_tables"] == []
+    with pytest.raises(re.OperationFailure):
+        re._hidden_surface(_Ctx(), None, table_min_run=1)
