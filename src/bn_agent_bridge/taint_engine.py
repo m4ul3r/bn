@@ -3753,10 +3753,16 @@ class TaintEngine:
             propagated: set[int] = set()
             addr = int(getattr(ins, "address", 0))
             sink = model.get("sink")
-            # opt-in sinks (e.g. file_write) stay silent unless their class was
+            # opt-in sinks (e.g. file_write) stay silent unless their gate was
             # enabled for this run; still a "modeled" call, so no fallback noise.
-            if sink is not None and sink.get("optional") and sink.get("class") not in self._enabled_sink_classes:
-                sink = None
+            # The `gate` field (falling back to `class`) lets a sink keep an
+            # accurate bug class -- recv/read report `overflow_len` -- while gating
+            # under a distinct opt-in name `recv_overflow`, since always-on recv/read
+            # length sinks are ~100% FP on the fill-loop idiom (#499).
+            if sink is not None and sink.get("optional"):
+                _gate = sink.get("gate") or sink.get("class")
+                if _gate not in self._enabled_sink_classes:
+                    sink = None
             if sink is not None:
                 # #443: a bounded-write sink (wrapped recv/read) is armed by its
                 # `len_arg` -- an attacker-controlled write length -- in addition to
