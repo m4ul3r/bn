@@ -1675,6 +1675,23 @@ def test_target_info_reports_quick_analysis_state(monkeypatch):
     assert info2["analysis_state"] == "full"
 
 
+def test_target_info_reports_unanalyzed_state_for_raw_bndb(monkeypatch):
+    """#458: a .bndb that restored a raw container with no product view is tracked
+    in _unanalyzed_views; target info must report analysis_state=unanalyzed (not
+    full), so a JSON consumer isn't told a 0-function raw view is fully analyzed."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+
+    bridge._unanalyzed_views.add(bv)
+    info = instance._target_info("active")
+    assert info["analyzed"] is False
+    assert info["analysis_state"] == "unanalyzed"
+    bridge._unanalyzed_views.discard(bv)
+
+
 def test_load_quick_marks_view_full_load_does_not(monkeypatch, tmp_path):
     bridge, instance, _ = _setup_load_test(monkeypatch)
 

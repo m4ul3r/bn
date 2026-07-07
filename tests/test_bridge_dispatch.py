@@ -435,9 +435,10 @@ def test_load_bndb_recovers_analyzed_view_from_raw_default(monkeypatch, tmp_path
 
 
 def test_load_bndb_raw_no_analysis_warns_hard(monkeypatch, tmp_path):
-    """#458: a .bndb that restores a raw view with no recoverable analyzed view
-    must emit a hard restore-failure diagnostic, not the soft 'confirm this is the
-    binary' note used for unrecognized raw binaries."""
+    """#458: a .bndb that restores a raw container with no saved product view must
+    emit a hard restore-failure diagnostic (not the soft 'confirm this is the
+    binary' note) AND report analysis_state=unanalyzed so JSON consumers aren't
+    told a 0-function raw view is fully analyzed."""
     bridge, instance, _ = _setup_load_test(monkeypatch)
     bndb = tmp_path / "broken.bndb"
     bndb.write_bytes(b"")
@@ -449,11 +450,15 @@ def test_load_bndb_raw_no_analysis_warns_hard(monkeypatch, tmp_path):
     result = instance._load_binary(str(bndb))
 
     assert bridge._headless_views == [raw]
-    assert any(n.startswith("WARNING:") and "saved analysis could not be restored" in n
+    assert any(n.startswith("WARNING:") and "no saved analyzed view" in n
                for n in result["notes"])
+    # Structured fields must match the WARNING, not claim full analysis (#458 P2).
+    assert result["analyzed"] is False
+    assert result["analysis_state"] == "unanalyzed"
     # Not the generic unrecognized-format note.
     assert not any("Confirm this is the binary you intended" in n for n in result["notes"])
     bridge._headless_views.clear()
+    bridge._unanalyzed_views.clear()
 
 
 def test_load_bndb_analyzed_view_no_spurious_warning(monkeypatch, tmp_path):
@@ -470,8 +475,32 @@ def test_load_bndb_analyzed_view_no_spurious_warning(monkeypatch, tmp_path):
     result = instance._load_binary(str(bndb))
 
     assert bridge._headless_views == [analyzed]
+    assert result["analyzed"] is True and result["analysis_state"] == "full"
     assert not any("WARNING" in n or "restored analyzed view" in n for n in result["notes"])
     assert not any("was opened as a raw" in n for n in result["notes"])
+    bridge._headless_views.clear()
+
+
+def test_load_bndb_codeless_product_view_not_warned(monkeypatch, tmp_path):
+    """#458 (Defect A): a legitimately-analyzed codeless/data database reloads as a
+    product view (e.g. Mapped) with 0 functions. That is analyzed-but-code-free, not
+    a restore failure -- it must NOT be warned about or reported unanalyzed. The
+    discriminator is view type (raw container), not function count alone."""
+    bridge, instance, _ = _setup_load_test(monkeypatch)
+    bndb = tmp_path / "datablob.bndb"
+    bndb.write_bytes(b"")
+
+    # A saved Mapped product view with 0 functions (data-only region).
+    codeless = _LoadBV(filename=str(bndb), view_type="Mapped", functions=[],
+                       existing_views=["Mapped", "Raw"], db_views={})
+    sys.modules["binaryninja"].load = lambda path, update_analysis=True: codeless
+
+    result = instance._load_binary(str(bndb))
+
+    assert bridge._headless_views == [codeless]      # accepted as-is, no swap
+    assert result["analyzed"] is True                # analyzed, just code-free
+    assert result["analysis_state"] == "full"
+    assert not any("WARNING" in n or "restored analyzed view" in n for n in result["notes"])
     bridge._headless_views.clear()
 
 

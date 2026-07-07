@@ -478,10 +478,16 @@ class TargetManager:
                         "view_name": record.view_name,
                         "active": bool(view is active),
                         # Per-target analysis state so `target list` can flag a
-                        # --quick (unanalyzed) view without a per-target lookup.
-                        "analyzed": view not in _quick_loaded_views,
+                        # --quick or restore-failed (#458) unanalyzed view without a
+                        # per-target lookup.
+                        "analyzed": (
+                            view not in _quick_loaded_views
+                            and view not in _unanalyzed_views
+                        ),
                         "analysis_state": (
-                            "quick" if view in _quick_loaded_views else "full"
+                            "quick" if view in _quick_loaded_views
+                            else "unanalyzed" if view in _unanalyzed_views
+                            else "full"
                         ),
                     }
                 )
@@ -973,8 +979,12 @@ class BinaryNinjaBridge:
     def _load_existing_result(self, load_path: Path, resolved: Path, notes: list[str], existing):
         with self._target_lock.write():
             targets = self.targets.refresh()
-        analyzed = existing not in _quick_loaded_views
-        analysis_state = "full" if analyzed else "quick"
+        analyzed = existing not in _quick_loaded_views and existing not in _unanalyzed_views
+        analysis_state = (
+            "quick" if existing in _quick_loaded_views
+            else "unanalyzed" if existing in _unanalyzed_views
+            else "full"
+        )
         notes.append(
             f"{load_path} is already open; returned the existing target "
             "instead of opening a duplicate (use `bn close` first to reload)"
@@ -1070,9 +1080,10 @@ class BinaryNinjaBridge:
             # the database holds a saved analyzed view -- recover it (under the lock,
             # since get_view_of_type touches BN state) or surface a hard restore
             # diagnostic, so an agent never silently continues on a no-symbol target.
+            bndb_unanalyzed = False
             if load_path.suffix == ".bndb":
                 with self._target_lock.write():
-                    bv, bndb_note = _restore_bndb_analyzed_view(bv, load_path)
+                    bv, bndb_note, bndb_unanalyzed = _restore_bndb_analyzed_view(bv, load_path)
                 if bndb_note:
                     notes.append(bndb_note)
 
@@ -1121,6 +1132,12 @@ class BinaryNinjaBridge:
                 bv.update_analysis_and_wait()
                 _quick_loaded_views.discard(bv)
 
+            # #458: a .bndb that restored a raw container with no analyzed product
+            # view is genuinely unanalyzed -- record it so target list/info report
+            # analysis_state="unanalyzed" (not "full"), matching the WARNING note.
+            if bndb_unanalyzed:
+                _unanalyzed_views.add(bv)
+
             # Publish under the exclusive lock so a concurrent target read sees a
             # consistent set. Append under _headless_views_lock, then refresh
             # (which re-acquires that non-reentrant lock itself).
@@ -1139,8 +1156,12 @@ class BinaryNinjaBridge:
                 "loaded": True,
                 "path": str(load_path),
                 "requested_path": str(resolved),
-                "analyzed": not quick_effective,
-                "analysis_state": "quick" if quick_effective else "full",
+                "analyzed": (not quick_effective) and not bndb_unanalyzed,
+                "analysis_state": (
+                    "quick" if quick_effective
+                    else "unanalyzed" if bndb_unanalyzed
+                    else "full"
+                ),
                 "notes": notes,
                 "targets": targets,
             }
@@ -1359,15 +1380,19 @@ class BinaryNinjaBridge:
                 record = item
                 break
         quick = bv in _quick_loaded_views
+        unanalyzed = bv in _unanalyzed_views
         info = {
             **(record or {}),
             "arch": str(getattr(bv, "arch", "")),
             "platform": str(getattr(bv, "platform", "")),
             "entry_point": hex(getattr(bv, "entry_point", 0)),
             # Machine-readable analysis state so callers can tell a --quick view
-            # (strings/full function set pending `bn refresh`) from a real one.
-            "analyzed": not quick,
-            "analysis_state": "quick" if quick else "full",
+            # (strings/full function set pending `bn refresh`) or a restore-failed
+            # raw .bndb (#458) from a real one.
+            "analyzed": not quick and not unanalyzed,
+            "analysis_state": (
+                "quick" if quick else "unanalyzed" if unanalyzed else "full"
+            ),
             # Function-count summary every agent reaches for (#122).
             **_function_name_summary(bv),
         }
@@ -2312,6 +2337,7 @@ from .bridge_state import (  # noqa: E402
     _headless_views,
     _headless_views_lock,
     _quick_loaded_views,
+    _unanalyzed_views,
 )
 
 
@@ -2874,25 +2900,33 @@ _RAW_CONTAINER_VIEW_TYPES = frozenset({"Raw", "Hex", ""})
 def _restore_bndb_analyzed_view(bv, load_path: Path):
     """For a directly-named ``.bndb``, ensure the *analyzed* view is returned (#458).
 
-    BN's ``load()`` can default to the raw container view (0 functions) even when the
-    database holds a saved analyzed view -- an agent that continues against it sees no
-    functions/symbols and mistakes a restore failure for an empty/different binary.
-    When the loaded view looks unanalyzed, recover the analyzed view from the shared
-    ``FileMetadata`` (``existing_views`` + ``get_view_of_type``); if none exists, return
-    a hard diagnostic instead of a silent no-symbol target.
+    BN's ``load()`` can default to the raw byte-container view (``Raw``/``Hex``) even
+    when the database holds a saved analyzed product view -- an agent that continues
+    against it sees no functions/symbols and mistakes a restore failure for an empty or
+    different binary. When the loaded view is a raw container, recover the analyzed
+    product view from the shared ``FileMetadata`` (``existing_views`` +
+    ``get_view_of_type``); if the database has no product view at all, return a hard
+    diagnostic instead of a silent no-symbol target.
 
-    Note: the discriminator is *function presence*, not the view-type name -- firmware
-    legitimately analyzes as a ``Mapped`` view, so a Mapped view WITH functions is fine
-    and left untouched.
+    The discriminator is the *view type*, not function count alone: a product view
+    (ELF/Mach-O/PE/Mapped/...) with 0 functions is a legitimately-analyzed codeless or
+    data region -- firmware data blobs analyze to a 0-function ``Mapped`` view -- so it
+    is accepted as-is and never warned about. Only a raw *container* view signals that
+    ``load()`` failed to select the saved analyzed view.
 
-    Returns ``(bv, note_or_None)`` where ``bv`` may be the recovered analyzed view.
+    Returns ``(bv, note_or_None, unanalyzed)`` where ``bv`` may be the recovered view
+    and ``unanalyzed`` is True only when the target is a raw container with no
+    recoverable analyzed view (so callers can report ``analyzed=False`` honestly).
     """
-    if _view_function_count(bv) > 0:
-        return bv, None  # analyzed view already restored -- the common case
-
     current_type = str(getattr(bv, "view_type", "") or "")
+    # A real product view (even with 0 functions) is the analyzed view -- accept it.
+    if current_type not in _RAW_CONTAINER_VIEW_TYPES or _view_function_count(bv) > 0:
+        return bv, None, False
+
+    # Loaded view is a raw container: look for a saved product view to recover.
     fm = getattr(bv, "file", None)
     existing = list(getattr(fm, "existing_views", None) or [])
+    best = None  # (name, view, function_count); a product view, preferring one with code
     for name in existing:
         if name in _RAW_CONTAINER_VIEW_TYPES or name == current_type:
             continue
@@ -2900,20 +2934,38 @@ def _restore_bndb_analyzed_view(bv, load_path: Path):
             candidate = fm.get_view_of_type(name)
         except Exception:  # noqa: BLE001 - a view type present on disk may still fail to open
             candidate = None
-        if candidate is not None and _view_function_count(candidate) > 0:
-            return candidate, (
-                f"restored analyzed view '{name}' ({_view_function_count(candidate)} "
-                f"functions) from {load_path.name}; load() had defaulted to the raw "
+        if candidate is None:
+            continue
+        count = _view_function_count(candidate)
+        if count > 0:
+            best = (name, candidate, count)
+            break  # a product view WITH functions is the clear winner
+        if best is None:
+            best = (name, candidate, 0)  # remember the first codeless product view
+
+    if best is not None:
+        name, candidate, count = best
+        if count > 0:
+            note = (
+                f"restored analyzed view '{name}' ({count} functions) from "
+                f"{load_path.name}; load() had defaulted to the raw "
                 f"'{current_type or 'Raw'}' container view"
             )
+        else:
+            note = (
+                f"restored analyzed view '{name}' from {load_path.name} (load() had "
+                f"defaulted to the raw '{current_type or 'Raw'}' container view); it has "
+                "0 functions -- an analyzed but code-free/data region"
+            )
+        return candidate, note, False
 
     return bv, (
         f"WARNING: {load_path.name} restored a raw '{current_type or 'Raw'}' view with "
-        "0 functions -- the saved analysis could not be restored (the database may have "
-        "been saved before analysis finished, or is corrupt). Function/symbol/xref "
-        "queries will be empty; this is NOT an analyzed target. Re-create the database "
-        "from the original binary, or load the raw binary and run `bn refresh`."
-    )
+        "no saved analyzed view -- the database has no product view (it may have been "
+        "saved before analysis, is a raw-only image, or is corrupt). Function/symbol/"
+        "xref queries will be empty; this is NOT an analyzed target. Re-create the "
+        "database from the original binary, or load the raw binary and run `bn refresh`."
+    ), True
 
 
 def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
@@ -2951,8 +3003,9 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
     # to the raw container view must recover its analyzed view (or log a hard
     # restore diagnostic), so `bn-agent <file>.bndb` doesn't silently preload a
     # no-symbol target.
+    bndb_unanalyzed = False
     if load_path.suffix == ".bndb":
-        bv, bndb_note = _restore_bndb_analyzed_view(bv, load_path)
+        bv, bndb_note, bndb_unanalyzed = _restore_bndb_analyzed_view(bv, load_path)
         if bndb_note:
             (bn.log_warn if bndb_note.startswith("WARNING:") else bn.log_info)(bndb_note)
     quick_effective = quick and load_path.suffix != ".bndb"
@@ -2961,6 +3014,8 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
     else:
         bv.update_analysis_and_wait()
         _quick_loaded_views.discard(bv)
+    if bndb_unanalyzed:
+        _unanalyzed_views.add(bv)
     with _headless_views_lock:
         _headless_views.append(bv)
     bn.log_info(f"Loaded {load_path}{' (no analysis)' if quick_effective else ''}")

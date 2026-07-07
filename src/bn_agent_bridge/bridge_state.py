@@ -25,6 +25,11 @@ _headless_views_lock = threading.Lock()
 # are unavailable until `bn refresh`, so commands consult this to stay honest
 # instead of returning a misleading empty result. Weak so closed views drop out.
 _quick_loaded_views: "weakref.WeakSet[Any]" = weakref.WeakSet()
+# Views restored from a .bndb that had no saved analyzed product view -- a raw
+# container with no functions/symbols (#458). Distinct from --quick: `bn refresh`
+# on a raw-only image will not recover a format view, so these are reported as
+# `analysis_state="unanalyzed"` rather than "quick". Weak so closed views drop out.
+_unanalyzed_views: "weakref.WeakSet[Any]" = weakref.WeakSet()
 
 
 def require_analysis(bv: Any, what: str = "This operation") -> None:
