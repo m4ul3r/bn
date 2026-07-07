@@ -587,15 +587,25 @@ def _callsites(args: argparse.Namespace) -> int:
              arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
              arg("--context", type=_non_negative_int, default=2,
                  help="Number of previous and next disassembly instructions to include around calls"),
+             arg("--limit", type=_positive_int, default=None, metavar="N",
+                 help="Return at most N call-evidence records -- slice a large/dispatch function"),
+             arg("--offset", type=_non_negative_int, default=0,
+                 help="Skip the first OFFSET call-evidence records (pagination, with --limit)"),
+             arg("--address-window", dest="address_window", default=None, metavar="A:B",
+                 help="Only calls whose address is in [A, B) (hex 0x.. or decimal), e.g. 0x402000:0x402200"),
          ])
 def _evidence_function(args: argparse.Namespace) -> int:
+    params: dict[str, Any] = {"identifier": args.identifier, "context": args.context}
+    if args.limit is not None:
+        params["limit"] = args.limit
+    if args.offset:
+        params["offset"] = args.offset
+    if args.address_window:
+        params["address_window"] = args.address_window
     return _call(
         args,
         "function_evidence",
-        {
-            "identifier": args.identifier,
-            "context": args.context,
-        },
+        params,
         require_target=True,
         text_renderer=_render_function_evidence_text,
         stem="function-evidence",

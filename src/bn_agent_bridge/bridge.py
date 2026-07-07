@@ -2575,10 +2575,25 @@ def _bind_disasm(bridge, params, target):
 
 @op("function_evidence", lock="read")
 def _bind_function_evidence(bridge, params, target):
+    aw = params.get("address_window")
+    window = None
+    if aw is not None:
+        # "A:B" -> (int, int); accept hex or decimal, half-open [A, B).
+        parts = str(aw).split(":", 1)
+        if len(parts) != 2:
+            raise OperationFailure("invalid_request",
+                                   f"--address-window must be A:B, got {aw!r}")
+        window = (_parse_address(parts[0]), _parse_address(parts[1]))
+        if window[1] <= window[0]:
+            raise OperationFailure("invalid_request",
+                                   f"--address-window end must exceed start: {aw!r}")
     return bridge._function_evidence(
         target,
         params["identifier"],
         context=int(params.get("context", 2)),
+        offset=int(params.get("offset", 0)),
+        limit=int(params["limit"]) if params.get("limit") is not None else None,
+        address_window=window,
     )
 
 

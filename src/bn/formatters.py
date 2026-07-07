@@ -1278,7 +1278,20 @@ def _render_function_evidence_text(value: Any) -> str:
 
     calls = list(value.get("calls") or [])
     lines.append("")
-    lines.append(f"calls: {len(calls)}")
+    # #471: show the slice window when the call set was paged/windowed.
+    total_calls = value.get("total_calls")
+    matched = value.get("matched_calls")
+    call_hdr = f"calls: {len(calls)}"
+    if isinstance(total_calls, int) and (
+        value.get("offset") or value.get("limit") is not None or matched != total_calls
+    ):
+        call_hdr += f" of {matched if matched is not None else total_calls}"
+        if matched is not None and matched != total_calls:
+            call_hdr += f" in window (of {total_calls} total)"
+        if value.get("has_more"):
+            nxt = int(value.get("offset") or 0) + len(calls)
+            call_hdr += f" -- more: rerun with --offset {nxt}"
+    lines.append(call_hdr)
     if not calls:
         return "\n".join(lines)
 

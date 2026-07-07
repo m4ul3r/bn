@@ -362,9 +362,15 @@ def _cpp_method_this_caveat(func, decompiled_text: str = "") -> str | None:
     )
 
 
-def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 2):
+def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 2,
+                       offset: int = 0, limit: int | None = None,
+                       address_window: tuple[int, int] | None = None):
     if context < 0:
         raise OperationFailure("invalid_context", f"Invalid evidence context size: {context}")
+    if offset < 0:
+        raise OperationFailure("invalid_request", f"Invalid offset: {offset}")
+    if limit is not None and limit < 1:
+        raise OperationFailure("invalid_request", f"Invalid limit: {limit}")
     bv = ctx._resolve_view(selector)
     func = ctx._find_function(bv, identifier)
     text = il_format._decompile_text(bv, func)
@@ -372,6 +378,26 @@ def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 
     this_caveat = _cpp_method_this_caveat(func, text)
     if this_caveat:
         warnings.append(this_caveat)
+
+    calls = _function_call_evidence(ctx, bv, func, context=context)
+    total_calls = len(calls)
+    # #471: slicing/windowing controls so a large call-heavy dispatch function can be
+    # inspected in bounded chunks instead of reading a full spill. Only sort by address
+    # when a slice is actually requested -- the default (unsliced) output keeps its
+    # original IL/discovery order so existing consumers see no change.
+    slicing = bool(offset or limit is not None or address_window is not None)
+    if slicing:
+        calls.sort(key=lambda c: int(str(c.get("address", "0x0")), 16))
+    if address_window is not None:
+        lo, hi = address_window
+        calls = [c for c in calls if lo <= int(str(c.get("address", "0x0")), 16) < hi]
+    matched = len(calls)
+    if offset:
+        calls = calls[offset:]
+    if limit is not None:
+        calls = calls[:limit]
+    returned = len(calls)
+
     return {
         "function": {
             "name": func.name,
@@ -380,7 +406,14 @@ def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 
         },
         **il_format._function_metadata(func),
         "thunk": _function_thunk_summary(ctx, bv, func),
-        "calls": _function_call_evidence(ctx, bv, func, context=context),
+        "calls": calls,
+        # #471 pagination metadata (present for both text and JSON consumers).
+        "total_calls": total_calls,
+        "matched_calls": matched,
+        "offset": offset,
+        "limit": limit,
+        "returned": returned,
+        "has_more": offset + returned < matched,
         "warnings": warnings,
     }
 
