@@ -1393,6 +1393,11 @@ class BinaryNinjaBridge:
             "analysis_state": (
                 "quick" if quick else "unanalyzed" if unanalyzed else "full"
             ),
+            # Pollable analysis phase/progress (#321): while a `bn refresh` runs on
+            # another connection, this advances (refresh no longer holds the
+            # read-blocking lock) so an agent can watch a large-target analysis
+            # instead of guessing whether the bridge is wedged.
+            "analysis_progress": _analysis_progress(bv),
             # Function-count summary every agent reaches for (#122).
             **_function_name_summary(bv),
         }
@@ -1405,12 +1410,30 @@ class BinaryNinjaBridge:
 
     def _refresh(self, selector: str | None):
         bv = self._resolve_view(selector)
-        bv.update_analysis_and_wait()
-        _quick_loaded_views.discard(bv)
-        return {
-            "refreshed": True,
-            "target": self._target_info(selector),
-        }
+        # #321: hold only the write GATE (which serializes other writers) around the
+        # possibly-multi-minute analysis -- NOT the exclusive target lock. BN allows
+        # concurrent reads while update_analysis_and_wait() runs (verified), so
+        # `target info` / `function list` / analysis-progress polls stay responsive
+        # on other connections and an agent can watch progress instead of guessing
+        # whether the bridge is wedged. The brief exclusive window at the end only
+        # flips the per-view analysis-state flags. (refresh is @op lock="none" so it
+        # self-manages locking, mirroring load_binary's unlocked analysis phase.)
+        with self._write_gate:
+            bv.update_analysis_and_wait()
+            with self._target_lock.write():
+                _quick_loaded_views.discard(bv)
+                # Only clear the #458 unanalyzed flag if analysis actually produced
+                # functions -- a refresh on a raw-only container (no product view)
+                # is a no-op and must stay "unanalyzed", not be mislabeled "full".
+                if _view_function_count(bv) > 0:
+                    _unanalyzed_views.discard(bv)
+        # Build the response under the READ lock: the tail read touches live view
+        # state (bv.functions / arch / analysis_progress), and the instant we drop
+        # the write gate a queued mutation can begin writing the same view -- so
+        # serialize this read against writers like every other read op does.
+        with self._target_lock.read():
+            target = self._target_info(selector)
+        return {"refreshed": True, "target": target}
 
     # ---- BridgeContext seam shims (bodies live in seam.py) --------------
     # Resolution / ABI / address-context helpers were relocated into the
@@ -2365,8 +2388,8 @@ def _bind_target_info(bridge, params, target):
     return bridge._target_info(params.get("selector") or target, verbose=_validate_bool(params.get("verbose"), label="verbose", default=False))
 
 
-@op("refresh", lock="write")
-def _bind_refresh(bridge, params, target):
+@op("refresh", lock="none")  # #321: self-manages locking -- analysis runs holding
+def _bind_refresh(bridge, params, target):  # only the write gate so reads stay live
     return bridge._refresh(target)
 
 
@@ -2891,6 +2914,27 @@ def _view_function_count(bv) -> int:
         return len(bv.functions)
     except Exception:  # noqa: BLE001 - a raw/uninitialised view may not expose functions
         return 0
+
+
+def _analysis_progress(bv):
+    """Pollable analysis progress for `target info` (#321): the current phase plus
+    item counts, so an agent watching a long `bn refresh` sees movement (and, on
+    another connection, can poll it while refresh runs -- refresh no longer holds
+    the read-blocking lock) instead of guessing whether the bridge is wedged.
+    Returns ``{"state","count","total"}`` or None if BN does not expose it."""
+    try:
+        ap = bv.analysis_progress
+    except Exception:  # noqa: BLE001 - not all view types expose progress
+        return None
+    if ap is None:
+        return None
+    state = getattr(ap, "state", None)
+    name = getattr(state, "name", None) or (str(state) if state is not None else None)
+    return {
+        "state": name,
+        "count": int(getattr(ap, "count", 0) or 0),
+        "total": int(getattr(ap, "total", 0) or 0),
+    }
 
 
 # View types that are the raw byte container, never the analyzed product view.

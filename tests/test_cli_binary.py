@@ -176,6 +176,37 @@ def test_target_summary_text_shows_analysis_state():
     assert "analysis: quick" in quick
 
 
+def test_target_summary_text_shows_analysis_progress_when_active():
+    """#321: a long `bn refresh` surfaces a live `analysis progress:` line in text so
+    the analysis reads as movement, not a wedge -- but only when actively progressing
+    (total > 0); an idle view omits it."""
+    from bn import formatters
+    active = formatters._render_target_summary({
+        "selector": "active", "view_id": 1, "analysis_state": "quick",
+        "analysis_progress": {"state": "AnalyzeState", "count": 1112, "total": 1939},
+    })
+    assert "analysis progress: AnalyzeState 1112/1939" in active
+    idle = formatters._render_target_summary({
+        "selector": "active", "view_id": 1, "analysis_state": "full",
+        "analysis_progress": {"state": "IdleState", "count": 0, "total": 0},
+    })
+    assert "analysis progress:" not in idle
+    # An active phase that legitimately reports 0/0 (Discovery/ExtendedAnalyze) still
+    # shows the line -- just without counts -- so it doesn't flicker away mid-analysis.
+    discovery = formatters._render_target_summary({
+        "selector": "active", "view_id": 1, "analysis_state": "quick",
+        "analysis_progress": {"state": "DiscoveryState", "count": 0, "total": 0},
+    })
+    assert "analysis progress: DiscoveryState" in discovery
+    assert "DiscoveryState 0/0" not in discovery  # no counts when total is 0
+    # Not-yet-started phase is hidden like idle.
+    initial = formatters._render_target_summary({
+        "selector": "active", "view_id": 1, "analysis_state": "quick",
+        "analysis_progress": {"state": "InitialState", "count": 0, "total": 0},
+    })
+    assert "analysis progress:" not in initial
+
+
 def test_target_info_verbose_renders_segments():
     """target info --verbose text appends the segment map with r/w/x perms; the
     block is absent when no segments are present (target list rows). (F21)"""
