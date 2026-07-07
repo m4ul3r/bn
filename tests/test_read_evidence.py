@@ -1700,3 +1700,33 @@ def test_hidden_surface_scan_503(monkeypatch):
     assert re._hidden_surface(_Ctx(), None, table_min_run=5)["candidate_tables"] == []
     with pytest.raises(re.OperationFailure):
         re._hidden_surface(_Ctx(), None, table_min_run=1)
+
+
+def test_hidden_surface_segment_fallback_503(monkeypatch):
+    # #503 (firmware): a raw/monolithic image with NO named data sections must fall
+    # back to scanning readable SEGMENTS, else it finds nothing on its primary target
+    # class (e.g. a VxWorks kernel loaded as one r-x segment).
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_init_arrays", lambda ctx, sel, **kw: {"items": []})
+
+    class _Seg:
+        readable = True
+        executable = True
+        start = 0x1000
+        end = 0x1000 + 8 * len(_SurfBV._VALS)
+
+    bv = _SurfBV()
+    bv.sections = {}                 # no named sections at all
+    bv.segments = [_Seg()]
+
+    class _Ctx:
+        def _resolve_view(self, s): return bv
+        def _pointer_size(self, b): return 8
+        def _byteorder(self, b): return "little"
+
+    out = re._hidden_surface(_Ctx(), None)
+    assert len(out["candidate_tables"]) == 1                # the table found via the segment
+    assert out["candidate_tables"][0]["section"].startswith("segment@")
+    assert any("no named data sections" in w for w in out["warnings"])   # fallback disclosed
+    assert out["summary"]["missing_function_candidates"] == 2

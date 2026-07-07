@@ -1593,7 +1593,7 @@ _SURFACE_SCAN_HINTS = (".data.rel.ro", ".data", ".rodata")
 
 def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
                     max_tables: int = 64, max_candidates: int = 128,
-                    max_scan_bytes: int = 4_000_000) -> dict[str, Any]:
+                    max_scan_bytes: int = 16_000_000) -> dict[str, Any]:
     """#503: enumerate the HIDDEN code surface a passive `function list` misses -- code
     reachable through data, not direct calls. READ-ONLY: it reports addresses BN did not
     turn into functions, it does NOT create them (that stays the agent's separate write).
@@ -1602,8 +1602,10 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
       - ``init_sections``: `.init_array`/`.ctors`/`.fini_array` constructor pointers (pre-
         main code), each flagged whether BN recovered a function for it.
       - ``candidate_tables``: runs of >= ``table_min_run`` consecutive pointers-to-executable
-        in `.data`/`.rodata`/`.data.rel.ro`/`.got` -- vtable/dispatch-table candidates, with
-        resolved-vs-missing slot counts.
+        -- vtable/dispatch-table candidates, with resolved-vs-missing slot counts. Scans the
+        named data sections (`.data`/`.rodata`/`.data.rel.ro`) when present, else falls back
+        to the readable SEGMENTS (a raw/monolithic firmware image with no named sections, its
+        tables interleaved in a single r-x region -- the primary target class).
       - ``missing_function_candidates``: the deduped executable targets (from init + tables)
         with NO BN function, each carrying two weak honest signals -- ``aligned`` (target on
         the arch's code granularity) and ``decodes`` (BN decodes an instruction there).
@@ -1701,15 +1703,31 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
             "resolved_functions": resolved, "missing_functions": missing_here,
         })
 
-    # 2) scan data-ish sections for runs of consecutive pointers-to-executable.
+    # 2) scan data regions for runs of consecutive pointers-to-executable. Prefer named
+    # data sections; on a raw/monolithic firmware image with NO named data sections
+    # (e.g. a VxWorks kernel BN loads as a single r-x segment, code + data interleaved)
+    # fall back to the readable SEGMENTS so the feature works on its primary target class.
+    scan_regions: list[tuple[str, int, int]] = []
+    for name, section in (getattr(bv, "sections", {}) or {}).items():
+        if any(h in str(name).lower() for h in _SURFACE_SCAN_HINTS):
+            scan_regions.append((str(name), int(getattr(section, "start", 0)),
+                                 int(getattr(section, "end", 0))))
+    if not scan_regions:
+        for seg in (getattr(bv, "segments", []) or []):
+            if getattr(seg, "readable", False):
+                scan_regions.append((f"segment@{hex(int(seg.start))}",
+                                     int(seg.start), int(seg.end)))
+        if scan_regions:
+            warnings.append(
+                "no named data sections matched -- scanned readable segment(s) instead "
+                "(raw/monolithic firmware); code and data share the region so candidate "
+                "tables carry more noise -- lean on the resolved/missing counts and confirm "
+                "with disasm")
+
     candidate_tables: list[dict[str, Any]] = []
     scanned = 0
     scan_capped = False
-    for name, section in (getattr(bv, "sections", {}) or {}).items():
-        if not any(h in str(name).lower() for h in _SURFACE_SCAN_HINTS):
-            continue
-        start = int(getattr(section, "start", 0))
-        end = int(getattr(section, "end", 0))
+    for name, start, end in scan_regions:
         if scanned >= max_scan_bytes:
             scan_capped = True
             break
@@ -1758,8 +1776,9 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
 
     if scan_capped:
         warnings.append(
-            f"data scan capped at {max_scan_bytes} bytes; some sections (or their tails) "
-            "were not scanned -- raise --max-scan-bytes for full coverage")
+            f"data scan capped at {max_scan_bytes} bytes; regions (or their tails) beyond "
+            "the budget were not scanned -- on a monolithic image the pointer tables often "
+            "sit in the TAIL, so raise --max-scan-bytes to cover the whole image")
     if len(candidate_tables) >= max_tables:
         warnings.append(f"candidate tables capped at {max_tables} (--max-tables)")
     if len(missing) >= max_candidates:
