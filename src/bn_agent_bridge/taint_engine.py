@@ -2653,6 +2653,17 @@ class TaintEngine:
         "Znwm": 0, "Znam": 0,
     }
 
+    # 2-arg (nmemb, size) allocators: the total allocation is nmemb*size, which the
+    # single-expression size machinery can't represent. The dominant bounded idiom
+    # pins one operand to the constant 1 (`calloc(1, n)` / `calloc(n, 1)`), where the
+    # total equals the OTHER operand -- so we can hand that operand to the downgrade
+    # comparison. Any non-trivial nmemb*size stays a safe over-report (#500). Only
+    # names whose signature is exactly (nmemb, size) belong here, else the wrong
+    # operand could be matched and a real overflow hidden.
+    _CALLOC_SIZE_ARGS = {
+        "calloc": (0, 1), "xcalloc": (0, 1), "ecalloc": (0, 1),
+    }
+
     def _pointer_alloc_root(self, ssaf: Any, var: Any, depth: int = 0) -> Any:
         """Follow a destination pointer through pure SSA copies (``t = s``) and
         CONSTANT pointer arithmetic (``t = base +/- const``) to the root pointer
@@ -2712,6 +2723,21 @@ class TaintEngine:
             return None
         callee = self._callee_name(self._resolve_direct_target(d))
         base = (callee or "").split("@", 1)[0].lstrip("_")
+        cargs = self._CALLOC_SIZE_ARGS.get(base)
+        if cargs is not None:
+            # calloc(nmemb, size): total = nmemb*size. Return the non-unit operand
+            # when the other is the constant 1, so `calloc(1, n)` / `calloc(n, 1)`
+            # downgrade like `malloc(n)`; otherwise the product isn't representable
+            # here -> None (safe over-report, never a false downgrade) (#500).
+            aparams = self._call_params(d)
+            nmemb_i, size_i = cargs
+            if nmemb_i < len(aparams) and size_i < len(aparams):
+                nmemb_e, size_e = aparams[nmemb_i], aparams[size_i]
+                if self._int_const(nmemb_e) == 1:
+                    return size_e
+                if self._int_const(size_e) == 1:
+                    return nmemb_e
+            return None
         idx = self._ALLOC_SIZE_ARG.get(base)
         if idx is None:
             # C++ operator new/new[] (mangled variants / demangled) -> canonical key.
