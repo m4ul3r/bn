@@ -4776,17 +4776,16 @@ def test_arg_under_recovered_leaf_discloses_stack_passed(models, monkeypatch):
     assert "..." in leaf["note"]  # variadic prototype hint
 
 
-def test_arg_under_recovered_leaf_i386_pure_stack_discloses(models, monkeypatch):
-    # #324: on a pure stack ABI (i386 cdecl, int_arg_regs=[]) EVERY dropped index is
-    # stack-passed; the frontier must still fire (previously len(arg_regs)==0 meant
-    # every index was skipped and nothing was disclosed).
+def test_arg_under_recovered_leaf_i386_pure_stack_stays_silent(models, monkeypatch):
+    # #324 FP audit: on a pure stack ABI (i386 cdecl, int_arg_regs=[]) the register-
+    # style "does the callee read it" gate cannot apply to ANY index, so the stack
+    # disclosure would be entirely unverified. Stay silent there (BN also clamps i386
+    # direct calls to callee arity, so a real drop rarely reaches here) rather than
+    # emit an unverifiable frontier -- the trace `--arg` caveat still covers i386.
     engine = te.TaintEngine(FBV({}), models)
     callee = _fake_under_recovered_callee("cdecl_log", 0x3000, [])  # pure stack ABI
     ins = types.SimpleNamespace(address=0x40130a)
-    leaf = engine._arg_under_recovered_leaf(ins, callee, [1, 2], 1)
-    assert leaf is not None
-    assert leaf["stack_dropped_args"] == [1, 2]
-    assert leaf["dropped_args"] == [1, 2]
+    assert engine._arg_under_recovered_leaf(ins, callee, [1, 2], 1) is None
 
 
 def test_arg_under_recovered_leaf_mixed_reg_and_stack(models, monkeypatch):

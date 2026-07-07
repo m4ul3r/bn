@@ -3247,7 +3247,17 @@ class TaintEngine:
         stack_confirmed: list[int] = []
         for i in sorted(dropped):
             if i >= len(arg_regs):
-                stack_confirmed.append(i)  # stack-passed: caller-confirmed (#324)
+                # Stack-passed. Disclose only on a convention that HAS integer-arg
+                # registers, where an index beyond that cutoff is unambiguously in the
+                # outgoing-argument region and BN's direct-call arity-clamping makes a
+                # spurious over-recovered stack param rare. On a pure-stack ABI (i386
+                # cdecl, no arg regs) the register-style "does the callee read it" gate
+                # cannot apply at all and BN's stack-arg modeling is weakest, so stay
+                # silent rather than emit an unverifiable frontier -- BN also clamps
+                # i386 direct calls to callee arity, so a real drop rarely reaches here
+                # anyway (#324 FP audit).
+                if arg_regs:
+                    stack_confirmed.append(i)
                 continue
             try:
                 if self._reg_reads_as_input(callee_fn, arg_regs[i]):
