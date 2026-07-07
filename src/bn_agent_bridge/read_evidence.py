@@ -646,6 +646,10 @@ def _parse_field_spec(spec: str) -> dict[str, Any]:
         raise OperationFailure("invalid_field", f"bad offset {off_s!r} in --field {spec!r}")
     if offset < 0:
         raise OperationFailure("invalid_field", f"negative offset in --field {spec!r}")
+    if typ == "ptr":
+        # A pointer field; width is the target pointer size, resolved by the caller
+        # (evidence calls --arg-struct #469, and the record-mode pointer path #467).
+        return {"name": name, "kind": "ptr", "width": None, "offset": offset, "type": "ptr"}
     ca = _CHAR_ARRAY_RE.match(typ)
     if ca:
         width = int(ca.group(1))
@@ -712,12 +716,14 @@ def _record_table_for_view(ctx, bv, start: int, *, entries: int, record_size: in
     specs = list(field_specs or [])
     declared: list[dict[str, Any]] = [{"offset": o, "width": ptr, "_ptr": True} for o in fields_sorted]
     for s in specs:
-        if s["offset"] + s["width"] > record_size:
+        # A `ptr` typed field (#469 type, also usable here) is a named pointer field.
+        width = ptr if s["kind"] == "ptr" else s["width"]
+        if s["offset"] + width > record_size:
             raise OperationFailure(
                 "invalid_field",
-                f"field {s['name']!r} at {hex(s['offset'])} + {s['width']} bytes exceeds "
+                f"field {s['name']!r} at {hex(s['offset'])} + {width} bytes exceeds "
                 f"record-size {hex(record_size)}")
-        declared.append({**s, "_ptr": False})
+        declared.append({**s, "width": width, "_ptr": s["kind"] == "ptr"})
     declared.sort(key=lambda d: d["offset"])
     prev_end = 0
     for d in declared:
@@ -765,6 +771,323 @@ def _record_table_for_view(ctx, bv, start: int, *, entries: int, record_size: in
         "address": hex(start),
         "record_size": record_size,
         "ptr_fields": [hex(o) for o in fields_sorted],
+        "fields": [{"name": s["name"], "type": s.get("type"), "offset": hex(s["offset"])}
+                   for s in specs],
+        "items": rows,
+        "count": len(rows),
+        "total": len(rows),
+        "warnings": warnings,
+    }
+
+
+def _callee_ref_addrs(bv, callee) -> list[int]:
+    """Callsite addresses that reference *callee* -- its entry plus any same-name
+    PLT/import thunk (#286), so an imported registration primitive's real callers are
+    found, not just direct calls to the entry."""
+    targets = {int(getattr(callee, "start", -1))}
+    name = getattr(callee, "name", None)
+    if name:
+        for sym in (bv.get_symbols_by_name(name) or []):
+            targets.add(int(getattr(sym, "address", -1)))
+    addrs: set[int] = set()
+    get_refs = getattr(bv, "get_code_refs", None)
+    if callable(get_refs):
+        for t in targets:
+            if t < 0:
+                continue
+            for ref in (get_refs(t) or []):
+                a = int(getattr(ref, "address", -1))
+                if a >= 0:
+                    addrs.add(a)
+    return sorted(addrs)
+
+
+def _mlil_call_at(caller, call_addr: int):
+    """The MLIL call instruction at *call_addr* in *caller*, or None."""
+    try:
+        instrs = list(caller.mlil.instructions)
+    except Exception:
+        return None
+    for ins in instrs:
+        if int(getattr(ins, "address", -1)) == call_addr and "CALL" in _op(ins):
+            return ins
+    return None
+
+
+def _op(ins) -> str:
+    try:
+        return ins.operation.name
+    except Exception:
+        return ""
+
+
+def _resolve_pointed_var(caller, param_expr, call_addr: int):
+    """Resolve a call argument expression to the LOCAL variable it points at -- an
+    ``&desc`` (MLIL_ADDRESS_OF) directly, or a register/temp copy of one (``rsi =
+    &desc``). Follows up to a few SET_VAR copies back from the call. Returns the
+    Variable or None (arg isn't a &local descriptor)."""
+    expr = param_expr
+    for _ in range(6):
+        op = _op(expr)
+        if "ADDRESS_OF" in op:
+            return getattr(expr, "src", None)
+        if op != "MLIL_VAR":
+            return None
+        var = getattr(expr, "src", None)
+        if var is None:
+            return None
+        # last SET_VAR of this var before the call defines the copy.
+        best = None
+        best_addr = -1
+        try:
+            instrs = list(caller.mlil.instructions)
+        except Exception:
+            return None
+        for ins in instrs:
+            a = int(getattr(ins, "address", -1))
+            if a >= call_addr or _op(ins) != "MLIL_SET_VAR":
+                continue
+            if getattr(ins, "dest", None) == var and a > best_addr:
+                best, best_addr = ins, a
+        if best is None:
+            return None
+        expr = getattr(best, "src", None)
+    return None
+
+
+def _stack_storage(v) -> int | None:
+    """The stack slot offset of Variable *v* (negative, frame-relative), or None if
+    *v* is not a stack variable (register/flag)."""
+    try:
+        if "Stack" in v.source_type.name:
+            return int(v.storage)
+    except Exception:
+        pass
+    return None
+
+
+def _src_width(ins, src) -> int:
+    """Byte width of a write -- the instruction store size, else the src expr size."""
+    for obj in (ins, src):
+        try:
+            w = int(getattr(obj, "size", 0) or 0)
+        except Exception:
+            w = 0
+        if w:
+            return w
+    return 1
+
+
+def _descriptor_writes(caller, var, call_addr: int) -> list[tuple[int, int, int, Any, bool]]:
+    """Raw writes into the local descriptor based at *var* strictly BEFORE *call_addr*,
+    as ``(desc_offset, width, addr, src, is_sibling)``. Matches by DESCRIPTOR OFFSET so
+    an optimizer that split the struct across sibling stack slots -- or write-combined
+    several fields into one wide store to the base var -- is still recovered:
+      - ``SET_VAR`` / ``SET_VAR_FIELD`` on *var*        -> offset 0 / ins.offset (same var)
+      - ``SET_VAR`` / ``SET_VAR_FIELD`` on a sibling    -> (sib.storage - base.storage)(+ins.offset) (sibling)
+      - ``STORE`` to ``&var + k``                       -> k (same var)
+    A whole-var ``SET_VAR`` of the base itself is offset 0 (the P1 case the field-only
+    scan missed). ``is_sibling`` flags a slot recovered from a DIFFERENT stack variable
+    (lower confidence -- it could be an adjacent object, so the caller marks it)."""
+    base_stor = _stack_storage(var)
+    out: list[tuple[int, int, int, Any, bool]] = []
+    try:
+        instrs = list(caller.mlil.instructions)
+    except Exception:
+        return out
+    for ins in instrs:
+        a = int(getattr(ins, "address", -1))
+        if a < 0 or a >= call_addr:
+            continue
+        op = _op(ins)
+        dest = getattr(ins, "dest", None)
+        src = getattr(ins, "src", None)
+        off = None
+        sibling = False
+        if op == "MLIL_SET_VAR_FIELD":
+            if dest == var:
+                off = int(getattr(ins, "offset", 0))
+            elif base_stor is not None and _stack_storage(dest) is not None:
+                off = (_stack_storage(dest) - base_stor) + int(getattr(ins, "offset", 0))
+                sibling = True
+        elif op == "MLIL_SET_VAR":
+            if dest == var:
+                off = 0
+            elif base_stor is not None and _stack_storage(dest) is not None:
+                off = _stack_storage(dest) - base_stor
+                sibling = True
+        elif op == "MLIL_STORE":
+            off = _store_offset_into(getattr(ins, "dest", None), var)
+        if off is None:
+            continue
+        out.append((off, _src_width(ins, src), a, src, sibling))
+    return out
+
+
+def _covering_write(writes: list[tuple[int, int, int, Any, bool]], field_off: int, field_w: int):
+    """The latest (by address) write whose byte span COVERS ``[field_off, field_off +
+    field_w)`` -- an exact field store or a wider write-combined store containing it,
+    else None. Returns ``(addr, write_off, src, is_sibling)``."""
+    best = None
+    for (woff, ww, a, src, sib) in writes:
+        if woff <= field_off and field_off + field_w <= woff + ww:
+            if best is None or a >= best[0]:
+                best = (a, woff, src, sib)
+    return best
+
+
+def _store_offset_into(dest_expr, var) -> int | None:
+    """If *dest_expr* is ``&var`` or ``&var + const``, the byte offset (0 for the
+    bare address), else None."""
+    if dest_expr is None:
+        return None
+    op = _op(dest_expr)
+    if "ADDRESS_OF" in op and getattr(dest_expr, "src", None) == var:
+        return 0
+    if op in ("MLIL_ADD",):
+        left = getattr(dest_expr, "left", None)
+        right = getattr(dest_expr, "right", None)
+        if left is not None and "ADDRESS_OF" in _op(left) and getattr(left, "src", None) == var \
+                and "CONST" in _op(right):
+            return int(getattr(right, "constant", getattr(right, "value", 0)) or 0)
+    return None
+
+
+def _decode_descriptor_field(bv, spec: dict[str, Any], write, ptr_size: int) -> dict[str, Any]:
+    """Decode a covering *write* -- a ``(source_address, write_offset, src_expr,
+    is_sibling)`` tuple or None -- per its declared *spec*. A CONST/CONST_PTR yields a
+    value (a ptr also resolves a function/symbol name); a wider write-combined store is
+    SLICED to the field's byte span; a non-constant src is reported as ``computed``
+    rather than dropped; a missing write is ``unknown``. ``via: sibling_slot`` marks a
+    value recovered from a different stack variable (lower confidence -- could be an
+    adjacent object), and the source instruction address is recorded (#469)."""
+    field: dict[str, Any] = {"name": spec["name"], "offset": spec["offset"],
+                             "type": spec.get("type")}
+    if write is None:
+        field["status"] = "unknown"
+        return field
+    src_addr, write_off, src, is_sibling = write
+    field["source_address"] = hex(int(src_addr))
+    if is_sibling:
+        field["via"] = "sibling_slot"
+    if src is None:
+        field["status"] = "unknown"
+        return field
+    if "CONST" not in _op(src):
+        field["status"] = "computed"   # non-constant: merged/runtime value
+        field["expr"] = str(src)
+        return field
+    raw = int(getattr(src, "constant", getattr(src, "value", 0)) or 0)
+    field_w = ptr_size if spec["kind"] == "ptr" else int(spec.get("width") or 1)
+    # Extract the field's bytes from the (possibly wider write-combined) store: shift
+    # to the field's byte position and mask to its width. A no-op when the store is
+    # exactly the field.
+    shift = (int(spec["offset"]) - int(write_off)) * 8
+    raw = (raw >> shift) & ((1 << (field_w * 8)) - 1)
+    exact = int(write_off) == int(spec["offset"])
+    field["status"] = "resolved"
+    if spec["kind"] == "ptr":
+        field["value"] = hex(raw)
+        # Only resolve a symbol for a pointer store that STARTS at the field -- a
+        # sub-word sliced out of a wider scalar block is not a real pointer.
+        if exact:
+            fn = bv.get_function_at(raw) if hasattr(bv, "get_function_at") else None
+            if fn is not None:
+                field["symbol"] = il_format._display_name(fn)
+            else:
+                sym = bv.get_symbol_at(raw) if hasattr(bv, "get_symbol_at") else None
+                if sym is not None:
+                    field["symbol"] = getattr(sym, "short_name", None) or getattr(sym, "name", None)
+    elif spec["kind"] == "char_array":
+        field["value"] = hex(raw)
+    else:
+        signed = bool(spec.get("signed"))
+        if signed:
+            bits = field_w * 8
+            if raw >= (1 << (bits - 1)):
+                raw -= (1 << bits)
+        field["value"] = raw if signed else hex(raw)
+    return field
+
+
+def _call_descriptor_evidence(ctx, selector: str | None, identifier, *,
+                              arg_index: int, field_specs: list[str] | None):
+    """#469: treat call argument *arg_index* of every callsite of *identifier* as a
+    pointer to a stack/local descriptor, and summarize the declared field values
+    (constants + resolved callback symbols) written before each call."""
+    if arg_index < 0:
+        raise OperationFailure("invalid_request", f"--arg-struct must be >= 0, got {arg_index}")
+    specs = [_parse_field_spec(f) for f in (field_specs or [])]
+    if not specs:
+        raise OperationFailure("invalid_request",
+                               "evidence calls needs at least one --field NAME:TYPE@OFF")
+    bv = ctx._resolve_view(selector)
+    callee = ctx._find_function(bv, identifier)
+    ptr_size = ctx._pointer_size(bv)
+    for s in specs:
+        if s["kind"] == "ptr":
+            s["width"] = ptr_size
+
+    # Refs that land inside the callee's own PLT/import thunk (the `jmp [GOT]` forwarder
+    # named after the callee) are not real callsites -- skip them so a thunk self-ref
+    # isn't reported as a degenerate descriptor row.
+    name = getattr(callee, "name", None)
+    thunk_addrs = {int(getattr(callee, "start", -1))}
+    if name:
+        for sym in (bv.get_symbols_by_name(name) or []):
+            thunk_addrs.add(int(getattr(sym, "address", -1)))
+
+    rows: list[dict[str, Any]] = []
+    unresolved_calls = 0
+    for call_addr in _callee_ref_addrs(bv, callee):
+        callers = bv.get_functions_containing(call_addr) or []
+        if not callers:
+            continue
+        caller = callers[0]
+        if int(getattr(caller, "start", -2)) in thunk_addrs:
+            continue  # ref sits inside the callee's own thunk, not a real caller
+        row: dict[str, Any] = {
+            "caller": il_format._display_name(caller),
+            "caller_address": hex(int(getattr(caller, "start", 0))),
+            "call_address": hex(call_addr),
+        }
+        call_ins = _mlil_call_at(caller, call_addr)
+        params = list(getattr(call_ins, "params", []) or []) if call_ins is not None else []
+        if arg_index >= len(params):
+            row["status"] = "arg_out_of_range"
+            row["fields"] = []
+            unresolved_calls += 1
+            rows.append(row)
+            continue
+        var = _resolve_pointed_var(caller, params[arg_index], call_addr)
+        if var is None:
+            row["status"] = "not_a_local_descriptor"
+            row["fields"] = []
+            unresolved_calls += 1
+            rows.append(row)
+            continue
+        writes = _descriptor_writes(caller, var, call_addr)
+        fields = []
+        for s in specs:
+            field_w = ptr_size if s["kind"] == "ptr" else int(s.get("width") or 1)
+            cover = _covering_write(writes, int(s["offset"]), field_w)
+            fields.append(_decode_descriptor_field(bv, s, cover, ptr_size))
+        row["fields"] = fields
+        # If NOTHING was recovered, the descriptor was likely filled some other way
+        # (memcpy from a const template, a helper) -- flag it rather than present an
+        # all-unknown row as a confident "ok" (#469 audit P3).
+        row["status"] = "ok" if any(f.get("status") != "unknown" for f in fields) else "no_field_writes"
+        rows.append(row)
+
+    warnings: list[str] = []
+    if unresolved_calls:
+        warnings.append(
+            f"{unresolved_calls} callsite(s) did not resolve arg {arg_index} to a local "
+            "descriptor (indirect/aliased pointer, or the descriptor is not stack-local)")
+    return {
+        "kind": "call_descriptors",
+        "callee": il_format._display_name(callee),
+        "arg_index": arg_index,
         "fields": [{"name": s["name"], "type": s.get("type"), "offset": hex(s["offset"])}
                    for s in specs],
         "items": rows,

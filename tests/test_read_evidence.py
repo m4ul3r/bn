@@ -1540,3 +1540,93 @@ def test_record_table_text_shows_signed_scalar_467():
     out = _render_record_table_text(value)
     assert "delta  -2 (0xfffe)" in out       # signed: decimal + hex
     assert "flags  0x5" in out                # unsigned: hex
+
+
+class _FakeExpr:
+    def __init__(self, op, **kw):
+        self._op = op
+        for k, v in kw.items():
+            setattr(self, k, v)
+    @property
+    def operation(self):
+        return type("Op", (), {"name": self._op})
+
+
+class _DescBV:
+    def __init__(self, fns=None, syms=None):
+        self._fns = fns or {}       # addr -> name
+        self._syms = syms or {}     # addr -> short_name
+    def get_function_at(self, a):
+        n = self._fns.get(int(a))
+        return type("F", (), {"name": n, "symbol": type("S", (), {"short_name": n})}) if n else None
+    def get_symbol_at(self, a):
+        n = self._syms.get(int(a))
+        return type("S", (), {"short_name": n, "name": n}) if n else None
+
+
+def test_parse_field_spec_ptr_469(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    p = bridge.read_evidence._parse_field_spec("callback:ptr@0x10")
+    assert p == {"name": "callback", "kind": "ptr", "width": None, "offset": 16, "type": "ptr"}
+
+
+def test_decode_descriptor_field_469(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    dec = bridge.read_evidence._decode_descriptor_field
+    bv = _DescBV(fns={0x401139: "status_rsp"}, syms={0x600100: "g_table"})
+    # ptr resolving to a function symbol
+    ptr_spec = {"name": "callback", "kind": "ptr", "offset": 16, "type": "ptr", "width": 8}
+    f = dec(bv, ptr_spec, (0x402100, 16, _FakeExpr("MLIL_CONST_PTR", constant=0x401139), False), 8)
+    assert f["status"] == "resolved" and f["value"] == "0x401139" and f["symbol"] == "status_rsp"
+    # ptr resolving to a data symbol
+    f = dec(bv, {**ptr_spec, "name": "ctx"}, (0x402108, 16, _FakeExpr("MLIL_CONST_PTR", constant=0x600100), False), 8)
+    assert f["symbol"] == "g_table"
+    # signed scalar
+    s_spec = {"name": "delta", "kind": "scalar", "offset": 4, "type": "i16", "width": 2, "signed": True}
+    f = dec(bv, s_spec, (0x402110, 4, _FakeExpr("MLIL_CONST", constant=0xfffe), False), 8)
+    assert f["value"] == -2
+    # unsigned scalar -> hex
+    u_spec = {"name": "cmd", "kind": "scalar", "offset": 0, "type": "u16", "width": 2, "signed": False}
+    assert dec(bv, u_spec, (0x402114, 0, _FakeExpr("MLIL_CONST", constant=0x1101), False), 8)["value"] == "0x1101"
+    # non-constant src -> computed (not dropped)
+    f = dec(bv, u_spec, (0x402118, 0, _FakeExpr("MLIL_VAR", src="x"), False), 8)
+    assert f["status"] == "computed"
+    # no write -> unknown
+    assert dec(bv, u_spec, None, 8)["status"] == "unknown"
+    # source address recorded for a resolved field
+    assert dec(bv, u_spec, (0x402114, 0, _FakeExpr("MLIL_CONST", constant=1), False), 8)["source_address"] == "0x402114"
+
+
+def test_store_offset_into_469(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    soi = bridge.read_evidence._store_offset_into
+    var = object()
+    assert soi(_FakeExpr("MLIL_ADDRESS_OF", src=var), var) == 0
+    add = _FakeExpr("MLIL_ADD", left=_FakeExpr("MLIL_ADDRESS_OF", src=var),
+                    right=_FakeExpr("MLIL_CONST", constant=16))
+    assert soi(add, var) == 16
+    assert soi(_FakeExpr("MLIL_ADDRESS_OF", src=object()), var) is None  # different var
+
+
+def test_decode_descriptor_field_slice_and_sibling_469(monkeypatch):
+    # #469 audit P1/P2: a write-combined wide store is SLICED per field; a sibling-slot
+    # recovery is marked `via: sibling_slot` (lower confidence).
+    bridge = _load_bridge(monkeypatch)
+    dec = bridge.read_evidence._decode_descriptor_field
+    bv = _DescBV()
+    # one 8-byte store at offset 0 holds cmd@0(u16)=0x1101, type@2(u8)=0xed, flags@4(u32)=0x27
+    blob = 0x27 << 32 | 0xed << 16 | 0x1101
+    cmd = {"name": "cmd", "kind": "scalar", "offset": 0, "type": "u16", "width": 2, "signed": False}
+    typ = {"name": "type", "kind": "scalar", "offset": 2, "type": "u8", "width": 1, "signed": False}
+    flg = {"name": "flags", "kind": "scalar", "offset": 4, "type": "u32", "width": 4, "signed": False}
+    w = (0x401000, 0, _FakeExpr("MLIL_CONST", constant=blob), False)  # write_off=0, covers all three
+    assert dec(bv, cmd, w, 8)["value"] == "0x1101"
+    assert dec(bv, typ, w, 8)["value"] == "0xed"
+    assert dec(bv, flg, w, 8)["value"] == "0x27"
+    # sibling-slot marker
+    sib = dec(bv, cmd, (0x401000, 0, _FakeExpr("MLIL_CONST", constant=0x1101), True), 8)
+    assert sib["via"] == "sibling_slot"
+    # a ptr SLICED out of a scalar block is NOT resolved to a symbol (only exact stores)
+    pspec = {"name": "cb", "kind": "ptr", "offset": 2, "type": "ptr", "width": 8}
+    sliced = dec(bv, pspec, (0x401000, 0, _FakeExpr("MLIL_CONST_PTR", constant=0x401139), False), 8)
+    assert "symbol" not in sliced
