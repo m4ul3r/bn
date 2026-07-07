@@ -323,6 +323,18 @@ def _select_local_hlil_node(insn) -> Any | None:
     if not roots:
         return None
 
+    # #475/#476: BN folds adjacent/nested calls (e.g. `p = f(g(x))`) so one LLIL call
+    # maps to MULTIPLE HighLevelILCall roots -- the neighbor's included. Scope to the
+    # roots at THIS call's address; if none match and the fold is ambiguous (>1 root),
+    # return None so the caller emits a null statement rather than describing another
+    # call. A single unmatched root (the common, unambiguous case) is kept as-is. The
+    # sibling argument path already scopes this way (read_evidence `_call_arguments`).
+    call_addr = int(getattr(insn, "address", 0) or 0)
+    matched = [r for r in roots if int(getattr(r, "address", -1) or -1) == call_addr]
+    roots = matched or ([] if len(roots) > 1 else roots)
+    if not roots:
+        return None
+
     for root in roots:
         current = root
         best_expression = None

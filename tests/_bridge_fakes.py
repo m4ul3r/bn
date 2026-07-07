@@ -193,12 +193,18 @@ class _FakeReg:
 
 
 class _FakeHLILInstructionNode:
-    def __init__(self, text: str, *, condition=None, parent=None, expr_index: int = 0, instr_index: int = 0):
+    def __init__(self, text: str, *, condition=None, parent=None, expr_index: int = 0,
+                 instr_index: int = 0, address: int | None = None):
         self.text = text
         self.condition = condition
         self.parent = parent
         self.expr_index = expr_index
         self.instr_index = instr_index
+        # Real HLIL instructions carry an address; the #475/#476 fix scopes folded
+        # multi-root selection by it. Default None so pre-existing single-root tests
+        # are unaffected (a lone root is kept regardless of address).
+        if address is not None:
+            self.address = address
 
     def __str__(self):
         return self.text
@@ -215,6 +221,7 @@ def _FakeHLILInstruction(
     parent=None,
     expr_index: int = 0,
     instr_index: int = 0,
+    address: int | None = None,
 ):
     cls = _FAKE_HLIL_TYPES.get(class_name)
     if cls is None:
@@ -226,6 +233,7 @@ def _FakeHLILInstruction(
         parent=parent,
         expr_index=expr_index,
         instr_index=instr_index,
+        address=address,
     )
 
 

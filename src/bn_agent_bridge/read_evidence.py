@@ -158,6 +158,11 @@ def _call_arguments(ctx, bv, insn, call_addr: int) -> tuple[str, list[dict[str, 
     for root in roots:
         if root is chosen:
             continue
+        # #476: a folded NEIGHBOR call (e.g. the outer `g` in `p = g(f(x))`) is also
+        # in `roots`; adding its HLIL args leaks another call's candidates into this
+        # record. Only same-address roots are alternative renderings of THIS call.
+        if _safe_int(getattr(root, "address", None)) != int(call_addr):
+            continue
         add_candidates("hlil", _il_argument_texts(ctx, root))
     return source, primary, candidates
 
@@ -293,12 +298,58 @@ def _function_thunk_summary(ctx, bv, func) -> dict[str, Any]:
     return result
 
 
+def _cpp_method_this_caveat(func) -> str | None:
+    """#482: a C++ instance method whose implicit object pointer `this` BN recovered
+    as a NON-pointer scalar (no DWARF) renders field accesses off a scalar formal and
+    can show a real incoming register argument as uninitialized -- contradicting
+    MLIL/disasm. We faithfully pass BN's uncertain prototype through, so emit a caveat
+    rather than presenting it as fact (the ticket accepts a caveat). Signal: a
+    demangled ``Class::method`` name with a recovered first parameter that is not a
+    pointer. Advisory + hedged, so a namespaced free/static function that trips it
+    only gets a "possible" note. Returns the caveat or None."""
+    # Use the DEMANGLED display name (symbol.short_name) -- func.name is the mangled
+    # `_ZN...` on a stripped C++ binary, which never contains "::".
+    name = il_format._display_name(func)
+    if "::" not in name:
+        return None
+    try:
+        pvars = list(getattr(func, "parameter_vars", []) or [])
+    except Exception:
+        return None
+    if not pvars:
+        return None
+    first_type = getattr(pvars[0], "type", None)
+    if first_type is None:
+        return None
+    # Pointer detection: default from the rendered type ("*"), and let BN's real
+    # type_class confirm it when available (a typedef'd pointer may not show a "*").
+    is_pointer = "*" in str(first_type)
+    try:
+        if getattr(first_type, "type_class", None) == bn.TypeClass.PointerTypeClass:
+            is_pointer = True
+    except Exception:
+        pass
+    if is_pointer:
+        return None
+    return (
+        "possible under-recovered C++ prototype (no DWARF): the implicit object "
+        "pointer `this` may be typed as a scalar (field accesses render off a scalar "
+        "formal) and a real incoming register argument may render as an uninitialized "
+        "variable -- cross-check `disasm --linear` / `il --view mlil` for the true ABI "
+        "arguments, or recover the prototype with `proto set`."
+    )
+
+
 def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 2):
     if context < 0:
         raise OperationFailure("invalid_context", f"Invalid evidence context size: {context}")
     bv = ctx._resolve_view(selector)
     func = ctx._find_function(bv, identifier)
     text = il_format._decompile_text(bv, func)
+    warnings = list(il_format._render_warnings(text))
+    this_caveat = _cpp_method_this_caveat(func)
+    if this_caveat:
+        warnings.append(this_caveat)
     return {
         "function": {
             "name": func.name,
@@ -308,7 +359,7 @@ def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 
         **il_format._function_metadata(func),
         "thunk": _function_thunk_summary(ctx, bv, func),
         "calls": _function_call_evidence(ctx, bv, func, context=context),
-        "warnings": il_format._render_warnings(text),
+        "warnings": warnings,
     }
 
 
