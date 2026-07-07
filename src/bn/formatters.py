@@ -2252,11 +2252,17 @@ def _render_sections_text(value: Any) -> str:
     verdict (#453) so the security question ("any writable+executable region?")
     has a direct answer instead of being inferred from per-row perms."""
     body = _render_paged_list_text(value, "items", _render_sections_rows)
-    if isinstance(value, dict) and "writable_executable_count" in value:
-        n = value.get("writable_executable_count") or 0
-        names = value.get("writable_executable_items") or []
-        verdict = f"w+x: {n} section(s): {', '.join(names)}" if n else "w+x: none"
-        return verdict + "\n" + body
+    if isinstance(value, dict) and value.get("wx_verdict"):
+        verdict = value["wx_verdict"]
+        if verdict == "wx_sections_present":
+            names = value.get("writable_executable_items") or []
+            line = f"w+x: {len(names)} section(s): {', '.join(names)}"
+        elif verdict == "no_wx_sections_observed":
+            line = "w+x: none observed"
+        else:  # unknown_insufficient_metadata (#461)
+            line = ("w+x: unknown -- section metadata is insufficient (mapped/raw view "
+                    "with no segment permissions); NOT an all-clear")
+        return line + "\n" + body
     return body
 
 

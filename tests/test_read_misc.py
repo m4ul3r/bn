@@ -230,12 +230,40 @@ def test_sections_writable_executable_verdict(monkeypatch):
     # Top-level verdict counts only the genuinely W+X section.
     assert result["writable_executable_count"] == 1
     assert result["writable_executable_items"] == [".jit"]
+    assert result["wx_verdict"] == "wx_sections_present"       # #461
 
     # Text verdict line.
     from bn.formatters import _render_sections_text
     assert _render_sections_text(result).splitlines()[0] == "w+x: 1 section(s): .jit"
-    clean = {**result, "writable_executable_count": 0, "writable_executable_items": []}
-    assert _render_sections_text(clean).splitlines()[0] == "w+x: none"
+    clean = {**result, "wx_verdict": "no_wx_sections_observed",
+             "writable_executable_count": 0, "writable_executable_items": []}
+    assert _render_sections_text(clean).splitlines()[0] == "w+x: none observed"
+
+
+def test_sections_wx_verdict_unknown_on_mapped_view_without_perms_461(monkeypatch):
+    # #461: a mapped/raw embedded view whose sections carry only synthetic/external
+    # metadata (no segment perms) must report an explicit "unknown" verdict, NOT a
+    # silent empty W+X set that reads as an all-clear.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        sections={
+            # ExternalSection (semantics=4), mapped with all-false perms -- the exact
+            # shape from the ticket: readable/writable/executable all false.
+            ".synthetic_builtins": _FakeSection(".synthetic_builtins", 0x500000, 0x500018, semantics=4),
+        },
+        segments={
+            0x500000: _FakeSegment(readable=False, writable=False, executable=False),
+        },
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._sections(None)
+
+    assert result["wx_verdict"] == "unknown_insufficient_metadata"
+    assert "writable_executable_count" not in result       # nothing to count on
+    from bn.formatters import _render_sections_text
+    first = _render_sections_text(result).splitlines()[0]
+    assert first.startswith("w+x: unknown") and "NOT an all-clear" in first
 
 
 def test_sections_query_filters_by_name(monkeypatch):
@@ -999,3 +1027,38 @@ def test_sections_query_semantics_match_is_case_insensitive(monkeypatch):
     result = instance._sections(None, query="CODE")
 
     assert [s["name"] for s in result["items"]] == [".text"]
+
+
+def test_sections_wx_verdict_is_query_independent_461(monkeypatch):
+    """#461 audit P1: the W+X verdict is computed over the FULL section set, so
+    scoping `sections --query` to unrelated sections cannot flip it to a false
+    'no W+X' all-clear (or a spurious 'unknown') on a genuinely W+X image."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        sections={
+            ".text": _FakeSection(".text", 0x1000, 0x2000, semantics=1),
+            ".jitcode": _FakeSection(".jitcode", 0x2000, 0x3000, semantics=3),   # W+X
+            ".rodata": _FakeSection(".rodata", 0x3000, 0x4000, semantics=2),
+        },
+        segments={
+            0x1000: _FakeSegment(readable=True, writable=False, executable=True),
+            0x2000: _FakeSegment(readable=True, writable=True, executable=True),  # W+X
+            0x3000: _FakeSegment(readable=True, writable=False, executable=False),
+        },
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    assert instance._sections(None)["wx_verdict"] == "wx_sections_present"
+
+    # Query excludes the W+X section: the PAGE is filtered, but the verdict still
+    # reflects the whole binary (and still lists the full-set W+X section).
+    filtered = instance._sections(None, query="rodata")
+    assert [it["name"] for it in filtered["items"]] == [".rodata"]
+    assert filtered["wx_verdict"] == "wx_sections_present"
+    assert filtered["writable_executable_items"] == [".jitcode"]
+
+    # A no-match query on a fully-permissioned binary is NOT spuriously "unknown".
+    nomatch = instance._sections(None, query="zzznomatch")
+    assert nomatch["items"] == []
+    assert nomatch["wx_verdict"] == "wx_sections_present"
