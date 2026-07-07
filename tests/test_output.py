@@ -288,3 +288,58 @@ def test_write_output_reports_exact_tokens_for_explicit_out_path(tmp_path, monke
     assert envelope["spilled"] is False
     assert envelope["tokenizer"] == "estimate"
     assert int(envelope["tokens"]) == _token_count(artifact_text)
+
+
+def test_resolve_spill_limit_env_override_409(monkeypatch):
+    from bn.output import resolve_spill_limit, DEFAULT_SPILL_TOKEN_LIMIT
+    monkeypatch.delenv("BN_SPILL_TOKENS", raising=False)
+    assert resolve_spill_limit() == DEFAULT_SPILL_TOKEN_LIMIT
+    monkeypatch.setenv("BN_SPILL_TOKENS", "40000")
+    assert resolve_spill_limit() == 40000
+    monkeypatch.setenv("BN_SPILL_TOKENS", "0x1000")
+    assert resolve_spill_limit() == 0x1000
+    # non-positive / junk -> default (never silently disable spill)
+    for bad in ("0", "-5", "notanumber", ""):
+        monkeypatch.setenv("BN_SPILL_TOKENS", bad)
+        assert resolve_spill_limit() == DEFAULT_SPILL_TOKEN_LIMIT
+
+
+def test_rerun_hint_names_slicing_knob_409():
+    from bn.output import _rerun_hint
+    assert "--limit" in _rerun_hint("functions")
+    assert "--limit" in _rerun_hint("class-list")
+    assert "--lines" in _rerun_hint("disasm")
+    assert "--address-window" in _rerun_hint("function-evidence")
+    # unknown stem still points at the spilled file + generic knobs
+    assert "spilled file" in _rerun_hint("something-new")
+
+
+def test_spill_envelope_carries_rerun_hint_and_limit_409(tmp_path, monkeypatch):
+    from bn.output import write_output_result
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    value = {"kind": "functions", "items": [{"name": f"f{i}"} for i in range(500)], "total": 500}
+    res = write_output_result(value, fmt="json", out_path=None, stem="functions",
+                              spill_token_limit=64)
+    assert res.spilled is True
+    assert res.artifact["rerun"] and "--limit" in res.artifact["rerun"]
+    assert res.artifact["spill_token_limit"] == 64
+    assert "rerun" in res.rendered  # rendered JSON envelope carries the knob key
+    # text-format envelope renders it as a rerun: line
+    from bn.output import render_artifact_envelope
+    assert "rerun:" in render_artifact_envelope(res.artifact)
+
+
+def test_near_spill_flag_409(tmp_path, monkeypatch):
+    from bn.output import write_output_result
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    # comfortably small -> not near
+    small = write_output_result({"kind": "x", "items": [1]}, fmt="json", out_path=None,
+                                stem="functions", spill_token_limit=100000)
+    assert small.near_spill is False and small.spilled is False
+    # sized to land in [80%,100%] of a small limit -> near_spill, not spilled
+    payload = {"kind": "x", "items": ["y" * 10 for _ in range(30)]}
+    import json as _json
+    tok = -(-len(_json.dumps(payload)) // 3)
+    res = write_output_result(payload, fmt="json", out_path=None, stem="functions",
+                              spill_token_limit=int(tok / 0.9))
+    assert res.spilled is False and res.near_spill is True

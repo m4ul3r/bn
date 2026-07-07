@@ -136,6 +136,12 @@ Defaults:
 - `format` — `json`, `ndjson`, or `text`.
 - `bytes`, `tokens` (estimate), `tokenizer` (`estimate`), `sha256` — size + integrity.
 - `summary` — shape hint with `kind` and `count` / `chars` / `keys`.
+- `spill_token_limit` — the threshold that tripped (so you can see how far over you went).
+- `rerun` — the **command-specific slicing knob** to bound the next read (e.g. `--limit`/`--offset` for lists, `--lines` for `disasm`/`il`, `--address-window` for `evidence function`), so you re-run bounded instead of blind.
+
+**Predicting spill (#409).** Two signals let you avoid a wasted full run:
+- **Threshold override** — set `BN_SPILL_TOKENS` (e.g. `BN_SPILL_TOKENS=40000`) to raise/lower the spill point for a bigger/smaller context budget. Non-positive/garbage values fall back to the 10 000 default (spill is never silently disabled). 
+- **Near-spill note** — when a read *fits* but lands within 20 % of the threshold, `bn` prints a `note:` on stderr that the next (larger) page/scope will spill — slice it pre-emptively.
 
 **Pipe trap (correctness).** When output spills, a downstream `grep`/`jq`/`awk`/`rg` reads only the small envelope, **not** the data — so a no-match silently reads as "absent" (e.g. `bn decompile <fn> | grep memcpy` finding nothing does *not* mean there's no `memcpy`). `bn` now prints an extra `note:` on stderr when stdout is a pipe and output spilled, but don't rely on noticing it. Instead, write to a file first and process that: `bn decompile <fn> --out /tmp/f.txt && grep memcpy /tmp/f.txt`, or slice with `--lines`/`--limit` so it doesn't spill.
 
