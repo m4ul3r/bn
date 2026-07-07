@@ -1425,20 +1425,26 @@ def test_call_arguments_candidates_scoped_to_callsite_476(monkeypatch):
 
 def test_cpp_method_this_caveat_482(monkeypatch):
     """#482: a demangled C++ instance method whose recovered first param is a
-    non-pointer scalar (this mis-typed, no DWARF) gets an advisory caveat; a pointer
-    first param or a non-method name does not."""
+    non-pointer scalar AND is used as a pointer base (this mis-typed, no DWARF) gets
+    an advisory caveat. A pointer first param, a non-method name, or a first formal
+    used only as a plain scalar (static method / namespaced free function) does not."""
     bridge = _load_bridge(monkeypatch)
     caveat = bridge.read_evidence._cpp_method_this_caveat
 
     scalar_this = _FakeFunction(0x401000, "Owner::dispatch")
     scalar_this.parameter_vars = [_FakeVariable(name="arg1", storage=0, var_type="int32_t", identifier=1)]
-    note = caveat(scalar_this)
+    body = "void Owner::dispatch(int32_t arg1)\n{ return *(uint64_t*)(arg1 + 8); }"
+    note = caveat(scalar_this, body)
     assert note is not None and "proto set" in note and "this" in note
+
+    # #482 FP audit: same demangled shape but the scalar first formal is used only as
+    # a value (a static method / namespaced free fn) -> NO caveat.
+    assert caveat(scalar_this, "int32_t Owner::make(int32_t arg1) { return arg1 + 1; }") is None
 
     ptr_this = _FakeFunction(0x401100, "Owner::run")
     ptr_this.parameter_vars = [_FakeVariable(name="this", storage=0, var_type="Owner*", identifier=1)]
-    assert caveat(ptr_this) is None                            # pointer this -> no caveat
+    assert caveat(ptr_this, "*(uint64_t*)(this + 8)") is None  # pointer this -> no caveat
 
     free_fn = _FakeFunction(0x401200, "plain_handler")
     free_fn.parameter_vars = [_FakeVariable(name="arg1", storage=0, var_type="int32_t", identifier=1)]
-    assert caveat(free_fn) is None                            # no '::' -> not a method
+    assert caveat(free_fn, "*(uint64_t*)(arg1 + 8)") is None   # no '::' -> not a method

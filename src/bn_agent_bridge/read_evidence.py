@@ -298,17 +298,24 @@ def _function_thunk_summary(ctx, bv, func) -> dict[str, Any]:
     return result
 
 
-def _cpp_method_this_caveat(func) -> str | None:
+def _cpp_method_this_caveat(func, decompiled_text: str = "") -> str | None:
     """#482: a C++ instance method whose implicit object pointer `this` BN recovered
     as a NON-pointer scalar (no DWARF) renders field accesses off a scalar formal and
     can show a real incoming register argument as uninitialized -- contradicting
     MLIL/disasm. We faithfully pass BN's uncertain prototype through, so emit a caveat
-    rather than presenting it as fact (the ticket accepts a caveat). Signal: a
-    demangled ``Class::method`` name with a recovered first parameter that is not a
-    pointer. Advisory + hedged, so a namespaced free/static function that trips it
-    only gets a "possible" note. Returns the caveat or None."""
+    rather than presenting it as fact (the ticket accepts a caveat). Returns the caveat
+    or None.
+
+    Requires all of: (1) a demangled ``Class::method`` name; (2) a recovered first
+    parameter that is NOT a pointer; and (3) that first formal is actually used as a
+    POINTER base (deref / member / offset-index) in the decompiled body. Gate (3) is
+    what distinguishes a real mistyped-``this`` from the common false positives -- a
+    STATIC method or a NAMESPACED FREE function whose non-pointer first arg is a plain
+    scalar value -- since Itanium mangling can't tell namespace from class or static
+    from instance by name alone (#482 FP audit). Fires only on symbol-bearing binaries
+    (needs the demangled name); a fully-stripped image is a safe no-op."""
     # Use the DEMANGLED display name (symbol.short_name) -- func.name is the mangled
-    # `_ZN...` on a stripped C++ binary, which never contains "::".
+    # `_ZN...` on a symbol-bearing (but DWARF-less) C++ binary, which never has "::".
     name = il_format._display_name(func)
     if "::" not in name:
         return None
@@ -322,7 +329,8 @@ def _cpp_method_this_caveat(func) -> str | None:
     if first_type is None:
         return None
     # Pointer detection: default from the rendered type ("*"), and let BN's real
-    # type_class confirm it when available (a typedef'd pointer may not show a "*").
+    # type_class confirm it when available (a typedef'd pointer / C++ reference may
+    # not show a "*" but is modeled as a PointerTypeClass).
     is_pointer = "*" in str(first_type)
     try:
         if getattr(first_type, "type_class", None) == bn.TypeClass.PointerTypeClass:
@@ -330,6 +338,20 @@ def _cpp_method_this_caveat(func) -> str | None:
     except Exception:
         pass
     if is_pointer:
+        return None
+    # Gate (3): the scalar first formal must be used as a pointer base -- `p->f`,
+    # `p[i]`, or a deref that contains it (`*(t*)(p + off)`). A static/free function
+    # that merely uses the scalar as a value won't match, cutting the FP rate.
+    first_name = str(getattr(pvars[0], "name", "") or "")
+    if not first_name or not decompiled_text:
+        return None
+    escaped = re.escape(first_name)
+    used_as_pointer = bool(re.search(
+        r"\b" + escaped + r"\s*(?:->|\[)"          # p->f  or  p[i]
+        r"|\*\s*\([^;\n]*\b" + escaped + r"\b",    # *(t*)(p + off) / *(t*)p
+        decompiled_text,
+    ))
+    if not used_as_pointer:
         return None
     return (
         "possible under-recovered C++ prototype (no DWARF): the implicit object "
@@ -347,7 +369,7 @@ def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 
     func = ctx._find_function(bv, identifier)
     text = il_format._decompile_text(bv, func)
     warnings = list(il_format._render_warnings(text))
-    this_caveat = _cpp_method_this_caveat(func)
+    this_caveat = _cpp_method_this_caveat(func, text)
     if this_caveat:
         warnings.append(this_caveat)
     return {
