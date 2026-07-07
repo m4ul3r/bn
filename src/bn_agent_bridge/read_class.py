@@ -303,6 +303,55 @@ def _is_vendor_class(name: str) -> bool:
     return base in _VENDOR_NAMESPACES
 
 
+def _is_type_expression_name(name: str) -> bool:
+    """True when *name* is a C++ TYPE EXPRESSION (a function type ``void (int)``, a
+    pointer/reference ``char const*`` / ``Foo&``, an array ``int [4]``, or a bare
+    fundamental type ``unsigned int``) rather than a class/namespace identifier.
+
+    RTTI is emitted for such non-object types too, producing typeinfo-only pseudo-class
+    rows that are NOT domain classes (#481). The discriminator must be the name shape,
+    NOT "typeinfo-only": a real class (esp. anonymous-namespace or template
+    instantiations) frequently has typeinfo recovered but no vtable symbol / clustered
+    methods, so keying on missing-vtable alone mislabels real classes."""
+    # Strip the anonymous-namespace marker and balanced template args, which
+    # legitimately contain spaces/parens in a REAL class name.
+    s = name.replace("(anonymous namespace)", "")
+    out = []
+    depth = 0
+    for ch in s:
+        if ch == "<":
+            depth += 1
+        elif ch == ">" and depth:
+            depth -= 1
+        elif depth == 0:
+            out.append(ch)
+    core = "".join(out).strip()
+    if not core:
+        return False
+    # A function type / pointer / reference / array / multi-token fundamental type.
+    if any(c in core for c in "(*[&") or " " in core:
+        return True
+    _FUNDAMENTAL = {
+        "void", "bool", "char", "signed", "unsigned", "short", "int", "long",
+        "float", "double", "wchar_t", "char8_t", "char16_t", "char32_t", "nullptr_t",
+        "__int128", "decltype(nullptr)",
+    }
+    # A bare fundamental type has no `::` qualifier and is a known keyword.
+    return "::" not in core and core.lstrip("_") in _FUNDAMENTAL
+
+
+def _is_non_class_rtti_artifact(rec: dict[str, Any]) -> bool:
+    """#481: an RTTI row that is typeinfo for a NON-object TYPE (function/pointer/
+    fundamental), not a domain class. Requires rtti confidence, no vtable, no clustered
+    methods AND a type-expression name (so a real typeinfo-only class isn't mislabeled)."""
+    return bool(
+        rec["confidence"] == "rtti"
+        and rec["vtable"] is None
+        and len(rec["methods"]) == 0
+        and _is_type_expression_name(rec["name"])
+    )
+
+
 def _list_row(rec: dict[str, Any]) -> dict[str, Any]:
     return {
         "name": rec["name"],
@@ -311,15 +360,11 @@ def _list_row(rec: dict[str, Any]) -> dict[str, Any]:
         "size": rec["size"],
         "bases": [b.get("name") for b in rec.get("bases", [])],
         "confidence": rec["confidence"],
-        # #481: an RTTI-confidence row with NO methods AND NO vtable is typeinfo
-        # emitted for a NON-object type (a function signature, fundamental/pointer
-        # type), not a domain class -- so it doesn't inflate the class inventory and
-        # agents can filter it. A real class has a vtable and/or clustered methods.
-        "artifact": bool(
-            rec["confidence"] == "rtti"
-            and rec["vtable"] is None
-            and len(rec["methods"]) == 0
-        ),
+        # #481: typeinfo emitted for a NON-object TYPE (function/pointer/fundamental),
+        # not a domain class -- tagged so it doesn't inflate the class inventory and
+        # agents can filter it. Keyed on the name SHAPE (not just missing-vtable), so a
+        # real typeinfo-only class (anonymous-namespace / template) isn't mislabeled.
+        "artifact": _is_non_class_rtti_artifact(rec),
     }
 
 
@@ -372,10 +417,7 @@ def _class_list(
     # base decode. `artifact_count` (non-class RTTI/type rows, #481) is broken out so
     # the domain-class count is honest.
     if count_only:
-        artifact_count = sum(
-            1 for r in candidates
-            if r["confidence"] == "rtti" and r["vtable"] is None and len(r["methods"]) == 0
-        )
+        artifact_count = sum(1 for r in candidates if _is_non_class_rtti_artifact(r))
         return {
             "kind": "classes",
             "count": total,

@@ -1090,3 +1090,23 @@ def test_class_list_labels_non_class_rtti_artifacts_481():
     assert artifacts                                            # the function-type typeinfo row
     for r in artifacts:
         assert r["has_vtable"] is False and r["method_count"] == 0 and r["confidence"] == "rtti"
+
+
+def test_is_type_expression_name_481():
+    # #481: distinguish a non-class TYPE-EXPRESSION typeinfo from a real class name,
+    # incl. the anonymous-namespace / template cases that key-on-missing-vtable got
+    # wrong (they tagged real classes as artifacts).
+    f = read_class._is_type_expression_name
+    # non-class type expressions -> artifact
+    assert f("void (unsigned char)")          # function type
+    assert f("char const*")                    # pointer
+    assert f("Foo&")                           # reference
+    assert f("int [4]")                        # array
+    assert f("unsigned int")                   # multi-token fundamental
+    assert f("int")                            # bare fundamental
+    # real classes -> NOT artifacts (the libstdc++ false-positive class)
+    assert not f("(anonymous namespace)::future_error_category")
+    assert not f("net::Session")
+    assert not f("std::vector<int>")           # template args stripped
+    assert not f("std::__cxx11::basic_string<char, std::char_traits<char> >")
+    assert not f("Outer<Foo, Bar>::Inner")     # template with comma inside <>
