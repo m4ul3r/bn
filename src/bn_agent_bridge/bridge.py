@@ -2528,6 +2528,7 @@ def _bind_class_list(bridge, params, target):
         no_vendor=_validate_bool(params.get("no_vendor"), label="no_vendor", default=False),
         offset=int(params.get("offset", 0)),
         limit=int(params["limit"]) if params.get("limit") is not None else None,
+        count_only=_validate_bool(params.get("count_only"), label="count_only", default=False),
     )
 
 

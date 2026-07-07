@@ -311,6 +311,15 @@ def _list_row(rec: dict[str, Any]) -> dict[str, Any]:
         "size": rec["size"],
         "bases": [b.get("name") for b in rec.get("bases", [])],
         "confidence": rec["confidence"],
+        # #481: an RTTI-confidence row with NO methods AND NO vtable is typeinfo
+        # emitted for a NON-object type (a function signature, fundamental/pointer
+        # type), not a domain class -- so it doesn't inflate the class inventory and
+        # agents can filter it. A real class has a vtable and/or clustered methods.
+        "artifact": bool(
+            rec["confidence"] == "rtti"
+            and rec["vtable"] is None
+            and len(rec["methods"]) == 0
+        ),
     }
 
 
@@ -324,6 +333,7 @@ def _class_list(
     no_vendor: bool = False,
     offset: int = 0,
     limit: int | None = None,
+    count_only: bool = False,
 ) -> dict[str, Any]:
     bv = ctx._resolve_view(selector)
     registry = _build_class_registry(ctx, bv, query=query)
@@ -357,6 +367,24 @@ def _class_list(
     # `total` counts candidates AFTER the confidence + --no-stl filters but before
     # paging, so it reflects what this query actually surfaced.
     total = len(candidates)
+    # #484: count-only fast path for class-lens scale characterization -- respects
+    # every filter (--query / --no-stl / --no-vendor / --all) and skips the per-page
+    # base decode. `artifact_count` (non-class RTTI/type rows, #481) is broken out so
+    # the domain-class count is honest.
+    if count_only:
+        artifact_count = sum(
+            1 for r in candidates
+            if r["confidence"] == "rtti" and r["vtable"] is None and len(r["methods"]) == 0
+        )
+        return {
+            "kind": "classes",
+            "count": total,
+            "total": total,
+            "artifact_count": artifact_count,
+            "include_all": include_all,
+            "no_stl": no_stl,
+            "no_vendor": no_vendor,
+        }
     page = candidates[offset:] if offset else candidates
     if limit is not None:
         page = page[:limit]

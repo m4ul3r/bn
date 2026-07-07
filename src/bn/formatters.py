@@ -2859,6 +2859,13 @@ def _render_trace_text(value: Any) -> str:
 def _render_class_list_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
+    # #484 count-only: a bare count envelope (no items), with the non-class artifact
+    # (#481) share broken out so the domain-class count is honest.
+    if "count" in value and not value.get("items") and not value.get("classes"):
+        n = value.get("count", 0)
+        art = value.get("artifact_count") or 0
+        tail = f" ({art} non-class RTTI/type artifact{'s' if art != 1 else ''})" if art else ""
+        return f"classes: {n}{tail}"
     rows = list(value.get("items") or value.get("classes") or [])
     total = value.get("total", len(rows))
     header = f"classes: {len(rows)} shown of {total}"
@@ -2888,11 +2895,14 @@ def _render_class_list_text(value: Any) -> str:
         size_s = size.get("value") if isinstance(size, dict) else size
         bases = ", ".join(b for b in (rec.get("bases") or []) if b)
         base_s = f"  : {bases}" if bases else ""
+        # #481: mark a non-class RTTI/type-signature artifact (rtti confidence but no
+        # methods and no vtable) so it doesn't read as a domain class.
+        art_s = "  [artifact: non-class RTTI]" if rec.get("artifact") else ""
         lines.append(
             f"  {rec.get('name', '<unknown>')}  "
             f"methods={rec.get('method_count', 0)}  {vt}  "
             f"size={size_s if size_s is not None else '?'}  "
-            f"[{rec.get('confidence', '?')}]{base_s}"
+            f"[{rec.get('confidence', '?')}]{base_s}{art_s}"
         )
     return "\n".join(lines)
 
