@@ -1095,6 +1095,47 @@ def test_optional_sink_on_with_class(models):
     assert result2["reached_sinks"] == []
 
 
+def _recv_sink_func():
+    # handler(n): recv(3, &buf, n) -- the LENGTH (arg2) written into buf is
+    # attacker-controlled (param 0). recv is now an opt-in bounded-write sink (#499).
+    n = FVar("n", ident=1); n0 = FSSA(n, 0)
+    buf = FVar("buf")
+    rax = FVar("rax"); rax1 = FSSA(rax, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "rax#1 = recv(3, &buf, n#0)", reads=[n0], writes=[rax1],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_CONST", "3", constant=3),
+                       FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])]),
+    ]
+    return FFunc("handler", 0x10, FSSAFunc(instrs), params=[n]), FBV({0x900: "recv"})
+
+
+def test_recv_overflow_sink_off_by_default_499(models):
+    # #499: recv/read/recvfrom length sinks are opt-in (measured ~100% FP on the
+    # read-loop idiom), so an attacker-length recv fires nothing by default.
+    func, bv = _recv_sink_func()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert [s for s in result["reached_sinks"] if s["sink"]["callee"] == "recv"] == []
+
+
+def test_recv_overflow_sink_on_with_class_499(models):
+    # #499: with --sink-class recv_overflow enabled, the same attacker-length recv
+    # fires -- reported with the accurate overflow_len bug class, gated by recv_overflow.
+    func, bv = _recv_sink_func()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")],
+                            enabled_sink_classes={"recv_overflow"})
+    sinks = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "recv"]
+    assert len(sinks) == 1
+    assert sinks[0]["class"] == "overflow_len"
+    # an unrelated opt-in class leaves it silent (gated on recv_overflow, not its class)
+    r2 = engine.forward(func, [te.parse_locator("param:0")],
+                        enabled_sink_classes={"file_write"})
+    assert [s for s in r2["reached_sinks"] if s["sink"]["callee"] == "recv"] == []
+
+
 def _sprintf_vararg_func():
     # build(fd): read(fd,&buf,0x40); sprintf(&cmd,"echo %s",&buf); system(&cmd)
     # The format string is an UNTAINTED const ptr; the only taint into cmd is the

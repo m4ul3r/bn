@@ -139,10 +139,13 @@ _SINK_LOCATOR_HELP = (
              arg("--unknown-call", choices=("conservative", "stop"), default="conservative",
                  help="How to treat un-analyzed/external calls reached by taint (default: conservative)"),
              arg("--sink-class", dest="sink_classes", action="append", default=None,
-                 choices=("file_write", "net_write"), metavar="CLASS",
+                 choices=("file_write", "net_write", "recv_overflow"), metavar="CLASS",
                  help="Enable an opt-in sink class (repeatable). Off by default: "
-                      "file_write (fwrite/write/fputs), net_write (send/sendto). "
-                      "Use when auditing persistence / file-corruption / exfiltration paths."),
+                      "file_write (fwrite/write/fputs), net_write (send/sendto), "
+                      "recv_overflow (read/recv/recvfrom length -> undersized buffer). "
+                      "Use when auditing persistence / file-corruption / exfiltration, or "
+                      "recv-into-fixed-buffer overflows. recv_overflow is high-FP on the "
+                      "read-loop idiom (#499) -- enable it only when deliberately hunting."),
              _models_arg(),
              arg("--verbose", "-v", "--full", dest="full", action="store_true", default=False,
                  help="Show the full SSA path/slice for each flow (default: one compact line per flow)"),
