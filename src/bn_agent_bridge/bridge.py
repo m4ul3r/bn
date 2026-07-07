@@ -1065,12 +1065,24 @@ class BinaryNinjaBridge:
             if bv is None:
                 raise RuntimeError(f"Failed to open binary: {load_path}")
 
+            # #458: a directly-named .bndb must restore its analyzed view. BN's
+            # load() can default to the raw container view (0 functions) even when
+            # the database holds a saved analyzed view -- recover it (under the lock,
+            # since get_view_of_type touches BN state) or surface a hard restore
+            # diagnostic, so an agent never silently continues on a no-symbol target.
+            if load_path.suffix == ".bndb":
+                with self._target_lock.write():
+                    bv, bndb_note = _restore_bndb_analyzed_view(bv, load_path)
+                if bndb_note:
+                    notes.append(bndb_note)
+
             # #369 (part 1): BN's format detection failed and fell back to a raw
             # 'Raw'/'Mapped' view -- an empty/garbage/text file opened this way has
             # no functions or symbols. Warn so an agent doesn't proceed against a
-            # 0-function phantom target thinking it loaded a real binary.
+            # 0-function phantom target thinking it loaded a real binary. The .bndb
+            # case is handled above with a stronger, restore-specific diagnostic.
             view_type_name = str(getattr(bv, "view_type", "") or "")
-            if view_type_name in ("Raw", "Mapped"):
+            if view_type_name in ("Raw", "Mapped") and load_path.suffix != ".bndb":
                 notes.append(
                     f"{resolved.name} was opened as a raw '{view_type_name}' view -- "
                     "its format was not recognized, so it has no functions/symbols to "
@@ -2846,6 +2858,64 @@ def _resolve_bndb_sidecar(resolved: Path, prefer_bndb: bool) -> tuple[Path, str]
     return None
 
 
+def _view_function_count(bv) -> int:
+    """Cheap "does this view carry analysis" probe: the count of recovered
+    functions, or 0 if the attribute is missing/raises (a raw container view)."""
+    try:
+        return len(bv.functions)
+    except Exception:  # noqa: BLE001 - a raw/uninitialised view may not expose functions
+        return 0
+
+
+# View types that are the raw byte container, never the analyzed product view.
+_RAW_CONTAINER_VIEW_TYPES = frozenset({"Raw", "Hex", ""})
+
+
+def _restore_bndb_analyzed_view(bv, load_path: Path):
+    """For a directly-named ``.bndb``, ensure the *analyzed* view is returned (#458).
+
+    BN's ``load()`` can default to the raw container view (0 functions) even when the
+    database holds a saved analyzed view -- an agent that continues against it sees no
+    functions/symbols and mistakes a restore failure for an empty/different binary.
+    When the loaded view looks unanalyzed, recover the analyzed view from the shared
+    ``FileMetadata`` (``existing_views`` + ``get_view_of_type``); if none exists, return
+    a hard diagnostic instead of a silent no-symbol target.
+
+    Note: the discriminator is *function presence*, not the view-type name -- firmware
+    legitimately analyzes as a ``Mapped`` view, so a Mapped view WITH functions is fine
+    and left untouched.
+
+    Returns ``(bv, note_or_None)`` where ``bv`` may be the recovered analyzed view.
+    """
+    if _view_function_count(bv) > 0:
+        return bv, None  # analyzed view already restored -- the common case
+
+    current_type = str(getattr(bv, "view_type", "") or "")
+    fm = getattr(bv, "file", None)
+    existing = list(getattr(fm, "existing_views", None) or [])
+    for name in existing:
+        if name in _RAW_CONTAINER_VIEW_TYPES or name == current_type:
+            continue
+        try:
+            candidate = fm.get_view_of_type(name)
+        except Exception:  # noqa: BLE001 - a view type present on disk may still fail to open
+            candidate = None
+        if candidate is not None and _view_function_count(candidate) > 0:
+            return candidate, (
+                f"restored analyzed view '{name}' ({_view_function_count(candidate)} "
+                f"functions) from {load_path.name}; load() had defaulted to the raw "
+                f"'{current_type or 'Raw'}' container view"
+            )
+
+    return bv, (
+        f"WARNING: {load_path.name} restored a raw '{current_type or 'Raw'}' view with "
+        "0 functions -- the saved analysis could not be restored (the database may have "
+        "been saved before analysis finished, or is corrupt). Function/symbol/xref "
+        "queries will be empty; this is NOT an analyzed target. Re-create the database "
+        "from the original binary, or load the raw binary and run `bn refresh`."
+    )
+
+
 def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
     """Open one headless preload binary and register it.
 
@@ -2877,6 +2947,14 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
     if bv is None:
         bn.log_warn(f"Failed to open binary: {load_path}")
         return None
+    # #458 parity with _load_binary: a directly-named .bndb whose load() defaults
+    # to the raw container view must recover its analyzed view (or log a hard
+    # restore diagnostic), so `bn-agent <file>.bndb` doesn't silently preload a
+    # no-symbol target.
+    if load_path.suffix == ".bndb":
+        bv, bndb_note = _restore_bndb_analyzed_view(bv, load_path)
+        if bndb_note:
+            (bn.log_warn if bndb_note.startswith("WARNING:") else bn.log_info)(bndb_note)
     quick_effective = quick and load_path.suffix != ".bndb"
     if quick_effective:
         _quick_loaded_views.add(bv)

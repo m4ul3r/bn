@@ -709,11 +709,21 @@ def _local_retype_result(**overrides):
 
 
 class _LoadBV:
-    def __init__(self, filename: str | None = None, view_type: str = "ELF"):
+    def __init__(self, filename: str | None = None, view_type: str = "ELF",
+                 functions=None, existing_views=None, db_views=None):
         self.analysis_updated = False
-        # _load_binary's #355 idempotency scan reads bv.file.filename, and the
-        # #369 raw-mapped warning reads bv.view_type.
+        # A real loaded view carries functions; default to one so the #458 .bndb
+        # analyzed-view check treats a plain loaded view as analyzed. Tests that
+        # need a raw/unanalyzed view pass functions=[].
+        self.functions = [object()] if functions is None else list(functions)
+        # _load_binary's #355 idempotency scan reads bv.file.filename, the #369
+        # raw-mapped warning reads bv.view_type, and the #458 recovery path reads
+        # bv.file.existing_views / bv.file.get_view_of_type(name).
         self.file = types.SimpleNamespace(filename=filename)
+        if existing_views is not None:
+            self.file.existing_views = list(existing_views)
+            _db = dict(db_views or {})
+            self.file.get_view_of_type = lambda name, _m=_db: _m.get(name)
         self.view_type = view_type
 
     def update_analysis_and_wait(self):
