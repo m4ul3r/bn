@@ -81,6 +81,17 @@ def test_skill_install_copy_mode(tmp_path):
     assert (destination / "bn-vr" / "SKILL.md").exists()
 
 
+def test_skill_install_copy_mode_orient_script_executable(tmp_path):
+    # #169 L3 / #504: a real copy-mode install ships bn-re/scripts/orient.sh and it is
+    # executable at the destination (copytree preserves the committed bit, and
+    # _ensure_scripts_executable restores it if the source ever loses it).
+    destination = tmp_path / "skill-copy"
+    assert bn.cli.main(["skill", "install", "--mode", "copy", "--dest", str(destination)]) == 0
+    orient = destination / "bn-re" / "scripts" / "orient.sh"
+    assert orient.exists(), "orient.sh should install with the bn-re skill"
+    assert orient.stat().st_mode & 0o111, "installed orient.sh must be executable"
+
+
 def test_skill_install_defaults_to_claude_only_without_codex_home(tmp_path, monkeypatch):
     claude_root = tmp_path / "claude" / "skills"
     codex_home = tmp_path / "codex"
