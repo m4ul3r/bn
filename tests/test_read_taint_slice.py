@@ -198,6 +198,88 @@ def test_stack_arg_offsets_reset_at_preceding_call(monkeypatch):
     assert rts._stack_arg_store_offsets(_func(block), early) == [0, 4]
 
 
+class _BVFn(_BV):
+    """Fake BinaryView adding `.get_function_at` so `resolve_call_target` can
+    resolve a direct call's callee entry address."""
+    def __init__(self, strings=None, funcs=None):
+        super().__init__(strings)
+        self._funcs = dict(funcs or {})
+
+    def get_function_at(self, addr):
+        return self._funcs.get(int(addr))
+
+
+def test_truncation_note_named_callee_renders_runnable_command(monkeypatch):
+    # #534: a NAMED callee still emits the runnable `bn proto set <name> ...`
+    # command verbatim -- unchanged behavior.
+    rts = _load_bridge(monkeypatch).read_taint_slice
+    call_addr = 0x1c
+    block = [_store(_reg("sp"), 0x10),
+             _store(_add(_reg("sp"), _const(4)), 0x12),
+             _call(call_addr)]
+    note = rts._call_model_truncation_note(
+        _BV(_FMT_STR), _func(block), None, call_addr, [_fmt_ptr(0x5000)], "my_logger")
+    assert 'bn proto set my_logger "<ret> my_logger(<fixed args>, ...)"' in note
+
+
+def test_truncation_note_prose_when_no_identifier(monkeypatch):
+    # #534: an unnamed/indirect callee with NO resolvable address (call_insn=None)
+    # must NOT emit the uncopy-pasteable `bn proto set the callee ...` command --
+    # it emits prose guidance instead.
+    rts = _load_bridge(monkeypatch).read_taint_slice
+    call_addr = 0x1c
+    block = [_store(_reg("sp"), 0x10),
+             _store(_add(_reg("sp"), _const(4)), 0x12),
+             _call(call_addr)]
+    note = rts._call_model_truncation_note(
+        _BV(_FMT_STR), _func(block), None, call_addr, [_fmt_ptr(0x5000)], None)
+    assert note is not None
+    assert "call-model truncation" in note
+    # The broken literal command must be gone.
+    assert "proto set the callee" not in note
+    # Still guidance pointing at proto set on the resolved callee.
+    assert "proto set" in note
+
+
+def test_truncation_note_uses_address_selector_when_name_unknown(monkeypatch):
+    # #534: no name, but the direct call resolves to a callee entry address -->
+    # use the ADDRESS as a runnable `bn proto set 0x... ...` selector.
+    rts = _load_bridge(monkeypatch).read_taint_slice
+    call_addr = 0x1c
+    block = [_store(_reg("sp"), 0x10),
+             _store(_add(_reg("sp"), _const(4)), 0x12),
+             _call(call_addr)]
+    call_insn = block[-1]                       # .dest = _const(0x1000)
+    callee = types.SimpleNamespace(name="", start=0x1000)
+    bv = _BVFn(_FMT_STR, {0x1000: callee})
+    note = rts._call_model_truncation_note(
+        bv, _func(block), call_insn, call_addr, [_fmt_ptr(0x5000)], None)
+    assert note is not None
+    assert "bn proto set 0x1000" in note
+    assert "proto set the callee" not in note
+
+
+def test_truncation_note_prose_when_indirect_call_unresolvable(monkeypatch):
+    # #534: a real indirect call_insn (register-indirect dest, no constant and no
+    # symbol name) resolves to `.address is None` -- exercise the prose branch via
+    # the resolver returning no address, not just the call_insn=None shortcut.
+    rts = _load_bridge(monkeypatch).read_taint_slice
+    call_addr = 0x1c
+    indirect = _op("LLIL_CALL")
+    indirect.address = call_addr
+    indirect.dest = _reg("r3")                  # register-indirect: no .constant/.name
+    block = [_store(_reg("sp"), 0x10),
+             _store(_add(_reg("sp"), _const(4)), 0x12),
+             indirect]
+    bv = _BVFn(_FMT_STR, {})                     # get_function_at -> None for any addr
+    note = rts._call_model_truncation_note(
+        bv, _func(block), indirect, call_addr, [_fmt_ptr(0x5000)], None)
+    assert note is not None
+    assert "call-model truncation" in note
+    assert "proto set the callee" not in note
+    assert "proto set" in note
+
+
 def test_truncation_note_silent_when_arch_unknown(monkeypatch):
     # Unknown calling convention (no int_arg_regs) -> can't reason -> silent.
     rts = _load_bridge(monkeypatch).read_taint_slice

@@ -470,17 +470,43 @@ def _call_model_truncation_note(bv, func, call_insn, target_addr: int,
                 break
     if len(offsets) < 2:
         return None
-    name = callee_name or "the callee"
+    disp = callee_name or "the callee"
     off_list = ", ".join(f"sp+{hex(o)}" for o in offsets)
+    # Pick a RUNNABLE `proto set` selector: the callee name if known, else its
+    # resolved entry address (a direct call's constant dest still gives us an
+    # address even when the target is unnamed). An unnamed/indirect callee with
+    # neither has no runnable selector -- emit prose guidance, never the literal
+    # `bn proto set the callee ...` command, which cannot be copy-pasted (#534).
+    selector = callee_name or None
+    if selector is None and call_insn is not None:
+        try:
+            addr = _taint.resolve_call_target(
+                bv, call_insn, follow_thunks=True).address
+        except Exception:
+            addr = None
+        if addr is not None:
+            selector = hex(int(addr))
+    if selector is not None:
+        proto_name = callee_name or "<callee>"
+        remedy = (
+            f"declare it variadic with "
+            f"`bn proto set {selector} \"<ret> {proto_name}(<fixed args>, ...)\"` "
+            f"(or the full prototype) and re-run."
+        )
+    else:
+        remedy = (
+            "declare it variadic on the concrete callee once you resolve this "
+            "indirect/unnamed call -- run "
+            "`bn proto set <callee> \"<ret> <callee>(<fixed args>, ...)\"` against "
+            "the resolved target's address or name and re-run."
+        )
     return (
-        f"call-model truncation (#489): {name} was recovered with {len(params)} MLIL "
+        f"call-model truncation (#489): {disp} was recovered with {len(params)} MLIL "
         f"argument(s) (all register-passed), but LLIL shows {len(offsets)} outgoing "
         f"stack-arg store(s) [{off_list}] feeding this call -- those stack-passed "
         f"arg(s) are DROPPED from the call model, most often a variadic callee "
         f"auto-typed as fixed-arity. `trace`/`taint`/`defuse` cannot see them until "
-        f"the prototype is fixed: declare it variadic with "
-        f"`bn proto set {name} \"<ret> {name}(<fixed args>, ...)\"` (or the full "
-        f"prototype) and re-run. Inspect the stores with "
+        f"the prototype is fixed: {remedy} Inspect the stores with "
         f"`bn il {getattr(func, 'name', '<fn>')} --view llil --ssa`."
     )
 
