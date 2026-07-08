@@ -146,6 +146,30 @@ def test_refresh_keeps_unanalyzed_flag_when_analysis_yields_no_functions(monkeyp
     bridge._unanalyzed_views.discard(bv)
 
 
+def test_refresh_resolves_target_under_write_gate(monkeypatch):
+    """#522 (TOCTOU): refresh is @op lock="none", so dispatch takes no lock. It must
+    acquire the write gate BEFORE resolving the view -- otherwise a concurrent
+    close_binary/save_database (lock="write") could invalidate the view between the
+    resolve and the gate acquisition, and update_analysis_and_wait() would run on a
+    dead view. Assert the gate is already held at the moment _resolve_view runs."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+    gate_held_at_resolve = {"v": None}
+
+    def recording_resolve(selector):
+        # threading.Lock.locked() is True while the `with self._write_gate:` block holds it.
+        gate_held_at_resolve["v"] = instance._write_gate.locked()
+        return bv
+
+    monkeypatch.setattr(instance, "_resolve_view", recording_resolve)
+    monkeypatch.setattr(instance, "_target_info", lambda selector: {})
+
+    instance._refresh("active")
+
+    assert gate_held_at_resolve["v"] is True  # gate acquired before the target was resolved
+
+
 def test_target_info_surfaces_analysis_progress(monkeypatch):
     """#321: target info exposes pollable analysis phase/counts so a large-target
     analysis can be watched instead of guessing whether the bridge is wedged."""
@@ -1286,6 +1310,87 @@ def test_preload_binary_no_bndb_opt_out(monkeypatch, tmp_path):
 
     assert loaded_paths == [str(raw)]
     bridge._headless_views.clear()
+
+
+def test_start_headless_rewrites_registry_after_preload(monkeypatch, tmp_path):
+    """#524: _preload_binary appends to _headless_views but never rewrites the
+    registry (unlike the runtime `bn load` path). start_headless must call
+    _write_registry once AFTER the preload loop, so a `bn-agent <binary>`
+    instance's on-disk registry lists its live targets instead of zero binaries."""
+    bridge = _load_bridge(monkeypatch)
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    bridge._headless_views.clear()
+
+    # Neuter the socket server / GUI-only start() -- and make it release the
+    # shutdown wait so start_headless returns synchronously. Crucially, start()
+    # normally writes the registry itself; stubbing it means the ONLY registry
+    # write under test is the post-preload one the #524 fix adds.
+    def fake_start(self):
+        self._shutdown_event.set()
+
+    monkeypatch.setattr(bridge.BinaryNinjaBridge, "start", fake_start)
+    monkeypatch.setattr(bridge, "_stop_bridge", lambda: None)
+
+    # The registry's binaries list comes from targets.refresh(); model one loaded
+    # target so a correctly-timed post-preload write records it.
+    monkeypatch.setattr(bridge.TargetManager, "refresh",
+                        lambda self: [{"filename": "/proj/foo.so"}])
+
+    loaded: list[str] = []
+
+    def fake_preload(path, quick, prefer_bndb=True):
+        loaded.append(path)
+        bridge._headless_views.append(object())
+        return object()
+
+    monkeypatch.setattr(bridge, "_preload_binary", fake_preload)
+
+    bridge.start_headless(binaries=["/proj/foo.so"], instance_id="testinst")
+
+    assert loaded == ["/proj/foo.so"]
+    registry = tmp_path / "instances" / "testinst.json"
+    assert registry.exists(), "registry not written after preload (#524)"
+    payload = json.loads(registry.read_text())
+    assert payload["binaries"] == ["/proj/foo.so"]
+    bridge._headless_views.clear()
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "rename_symbol",
+        "set_comment",
+        "delete_comment",
+        "set_prototype",
+        "local_rename",
+        "local_retype",
+        "struct_field_set",
+        "struct_field_rename",
+        "struct_field_delete",
+        "types_declare",
+    ],
+)
+def test_single_mutation_binder_ignores_injected_op(endpoint, monkeypatch):
+    """#525: a single-mutation endpoint builds its manifest with the literal op
+    spread LAST (`{**params, "op": endpoint}`), so a caller-supplied
+    `params["op"]` can never redirect the operation (e.g. a set_comment request
+    carrying `params={"op":"delete_comment"}` must still run set_comment). Only
+    batch_apply legitimately trusts manifest ops."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    captured: dict = {}
+
+    def fake_mutation(target, preview, operations):
+        captured["operations"] = operations
+        return {"ok": True}
+
+    monkeypatch.setattr(instance, "_mutation", fake_mutation)
+
+    # Inject a hostile op distinct from the endpoint's own op.
+    injected = "delete_comment" if endpoint != "delete_comment" else "set_comment"
+    instance._dispatch_on_main(endpoint, {"op": injected, "address": "0x1000"}, None)
+
+    assert captured["operations"][0]["op"] == endpoint  # endpoint op wins, not the injected one
 
 
 def test_dispatch_rejects_non_boolean_all(monkeypatch):
