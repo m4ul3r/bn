@@ -897,6 +897,42 @@ def test_find_var_for_restore_relocates_register_local_via_func_vars(monkeypatch
     assert found is narrowed
 
 
+def test_find_var_for_restore_rejects_same_storage_stranger_after_identifier_miss(monkeypatch):
+    """#521: when a captured identifier no longer resolves, the restore must NOT
+    fall back to a storage-only match -- a DIFFERENT variable now at the same
+    storage would match and the restore closure would stamp the old name/type
+    onto the wrong logical variable. Return None instead."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    # A stranger occupies storage -72 now, but with a different identifier than
+    # the one we captured (3001). The captured variable is gone.
+    stranger = _FakeVariable(name="other", storage=-72, var_type="int32_t", identifier=9999)
+    fn = _FakeFunction(0x401000, "process_usb")
+    fn.stack_layout = [stranger]
+
+    found = bridge.mutation_engine._find_var_for_restore(
+        instance, fn, 3001, -72, False
+    )
+    assert found is None  # must not clobber the same-storage stranger
+
+
+def test_find_var_for_restore_falls_back_to_storage_when_no_identifier(monkeypatch):
+    """#521: the storage fallback is still the legitimate recovery when BN never
+    gave an identifier -- the same logical variable recreated with no identifier."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    var = _FakeVariable(name="var_48", storage=-72, var_type="int32_t", identifier=3001)
+    fn = _FakeFunction(0x401000, "process_usb")
+    fn.stack_layout = [var]
+
+    found = bridge.mutation_engine._find_var_for_restore(
+        instance, fn, None, -72, False
+    )
+    assert found is var
+
+
 def test_load_binary_quick_skips_analysis(monkeypatch, tmp_path):
     bridge, instance, loaded_paths = _setup_load_test(monkeypatch)
     raw = tmp_path / "foo.so"

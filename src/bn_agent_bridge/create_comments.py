@@ -233,6 +233,16 @@ def _function_create(ctx, selector: str | None, address, preview: bool):
             committed = True
             success = True
             message = "Function created and verified in the live Binary Ninja session."
+            # This standalone path bypasses the generic _mutation() shim that
+            # marks the view dirty, and BN's bv.file.modified does NOT flip True
+            # after our verified mutation -- so without this, `bn close` computes
+            # unsaved=false and silently drops the created function (#519). Mark
+            # dirty only on a committed, verified (non-preview) create; preview
+            # reverts and the noop / guard-rejected paths return earlier.
+            try:
+                ctx.targets.mark_dirty(bv)
+            except Exception:
+                pass
         result = {
             "preview": preview,
             "success": success,
