@@ -11,6 +11,24 @@ export const meta = {
   ],
 }
 
+/*
+ * ultracode — dev-only harness for exercising the bn / bn-re / bn-vr skills.
+ * NOT part of the bn package; reports go to the git-ignored .dogfood/ tree.
+ *
+ * INVOKE via scriptPath — the `name:` registry caches the FIRST version, so to run
+ * the current file always pass its path:
+ *   Workflow({ scriptPath: '<repo>/.claude/workflows/ultracode.js',
+ *              args: { binary: '<path>', focus?: '<hint>', depth?: 'deep'|'smoke' } })
+ *   • args may be an object OR a JSON string (both are handled).
+ *   • depth 'deep' (default): full pipeline + one bounded targeted redo per working
+ *     phase, normal agent effort.
+ *   • depth 'smoke': single pass (no redo loops) at low agent effort — a faster,
+ *     cheaper triage. Every stage still runs (incl. the independent verify), so the
+ *     "no false all-clear" guarantee holds; only the corrective retry is skipped.
+ * Output: a git-ignored .dogfood/audits/<runid>.md report + a saved BNDB. The report
+ * carries real target data — never commit it.
+ */
+
 // ---- args & identity (no Date.now/Math.random available) ----
 // The Workflow tool may hand `args` through as a JSON string rather than an
 // object; accept either so invocation is robust.
@@ -21,6 +39,10 @@ if (typeof _args === 'string') {
 const binary = _args && _args.binary
 if (!binary) throw new Error(`ultracode: args.binary is required (path to the target binary); got typeof args=${typeof args}, value=${String(JSON.stringify(args)).slice(0, 160)}`)
 const focus = (_args && _args.focus) || ''
+const depth = String((_args && _args.depth) || 'deep').toLowerCase()
+const SMOKE = depth === 'smoke'
+// Low agent effort in smoke mode; inherit the session default in deep mode.
+const EX = SMOKE ? { effort: 'low' } : {}
 const base = String(binary).split('/').pop().replace(/[^A-Za-z0-9._-]/g, '_')
 const instance = (_args && _args.instance) || `ultracode-${base}`
 const runid = (_args && _args.runid) || base
@@ -33,6 +55,13 @@ const HYGIENE = [
   `Large bn reads spill to disk and stdout carries only an envelope: write to a file then grep/jq it (\`bn decompile f --out /tmp/f.txt && grep x /tmp/f.txt\`), NEVER \`bn ... | grep\` (that greps the envelope, not the data).`,
   `Keep real target names/addresses out of anything you would commit; this run's report is written to a git-ignored path only.`,
 ].join(' ')
+
+// ---- severity ranking (for the return payload + prose ordering) ----
+const SEV_RANK = { critical: 3, high: 2, medium: 1, low: 0 }
+const sevRank = (s) => {
+  const r = SEV_RANK[String(s || '').toLowerCase()]
+  return r === undefined ? -1 : r
+}
 
 // ---- structured-output schemas ----
 const SETUP_SCHEMA = {
@@ -90,22 +119,24 @@ const REVIEW_SCHEMA = {
   },
 }
 
+// A verified/candidate finding. severity + headline drive the return payload and the
+// prose report; the rest is the evidence.
+const FINDING_PROPS = {
+  severity: { type: 'string', enum: ['critical', 'high', 'medium', 'low', 'info'] },
+  headline: { type: 'string', description: 'one-line summary, no addresses' },
+  class: { type: 'string' }, location: { type: 'string' },
+  source: { type: 'string' }, sink: { type: 'string' },
+  path: { type: 'string' }, prelim_confidence: { type: 'string' },
+  soundness: { type: 'string' },
+}
+
 const VR_SCHEMA = {
   type: 'object',
   required: ['findings'],
   properties: {
     findings: {
       type: 'array',
-      items: {
-        type: 'object',
-        required: ['class', 'location', 'soundness'],
-        properties: {
-          class: { type: 'string' }, location: { type: 'string' },
-          source: { type: 'string' }, sink: { type: 'string' },
-          path: { type: 'string' }, prelim_confidence: { type: 'string' },
-          soundness: { type: 'string' },
-        },
-      },
+      items: { type: 'object', required: ['class', 'location', 'severity', 'headline', 'soundness'], properties: FINDING_PROPS },
     },
   },
 }
@@ -117,7 +148,7 @@ const REVIEW_VR_SCHEMA = {
     verdict: { type: 'string', enum: ['pass', 'gaps'] },
     redo: { type: 'array', items: { type: 'string' } },
     efficiency_notes: { type: 'string' },
-    verified: { type: 'array', items: { type: 'object' } },
+    verified: { type: 'array', items: { type: 'object', properties: FINDING_PROPS } },
     demoted: { type: 'array', items: { type: 'object' } },
   },
 }
@@ -142,10 +173,10 @@ Load and orient a binary for a downstream RE→VR pipeline. Do:
 4. Decide the LANE by the real tell, NOT \`file\`: "import-first" if \`bn imports\` is non-empty OR \`bn function list\` is mostly named; "stripped-static" only if imports are empty AND names are overwhelmingly sub_XXXX.
 5. Capture BASELINE counts (the review stage diffs against these): total functions, named symbols (non sub_*), and comments.
 Return the structured result.`,
-  { label: 'setup', phase: 'Setup', schema: SETUP_SCHEMA, agentType: 'general-purpose' })
+  { ...EX, label: 'setup', phase: 'Setup', schema: SETUP_SCHEMA, agentType: 'general-purpose' })
 
 if (!setup) throw new Error('ultracode: setup stage failed (agent returned null)')
-log(`setup: arch=${setup.arch} lane=${setup.lane} baseline fns=${setup.baseline && setup.baseline.functions}`)
+log(`setup: arch=${setup.arch} lane=${setup.lane} depth=${depth} baseline fns=${setup.baseline && setup.baseline.functions}`)
 
 // ================= Stage 1: RE =================
 phase('RE')
@@ -160,7 +191,7 @@ Follow the bn-re methodology. Reverse-engineer ${focus ? `the "${focus}" surface
 Produce a distilled entry→dispatch→handler→sink map the VR phase can act on.${redo ? `\n\nA reviewer flagged gaps — address ONLY these, then return the updated map:\n${redo}` : ''}
 Return the structured map and the counts of what you enriched.`
 
-let re = await agent(rePrompt(''), { label: 'RE', phase: 'RE', schema: RE_SCHEMA, agentType: 'bn-re' })
+let re = await agent(rePrompt(''), { ...EX, label: 'RE', phase: 'RE', schema: RE_SCHEMA, agentType: 'bn-re' })
 if (!re) throw new Error('ultracode: RE stage failed (agent returned null)')
 
 // ================= Stage 2: review-RE =================
@@ -180,13 +211,16 @@ PRIMARY (methodology + soundness):
 SECONDARY (flag, do NOT gate): pipe/spill trap, one-shot digests used, no redundant re-decompiles.
 
 Return verdict 'pass' or 'gaps'. If 'gaps', give a SHORT targeted redo list (only material items the RE agent must fix). Put secondary observations in efficiency_notes.`,
-  { label: 'review:RE', phase: 'Review-RE', schema: REVIEW_SCHEMA, agentType: 'general-purpose' })
+  { ...EX, label: 'review:RE', phase: 'Review-RE', schema: REVIEW_SCHEMA, agentType: 'general-purpose' })
 
-if (reReview && reReview.verdict === 'gaps' && reReview.redo && reReview.redo.length) {
+// deep mode gates a single bounded targeted redo; smoke mode logs the gaps and proceeds.
+if (!SMOKE && reReview && reReview.verdict === 'gaps' && reReview.redo && reReview.redo.length) {
   log(`review-RE: gaps → one targeted redo (${reReview.redo.length} items)`)
   const redone = await agent(rePrompt(reReview.redo.join('\n')),
-    { label: 'RE-redo', phase: 'RE', schema: RE_SCHEMA, agentType: 'bn-re' })
+    { ...EX, label: 'RE-redo', phase: 'RE', schema: RE_SCHEMA, agentType: 'bn-re' })
   if (redone) re = redone
+} else if (SMOKE && reReview && reReview.verdict === 'gaps') {
+  log(`review-RE: gaps (smoke mode — no redo)`)
 }
 
 // ================= Stage 3: VR =================
@@ -197,15 +231,15 @@ Follow the bn-vr methodology against this ENRICHED BNDB — the RE phase named h
 - Enumerate sinks exhaustively: \`bn taint models --role sink --present --callsites\`. A short/empty list is NOT an all-clear on a stripped/static target — recover sinks by shape (bn-vr stripped/static lane).
 - Source→sink trace each candidate (\`bn taint forward/backward\`, \`bn trace\`). An empty taint result is NOT an all-clear: also run the MANUAL lanes — parser/fixed-header invariants (loop guard vs header width) and destination-capacity (strcpy/strcat aggregate, audit every wrapper caller).
 - Confirm every bound/field-width in \`bn disasm\`, not HLIL.
-For each finding report: class, location (fn+addr), source, sink, the source→sink path, a preliminary confidence, and the \`bn taint\` soundness caveat.${redo ? `\n\nA reviewer flagged gaps — address ONLY these:\n${redo}` : ''}
+For each finding report: severity (critical/high/medium/low/info), a one-line headline (no addresses), class, location (fn+addr), source, sink, the source→sink path, a preliminary confidence, and the \`bn taint\` soundness caveat.${redo ? `\n\nA reviewer flagged gaps — address ONLY these:\n${redo}` : ''}
 Return structured findings (empty array is allowed, but only after the manual lanes were genuinely checked).`
 
-let vr = await agent(vrPrompt(''), { label: 'VR', phase: 'VR', schema: VR_SCHEMA, agentType: 'bn-vr' })
+let vr = await agent(vrPrompt(''), { ...EX, label: 'VR', phase: 'VR', schema: VR_SCHEMA, agentType: 'bn-vr' })
 if (!vr) throw new Error('ultracode: VR stage failed (agent returned null)')
 
 // ================= Stage 4: review-VR (audit + adversarial verify) =================
 phase('Review-VR')
-const VERIFY_INSTRUCTIONS = `ADVERSARIALLY VERIFY each finding — independently re-derive it in bn: disasm-confirm the bound/field-width, prove the attacker controls the reaching input, and require a soundness caveat. Move any finding you cannot independently confirm (unproven control, HLIL-only bound, false all-clear) into 'demoted' with a one-line reason. Keep confirmed ones in 'verified'.`
+const VERIFY_INSTRUCTIONS = `ADVERSARIALLY VERIFY each finding — independently re-derive it in bn: disasm-confirm the bound/field-width, prove the attacker controls the reaching input, and require a soundness caveat. Move any finding you cannot independently confirm (unproven control, HLIL-only bound, false all-clear) into 'demoted' with a one-line reason. Keep confirmed ones in 'verified'. Each verified item MUST carry: severity (critical/high/medium/low/info), a one-line headline (no addresses), class, location, source, sink, path, soundness — set severity from real impact + attacker control, downgrading anything not fully proven.`
 
 const vrReview = await agent(`${HYGIENE}
 
@@ -217,28 +251,50 @@ Findings to verify:
 ${JSON.stringify((vr && vr.findings) || [], null, 2)}
 
 Return: verdict ('pass', or 'gaps' only for a tool-usage gap worth one redo — e.g. a whole lane unaudited), redo[], efficiency_notes, verified[], demoted[].`,
-  { label: 'review:VR', phase: 'Review-VR', schema: REVIEW_VR_SCHEMA, agentType: 'general-purpose' })
+  { ...EX, label: 'review:VR', phase: 'Review-VR', schema: REVIEW_VR_SCHEMA, agentType: 'general-purpose' })
 
 let verified = (vrReview && vrReview.verified) || []
-if (vrReview && vrReview.verdict === 'gaps' && vrReview.redo && vrReview.redo.length) {
+if (!SMOKE && vrReview && vrReview.verdict === 'gaps' && vrReview.redo && vrReview.redo.length) {
   log(`review-VR: gaps → one targeted redo (${vrReview.redo.length} items)`)
   const vrRedone = await agent(vrPrompt(vrReview.redo.join('\n')),
-    { label: 'VR-redo', phase: 'VR', schema: VR_SCHEMA, agentType: 'bn-vr' })
+    { ...EX, label: 'VR-redo', phase: 'VR', schema: VR_SCHEMA, agentType: 'bn-vr' })
   if (vrRedone) vr = vrRedone
   const reverify = await agent(`${HYGIENE}\n\n${VERIFY_INSTRUCTIONS}\n\nFindings:\n${JSON.stringify((vr && vr.findings) || [], null, 2)}\n\nReturn verified[] and demoted[] (verdict 'pass', empty redo).`,
-    { label: 'reverify:VR', phase: 'Review-VR', schema: REVIEW_VR_SCHEMA, agentType: 'general-purpose' })
+    { ...EX, label: 'reverify:VR', phase: 'Review-VR', schema: REVIEW_VR_SCHEMA, agentType: 'general-purpose' })
   if (reverify && reverify.verified) verified = reverify.verified
+} else if (SMOKE && vrReview && vrReview.verdict === 'gaps') {
+  log(`review-VR: gaps (smoke mode — no redo)`)
 }
+
+// rank verified findings by severity (highest first) for the report + return payload
+const ranked = verified.slice().sort((a, b) => sevRank(b && b.severity) - sevRank(a && a.severity))
 
 // ================= Stage 5: Synthesize =================
 phase('Synthesize')
+const sevBadge = (s) => `[${String(s || 'UNRATED').toUpperCase()}]`
+const findingsProse = ranked.length
+  ? ranked.map((f, i) => [
+      `### ${i + 1}. ${sevBadge(f && f.severity)} ${(f && f.headline) || (f && f.class) || 'finding'}`,
+      (f && f.class) ? `- **class:** ${f.class}` : null,
+      (f && f.location) ? `- **location:** ${f.location}` : null,
+      (f && f.source) ? `- **source:** ${f.source}` : null,
+      (f && f.sink) ? `- **sink:** ${f.sink}` : null,
+      (f && f.path) ? `- **path:** ${f.path}` : null,
+      (f && f.soundness) ? `- **soundness:** ${f.soundness}` : null,
+    ].filter(Boolean).join('\n')).join('\n\n')
+  : '_No verified findings._ (An empty result here means the pipeline could not confirm a bug — check the Efficiency audit + RE map for disclosed frontiers, which are NOT all-clears.)'
+
 const report = [
   `# ultracode audit — ${runid}`,
   ``,
   `- binary: \`${binary}\``,
   `- focus: ${focus || '(broad)'}`,
+  `- depth: ${depth}${SMOKE ? ' (single-pass, low-effort triage)' : ''}`,
   `- arch / lane: ${setup.arch} / ${setup.lane}`,
-  `- verified findings: ${verified.length}`,
+  `- verified findings: ${ranked.length}`,
+  ``,
+  `## Verified findings (${ranked.length})`,
+  findingsProse,
   ``,
   `## RE map`,
   '```json', JSON.stringify((re && re.map) || [], null, 2), '```',
@@ -246,9 +302,6 @@ const report = [
   `### BNDB enrichment`,
   '```json', JSON.stringify((re && re.enriched) || {}, null, 2), '```',
   `${(re && re.hidden_surface) ? `\nHidden surface: ${re.hidden_surface}` : ''}`,
-  ``,
-  `## Verified findings (${verified.length})`,
-  '```json', JSON.stringify(verified, null, 2), '```',
   ``,
   `## Efficiency audit`,
   `### RE phase`,
@@ -267,11 +320,20 @@ Return the exact report path written and a 2-3 line summary (arch, #verified fin
 
 ---- REPORT (write verbatim) ----
 ${report}`,
-  { label: 'synthesize', phase: 'Synthesize', schema: SYNTH_SCHEMA, agentType: 'general-purpose' })
+  { ...EX, label: 'synthesize', phase: 'Synthesize', schema: SYNTH_SCHEMA, agentType: 'general-purpose' })
 
-log(`ultracode done: ${verified.length} verified finding(s) → ${(synth && synth.report_path) || `.dogfood/audits/${runid}.md`}`)
+const top = ranked[0]
+  ? { severity: (ranked[0].severity) || 'unrated', headline: ranked[0].headline || ranked[0].class || 'finding' }
+  : null
+log(`ultracode done (${depth}): ${ranked.length} verified finding(s) → ${(synth && synth.report_path) || `.dogfood/audits/${runid}.md`}`)
 return {
   report_path: (synth && synth.report_path) || `.dogfood/audits/${runid}.md`,
   summary: (synth && synth.summary) || 'run complete; see report',
-  verified_count: verified.length,
+  verified_count: ranked.length,
+  top,
+  findings: ranked.map((f) => ({
+    severity: (f && f.severity) || 'unrated',
+    headline: (f && f.headline) || (f && f.class) || 'finding',
+    location: (f && f.location) || '?',
+  })),
 }
