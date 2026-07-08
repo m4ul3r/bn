@@ -1913,7 +1913,27 @@ def _vc_slot_and_factory(caller, call_ins, ptr):
     None when the call's target is not a vtable-slot load (a direct/register call
     with no vtable slot). The factory is best-effort provenance; slot_offset is the
     load-bearing result and is returned even when the factory can't be traced."""
+    # Build the instruction list once -- reused by the aarch64 def-hop below and by
+    # the factory trace.
+    instrs = None
+    call_addr = int(getattr(call_ins, "address", 0))
     dest = getattr(call_ins, "dest", None)
+    # #544: on non-folded ISAs (aarch64, etc.) BN does not inline the vtable load
+    # into the call target. The dispatch is two instructions -- `xN = [vtable + off]`
+    # (a SET_VAR whose src is a LOAD) then `CALL xN` -- so `dest` is an MLIL_VAR, not
+    # a LOAD. Follow the call-dest variable ONE reaching-def hop; if that def is a
+    # SET_VAR/SET_VAR_FIELD whose src is a LOAD, use that LOAD as the dispatch load.
+    # x86 (dest already a LOAD) takes the fast path unchanged.
+    if dest is not None and "LOAD" not in _op(dest):
+        v = _vc_var(dest)
+        if v is not None:
+            instrs = list(caller.mlil.instructions)
+            d = _vc_def_ins(instrs, v, call_addr)
+            if d is not None and _op(d) in ("MLIL_SET_VAR", "MLIL_SET_VAR_FIELD"):
+                dsrc = getattr(d, "src", None)
+                if dsrc is not None and "LOAD" in _op(dsrc):
+                    dest = dsrc
+    # Genuine register-indirect (non-vtable) calls still fall through this guard.
     if dest is None or "LOAD" not in _op(dest):
         return None
     addr_expr = getattr(dest, "src", None)
@@ -1927,8 +1947,8 @@ def _vc_slot_and_factory(caller, call_ins, ptr):
     # Best-effort factory trace: base (the vtable) is `[obj]`; obj is `factory()`.
     factory = None
     try:
-        instrs = list(caller.mlil.instructions)
-        call_addr = int(getattr(call_ins, "address", 0))
+        if instrs is None:
+            instrs = list(caller.mlil.instructions)
         vt_def = _vc_def_ins(instrs, _vc_var(base), call_addr)
         load_src = getattr(vt_def, "src", None) if vt_def is not None else None
         if load_src is not None and "LOAD" in _op(load_src):

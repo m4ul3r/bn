@@ -1915,6 +1915,48 @@ def test_virtual_call_not_vtable_dispatch_466(monkeypatch):
     assert re_mod._vc_slot_and_factory(caller, call, 8) is None
 
 
+def test_virtual_call_slot_extraction_aarch64_shape_544(monkeypatch):
+    """#544: on a non-folded ISA (aarch64) the dispatch is two instructions --
+    `xN = [vtable + off]` (a SET_VAR whose src is a LOAD) then `CALL xN` -- so the
+    call `dest` is an MLIL_VAR, not a LOAD. The resolver must follow the call-dest
+    var one reaching-def hop to the LOAD and extract the slot offset. Under the OLD
+    code this same input returned None (dest op is MLIL_VAR, rejected by the LOAD
+    guard) -- asserted below so the test is meaningful."""
+    bridge = _load_bridge(monkeypatch)
+    re_mod = bridge.read_evidence
+    vt_expr, _ = _vc_var_expr("x8", 2)                       # vtable pointer register
+    add = _vc_expr("MLIL_ADD", left=vt_expr,
+                   right=_vc_expr("MLIL_CONST", constant=0x18))
+    load = _vc_expr("MLIL_LOAD", src=add)
+    call_dest, call_var = _vc_var_expr("x9", 3)              # xN holding the slot target
+    set_var = _vc_expr("MLIL_SET_VAR", dest=call_var, src=load, address=0x1000)
+    call = _vc_expr("MLIL_CALL", dest=call_dest, output=[], address=0x1004)
+    caller = types.SimpleNamespace(
+        mlil=types.SimpleNamespace(instructions=[set_var, call]), view=None)
+    # The OLD fast-path guard (`"LOAD" not in _op(dest)`) rejected this exact input:
+    assert re_mod._op(call.dest) == "MLIL_VAR"
+    off, factory = re_mod._vc_slot_and_factory(caller, call, 8)
+    assert off == 0x18
+    assert factory is None
+
+
+def test_virtual_call_register_indirect_not_misresolved_544(monkeypatch):
+    """#544: a plain register-indirect call whose reaching def is NOT a vtable-slot
+    load (`xN = &func` -- a function-pointer constant) must still return None. The
+    def-hop follows the var but its src is a CONST_PTR, not a LOAD, so the LOAD guard
+    still cleanly rejects it -- no misresolve to a bogus slot."""
+    bridge = _load_bridge(monkeypatch)
+    re_mod = bridge.read_evidence
+    call_dest, call_var = _vc_var_expr("x9", 3)
+    set_var = _vc_expr("MLIL_SET_VAR", dest=call_var,
+                       src=_vc_expr("MLIL_CONST_PTR", constant=0x401050),
+                       address=0x1000)
+    call = _vc_expr("MLIL_CALL", dest=call_dest, output=[], address=0x1004)
+    caller = types.SimpleNamespace(
+        mlil=types.SimpleNamespace(instructions=[set_var, call]), view=None)
+    assert re_mod._vc_slot_and_factory(caller, call, 8) is None
+
+
 # --- #530 Thumb-pointer miss count normalization -----------------------------
 
 class _ThumbSurfBV:
