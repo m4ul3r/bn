@@ -1116,6 +1116,39 @@ def test_resolve_bndb_strip_is_exact_not_prefix(monkeypatch):
     bridge._headless_views.clear()
 
 
+def test_resolve_matches_global_cache_bndb_stem(monkeypatch):
+    # A read-only-mount target restores the GLOBAL cache DB named
+    # `<stem>.<16-hex path digest>.bndb` (see _cache_bndb_path); the obvious
+    # `-t <stem>` (e.g. `-t myprog`) must resolve it, not just the full name.
+    bridge = _load_bridge(monkeypatch)
+    cache_name = str(bridge._cache_bndb_path("/ro/usr/bin/myprog"))
+    base = Path(cache_name).name  # myprog.<16 hex>.bndb
+    bv = _FakeFileBV(cache_name, session_id="1")
+    other = _FakeFileBV("/corpus/other.bndb", session_id="2")
+    _register_views(bridge, bv, other)
+    manager = bridge.TargetManager()
+    assert manager.resolve("myprog") is bv                     # stem shortcut
+    assert manager.resolve(base) is bv                         # exact cache basename
+    assert manager.resolve(base[: -len(".bndb")]) is bv        # <stem>.<hash> core (#312)
+    bridge._headless_views.clear()
+
+
+def test_resolve_cache_stem_requires_16_hex_digest(monkeypatch):
+    # The stem shortcut is specific to the cache scheme (a trailing `.<16 hex>`).
+    # A `<name>.<not-16-hex>.bndb` must NOT resolve by `-t <name>` (no over-match).
+    bridge = _load_bridge(monkeypatch)
+    short = _FakeFileBV("/x/report.2024.bndb", session_id="1")            # tail not 16 chars
+    nonhex = _FakeFileBV("/x/notes.deadbeefdeadbeXX.bndb", session_id="2")  # 16 chars, non-hex
+    _register_views(bridge, short, nonhex)
+    manager = bridge.TargetManager()
+    with pytest.raises(Exception) as exc:
+        manager.resolve("report")
+    assert "nknown target selector" in str(exc.value)
+    with pytest.raises(Exception):
+        manager.resolve("notes")
+    bridge._headless_views.clear()
+
+
 def _close_on_watchdog(instance, *, timeout: float = 5.0, **kwargs):
     """Run _close_binary on a watchdog thread so a deadlock regression (e.g. a
     _write_registry()/resolve() call re-acquiring the non-reentrant

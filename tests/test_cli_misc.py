@@ -860,3 +860,22 @@ def test_batch_apply_drops_instance_id_target(monkeypatch):
     assert "target" not in captured["params"]      # instance-id target was dropped
 
 
+
+
+def test_bare_py_arg_hints_at_exec_subcommand(capsys):
+    # `bn py '<code>'` is the natural (wrong) shape; argparse rejects the code as
+    # an invalid subcommand choice. A single-subcommand group must point at the
+    # real form (`bn py exec ...`) instead of echoing the code as a bad choice.
+    with pytest.raises(SystemExit) as exc:
+        bn.cli.main(["py", "print(1+1)", "--target", "active"])
+    assert exc.value.code == 2
+    _, err = capsys.readouterr()
+    assert "bn py exec" in err  # actionable hint, not just "invalid choice"
+
+
+def test_valid_py_exec_still_parses(capsys):
+    # The hint must not disturb the correct form: `bn py exec '<code>'` still
+    # reaches the handler (fails only at transport, exit 2, not an arg error).
+    parser = bn.cli.build_parser()
+    ns = parser.parse_args(["py", "exec", "1+1", "--target", "active"])
+    assert getattr(ns, "code_pos", None) == "1+1"

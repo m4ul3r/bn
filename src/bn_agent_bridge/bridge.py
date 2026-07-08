@@ -376,8 +376,23 @@ class TargetManager:
         # A .bndb corpus loads <binary>.bndb, but the obvious selector is
         # <binary>; match a candidate against the basename / path tail with a
         # trailing .bndb stripped so `-t foo` resolves `foo.bndb` (#312).
-        if record.basename.endswith(".bndb") and candidate == record.basename[: -len(".bndb")]:
-            return True
+        if record.basename.endswith(".bndb"):
+            core = record.basename[: -len(".bndb")]
+            if candidate == core:
+                return True
+            # Read-only-mount targets restore the GLOBAL cache DB, named
+            # `<stem>.<16-hex path digest>.bndb` by `_cache_bndb_path`. Its core
+            # is `<stem>.<digest>`, so `-t <stem>` (e.g. `-t foo`, the obvious
+            # base name) would miss the exact/`.bndb`-strip cases above. Strip a
+            # trailing `.<16 hex>` so the cache name resolves by stem.
+            stem, dot, digest = core.rpartition(".")
+            if (
+                dot
+                and candidate == stem
+                and len(digest) == 16
+                and all(c in "0123456789abcdef" for c in digest)
+            ):
+                return True
         suffix = _path_components(candidate)
         if suffix:
             parts = _path_components(record.filename)

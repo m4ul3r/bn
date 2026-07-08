@@ -166,7 +166,28 @@ class BnArgumentParser(argparse.ArgumentParser):
             help="Show help for this command and all subcommands",
         )
 
+    def _augment_subcommand_error(self, message: str) -> str:
+        # `bn py '<code>'` fails with argparse's opaque "invalid choice: '<code>'
+        # (choose from 'exec')" because a command GROUP takes a subcommand, not a
+        # bare argument. For a single-subcommand group the intent is unambiguous,
+        # so point at the real form (`bn py exec ...`) instead of leaving the
+        # user staring at their own code echoed as a rejected choice.
+        if "invalid choice:" not in message:
+            return message
+        for action in self._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                choices = list(action.choices)
+                if len(choices) == 1:
+                    return (
+                        f"{message}\n{self.prog} is a command group — pass your "
+                        f"input to the '{choices[0]}' subcommand: "
+                        f"`{self.prog} {choices[0]} ...`"
+                    )
+                break
+        return message
+
     def error(self, message: str) -> None:  # type: ignore[override]
+        message = self._augment_subcommand_error(message)
         # Argparse usage/type errors (bad --limit, unrecognized args, ...) print
         # usage to stderr and exit 2 with an EMPTY stdout, which breaks
         # `bn ... --format json | jq`. When a machine format was requested, emit

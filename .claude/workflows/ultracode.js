@@ -48,13 +48,20 @@ const instance = (_args && _args.instance) || `ultracode-${base}`
 const runid = (_args && _args.runid) || base
 
 // ---- fan-out hygiene reminder, threaded into every agent prompt ----
-const HYGIENE = [
+// A function of the resolved selector: Setup discovers the exact `bn target
+// list` selector (a read-only-mount target restores a cache DB named
+// `<stem>.<hash>.bndb`, not `<stem>`) and threads it to every later stage, so no
+// agent has to re-discover it. `base` is only the bootstrap guess for Setup.
+const makeHygiene = (sel) => [
   `You are a fan-out agent sharing ONE bn instance with the rest of this pipeline.`,
-  `On EVERY bn command pass \`--instance ${instance}\` and \`-t ${base}\` (or the exact selector \`bn target list\` shows).`,
+  `On EVERY bn command pass \`--instance ${instance}\` and \`-t ${sel}\` — this is the exact selector \`bn target list\` shows; use it verbatim (do NOT abbreviate or re-derive it).`,
   `NEVER run \`bn instance use\` / \`bn target use\` / any \`*clear\` — sticky pins are one shared file per repo and clobber concurrent agents.`,
+  `The shell is zsh, which does NOT word-split an unquoted \`$var\`: NEVER stash bn flags in a shell variable and expand it (\`D="--instance x -t y"; bn cmd $D\` sends the whole string as ONE argv token → "unrecognized arguments"/"Invalid instance id"). Write the flags inline on each command.`,
   `Large bn reads spill to disk and stdout carries only an envelope: write to a file then grep/jq it (\`bn decompile f --out /tmp/f.txt && grep x /tmp/f.txt\`), NEVER \`bn ... | grep\` (that greps the envelope, not the data).`,
   `Keep real target names/addresses out of anything you would commit; this run's report is written to a git-ignored path only.`,
 ].join(' ')
+// Bootstrap for Setup only; reassigned to the resolved selector once Setup runs.
+let HYGIENE = makeHygiene(base)
 
 // ---- severity ranking (for the return payload + prose ordering) ----
 const SEV_RANK = { critical: 3, high: 2, medium: 1, low: 0 }
@@ -66,9 +73,10 @@ const sevRank = (s) => {
 // ---- structured-output schemas ----
 const SETUP_SCHEMA = {
   type: 'object',
-  required: ['arch', 'lane', 'baseline', 'orientation'],
+  required: ['arch', 'lane', 'baseline', 'orientation', 'selector'],
   properties: {
     arch: { type: 'string' },
+    selector: { type: 'string', description: 'the exact `bn target list` selector for this target (used verbatim by every later stage)' },
     lane: { type: 'string', enum: ['import-first', 'stripped-static'] },
     baseline: {
       type: 'object',
@@ -168,15 +176,20 @@ const setup = await agent(`${HYGIENE}
 
 Load and orient a binary for a downstream RE→VR pipeline. Do:
 1. \`bn session start ${binary} --instance-id ${instance}\`. If it reports "restored cached database", say so in orientation (state may be a prior run's).
-2. If \`bn target info\` shows analysis_state != "full", run \`bn refresh\` before surveying.
-3. Run \`bn evidence orient\` for a one-shot digest (arch, imports, strings sample, sections, count).
-4. Decide the LANE by the real tell, NOT \`file\`: "import-first" if \`bn imports\` is non-empty OR \`bn function list\` is mostly named; "stripped-static" only if imports are empty AND names are overwhelmingly sub_XXXX.
-5. Capture BASELINE counts (the review stage diffs against these): total functions, named symbols (non sub_*), and comments.
-Return the structured result.`,
+2. Run \`bn target list --instance ${instance}\` and capture the EXACT selector it prints for this target as \`selector\` — on a read-only mount it will be a cache name like \`<stem>.<hash>.bndb\`, not the bare stem. Every later stage uses this verbatim, so it must be the literal selector, not a guess.
+3. If \`bn target info\` shows analysis_state != "full", run \`bn refresh\` before surveying.
+4. Run \`bn evidence orient\` for a one-shot digest (arch, imports, strings sample, sections, count).
+5. Decide the LANE by the real tell, NOT \`file\`: "import-first" if \`bn imports\` is non-empty OR \`bn function list\` is mostly named; "stripped-static" only if imports are empty AND names are overwhelmingly sub_XXXX.
+6. Capture BASELINE counts (the review stage diffs against these): total functions, named symbols (non sub_*), and comments.
+Return the structured result (including \`selector\`).`,
   { ...EX, label: 'setup', phase: 'Setup', schema: SETUP_SCHEMA, agentType: 'general-purpose' })
 
 if (!setup) throw new Error('ultracode: setup stage failed (agent returned null)')
-log(`setup: arch=${setup.arch} lane=${setup.lane} depth=${depth} baseline fns=${setup.baseline && setup.baseline.functions}`)
+// Thread the exact selector Setup resolved into every later stage's HYGIENE, so
+// no agent re-derives it (a read-only-mount cache DB is `<stem>.<hash>.bndb`).
+const SELECTOR = (setup.selector && String(setup.selector).trim()) || base
+HYGIENE = makeHygiene(SELECTOR)
+log(`setup: arch=${setup.arch} lane=${setup.lane} depth=${depth} selector=${SELECTOR} baseline fns=${setup.baseline && setup.baseline.functions}`)
 
 // ================= Stage 1: RE =================
 phase('RE')
