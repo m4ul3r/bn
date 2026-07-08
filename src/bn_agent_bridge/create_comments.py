@@ -227,6 +227,17 @@ def _function_create(ctx, selector: str | None, address, preview: bool):
                     "revert failed; the view may be left modified."
                 )
                 op_status = "rollback_failed"
+                # The fabricated function is still LIVE in the view, but BN's
+                # bv.file.modified never flips True for our create -- so without
+                # this mark `bn close` computes unsaved=false and never warns
+                # about the leftover. Mark dirty so close still warns, even though
+                # the op itself reports failure. A clean preview revert (the
+                # branch above) intentionally does NOT dirty the view (#545). Same
+                # guarded helper the committed #519 path uses.
+                try:
+                    ctx.targets.mark_dirty(bv)
+                except Exception:
+                    pass
         else:
             bv.commit_undo_actions(state)
             reverted = None
