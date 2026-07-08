@@ -1535,6 +1535,80 @@ class TaintEngine:
             return False  # buffer contents tainted -> a real overflow operand
         return self._taint_operand_roles(ssaf, expr, tainted, pointer_arg=pointer_arg) == {"index"}
 
+    # -- reused/aliased-slot length: propagation fact, not overflow verdict --
+    # #307 FP-1. `bn taint` is a PROPAGATION tool, not an overflow *detector*:
+    # it shows where taint flows and defers the overflow-vs-bounded judgement
+    # (which needs control-dependence the engine lacks) to the model/agent. When
+    # an `overflow_len` length reads an address-taken ("aliased") stack slot
+    # whose taint arrived version-agnostically -- a `(var_key, None)` entry an
+    # out-param call leaves when it writes through `&slot` -- and that slot has a
+    # COMPETING in-function writer (the in-loop bounded store in the #307 shape),
+    # the reaching definition is path-ambiguous. The taint genuinely reaches the
+    # length via a path-insensitive reused-slot memory merge, but the engine
+    # cannot stand behind an "attacker-controlled length" *verdict*. So the class
+    # is neutralized to `tainted_len` (a tainted value reaches this length;
+    # overflow determination deferred) while the SAME taint-reaches-arg flow
+    # stays in reached_sinks -- nothing is hidden, so no false-negative.
+
+    def _aliased_slot_var(self, ssaf: Any, expr: Any, depth: int = 0):
+        """Follow pure SSA copies from *expr* to a read of an address-taken
+        (aliased) local variable (``MLIL_VAR_ALIASED``), returning that base
+        SSAVariable, else None. Recognizes ``len = slot@mem; memcpy(.., len)``
+        through any chain of bare ``SET_VAR_SSA`` copies (the wpa_receive shape:
+        ``x2 = x3; x3 = var_180 @ mem``)."""
+        if expr is None or depth > 8:
+            return None
+        if op_name(expr) == "MLIL_VAR_ALIASED":
+            reads = expr_reads(expr)
+            if reads:
+                return reads[0]
+            return getattr(expr, "src", None) or getattr(expr, "var", None)
+        v = self._as_single_ssa_var(expr)
+        if v is None:
+            reads = expr_reads(expr)
+            v = reads[0] if len(reads) == 1 else None
+        if v is None:
+            return None
+        try:
+            d = ssaf.get_ssa_var_definition(v)
+        except Exception:
+            d = None
+        if d is None or op_name(d) != "MLIL_SET_VAR_SSA":
+            return None
+        return self._aliased_slot_var(ssaf, getattr(d, "src", None), depth + 1)
+
+    def _slot_has_direct_writer(self, ssaf: Any, instrs: Any, slot_key: Any) -> bool:
+        """True if some instruction DIRECTLY writes the aliased slot keyed
+        *slot_key* -- an ``MLIL_SET_VAR_ALIASED[_FIELD]`` or a ``STORE`` through
+        ``&slot`` (unified by :meth:`_field_store_slot`). The out-param CALL that
+        seeded the ``(k, None)`` taint is NOT one of these (it writes through a
+        passed ``&slot`` arg, not a store the callee's frame owns), so a direct
+        writer here is a COMPETING reaching def -- exactly the #307 in-loop
+        bounded store that makes the version-agnostic taint path-ambiguous."""
+        for ins in instrs:
+            slot = self._field_store_slot(ssaf, ins)
+            if slot is not None and slot[0] == slot_key:
+                return True
+        return False
+
+    def _length_is_reused_aliased_slot(self, ssaf: Any, instrs: Any,
+                                       length_expr: Any, tainted: set) -> bool:
+        """The ambiguous #307 shape: the memcpy-family LENGTH reads an aliased
+        stack slot whose taint arrived version-agnostically (``(k, None)``, from
+        an out-param write through ``&slot``) AND the slot has a competing
+        in-function writer, so the reaching def is path-ambiguous. Targeted: a
+        clean single-def aliased slot (sole out-param writer, no competing store)
+        stays ``overflow_len`` -- its length really is attacker-controlled with
+        no ambiguity; a plain versioned tainted length carries no ``(k, None)``
+        entry and is untouched."""
+        aliased = self._aliased_slot_var(ssaf, length_expr)
+        if aliased is None:
+            return False
+        slot_key = var_key(aliased)
+        if (slot_key, None) not in tainted:
+            return False
+        return self._slot_has_direct_writer(ssaf, instrs, slot_key)
+
     # -- global/static buffers as taint locations -------------------------
     # A global buffer is referenced by an absolute address (MLIL_CONST_PTR), which
     # _pointee_var (stack-only) misses. We make it a single coarse taint location
@@ -3862,6 +3936,35 @@ class TaintEngine:
                                         f"operand -- reclassified from {_prior}; an "
                                         "out-of-bounds access risk, not a plain "
                                         "unbounded/length overflow)",
+                                    }
+                                # #307 FP-1: a still-`overflow_len` length that
+                                # reads a reused/address-taken stack slot whose
+                                # taint arrived version-agnostically (an out-param
+                                # write through &slot) with a competing in-function
+                                # writer is a path-ambiguous reaching def -- the
+                                # engine can't stand behind the "attacker-controlled
+                                # length" VERDICT (that needs control-dependence it
+                                # lacks). Re-headline to the NEUTRAL `tainted_len`
+                                # (propagation fact: a tainted value reaches this
+                                # length; overflow-vs-bounded deferred). Nothing is
+                                # hidden -- the same taint-reaches-arg flow stays in
+                                # reached_sinks, so there is NO false-negative, only
+                                # the unsound overflow label is dropped. Runs after
+                                # the bounded_len / tainted_index reclassifications
+                                # so those more-specific verdicts take precedence.
+                                if eff_sink.get("class") == "overflow_len" \
+                                        and self._length_is_reused_aliased_slot(
+                                            ssaf, instrs, params[argidx], tainted):
+                                    eff_sink = {
+                                        **eff_sink,
+                                        "class": "tainted_len",
+                                        "via": "reused_aliased_slot",
+                                        "detail": "a tainted value reaches this length "
+                                        "argument via a reused/address-taken stack slot "
+                                        "(written through &slot by an out-param call, with a "
+                                        "competing in-function writer); the reaching definition "
+                                        "is path-ambiguous, so overflow-vs-bounded is deferred -- "
+                                        "corroborate with `taint backward`",
                                     }
                                 findings.append(self._make_finding(ins, mkey or name, argidx, eff_sink, ht, why))
             for rule in model.get("propagates") or []:
