@@ -166,6 +166,42 @@ def test_go_functions_declines_32bit(monkeypatch):
     assert exc.value.status == "unsupported_ptr_size"
 
 
+def test_go_functions_partial_walk_is_disclosed(monkeypatch):
+    # #528: a functab that declares more functions than are recoverable (an entry
+    # whose funcInfo runs off the section) must report recovered < expected with the
+    # truncation signal set -- not len(items) masquerading as a complete count.
+    blob = bytearray(_build_pclntab())            # nfunc=2, both recoverable
+    pcln_off = 96
+    struct.pack_into("<Q", blob, 8, 3)            # bump declared nfunc to 3
+    # entry2's funcInfo offset points past the end of the section -> skipped.
+    struct.pack_into("<I", blob, pcln_off + 20, 250)
+    bv = _GoBV(bytes(blob), defined={0x401000})
+    bridge, inst = _ctx(monkeypatch, bv)
+
+    out = inst._go_functions(None)
+    assert out["expected"] == 3
+    assert out["recovered"] == 2
+    assert out["skipped"] == 1
+    assert out["truncated"] is True
+    # the recovered items themselves are unchanged
+    assert {i["name"] for i in out["items"]} == {"main.foo", "main.bar"}
+
+    # count_only and summary paths carry the same honest disclosure
+    co = inst._go_functions(None, count_only=True)
+    assert co["count"] == 2 and co["expected"] == 3 and co["skipped"] == 1 and co["truncated"] is True
+    sm = inst._go_functions(None, summary=True)
+    assert sm["recovered"] == 2 and sm["expected"] == 3 and sm["skipped"] == 1 and sm["truncated"] is True
+
+
+def test_go_functions_complete_walk_not_truncated(monkeypatch):
+    # A fully-recovered table reports recovered == expected and truncated False.
+    bv = _GoBV(_build_pclntab(), defined={0x401000})
+    bridge, inst = _ctx(monkeypatch, bv)
+    out = inst._go_functions(None)
+    assert out["expected"] == 2 and out["recovered"] == 2
+    assert out["skipped"] == 0 and out["truncated"] is False
+
+
 class _FakeFn:
     def __init__(self, name):
         self.name = name
