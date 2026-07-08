@@ -26,6 +26,7 @@ Import direction is one-way: this module imports ``il_format``, ``vars``,
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
 import binaryninja as bn  # noqa: F401  (kept for parity with sibling read_* modules)
@@ -287,6 +288,201 @@ def _int_arg_reg_count(caller_func) -> int | None:
         return len(list(getattr(cc, "int_arg_regs", []) or []))
     except Exception:
         return None
+
+
+def _llil_sp_offset(expr, sp_name: str):
+    """If an LLIL address expr is the stack pointer `sp` or `sp + const` (const>=0),
+    return the const offset; else None. Recognizes the outgoing-argument stack slot
+    an `LLIL_STORE` writes (#489)."""
+    if expr is None or not sp_name:
+        return None
+    op = il_format._il_op_name(expr)
+    if op.endswith("_REG") or op == "LLIL_REG":
+        r = getattr(expr, "src", None)
+        return 0 if str(getattr(r, "name", r)) == sp_name else None
+    if op.endswith("_ADD") or op == "LLIL_ADD":
+        left = getattr(expr, "left", None)
+        right = getattr(expr, "right", None)
+        if _llil_sp_offset(left, sp_name) == 0:
+            c = il_format._llil_constant_value(right)
+            if c is not None and c >= 0:
+                return int(c)
+    return None
+
+
+def _stack_arg_store_offsets(func, target_addr: int, *, max_off: int = 0x100) -> list[int]:
+    """Distinct offsets of outgoing stack-arg stores (`LLIL_STORE` to `sp+const`,
+    0<=const<max_off) in the LLIL basic block of the call at *target_addr*, at or
+    before the call (the branch-delay-slot store at ==addr is included). These are
+    the values pushed for the call. Empty on any BN-API shortfall so it never
+    fabricates a signal (#489)."""
+    try:
+        llil = getattr(func, "low_level_il", None)
+        sp = str(getattr(getattr(func, "arch", None), "stack_pointer", "") or "")
+        if llil is None or not sp:
+            return []
+        offsets: set[int] = set()
+        for bb in llil:
+            insns = list(bb)
+            addrs = [int(getattr(i, "address", -1)) for i in insns]
+            if target_addr not in addrs:
+                continue
+            call_k = max(k for k, a in enumerate(addrs) if a == target_addr)
+            # Start AFTER the nearest preceding call in the block: an earlier call's
+            # outgoing stack-arg stores must not be misattributed to THIS call (the
+            # dominant false-positive source found in review, #489).
+            start = 0
+            for k in range(call_k):
+                if "CALL" in il_format._il_op_name(insns[k]):
+                    start = k + 1
+            for k in range(start, call_k + 1):
+                ins = insns[k]
+                if il_format._il_op_name(ins) != "LLIL_STORE":
+                    continue
+                off = _llil_sp_offset(getattr(ins, "dest", None), sp)
+                if off is not None and 0 <= off < max_off:
+                    offsets.add(off)
+            break
+        return sorted(offsets)
+    except Exception:
+        return []
+
+
+# A printf conversion specifier: `%` + optional flags/width/precision + optional
+# length modifier + a conversion char. Matches %d, %s, %08X, %-5.2f, %llu, %p, ...
+# The space flag is deliberately excluded from the flag class so a natural string
+# like "50% off" / "5% charge" (`% o`/`% c`) can't coincidentally match (#489).
+_FMT_SPEC_RE = re.compile(r"%[-+#0-9.*]*(?:hh|h|ll|l|L|q|z|j|t)?[diouxXeEfFgGaAcsp]")
+
+# Well-known FIXED-ARITY libc/BSD functions. A truncated-variadic note must never
+# fire on these even when they take a format-SHAPED string literal (e.g. `strlen`
+# measuring a format string before an sprintf/log elsewhere) -- that was the one
+# residual false positive after the format-string gate (#489 review). Matched on
+# the modeled callee name (decorations stripped).
+_KNOWN_FIXED_ARITY = frozenset({
+    "strlen", "strnlen", "strchr", "strrchr", "strchrnul", "strstr", "strcasestr",
+    "strcmp", "strncmp", "strcasecmp", "strncasecmp", "strcoll", "strspn", "strcspn",
+    "strpbrk", "strcpy", "strncpy", "strlcpy", "strcat", "strncat", "strlcat",
+    "strdup", "strndup", "index", "rindex", "strtok", "strtok_r",
+    "atoi", "atol", "atoll", "atof", "strtol", "strtoul", "strtoll", "strtoull",
+    "strtod", "memcpy", "memmove", "memset", "memcmp", "memchr", "bcopy", "bcmp",
+    "bzero", "puts", "fputs", "perror",
+})
+
+
+def _mlil_const_addr(expr):
+    """The constant address an MLIL expr points at (a const / const-ptr / import),
+    else None."""
+    if expr is None:
+        return None
+    op = il_format._il_op_name(expr)
+    if "CONST_PTR" in op or op == "MLIL_CONST" or "IMPORT" in op:
+        c = getattr(expr, "constant", None)
+        try:
+            return int(c) if c is not None else None
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _read_cstring(bv, addr: int, *, cap: int = 256) -> str | None:
+    try:
+        data = bytes(bv.read(int(addr), cap) or b"")
+    except Exception:
+        return None
+    if not data:
+        return None
+    nul = data.find(b"\x00")
+    raw = data[:nul] if nul >= 0 else data
+    try:
+        return raw.decode("latin-1")
+    except Exception:
+        return None
+
+
+def _params_have_format_string(bv, params) -> bool:
+    """True when a recovered arg is a const pointer to a rodata string containing a
+    printf conversion specifier -- a strong POSITIVE signal that the callee is a
+    variadic (printf/log-family) function, so its dropped stack stores really are
+    variadic args and not a fixed-arity libc/BSD call's frame noise. This is the
+    discriminator that keeps the #489 frontier from firing on strchr/memset/bcopy/
+    __gedf2 etc., whose recovered args have no format string (#489 review)."""
+    if bv is None:
+        return False
+    for p in params or []:
+        addr = _mlil_const_addr(p)
+        if addr is None:
+            continue
+        s = _read_cstring(bv, addr)
+        if s and _FMT_SPEC_RE.search(s):
+            return True
+    return False
+
+
+def _call_model_truncation_note(bv, func, call_insn, target_addr: int,
+                                params: list, callee_name: str | None) -> str | None:
+    """#489: a PROACTIVE truncation disclosure. BN auto-types an internal variadic /
+    many-arg callee as fixed-arity, so the call site's MLIL `.params` omit the
+    stack-passed args -- and unlike the reactive out-of-range message (#324/#488),
+    an analyst asking only for in-range args gets no hint the drop exists. Fire when
+    BN recovered NO stack params (`len(params) <= int_arg_regs`) yet LLIL shows
+    outgoing stack-arg stores feeding the call. Conservative: silent when the arch's
+    arg-reg count is unknown, or when BN already recovered stack params. None = no
+    disclosure."""
+    reg_count = _int_arg_reg_count(func)
+    if reg_count is None or len(params) > reg_count:
+        return None
+    # A known fixed-arity libc/BSD callee is never a truncated variadic, even if it
+    # takes a format-shaped string arg (the residual FP the format-string gate alone
+    # let through -- e.g. strlen of a format literal on MIPS, #489 review).
+    _base = str(callee_name or "").split("@", 1)[0].lstrip("_")
+    if _base in _KNOWN_FIXED_ARITY:
+        return None
+    # POSITIVE variadic signal (review): only fire when a recovered arg is a format
+    # string. Offset shape alone can't tell a truncated variadic from a fixed-arity
+    # libc/BSD call (strchr/memset/bcopy/__gedf2) whose frame happens to have low
+    # contiguous sp stores -- those had a ~2-10% false-positive rate on real
+    # firmware. Requiring a caller-passed format string makes "auto-typed
+    # variadic-as-fixed" actually plausible and excludes those FPs (their args have
+    # no format string). Scope: this catches the printf/log/err family (format
+    # passed by the caller); it deliberately does NOT flag a variadic whose format
+    # is INTERNAL (a `sprintf(buf,"...",...)` wrapper) or a non-format variadic --
+    # a no-false-positive trade, since those can't be confirmed from the call site.
+    if not _params_have_format_string(bv, params):
+        return None
+    raw = _stack_arg_store_offsets(func, target_addr)
+    # Distinguish deliberate outgoing-argument pushes from isolated local spills:
+    # require a CONTIGUOUS pointer-width run of >=2 stores STARTING near sp (the
+    # low outgoing-arg region -- sp+0 on AAPCS, up to the 16-byte arg-save area on
+    # MIPS-o32). An isolated store at sp+0x8/0x28 is a local, not an arg -- staying
+    # silent there is the no-false-positive direction for a proactive frontier.
+    try:
+        word = int(getattr(getattr(func, "arch", None), "address_size", 0)) or 4
+    except Exception:
+        word = 4
+    offsets: list[int] = []
+    if len(raw) >= 2 and raw[0] <= 0x10:
+        offsets = [raw[0]]
+        for o in raw[1:]:
+            if o == offsets[-1] + word:
+                offsets.append(o)
+            else:
+                break
+    if len(offsets) < 2:
+        return None
+    name = callee_name or "the callee"
+    off_list = ", ".join(f"sp+{hex(o)}" for o in offsets)
+    return (
+        f"call-model truncation (#489): {name} was recovered with {len(params)} MLIL "
+        f"argument(s) (all register-passed), but LLIL shows {len(offsets)} outgoing "
+        f"stack-arg store(s) [{off_list}] feeding this call -- those stack-passed "
+        f"arg(s) are DROPPED from the call model, most often a variadic callee "
+        f"auto-typed as fixed-arity. `trace`/`taint`/`defuse` cannot see them until "
+        f"the prototype is fixed: declare it variadic with "
+        f"`bn proto set {name} \"<ret> {name}(<fixed args>, ...)\"` (or the full "
+        f"prototype) and re-run. Inspect the stores with "
+        f"`bn il {getattr(func, 'name', '<fn>')} --view llil --ssa`."
+    )
 
 
 def _out_of_range_arg_msg(func, arg_index: int, n: int) -> str:
@@ -899,6 +1095,20 @@ def _backward_slice(
     arg_label = _arg_label(ctx, bv, call_insn, arg_index, func)
 
     hints: list[str] = []
+    # #489: proactive call-model-truncation disclosure -- fires for IN-RANGE args too,
+    # so an analyst tracing a recovered arg is warned that stack-passed args were
+    # dropped from the model (the reactive #324 message only fires for out-of-range).
+    _callee_nm = _modeled_callee_name(bv, call_insn)
+    if not _callee_nm:
+        try:
+            _cf = _resolve_callee(ctx, bv, call_insn)
+            _callee_nm = str(getattr(_cf, "name", "") or "") or None
+        except Exception:
+            _callee_nm = None
+    _trunc = _call_model_truncation_note(
+        bv, func, call_insn, target_addr, params, _callee_nm or recovered_callee)
+    if _trunc is not None:
+        hints.append(_trunc)
     if recovered_reg is not None:
         hints.append(
             f"arg {arg_index} of {recovered_callee} was recovered from calling-"
