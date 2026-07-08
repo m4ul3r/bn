@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import types
 
 read_class = importlib.import_module("bn_agent_bridge.read_class")
 split = read_class._split_qualified_method
@@ -1110,3 +1111,69 @@ def test_is_type_expression_name_481():
     assert not f("std::vector<int>")           # template args stripped
     assert not f("std::__cxx11::basic_string<char, std::char_traits<char> >")
     assert not f("Outer<Foo, Bar>::Inner")     # template with comma inside <>
+
+
+def test_rtti_symbol_maps_prefers_local_definition_over_alias_529():
+    # #529: a GOT/import/external alias carries the SAME demangled RTTI name as the
+    # real local vtable definition. When get_symbols() yields the alias first, the
+    # (class, kind) slot must still keep the LOCAL definition -- otherwise class
+    # recovery decodes the extern/GOT stub as the vtable object and reports
+    # missing/empty slots despite a real local vtable.
+    local = _Sym("_ZTVN3net7SessionE", "vtable for net::Session", 0x9000,
+                 sym_type="SymbolType.DataSymbol")
+    alias = _Sym("_ZTVN3net7SessionE", "vtable for net::Session", 0x41000,
+                 sym_type="SymbolType.ExternalSymbol")
+
+    # alias first in iteration order -- the local must still win.
+    m1 = read_class._rtti_symbol_maps(_RegistryBV([], [alias, local]))
+    assert m1["net::Session"]["vtable"] is local
+    # local first -- an alias must never overwrite it.
+    m2 = read_class._rtti_symbol_maps(_RegistryBV([], [local, alias]))
+    assert m2["net::Session"]["vtable"] is local
+    # import-address alias variant, alias first -> local still wins.
+    imp = _Sym("_ZTVN3net7SessionE", "vtable for net::Session", 0x42000,
+               sym_type="SymbolType.ImportAddressSymbol")
+    m3 = read_class._rtti_symbol_maps(_RegistryBV([], [imp, local]))
+    assert m3["net::Session"]["vtable"] is local
+    # single symbol -- behavior unchanged (kept regardless of type).
+    m4 = read_class._rtti_symbol_maps(_RegistryBV([], [alias]))
+    assert m4["net::Session"]["vtable"] is alias
+
+
+class _EnumType:
+    """Mimics a real BN ``SymbolType`` IntEnum: ``.name`` is the member name but
+    ``str()`` renders as the integer value -- so a str(sym.type) substring match
+    would NEVER fire on a live BV. Guards against the regression."""
+    def __init__(self, name, value):
+        self.name = name
+        self._value = value
+    def __str__(self):
+        return str(self._value)
+
+
+def test_is_alias_symbol_uses_enum_name_not_str_529():
+    # #529 regression guard: real BN SymbolType.__str__ is the integer, so the
+    # classification must read .name. A str()-based match would misclassify BOTH.
+    ext = types.SimpleNamespace(type=_EnumType("ExternalSymbol", 5))
+    dat = types.SimpleNamespace(type=_EnumType("DataSymbol", 3))
+    assert read_class._is_alias_symbol(ext) is True     # alias detected via .name
+    assert read_class._is_alias_symbol(dat) is False    # local not misclassified
+    # local BN types whose names must NOT contain an alias substring.
+    for local in ("FunctionSymbol", "LibraryFunctionSymbol", "LocalLabelSymbol",
+                  "SymbolicFunctionSymbol"):
+        assert read_class._is_alias_symbol(
+            types.SimpleNamespace(type=_EnumType(local, 0))) is False
+    # and the live enum-name preference wins the slot over an alias.
+    local_v = types.SimpleNamespace(name="_ZTVN3net7SessionE", address=0x9000,
+                                    type=_EnumType("DataSymbol", 3))
+    alias_v = types.SimpleNamespace(name="_ZTVN3net7SessionE", address=0x41000,
+                                    type=_EnumType("ExternalSymbol", 5))
+    def _kc(sym):
+        return ("vtable", "net::Session")
+    orig = read_class._rtti_kind_and_class
+    read_class._rtti_kind_and_class = _kc
+    try:
+        m = read_class._rtti_symbol_maps(_RegistryBV([], [alias_v, local_v]))
+        assert m["net::Session"]["vtable"] is local_v
+    finally:
+        read_class._rtti_kind_and_class = orig

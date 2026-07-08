@@ -248,3 +248,61 @@ def test_taint_two_distinct_sink_addresses_never_fold():
     ]}
     out = _render_taint_text(two)
     assert "0x401f30" in out and "0x402a10" in out       # both sinks visible, not folded
+
+
+def test_render_field_xrefs_text_paging_note_532():
+    from bn.formatters import _render_field_xrefs_text
+    base_field = {"type_name": "Hot", "field_name": "f", "offset": 8, "field_type": "int"}
+    # Full set (offset 0, returned == total): no paging note.
+    full = {"kind": "field_xrefs", "field": base_field,
+            "items": [{"kind": "code", "address": "0x1000"}],
+            "total": 1, "offset": 0, "limit": None, "returned": 1, "has_more": False}
+    assert "showing" not in _render_field_xrefs_text(full)
+    # More pages remain: note + "more available".
+    more = {**full, "total": 12, "returned": 5, "limit": 5, "has_more": True}
+    out_more = _render_field_xrefs_text(more)
+    assert "showing 5 of 12" in out_more and "more available" in out_more
+    # Last page of an --offset run (has_more False but returned != total): still noted,
+    # so the skipped refs aren't silently dropped.
+    tail = {**full, "total": 12, "offset": 10, "returned": 2, "limit": 5, "has_more": False}
+    out_tail = _render_field_xrefs_text(tail)
+    assert "showing 2 of 12" in out_tail and "offset 10" in out_tail
+
+
+def test_render_virtual_call_text_includes_method_address_533():
+    # #533: the text output must show the concrete jump target (method_address) --
+    # the pointer's VALUE, distinct from vtable_entry (the slot's address).
+    from bn.formatters import _render_virtual_call_text
+    value = {
+        "callsite": "0x40115d", "caller": "consumer",
+        "slot_offset": "0x18", "slot_index": 3, "factory": "makeProvider",
+        "candidates": [{
+            "provider": "libprov.so", "class": "Provider",
+            "vtable": "0x9000", "vtable_entry": "0x9020",
+            "method": "doWork", "method_address": "0x4100",
+        }],
+        "ambiguous": False, "resolved": True,
+    }
+    out = _render_virtual_call_text(value)
+    assert "0x4100" in out            # method_address rendered
+    assert "0x9020" in out            # vtable_entry still shown, distinct
+    assert "doWork" in out
+
+
+def test_render_virtual_call_text_handles_int_and_missing_method_address_533():
+    from bn.formatters import _render_virtual_call_text
+    # int method_address is hex-formatted; a None one renders without crashing.
+    value = {
+        "callsite": "0x1000", "caller": "c", "slot_offset": "0x8", "slot_index": 1,
+        "factory": None,
+        "candidates": [
+            {"class": "A", "method": "m", "vtable": "0x1", "vtable_entry": "0x2",
+             "provider": "p", "method_address": 0x4200},
+            {"class": "B", "method": "n", "vtable": "0x3", "vtable_entry": "0x4",
+             "provider": "p", "method_address": None},
+        ],
+        "ambiguous": True, "resolved": False,
+    }
+    out = _render_virtual_call_text(value)
+    assert "0x4200" in out            # int -> hex
+    assert "B" in out and "n" in out  # missing method_address still renders the line

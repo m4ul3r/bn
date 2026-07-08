@@ -2646,7 +2646,12 @@ def _bind_xrefs_any(bridge, params, target):
 
 @op("field_xrefs", lock="read")
 def _bind_field_xrefs(bridge, params, target):
-    return bridge._field_xrefs(target, str(params["field"]))
+    return bridge._field_xrefs(
+        target,
+        str(params["field"]),
+        offset=int(params.get("offset", 0)),
+        limit=int(params["limit"]) if params.get("limit") is not None else None,
+    )
 
 
 @op("pointer_table", lock="read")

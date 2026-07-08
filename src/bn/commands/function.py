@@ -438,11 +438,19 @@ def _xrefs(args: argparse.Namespace) -> int:
             f"(got {identifier!r} and --field {field_spec!r})"
         )
     if field_spec:
-        # --field is a distinct shape (field info + refs); paging args don't apply.
+        # --field is a distinct shape (field info + refs), but the ref list is a flat
+        # `items` envelope so it pages like every other xref path (#532): forward
+        # offset/limit so a hot field respects --limit/--offset instead of spilling.
+        field_params: dict[str, Any] = {"field": field_spec}
+        field_limit = _effective_limit(args)
+        if args.offset:
+            field_params["offset"] = args.offset
+        if field_limit is not None:
+            field_params["limit"] = field_limit
         return _call(
             args,
             "field_xrefs",
-            {"field": field_spec},
+            field_params,
             require_target=True,
             text_renderer=_render_field_xrefs_text,
             stem="field-xrefs",

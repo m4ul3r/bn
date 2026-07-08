@@ -1779,7 +1779,11 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
                 return
             if len(candidate_tables) >= max_tables:
                 return
-            miss = sum(1 for v in run_vals if not has_fn(v))
+            # Normalize each pointer before the miss count so a Thumb pointer
+            # (stored as addr|1) is checked at its real even entry -- matching what
+            # note_missing already does (#530). Without this, every Thumb slot counts
+            # as missing (over-reports missing, under-reports resolved) on ARM/Thumb.
+            miss = sum(1 for v in run_vals if not has_fn(norm_ptr(v)))
             for v in run_vals:
                 note_missing(v, f"table:{hex(run_addr)}")
             candidate_tables.append({
@@ -1972,7 +1976,31 @@ def _resolve_virtual_call(ctx, selector, at, providers=None):
             f"(`[*obj + slot](...)`); a direct or plain register-indirect call has no "
             f"vtable slot to resolve")
     slot_off, factory = info
-    slot_index = (slot_off // ptr) if ptr else slot_off
+    if ptr:
+        # #531: validate the slot offset before flooring it to an index. slot_off is
+        # an arbitrary _vc_const from an MLIL_ADD; if it is negative or not a whole
+        # multiple of the pointer size, `slot_off // ptr` would silently floor to a
+        # wrong slot index and name the wrong provider method. Report it unresolved
+        # (with a reason) rather than emit a bogus concrete method.
+        if slot_off < 0 or (slot_off % ptr) != 0:
+            return {
+                "kind": "virtual_call",
+                "callsite": hex(at_addr),
+                "caller": str(getattr(caller, "name", "") or ""),
+                "factory": factory,
+                "slot_offset": hex(slot_off),
+                "slot_index": None,
+                "candidates": [],
+                "ambiguous": False,
+                "resolved": False,
+                "unresolved_reason": (
+                    f"slot offset {hex(slot_off)} is not a non-negative multiple of the "
+                    f"pointer size ({ptr}); it cannot be mapped to a vtable slot index "
+                    f"without guessing the wrong method"),
+            }
+        slot_index = slot_off // ptr
+    else:
+        slot_index = slot_off
     # Provider views: the --providers selector, else resolve within the consumer.
     if providers:
         try:
