@@ -1422,7 +1422,6 @@ class BinaryNinjaBridge:
         return info
 
     def _refresh(self, selector: str | None):
-        bv = self._resolve_view(selector)
         # #321: hold only the write GATE (which serializes other writers) around the
         # possibly-multi-minute analysis -- NOT the exclusive target lock. BN allows
         # concurrent reads while update_analysis_and_wait() runs (verified), so
@@ -1431,7 +1430,15 @@ class BinaryNinjaBridge:
         # whether the bridge is wedged. The brief exclusive window at the end only
         # flips the per-view analysis-state flags. (refresh is @op lock="none" so it
         # self-manages locking, mirroring load_binary's unlocked analysis phase.)
+        #
+        # #522: resolve the target INSIDE the gate, not before it. Because refresh
+        # is lock="none", a concurrent close_binary/save_database (lock="write")
+        # that ran between an earlier out-of-gate resolve and the gate acquisition
+        # could invalidate/close the view, leaving update_analysis_and_wait() to
+        # run on a dead view (TOCTOU). Acquiring the gate first serializes refresh
+        # against those writers before we ever touch the view.
         with self._write_gate:
+            bv = self._resolve_view(selector)
             bv.update_analysis_and_wait()
             with self._target_lock.write():
                 _quick_loaded_views.discard(bv)
@@ -2839,9 +2846,15 @@ def _bind_py_exec(bridge, params, target):
     return bridge._py_exec(target, str(params["script"]))
 
 
+# #525: every single-mutation binder below builds its manifest as
+# `{**params, "op": "<the_op>"}` -- the literal op is spread LAST so a
+# caller-supplied `params["op"]` can never override the endpoint's own
+# operation (e.g. a `set_comment` request with `params={"op":"delete_comment"}`
+# must still run set_comment). Only `batch_apply` legitimately trusts
+# manifest-supplied ops; these fixed-op endpoints must not.
 @op("rename_symbol", lock="write")
 def _bind_rename_symbol(bridge, params, target):
-    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{"op": "rename_symbol", **params}])
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "rename_symbol"}])
 
 
 @op("get_comment", lock="read")
@@ -2865,47 +2878,47 @@ def _bind_list_comments(bridge, params, target):
 
 @op("set_comment", lock="write")
 def _bind_set_comment(bridge, params, target):
-    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{"op": "set_comment", **params}])
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "set_comment"}])
 
 
 @op("delete_comment", lock="write")
 def _bind_delete_comment(bridge, params, target):
-    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{"op": "delete_comment", **params}])
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "delete_comment"}])
 
 
 @op("set_prototype", lock="write")
 def _bind_set_prototype(bridge, params, target):
-    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{"op": "set_prototype", **params}])
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "set_prototype"}])
 
 
 @op("local_rename", lock="write")
 def _bind_local_rename(bridge, params, target):
-    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{"op": "local_rename", **params}])
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "local_rename"}])
 
 
 @op("local_retype", lock="write")
 def _bind_local_retype(bridge, params, target):
-    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{"op": "local_retype", **params}])
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "local_retype"}])
 
 
 @op("struct_field_set", lock="write")
 def _bind_struct_field_set(bridge, params, target):
-    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{"op": "struct_field_set", **params}])
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "struct_field_set"}])
 
 
 @op("struct_field_rename", lock="write")
 def _bind_struct_field_rename(bridge, params, target):
-    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{"op": "struct_field_rename", **params}])
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "struct_field_rename"}])
 
 
 @op("struct_field_delete", lock="write")
 def _bind_struct_field_delete(bridge, params, target):
-    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{"op": "struct_field_delete", **params}])
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "struct_field_delete"}])
 
 
 @op("types_declare", lock="write")
 def _bind_types_declare(bridge, params, target):
-    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{"op": "types_declare", **params}])
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "types_declare"}])
 
 
 @op("batch_apply", lock="write")
@@ -3190,6 +3203,12 @@ def start_headless(
     if binaries:
         for path in binaries:
             _preload_binary(path, quick, prefer_bndb)
+        # #524: _preload_binary appends to _headless_views but (unlike the
+        # runtime `bn load` path, which calls _write_registry) never rewrites the
+        # registry, so the on-disk registry still lists zero binaries while the
+        # instance holds live targets. Rewrite it once after the preload loop so
+        # `bn instance list` / discovery see the loaded binaries.
+        _bridge._write_registry()
 
     try:
         _bridge._shutdown_event.wait()

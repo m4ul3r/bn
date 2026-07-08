@@ -122,7 +122,7 @@ def validate_instance_id(instance_id: str) -> str:
     """
     if not isinstance(instance_id, str) or not instance_id:
         raise BridgeError("Instance id must be a non-empty string")
-    if instance_id in (".", "..") or not _INSTANCE_ID_RE.match(instance_id):
+    if instance_id in (".", "..") or not _INSTANCE_ID_RE.fullmatch(instance_id):
         raise BridgeError(
             f"Invalid instance id: {instance_id!r}. Use only letters, digits, "
             "'_', '-', and '.' (no path separators, no '.'/'..', no absolute paths)."

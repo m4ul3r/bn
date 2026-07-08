@@ -1213,6 +1213,44 @@ def test_choose_instance_rejects_traversal_id(tmp_path, monkeypatch):
         choose_instance("../escape")
 
 
+# --- #523: bridge path boundary validates instance ids too ------------------
+# The CLI validates ids before spawning, but a bridge started directly
+# (bn-agent --instance-id) reaches bridge_socket_path/bridge_registry_path with
+# a raw id. Those helpers must reject a traversal/absolute/empty id before it is
+# joined into a filesystem path, so no bridge files land outside instances_dir().
+
+
+@pytest.mark.parametrize("bad", ["../evil", "../../tmp/evil", "/abs/id", "a/b", "a\\b", ".", "..", "", "safe\n", "\nsafe"])
+def test_bridge_path_helpers_reject_unsafe_instance_id(bad, tmp_path, monkeypatch):
+    from bn.paths import bridge_registry_path as reg, bridge_socket_path as sock
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    with pytest.raises(ValueError, match="Invalid instance id|non-empty"):
+        reg(bad)
+    with pytest.raises(ValueError, match="Invalid instance id|non-empty"):
+        sock(bad)
+
+
+def test_bridge_path_helpers_accept_generated_and_legacy_ids(tmp_path, monkeypatch):
+    import secrets
+
+    from bn.paths import (
+        bridge_registry_path as reg,
+        bridge_socket_path as sock,
+        cache_home,
+        instances_dir,
+    )
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    # A normal generated id (secrets.token_hex) must pass and stay inside instances_dir().
+    gen = secrets.token_hex(4)
+    assert reg(gen) == instances_dir() / f"{gen}.json"
+    assert sock(gen) == instances_dir() / f"{gen}.sock"
+    # The legacy GUI fixed pair (instance_id=None) is exempt from validation.
+    assert reg(None) == cache_home() / "bn_agent_bridge.json"
+    assert sock(None) == cache_home() / "bn_agent_bridge.sock"
+
+
 # ---------------------------------------------------------------------------
 # #92 — spawn pid verification + stop-teardown convergence
 # ---------------------------------------------------------------------------

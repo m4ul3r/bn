@@ -4,11 +4,44 @@ import hashlib
 import importlib.util
 import os
 import platform
+import re
 import sys
 from pathlib import Path
 
 
 PLUGIN_NAME = "bn_agent_bridge"
+
+# A bridge instance id is joined directly into filesystem paths
+# (instances_dir()/<id>.{json,sock}). Path semantics make an unvalidated id a
+# traversal primitive: "../evil" escapes instances_dir() and "/abs" replaces it
+# entirely, placing a bridge's files outside the cache tree -- never listed by
+# instance enumeration (which only globs instances_dir()/*.json) and impossible
+# to stop normally (#84, #523). The CLI validates ids before they reach a
+# bridge, but the bridge boundary (bn-agent --instance-id -> start_headless ->
+# the path helpers below) had NO such check, so a raw/adversarial id reached the
+# filesystem unsanitized. Enforce a strict basename grammar here, the shared
+# chokepoint both processes route through. Kept dependency-light (stdlib only,
+# ValueError) because paths.py is symlinked into the bridge package.
+_INSTANCE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def validate_instance_id(instance_id: str) -> str:
+    """Reject any instance id that isn't a safe path basename.
+
+    Accepts letters, digits, '_', '-', '.'; rejects empty strings, '.'/'..',
+    and anything containing a path separator or other character (which also
+    rules out absolute paths and traversal). Raises ValueError before the id is
+    joined into a filesystem path. Returns the id unchanged when valid. Mirrors
+    the CLI's transport.validate_instance_id rules so both sides agree.
+    """
+    if not isinstance(instance_id, str) or not instance_id:
+        raise ValueError("Instance id must be a non-empty string")
+    if instance_id in (".", "..") or not _INSTANCE_ID_RE.fullmatch(instance_id):
+        raise ValueError(
+            f"Invalid instance id: {instance_id!r}. Use only letters, digits, "
+            "'_', '-', and '.' (no path separators, no '.'/'..', no absolute paths)."
+        )
+    return instance_id
 
 
 def repo_root() -> Path:
@@ -130,13 +163,16 @@ def remove_instance_markers(instance_id: str, start: Path | None = None) -> list
 def bridge_registry_path(instance_id: str | None = None) -> Path:
     if instance_id is None:
         return cache_home() / f"{PLUGIN_NAME}.json"
-    return instances_dir() / f"{instance_id}.json"
+    # #523: validate at the path boundary so a traversal/absolute id can never be
+    # joined into instances_dir(). None (legacy GUI fixed pair) is exempt above.
+    return instances_dir() / f"{validate_instance_id(instance_id)}.json"
 
 
 def bridge_socket_path(instance_id: str | None = None) -> Path:
     if instance_id is None:
         return cache_home() / f"{PLUGIN_NAME}.sock"
-    return instances_dir() / f"{instance_id}.sock"
+    # #523: see bridge_registry_path -- same basename enforcement.
+    return instances_dir() / f"{validate_instance_id(instance_id)}.sock"
 
 
 def spill_root() -> Path:
