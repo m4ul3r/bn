@@ -1774,6 +1774,148 @@ def test_forward_scalar_arg_propagation_is_not_a_buffer_source(models):
     assert "tainted_index" not in classes
 
 
+def _reused_aliased_len_program(*, competing_writer=True):
+    # #307 FP-1, reduced to the wpa_receive shape. `bn taint` is a PROPAGATION
+    # tool, not an overflow detector -- when the memcpy length reads a reused,
+    # address-taken (aliased) stack slot written on a NON-reaching branch by an
+    # out-param call (attacker data) while a competing in-loop store is the real
+    # bounded reaching def, the engine cannot stand behind an overflow VERDICT.
+    #
+    #   callee fill_len(p, s): strcpy(p, s)         -> p is a tainted out-param
+    #   handler(fd):
+    #     rb#1 = &abuf; read(fd, rb#1, 0x40)        ; seed arg:read:1 -> abuf
+    #     rp#1 = &slot; fill_len(rp#1, rb#1)        ; out-param 0 -> (slot, None)
+    #     [slot = 0x10]                             ; competing SET_VAR_ALIASED
+    #     ln#1 = slot @ mem                         ; version-agnostic aliased read
+    #     memcpy(&dst, &src2, ln#1)                 ; overflow_len length arg
+    p = FVar("p", ident=20); s = FVar("s", ident=21)
+    p0 = FSSA(p, 0); s0 = FSSA(s, 0)
+    fill_len = FFunc("fill_len", 0xB00, FSSAFunc([
+        FInstr(0, 0xB04, "MLIL_CALL_SSA", "0x920(p#0, s#0)", reads=[p0, s0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x920", constant=0x920),
+               params=[FExpr("MLIL_VAR_SSA", "p#0", reads=[p0]),
+                       FExpr("MLIL_VAR_SSA", "s#0", reads=[s0])]),
+    ]), params=[p, s])
+
+    abuf = FVar("abuf"); slot = FVar("slot", ident=30); fd = FVar("fd")
+    dst = FVar("dst"); src2 = FVar("src2")
+    rb = FVar("rb"); rp = FVar("rp"); ln = FVar("ln")
+    rb1 = FSSA(rb, 1); rp1 = FSSA(rp, 1); ln1 = FSSA(ln, 1); slot4 = FSSA(slot, 4)
+    instrs = [
+        FInstr(0, 0xC04, "MLIL_SET_VAR_SSA", "rb#1 = &abuf", writes=[rb1],
+               src=FExpr("MLIL_ADDRESS_OF", "&abuf", src=abuf)),
+        FInstr(1, 0xC08, "MLIL_CALL_SSA", "0x910(fd, rb#1, 0x40)", reads=[rb1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x910", constant=0x910),
+               params=[FExpr("MLIL_VAR_SSA", "fd", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "rb#1", reads=[rb1]),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+        FInstr(2, 0xC0C, "MLIL_SET_VAR_SSA", "rp#1 = &slot", writes=[rp1],
+               src=FExpr("MLIL_ADDRESS_OF", "&slot", src=slot)),
+        FInstr(3, 0xC10, "MLIL_CALL_SSA", "0xB00(rp#1, rb#1)", reads=[rp1, rb1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0xB00", constant=0xB00),
+               params=[FExpr("MLIL_VAR_SSA", "rp#1", reads=[rp1]),
+                       FExpr("MLIL_VAR_SSA", "rb#1", reads=[rb1])]),
+    ]
+    idx, addr = 4, 0xC14
+    if competing_writer:
+        instrs.append(FInstr(idx, addr, "MLIL_SET_VAR_ALIASED", "slot = 0x10",
+                             dest=slot, src=FExpr("MLIL_CONST", "0x10", constant=0x10)))
+        idx, addr = idx + 1, addr + 4
+    instrs.append(FInstr(idx, addr, "MLIL_SET_VAR_SSA", "ln#1 = slot @ mem",
+                         reads=[slot4], writes=[ln1],
+                         src=FExpr("MLIL_VAR_ALIASED", "slot @ mem", reads=[slot4])))
+    idx, addr = idx + 1, addr + 4
+    instrs.append(FInstr(idx, addr, "MLIL_CALL_SSA", "0x2010(&dst, &src2, ln#1)",
+                         reads=[ln1], writes=[],
+                         dest=FExpr("MLIL_CONST_PTR", "0x2010", constant=0x2010),
+                         params=[FExpr("MLIL_ADDRESS_OF", "&dst", src=dst),
+                                 FExpr("MLIL_ADDRESS_OF", "&src2", src=src2),
+                                 FExpr("MLIL_VAR_SSA", "ln#1", reads=[ln1])]))
+    handler = FFunc("handler", 0xC00, FSSAFunc(instrs), params=[fd])
+    bv = FBV({0x910: "read", 0x920: "strcpy", 0x2010: "memcpy"}, funcs={0xB00: fill_len})
+    return handler, bv
+
+
+def test_forward_reused_aliased_length_neutralized_to_tainted_len(models):
+    # #307 FP-1: the length reads a reused address-taken slot tainted
+    # version-agnostically by an out-param call, WITH a competing in-function
+    # writer -> the overflow VERDICT is unsound, so re-headline to the neutral
+    # propagation class `tainted_len`. CRITICAL: the taint-reaches-arg2 flow must
+    # remain fully visible -- nothing is hidden, only the overflow label dropped.
+    handler, bv = _reused_aliased_len_program(competing_writer=True)
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(handler, [te.parse_locator("arg:read:1")])
+
+    memcpy_sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(memcpy_sinks) == 1, "the taint-reaches-length flow must stay visible"
+    sink = memcpy_sinks[0]["sink"]
+    assert sink["class"] == "tainted_len"          # neutralized, NOT overflow_len
+    assert sink["via"] == "reused_aliased_slot"
+    assert "attacker-controlled length" not in sink["detail"]
+    assert "reused" in sink["detail"] and "taint backward" in sink["detail"]
+    # the propagation path to arg2 is still recorded
+    assert memcpy_sinks[0]["sink"]["tainted_arg_index"] == 2
+
+
+def test_forward_clean_single_def_aliased_length_stays_overflow_len(models):
+    # Targeted honesty: an aliased slot with a SOLE out-param writer (no competing
+    # in-function store) is a clean reaching def -- the length really is attacker
+    # controlled with no path ambiguity -- so it must STAY overflow_len. Only the
+    # competing-writer (path-ambiguous) shape is neutralized.
+    handler, bv = _reused_aliased_len_program(competing_writer=False)
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(handler, [te.parse_locator("arg:read:1")])
+
+    memcpy_sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(memcpy_sinks) == 1
+    assert memcpy_sinks[0]["sink"]["class"] == "overflow_len"     # NOT neutralized
+
+
+def test_forward_plain_tainted_length_stays_overflow_len(models):
+    # A plain tainted length that is a versioned SSA value (not an aliased
+    # reused slot) carries no `(k, None)` entry, so the #307 neutralization must
+    # NOT fire -- the sink-model's legitimate overflow_len classification stands.
+    n = FVar("n"); n0 = FSSA(n, 0)
+    call = FInstr(0, 0x40, "MLIL_CALL_SSA", "0x2010(&dst, &src, n#0)", reads=[n0], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", "memcpy", constant=0x2010),
+                  params=[FExpr("MLIL_ADDRESS_OF", "&dst", src=FVar("dst")),
+                          FExpr("MLIL_ADDRESS_OF", "&src", src=FVar("src")),
+                          FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])])
+    func = FFunc("copy_n_plain", 0x40, FSSAFunc([call]), params=[n])
+    engine = te.TaintEngine(FBV({0x2010: "memcpy"}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+
+    classes = {x["sink"]["class"] for x in result["reached_sinks"]}
+    assert "overflow_len" in classes
+    assert "tainted_len" not in classes
+
+
+def test_length_is_reused_aliased_slot_helper(models):
+    # Unit-pin the detector: aliased read + version-agnostic (k, None) taint +
+    # competing direct writer -> True; drop any one condition -> False.
+    engine = te.TaintEngine(FBV({}), models)
+    slot = FVar("slot", ident=30); slot4 = FSSA(slot, 4)
+    ln = FVar("ln"); ln1 = FSSA(ln, 1)
+    writer = FInstr(0, 0x10, "MLIL_SET_VAR_ALIASED", "slot = 0x10",
+                    dest=slot, src=FExpr("MLIL_CONST", "0x10", constant=0x10))
+    read = FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "ln#1 = slot @ mem", writes=[ln1],
+                  src=FExpr("MLIL_VAR_ALIASED", "slot @ mem", reads=[slot4]))
+    ssaf = FSSAFunc([writer, read])
+    instrs = ssaf.instructions
+    length_expr = FExpr("MLIL_VAR_SSA", "ln#1", reads=[ln1])
+    slot_key = te.var_key(slot4)
+
+    # all three conditions met
+    assert engine._length_is_reused_aliased_slot(ssaf, instrs, length_expr, {(slot_key, None)})
+    # versioned taint only (no (k, None)) -> not the reused-slot shape
+    assert not engine._length_is_reused_aliased_slot(ssaf, instrs, length_expr, {(slot_key, 4)})
+    # (k, None) present but no competing direct writer -> clean single def
+    assert not engine._length_is_reused_aliased_slot(FSSAFunc([read]), [read], length_expr, {(slot_key, None)})
+    # a plain (non-aliased) length is never the reused-slot shape
+    plain = FExpr("MLIL_VAR_SSA", "n#0", reads=[FSSA(FVar("n"), 0)])
+    assert not engine._length_is_reused_aliased_slot(ssaf, instrs, plain, {(slot_key, None)})
+
+
 def test_forward_tainted_source_pointer_plus_const_keeps_overflow(models):
     # Soundness lock: strcpy(dst, p + 4) where the SOURCE POINTER p is tainted
     # (attacker controls where to read from) is NOT an index -- the tainted base
