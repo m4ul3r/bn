@@ -356,6 +356,20 @@ def _render_field_xrefs_text(value: Any) -> str:
     else:
         lines.append("- none")
 
+    # #532: field xrefs now page like every other xref path. Surface the paging
+    # metadata whenever the page isn't the whole ref set -- either more pages remain
+    # (has_more) or an --offset skipped earlier refs -- so a partial view (including
+    # the last, has_more=False page of an --offset run) isn't read as the full set.
+    total = value.get("total")
+    returned = value.get("returned", len(items))
+    offset = value.get("offset", 0) or 0
+    has_more = bool(value.get("has_more"))
+    if isinstance(total, int) and (has_more or offset or returned != total):
+        note = f"showing {returned} of {total} refs (offset {offset})"
+        if has_more:
+            note += "; more available -- raise --limit or use --offset"
+        lines.extend(["", note])
+
     return "\n".join(lines)
 
 
@@ -1477,8 +1491,14 @@ def _render_virtual_call_text(value: Any) -> str:
     lines = [head]
     cands = list(value.get("candidates") or [])
     if not cands:
-        lines.append("  no provider class implements this slot "
-                     "(check --providers, or the slot is beyond the recovered vtable)")
+        # #531: an unresolved slot (e.g. an unaligned offset that can't map to a slot
+        # index) carries a concrete reason -- surface it instead of the generic hint.
+        reason = value.get("unresolved_reason")
+        if reason:
+            lines.append(f"  unresolved: {reason}")
+        else:
+            lines.append("  no provider class implements this slot "
+                         "(check --providers, or the slot is beyond the recovered vtable)")
         return "\n".join(lines)
     if value.get("ambiguous"):
         lines.append(f"  AMBIGUOUS: {len(cands)} provider classes implement slot "
@@ -1486,7 +1506,14 @@ def _render_virtual_call_text(value: Any) -> str:
     for c in cands:
         method = c.get("method") or "<unnamed>"
         entry = c.get("vtable_entry") or "?"
-        lines.append(f"  {c.get('class', '?')}  ->  {method}"
+        # #533: include the concrete jump target (method_address) -- the pointer's
+        # VALUE, distinct from vtable_entry (the slot's address). Render as hex when
+        # present; tolerate None/absent (unrecovered target) without crashing.
+        ma = c.get("method_address")
+        if isinstance(ma, int):
+            ma = hex(ma)
+        target = str(ma) if ma else "?"
+        lines.append(f"  {c.get('class', '?')}  ->  {method} @ {target}"
                      f"   [{c.get('provider', '?')} vtable {c.get('vtable', '?')} @ {entry}]")
     return "\n".join(lines)
 

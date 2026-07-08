@@ -997,3 +997,67 @@ def test_data_section_ranges_skips_metadata_and_bss(monkeypatch):
     })
     names = {n for n, _s, _l in rx._data_section_ranges(bv)}
     assert names == {".data.rel.ro", "fw_table"}
+
+
+def _paging_field_bv(n_code):
+    # n_code code refs at 0x1000, 0x1004, ... plus 2 data refs.
+    code = {("Hot", 0): [
+        types.SimpleNamespace(func=_FakeFunction(0x1000 + 4 * i, f"use_{i}"),
+                              address=0x1000 + 4 * i, size=4, incomingType="Hot*")
+        for i in range(n_code)]}
+    return _FieldRefBV(
+        code_refs=code,
+        data_refs={("Hot", 0): [0x8000, 0x8008]},
+        symbols={},
+        data_vars={},
+        disassembly={},
+    )
+
+
+def test_field_xrefs_pages_with_limit_and_offset_532(monkeypatch):
+    # #532: field xrefs now honor offset/limit and return the canonical paging
+    # envelope (offset/limit/returned/has_more/total) like every other xref path,
+    # instead of dumping the whole ref set and spilling.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _paging_field_bv(10)   # 10 code + 2 data = 12 total
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(
+        bridge.read_xrefs, "_resolve_type_field",
+        lambda ctx, view, spec: {"type_name": "Hot", "offset": 0, "field_name": "f"},
+    )
+
+    page = instance._field_xrefs("active", "Hot.f", offset=0, limit=5)
+    assert page["total"] == 12
+    assert page["returned"] == 5
+    assert len(page["items"]) == 5
+    assert page["offset"] == 0 and page["limit"] == 5
+    assert page["has_more"] is True
+
+    # offset skips into the list; last page has no more.
+    tail = instance._field_xrefs("active", "Hot.f", offset=10, limit=5)
+    assert tail["returned"] == 2          # only the 2 data refs remain
+    assert tail["has_more"] is False
+    assert [it["kind"] for it in tail["items"]] == ["data", "data"]
+
+    # no limit -> whole set, has_more False.
+    full = instance._field_xrefs("active", "Hot.f")
+    assert full["returned"] == 12 and full["has_more"] is False
+
+
+def test_field_xrefs_rejects_invalid_paging_532(monkeypatch):
+    # #532: a raw-socket / py-exec caller must not slip a negative offset or a
+    # limit<=0 past the op and get Python slice semantics -- same contract as
+    # every other paged op (_validate_count).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: object())
+    monkeypatch.setattr(
+        bridge.read_xrefs, "_resolve_type_field",
+        lambda ctx, view, spec: {"type_name": "Hot", "offset": 0, "field_name": "f"},
+    )
+    import pytest
+    with pytest.raises(bridge.OperationFailure):
+        instance._field_xrefs("active", "Hot.f", offset=-1)
+    with pytest.raises(bridge.OperationFailure):
+        instance._field_xrefs("active", "Hot.f", limit=0)

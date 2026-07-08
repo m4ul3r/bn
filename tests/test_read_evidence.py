@@ -1913,3 +1913,127 @@ def test_virtual_call_not_vtable_dispatch_466(monkeypatch):
                     output=[], address=0x1000)
     caller = types.SimpleNamespace(mlil=types.SimpleNamespace(instructions=[call]), view=None)
     assert re_mod._vc_slot_and_factory(caller, call, 8) is None
+
+
+# --- #530 Thumb-pointer miss count normalization -----------------------------
+
+class _ThumbSurfBV:
+    """ARM/Thumb bv: a table of 3 Thumb function pointers (stored as addr|1). The
+    real functions live at the EVEN entries. Before #530, the candidate-table miss
+    count checked the raw odd value and counted every Thumb slot as missing."""
+    address_size = 4
+    start = 0x1000
+    end = 0x6000
+    _VALS = [0x2001, 0x2011, 0x2021]         # addr | 1 (Thumb tag)
+
+    def __init__(self):
+        end = 0x1000 + 4 * len(self._VALS)
+        self.sections = {".rodata": _SurfSection(".rodata", 0x1000, end)}
+        self.arch = _SurfArch()
+        self._fns = {0x2000, 0x2010, 0x2020}  # functions at the EVEN entries
+
+    def read(self, addr, n):
+        if int(addr) == 0x1000:
+            return b"".join(v.to_bytes(4, "little") for v in self._VALS)[:n]
+        return b"\x00" * int(n)
+
+    def get_functions_containing(self, a):
+        return [object()] if int(a) in self._fns else []
+
+    def get_segment_at(self, a):
+        return _SurfSeg(0x2000, 0x6000) if 0x2000 <= int(a) < 0x6000 else None
+
+    def get_disassembly(self, a):
+        return "mov r0, r0"
+
+    def get_sections_at(self, a):
+        return [self.sections[".rodata"]]
+
+
+def test_hidden_surface_thumb_miss_count_normalized_530(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_init_arrays", lambda ctx, sel, **kw: {"items": []})
+    bv = _ThumbSurfBV()
+
+    class _Ctx:
+        def _resolve_view(self, s): return bv
+        def _pointer_size(self, b): return 4
+        def _byteorder(self, b): return "little"
+        def _supports_thumb_pointer_tags(self, b): return True
+
+    out = re._hidden_surface(_Ctx(), None, table_min_run=3)
+    assert len(out["candidate_tables"]) == 1
+    t = out["candidate_tables"][0]
+    # All three Thumb pointers normalize to real functions -> 0 missing, 3 resolved.
+    assert t["entries"] == 3
+    assert t["missing_functions"] == 0
+    assert t["resolved_functions"] == 3
+    # And no functionless candidates surface (they all normalize to real fns).
+    assert out["summary"]["missing_function_candidates"] == 0
+
+
+def test_hidden_surface_non_arm_miss_count_unchanged_530(monkeypatch):
+    # Guard: a non-Thumb target must be unaffected (norm_ptr is a no-op) -- the
+    # original _SurfBV still reports 2 resolved / 2 missing.
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_init_arrays", lambda ctx, sel, **kw: {"items": []})
+    bv = _SurfBV()
+
+    class _Ctx:
+        def _resolve_view(self, s): return bv
+        def _pointer_size(self, b): return 8
+        def _byteorder(self, b): return "little"
+
+    t = re._hidden_surface(_Ctx(), None)["candidate_tables"][0]
+    assert t["resolved_functions"] == 2 and t["missing_functions"] == 2
+
+
+# --- #531 virtual-call slot alignment validation -----------------------------
+
+def _vc_resolve_ctx(bv, ptr=8):
+    class _Ctx:
+        def _resolve_view(self, s): return bv
+        def _pointer_size(self, b): return ptr
+        def _find_function(self, b, addr, contained=True):
+            return types.SimpleNamespace(name="consumer", view=b)
+    return _Ctx()
+
+
+def test_virtual_call_unaligned_slot_offset_skipped_531(monkeypatch):
+    # #531: an unaligned slot offset (ptr=8, slot_off=12) must NOT floor to slot 1
+    # and name that provider's method -- it is reported unresolved with a reason.
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_mlil_call_at", lambda caller, a: object())
+    monkeypatch.setattr(re, "_vc_slot_and_factory", lambda caller, call, ptr: (12, None))
+
+    def _boom(*a, **k):
+        raise AssertionError("must not build candidates for an unaligned slot")
+    monkeypatch.setattr(bridge.read_class, "_rtti_symbol_maps", _boom)
+
+    out = re._resolve_virtual_call(_vc_resolve_ctx(object()), None, "0x1000")
+    assert out["resolved"] is False
+    assert out["candidates"] == []
+    assert out["slot_index"] is None
+    assert "unresolved_reason" in out
+
+
+def test_virtual_call_aligned_slot_offset_resolves_531(monkeypatch):
+    # An aligned offset (ptr=8, slot_off=16 -> index 2) still resolves normally.
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_mlil_call_at", lambda caller, a: object())
+    monkeypatch.setattr(re, "_vc_slot_and_factory", lambda caller, call, ptr: (16, None))
+    monkeypatch.setattr(bridge.read_class, "_rtti_symbol_maps",
+                        lambda pv: {"Provider": {"vtable": types.SimpleNamespace(address=0x9000)}})
+    monkeypatch.setattr(bridge.read_class, "_vtable_layout",
+                        lambda ctx, pv, addr: {"slots": [
+                            {"index": 2, "method": {"name": "doWork", "address": "0x4100"}}]})
+
+    out = re._resolve_virtual_call(_vc_resolve_ctx(object()), None, "0x1000")
+    assert out["slot_index"] == 2
+    assert out["resolved"] is True
+    assert out["candidates"][0]["class"] == "Provider"
+    assert out["candidates"][0]["method"] == "doWork"

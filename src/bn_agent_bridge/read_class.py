@@ -135,13 +135,54 @@ def _class_of_rtti_symbol(sym) -> str | None:
     return _rtti_kind_and_class(sym)[1]
 
 
+# BN classifies a GOT/import/external alias with one of these symbol types; a real
+# local definition is a DataSymbol/FunctionSymbol/etc. (#529). An alias carries the
+# same demangled RTTI name as the local definition, so if get_symbols() yields the
+# alias first it would win the (class, kind) slot and class recovery would decode the
+# GOT/extern stub as the vtable object -- reporting missing/empty slots despite a real
+# local vtable. Prefer the local definition regardless of iteration order.
+_ALIAS_SYMBOL_TYPES = (
+    "ImportAddressSymbol",
+    "ImportedFunctionSymbol",
+    "ImportedDataSymbol",
+    "ExternalSymbol",
+)
+
+
+def _is_alias_symbol(sym) -> bool:
+    """True if *sym* is a GOT/import/external alias rather than a local definition.
+
+    A real BN ``SymbolType`` is an ``IntEnum`` whose ``str()`` renders as the numeric
+    value (``str(SymbolType.ExternalSymbol) == "5"``), so the member NAME must come
+    from ``.name`` -- matching on ``str(sym.type)`` would never fire on a live BV.
+    Falls back to ``str()`` for the plain-string ``sym.type`` used by test scaffolding
+    (e.g. ``"SymbolType.ExternalSymbol"``)."""
+    st = getattr(sym, "type", None)
+    if st is None:
+        return False
+    tname = getattr(st, "name", None) or str(st)
+    tname = tname.rsplit(".", 1)[-1]   # tolerate a "SymbolType." prefix (test strings)
+    return tname in _ALIAS_SYMBOL_TYPES
+
+
 def _rtti_symbol_maps(bv) -> dict[str, dict[str, Any]]:
-    """{class_name: {"vtable": sym, "typeinfo": sym, "typeinfo_name": sym}}."""
+    """{class_name: {"vtable": sym, "typeinfo": sym, "typeinfo_name": sym}}.
+
+    When several symbols share the same (class, kind) -- e.g. a GOT/import alias and
+    the real local definition -- prefer the LOCAL definition regardless of the order
+    ``get_symbols()`` yields them (#529). A local never gets overwritten by an alias,
+    and an alias is replaced the moment a local for the same slot is seen."""
     maps: dict[str, dict[str, Any]] = {}
     for sym in bv.get_symbols():
         kind, cls = _rtti_kind_and_class(sym)
-        if kind and cls:
-            maps.setdefault(cls, {}).setdefault(kind, sym)
+        if not (kind and cls):
+            continue
+        slot = maps.setdefault(cls, {})
+        existing = slot.get(kind)
+        if existing is None:
+            slot[kind] = sym
+        elif _is_alias_symbol(existing) and not _is_alias_symbol(sym):
+            slot[kind] = sym
     return maps
 
 

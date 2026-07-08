@@ -844,7 +844,13 @@ def _resolve_type_field(ctx, bv, field_spec: str):
     raise RuntimeError(f"Field not found: {resolved_name}.{field_name}")
 
 
-def _field_xrefs(ctx, selector: str | None, field_spec: str):
+def _field_xrefs(ctx, selector: str | None, field_spec: str,
+                 *, offset: int = 0, limit: int | None = None):
+    # #532: validate paging inputs on the same contract every other paged op uses,
+    # so a raw-socket / py-exec caller can't pass a negative offset or limit<=0 and
+    # get Python slice semantics instead of a clean error.
+    offset = _validate_count(offset, label="offset", minimum=0)
+    limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     bv = ctx._resolve_view(selector)
     field = _resolve_type_field(ctx, bv, field_spec)
 
@@ -886,9 +892,20 @@ def _field_xrefs(ctx, selector: str | None, field_spec: str):
     # top-level metadata. The legacy code_refs/data_refs arrays are dropped.
     items = ([{**ref, "kind": "code"} for ref in code_refs]
              + [{**ref, "kind": "data"} for ref in data_refs])
+    # #532: page the unified list like every other xref path (canonical paging
+    # envelope keys: offset/limit/returned/has_more/total). Hot fields used to
+    # return the whole list ignoring --limit/--offset and spill to disk.
+    total = len(items)
+    page = items[offset:]
+    if limit is not None:
+        page = page[:limit]
     return {
         "kind": "field_xrefs",
         "field": field,
-        "items": items,
-        "total": len(items),
+        "items": page,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "returned": len(page),
+        "has_more": (offset + len(page)) < total,
     }
