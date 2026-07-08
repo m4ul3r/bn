@@ -503,8 +503,19 @@ def _format_hlil_tree(ins, indent=0, *, _else_prefix=False, addresses: bool = Tr
     return lines
 
 
+_VALID_IL_VIEWS = ("hlil", "mlil", "llil")
+
+
 def _function_text(bv, func, *, view: str = "hlil", ssa: bool = False, addresses: bool = True) -> str:
-    il_name = {"hlil": "hlil", "mlil": "mlil", "llil": "llil"}.get(view, "hlil")
+    if view not in _VALID_IL_VIEWS:
+        # Refuse an unrecognized view rather than silently substituting HLIL: the
+        # caller stamps the result with the raw requested view string, so a fallback
+        # would mislabel another IL layer's content as the requested view (#527).
+        raise OperationFailure(
+            "unsupported",
+            f"unknown IL view {view!r}; expected one of {', '.join(_VALID_IL_VIEWS)}",
+        )
+    il_name = view
     try:
         il = getattr(func, il_name)
         if ssa and hasattr(il, "ssa_form") and il.ssa_form is not None:
@@ -754,7 +765,15 @@ def _analysis_stub_warning(func, text: str, *, forced: bool = False) -> str | No
 
 
 def _il_function_for(func, view: str, ssa: bool):
-    attr = {"hlil": "hlil", "mlil": "mlil", "llil": "llil"}.get(view, "mlil")
+    if view not in _VALID_IL_VIEWS:
+        # Refuse an unrecognized structured-IL view rather than silently falling
+        # back to MLIL: the caller labels the result with the raw view string, so a
+        # fallback would mislabel another IL layer's instructions as requested (#527).
+        raise OperationFailure(
+            "unsupported",
+            f"unknown IL view {view!r}; expected one of {', '.join(_VALID_IL_VIEWS)}",
+        )
+    attr = view
     il = getattr(func, attr, None)
     if il is None:
         raise OperationFailure("unsupported", f"function has no {view.upper()}")

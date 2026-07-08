@@ -1609,6 +1609,39 @@ def test_function_text_marks_il_failure_instead_of_silent_prototype(monkeypatch)
     assert warnings  # failure was logged, not swallowed
 
 
+def test_function_text_rejects_unknown_view(monkeypatch):
+    # #527: an unrecognized view must raise, not silently fall back to HLIL and
+    # then get mislabeled with the raw requested view string by the caller.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "player_update")
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._function_text(None, fn, view="pseudo")
+    assert exc.value.status == "unsupported"
+    assert "pseudo" in exc.value.message
+
+
+def test_function_text_accepts_valid_views(monkeypatch):
+    # Valid views still render (no raise); llil is a legitimate view.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "player_update")
+    for view in ("hlil", "mlil", "llil"):
+        text = instance._function_text(None, fn, view=view)
+        assert isinstance(text, str)
+
+
+def test_il_function_for_rejects_unknown_view(monkeypatch):
+    # #527: the structured-IL boundary must reject an unknown view rather than
+    # silently substituting MLIL (which the caller then labels as requested).
+    bridge = _load_bridge(monkeypatch)
+    func = types.SimpleNamespace(name="f", start=0x1000)
+    with pytest.raises(bridge.OperationFailure) as exc:
+        bridge.il_format._il_function_for(func, "garbage", False)
+    assert exc.value.status == "unsupported"
+    assert "garbage" in exc.value.message
+
+
 def test_decompile_force_requested_but_not_skipped_echoes_flag(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -1743,6 +1776,16 @@ def test_possible_values_no_source_uses_instruction(monkeypatch):
     res = instance._possible_values(None, "f", "0x1000")
     assert res["value_basis"] == "instruction"
     assert res["possible_values"]["value"] == 3
+
+
+def test_possible_values_no_instruction_at_address_raises(monkeypatch):
+    # #526: when no MLIL instruction begins at --at, refuse instead of returning a
+    # success dict with expression:None that makes a bogus address look real.
+    ins = types.SimpleNamespace(address=0x1000, possible_values=_pvs("ConstantValue", value=3))
+    bridge, instance = _dataflow_values_instance(monkeypatch, ins)
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._possible_values(None, "f", "0x2000")   # no instruction at 0x2000
+    assert exc.value.status == "no_instruction"
 
 
 def test_pvs_determined_helper(monkeypatch):

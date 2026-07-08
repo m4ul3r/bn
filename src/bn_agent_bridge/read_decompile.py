@@ -694,6 +694,17 @@ def _possible_values(ctx, selector, identifier, at):
                 break
     except Exception:
         target_ins = None
+    if target_ins is None:
+        # No MLIL instruction begins at --at: returning a success dict with
+        # expression:None makes a bogus address look like a real instruction
+        # with an unknown value-set. Refuse instead of emitting a false read (#526).
+        raise OperationFailure(
+            "no_instruction",
+            f"No MLIL instruction at {hex(address)} in {func.name}: --at must name the "
+            f"address of an instruction within the function (use `bn function il "
+            f"--view mlil` to list valid instruction addresses).",
+            requested={"identifier": str(identifier), "at": hex(address)},
+        )
     instr_pvs = getattr(target_ins, "possible_values", None) if target_ins is not None else None
     src_expr = getattr(target_ins, "src", None) if target_ins is not None else None
     src_pvs = getattr(src_expr, "possible_values", None) if src_expr is not None else None

@@ -840,6 +840,13 @@ def _render_go_functions_text(value: Any) -> str:
     if parts:
         head += ": " + ", ".join(parts)
     lines = [head]
+    if value.get("truncated"):
+        # #528: a partial walk must not read as a complete count.
+        lines.append(
+            f"warning: partial pcln walk -- {value.get('recovered')} of "
+            f"{value.get('expected')} declared functions recovered "
+            f"({value.get('skipped')} skipped/truncated); the table is malformed or truncated."
+        )
     if value.get("note"):
         lines.append(f"note: {value['note']}")
     lines.append(_render_paged_list_text(value, "items", _render_name_address_rows))
@@ -859,6 +866,12 @@ def _render_go_functions_summary_text(value: Any) -> str:
                        ("undefined", "undefined"), ("renamable", "renamable")):
         if isinstance(value.get(key), int):
             lines.append(f"  {label}: {value[key]}")
+    if value.get("truncated"):
+        # #528: disclose that the declared table was only partially recovered.
+        lines.append(
+            f"  expected: {value.get('expected')} (partial walk -- "
+            f"{value.get('skipped')} skipped/truncated)"
+        )
     ts, tsb = value.get("text_start"), value.get("text_start_bv")
     if ts is not None:
         rebase = "" if (tsb is None or tsb == ts) else f"  (BN text {tsb} -- rebase needed)"

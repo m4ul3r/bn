@@ -134,21 +134,28 @@ def _go_functions(ctx, selector: str | None, *, offset: int = 0, limit: int | No
     items: list[dict[str, Any]] = []
     defined_count = 0
     renamable_count = 0  # #414: defined fns whose current BN name `go rename` would replace
+    skipped_count = 0  # #528: functab entries that ran off the section or held no name
     for i in range(nfunc):
         ent = pcln_off + i * 8
         if ent + 8 > length:
+            # The functab itself runs off the end of the section: every remaining
+            # declared entry is unrecoverable, so count them as skipped (#528).
+            skipped_count += nfunc - i
             break
         func_off = u32(ent + 4)
         fo = pcln_off + func_off
         if fo + 8 > length:
+            skipped_count += 1
             continue
         entryoff = u32(fo)
         nameoff = i32(fo + 4)
         npos = funcname_off + nameoff
         if npos < 0 or npos >= length:
+            skipped_count += 1
             continue
         name = cstr(npos)
         if not name:
+            skipped_count += 1
             continue
         addr = text_start + entryoff
         fn_obj = get_fn(addr) if callable(get_fn) else None
@@ -162,16 +169,24 @@ def _go_functions(ctx, selector: str | None, *, offset: int = 0, limit: int | No
                 renamable_count += 1
         items.append({"name": name, "address": hex(addr), "defined": defined})
 
+    # #528: a partial walk (entries that ran off the section or held no name) must
+    # be disclosed -- otherwise len(items) reads as a complete count. `expected` is
+    # the header's declared nfunc, `recovered` the entries we actually parsed, and
+    # `skipped`/`truncated` flag the shortfall.
+    recovered = len(items)
+    truncated = recovered < nfunc
     if count_only:
         # #414: cheap sizing primitive -- recovered count without the full list.
-        return {"kind": "go_functions", "count": len(items), "total": len(items),
-                "go_version": go_version}
+        return {"kind": "go_functions", "count": recovered, "total": recovered,
+                "expected": nfunc, "recovered": recovered, "skipped": skipped_count,
+                "truncated": truncated, "go_version": go_version}
     text_sec = _gopclntab_text_start(bv)
     if summary:
         # #414: enough signal to decide whether to run `go rename`.
         return {"kind": "go_functions_summary", "go_version": go_version,
-                "recovered": len(items), "defined": defined_count,
-                "undefined": len(items) - defined_count, "renamable": renamable_count,
+                "recovered": recovered, "defined": defined_count,
+                "undefined": recovered - defined_count, "renamable": renamable_count,
+                "expected": nfunc, "skipped": skipped_count, "truncated": truncated,
                 "text_start": hex(text_start),
                 "text_start_bv": hex(text_sec) if text_sec is not None else None,
                 "pclntab": True}
@@ -179,6 +194,10 @@ def _go_functions(ctx, selector: str | None, *, offset: int = 0, limit: int | No
     items.sort(key=lambda it: int(it["address"], 16))
     result = _paged_list_result(items, offset=offset, limit=limit, kind="go_functions")
     result["go_version"] = go_version
+    result["expected"] = nfunc
+    result["recovered"] = recovered
+    result["skipped"] = skipped_count
+    result["truncated"] = truncated
     result["text_start"] = hex(text_start)
     # Disclose a likely PIE/rebase mismatch so the addresses aren't trusted blindly:
     # when almost nothing resolves to a BN function, the table's textStart differs
