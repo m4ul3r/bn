@@ -433,6 +433,36 @@ def test_function_create_noop_does_not_mark_view_dirty(monkeypatch):
     assert dirtied == []
 
 
+def test_function_create_preview_revert_failure_marks_view_dirty(monkeypatch):
+    """#545: a --preview create whose revert FAILS leaves the fabricated function
+    live in the view, yet BN's bv.file.modified never flips True for our create --
+    so without a dirty mark `bn close` would compute unsaved=false and never warn
+    about the leftover. The op still reports failure, but the view must be dirtied
+    so close warns. (A clean preview revert stays non-dirtying -- see the sibling
+    test.)"""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFunctionCreateBV(
+        segments={0x1000: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x55\x48\x89\xe5"},
+    )
+    # BOTH removal paths silently do nothing, so the function persists past the
+    # revert -- the rollback_failed condition.
+    bv.remove_function = lambda fn: bv.events.append(("remove_attempt", int(fn.start)))
+    bv.remove_user_function = lambda fn: bv.events.append(("remove_attempt_user", int(fn.start)))
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    dirtied: list = []
+    monkeypatch.setattr(instance.ctx.targets, "mark_dirty", lambda b: dirtied.append(b))
+
+    result = instance._function_create(None, "0x1000", True)
+
+    assert result["success"] is False
+    assert result["results"][0]["status"] == "rollback_failed"
+    assert bv.get_function_at(0x1000) is not None
+    # The leftover function must dirty the view so `bn close` still warns.
+    assert dirtied == [bv]
+
+
 def test_op_function_create_guard_rejection_with_failed_removal_is_not_clean_rollback(monkeypatch):
     """#520: when the code guard rejects a just-created function AND removing it
     fails (create_user_function is not reliably undone), the batch must NOT report
