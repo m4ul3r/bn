@@ -22,6 +22,7 @@ make -C tests/fixtures clean
 | `crypto_x86_64`        | a toy XOR/rotate routine + a key string         |
 | `statemachine_x86_64`  | a branchy switch state machine                  |
 | `parser_x86_64`        | a length-prefixed record parser (source→sink)   |
+| `dispatch_table_x86_64`| a const function-pointer dispatch table (indirect source→sink) |
 
 ## Multi-instance stress test
 

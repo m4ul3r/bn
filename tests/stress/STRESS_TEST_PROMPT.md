@@ -8,7 +8,7 @@ You are testing the `bn` CLI tool's multi-instance session support. The code is 
 cd /opt/bn/tests/fixtures && make
 ```
 
-Verify you have 5 binaries: `hello_x86_64`, `add_x86_64`, `crypto_x86_64`, `statemachine_x86_64`, `parser_x86_64`.
+Verify you have 6 binaries: `hello_x86_64`, `add_x86_64`, `crypto_x86_64`, `statemachine_x86_64`, `parser_x86_64`, `dispatch_table_x86_64`.
 
 ## Step 2: Run the automated stress test
 
@@ -43,7 +43,7 @@ Report the exact output. If any tests fail, investigate:
 cd /opt/bn && uv run pytest tests/ -v
 ```
 
-All 106 tests should pass. Report any failures with full tracebacks.
+The full suite should pass with zero failures. Report any failures with full tracebacks.
 
 ## Step 4: Manual edge-case probing
 
@@ -102,7 +102,7 @@ Provide a summary table:
 | Category | Result | Notes |
 |----------|--------|-------|
 | Stress test (12 groups) | PASS/FAIL | count |
-| Unit tests (106) | PASS/FAIL | count |
+| Unit tests | PASS/FAIL (zero failures) | count |
 | Auto-start | PASS/FAIL | |
 | Double stop | PASS/FAIL | |
 | ID collision | PASS/FAIL | behavior |

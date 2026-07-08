@@ -69,7 +69,7 @@ Not all functions matter equally. Prioritize:
 
 Binary Ninja's auto-analysis follows direct calls. Two important categories of code don't sit on that graph and will be invisible until you go looking for them.
 
-> **One-shot sweep: `bn evidence surface`.** It composes this whole section — `.init_array`/`.ctors` constructors, candidate vtable/dispatch tables (runs of pointers-into-executable across `.data`/`.rodata`/`.data.rel.ro`/`.got`), and the **missing-function candidates** (executable, data-referenced addresses with no BN function, each tagged `plausible`) — into one read-locked digest. On a fully-analyzed binary it's mostly `missing=0` (BN already found everything); its value is on stripped/optimized firmware, where it hands you the code BN's linear sweep didn't reach. It's **read-only** — confirm a candidate with `bn disasm <addr>` before `bn function create`. Use it to decide whether the manual steps below are even warranted, then drill in with them.
+> **One-shot sweep: `bn evidence surface`.** It composes this whole section — `.init_array`/`.ctors` constructors, candidate vtable/dispatch tables (runs of pointers-into-executable across `.data`/`.rodata`/`.data.rel.ro`), and the **missing-function candidates** (executable, data-referenced addresses with no BN function, each tagged `plausible`) — into one read-locked digest. On a fully-analyzed binary it's mostly `missing=0` (BN already found everything); its value is on stripped/optimized firmware, where it hands you the code BN's linear sweep didn't reach. It's **read-only** — confirm a candidate with `bn disasm <addr>` before `bn function create`. Use it to decide whether the manual steps below are even warranted, then drill in with them.
 
 ### Pre-main code (`.init_array`, constructors)
 
@@ -135,15 +135,15 @@ When you see repeated field accesses at fixed offsets from a pointer, that point
 When you have multiple renames or retypes queued up, use `bn batch apply` with a manifest instead of individual commands. This is faster and atomic. Pipe the manifest on stdin with a quoted heredoc — no temp file, and free-text comments need no escaping:
 
 ```bash
-bn batch apply - <<'BN_EOF'
-{"target": "active", "ops": [
+bn batch apply -t <selector> - <<'BN_EOF'
+{"ops": [
   {"op": "rename_symbol", "identifier": "sub_401000", "new_name": "parse_header"},
   {"op": "set_comment", "address": "0x401040", "comment": "len isn't bounds-checked"}
 ]}
 BN_EOF
 ```
 
-A file path is also accepted (`bn batch apply /tmp/manifest.json`); `--preview` (before `-`) diffs without committing.
+Pass the target with `-t <selector>` — do **not** put `"target": "active"` in the manifest, since `active` does not resolve under multi-target headless. A file path is also accepted (`bn batch apply /tmp/manifest.json`); `--preview` (before `-`) diffs without committing.
 
 ## Call Graph Analysis
 

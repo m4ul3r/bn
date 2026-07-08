@@ -65,11 +65,20 @@ assert_rc() {
 }
 
 start_session() {
-    local out
+    local out rc
     # session start defaults to text; request JSON so we can parse instance_id.
     out=$($BN session start "$@" --format json 2>/dev/null)
+    rc=$?
+    if [[ $rc -ne 0 ]]; then
+        red "start_session: 'bn session start $*' failed (exit $rc)" >&2
+        return 1
+    fi
     local id
     id=$(echo "$out" | python3 -c "import sys,json; print(json.load(sys.stdin)['instance_id'])")
+    if [[ -z "$id" ]]; then
+        red "start_session: no instance_id in 'bn session start $*' output" >&2
+        return 1
+    fi
     STARTED_INSTANCES+=("$id")
     echo "$id"
 }

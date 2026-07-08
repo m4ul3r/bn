@@ -1,10 +1,10 @@
 # bn Large Binary Stress Test
 
-You are testing the `bn` CLI tool's behavior with large system binaries that exceed the default 30-second load timeout. The code is at `/opt/bn`.
+You are testing the `bn` CLI tool's behavior with large system binaries whose load/analysis can outlast the CLI's request timeout. The code is at `/opt/bn`.
 
 ## Background
 
-`bn load` has a 30s default socket timeout. For binaries above ~500KB, `binaryninja.load()` + analysis takes longer than 30s. The CLI reports a timeout error, but the bridge continues loading in the background. The binary should eventually appear in `bn target list`.
+`bn load` uses a generous default request timeout (`DEFAULT_REQUEST_TIMEOUT = 600s`; load/refresh get `REFRESH_REQUEST_TIMEOUT = 3600s` — see `src/bn/transport.py`). A very large binary's `binaryninja.load()` + analysis can still outlast even that. When it does, the CLI reports a timeout error, but the bridge continues loading in the background. The binary should eventually appear in `bn target list`.
 
 **Known timing baselines** (your results may vary):
 - `/usr/bin/bash` (1.4MB): ~60s total
@@ -24,7 +24,7 @@ Test that a timed-out load still completes in the background.
 ```bash
 bn session start
 ```
-2. Attempt to load bash (will timeout at ~30s):
+2. Attempt to load bash (may time out if analysis outlasts the request timeout):
 ```bash
 bn --instance <id> load /usr/bin/bash --format json
 ```
