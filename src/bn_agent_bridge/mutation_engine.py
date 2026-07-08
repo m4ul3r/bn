@@ -1342,6 +1342,13 @@ def _find_var_for_restore(ctx, fn, identifier, storage, is_parameter):
         relocated = vars_mod._find_variable_by_identifier(fn, identifier)
         if relocated is not None:
             return relocated
+        # A captured identifier that no longer resolves must NOT fall through to
+        # the storage lookup: _find_variable_by_storage matches on storage
+        # alone, so a DIFFERENT variable now occupying the same storage would
+        # match and the restore closure would stamp the old name/type onto the
+        # wrong logical variable (#521). Give up instead -- the storage fallback
+        # is only safe when BN never gave us an identifier to be exact with.
+        return None
     try:
         var, _ = vars_mod._find_variable_by_storage(fn, int(storage), is_parameter=is_parameter)
         return var
@@ -2570,11 +2577,33 @@ def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = Non
             requested=requested,
             observed={"address": hex(addr), "function": None},
         )
+    # Register the removal of this created function as a batch restore BEFORE the
+    # code guard runs, so a guard REJECTION is covered by the standard batch
+    # rollback accounting rather than a fire-and-forget cleanup whose failure is
+    # discarded (#520). create_user_function is not reliably undone by
+    # revert_undo_actions, so this explicit removal (non-poisoning
+    # remove_function, #304) is the only real revert. The restore RAISES when
+    # removal fails so _run_local_restores marks restore_ok=False and the batch
+    # reports rolled_back=false instead of claiming a clean rollback while the
+    # fabricated function still persists in the view.
+    def _remove_created_restore():
+        if not create_comments._remove_created_function(ctx, bv, addr):
+            raise RuntimeError(
+                f"failed to remove fabricated function at {hex(addr)} on revert"
+            )
+
+    if restores is not None:
+        restores.append(_remove_created_restore)
+
     reason = _function_looks_like_code(bv, created, addr)
     if reason is not None:
         # The forced create landed a junk function on non-code; drop it
         # (non-poisoning remove_function) and fail honestly instead of reporting
-        # the fabricated function verified (#386).
+        # the fabricated function verified (#386). The removal boolean is not
+        # discarded: the restore registered above re-checks it on batch rollback
+        # and RAISES if the function still persists, so a failed cleanup is
+        # reported as rolled_back=false rather than a silent clean rollback with
+        # the fabricated function still live (#520).
         create_comments._remove_created_function(ctx, bv, addr)
         raise OperationFailure(
             "verification_failed",
@@ -2582,8 +2611,6 @@ def _op_function_create(ctx, bv, op: dict[str, Any], restores: list | None = Non
             requested=requested,
             observed={"address": hex(addr), "function": str(created.name)},
         )
-    if restores is not None:
-        restores.append(lambda: create_comments._remove_created_function(ctx, bv, addr))
     return {
         "op": "function_create",
         "status": "verified",

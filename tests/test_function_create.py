@@ -372,6 +372,132 @@ def test_function_create_standalone_rejects_unaligned_address(monkeypatch):
     assert bv.get_function_at(0x1001) is None
 
 
+def test_function_create_commit_marks_view_dirty(monkeypatch):
+    """#519: a committed standalone function create must mark the target dirty so
+    `bn close` warns about unsaved changes. This path bypasses the generic
+    _mutation() dirty-marking shim, and BN's bv.file.modified never flips True for
+    our verified mutations -- so without the mark, close reports unsaved=false and
+    silently drops the created function."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFunctionCreateBV(
+        segments={0x1000: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x55\x48\x89\xe5"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    dirtied: list = []
+    monkeypatch.setattr(instance.ctx.targets, "mark_dirty", lambda b: dirtied.append(b))
+
+    result = instance._function_create(None, "0x1000", False)
+
+    assert result["committed"] is True
+    assert result["results"][0]["status"] == "verified"
+    assert dirtied == [bv]
+
+
+def test_function_create_preview_does_not_mark_view_dirty(monkeypatch):
+    """#519: a --preview create reverts, so it must NOT dirty the view."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFunctionCreateBV(
+        segments={0x1000: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x55\x48\x89\xe5"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    dirtied: list = []
+    monkeypatch.setattr(instance.ctx.targets, "mark_dirty", lambda b: dirtied.append(b))
+
+    result = instance._function_create(None, "0x1000", True)
+
+    assert result["committed"] is False
+    assert dirtied == []
+
+
+def test_function_create_noop_does_not_mark_view_dirty(monkeypatch):
+    """#519: creating a function where one already exists is a no-op and changes
+    nothing, so it must NOT dirty the view."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFunctionCreateBV(
+        functions=[_FakeFunction(0x1000, "already_here")],
+        segments={0x1000: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x55\x48\x89\xe5"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    dirtied: list = []
+    monkeypatch.setattr(instance.ctx.targets, "mark_dirty", lambda b: dirtied.append(b))
+
+    result = instance._function_create(None, "0x1000", False)
+
+    assert result["results"][0]["status"] == "noop"
+    assert dirtied == []
+
+
+def test_op_function_create_guard_rejection_with_failed_removal_is_not_clean_rollback(monkeypatch):
+    """#520: when the code guard rejects a just-created function AND removing it
+    fails (create_user_function is not reliably undone), the batch must NOT report
+    a clean rollback. The op registers the cleanup as a restore BEFORE the guard so
+    the standard batch accounting covers it, and that restore RAISES on removal
+    failure so _run_local_restores marks restore_ok=False -> rolled_back=false."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    ctx = bridge.BinaryNinjaBridge().ctx
+    bv = _FakeFunctionCreateBV(
+        segments={0x1001: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x00\x01\x02\x03\x04\x05\x06\x07"},
+        arch=_FakeArch(name="aarch64", instr_alignment=4),
+    )
+    # Both removal paths silently do nothing, so the fabricated function persists
+    # past cleanup -> _remove_created_function returns False.
+    bv.remove_function = lambda fn: bv.events.append(("remove_attempt", int(fn.start)))
+    bv.remove_user_function = lambda fn: bv.events.append(("remove_attempt_user", int(fn.start)))
+
+    restores: list = []
+    with pytest.raises(bridge.OperationFailure) as exc:
+        me._op_function_create(ctx, bv, {"op": "function_create", "address": "0x1001"}, restores)
+
+    assert exc.value.status == "verification_failed"
+    # A restore was registered DESPITE the guard rejection (before-guard registration).
+    assert len(restores) == 1
+    # Removal failed, so the fabricated function is still present.
+    assert bv.get_function_at(0x1001) is not None
+    # The batch rollback restores must therefore report FAILURE -- the batch may
+    # not claim rolled_back=true while the fabricated function persists.
+    assert me._run_local_restores(ctx, bv, restores) is False
+    assert bv.get_function_at(0x1001) is not None
+
+
+def test_op_function_create_guard_rejection_with_successful_removal_is_clean_rollback(monkeypatch):
+    """#520 companion: when the guard rejects a just-created function AND the
+    inline removal SUCCEEDS, the restore closure registered before the guard must
+    be a harmless no-op on batch rollback (the function is already gone) and must
+    NOT raise -- otherwise the double-removal would falsely flip a clean rollback
+    to rolled_back=false. Locks down the inline-removal + restore ordering."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+    ctx = bridge.BinaryNinjaBridge().ctx
+    bv = _FakeFunctionCreateBV(
+        segments={0x1001: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x00\x01\x02\x03\x04\x05\x06\x07"},
+        arch=_FakeArch(name="aarch64", instr_alignment=4),
+    )
+    # remove_function is left at its default -- it actually removes the function,
+    # so the inline cleanup on guard rejection succeeds.
+    restores: list = []
+    with pytest.raises(bridge.OperationFailure) as exc:
+        me._op_function_create(ctx, bv, {"op": "function_create", "address": "0x1001"}, restores)
+
+    assert exc.value.status == "verification_failed"
+    # A restore was registered before the guard, even though inline removal ran.
+    assert len(restores) == 1
+    # The inline removal already dropped the fabricated function.
+    assert bv.get_function_at(0x1001) is None
+    # The registered restore is therefore a no-op: it must succeed (idempotent,
+    # fn already gone) and NOT raise -> the batch reports a clean rollback.
+    assert me._run_local_restores(ctx, bv, restores) is True
+    assert bv.get_function_at(0x1001) is None
+
+
 def test_batch_op_function_create_existing_is_noop(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     me = bridge.mutation_engine
