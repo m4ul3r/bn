@@ -181,7 +181,7 @@ def test_build_catalog_surfaces_bounded_write_sink_443():
 def test_validate_bounded_write_sink_schema_443():
     # #443: len_arg/buf_arg are validated as integer arg indices; a sink must be armed
     # by tainted_args OR len_arg.
-    from bn_agent_bridge.taint_engine import _coerce_model_map, TaintError
+    from bn_agent_bridge.taint_models import _coerce_model_map, TaintError
     ok = {"app_recv": {"sink": {"class": "overflow_len", "len_arg": 1, "buf_arg": 2}}}
     _coerce_model_map(ok, source="test")  # no raise
     # len_arg without buf_arg is valid (armed sink, no bounded downgrade).

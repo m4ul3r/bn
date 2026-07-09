@@ -16,6 +16,14 @@ of reachability. Every place the analysis is coarse or stops is surfaced in
 ``assumptions``/``leaves`` and the output always carries a ``soundness``
 disclaimer — we never silently drop an edge.
 
+Implementation is split across sibling modules so this file stays the fixpoint
+engine + public re-exports:
+
+- ``taint_models`` — model DB load/lookup/overlay
+- ``taint_il`` — MLIL-SSA helpers, call/thunk resolution, reg seed fallback
+- ``taint_locators`` — locator grammar, signatures, node labels
+- ``taint_result`` — claim gates / diagnostics on results
+
 API behaviour verified against /opt/binaryninja (see the design's spike):
   - ``func.mlil.ssa_form`` -> MediumLevelILFunction; ``.instructions`` iterable
   - instr: ``.instr_index`` ``.address`` ``.operation.name`` ``.vars_read``
@@ -26,841 +34,85 @@ API behaviour verified against /opt/binaryninja (see the design's spike):
 """
 from __future__ import annotations
 
-import json
-import os
-import re
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-try:  # paths is a symlink into the bridge dir; tolerate import-time absence
-    from .paths import taint_models_path
-except Exception:  # pragma: no cover - defensive
-    taint_models_path = None  # type: ignore[assignment]
-
-_BUILTIN_MODELS = Path(__file__).resolve().parent / "taint_models.json"
-
-SOUNDNESS = (
-    "may-analysis (interprocedural, summary-based, depth-bounded); memory is "
-    "tracked via SSA store/load correlation where addresses match and coarsely "
-    "otherwise; unresolved indirect/external calls are surfaced as assumptions/"
-    "leaves; NOT a proof of reachability"
+# --- public re-exports (callers use ``from . import taint_engine as _taint``) ---
+from . import taint_il as _taint_il_mod
+from . import taint_models as _taint_models_mod
+from .taint_models import (  # noqa: F401
+    SOUNDNESS,
+    TaintError,
+    BoundedSink,
+    load_models,
+    model_overlay_sources,
+    lookup_model,
+    model_arg_indices,
+    taint_models_path,
+    _try_arg_index,
+    _model_buffer_source_args,
+    _canonical_cxx_alloc,
+    _coerce_model_map,
+    _validate_model_interior,
+    _OVERFLOW_INDEX_CLASSES,
+    _RECVMSG_FAMILY,
+    _BROAD_SOURCE_BYTES,
+    _BROAD_SOURCE_MEMBERS,
+    _BUILTIN_MODELS,
+)
+from .taint_il import (  # noqa: F401
+    op_name,
+    is_ssa_var,
+    var_key,
+    var_label,
+    ssa_reads,
+    ssa_writes,
+    expr_reads,
+    function_at,
+    const_target,
+    extract_dest_address,
+    targets_from_pvs,
+    follow_thunk,
+    ResolvedTarget,
+    resolve_call_target,
+    reaching_reg_def,
+    reaching_arg_seed_vars,
+    _count_format_args,
+    _mlil_ssa,
+    _ssa_instructions,
+    _symbols_by_name,
+    _symbol_by_raw_name,
+)
+from .taint_locators import (  # noqa: F401
+    parse_locator,
+    format_locator,
+    derive_flow_facts,
+    var_label_of,
+    node_label,
+    _instr_dict,
+    _make_signature,
+    _render_source_label,
 )
 
-# Overflow sink classes whose finding is reclassified to `tainted_index` when the
-# taint reaches the sink only through an array index/offset (#163). Covers the
-# plain copy/length classes and the fortified (__*_chk / *_s) family, which spans
-# both copy-source pointer args and length args -- the per-arg pointer role is
-# resolved separately from the model's buffer-propagation rules, not the class.
-_OVERFLOW_INDEX_CLASSES = frozenset({"overflow_unbounded", "overflow_len", "fortified_overflow"})
-
-# Scatter-gather receive calls: the received bytes land in msghdr->msg_iov[i].
-# iov_base, not the msghdr pointer arg, so seeding the arg taints the header, not
-# the payload (#306). Names compared after stripping leading underscores / @plt.
-_RECVMSG_FAMILY = frozenset({"recvmsg", "recvmmsg"})
-
-# A param: source that is a pointer to an aggregate at least this large (by byte
-# size OR member count) is flagged as a "broad source" -- the whole struct is
-# treated as one tainted location, which over-taints into unrelated code (#219).
-_BROAD_SOURCE_BYTES = 0x40
-_BROAD_SOURCE_MEMBERS = 8
-
-
-def _model_buffer_source_args(model: dict[str, Any]) -> frozenset[int]:
-    """Arg indices the model propagates a buffer FROM (``*arg:N`` in a
-    ``propagates`` rule's ``from``). These are the copy-SOURCE pointer args (e.g.
-    strcpy / __strcpy_chk arg1), as opposed to length scalars -- used to decide
-    whether the index-role broadening applies to a given sink arg (#163)."""
-    out: set[int] = set()
-    for rule in model.get("propagates") or []:
-        frm = rule.get("from")
-        # Require the POINTEE form ``*arg:N`` -- the buffer arg N points at. A
-        # scalar ``arg:N`` (arg N's value, e.g. GLib g_slist_append's
-        # ``from: "arg:1"``) is NOT a buffer source, and treating it as one would
-        # enable the pointer index broadening on a scalar/length arg (#163 review).
-        if isinstance(frm, str) and frm.startswith("*arg:"):
-            try:
-                out.add(int(frm[len("*arg:"):]))
-            except ValueError:
-                pass
-    return frozenset(out)
-
-
-class TaintError(RuntimeError):
-    """User-facing taint configuration/resolution error."""
-
-
-class BoundedSink(Exception):
-    """A backward sink whose argument is a compile-time constant (e.g. a fixed
-    copy length): provably bounded, with no def-chain to slice. This is a
-    SUCCESSFUL conclusion, not a seed failure -- it must NOT count toward the
-    all-sinks-failed hard error, so a bounded sink returns a clean result
-    (exit 0, --out written) instead of looking like a crash (#310)."""
-
-
-# --------------------------------------------------------------------------
-# model database
-# --------------------------------------------------------------------------
-
-def _coerce_model_map(raw: Any, *, source: str) -> dict[str, Any]:
-    """Validate a parsed model DB and return its name->model map.
-
-    Accepts either ``{"models": {...}}`` or a bare ``{name: model}`` map; rejects
-    any other top-level shape so a malformed file can't silently merge to nothing
-    (a model whose value isn't a dict couldn't carry source/sink/propagate data).
-    """
-    if isinstance(raw, dict) and "models" in raw:
-        raw = raw.get("models")
-    if not isinstance(raw, dict):
-        raise TaintError(
-            f"{source} must be a JSON object of name->model (or {{\"models\": {{...}}}}); "
-            f"got {type(raw).__name__}"
-        )
-    for name, model in raw.items():
-        # `_comment*` keys are free-text documentation in the DB (their string
-        # values never match a symbol, so lookup_model ignores them); every real
-        # model name must map to an object that can carry source/sink/propagate.
-        if str(name).startswith("_comment"):
-            continue
-        if not isinstance(model, dict):
-            raise TaintError(
-                f"{source}: model {name!r} must be a JSON object, got {type(model).__name__}"
-            )
-        _validate_model_interior(name, model, source)
-    return raw
-
-
-def _validate_model_interior(name: str, model: dict[str, Any], source: str) -> None:
-    """Validate the interior shape of a single model so a structurally-malformed
-    USER model (`taint --models`, #317) is a clean, attributable error naming the
-    model+field -- not an unhandled AttributeError/TypeError deep in apply_model
-    that surfaces as a misleading `internal error:` (#317 review). Only the fields
-    the engine indexes are checked; unknown keys are left alone for forward-compat."""
-    def _fail(msg: str) -> None:
-        raise TaintError(f"{source}: model {name!r} {msg}")
-
-    def _is_int(v: Any) -> bool:
-        return isinstance(v, int) and not isinstance(v, bool)
-
-    if "sink" in model:
-        sink = model["sink"]
-        if not isinstance(sink, dict):
-            _fail(f"`sink` must be an object, got {type(sink).__name__}")
-        if not isinstance(sink.get("class"), str):
-            _fail("`sink` requires a string `class`")
-        ta = sink.get("tainted_args")
-        if ta is not None and not (isinstance(ta, list) and all(_is_int(i) for i in ta)):
-            _fail("`sink.tainted_args` must be a list of integers")
-        # #443: a bounded-WRITE sink (a wrapped recv/read that writes len bytes into
-        # buf) is declared with `len_arg` (the attacker-controlled write length that
-        # arms the sink) and optionally `buf_arg` (the destination, for the
-        # provably-bounded downgrade). Both are argument indices.
-        la = sink.get("len_arg")
-        if la is not None and (not _is_int(la) or la < 0):
-            _fail("`sink.len_arg` must be a non-negative integer argument index")
-        ba = sink.get("buf_arg")
-        if ba is not None and (not _is_int(ba) or ba < 0):
-            _fail("`sink.buf_arg` must be a non-negative integer argument index")
-        if ta is None and la is None:
-            _fail("`sink` requires `tainted_args` or `len_arg` (nothing arms the sink)")
-    for key in ("sources", "propagates"):
-        if key in model:
-            seq = model[key]
-            if not isinstance(seq, list) or not all(isinstance(e, dict) for e in seq):
-                _fail(f"`{key}` must be a list of objects")
-    if "varargs" in model:
-        va = model["varargs"]
-        if not isinstance(va, dict):
-            _fail(f"`varargs` must be an object, got {type(va).__name__}")
-        fi = va.get("first_index")
-        if fi is not None and not _is_int(fi):
-            _fail("`varargs.first_index` must be an integer")
-
-
-def load_models(extra: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Return the merged function-model DB: builtin <- user override <- extra.
-
-    Model-load failures used to be swallowed, silently degrading into missing
-    source/sink/propagation models -- false negatives indistinguishable from
-    analysis limits (#97). Now a broken builtin DB (a packaging bug) and a broken
-    BN_TAINT_MODELS override (a user typo that should be loud, not silent) both
-    raise TaintError, which the taint command surfaces as a clean error.
-    """
-    models: dict[str, Any] = {}
+try:
+    from .taint_result import enrich_forward_result, misanchored_recv_leaf
+except Exception:  # pragma: no cover
     try:
-        raw = json.loads(_BUILTIN_MODELS.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise TaintError(
-            f"builtin taint model DB at {_BUILTIN_MODELS} could not be loaded: {exc}. "
-            "This is a packaging bug -- reinstall the bridge."
-        ) from exc
-    models.update(_coerce_model_map(raw, source=f"builtin taint model DB ({_BUILTIN_MODELS})"))
-    if taint_models_path is not None:
-        override_path = taint_models_path()
-        if override_path.exists():
-            try:
-                raw = json.loads(override_path.read_text(encoding="utf-8"))
-            except Exception as exc:
-                raise TaintError(
-                    f"BN_TAINT_MODELS override at {override_path} could not be loaded: {exc}. "
-                    "Fix or remove the file (it overrides the builtin models)."
-                ) from exc
-            models.update(_coerce_model_map(raw, source=f"BN_TAINT_MODELS override ({override_path})"))
-    if extra:
-        # User-supplied models (e.g. `taint --models project.json` for
-        # project-internal copy/format wrappers, #317) are validated through the
-        # same coercion as the builtin/override DBs, so a malformed user file is
-        # a loud error, not a silent merge-to-nothing (#97). User entries win on
-        # a name clash -- they're the most specific to the target.
-        models.update(_coerce_model_map(extra, source="user-provided models (--models / extra)"))
-    return models
-
-
-def model_overlay_sources(extra: dict[str, Any] | None = None, *,
-                          user_models_path: str | None = None) -> list[dict[str, Any]]:
-    """#415: the active taint-model overlay sources (most-specific last), so a
-    `taint` run discloses WHICH models are in effect.
-
-    load_models() re-reads the builtin DB, the BN_TAINT_MODELS-pointed file, and
-    any ``--models`` file on EVERY request, so editing a project-local model file
-    (or passing ``--models``) takes effect on the next taint command with no
-    bridge restart -- this disclosure makes that visible (and lets a status check
-    confirm an overlay landed). ``user_models_path`` (when known) names the
-    ``--models`` file so the disclosure points at WHICH file landed, not just a
-    count."""
-    sources: list[dict[str, Any]] = [{"kind": "builtin", "path": str(_BUILTIN_MODELS)}]
-    if taint_models_path is not None:
-        try:
-            override = taint_models_path()
-        except Exception:
-            override = None
-        if override is not None and override.exists():
-            # taint_models_path() returns the BN_TAINT_MODELS path when that env
-            # var is set, else the default ~/.cache/bn/taint_models.json -- both of
-            # which load_models honors. Only claim the env var when it's actually
-            # set; otherwise label the default-file override honestly (review).
-            if os.environ.get("BN_TAINT_MODELS"):
-                sources.append({"kind": "env_override", "env": "BN_TAINT_MODELS",
-                                "path": str(override)})
-            else:
-                sources.append({"kind": "override_default", "path": str(override)})
-    if extra:
-        # Count the actual models the way load_models()/_coerce_model_map does:
-        # unwrap a ``{"models": {...}}`` envelope and skip ``_comment*`` doc keys,
-        # so the disclosed count matches what was really merged (review: a wrapped
-        # file with two inner models otherwise reported count 1).
-        inner = extra.get("models") if isinstance(extra, dict) and "models" in extra else extra
-        count = sum(1 for k in inner if not str(k).startswith("_comment")) if isinstance(inner, dict) else 0
-        user: dict[str, Any] = {"kind": "user", "via": "--models", "count": count}
-        if user_models_path:
-            user["path"] = str(user_models_path)
-        sources.append(user)
-    return sources
-
-
-def _canonical_cxx_alloc(name: str) -> str | None:
-    """Canonical model key for a C++ ``operator new`` / ``operator new[]``
-    spelling -- mangled or demangled -- or None when *name* is neither (#204).
-
-    BN renders these allocators either Itanium-mangled (``Znwm``/``Znwj`` for
-    ``operator new``, ``Znam``/``Znaj`` for ``operator new[]``; the ``m``/``j``
-    is the 64-/32-bit ``size_t`` overload, with optional ``St11align_val_t`` /
-    ``RKSt9nothrow_t`` suffixes) or demangled (``operator new(unsigned long)``).
-    All of those allocate with the size at arg 0, so they collapse to the two
-    keys ``Znwm`` / ``Znam``. Placement new (``_ZnwmPv`` / ``operator
-    new(unsigned long, void*)``) constructs in caller-supplied storage -- it
-    does NOT allocate -- so it is excluded to avoid a false ``alloc_size`` sink.
-
-    *name* is expected already stripped of a leading ``_`` (as ``lookup_model``
-    passes it).
-    """
-    if not name:
-        return None
-    if name.startswith("operator new"):
-        if "void*" in name or "void *" in name:        # placement new
-            return None
-        return "Znam" if name.startswith("operator new[]") else "Znwm"
-    if name.startswith("Znw") or name.startswith("Zna"):
-        if name[3:4] not in ("m", "j"):                # not a size_t overload
-            return None
-        if name[4:].startswith("Pv"):                  # placement new (..., void*)
-            return None
-        return "Znam" if name.startswith("Zna") else "Znwm"
-    return None
-
-
-def lookup_model(models: dict[str, Any], name: str | None) -> tuple[str | None, dict[str, Any] | None]:
-    """Match a (possibly decorated) symbol name against the model DB.
-
-    Tries the raw name, then the part before ``@`` (``memcpy@plt`` ->
-    ``memcpy``), then with leading underscores stripped, then the canonical
-    C++ allocator key (so mangled ``_Znam`` and demangled ``operator new[]``
-    both resolve to the ``Znam`` model -- #204).
-    """
-    if not name:
-        return None, None
-    candidates = [name]
-    base = name.split("@", 1)[0]
-    if base != name:
-        candidates.append(base)
-    stripped = base.lstrip("_")
-    if stripped and stripped != base:
-        candidates.append(stripped)
-    alias = _canonical_cxx_alloc(stripped or base)
-    if alias and alias not in candidates:
-        candidates.append(alias)
-    for cand in candidates:
-        if cand in models:
-            return cand, models[cand]
-    return None, None
-
-
-def _try_arg_index(token: str) -> int | None:
-    """Parse N from a model source token ``arg:N`` / ``*arg:N``; None if malformed."""
-    try:
-        return int(str(token).split("arg:", 1)[1])
-    except (IndexError, ValueError):
-        return None
-
-
-# --------------------------------------------------------------------------
-# #433: register fallback for under-recovered copy-sink call args. Shared by
-# `taint backward` (TaintEngine) and `trace` (read_taint_slice) -- both seed on
-# an MLIL SSA var recovered from a calling-convention register when a thunk/
-# import with a too-narrow prototype dropped the arg from the MLIL call.
-# --------------------------------------------------------------------------
-
-def model_arg_indices(models: dict[str, Any], callee: str) -> set[int]:
-    """Argument indices a MODELED sink provably references -- the union of its
-    ``propagates`` ``*arg:N`` operands, its ``sink.tainted_args``, and its
-    ``varargs.first_index``. Empty for an unmodeled callee. Gates the register
-    fallback so it only ever recovers an argument the model proves is actually
-    passed (never fabricates one beyond the sink's real arity)."""
-    _, model = lookup_model(models, callee)
-    if not model:
-        return set()
-    idxs: set[int] = set()
-    for spec in (model.get("propagates") or []):
-        if not isinstance(spec, dict):
-            continue
-        for key in ("from", "to"):
-            tok = _try_arg_index(spec.get(key))
-            if tok is not None:
-                idxs.add(tok)
-    sink = model.get("sink") or {}
-    for a in (sink.get("tainted_args") or []):
-        try:
-            idxs.add(int(a))
-        except (TypeError, ValueError):
-            pass
-    first = (model.get("varargs") or {}).get("first_index")
-    if isinstance(first, int):
-        idxs.add(first)
-    return idxs
-
-
-def reaching_reg_def(call_ins: Any, reg: str, bn: Any) -> Any | None:
-    """Nearest dominating LLIL-SSA definition of register ``reg`` reaching
-    ``call_ins``: walk the immediate-dominator chain from the call's block,
-    taking the latest def of ``reg`` that precedes the call. This is the
-    dominance-correct reaching def (it includes a ``REG_PHI`` when the value
-    joins from multiple paths), so the recovered argument is never seeded from a
-    non-reaching definition. Returns the defining LLIL instruction or None."""
-    Op = bn.LowLevelILOperation
-    call_ops = {getattr(Op, n, None) for n in (
-        "LLIL_CALL_SSA", "LLIL_SYSCALL_SSA", "LLIL_INTRINSIC_SSA",
-        "LLIL_TAILCALL_SSA")} - {None}
-
-    def defines_reg(ins: Any) -> bool:
-        op = getattr(ins, "operation", None)
-        if op in (Op.LLIL_SET_REG_SSA, Op.LLIL_REG_PHI):
-            return str(getattr(getattr(ins, "dest", None), "reg", "")) == reg
-        if op in call_ops:
-            return any(str(getattr(o, "reg", "")) == reg
-                       for o in (getattr(ins, "output", None) or []))
-        return False
-
-    call_bb = getattr(call_ins, "il_basic_block", None)
-    call_idx = int(getattr(call_ins, "instr_index", -1))
-    bb = call_bb
-    seen: set[int] = set()
-    while bb is not None and id(bb) not in seen:
-        seen.add(id(bb))
-        best = None
-        for ins in bb:
-            ii = int(getattr(ins, "instr_index", -1))
-            if bb is call_bb and ii >= call_idx:
-                continue
-            if defines_reg(ins) and (best is None or ii > int(getattr(best, "instr_index", -1))):
-                best = ins
-        if best is not None:
-            return best
-        bb = getattr(bb, "immediate_dominator", None)
-    return None
-
-
-def reaching_arg_seed_vars(func: Any, addr: int, reg: str,
-                           bn: Any) -> list[tuple[Any, Any]]:
-    """Find the call at ``addr`` in *func*'s LLIL-SSA and recover ``reg``'s
-    reaching definition (:func:`reaching_reg_def`), bridged to the MLIL SSA
-    variable(s) that hold it -- the seeds a backward walk / trace can slice.
-    Returns ``[(mlil_ssa_var, mlil_instr), ...]``; ``[]`` when not recoverable
-    (e.g. no LLIL, as in the unit fakes)."""
-    lssa = getattr(getattr(func, "llil", None), "ssa_form", None)
-    if lssa is None:
-        return []
-    seeds: list[tuple[Any, Any]] = []
-    try:
-        for block in lssa:
-            for ins in block:
-                if int(getattr(ins, "address", -1)) != int(addr):
-                    continue
-                if getattr(ins, "operation", None) != bn.LowLevelILOperation.LLIL_CALL_SSA:
-                    continue
-                definition = reaching_reg_def(ins, reg, bn)
-                if definition is None:
-                    continue
-                mapped = getattr(definition, "mlil", None)
-                mssa = getattr(mapped, "ssa_form", None) if mapped is not None else None
-                if mssa is None:
-                    continue
-                for w in (getattr(mssa, "vars_written", None) or []):
-                    if is_ssa_var(w):
-                        seeds.append((w, mssa))
+        import importlib.util as _ilu
+        _tr_path = Path(__file__).resolve().parent / "taint_result.py"
+        _tr_spec = _ilu.spec_from_file_location("bn_taint_result_under_test", _tr_path)
+        _tr_mod = _ilu.module_from_spec(_tr_spec)  # type: ignore[arg-type]
+        assert _tr_spec and _tr_spec.loader
+        _tr_spec.loader.exec_module(_tr_mod)
+        enrich_forward_result = _tr_mod.enrich_forward_result
+        misanchored_recv_leaf = _tr_mod.misanchored_recv_leaf
     except Exception:
-        return seeds
-    return seeds
+        enrich_forward_result = None  # type: ignore[assignment]
+        misanchored_recv_leaf = None  # type: ignore[assignment]
 
-
-# --------------------------------------------------------------------------
-# small IL helpers (defensive getattr style, matching bridge.py)
-# --------------------------------------------------------------------------
-
-def op_name(item: Any) -> str:
-    operation = getattr(item, "operation", None)
-    name = getattr(operation, "name", None)
-    return str(name) if name else str(operation)
-
-
-def is_ssa_var(v: Any) -> bool:
-    return hasattr(v, "version") and hasattr(v, "var")
-
-
-# printf-family conversion specifier: optional flags, width, precision, length
-# modifier, then a conversion char. `%%` is a literal (consumes nothing); a `*`
-# width or precision each consume one extra int arg.
-_FORMAT_SPEC_RE = re.compile(
-    r"%([-+ 0#]*)(\*|[0-9]+)?(?:\.(\*|[0-9]+))?(?:hh|h|ll|l|L|q|j|z|t)?([diouxXeEfFgGaAcspn%])")
-
-
-def _count_format_args(fmt: str) -> int | None:
-    """Number of varargs a printf-style *constant* format string consumes, so a
-    tainted vararg beyond it can be recognized as a provably-dead flow (#45).
-
-    Returns None when the consumed count can't be determined reliably -- a POSIX
-    positional ``%n$`` specifier reorders/reuses args, so a positional format is
-    not the linear consumption this regex pass assumes (#69). The caller stays
-    conservative (every vararg live) on None, avoiding a false-negative sink."""
-    if re.search(r"%\d+\$", fmt):
-        return None
-    n = 0
-    for m in _FORMAT_SPEC_RE.finditer(fmt):
-        if m.group(4) == "%":
-            continue
-        if m.group(2) == "*":
-            n += 1
-        if m.group(3) == "*":
-            n += 1
-        n += 1
-    return n
-
-
-def var_key(v: Any) -> tuple[str, Any]:
-    """Stable identity for a Variable or the base of an SSAVariable."""
-    base = getattr(v, "var", v)
-    ident = getattr(base, "identifier", None)
-    if ident is not None:
-        try:
-            return ("id", int(ident))
-        except Exception:
-            pass
-    return ("name", str(getattr(base, "name", base)))
-
-
-def var_label(v: Any) -> str:
-    base = getattr(v, "var", v)
-    name = str(getattr(base, "name", base))
-    version = getattr(v, "version", None)
-    return f"{name}#{version}" if version is not None else name
-
-
-def ssa_reads(ins: Any) -> list[Any]:
-    """SSAVariables an instruction reads by value (excludes AddressOf targets,
-    which appear in vars_read as plain Variables)."""
-    return [v for v in (getattr(ins, "vars_read", None) or []) if is_ssa_var(v)]
-
-
-def ssa_writes(ins: Any) -> list[Any]:
-    return [v for v in (getattr(ins, "vars_written", None) or []) if is_ssa_var(v)]
-
-
-def expr_reads(expr: Any) -> list[Any]:
-    return [v for v in (getattr(expr, "vars_read", None) or []) if is_ssa_var(v)]
-
-
-def function_at(bv: Any, addr: int | None) -> Any | None:
-    """``get_function_at`` with ARM/Thumb low-bit normalization.
-
-    A code pointer on ARM carries the Thumb tag in its LSB, so an indirect/
-    value-set target address can be odd while the function lives at ``addr & ~1``.
-    The exact lookup is tried first (raw address preserved for diagnostics), then
-    the normalized one (#89). Returns None when neither resolves or *bv* lacks
-    ``get_function_at`` (the synthetic test fakes).
-    """
-    if addr is None or not hasattr(bv, "get_function_at"):
-        return None
-    try:
-        fn = bv.get_function_at(addr)
-    except Exception:
-        fn = None
-    if fn is None and (addr & 1):
-        try:
-            fn = bv.get_function_at(addr & ~1)
-        except Exception:
-            fn = None
-    return fn
-
-
-def const_target(expr: Any) -> int | None:
-    """Constant call destination (direct call) or None (indirect).
-
-    Accepts MLIL_CONST_PTR *and* MLIL_EXTERN_PTR. On a statically-linked object
-    (e.g. a kernel .ko) a direct `bl` to an external helper (strlen / sscanf /
-    memcpy / copy_from_user) renders as an EXTERN_PTR whose `.constant` IS the
-    stub address that `get_symbol_at` resolves to the real name -- so without
-    this the callee name (and its sink/source model) is never recovered and the
-    call is misreported as an unresolved indirect call, all-clearing every .ko
-    sink reached through a stub. (T2; MLIL_IMPORT stays out: its `.constant` is
-    a GOT slot, resolved by name via resolve_call_target/extract_dest_address.)
-    """
-    if expr is None:
-        return None
-    name = op_name(expr)
-    if "CONST" not in name and "EXTERN_PTR" not in name:
-        return None
-    c = getattr(expr, "constant", None)
-    if c is None:
-        c = getattr(expr, "value", None)
-        c = getattr(c, "value", c)
-    try:
-        return int(c)
-    except Exception:
-        return None
-
-
-def _instr_dict(ins: Any, reason: str | None = None, tainted: list[str] | None = None,
-                callee: str | None = None) -> dict[str, Any]:
-    out = {
-        "il_index": int(getattr(ins, "instr_index", -1)),
-        "address": hex(int(getattr(ins, "address", 0))),
-        "op": op_name(ins),
-        "il_text": str(ins),
-    }
-    if reason is not None:
-        out["reason"] = reason
-    if tainted is not None:
-        out["tainted"] = tainted
-    if callee is not None:
-        out["callee"] = str(callee)
-    return out
-
-
-def _make_signature(source: Any, chain: list[str], sink_class: str | None,
-                    sink_callee: str | None) -> dict[str, Any]:
-    cls = f"[{sink_class}] " if sink_class else ""
-    parts = [str(source)] + [str(c) for c in chain] + [f"{cls}{sink_callee}"]
-    return {
-        "source": str(source),
-        "chain": [str(c) for c in chain],
-        "sink_class": sink_class,
-        "sink_callee": sink_callee,
-        "rendered": " → ".join(parts),
-    }
-
-
-def derive_flow_facts(*, direction: str,
-                      path: list[dict[str, Any]] | None = None,
-                      sink: dict[str, Any] | None = None,
-                      sources: list[str] | None = None,
-                      leaves: list[dict[str, Any]] | None = None,
-                      fn_name: str | None = None,
-                      origin: dict[str, Any] | None = None,
-                      crossed_functions: list[str] | None = None,
-                      ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Structural triage facts + an address-free grouping signature for one flow.
-
-    Pure: derived from the already-assembled result (the flow's reconstructed
-    path/slice, the run's source echo, the run-global leaves). No BN access, no
-    engine state -- unit-testable against fabricated dicts. Returns
-    (metrics, signature). ``traverses_unresolved`` is an honest structural
-    correlation (a leaf address coincides with a path address), NOT causal proof.
-    See design spec 2026-07-03-taint-triage-output.
-    """
-    steps = path or []
-    if direction == "forward":
-        callees = [s.get("callee") for s in steps if s.get("callee")]
-        sink_callee = (sink or {}).get("callee")
-        chain: list[str] = []
-        for c in callees[:-1]:                       # drop trailing sink callee
-            if c and c != sink_callee and c not in chain:
-                chain.append(str(c))
-        srcs = sources or []
-        source = srcs[0] if len(srcs) == 1 else ("multiple" if len(srcs) > 1 else "?")
-        sink_class = (sink or {}).get("class")
-        step_addrs = {s.get("address") for s in steps}
-        traverses = any(lf.get("address") in step_addrs
-                        for lf in (leaves or []) if lf.get("address"))
-        metrics = {"steps": len(steps), "fns_spanned": 1 + len(chain),
-                   "traverses_unresolved": bool(traverses)}
-        return metrics, _make_signature(source, chain, sink_class, sink_callee)
-
-    # backward
-    crossed = [str(c) for c in (crossed_functions or [])]
-    chain = []
-    for c in crossed[1:]:                            # crossed[0] is the sink's fn
-        if c and c not in chain:
-            chain.append(c)
-    o = origin or {}
-    source = o.get("callee") or o.get("kind") or "?"
-    sink_callee = (sink or {}).get("callee") or (sink or {}).get("kind")
-    traverses = o.get("kind") in {"unresolved", "indirect_call", "field_load_unresolved"}
-    metrics = {"steps": len(steps), "fns_spanned": max(1, len(set(crossed)) + 1),
-               "traverses_unresolved": bool(traverses)}
-    return metrics, _make_signature(source, chain, None, sink_callee)
-
-
-# --------------------------------------------------------------------------
-# unified call-target / thunk resolver
-# --------------------------------------------------------------------------
-# Canonical home (issue #7) for "what does this call target, through thunks?".
-# Faithful ports of the trace resolver that lived in bridge.py; the bridge now
-# delegates here. Kept import-free of binaryninja: all BN access is via
-# duck-typed methods on the passed objects, and symbol-table lookups are guarded
-# so the resolver degrades gracefully against the synthetic fakes the tests use.
-
-
-def _mlil_ssa(fn: Any) -> Any:
-    """MLIL SSA form of a function, tolerating the ``mlil`` vs ``medium_level_il``
-    attribute alias (real BN exposes both; the test fakes expose only ``mlil``)."""
-    mlil = getattr(fn, "mlil", None) or getattr(fn, "medium_level_il", None)
-    if mlil is None:
-        return None
-    return getattr(mlil, "ssa_form", None)
-
-
-def _ssa_instructions(ssaf: Any) -> list[Any]:
-    """All SSA instructions, preferring ``.instructions`` and falling back to
-    flattening ``.basic_blocks`` (both are valid on real BN)."""
-    try:
-        return list(ssaf.instructions)
-    except Exception:
-        out: list[Any] = []
-        for block in (getattr(ssaf, "basic_blocks", None) or []):
-            try:
-                out.extend(list(block))
-            except Exception:
-                continue
-        return out
-
-
-def _symbols_by_name(bv: Any, name: str) -> list[Any]:
-    fn = getattr(bv, "get_symbols_by_name", None)
-    if fn is None:
-        return []
-    try:
-        return list(fn(name) or [])
-    except Exception:
-        return []
-
-
-def _symbol_by_raw_name(bv: Any, name: str) -> Any:
-    fn = getattr(bv, "get_symbol_by_raw_name", None)
-    if fn is None:
-        return None
-    try:
-        return fn(name)
-    except Exception:
-        return None
-
-
-def extract_dest_address(bv: Any, dest: Any) -> int | None:
-    """Numeric address of a call/tailcall destination expression, or None.
-
-    Handles a raw int, MLIL_CONST_PTR (``.constant``), and MLIL_IMPORT. For
-    imports the symbol name is resolved *before* ``.constant`` because
-    ``.constant`` is the GOT slot, not the function entry point.
-    """
-    try:
-        return int(dest)
-    except (ValueError, TypeError):
-        pass
-    name = getattr(dest, "name", None) or str(dest)
-    if name:
-        for sym in _symbols_by_name(bv, name):
-            fn = bv.get_function_at(sym.address)
-            if fn is not None:
-                return int(fn.start)
-        sym = _symbol_by_raw_name(bv, name)
-        if sym is not None:
-            fn = bv.get_function_at(sym.address)
-            if fn is not None:
-                return int(fn.start)
-    addr = getattr(dest, "constant", None)
-    if addr is not None:
-        return int(addr)
-    return None
-
-
-def targets_from_pvs(pvs: Any) -> list[int]:
-    """Extract concrete call-target addresses from a PossibleValueSet.
-
-    Handles constants, in-set values, and lookup tables (function-pointer
-    tables expose ``.mapping`` {idx: addr} / ``.table``, not ``.values``).
-    """
-    if pvs is None:
-        return []
-    tname = str(getattr(getattr(pvs, "type", None), "name", "") or "")
-    out: list[int] = []
-
-    def _add(v):
-        try:
-            out.append(int(v))
-        except Exception:
-            pass
-
-    if tname in {"ConstantValue", "ConstantPointerValue", "ImportedAddressValue", "ExternalPointerValue"}:
-        _add(getattr(pvs, "value", None))
-    elif tname == "InSetOfValues":
-        for v in (getattr(pvs, "values", None) or []):
-            _add(v)
-    elif tname == "LookupTableValue":
-        mapping = getattr(pvs, "mapping", None)
-        if isinstance(mapping, dict):
-            for v in mapping.values():
-                _add(v)
-        else:
-            for entry in (getattr(pvs, "table", None) or []):
-                _add(getattr(entry, "to", None))
-    return sorted({a for a in out if a})
-
-
-def follow_thunk(bv: Any, fn: Any) -> Any | None:
-    """If *fn* is a single-instruction tailcall thunk, return its real target.
-
-    Follows thunk chains (PLT stubs, GCC veneers) iteratively, guarding against
-    cycles of *any* length via a visited-set of function starts. The old
-    recursive form only rejected a direct A->A self-loop, so a multi-step
-    tailcall cycle in the binary (A->B->A, or longer) recursed without bound and
-    raised ``RecursionError``. Returns the deepest resolved target, or None when
-    *fn* is not a thunk.
-    """
-    seen: set[int] = {int(getattr(fn, "start", -1))}
-    cur = fn
-    result: Any | None = None
-    while True:
-        ssa = _mlil_ssa(cur)
-        if ssa is None:
-            break
-        instructions = _ssa_instructions(ssa)
-        if len(instructions) != 1:
-            break
-        insn = instructions[0]
-        if "TAILCALL" not in op_name(insn):
-            break
-        dest = getattr(insn, "dest", None)
-        if dest is None:
-            break
-        addr = extract_dest_address(bv, dest)
-        if addr is None:
-            break
-        target = bv.get_function_at(addr)
-        if target is None:
-            target = bv.get_function_at(addr & ~1)
-        if target is None or int(getattr(target, "start", -2)) in seen:
-            break
-        seen.add(int(getattr(target, "start", -1)))
-        result = target
-        cur = target
-    return result
-
-
-@dataclass
-class ResolvedTarget:
-    """Result of resolving a call instruction's callee."""
-    address: int | None         # entry of the resolved function (post-thunk if followed)
-    function: Any | None        # bv function object, or None
-    via: str | None = None      # "direct" | "import" | "thunk" | None
-    thunk_chain: list[int] = field(default_factory=list)  # addresses traversed while following thunks
-
-
-def resolve_call_target(bv: Any, call_insn: Any, *, follow_thunks: bool = False) -> ResolvedTarget:
-    """Resolve a call instruction's callee to a function.
-
-    Mirrors the trace resolver: direct numeric/``.constant`` dest first, then
-    import-name resolution (the primary path for PLT stubs, where ``.constant``
-    is a GOT slot), then optional thunk following. Value-sets and agent-supplied
-    resolve-maps are deliberately *not* consulted here — those are forward-taint
-    concerns (see ``targets_from_pvs`` and the engine's resolve_map handling).
-    """
-    dest = getattr(call_insn, "dest", None)
-    if dest is None:
-        return ResolvedTarget(None, None)
-
-    fn = None
-    via: str | None = None
-    try:
-        addr = int(dest)
-    except (ValueError, TypeError):
-        addr = getattr(dest, "constant", None)
-    if addr is not None and addr != 0:
-        fn = bv.get_function_at(int(addr))
-        if fn is None:
-            fn = bv.get_function_at(int(addr) & ~1)
-        if fn is not None:
-            via = "direct"
-
-    if fn is None:
-        name = getattr(dest, "name", None)
-        if name:
-            for sym in _symbols_by_name(bv, name):
-                fn = bv.get_function_at(sym.address)
-                if fn is not None:
-                    via = "import"
-                    break
-            if fn is None:
-                sym = _symbol_by_raw_name(bv, name)
-                if sym is not None:
-                    fn = bv.get_function_at(sym.address)
-                    if fn is not None:
-                        via = "import"
-
-    if fn is None:
-        return ResolvedTarget(None, None)
-
-    thunk_chain: list[int] = []
-    if follow_thunks:
-        resolved = follow_thunk(bv, fn)
-        if resolved is not None and resolved is not fn:
-            thunk_chain = [int(getattr(fn, "start", 0))]
-            fn = resolved
-            via = "thunk"
-
-    return ResolvedTarget(int(getattr(fn, "start", 0)), fn, via, thunk_chain)
-
-
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # engine
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 
 class TaintEngine:
     def __init__(
@@ -2585,7 +1837,7 @@ class TaintEngine:
                 sources=sources_echo, leaves=sub["leaves"], fn_name=str(func.name))
             f["metrics"] = fm
             f["signature"] = fs
-        return {
+        result = {
             "direction": "forward",
             "function": {"name": str(func.name), "address": hex(int(func.start))},
             "sources": sources_echo,
@@ -2603,6 +1855,10 @@ class TaintEngine:
             },
             "soundness": SOUNDNESS,
         }
+        # Claim gate + suggested next actions (dogfood: empty ≠ all-clear).
+        if enrich_forward_result is not None:
+            enrich_forward_result(result)
+        return result
 
     def _attributable_callsites(self, func: Any, sources: list[dict[str, Any]]) -> list[int]:
         """Distinct call addresses to attribute a single ret/arg source across.
@@ -2686,7 +1942,7 @@ class TaintEngine:
             f"independently ({len(callsite_addrs)} propagations); top-level reached_sinks/leaves "
             f"are the union, by_source has the per-callsite split")
 
-        return {
+        result = {
             "direction": "forward",
             "function": base["function"],
             "sources": base["sources"],
@@ -2707,6 +1963,9 @@ class TaintEngine:
             },
             "soundness": SOUNDNESS,
         }
+        if enrich_forward_result is not None:
+            enrich_forward_result(result)
+        return result
 
     def _follow_thunk_cached(self, fn: Any) -> Any | None:
         """``follow_thunk`` memoized per resolved function start address."""
@@ -3727,7 +2986,8 @@ class TaintEngine:
         # local to this run, so a descended callee's run keeps its own.
         buffer_slots: dict = {}
         correlated_slots: set = set()
-        seeded = self._seed_forward(func, ssaf, instrs, locators, taint_node, add_assumption, buffer_slots)
+        seeded = self._seed_forward(
+            func, ssaf, instrs, locators, taint_node, add_assumption, buffer_slots, leaves)
         if not seeded:
             if top:
                 raise TaintError("no taint sources resolved; check --source locator")
@@ -4584,9 +3844,17 @@ class TaintEngine:
             f"stripped-proto shape), apply `bn proto set {func.name} \"<prototype>\"` "
             f"and re-run this taint query")
 
-    def _seed_forward(self, func, ssaf, instrs, sources, taint_node, add_assumption, buffer_slots=None) -> bool:
+    def _seed_forward(self, func, ssaf, instrs, sources, taint_node, add_assumption,
+                      buffer_slots=None, leaves=None) -> bool:
         if buffer_slots is None:
             buffer_slots = {}
+        if leaves is None:
+            leaves = []
+
+        def add_leaf(leaf: dict[str, Any]) -> None:
+            if leaf and leaf not in leaves:
+                leaves.append(leaf)
+
         seeded = False
         for src in sources:
             kind = src.get("kind")
@@ -4630,6 +3898,14 @@ class TaintEngine:
                         f"automatically, or seed the filled buffer directly (--source "
                         f"var:<buf>) when the iovec is built dynamically."
                     )
+                    # Structured leaf so JSON leaves is non-empty (dogfood: agents
+                    # misread assumptions-only + 0 sinks as all-clear).
+                    if misanchored_recv_leaf is not None:
+                        add_leaf(misanchored_recv_leaf(
+                            callee=str(callee),
+                            arg_index=int(src.get("index", 1)),
+                            reason="msghdr_not_payload",
+                        ))
                 if kind == "ret":
                     # A ret: source on a function whose model also fills an
                     # output-pointer buffer would silently miss those bytes;
@@ -4693,10 +3969,12 @@ class TaintEngine:
                                               f"source: {callee} fills arg{idx} buffer", []):
                                     seeded = True
                             else:
+                                ptr_seeded = False
                                 for r in expr_reads(params[idx]):
                                     if taint_node((var_key(r), getattr(r, "version", None)), var_label(r), c,
                                                   f"source: {callee} arg{idx}", []):
                                         seeded = True
+                                        ptr_seeded = True
                                 # The buffer couldn't be anchored to a stack var or
                                 # writable global. If the pointer is itself loaded
                                 # from a global/struct slot, register the slot so a
@@ -4705,6 +3983,19 @@ class TaintEngine:
                                 # slot can't be named.
                                 self._register_indirect_buffer_slot(
                                     ssaf, params[idx], c, callee, idx, buffer_slots, add_assumption)
+                                # Weak seed: pointer value tainted but buffer not keyed
+                                # (the arg:recv:1 dogfood false-all-clear shape).
+                                _base = (callee or "").split("@", 1)[0].lstrip("_")
+                                if ptr_seeded and _base in (
+                                        "recv", "recvfrom", "read", "pread", "fread",
+                                        "recvmsg", "recvmmsg") \
+                                        and misanchored_recv_leaf is not None:
+                                    add_leaf(misanchored_recv_leaf(
+                                        callee=str(callee),
+                                        arg_index=idx,
+                                        address=hex(int(getattr(c, "address", 0))),
+                                        reason="buffer_not_keyed",
+                                    ))
                 if kind == "ret" and not ret_seeded:
                     # T3: callsites of `callee` exist but NONE consume its return
                     # value (a void or discarded return), so a ret: source has
@@ -5393,108 +4684,3 @@ class TaintEngine:
 
     def _describe_locator(self, loc: dict[str, Any]) -> dict[str, Any]:
         return {k: v for k, v in loc.items() if k != "_resolved"}
-
-
-def var_label_of(node: tuple) -> str:
-    key, version = node
-    if key[0] == "global":
-        name = f"glob_{hex(key[1])}"
-    elif key[0] == "name":
-        name = key[1]
-    else:
-        name = f"var#{key[1]}"
-    return f"{name}#{version}" if version is not None else str(name)
-
-
-def node_label(node: tuple, why: dict | None = None) -> str:
-    """Human-readable label for a taint node.
-
-    Prefers the label captured when the node was first tainted (the live
-    variable's ``name#version``, e.g. ``r1#2``). Falls back to deriving one from
-    the node key, which can only yield ``var#<identifier>`` for id-keyed
-    variables because :func:`var_key` intentionally drops the (unstable) name in
-    favor of the stable identifier for set membership -- so the recorded label
-    is what keeps JSON/ndjson output as readable as the text renderer.
-    """
-    if why is not None:
-        record = why.get(node)
-        if record:
-            label = record.get("label")
-            if label:
-                return str(label)
-    return var_label_of(node)
-
-
-# --------------------------------------------------------------------------
-# locator grammar parsing (string -> dict) — shared by CLI/bridge
-# --------------------------------------------------------------------------
-
-def parse_locator(spec: str) -> dict[str, Any]:
-    """Parse a source/sink locator string into a dict.
-
-    Grammar (MVP):
-      param:<n>            -> {"kind":"param","index":n}
-      var:<selector>       -> {"kind":"var","selector":...}
-      ret:<callee>         -> {"kind":"ret","callee":...}
-      arg:<callee>:<n>     -> {"kind":"arg","callee":...,"index":n}
-    """
-    if not spec:
-        raise TaintError("empty locator")
-    head, _, rest = spec.partition(":")
-    if head == "param":
-        return {"kind": "param", "index": _locator_index(rest, "param")}
-    if head == "var":
-        if not rest:
-            raise TaintError("var: locator needs a selector")
-        return {"kind": "var", "selector": rest}
-    if head == "ret":
-        if not rest:
-            raise TaintError("ret: locator needs a callee")
-        return {"kind": "ret", "callee": rest}
-    if head == "arg":
-        # Split at the LAST colon so a C++ qualified callee keeps its own colons:
-        # "arg:Ns::method:1" -> callee="Ns::method", n="1". partition(":") split at
-        # the FIRST colon and mis-parsed callee="Ns" (#98).
-        callee, sep, n = rest.rpartition(":")
-        if not sep or not callee or not n:
-            raise TaintError("arg: locator must be arg:<callee>:<n>")
-        return {"kind": "arg", "callee": callee, "index": _locator_index(n, f"arg:{callee}")}
-    if head in ("call", "model"):
-        # call:<callee> / model:<callee> -- seed ALL outputs the callee's taint
-        # model declares (return value AND output-pointer buffers), so a
-        # receive-style API like read/recv that writes its tainted bytes through
-        # an output-pointer arg is no longer a silent all-clear (#157).
-        if not rest:
-            raise TaintError(f"{head}: locator needs a callee")
-        return {"kind": "call", "callee": rest}
-    raise TaintError(f"unknown locator kind: {head!r} (use param:/var:/ret:/arg:/call:/model:)")
-
-
-def _locator_index(text: str, what: str) -> int:
-    """Parse a 0-based argument/parameter index, rejecting negatives.
-
-    A negative index would otherwise pass ``idx < len(params)`` and silently
-    seed ``params[-1]`` (the *last* argument) -- a confidently-wrong slice.
-    """
-    try:
-        n = int(text)
-    except (TypeError, ValueError):
-        raise TaintError(f"{what} index must be an integer, got {text!r}")
-    if n < 0:
-        raise TaintError(
-            f"{what} index must be >= 0 (argument indices are 0-based), got {n}")
-    return n
-
-
-def format_locator(loc: dict[str, Any]) -> str:
-    """Render a locator dict back to its ``kind:...`` string for diagnostics."""
-    kind = loc.get("kind")
-    if kind == "arg":
-        return f"arg:{loc.get('callee')}:{loc.get('index')}"
-    if kind == "param":
-        return f"param:{loc.get('index')}"
-    if kind == "var":
-        return f"var:{loc.get('selector')}"
-    if kind == "ret":
-        return f"ret:{loc.get('callee')}"
-    return str(kind)

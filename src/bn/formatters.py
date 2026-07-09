@@ -2080,24 +2080,36 @@ def _taint_forward_verdict(value: dict[str, Any]) -> str:
     findings = value.get("reached_sinks") or []
     leaves = value.get("leaves") or []
     stats = value.get("stats") or {}
+    conf = value.get("confidence") or {}
     fns = stats.get("functions_visited")
     fns_part = f" · taint crossed {fns} fn(s)" if fns else ""
     trunc = f" · truncated @depth {stats.get('max_depth')}" if stats.get("truncated") else ""
+    # Machine-readable gate from taint_result.enrich_forward_result (preferred).
+    gate = value.get("safe_to_report_all_clear")
+    if gate is None and conf:
+        gate = conf.get("safe_to_report_all_clear")
+    gate_part = ""
+    if gate is False:
+        gate_part = " · safe_to_report_all_clear=false"
+    elif gate is True:
+        gate_part = " · safe_to_report_all_clear=true (may-analysis, not a proof)"
     if findings:
         classes = ", ".join(sorted({(f.get("sink") or {}).get("class") or "?" for f in findings}))
-        return f"verdict: {len(findings)} sink(s) reached ({classes}){fns_part}{trunc}"
+        return f"verdict: {len(findings)} sink(s) reached ({classes}){fns_part}{trunc}{gate_part}"
     if leaves:
         return (f"verdict: NO modeled sink reached — {len(leaves)} tainted frontier(s) "
-                f"(NOT an all-clear){fns_part}{trunc}")
+                f"(NOT an all-clear){fns_part}{trunc}{gate_part}")
     # Genuinely empty: no sink AND no frontier. This is the MOST caveated case, not
     # the least -- the engine reaching nothing does not mean the function is safe;
     # it is exactly the shape a structurally-invisible bug (use-after-free,
     # temporal, or an unmodeled source) produces. Carry the same "NOT an
     # all-clear" qualifier the partial-coverage paths do (#310).
     visited = f"visited {fns} fn(s)" if fns else "shallow coverage"
+    reason = conf.get("reason") if isinstance(conf, dict) else None
+    extra = f" — {reason}" if reason else ""
     return (f"verdict: no taint reached any sink or frontier — NOT an all-clear "
             f"({visited}; no modeled sink or tainted frontier found — also how a bug "
-            f"the engine can't structurally see appears){trunc}")
+            f"the engine can't structurally see appears){extra}{trunc}{gate_part}")
 
 
 def _taint_via_trail(value: dict[str, Any], finding: dict[str, Any]) -> str | None:
@@ -2248,6 +2260,23 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
         lines.append(f"caveats ({len(assumptions)}):")
         for a in assumptions:
             lines.append(f"  - {a}")
+    # Claim gate + next steps (taint_result.enrich_forward_result).
+    conf = value.get("confidence") if isinstance(value.get("confidence"), dict) else None
+    diag = value.get("diagnostics") if isinstance(value.get("diagnostics"), dict) else None
+    if conf is not None or value.get("safe_to_report_all_clear") is not None:
+        lines.append("")
+        gate = value.get("safe_to_report_all_clear")
+        if gate is None and conf:
+            gate = conf.get("safe_to_report_all_clear")
+        lines.append(f"confidence: safe_to_report_all_clear={gate}")
+        if conf and conf.get("reason"):
+            lines.append(f"  reason: {conf['reason']}")
+    if diag:
+        tips = diag.get("suggested_next") or []
+        if tips:
+            lines.append("suggested next:")
+            for t in tips[:6]:
+                lines.append(f"  - {t}")
     msrc = _render_model_sources(value.get("model_sources"))
     if msrc:
         lines.append("")
@@ -2328,6 +2357,8 @@ def _describe_loc(loc: Any) -> str:
         return f"ret:{loc.get('callee')}"
     if kind == "arg":
         return f"arg:{loc.get('callee')}:{loc.get('index')}"
+    if kind in ("call", "model"):
+        return f"{kind}:{loc.get('callee')}"
     return str(kind)
 
 

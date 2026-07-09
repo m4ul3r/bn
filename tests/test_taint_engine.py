@@ -19,13 +19,21 @@ from pathlib import Path
 import pytest
 
 _ENGINE_PATH = Path(__file__).resolve().parents[1] / "src" / "bn_agent_bridge" / "taint_engine.py"
+_SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
 
 
 def _load_engine():
-    # Load as a top-level module so the wrapped `from .paths import ...` falls
-    # back gracefully (no package context) — load_models still reads the
-    # builtin JSON beside the file. Don't write bytecode into the source tree.
+    # Prefer the package import so the multi-module split (taint_models /
+    # taint_il / taint_locators / taint_result) resolves normally. Fall back to
+    # file-load only if the package is unavailable (legacy standalone runs).
     sys.dont_write_bytecode = True
+    if str(_SRC_ROOT) not in sys.path:
+        sys.path.insert(0, str(_SRC_ROOT))
+    try:
+        import bn_agent_bridge.taint_engine as module
+        return module
+    except Exception:
+        pass
     spec = importlib.util.spec_from_file_location("bn_taint_engine_under_test", _ENGINE_PATH)
     module = importlib.util.module_from_spec(spec)
     sys.modules.setdefault("bn_taint_engine_under_test", module)
@@ -288,7 +296,8 @@ def test_model_overlay_sources_labels_override_by_env_presence(monkeypatch, tmp_
     # not a false claim that the env var is in effect.
     override = tmp_path / "models.json"
     override.write_text("{}")
-    monkeypatch.setattr(te, "taint_models_path", lambda: override)
+    # Implementation lives in taint_models (engine re-exports); patch the owner.
+    monkeypatch.setattr(te._taint_models_mod, "taint_models_path", lambda: override)
 
     monkeypatch.setenv("BN_TAINT_MODELS", str(override))
     by_env = te.model_overlay_sources(None)
@@ -3481,7 +3490,7 @@ def test_parse_locator_arg_requires_an_index():
 def test_load_models_raises_on_corrupt_builtin(monkeypatch, tmp_path):
     bad = tmp_path / "builtin.json"
     bad.write_text("{ this is not json", encoding="utf-8")
-    monkeypatch.setattr(te, "_BUILTIN_MODELS", bad)
+    monkeypatch.setattr(te._taint_models_mod, "_BUILTIN_MODELS", bad)
     with pytest.raises(te.TaintError, match="packaging bug"):
         te.load_models()
 
@@ -3489,7 +3498,7 @@ def test_load_models_raises_on_corrupt_builtin(monkeypatch, tmp_path):
 def test_load_models_raises_on_broken_override(monkeypatch, tmp_path):
     bad = tmp_path / "override.json"
     bad.write_text("{ broken", encoding="utf-8")
-    monkeypatch.setattr(te, "taint_models_path", lambda: bad)
+    monkeypatch.setattr(te._taint_models_mod, "taint_models_path", lambda: bad)
     with pytest.raises(te.TaintError, match="BN_TAINT_MODELS"):
         te.load_models()
 
@@ -3497,7 +3506,7 @@ def test_load_models_raises_on_broken_override(monkeypatch, tmp_path):
 def test_load_models_rejects_non_object_override(monkeypatch, tmp_path):
     bad = tmp_path / "override.json"
     bad.write_text('["a", "b"]', encoding="utf-8")
-    monkeypatch.setattr(te, "taint_models_path", lambda: bad)
+    monkeypatch.setattr(te._taint_models_mod, "taint_models_path", lambda: bad)
     with pytest.raises(te.TaintError, match="must be a JSON object"):
         te.load_models()
 
@@ -3505,7 +3514,7 @@ def test_load_models_rejects_non_object_override(monkeypatch, tmp_path):
 def test_load_models_rejects_non_dict_model_value(monkeypatch, tmp_path):
     bad = tmp_path / "override.json"
     bad.write_text('{"models": {"memcpy": "oops"}}', encoding="utf-8")
-    monkeypatch.setattr(te, "taint_models_path", lambda: bad)
+    monkeypatch.setattr(te._taint_models_mod, "taint_models_path", lambda: bad)
     with pytest.raises(te.TaintError, match="must be a JSON object"):
         te.load_models()
 
@@ -3516,7 +3525,7 @@ def test_load_models_accepts_valid_override_with_comment(monkeypatch, tmp_path):
         '{"my_custom_sink": {"sink": {"class": "x", "tainted_args": [0]}}, "_comment_x": "doc text"}',
         encoding="utf-8",
     )
-    monkeypatch.setattr(te, "taint_models_path", lambda: ok)
+    monkeypatch.setattr(te._taint_models_mod, "taint_models_path", lambda: ok)
     models = te.load_models()
     assert "my_custom_sink" in models           # override merged over builtin
     assert "memcpy" in models                   # builtin still present
@@ -5112,7 +5121,8 @@ def test_reaching_arg_seed_vars_bridges_llil_def_to_mlil_seed(monkeypatch):
     func = type("F", (), {"llil": type("LL", (), {"ssa_form": [[call_ins]]})()})()
     fake_bn = type("BN", (), {"LowLevelILOperation":
                               type("Op", (), {"LLIL_CALL_SSA": "CALL_SSA_OP"})()})()
-    monkeypatch.setattr(te, "reaching_reg_def",
+    # reaching_reg_def is closed over from taint_il; patch the owner module.
+    monkeypatch.setattr(te._taint_il_mod, "reaching_reg_def",
                         lambda ci, reg, bn: fake_def if ci is call_ins else None)
     seeds = te.reaching_arg_seed_vars(func, 0x18, "r2", fake_bn)
     assert [v for v, _ in seeds] == [seedvar]
@@ -5358,3 +5368,130 @@ def test_reclassify_constant_format_sink_477(models):
     other = {"class": "overflow_len", "detail": "y"}
     assert engine._reclassify_constant_format_sink(other, "%d") == other
     assert engine._reclassify_constant_format_sink(None, "%d") is None
+
+
+# --- confidence / claim gate (taint_result + engine wire-up) -----------------
+
+def _load_taint_result():
+    import importlib.util
+    path = Path(__file__).resolve().parents[1] / "src" / "bn_agent_bridge" / "taint_result.py"
+    spec = importlib.util.spec_from_file_location("bn_taint_result_ut", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+tr = _load_taint_result()
+
+
+def test_confidence_blocking_leaf_not_all_clear():
+    conf = tr.derive_forward_confidence(
+        reached_sinks=[],
+        leaves=[{"kind": "coarse_memory_store", "address": "0x10"}],
+        assumptions=[],
+        stats={},
+    )
+    assert conf["safe_to_report_all_clear"] is False
+    assert "coarse_memory_store" in conf["blocking_leaf_kinds"]
+
+
+def test_confidence_findings_not_all_clear():
+    conf = tr.derive_forward_confidence(
+        reached_sinks=[{"sink": {"class": "overflow_len"}}],
+        leaves=[],
+        assumptions=[],
+    )
+    assert conf["safe_to_report_all_clear"] is False
+    assert conf["has_modeled_sinks"] is True
+
+
+def test_confidence_clean_empty_may_all_clear():
+    conf = tr.derive_forward_confidence(
+        reached_sinks=[], leaves=[], assumptions=[], stats={"truncated": False})
+    assert conf["safe_to_report_all_clear"] is True
+
+
+def test_confidence_weak_seed_assumption_blocks():
+    conf = tr.derive_forward_confidence(
+        reached_sinks=[], leaves=[],
+        assumptions=["recvmsg writes the received bytes to the scatter-gather iov "
+                     "buffer(s); the payload taint is NOT followed from here"],
+    )
+    assert conf["safe_to_report_all_clear"] is False
+    assert conf["weak_seed"] is True
+
+
+def test_forward_result_carries_confidence_gate(process_func, models):
+    bv = FBV({0x401070: "read", 0x401080: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(process_func, [te.parse_locator("arg:read:1")])
+    assert "confidence" in result
+    assert "safe_to_report_all_clear" in result
+    # findings present -> not an all-clear
+    assert result["safe_to_report_all_clear"] is False
+    assert result["confidence"]["has_modeled_sinks"] is True
+    # signature uses locator grammar, not str(dict)
+    rendered = result["reached_sinks"][0]["signature"]["rendered"]
+    assert "arg:read:1" in rendered
+    assert "{'kind'" not in rendered
+
+
+def test_forward_empty_clean_has_confidence_true(models):
+    a = FVar("a"); r = FVar("r")
+    a0 = FSSA(a, 0); r1 = FSSA(r, 1)
+    ssa = FSSAFunc([
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "r#1 = a#0 + 1", reads=[a0], writes=[r1]),
+        FInstr(1, 0x14, "MLIL_RET", "return r#1", reads=[r1]),
+    ])
+    func = FFunc("add_one", 0x10, ssa, params=[a])
+    engine = te.TaintEngine(FBV({}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert result["reached_sinks"] == []
+    assert result["leaves"] == []
+    assert result["safe_to_report_all_clear"] is True
+    assert result["diagnostics"]["empty_result"] is True
+
+
+def test_forward_recvmsg_arg_seed_emits_misanchored_leaf(models):
+    # arg:recvmsg:1 must not be a silent empty all-clear — structured leaf + gate.
+    msg = FVar("msg")
+    msg0 = FSSA(msg, 0)
+    ssa = FSSAFunc([
+        FInstr(0, 0x1c, "MLIL_CALL_SSA", "rax#1 = recvmsg(fd, msg, 0)",
+               params=[FExpr("MLIL_VAR_SSA", "fd", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "msg#0", reads=[msg0]),
+                       FExpr("MLIL_CONST", "0", constant=0)],
+               dest=FExpr("MLIL_CONST_PTR", "recvmsg", constant=0x900)),
+    ])
+    func = FFunc("recv_loop", 0x10, ssa, params=[])
+    # parameter_vars empty is fine; msg is a local
+    engine = te.TaintEngine(FBV({0x900: "recvmsg"}), models)
+    result = engine.forward(func, [te.parse_locator("arg:recvmsg:1")])
+    kinds = {lf.get("kind") for lf in result["leaves"]}
+    assert "source_seed_misanchored" in kinds, result["leaves"]
+    assert result["safe_to_report_all_clear"] is False
+    tips = " ".join(result.get("diagnostics", {}).get("suggested_next") or [])
+    assert "call:recvmsg" in tips
+
+
+def test_fgetc_in_builtin_source_models(models):
+    key, model = te.lookup_model(models, "fgetc")
+    assert key == "fgetc"
+    assert any(s.get("to") == "ret" for s in model.get("sources") or [])
+    key2, _ = te.lookup_model(models, "getc")
+    assert key2 == "getc"
+    key3, _ = te.lookup_model(models, "getchar")
+    assert key3 == "getchar"
+
+
+def test_derive_flow_facts_dict_source_renders_locator():
+    # #551: sources_echo is a list of locator dicts — must not str() them.
+    path = [{"address": "0x401180", "op": "MLIL_CALL_SSA", "callee": "memcpy"}]
+    sink = {"callee": "memcpy", "address": "0x401180", "class": "overflow_len"}
+    _, sig = te.derive_flow_facts(
+        direction="forward", path=path, sink=sink,
+        sources=[{"kind": "arg", "callee": "recv", "index": 1}],
+        leaves=[], fn_name="f")
+    assert sig["source"] == "arg:recv:1"
+    assert sig["rendered"].startswith("arg:recv:1")
+    assert "{" not in sig["rendered"]
