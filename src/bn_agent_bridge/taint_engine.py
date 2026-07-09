@@ -34,10 +34,12 @@ API behaviour verified against /opt/binaryninja (see the design's spike):
 """
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 # --- public re-exports (callers use ``from . import taint_engine as _taint``) ---
+# Package import only: sibling modules are loaded via relative imports. Standalone
+# ``importlib.util.spec_from_file_location`` load of this file is not supported
+# after the multi-module split (no parent package → ImportError on ``from .``).
 from . import taint_il as _taint_il_mod
 from . import taint_models as _taint_models_mod
 from .taint_models import (  # noqa: F401
@@ -93,22 +95,7 @@ from .taint_locators import (  # noqa: F401
     _make_signature,
     _render_source_label,
 )
-
-try:
-    from .taint_result import enrich_forward_result, misanchored_recv_leaf
-except Exception:  # pragma: no cover
-    try:
-        import importlib.util as _ilu
-        _tr_path = Path(__file__).resolve().parent / "taint_result.py"
-        _tr_spec = _ilu.spec_from_file_location("bn_taint_result_under_test", _tr_path)
-        _tr_mod = _ilu.module_from_spec(_tr_spec)  # type: ignore[arg-type]
-        assert _tr_spec and _tr_spec.loader
-        _tr_spec.loader.exec_module(_tr_mod)
-        enrich_forward_result = _tr_mod.enrich_forward_result
-        misanchored_recv_leaf = _tr_mod.misanchored_recv_leaf
-    except Exception:
-        enrich_forward_result = None  # type: ignore[assignment]
-        misanchored_recv_leaf = None  # type: ignore[assignment]
+from .taint_result import enrich_forward_result, misanchored_recv_leaf
 
 # ---------------------------------------------------------------------------
 # engine
@@ -1856,8 +1843,7 @@ class TaintEngine:
             "soundness": SOUNDNESS,
         }
         # Claim gate + suggested next actions (dogfood: empty ≠ all-clear).
-        if enrich_forward_result is not None:
-            enrich_forward_result(result)
+        enrich_forward_result(result)
         return result
 
     def _attributable_callsites(self, func: Any, sources: list[dict[str, Any]]) -> list[int]:
@@ -1963,8 +1949,7 @@ class TaintEngine:
             },
             "soundness": SOUNDNESS,
         }
-        if enrich_forward_result is not None:
-            enrich_forward_result(result)
+        enrich_forward_result(result)
         return result
 
     def _follow_thunk_cached(self, fn: Any) -> Any | None:
@@ -3900,12 +3885,11 @@ class TaintEngine:
                     )
                     # Structured leaf so JSON leaves is non-empty (dogfood: agents
                     # misread assumptions-only + 0 sinks as all-clear).
-                    if misanchored_recv_leaf is not None:
-                        add_leaf(misanchored_recv_leaf(
-                            callee=str(callee),
-                            arg_index=int(src.get("index", 1)),
-                            reason="msghdr_not_payload",
-                        ))
+                    add_leaf(misanchored_recv_leaf(
+                        callee=str(callee),
+                        arg_index=int(src.get("index", 1)),
+                        reason="msghdr_not_payload",
+                    ))
                 if kind == "ret":
                     # A ret: source on a function whose model also fills an
                     # output-pointer buffer would silently miss those bytes;
@@ -3988,8 +3972,7 @@ class TaintEngine:
                                 _base = (callee or "").split("@", 1)[0].lstrip("_")
                                 if ptr_seeded and _base in (
                                         "recv", "recvfrom", "read", "pread", "fread",
-                                        "recvmsg", "recvmmsg") \
-                                        and misanchored_recv_leaf is not None:
+                                        "recvmsg", "recvmmsg"):
                                     add_leaf(misanchored_recv_leaf(
                                         callee=str(callee),
                                         arg_index=idx,

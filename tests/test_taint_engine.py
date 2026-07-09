@@ -18,26 +18,18 @@ from pathlib import Path
 
 import pytest
 
-_ENGINE_PATH = Path(__file__).resolve().parents[1] / "src" / "bn_agent_bridge" / "taint_engine.py"
 _SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
 
 
 def _load_engine():
-    # Prefer the package import so the multi-module split (taint_models /
-    # taint_il / taint_locators / taint_result) resolves normally. Fall back to
-    # file-load only if the package is unavailable (legacy standalone runs).
+    # Package import only: after the multi-module split (taint_models / taint_il /
+    # taint_locators / taint_result), ``taint_engine`` uses unguarded relative
+    # imports and is not loadable via ``spec_from_file_location`` (no parent
+    # package). Production and tests both import ``bn_agent_bridge.taint_engine``.
     sys.dont_write_bytecode = True
     if str(_SRC_ROOT) not in sys.path:
         sys.path.insert(0, str(_SRC_ROOT))
-    try:
-        import bn_agent_bridge.taint_engine as module
-        return module
-    except Exception:
-        pass
-    spec = importlib.util.spec_from_file_location("bn_taint_engine_under_test", _ENGINE_PATH)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules.setdefault("bn_taint_engine_under_test", module)
-    spec.loader.exec_module(module)
+    import bn_agent_bridge.taint_engine as module
     return module
 
 
@@ -5373,15 +5365,24 @@ def test_reclassify_constant_format_sink_477(models):
 # --- confidence / claim gate (taint_result + engine wire-up) -----------------
 
 def _load_taint_result():
-    import importlib.util
-    path = Path(__file__).resolve().parents[1] / "src" / "bn_agent_bridge" / "taint_result.py"
-    spec = importlib.util.spec_from_file_location("bn_taint_result_ut", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    if str(_SRC_ROOT) not in sys.path:
+        sys.path.insert(0, str(_SRC_ROOT))
+    import bn_agent_bridge.taint_result as mod
     return mod
 
 
 tr = _load_taint_result()
+
+
+def test_taint_engine_requires_package_import_not_file_load():
+    # Contract after the multi-module split: standalone file-load has no parent
+    # package, so relative imports fail. Tests and production use the package.
+    engine_path = _SRC_ROOT / "bn_agent_bridge" / "taint_engine.py"
+    spec = importlib.util.spec_from_file_location(
+        "bn_taint_engine_fileload_must_fail", engine_path)
+    module = importlib.util.module_from_spec(spec)
+    with pytest.raises(ImportError, match="relative import|no known parent package"):
+        spec.loader.exec_module(module)
 
 
 def test_confidence_blocking_leaf_not_all_clear():
