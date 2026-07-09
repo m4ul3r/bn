@@ -458,11 +458,11 @@ def _batch_apply(args: argparse.Namespace) -> int:
             f'Manifest ({source}) must have an "ops" array (the list of '
             f"operations to apply)."
         )
-    # #227: fan-out agents are told to thread `--instance <id>` everywhere and
+    # #227: fan-out agents are told to thread `-i/--instance <id>` everywhere and
     # naturally put that id in the manifest "target" -- but an instance id is a
     # bridge, not a target selector, so it gets rejected. When the manifest target
-    # is just the --instance id, drop it: the bridge then resolves the instance's
-    # single open target (the manifest "target" is optional with --instance).
+    # is just the -i/--instance id, drop it: the bridge then resolves the instance's
+    # single open target (the manifest "target" is optional with -i/--instance).
     inst = getattr(args, "instance", None)
     if inst and manifest.get("target") == inst:
         manifest.pop("target", None)

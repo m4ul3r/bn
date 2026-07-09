@@ -70,7 +70,10 @@ def test_instance_short_flag_shown_in_help(capsys):
     with pytest.raises(SystemExit):
         parser.parse_args(["function", "list", "--help"])
     out = capsys.readouterr().out
-    assert "-i, --instance" in out
+    # argparse formats this as either "-i, --instance …" or
+    # "-i INSTANCE, --instance INSTANCE" depending on Python version.
+    assert "-i" in out and "--instance" in out
+    assert "BN_INSTANCE" in out
 
 
 def test_target_flag_after_subcommand_still_works():

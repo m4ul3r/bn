@@ -961,7 +961,7 @@ def test_choose_instance_requires_id_when_multiple_instances_exist(tmp_path, mon
         with pytest.raises(BridgeError, match="Multiple Binary Ninja bridge instances are running") as exc:
             choose_instance(auto_start=False)
         message = str(exc.value)
-        assert "--instance <id>" in message
+        assert "-i/--instance <id>" in message
         assert "aaaa1111" in message
         assert "bbbb2222" in message
     finally:

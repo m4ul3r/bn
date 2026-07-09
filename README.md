@@ -44,7 +44,7 @@ If the plugin code changes, reload Binary Ninja Python plugins or restart Binary
   - a Binary Ninja bridge that owns all Binary Ninja API access
 - The bridge runs either as a GUI plugin or as a standalone headless process.
 - The GUI plugin uses a single fixed bridge socket and registry file. Headless bridges each get their own socket and registry under `~/.cache/bn/instances/`, so you can run multiple in parallel.
-- The CLI discovers a bridge, connects to it, and forwards commands. With multiple bridges open, pick one with `--instance` or pin it with `bn instance use`.
+- The CLI discovers a bridge, connects to it, and forwards commands. With multiple bridges open, pick one with `-i/--instance <id>` or pin it with `bn instance use` (single shell only — parallel agents must pass `-i` every time).
 - In GUI mode, the bridge runs as a plugin and works with a personal license.
 - In headless mode, the bridge runs standalone and requires the `binaryninja` Python package on `sys.path` (commercial headless license or the headless API).
 
@@ -73,12 +73,15 @@ bn session stop <instance>
 
 `bn session start` spawns a `bn-agent` process, registers it under `~/.cache/bn/instances/<id>.{json,sock}`, and prints the instance ID. Use `bn session list` to see what's running and `bn session stop <id>` to shut one down. You can also start a bridge directly with `python -m bn_agent_bridge /path/to/binary.bndb` if you want to manage the process yourself.
 
-You can run several sessions in parallel. With more than one instance up, either pass `--instance <id>` per call or pin one for the shell with:
+You can run several sessions in parallel. With more than one instance up, either pass **`-i/--instance <id>`** per call (prefer the short form) or pin one for a single shell with:
 
 ```bash
-bn instance use <id>      # remembered per project root
+bn -i <id> decompile main          # explicit per call (required for parallel agents)
+bn instance use <id>               # sticky pin — single shell only; not for multi-agent
 bn instance clear
 ```
+
+Spawn naming is separate from routing: `bn session start /path/to/bin --instance-id myid` names the new bridge; subsequent commands use `bn -i myid …` to talk to it.
 
 `bn load` and `bn close` are available for dynamic binary management (useful in headless, but also work with the GUI bridge). All commands work identically in GUI and headless mode.
 

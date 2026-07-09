@@ -345,8 +345,8 @@ def _resolve_from_markers(instances: list[BridgeInstance]) -> BridgeInstance | N
 
 def _multiple_instances_error(instances: list[BridgeInstance]) -> BridgeError:
     return BridgeError(
-        "Multiple Binary Ninja bridge instances are running; pass --instance <id> "
-        "or set BN_INSTANCE.\n"
+        "Multiple Binary Ninja bridge instances are running; pass -i/--instance <id> "
+        "or set BN_INSTANCE (single-agent only).\n"
         f"Instances:\n{_format_instance_choices(instances)}"
     )
 

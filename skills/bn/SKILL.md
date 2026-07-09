@@ -24,7 +24,15 @@ The full command catalog lives in three files **in this skill's directory** — 
 
 One open target: omit `-t`. Multiple open: pass `-t <selector>` (from `bn target list`; matches selector / target_id / view_id / filename / basename), before *or* after the subcommand.
 
-> **Parallel / fan-out agents — HARD rule.** Sticky pins (`instance use` / `target use`) are one shared file per git repo, so concurrent agents clobber each other. Fan-out agents **MUST** pass `--instance` and `-t` explicitly on every command and **MUST NOT** call `instance use` / `target use` / `*clear`. Prefer one dedicated instance per agent: `bn session start <bin> --instance-id <id>`, then thread `--instance <id>` everywhere. (Detail → `reference/runtime.md`.)
+> **Parallel / fan-out agents — HARD rule.** Sticky pins (`instance use` / `target use`) are one shared file per git repo, so concurrent agents clobber each other. Fan-out agents **MUST** pass **`-i/--instance` and `-t/--target`** explicitly on **every** command and **MUST NOT** call `instance use` / `target use` / `*clear`. Prefer one dedicated instance per agent, then use the short flags everywhere:
+>
+> ```bash
+> bn session start /path/to/bin --instance-id dogfood-1   # spawn name (not global -i)
+> bn -i dogfood-1 -t <sel> decompile main
+> bn -i dogfood-1 -t <sel> xrefs main
+> ```
+>
+> Prefer **`-i <id>`** (short form of `--instance`) to keep fan-out command lines short. Env `BN_INSTANCE` is optional single-agent convenience only — **not** for multi-agent fan-out (shared env is still clobberable). (Detail → `reference/runtime.md`.)
 
 ## Two gotchas that cause wrong answers
 
