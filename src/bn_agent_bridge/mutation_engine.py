@@ -61,6 +61,7 @@ REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "struct_field_delete": ("struct_name", "field_name"),
     "types_declare": ("declaration",),
     "function_create": ("address",),
+    "tag_add": ("type",),
 }
 
 # Ops that accept one of several alternative locator fields. set_comment /
@@ -70,6 +71,7 @@ REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
 REQUIRED_ONE_OF: dict[str, tuple[tuple[str, ...], ...]] = {
     "set_comment": (("function", "address"),),
     "delete_comment": (("function", "address"),),
+    "tag_add": (("function", "address"),),
 }
 
 # Fields restricted to a fixed value set, mirroring an interactive command's
@@ -115,7 +117,7 @@ _VAR_DRIFT_OPS = {"local_rename", "local_retype", "set_prototype"}
 _BATCH_OP_NAMES = (
     "rename_symbol", "set_comment", "delete_comment", "set_prototype",
     "local_rename", "local_retype", "struct_field_set", "struct_field_rename",
-    "struct_field_delete", "types_declare", "function_create",
+    "struct_field_delete", "types_declare", "function_create", "tag_add",
 )
 
 
@@ -736,6 +738,8 @@ def _verify_operation(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
             return _verify_declared_types(ctx, bv, result)
         if op == "function_create":
             return _verify_function_create(ctx, bv, result)
+        if op == "tag_add":
+            return _verify_tag_add(ctx, bv, result)
         raise OperationFailure("unsupported", f"Unsupported verification path: {op}", requested=result.get("requested"))
     except OperationFailure as exc:
         item = dict(result)
@@ -802,6 +806,36 @@ def _verify_set_comment(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
             observed=item["observed"],
         )
     item["status"] = "noop" if item.get("before_comment", "") == expected else "verified"
+    return item
+
+
+
+def _verify_tag_add(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
+    item = dict(result)
+    type_name = str(item["tag_type"])
+    data = str(item["data"])
+    scope = item["scope"]
+    if scope == "function":
+        fn = ctx._find_function(bv, item["function"])
+        present = any(t.type.name == type_name and t.data == data
+                      for t in fn.get_function_tags(auto=False))
+    else:
+        addr = _parse_address(item["address"])
+        if scope == "data":
+            present = any(t.type.name == type_name and t.data == data
+                          for t in bv.get_tags_at(addr, auto=False))
+        else:
+            fn = ctx._find_function(bv, item["function"])
+            present = any(t.type.name == type_name and t.data == data
+                          for t in fn.get_tags_at(addr, auto=False))
+    item["observed"] = {"present": present}
+    if not present:
+        raise OperationFailure(
+            "verification_failed",
+            f"Tag {type_name!r} not found after add ({scope} scope).",
+            requested=item.get("requested"), observed=item["observed"],
+        )
+    item["status"] = "verified"
     return item
 
 
@@ -1284,6 +1318,8 @@ def _apply_operation(ctx, bv, op: dict[str, Any], restores: list | None = None):
             return _op_types_declare(ctx, bv, op)
         if kind == "function_create":
             return _op_function_create(ctx, bv, op, restores)
+        if kind == "tag_add":
+            return _op_tag_add(ctx, bv, op)
         # The batch op names are a different namespace than the CLI verbs
         # (`bn proto set` -> op `set_prototype`); an agent reusing the CLI verb
         # gets a bare "unsupported" and silently wastes a batch. Suggest the
@@ -1715,6 +1751,58 @@ def _op_set_comment(ctx, bv, op: dict[str, Any]):
         "before_comment": before_comment,
         "requested": _operation_requested(ctx, op),
     }
+
+
+
+def _resolve_tag_type_or_fail(ctx, bv, op, type_name: str):
+    tt = bv.get_tag_type(type_name)
+    if tt is None:
+        available = ", ".join(sorted(bv.tag_types)) or "(none)"
+        raise OperationFailure(
+            "invalid_request",
+            f"Unknown tag type {type_name!r}. Available types: {available}. "
+            "Create a custom type with `bn tag type create`.",
+            requested=_operation_requested(ctx, op),
+        )
+    return tt
+
+
+def _op_tag_add(ctx, bv, op: dict[str, Any]):
+    type_name = str(op["type"])
+    data = str(op.get("data", ""))
+    _resolve_tag_type_or_fail(ctx, bv, op, type_name)
+    if op.get("function") and op.get("address"):
+        raise OperationFailure(
+            "invalid_request",
+            "Pass a function OR an address, not both: they target different locations.",
+            requested=_operation_requested(ctx, op),
+        )
+    requested = _operation_requested(ctx, op)
+
+    if op.get("function"):
+        fn = ctx._find_function(bv, op["function"])
+        tag = fn.add_tag(type_name, data, None)
+        return {"op": "tag_add", "tag_type": type_name, "data": data, "scope": "function",
+                "function": fn.name, "address": hex(int(fn.start)), "tag_id": str(tag.id),
+                "message": f"Added function tag {type_name!r} to {fn.name}.",
+                "requested": requested}
+
+    addr = _parse_address(op["address"])
+    force_data = bool(op.get("force_data"))
+    funcs = bv.get_functions_containing(addr)
+    if force_data or not funcs:
+        tag = bv.add_tag(addr, type_name, data)
+        note = "" if force_data else " (no function contains this address)"
+        return {"op": "tag_add", "tag_type": type_name, "data": data, "scope": "data",
+                "address": hex(addr), "function": None, "tag_id": str(tag.id),
+                "message": f"Added data tag {type_name!r} at {hex(addr)}{note}.",
+                "requested": requested}
+    fn = funcs[0]
+    tag = fn.add_tag(type_name, data, addr)
+    return {"op": "tag_add", "tag_type": type_name, "data": data, "scope": "address",
+            "address": hex(addr), "function": fn.name, "tag_id": str(tag.id),
+            "message": f"Added tag {type_name!r} at {hex(addr)} in {fn.name}.",
+            "requested": requested}
 
 
 

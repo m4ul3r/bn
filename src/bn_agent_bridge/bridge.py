@@ -2323,6 +2323,9 @@ class BinaryNinjaBridge:
     def _verify_declared_types(self, *a, **k):
         return mutation_engine._verify_declared_types(self.ctx, *a, **k)
 
+    def _verify_tag_add(self, *a, **k):
+        return mutation_engine._verify_tag_add(self.ctx, *a, **k)
+
     def _apply_operation(self, *a, **k):
         return mutation_engine._apply_operation(self.ctx, *a, **k)
 
@@ -2404,6 +2407,9 @@ class BinaryNinjaBridge:
 
     def _op_types_declare(self, *a, **k):
         return mutation_engine._op_types_declare(self.ctx, *a, **k)
+
+    def _op_tag_add(self, *a, **k):
+        return mutation_engine._op_tag_add(self.ctx, *a, **k)
 
 _bridge: BinaryNinjaBridge | None = None
 # Mutable view-tracking globals now live in bridge_state.py so read-op modules
@@ -2928,6 +2934,11 @@ def _bind_list_tags(bridge, params, target):
         offset=int(params.get("offset", 0)),
         limit=int(params["limit"]) if params.get("limit") is not None else None,
     )
+
+
+@op("tag_add", lock="write")
+def _bind_tag_add(bridge, params, target):
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "tag_add"}])
 
 
 @op("set_comment", lock="write")

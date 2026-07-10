@@ -147,3 +147,62 @@ def test_list_tags_dedupes_same_tag_id_across_collection_sources():
     matching = [t for t in result["items"] if t["id"] == str(tag.id)]
     assert len(matching) == 1
     assert result["total"] == 1
+
+
+from bn_agent_bridge import mutation_engine
+from bn_agent_bridge._shared import OperationFailure
+from _bridge_fakes import _FakeTagMutationBV
+
+
+def _mut_bv_with_fn():
+    fn = _FakeFunction(0x1000, "sub_1000")
+    fn.basic_blocks = [_FakeBasicBlock(0x1000, 0x1040)]
+    bv = _FakeTagMutationBV()
+    bv.functions = [fn]
+    fn.view = bv
+    bv.create_tag_type("Important", "!")
+    return bv, fn
+
+
+class _CtxMut(_CtxFn):
+    pass
+
+
+def test_op_tag_add_address_scope_attaches_to_function():
+    bv, fn = _mut_bv_with_fn()
+    op = {"op": "tag_add", "type": "Important", "data": "look here", "address": "0x1010"}
+    result = mutation_engine._op_tag_add(_CtxMut(bv), bv, op)
+    assert result["scope"] == "address"
+    assert [(t.type.name, t.data) for t in fn.get_tags_at(0x1010)] == [("Important", "look here")]
+
+
+def test_op_tag_add_function_scope():
+    bv, fn = _mut_bv_with_fn()
+    op = {"op": "tag_add", "type": "Important", "data": "doc", "function": "sub_1000"}
+    result = mutation_engine._op_tag_add(_CtxMut(bv), bv, op)
+    assert result["scope"] == "function"
+    assert [(t.type.name, t.data) for t in fn.get_function_tags()] == [("Important", "doc")]
+
+
+def test_op_tag_add_force_data_scope():
+    bv, fn = _mut_bv_with_fn()
+    op = {"op": "tag_add", "type": "Important", "data": "d", "address": "0x1010", "force_data": True}
+    result = mutation_engine._op_tag_add(_CtxMut(bv), bv, op)
+    assert result["scope"] == "data"
+    assert [(t.type.name, t.data) for t in bv.get_tags_at(0x1010)] == [("Important", "d")]
+
+
+def test_op_tag_add_no_function_falls_back_to_data():
+    bv, fn = _mut_bv_with_fn()  # 0x9000 is outside sub_1000
+    op = {"op": "tag_add", "type": "Important", "data": "d", "address": "0x9000"}
+    result = mutation_engine._op_tag_add(_CtxMut(bv), bv, op)
+    assert result["scope"] == "data"
+    assert "no function" in result["message"].lower()
+
+
+def test_op_tag_add_unknown_type_is_invalid_request():
+    bv, fn = _mut_bv_with_fn()
+    op = {"op": "tag_add", "type": "Nonexistent", "data": "d", "address": "0x1010"}
+    with pytest.raises(OperationFailure) as exc:
+        mutation_engine._op_tag_add(_CtxMut(bv), bv, op)
+    assert exc.value.status == "invalid_request"

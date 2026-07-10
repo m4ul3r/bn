@@ -24,7 +24,7 @@ EXPECTED_WRITE = {
     "py_exec", "function_create", "rename_symbol", "set_comment", "delete_comment",
     "set_prototype", "local_rename", "local_retype", "struct_field_set",
     "struct_field_rename", "struct_field_delete", "types_declare", "batch_apply",
-    "close_binary", "save_database",
+    "close_binary", "save_database", "tag_add",
     # NB: "refresh" is intentionally NOT here -- #321 made it lock="none" so it
     # self-manages locking (analysis runs under the write GATE only, leaving reads
     # responsive), mirroring load_binary. See the self-managed set below.

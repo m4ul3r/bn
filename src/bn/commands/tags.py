@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 
-from ..cli import _call, _pick, arg, command, preview_arg, summary_arg
+from ..cli import _call, _mutate, _pick, arg, command, preview_arg, summary_arg
 from ..formatters import _render_tag_get_text, _render_tag_list_text, _render_tag_types_text
 from ..transport import BridgeError
 
@@ -83,4 +83,31 @@ def _tag_list(args: argparse.Namespace) -> int:
         paged_spill=True,
         page_label="tags",
         stem="tags",
+    )
+
+
+@command("tag", "add", help="Add a tag at an address or on a function", target=True, fmt="json",
+         args=[
+             preview_arg(), summary_arg(),
+             arg("address", nargs="?", help="Address to tag (hex 0x.. or decimal)"),
+             arg("data", help="Tag text (data)"),
+             arg("--address", dest="address_flag", default=None, help="Address alias for the positional"),
+             arg("--function", default=None, help="Tag the whole function (name or address)"),
+             arg("--type", required=True, help="Tag type name (e.g. Important, Bookmarks)"),
+             arg("--data", dest="force_data", action="store_true",
+                 help="Force a data-scope tag at the address (not attached to a function)"),
+         ])
+def _tag_add(args: argparse.Namespace) -> int:
+    address = _pick(args.address, args.address_flag, "tag address", required=False)
+    if address is not None and args.function is not None:
+        raise BridgeError("tag add takes an address or --function, not both")
+    if address is None and args.function is None:
+        raise BridgeError("tag add needs a location: an address or --function")
+    return _mutate(
+        args,
+        "tag_add",
+        {"type": args.type, "data": args.data, "address": address,
+         "function": args.function, "force_data": bool(args.force_data)},
+        preview=bool(args.preview),
+        stem="tag-add",
     )
