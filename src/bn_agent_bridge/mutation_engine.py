@@ -1856,6 +1856,19 @@ def _resolve_tag_type_or_fail(ctx, bv, op, type_name: str):
     return tt
 
 
+def _find_new_tag(before_ids: set[str], tags) -> Any | None:
+    """Both ``Function.add_tag`` and ``BinaryView.add_tag`` return ``None`` on
+    real Binary Ninja (only the test fakes return the created Tag, as a test
+    convenience) -- so the id needed for ``tag remove --id`` has to be
+    recovered by diffing the relevant tag collection before/after the add.
+    Discovered live (#see _op_tag_add): the old code called ``.id`` on the
+    ``None`` return and crashed every real-BN tag add."""
+    for t in tags:
+        if str(t.id) not in before_ids:
+            return t
+    return None
+
+
 def _op_tag_add(ctx, bv, op: dict[str, Any]):
     type_name = str(op["type"])
     data = str(op.get("data", ""))
@@ -1870,9 +1883,12 @@ def _op_tag_add(ctx, bv, op: dict[str, Any]):
 
     if op.get("function"):
         fn = ctx._find_function(bv, op["function"])
-        tag = fn.add_tag(type_name, data, None)
+        before_ids = {str(t.id) for t in fn.get_function_tags(auto=False)}
+        fn.add_tag(type_name, data, None)
+        tag = _find_new_tag(before_ids, fn.get_function_tags(auto=False))
         return {"op": "tag_add", "tag_type": type_name, "data": data, "scope": "function",
-                "function": fn.name, "address": hex(int(fn.start)), "tag_id": str(tag.id),
+                "function": fn.name, "address": hex(int(fn.start)),
+                "tag_id": str(tag.id) if tag is not None else None,
                 "message": f"Added function tag {type_name!r} to {fn.name}.",
                 "requested": requested}
 
@@ -1880,16 +1896,22 @@ def _op_tag_add(ctx, bv, op: dict[str, Any]):
     force_data = bool(op.get("force_data"))
     funcs = bv.get_functions_containing(addr)
     if force_data or not funcs:
-        tag = bv.add_tag(addr, type_name, data)
+        before_ids = {str(t.id) for t in bv.get_tags_at(addr, auto=False)}
+        bv.add_tag(addr, type_name, data)
+        tag = _find_new_tag(before_ids, bv.get_tags_at(addr, auto=False))
         note = "" if force_data else " (no function contains this address)"
         return {"op": "tag_add", "tag_type": type_name, "data": data, "scope": "data",
-                "address": hex(addr), "function": None, "tag_id": str(tag.id),
+                "address": hex(addr), "function": None,
+                "tag_id": str(tag.id) if tag is not None else None,
                 "message": f"Added data tag {type_name!r} at {hex(addr)}{note}.",
                 "requested": requested}
     fn = funcs[0]
-    tag = fn.add_tag(type_name, data, addr)
+    before_ids = {str(t.id) for t in fn.get_tags_at(addr, auto=False)}
+    fn.add_tag(type_name, data, addr)
+    tag = _find_new_tag(before_ids, fn.get_tags_at(addr, auto=False))
     return {"op": "tag_add", "tag_type": type_name, "data": data, "scope": "address",
-            "address": hex(addr), "function": fn.name, "tag_id": str(tag.id),
+            "address": hex(addr), "function": fn.name,
+            "tag_id": str(tag.id) if tag is not None else None,
             "message": f"Added tag {type_name!r} at {hex(addr)} in {fn.name}.",
             "requested": requested}
 

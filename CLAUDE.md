@@ -77,6 +77,15 @@ The CLI supports several headless bridges concurrently. Each instance gets its o
 
 All mutations support `--preview` (apply → capture diffs → revert) and live verification (readback confirms requested state landed). Statuses: `verified`, `noop`, `unsupported`, `verification_failed`. Failed batches are fully reverted.
 
+### Tags & function docs
+
+- `bn tag list/get/add/remove` manage Binary Ninja tags at data/address/function
+  scope; "bookmarks" are just `--type Bookmarks`. `bn tag types` and
+  `bn tag type create/remove` manage tag types (built-ins cannot be removed).
+- `bn comment --function` targets the function's documentation comment
+  (`fn.comment`), shown atop the function — NOT an address comment. Use the
+  function's entry address for an entry-line note.
+
 ### JSON Protocol
 
 Request: `{"op": "decompile", "params": {...}, "target": "selector", "id": "uuid"}`
