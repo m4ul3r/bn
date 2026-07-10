@@ -468,6 +468,18 @@ class _FakeBV:
     def get_comment_at(self, address: int):
         return self._comments.get(int(address), "")
 
+    @property
+    def address_comments(self):
+        return dict(self._comments)
+
+    @address_comments.setter
+    def address_comments(self, value):
+        # Several tests assign a fresh dict directly (`bv.address_comments = {...}`)
+        # to seed comment state post-construction; a read-only property would break
+        # that existing pattern, so route the write through the same backing store
+        # `get_comment_at` reads (`self._comments`) -- keeps both call styles honest.
+        self._comments = dict(value or {})
+
     def get_functions_containing(self, address: int):
         result = []
         for fn in self.functions:

@@ -376,16 +376,23 @@ def _render_field_xrefs_text(value: Any) -> str:
 def _render_comment_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    # `comment get --function` aggregates all in-function comments as a list (#203).
+    # `comment get --function` aggregates all in-function comments as a list (#203),
+    # and, alongside them, the whole-function documentation (`fn.comment`) as
+    # `function_doc` -- surfaced above the address comments so the two stores read
+    # as one coherent view instead of the doc silently going missing from `get`.
     comments = value.get("comments")
     if isinstance(comments, list):
-        if not comments:
+        lines = []
+        doc = value.get("function_doc")
+        if doc:
+            lines.append(f"[doc] {doc}")
+        if not comments and not doc:
             return "(no comment)"
-        return "\n".join(
+        lines.extend(
             f"{c.get('address', '?')}  {c.get('comment', '')}"
-            for c in comments
-            if isinstance(c, dict)
+            for c in comments if isinstance(c, dict)
         )
+        return "\n".join(lines)
     comment = value.get("comment")
     if isinstance(comment, str):
         return comment if comment else "(no comment)"

@@ -420,3 +420,21 @@ def test_bind_list_comments_tolerates_none_limit(monkeypatch):
     res2 = bridge._bind_list_comments(instance, {"query": None, "offset": 0, "limit": 1}, "active")
     assert res2["returned"] == 1
     assert res2["has_more"] is True
+
+
+def test_get_comment_function_includes_function_doc_and_address_comments():
+    fn = _FakeFunction(0x1000, "sub_1000")
+    fn.basic_blocks = [_FakeBasicBlock(0x1000, 0x1040)]
+    fn.comment = "top-level doc"
+    bv = _FakeBV(functions=[fn], comments={0x1010: "note at a call"})
+    fn.view = bv
+
+    class _C:
+        def _resolve_view(self, s): return bv
+        def _find_function(self, b, ident): return fn
+
+    from bn_agent_bridge import create_comments
+    result = create_comments._get_comment(_C(), None, None, "sub_1000")
+    assert result["function_doc"] == "top-level doc"
+    assert result["has_function_doc"] is True
+    assert [c["comment"] for c in result["comments"]] == ["note at a call"]

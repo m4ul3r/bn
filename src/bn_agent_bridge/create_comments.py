@@ -320,9 +320,12 @@ def _get_comment(ctx, selector: str | None, address, function):
             if not any(int(f.start) == int(fn.start) for f in funcs):
                 continue
             comments.append({"address": hex(int(addr)), "comment": text})
+        function_doc = str(getattr(fn, "comment", "") or "")
         return {
             "function": fn.name,
             "address": hex(fn.start),
+            "function_doc": function_doc,
+            "has_function_doc": bool(function_doc),
             "comments": comments,
             "comment_count": len(comments),
             "has_comment": bool(comments),
