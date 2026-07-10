@@ -123,3 +123,27 @@ def test_list_tags_query_substring_on_data():
     bv, fn = _bv_with_tagged_fn()
     result = read_tags._list_tags(_CtxFn(bv), None, query="whole")
     assert [t["data"] for t in result["items"]] == ["whole fn"]
+
+
+def test_list_tags_dedupes_same_tag_id_across_collection_sources():
+    """The whole-view sweep in _collect_tags normally sees disjoint tags from
+    bv.get_tags() (data) and fn.tags (address) -- so a `seen`-guard regression
+    that reintroduced overlap between those sources wouldn't be caught by any
+    existing test. Force the SAME _FakeTag object (same .id) to be reachable
+    from BOTH bv.get_tags() and fn.tags, and assert it still collapses to a
+    single entry -- proving the dedup guard is load-bearing, not vacuous."""
+    fn = _FakeFunction(0x1000, "sub_1000")
+    fn.basic_blocks = [_FakeBasicBlock(0x1000, 0x1040)]
+    bv = _FakeBV(functions=[fn])
+    fn.view = bv
+    bv.create_tag_type("Bugs", "B")
+    tag = bv.add_tag(0x1010, "Bugs", "shared tag")
+    # Directly alias the same tag object into the function's address-tag sweep,
+    # simulating a source-overlap regression (e.g. fn.tags also surfacing a
+    # view-level data tag) without touching production code.
+    fn._address_tags[0x1010] = [tag]
+
+    result = read_tags._list_tags(_CtxFn(bv), None)
+    matching = [t for t in result["items"] if t["id"] == str(tag.id)]
+    assert len(matching) == 1
+    assert result["total"] == 1
