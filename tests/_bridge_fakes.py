@@ -149,9 +149,53 @@ class _FakeFunction:
         # The #386 "looks like code" guard reads these off the created function.
         self.arch = arch
         self.total_bytes = total_bytes
+        self.view = None
+        self._function_tags: list[_FakeTag] = []
+        self._address_tags: dict[int, list[_FakeTag]] = {}
+        # BN's real whole-function documentation property (Function.comment),
+        # DISTINCT from an address comment. `comment --function` targets this.
+        self.comment = ""
 
     def reanalyze(self, *args, **kwargs):
         self.reanalyzed = True
+
+    def add_tag(self, tag_type, data, addr=None, auto=False, arch=None):
+        tt = self.view.get_tag_type(str(tag_type))
+        tag = _FakeTag(tt, str(data), _TAG_IDS.next())
+        if addr is None:
+            self._function_tags.append(tag)
+        else:
+            self._address_tags.setdefault(int(addr), []).append(tag)
+        return tag
+
+    def get_function_tags(self, auto=None, tag_type=None):
+        tags = list(self._function_tags)
+        if tag_type is not None:
+            tags = [t for t in tags if t.type.name == tag_type]
+        return tags
+
+    def get_tags_at(self, addr, arch=None, auto=None):
+        return list(self._address_tags.get(int(addr), []))
+
+    @property
+    def tags(self):
+        # Mirrors real BN Function.tags: a TagList of (arch, addr, Tag) for every
+        # address tag on the function (NOT function tags) -- verified against a
+        # live BN install (function.py TagList / get_tags_at), which is the
+        # supported way to sweep all of a function's address tags without
+        # already knowing which addresses carry one.
+        out = []
+        for addr, bucket in self._address_tags.items():
+            for tag in bucket:
+                out.append((self.arch, addr, tag))
+        return out
+
+    def remove_user_function_tag(self, tag):
+        self._function_tags = [t for t in self._function_tags if t.id != tag.id]
+
+    def remove_user_address_tag(self, addr, tag, arch=None):
+        bucket = self._address_tags.get(int(addr), [])
+        self._address_tags[int(addr)] = [t for t in bucket if t.id != tag.id]
 
 
 class _FakeBasicBlock:
@@ -313,6 +357,39 @@ class _FakeReloc:
         self.symbol = symbol
 
 
+class _TagIdCounter:
+    """Deterministic tag-id source. Emits valid UUID strings (real BN tag ids are
+    UUIDs, and `_op_tag_remove` now rejects a non-UUID `--id`) that are still
+    stable/predictable per run -- e.g. n=1 -> '0000fa5e-0000-0000-0000-000000000001'.
+    The 'fa5e' marker keeps them recognizable as fakes and clear of the all-zeros
+    UUID a test may use for the well-formed-but-nonexistent case."""
+    def __init__(self):
+        self._n = 0
+
+    def next(self) -> str:
+        self._n += 1
+        return f"0000fa5e-0000-0000-0000-{self._n:012d}"
+
+
+_TAG_IDS = _TagIdCounter()
+
+
+class _FakeTagType:
+    def __init__(self, name: str, icon: str):
+        self.name = name
+        self.icon = icon
+        self.id = f"tt-{name}"
+        self.type = "UserTagType"
+        self.visible = True
+
+
+class _FakeTag:
+    def __init__(self, tag_type: "_FakeTagType", data: str, tag_id: str):
+        self.type = tag_type
+        self.data = data
+        self.id = tag_id
+
+
 class _FakeBV:
     def __init__(self, *, functions=None, symbols=None, types_=None, qualified_types_=None, arch=None, disassembly=None, instruction_lengths=None,
                  strings=None, sections=None, segments=None, memory=None, code_refs=None, data_refs=None, comments=None, relocations=None):
@@ -337,6 +414,9 @@ class _FakeBV:
         self._memory = dict(memory or {})
         self._code_refs = dict(code_refs or {})
         self._data_refs = dict(data_refs or {})
+        # tag state: {name: _FakeTagType}, data/address tags {addr: [_FakeTag]}
+        self._tag_types: dict[str, _FakeTagType] = {}
+        self._data_tags: dict[int, list[_FakeTag]] = {}
 
     def get_function_at(self, address: int):
         for fn in self.functions:
@@ -392,6 +472,18 @@ class _FakeBV:
     def get_comment_at(self, address: int):
         return self._comments.get(int(address), "")
 
+    @property
+    def address_comments(self):
+        return dict(self._comments)
+
+    @address_comments.setter
+    def address_comments(self, value):
+        # Several tests assign a fresh dict directly (`bv.address_comments = {...}`)
+        # to seed comment state post-construction; a read-only property would break
+        # that existing pattern, so route the write through the same backing store
+        # `get_comment_at` reads (`self._comments`) -- keeps both call styles honest.
+        self._comments = dict(value or {})
+
     def get_functions_containing(self, address: int):
         result = []
         for fn in self.functions:
@@ -437,6 +529,44 @@ class _FakeBV:
                     return blob[start:start + length]
             return b""
         return b"\x90" * length
+
+    @property
+    def tag_types(self):
+        return dict(self._tag_types)
+
+    def get_tag_type(self, name):
+        return self._tag_types.get(str(name))
+
+    def create_tag_type(self, name, icon):
+        existing = self._tag_types.get(str(name))
+        if existing is not None:  # BN: creating an existing name is a no-op
+            return existing
+        tt = _FakeTagType(str(name), str(icon))
+        self._tag_types[str(name)] = tt
+        return tt
+
+    def remove_tag_type(self, name):
+        self._tag_types.pop(str(name), None)
+
+    def add_tag(self, addr, tag_type_name, data, user=True):
+        tt = self._tag_types[str(tag_type_name)]  # KeyError if unknown -> handler validates first
+        tag = _FakeTag(tt, str(data), _TAG_IDS.next())
+        self._data_tags.setdefault(int(addr), []).append(tag)
+        return tag
+
+    def get_tags_at(self, addr, auto=None):
+        return list(self._data_tags.get(int(addr), []))
+
+    def get_tags(self, auto=None):
+        out = []
+        for addr in sorted(self._data_tags):
+            for tag in self._data_tags[addr]:
+                out.append((addr, tag))
+        return out
+
+    def remove_user_data_tag(self, addr, tag):
+        bucket = self._data_tags.get(int(addr), [])
+        self._data_tags[int(addr)] = [t for t in bucket if t.id != tag.id]
 
 
 class _FakeType:
@@ -538,6 +668,10 @@ _BATCH_OP_PARITY = {
     "struct_field_delete": {"required": ("struct_name", "field_name"),                       "one_of": (),                           "enum": {},                                     "cli": "bn struct field delete"},
     "types_declare":       {"required": ("declaration",),                                    "one_of": (),                           "enum": {},                                     "cli": "bn types declare"},
     "function_create":     {"required": ("address",),                                        "one_of": (),                           "enum": {},                                     "cli": "bn function create"},
+    "tag_add":             {"required": ("type",),                                           "one_of": (("function", "address"),),   "enum": {},                                     "cli": "bn tag add"},
+    "tag_remove":          {"required": (),                                                  "one_of": (("tag_id", "address", "function"),), "enum": {},                             "cli": "bn tag remove"},
+    "tag_type_create":     {"required": ("name", "icon"),                                    "one_of": (),                           "enum": {},                                     "cli": "bn tag type create"},
+    "tag_type_remove":     {"required": ("name",),                                           "one_of": (),                           "enum": {},                                     "cli": "bn tag type remove"},
 }
 
 
@@ -574,6 +708,26 @@ class _FakeCommentMutationBV(_FakeMutationBV):
             self.comments.pop(int(address), None)
         else:
             self.comments[int(address)] = comment
+
+
+class _FakeTagMutationBV(_FakeMutationBV):
+    """Records begin/revert/commit and stores tags so a tag mutation can be
+    applied then reverted by a batch (mirrors _FakeCommentMutationBV)."""
+
+    def __init__(self):
+        super().__init__()
+        self._tag_types = {}
+        self._data_tags = {}
+
+    # tag-type + data-tag methods are identical to _FakeBV's; reuse them.
+    tag_types = _FakeBV.tag_types
+    get_tag_type = _FakeBV.get_tag_type
+    create_tag_type = _FakeBV.create_tag_type
+    remove_tag_type = _FakeBV.remove_tag_type
+    add_tag = _FakeBV.add_tag
+    get_tags_at = _FakeBV.get_tags_at
+    get_tags = _FakeBV.get_tags
+    remove_user_data_tag = _FakeBV.remove_user_data_tag
 
 
 def _install_fake_pseudo_c(monkeypatch, bridge, func, batches):

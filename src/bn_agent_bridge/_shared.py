@@ -250,3 +250,20 @@ def _write_json_artifact(path_text: str | None, payload: Any) -> dict[str, Any] 
         "sha256": hashlib.sha256(data).hexdigest(),
         "summary": _artifact_summary(payload),
     }
+
+
+# BN's built-in tag-type names (probed on BN 5.4). BN itself offers NO protection
+# against removing these -- `remove_tag_type("Bugs")` succeeds silently -- so the
+# tag-type removal op guards against them, and `tag types` marks them is_builtin.
+# There is no programmatic "builtin" flag on TagType (both built-in and
+# user-created report TagTypeType.UserTagType), so this name set is the signal.
+_BUILTIN_TAG_TYPE_NAMES: frozenset[str] = frozenset({
+    "Bookmarks", "Bugs", "Crashes", "Important", "Library", "Needs Analysis",
+    "Unresolved Stack Adjustment", "Unresolved Indirect Control Flow",
+    "Unresolved Stack Pointer Value", "Invalid Instruction",
+    "Could not Generate Flag IL", "Unimplemented Instruction (LLIL)",
+    "Unimplemented Instruction (MLIL)", "Unimplemented Instruction (HLIL)",
+    "Non-code Branch", "Function too Large",
+    "Function Exceeded Max Analysis Time", "Jump to Unhandled Relocation",
+    "Jump to Malformed Target", "WARP", "WARP: Ignored Function",
+})

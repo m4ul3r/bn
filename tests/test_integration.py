@@ -878,3 +878,142 @@ class TestTaintArgRegisterFallback:
                 "trace: expected the #433 register-recovery hint"
         finally:
             _session_stop(inst)
+
+
+class TestTagRoundtrip:
+    """Real-BN round trip for the `bn tag` group: a custom tag type, a
+    FUNCTION-scope tag, and an ADDRESS-scope tag. The address-scope readback
+    is the key dogfood check here: our code (read_tags._collect_tags /
+    _get_tags) assumes real BN's `Function.tags` / `Function.get_tags_at`
+    surface address-scope tags the way the mocked fakes in test_tags.py model
+    them -- only a real BN Function object can prove that assumption."""
+
+    def _first_function_address(self, inst) -> str:
+        out = _bn("--instance", inst, "function", "list", "--limit", "1", "--format", "json")
+        assert out.returncode == 0, f"{out.stdout}\n{out.stderr}"
+        listing = json.loads(out.stdout)
+        items = listing.get("items") if isinstance(listing, dict) else listing
+        return items[0]["address"]
+
+    def test_tag_roundtrip_across_scopes(self):
+        info = _session_start(str(HELLO_BINARY))
+        inst = info["instance_id"]
+        try:
+            created = _bn("--instance", inst, "tag", "type", "create", "AgentNote",
+                          "--icon", "\U0001F916", "--format", "json")
+            assert created.returncode == 0, f"{created.stdout}\n{created.stderr}"
+            assert json.loads(created.stdout)["results"][0]["status"] in ("verified", "noop")
+
+            fn_addr = self._first_function_address(inst)
+
+            # FUNCTION-scope tag.
+            add_fn = _bn("--instance", inst, "tag", "add", "--function", fn_addr,
+                        "--type", "AgentNote", "--data", "reviewed by agent",
+                        "--format", "json")
+            assert add_fn.returncode == 0, f"{add_fn.stdout}\n{add_fn.stderr}"
+            assert json.loads(add_fn.stdout)["results"][0]["status"] == "verified"
+
+            # ADDRESS-scope tag at the function's entry address (still an
+            # address tag, not a function tag -- distinct scope, distinct id).
+            add_addr = _bn("--instance", inst, "tag", "add", fn_addr,
+                           "--type", "AgentNote", "--data", "flagged address",
+                           "--format", "json")
+            assert add_addr.returncode == 0, f"{add_addr.stdout}\n{add_addr.stderr}"
+            assert json.loads(add_addr.stdout)["results"][0]["status"] == "verified"
+
+            # `tag list` sweeps Function.get_function_tags() AND Function.tags --
+            # both scopes must be found (the address-scope entry is the key
+            # real-BN dogfood check, see class docstring).
+            listing = json.loads(_bn("--instance", inst, "tag", "list",
+                                     "--type", "AgentNote", "--format", "json").stdout)
+            items = listing["items"]
+            scopes_and_data = {(t["scope"], t["data"]) for t in items}
+            assert ("function", "reviewed by agent") in scopes_and_data, items
+            assert ("address", "flagged address") in scopes_and_data, items
+
+            # `tag get <addr>` independently surfaces the address-scope tag via
+            # Function.get_tags_at -- a second, distinct real-BN code path.
+            got = json.loads(_bn("--instance", inst, "tag", "get", fn_addr,
+                                 "--format", "json").stdout)
+            assert any(t["scope"] == "address" and t["data"] == "flagged address"
+                      for t in got["tags"]), got
+
+            # Remove both tags (each `tag remove` targets one scope).
+            rm_addr = _bn("--instance", inst, "tag", "remove", fn_addr,
+                          "--type", "AgentNote", "--format", "json")
+            assert rm_addr.returncode == 0, f"{rm_addr.stdout}\n{rm_addr.stderr}"
+            assert json.loads(rm_addr.stdout)["results"][0]["status"] == "verified"
+
+            rm_fn = _bn("--instance", inst, "tag", "remove", "--function", fn_addr,
+                       "--type", "AgentNote", "--format", "json")
+            assert rm_fn.returncode == 0, f"{rm_fn.stdout}\n{rm_fn.stderr}"
+            assert json.loads(rm_fn.stdout)["results"][0]["status"] == "verified"
+
+            # Now that no tags of this type remain, the custom tag type itself
+            # can be removed.
+            rm_type = _bn("--instance", inst, "tag", "type", "remove", "AgentNote",
+                          "--format", "json")
+            assert rm_type.returncode == 0, f"{rm_type.stdout}\n{rm_type.stderr}"
+            assert json.loads(rm_type.stdout)["results"][0]["status"] == "verified"
+        finally:
+            _session_stop(inst)
+
+    def test_tag_type_remove_refuses_builtin(self):
+        """A built-in tag type (e.g. Bookmarks) must be refused with a clean
+        invalid_request, not removed -- mirrors the bitfield-rejection shape in
+        TestTypesDeclareBitfield above."""
+        info = _session_start(str(HELLO_BINARY))
+        inst = info["instance_id"]
+        try:
+            res = _bn("--instance", inst, "tag", "type", "remove", "Bookmarks",
+                      "--format", "json")
+            assert res.returncode != 0, f"expected rejection, got: {res.stdout}"
+            parsed = json.loads(res.stdout)
+            results = parsed.get("results") or [parsed]
+            assert results[0].get("status") == "invalid_request", parsed
+            assert "built-in" in (results[0].get("message") or "").lower(), parsed
+            # Must NOT have been removed -- still present and flagged built-in.
+            types = json.loads(_bn("--instance", inst, "tag", "types",
+                                   "--format", "json").stdout)["tag_types"]
+            bookmarks = next((t for t in types if t["name"] == "Bookmarks"), None)
+            assert bookmarks is not None and bookmarks["is_builtin"] is True, types
+        finally:
+            _session_stop(inst)
+
+
+class TestFunctionDocRoundtrip:
+    """Real-BN round trip for the function-doc surface: `comment --function`
+    now targets `fn.comment` (the function's documentation comment shown atop
+    the function), not an address comment."""
+
+    def test_function_doc_set_get_delete(self):
+        info = _session_start(str(HELLO_BINARY))
+        inst = info["instance_id"]
+        try:
+            listing = json.loads(_bn("--instance", inst, "function", "list",
+                                     "--limit", "1", "--format", "json").stdout)
+            items = listing.get("items") if isinstance(listing, dict) else listing
+            fn_addr = items[0]["address"]
+
+            doc_text = "AgentNote: reviewed and documented by an integration test"
+            set_res = _bn("--instance", inst, "comment", "set", "--function", fn_addr,
+                          doc_text, "--format", "json")
+            assert set_res.returncode == 0, f"{set_res.stdout}\n{set_res.stderr}"
+            assert json.loads(set_res.stdout)["results"][0]["status"] == "verified"
+
+            got = json.loads(_bn("--instance", inst, "comment", "get", "--function", fn_addr,
+                                 "--format", "json").stdout)
+            assert got["function_doc"] == doc_text, got
+            assert got["has_function_doc"] is True, got
+
+            del_res = _bn("--instance", inst, "comment", "delete", "--function", fn_addr,
+                          "--format", "json")
+            assert del_res.returncode == 0, f"{del_res.stdout}\n{del_res.stderr}"
+            assert json.loads(del_res.stdout)["results"][0]["status"] == "verified"
+
+            after = json.loads(_bn("--instance", inst, "comment", "get", "--function", fn_addr,
+                                   "--format", "json").stdout)
+            assert after["function_doc"] == "", after
+            assert after["has_function_doc"] is False, after
+        finally:
+            _session_stop(inst)

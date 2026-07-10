@@ -28,6 +28,7 @@ from . import read_evidence
 from . import read_go
 from . import read_listing
 from . import read_misc
+from . import read_tags
 from . import read_taint_slice
 from . import read_types
 from . import read_xrefs
@@ -2138,6 +2139,15 @@ class BinaryNinjaBridge:
     def _list_comments(self, *a, **k):
         return create_comments._list_comments(self.ctx, *a, **k)
 
+    def _list_tag_types(self, *a, **k):
+        return read_tags._list_tag_types(self.ctx, *a, **k)
+
+    def _get_tags(self, *a, **k):
+        return read_tags._get_tags(self.ctx, *a, **k)
+
+    def _list_tags(self, *a, **k):
+        return read_tags._list_tags(self.ctx, *a, **k)
+
     def _bundle_function(self, selector: str | None, identifier, out_path: str | None):
         bv = self._resolve_view(selector)
         func = self._find_function(bv, identifier)
@@ -2313,6 +2323,18 @@ class BinaryNinjaBridge:
     def _verify_declared_types(self, *a, **k):
         return mutation_engine._verify_declared_types(self.ctx, *a, **k)
 
+    def _verify_tag_add(self, *a, **k):
+        return mutation_engine._verify_tag_add(self.ctx, *a, **k)
+
+    def _verify_tag_remove(self, *a, **k):
+        return mutation_engine._verify_tag_remove(self.ctx, *a, **k)
+
+    def _verify_tag_type_create(self, *a, **k):
+        return mutation_engine._verify_tag_type_create(self.ctx, *a, **k)
+
+    def _verify_tag_type_remove(self, *a, **k):
+        return mutation_engine._verify_tag_type_remove(self.ctx, *a, **k)
+
     def _apply_operation(self, *a, **k):
         return mutation_engine._apply_operation(self.ctx, *a, **k)
 
@@ -2394,6 +2416,18 @@ class BinaryNinjaBridge:
 
     def _op_types_declare(self, *a, **k):
         return mutation_engine._op_types_declare(self.ctx, *a, **k)
+
+    def _op_tag_add(self, *a, **k):
+        return mutation_engine._op_tag_add(self.ctx, *a, **k)
+
+    def _op_tag_remove(self, *a, **k):
+        return mutation_engine._op_tag_remove(self.ctx, *a, **k)
+
+    def _op_tag_type_create(self, *a, **k):
+        return mutation_engine._op_tag_type_create(self.ctx, *a, **k)
+
+    def _op_tag_type_remove(self, *a, **k):
+        return mutation_engine._op_tag_type_remove(self.ctx, *a, **k)
 
 _bridge: BinaryNinjaBridge | None = None
 # Mutable view-tracking globals now live in bridge_state.py so read-op modules
@@ -2894,6 +2928,50 @@ def _bind_list_comments(bridge, params, target):
         # strings/imports/sections/types binders.
         limit=int(params["limit"]) if params.get("limit") is not None else None,
     )
+
+
+@op("list_tag_types", lock="read")
+def _bind_list_tag_types(bridge, params, target):
+    return bridge._list_tag_types(target)
+
+
+@op("get_tags", lock="read")
+def _bind_get_tags(bridge, params, target):
+    return bridge._get_tags(target, params.get("address"), params.get("function"))
+
+
+@op("list_tags", lock="read")
+def _bind_list_tags(bridge, params, target):
+    return bridge._list_tags(
+        target,
+        function=params.get("function"),
+        address=params.get("address"),
+        type=params.get("type"),
+        data_only=bool(params.get("data_only")),
+        query=params.get("query"),
+        offset=int(params.get("offset", 0)),
+        limit=int(params["limit"]) if params.get("limit") is not None else None,
+    )
+
+
+@op("tag_add", lock="write")
+def _bind_tag_add(bridge, params, target):
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "tag_add"}])
+
+
+@op("tag_remove", lock="write")
+def _bind_tag_remove(bridge, params, target):
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "tag_remove"}])
+
+
+@op("tag_type_create", lock="write")
+def _bind_tag_type_create(bridge, params, target):
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "tag_type_create"}])
+
+
+@op("tag_type_remove", lock="write")
+def _bind_tag_type_remove(bridge, params, target):
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "tag_type_remove"}])
 
 
 @op("set_comment", lock="write")

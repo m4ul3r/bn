@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import difflib
 import re
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -38,6 +39,7 @@ from .bridge_state import _quick_loaded_views
 from ._shared import (
     USER_FACING_ERRORS,
     OperationFailure,
+    _BUILTIN_TAG_TYPE_NAMES,
     _normalize_prototype,
     _parse_address,
     _serialize_error,
@@ -61,6 +63,10 @@ REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "struct_field_delete": ("struct_name", "field_name"),
     "types_declare": ("declaration",),
     "function_create": ("address",),
+    "tag_add": ("type",),
+    "tag_remove": (),
+    "tag_type_create": ("name", "icon"),
+    "tag_type_remove": ("name",),
 }
 
 # Ops that accept one of several alternative locator fields. set_comment /
@@ -70,6 +76,8 @@ REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
 REQUIRED_ONE_OF: dict[str, tuple[tuple[str, ...], ...]] = {
     "set_comment": (("function", "address"),),
     "delete_comment": (("function", "address"),),
+    "tag_add": (("function", "address"),),
+    "tag_remove": (("tag_id", "address", "function"),),
 }
 
 # Fields restricted to a fixed value set, mirroring an interactive command's
@@ -115,7 +123,8 @@ _VAR_DRIFT_OPS = {"local_rename", "local_retype", "set_prototype"}
 _BATCH_OP_NAMES = (
     "rename_symbol", "set_comment", "delete_comment", "set_prototype",
     "local_rename", "local_retype", "struct_field_set", "struct_field_rename",
-    "struct_field_delete", "types_declare", "function_create",
+    "struct_field_delete", "types_declare", "function_create", "tag_add", "tag_remove",
+    "tag_type_create", "tag_type_remove",
 )
 
 
@@ -488,6 +497,13 @@ def _capture_function_snapshots(ctx, bv, functions):
             "text": il_format._function_text(bv, fn, view="hlil"),
             "comments": _function_comment_state(ctx, bv, fn),
             "locals": _function_local_state(ctx, fn),
+            # BN's whole-function documentation property (Function.comment),
+            # DISTINCT from the address-comment store `comments` above --
+            # `comment set/delete --function` (Task 8) writes here. Without
+            # it in the snapshot, a --preview of that op showed changed:false
+            # / an empty diff even though apply/verify/revert all landed
+            # (final-review Fix 1, #121 pattern).
+            "function_doc": str(getattr(fn, "comment", "") or ""),
         }
     return snapshots
 
@@ -509,6 +525,9 @@ def _format_metadata_change(old: dict[str, Any], new: dict[str, Any], address: i
     for ident in sorted(set(ol) | set(nl)):
         if ol.get(ident) != nl.get(ident):
             lines.append(f"local {ident}: {ol.get(ident, '')} -> {nl.get(ident, '')}")
+    old_doc, new_doc = old.get("function_doc") or "", new.get("function_doc") or ""
+    if old_doc != new_doc:
+        lines.append(f"function_doc: {old_doc!r} -> {new_doc!r}")
     return "\n".join(lines)
 
 
@@ -576,6 +595,7 @@ def _diff_snapshots(ctx, before: dict[int, Any], after: dict[int, Any]):
         # change signal and synthesize a diff for them (#121).
         comments_changed = old.get("comments") != new.get("comments")
         locals_changed = old.get("locals") != new.get("locals")
+        doc_changed = (old.get("function_doc") or "") != (new.get("function_doc") or "")
         diff = "\n".join(
             difflib.unified_diff(
                 old["text"].splitlines(),
@@ -585,14 +605,16 @@ def _diff_snapshots(ctx, before: dict[int, Any], after: dict[int, Any]):
                 lineterm="",
             )
         )
-        if not diff and (name_changed or comments_changed or locals_changed):
+        if not diff and (name_changed or comments_changed or locals_changed or doc_changed):
             diff = _format_metadata_change(old, new, address)
         diffs.append(
             {
                 "address": hex(address),
                 "before_name": old.get("name"),
                 "after_name": new.get("name"),
-                "changed": bool(text_changed or name_changed or comments_changed or locals_changed),
+                "changed": bool(
+                    text_changed or name_changed or comments_changed or locals_changed or doc_changed
+                ),
                 "diff": _truncate_preview_diff(diff),
             }
         )
@@ -736,6 +758,14 @@ def _verify_operation(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
             return _verify_declared_types(ctx, bv, result)
         if op == "function_create":
             return _verify_function_create(ctx, bv, result)
+        if op == "tag_add":
+            return _verify_tag_add(ctx, bv, result)
+        if op == "tag_remove":
+            return _verify_tag_remove(ctx, bv, result)
+        if op == "tag_type_create":
+            return _verify_tag_type_create(ctx, bv, result)
+        if op == "tag_type_remove":
+            return _verify_tag_type_remove(ctx, bv, result)
         raise OperationFailure("unsupported", f"Unsupported verification path: {op}", requested=result.get("requested"))
     except OperationFailure as exc:
         item = dict(result)
@@ -790,14 +820,19 @@ def _verify_rename_symbol(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
 
 def _verify_set_comment(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     item = dict(result)
-    address = _parse_address(item["address"])
     expected = str(item["requested"]["comment"])
-    observed = bv.get_comment_at(address) or ""
-    item["observed"] = {"address": item["address"], "comment": observed}
+    if item.get("scope") == "function_doc":
+        fn = ctx._find_function(bv, item["function"])
+        observed = str(getattr(fn, "comment", "") or "")
+        item["observed"] = {"function": item["function"], "comment": observed}
+    else:
+        address = _parse_address(item["address"])
+        observed = bv.get_comment_at(address) or ""
+        item["observed"] = {"address": item["address"], "comment": observed}
     if observed != expected:
         raise OperationFailure(
             "verification_failed",
-            f"Live comment verification failed at {item['address']}",
+            f"Live comment verification failed for {item.get('function') or item['address']}",
             requested=item.get("requested"),
             observed=item["observed"],
         )
@@ -806,15 +841,110 @@ def _verify_set_comment(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
 
 
 
+def _verify_tag_add(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
+    item = dict(result)
+    type_name = str(item["tag_type"])
+    data = str(item["data"])
+    scope = item["scope"]
+    if scope == "function":
+        fn = ctx._find_function(bv, item["function"])
+        present = any(t.type.name == type_name and t.data == data
+                      for t in fn.get_function_tags(auto=False))
+    else:
+        addr = _parse_address(item["address"])
+        if scope == "data":
+            present = any(t.type.name == type_name and t.data == data
+                          for t in bv.get_tags_at(addr, auto=False))
+        else:
+            fn = ctx._find_function(bv, item["function"])
+            present = any(t.type.name == type_name and t.data == data
+                          for t in fn.get_tags_at(addr, auto=False))
+    item["observed"] = {"present": present}
+    if not present:
+        raise OperationFailure(
+            "verification_failed",
+            f"Tag {type_name!r} not found after add ({scope} scope).",
+            requested=item.get("requested"), observed=item["observed"],
+        )
+    item["status"] = "verified"
+    return item
+
+
+def _verify_tag_remove(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
+    item = dict(result)
+    if not item.get("targets"):
+        item["status"] = "noop"
+        item["observed"] = {"removed": 0}
+        return item
+    still_present = []
+    for tgt in item["targets"]:
+        if tgt["scope"] == "function":
+            fn = ctx._find_function(bv, tgt["function"])
+            ids = {str(t.id) for t in fn.get_function_tags(auto=False)}
+        elif tgt["scope"] == "data":
+            ids = {str(t.id) for t in bv.get_tags_at(_parse_address(tgt["address"]), auto=False)}
+        else:
+            addr = _parse_address(tgt["address"])
+            ids = set()
+            for fn in bv.get_functions_containing(addr):
+                ids |= {str(t.id) for t in fn.get_tags_at(addr, auto=False)}
+        if tgt["id"] in ids:
+            still_present.append(tgt["id"])
+    item["observed"] = {"still_present": still_present}
+    if still_present:
+        raise OperationFailure(
+            "verification_failed",
+            f"{len(still_present)} tag(s) still present after remove.",
+            requested=item.get("requested"), observed=item["observed"],
+        )
+    item["status"] = "verified"
+    return item
+
+
+def _verify_tag_type_create(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
+    item = dict(result)
+    name = str(item["name"])
+    tt = bv.get_tag_type(name)
+    item["observed"] = {"present": tt is not None}
+    if tt is None:
+        raise OperationFailure(
+            "verification_failed",
+            f"Tag type {name!r} not present after create.",
+            requested=item.get("requested"), observed=item["observed"],
+        )
+    item["status"] = "noop" if item.get("existed") else "verified"
+    return item
+
+
+def _verify_tag_type_remove(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
+    item = dict(result)
+    name = str(item["name"])
+    tt = bv.get_tag_type(name)
+    item["observed"] = {"present": tt is not None}
+    if tt is not None:
+        raise OperationFailure(
+            "verification_failed",
+            f"Tag type {name!r} still present after remove.",
+            requested=item.get("requested"), observed=item["observed"],
+        )
+    item["status"] = "noop" if not item.get("existed") else "verified"
+    return item
+
+
 def _verify_delete_comment(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     item = dict(result)
-    address = _parse_address(item["address"])
-    observed = bv.get_comment_at(address) or ""
-    item["observed"] = {"address": item["address"], "comment": observed}
+    if item.get("scope") == "function_doc":
+        fn = ctx._find_function(bv, item["function"])
+        observed = str(getattr(fn, "comment", "") or "")
+        item["observed"] = {"function": item["function"], "comment": observed}
+    else:
+        address = _parse_address(item["address"])
+        observed = bv.get_comment_at(address) or ""
+        item["observed"] = {"address": item["address"], "comment": observed}
     if observed:
         raise OperationFailure(
             "verification_failed",
-            f"Live comment deletion verification failed at {item['address']}",
+            f"Live comment deletion verification failed for {item.get('function') or item['address']}",
             requested=item.get("requested"),
             observed=item["observed"],
         )
@@ -1284,6 +1414,14 @@ def _apply_operation(ctx, bv, op: dict[str, Any], restores: list | None = None):
             return _op_types_declare(ctx, bv, op)
         if kind == "function_create":
             return _op_function_create(ctx, bv, op, restores)
+        if kind == "tag_add":
+            return _op_tag_add(ctx, bv, op)
+        if kind == "tag_remove":
+            return _op_tag_remove(ctx, bv, op)
+        if kind == "tag_type_create":
+            return _op_tag_type_create(ctx, bv, op)
+        if kind == "tag_type_remove":
+            return _op_tag_type_remove(ctx, bv, op)
         # The batch op names are a different namespace than the CLI verbs
         # (`bn proto set` -> op `set_prototype`); an agent reusing the CLI verb
         # gets a bare "unsupported" and silently wastes a batch. Suggest the
@@ -1695,12 +1833,13 @@ def _op_set_comment(ctx, bv, op: dict[str, Any]):
         )
     if op.get("function"):
         fn = ctx._find_function(bv, op["function"])
-        before_comment = bv.get_comment_at(fn.start) or ""
+        before_comment = str(getattr(fn, "comment", "") or "")
         if before_comment != comment:
-            bv.set_comment_at(fn.start, comment)
+            fn.comment = comment
         return {
             "op": "set_comment",
-            "address": hex(fn.start),
+            "scope": "function_doc",
+            "address": hex(int(fn.start)),
             "function": fn.name,
             "before_comment": before_comment,
             "requested": _operation_requested(ctx, op),
@@ -1718,6 +1857,223 @@ def _op_set_comment(ctx, bv, op: dict[str, Any]):
 
 
 
+def _resolve_tag_type_or_fail(ctx, bv, op, type_name: str):
+    tt = bv.get_tag_type(type_name)
+    if tt is None:
+        available = ", ".join(sorted(bv.tag_types)) or "(none)"
+        raise OperationFailure(
+            "invalid_request",
+            f"Unknown tag type {type_name!r}. Available types: {available}. "
+            "Create a custom type with `bn tag type create`.",
+            requested=_operation_requested(ctx, op),
+        )
+    return tt
+
+
+def _find_new_tag(before_ids: set[str], tags) -> Any | None:
+    """Both ``Function.add_tag`` and ``BinaryView.add_tag`` return ``None`` on
+    real Binary Ninja (only the test fakes return the created Tag, as a test
+    convenience) -- so the id needed for ``tag remove --id`` has to be
+    recovered by diffing the relevant tag collection before/after the add.
+    Discovered live (#see _op_tag_add): the old code called ``.id`` on the
+    ``None`` return and crashed every real-BN tag add."""
+    for t in tags:
+        if str(t.id) not in before_ids:
+            return t
+    return None
+
+
+def _op_tag_add(ctx, bv, op: dict[str, Any]):
+    type_name = str(op["type"])
+    data = str(op.get("data", ""))
+    _resolve_tag_type_or_fail(ctx, bv, op, type_name)
+    if op.get("function") and op.get("address"):
+        raise OperationFailure(
+            "invalid_request",
+            "Pass a function OR an address, not both: they target different locations.",
+            requested=_operation_requested(ctx, op),
+        )
+    if op.get("function") and op.get("force_data"):
+        # --data-scope forces the data-level (bv.add_tag) path, which is
+        # inherently address-based; a function tag has no address, so the two
+        # are contradictory. Reject rather than silently dropping force_data.
+        raise OperationFailure(
+            "invalid_request",
+            "--data-scope only applies to a tag at an address; it can't be "
+            "combined with --function (a function tag has no address).",
+            requested=_operation_requested(ctx, op),
+        )
+    requested = _operation_requested(ctx, op)
+
+    if op.get("function"):
+        fn = ctx._find_function(bv, op["function"])
+        before_ids = {str(t.id) for t in fn.get_function_tags(auto=False)}
+        fn.add_tag(type_name, data, None)
+        tag = _find_new_tag(before_ids, fn.get_function_tags(auto=False))
+        return {"op": "tag_add", "tag_type": type_name, "data": data, "scope": "function",
+                "function": fn.name, "address": hex(int(fn.start)),
+                "tag_id": str(tag.id) if tag is not None else None,
+                "message": f"Added function tag {type_name!r} to {fn.name}.",
+                "requested": requested}
+
+    addr = _parse_address(op["address"])
+    force_data = bool(op.get("force_data"))
+    funcs = bv.get_functions_containing(addr)
+    if force_data or not funcs:
+        before_ids = {str(t.id) for t in bv.get_tags_at(addr, auto=False)}
+        bv.add_tag(addr, type_name, data)
+        tag = _find_new_tag(before_ids, bv.get_tags_at(addr, auto=False))
+        note = "" if force_data else " (no function contains this address)"
+        return {"op": "tag_add", "tag_type": type_name, "data": data, "scope": "data",
+                "address": hex(addr), "function": None,
+                "tag_id": str(tag.id) if tag is not None else None,
+                "message": f"Added data tag {type_name!r} at {hex(addr)}{note}.",
+                "requested": requested}
+    fn = funcs[0]
+    before_ids = {str(t.id) for t in fn.get_tags_at(addr, auto=False)}
+    fn.add_tag(type_name, data, addr)
+    tag = _find_new_tag(before_ids, fn.get_tags_at(addr, auto=False))
+    return {"op": "tag_add", "tag_type": type_name, "data": data, "scope": "address",
+            "address": hex(addr), "function": fn.name,
+            "tag_id": str(tag.id) if tag is not None else None,
+            "message": f"Added tag {type_name!r} at {hex(addr)} in {fn.name}.",
+            "requested": requested}
+
+
+def _tag_matches(tag, type_name, data) -> bool:
+    if type_name is not None and tag.type.name != type_name:
+        return False
+    if data is not None and tag.data != data:
+        return False
+    return True
+
+
+def _op_tag_remove(ctx, bv, op: dict[str, Any]):
+    tag_id = op.get("tag_id")
+    type_name = op.get("type")
+    data = op.get("data")
+    requested = _operation_requested(ctx, op)
+    if not tag_id and not type_name:
+        raise OperationFailure(
+            "invalid_request",
+            "tag remove needs --id, or a location plus --type.",
+            requested=requested,
+        )
+    # A tag id is a UUID (the `id` column of `bn tag list`). Reject a malformed
+    # id up front -- parity with `tag add`'s bad-type/bad-address errors -- so a
+    # typo'd id is a clear invalid_request instead of a silent no-op that reads
+    # like "there was no such tag". A well-formed but nonexistent id still falls
+    # through to the normal no-match `noop` (below).
+    if tag_id:
+        try:
+            uuid.UUID(str(tag_id))
+        except (ValueError, AttributeError, TypeError):
+            raise OperationFailure(
+                "invalid_request",
+                f"{tag_id!r} is not a valid tag id; expected a UUID from the "
+                "`id` column of `bn tag list`.",
+                requested=requested,
+            )
+    removed: list[dict[str, Any]] = []
+    targets: list[dict[str, Any]] = []  # for verification: (scope, address, id)
+
+    def match(tag) -> bool:
+        if tag_id:
+            return str(tag.id) == str(tag_id)
+        return _tag_matches(tag, type_name, data)
+
+    if op.get("function"):
+        fn = ctx._find_function(bv, op["function"])
+        for t in list(fn.get_function_tags(auto=False)):
+            if match(t):
+                fn.remove_user_function_tag(t)
+                removed.append({"type": t.type.name, "data": t.data, "scope": "function"})
+                targets.append({"scope": "function", "function": fn.name, "id": str(t.id)})
+    elif op.get("address") is not None:
+        addr = _parse_address(op["address"])
+        force_data = bool(op.get("force_data"))
+        if not force_data:
+            for fn in bv.get_functions_containing(addr):
+                for t in list(fn.get_tags_at(addr, auto=False)):
+                    if match(t):
+                        fn.remove_user_address_tag(addr, t)
+                        removed.append({"type": t.type.name, "data": t.data, "scope": "address"})
+                        targets.append({"scope": "address", "address": hex(addr), "id": str(t.id)})
+        for t in list(bv.get_tags_at(addr, auto=False)):
+            if match(t):
+                bv.remove_user_data_tag(addr, t)
+                removed.append({"type": t.type.name, "data": t.data, "scope": "data"})
+                targets.append({"scope": "data", "address": hex(addr), "id": str(t.id)})
+    elif tag_id:
+        # id-only: search every scope. bv.get_tags() only covers view-level
+        # DATA tags -- it never surfaces a function's ADDRESS-scope tags
+        # (fn.tags), so those need their own sweep, mirroring
+        # read_tags._collect_tags's address-tag sweep exactly. Track removed
+        # ids so a tag id that (in principle) turns up more than once across
+        # sweeps isn't double-removed/double-counted.
+        removed_ids: set[str] = set()
+        for addr, t in list(bv.get_tags(auto=False)):
+            if str(t.id) == str(tag_id) and str(t.id) not in removed_ids:
+                bv.remove_user_data_tag(addr, t)
+                removed.append({"type": t.type.name, "data": t.data, "scope": "data"})
+                targets.append({"scope": "data", "address": hex(addr), "id": str(t.id)})
+                removed_ids.add(str(t.id))
+        for fn in list(bv.functions):
+            for t in list(fn.get_function_tags(auto=False)):
+                if str(t.id) == str(tag_id) and str(t.id) not in removed_ids:
+                    fn.remove_user_function_tag(t)
+                    removed.append({"type": t.type.name, "data": t.data, "scope": "function"})
+                    targets.append({"scope": "function", "function": fn.name, "id": str(t.id)})
+                    removed_ids.add(str(t.id))
+            for _arch, addr, t in list(fn.tags):
+                if str(t.id) == str(tag_id) and str(t.id) not in removed_ids:
+                    fn.remove_user_address_tag(addr, t)
+                    removed.append({"type": t.type.name, "data": t.data, "scope": "address"})
+                    targets.append({"scope": "address", "address": hex(addr), "id": str(t.id)})
+                    removed_ids.add(str(t.id))
+    else:
+        raise OperationFailure(
+            "invalid_request",
+            "tag remove needs --id, an address, or --function.",
+            requested=requested,
+        )
+
+    return {"op": "tag_remove", "removed": len(removed), "removed_tags": removed,
+            "targets": targets, "requested": requested,
+            "message": f"Removed {len(removed)} tag(s)."}
+
+
+def _op_tag_type_create(ctx, bv, op: dict[str, Any]):
+    name = str(op["name"])
+    icon = str(op["icon"])
+    requested = _operation_requested(ctx, op)
+    existed = bv.get_tag_type(name) is not None
+    bv.create_tag_type(name, icon)  # BN no-ops on an existing name
+    return {"op": "tag_type_create", "name": name, "icon": icon,
+            "existed": existed, "requested": requested,
+            "message": (f"Tag type {name!r} already exists." if existed
+                        else f"Created tag type {name!r}.")}
+
+
+def _op_tag_type_remove(ctx, bv, op: dict[str, Any]):
+    name = str(op["name"])
+    requested = _operation_requested(ctx, op)
+    if name in _BUILTIN_TAG_TYPE_NAMES:
+        raise OperationFailure(
+            "invalid_request",
+            f"Refusing to remove built-in tag type {name!r}. Only custom tag "
+            "types can be removed.",
+            requested=requested,
+        )
+    existed = bv.get_tag_type(name) is not None
+    if existed:
+        bv.remove_tag_type(name)
+    return {"op": "tag_type_remove", "name": name, "existed": existed,
+            "requested": requested,
+            "message": (f"Removed tag type {name!r}." if existed
+                        else f"Tag type {name!r} does not exist.")}
+
+
 def _op_delete_comment(ctx, bv, op: dict[str, Any]):
     if op.get("function") and op.get("address"):
         raise OperationFailure(
@@ -1727,12 +2083,13 @@ def _op_delete_comment(ctx, bv, op: dict[str, Any]):
         )
     if op.get("function"):
         fn = ctx._find_function(bv, op["function"])
-        before_comment = bv.get_comment_at(fn.start) or ""
+        before_comment = str(getattr(fn, "comment", "") or "")
         if before_comment:
-            bv.set_comment_at(fn.start, None)
+            fn.comment = ""
         return {
             "op": "delete_comment",
-            "address": hex(fn.start),
+            "scope": "function_doc",
+            "address": hex(int(fn.start)),
             "function": fn.name,
             "before_comment": before_comment,
             "requested": _operation_requested(ctx, op),

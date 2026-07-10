@@ -376,16 +376,23 @@ def _render_field_xrefs_text(value: Any) -> str:
 def _render_comment_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    # `comment get --function` aggregates all in-function comments as a list (#203).
+    # `comment get --function` aggregates all in-function comments as a list (#203),
+    # and, alongside them, the whole-function documentation (`fn.comment`) as
+    # `function_doc` -- surfaced above the address comments so the two stores read
+    # as one coherent view instead of the doc silently going missing from `get`.
     comments = value.get("comments")
     if isinstance(comments, list):
-        if not comments:
+        lines = []
+        doc = value.get("function_doc")
+        if doc:
+            lines.append(f"[doc] {doc}")
+        if not comments and not doc:
             return "(no comment)"
-        return "\n".join(
+        lines.extend(
             f"{c.get('address', '?')}  {c.get('comment', '')}"
-            for c in comments
-            if isinstance(c, dict)
+            for c in comments if isinstance(c, dict)
         )
+        return "\n".join(lines)
     comment = value.get("comment")
     if isinstance(comment, str):
         return comment if comment else "(no comment)"
@@ -411,6 +418,50 @@ def _render_comment_list_text(value: Any) -> str:
         comment = item.get("comment", "")
         lines.append(f"{address}  {func}  {comment}")
     return "\n".join(lines)
+
+
+def _render_tag_types_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    types = value.get("tag_types")
+    if not isinstance(types, list) or not types:
+        return "none"
+    lines = []
+    for t in types:
+        if not isinstance(t, dict):
+            lines.append(_render_fallback_text(t))
+            continue
+        builtin = "  [builtin]" if t.get("is_builtin") else ""
+        lines.append(f"{t.get('icon', '')}  {t.get('name', '<unknown>')}{builtin}")
+    return "\n".join(lines)
+
+
+def _render_tag_get_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    tags = value.get("tags")
+    if not isinstance(tags, list) or not tags:
+        return "(no tags)"
+    return "\n".join(_render_tag_row(t) for t in tags if isinstance(t, dict))
+
+
+def _render_tag_row(t: dict) -> str:
+    # A function-scope tag has no address; show the function name it belongs to
+    # instead of a bare placeholder. The JSON already carries `function`, so the
+    # text renderer just surfaces it (address scope keeps the address, which is
+    # the more precise locator when both are present).
+    loc = t.get("address") or t.get("function") or "<function>"
+    return f"{loc}  [{t.get('scope', '?')}]  {t.get('icon', '')} {t.get('type', '')}  {t.get('data', '')}"
+
+
+def _render_tag_list_text(value: Any) -> str:
+    if isinstance(value, dict) and "items" in value:
+        return _render_paged_list_text(value, "items", _render_tag_list_text)
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "none"
+    return "\n".join(_render_tag_row(t) for t in value if isinstance(t, dict))
 
 
 def _render_refresh_text(value: Any) -> str:

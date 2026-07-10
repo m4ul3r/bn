@@ -288,6 +288,100 @@ def test_get_comment_function_aggregates_body_comments(monkeypatch):
     ]
 
 
+def test_set_comment_function_targets_fn_comment_not_address(monkeypatch):
+    """`comment set --function` writes BN's real whole-function documentation
+    property (fn.comment), NOT an address comment at the function's entry --
+    the two are different stores (function-doc vs. address comment) and this
+    is the deliberate repurposing of the --function locator (Task 8)."""
+    bridge = _load_bridge(monkeypatch)
+    mutation_engine = bridge.mutation_engine
+
+    fn = _FakeFunction(0x1000, "sub_1000")
+    fn.basic_blocks = [_FakeBasicBlock(0x1000, 0x1040)]
+    fn.comment = ""
+    bv = _FakeCommentMutationBV()
+    bv.functions = [fn]
+
+    class _C:
+        def _resolve_view(self, s): return bv
+        def _find_function(self, b, ident): return fn
+
+    op = {"op": "set_comment", "function": "sub_1000", "comment": "documents the parser"}
+    result = mutation_engine._op_set_comment(_C(), bv, op)
+    assert fn.comment == "documents the parser"
+    # the address store at the entry must NOT be touched
+    assert bv.get_comment_at(0x1000) == ""
+    assert result.get("scope") == "function_doc"
+
+    verified = mutation_engine._verify_set_comment(_C(), bv, result)
+    assert verified["status"] == "verified"
+
+
+def test_delete_comment_function_clears_fn_comment(monkeypatch):
+    """`comment delete --function` clears fn.comment (sets it to ""), the same
+    function-doc store `comment set --function` now writes -- and leaves the
+    address-comment store at the function's entry untouched (Task 8). Seeding a
+    distinct address comment at fn.start before the delete is what gives this
+    test teeth: without it, a regression that dropped the `scope` key would fall
+    through _verify_delete_comment's ADDRESS branch, read get_comment_at(fn.start)
+    (also "" in that case), and still report "verified"."""
+    bridge = _load_bridge(monkeypatch)
+    mutation_engine = bridge.mutation_engine
+
+    fn = _FakeFunction(0x1000, "sub_1000")
+    fn.comment = "old doc"
+    bv = _FakeCommentMutationBV()
+    bv.functions = [fn]
+    # seed the address-comment store at the entry with a distinct value so a
+    # wrong-store delete (or misclassified verify) would be caught.
+    bv.set_comment_at(fn.start, "entry note")
+
+    class _C:
+        def _resolve_view(self, s): return bv
+        def _find_function(self, b, ident): return fn
+
+    op = {"op": "delete_comment", "function": "sub_1000"}
+    result = mutation_engine._op_delete_comment(_C(), bv, op)
+    assert fn.comment == ""
+    # the address store at the entry must NOT be touched
+    assert bv.get_comment_at(fn.start) == "entry note"
+    assert result.get("scope") == "function_doc"
+
+    verified = mutation_engine._verify_delete_comment(_C(), bv, result)
+    assert verified["status"] == "verified"
+
+
+def test_preview_set_comment_function_doc_shows_diff(monkeypatch):
+    """`comment set --function --preview` writes fn.comment (function-doc,
+    Task 8's repurposing of --function), a store the metadata-diff snapshot
+    machinery never captured -- so the preview reported changed:false and an
+    empty diff even though apply/verify/revert all landed correctly (final
+    review Fix 1). The function_doc field in the snapshot must flip `changed`
+    and render a before/after doc line, same as the existing comment/local
+    handling in _format_metadata_change / _diff_snapshots (#121 pattern)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(bridge.il_format, "_function_text", lambda bv, fn, view="hlil": "return 7;")
+
+    fn = _FakeFunction(0x1000, "sub_1000")
+    fn.basic_blocks = [_FakeBasicBlock(0x1000, 0x1040)]
+    fn.comment = ""
+    bv = _FakeCommentMutationBV()
+    bv.functions = [fn]
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._mutation(
+        "active", True,
+        [{"op": "set_comment", "function": "sub_1000", "comment": "documents the parser"}],
+    )
+
+    assert result["success"] is True
+    diffs = result["affected_functions"]
+    assert len(diffs) == 1
+    assert diffs[0]["changed"] is True
+    assert "documents the parser" in diffs[0]["diff"]
+
+
 def test_op_set_comment_rejects_both_locators(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -357,3 +451,21 @@ def test_bind_list_comments_tolerates_none_limit(monkeypatch):
     res2 = bridge._bind_list_comments(instance, {"query": None, "offset": 0, "limit": 1}, "active")
     assert res2["returned"] == 1
     assert res2["has_more"] is True
+
+
+def test_get_comment_function_includes_function_doc_and_address_comments():
+    fn = _FakeFunction(0x1000, "sub_1000")
+    fn.basic_blocks = [_FakeBasicBlock(0x1000, 0x1040)]
+    fn.comment = "top-level doc"
+    bv = _FakeBV(functions=[fn], comments={0x1010: "note at a call"})
+    fn.view = bv
+
+    class _C:
+        def _resolve_view(self, s): return bv
+        def _find_function(self, b, ident): return fn
+
+    from bn_agent_bridge import create_comments
+    result = create_comments._get_comment(_C(), None, None, "sub_1000")
+    assert result["function_doc"] == "top-level doc"
+    assert result["has_function_doc"] is True
+    assert [c["comment"] for c in result["comments"]] == ["note at a call"]
