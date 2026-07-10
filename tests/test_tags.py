@@ -95,3 +95,31 @@ def test_get_tags_data_scope_outside_any_function():
     result = read_tags._get_tags(_CtxFn(bv), None, "0x9000", None)
     datas = {(t["type"], t["data"], t["scope"], t["function"]) for t in result["tags"]}
     assert ("Bugs", "data tag", "data", None) in datas
+
+
+def test_list_tags_all_scopes_deduped_and_paged():
+    bv, fn = _bv_with_tagged_fn()  # 1 function tag, 1 address tag, 1 data tag
+    result = read_tags._list_tags(_CtxFn(bv), None)
+    scopes = sorted(t["scope"] for t in result["items"])
+    assert scopes == ["address", "data", "function"]
+    assert result["total"] == 3
+    assert result["kind"] == "tags"
+
+
+def test_list_tags_filter_by_type():
+    bv, fn = _bv_with_tagged_fn()
+    result = read_tags._list_tags(_CtxFn(bv), None, type="Important")
+    assert [t["type"] for t in result["items"]] == ["Important"]
+
+
+def test_list_tags_data_only():
+    bv, fn = _bv_with_tagged_fn()
+    result = read_tags._list_tags(_CtxFn(bv), None, data_only=True)
+    assert all(t["scope"] == "data" for t in result["items"])
+    assert result["total"] == 1
+
+
+def test_list_tags_query_substring_on_data():
+    bv, fn = _bv_with_tagged_fn()
+    result = read_tags._list_tags(_CtxFn(bv), None, query="whole")
+    assert [t["data"] for t in result["items"]] == ["whole fn"]

@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 
 from ..cli import _call, _pick, arg, command, preview_arg, summary_arg
-from ..formatters import _render_tag_get_text, _render_tag_types_text
+from ..formatters import _render_tag_get_text, _render_tag_list_text, _render_tag_types_text
 from ..transport import BridgeError
 
 
@@ -53,4 +53,34 @@ def _tag_get(args: argparse.Namespace) -> int:
         require_target=True,
         text_renderer=_render_tag_get_text,
         stem="tag-get",
+    )
+
+
+@command("tag", "list", help="List tags (all scopes, filterable)", target=True, paged=True,
+         args=[
+             arg("--function", default=None, help="Only tags belonging to this function"),
+             arg("--address", default=None, help="Only tags at this address"),
+             arg("--type", default=None, help="Filter by tag type name"),
+             arg("--data", dest="data_only", action="store_true",
+                 help="Only data-scope tags (not function/address tags)"),
+             arg("--query", default=None, help="Filter by substring of the tag data"),
+         ])
+def _tag_list(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "list_tags",
+        {
+            "function": args.function,
+            "address": args.address,
+            "type": args.type,
+            "data_only": bool(args.data_only),
+            "query": args.query,
+            "offset": args.offset,
+            "limit": args.limit,
+        },
+        require_target=True,
+        text_renderer=_render_tag_list_text,
+        paged_spill=True,
+        page_label="tags",
+        stem="tags",
     )

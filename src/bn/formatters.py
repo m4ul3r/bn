@@ -443,6 +443,16 @@ def _render_tag_row(t: dict) -> str:
     return f"{addr}  [{t.get('scope', '?')}]  {t.get('icon', '')} {t.get('type', '')}  {t.get('data', '')}"
 
 
+def _render_tag_list_text(value: Any) -> str:
+    if isinstance(value, dict) and "items" in value:
+        return _render_paged_list_text(value, "items", _render_tag_list_text)
+    if not isinstance(value, list):
+        return _render_fallback_text(value)
+    if not value:
+        return "none"
+    return "\n".join(_render_tag_row(t) for t in value if isinstance(t, dict))
+
+
 def _render_refresh_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)

@@ -2145,6 +2145,9 @@ class BinaryNinjaBridge:
     def _get_tags(self, *a, **k):
         return read_tags._get_tags(self.ctx, *a, **k)
 
+    def _list_tags(self, *a, **k):
+        return read_tags._list_tags(self.ctx, *a, **k)
+
     def _bundle_function(self, selector: str | None, identifier, out_path: str | None):
         bv = self._resolve_view(selector)
         func = self._find_function(bv, identifier)
@@ -2911,6 +2914,20 @@ def _bind_list_tag_types(bridge, params, target):
 @op("get_tags", lock="read")
 def _bind_get_tags(bridge, params, target):
     return bridge._get_tags(target, params.get("address"), params.get("function"))
+
+
+@op("list_tags", lock="read")
+def _bind_list_tags(bridge, params, target):
+    return bridge._list_tags(
+        target,
+        function=params.get("function"),
+        address=params.get("address"),
+        type=params.get("type"),
+        data_only=bool(params.get("data_only")),
+        query=params.get("query"),
+        offset=int(params.get("offset", 0)),
+        limit=int(params["limit"]) if params.get("limit") is not None else None,
+    )
 
 
 @op("set_comment", lock="write")

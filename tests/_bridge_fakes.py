@@ -174,6 +174,19 @@ class _FakeFunction:
     def get_tags_at(self, addr, arch=None, auto=None):
         return list(self._address_tags.get(int(addr), []))
 
+    @property
+    def tags(self):
+        # Mirrors real BN Function.tags: a TagList of (arch, addr, Tag) for every
+        # address tag on the function (NOT function tags) -- verified against a
+        # live BN install (function.py TagList / get_tags_at), which is the
+        # supported way to sweep all of a function's address tags without
+        # already knowing which addresses carry one.
+        out = []
+        for addr, bucket in self._address_tags.items():
+            for tag in bucket:
+                out.append((self.arch, addr, tag))
+        return out
+
     def remove_user_function_tag(self, tag):
         self._function_tags = [t for t in self._function_tags if t.id != tag.id]
 

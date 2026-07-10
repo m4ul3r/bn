@@ -9,7 +9,9 @@ from __future__ import annotations
 from typing import Any
 
 from . import read_misc
-from ._shared import _BUILTIN_TAG_TYPE_NAMES, _parse_address, _require_mapped_address
+from ._shared import (
+    _BUILTIN_TAG_TYPE_NAMES, _parse_address, _require_mapped_address, _validate_count,
+)
 
 
 def _tag_type_entry(tt) -> dict[str, Any]:
@@ -74,3 +76,70 @@ def _get_tags(ctx, selector: str | None, address, function) -> dict[str, Any]:
     if not tags:
         _require_mapped_address(bv, addr)
     return {"address": hex(addr), "tags": tags, "count": len(tags)}
+
+
+def _collect_tags(ctx, bv, *, function, address, data_only) -> list[dict[str, Any]]:
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+
+    def push(entry: dict[str, Any]) -> None:
+        if entry["id"] in seen:
+            return
+        seen.add(entry["id"])
+        out.append(entry)
+
+    if function is not None:
+        fn = ctx._find_function(bv, function)
+        for t in fn.get_function_tags(auto=False):
+            push(_tag_entry(t, scope="function", address=None, function=fn.name))
+        # Function.tags is BN's own "all address tags on this function" sweep
+        # (verified live: function.py TagList / get_tags_at) -- NOT
+        # bv.get_tags(), which surfaces only view-level DATA tags (see below).
+        for _arch, addr, t in fn.tags:
+            push(_tag_entry(t, scope="address", address=addr, function=fn.name))
+        return out
+
+    if address is not None:
+        addr = _parse_address(address)
+        funcs = bv.get_functions_containing(addr)
+        fname = funcs[0].name if funcs else None
+        for fn in funcs:
+            for t in fn.get_tags_at(addr, auto=False):
+                push(_tag_entry(t, scope="address", address=addr, function=fn.name))
+        for t in bv.get_tags_at(addr, auto=False):
+            push(_tag_entry(t, scope="data", address=addr, function=fname))
+        return out
+
+    # whole view: bv.get_tags(auto=False) is BN's DATA tag sweep (never
+    # function-scoped address tags, verified live), so every entry it yields is
+    # scope="data" -- attributed to a containing function (if any) for context,
+    # matching _get_tags's convention, but not reclassified as "address".
+    for addr, t in bv.get_tags(auto=False):
+        funcs = bv.get_functions_containing(addr)
+        fname = funcs[0].name if funcs else None
+        push(_tag_entry(t, scope="data", address=addr, function=fname))
+    if not data_only:
+        for fn in list(bv.functions):
+            for t in fn.get_function_tags(auto=False):
+                push(_tag_entry(t, scope="function", address=None, function=fn.name))
+            for _arch, addr, t in fn.tags:
+                push(_tag_entry(t, scope="address", address=addr, function=fn.name))
+    return out
+
+
+def _list_tags(ctx, selector: str | None, *, function=None, address=None,
+               type=None, data_only: bool = False, query=None,
+               offset: int = 0, limit: int | None = None) -> dict[str, Any]:
+    offset = _validate_count(offset, label="offset", minimum=0)
+    limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
+    bv = ctx._resolve_view(selector)
+    items = _collect_tags(ctx, bv, function=function, address=address, data_only=data_only)
+    if data_only:
+        items = [t for t in items if t["scope"] == "data"]
+    if type is not None:
+        items = [t for t in items if t["type"] == type]
+    if query:
+        needle = query.lower()
+        items = [t for t in items if needle in t["data"].lower()]
+    items.sort(key=lambda t: (t["address"] or "", t["scope"], t["type"]))
+    return read_misc._paged_list_result(items, offset=offset, limit=limit, kind="tags")
