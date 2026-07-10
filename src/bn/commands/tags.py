@@ -118,3 +118,40 @@ def _tag_add(args: argparse.Namespace) -> int:
         preview=bool(args.preview),
         stem="tag-add",
     )
+
+
+@command("tag", "remove", help="Remove tag(s) by id, or by type at a location", target=True, fmt="json",
+         args=[
+             preview_arg(), summary_arg(),
+             arg("address", nargs="?", help="Address to remove tags at (hex 0x.. or decimal)"),
+             arg("--address", dest="address_flag", default=None, help="Address alias for the positional"),
+             arg("--function", default=None, help="Remove whole-function tags of this function"),
+             arg("--id", dest="tag_id", default=None, help="Remove exactly this tag id (from `tag list`)"),
+             arg("--type", default=None, help="Tag type name to match"),
+             arg("--data", dest="data_match", default=None, help="Only remove tags whose data equals this"),
+             arg("--data-scope", dest="force_data", action="store_true",
+                 help="Only remove data-scope tags at the address (skip function/address tags)"),
+         ])
+def _tag_remove(args: argparse.Namespace) -> int:
+    """Remove tag(s) by id, or by type at a location.
+
+    Examples:
+        bn tag remove --id 0123abcd-...
+        bn tag remove 0x1000 --type Important
+        bn tag remove --function sub_1000 --type Important --data "doc"
+    """
+    address = _pick(args.address, args.address_flag, "tag address", required=False)
+    if args.tag_id is None and args.type is None:
+        raise BridgeError("tag remove needs --id, or --type with a location (address or --function)")
+    if args.tag_id is None and address is None and args.function is None:
+        raise BridgeError("tag remove by --type needs an address or --function")
+    if address is not None and args.function is not None:
+        raise BridgeError("tag remove takes an address or --function, not both")
+    return _mutate(
+        args,
+        "tag_remove",
+        {"tag_id": args.tag_id, "type": args.type, "data": args.data_match,
+         "address": address, "function": args.function, "force_data": bool(args.force_data)},
+        preview=bool(args.preview),
+        stem="tag-remove",
+    )

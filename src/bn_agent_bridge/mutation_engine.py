@@ -62,6 +62,7 @@ REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "types_declare": ("declaration",),
     "function_create": ("address",),
     "tag_add": ("type",),
+    "tag_remove": (),
 }
 
 # Ops that accept one of several alternative locator fields. set_comment /
@@ -72,6 +73,7 @@ REQUIRED_ONE_OF: dict[str, tuple[tuple[str, ...], ...]] = {
     "set_comment": (("function", "address"),),
     "delete_comment": (("function", "address"),),
     "tag_add": (("function", "address"),),
+    "tag_remove": (("tag_id", "address", "function"),),
 }
 
 # Fields restricted to a fixed value set, mirroring an interactive command's
@@ -117,7 +119,7 @@ _VAR_DRIFT_OPS = {"local_rename", "local_retype", "set_prototype"}
 _BATCH_OP_NAMES = (
     "rename_symbol", "set_comment", "delete_comment", "set_prototype",
     "local_rename", "local_retype", "struct_field_set", "struct_field_rename",
-    "struct_field_delete", "types_declare", "function_create", "tag_add",
+    "struct_field_delete", "types_declare", "function_create", "tag_add", "tag_remove",
 )
 
 
@@ -740,6 +742,8 @@ def _verify_operation(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
             return _verify_function_create(ctx, bv, result)
         if op == "tag_add":
             return _verify_tag_add(ctx, bv, result)
+        if op == "tag_remove":
+            return _verify_tag_remove(ctx, bv, result)
         raise OperationFailure("unsupported", f"Unsupported verification path: {op}", requested=result.get("requested"))
     except OperationFailure as exc:
         item = dict(result)
@@ -833,6 +837,37 @@ def _verify_tag_add(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
         raise OperationFailure(
             "verification_failed",
             f"Tag {type_name!r} not found after add ({scope} scope).",
+            requested=item.get("requested"), observed=item["observed"],
+        )
+    item["status"] = "verified"
+    return item
+
+
+def _verify_tag_remove(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
+    item = dict(result)
+    if not item.get("targets"):
+        item["status"] = "noop"
+        item["observed"] = {"removed": 0}
+        return item
+    still_present = []
+    for tgt in item["targets"]:
+        if tgt["scope"] == "function":
+            fn = ctx._find_function(bv, tgt["function"])
+            ids = {str(t.id) for t in fn.get_function_tags(auto=False)}
+        elif tgt["scope"] == "data":
+            ids = {str(t.id) for t in bv.get_tags_at(_parse_address(tgt["address"]), auto=False)}
+        else:
+            addr = _parse_address(tgt["address"])
+            ids = set()
+            for fn in bv.get_functions_containing(addr):
+                ids |= {str(t.id) for t in fn.get_tags_at(addr, auto=False)}
+        if tgt["id"] in ids:
+            still_present.append(tgt["id"])
+    item["observed"] = {"still_present": still_present}
+    if still_present:
+        raise OperationFailure(
+            "verification_failed",
+            f"{len(still_present)} tag(s) still present after remove.",
             requested=item.get("requested"), observed=item["observed"],
         )
     item["status"] = "verified"
@@ -1319,6 +1354,8 @@ def _apply_operation(ctx, bv, op: dict[str, Any], restores: list | None = None):
             return _op_function_create(ctx, bv, op, restores)
         if kind == "tag_add":
             return _op_tag_add(ctx, bv, op)
+        if kind == "tag_remove":
+            return _op_tag_remove(ctx, bv, op)
         # The batch op names are a different namespace than the CLI verbs
         # (`bn proto set` -> op `set_prototype`); an agent reusing the CLI verb
         # gets a bare "unsupported" and silently wastes a batch. Suggest the
@@ -1802,6 +1839,80 @@ def _op_tag_add(ctx, bv, op: dict[str, Any]):
             "address": hex(addr), "function": fn.name, "tag_id": str(tag.id),
             "message": f"Added tag {type_name!r} at {hex(addr)} in {fn.name}.",
             "requested": requested}
+
+
+def _tag_matches(tag, type_name, data) -> bool:
+    if type_name is not None and tag.type.name != type_name:
+        return False
+    if data is not None and tag.data != data:
+        return False
+    return True
+
+
+def _op_tag_remove(ctx, bv, op: dict[str, Any]):
+    tag_id = op.get("tag_id")
+    type_name = op.get("type")
+    data = op.get("data")
+    requested = _operation_requested(ctx, op)
+    if not tag_id and not type_name:
+        raise OperationFailure(
+            "invalid_request",
+            "tag remove needs --id, or a location plus --type.",
+            requested=requested,
+        )
+    removed: list[dict[str, Any]] = []
+    targets: list[dict[str, Any]] = []  # for verification: (scope, address, id)
+
+    def match(tag) -> bool:
+        if tag_id:
+            return str(tag.id) == str(tag_id)
+        return _tag_matches(tag, type_name, data)
+
+    if op.get("function"):
+        fn = ctx._find_function(bv, op["function"])
+        for t in list(fn.get_function_tags(auto=False)):
+            if match(t):
+                fn.remove_user_function_tag(t)
+                removed.append({"type": t.type.name, "data": t.data, "scope": "function"})
+                targets.append({"scope": "function", "function": fn.name, "id": str(t.id)})
+    elif op.get("address") is not None:
+        addr = _parse_address(op["address"])
+        force_data = bool(op.get("force_data"))
+        if not force_data:
+            for fn in bv.get_functions_containing(addr):
+                for t in list(fn.get_tags_at(addr, auto=False)):
+                    if match(t):
+                        fn.remove_user_address_tag(addr, t)
+                        removed.append({"type": t.type.name, "data": t.data, "scope": "address"})
+                        targets.append({"scope": "address", "address": hex(addr), "id": str(t.id)})
+        for t in list(bv.get_tags_at(addr, auto=False)):
+            if match(t):
+                bv.remove_user_data_tag(addr, t)
+                removed.append({"type": t.type.name, "data": t.data, "scope": "data"})
+                targets.append({"scope": "data", "address": hex(addr), "id": str(t.id)})
+    elif tag_id:
+        # id-only: search every scope
+        for addr, t in list(bv.get_tags(auto=False)):
+            if str(t.id) == str(tag_id):
+                bv.remove_user_data_tag(addr, t)
+                removed.append({"type": t.type.name, "data": t.data, "scope": "data"})
+                targets.append({"scope": "data", "address": hex(addr), "id": str(t.id)})
+        for fn in list(bv.functions):
+            for t in list(fn.get_function_tags(auto=False)):
+                if str(t.id) == str(tag_id):
+                    fn.remove_user_function_tag(t)
+                    removed.append({"type": t.type.name, "data": t.data, "scope": "function"})
+                    targets.append({"scope": "function", "function": fn.name, "id": str(t.id)})
+    else:
+        raise OperationFailure(
+            "invalid_request",
+            "tag remove needs --id, an address, or --function.",
+            requested=requested,
+        )
+
+    return {"op": "tag_remove", "removed": len(removed), "removed_tags": removed,
+            "targets": targets, "requested": requested,
+            "message": f"Removed {len(removed)} tag(s)."}
 
 
 def _op_delete_comment(ctx, bv, op: dict[str, Any]):

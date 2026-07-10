@@ -249,3 +249,56 @@ def test_verify_tag_add_raises_verification_failed_when_tag_missing():
     with pytest.raises(OperationFailure) as exc:
         mutation_engine._verify_tag_add(_CtxMut(bv), bv, result)
     assert exc.value.status == "verification_failed"
+
+
+def test_op_tag_remove_by_type_at_address():
+    bv, fn = _mut_bv_with_fn()
+    fn.add_tag("Important", "x", 0x1010)
+    op = {"op": "tag_remove", "type": "Important", "address": "0x1010"}
+    result = mutation_engine._op_tag_remove(_CtxMut(bv), bv, op)
+    assert result["removed"] == 1
+    assert fn.get_tags_at(0x1010) == []
+
+
+def test_op_tag_remove_by_id():
+    bv, fn = _mut_bv_with_fn()
+    tag = fn.add_tag("Important", "x", None)
+    op = {"op": "tag_remove", "tag_id": tag.id}
+    result = mutation_engine._op_tag_remove(_CtxMut(bv), bv, op)
+    assert result["removed"] == 1
+    assert fn.get_function_tags() == []
+
+
+def test_op_tag_remove_no_match_is_noop_shaped():
+    bv, fn = _mut_bv_with_fn()
+    op = {"op": "tag_remove", "type": "Important", "address": "0x1010"}
+    result = mutation_engine._op_tag_remove(_CtxMut(bv), bv, op)
+    assert result["removed"] == 0
+
+
+def test_verify_tag_remove_noop_when_nothing_removed():
+    bv, fn = _mut_bv_with_fn()
+    result = {"op": "tag_remove", "removed": 0, "removed_tags": [],
+              "requested": {}, "targets": []}
+    verified = mutation_engine._verify_tag_remove(_CtxMut(bv), bv, result)
+    assert verified["status"] == "noop"
+
+
+def test_op_tag_remove_filters_by_data():
+    bv, fn = _mut_bv_with_fn()
+    fn.add_tag("Important", "keep", 0x1010)
+    fn.add_tag("Important", "drop", 0x1010)
+    op = {"op": "tag_remove", "type": "Important", "data": "drop", "address": "0x1010"}
+    result = mutation_engine._op_tag_remove(_CtxMut(bv), bv, op)
+    assert result["removed"] == 1
+    assert [t.data for t in fn.get_tags_at(0x1010)] == ["keep"]
+
+
+def test_verify_tag_remove_success_when_tag_gone():
+    bv, fn = _mut_bv_with_fn()
+    fn.add_tag("Important", "x", 0x1010)
+    op = {"op": "tag_remove", "type": "Important", "address": "0x1010"}
+    result = mutation_engine._op_tag_remove(_CtxMut(bv), bv, op)
+    verified = mutation_engine._verify_tag_remove(_CtxMut(bv), bv, result)
+    assert verified["status"] == "verified"
+    assert verified["observed"] == {"still_present": []}
