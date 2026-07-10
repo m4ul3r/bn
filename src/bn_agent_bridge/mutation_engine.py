@@ -806,14 +806,19 @@ def _verify_rename_symbol(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
 
 def _verify_set_comment(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     item = dict(result)
-    address = _parse_address(item["address"])
     expected = str(item["requested"]["comment"])
-    observed = bv.get_comment_at(address) or ""
-    item["observed"] = {"address": item["address"], "comment": observed}
+    if item.get("scope") == "function_doc":
+        fn = ctx._find_function(bv, item["function"])
+        observed = str(getattr(fn, "comment", "") or "")
+        item["observed"] = {"function": item["function"], "comment": observed}
+    else:
+        address = _parse_address(item["address"])
+        observed = bv.get_comment_at(address) or ""
+        item["observed"] = {"address": item["address"], "comment": observed}
     if observed != expected:
         raise OperationFailure(
             "verification_failed",
-            f"Live comment verification failed at {item['address']}",
+            f"Live comment verification failed for {item.get('function') or item['address']}",
             requested=item.get("requested"),
             observed=item["observed"],
         )
@@ -914,13 +919,18 @@ def _verify_tag_type_remove(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
 
 def _verify_delete_comment(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     item = dict(result)
-    address = _parse_address(item["address"])
-    observed = bv.get_comment_at(address) or ""
-    item["observed"] = {"address": item["address"], "comment": observed}
+    if item.get("scope") == "function_doc":
+        fn = ctx._find_function(bv, item["function"])
+        observed = str(getattr(fn, "comment", "") or "")
+        item["observed"] = {"function": item["function"], "comment": observed}
+    else:
+        address = _parse_address(item["address"])
+        observed = bv.get_comment_at(address) or ""
+        item["observed"] = {"address": item["address"], "comment": observed}
     if observed:
         raise OperationFailure(
             "verification_failed",
-            f"Live comment deletion verification failed at {item['address']}",
+            f"Live comment deletion verification failed for {item.get('function') or item['address']}",
             requested=item.get("requested"),
             observed=item["observed"],
         )
@@ -1809,12 +1819,13 @@ def _op_set_comment(ctx, bv, op: dict[str, Any]):
         )
     if op.get("function"):
         fn = ctx._find_function(bv, op["function"])
-        before_comment = bv.get_comment_at(fn.start) or ""
+        before_comment = str(getattr(fn, "comment", "") or "")
         if before_comment != comment:
-            bv.set_comment_at(fn.start, comment)
+            fn.comment = comment
         return {
             "op": "set_comment",
-            "address": hex(fn.start),
+            "scope": "function_doc",
+            "address": hex(int(fn.start)),
             "function": fn.name,
             "before_comment": before_comment,
             "requested": _operation_requested(ctx, op),
@@ -2011,12 +2022,13 @@ def _op_delete_comment(ctx, bv, op: dict[str, Any]):
         )
     if op.get("function"):
         fn = ctx._find_function(bv, op["function"])
-        before_comment = bv.get_comment_at(fn.start) or ""
+        before_comment = str(getattr(fn, "comment", "") or "")
         if before_comment:
-            bv.set_comment_at(fn.start, None)
+            fn.comment = ""
         return {
             "op": "delete_comment",
-            "address": hex(fn.start),
+            "scope": "function_doc",
+            "address": hex(int(fn.start)),
             "function": fn.name,
             "before_comment": before_comment,
             "requested": _operation_requested(ctx, op),

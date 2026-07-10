@@ -152,6 +152,9 @@ class _FakeFunction:
         self.view = None
         self._function_tags: list[_FakeTag] = []
         self._address_tags: dict[int, list[_FakeTag]] = {}
+        # BN's real whole-function documentation property (Function.comment),
+        # DISTINCT from an address comment. `comment --function` targets this.
+        self.comment = ""
 
     def reanalyze(self, *args, **kwargs):
         self.reanalyzed = True

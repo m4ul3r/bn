@@ -288,6 +288,57 @@ def test_get_comment_function_aggregates_body_comments(monkeypatch):
     ]
 
 
+def test_set_comment_function_targets_fn_comment_not_address(monkeypatch):
+    """`comment set --function` writes BN's real whole-function documentation
+    property (fn.comment), NOT an address comment at the function's entry --
+    the two are different stores (function-doc vs. address comment) and this
+    is the deliberate repurposing of the --function locator (Task 8)."""
+    bridge = _load_bridge(monkeypatch)
+    mutation_engine = bridge.mutation_engine
+
+    fn = _FakeFunction(0x1000, "sub_1000")
+    fn.basic_blocks = [_FakeBasicBlock(0x1000, 0x1040)]
+    fn.comment = ""
+    bv = _FakeCommentMutationBV()
+    bv.functions = [fn]
+
+    class _C:
+        def _resolve_view(self, s): return bv
+        def _find_function(self, b, ident): return fn
+
+    op = {"op": "set_comment", "function": "sub_1000", "comment": "documents the parser"}
+    result = mutation_engine._op_set_comment(_C(), bv, op)
+    assert fn.comment == "documents the parser"
+    # the address store at the entry must NOT be touched
+    assert bv.get_comment_at(0x1000) == ""
+    assert result.get("scope") == "function_doc"
+
+    verified = mutation_engine._verify_set_comment(_C(), bv, result)
+    assert verified["status"] == "verified"
+
+
+def test_delete_comment_function_clears_fn_comment(monkeypatch):
+    """`comment delete --function` clears fn.comment (sets it to ""), the same
+    function-doc store `comment set --function` now writes."""
+    bridge = _load_bridge(monkeypatch)
+    mutation_engine = bridge.mutation_engine
+
+    fn = _FakeFunction(0x1000, "sub_1000")
+    fn.comment = "old doc"
+    bv = _FakeCommentMutationBV()
+    bv.functions = [fn]
+
+    class _C:
+        def _resolve_view(self, s): return bv
+        def _find_function(self, b, ident): return fn
+
+    op = {"op": "delete_comment", "function": "sub_1000"}
+    result = mutation_engine._op_delete_comment(_C(), bv, op)
+    assert fn.comment == ""
+    verified = mutation_engine._verify_delete_comment(_C(), bv, result)
+    assert verified["status"] == "verified"
+
+
 def test_op_set_comment_rejects_both_locators(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

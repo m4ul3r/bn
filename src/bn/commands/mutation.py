@@ -75,7 +75,9 @@ def _comment_locator_args() -> list:
         arg("--address", dest="address_flag", default=None,
             help="Address to comment (alias for the positional)"),
         arg("--function", default=None,
-            help="Attach the comment to a function (name or address) instead of an address"),
+            help="Target the function's documentation comment (fn.comment), "
+                 "shown atop the function; NOT an address comment. For an "
+                 "entry-line note use the function's entry address instead."),
     ]
 
 
@@ -107,7 +109,9 @@ def _comment_locator(args: argparse.Namespace, verb: str) -> tuple[str | None, s
              arg("--address", dest="address_flag", default=None,
                  help="Address to comment (alias for the positional)"),
              arg("--function", default=None,
-                 help="Attach the comment to a function (name or address) instead of an address"),
+                 help="Target the function's documentation comment (fn.comment), "
+                      "shown atop the function; NOT an address comment. For an "
+                      "entry-line note use the function's entry address instead."),
          ])
 def _comment_set(args: argparse.Namespace) -> int:
     if getattr(args, "extra", None):
