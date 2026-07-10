@@ -38,6 +38,7 @@ from .bridge_state import _quick_loaded_views
 from ._shared import (
     USER_FACING_ERRORS,
     OperationFailure,
+    _BUILTIN_TAG_TYPE_NAMES,
     _normalize_prototype,
     _parse_address,
     _serialize_error,
@@ -63,6 +64,8 @@ REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "function_create": ("address",),
     "tag_add": ("type",),
     "tag_remove": (),
+    "tag_type_create": ("name", "icon"),
+    "tag_type_remove": ("name",),
 }
 
 # Ops that accept one of several alternative locator fields. set_comment /
@@ -120,6 +123,7 @@ _BATCH_OP_NAMES = (
     "rename_symbol", "set_comment", "delete_comment", "set_prototype",
     "local_rename", "local_retype", "struct_field_set", "struct_field_rename",
     "struct_field_delete", "types_declare", "function_create", "tag_add", "tag_remove",
+    "tag_type_create", "tag_type_remove",
 )
 
 
@@ -744,6 +748,10 @@ def _verify_operation(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
             return _verify_tag_add(ctx, bv, result)
         if op == "tag_remove":
             return _verify_tag_remove(ctx, bv, result)
+        if op == "tag_type_create":
+            return _verify_tag_type_create(ctx, bv, result)
+        if op == "tag_type_remove":
+            return _verify_tag_type_remove(ctx, bv, result)
         raise OperationFailure("unsupported", f"Unsupported verification path: {op}", requested=result.get("requested"))
     except OperationFailure as exc:
         item = dict(result)
@@ -871,6 +879,36 @@ def _verify_tag_remove(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
             requested=item.get("requested"), observed=item["observed"],
         )
     item["status"] = "verified"
+    return item
+
+
+def _verify_tag_type_create(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
+    item = dict(result)
+    name = str(item["name"])
+    tt = bv.get_tag_type(name)
+    item["observed"] = {"present": tt is not None}
+    if tt is None:
+        raise OperationFailure(
+            "verification_failed",
+            f"Tag type {name!r} not present after create.",
+            requested=item.get("requested"), observed=item["observed"],
+        )
+    item["status"] = "noop" if item.get("existed") else "verified"
+    return item
+
+
+def _verify_tag_type_remove(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
+    item = dict(result)
+    name = str(item["name"])
+    tt = bv.get_tag_type(name)
+    item["observed"] = {"present": tt is not None}
+    if tt is not None:
+        raise OperationFailure(
+            "verification_failed",
+            f"Tag type {name!r} still present after remove.",
+            requested=item.get("requested"), observed=item["observed"],
+        )
+    item["status"] = "noop" if not item.get("existed") else "verified"
     return item
 
 
@@ -1356,6 +1394,10 @@ def _apply_operation(ctx, bv, op: dict[str, Any], restores: list | None = None):
             return _op_tag_add(ctx, bv, op)
         if kind == "tag_remove":
             return _op_tag_remove(ctx, bv, op)
+        if kind == "tag_type_create":
+            return _op_tag_type_create(ctx, bv, op)
+        if kind == "tag_type_remove":
+            return _op_tag_type_remove(ctx, bv, op)
         # The batch op names are a different namespace than the CLI verbs
         # (`bn proto set` -> op `set_prototype`); an agent reusing the CLI verb
         # gets a bare "unsupported" and silently wastes a batch. Suggest the
@@ -1927,6 +1969,37 @@ def _op_tag_remove(ctx, bv, op: dict[str, Any]):
     return {"op": "tag_remove", "removed": len(removed), "removed_tags": removed,
             "targets": targets, "requested": requested,
             "message": f"Removed {len(removed)} tag(s)."}
+
+
+def _op_tag_type_create(ctx, bv, op: dict[str, Any]):
+    name = str(op["name"])
+    icon = str(op["icon"])
+    requested = _operation_requested(ctx, op)
+    existed = bv.get_tag_type(name) is not None
+    bv.create_tag_type(name, icon)  # BN no-ops on an existing name
+    return {"op": "tag_type_create", "name": name, "icon": icon,
+            "existed": existed, "requested": requested,
+            "message": (f"Tag type {name!r} already exists." if existed
+                        else f"Created tag type {name!r}.")}
+
+
+def _op_tag_type_remove(ctx, bv, op: dict[str, Any]):
+    name = str(op["name"])
+    requested = _operation_requested(ctx, op)
+    if name in _BUILTIN_TAG_TYPE_NAMES:
+        raise OperationFailure(
+            "invalid_request",
+            f"Refusing to remove built-in tag type {name!r}. Only custom tag "
+            "types can be removed.",
+            requested=requested,
+        )
+    existed = bv.get_tag_type(name) is not None
+    if existed:
+        bv.remove_tag_type(name)
+    return {"op": "tag_type_remove", "name": name, "existed": existed,
+            "requested": requested,
+            "message": (f"Removed tag type {name!r}." if existed
+                        else f"Tag type {name!r} does not exist.")}
 
 
 def _op_delete_comment(ctx, bv, op: dict[str, Any]):

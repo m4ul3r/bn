@@ -25,6 +25,7 @@ EXPECTED_WRITE = {
     "set_prototype", "local_rename", "local_retype", "struct_field_set",
     "struct_field_rename", "struct_field_delete", "types_declare", "batch_apply",
     "close_binary", "save_database", "tag_add", "tag_remove",
+    "tag_type_create", "tag_type_remove",
     # NB: "refresh" is intentionally NOT here -- #321 made it lock="none" so it
     # self-manages locking (analysis runs under the write GATE only, leaving reads
     # responsive), mirroring load_binary. See the self-managed set below.

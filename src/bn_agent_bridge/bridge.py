@@ -2329,6 +2329,12 @@ class BinaryNinjaBridge:
     def _verify_tag_remove(self, *a, **k):
         return mutation_engine._verify_tag_remove(self.ctx, *a, **k)
 
+    def _verify_tag_type_create(self, *a, **k):
+        return mutation_engine._verify_tag_type_create(self.ctx, *a, **k)
+
+    def _verify_tag_type_remove(self, *a, **k):
+        return mutation_engine._verify_tag_type_remove(self.ctx, *a, **k)
+
     def _apply_operation(self, *a, **k):
         return mutation_engine._apply_operation(self.ctx, *a, **k)
 
@@ -2416,6 +2422,12 @@ class BinaryNinjaBridge:
 
     def _op_tag_remove(self, *a, **k):
         return mutation_engine._op_tag_remove(self.ctx, *a, **k)
+
+    def _op_tag_type_create(self, *a, **k):
+        return mutation_engine._op_tag_type_create(self.ctx, *a, **k)
+
+    def _op_tag_type_remove(self, *a, **k):
+        return mutation_engine._op_tag_type_remove(self.ctx, *a, **k)
 
 _bridge: BinaryNinjaBridge | None = None
 # Mutable view-tracking globals now live in bridge_state.py so read-op modules
@@ -2950,6 +2962,16 @@ def _bind_tag_add(bridge, params, target):
 @op("tag_remove", lock="write")
 def _bind_tag_remove(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "tag_remove"}])
+
+
+@op("tag_type_create", lock="write")
+def _bind_tag_type_create(bridge, params, target):
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "tag_type_create"}])
+
+
+@op("tag_type_remove", lock="write")
+def _bind_tag_type_remove(bridge, params, target):
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "tag_type_remove"}])
 
 
 @op("set_comment", lock="write")

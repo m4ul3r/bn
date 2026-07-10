@@ -155,3 +155,22 @@ def _tag_remove(args: argparse.Namespace) -> int:
         preview=bool(args.preview),
         stem="tag-remove",
     )
+
+
+@command("tag", "type", "create", help="Create a custom tag type", target=True, fmt="json",
+         args=[preview_arg(), summary_arg(),
+               arg("name", help="Tag type name"),
+               arg("--icon", required=True, help="Emoji icon for the tag type, e.g. 🎯")])
+def _tag_type_create(args: argparse.Namespace) -> int:
+    return _mutate(args, "tag_type_create",
+                   {"name": args.name, "icon": args.icon},
+                   preview=bool(args.preview), stem="tag-type-create")
+
+
+@command("tag", "type", "remove", help="Remove a custom tag type", target=True, fmt="json",
+         args=[preview_arg(), summary_arg(),
+               arg("name", help="Custom tag type name (built-ins cannot be removed)")])
+def _tag_type_remove(args: argparse.Namespace) -> int:
+    return _mutate(args, "tag_type_remove",
+                   {"name": args.name},
+                   preview=bool(args.preview), stem="tag-type-remove")

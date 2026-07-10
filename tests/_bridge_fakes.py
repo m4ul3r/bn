@@ -651,6 +651,8 @@ _BATCH_OP_PARITY = {
     "function_create":     {"required": ("address",),                                        "one_of": (),                           "enum": {},                                     "cli": "bn function create"},
     "tag_add":             {"required": ("type",),                                           "one_of": (("function", "address"),),   "enum": {},                                     "cli": "bn tag add"},
     "tag_remove":          {"required": (),                                                  "one_of": (("tag_id", "address", "function"),), "enum": {},                             "cli": "bn tag remove"},
+    "tag_type_create":     {"required": ("name", "icon"),                                    "one_of": (),                           "enum": {},                                     "cli": "bn tag type create"},
+    "tag_type_remove":     {"required": ("name",),                                           "one_of": (),                           "enum": {},                                     "cli": "bn tag type remove"},
 }
 
 

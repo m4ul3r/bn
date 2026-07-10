@@ -328,3 +328,48 @@ def test_op_tag_remove_by_type_leaves_other_types():
     assert result["removed"] == 1
     remaining = [(t.type.name, t.data) for t in fn.get_tags_at(0x1010)]
     assert remaining == [("Bookmarks", "bookmark x")]
+
+
+def test_op_tag_type_create_and_verify():
+    bv, fn = _mut_bv_with_fn()
+    op = {"op": "tag_type_create", "name": "MyNotes", "icon": "N"}
+    result = mutation_engine._op_tag_type_create(_CtxMut(bv), bv, op)
+    assert bv.get_tag_type("MyNotes") is not None
+    verified = mutation_engine._verify_tag_type_create(_CtxMut(bv), bv, result)
+    assert verified["status"] == "verified"
+
+
+def test_op_tag_type_create_existing_is_noop():
+    bv, fn = _mut_bv_with_fn()  # "Important" already exists
+    op = {"op": "tag_type_create", "name": "Important", "icon": "!"}
+    result = mutation_engine._op_tag_type_create(_CtxMut(bv), bv, op)
+    verified = mutation_engine._verify_tag_type_create(_CtxMut(bv), bv, result)
+    assert verified["status"] == "noop"
+
+
+def test_op_tag_type_remove_custom():
+    bv, fn = _mut_bv_with_fn()
+    bv.create_tag_type("MyNotes", "N")
+    op = {"op": "tag_type_remove", "name": "MyNotes"}
+    result = mutation_engine._op_tag_type_remove(_CtxMut(bv), bv, op)
+    assert bv.get_tag_type("MyNotes") is None
+    verified = mutation_engine._verify_tag_type_remove(_CtxMut(bv), bv, result)
+    assert verified["status"] == "verified"
+
+
+def test_op_tag_type_remove_builtin_is_rejected():
+    bv, fn = _mut_bv_with_fn()
+    bv.create_tag_type("Bugs", "B")  # a built-in name
+    op = {"op": "tag_type_remove", "name": "Bugs"}
+    with pytest.raises(OperationFailure) as exc:
+        mutation_engine._op_tag_type_remove(_CtxMut(bv), bv, op)
+    assert exc.value.status == "invalid_request"
+    assert bv.get_tag_type("Bugs") is not None  # not removed
+
+
+def test_op_tag_type_remove_nonexistent_is_noop():
+    bv, fn = _mut_bv_with_fn()
+    op = {"op": "tag_type_remove", "name": "GhostType"}
+    result = mutation_engine._op_tag_type_remove(_CtxMut(bv), bv, op)
+    verified = mutation_engine._verify_tag_type_remove(_CtxMut(bv), bv, result)
+    assert verified["status"] == "noop"
