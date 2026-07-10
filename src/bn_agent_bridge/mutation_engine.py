@@ -1893,6 +1893,16 @@ def _op_tag_add(ctx, bv, op: dict[str, Any]):
             "Pass a function OR an address, not both: they target different locations.",
             requested=_operation_requested(ctx, op),
         )
+    if op.get("function") and op.get("force_data"):
+        # --data-scope forces the data-level (bv.add_tag) path, which is
+        # inherently address-based; a function tag has no address, so the two
+        # are contradictory. Reject rather than silently dropping force_data.
+        raise OperationFailure(
+            "invalid_request",
+            "--data-scope only applies to a tag at an address; it can't be "
+            "combined with --function (a function tag has no address).",
+            requested=_operation_requested(ctx, op),
+        )
     requested = _operation_requested(ctx, op)
 
     if op.get("function"):

@@ -690,6 +690,16 @@ def test_comment_get_requires_a_locator(capsys):
     assert "needs a location" in capsys.readouterr().err
 
 
+def test_tag_add_rejects_function_with_data_scope(capsys):
+    # --data-scope is address-based and can't be combined with --function; the
+    # CLI rejects the contradiction up front (BridgeError, exit 2) before any
+    # bridge round-trip, parity with the function/address "not both" check.
+    rc = bn.cli.main(["tag", "add", "--target", "active", "--function", "main",
+                      "--type", "Important", "--data-scope"])
+    assert rc == 2
+    assert "data-scope" in capsys.readouterr().err.lower()
+
+
 def test_render_mutation_text_set_prototype_shows_landed_signature():
     """A verified set_prototype confirms itself with the live signature (convention
     cleaned) so no follow-up `proto get` is needed."""

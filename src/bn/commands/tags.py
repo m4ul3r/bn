@@ -110,6 +110,10 @@ def _tag_add(args: argparse.Namespace) -> int:
         raise BridgeError("tag add takes an address or --function, not both")
     if address is None and args.function is None:
         raise BridgeError("tag add needs a location: an address or --function")
+    if args.function is not None and args.force_data:
+        raise BridgeError(
+            "tag add: --data-scope can't be combined with --function "
+            "(a function tag has no address); drop one")
     return _mutate(
         args,
         "tag_add",

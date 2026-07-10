@@ -194,6 +194,18 @@ def test_op_tag_add_address_scope_attaches_to_function():
     assert [(t.type.name, t.data) for t in fn.get_tags_at(0x1010)] == [("Important", "look here")]
 
 
+def test_op_tag_add_function_with_force_data_is_invalid_request():
+    # --data-scope is address-based; combined with --function (no address) it is
+    # contradictory and must be rejected, not silently ignored.
+    bv, fn = _mut_bv_with_fn()
+    op = {"op": "tag_add", "type": "Important", "data": "x",
+          "function": "sub_1000", "force_data": True}
+    with pytest.raises(OperationFailure) as exc:
+        mutation_engine._op_tag_add(_CtxMut(bv), bv, op)
+    assert exc.value.status == "invalid_request"
+    assert fn.get_function_tags() == []  # nothing was added
+
+
 def test_op_tag_add_function_scope():
     bv, fn = _mut_bv_with_fn()
     op = {"op": "tag_add", "type": "Important", "data": "doc", "function": "sub_1000"}
