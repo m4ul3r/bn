@@ -839,7 +839,6 @@ def _verify_tag_add(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
-
 def _verify_delete_comment(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     item = dict(result)
     address = _parse_address(item["address"])
@@ -1803,7 +1802,6 @@ def _op_tag_add(ctx, bv, op: dict[str, Any]):
             "address": hex(addr), "function": fn.name, "tag_id": str(tag.id),
             "message": f"Added tag {type_name!r} at {hex(addr)} in {fn.name}.",
             "requested": requested}
-
 
 
 def _op_delete_comment(ctx, bv, op: dict[str, Any]):

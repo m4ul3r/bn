@@ -206,3 +206,46 @@ def test_op_tag_add_unknown_type_is_invalid_request():
     with pytest.raises(OperationFailure) as exc:
         mutation_engine._op_tag_add(_CtxMut(bv), bv, op)
     assert exc.value.status == "invalid_request"
+
+
+def test_verify_tag_add_address_scope_passes():
+    bv, fn = _mut_bv_with_fn()
+    op = {"op": "tag_add", "type": "Important", "data": "look here", "address": "0x1010"}
+    result = mutation_engine._op_tag_add(_CtxMut(bv), bv, op)
+    verified = mutation_engine._verify_tag_add(_CtxMut(bv), bv, result)
+    assert verified["status"] == "verified"
+    assert verified["observed"] == {"present": True}
+
+
+def test_verify_tag_add_function_scope_passes():
+    bv, fn = _mut_bv_with_fn()
+    op = {"op": "tag_add", "type": "Important", "data": "doc", "function": "sub_1000"}
+    result = mutation_engine._op_tag_add(_CtxMut(bv), bv, op)
+    verified = mutation_engine._verify_tag_add(_CtxMut(bv), bv, result)
+    assert verified["status"] == "verified"
+
+
+def test_verify_tag_add_data_scope_passes():
+    bv, fn = _mut_bv_with_fn()
+    op = {"op": "tag_add", "type": "Important", "data": "d", "address": "0x1010", "force_data": True}
+    result = mutation_engine._op_tag_add(_CtxMut(bv), bv, op)
+    verified = mutation_engine._verify_tag_add(_CtxMut(bv), bv, result)
+    assert verified["status"] == "verified"
+
+
+def test_verify_tag_add_raises_verification_failed_when_tag_missing():
+    bv, fn = _mut_bv_with_fn()
+    # Describe a tag that was never added -- verification must reject it
+    # instead of silently reporting success.
+    result = {
+        "op": "tag_add",
+        "tag_type": "Important",
+        "data": "never added",
+        "scope": "address",
+        "address": "0x1010",
+        "function": "sub_1000",
+        "requested": {},
+    }
+    with pytest.raises(OperationFailure) as exc:
+        mutation_engine._verify_tag_add(_CtxMut(bv), bv, result)
+    assert exc.value.status == "verification_failed"

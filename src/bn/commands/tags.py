@@ -89,15 +89,22 @@ def _tag_list(args: argparse.Namespace) -> int:
 @command("tag", "add", help="Add a tag at an address or on a function", target=True, fmt="json",
          args=[
              preview_arg(), summary_arg(),
-             arg("address", nargs="?", help="Address to tag (hex 0x.. or decimal)"),
-             arg("data", help="Tag text (data)"),
+             arg("address", nargs="?", help="Address to tag (hex 0x.. or decimal); alias for --address"),
              arg("--address", dest="address_flag", default=None, help="Address alias for the positional"),
              arg("--function", default=None, help="Tag the whole function (name or address)"),
              arg("--type", required=True, help="Tag type name (e.g. Important, Bookmarks)"),
-             arg("--data", dest="force_data", action="store_true",
+             arg("--data", dest="data", default="", help="Tag text (data)"),
+             arg("--data-scope", dest="force_data", action="store_true",
                  help="Force a data-scope tag at the address (not attached to a function)"),
          ])
 def _tag_add(args: argparse.Namespace) -> int:
+    """Add a tag at an address or on a function.
+
+    Examples:
+        bn tag add 0x1000 --type Important --data "note"
+        bn tag add --function sub_1000 --type Important --data "doc"
+        bn tag add 0x1000 --type Library --data "libc" --data-scope
+    """
     address = _pick(args.address, args.address_flag, "tag address", required=False)
     if address is not None and args.function is not None:
         raise BridgeError("tag add takes an address or --function, not both")
