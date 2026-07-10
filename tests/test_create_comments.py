@@ -319,7 +319,12 @@ def test_set_comment_function_targets_fn_comment_not_address(monkeypatch):
 
 def test_delete_comment_function_clears_fn_comment(monkeypatch):
     """`comment delete --function` clears fn.comment (sets it to ""), the same
-    function-doc store `comment set --function` now writes."""
+    function-doc store `comment set --function` now writes -- and leaves the
+    address-comment store at the function's entry untouched (Task 8). Seeding a
+    distinct address comment at fn.start before the delete is what gives this
+    test teeth: without it, a regression that dropped the `scope` key would fall
+    through _verify_delete_comment's ADDRESS branch, read get_comment_at(fn.start)
+    (also "" in that case), and still report "verified"."""
     bridge = _load_bridge(monkeypatch)
     mutation_engine = bridge.mutation_engine
 
@@ -327,6 +332,9 @@ def test_delete_comment_function_clears_fn_comment(monkeypatch):
     fn.comment = "old doc"
     bv = _FakeCommentMutationBV()
     bv.functions = [fn]
+    # seed the address-comment store at the entry with a distinct value so a
+    # wrong-store delete (or misclassified verify) would be caught.
+    bv.set_comment_at(fn.start, "entry note")
 
     class _C:
         def _resolve_view(self, s): return bv
@@ -335,6 +343,10 @@ def test_delete_comment_function_clears_fn_comment(monkeypatch):
     op = {"op": "delete_comment", "function": "sub_1000"}
     result = mutation_engine._op_delete_comment(_C(), bv, op)
     assert fn.comment == ""
+    # the address store at the entry must NOT be touched
+    assert bv.get_comment_at(fn.start) == "entry note"
+    assert result.get("scope") == "function_doc"
+
     verified = mutation_engine._verify_delete_comment(_C(), bv, result)
     assert verified["status"] == "verified"
 
