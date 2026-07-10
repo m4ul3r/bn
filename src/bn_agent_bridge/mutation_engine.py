@@ -1891,18 +1891,32 @@ def _op_tag_remove(ctx, bv, op: dict[str, Any]):
                 removed.append({"type": t.type.name, "data": t.data, "scope": "data"})
                 targets.append({"scope": "data", "address": hex(addr), "id": str(t.id)})
     elif tag_id:
-        # id-only: search every scope
+        # id-only: search every scope. bv.get_tags() only covers view-level
+        # DATA tags -- it never surfaces a function's ADDRESS-scope tags
+        # (fn.tags), so those need their own sweep, mirroring
+        # read_tags._collect_tags's address-tag sweep exactly. Track removed
+        # ids so a tag id that (in principle) turns up more than once across
+        # sweeps isn't double-removed/double-counted.
+        removed_ids: set[str] = set()
         for addr, t in list(bv.get_tags(auto=False)):
-            if str(t.id) == str(tag_id):
+            if str(t.id) == str(tag_id) and str(t.id) not in removed_ids:
                 bv.remove_user_data_tag(addr, t)
                 removed.append({"type": t.type.name, "data": t.data, "scope": "data"})
                 targets.append({"scope": "data", "address": hex(addr), "id": str(t.id)})
+                removed_ids.add(str(t.id))
         for fn in list(bv.functions):
             for t in list(fn.get_function_tags(auto=False)):
-                if str(t.id) == str(tag_id):
+                if str(t.id) == str(tag_id) and str(t.id) not in removed_ids:
                     fn.remove_user_function_tag(t)
                     removed.append({"type": t.type.name, "data": t.data, "scope": "function"})
                     targets.append({"scope": "function", "function": fn.name, "id": str(t.id)})
+                    removed_ids.add(str(t.id))
+            for _arch, addr, t in list(fn.tags):
+                if str(t.id) == str(tag_id) and str(t.id) not in removed_ids:
+                    fn.remove_user_address_tag(addr, t)
+                    removed.append({"type": t.type.name, "data": t.data, "scope": "address"})
+                    targets.append({"scope": "address", "address": hex(addr), "id": str(t.id)})
+                    removed_ids.add(str(t.id))
     else:
         raise OperationFailure(
             "invalid_request",

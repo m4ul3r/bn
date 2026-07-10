@@ -302,3 +302,29 @@ def test_verify_tag_remove_success_when_tag_gone():
     verified = mutation_engine._verify_tag_remove(_CtxMut(bv), bv, result)
     assert verified["status"] == "verified"
     assert verified["observed"] == {"still_present": []}
+
+
+def test_op_tag_remove_by_id_address_scope():
+    """CRITICAL: `bn tag remove --id <uuid>` for an ADDRESS-scope tag (the
+    common case -- `tag add <addr> --type X`) used to silently no-op:
+    the id-only branch swept bv.get_tags() (DATA scope) and each function's
+    get_function_tags() (FUNCTION scope) but never a function's ADDRESS-scope
+    tags (fn.tags). Same bug class Task 4 fixed for _collect_tags."""
+    bv, fn = _mut_bv_with_fn()
+    tag = fn.add_tag("Important", "x", 0x1010)
+    op = {"op": "tag_remove", "tag_id": tag.id}
+    result = mutation_engine._op_tag_remove(_CtxMut(bv), bv, op)
+    assert result["removed"] == 1
+    assert fn.get_tags_at(0x1010) == []
+
+
+def test_op_tag_remove_by_type_leaves_other_types():
+    bv, fn = _mut_bv_with_fn()
+    bv.create_tag_type("Bookmarks", "*")
+    fn.add_tag("Important", "important x", 0x1010)
+    fn.add_tag("Bookmarks", "bookmark x", 0x1010)
+    op = {"op": "tag_remove", "type": "Important", "address": "0x1010"}
+    result = mutation_engine._op_tag_remove(_CtxMut(bv), bv, op)
+    assert result["removed"] == 1
+    remaining = [(t.type.name, t.data) for t in fn.get_tags_at(0x1010)]
+    assert remaining == [("Bookmarks", "bookmark x")]
