@@ -15,32 +15,42 @@ Target selection, sticky pins, instance/target resolution order, sessions/headle
 2. Pick a target:
    - Single open BinaryView: omit `-t`.
    - Multiple open: pass `-t <selector>` from `bn target list`. Selectors match against `selector`, `target_id`, `view_id`, full filename, or basename.
-   - `-t` / `--instance` work **before or after** the subcommand, and for two-level commands they are also accepted **between the group and the leaf**. Use a pre-subcommand form to disambiguate selectors that collide with subcommand names like `session` or `pam_qnx.so.2`:
+   - `-t/--target` and `-i/--instance` work **before or after** the subcommand, and for two-level commands they are also accepted **between the group and the leaf**. Prefer the short forms (`-t`, `-i`). Use a pre-subcommand form to disambiguate selectors that collide with subcommand names like `session` or `pam_qnx.so.2`:
 
      ```bash
-     bn -t pam_qnx.so.2 decompile main      # at root
-     bn decompile main -t pam_qnx.so.2      # after the leaf
-     bn bundle -t pam_qnx.so.2 function main  # between group and leaf (two-level)
+     bn -i myid -t pam_qnx.so.2 decompile main      # at root (preferred for agents)
+     bn decompile main -i myid -t pam_qnx.so.2      # after the leaf
+     bn bundle -i myid -t pam_qnx.so.2 function main  # between group and leaf (two-level)
      ```
 
    - Use `-t active` only when you explicitly want to follow the GUI selection.
 
-3. (Optional) Pin sticky defaults — useful when you'll run many commands against the same instance/target:
+3. (Optional) Pin sticky defaults — useful for a **single** agent/shell running many commands against the same instance/target. **Do not** use sticky pins under multi-agent fan-out (see HARD rule below).
 
    ```bash
-   bn instance use <id>          # pin --instance for this project
+   bn instance use <id>          # pin -i/--instance for this project
    bn target use <selector>       # pin -t for this project
    bn instance clear              # clear pinned instance
    bn target clear                # clear pinned target
    ```
 
    Resolution order:
-   - **Instance:** CLI `--instance` > env `BN_INSTANCE` > sticky > auto-pick / auto-spawn.
+   - **Instance:** CLI `-i/--instance` > env `BN_INSTANCE` > sticky > auto-pick / auto-spawn.
    - **Target:** CLI `-t/--target` > sticky > single-open auto-pick. **`BN_TARGET` does not exist** — target selection is the CLI flag or `bn target use`, nothing else.
+
+   Env `BN_INSTANCE` is optional **single-agent** convenience (same effect as always passing `-i`). **Do not** rely on it for multi-agent fan-out — a shared process env is still clobberable across concurrent agents; pass `-i` on every command instead.
 
    State lives at `~/.cache/bn/sessions/<sha256(project_root)[:16]>.json`. Project root walks up to the nearest `.git` (cwd as fallback). `bn session list` and `bn target list` mark matching entries with `[sticky]`. When a sticky instance points at a dead bridge, errors append `Clear it with bn instance clear`.
 
-   > **HARD rule for parallel / fan-out agents.** Sticky pins are **one shared file per git repo** — every agent rooted in the same repo reads and writes the same `instance_id` / `target`. If multiple agents run concurrently against that repo, one agent's `bn instance use` / `bn target use` / `bn instance clear` / `bn target clear` silently changes the target for *all* of them, causing cross-talk and commands hitting the wrong binary. Parallel/fan-out agents **MUST** pass `-t/--target` and `--instance` explicitly on **every** command and **MUST NOT** call `instance use` / `target use` / `instance clear` / `target clear`. Prefer one dedicated headless instance per agent: `bn session start <binary> --instance-id <unique-id>`, then thread that `--instance <unique-id>` (and an explicit `-t`) through every subsequent call.
+   > **HARD rule for parallel / fan-out agents.** Sticky pins are **one shared file per git repo** — every agent rooted in the same repo reads and writes the same `instance_id` / `target`. If multiple agents run concurrently against that repo, one agent's `bn instance use` / `bn target use` / `bn instance clear` / `bn target clear` silently changes the target for *all* of them, causing cross-talk and commands hitting the wrong binary. Parallel/fan-out agents **MUST** pass **`-i/--instance` and `-t/--target`** explicitly on **every** command and **MUST NOT** call `instance use` / `target use` / `instance clear` / `target clear`. Prefer one dedicated headless instance per agent, then the short flags:
+   >
+   > ```bash
+   > bn session start /path/to/binary --instance-id dogfood-1   # spawn naming
+   > bn -i dogfood-1 -t <sel> decompile main
+   > bn -i dogfood-1 -t <sel> xrefs main
+   > ```
+   >
+   > Note: global **`-i/--instance` is routing** (which live bridge to talk to). **`--instance-id` on `session start` / `load` is spawn naming** (what ID the new bridge gets). They are distinct flags — `bn session start -i foo …` does **not** name the spawn `foo`; use `--instance-id foo` for that.
 
 ## 2. Sessions & headless
 
@@ -109,7 +119,7 @@ Run `bn refresh` once to promote the view to full analysis (`analysis_state` fli
 
 After `bn refresh` (or `--force-analysis` on a single function) every row promotes to full behavior; branch on `analysis_state`, not on an empty or errored result.
 
-`--instance` is accepted on every subcommand (env `BN_INSTANCE`). On `bn load`, `--instance-id` is an accepted alias that names the bridge instance to auto-spawn — the same spelling as `bn session start --instance-id`, so you can use `--instance-id <id>` consistently across both.
+`-i/--instance` is accepted on every subcommand (short form **`-i <id>`** preferred for agents; long form `--instance`; env `BN_INSTANCE` as single-agent convenience only). On `bn load`, `--instance-id` is an accepted alias that names the bridge instance to auto-spawn — the same spelling as `bn session start --instance-id`, so you can use `--instance-id <id>` consistently across both. Global `-i` does **not** replace `--instance-id` for spawn naming.
 
 **Project markers (`.bn-<id>`, #80).** `bn load` drops a `.bn-<instance_id>` pointer file in the **project root** of your cwd (walking up to the nearest `.git`, else cwd). When **multiple** bridges are running and you haven't selected one, instance resolution walks up from cwd and a marker matching a live instance picks it — so `cd project && bn …` resolves the bridge that loaded its binary instead of erroring "multiple instances". It's a fallback **below** an explicit `-i`/`BN_INSTANCE`/sticky pin (those still win), the registry stays authoritative (a marker only resolves to a *live* instance; a stale one is unlinked on read), and `.bn-*` is added to `.git/info/exclude` so it doesn't dirty `git status`. Opt out with `--no-marker` or `BN_NO_MARKERS=1`. (Caveat: with no `.git` ancestor the marker lands in cwd itself, so loading with cwd in a system dir like `/usr/bin` would drop it there — use `--no-marker` or run from a project dir.)
 
