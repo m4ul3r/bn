@@ -358,13 +358,17 @@ class _FakeReloc:
 
 
 class _TagIdCounter:
-    """Deterministic tag-id source so tests assert stable ids ('tag-1', ...)."""
+    """Deterministic tag-id source. Emits valid UUID strings (real BN tag ids are
+    UUIDs, and `_op_tag_remove` now rejects a non-UUID `--id`) that are still
+    stable/predictable per run -- e.g. n=1 -> '0000fa5e-0000-0000-0000-000000000001'.
+    The 'fa5e' marker keeps them recognizable as fakes and clear of the all-zeros
+    UUID a test may use for the well-formed-but-nonexistent case."""
     def __init__(self):
         self._n = 0
 
     def next(self) -> str:
         self._n += 1
-        return f"tag-{self._n}"
+        return f"0000fa5e-0000-0000-0000-{self._n:012d}"
 
 
 _TAG_IDS = _TagIdCounter()

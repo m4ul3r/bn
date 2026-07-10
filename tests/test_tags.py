@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from bn_agent_bridge import read_tags
+from bn.formatters import _render_tag_row
 from _bridge_fakes import _FakeBV
 
 
@@ -286,6 +287,28 @@ def test_op_tag_remove_by_id():
     assert fn.get_function_tags() == []
 
 
+def test_op_tag_remove_malformed_id_is_invalid_request():
+    # A non-UUID --id is a typo, not a "no such tag" -- reject it like tag add
+    # rejects an unknown type, rather than silently no-opping (dogfood defect 2).
+    bv, fn = _mut_bv_with_fn()
+    fn.add_tag("Important", "x", None)  # a real tag exists; the bad id must not touch it
+    op = {"op": "tag_remove", "tag_id": "not-a-uuid"}
+    with pytest.raises(OperationFailure) as exc:
+        mutation_engine._op_tag_remove(_CtxMut(bv), bv, op)
+    assert exc.value.status == "invalid_request"
+    assert len(fn.get_function_tags()) == 1  # nothing removed
+
+
+def test_op_tag_remove_wellformed_nonexistent_id_is_noop():
+    # A syntactically-valid UUID that matches nothing is still a clean noop --
+    # the malformed-id rejection above must not swallow this case.
+    bv, fn = _mut_bv_with_fn()
+    op = {"op": "tag_remove", "tag_id": "00000000-0000-0000-0000-000000000000"}
+    result = mutation_engine._op_tag_remove(_CtxMut(bv), bv, op)
+    assert result["removed"] == 0
+    assert result["targets"] == []
+
+
 def test_op_tag_remove_no_match_is_noop_shaped():
     bv, fn = _mut_bv_with_fn()
     op = {"op": "tag_remove", "type": "Important", "address": "0x1010"}
@@ -390,3 +413,25 @@ def test_op_tag_type_remove_nonexistent_is_noop():
     result = mutation_engine._op_tag_type_remove(_CtxMut(bv), bv, op)
     verified = mutation_engine._verify_tag_type_remove(_CtxMut(bv), bv, result)
     assert verified["status"] == "noop"
+
+
+def test_render_tag_row_function_scope_shows_function_name():
+    # dogfood defect 1: a function-scope tag used to render the literal
+    # "<function>" placeholder; it must show the owning function's name.
+    row = _render_tag_row({
+        "scope": "function", "function": "main", "address": None,
+        "icon": "🔖", "type": "Bookmarks", "data": "entry point",
+    })
+    assert row.startswith("main  ")
+    assert "<function>" not in row
+    assert "Bookmarks" in row and "entry point" in row
+
+
+def test_render_tag_row_address_scope_prefers_address():
+    # An address-scope tag carries both address and function; the address is the
+    # more precise locator and wins.
+    row = _render_tag_row({
+        "scope": "address", "function": "main", "address": "0x1010",
+        "icon": "🐛", "type": "Bugs", "data": "check this",
+    })
+    assert row.startswith("0x1010  ")

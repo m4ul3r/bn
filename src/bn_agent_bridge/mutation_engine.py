@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import difflib
 import re
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -1948,6 +1949,21 @@ def _op_tag_remove(ctx, bv, op: dict[str, Any]):
             "tag remove needs --id, or a location plus --type.",
             requested=requested,
         )
+    # A tag id is a UUID (the `id` column of `bn tag list`). Reject a malformed
+    # id up front -- parity with `tag add`'s bad-type/bad-address errors -- so a
+    # typo'd id is a clear invalid_request instead of a silent no-op that reads
+    # like "there was no such tag". A well-formed but nonexistent id still falls
+    # through to the normal no-match `noop` (below).
+    if tag_id:
+        try:
+            uuid.UUID(str(tag_id))
+        except (ValueError, AttributeError, TypeError):
+            raise OperationFailure(
+                "invalid_request",
+                f"{tag_id!r} is not a valid tag id; expected a UUID from the "
+                "`id` column of `bn tag list`.",
+                requested=requested,
+            )
     removed: list[dict[str, Any]] = []
     targets: list[dict[str, Any]] = []  # for verification: (scope, address, id)
 

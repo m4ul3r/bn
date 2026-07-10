@@ -446,8 +446,12 @@ def _render_tag_get_text(value: Any) -> str:
 
 
 def _render_tag_row(t: dict) -> str:
-    addr = t.get("address") or "<function>"
-    return f"{addr}  [{t.get('scope', '?')}]  {t.get('icon', '')} {t.get('type', '')}  {t.get('data', '')}"
+    # A function-scope tag has no address; show the function name it belongs to
+    # instead of a bare placeholder. The JSON already carries `function`, so the
+    # text renderer just surfaces it (address scope keeps the address, which is
+    # the more precise locator when both are present).
+    loc = t.get("address") or t.get("function") or "<function>"
+    return f"{loc}  [{t.get('scope', '?')}]  {t.get('icon', '')} {t.get('type', '')}  {t.get('data', '')}"
 
 
 def _render_tag_list_text(value: Any) -> str:
