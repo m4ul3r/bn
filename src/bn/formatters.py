@@ -413,6 +413,22 @@ def _render_comment_list_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+def _render_tag_types_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    types = value.get("tag_types")
+    if not isinstance(types, list) or not types:
+        return "none"
+    lines = []
+    for t in types:
+        if not isinstance(t, dict):
+            lines.append(_render_fallback_text(t))
+            continue
+        builtin = "  [builtin]" if t.get("is_builtin") else ""
+        lines.append(f"{t.get('icon', '')}  {t.get('name', '<unknown>')}{builtin}")
+    return "\n".join(lines)
+
+
 def _render_refresh_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)

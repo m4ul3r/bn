@@ -28,6 +28,7 @@ from . import read_evidence
 from . import read_go
 from . import read_listing
 from . import read_misc
+from . import read_tags
 from . import read_taint_slice
 from . import read_types
 from . import read_xrefs
@@ -2138,6 +2139,9 @@ class BinaryNinjaBridge:
     def _list_comments(self, *a, **k):
         return create_comments._list_comments(self.ctx, *a, **k)
 
+    def _list_tag_types(self, *a, **k):
+        return read_tags._list_tag_types(self.ctx, *a, **k)
+
     def _bundle_function(self, selector: str | None, identifier, out_path: str | None):
         bv = self._resolve_view(selector)
         func = self._find_function(bv, identifier)
@@ -2894,6 +2898,11 @@ def _bind_list_comments(bridge, params, target):
         # strings/imports/sections/types binders.
         limit=int(params["limit"]) if params.get("limit") is not None else None,
     )
+
+
+@op("list_tag_types", lock="read")
+def _bind_list_tag_types(bridge, params, target):
+    return bridge._list_tag_types(target)
 
 
 @op("set_comment", lock="write")

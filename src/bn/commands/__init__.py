@@ -13,4 +13,5 @@ from . import dataflow  # noqa: F401
 from . import function  # noqa: F401
 from . import misc  # noqa: F401
 from . import mutation  # noqa: F401
+from . import tags  # noqa: F401
 from . import types  # noqa: F401
