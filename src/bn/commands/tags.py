@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import argparse
 
-from ..cli import _call, arg, command
-from ..formatters import _render_tag_types_text
+from ..cli import _call, _pick, arg, command, preview_arg, summary_arg
+from ..formatters import _render_tag_get_text, _render_tag_types_text
+from ..transport import BridgeError
 
 
 @command("tag", "types", help="List tag types (name, icon, built-in)", target=True)
@@ -16,4 +17,40 @@ def _tag_types(args: argparse.Namespace) -> int:
         require_target=True,
         text_renderer=_render_tag_types_text,
         stem="tag-types",
+    )
+
+
+def _tag_locator_args() -> list:
+    return [
+        arg("address", nargs="?",
+            help="Address to read tags at (hex 0x.. or decimal); alias for --address"),
+        arg("--address", dest="address_flag", default=None,
+            help="Address to read tags at (alias for the positional)"),
+        arg("--function", default=None,
+            help="Read the whole-function tags of a function (name or address)"),
+    ]
+
+
+def _tag_locator(args: argparse.Namespace, verb: str) -> tuple[str | None, str | None]:
+    address = _pick(args.address, args.address_flag, "tag address", required=False)
+    function = args.function
+    if address is not None and function is not None:
+        raise BridgeError(f"tag {verb} takes an address or --function, not both")
+    if address is None and function is None:
+        raise BridgeError(
+            f"tag {verb} needs a location: an address (positional or --address) or --function")
+    return address, function
+
+
+@command("tag", "get", help="Get tags at an address or on a function", target=True,
+         args=_tag_locator_args())
+def _tag_get(args: argparse.Namespace) -> int:
+    address, function = _tag_locator(args, "get")
+    return _call(
+        args,
+        "get_tags",
+        {"address": address, "function": function},
+        require_target=True,
+        text_renderer=_render_tag_get_text,
+        stem="tag-get",
     )

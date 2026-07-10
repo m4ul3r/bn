@@ -2142,6 +2142,9 @@ class BinaryNinjaBridge:
     def _list_tag_types(self, *a, **k):
         return read_tags._list_tag_types(self.ctx, *a, **k)
 
+    def _get_tags(self, *a, **k):
+        return read_tags._get_tags(self.ctx, *a, **k)
+
     def _bundle_function(self, selector: str | None, identifier, out_path: str | None):
         bv = self._resolve_view(selector)
         func = self._find_function(bv, identifier)
@@ -2903,6 +2906,11 @@ def _bind_list_comments(bridge, params, target):
 @op("list_tag_types", lock="read")
 def _bind_list_tag_types(bridge, params, target):
     return bridge._list_tag_types(target)
+
+
+@op("get_tags", lock="read")
+def _bind_get_tags(bridge, params, target):
+    return bridge._get_tags(target, params.get("address"), params.get("function"))
 
 
 @op("set_comment", lock="write")

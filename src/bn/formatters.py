@@ -429,6 +429,20 @@ def _render_tag_types_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+def _render_tag_get_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    tags = value.get("tags")
+    if not isinstance(tags, list) or not tags:
+        return "(no tags)"
+    return "\n".join(_render_tag_row(t) for t in tags if isinstance(t, dict))
+
+
+def _render_tag_row(t: dict) -> str:
+    addr = t.get("address") or "<function>"
+    return f"{addr}  [{t.get('scope', '?')}]  {t.get('icon', '')} {t.get('type', '')}  {t.get('data', '')}"
+
+
 def _render_refresh_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)

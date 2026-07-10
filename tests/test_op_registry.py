@@ -18,7 +18,7 @@ EXPECTED_READ = {
     "message_lens", "init_arrays", "backward_slice", "types", "type_info",
     "strings", "imports", "list_exports", "bundle_function", "get_comment", "list_comments",
     "sections", "read", "class_list", "class_show", "go_functions", "orient_digest",
-    "list_tag_types",
+    "list_tag_types", "get_tags",
 }
 EXPECTED_WRITE = {
     "py_exec", "function_create", "rename_symbol", "set_comment", "delete_comment",
