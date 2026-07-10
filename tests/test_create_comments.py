@@ -351,6 +351,37 @@ def test_delete_comment_function_clears_fn_comment(monkeypatch):
     assert verified["status"] == "verified"
 
 
+def test_preview_set_comment_function_doc_shows_diff(monkeypatch):
+    """`comment set --function --preview` writes fn.comment (function-doc,
+    Task 8's repurposing of --function), a store the metadata-diff snapshot
+    machinery never captured -- so the preview reported changed:false and an
+    empty diff even though apply/verify/revert all landed correctly (final
+    review Fix 1). The function_doc field in the snapshot must flip `changed`
+    and render a before/after doc line, same as the existing comment/local
+    handling in _format_metadata_change / _diff_snapshots (#121 pattern)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(bridge.il_format, "_function_text", lambda bv, fn, view="hlil": "return 7;")
+
+    fn = _FakeFunction(0x1000, "sub_1000")
+    fn.basic_blocks = [_FakeBasicBlock(0x1000, 0x1040)]
+    fn.comment = ""
+    bv = _FakeCommentMutationBV()
+    bv.functions = [fn]
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._mutation(
+        "active", True,
+        [{"op": "set_comment", "function": "sub_1000", "comment": "documents the parser"}],
+    )
+
+    assert result["success"] is True
+    diffs = result["affected_functions"]
+    assert len(diffs) == 1
+    assert diffs[0]["changed"] is True
+    assert "documents the parser" in diffs[0]["diff"]
+
+
 def test_op_set_comment_rejects_both_locators(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

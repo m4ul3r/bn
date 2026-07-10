@@ -141,5 +141,9 @@ def _list_tags(ctx, selector: str | None, *, function=None, address=None,
     if query:
         needle = query.lower()
         items = [t for t in items if needle in t["data"].lower()]
-    items.sort(key=lambda t: (t["address"] or "", t["scope"], t["type"]))
+    # Sort by NUMERIC address, not the hex string -- lexicographic order put
+    # "0x1000" before "0x900" (final-review Fix 2). Function-scope tags carry
+    # address=None; sink those first via -1 so they don't interleave with
+    # address-ordered entries.
+    items.sort(key=lambda t: (int(t["address"], 16) if t["address"] else -1, t["scope"], t["type"]))
     return read_misc._paged_list_result(items, offset=offset, limit=limit, kind="tags")

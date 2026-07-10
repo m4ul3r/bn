@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import pytest
-
 from _bridge_fakes import _load_bridge
 
 

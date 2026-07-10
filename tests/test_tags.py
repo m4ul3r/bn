@@ -125,6 +125,23 @@ def test_list_tags_query_substring_on_data():
     assert [t["data"] for t in result["items"]] == ["whole fn"]
 
 
+def test_list_tags_sorts_addresses_numerically_not_lexicographically():
+    """The address sort key must compare NUMERIC address order -- sorting the
+    hex STRING put "0x1000" before "0x900" (final-review Fix 2), which reads
+    backwards to an analyst walking a tag list top-to-bottom."""
+    fn = _FakeFunction(0x1000, "sub_1000")
+    fn.basic_blocks = [_FakeBasicBlock(0x1000, 0x2000)]
+    bv = _FakeBV(functions=[fn])
+    fn.view = bv
+    bv.create_tag_type("Bugs", "B")
+    bv.add_tag(0x1000, "Bugs", "at 0x1000")
+    bv.add_tag(0x900, "Bugs", "at 0x900")
+
+    result = read_tags._list_tags(_CtxFn(bv), None)
+    addresses = [t["address"] for t in result["items"]]
+    assert addresses == ["0x900", "0x1000"]
+
+
 def test_list_tags_dedupes_same_tag_id_across_collection_sources():
     """The whole-view sweep in _collect_tags normally sees disjoint tags from
     bv.get_tags() (data) and fn.tags (address) -- so a `seen`-guard regression

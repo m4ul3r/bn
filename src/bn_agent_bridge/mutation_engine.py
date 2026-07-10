@@ -496,6 +496,13 @@ def _capture_function_snapshots(ctx, bv, functions):
             "text": il_format._function_text(bv, fn, view="hlil"),
             "comments": _function_comment_state(ctx, bv, fn),
             "locals": _function_local_state(ctx, fn),
+            # BN's whole-function documentation property (Function.comment),
+            # DISTINCT from the address-comment store `comments` above --
+            # `comment set/delete --function` (Task 8) writes here. Without
+            # it in the snapshot, a --preview of that op showed changed:false
+            # / an empty diff even though apply/verify/revert all landed
+            # (final-review Fix 1, #121 pattern).
+            "function_doc": str(getattr(fn, "comment", "") or ""),
         }
     return snapshots
 
@@ -517,6 +524,9 @@ def _format_metadata_change(old: dict[str, Any], new: dict[str, Any], address: i
     for ident in sorted(set(ol) | set(nl)):
         if ol.get(ident) != nl.get(ident):
             lines.append(f"local {ident}: {ol.get(ident, '')} -> {nl.get(ident, '')}")
+    old_doc, new_doc = old.get("function_doc") or "", new.get("function_doc") or ""
+    if old_doc != new_doc:
+        lines.append(f"function_doc: {old_doc!r} -> {new_doc!r}")
     return "\n".join(lines)
 
 
@@ -584,6 +594,7 @@ def _diff_snapshots(ctx, before: dict[int, Any], after: dict[int, Any]):
         # change signal and synthesize a diff for them (#121).
         comments_changed = old.get("comments") != new.get("comments")
         locals_changed = old.get("locals") != new.get("locals")
+        doc_changed = (old.get("function_doc") or "") != (new.get("function_doc") or "")
         diff = "\n".join(
             difflib.unified_diff(
                 old["text"].splitlines(),
@@ -593,14 +604,16 @@ def _diff_snapshots(ctx, before: dict[int, Any], after: dict[int, Any]):
                 lineterm="",
             )
         )
-        if not diff and (name_changed or comments_changed or locals_changed):
+        if not diff and (name_changed or comments_changed or locals_changed or doc_changed):
             diff = _format_metadata_change(old, new, address)
         diffs.append(
             {
                 "address": hex(address),
                 "before_name": old.get("name"),
                 "after_name": new.get("name"),
-                "changed": bool(text_changed or name_changed or comments_changed or locals_changed),
+                "changed": bool(
+                    text_changed or name_changed or comments_changed or locals_changed or doc_changed
+                ),
                 "diff": _truncate_preview_diff(diff),
             }
         )
