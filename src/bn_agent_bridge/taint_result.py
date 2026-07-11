@@ -63,6 +63,12 @@ BLOCKING_LEAF_KINDS = frozenset({
     "field_load_unresolved",
     "source_seed_misanchored",
     "weak_buffer_seed",
+    # #206: a tainted value reached an unlifted/unimplemented instruction, so
+    # BN's lifter could not model the op and propagation through it is a silent
+    # hole -- an empty reached_sinks past it is NOT an all-clear. Emitted
+    # flow-sensitively (only when taint actually reaches such an instruction),
+    # so a function that merely CONTAINS unlifted ops does not block the gate.
+    "unlifted_instruction_reached",
 })
 
 # The seed-honesty leaf kinds specifically (subset of BLOCKING_LEAF_KINDS): a
@@ -284,6 +290,47 @@ def misanchored_recv_leaf(
             f"empty reached_sinks with this leaf means the seed was wrong, not "
             f"that the path is clean"),
     }
+    if address is not None:
+        leaf["address"] = address
+    return leaf
+
+
+def indirect_pointer_slot_leaf(
+    *,
+    callee: str,
+    arg_index: int,
+    address: str | None = None,
+    slot: Any = None,
+) -> dict[str, Any]:
+    """Structured leaf for an indirect-load buffer-pointer arg seed (#193/#562):
+    the source's buffer pointer is itself loaded from a global/struct slot
+    (``recvfrom(fd, *(ctx+off), n)``), so the seed anchors to the loaded POINTER
+    value, not the pointee -- and the engine did not correlate it with a later
+    re-load of the same slot. A flow that re-loads the pointer and parses the
+    payload may therefore be silently missed. Kind ``source_seed_misanchored``
+    (the seed anchored the pointer, not the payload -- exactly a mis-anchored
+    seed), so it lands in ``result["leaves"]`` / ``frontier.seed_misanchored``
+    and the claim gate WITHHOLDS an all-clear the same way the recv-buffer case
+    does. A propagation/coverage fact, not a vulnerability claim."""
+    base = (callee or "").split("@", 1)[0].lstrip("_")
+    detail = (
+        f"arg:{base}:{arg_index} buffer pointer is loaded indirectly (from a "
+        f"global/struct slot); the seed anchors to the pointer value, not the "
+        f"pointee, and was not correlated with a later re-load of the same slot "
+        f"-- a flow that re-loads the pointer and parses it may be missed")
+    leaf: dict[str, Any] = {
+        "kind": "source_seed_misanchored",
+        "callee": base,
+        "arg_index": arg_index,
+        "detail": detail,
+        "suggested_source": f"param:N (seed the parser entry directly)",
+        "note": (
+            "NOT an all-clear -- the indirect-load pointer slot was not "
+            "correlated forward; seed the parser entry directly with param:N "
+            "or the filled buffer with --source var:<buf>"),
+    }
+    if slot is not None:
+        leaf["slot"] = str(slot)
     if address is not None:
         leaf["address"] = address
     return leaf
