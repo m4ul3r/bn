@@ -3996,8 +3996,17 @@ class TaintEngine:
                                 # clean. Distinct from recvmsg (handled above): here
                                 # the buffer simply couldn't be anchored.
                                 _rbase = (callee or "").split("@", 1)[0].lstrip("_")
-                                if ptr_seeded and _rbase in (
-                                        "recv", "recvfrom", "read", "pread", "fread"):
+                                # The "buffer_not_keyed" leaf only applies when the
+                                # SEEDED arg is the output-buffer pointer (read/recv/
+                                # recvfrom/pread buf=arg1, fread ptr=arg0). A non-buffer
+                                # arg seed (e.g. arg:read:0 = fd) is a different mistake
+                                # and must NOT be mislabeled as a buffer that couldn't be
+                                # keyed (#562 LOW) -- gate on the buffer arg index.
+                                _buf_arg = {
+                                    "recv": 1, "recvfrom": 1, "read": 1,
+                                    "pread": 1, "fread": 0,
+                                }.get(_rbase)
+                                if ptr_seeded and idx == _buf_arg:
                                     add_leaf(misanchored_recv_leaf(
                                         callee=str(callee),
                                         arg_index=idx,

@@ -103,14 +103,24 @@ def _derive_all_clear(
     assumptions: list[str],
     *,
     truncated: bool,
+    unmodeled_reached: bool = False,
 ) -> tuple[bool, str]:
     """The honesty claim gate for a ZERO-SINK forward result.
 
     Returns ``(safe_to_report_all_clear, reason)``. True ONLY when no tainted
-    frontier leaf remains, no weak/mis-anchored-seed condition holds, and the
-    run was not truncated. Even True is a may-analysis (the reason says so) --
-    never a proof of safety. This function never asserts a vulnerability; a
-    False value WITHHOLDS an all-clear, it does not claim a bug.
+    frontier leaf remains, no weak/mis-anchored-seed condition holds, taint did
+    not reach an unmodeled call frontier, and the run was not truncated. Even
+    True is a may-analysis (the reason says so) -- never a proof of safety. This
+    function never asserts a vulnerability; a False value WITHHOLDS an
+    all-clear, it does not claim a bug.
+
+    ``unmodeled_reached`` is the caller-computed "taint reached an unmodeled
+    call" signal (an unresolved in-binary callee counted in the frontier, OR an
+    external callee disclosed only as a ``"...has no model; return
+    conservatively tainted"`` assumption with NO leaf -- the most common
+    frontier). The engine returns such a callee conservatively tainted, so
+    analysis genuinely ESCAPED and an empty ``reached_sinks`` is not an
+    all-clear even though no blocking leaf was emitted (#562).
     """
     blocking = [str(lf.get("kind")) for lf in leaves
                 if lf.get("kind") in BLOCKING_LEAF_KINDS]
@@ -134,6 +144,12 @@ def _derive_all_clear(
             "no sinks/leaves, but the source seed was incomplete or mis-anchored "
             "(see caveats) -- NOT an all-clear; reseed with --source call:<recv> "
             "or var:<buf>")
+    if unmodeled_reached:
+        return False, (
+            "no modeled sink reached, but taint reached an unmodeled call "
+            "frontier (an unresolved in-binary callee or an external callee with "
+            "no taint model, returned conservatively tainted) -- analysis "
+            "escaped there, NOT an all-clear")
     if truncated:
         return False, (
             "analysis truncated (depth/recursion) -- incomplete coverage, NOT an "
@@ -208,7 +224,9 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
             "frontier; the flow appears to dead-end locally -- inspect the last "
             "propagated use or widen `--max-depth`")
 
-    safe, reason = _derive_all_clear(leaves, assumptions, truncated=truncated)
+    safe, reason = _derive_all_clear(
+        leaves, assumptions, truncated=truncated,
+        unmodeled_reached=unmodeled_reached)
 
     return {
         "source_callsites": int(seed_callsites),

@@ -1011,6 +1011,17 @@ def test_forward_ret_source_keeps_call_nudge_with_non_output_arg_sibling(models)
     assert any("call:read" in a for a in result["assumptions"])
 
 
+def test_arg_read_fd_seed_does_not_emit_buffer_not_keyed_leaf_562(models):
+    # #562 LOW: the misanchored "buffer_not_keyed" leaf keys on the recv/read
+    # BUFFER arg (read/recv/recvfrom/pread buf=arg1). Seeding a non-buffer arg
+    # (arg:read:0 = fd) is a different mistake and must NOT be mislabeled as a
+    # filled buffer that couldn't be keyed -- gate on the buffer arg index.
+    engine = te.TaintEngine(FBV({0x900: "read"}), models)
+    result = engine.forward(_read_callsite_func(), [te.parse_locator("arg:read:0")])
+    mis = [l for l in result["leaves"] if l.get("kind") == "source_seed_misanchored"]
+    assert mis == [], result["leaves"]
+
+
 def test_find_callsites_matches_demangled_callee(models):
     # A callsite to a function whose fn.name BN kept mangled must be found by its
     # demangled short_name, so arg:<demangled>:N seeds it the same way xrefs
@@ -5513,6 +5524,34 @@ def test_frontier_leaf_withholds_all_clear_562(models):
     assert "proto set" in diag["next_action"]
     # #562 gate folded in:
     assert diag["safe_to_report_all_clear"] is False
+
+
+def test_unmodeled_external_assumption_withholds_all_clear_562():
+    """Regression for the honesty-gate LIE (#562): when taint reaches an external
+    callee with NO taint model, the engine returns it conservatively tainted and
+    discloses it ONLY as a ``"...has no model..."`` assumption -- with NO blocking
+    leaf. ``_derive_all_clear`` previously inspected only leaves + seed markers,
+    so it emitted ``safe_to_report_all_clear=true`` in the SAME block that reports
+    ``unmodeled_calls_reached=true`` (a false all-clear). The gate must WITHHOLD
+    on this assumption-only external-callee frontier -- the most common one, which
+    the in-binary-leaf ``_frontier_leaf`` test did NOT cover."""
+    sub = {
+        "leaves": [],  # the escape is an assumption, NOT a structured leaf
+        "assumptions": [
+            "external parse_pkt has no model; return conservatively tainted",
+        ],
+        "diag": {"tainted_values": 3},
+    }
+    diag = te.forward_zero_diagnostics(sub, seed_callsites=1)
+
+    # descriptive #571 field already reports the escape ...
+    assert diag["unmodeled_calls_reached"] is True
+    # ... and the folded-in gate must now agree instead of contradicting it.
+    assert diag["safe_to_report_all_clear"] is False
+    assert "unmodeled call" in diag["all_clear_reason"]
+    assert "NOT an all-clear" in diag["all_clear_reason"]
+    # coherent with next_action (both point at the unmodeled-call frontier).
+    assert "unmodeled call frontier" in diag["next_action"]
 
 
 def test_reclassify_constant_format_sink_477(models):
