@@ -18,18 +18,18 @@ from pathlib import Path
 
 import pytest
 
-_ENGINE_PATH = Path(__file__).resolve().parents[1] / "src" / "bn_agent_bridge" / "taint_engine.py"
+_SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
 
 
 def _load_engine():
-    # Load as a top-level module so the wrapped `from .paths import ...` falls
-    # back gracefully (no package context) — load_models still reads the
-    # builtin JSON beside the file. Don't write bytecode into the source tree.
+    # Package import only: after the multi-module split (taint_models / taint_il /
+    # taint_locators / taint_result), ``taint_engine`` uses unguarded relative
+    # imports and is not loadable via ``spec_from_file_location`` (no parent
+    # package). Production and tests both import ``bn_agent_bridge.taint_engine``.
     sys.dont_write_bytecode = True
-    spec = importlib.util.spec_from_file_location("bn_taint_engine_under_test", _ENGINE_PATH)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules.setdefault("bn_taint_engine_under_test", module)
-    spec.loader.exec_module(module)
+    if str(_SRC_ROOT) not in sys.path:
+        sys.path.insert(0, str(_SRC_ROOT))
+    import bn_agent_bridge.taint_engine as module
     return module
 
 
@@ -288,7 +288,7 @@ def test_model_overlay_sources_labels_override_by_env_presence(monkeypatch, tmp_
     # not a false claim that the env var is in effect.
     override = tmp_path / "models.json"
     override.write_text("{}")
-    monkeypatch.setattr(te, "taint_models_path", lambda: override)
+    monkeypatch.setattr(te._taint_models_mod, "taint_models_path", lambda: override)
 
     monkeypatch.setenv("BN_TAINT_MODELS", str(override))
     by_env = te.model_overlay_sources(None)
@@ -3481,7 +3481,7 @@ def test_parse_locator_arg_requires_an_index():
 def test_load_models_raises_on_corrupt_builtin(monkeypatch, tmp_path):
     bad = tmp_path / "builtin.json"
     bad.write_text("{ this is not json", encoding="utf-8")
-    monkeypatch.setattr(te, "_BUILTIN_MODELS", bad)
+    monkeypatch.setattr(te._taint_models_mod, "_BUILTIN_MODELS", bad)
     with pytest.raises(te.TaintError, match="packaging bug"):
         te.load_models()
 
@@ -3489,7 +3489,7 @@ def test_load_models_raises_on_corrupt_builtin(monkeypatch, tmp_path):
 def test_load_models_raises_on_broken_override(monkeypatch, tmp_path):
     bad = tmp_path / "override.json"
     bad.write_text("{ broken", encoding="utf-8")
-    monkeypatch.setattr(te, "taint_models_path", lambda: bad)
+    monkeypatch.setattr(te._taint_models_mod, "taint_models_path", lambda: bad)
     with pytest.raises(te.TaintError, match="BN_TAINT_MODELS"):
         te.load_models()
 
@@ -3497,7 +3497,7 @@ def test_load_models_raises_on_broken_override(monkeypatch, tmp_path):
 def test_load_models_rejects_non_object_override(monkeypatch, tmp_path):
     bad = tmp_path / "override.json"
     bad.write_text('["a", "b"]', encoding="utf-8")
-    monkeypatch.setattr(te, "taint_models_path", lambda: bad)
+    monkeypatch.setattr(te._taint_models_mod, "taint_models_path", lambda: bad)
     with pytest.raises(te.TaintError, match="must be a JSON object"):
         te.load_models()
 
@@ -3505,7 +3505,7 @@ def test_load_models_rejects_non_object_override(monkeypatch, tmp_path):
 def test_load_models_rejects_non_dict_model_value(monkeypatch, tmp_path):
     bad = tmp_path / "override.json"
     bad.write_text('{"models": {"memcpy": "oops"}}', encoding="utf-8")
-    monkeypatch.setattr(te, "taint_models_path", lambda: bad)
+    monkeypatch.setattr(te._taint_models_mod, "taint_models_path", lambda: bad)
     with pytest.raises(te.TaintError, match="must be a JSON object"):
         te.load_models()
 
@@ -3516,7 +3516,7 @@ def test_load_models_accepts_valid_override_with_comment(monkeypatch, tmp_path):
         '{"my_custom_sink": {"sink": {"class": "x", "tainted_args": [0]}}, "_comment_x": "doc text"}',
         encoding="utf-8",
     )
-    monkeypatch.setattr(te, "taint_models_path", lambda: ok)
+    monkeypatch.setattr(te._taint_models_mod, "taint_models_path", lambda: ok)
     models = te.load_models()
     assert "my_custom_sink" in models           # override merged over builtin
     assert "memcpy" in models                   # builtin still present
@@ -5112,7 +5112,8 @@ def test_reaching_arg_seed_vars_bridges_llil_def_to_mlil_seed(monkeypatch):
     func = type("F", (), {"llil": type("LL", (), {"ssa_form": [[call_ins]]})()})()
     fake_bn = type("BN", (), {"LowLevelILOperation":
                               type("Op", (), {"LLIL_CALL_SSA": "CALL_SSA_OP"})()})()
-    monkeypatch.setattr(te, "reaching_reg_def",
+    # reaching_reg_def is closed over from taint_il; patch the owner module.
+    monkeypatch.setattr(te._taint_il_mod, "reaching_reg_def",
                         lambda ci, reg, bn: fake_def if ci is call_ins else None)
     seeds = te.reaching_arg_seed_vars(func, 0x18, "r2", fake_bn)
     assert [v for v, _ in seeds] == [seedvar]
