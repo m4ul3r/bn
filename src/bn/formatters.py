@@ -2390,6 +2390,12 @@ def _render_taint_models_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     lines: list[str] = []
+    # #555: lead with the non-findings disclaimer so the callsite inventory below
+    # is never skimmed as a taint/vuln findings list.
+    note = value.get("catalog_note")
+    if note:
+        lines.append("NOTE: " + str(note))
+        lines.append("")
     srcs = value.get("sources") or []
     if srcs:
         lines.append(f"sources ({len(srcs)}):")
@@ -2400,14 +2406,11 @@ def _render_taint_models_text(value: Any) -> str:
     if sbc:
         lines.append("")
         total = sum(len(v) for v in sbc.values())
-        lines.append(f"sinks ({total} in {len(sbc)} class(es)):")
+        lines.append(f"sinks ({total} in {len(sbc)} class(es)); NOT findings:")
         for cls, lst in sbc.items():
             lines.append(f"  [{cls}]")
             for e in lst:
-                cs = f" ({e['callsites']} callsites)" if e.get("callsites") is not None else ""
-                p = " [present]" if e.get("present") else (" [absent]" if "present" in e else "")
-                addrs = ("  " + ", ".join(e["addresses"])) if e.get("addresses") else ""
-                lines.append(f"    {e['symbol']} (arg {e.get('tainted_args')}){p}{cs}{addrs}")
+                lines.extend(_render_taint_sink_entry(e))
     props = value.get("propagators") or []
     if props:
         lines.append("")
@@ -2419,6 +2422,29 @@ def _render_taint_models_text(value: Any) -> str:
         lines.append("")
         lines.append("overlays: " + ", ".join(o.get("path", o.get("kind", "?")) for o in ov))
     return "\n".join(lines) if lines else "no models match the filter"
+
+
+def _render_taint_sink_entry(e: dict[str, Any]) -> list[str]:
+    """One present/catalog sink entry: the model line plus, under --callsites, its
+    enriched callsite rows (address + containing function + non-audit kind)."""
+    p = " [present]" if e.get("present") else (" [absent]" if "present" in e else "")
+    count = e.get("callsite_count")
+    if count is not None:
+        audit = e.get("audit_callsite_count")
+        if isinstance(audit, int) and audit != count:
+            cs = f" ({count} callsites, {audit} application)"
+        else:
+            cs = f" ({count} callsites)"
+    else:
+        cs = ""
+    desc = f"  -- {e['model_description']}" if e.get("model_description") else ""
+    out = [f"    {e['symbol']} (arg {e.get('tainted_args')}){p}{cs}{desc}"]
+    for c in (e.get("callsites") or []):
+        fn = c.get("function") or "?"
+        kind = c.get("kind")
+        tag = f" [{kind}]" if kind and kind != "app_caller" else ""
+        out.append(f"      {c.get('address')}  {fn}{tag}")
+    return out
 
 
 def _render_model_sources(sources: Any) -> str:

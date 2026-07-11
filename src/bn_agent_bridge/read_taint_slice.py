@@ -100,7 +100,9 @@ def _taint_op(ctx, selector, params: dict[str, Any]):
 
 def _taint_models_op(ctx, selector, params: dict[str, Any]):
     """`taint models`: dump the model catalog; with a target, annotate which
-    modeled symbols are present in the binary (+ callsite counts)."""
+    modeled symbols are present in the binary (+ enriched callsite rows). The
+    result is always a CATALOG, not a findings list -- see ``build_catalog``'s
+    top-level ``presence_catalog``/``is_finding`` markers (#555)."""
     present_only = bool(params.get("present"))
     want_callsites = bool(params.get("callsites"))
     if (present_only or want_callsites) and selector is None:
@@ -120,22 +122,84 @@ def _taint_models_op(ctx, selector, params: dict[str, Any]):
                         + [{"role": "propagator", **p} for p in catalog["propagators"]])
     if selector is not None:
         bv = ctx._resolve_view(selector)
-        present_keys, counts = _present_models(bv, models, want_callsites)
-        _annotate_presence(catalog, present_keys, counts, present_only)
+        present_keys, info = _present_models(bv, models, want_callsites)
+        _annotate_presence(catalog, present_keys, info, present_only)
     return catalog
+
+
+def _containing_fn(bv, addr: int):
+    """Function whose body contains ``addr`` (best-effort, BN-shape-tolerant so the
+    unit fakes without ``get_functions_containing`` degrade to None, not a crash)."""
+    try:
+        fns = list(getattr(bv, "get_functions_containing")(int(addr)))
+        if fns:
+            return fns[0]
+    except Exception:
+        pass
+    try:
+        return getattr(bv, "get_function_at")(int(addr))
+    except Exception:
+        return None
+
+
+def _is_thunk_fn(bv, fn) -> bool:
+    """True if ``fn`` is a PLT-style veneer / same-name thunk that forwards to a
+    different target -- BN's ``is_thunk`` flag, or a single-tailcall body that
+    ``follow_thunk`` resolves elsewhere. Mirrors ``read_xrefs._is_thunk_like``
+    without a cross-module import (this module never imports ``read_xrefs``)."""
+    if bool(getattr(fn, "is_thunk", False)):
+        return True
+    try:
+        resolved = _taint.follow_thunk(bv, fn)
+    except Exception:
+        resolved = None
+    return (resolved is not None
+            and int(getattr(resolved, "start", -1)) != int(getattr(fn, "start", -2)))
+
+
+def _classify_callsite(bv, addr: int, sink_key: str, models) -> tuple[str | None, str]:
+    """(containing-function-name, kind) for a present-model callsite.
+
+    ``kind`` is one of ``app_caller`` (a real application caller body),
+    ``import_thunk`` (an import/PLT veneer -- #560), or ``self_stub`` (the
+    modeled symbol's own body referencing itself, e.g. a self-tailcall stub).
+    Thunk/self-stub sites are NON-audit: they inflate a sink's callsite count
+    without being places an analyst would triage."""
+    fn = _containing_fn(bv, addr)
+    if fn is None:
+        return None, "app_caller"
+    fname = str(getattr(fn, "name", "")) or None
+    if _is_thunk_fn(bv, fn):
+        return fname, "import_thunk"
+    ck, _ = _taint.lookup_model(models, fname or "")
+    if ck is not None and ck == sink_key:
+        return fname, "self_stub"
+    return fname, "app_caller"
+
+
+def _pick_resolved(key: str, raws: list[str]) -> str | None:
+    """The canonical binary spelling for xrefs/callsites (#556): prefer the exact
+    model key, then an undecorated spelling (no ``@plt``), then the shortest."""
+    if not raws:
+        return None
+    if key in raws:
+        return key
+    plain = [r for r in raws if "@" not in r]
+    return min(plain or raws, key=lambda s: (len(s), s))
 
 
 def _present_models(bv, models, want_callsites):
     """Map the binary's symbols to model keys via the engine's own normalization;
-    return (present model-key set, {model-key: {callsites, addresses?}})."""
+    return ``(present model-key set, {model-key: info})`` where ``info`` carries
+    the raw binary spellings (#556) and, under ``want_callsites``, enriched
+    callsite rows with containing function + kind (#553/#560)."""
     present: set[str] = set()
-    counts: dict[str, dict[str, Any]] = {}
+    info: dict[str, dict[str, Any]] = {}
     # #472: several distinct binary symbol spellings can normalize to the SAME
     # model key (memcpy + memcpy@plt -> memcpy; _Znwm + operator new -> Znwm), so
-    # accumulate their callsites into one slot instead of overwriting -- an
-    # assignment let whichever spelling was seen last (set iteration order) clobber
-    # the rest, dropping a present sink to "(0 callsites)". Dedup addresses so an
-    # alias resolving to the same site is not double-counted.
+    # accumulate their callsites into one slot instead of overwriting, and track
+    # every raw spelling so the model output can name what xrefs/callsites expect.
+    raw_names: dict[str, set[str]] = {}
     seen_addrs: dict[str, set[str]] = {}
     names: set[str] = set()
     for fn in getattr(bv, "functions", []) or []:
@@ -147,31 +211,58 @@ def _present_models(bv, models, want_callsites):
         if not key:
             continue
         present.add(key)
+        raw_names.setdefault(key, set()).add(nm)
         if want_callsites:
-            slot = counts.setdefault(key, {"callsites": 0, "addresses": []})
+            slot = info.setdefault(key, {"callsites": []})
             seen = seen_addrs.setdefault(key, set())
             for sym in (getattr(bv, "get_symbols_by_name", lambda n: [])(nm) or []):
                 for ref in (getattr(bv, "get_code_refs", lambda a: [])(
                         getattr(sym, "address", 0)) or []):
-                    a = hex(int(getattr(ref, "address", 0)))
-                    if a not in seen:
-                        seen.add(a)
-                        slot["addresses"].append(a)
-            slot["callsites"] = len(slot["addresses"])
+                    ai = int(getattr(ref, "address", 0))
+                    a = hex(ai)
+                    # Dedup addresses so an alias resolving to the same site is not
+                    # double-counted (#472).
+                    if a in seen:
+                        continue
+                    seen.add(a)
+                    fname, kind = _classify_callsite(bv, ai, key, models)
+                    slot["callsites"].append(
+                        {"address": a, "function": fname, "kind": kind})
         else:
-            counts.setdefault(key, {"callsites": None})
-    return present, counts
+            info.setdefault(key, {})
+    for key, rn in raw_names.items():
+        slot = info.setdefault(key, {})
+        slot["raw_symbols"] = sorted(rn)
+        slot["resolved_symbol"] = _pick_resolved(key, slot["raw_symbols"])
+        if want_callsites:
+            cs = slot.get("callsites") or []
+            slot["callsite_count"] = len(cs)
+            # #560: application-caller subset -- the real VR work queue, excluding
+            # import-thunk / self-stub sites that only inflate the raw count.
+            slot["audit_callsite_count"] = sum(
+                1 for c in cs if c["kind"] == "app_caller")
+    return present, info
 
 
-def _annotate_presence(catalog, present_keys, counts, present_only):
+def _annotate_presence(catalog, present_keys, info, present_only):
     def _mark(entry):
         key = entry["symbol"]
         entry["present"] = key in present_keys
-        info = counts.get(key) or {}
-        if info.get("callsites") is not None:
-            entry["callsites"] = info["callsites"]
-            if "addresses" in info:
-                entry["addresses"] = info["addresses"]
+        data = info.get(key) or {}
+        # #556: the raw imported/exported spelling(s) so a consumer can pick the
+        # right identifier for xrefs/callsites itself, rather than guessing which
+        # command wants the normalized alias vs the raw symbol.
+        if data.get("raw_symbols"):
+            entry["raw_symbol"] = data.get("resolved_symbol")
+            entry["resolved_symbol"] = data.get("resolved_symbol")
+            entry["accepted_aliases"] = data["raw_symbols"]
+        # #553/#560: callsite rows (address + containing function + kind) plus the
+        # raw and audit-only counts. Present-only mode (no --callsites) has no
+        # count, matching the prior behavior.
+        if "callsite_count" in data:
+            entry["callsite_count"] = data["callsite_count"]
+            entry["callsites"] = data.get("callsites", [])
+            entry["audit_callsite_count"] = data.get("audit_callsite_count", 0)
         return entry["present"]
     catalog["sources"] = [e for e in catalog["sources"] if (_mark(e) or not present_only)]
     for cls, lst in list(catalog["sinks_by_class"].items()):

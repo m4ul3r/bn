@@ -123,6 +123,10 @@ class _BVSpellings:
         return self._refs.get(a, [])
 
 
+def _addrs(entry):
+    return {c["address"] for c in entry.get("callsites", [])}
+
+
 def test_present_callsites_aggregates_across_symbol_spellings():
     # #472: two symbol spellings mapping to one model key must AGGREGATE their
     # callsites, not clobber -- the old assignment let whichever spelling was seen
@@ -131,8 +135,8 @@ def test_present_callsites_aggregates_across_symbol_spellings():
                                {"present": True, "callsites": True})
     mc = [e for lst in res["sinks_by_class"].values() for e in lst if e["symbol"] == "memcpy"]
     assert len(mc) == 1
-    assert mc[0]["callsites"] == 3                        # 2 + 1 aggregated, not clobbered
-    assert set(mc[0]["addresses"]) == {"0x400", "0x404", "0x408"}
+    assert mc[0]["callsite_count"] == 3                   # 2 + 1 aggregated, not clobbered
+    assert _addrs(mc[0]) == {"0x400", "0x404", "0x408"}
 
 
 def test_present_callsites_dedups_aliased_addresses():
@@ -144,8 +148,8 @@ def test_present_callsites_dedups_aliased_addresses():
     res = rts._taint_models_op(_CtxWithBV(_BVDup()), "active",
                                {"present": True, "callsites": True})
     mc = [e for lst in res["sinks_by_class"].values() for e in lst if e["symbol"] == "memcpy"]
-    assert mc[0]["callsites"] == 1
-    assert mc[0]["addresses"] == ["0x400"]
+    assert mc[0]["callsite_count"] == 1
+    assert _addrs(mc[0]) == {"0x400"}
 
 
 def test_builtin_catalog_covers_fortify_and_exec_sinks():
@@ -166,6 +170,174 @@ def test_builtin_catalog_covers_fortify_and_exec_sinks():
     # so retiring the name-regex net does not silently drop it from enumeration.
     src_syms = {s["symbol"] for s in build_catalog(models, role="source")["sources"]}
     assert "fscanf" in src_syms, "fscanf must be a modeled source"
+
+
+# --- #555: catalog entries marked as NON-findings --------------------------
+
+def test_build_catalog_marks_non_findings_555():
+    cat = build_catalog(_MODELS)
+    # Top-level: loud, machine-readable "this is a catalog, not findings".
+    assert cat["presence_catalog"] is True
+    assert cat["is_finding"] is False
+    assert "NOT taint findings" in cat["catalog_note"]
+    # Every sink entry is a non-finding and carries conditional wording.
+    memcpy = cat["sinks_by_class"]["overflow_len"][0]
+    assert memcpy["is_finding"] is False
+    assert memcpy["model_name"] == "memcpy"
+    # Keeps the "... IF argument N is tainted" framing so a constant arg isn't a bug.
+    assert "IF argument 2 is tainted" in memcpy["model_description"]
+
+
+def test_build_catalog_unconditional_sink_description_555():
+    # A sink with an empty tainted_args list (e.g. gets) is still a catalog entry,
+    # not a finding, and its description says so without asserting a vuln.
+    models = {"gets": {"sink": {"tainted_args": [], "class": "unbounded_input",
+                                "detail": "always unsafe"}}}
+    entry = build_catalog(models, role="sink")["sinks_by_class"]["unbounded_input"][0]
+    assert entry["is_finding"] is False
+    assert "not a finding" in entry["model_description"].lower()
+
+
+def test_build_catalog_multi_arg_description_555():
+    models = {"calloc": {"sink": {"tainted_args": [0, 1], "class": "alloc_size",
+                                  "detail": "size"}}}
+    entry = build_catalog(models, role="sink")["sinks_by_class"]["alloc_size"][0]
+    assert "arguments 0 or 1 are tainted" in entry["model_description"]
+
+
+# --- #553: containing function + context per callsite ----------------------
+
+class _FnFull:
+    def __init__(self, name, start, is_thunk=False):
+        self.name = name
+        self.start = start
+        self.is_thunk = is_thunk
+
+
+class _BVTriage:
+    """Present sink ``system`` with one real application caller (parse_record) and
+    one import-thunk site (the ``system`` PLT veneer). Exercises #553 (function per
+    callsite) and #560 (thunk labeling / audit count)."""
+    def __init__(self):
+        self._app = _FnFull("parse_record", 0x5000)
+        self._thunk = _FnFull("system", 0x1000, is_thunk=True)
+        self.functions = [self._app, self._thunk]
+        self._syms = {"system": [_Sym("system", 0x1000)]}
+        self._refs = {0x1000: [_Ref(0x5010), _Ref(0x2000)]}
+        self._contain = {0x5010: self._app, 0x2000: self._thunk}
+
+    def get_symbols(self):
+        return []
+
+    def get_symbols_by_name(self, n):
+        return self._syms.get(n, [])
+
+    def get_code_refs(self, a):
+        return self._refs.get(a, [])
+
+    def get_functions_containing(self, a):
+        f = self._contain.get(a)
+        return [f] if f else []
+
+    def get_function_at(self, a):
+        return next((f for f in self.functions if f.start == a), None)
+
+
+def _sink_entry(res, symbol):
+    return next(e for lst in res["sinks_by_class"].values() for e in lst
+               if e["symbol"] == symbol)
+
+
+def test_present_callsites_include_function_553():
+    res = rts._taint_models_op(_CtxWithBV(_BVTriage()), "active",
+                               {"present": True, "callsites": True})
+    system = _sink_entry(res, "system")
+    rows = {c["address"]: c for c in system["callsites"]}
+    assert rows["0x5010"]["function"] == "parse_record"
+    assert rows["0x5010"]["kind"] == "app_caller"
+
+
+# --- #560: label import-thunk / self-stub callsites, expose audit count -----
+
+def test_present_callsites_label_import_thunk_560():
+    res = rts._taint_models_op(_CtxWithBV(_BVTriage()), "active",
+                               {"present": True, "callsites": True})
+    system = _sink_entry(res, "system")
+    rows = {c["address"]: c for c in system["callsites"]}
+    assert rows["0x2000"]["kind"] == "import_thunk"
+    # Raw count includes the thunk; the audit count excludes it (the real queue).
+    assert system["callsite_count"] == 2
+    assert system["audit_callsite_count"] == 1
+
+
+def test_present_self_stub_labeled_non_audit_560():
+    # A code ref located inside the modeled symbol's OWN body (a self-tailcall
+    # stub) is non-audit, distinct from an import thunk.
+    class _BVSelf:
+        def __init__(self):
+            self._body = _FnFull("memcpy", 0x1000)          # not is_thunk
+            self.functions = [self._body]
+            self._syms = {"memcpy": [_Sym("memcpy", 0x1000)]}
+            self._refs = {0x1000: [_Ref(0x1004)]}           # self-reference
+            self._contain = {0x1004: self._body}
+
+        def get_symbols(self):
+            return []
+
+        def get_symbols_by_name(self, n):
+            return self._syms.get(n, [])
+
+        def get_code_refs(self, a):
+            return self._refs.get(a, [])
+
+        def get_functions_containing(self, a):
+            f = self._contain.get(a)
+            return [f] if f else []
+
+        def get_function_at(self, a):
+            return self._body if a == 0x1000 else None
+
+    res = rts._taint_models_op(_CtxWithBV(_BVSelf()), "active",
+                               {"present": True, "callsites": True})
+    mc = _sink_entry(res, "memcpy")
+    assert mc["callsites"][0]["kind"] == "self_stub"
+    assert mc["audit_callsite_count"] == 0
+
+
+# --- #556: portable / stable identifiers in model output -------------------
+
+def test_present_exposes_portable_identifiers_556():
+    res = rts._taint_models_op(_CtxWithBV(_BVSpellings()), "active",
+                               {"present": True, "callsites": True})
+    mc = _sink_entry(res, "memcpy")
+    # model_name = normalized alias taint commands accept; raw/resolved = the
+    # imported spelling xrefs/callsites need; accepted_aliases lists all spellings.
+    assert mc["model_name"] == "memcpy"
+    assert mc["resolved_symbol"] == "memcpy"              # exact key preferred over @plt
+    assert mc["raw_symbol"] == "memcpy"
+    assert set(mc["accepted_aliases"]) == {"memcpy", "memcpy@plt"}
+
+
+def test_catalog_only_has_model_name_but_no_raw_symbol_556():
+    # Without a target there is no binary spelling to resolve; model_name is still
+    # present so a consumer always has the portable alias.
+    res = rts._taint_models_op(_CtxNoView(), None, {})
+    sink = next(e for e in res["items"] if e["role"] == "sink")
+    assert sink["model_name"] == sink["symbol"]
+    assert "raw_symbol" not in sink
+
+
+# --- text rendering ---------------------------------------------------------
+
+def test_render_taint_models_text_non_finding_banner_and_rows():
+    from bn.formatters import _render_taint_models_text
+    res = rts._taint_models_op(_CtxWithBV(_BVTriage()), "active",
+                               {"present": True, "callsites": True})
+    text = _render_taint_models_text(res)
+    assert "NOT taint findings" in text
+    assert "parse_record" in text                         # #553 function context
+    assert "[import_thunk]" in text                       # #560 non-audit label
+    assert "2 callsites, 1 application" in text           # raw vs audit count
 
 
 def test_build_catalog_surfaces_bounded_write_sink_443():
