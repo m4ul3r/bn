@@ -1011,6 +1011,17 @@ def test_forward_ret_source_keeps_call_nudge_with_non_output_arg_sibling(models)
     assert any("call:read" in a for a in result["assumptions"])
 
 
+def test_arg_read_fd_seed_does_not_emit_buffer_not_keyed_leaf_562(models):
+    # #562 LOW: the misanchored "buffer_not_keyed" leaf keys on the recv/read
+    # BUFFER arg (read/recv/recvfrom/pread buf=arg1). Seeding a non-buffer arg
+    # (arg:read:0 = fd) is a different mistake and must NOT be mislabeled as a
+    # filled buffer that couldn't be keyed -- gate on the buffer arg index.
+    engine = te.TaintEngine(FBV({0x900: "read"}), models)
+    result = engine.forward(_read_callsite_func(), [te.parse_locator("arg:read:0")])
+    mis = [l for l in result["leaves"] if l.get("kind") == "source_seed_misanchored"]
+    assert mis == [], result["leaves"]
+
+
 def test_find_callsites_matches_demangled_callee(models):
     # A callsite to a function whose fn.name BN kept mangled must be found by its
     # demangled short_name, so arg:<demangled>:N seeds it the same way xrefs
@@ -5433,6 +5444,215 @@ def test_forward_zero_result_diagnostics_no_propagation_559(models):
     assert diag["frontier"]["unresolved"] == 0
     assert diag["frontier"]["coarse_memory"] == 0
     assert diag["next_action"]                                 # a factual suggestion, not a verdict
+
+
+# --------------------------------------------------------------------------
+# #562 behavioral half: fgetc sources, recv-seed honesty, claim gate
+# --------------------------------------------------------------------------
+
+def test_fgetc_family_are_ret_taint_sources_562(models):
+    """#562 change 1: fgetc/getc/getchar are byte-at-a-time file sources whose
+    tainted value is the RETURN (the byte read). Without a model they are
+    unmodeled calls and a hand-rolled token loop shows no modeled source."""
+    for name in ("fgetc", "getc", "getchar"):
+        assert name in models, f"{name} missing from model DB"
+        tos = [str(s.get("to")) for s in models[name].get("sources") or []]
+        assert tos == ["ret"], (name, tos)     # the byte, not a buffer arg
+
+
+def test_arg_recvmsg_seed_emits_misanchored_leaf_and_withholds_all_clear_562(models):
+    """#562 change 2/3: an arg:recvmsg:N seed anchors the msghdr*, never the
+    scatter-gather payload, so the buffer is never tainted and no sink fires.
+    That empty result must NOT read as a clean all-clear: a structured
+    source_seed_misanchored leaf lands in leaves, and the folded-in claim gate
+    withholds the all-clear."""
+    func = _recvmsg_static_iov_func()
+    bv = FBV({0x900: "recvmsg", 0x910: "system"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:recvmsg:1")])
+
+    assert result["reached_sinks"] == []                        # payload never tainted
+    mis = [l for l in result["leaves"] if l.get("kind") == "source_seed_misanchored"]
+    assert len(mis) == 1, result["leaves"]
+    assert mis[0]["callee"] == "recvmsg"
+    assert "call:recvmsg" == mis[0]["suggested_source"]
+
+    diag = result["diagnostics"]
+    assert diag["frontier"]["seed_misanchored"] == 1
+    # The honesty gate is FOLDED INTO the single diagnostics block (#571 schema).
+    assert diag["safe_to_report_all_clear"] is False
+    assert "NOT an all-clear" in diag["all_clear_reason"]
+    # propagation-not-verdict: the gate withholds, it never asserts a bug.
+    assert "call:<recv>" in diag["next_action"] or "call:recv" in diag["next_action"]
+
+
+def test_zero_sink_clean_run_reports_safe_to_report_all_clear_true_562(models):
+    """A forward run that produces no sink and no tainted frontier folds a
+    safe_to_report_all_clear=true into diagnostics -- framed as may-analysis,
+    never a proof of safety (propagation-not-verdict)."""
+    a = FVar("a"); r = FVar("r")
+    a0 = FSSA(a, 0); r1 = FSSA(r, 1)
+    ssa = FSSAFunc([
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "r#1 = a#0 + 1", reads=[a0], writes=[r1]),
+        FInstr(1, 0x14, "MLIL_RET", "return r#1", reads=[r1]),
+    ])
+    func = FFunc("add_one", 0x10, ssa, params=[a])
+    engine = te.TaintEngine(FBV({}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+
+    assert result["reached_sinks"] == []
+    assert result["leaves"] == []
+    diag = result["diagnostics"]
+    assert diag["safe_to_report_all_clear"] is True
+    assert "may-analysis" in diag["all_clear_reason"]
+    assert "not a proof" in diag["all_clear_reason"]           # never asserts safety
+
+
+def test_frontier_leaf_withholds_all_clear_562(models):
+    """A zero-sink run that hit an unmodeled in-binary parser (a real frontier
+    leaf) must fold safe_to_report_all_clear=false -- the existing #571 frontier
+    fields stay intact alongside the new gate (unified schema)."""
+    func, bv = _frontier_no_params_program()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:recv:1")])
+
+    diag = result["diagnostics"]
+    # #571 fields preserved:
+    assert diag["source_callsites"] == 1
+    assert diag["unmodeled_calls_reached"] is True
+    assert diag["frontier"]["by_kind"].get("unmodeled_callee") == 1
+    assert "proto set" in diag["next_action"]
+    # #562 gate folded in:
+    assert diag["safe_to_report_all_clear"] is False
+
+
+def test_unmodeled_external_assumption_withholds_all_clear_562():
+    """Regression for the honesty-gate LIE (#562): when taint reaches an external
+    callee with NO taint model, the engine returns it conservatively tainted and
+    discloses it ONLY as a ``"...has no model..."`` assumption -- with NO blocking
+    leaf. ``_derive_all_clear`` previously inspected only leaves + seed markers,
+    so it emitted ``safe_to_report_all_clear=true`` in the SAME block that reports
+    ``unmodeled_calls_reached=true`` (a false all-clear). The gate must WITHHOLD
+    on this assumption-only external-callee frontier -- the most common one, which
+    the in-binary-leaf ``_frontier_leaf`` test did NOT cover."""
+    sub = {
+        "leaves": [],  # the escape is an assumption, NOT a structured leaf
+        "assumptions": [
+            "external parse_pkt has no model; return conservatively tainted",
+        ],
+        "diag": {"tainted_values": 3},
+    }
+    diag = te.forward_zero_diagnostics(sub, seed_callsites=1)
+
+    # descriptive #571 field already reports the escape ...
+    assert diag["unmodeled_calls_reached"] is True
+    # ... and the folded-in gate must now agree instead of contradicting it.
+    assert diag["safe_to_report_all_clear"] is False
+    assert "unmodeled call" in diag["all_clear_reason"]
+    assert "NOT an all-clear" in diag["all_clear_reason"]
+    # coherent with next_action (both point at the unmodeled-call frontier).
+    assert "unmodeled call frontier" in diag["next_action"]
+
+
+# --------------------------------------------------------------------------
+# #562 residual honesty gaps: indirect-pointer-slot (#193) and taint-reached
+# unlifted instruction (#206) must WITHHOLD the all-clear (assumption-only
+# escapes that previously left safe_to_report_all_clear=true).
+# --------------------------------------------------------------------------
+
+def _indirect_nonrecv_pointer_arg_func():
+    # parse_pkt(ctx, pkt) where the buffer pointer `pkt = [G]` is loaded from a
+    # global slot. parse_pkt is a CUSTOM parser (not recv-family), so the
+    # recv-buffer misanchored leaf never fires -- only the #193 indirect-load
+    # caveat applies. unknown_call_policy="stop" keeps the unmodeled parse_pkt
+    # call from also escaping, so the indirect-slot leaf is the SOLE reason the
+    # gate must withhold.
+    t = FVar("t"); t1 = FSSA(t, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "t#1 = [G]", writes=[t1],
+               src=FExpr("MLIL_LOAD", "[G]", reads=[])),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "parse_pkt(ctx, t#1)", reads=[t1],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_VAR_SSA", "ctx", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "t#1", reads=[t1])]),
+        FInstr(2, 0x18, "MLIL_RET", "return", reads=[]),
+    ]
+    return FFunc("handler", 0x10, FSSAFunc(instrs), params=[])
+
+
+def test_indirect_pointer_slot_nonrecv_arg_withholds_all_clear_193(models):
+    # #193/#562 residual 1: an arg:<parser>:N seed whose buffer pointer is loaded
+    # indirectly (non-recv callee, so NOT covered by the recv-buffer leaf) escaped
+    # analysis -- the pointed-to payload was provably not followed. Before the fix
+    # this was assumption-only and the gate LIED with safe_to_report_all_clear=true.
+    # Now a source_seed_misanchored leaf lands in leaves/frontier and the gate
+    # withholds.
+    func = _indirect_nonrecv_pointer_arg_func()
+    bv = FBV({0x900: "parse_pkt"})
+    engine = te.TaintEngine(bv, models, unknown_call_policy="stop")
+    result = engine.forward(func, [te.parse_locator("arg:parse_pkt:1")])
+
+    assert result["reached_sinks"] == []
+    mis = [l for l in result["leaves"] if l.get("kind") == "source_seed_misanchored"]
+    assert len(mis) == 1, result["leaves"]
+    assert mis[0]["callee"] == "parse_pkt"
+    # the honest assumption is still present (informational) ...
+    assert any("loaded indirectly" in a for a in result["assumptions"])
+    # ... but it is the LEAF that gates.
+    diag = result["diagnostics"]
+    assert diag["frontier"]["seed_misanchored"] == 1
+    assert diag["safe_to_report_all_clear"] is False
+    assert "NOT an all-clear" in diag["all_clear_reason"]
+
+
+def test_taint_reaches_unlifted_instruction_withholds_all_clear_206(models):
+    # #206/#562 residual 2 (positive): a tainted value that REACHES an unlifted/
+    # unimplemented instruction passes through an op BN could not model -- a silent
+    # hole. The flow-sensitive leaf must land and the gate must withhold, even
+    # though no modeled sink was reached.
+    a = FVar("a"); a0 = FSSA(a, 0)
+    ssa = FSSAFunc([
+        FInstr(0, 0x10, "MLIL_UNIMPL", "vfma d0, a#0, d1, d2", reads=[a0]),
+        FInstr(1, 0x14, "MLIL_RET", "return", reads=[]),
+    ])
+    func = FFunc("simd_transform", 0x10, ssa, params=[a])
+    engine = te.TaintEngine(FBV({}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+
+    assert result["reached_sinks"] == []
+    ul = [l for l in result["leaves"] if l.get("kind") == "unlifted_instruction_reached"]
+    assert len(ul) == 1, result["leaves"]
+    assert ul[0]["address"] == "0x10"
+    diag = result["diagnostics"]
+    assert diag["safe_to_report_all_clear"] is False
+    assert "NOT an all-clear" in diag["all_clear_reason"]
+
+
+def test_unlifted_instruction_not_reached_does_not_over_withhold_206(models):
+    # #206/#562 residual 2 (negative / no over-withhold): a function that CONTAINS
+    # an unlifted instruction but where NO tainted value reaches it must STILL be
+    # an all-clear. The function-scoped assumption is flow-insensitive and fires,
+    # but the flow-sensitive leaf does NOT -- so the gate must not over-withhold.
+    a = FVar("a"); a0 = FSSA(a, 0); r = FVar("r"); r1 = FSSA(r, 1)
+    b = FVar("b"); b0 = FSSA(b, 0)
+    ssa = FSSAFunc([
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "r#1 = a#0 + 1", reads=[a0], writes=[r1]),
+        # unlifted op reads an UNTAINTED operand (b, param:1, never seeded).
+        FInstr(1, 0x14, "MLIL_UNIMPL", "fnmsub s0, b#0, s1, s2", reads=[b0]),
+        FInstr(2, 0x18, "MLIL_RET", "return r#1", reads=[r1]),
+    ])
+    func = FFunc("mixed", 0x10, ssa, params=[a, b])
+    engine = te.TaintEngine(FBV({}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])   # taints a, not b
+
+    assert result["reached_sinks"] == []
+    # the flow-insensitive assumption still fires (informational) ...
+    assert any("unlifted/unimplemented" in s for s in result["assumptions"])
+    # ... but NO flow-sensitive leaf, so the gate must NOT over-withhold.
+    assert not any(l.get("kind") == "unlifted_instruction_reached" for l in result["leaves"])
+    diag = result["diagnostics"]
+    assert diag["safe_to_report_all_clear"] is True
+    assert "may-analysis" in diag["all_clear_reason"]
 
 
 def test_reclassify_constant_format_sink_477(models):

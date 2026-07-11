@@ -53,7 +53,11 @@ from .taint_locators import (  # noqa: F401
     node_label, _instr_dict, _render_source, _make_signature,
     derive_flow_facts,
 )
-from .taint_result import forward_zero_diagnostics  # noqa: F401
+from .taint_result import (  # noqa: F401
+    forward_zero_diagnostics,
+    indirect_pointer_slot_leaf,
+    misanchored_recv_leaf,
+)
 
 # Module aliases so tests/callers can patch a moved symbol on its OWNER module
 # (a re-exported binding on the engine is a separate name -- rebinding it would
@@ -1836,7 +1840,8 @@ class TaintEngine:
         engine-state-free implementation); the only engine input is the matched
         seed-callsite count."""
         return forward_zero_diagnostics(
-            sub, seed_callsites=int(getattr(self, "_seed_callsites", 0)))
+            sub, seed_callsites=int(getattr(self, "_seed_callsites", 0)),
+            truncated=bool(getattr(self, "_truncated", False)))
 
     def _attributable_callsites(self, func: Any, sources: list[dict[str, Any]]) -> list[int]:
         """Distinct call addresses to attribute a single ret/arg source across.
@@ -2255,12 +2260,23 @@ class TaintEngine:
         return None
 
     def _register_indirect_buffer_slot(self, ssaf, ptr_expr, callsite, callee, idx,
-                                       buffer_slots, add_assumption) -> None:
+                                       buffer_slots, add_assumption,
+                                       add_leaf=None, recv_buffer_covered=False) -> None:
         """When a buffer source's pointer is an indirect load `[slot]`, register the
         slot so a later re-load of it can be correlated forward (#193 Part 1). If the
         slot can't be named, fall back to today's honest "may be missed" caveat. When
         it can, defer that caveat -- `_forward_run` decides post-fixpoint whether the
-        slot actually correlated (positive note) or not (the caveat)."""
+        slot actually correlated (positive note) or not (the caveat).
+
+        Honesty gate (#562): the "may be missed" caveat is assumption-only, so on a
+        zero-sink run it did NOT block the claim gate even though analysis provably
+        did not follow the pointed-to payload. Emit a real blocking leaf
+        (``source_seed_misanchored`` via :func:`indirect_pointer_slot_leaf`) on the
+        SAME (un)correlated sub-path so the gate withholds via the existing leaf
+        mechanism -- exactly like the recv-buffer case. ``recv_buffer_covered`` is
+        set by the ``arg:`` caller when it already emits a recv-buffer misanchored
+        leaf for this (callee, idx), so the leaf is not double-counted there; the
+        ``*arg:`` (call: preset) caller has no such leaf and passes False."""
         if not self._arg_ptr_is_indirect_load(ssaf, ptr_expr):
             return
         pending = (
@@ -2270,8 +2286,20 @@ class TaintEngine:
             f"flow that re-loads the pointer and parses it may be missed. Consider "
             f"seeding the parser entry directly with param:N")
         key = self._buffer_slot_key(ssaf, ptr_expr)
+        # The blocking leaf that mirrors the caveat (None when the recv-buffer
+        # caller already covers this (callee, idx), or when no leaf sink was
+        # provided -- e.g. a legacy caller). It fires on exactly the sub-paths
+        # where the assumption fires, never when the slot correlates forward.
+        pending_leaf = None
+        if add_leaf is not None and not recv_buffer_covered:
+            pending_leaf = indirect_pointer_slot_leaf(
+                callee=str(callee), arg_index=idx,
+                address=hex(int(getattr(callsite, "address", 0))),
+                slot=key)
         if key is None:
             add_assumption(pending)
+            if pending_leaf is not None:
+                add_leaf(pending_leaf)
             return
         recv_node = None
         for r in expr_reads(ptr_expr):
@@ -2280,6 +2308,7 @@ class TaintEngine:
         buffer_slots[key] = {
             "recv_idx": getattr(callsite, "instr_index", None),
             "callee": callee, "idx": idx, "recv_node": recv_node, "pending": pending,
+            "pending_leaf": pending_leaf,
         }
 
     def _as_single_ssa_var(self, expr: Any) -> Any | None:
@@ -2966,7 +2995,8 @@ class TaintEngine:
         # local to this run, so a descended callee's run keeps its own.
         buffer_slots: dict = {}
         correlated_slots: set = set()
-        seeded = self._seed_forward(func, ssaf, instrs, locators, taint_node, add_assumption, buffer_slots)
+        seeded = self._seed_forward(func, ssaf, instrs, locators, taint_node, add_assumption,
+                                    buffer_slots, leaves)
         if not seeded:
             if top:
                 raise TaintError("no taint sources resolved; check --source locator")
@@ -2976,8 +3006,14 @@ class TaintEngine:
         # Honesty signal: a visited function with unlifted instructions is a
         # potential silent dataflow hole -- BN couldn't model those ops, so taint
         # through them isn't tracked. Surface it the way unmodeled calls/coarse
-        # stores already are, instead of flowing through silently (#206).
+        # stores already are, instead of flowing through silently (#206). The
+        # function-scoped ASSUMPTION below is flow-INSENSITIVE (fires whenever the
+        # function contains any unlifted op); it is kept as an informational note.
+        # The claim gate is driven instead by the flow-SENSITIVE leaf emitted in
+        # the fixpoint loop (only when a tainted value actually reaches such an
+        # instruction) so the gate does not over-withhold on every SIMD/FP function.
         unimpl = self._unimplemented_addrs(func, instrs)
+        unimpl_addr_set = set(unimpl)
         if unimpl:
             sample = ", ".join(hex(a) for a in unimpl[:5])
             more = "" if len(unimpl) <= 5 else f", +{len(unimpl) - 5} more"
@@ -3301,6 +3337,38 @@ class TaintEngine:
             changed = False
             for ins in instrs:
                 opn = op_name(ins)
+
+                # #206 flow-sensitive honesty: a tainted value that reaches an
+                # unlifted/unimplemented instruction passes through an op BN's
+                # lifter could not model, so propagation past it is a silent hole.
+                # Reuse the SAME unlifted detection that produced the assumption
+                # count (MLIL_UNIMPL* op OR an address in the LLIL/MLIL unlifted
+                # set), and gate on taint actually reaching it -- a tainted SSA
+                # read operand, OR a defined var already in the tainted flow. Emit
+                # a blocking leaf (deduped by address) so the claim gate withholds
+                # ONLY when taint truly reaches such an instruction; a function
+                # that merely contains unlifted ops does not block the gate.
+                if unimpl_addr_set or "UNIMPL" in opn:
+                    _uaddr = int(getattr(ins, "address", 0))
+                    if "UNIMPL" in opn or _uaddr in unimpl_addr_set:
+                        _reaches = bool(read_taint(ins)) or any(
+                            (var_key(w), getattr(w, "version", None)) in tainted
+                            for w in ssa_writes(ins))
+                        if _reaches:
+                            _ul = {
+                                "kind": "unlifted_instruction_reached",
+                                "address": hex(_uaddr),
+                                "il_text": str(ins),
+                                "detail": (
+                                    "a tainted value reaches an unlifted/unimplemented "
+                                    "instruction here; BN's lifter could not model this "
+                                    "op, so propagation through it is not tracked (a "
+                                    "silent dataflow hole) -- a 'no sinks reached' result "
+                                    "past this point is NOT proof of safety; inspect the "
+                                    "instruction or seed downstream of it"),
+                            }
+                            if _ul not in leaves:
+                                leaves.append(_ul)
 
                 if opn == "MLIL_RET":
                     if read_taint(ins) or self._return_buffer_tainted(ssaf, ins, tainted):
@@ -3727,6 +3795,12 @@ class TaintEngine:
         for sk, slot in buffer_slots.items():
             if sk not in correlated_slots:
                 add_assumption(slot["pending"])
+                # #562: the caveat is assumption-only; also emit the deferred
+                # blocking leaf so a zero-sink run whose only escape is this
+                # uncorrelated indirect-pointer slot withholds the all-clear.
+                pl = slot.get("pending_leaf")
+                if pl is not None and pl not in leaves:
+                    leaves.append(pl)
 
         # #559: for the top run, capture the seed-frontier facts a zero-result
         # query needs to explain WHY the frontier stopped -- how many SSA values
@@ -3842,9 +3916,20 @@ class TaintEngine:
             f"stripped-proto shape), apply `bn proto set {func.name} \"<prototype>\"` "
             f"and re-run this taint query")
 
-    def _seed_forward(self, func, ssaf, instrs, sources, taint_node, add_assumption, buffer_slots=None) -> bool:
+    def _seed_forward(self, func, ssaf, instrs, sources, taint_node, add_assumption,
+                      buffer_slots=None, leaves=None) -> bool:
         if buffer_slots is None:
             buffer_slots = {}
+        if leaves is None:
+            leaves = []
+
+        def add_leaf(leaf: dict[str, Any]) -> None:
+            # A structured seed-honesty leaf (#562): dedupe so a re-seeded run
+            # doesn't stack duplicates. Distinct from assumptions -- this lands
+            # in result["leaves"] and feeds the frontier accounting/claim gate.
+            if leaf and leaf not in leaves:
+                leaves.append(leaf)
+
         seeded = False
         for src in sources:
             kind = src.get("kind")
@@ -3888,6 +3973,16 @@ class TaintEngine:
                         f"automatically, or seed the filled buffer directly (--source "
                         f"var:<buf>) when the iovec is built dynamically."
                     )
+                    # #562: structured leaf so JSON `leaves` is non-empty and the
+                    # claim gate withholds an all-clear. An arg:recvmsg:N seed
+                    # ALWAYS mis-anchors (it seeds the msghdr*, never the payload),
+                    # so emit unconditionally here -- dogfood: agents misread a
+                    # bare assumptions-only + 0-sinks result as clean.
+                    add_leaf(misanchored_recv_leaf(
+                        callee=str(callee),
+                        arg_index=int(src.get("index", 1)),
+                        reason="msghdr_not_payload",
+                    ))
                 if kind == "ret":
                     # A ret: source on a function whose model also fills an
                     # output-pointer buffer would silently miss those bytes;
@@ -3952,18 +4047,49 @@ class TaintEngine:
                                               f"source: {callee} fills arg{idx} buffer", []):
                                     seeded = True
                             else:
+                                ptr_seeded = False
                                 for r in expr_reads(params[idx]):
                                     if taint_node((var_key(r), getattr(r, "version", None)), var_label(r), c,
                                                   f"source: {callee} arg{idx}", []):
                                         seeded = True
+                                        ptr_seeded = True
+                                # #562: a recv-family arg seed that tainted only the
+                                # pointer value (buffer not keyed) is the arg:recv:1
+                                # false-all-clear shape -- emit a structured leaf so
+                                # the claim gate stops reading the empty result as
+                                # clean. Distinct from recvmsg (handled above): here
+                                # the buffer simply couldn't be anchored.
+                                _rbase = (callee or "").split("@", 1)[0].lstrip("_")
+                                # The "buffer_not_keyed" leaf only applies when the
+                                # SEEDED arg is the output-buffer pointer (read/recv/
+                                # recvfrom/pread buf=arg1, fread ptr=arg0). A non-buffer
+                                # arg seed (e.g. arg:read:0 = fd) is a different mistake
+                                # and must NOT be mislabeled as a buffer that couldn't be
+                                # keyed (#562 LOW) -- gate on the buffer arg index.
+                                _buf_arg = {
+                                    "recv": 1, "recvfrom": 1, "read": 1,
+                                    "pread": 1, "fread": 0,
+                                }.get(_rbase)
+                                _recv_covered = bool(ptr_seeded and idx == _buf_arg)
                                 # The buffer couldn't be anchored to a stack var or
                                 # writable global. If the pointer is itself loaded
                                 # from a global/struct slot, register the slot so a
                                 # later re-load correlates forward (#193 Part 1); the
                                 # helper falls back to today's honest caveat when the
-                                # slot can't be named.
+                                # slot can't be named, and (#562) emits a blocking leaf
+                                # on the uncorrelated sub-path unless the recv-buffer
+                                # leaf below already covers this (callee, idx).
                                 self._register_indirect_buffer_slot(
-                                    ssaf, params[idx], c, callee, idx, buffer_slots, add_assumption)
+                                    ssaf, params[idx], c, callee, idx, buffer_slots,
+                                    add_assumption, add_leaf=add_leaf,
+                                    recv_buffer_covered=_recv_covered)
+                                if _recv_covered:
+                                    add_leaf(misanchored_recv_leaf(
+                                        callee=str(callee),
+                                        arg_index=idx,
+                                        address=hex(int(getattr(c, "address", 0))),
+                                        reason="buffer_not_keyed",
+                                    ))
                 if kind == "ret" and not ret_seeded:
                     # T3: callsites of `callee` exist but NONE consume its return
                     # value (a void or discarded return), so a ret: source has
@@ -4090,8 +4216,13 @@ class TaintEngine:
                                         if taint_node((var_key(r), getattr(r, "version", None)), var_label(r), c,
                                                       f"source: {callee} arg{idx} (call: preset)", []):
                                             seeded = True
+                                    # #562: no recv-buffer leaf fires on the call:
+                                    # preset path, so the indirect-slot leaf is the
+                                    # only thing that can withhold the all-clear here.
                                     self._register_indirect_buffer_slot(
-                                        ssaf, params[idx], c, callee, idx, buffer_slots, add_assumption)
+                                        ssaf, params[idx], c, callee, idx, buffer_slots,
+                                        add_assumption, add_leaf=add_leaf,
+                                        recv_buffer_covered=False)
                         elif to.startswith("arg:"):
                             idx = _try_arg_index(to)
                             if idx is not None and idx < len(params):

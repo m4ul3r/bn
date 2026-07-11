@@ -277,6 +277,40 @@ def test_taint_zero_result_without_diagnostics_is_unchanged():
     assert "diagnostics:" not in out
 
 
+def test_taint_zero_result_renders_folded_claim_gate_562():
+    """#562: the honesty claim gate is FOLDED INTO the single diagnostics block
+    (#571 renderer), never a competing block. A false gate withholds the
+    all-clear and names the seed-misanchored frontier."""
+    from bn.formatters import _render_taint_text
+    payload = {k: v for k, v in _FWD_ZERO_WITH_DIAG.items()}
+    payload["diagnostics"] = {
+        **_FWD_ZERO_WITH_DIAG["diagnostics"],
+        "frontier": {"unresolved": 0, "coarse_memory": 0, "seed_misanchored": 1,
+                     "by_kind": {"source_seed_misanchored": 1}},
+        "safe_to_report_all_clear": False,
+        "all_clear_reason": "no modeled sink reached, but 1 blocking frontier "
+                            "leaf(s) (source_seed_misanchored) remain -- NOT an all-clear",
+    }
+    out = _render_taint_text(payload)
+    assert "safe_to_report_all_clear: false" in out
+    assert "NOT an all-clear" in out
+    assert "1 seed-misanchored" in out
+
+
+def test_taint_zero_result_renders_true_gate_as_may_analysis_562():
+    """A true gate must render as may-analysis, not a proof of safety."""
+    from bn.formatters import _render_taint_text
+    payload = {k: v for k, v in _FWD_ZERO_WITH_DIAG.items()}
+    payload["diagnostics"] = {
+        **_FWD_ZERO_WITH_DIAG["diagnostics"],
+        "safe_to_report_all_clear": True,
+        "all_clear_reason": "no modeled sink and no tainted frontier; still a "
+                            "may-analysis -- not a proof of safety",
+    }
+    out = _render_taint_text(payload)
+    assert "safe_to_report_all_clear: true (may-analysis, not a proof)" in out
+
+
 def test_taint_full_restores_ssa_path():
     from bn.formatters import _render_taint_text
     out = _render_taint_text(_FWD_FLOW, full=True)
