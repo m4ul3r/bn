@@ -21,6 +21,10 @@ PASS=0
 FAIL=0
 STARTED_INSTANCES=()
 
+# Scratch dir for files the tests write (e.g. saved BNDBs); removed by the
+# EXIT trap on normal exit, failure, and interrupt (#563).
+SCRATCH_DIR="$(mktemp -d "${TMPDIR:-/tmp}/bn_stress.XXXXXX")"
+
 # ---------- helpers ----------
 red()   { printf '\033[1;31m%s\033[0m\n' "$*"; }
 green() { printf '\033[1;32m%s\033[0m\n' "$*"; }
@@ -84,6 +88,7 @@ start_session() {
 }
 
 cleanup() {
+    rm -rf "$SCRATCH_DIR"
     if [[ $KEEP -eq 1 ]]; then
         blue "Keeping sessions alive (--keep): ${STARTED_INSTANCES[*]:-none}"
         return
@@ -94,6 +99,8 @@ cleanup() {
     sleep 1
 }
 trap cleanup EXIT
+# Make Ctrl-C / kill exit through the EXIT trap so the scratch dir is removed.
+trap 'exit 130' INT TERM
 
 # ---------- preflight ----------
 blue "=== Preflight ==="
@@ -253,7 +260,7 @@ LOAD=$($BN --instance "$ID_LC" load "$FIXTURE_DIR/crypto_x86_64" --format json 2
 assert_contains "load succeeds" '"loaded": true' "$LOAD"
 
 # Save it
-SAVE_PATH="/tmp/bn_stress_test_$$.bndb"
+SAVE_PATH="$SCRATCH_DIR/bn_stress_test.bndb"
 SAVE=$($BN --instance "$ID_LC" save "$SAVE_PATH" --format json 2>/dev/null)
 assert_contains "save succeeds" '"saved": true' "$SAVE"
 
