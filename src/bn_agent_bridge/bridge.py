@@ -2215,6 +2215,41 @@ class BinaryNinjaBridge:
             }
         func_count = read_listing._list_functions(self.ctx, selector, count_only=True)
         sections = read_misc._sections(self.ctx, selector)
+        # #561: disclose annotations ALREADY present in the view. On a cached/shared
+        # BNDB, inherited comments/names bias analysis and let an agent over-credit
+        # itself; surface bounded counts + a provenance hint so the inherited baseline
+        # is visible up front instead of requiring a separate `bn comment list` pass.
+        # Annotation counting is best-effort -- if the view can't be resolved/read it
+        # degrades to an `unavailable` marker rather than erroring the whole digest.
+        filename = str(target.get("filename", "") or "")
+        analysis_cache_restored = filename.endswith(".bndb")
+        try:
+            bv = self._resolve_view(selector)
+            annotations = read_listing._annotation_summary(self.ctx, bv)
+            total_annotations = (
+                annotations["comments"] + annotations["function_comments"]
+                + annotations["user_symbols"]
+            )
+            hint = None
+            if analysis_cache_restored or total_annotations:
+                hint = (
+                    f"existing BNDB annotations may predate this run: "
+                    f"{annotations['comments']} comment(s), "
+                    f"{annotations['function_comments']} function doc(s), "
+                    f"{annotations['user_symbols']} user symbol(s) already present"
+                    + (" (analysis cache restored from a .bndb)" if analysis_cache_restored else "")
+                    + " -- do not over-credit current-run analysis"
+                )
+            existing_annotations = {
+                **annotations,
+                "analysis_cache_restored": analysis_cache_restored,
+                "provenance_hint": hint,
+            }
+        except Exception as exc:
+            existing_annotations = {
+                "unavailable": f"annotation counts unavailable: {exc}",
+                "analysis_cache_restored": analysis_cache_restored,
+            }
         return {
             "kind": "orient_digest",
             "target": target,
@@ -2225,6 +2260,7 @@ class BinaryNinjaBridge:
             "strings_min_length": strings_min_length,
             "function_count": func_count.get("total", func_count.get("count")),
             "sections": sections,
+            "existing_annotations": existing_annotations,
         }
 
     def _normalize_py_result(self, *a, **k):
@@ -2655,7 +2691,8 @@ def _bind_taint_models(bridge, params, target):
 @op("disasm", lock="read")
 def _bind_disasm(bridge, params, target):
     return bridge._disasm(target, params["identifier"], linear=params.get("linear"),
-                          mode=params.get("mode"))
+                          mode=params.get("mode"),
+                          snap_to_instruction=params.get("snap_to_instruction", False))
 
 
 @op("function_evidence", lock="read")
