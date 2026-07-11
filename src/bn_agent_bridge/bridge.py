@@ -1414,6 +1414,13 @@ class BinaryNinjaBridge:
             **(record or {}),
             "arch": str(getattr(bv, "arch", "")),
             "platform": str(getattr(bv, "platform", "")),
+            # Preferred/image base BN loaded the view at (#564). For a PIE ELF this
+            # is BN's chosen preferred base (commonly 0x400000 on x86_64), NOT ELF
+            # VA 0 -- dynamic tools need it to rebase a BN address to runtime
+            # (runtime = module_base + (bn_addr - image_base)). bv.start is the
+            # authoritative source; agents previously fell back to
+            # `py exec "result['value']=hex(bv.start)"` or guessed 0x400000.
+            "image_base": hex(getattr(bv, "start", 0)),
             "entry_point": hex(getattr(bv, "entry_point", 0)),
             # Machine-readable analysis state so callers can tell a --quick view
             # (strings/full function set pending `bn refresh`) or a restore-failed

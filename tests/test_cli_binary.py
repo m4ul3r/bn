@@ -229,6 +229,21 @@ def test_target_info_verbose_renders_segments():
     assert "segments:" not in out2
 
 
+def test_target_info_renders_image_base():
+    """#564: target info text surfaces the preferred/image base (bv.start) so a
+    debugger handoff can rebase BN addresses; absent when not reported."""
+    from bn.formatters import _render_target_summary
+
+    out = _render_target_summary({
+        "selector": "svc", "arch": "x86_64",
+        "image_base": "0x400000", "entry_point": "0x40b180",
+    })
+    assert "image base: 0x400000" in out
+
+    out2 = _render_target_summary({"selector": "svc", "arch": "x86_64"})
+    assert "image base" not in out2
+
+
 def test_save_accepts_path_flag(monkeypatch, tmp_path):
     captured_params = {}
 

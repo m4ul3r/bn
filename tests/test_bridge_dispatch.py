@@ -187,6 +187,23 @@ def test_target_info_surfaces_analysis_progress(monkeypatch):
     assert info["analysis_progress"] == {"state": "AnalyzeState", "count": 1112, "total": 1939}
 
 
+def test_target_info_surfaces_image_base(monkeypatch):
+    """#564: target info exposes image_base from bv.start so dynamic tools can
+    rebase a BN address to runtime instead of guessing the preferred base."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()
+    bv.start = 0x400000
+    bv.entry_point = 0x40B180
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+
+    info = instance._target_info("active")
+
+    assert info["image_base"] == "0x400000"
+    assert info["entry_point"] == "0x40b180"
+
+
 def test_validate_count_enforces_minimum(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     # count flags require >= 1

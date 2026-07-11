@@ -652,6 +652,9 @@ def _render_target_summary(value: dict[str, Any]) -> str:
         ("file", value.get("filename")),
         ("arch", value.get("arch")),
         ("platform", value.get("platform")),
+        # Preferred/image base BN loaded at (#564) -- for a PIE binary this is the
+        # rebase anchor a debugger handoff needs, so surface it beside entry.
+        ("image base", value.get("image_base")),
         ("entry", value.get("entry_point")),
     ]
     for key, item in details:
