@@ -575,12 +575,30 @@ def _instr_dict(ins: Any, reason: str | None = None, tainted: list[str] | None =
     return out
 
 
+def _render_source(source: Any) -> str:
+    """Canonical locator string for a forward-flow source echo.
+
+    The forward run echoes its sources as locator *dicts* (``_describe_locator``),
+    so rendering them with ``str()`` leaks Python's ``dict.__repr__`` into
+    ``signature.rendered`` (``"{'kind': 'param', 'index': 0} -> ..."``). Route
+    locator dicts through the shared canonical grammar (:func:`format_locator`)
+    instead, so the rendered signature reads ``param:0 -> ...`` and round-trips
+    with :func:`parse_locator` (#551). Non-dict sources -- the backward origin's
+    callee/kind string and the ``"multiple"``/``"?"`` sentinels -- pass through
+    unchanged. The structured ``source`` object stays available separately in the
+    result's top-level ``sources`` echo."""
+    if isinstance(source, dict) and source.get("kind"):
+        return format_locator(source)
+    return str(source)
+
+
 def _make_signature(source: Any, chain: list[str], sink_class: str | None,
                     sink_callee: str | None) -> dict[str, Any]:
     cls = f"[{sink_class}] " if sink_class else ""
-    parts = [str(source)] + [str(c) for c in chain] + [f"{cls}{sink_callee}"]
+    src = _render_source(source)
+    parts = [src] + [str(c) for c in chain] + [f"{cls}{sink_callee}"]
     return {
-        "source": str(source),
+        "source": src,
         "chain": [str(c) for c in chain],
         "sink_class": sink_class,
         "sink_callee": sink_callee,
@@ -2556,6 +2574,11 @@ class TaintEngine:
         self._max_depth_seen = 0
         self._truncated = False
         self._only_callsite_addr = only_callsite_addr
+        # #559: count the source callsites the seed actually matched, so a
+        # zero-result query can report "matched N source callsites" instead of an
+        # unexplained empty result. Only the top run's ret/arg/call sources touch
+        # this -- descended callees are seeded with synthetic param: locators.
+        self._seed_callsites = 0
 
         try:
             sub = self._run_forward(func, sources, depth=0, max_depth=max_depth, top=True)
@@ -2585,7 +2608,7 @@ class TaintEngine:
                 sources=sources_echo, leaves=sub["leaves"], fn_name=str(func.name))
             f["metrics"] = fm
             f["signature"] = fs
-        return {
+        result = {
             "direction": "forward",
             "function": {"name": str(func.name), "address": hex(int(func.start))},
             "sources": sources_echo,
@@ -2602,6 +2625,74 @@ class TaintEngine:
                 "truncated": self._truncated,
             },
             "soundness": SOUNDNESS,
+        }
+        # #559: a modeled source that reaches no sink returns an otherwise-empty
+        # result an agent can misread as a clean breadth check. Attach a compact,
+        # factual frontier diagnostic (NOT a verdict) explaining where the seed
+        # went and why the frontier stopped.
+        if not unique_findings:
+            result["diagnostics"] = self._forward_zero_diagnostics(sub)
+        return result
+
+    def _forward_zero_diagnostics(self, sub: dict[str, Any]) -> dict[str, Any]:
+        """Frontier diagnostics for a zero-sink forward run (#559).
+
+        Purely descriptive: seed reach (matched source callsites, tainted SSA
+        values produced, last propagated use) plus the frontier the propagation
+        stopped at (unresolved / coarse-memory leaf counts, whether any unmodeled
+        external/in-binary call was reached) and a suggested next action. Never
+        asserts a vulnerability -- it explains "flow hit an unmodeled parser we
+        couldn't follow" vs "nothing flows"."""
+        diag = sub.get("diag") or {}
+        leaves = sub.get("leaves") or []
+        assumptions = sub.get("assumptions") or []
+        by_kind: dict[str, int] = {}
+        for lf in leaves:
+            k = str(lf.get("kind", "?"))
+            by_kind[k] = by_kind.get(k, 0) + 1
+        UNRESOLVED = ("unmodeled_callee", "arg_under_recovered", "indirect_call_unresolved")
+        COARSE = ("coarse_memory_store", "pointer_escape")
+        unresolved_n = sum(by_kind.get(k, 0) for k in UNRESOLVED)
+        coarse_n = sum(by_kind.get(k, 0) for k in COARSE)
+        # An external callee with no taint model returns conservatively tainted
+        # and is disclosed as an assumption, not a leaf -- fold it into the
+        # "unmodeled call reached" signal so a parser behind an import stub counts.
+        ext_no_model = any("has no model" in a for a in assumptions)
+        unmodeled_reached = bool(unresolved_n or ext_no_model)
+        tainted_values = int(diag.get("tainted_values", 0))
+
+        if unmodeled_reached:
+            next_action = (
+                "taint reached an unmodeled call frontier (an unresolved/in-binary "
+                "callee or an external callee with no taint model); recover the "
+                "callee prototype with `bn proto set` or re-run `bn taint forward` "
+                "seeded inside it to follow the flow further")
+        elif coarse_n:
+            next_action = (
+                "taint escaped through a coarse-memory frontier (a pointer/store not "
+                "precisely tracked); inspect the frontier leaves or seed the "
+                "destination buffer directly with `--source var:<buf>`")
+        elif tainted_values <= 1:
+            next_action = (
+                "the source seeded but produced no further tainted uses; verify the "
+                "`--source` locator matches the intended value")
+        else:
+            next_action = (
+                "taint propagated but reached no modeled sink and hit no unresolved "
+                "frontier; the flow appears to dead-end locally -- inspect the last "
+                "propagated use or widen `--max-depth`")
+
+        return {
+            "source_callsites": int(getattr(self, "_seed_callsites", 0)),
+            "tainted_values": tainted_values,
+            "last_use": diag.get("last_use"),
+            "unmodeled_calls_reached": unmodeled_reached,
+            "frontier": {
+                "unresolved": unresolved_n,
+                "coarse_memory": coarse_n,
+                "by_kind": by_kind,
+            },
+            "next_action": next_action,
         }
 
     def _attributable_callsites(self, func: Any, sources: list[dict[str, Any]]) -> list[int]:
@@ -2686,7 +2777,7 @@ class TaintEngine:
             f"independently ({len(callsite_addrs)} propagations); top-level reached_sinks/leaves "
             f"are the union, by_source has the per-callsite split")
 
-        return {
+        out = {
             "direction": "forward",
             "function": base["function"],
             "sources": base["sources"],
@@ -2707,6 +2798,11 @@ class TaintEngine:
             },
             "soundness": SOUNDNESS,
         }
+        # #559: carry the frontier diagnostic from the representative (first)
+        # per-callsite run when the whole attributed union reached no sink.
+        if not findings and base.get("diagnostics"):
+            out["diagnostics"] = base["diagnostics"]
+        return out
 
     def _follow_thunk_cached(self, fn: Any) -> Any | None:
         """``follow_thunk`` memoized per resolved function start address."""
@@ -4489,9 +4585,28 @@ class TaintEngine:
             if sk not in correlated_slots:
                 add_assumption(slot["pending"])
 
+        # #559: for the top run, capture the seed-frontier facts a zero-result
+        # query needs to explain WHY the frontier stopped -- how many SSA values
+        # the seed produced and the last one taint reached. `why` preserves
+        # insertion order, so the last record with a backing instruction is the
+        # last propagated use (the param/var seed itself has instr=None).
+        diag = None
+        if top:
+            last_use = None
+            for node in reversed(list(why)):
+                rec = why[node]
+                ins = rec.get("instr")
+                if ins is not None:
+                    last_use = {"label": rec.get("label"),
+                                "address": hex(int(getattr(ins, "address", 0))),
+                                "reason": rec.get("reason")}
+                    break
+            diag = {"tainted_values": len(tainted), "last_use": last_use}
+
         return {"reached_return": reached_return, "out_params": frozenset(out_params),
                 "out_param_elems": frozenset(out_param_elems),
-                "findings": findings, "leaves": leaves, "assumptions": assumptions}
+                "findings": findings, "leaves": leaves, "assumptions": assumptions,
+                "diag": diag}
 
     def _reason_for(self, opn: str) -> str:
         if "PHI" in opn:
@@ -4674,6 +4789,7 @@ class TaintEngine:
                     add_assumption(f"seeded from {callee} callsite at {hex(only)} (per-source attribution)")
                 elif len(calls) > 1:
                     add_assumption(f"{len(calls)} callsites of {callee}; seeded from all")
+                self._seed_callsites += len(calls)   # #559 frontier diagnostics
                 ret_seeded = False
                 for c in calls:
                     if kind == "ret":
@@ -4737,6 +4853,7 @@ class TaintEngine:
                     add_assumption(f"seeded from {callee} callsite at {hex(only)} (per-source attribution)")
                 elif len(calls) > 1:
                     add_assumption(f"{len(calls)} callsites of {callee}; seeded from all")
+                self._seed_callsites += len(calls)   # #559 frontier diagnostics
                 _, model = lookup_model(self.models, callee)
                 src_defs = (model or {}).get("sources") or []
                 if not src_defs:
@@ -5497,4 +5614,8 @@ def format_locator(loc: dict[str, Any]) -> str:
         return f"var:{loc.get('selector')}"
     if kind == "ret":
         return f"ret:{loc.get('callee')}"
+    if kind in ("call", "model"):
+        # call:/model: seed every output the callee's taint model declares; both
+        # parse to kind "call" today, but round-trip either spelling for safety.
+        return f"{kind}:{loc.get('callee')}"
     return str(kind)

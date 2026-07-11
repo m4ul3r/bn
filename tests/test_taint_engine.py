@@ -5341,6 +5341,99 @@ def test_forward_result_carries_metrics_and_signature(process_func, models):
     assert any(s.get("callee") for s in f["path"])
 
 
+def test_forward_signature_renders_source_dict_in_canonical_grammar_551():
+    """#551: the forward run echoes sources as locator DICTS (`_describe_locator`),
+    so `signature.rendered`/`signature.source` must route them through the shared
+    canonical grammar (`format_locator`) instead of leaking `dict.__repr__`."""
+    path = [
+        {"address": "0x401100", "op": "MLIL_SET_VAR_SSA"},
+        {"address": "0x401180", "op": "MLIL_CALL_SSA", "callee": "memcpy"},
+    ]
+    sink = {"callee": "memcpy", "address": "0x401180", "class": "overflow_len"}
+
+    # param source dict -> "param:0"
+    _, sig = te.derive_flow_facts(
+        direction="forward", path=path, sink=sink,
+        sources=[{"kind": "param", "index": 0}], leaves=[], fn_name="handler")
+    assert sig["source"] == "param:0"
+    assert sig["rendered"] == "param:0 → [overflow_len] memcpy"
+    assert "{'kind'" not in sig["rendered"]                    # no python-dict leak
+
+    # arg source dict -> "arg:read:0"
+    _, sig2 = te.derive_flow_facts(
+        direction="forward", path=path, sink=sink,
+        sources=[{"kind": "arg", "callee": "read", "index": 0}], leaves=[], fn_name="handler")
+    assert sig2["source"] == "arg:read:0"
+    assert sig2["rendered"].startswith("arg:read:0 → ")
+
+
+def test_forward_engine_signature_source_is_canonical_not_dict_551(process_func, models):
+    """End-to-end: a real forward run must not emit a python-dict source string."""
+    bv = FBV({0x401070: "read", 0x401080: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(process_func, [te.parse_locator("arg:read:1")])
+    sig = result["reached_sinks"][0]["signature"]
+    assert sig["source"] == "arg:read:1"
+    assert sig["rendered"].startswith("arg:read:1 → ")
+    assert "{'kind'" not in sig["rendered"]
+    # the structured source object is preserved separately in the sources echo
+    assert result["sources"][0] == {"kind": "arg", "callee": "read", "index": 1}
+
+
+def test_format_locator_round_trips_call_kind_551():
+    """`call:`/`model:` locators (valid forward sources) must render canonically,
+    not fall through to the bare `str(kind)` default."""
+    assert te.format_locator({"kind": "call", "callee": "recv"}) == "call:recv"
+    assert te.format_locator(te.parse_locator("call:recv")) == "call:recv"
+
+
+def test_forward_zero_result_includes_frontier_diagnostics_559(models):
+    """#559: a modeled source that reaches no sink but hits an unmodeled in-binary
+    parser must carry a frontier diagnostic explaining WHERE taint stopped."""
+    func, bv = _frontier_no_params_program()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:recv:1")])
+
+    assert result["reached_sinks"] == []
+    diag = result["diagnostics"]
+    assert diag["source_callsites"] == 1                       # one recv callsite seeded
+    assert diag["tainted_values"] >= 1                         # seed produced tainted SSA values
+    assert diag["unmodeled_calls_reached"] is True             # parse_event was reached, unmodeled
+    assert diag["frontier"]["unresolved"] == 1                 # the unmodeled_callee leaf
+    assert diag["frontier"]["by_kind"].get("unmodeled_callee") == 1
+    assert "proto set" in diag["next_action"]                  # actionable, not a verdict
+
+
+def test_forward_zero_result_diagnostics_absent_when_sink_reached_559(process_func, models):
+    """The diagnostic block is a ZERO-RESULT aid; a run that reaches a sink omits it."""
+    bv = FBV({0x401070: "read", 0x401080: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(process_func, [te.parse_locator("arg:read:1")])
+    assert result["reached_sinks"]
+    assert "diagnostics" not in result
+
+
+def test_forward_zero_result_diagnostics_no_propagation_559(models):
+    """A source that seeds but never propagates to another use reports it plainly
+    (tainted count, no unmodeled frontier) with a locator-check next action."""
+    a = FVar("a"); r = FVar("r")
+    a0 = FSSA(a, 0); r1 = FSSA(r, 1)
+    ssa = FSSAFunc([
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "r#1 = a#0 + 1", reads=[a0], writes=[r1]),
+        FInstr(1, 0x14, "MLIL_RET", "return r#1", reads=[r1]),
+    ])
+    func = FFunc("add_one", 0x10, ssa, params=[a])
+    engine = te.TaintEngine(FBV({}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert result["reached_sinks"] == []
+    diag = result["diagnostics"]
+    assert diag["source_callsites"] == 0                       # a param source has no callsite
+    assert diag["unmodeled_calls_reached"] is False
+    assert diag["frontier"]["unresolved"] == 0
+    assert diag["frontier"]["coarse_memory"] == 0
+    assert diag["next_action"]                                 # a factual suggestion, not a verdict
+
+
 def test_reclassify_constant_format_sink_477(models):
     # #477: a printf-family sink whose format operand is a resolved constant carries
     # a tainted DATA vararg, not format-string control -> reclassify off the format
