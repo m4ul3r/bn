@@ -233,6 +233,50 @@ def test_taint_compact_default_one_line_per_flow():
     assert "soundness" in out                            # honesty guard kept
 
 
+_FWD_ZERO_WITH_DIAG = {
+    "direction": "forward",
+    "function": {"name": "ipc_read", "address": "0x1000"},
+    "sources": [{"kind": "arg", "callee": "recv", "index": 1}],
+    "reached_sinks": [],
+    "leaves": [{"kind": "unmodeled_callee", "address": "0x1008",
+                "callee": {"name": "parse_event", "address": "0x3000"}}],
+    "assumptions": [],
+    "soundness": "may-analysis",
+    "stats": {"functions_visited": 1, "leaves": 1, "truncated": False, "max_depth": 0},
+    "diagnostics": {
+        "source_callsites": 1,
+        "tainted_values": 2,
+        "last_use": {"label": "rsi#1", "address": "0x1008", "reason": "arg to parse_event"},
+        "unmodeled_calls_reached": True,
+        "frontier": {"unresolved": 1, "coarse_memory": 0,
+                     "by_kind": {"unmodeled_callee": 1}},
+        "next_action": "recover the callee prototype with `bn proto set`",
+    },
+}
+
+
+def test_taint_zero_result_renders_frontier_diagnostics_559():
+    """#559: a zero-result forward run surfaces its diagnostic block in text mode
+    so an agent doesn't misread the empty result as a clean breadth check."""
+    from bn.formatters import _render_taint_text
+    out = _render_taint_text(_FWD_ZERO_WITH_DIAG)
+    assert "diagnostics:" in out
+    assert "matched 1 source callsite(s)" in out
+    assert "produced 2 tainted value(s)" in out
+    assert "last propagated use: rsi#1 @ 0x1008" in out
+    assert "unmodeled call(s) reached: yes" in out
+    assert "1 unresolved" in out
+    assert "bn proto set" in out
+
+
+def test_taint_zero_result_without_diagnostics_is_unchanged():
+    """A zero-result payload with no diagnostics block renders no diagnostics line."""
+    from bn.formatters import _render_taint_text
+    bare = {k: v for k, v in _FWD_ZERO_WITH_DIAG.items() if k != "diagnostics"}
+    out = _render_taint_text(bare)
+    assert "diagnostics:" not in out
+
+
 def test_taint_full_restores_ssa_path():
     from bn.formatters import _render_taint_text
     out = _render_taint_text(_FWD_FLOW, full=True)

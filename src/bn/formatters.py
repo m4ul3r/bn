@@ -2186,6 +2186,34 @@ def _render_flow_line(f: dict[str, Any]) -> str:
     return f"  {head}   {sig}   {facts}".rstrip()
 
 
+def _render_forward_diagnostics(diag: dict[str, Any]) -> list[str]:
+    """Compact frontier diagnostic for a zero-result forward taint query (#559).
+
+    Factual only: where the seed reached and why the frontier stopped -- never a
+    vulnerability verdict."""
+    if not isinstance(diag, dict):
+        return []
+    fr = diag.get("frontier") or {}
+    lu = diag.get("last_use") or {}
+    out = ["diagnostics:"]
+    out.append(
+        f"  seed: matched {diag.get('source_callsites', 0)} source callsite(s), "
+        f"produced {diag.get('tainted_values', 0)} tainted value(s)")
+    if lu:
+        _reason = f" ({lu['reason']})" if lu.get("reason") else ""
+        out.append(f"  last propagated use: {lu.get('label', '?')} @ {lu.get('address', '?')}{_reason}")
+    else:
+        out.append("  last propagated use: <none — seed did not propagate>")
+    out.append(
+        f"  unmodeled call(s) reached: {'yes' if diag.get('unmodeled_calls_reached') else 'no'}")
+    out.append(
+        f"  frontier: {fr.get('unresolved', 0)} unresolved, "
+        f"{fr.get('coarse_memory', 0)} coarse-memory")
+    if diag.get("next_action"):
+        out.append(f"  next: {diag['next_action']}")
+    return out
+
+
 def _render_taint_text(value: Any, full: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -2198,6 +2226,8 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
         lines.append("sources: " + (", ".join(_describe_loc(s) for s in srcs) or "<none>"))
         findings = list(value.get("reached_sinks") or [])
         lines.append(_taint_forward_verdict(value))
+        if not findings and value.get("diagnostics"):
+            lines.extend(_render_forward_diagnostics(value["diagnostics"]))
         if findings:
             lines.append("")
             lines.append(f"flows ({len(findings)}):")
