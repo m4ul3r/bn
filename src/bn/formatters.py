@@ -3103,9 +3103,40 @@ def _render_trace_text(value: Any) -> str:
             else:
                 lines.append(f"  {il_text}")
 
+    lines.extend(_render_trace_frontiers(value.get("frontiers")))
+
     for h in hints:
         lines.append(f"  hint: {h}")
     return "\n".join(lines)
+
+
+def _render_trace_frontiers(frontiers: Any) -> list[str]:
+    """Concise top-level roll-up of where the slice stopped (#552): one line per
+    reason group with its count and a couple of examples. A factual summary of
+    stopping conditions, not a verdict."""
+    if not isinstance(frontiers, list) or not frontiers:
+        return []
+    total = sum(g.get("count", 0) for g in frontiers if isinstance(g, dict))
+    out = ["", f"  frontiers ({total} terminal step(s) in {len(frontiers)} group(s)):"]
+    for g in frontiers:
+        if not isinstance(g, dict):
+            continue
+        reason = g.get("reason") or "unspecified"
+        label = _TRACE_REASON_LABELS.get(reason, reason.replace("_", " "))
+        # Name the resolved callee(s) at a boundary so the roll-up reads
+        # `call boundary x3 (strlen, memcpy)` rather than a bare count.
+        callees = []
+        for ex in (g.get("examples") or []):
+            if not isinstance(ex, dict):
+                continue
+            nm = ex.get("callee") or ex.get("out_param_callee")
+            if nm and nm not in callees:
+                callees.append(str(nm))
+        line = f"    {label}  x{g.get('count', 0)}"
+        if callees:
+            line += f" ({', '.join(callees)})"
+        out.append(line)
+    return out
 
 
 def _render_class_list_text(value: Any) -> str:

@@ -289,3 +289,102 @@ def test_truncation_note_silent_when_arch_unknown(monkeypatch):
                                  arch=types.SimpleNamespace(stack_pointer="sp"),
                                  calling_convention=None, name="f")
     assert rts._call_model_truncation_note(_BV(), func, None, call_addr, [_fmt_ptr(0x5000)], "f") is None
+
+
+# --- #552: top-level frontier/terminal roll-up ------------------------------
+
+
+def _step(reason, *, terminates=True, **extra):
+    return {"ssa_label": extra.pop("ssa_label", "v#1"), "reason": reason,
+            "terminates": terminates, **extra}
+
+
+def test_summarize_frontiers_groups_and_counts(monkeypatch):
+    # Terminal steps roll up per reason; non-terminal steps are excluded.
+    rts = _load_bridge(monkeypatch).read_taint_slice
+    trace = [
+        _step("definition", terminates=False),           # excluded (not terminal)
+        _step("call_or_jump_boundary", callee="strlen", address="0x10"),
+        _step("call_or_jump_boundary", callee="memcpy", address="0x14"),
+        _step("call_or_jump_boundary", callee="strlen", address="0x18"),
+        _step("undefined_or_global", address="0x20"),
+    ]
+    fr = rts._summarize_frontiers(trace)
+    # Ordered by descending count: 3 call boundaries before 1 undefined.
+    assert [g["reason"] for g in fr] == ["call_or_jump_boundary", "undefined_or_global"]
+    assert [g["count"] for g in fr] == [3, 1]
+    # Examples carry the compact machine-consumable subset (callee, address).
+    boundary = fr[0]["examples"]
+    assert boundary[0]["callee"] == "strlen" and boundary[0]["address"] == "0x10"
+    assert boundary[1]["callee"] == "memcpy"
+
+
+def test_summarize_frontiers_caps_examples_at_three(monkeypatch):
+    rts = _load_bridge(monkeypatch).read_taint_slice
+    trace = [_step("undefined_or_global", address=hex(i)) for i in range(10)]
+    fr = rts._summarize_frontiers(trace)
+    assert fr[0]["count"] == 10               # count reflects ALL terminals
+    assert len(fr[0]["examples"]) == 3        # examples capped
+
+
+def test_summarize_frontiers_empty_when_no_terminals(monkeypatch):
+    rts = _load_bridge(monkeypatch).read_taint_slice
+    assert rts._summarize_frontiers([]) == []
+    assert rts._summarize_frontiers([_step("definition", terminates=False)]) == []
+
+
+def test_summarize_frontiers_ties_broken_by_reason_name(monkeypatch):
+    # Equal counts -> deterministic order by reason name.
+    rts = _load_bridge(monkeypatch).read_taint_slice
+    trace = [_step("memory_load"), _step("function_parameter")]
+    fr = rts._summarize_frontiers(trace)
+    assert [g["reason"] for g in fr] == ["function_parameter", "memory_load"]
+
+
+def test_backward_slice_result_includes_frontiers(monkeypatch):
+    # End-to-end: `_backward_slice` result carries a top-level `frontiers` roll-up
+    # derived from the trace's terminal steps (#552).
+    from _bridge_fakes import (
+        _FakeBV, _FakeFunction, _FakeMLILFunction, _FakeMLILInsn, _FakeSSAVariable,
+    )
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    var_r0 = _FakeSSAVariable("r0#1")
+    var_r1 = _FakeSSAVariable("r1#2")
+    call_insn = _FakeMLILInsn(
+        0x10010, operation="MLIL_CALL_SSA",
+        params=[_FakeMLILInsn(0x10010, operation="MLIL_VAR_SSA", vars_read=[var_r0])],
+        vars_read=[var_r0])
+    def_insn = _FakeMLILInsn(0x10008, operation="MLIL_SET_VAR_SSA", vars_read=[var_r1])
+    fn = _FakeFunction(0x10000, "test_func")
+    fn.medium_level_il = _FakeMLILFunction(
+        instructions=[call_insn], definitions={var_r0: def_insn})
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._backward_slice("active", "test_func", "0x10010", arg_index=0)
+
+    assert "frontiers" in result
+    # The chain terminates once, at an undefined/no-reaching-def leaf.
+    assert result["frontiers"] == [
+        {"reason": "undefined_or_global", "count": 1,
+         "examples": [{"ssa_label": "r1#2", "depth": 1}]},
+    ]
+
+
+def test_render_trace_frontiers_text(monkeypatch):
+    # Text mode shows a concise frontier roll-up with counts + named callees.
+    from bn.formatters import _render_trace_frontiers
+    frontiers = [
+        {"reason": "call_or_jump_boundary", "count": 2,
+         "examples": [{"callee": "strlen"}, {"callee": "memcpy"}]},
+        {"reason": "undefined_or_global", "count": 1, "examples": [{"address": "0x20"}]},
+    ]
+    out = "\n".join(_render_trace_frontiers(frontiers))
+    assert "frontiers (3 terminal step(s) in 2 group(s)):" in out
+    assert "call boundary  x2 (strlen, memcpy)" in out
+    assert "undefined / no reaching definition  x1" in out
+    # Empty / missing frontiers render nothing.
+    assert _render_trace_frontiers([]) == []
+    assert _render_trace_frontiers(None) == []

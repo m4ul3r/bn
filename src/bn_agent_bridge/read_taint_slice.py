@@ -807,6 +807,39 @@ def _build_backward_trace(
     return trace
 
 
+# Compact per-example fields carried into a frontier roll-up (#552). Kept to the
+# machine-consumable subset already present on a terminal step -- never recomputed.
+_FRONTIER_EXAMPLE_KEYS = (
+    "ssa_label", "address", "depth", "callee", "out_param_callee",
+    "base", "offset", "width", "function_context",
+)
+_FRONTIER_EXAMPLE_CAP = 3
+
+
+def _summarize_frontiers(trace: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Roll up the trace's TERMINAL steps into per-reason frontier groups (#552).
+
+    A factual summary of where the backward slice STOPPED -- unresolved loads,
+    caller/call boundaries, constants, parameters -- derived only from the
+    terminal steps already present in ``trace`` (never recomputed, never a fresh
+    walk). This classifies STOPPING REASONS, not vulnerabilities: it is a
+    roll-up, not a verdict. Groups are ordered by descending count (ties broken
+    by reason name) so the dominant frontier reads first; each carries up to
+    ``_FRONTIER_EXAMPLE_CAP`` compact examples in trace order.
+    """
+    groups: dict[str, dict[str, Any]] = {}
+    for step in trace:
+        if not isinstance(step, dict) or not step.get("terminates"):
+            continue
+        reason = step.get("reason") or "unspecified"
+        grp = groups.setdefault(reason, {"reason": reason, "count": 0, "examples": []})
+        grp["count"] += 1
+        if len(grp["examples"]) < _FRONTIER_EXAMPLE_CAP:
+            grp["examples"].append(
+                {k: step[k] for k in _FRONTIER_EXAMPLE_KEYS if step.get(k) is not None})
+    return sorted(groups.values(), key=lambda g: (-g["count"], g["reason"]))
+
+
 def _is_parameter_ssa_var(ctx, ssa_func, ssa_var) -> bool:
     """True if *ssa_var* (an SSA variable with no reaching definition) is a
     formal parameter of the function, vs. an undefined local or a global.
@@ -1191,5 +1224,9 @@ def _backward_slice(
         "truncated": len(trace) >= max_depth,
         "step_count": len(trace),
         "trace": trace,
+        # Top-level roll-up of where the slice stopped, so an agent needn't scan
+        # the whole `trace` array to compare stopping conditions across callsites
+        # (#552). Factual summary, not a verdict.
+        "frontiers": _summarize_frontiers(trace),
         "hints": hints,
     }
