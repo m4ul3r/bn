@@ -6,7 +6,6 @@ import os
 import socket
 import socketserver
 import threading
-import uuid
 from pathlib import Path
 
 import pytest
@@ -59,11 +58,17 @@ class _Handler(socketserver.StreamRequestHandler):
 class _Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
 
+    def server_close(self):
+        # Closing an AF_UNIX socket does not remove its filesystem pathname;
+        # unlink it so tests never leave stale *.sock files behind (#563).
+        super().server_close()
+        Path(self.server_address).unlink(missing_ok=True)
+
 
 def test_send_request_uses_registry_and_socket(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     pid = os.getpid()
-    socket_path = Path("/tmp") / f"bn-test-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
+    socket_path = tmp_path / "bn-test.sock"
     registry_path = bridge_registry_path()
     registry_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -102,7 +107,7 @@ def test_list_instances_prunes_stale_registry_and_socket(tmp_path, monkeypatch):
     registry_path = bridge_registry_path()
     registry_path.parent.mkdir(parents=True, exist_ok=True)
 
-    stale_socket_path = Path("/tmp") / f"bn-stale-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
+    stale_socket_path = tmp_path / "bn-stale.sock"
     stale_server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     stale_server.bind(str(stale_socket_path))
     stale_server.listen(1)
@@ -120,14 +125,19 @@ def test_list_instances_prunes_stale_registry_and_socket(tmp_path, monkeypatch):
         encoding="utf-8",
     )
 
-    assert stale_socket_path.exists()
+    try:
+        assert stale_socket_path.exists()
 
-    instances = list_instances()
+        instances = list_instances()
 
-    assert instances == []
-    assert not registry_path.exists()
-    # The dead socket file is swept too (a SIGKILL/crash leaves it behind).
-    assert not stale_socket_path.exists()
+        assert instances == []
+        assert not registry_path.exists()
+        # The dead socket file is swept too (a SIGKILL/crash leaves it behind).
+        assert not stale_socket_path.exists()
+    finally:
+        # list_instances() is expected to sweep the stale socket; if the test
+        # fails before that, don't leave the pathname behind.
+        stale_socket_path.unlink(missing_ok=True)
 
 
 def test_send_request_wraps_socket_errors(tmp_path, monkeypatch):
@@ -802,7 +812,7 @@ def test_list_instances_trusts_live_socket_even_with_stale_pid(tmp_path, monkeyp
     registry_path = bridge_registry_path()
     registry_path.parent.mkdir(parents=True, exist_ok=True)
 
-    socket_path = Path("/tmp") / f"bn-live-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
+    socket_path = tmp_path / "bn-live.sock"
     server = _Server(str(socket_path), _Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -833,7 +843,7 @@ def test_list_instances_trusts_live_socket_even_with_stale_pid(tmp_path, monkeyp
 def test_list_instances_reads_fixed_registry_path(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     pid = os.getpid()
-    socket_path = Path("/tmp") / f"bn-fixed-{pid}-{uuid.uuid4().hex[:8]}.sock"
+    socket_path = tmp_path / "bn-fixed.sock"
     server = _Server(str(socket_path), _Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -864,10 +874,14 @@ def test_list_instances_reads_fixed_registry_path(tmp_path, monkeypatch):
 
 
 def _create_live_instance(tmp_path, instance_id, *, subdir="instances"):
-    """Helper: start a mock server and write a registry file, return server."""
+    """Helper: start a mock server and write a registry file, return server.
+
+    The socket lives at tmp_path root (NOT under instances_dir()) so gc's
+    orphan sweep can't touch it; server_close() unlinks it on teardown.
+    """
     inst_dir = tmp_path / subdir
     inst_dir.mkdir(parents=True, exist_ok=True)
-    socket_path = Path("/tmp") / f"bn-inst-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
+    socket_path = tmp_path / f"bn-inst-{instance_id}.sock"
     server = _Server(str(socket_path), _Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -922,7 +936,7 @@ def test_choose_instance_by_id(tmp_path, monkeypatch):
 def test_choose_instance_by_default_selects_fixed_registry(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     pid = os.getpid()
-    socket_path = Path("/tmp") / f"bn-default-{pid}-{uuid.uuid4().hex[:8]}.sock"
+    socket_path = tmp_path / "bn-default.sock"
     server = _Server(str(socket_path), _Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -987,7 +1001,7 @@ def test_list_instances_prunes_stale_in_instances_dir(tmp_path, monkeypatch):
     inst_dir = instances_dir()
     inst_dir.mkdir(parents=True, exist_ok=True)
 
-    stale_socket = Path("/tmp") / f"bn-stale-inst-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
+    stale_socket = inst_dir / "bn-stale-inst.sock"
     stale_server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     stale_server.bind(str(stale_socket))
     stale_server.listen(1)
@@ -1005,9 +1019,14 @@ def test_list_instances_prunes_stale_in_instances_dir(tmp_path, monkeypatch):
         encoding="utf-8",
     )
 
-    instances = list_instances()
-    assert not any(inst.instance_id == "deadbeef" for inst in instances)
-    assert not registry_path.exists()
+    try:
+        instances = list_instances()
+        assert not any(inst.instance_id == "deadbeef" for inst in instances)
+        assert not registry_path.exists()
+        # The dead socket is swept alongside its registry.
+        assert not stale_socket.exists()
+    finally:
+        stale_socket.unlink(missing_ok=True)
 
 
 def test_choose_instance_no_auto_start_raises(tmp_path, monkeypatch):
@@ -1284,7 +1303,7 @@ def test_spawn_rejects_registry_owned_by_other_pid(tmp_path, monkeypatch):
 
     inst_dir = instances_dir()
     inst_dir.mkdir(parents=True, exist_ok=True)
-    socket_path = Path("/tmp") / f"bn-pidtest-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
+    socket_path = tmp_path / "bn-pidtest.sock"
     server = _Server(str(socket_path), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
@@ -1342,7 +1361,7 @@ def test_wait_for_teardown_times_out_while_live(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     from bn.transport import BridgeInstance
 
-    socket_path = Path("/tmp") / f"bn-live-{os.getpid()}-{uuid.uuid4().hex[:8]}.sock"
+    socket_path = tmp_path / "bn-live.sock"
     server = _Server(str(socket_path), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     reg = tmp_path / "live.json"
