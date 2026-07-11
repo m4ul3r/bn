@@ -1536,6 +1536,55 @@ def test_dispatch_passes_boolean_go_functions_flags_unchanged(monkeypatch):
     assert seen == [(False, False), (True, False), (False, True)]
 
 
+def test_dispatch_forwards_strings_max_length_and_probable_format(monkeypatch):
+    # #554: the strings op binder must forward the max_length filter and the
+    # probable_format_strings mode to _strings. Before the binder was updated it
+    # hard-enumerated the kwargs and silently dropped both, making the CLI flags a
+    # no-op through the real RPC path. Drive them through the dispatch seam.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    seen: list[tuple[object, bool]] = []
+
+    def fake_strings(
+        target,
+        *,
+        query=None,
+        offset=0,
+        limit=None,
+        min_length=None,
+        max_length=None,
+        section=None,
+        no_crt=False,
+        regex=False,
+        probable_format_strings=False,
+        count_only=False,
+    ):
+        seen.append((max_length, probable_format_strings))
+        return {"target": target, "items": []}
+
+    monkeypatch.setattr(instance, "_strings", fake_strings)
+
+    instance._dispatch_on_main("strings", {}, None)
+    instance._dispatch_on_main(
+        "strings", {"max_length": 12, "probable_format_strings": True}, None
+    )
+
+    assert seen == [(None, False), (12, True)]
+
+
+def test_dispatch_rejects_non_boolean_probable_format_strings(monkeypatch):
+    # #554: probable_format_strings must be a real boolean, mirroring no_crt/regex.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    for bad in ("false", "true", 0, 1, "", "yes"):
+        with pytest.raises(bridge.OperationFailure) as exc:
+            instance._dispatch_on_main(
+                "strings", {"probable_format_strings": bad}, None
+            )
+        assert exc.value.status == "invalid_request"
+
+
 def test_validate_bool_accepts_real_booleans_and_default(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     assert bridge._validate_bool(None, label="quick", default=True) is True

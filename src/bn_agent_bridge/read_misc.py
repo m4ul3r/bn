@@ -39,6 +39,55 @@ _STRING_TYPE_NAMES: dict[int, str] = {
     2: "utf32",
 }
 
+# C printf directive grammar: %[flags][width][.precision][length]conversion, plus
+# the escaped literal %%. The SPACE flag is deliberately excluded: "% d" is legal
+# but vanishingly rare in real code, and admitting it turns ordinary prose like
+# "100% done" or "50% off" into false format-string hits. Dropping it forfeits the
+# uncommon space-flag directive but removes the dominant natural-language false
+# positive.
+_C_FORMAT_DIRECTIVE = re.compile(
+    r"%(?:"
+    r"%"                                                     # literal %%
+    r"|[-+#0]*(?:\d+|\*)?(?:\.(?:\d+|\*))?(?:hh|ll|[hlLjztq])?"
+    r"[diouxXeEfFgGaAcspn]"                                  # conversion
+    r")"
+)
+
+
+def _probable_format_directives(value: str) -> list[str] | None:
+    """Return the real (argument-consuming) printf conversion directives in
+    *value* when it plausibly IS a C format string, else ``None``.
+
+    A string qualifies only when EVERY ``%`` is either an escaped ``%%`` or a
+    valid directive (no stray/malformed percents -- the signature of accidental
+    percent-substrings in resource/font/blob data) AND at least one of those
+    directives is a real conversion (a bare ``%%`` string consumes no argument
+    and is uninteresting for a format-token survey).
+
+    This is a labeling heuristic, NOT a vulnerability verdict: it reports "this
+    looks like a C format string" and which directives it carries -- never "this
+    is a format-string bug". A ``%n`` in the list is provenance for the model to
+    weigh, not a finding the engine asserts."""
+    directives: list[str] = []
+    i = 0
+    n = len(value)
+    while i < n:
+        if value[i] != "%":
+            i += 1
+            continue
+        m = _C_FORMAT_DIRECTIVE.match(value, i)
+        if m is None:
+            # A '%' that does not begin a valid directive -> not a plausible C
+            # format string. This is exactly the raw-regex noise the mode exists
+            # to reject, so drop the whole string.
+            return None
+        token = m.group(0)
+        if token != "%%":
+            directives.append(token)
+        i = m.end()
+    return directives or None
+
+
 _NO_CRT_PATTERNS = re.compile(
     r"^(?:"
     r"[A-Za-z]$"                                      # single letters
@@ -110,8 +159,9 @@ def _paged_list_result(items: list[dict[str, Any]], *, offset: int,
 
 
 def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None,
-             min_length: int | None = None, section: str | None = None,
-             no_crt: bool = False, regex: bool = False, count_only: bool = False):
+             min_length: int | None = None, max_length: int | None = None,
+             section: str | None = None, no_crt: bool = False, regex: bool = False,
+             probable_format_strings: bool = False, count_only: bool = False):
     offset = _validate_count(offset, label="offset", minimum=0)
     # allow_none mirrors the sibling list ops (imports/sections): limit=None
     # means "no limit", so a raw-socket / py exec caller can fetch every string.
@@ -152,6 +202,8 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
             continue
         if min_length is not None and length < min_length:
             continue
+        if max_length is not None and length > max_length:
+            continue
         if section:
             secs = bv.get_sections_at(address) if hasattr(bv, "get_sections_at") else []
             if not any(getattr(s, "name", "") == section for s in secs):
@@ -165,6 +217,12 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
             if any(getattr(s, "name", "") == ".text" for s in secs):
                 continue
 
+        directives: list[str] | None = None
+        if probable_format_strings:
+            directives = _probable_format_directives(value)
+            if directives is None:
+                continue
+
         entry = {
             "address": hex(address),
             "length": length,
@@ -172,6 +230,18 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
             "type": string_type,
             "value": value,
         }
+        if directives is not None:
+            # Provenance for the model: WHICH printf directives the candidate
+            # carries (a `%n`/`%s` here is a signal to weigh, not a verdict), and
+            # the code-xref count -- a plausible format string is usually
+            # referenced by code. Reuse the existing xref helper rather than
+            # recompute, and only for the already-filtered survivors so the mode
+            # stays cheap. code_refs stays enrichment, NOT a hard filter: a format
+            # string reached indirectly can have zero direct xrefs, and dropping
+            # it would be a false negative.
+            entry["format_directives"] = directives
+            entry["directive_count"] = len(directives)
+            entry["code_refs"] = read_xrefs._code_ref_count(bv, address)
         items.append(entry)
     if count_only:
         # `total` mirrors the list envelope key for the same number (#165).

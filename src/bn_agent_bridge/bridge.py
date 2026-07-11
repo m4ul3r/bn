@@ -2818,9 +2818,13 @@ def _bind_strings(bridge, params, target):
         # raw-socket / py exec caller that omits limit gets every string (#122).
         limit=int(params["limit"]) if params.get("limit") is not None else None,
         min_length=int(params["min_length"]) if params.get("min_length") is not None else None,
+        max_length=int(params["max_length"]) if params.get("max_length") is not None else None,
         section=params.get("section"),
         no_crt=_validate_bool(params.get("no_crt"), label="no_crt", default=False),
         regex=_validate_bool(params.get("regex"), label="regex", default=False),
+        probable_format_strings=_validate_bool(
+            params.get("probable_format_strings"), label="probable_format_strings", default=False
+        ),
         count_only=_validate_bool(params.get("count_only"), label="count_only", default=False),
     )
 

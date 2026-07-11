@@ -152,6 +152,97 @@ def test_strings_invalid_regex_is_actionable(monkeypatch):
         instance._strings(None, query="(", offset=0, limit=100, regex=True)
 
 
+def test_strings_max_length_excludes_long_strings(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(strings=[
+        _FakeStringRef(0x1000, 4, "abcd"),
+        _FakeStringRef(0x2000, 12, "a long blobby"),
+    ])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._strings(None, query=None, offset=0, limit=100, max_length=8)
+
+    assert [item["value"] for item in result["items"]] == ["abcd"]
+
+
+def test_strings_probable_format_rejects_blob_noise_keeps_real_format(monkeypatch):
+    # The whole point (#554): a raw `%s|%d` regex matches accidental
+    # percent-substrings in resource/font/blob data. The directive-grammar mode
+    # keeps only strings whose EVERY '%' is a valid directive (or %%), rejecting
+    # stray percents -- and rejects prose like "100% done" and bare "%%".
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(strings=[
+        _FakeStringRef(0x1000, 7, "%s: %d\n"),      # real format string
+        _FakeStringRef(0x1010, 8, "hp=%d/%d"),       # real format string
+        _FakeStringRef(0x1020, 9, "100% done"),      # prose, NOT a directive
+        _FakeStringRef(0x1030, 6, "50%% off"),       # only escaped %% -> no arg
+        _FakeStringRef(0x1040, 7, "x%zzq%1"),        # blob noise: malformed %
+        _FakeStringRef(0x1050, 5, "plain"),          # no percents at all
+    ])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._strings(None, query=None, offset=0, limit=100,
+                               probable_format_strings=True)
+
+    assert [item["value"] for item in result["items"]] == ["%s: %d\n", "hp=%d/%d"]
+
+
+def test_strings_probable_format_annotates_directives_and_code_refs(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        strings=[_FakeStringRef(0x1000, 12, "user %s: %d%%")],
+        code_refs={0x1000: [_FakeCodeRef(0x400100), _FakeCodeRef(0x400200)]},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._strings(None, query=None, offset=0, limit=100,
+                               probable_format_strings=True)
+
+    items = result["items"]
+    assert len(items) == 1
+    entry = items[0]
+    # %% is an escaped literal, not an argument-consuming directive, so it is
+    # excluded from the directive list.
+    assert entry["format_directives"] == ["%s", "%d"]
+    assert entry["directive_count"] == 2
+    assert entry["code_refs"] == 2
+
+
+def test_strings_probable_format_recovers_flags_width_precision_length(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(strings=[
+        _FakeStringRef(0x1000, 20, "%-10s %08x %5.2f %ld %p %n"),
+    ])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._strings(None, query=None, offset=0, limit=100,
+                               probable_format_strings=True)
+
+    entry = result["items"][0]
+    assert entry["format_directives"] == ["%-10s", "%08x", "%5.2f", "%ld", "%p", "%n"]
+
+
+def test_strings_probable_format_keeps_indirect_zero_xref_candidate(monkeypatch):
+    # code_refs is enrichment, NOT a hard filter: a format string reached
+    # indirectly can have zero direct xrefs. Dropping it would be a false
+    # negative, so it is kept and annotated code_refs=0.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(strings=[_FakeStringRef(0x2000, 6, "err %d")])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._strings(None, query=None, offset=0, limit=100,
+                               probable_format_strings=True)
+
+    entry = result["items"][0]
+    assert entry["format_directives"] == ["%d"]
+    assert entry["code_refs"] == 0
+
+
 # --- I5: sections ---
 
 

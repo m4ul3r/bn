@@ -387,8 +387,10 @@ def test_batch_apply_manifest_target_used_when_no_flag(monkeypatch, fake_transpo
     assert calls[-1]["params"].get("target") == "explicit"
 @pytest.mark.parametrize("argv, expected", [
     pytest.param(["--min-length", "5"], {"min_length": 5}, id="min-length"),
+    pytest.param(["--max-length", "80"], {"max_length": 80}, id="max-length"),
     pytest.param(["--section", ".rodata", "--no-crt"], {"section": ".rodata", "no_crt": True}, id="section-no-crt"),
     pytest.param(["--query", "foo|bar", "--regex"], {"query": "foo|bar", "regex": True}, id="regex"),
+    pytest.param(["--probable-format-strings"], {"probable_format_strings": True}, id="probable-format"),
 ])
 def test_strings_passes_args_to_bridge(fake_transport, argv, expected):
     # The CLI's job is argv -> bridge request; assert the params it forwarded.
@@ -398,6 +400,26 @@ def test_strings_passes_args_to_bridge(fake_transport, argv, expected):
     params = calls[-1]["params"]
     for key, val in expected.items():
         assert params[key] == val
+
+
+def test_strings_probable_format_text_shows_directives_and_refs(fake_transport, capsys):
+    # --probable-format-strings enrichment renders in text mode: the recovered
+    # directives and the code-xref count appear on the row.
+    fake_transport({"strings": {"ok": True, "result": {
+        "kind": "strings",
+        "items": [{
+            "address": "0x1000", "length": 7, "chars": 7, "type": "ascii",
+            "value": "%s: %d\n", "format_directives": ["%s", "%d"],
+            "directive_count": 2, "code_refs": 3,
+        }],
+        "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False,
+    }}})
+    rc = bn.cli.main(["strings", "--target", "active", "--probable-format-strings",
+                      "--format", "text"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "fmt: %s %d" in out
+    assert "code_refs=3" in out
 
 
 

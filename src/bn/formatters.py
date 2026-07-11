@@ -2466,7 +2466,19 @@ def _render_strings_rows(value: Any) -> str:
             size = f"chars={chars}"
         else:
             size = f"len={length}"
-        lines.append(f"{address}  {size}  {string_type}  {rendered}".rstrip())
+        row = f"{address}  {size}  {string_type}  {rendered}".rstrip()
+        # --probable-format-strings enrichment: surface the recovered printf
+        # directives and code-xref count so the survey is scannable without
+        # re-reading the JSON. Absent on a plain strings dump.
+        directives = item.get("format_directives")
+        if isinstance(directives, list) and directives:
+            refs = item.get("code_refs")
+            suffix = f"  [fmt: {' '.join(str(d) for d in directives)}"
+            if isinstance(refs, int):
+                suffix += f"; code_refs={refs}"
+            suffix += "]"
+            row += suffix
+        lines.append(row)
     return "\n".join(lines)
 
 
