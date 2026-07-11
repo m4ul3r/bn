@@ -5435,6 +5435,86 @@ def test_forward_zero_result_diagnostics_no_propagation_559(models):
     assert diag["next_action"]                                 # a factual suggestion, not a verdict
 
 
+# --------------------------------------------------------------------------
+# #562 behavioral half: fgetc sources, recv-seed honesty, claim gate
+# --------------------------------------------------------------------------
+
+def test_fgetc_family_are_ret_taint_sources_562(models):
+    """#562 change 1: fgetc/getc/getchar are byte-at-a-time file sources whose
+    tainted value is the RETURN (the byte read). Without a model they are
+    unmodeled calls and a hand-rolled token loop shows no modeled source."""
+    for name in ("fgetc", "getc", "getchar"):
+        assert name in models, f"{name} missing from model DB"
+        tos = [str(s.get("to")) for s in models[name].get("sources") or []]
+        assert tos == ["ret"], (name, tos)     # the byte, not a buffer arg
+
+
+def test_arg_recvmsg_seed_emits_misanchored_leaf_and_withholds_all_clear_562(models):
+    """#562 change 2/3: an arg:recvmsg:N seed anchors the msghdr*, never the
+    scatter-gather payload, so the buffer is never tainted and no sink fires.
+    That empty result must NOT read as a clean all-clear: a structured
+    source_seed_misanchored leaf lands in leaves, and the folded-in claim gate
+    withholds the all-clear."""
+    func = _recvmsg_static_iov_func()
+    bv = FBV({0x900: "recvmsg", 0x910: "system"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:recvmsg:1")])
+
+    assert result["reached_sinks"] == []                        # payload never tainted
+    mis = [l for l in result["leaves"] if l.get("kind") == "source_seed_misanchored"]
+    assert len(mis) == 1, result["leaves"]
+    assert mis[0]["callee"] == "recvmsg"
+    assert "call:recvmsg" == mis[0]["suggested_source"]
+
+    diag = result["diagnostics"]
+    assert diag["frontier"]["seed_misanchored"] == 1
+    # The honesty gate is FOLDED INTO the single diagnostics block (#571 schema).
+    assert diag["safe_to_report_all_clear"] is False
+    assert "NOT an all-clear" in diag["all_clear_reason"]
+    # propagation-not-verdict: the gate withholds, it never asserts a bug.
+    assert "call:<recv>" in diag["next_action"] or "call:recv" in diag["next_action"]
+
+
+def test_zero_sink_clean_run_reports_safe_to_report_all_clear_true_562(models):
+    """A forward run that produces no sink and no tainted frontier folds a
+    safe_to_report_all_clear=true into diagnostics -- framed as may-analysis,
+    never a proof of safety (propagation-not-verdict)."""
+    a = FVar("a"); r = FVar("r")
+    a0 = FSSA(a, 0); r1 = FSSA(r, 1)
+    ssa = FSSAFunc([
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "r#1 = a#0 + 1", reads=[a0], writes=[r1]),
+        FInstr(1, 0x14, "MLIL_RET", "return r#1", reads=[r1]),
+    ])
+    func = FFunc("add_one", 0x10, ssa, params=[a])
+    engine = te.TaintEngine(FBV({}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+
+    assert result["reached_sinks"] == []
+    assert result["leaves"] == []
+    diag = result["diagnostics"]
+    assert diag["safe_to_report_all_clear"] is True
+    assert "may-analysis" in diag["all_clear_reason"]
+    assert "not a proof" in diag["all_clear_reason"]           # never asserts safety
+
+
+def test_frontier_leaf_withholds_all_clear_562(models):
+    """A zero-sink run that hit an unmodeled in-binary parser (a real frontier
+    leaf) must fold safe_to_report_all_clear=false -- the existing #571 frontier
+    fields stay intact alongside the new gate (unified schema)."""
+    func, bv = _frontier_no_params_program()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:recv:1")])
+
+    diag = result["diagnostics"]
+    # #571 fields preserved:
+    assert diag["source_callsites"] == 1
+    assert diag["unmodeled_calls_reached"] is True
+    assert diag["frontier"]["by_kind"].get("unmodeled_callee") == 1
+    assert "proto set" in diag["next_action"]
+    # #562 gate folded in:
+    assert diag["safe_to_report_all_clear"] is False
+
+
 def test_reclassify_constant_format_sink_477(models):
     # #477: a printf-family sink whose format operand is a resolved constant carries
     # a tainted DATA vararg, not format-string control -> reclassify off the format

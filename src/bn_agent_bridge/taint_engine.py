@@ -53,7 +53,7 @@ from .taint_locators import (  # noqa: F401
     node_label, _instr_dict, _render_source, _make_signature,
     derive_flow_facts,
 )
-from .taint_result import forward_zero_diagnostics  # noqa: F401
+from .taint_result import forward_zero_diagnostics, misanchored_recv_leaf  # noqa: F401
 
 # Module aliases so tests/callers can patch a moved symbol on its OWNER module
 # (a re-exported binding on the engine is a separate name -- rebinding it would
@@ -1836,7 +1836,8 @@ class TaintEngine:
         engine-state-free implementation); the only engine input is the matched
         seed-callsite count."""
         return forward_zero_diagnostics(
-            sub, seed_callsites=int(getattr(self, "_seed_callsites", 0)))
+            sub, seed_callsites=int(getattr(self, "_seed_callsites", 0)),
+            truncated=bool(getattr(self, "_truncated", False)))
 
     def _attributable_callsites(self, func: Any, sources: list[dict[str, Any]]) -> list[int]:
         """Distinct call addresses to attribute a single ret/arg source across.
@@ -2966,7 +2967,8 @@ class TaintEngine:
         # local to this run, so a descended callee's run keeps its own.
         buffer_slots: dict = {}
         correlated_slots: set = set()
-        seeded = self._seed_forward(func, ssaf, instrs, locators, taint_node, add_assumption, buffer_slots)
+        seeded = self._seed_forward(func, ssaf, instrs, locators, taint_node, add_assumption,
+                                    buffer_slots, leaves)
         if not seeded:
             if top:
                 raise TaintError("no taint sources resolved; check --source locator")
@@ -3842,9 +3844,20 @@ class TaintEngine:
             f"stripped-proto shape), apply `bn proto set {func.name} \"<prototype>\"` "
             f"and re-run this taint query")
 
-    def _seed_forward(self, func, ssaf, instrs, sources, taint_node, add_assumption, buffer_slots=None) -> bool:
+    def _seed_forward(self, func, ssaf, instrs, sources, taint_node, add_assumption,
+                      buffer_slots=None, leaves=None) -> bool:
         if buffer_slots is None:
             buffer_slots = {}
+        if leaves is None:
+            leaves = []
+
+        def add_leaf(leaf: dict[str, Any]) -> None:
+            # A structured seed-honesty leaf (#562): dedupe so a re-seeded run
+            # doesn't stack duplicates. Distinct from assumptions -- this lands
+            # in result["leaves"] and feeds the frontier accounting/claim gate.
+            if leaf and leaf not in leaves:
+                leaves.append(leaf)
+
         seeded = False
         for src in sources:
             kind = src.get("kind")
@@ -3888,6 +3901,16 @@ class TaintEngine:
                         f"automatically, or seed the filled buffer directly (--source "
                         f"var:<buf>) when the iovec is built dynamically."
                     )
+                    # #562: structured leaf so JSON `leaves` is non-empty and the
+                    # claim gate withholds an all-clear. An arg:recvmsg:N seed
+                    # ALWAYS mis-anchors (it seeds the msghdr*, never the payload),
+                    # so emit unconditionally here -- dogfood: agents misread a
+                    # bare assumptions-only + 0-sinks result as clean.
+                    add_leaf(misanchored_recv_leaf(
+                        callee=str(callee),
+                        arg_index=int(src.get("index", 1)),
+                        reason="msghdr_not_payload",
+                    ))
                 if kind == "ret":
                     # A ret: source on a function whose model also fills an
                     # output-pointer buffer would silently miss those bytes;
@@ -3952,10 +3975,12 @@ class TaintEngine:
                                               f"source: {callee} fills arg{idx} buffer", []):
                                     seeded = True
                             else:
+                                ptr_seeded = False
                                 for r in expr_reads(params[idx]):
                                     if taint_node((var_key(r), getattr(r, "version", None)), var_label(r), c,
                                                   f"source: {callee} arg{idx}", []):
                                         seeded = True
+                                        ptr_seeded = True
                                 # The buffer couldn't be anchored to a stack var or
                                 # writable global. If the pointer is itself loaded
                                 # from a global/struct slot, register the slot so a
@@ -3964,6 +3989,21 @@ class TaintEngine:
                                 # slot can't be named.
                                 self._register_indirect_buffer_slot(
                                     ssaf, params[idx], c, callee, idx, buffer_slots, add_assumption)
+                                # #562: a recv-family arg seed that tainted only the
+                                # pointer value (buffer not keyed) is the arg:recv:1
+                                # false-all-clear shape -- emit a structured leaf so
+                                # the claim gate stops reading the empty result as
+                                # clean. Distinct from recvmsg (handled above): here
+                                # the buffer simply couldn't be anchored.
+                                _rbase = (callee or "").split("@", 1)[0].lstrip("_")
+                                if ptr_seeded and _rbase in (
+                                        "recv", "recvfrom", "read", "pread", "fread"):
+                                    add_leaf(misanchored_recv_leaf(
+                                        callee=str(callee),
+                                        arg_index=idx,
+                                        address=hex(int(getattr(c, "address", 0))),
+                                        reason="buffer_not_keyed",
+                                    ))
                 if kind == "ret" and not ret_seeded:
                     # T3: callsites of `callee` exist but NONE consume its return
                     # value (a void or discarded return), so a ret: source has

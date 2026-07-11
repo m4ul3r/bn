@@ -2253,9 +2253,20 @@ def _render_forward_diagnostics(diag: dict[str, Any]) -> list[str]:
         out.append("  last propagated use: <none — seed did not propagate>")
     out.append(
         f"  unmodeled call(s) reached: {'yes' if diag.get('unmodeled_calls_reached') else 'no'}")
-    out.append(
-        f"  frontier: {fr.get('unresolved', 0)} unresolved, "
-        f"{fr.get('coarse_memory', 0)} coarse-memory")
+    _fr = (f"  frontier: {fr.get('unresolved', 0)} unresolved, "
+           f"{fr.get('coarse_memory', 0)} coarse-memory")
+    _sm = fr.get("seed_misanchored", 0)
+    if _sm:
+        _fr += f", {_sm} seed-misanchored"
+    out.append(_fr)
+    # #562 honesty gate, folded into the same block: the anti-verdict, never a
+    # vulnerability claim. Only present when the diagnostics carry it.
+    if "safe_to_report_all_clear" in diag:
+        gate = diag.get("safe_to_report_all_clear")
+        out.append(f"  safe_to_report_all_clear: {'true' if gate else 'false'}"
+                   + (" (may-analysis, not a proof)" if gate else ""))
+        if diag.get("all_clear_reason"):
+            out.append(f"    reason: {diag['all_clear_reason']}")
     if diag.get("next_action"):
         out.append(f"  next: {diag['next_action']}")
     return out
