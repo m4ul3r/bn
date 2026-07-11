@@ -306,3 +306,62 @@ def test_render_virtual_call_text_handles_int_and_missing_method_address_533():
     out = _render_virtual_call_text(value)
     assert "0x4200" in out            # int -> hex
     assert "B" in out and "n" in out  # missing method_address still renders the line
+
+
+def test_render_callsites_shows_null_hlil_reason_and_variadic_hint():
+    # #557 + #558: text output surfaces the null-hlil reason code and the
+    # variadic-callee steer.
+    from bn.formatters import _render_callsites_text
+    value = {"items": [{
+        "callee": {"name": "sscanf", "address": "0x461746"},
+        "containing_function": {"name": "parse_line", "address": "0x500000"},
+        "call_addr": "0x500010", "caller_static": "0x500014",
+        "hlil_statement": None, "hlil_statement_reason": "no_hlil_mapping",
+        "call_instruction": {"address": "0x500010", "text": "bl sscanf"},
+        "previous_instructions": [], "next_instructions": [],
+        "callee_variadic": {"name": "sscanf", "is_variadic": True, "family": "scanf",
+                            "format_arg_index": 1, "note": "..."},
+    }], "total": 1, "has_more": False}
+    out = _render_callsites_text(value)
+    assert "hlil: null (no_hlil_mapping)" in out
+    assert "variadic-callee: sscanf" in out
+    assert "bn evidence function parse_line" in out
+
+
+def test_render_evidence_shows_argument_confidence_and_variadic():
+    # #549 + #558: evidence text tags argument confidence and the variadic warning.
+    from bn.formatters import _render_function_evidence_text
+    value = {
+        "function": {"name": "parse_line", "address": "0x500000"},
+        "prototype": "void parse_line()", "calling_convention": "__cdecl",
+        "thunk": {"is_candidate": False},
+        "total_calls": 1, "matched_calls": 1, "offset": 0, "limit": None,
+        "calls": [{
+            "address": "0x500010", "operation": "LLIL_CALL", "direct": True,
+            "hlil_statement": None, "hlil_statement_reason": "hlil_not_call_shaped",
+            "argument_source": "hlil", "argument_confidence": "authoritative",
+            "arguments": [{"text": "input"}],
+            "argument_candidates": [{"source": "llil", "index": 0, "text": "r0", "confidence": "low"}],
+            "variadic": {"is_variadic": True, "family": "scanf", "callee": "sscanf",
+                         "under_recovered": True,
+                         "warning": "imported variadic call `sscanf` under-recovered in HLIL: ..."},
+        }],
+    }
+    out = _render_function_evidence_text(value)
+    assert "hlil: null (hlil_not_call_shaped)" in out
+    assert "arguments: (hlil authoritative)" in out
+    assert "variadic: UNDER-RECOVERED" in out
+
+
+def test_render_orient_shows_existing_annotations():
+    # #561: the orient card surfaces inherited-annotation counts + provenance hint.
+    from bn.formatters import _render_orient_text
+    value = {"kind": "orient_digest", "target": {"basename": "shared.bndb"},
+             "analyzed": True, "analysis_state": "full", "function_count": 10,
+             "existing_annotations": {"comments": 8, "function_comments": 3, "user_symbols": 12,
+                                      "analysis_cache_restored": True,
+                                      "provenance_hint": "existing BNDB annotations may predate this run"}}
+    out = _render_orient_text(value)
+    assert "existing annotations: comments=8" in out
+    assert "user-symbols=12" in out and "cache-restored=True" in out
+    assert "predate this run" in out

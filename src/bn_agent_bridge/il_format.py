@@ -387,12 +387,52 @@ def _select_local_hlil_node(insn) -> Any | None:
     return None
 
 
-def _hlil_statement_text(insn) -> str | None:
+def _hlil_statement_localization(insn) -> tuple[str | None, str | None]:
+    """Localize a call's HLIL statement AND report why it failed (#557).
+
+    Returns ``(text, reason)``. On success ``text`` is the local HLIL statement
+    for THIS call site and ``reason`` is None. On failure ``text`` is None and
+    ``reason`` is a stable machine-readable code so a caller emitting a null
+    ``hlil_statement`` can say WHY it is null instead of leaving an agent to
+    re-run decompile and correlate addresses by hand:
+
+    * ``no_hlil_mapping`` -- BN produced no HLIL instruction for this LLIL call
+      at all (nothing to render).
+    * ``hlil_not_call_shaped`` -- HLIL exists for the LLIL call but folded into a
+      non-call statement (a coarse assignment/return/block), so no
+      ``HighLevelILCall`` root is reachable to describe.
+    * ``ambiguous_fold`` -- BN folded several calls into this one LLIL
+      instruction (#475/#476) and none of the resulting call roots sit at this
+      call's address, so attributing a statement would risk describing a
+      neighbor's call.
+    * ``statement_not_local`` -- a statement was selected but its rendered text
+      is non-local (too long / multi-line, e.g. a whole-function blob), which
+      the localness filter rejects.
+    * ``no_local_statement`` -- roots matched this address but the ancestor walk
+      produced no renderable enclosing statement (rare).
+    """
+    roots = _hlil_call_roots(insn)
+    if not roots:
+        if not _hlil_candidates_for_llil(insn):
+            return None, "no_hlil_mapping"
+        return None, "hlil_not_call_shaped"
+    call_addr = int(getattr(insn, "address", 0) or 0)
+    matched = [r for r in roots if int(getattr(r, "address", -1) or -1) == call_addr]
+    selected_roots = matched or ([] if len(roots) > 1 else roots)
+    if not selected_roots:
+        return None, "ambiguous_fold"
     node = _select_local_hlil_node(insn)
     if node is None:
-        return None
+        return None, "no_local_statement"
     text = str(node)
-    return text if _hlil_text_is_local(text) else None
+    if not _hlil_text_is_local(text):
+        return None, "statement_not_local"
+    return text, None
+
+
+def _hlil_statement_text(insn) -> str | None:
+    text, _reason = _hlil_statement_localization(insn)
+    return text
 
 
 def _hlil_pre_branch_condition(insn) -> str | None:
@@ -417,6 +457,112 @@ def _hlil_pre_branch_condition(insn) -> str | None:
             return text if _hlil_condition_is_meaningful(text) else None
         current = parent
     return None
+
+
+# --- variadic (printf/scanf-family) format-argument recovery (#558) ----------
+#
+# Maps a libc variadic format function to (format_arg_index, is_scanf). The
+# format arg is 0-based; is_scanf marks the families whose variadic arguments
+# are DESTINATION POINTERS (writes into caller storage) rather than values, so
+# under-recovery there silently hides parser field writes.
+_VARIADIC_FORMAT_FAMILY: dict[str, tuple[int, bool]] = {
+    # scanf family: variadic args are destination pointers
+    "scanf": (0, True),
+    "fscanf": (1, True),
+    "sscanf": (1, True),
+    # printf family: variadic args are values (%s is a source pointer)
+    "printf": (0, False),
+    "fprintf": (1, False),
+    "sprintf": (1, False),
+    "snprintf": (2, False),
+    "dprintf": (1, False),
+    "syslog": (1, False),
+}
+
+# Scanf/printf length modifiers to skip before the conversion specifier.
+_FORMAT_LENGTH_MODS = set("hlLqjzt")
+
+
+def _normalize_libc_name(name: str) -> str:
+    """Strip PLT/GOT/import decorations and glibc wrappers from a callee name so
+    ``__isoc99_sscanf`` / ``sscanf@plt`` / ``_sscanf`` all resolve to ``sscanf``."""
+    n = str(name or "").strip()
+    n = n.split("@", 1)[0]           # drop @plt / @got / @GLIBC_* decorations
+    if n.startswith("__isoc99_"):
+        n = n[len("__isoc99_"):]
+    return n.lstrip("_")
+
+
+def _variadic_format_family(name: str) -> tuple[int, bool] | None:
+    """(format_arg_index, is_scanf) for a known printf/scanf-family callee, else None."""
+    return _VARIADIC_FORMAT_FAMILY.get(_normalize_libc_name(name))
+
+
+def _function_is_variadic(func) -> bool:
+    """Whether BN's recovered prototype for *func* is variadic (``...``). Tolerates
+    a BoolWithConfidence, a plain bool, or a type that lacks the attribute."""
+    func_type = getattr(func, "type", None)
+    if func_type is None:
+        return False
+    has_varargs = getattr(func_type, "has_variable_arguments", None)
+    if has_varargs is None:
+        return False
+    value = getattr(has_varargs, "value", has_varargs)
+    try:
+        return bool(value)
+    except Exception:
+        return False
+
+
+def _extract_format_literal(text: str) -> str | None:
+    """Pull the C string body out of a rendered format argument like ``"%d %s"``
+    (BN renders resolved string constants quoted). Returns None when *text* is not
+    a simple double-quoted literal."""
+    stripped = str(text or "").strip()
+    if len(stripped) >= 2 and stripped[0] == '"' and stripped[-1] == '"':
+        return stripped[1:-1]
+    return None
+
+
+def _count_format_conversions(fmt: str, *, is_scanf: bool) -> int:
+    """Count the argument-consuming conversion specifiers in a printf/scanf format
+    string. ``%%`` is skipped; a scanf ``%*`` (assignment suppression) consumes no
+    pointer. Heuristic (width ``%*`` in printf and exotic specifiers are not modeled)
+    -- used only to estimate an expected argument count, never asserted as fact."""
+    count = 0
+    i, n = 0, len(fmt)
+    while i < n:
+        if fmt[i] != "%":
+            i += 1
+            continue
+        i += 1
+        if i >= n:
+            break
+        if fmt[i] == "%":          # literal %%
+            i += 1
+            continue
+        suppressed = is_scanf and fmt[i] == "*"
+        if suppressed:
+            i += 1
+        while i < n and (fmt[i].isdigit() or fmt[i] in _FORMAT_LENGTH_MODS):
+            i += 1
+        if i >= n:
+            break
+        conv = fmt[i]
+        if conv == "[":            # scanf scanset %[...] / %[^...]
+            i += 1
+            if i < n and fmt[i] == "^":
+                i += 1
+            if i < n and fmt[i] == "]":   # ] as the first member is literal
+                i += 1
+            while i < n and fmt[i] != "]":
+                i += 1
+            i += 1
+        else:
+            i += 1
+        if not suppressed:
+            count += 1
+    return count
 
 
 def _format_hlil_tree(ins, indent=0, *, _else_prefix=False, addresses: bool = True):

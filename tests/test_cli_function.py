@@ -1799,6 +1799,24 @@ def test_disasm_linear_works_in_json_format(fake_transport, capsys):
     assert result["instructions"][0]["text"] == "ret"
 
 
+def test_disasm_linear_snap_flag_reaches_bridge(fake_transport):
+    # #550: --snap-to-instruction threads through to the bridge as a param.
+    calls = fake_transport({"disasm": {"ok": True, "result": {
+        "linear": True, "function": None, "address": "0x402020", "note": "n", "text": "t"}}})
+    rc = bn.cli.main(["disasm", "0x402020", "--target", "active", "--linear", "2",
+                      "--snap-to-instruction"])
+    assert rc == 0
+    assert calls[-1]["params"] == {"identifier": "0x402020", "linear": 2,
+                                   "snap_to_instruction": True}
+
+
+def test_disasm_snap_requires_linear(capsys):
+    # #550: --snap-to-instruction only makes sense with --linear.
+    rc = bn.cli.main(["disasm", "sub_401000", "--target", "active", "--snap-to-instruction"])
+    assert rc == 2
+    assert "--snap-to-instruction applies only to --linear" in capsys.readouterr().err
+
+
 def test_disasm_linear_and_count_mutually_exclusive(capsys):
     with pytest.raises(SystemExit) as exc:
         bn.cli.main(["disasm", "0x1000", "--target", "active", "--linear", "4", "--count", "2"])

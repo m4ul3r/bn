@@ -252,10 +252,12 @@ def _il(ctx, selector: str | None, identifier, view: str, ssa: bool):
     return result
 
 
-def _disasm(ctx, selector: str | None, identifier, linear=None, mode=None):
+def _disasm(ctx, selector: str | None, identifier, linear=None, mode=None,
+            snap_to_instruction: bool = False):
     bv = ctx._resolve_view(selector)
     if linear is not None:
-        return _disasm_linear(ctx, bv, identifier, int(linear), mode=mode)
+        return _disasm_linear(ctx, bv, identifier, int(linear), mode=mode,
+                              snap_to_instruction=bool(snap_to_instruction))
     try:
         func = ctx._find_function(bv, identifier, contained=True)
     except Exception as exc:
@@ -363,7 +365,50 @@ def _linear_decode_arch(ctx, bv, address: int, mode):
     return bv_arch
 
 
-def _disasm_linear(ctx, bv, identifier, count: int, *, mode=None) -> dict[str, Any]:
+def _function_instruction_starts(bv, func) -> set[int]:
+    """The set of recovered instruction START addresses in *func* (#550).
+
+    Walks BN's basic blocks with the function's own arch instruction lengths --
+    the authoritative decode boundaries. Used to detect a ``--linear`` start that
+    lands INSIDE a function but mid-instruction (which would decode junk that
+    looks plausible)."""
+    arch = getattr(func, "arch", None)
+    starts: set[int] = set()
+    try:
+        blocks = list(func.basic_blocks)
+    except Exception:
+        return starts
+    for block in blocks:
+        try:
+            addr = int(block.start)
+            end = int(block.end)
+        except Exception:
+            continue
+        while addr < end:
+            starts.add(addr)
+            addr += max(1, il_format._instruction_length(bv, addr, arch=arch))
+    return starts
+
+
+def _linear_boundary_check(bv, func, address: int) -> dict[str, Any] | None:
+    """If *address* is inside *func* but not at a recovered instruction start,
+    return a boundary-warning descriptor naming the nearest valid start(s) (#550);
+    else None. A start exactly on a boundary is silent."""
+    starts = _function_instruction_starts(bv, func)
+    if not starts or address in starts:
+        return None
+    at_or_below = max((s for s in starts if s <= address), default=None)
+    above = min((s for s in starts if s > address), default=None)
+    return {
+        "requested": hex(address),
+        "in_function": {"name": str(func.name), "address": hex(int(func.start))},
+        "nearest_start_at_or_below": hex(at_or_below) if at_or_below is not None else None,
+        "nearest_start_above": hex(above) if above is not None else None,
+    }
+
+
+def _disasm_linear(ctx, bv, identifier, count: int, *, mode=None,
+                   snap_to_instruction: bool = False) -> dict[str, Any]:
     """Linear disassembly of *count* instructions from an arbitrary MAPPED address,
     independent of function membership (#314). The stripped/static lane needs to
     read the bytes at a suspected missed handler -- a dispatch/vtable slot BN left
@@ -394,6 +439,27 @@ def _disasm_linear(ctx, bv, identifier, count: int, *, mode=None) -> dict[str, A
             f"address {hex(address)} is not mapped in this binary; nothing to "
             f"disassemble there"
         )
+    # #550: detect a start that lands inside a known function but NOT at a recovered
+    # instruction boundary -- linear decoding from mid-instruction produces junk that
+    # reads like real control flow. Warn (naming the nearest valid starts) and, with
+    # --snap-to-instruction, snap DOWN to the enclosing instruction's start.
+    containing_func = None
+    try:
+        containers = ctx._functions_containing(bv, int(address))
+        if containers:
+            containing_func = containers[0]
+    except Exception:
+        containing_func = None
+    boundary_warning = None
+    snapped_from = None
+    if containing_func is not None:
+        boundary_warning = _linear_boundary_check(bv, containing_func, address)
+        if boundary_warning is not None and snap_to_instruction:
+            below = boundary_warning.get("nearest_start_at_or_below")
+            if below is not None:
+                snapped_from = address
+                address = int(below, 16)
+                boundary_warning = None  # snapped onto a real boundary; no longer junk
     arch = _linear_decode_arch(ctx, bv, address, mode)
     # Under an explicit --mode the decode is FORCED to that arch: a byte the forced
     # mode can't model must surface as `.byte` (the existing path below), NOT a
@@ -430,26 +496,52 @@ def _disasm_linear(ctx, bv, identifier, count: int, *, mode=None) -> dict[str, A
         })
         lines.append(f"{addr:08x}  {hex_bytes:<16} {text}")
         addr += length
+    # Recompute containment at the FINAL (possibly snapped) start address.
     in_function = None
-    try:
-        containers = ctx._functions_containing(bv, int(address))
-        if containers:
-            fn = containers[0]
-            in_function = {"name": fn.name, "address": hex(int(fn.start))}
-    except Exception:
-        in_function = None
+    if containing_func is not None:
+        in_function = {
+            "name": containing_func.name,
+            "address": hex(int(containing_func.start)),
+        }
+    else:
+        try:
+            containers = ctx._functions_containing(bv, int(address))
+            if containers:
+                fn = containers[0]
+                in_function = {"name": fn.name, "address": hex(int(fn.start))}
+        except Exception:
+            in_function = None
     note = (
         f"linear disassembly of {len(entries)} instruction"
         f"{'' if len(entries) == 1 else 's'} from {hex(address)} "
-        f"(not function-bounded)"
+        # #550: name the ordering explicitly -- this is address-linear (byte order),
+        # NOT the basic-block/graph order a function-scoped `disasm <fn>` renders.
+        f"(address-linear order, not function-bounded)"
     )
     if thumb_tag_normalized is not None:
         note += (
             f"; normalized a Thumb function-pointer tag (bit 0) "
             f"{hex(thumb_tag_normalized)} -> {hex(address)}"
         )
+    if snapped_from is not None:
+        note += (
+            f"; snapped {hex(snapped_from)} back to the enclosing instruction "
+            f"start {hex(address)} (--snap-to-instruction)"
+        )
     if in_function is not None:
         note += f"; this address is inside {in_function['name']} @ {in_function['address']}"
+    if boundary_warning is not None:
+        # #550: the start is inside a function but mid-instruction -- the decode below
+        # is very likely junk. Name the nearest valid starts so the caller can re-run.
+        below = boundary_warning.get("nearest_start_at_or_below")
+        above = boundary_warning.get("nearest_start_above")
+        nearest = ", ".join(x for x in (below, above) if x) or "unknown"
+        note += (
+            f"; WARNING: {boundary_warning['requested']} is NOT a recovered instruction "
+            f"boundary inside {boundary_warning['in_function']['name']} -- linear decode "
+            f"from here may be junk. Nearest valid start(s): {nearest}. Re-run at a valid "
+            f"start or add --snap-to-instruction"
+        )
     arch_name = str(getattr(arch, "name", "") or "")
     if arch_name:
         # #382: disclose the decode mode so an ARM/Thumb decode isn't silently
@@ -460,6 +552,7 @@ def _disasm_linear(ctx, bv, identifier, count: int, *, mode=None) -> dict[str, A
         note += f"; capped at {_LINEAR_DISASM_MAX} (requested {requested_count})"
     return {
         "linear": True,
+        "order": "address-linear",
         "function": in_function,
         "address": hex(address),
         "decode_arch": arch_name or None,
@@ -468,6 +561,8 @@ def _disasm_linear(ctx, bv, identifier, count: int, *, mode=None) -> dict[str, A
         "instruction_count": len(entries),
         "instructions": entries,
         "text": "\n".join(lines),
+        "boundary_warning": boundary_warning,
+        "snapped_from": hex(snapped_from) if snapped_from is not None else None,
         "note": note,
     }
 

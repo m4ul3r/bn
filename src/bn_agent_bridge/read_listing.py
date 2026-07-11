@@ -35,8 +35,35 @@ from ._shared import OperationFailure, _parse_address, _validate_count
 from .bridge_state import require_analysis, _quick_loaded_views
 
 
+def _callee_variadic_hint(callee) -> dict[str, Any] | None:
+    """A provenance-labeled hint when the callee is an imported variadic
+    (printf/scanf-family) function (#558): HLIL callsite text can show only the
+    fixed argument, so point at the argument-recovery views. Returns None for a
+    non-variadic callee. Never asserts a finding -- it steers, it does not judge."""
+    name = str(getattr(callee, "name", "") or "")
+    family = il_format._variadic_format_family(name)
+    if family is None and not il_format._function_is_variadic(callee):
+        return None
+    fmt_index = family[0] if family is not None else None
+    is_scanf = bool(family[1]) if family is not None else False
+    return {
+        "name": il_format._normalize_libc_name(name),
+        "is_variadic": True,
+        "family": "scanf" if is_scanf else ("printf" if family is not None else None),
+        "format_arg_index": fmt_index,
+        "note": (
+            "callee is an imported variadic function; the HLIL statement may show only "
+            "the fixed argument(s) even when ABI setup supplied a format string and "
+            "additional arguments. Run `bn evidence function <caller>` for the format "
+            "string, destination pointers, and raw ABI argument candidates, or inspect "
+            "`bn disasm <caller> --linear`."
+        ),
+    }
+
+
 def _callsites_within_function(ctx, bv, callee, func, *, context: int,
-                               stub_addrs: frozenset[int] = frozenset()) -> list[dict[str, Any]]:
+                               stub_addrs: frozenset[int] = frozenset(),
+                               variadic_hint: dict[str, Any] | None = None) -> list[dict[str, Any]]:
     func_arch = getattr(func, "arch", None)
     disasm_entries = il_format._structured_disasm_entries(bv, func)
     index_by_addr = {
@@ -98,6 +125,11 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int,
             "address": disasm_entries[disasm_index]["address"],
             "text": disasm_entries[disasm_index]["text"],
         }
+        # #557: when the HLIL statement can't be localized, expose a stable
+        # machine-readable reason code alongside the null so an agent knows WHY
+        # (e.g. an ambiguous BN call-fold) instead of re-running decompile and
+        # correlating addresses by hand. Null the reason when a statement is present.
+        hlil_statement, hlil_reason = il_format._hlil_statement_localization(insn)
         rows.append(
             {
                 "callee": {
@@ -115,10 +147,13 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int,
                 "call_instruction": call_instruction,
                 "previous_instructions": previous,
                 "next_instructions": next_instructions,
-                "hlil_statement": il_format._hlil_statement_text(insn),
+                "hlil_statement": hlil_statement,
+                "hlil_statement_reason": hlil_reason,
                 "pre_branch_condition": il_format._hlil_pre_branch_condition(insn),
             }
         )
+        if variadic_hint is not None:
+            rows[-1]["callee_variadic"] = variadic_hint
     rows.sort(key=lambda item: int(item["call_addr"], 16))
     return rows
 
@@ -148,11 +183,15 @@ def _callsites(
     except Exception:
         stub_addrs = frozenset()
     scope_functions = ctx._resolve_scope_functions(bv, within_identifiers)
+    # #558: an imported variadic (scanf/printf-family) callee's HLIL callsite text
+    # can show only the fixed argument; attach a steer to the argument-recovery views.
+    variadic_hint = _callee_variadic_hint(callee)
 
     rows = []
     for within_query, func in scope_functions:
         function_rows = _callsites_within_function(
-            ctx, bv, callee, func, context=context, stub_addrs=stub_addrs)
+            ctx, bv, callee, func, context=context, stub_addrs=stub_addrs,
+            variadic_hint=variadic_hint)
         for call_index, row in enumerate(function_rows):
             row["call_index"] = call_index
             row["within_query"] = str(within_query)
@@ -162,6 +201,51 @@ def _callsites(
     # sink, page bridge-side with --limit/--offset (the true total + remainder stay
     # in the envelope), same contract as xrefs / function list.
     return read_misc._paged_list_result(rows, offset=offset, limit=limit, kind="callsites")
+
+
+def _annotation_summary(ctx, bv) -> dict[str, Any]:
+    """Count annotations ALREADY present in the view (#561).
+
+    On a cached/shared BNDB, inherited comments/names can bias analysis and let
+    an agent over-credit itself for state a prior run produced. Surface bounded
+    counts so orientation discloses the inherited baseline. Cheap: global address
+    comments come from the ``address_comments`` map; function-doc comments read one
+    string attribute per function (the per-function address-comment map is NOT
+    materialized, to keep this a fast triage read)."""
+    comments = 0
+    try:
+        address_comments = getattr(bv, "address_comments", None)
+        if address_comments is not None:
+            comments = len(address_comments)
+    except Exception:
+        comments = 0
+
+    function_comments = 0
+    for fn in list(getattr(bv, "functions", []) or []):
+        try:
+            if str(getattr(fn, "comment", "") or "").strip():
+                function_comments += 1
+        except Exception:
+            continue
+
+    user_symbols = 0
+    try:
+        getter = getattr(bv, "get_symbols", None)
+        symbols = getter() if callable(getter) else list(getattr(bv, "symbols", []) or [])
+        for symbol in symbols:
+            # BN marks analysis-generated symbols auto=True; a user (or prior dogfood
+            # run) name has auto=False. Count only the latter so auto names don't
+            # inflate the inherited-annotation baseline.
+            if getattr(symbol, "auto", None) is False:
+                user_symbols += 1
+    except Exception:
+        user_symbols = 0
+
+    return {
+        "comments": comments,
+        "function_comments": function_comments,
+        "user_symbols": user_symbols,
+    }
 
 
 def _parse_function_address_bounds(

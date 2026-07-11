@@ -1390,6 +1390,9 @@ def _render_function_evidence_text(value: Any) -> str:
                 lines.append(f"  instruction: {instr.get('address', call_addr)}  {instr.get('text', '')}".rstrip())
         if call.get("hlil_statement"):
             lines.append(f"  hlil: {call['hlil_statement']}")
+        elif call.get("hlil_statement_reason"):
+            # #557: expose WHY the HLIL statement is null.
+            lines.append(f"  hlil: null ({call['hlil_statement_reason']})")
         if call.get("mlil"):
             lines.append(f"  mlil: {call['mlil']}")
         if call.get("llil"):
@@ -1397,9 +1400,24 @@ def _render_function_evidence_text(value: Any) -> str:
         args = [arg for arg in list(call.get("arguments") or []) if isinstance(arg, dict)]
         if args:
             source = call.get("argument_source")
-            lines.append("  arguments:" + (f" ({source})" if source else ""))
+            # #549: mark whether `arguments` is canonical (authoritative HLIL/ABI) or a
+            # heuristic lower-IL fallback, so an agent traces the right field.
+            confidence = call.get("argument_confidence")
+            tag = " ".join(x for x in (source, confidence) if x)
+            lines.append("  arguments:" + (f" ({tag})" if tag else ""))
             for arg in args:
                 lines.append(f"    {arg.get('text', '')}{_render_resolved_arg(arg.get('resolved'))}")
+        variadic = call.get("variadic")
+        if isinstance(variadic, dict) and variadic.get("is_variadic"):
+            # #558: surface variadic under-recovery / recovered format string.
+            if variadic.get("under_recovered") and variadic.get("warning"):
+                lines.append(f"  variadic: UNDER-RECOVERED — {variadic['warning']}")
+            elif variadic.get("format_string") is not None:
+                lines.append(
+                    f"  variadic: {variadic.get('callee', '?')} "
+                    f"format={variadic['format_string']!r} "
+                    f"conversions={variadic.get('format_conversions')}"
+                )
     return "\n".join(lines)
 
 
@@ -1788,6 +1806,21 @@ def _render_orient_text(value: Any) -> str:
     if isinstance(sec_items, list):
         names = " ".join(str(s.get("name", "?")) for s in sec_items[:12] if isinstance(s, dict))
         lines.append(f"  sections: {secs.get('total', len(sec_items))}  {names}")
+    ea = value.get("existing_annotations")
+    if isinstance(ea, dict):
+        # #561: disclose annotations already present so an agent doesn't over-credit
+        # itself or trust inherited names/comments as current-run analysis.
+        if ea.get("unavailable"):
+            lines.append(f"  existing annotations: unavailable — {ea['unavailable']}")
+        else:
+            lines.append(
+                f"  existing annotations: comments={ea.get('comments', 0)}, "
+                f"function-docs={ea.get('function_comments', 0)}, "
+                f"user-symbols={ea.get('user_symbols', 0)}, "
+                f"cache-restored={ea.get('analysis_cache_restored', False)}"
+            )
+            if ea.get("provenance_hint"):
+                lines.append(f"  ! {ea['provenance_hint']}")
     ss = value.get("strings_sample") or {}
     if isinstance(ss, dict) and ss.get("unavailable"):
         lines.append(f"  strings: unavailable — {ss['unavailable']}")
@@ -1889,8 +1922,19 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
             lines.append(f"within-query: {row['within_query']}")
         if row.get("hlil_statement"):
             lines.append(f"hlil: {row['hlil_statement']}")
+        elif row.get("hlil_statement_reason"):
+            # #557: say WHY the HLIL statement is null instead of silently omitting it.
+            lines.append(f"hlil: null ({row['hlil_statement_reason']})")
         if row.get("pre_branch_condition"):
             lines.append(f"pre-branch: {row['pre_branch_condition']}")
+        variadic = row.get("callee_variadic")
+        if isinstance(variadic, dict) and variadic.get("is_variadic"):
+            # #558: steer to the argument-recovery views for an imported variadic callee.
+            lines.append(
+                f"variadic-callee: {variadic.get('name', '?')} — HLIL may show only fixed "
+                f"args; run `bn evidence function {containing.get('name', '<caller>')}` "
+                f"or `bn disasm {containing.get('name', '<caller>')} --linear`"
+            )
 
         call_instruction = row.get("call_instruction") if isinstance(row.get("call_instruction"), dict) else {}
         previous = list(row.get("previous_instructions") or [])

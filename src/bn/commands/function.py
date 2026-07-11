@@ -330,6 +330,13 @@ def _function_structured_il(args: argparse.Namespace) -> int:
              # is honored automatically when known.
              arg("--mode", choices=("arm", "thumb"), default=None,
                  help="Force ARM or Thumb decode for --linear on an ARM target"),
+             # #550: a --linear start inside a function but mid-instruction decodes
+             # junk; snap DOWN to the enclosing instruction's recovered start.
+             arg("--snap-to-instruction", dest="snap_to_instruction", action="store_true",
+                 default=False,
+                 help="With --linear: if the start is inside a function but not at a "
+                      "recovered instruction boundary, snap to the nearest valid start "
+                      "at/below it (default: warn only)"),
          ],
          # --lines and --count are two spellings of the same slice; one disasm
          # line is one instruction, so --count N is the first N instructions
@@ -354,8 +361,11 @@ def _function_structured_il(args: argparse.Namespace) -> int:
 def _disasm(args: argparse.Namespace) -> int:
     linear = getattr(args, "linear", None)
     mode = getattr(args, "mode", None)
+    snap = getattr(args, "snap_to_instruction", False)
     if mode is not None and linear is None:
         raise BridgeError("--mode applies only to --linear disassembly")
+    if snap and linear is None:
+        raise BridgeError("--snap-to-instruction applies only to --linear disassembly")
     if linear is not None:
         # Linear mode: the bridge walks N instructions from the address and
         # returns exactly that window, so there is no client-side slice and no
@@ -363,6 +373,8 @@ def _disasm(args: argparse.Namespace) -> int:
         params: dict[str, Any] = {"identifier": args.identifier, "linear": int(linear)}
         if mode is not None:
             params["mode"] = mode
+        if snap:
+            params["snap_to_instruction"] = True
         return _call(
             args,
             "disasm",

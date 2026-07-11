@@ -2079,3 +2079,222 @@ def test_virtual_call_aligned_slot_offset_resolves_531(monkeypatch):
     assert out["resolved"] is True
     assert out["candidates"][0]["class"] == "Provider"
     assert out["candidates"][0]["method"] == "doWork"
+
+
+# --- #557: machine-readable reason codes for a null hlil_statement ---------
+
+
+def test_hlil_statement_localization_reason_codes(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    il_format = bridge.il_format
+
+    # no HLIL mapping at all -> no_hlil_mapping
+    bare = _FakeLLILInstruction(0xA, _FakeConstPtr(0x1000))
+    assert il_format._hlil_statement_localization(bare) == (None, "no_hlil_mapping")
+
+    # HLIL exists but folded into a non-call statement -> hlil_not_call_shaped
+    var_init = _FakeHLILInstruction("if (x)\nwhole blob\nreturn",
+                                    class_name="HighLevelILVarInit", expr_index=10, instr_index=10)
+    coarse = _FakeLLILInstruction(0xA, _FakeConstPtr(0x1000), hlils=[var_init])
+    assert il_format._hlil_statement_localization(coarse) == (None, "hlil_not_call_shaped")
+
+    # multiple folded call roots, none at this address -> ambiguous_fold
+    stmt_b = _FakeHLILInstruction("y = sinkB(d)", class_name="HighLevelILVarInit",
+                                  address=0xB, expr_index=20, instr_index=20)
+    call_b = _FakeHLILInstruction("sinkB(d)", class_name="HighLevelILCall",
+                                  parent=stmt_b, address=0xB, expr_index=21, instr_index=21)
+    call_c = _FakeHLILInstruction("sinkC()", class_name="HighLevelILCall",
+                                  address=0xC, expr_index=31, instr_index=31)
+    ambiguous = _FakeLLILInstruction(0xA, _FakeConstPtr(0x1000), hlils=[call_b, call_c])
+    assert il_format._hlil_statement_localization(ambiguous) == (None, "ambiguous_fold")
+
+    # a matched, localizable statement -> (text, None)
+    stmt_a = _FakeHLILInstruction("x = sinkA(d, s)", class_name="HighLevelILVarInit",
+                                  address=0xA, expr_index=10, instr_index=10)
+    call_a = _FakeHLILInstruction("sinkA(d, s)", class_name="HighLevelILCall",
+                                  parent=stmt_a, address=0xA, expr_index=11, instr_index=11)
+    good = _FakeLLILInstruction(0xA, _FakeConstPtr(0x1000), hlils=[call_a])
+    assert il_format._hlil_statement_localization(good) == ("x = sinkA(d, s)", None)
+
+
+def test_callsites_null_hlil_carries_reason_code(monkeypatch):
+    # #557: an indirect/unmapped callsite whose hlil_statement is null now also
+    # reports WHY it's null instead of a bare null.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    callee = _FakeFunction(0x461746, "crt_rand")
+    fn = _FakeFunction(0x500000, "caller")
+    fn.basic_blocks = [_FakeBasicBlock(0x500010, 0x500015)]
+    fn.low_level_il = [[_FakeLLILInstruction(0x500010, _FakeConstPtr(0x461746))]]
+    bv = _FakeBV(functions=[callee, fn], instruction_lengths={0x500010: 5},
+                 disassembly={0x500010: "call crt_rand"})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    rows = _callsites_items(instance, "active", "crt_rand", within_identifiers=["caller"], context=1)
+    assert rows[0]["hlil_statement"] is None
+    assert rows[0]["hlil_statement_reason"] == "no_hlil_mapping"
+
+
+# --- #549: authoritative arguments vs low-confidence candidates ------------
+
+
+def test_function_evidence_marks_argument_confidence(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    callee = _FakeFunction(0x461746, "send_message")
+    caller = _FakeFunction(0x412470, "build_response")
+    stmt = _FakeHLILInstruction("rc = send_message(6, &response)", class_name="HighLevelILVarInit",
+                                address=0x4124A0, expr_index=29, instr_index=29)
+    call_expr = _FakeHLILInstruction("send_message(6, &response)", class_name="HighLevelILCall",
+                                     parent=stmt, address=0x4124A0, expr_index=30, instr_index=30)
+    call_expr.params = ["6", "&response"]
+    call_insn = _FakeLLILInstruction(0x4124A0, _FakeConstPtr(0x461746), hlils=[call_expr])
+    call_insn.params = [_FakeReg("r0"), _FakeConstPtr(6)]
+    caller.basic_blocks = [_FakeBasicBlock(0x4124A0, 0x4124A4)]
+    caller.low_level_il = [[call_insn]]
+    bv = _FakeBV(functions=[callee, caller], instruction_lengths={0x4124A0: 4},
+                 disassembly={0x4124A0: "bl send_message"})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    call = instance._function_evidence("active", "build_response", context=0)["calls"][0]
+    # canonical HLIL args -> authoritative; the reason code is null (statement present)
+    assert call["argument_source"] == "hlil"
+    assert call["argument_confidence"] == "authoritative"
+    assert call["hlil_statement_reason"] is None
+    # every candidate is explicitly low-confidence with a provenance source
+    assert call["argument_candidates"]
+    for cand in call["argument_candidates"]:
+        assert cand["confidence"] == "low"
+        assert cand["source"] in ("llil", "mlil", "hlil")
+
+
+# --- #558: variadic (scanf-family) under-recovery warning + recovery -------
+
+
+def test_variadic_format_helpers(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    il_format = bridge.il_format
+    assert il_format._variadic_format_family("sscanf") == (1, True)
+    assert il_format._variadic_format_family("__isoc99_sscanf") == (1, True)
+    assert il_format._variadic_format_family("printf@plt") == (0, False)
+    assert il_format._variadic_format_family("memcpy") is None
+    # conversion counting: %% skipped, scanf %* suppressed, scanset handled
+    assert il_format._count_format_conversions("%d %31s", is_scanf=True) == 2
+    assert il_format._count_format_conversions("%d%%", is_scanf=True) == 1
+    assert il_format._count_format_conversions("%*d %d", is_scanf=True) == 1
+    assert il_format._count_format_conversions("%[^,],%d", is_scanf=True) == 2
+
+
+def _variadic_caller_bv(monkeypatch, instance, *, params):
+    callee = _FakeFunction(0x461746, "sscanf")
+    caller = _FakeFunction(0x412470, "parse_line")
+    call_expr = _FakeHLILInstruction("sscanf(...)", class_name="HighLevelILCall",
+                                     address=0x4124A0, expr_index=30, instr_index=30)
+    call_expr.params = params
+    call_insn = _FakeLLILInstruction(0x4124A0, _FakeConstPtr(0x461746), hlils=[call_expr])
+    caller.basic_blocks = [_FakeBasicBlock(0x4124A0, 0x4124A4)]
+    caller.low_level_il = [[call_insn]]
+    bv = _FakeBV(functions=[callee, caller], instruction_lengths={0x4124A0: 4},
+                 disassembly={0x4124A0: "bl sscanf"})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    return bv
+
+
+def test_evidence_warns_variadic_under_recovery(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _variadic_caller_bv(monkeypatch, instance, params=["input"])   # only the fixed arg
+    result = instance._function_evidence("active", "parse_line", context=0)
+    call = result["calls"][0]
+    variadic = call["variadic"]
+    assert variadic["is_variadic"] is True and variadic["family"] == "scanf"
+    assert variadic["under_recovered"] is True
+    assert variadic["recovered_arg_count"] == 1
+    assert "under-recovered" in variadic["warning"]
+    # hoisted to the function-level warnings, address-tagged
+    assert any("under-recovered" in w and "0x4124a0" in w.lower() for w in result["warnings"])
+
+
+def test_evidence_variadic_recovers_format_and_is_not_under_when_complete(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _variadic_caller_bv(monkeypatch, instance,
+                        params=["input", '"%d %d"', "&a", "&b"])   # fully recovered
+    call = instance._function_evidence("active", "parse_line", context=0)["calls"][0]
+    variadic = call["variadic"]
+    assert variadic["format_string"] == "%d %d"
+    assert variadic["format_conversions"] == 2
+    assert variadic["expected_min_arg_count"] == 4
+    assert variadic["under_recovered"] is False
+
+
+def test_callsites_variadic_callee_hint(monkeypatch):
+    # #558: callsites to an imported variadic callee carry a steer to the
+    # argument-recovery views on every row.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    callee = _FakeFunction(0x461746, "sscanf")
+    fn = _FakeFunction(0x500000, "parse_line")
+    fn.basic_blocks = [_FakeBasicBlock(0x500010, 0x500015)]
+    fn.low_level_il = [[_FakeLLILInstruction(0x500010, _FakeConstPtr(0x461746))]]
+    bv = _FakeBV(functions=[callee, fn], instruction_lengths={0x500010: 5},
+                 disassembly={0x500010: "bl sscanf"})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    rows = _callsites_items(instance, "active", "sscanf", within_identifiers=["parse_line"], context=1)
+    hint = rows[0]["callee_variadic"]
+    assert hint["is_variadic"] is True and hint["name"] == "sscanf" and hint["family"] == "scanf"
+
+
+def test_callsites_no_variadic_hint_for_ordinary_callee(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    callee = _FakeFunction(0x461746, "memcpy")
+    fn = _FakeFunction(0x500000, "caller")
+    fn.basic_blocks = [_FakeBasicBlock(0x500010, 0x500015)]
+    fn.low_level_il = [[_FakeLLILInstruction(0x500010, _FakeConstPtr(0x461746))]]
+    bv = _FakeBV(functions=[callee, fn], instruction_lengths={0x500010: 5},
+                 disassembly={0x500010: "bl memcpy"})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    rows = _callsites_items(instance, "active", "memcpy", within_identifiers=["caller"], context=1)
+    assert "callee_variadic" not in rows[0]
+
+
+# --- #561: existing-annotation counts in the orient digest -----------------
+
+
+def test_annotation_summary_counts(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _AutoSym:
+        def __init__(self, auto):
+            self.auto = auto
+
+    documented = _FakeFunction(0x1000, "documented")
+    documented.comment = "prior-run note"
+    plain = _FakeFunction(0x2000, "plain")
+    bv = _FakeBV(functions=[documented, plain],
+                 symbols=[_AutoSym(False), _AutoSym(False), _AutoSym(True)],
+                 comments={0x1000: "an address comment", 0x1004: "another"})
+    summary = bridge.read_listing._annotation_summary(instance.ctx, bv)
+    assert summary == {"comments": 2, "function_comments": 1, "user_symbols": 2}
+
+
+def test_orient_surfaces_existing_annotations(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    inst = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(inst, "_target_info",
+                        lambda sel: {"basename": "x.bndb", "filename": "/c/x.bndb",
+                                     "analyzed": True, "analysis_state": "full"})
+    monkeypatch.setattr(bridge.read_misc, "_imports", lambda ctx, sel, **k: {"total_symbols": 0})
+    monkeypatch.setattr(bridge.read_misc, "_strings",
+                        lambda ctx, sel, **k: {"items": [], "total": 0})
+    monkeypatch.setattr(bridge.read_misc, "_sections", lambda ctx, sel, **k: {"items": [], "total": 0})
+    monkeypatch.setattr(bridge.read_listing, "_list_functions", lambda ctx, sel, **k: {"total": 0})
+    bv = _FakeBV(functions=[], comments={0x1: "c"})
+    monkeypatch.setattr(inst, "_resolve_view", lambda sel: bv)
+
+    d = inst._orient_digest(None)
+    ea = d["existing_annotations"]
+    assert ea["comments"] == 1
+    assert ea["analysis_cache_restored"] is True
+    assert "predate this run" in ea["provenance_hint"]

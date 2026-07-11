@@ -150,7 +150,17 @@ def _call_arguments(ctx, bv, insn, call_addr: int) -> tuple[str, list[dict[str, 
             if marker in seen:
                 continue
             seen.add(marker)
-            candidates.append({"source": candidate_source, "index": index, "text": text})
+            # #549: candidates are LOWER-confidence alternative renderings from a
+            # different IL layer than the canonical `arguments` -- tag each with an
+            # explicit low confidence + its provenance (`source`) so an agent never
+            # mistakes a heuristic candidate for an authoritative argument and traces
+            # the wrong value. `arguments` (source `argument_source`) is canonical.
+            candidates.append({
+                "source": candidate_source,
+                "index": index,
+                "text": text,
+                "confidence": "low",
+            })
 
     add_candidates("llil", _il_argument_texts(ctx, insn))
     if mlil is not None:
@@ -165,6 +175,119 @@ def _call_arguments(ctx, bv, insn, call_addr: int) -> tuple[str, list[dict[str, 
             continue
         add_candidates("hlil", _il_argument_texts(ctx, root))
     return source, primary, candidates
+
+
+def _callee_name_for_call(ctx, bv, dest_value, target) -> str | None:
+    """Best-effort callee name for a call: the resolved target function's name,
+    else the function/symbol at the (direct) destination address. None for an
+    indirect/unresolved call."""
+    if isinstance(target, dict):
+        fn = target.get("function")
+        if isinstance(fn, dict) and fn.get("name"):
+            return str(fn["name"])
+    if dest_value is not None:
+        getter = getattr(bv, "get_function_at", None)
+        fn = getter(int(dest_value)) if callable(getter) else None
+        if fn is not None and getattr(fn, "name", None):
+            return str(fn.name)
+        sym_getter = getattr(bv, "get_symbol_at", None)
+        sym = sym_getter(int(dest_value)) if callable(sym_getter) else None
+        if sym is not None and getattr(sym, "name", None):
+            return str(sym.name)
+    return None
+
+
+def _variadic_diagnostic(ctx, bv, dest_value, target, arg_source,
+                         arguments: list[dict[str, Any]],
+                         candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Provenance-labeled under-recovery diagnostic for an imported variadic
+    (printf/scanf-family) call (#558).
+
+    HLIL can render a scanf-family call showing only the fixed argument even
+    though ABI setup supplied a format string and destination pointers, so a
+    non-expert agent concludes the call has fewer arguments than it really does.
+    This DESCRIBES the shortfall and points to a lower-IL follow-up; it never
+    asserts a vulnerability. Returns None when the callee is not a recognized
+    variadic format function.
+    """
+    callee_name = _callee_name_for_call(ctx, bv, dest_value, target)
+    if callee_name is None:
+        return None
+    family = il_format._variadic_format_family(callee_name)
+    # Fall back to BN's recovered prototype for a variadic callee we don't have a
+    # format-arg-index table for -- still worth flagging, just without format parse.
+    fmt_index: int | None
+    is_scanf = False
+    if family is not None:
+        fmt_index, is_scanf = family
+    else:
+        callee_fn = None
+        if dest_value is not None:
+            getter = getattr(bv, "get_function_at", None)
+            callee_fn = getter(int(dest_value)) if callable(getter) else None
+        if callee_fn is None or not il_format._function_is_variadic(callee_fn):
+            return None
+        fmt_index = None
+
+    recovered = len(arguments)
+    diag: dict[str, Any] = {
+        "callee": il_format._normalize_libc_name(callee_name),
+        "is_variadic": True,
+        "family": "scanf" if is_scanf else ("printf" if family is not None else None),
+        "format_arg_index": fmt_index,
+        "recovered_arg_count": recovered,
+        "format_string": None,
+        "format_conversions": None,
+        "expected_min_arg_count": None,
+        "confidence": "heuristic",
+        "provenance": "abi-format-heuristic",
+    }
+
+    # Recover the format literal when HLIL retained it (the arg at fmt_index).
+    conversions: int | None = None
+    if fmt_index is not None and recovered > fmt_index:
+        fmt_arg = arguments[fmt_index]
+        literal = il_format._extract_format_literal(fmt_arg.get("text", ""))
+        if literal is None:
+            resolved = fmt_arg.get("resolved")
+            if isinstance(resolved, dict) and isinstance(resolved.get("string"), str):
+                literal = resolved["string"]
+        if literal is not None:
+            diag["format_string"] = literal
+            conversions = il_format._count_format_conversions(literal, is_scanf=is_scanf)
+            diag["format_conversions"] = conversions
+            diag["expected_min_arg_count"] = fmt_index + 1 + conversions
+
+    # Under-recovered when the recovered arg count falls short of what the format
+    # (or, absent a parsed format, the mere presence of variadic setup) implies.
+    if diag["expected_min_arg_count"] is not None:
+        under = recovered < int(diag["expected_min_arg_count"])
+    elif fmt_index is not None:
+        # Format not parseable (often BN dropped it too): only the fixed args are
+        # present, so no variadic argument was recovered -> likely under-recovered.
+        under = recovered <= fmt_index + 1
+    else:
+        # Unknown-index variadic prototype: flag when nothing beyond a lone arg shows.
+        under = recovered <= 1
+    diag["under_recovered"] = bool(under)
+
+    if under:
+        role = "destination pointer(s)" if is_scanf else "variadic value(s)"
+        if diag["expected_min_arg_count"] is not None:
+            shortfall = (
+                f"recovered {recovered} of an expected >= {diag['expected_min_arg_count']} "
+                f"argument(s) (format + {conversions} {role})"
+            )
+        else:
+            shortfall = f"recovered only {recovered} fixed argument(s); variadic {role} not surfaced in HLIL"
+        diag["warning"] = (
+            f"imported variadic call `{diag['callee']}` under-recovered in HLIL: {shortfall}. "
+            f"Raw ABI candidates are in `argument_candidates` (low confidence); inspect "
+            f"`bn disasm <caller> --linear` or `bn il <caller> --view llil` for the full "
+            f"argument setup."
+        )
+        diag["follow_up"] = "disasm --linear / il --view llil"
+    return diag
 
 
 def _mlil_call_text(mlil) -> str | None:
@@ -224,6 +347,15 @@ def _function_call_evidence(ctx, bv, func, *, context: int) -> list[dict[str, An
         dest_value = _call_destination_value(ctx, insn)
         target = _target_entry_for_call(ctx, bv, dest_value)
         arg_source, arguments, argument_candidates = _call_arguments(ctx, bv, insn, call_addr)
+        # #549: `arguments` (from `argument_source`) is canonical only when it came
+        # from HLIL/ABI recovery; an mlil/llil fallback is itself heuristic. Surface
+        # that trust level so downstream automation traces the right field.
+        argument_confidence = "authoritative" if arg_source == "hlil" else "heuristic"
+        # #557: expose WHY the HLIL statement is null (reason code) rather than a bare null.
+        hlil_statement, hlil_reason = il_format._hlil_statement_localization(insn)
+        # #558: under-recovered imported variadic (scanf/printf-family) calls.
+        variadic = _variadic_diagnostic(
+            ctx, bv, dest_value, target, arg_source, arguments, argument_candidates)
         calls.append(
             {
                 "address": hex(call_addr),
@@ -232,11 +364,14 @@ def _function_call_evidence(ctx, bv, func, *, context: int) -> list[dict[str, An
                 "target": target,
                 "llil": str(insn),
                 "mlil": _mlil_call_text(mlil),
-                "hlil_statement": il_format._hlil_statement_text(insn),
+                "hlil_statement": hlil_statement,
+                "hlil_statement_reason": hlil_reason,
                 "pre_branch_condition": il_format._hlil_pre_branch_condition(insn),
                 "argument_source": arg_source,
+                "argument_confidence": argument_confidence,
                 "arguments": arguments,
                 "argument_candidates": argument_candidates,
+                "variadic": variadic,
                 "call_instruction": call_instruction,
                 "previous_instructions": previous,
                 "next_instructions": next_instructions,
@@ -381,6 +516,13 @@ def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 
 
     calls = _function_call_evidence(ctx, bv, func, context=context)
     total_calls = len(calls)
+    # #558: hoist per-call variadic under-recovery warnings to the function level so
+    # they're visible regardless of which page is requested. Computed from the full
+    # call set (before slicing) and address-tagged so an agent can find the callsite.
+    for call in calls:
+        variadic = call.get("variadic")
+        if isinstance(variadic, dict) and variadic.get("under_recovered") and variadic.get("warning"):
+            warnings.append(f"{call.get('address', '?')}: {variadic['warning']}")
     # #471: slicing/windowing controls so a large call-heavy dispatch function can be
     # inspected in bounded chunks instead of reading a full spill. Only sort by address
     # when a slice is actually requested -- the default (unsliced) output keeps its

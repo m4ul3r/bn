@@ -2212,3 +2212,71 @@ def test_callgraph_result_carries_kind_envelope(monkeypatch):
     assert result["kind"] == "callgraph"
     assert result["function"]["name"] == "f"
     assert "callers" in result
+
+
+# --- #550: linear disasm warns / snaps on a non-instruction-boundary start ---
+
+
+def _boundary_bv():
+    fn = _FakeFunction(0x1000, "known")
+    fn.basic_blocks = [_FakeBasicBlock(0x1000, 0x1006)]  # starts at 0x1000/0x1002/0x1004
+    return _FakeBV(
+        functions=[fn],
+        memory={0x1000: b"\x90" * 16},
+        disassembly={0x1000: "insA", 0x1002: "insB", 0x1003: "junkB",
+                     0x1004: "insC", 0x1005: "junkC"},
+        instruction_lengths={0x1000: 2, 0x1002: 2, 0x1004: 2, 0x1003: 1, 0x1005: 1},
+    )
+
+
+def test_disasm_linear_warns_on_non_boundary_start(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _boundary_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    res = instance._disasm(None, "0x1003", linear=2)   # inside `known`, mid-instruction
+    bw = res["boundary_warning"]
+    assert bw is not None
+    assert bw["in_function"]["name"] == "known"
+    assert bw["nearest_start_at_or_below"] == "0x1002"
+    assert bw["nearest_start_above"] == "0x1004"
+    assert "NOT a recovered instruction boundary" in res["note"]
+    assert res["snapped_from"] is None
+    assert res["order"] == "address-linear"
+    assert res["address"] == "0x1003"           # not moved without --snap
+
+
+def test_disasm_linear_snaps_to_instruction(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _boundary_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    res = instance._disasm(None, "0x1003", linear=2, snap_to_instruction=True)
+    assert res["address"] == "0x1002"           # snapped down to the enclosing start
+    assert res["snapped_from"] == "0x1003"
+    assert res["boundary_warning"] is None       # landed on a real boundary
+    assert "snapped 0x1003" in res["note"]
+
+
+def test_disasm_linear_boundary_start_is_silent(monkeypatch):
+    # Starting exactly on a recovered instruction boundary produces no warning.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _boundary_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    res = instance._disasm(None, "0x1002", linear=2)
+    assert res["boundary_warning"] is None
+    assert "NOT a recovered instruction boundary" not in res["note"]
+
+
+def test_disasm_linear_no_boundary_warning_outside_function(monkeypatch):
+    # A start not inside any function (the classic stripped/data case) is not a
+    # boundary concern -- no warning.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(memory={0x2000: b"\x90" * 8},
+                 disassembly={0x2000: "nop", 0x2002: "nop"},
+                 instruction_lengths={0x2000: 2, 0x2002: 2})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    res = instance._disasm(None, "0x2001", linear=1)
+    assert res["boundary_warning"] is None
