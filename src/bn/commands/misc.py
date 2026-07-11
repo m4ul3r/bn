@@ -32,10 +32,18 @@ from ..transport import BridgeError
                  help="Interpret --query as a case-insensitive regular expression"),
              arg("--min-length", type=_non_negative_int, default=None,
                  help="Exclude strings shorter than N characters"),
+             arg("--max-length", type=_non_negative_int, default=None,
+                 help="Exclude strings longer than N characters (drops long resource/blob data)"),
              arg("--section",
                  help="Only include strings in this section (e.g. .rodata, .rdata)"),
              arg("--no-crt", action="store_true", default=False,
                  help="Heuristic filter: exclude likely CRT/locale strings (platform-biased, best-effort)"),
+             arg("--probable-format-strings", action="store_true", default=False,
+                 help="Keep only strings that plausibly are C printf format strings "
+                      "(validate the %% sequences against the printf directive grammar "
+                      "instead of raw substring matching); annotate each with its "
+                      "directives and code-xref count. Labels candidates, does NOT "
+                      "assert a format-string vulnerability."),
              arg("--count", action="store_true", default=False,
                  help="Show the matching string count instead of listing"),
          ])
@@ -43,9 +51,11 @@ def _strings(args: argparse.Namespace) -> int:
     common = {
         "query": args.query,
         "min_length": args.min_length,
+        "max_length": args.max_length,
         "section": args.section,
         "no_crt": args.no_crt,
         "regex": bool(args.regex),
+        "probable_format_strings": bool(args.probable_format_strings),
     }
     if args.count:
         return _call(
@@ -79,7 +89,8 @@ def _strings(args: argparse.Namespace) -> int:
     # The "narrow your noisy dump" tip only makes sense after a successful,
     # unfiltered dump. Emitting it BEFORE the request put it ahead of (and buried)
     # a --quick refusal / error; print it after a clean result instead.
-    if rc == 0 and args.section is None and args.query is None and args.min_length is None and not args.no_crt:
+    if (rc == 0 and args.section is None and args.query is None and args.min_length is None
+            and args.max_length is None and not args.no_crt and not args.probable_format_strings):
         print(
             "tip: an unfiltered string dump includes .dynsym/.hash/.symtab noise; "
             "narrow with --section .rodata (or --query / --min-length) for signal.",
