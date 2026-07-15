@@ -23,7 +23,14 @@ from conftest import FixtureBuildError
 CORPUS = Path(__file__).parent / "taint_corpus"
 _BN_CLI = [str(Path(sys.executable).parent / "bn")]
 
-pytestmark = pytest.mark.real_bn
+# xdist_group pins this whole module to ONE worker (see `--dist loadgroup` in
+# pyproject.toml). This module self-compiles its own corpus under
+# tests/taint_corpus/ and drives live bn instances; #590's
+# tests/fixtures/.build.lock does not cover either. Distributed across workers
+# this lane fails 3/21 while passing 21/21 on a single worker. Grouping only
+# this module keeps the rest of the suite fully parallel (~28s vs ~85s under a
+# blanket --dist loadfile).
+pytestmark = [pytest.mark.real_bn, pytest.mark.xdist_group("taint_corpus")]
 
 
 def _bn(*args: str, timeout: float = 120.0) -> subprocess.CompletedProcess[str]:

@@ -85,10 +85,20 @@ def test_session_state_cannot_read_real_sticky_pins(monkeypatch):
     assert Path.home() not in isolated.parents
     assert not isolated.exists(), "a sticky pin leaked into the isolated cache"
 
+    # A developer who has ever run `bn target use` here legitimately HAS a real
+    # session file for this project, so assert it is UNTOUCHED rather than
+    # absent. Asserting absence fails on any such working copy and passes only
+    # while unrelated test pollution perturbs the project-root hash that names
+    # this file -- i.e. for the wrong reason, and only in whole-suite order.
+    before = real.read_bytes() if real.exists() else None
+
     session_state.update(target="isolation-probe")
     assert isolated.exists()
     assert session_state.read()["target"] == "isolation-probe"
-    assert not real.exists(), "a test's sticky pin landed in the real user cache"
+
+    after = real.read_bytes() if real.exists() else None
+    assert after == before, "a test's sticky pin reached the developer's real cache"
+    assert after is None or b"isolation-probe" not in after
 
 
 _SEEN_ROOTS: list[Path] = []
