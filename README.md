@@ -419,3 +419,11 @@ Run the CLI from the repo without installing it globally:
 ```bash
 uv run bn --help
 ```
+
+## License
+
+`bn` is released under the [MIT License](LICENSE).
+
+It is a fork of [`banteg/bn`](https://github.com/banteg/bn); the original
+copyright and permission notice are retained in `LICENSE` alongside this
+fork's, as required by the MIT terms.
