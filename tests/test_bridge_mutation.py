@@ -97,7 +97,7 @@ def test_mutation_refused_on_quick_view_before_any_analysis(monkeypatch):
         assert "--quick" in str(exc.value)
     # Refused before any undo bracket / analysis was started -> no wedge.
     assert "refresh" not in bv.events
-    assert ("begin", "state") not in bv.events
+    assert not _has_event(bv, "begin")
     bridge._quick_loaded_views.discard(bv)
 
 
@@ -139,8 +139,8 @@ def test_mutation_reverts_on_verification_failure(monkeypatch):
 
     assert result["success"] is False
     assert result["committed"] is False
-    assert ("revert", "state") in bv.events
-    assert ("commit", "state") not in bv.events
+    assert _has_event(bv, "revert")
+    assert not _has_event(bv, "commit")
 
 
 def test_run_local_restores_runs_reverse_and_reports_failure(monkeypatch):
@@ -234,8 +234,8 @@ def test_preview_restore_failure_is_not_success(monkeypatch):
     assert result["committed"] is False
     assert result["rolled_back"] is False
     assert "failed" in result["message"]
-    assert ("revert", "state") in bv.events
-    assert ("commit", "state") not in bv.events
+    assert _has_event(bv, "revert")
+    assert not _has_event(bv, "commit")
 
 
 def test_preview_drift_restore_failure_is_not_success(monkeypatch):
@@ -485,7 +485,7 @@ def test_op_set_prototype_uses_string_user_type_for_bn_compat(monkeypatch):
         def set_user_type(self, value):
             self.user_type_calls.append(value)
             if isinstance(value, str):
-                self.type = value
+                super().set_user_type(value)
 
     class _PrototypeBV(_FakeBV):
         def parse_type_string(self, declaration):
@@ -718,8 +718,8 @@ def test_batch_invalid_op_rolls_back_prior_applied_op(monkeypatch):
     assert result["success"] is False
     assert result["committed"] is False
     assert result["rolled_back"] is True
-    assert ("revert", "state") in bv.events
-    assert ("commit", "state") not in bv.events
+    assert _has_event(bv, "revert")
+    assert not _has_event(bv, "commit")
 
     statuses = [r.get("status") for r in result["results"]]
     assert statuses[0] == "reverted"          # 1st op applied, then rolled back
@@ -774,7 +774,7 @@ def test_op_set_prototype_registers_restore_for_preview(monkeypatch):
             super().__init__(0x1000, "f", "int32_t(int32_t* arg1)")
 
         def set_user_type(self, value):
-            self.type = value if isinstance(value, str) else str(value)
+            super().set_user_type(value if isinstance(value, str) else str(value))
 
     class _PrototypeBV(_FakeBV):
         def parse_type_string(self, declaration):
@@ -807,7 +807,7 @@ def test_op_set_prototype_no_restore_when_unchanged(monkeypatch):
             super().__init__(0x1000, "f", "int32_t(int32_t* arg1)")
 
         def set_user_type(self, value):
-            self.type = value if isinstance(value, str) else str(value)
+            super().set_user_type(value if isinstance(value, str) else str(value))
 
     class _PrototypeBV(_FakeBV):
         def parse_type_string(self, declaration):
@@ -1266,7 +1266,7 @@ def test_verify_prototype_passes_with_implicit_calling_convention(monkeypatch):
 
         def set_user_type(self, value):
             # Store with convention added by analysis.
-            self.type = 'int32_t __convention("cdecl")(char const* path)'
+            super().set_user_type('int32_t __convention("cdecl")(char const* path)')
 
     class _ConventionBV(_FakeBV):
         def parse_type_string(self, declaration):
@@ -1305,7 +1305,7 @@ def test_verify_prototype_still_fails_on_real_mismatch(monkeypatch):
 
         def set_user_type(self, value):
             # Analysis "corrected" the type to something different.
-            self.type = "void*(int32_t x)"
+            super().set_user_type("void*(int32_t x)")
 
     class _MismatchBV(_FakeBV):
         def parse_type_string(self, declaration):
@@ -1343,7 +1343,7 @@ def test_verify_prototype_passes_when_bn_infers_pure_attribute(monkeypatch):
         def set_user_type(self, value):
             # After set_user_type + analysis BN re-adds the __pure suffix that
             # the requested prototype did not carry.
-            self.type = "void(void* self) __pure"
+            super().set_user_type("void(void* self) __pure")
 
     class _PureBV(_FakeBV):
         def parse_type_string(self, declaration):
@@ -2055,7 +2055,7 @@ def test_mutation_mixed_batch_scopes_blast_radius_and_tags_direct(monkeypatch):
                                 [{"op": "types_declare"}, {"op": "set_prototype"}])
 
     assert result["success"] is True
-    assert ("commit", "state") in bv.events
+    assert _has_event(bv, "commit")
     # Blast radius counts the type's reach only -- handler (direct) is excluded.
     assert result["affected_summary"] == {"referenced": 1, "reflowed": 1}
     tags = {d["address"]: d["direct"] for d in result["affected_functions"]}

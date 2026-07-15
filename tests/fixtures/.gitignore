@@ -1,2 +1,5 @@
 # Built fixtures are regenerated from src/*.c by the Makefile; never commit them.
 *_x86_64
+
+# Cross-worker build lock for the autobuild fixture (tests/conftest.py).
+.build.lock

@@ -32,7 +32,7 @@ def test_function_create_at_executable_address_returns_verified(monkeypatch):
     assert result["committed"] is True
     assert bv.added == [0x1000]
     assert "refresh" in bv.events
-    assert ("commit", "state") in bv.events
+    assert _has_event(bv, "commit")
     res = result["results"][0]
     assert res["op"] == "function_create"
     assert res["status"] == "verified"
@@ -55,8 +55,8 @@ def test_function_create_preview_reverts_without_committing(monkeypatch):
     assert result["success"] is True
     assert result["committed"] is False
     assert result["results"][0]["status"] == "verified"
-    assert ("revert", "state") in bv.events
-    assert ("commit", "state") not in bv.events
+    assert _has_event(bv, "revert")
+    assert not _has_event(bv, "commit")
 
 
 def test_function_create_existing_function_is_noop(monkeypatch):

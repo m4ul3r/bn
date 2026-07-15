@@ -19,16 +19,15 @@ HELLO_BINARY = FIXTURES_DIR / "hello_x86_64"
 ADD_BINARY = FIXTURES_DIR / "add_x86_64"
 DISPATCH_BINARY = FIXTURES_DIR / "dispatch_table_x86_64"
 
-try:
-    # Try a cheap check: can bn-agent even start?
-    # We don't import binaryninja directly since it might not be on sys.path
-    # without the path-setup that headless.py does.
-    _bn_python = Path("/opt/binaryninja/python")
-    _has_bn = _bn_python.is_dir() and (HELLO_BINARY.exists() and ADD_BINARY.exists())
-except Exception:
-    _has_bn = False
-
-pytestmark = pytest.mark.skipif(not _has_bn, reason="Binary Ninja or fixtures not available")
+# The gate is BN availability *only* (#590). Gating on whether the generated
+# fixtures happen to exist made a fresh checkout report "27 skipped, exit 0"
+# with BN installed -- indistinguishable from a pass. `real_bn` skips visibly
+# (and fails under BN_REQUIRE_REAL_TESTS=1); the session-scoped
+# `integration_fixtures` builds the binaries, and errors loudly if it can't.
+pytestmark = [
+    pytest.mark.real_bn,
+    pytest.mark.usefixtures("integration_fixtures"),
+]
 
 # Use the bn console-scripts entry point instead of -m bn.cli
 # to avoid Python module shadowing issues with the 'bn' package name.
@@ -36,7 +35,13 @@ _BN_CLI = [str(Path(sys.executable).parent / "bn")]
 # Don't litter the bn repo with `.bn-<id>` project markers (#80) during integration
 # runs (`bn load` from the repo cwd would otherwise drop one here + touch
 # .git/info/exclude). The marker path has its own unit coverage.
-_ENV = {**os.environ, "BN_NO_MARKERS": "1"}
+#
+# Built at call time, not import time (#589): conftest's autouse `_hermetic_env`
+# fixture pins BN_CACHE_DIR/NO_COLOR per test, and a module-import-time snapshot
+# of os.environ would predate every fixture -- so the subprocesses these helpers
+# spawn would read the developer's real ~/.cache/bn instead of the isolated one.
+def _env() -> dict[str, str]:
+    return {**os.environ, "BN_NO_MARKERS": "1"}
 
 
 def _bn(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
@@ -45,7 +50,7 @@ def _bn(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         timeout=timeout,
-        env=_ENV,
+        env=_env(),
     )
 
 
@@ -53,7 +58,7 @@ def _session_start(*binaries: str, timeout: float = 30.0) -> dict:
     # session start defaults to text output; this helper parses JSON.
     cmd = [*_BN_CLI, "session", "start", "--format", "json"]
     cmd.extend(str(b) for b in binaries)
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=_ENV)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=_env())
     assert result.returncode == 0, f"session start failed: {result.stderr}"
     return json.loads(result.stdout)
 
@@ -64,7 +69,7 @@ def _session_stop(instance_id: str, timeout: float = 10.0) -> None:
         capture_output=True,
         text=True,
         timeout=timeout,
-        env=_ENV,
+        env=_env(),
     )
 
 
@@ -314,11 +319,13 @@ class TestTaintIndirectValueSetAnchor:
     pins (C++ vtables / data-indexed tables / PIE GOT do not)."""
 
     def _ensure_fixture(self):
-        if not DISPATCH_BINARY.exists():
-            subprocess.run(["make", "-C", str(FIXTURES_DIR), DISPATCH_BINARY.name],
-                           capture_output=True, text=True, timeout=60)
-        if not DISPATCH_BINARY.exists():
-            pytest.skip("dispatch_table fixture could not be built")
+        # The ad hoc builder this replaced (#590) was unreachable: the module
+        # gate skipped before it could run. `integration_fixtures` owns the
+        # build now, so an absent binary here is a bug, not a skip.
+        assert DISPATCH_BINARY.exists(), (
+            f"{DISPATCH_BINARY.name} missing -- the integration_fixtures build "
+            f"fixture should have produced it"
+        )
 
     def test_value_set_resolved_indirect_call_anchors_source(self):
         self._ensure_fixture()

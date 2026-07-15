@@ -130,13 +130,85 @@ def _load_bridge(monkeypatch):
     return module
 
 
+def _split_prototype(decl):
+    """Split a C function prototype into (type text without the name, name).
+
+    Mirrors what BN's ``bv.parse_type_string`` does with a prototype string,
+    verified live on BN 5.4: ``'uint64_t f(int32_t a)'`` parses to the type
+    ``'uint64_t(int32_t a)'`` plus the QualifiedName ``'f'``, while an anonymous
+    ``'int32_t()'`` yields the type unchanged and an EMPTY name. Handles the
+    declarator forms the suite uses (pointer returns written either ``char* f``
+    or ``char *f``); it is not a general C parser.
+    """
+    text = str(decl).strip().rstrip(";").strip()
+    open_paren = text.find("(")
+    if open_paren < 0:
+        return text, ""
+    head, tail = text[:open_paren].strip(), text[open_paren:]
+    tokens = head.split()
+    if len(tokens) < 2:
+        # Only a return type, no declarator name: 'int32_t()'.
+        return text, ""
+    name = tokens[-1]
+    stars = ""
+    while name.startswith("*"):
+        stars += "*"
+        name = name[1:]
+    if not name.isidentifier():
+        return text, ""
+    return f"{' '.join(tokens[:-1])}{stars}{tail}", name
+
+
+def _qualified_name(name):
+    """Wrap *name* the way BN does (QualifiedName), when the fake bn module is
+    installed; otherwise the bare string, which str()s identically."""
+    fake_bn = sys.modules.get("binaryninja")
+    qn_cls = getattr(fake_bn, "QualifiedName", None)
+    if qn_cls is None:
+        return name
+    return qn_cls(name)
+
+
+def _var_key(var):
+    """Stable identity for a variable, mirroring how BN keys a Variable.
+
+    Real BN identifies a Variable by (source_type, index, storage), which the
+    fake's `identifier` stands in for when present. Falls back to the storage
+    tuple so ad hoc variable fakes still work.
+    """
+    ident = getattr(var, "identifier", None)
+    if ident is not None:
+        return ("id", int(ident))
+    source = getattr(var, "source_type", None)
+    return ("loc", getattr(source, "name", None), getattr(var, "index", 0),
+            getattr(var, "storage", None))
+
+
 class _FakeFunction:
     def __init__(self, start: int, name: str, type_text: str = "int32_t()",
                  *, arch=None, total_bytes: int | None = None):
         self.start = start
         self.name = name
         self.raw_name = name
-        self.type = type_text
+        # AUTO/USER provenance, modelled after live BN 5.4 (see
+        # tests/test_fakes_provenance.py): a prototype write through the
+        # `type` setter or set_user_type pins BNFunctionHasUserType, and
+        # create_user_var pins a variable as user-defined. The fake must not
+        # be more forgiving than BN here -- #581/#582 are exactly the bugs
+        # that a provenance-blind fake hides.
+        self._type = type_text
+        self._has_user_type = False
+        self._user_vars: set = set()
+        # The analysis-derived default (name, type) per variable -- what BN
+        # re-derives once a user override is deleted -- recorded the first time
+        # the fake sees the variable.
+        self._analysis_defaults: dict = {}
+        # The last USER (name, type) per variable, which analysis restores if an
+        # AUTO write transiently displaces it.
+        self._user_values: dict = {}
+        self._pending_auto_restore: set = set()
+        self._pending_user_restore: set = set()
+        self._tracked_vars: list = []
         self.parameter_vars = []
         self.stack_layout = []
         self.calling_convention = "__cdecl"
@@ -155,6 +227,157 @@ class _FakeFunction:
         # BN's real whole-function documentation property (Function.comment),
         # DISTINCT from an address comment. `comment --function` targets this.
         self.comment = ""
+
+    # --- prototype provenance ---------------------------------------------
+
+    @property
+    def type(self):
+        return self._type
+
+    @type.setter
+    def type(self, value):
+        # BN 5.4 function.py L1207-1214. A STRING prototype is parsed through the
+        # view and ALSO RENAMES the function (`self.name = str(new_name)`, applied
+        # unconditionally -- an anonymous prototype blanks the name; verified
+        # live). A type object routes straight to set_user_type. Either way the
+        # setter pins BNFunctionHasUserType: it is never a provenance-neutral
+        # value write, and never a rename-free one for strings.
+        if isinstance(value, str):
+            parsed, new_name = self.view.parse_type_string(value)
+            self.name = str(new_name)
+            self.set_user_type(parsed)
+        else:
+            self.set_user_type(value)
+
+    def set_user_type(self, value):
+        self._type = value
+        self._has_user_type = True
+
+    def set_auto_type(self, value):
+        self._type = value
+
+    @property
+    def has_user_type(self) -> bool:
+        return self._has_user_type
+
+    # --- local variable provenance ----------------------------------------
+
+    def _var_universe(self):
+        """Every variable object this function exposes, deduped by identity.
+
+        BN surfaces the same variable through several views; in particular a
+        local can live ONLY in `hlil.vars` (see mutation_engine's aliasing
+        handling), and an hlil mirror can share an identifier with a distinct
+        stack_layout object. A write to one must be observable through all of
+        them, so the model enumerates the whole universe rather than the first
+        non-empty list.
+        """
+        hlil = getattr(self, "hlil", None)
+        seen: dict = {}
+        for v in (list(self.stack_layout) + list(self.parameter_vars)
+                  + list(getattr(hlil, "vars", None) or []) + list(self._tracked_vars)):
+            seen.setdefault(id(v), v)
+        return list(seen.values())
+
+    def _vars_matching(self, key):
+        return [v for v in self._var_universe() if _var_key(v) == key]
+
+    def _track(self, var):
+        if all(v is not var for v in self._tracked_vars):
+            self._tracked_vars.append(var)
+
+    def _observe(self, var, key):
+        # Record the analysis-derived default the first time a variable is seen.
+        # Live probe (BN 5.4): create_auto_var(v, t, "auto_named") ->
+        # create_user_var(v, t, "user_named") -> delete_user_var(v) settles back
+        # to "var_8" -- the value analysis derives, NOT the intervening AUTO
+        # name. So the default is the pre-write value, not the last auto write.
+        self._analysis_defaults.setdefault(key, (var.name, var.type))
+        self._track(var)
+
+    def _write_var(self, key, name, var_type):
+        for v in self._vars_matching(key):
+            v.name = name
+            v.type = var_type
+
+    def create_user_var(self, var, var_type, name, ignore_disjoint_uses: bool = False):
+        key = _var_key(var)
+        self._observe(var, key)
+        self._user_vars.add(key)
+        self._user_values[key] = (name, var_type)
+        self._pending_auto_restore.discard(key)
+        self._pending_user_restore.discard(key)
+        self._write_var(key, name, var_type)
+
+    def create_auto_var(self, var, var_type, name, ignore_disjoint_uses: bool = False):
+        key = _var_key(var)
+        self._observe(var, key)
+        # Live BN 5.4: the AUTO write lands immediately even over a USER
+        # override, but the next analysis pass puts the user value back --
+        # BNCreateAutoVariable never displaces a user override for good.
+        self._write_var(key, name, var_type)
+        if key in self._user_vars:
+            self._pending_user_restore.add(key)
+
+    def delete_user_var(self, var):
+        key = _var_key(var)
+        if key not in self._user_vars:
+            # No user override to remove: BN leaves the variable untouched.
+            return
+        self._user_vars.discard(key)
+        self._user_values.pop(key, None)
+        self._pending_user_restore.discard(key)
+        # Live BN: provenance clears immediately, but the AUTO name/type is
+        # only re-derived by the next analysis pass.
+        self._pending_auto_restore.add(key)
+
+    def is_var_user_defined(self, var) -> bool:
+        return _var_key(var) in self._user_vars
+
+    def settle_analysis(self):
+        """Apply state that real BN only materializes on reanalysis."""
+        for key in list(self._pending_auto_restore):
+            default = self._analysis_defaults.get(key)
+            if default is not None:
+                self._write_var(key, *default)
+        self._pending_auto_restore.clear()
+        for key in list(self._pending_user_restore):
+            value = self._user_values.get(key)
+            if value is not None:
+                self._write_var(key, *value)
+        self._pending_user_restore.clear()
+
+    def provenance_snapshot(self):
+        vars_ = {}
+        for v in self._var_universe():
+            vars_.setdefault(id(v), (v, v.name, v.type))
+        return (
+            self._type,
+            set(self._user_vars),
+            dict(self._user_values),
+            dict(self._analysis_defaults),
+            set(self._pending_auto_restore),
+            set(self._pending_user_restore),
+            list(vars_.values()),
+        )
+
+    def provenance_restore(self, snapshot):
+        """Undo-restore this function, modelling BN 5.4's journal exactly.
+
+        Values and variable provenance come back; `has_user_type` does NOT --
+        BN's undo leaves BNFunctionHasUserType set (#582, verified live).
+        """
+        (type_text, user_vars, user_values, defaults, pending_auto,
+         pending_user, var_state) = snapshot
+        self._type = type_text
+        self._user_vars = set(user_vars)
+        self._user_values = dict(user_values)
+        self._analysis_defaults = dict(defaults)
+        self._pending_auto_restore = set(pending_auto)
+        self._pending_user_restore = set(pending_user)
+        for var, name, var_type in var_state:
+            var.name = name
+            var.type = var_type
 
     def reanalyze(self, *args, **kwargs):
         self.reanalyzed = True
@@ -426,6 +649,12 @@ class _FakeBV:
 
     def update_analysis_and_wait(self):
         self.analysis_updated = True
+        # Settle state that real BN only materializes on reanalysis (e.g. the
+        # AUTO name re-derived after delete_user_var).
+        for fn in self.functions:
+            settle = getattr(fn, "settle_analysis", None)
+            if settle is not None:
+                settle()
 
     def get_symbols_by_name(self, name: str):
         return [symbol for symbol in self._symbols if getattr(symbol, "name", None) == name]
@@ -454,6 +683,13 @@ class _FakeBV:
             if hit is not None:
                 return hit
         return self.types.get(str(name))
+
+    def parse_type_string(self, text):
+        # BN returns (Type, QualifiedName): the type carries NO declarator name,
+        # which is handed back separately (and is empty for an anonymous
+        # prototype). Function.type's string branch relies on exactly this.
+        type_text, name = _split_prototype(text)
+        return _FakeType(type_text, type_class="FunctionTypeClass"), _qualified_name(name)
 
     def define_user_type(self, name, type_obj):
         fake_bn = sys.modules["binaryninja"]
@@ -588,22 +824,64 @@ class _FakeMember:
 
 
 class _FakeMutationBV(_FakeBV):
-    def __init__(self):
-        super().__init__()
+    """A view with BN 5.4's undo journal semantics.
+
+    Verified live: `revert_undo_actions` restores a local variable's value AND
+    its AUTO/USER provenance, but does NOT clear `Function.has_user_type` --
+    that flag survives the undo (#582). The journal only tracks functions
+    registered on the view.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
         self.events: list[tuple[str, str] | str] = []
+        self._undo_journal: list[tuple[str, list]] = []
+        self._undo_states = 0
 
     def begin_undo_actions(self):
-        self.events.append("begin")
-        return "state"
+        # Real BN hands back a DISTINCT handle per transaction; a constant would
+        # make overlapping transactions indistinguishable and let a revert pop
+        # the wrong snapshot.
+        self._undo_states += 1
+        state = f"undo-{self._undo_states}"
+        self.events.append(("begin", state))
+        self._undo_journal.append(
+            (state, [(fn, fn.provenance_snapshot()) for fn in self.functions
+                     if hasattr(fn, "provenance_snapshot")])
+        )
+        return state
 
     def update_analysis_and_wait(self):
         self.events.append("refresh")
+        super().update_analysis_and_wait()
+
+    def _pop_journal(self, state):
+        for i in range(len(self._undo_journal) - 1, -1, -1):
+            if self._undo_journal[i][0] == state:
+                snapshot = self._undo_journal[i][1]
+                # Transactions opened after *state* are nested inside it, so
+                # closing the outer one closes them too -- they must not leak.
+                del self._undo_journal[i:]
+                return snapshot
+        return []
 
     def revert_undo_actions(self, state):
         self.events.append(("revert", state))
+        for fn, snapshot in self._pop_journal(state):
+            fn.provenance_restore(snapshot)
 
     def commit_undo_actions(self, state):
         self.events.append(("commit", state))
+        self._pop_journal(state)
+
+
+def _has_event(bv, kind: str) -> bool:
+    """True if *bv* recorded an undo event of *kind* ('begin'/'revert'/'commit').
+
+    Undo handles are per-transaction and opaque (as in real BN), so tests assert
+    on the event kind rather than on a fixed handle string.
+    """
+    return any(isinstance(e, tuple) and e and e[0] == kind for e in bv.events)
 
 
 class _ParseResult:
@@ -1300,4 +1578,4 @@ def _stub_code_context(monkeypatch, instance, function_entry):
     monkeypatch.setattr(instance.ctx, "_address_is_code", lambda bv, a: True)
 
 
-__all__ = ['_load_bridge', '_FakeFunction', '_FakeBasicBlock', '_FakeInstructionInfo', '_FakeArch', '_FakeOperation', '_FakeConstPtr', '_FakeReg', '_FakeHLILInstructionNode', '_FAKE_HLIL_TYPES', '_FakeHLILInstruction', '_FakeLLILInstruction', '_FakeVariable', '_FakeStringRef', '_FakeCodeRef', '_FakeSection', '_FakeSegment', '_FakeBV', '_FakeReloc', '_FakeType', '_FakeMember', '_FakeMutationBV', '_ParseResult', '_FakeSymbol', '_mutation_with_stubs', '_BATCH_OP_PARITY', '_minimal_valid_op', '_FakeCommentMutationBV', '_install_fake_pseudo_c', '_callsites_items', '_FakeFunctionCreateBV', '_local_retype_result', '_LoadBV', '_setup_load_test', '_FakeFileBV', '_register_views', '_ClosableBV', 'SSAVariable', '_FakeSSAVariable', '_FakeMLILInsn', '_FakeSSAFunction', '_FakeBlock', '_FakeMLILFunction', '_RecordingWriter', '_SaveBV', '_RehomingSaveBV', '_RehomingFailSaveBV', '_RestoreFailFile', '_RestoreFailSaveBV', '_FieldRefBV', '_FakeStructMember', '_FakeStructBuilder', '_struct_instance', '_AddableStructBuilder', '_struct_set_instance', '_pvs', '_dataflow_values_instance', '_stub_code_context']
+__all__ = ['_load_bridge', '_FakeFunction', '_FakeBasicBlock', '_FakeInstructionInfo', '_FakeArch', '_FakeOperation', '_FakeConstPtr', '_FakeReg', '_FakeHLILInstructionNode', '_FAKE_HLIL_TYPES', '_FakeHLILInstruction', '_FakeLLILInstruction', '_FakeVariable', '_FakeStringRef', '_FakeCodeRef', '_FakeSection', '_FakeSegment', '_FakeBV', '_FakeReloc', '_FakeType', '_FakeMember', '_FakeMutationBV', '_has_event', '_ParseResult', '_FakeSymbol', '_mutation_with_stubs', '_BATCH_OP_PARITY', '_minimal_valid_op', '_FakeCommentMutationBV', '_install_fake_pseudo_c', '_callsites_items', '_FakeFunctionCreateBV', '_local_retype_result', '_LoadBV', '_setup_load_test', '_FakeFileBV', '_register_views', '_ClosableBV', 'SSAVariable', '_FakeSSAVariable', '_FakeMLILInsn', '_FakeSSAFunction', '_FakeBlock', '_FakeMLILFunction', '_RecordingWriter', '_SaveBV', '_RehomingSaveBV', '_RehomingFailSaveBV', '_RestoreFailFile', '_RestoreFailSaveBV', '_FieldRefBV', '_FakeStructMember', '_FakeStructBuilder', '_struct_instance', '_AddableStructBuilder', '_struct_set_instance', '_pvs', '_dataflow_values_instance', '_stub_code_context']

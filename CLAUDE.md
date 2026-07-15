@@ -27,7 +27,15 @@ uv run pytest tests/test_cli.py::test_foo  # Single test
 uv run pytest -v                           # Verbose output
 ```
 
-Tests mock the `binaryninja` module — no BN license needed except for `test_integration.py` which requires a real BN install at `/opt/binaryninja`.
+Tests mock the `binaryninja` module — no BN license needed except for the two real-BN lanes, `test_integration.py` and `test_taint_integration.py`, which need a real BN install plus a C toolchain (`cc`/`gcc` + `make`). BN is discovered the same way the CLI discovers it (platform defaults), except that `BN_INSTALL_DIR` is authoritative here: if it points at a non-install, the lane treats BN as absent rather than falling back to another install.
+
+The `tests/fixtures/*_x86_64` binaries those tests run against are compiler output and stay untracked. A session-scoped fixture in `tests/conftest.py` builds them automatically when BN is present; if the build fails — missing compiler, make error, or timeout — the run errors out with `FixtureBuildError` and the diagnostics rather than skipping. Manual fallback: `make -C tests/fixtures`.
+
+```bash
+BN_REQUIRE_REAL_TESTS=1 uv run pytest tests/test_integration.py tests/test_taint_integration.py   # strict: fail (not skip) if BN is missing
+```
+
+Without BN the `real_bn`-marked tests skip visibly. Use the strict invocation on any lane that is *supposed* to have BN, so an absent install can't report green. Both real-BN modules carry `pytest.mark.real_bn` — never a bare module-level `skipif`, which bypasses the strict gate entirely.
 
 ## Architecture
 

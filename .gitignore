@@ -20,6 +20,7 @@ wheels/
 tests/fixtures/*_x86_64
 tests/fixtures/*.bndb
 tests/fixtures/*.bndb.*
+tests/fixtures/.build.lock
 
 # Local dogfood/review scratch artifacts (not part of the project)
 DEEPSEEK_*.md
