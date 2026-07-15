@@ -40,3 +40,6 @@ wheel-exclude = ["**/__pycache__", "**/*.pyc", "**/*.pyo"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+markers = [
+    "no_cache_isolation: opt out of conftest's per-test BN_CACHE_DIR pin (only for tests exercising platform-default path selection)",
+]

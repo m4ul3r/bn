@@ -36,7 +36,13 @@ _BN_CLI = [str(Path(sys.executable).parent / "bn")]
 # Don't litter the bn repo with `.bn-<id>` project markers (#80) during integration
 # runs (`bn load` from the repo cwd would otherwise drop one here + touch
 # .git/info/exclude). The marker path has its own unit coverage.
-_ENV = {**os.environ, "BN_NO_MARKERS": "1"}
+#
+# Built at call time, not import time (#589): conftest's autouse `_hermetic_env`
+# fixture pins BN_CACHE_DIR/NO_COLOR per test, and a module-import-time snapshot
+# of os.environ would predate every fixture -- so the subprocesses these helpers
+# spawn would read the developer's real ~/.cache/bn instead of the isolated one.
+def _env() -> dict[str, str]:
+    return {**os.environ, "BN_NO_MARKERS": "1"}
 
 
 def _bn(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
@@ -45,7 +51,7 @@ def _bn(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
         capture_output=True,
         text=True,
         timeout=timeout,
-        env=_ENV,
+        env=_env(),
     )
 
 
@@ -53,7 +59,7 @@ def _session_start(*binaries: str, timeout: float = 30.0) -> dict:
     # session start defaults to text output; this helper parses JSON.
     cmd = [*_BN_CLI, "session", "start", "--format", "json"]
     cmd.extend(str(b) for b in binaries)
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=_ENV)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=_env())
     assert result.returncode == 0, f"session start failed: {result.stderr}"
     return json.loads(result.stdout)
 
@@ -64,7 +70,7 @@ def _session_stop(instance_id: str, timeout: float = 10.0) -> None:
         capture_output=True,
         text=True,
         timeout=timeout,
-        env=_ENV,
+        env=_env(),
     )
 
 
