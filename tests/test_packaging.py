@@ -17,7 +17,7 @@ def test_wheel_excludes_python_bytecode_from_bridge_package(tmp_path):
     repo = Path(__file__).resolve().parents[1]
     tree = tmp_path / "tree"
     tree.mkdir()
-    for name in ("pyproject.toml", "README.md"):
+    for name in ("pyproject.toml", "README.md", "LICENSE"):
         shutil.copy2(repo / name, tree / name)
     for name in ("src", "skills"):
         shutil.copytree(repo / name, tree / name, symlinks=True)

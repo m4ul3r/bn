@@ -32,7 +32,10 @@ import contextlib
 import io
 from typing import Any
 
-import binaryninja as bn
+try:
+    import binaryninja as bn
+except ModuleNotFoundError:  # importable without the Binary Ninja runtime (tests, tooling)
+    bn = None  # type: ignore[assignment]
 
 from . import mutation_engine
 from . import read_misc

@@ -27,7 +27,10 @@ from __future__ import annotations
 import re
 from typing import Any
 
-import binaryninja as bn  # noqa: F401  (kept for parity / future use)
+try:
+    import binaryninja as bn  # noqa: F401  (kept for parity / future use)
+except ModuleNotFoundError:  # importable without the Binary Ninja runtime (tests, tooling)
+    bn = None  # type: ignore[assignment]
 
 from . import il_format
 from . import read_misc

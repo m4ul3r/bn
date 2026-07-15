@@ -31,7 +31,10 @@ from __future__ import annotations
 
 from typing import Any
 
-import binaryninja as bn  # bn.Architecture[...] for the #382 --mode arch lookup
+try:
+    import binaryninja as bn  # bn.Architecture[...] for the #382 --mode arch lookup
+except ModuleNotFoundError:  # importable without the Binary Ninja runtime (tests, tooling)
+    bn = None  # type: ignore[assignment]
 
 from . import il_format
 from . import read_xrefs

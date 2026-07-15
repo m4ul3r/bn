@@ -198,7 +198,14 @@
     "socket": {}, "bind": {}, "listen": {}, "accept": {}, "connect": {},
     "setsockopt": {}, "getsockopt": {}, "getsockname": {}, "getpeername": {},
     "close": {}, "shutdown": {},
-    "htons": {}, "htonl": {}, "ntohs": {}, "ntohl": {}, "inet_addr": {},
+
+    "_comment_byteorder": "Byte-order and address conversions TRANSFORM their input into their return value, so taint MUST flow arg->ret. Modeling them benign ({}) let an attacker-controlled length laundered through `n = ntohl(hdr->len)` drop to untainted before reaching `memcpy(dst, src, n)`, producing a false all-clear on the most common network-parse overflow. htons/htonl/ntohs/ntohl take a scalar; inet_addr derives its result from the string it is passed.",
+    "htons": {"propagates": [{"from": "arg:0", "to": "ret"}]},
+    "htonl": {"propagates": [{"from": "arg:0", "to": "ret"}]},
+    "ntohs": {"propagates": [{"from": "arg:0", "to": "ret"}]},
+    "ntohl": {"propagates": [{"from": "arg:0", "to": "ret"}]},
+    "inet_addr": {"propagates": [{"from": "*arg:0", "to": "ret"}]},
+
     "exit": {}, "abort": {}, "perror": {}, "fflush": {}, "fclose": {}, "puts": {},
     "strcmp": {}, "strncmp": {}, "strcasecmp": {}, "strncasecmp": {},
     "bzero": {}, "__builtin_memset": {}, "srand": {}, "rand": {}, "time": {}

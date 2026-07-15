@@ -442,6 +442,49 @@ def test_forward_reaches_memcpy(process_func, models):
     assert "soundness" in result
 
 
+@pytest.mark.parametrize("conv", ["ntohl", "ntohs", "htonl", "htons"])
+def test_forward_byteorder_propagates_length_to_sink(models, conv):
+    # #562: a byte-order conversion TRANSFORMS its arg into its return value, so
+    # taint must flow arg->ret. Modeling it benign ({}) let an attacker-controlled
+    # length laundered through `t = ntohl(n)` die before `memcpy(d, s, t)`, giving
+    # a false all-clear on the most common network-parse overflow.
+    n = FVar("n", typ="uint32_t"); t = FVar("t", ident=70)
+    n0 = FSSA(n, 0); t1 = FSSA(t, 1)
+    CONV, MEMCPY = 0xc00, 0xc20
+    conv_call = FInstr(0, 0x10, "MLIL_CALL_SSA", f"t#1 = {conv}(n#0)", reads=[n0], writes=[t1],
+                       dest=FExpr("MLIL_CONST_PTR", hex(CONV), constant=CONV),
+                       params=[FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])])
+    sink = FInstr(1, 0x14, "MLIL_CALL_SSA", "memcpy(d, s, t#1)", reads=[t1], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", hex(MEMCPY), constant=MEMCPY),
+                  params=[FExpr("MLIL_VAR_SSA", "d", reads=[]),
+                          FExpr("MLIL_VAR_SSA", "s", reads=[]),
+                          FExpr("MLIL_VAR_SSA", "t#1", reads=[t1])])
+    ssa = FSSAFunc([conv_call, sink])
+    func = FFunc("parse", 0x10, ssa, params=[n])
+    engine = te.TaintEngine(FBV({CONV: conv, MEMCPY: "memcpy"}), models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert any(s["sink"]["class"] == "overflow_len" for s in result["reached_sinks"]), \
+        f"{conv} dropped the length taint -> false all-clear: {result['reached_sinks']}"
+
+
+def test_store_covers_load_range_relation():
+    # #562: the memory-SSA slot comparison must carry width, or a narrow untainted
+    # store strong-kills a wider tainted store at the same base.
+    rel = te.TaintEngine._store_covers_load
+    # unknown widths fall back to exact-offset identity (pre-width behavior)
+    assert rel(0, None, 0, 4) == "cover"
+    assert rel(8, None, 0, 4) == "disjoint"
+    # a store that spans the whole loaded range is a strong update
+    assert rel(0, 8, 0, 8) == "cover"
+    assert rel(0, 8, 2, 4) == "cover"
+    # a 1-byte store under an 8-byte load is a WEAK update: overlap, never kill
+    assert rel(0, 1, 0, 8) == "overlap"
+    assert rel(4, 8, 0, 8) == "overlap"
+    # non-overlapping ranges on the same base
+    assert rel(0, 4, 4, 4) == "disjoint"
+    assert rel(8, 4, 0, 4) == "disjoint"
+
+
 def test_forward_no_flow_no_false_positive(models):
     # a function with no source->sink path must report zero sinks
     a = FVar("a"); r = FVar("r")

@@ -29,8 +29,15 @@ from __future__ import annotations
 import re
 from typing import Any
 
-import binaryninja as bn  # noqa: F401  (kept for parity with sibling read_* modules)
-from binaryninja import SSAVariable
+try:
+    import binaryninja as bn  # noqa: F401  (kept for parity with sibling read_* modules)
+except ModuleNotFoundError:  # importable without the Binary Ninja runtime (tests, tooling)
+    bn = None  # type: ignore[assignment]
+try:
+    from binaryninja import SSAVariable
+except ModuleNotFoundError:  # importable without the Binary Ninja runtime (tests, tooling)
+    class SSAVariable:  # sentinel: keeps isinstance(...) valid (and False) without BN
+        pass
 
 from . import il_format
 from . import taint_engine as _taint

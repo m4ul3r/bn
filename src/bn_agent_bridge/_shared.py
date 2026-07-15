@@ -15,8 +15,18 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-import binaryninja as bn
-from binaryninja.mainthread import execute_on_main_thread_and_wait, is_main_thread
+try:
+    import binaryninja as bn
+except ModuleNotFoundError:  # importable without the Binary Ninja runtime (tests, tooling)
+    bn = None  # type: ignore[assignment]
+try:
+    from binaryninja.mainthread import execute_on_main_thread_and_wait, is_main_thread
+except ModuleNotFoundError:  # no BN GUI runtime (tests, headless tooling): run inline
+    def execute_on_main_thread_and_wait(func):
+        return func()
+
+    def is_main_thread() -> bool:
+        return True
 
 
 def _json_response(*, ok: bool, result: Any = None, error: str | None = None) -> dict[str, Any]:

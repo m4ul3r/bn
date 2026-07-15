@@ -1243,7 +1243,30 @@ class TaintEngine:
                 pass
         return out
 
-    def _walk_mem(self, ssaf, mv, la, tainted, seen, depth):
+    @staticmethod
+    def _store_covers_load(s_off, s_w, l_off, l_w):
+        """Byte-range relation of a store (offset ``s_off``, width ``s_w``) to a
+        load (``l_off`` / ``l_w``) on a shared base: ``"cover"`` when the store
+        fully determines the loaded bytes (a strong update that may kill taint),
+        ``"overlap"`` when it writes only some of them (a WEAK update -- an
+        untainted narrow store must NOT kill a wider tainted store underneath),
+        or ``"disjoint"``. Unknown widths fall back to exact-offset identity, so a
+        store with no ``.size`` (or a fake that never set one) matches the
+        pre-width ``(base, offset)`` slot comparison exactly (#562)."""
+        if s_w is None or l_w is None:
+            return "cover" if s_off == l_off else "disjoint"
+        try:
+            s_lo, s_hi = s_off, s_off + int(s_w)
+            l_lo, l_hi = l_off, l_off + int(l_w)
+        except (TypeError, ValueError):
+            return "cover" if s_off == l_off else "disjoint"
+        if s_lo <= l_lo and s_hi >= l_hi:
+            return "cover"
+        if s_hi <= l_lo or s_lo >= l_hi:
+            return "disjoint"
+        return "overlap"
+
+    def _walk_mem(self, ssaf, mv, la, lw, tainted, seen, depth):
         if mv is None or depth > 64:
             return None
         try:
@@ -1262,15 +1285,23 @@ class TaintEngine:
         op = op_name(defn)
         if "STORE" in op:
             sa = self._addr_base_offset(ssaf, getattr(defn, "dest", None))
-            if sa is not None and sa == la:
-                for r in expr_reads(getattr(defn, "src", None)):
-                    if (var_key(r), getattr(r, "version", None)) in tainted or (var_key(r), None) in tainted:
-                        return (var_key(r), getattr(r, "version", None))
-                return None  # matching store wrote untainted data -> not tainted via memory
-            return self._walk_mem(ssaf, getattr(defn, "src_memory", None), la, tainted, seen, depth + 1)
+            if sa is not None and sa[0] == la[0]:
+                rel = self._store_covers_load(sa[1], getattr(defn, "size", None), la[1], lw)
+                if rel != "disjoint":
+                    for r in expr_reads(getattr(defn, "src", None)):
+                        if (var_key(r), getattr(r, "version", None)) in tainted or (var_key(r), None) in tainted:
+                            return (var_key(r), getattr(r, "version", None))
+                    # Untainted store: only a FULL cover strong-kills the loaded
+                    # bytes. A partial overlap leaves the uncovered bytes to an
+                    # earlier writer, so keep walking rather than declaring the load
+                    # untainted -- a narrow untainted store must not mask a wider
+                    # tainted store underneath (#562 false all-clear).
+                    if rel == "cover":
+                        return None  # matching store wrote untainted data -> not tainted via memory
+            return self._walk_mem(ssaf, getattr(defn, "src_memory", None), la, lw, tainted, seen, depth + 1)
         if "MEM_PHI" in op:
             for sv in self._mem_phi_sources(defn):
-                res = self._walk_mem(ssaf, sv, la, tainted, seen, depth + 1)
+                res = self._walk_mem(ssaf, sv, la, lw, tainted, seen, depth + 1)
                 if res is not None:
                     return res
             return None
@@ -1283,7 +1314,8 @@ class TaintEngine:
         mv = getattr(load_expr, "src_memory", None)
         if la is None or mv is None:
             return None
-        return self._walk_mem(ssaf, mv, la, tainted, set(), 0)
+        lw = getattr(load_expr, "size", None)
+        return self._walk_mem(ssaf, mv, la, lw, tainted, set(), 0)
 
     def _addr_base_var(self, ssaf: Any, expr: Any, depth: int = 0):
         """The root SSA var / Variable an address expression is based on (the
@@ -1339,12 +1371,13 @@ class TaintEngine:
                         return mkey or name
         return None
 
-    def _reaching_writer(self, ssaf, mv, la, seen, depth):
+    def _reaching_writer(self, ssaf, mv, la, lw, seen, depth):
         """Walk the memory-SSA chain backward from version *mv* for the writer of
-        address *la* = ``(base, offset)``. Returns ``("store", defn)`` for a
-        matching ``MLIL_STORE``, ``("source", call_defn, callee)`` for a modeled
-        source call that fills la's buffer, or None when the chain ends without a
-        recoverable writer (a genuinely unresolved field load, #158)."""
+        address *la* = ``(base, offset)`` loaded at width *lw*. Returns
+        ``("store", defn)`` for a ``MLIL_STORE`` whose bytes cover or overlap the
+        loaded range, ``("source", call_defn, callee)`` for a modeled source call
+        that fills la's buffer, or None when the chain ends without a recoverable
+        writer (a genuinely unresolved field load, #158)."""
         if mv is None or depth > 64:
             return None
         try:
@@ -1363,12 +1396,13 @@ class TaintEngine:
         op = op_name(defn)
         if "STORE" in op:
             sa = self._addr_base_offset(ssaf, getattr(defn, "dest", None))
-            if sa is not None and sa == la:
+            if sa is not None and sa[0] == la[0] \
+                    and self._store_covers_load(sa[1], getattr(defn, "size", None), la[1], lw) != "disjoint":
                 return ("store", defn)
-            return self._reaching_writer(ssaf, getattr(defn, "src_memory", None), la, seen, depth + 1)
+            return self._reaching_writer(ssaf, getattr(defn, "src_memory", None), la, lw, seen, depth + 1)
         if "MEM_PHI" in op:
             for sv in self._mem_phi_sources(defn):
-                res = self._reaching_writer(ssaf, sv, la, seen, depth + 1)
+                res = self._reaching_writer(ssaf, sv, la, lw, seen, depth + 1)
                 if res is not None:
                     return res
             return None
@@ -3101,6 +3135,39 @@ class TaintEngine:
             changed = False
             propagated: set[int] = set()
             addr = int(getattr(ins, "address", 0))
+
+            def _note_unkeyed_store(dest_tok):
+                # A modeled propagate targeted a memory destination (*arg:N) but
+                # _apply_to_token could not key it -- _buffer_target failed to
+                # correlate the pointer to a tracked buffer (a field-derived and/or
+                # non-constant index). Record a coarse_memory_store frontier so the
+                # tainted write is not dropped into a silent hole that would let the
+                # claim gate emit a false all-clear (#562). Distinguished from the
+                # benign "buffer already tainted" case by re-checking _buffer_target.
+                if not (isinstance(dest_tok, str) and dest_tok.startswith("*arg:")):
+                    return
+                try:
+                    di = int(dest_tok.split("arg:", 1)[1])
+                except (ValueError, IndexError):
+                    return
+                if di >= len(params) or self._buffer_target(ssaf, params[di]) is not None:
+                    return
+                leaf = {
+                    "kind": "coarse_memory_store",
+                    "address": hex(int(getattr(ins, "address", 0))),
+                    "dest_expr": str(params[di]),
+                    "il_text": str(ins),
+                    "detail": (
+                        f"{name or '?'} propagates a tainted value into a buffer "
+                        f"(arg{di}) whose pointer the engine could not correlate to a "
+                        "tracked buffer (field-derived and/or non-constant index); "
+                        "downstream reads of these bytes are not followed -- a "
+                        "'no sinks reached' result past this point is not proof of safety"
+                    ),
+                }
+                if leaf not in leaves:
+                    leaves.append(leaf)
+
             sink = model.get("sink")
             # opt-in sinks (e.g. file_write) stay silent unless their gate was
             # enabled for this run; still a "modeled" call, so no fallback noise.
@@ -3249,6 +3316,8 @@ class TaintEngine:
                 if hit is not None:
                     if self._apply_to_token(ssaf, ins, params, to, taint_node, name or "?", parents=[hit]):
                         changed = True
+                    else:
+                        _note_unkeyed_store(to)
                     if to and to.startswith("*arg:"):
                         k = int(to.split("arg:", 1)[1])
                         if k < len(params):
@@ -3320,6 +3389,8 @@ class TaintEngine:
                     if vto:
                         if self._apply_to_token(ssaf, ins, params, vto, taint_node, name or "?", parents=[ht[0]]):
                             changed = True
+                        else:
+                            _note_unkeyed_store(vto)
                         if vto.startswith("*arg:"):
                             k = int(vto.split("arg:", 1)[1])
                             if k < len(params):
@@ -4483,7 +4554,8 @@ class TaintEngine:
                 la = self._addr_base_offset(ssaf, getattr(src_expr, "src", None))
                 if la is not None:
                     rec = self._reaching_writer(
-                        ssaf, getattr(src_expr, "src_memory", None), la, set(), 0)
+                        ssaf, getattr(src_expr, "src_memory", None), la,
+                        getattr(src_expr, "size", None), set(), 0)
                     if rec is not None and rec[0] == "store":
                         # Recover the reaching store and continue the slice through
                         # the value it wrote -- not the base pointer's allocation,

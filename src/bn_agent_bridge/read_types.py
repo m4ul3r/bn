@@ -20,7 +20,10 @@ Import direction is one-way: this module imports ``_shared`` (plus
 """
 from __future__ import annotations
 
-import binaryninja as bn  # noqa: F401  (kept for parity with sibling read modules)
+try:
+    import binaryninja as bn  # noqa: F401  (kept for parity with sibling read modules)
+except ModuleNotFoundError:  # importable without the Binary Ninja runtime (tests, tooling)
+    bn = None  # type: ignore[assignment]
 
 from . import read_misc
 from ._shared import _validate_count

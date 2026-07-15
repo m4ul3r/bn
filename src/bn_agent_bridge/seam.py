@@ -20,7 +20,10 @@ import difflib
 import re
 from typing import Any
 
-import binaryninja as bn
+try:
+    import binaryninja as bn
+except ModuleNotFoundError:  # importable without the Binary Ninja runtime (tests, tooling)
+    bn = None  # type: ignore[assignment]
 
 from ._shared import (
     OperationFailure,

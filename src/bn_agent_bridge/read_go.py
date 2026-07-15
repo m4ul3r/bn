@@ -19,7 +19,10 @@ from __future__ import annotations
 import struct
 from typing import Any
 
-import binaryninja as bn  # noqa: F401  (parity with sibling read_* modules)
+try:
+    import binaryninja as bn  # noqa: F401  (parity with sibling read_* modules)
+except ModuleNotFoundError:  # importable without the Binary Ninja runtime (tests, tooling)
+    bn = None  # type: ignore[assignment]
 
 from ._shared import OperationFailure, _validate_count
 from .read_misc import _paged_list_result
