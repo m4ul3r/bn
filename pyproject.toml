@@ -41,5 +41,6 @@ wheel-exclude = ["**/__pycache__", "**/*.pyc", "**/*.pyo"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 markers = [
+    "real_bn: requires a real Binary Ninja install (skipped without one; fails when BN_REQUIRE_REAL_TESTS=1)",
     "no_cache_isolation: opt out of conftest's per-test BN_CACHE_DIR pin (only for tests exercising platform-default path selection)",
 ]

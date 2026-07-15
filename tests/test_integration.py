@@ -19,16 +19,15 @@ HELLO_BINARY = FIXTURES_DIR / "hello_x86_64"
 ADD_BINARY = FIXTURES_DIR / "add_x86_64"
 DISPATCH_BINARY = FIXTURES_DIR / "dispatch_table_x86_64"
 
-try:
-    # Try a cheap check: can bn-agent even start?
-    # We don't import binaryninja directly since it might not be on sys.path
-    # without the path-setup that headless.py does.
-    _bn_python = Path("/opt/binaryninja/python")
-    _has_bn = _bn_python.is_dir() and (HELLO_BINARY.exists() and ADD_BINARY.exists())
-except Exception:
-    _has_bn = False
-
-pytestmark = pytest.mark.skipif(not _has_bn, reason="Binary Ninja or fixtures not available")
+# The gate is BN availability *only* (#590). Gating on whether the generated
+# fixtures happen to exist made a fresh checkout report "27 skipped, exit 0"
+# with BN installed -- indistinguishable from a pass. `real_bn` skips visibly
+# (and fails under BN_REQUIRE_REAL_TESTS=1); the session-scoped
+# `integration_fixtures` builds the binaries, and errors loudly if it can't.
+pytestmark = [
+    pytest.mark.real_bn,
+    pytest.mark.usefixtures("integration_fixtures"),
+]
 
 # Use the bn console-scripts entry point instead of -m bn.cli
 # to avoid Python module shadowing issues with the 'bn' package name.
@@ -320,11 +319,13 @@ class TestTaintIndirectValueSetAnchor:
     pins (C++ vtables / data-indexed tables / PIE GOT do not)."""
 
     def _ensure_fixture(self):
-        if not DISPATCH_BINARY.exists():
-            subprocess.run(["make", "-C", str(FIXTURES_DIR), DISPATCH_BINARY.name],
-                           capture_output=True, text=True, timeout=60)
-        if not DISPATCH_BINARY.exists():
-            pytest.skip("dispatch_table fixture could not be built")
+        # The ad hoc builder this replaced (#590) was unreachable: the module
+        # gate skipped before it could run. `integration_fixtures` owns the
+        # build now, so an absent binary here is a bug, not a skip.
+        assert DISPATCH_BINARY.exists(), (
+            f"{DISPATCH_BINARY.name} missing -- the integration_fixtures build "
+            f"fixture should have produced it"
+        )
 
     def test_value_set_resolved_indirect_call_anchors_source(self):
         self._ensure_fixture()

@@ -13,11 +13,17 @@ CC      ?= cc
 # addresses; -fno-stack-protector keeps the decompiled output minimal.
 CFLAGS  ?= -O0 -fno-stack-protector -no-pie
 SRCDIR  := src
-BINS    := hello_x86_64 add_x86_64 crypto_x86_64 statemachine_x86_64 parser_x86_64 dispatch_table_x86_64
+# Where the binaries land. Defaults to this directory (what the real-BN
+# integration lane reads); tests that only exercise the *build* pass a tmp dir
+# so a unit-only run leaves no working-tree side effects.
+OUTDIR  ?= .
+NAMES   := hello_x86_64 add_x86_64 crypto_x86_64 statemachine_x86_64 parser_x86_64 dispatch_table_x86_64
+BINS    := $(addprefix $(OUTDIR)/,$(NAMES))
 
 all: $(BINS)
 
-%_x86_64: $(SRCDIR)/%.c
+$(OUTDIR)/%_x86_64: $(SRCDIR)/%.c
+	@mkdir -p $(OUTDIR)
 	$(CC) $(CFLAGS) -o $@ $<
 
 clean:

@@ -1,9 +1,13 @@
 """Tier-2 integration tests for bn taint/dataflow against a real Binary Ninja.
 
-Skipped unless Binary Ninja is importable (``/opt/binaryninja/python``) and a
-C/C++ compiler is on PATH. Each target in ``tests/taint_corpus`` is compiled at
-test time and checked against its structural ground truth (``*.EXPECTED.json``).
-Scoring is structural (callee/class/arg tuples), never exact addresses.
+This is the suite's second real-BN lane, and it goes through the same gate as
+the first (#590): the ``real_bn`` marker, so BN discovery matches the CLI's own,
+``BN_REQUIRE_REAL_TESTS=1`` turns an absent install into a failure instead of a
+silent "21 skipped, exit 0", and a missing/broken compiler with BN present is a
+loud error rather than another skip. Each target in ``tests/taint_corpus`` is
+compiled at test time and checked against its structural ground truth
+(``*.EXPECTED.json``). Scoring is structural (callee/class/arg tuples), never
+exact addresses.
 """
 from __future__ import annotations
 
@@ -14,16 +18,12 @@ import sys
 from pathlib import Path
 
 import pytest
+from conftest import FixtureBuildError
 
 CORPUS = Path(__file__).parent / "taint_corpus"
-_BN_PY = Path("/opt/binaryninja/python")
 _BN_CLI = [str(Path(sys.executable).parent / "bn")]
 
-_has_bn = _BN_PY.is_dir()
-_has_cc = shutil.which("gcc") is not None
-_has_cxx = shutil.which("g++") is not None
-
-pytestmark = pytest.mark.skipif(not (_has_bn and _has_cc), reason="Binary Ninja or gcc not available")
+pytestmark = pytest.mark.real_bn
 
 
 def _bn(*args: str, timeout: float = 120.0) -> subprocess.CompletedProcess[str]:
@@ -47,16 +47,28 @@ def _session_stop(inst: str) -> None:
 
 
 def _compile(src: Path, out: Path, extra_cflags: list[str] | None = None) -> None:
-    if src.suffix == ".cpp":
-        cc = ["g++"]
-    else:
-        cc = ["gcc"]
+    """Compile one corpus target, or raise `FixtureBuildError`.
+
+    An absent compiler is *not* a skip (#590): BN is present by the time we get
+    here, so the lane is supposed to run, and swallowing a broken toolchain into
+    a skip is how a lane reports green without executing anything.
+    """
+    cc = "g++" if src.suffix == ".cpp" else "gcc"
+    if shutil.which(cc) is None:
+        raise FixtureBuildError(
+            f"{cc!r} not found; Binary Ninja is installed, so the taint corpus "
+            f"lane is meant to run, but {src.name} cannot be built. Install a "
+            f"C/C++ toolchain."
+        )
     # extra_cflags lands after the defaults so a target can opt into e.g.
     # -O2 -D_FORTIFY_SOURCE=2 (needed to emit __*_chk calls); a later -O wins.
-    cmd = [*cc, "-O0", "-g", "-fno-stack-protector", "-no-pie",
+    cmd = [cc, "-O0", "-g", "-fno-stack-protector", "-no-pie",
            *(extra_cflags or []), str(src), "-o", str(out)]
     res = subprocess.run(cmd, capture_output=True, text=True, timeout=120.0)
-    assert res.returncode == 0, f"compile failed for {src.name}: {res.stderr}"
+    if res.returncode != 0:
+        raise FixtureBuildError(
+            f"compile failed for {src.name} (exit {res.returncode}): {res.stderr.strip()}"
+        )
 
 
 def _resolve_addr(inst: str, name: str) -> str:
@@ -111,9 +123,6 @@ def _expected_files():
 @pytest.mark.parametrize("expected_path", _expected_files(), ids=lambda p: p.stem)
 def test_corpus_target(expected_path, tmp_path):
     spec = json.loads(expected_path.read_text())
-    if spec.get("lang") == "cpp" and not _has_cxx:
-        pytest.skip("g++ not available")
-
     stem = expected_path.name[: -len(".EXPECTED.json")]
     src = CORPUS / (stem + (".cpp" if spec.get("lang") == "cpp" else ".c"))
     binary = tmp_path / stem
