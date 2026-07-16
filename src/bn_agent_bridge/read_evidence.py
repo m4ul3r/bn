@@ -732,15 +732,25 @@ def _pointer_table_for_view(
 
 def _scalar_field(ctx, bv, addr: int, offset: int, size: int) -> dict[str, Any]:
     """A scalar (non-pointer) record field: the little-endian value of up to 8
-    bytes at *addr*, tagged with its record *offset* + byte *size* (#455)."""
-    n = min(int(size), 8)
+    bytes at *addr*, tagged with its record *offset* + byte *size* (#455). A field
+    WIDER than 8 bytes cannot be rendered as one integer, so `value` is the low 8
+    bytes and the field is flagged `truncated` -- reporting the full `size` with a
+    silently-partial value would hide data (F5)."""
+    full = int(size)
+    n = min(full, 8)
     try:
         data = bytes(bv.read(addr, n) or b"")
     except Exception:
         data = b""
-    field: dict[str, Any] = {"offset": int(offset), "kind": "scalar", "size": int(size)}
+    field: dict[str, Any] = {"offset": int(offset), "kind": "scalar", "size": full}
     if n > 0 and len(data) == n:
         field["value"] = hex(int.from_bytes(data, ctx._byteorder(bv), signed=False))
+        if full > 8:
+            field["truncated"] = True
+            field["read_bytes"] = n
+            field["note"] = (
+                f"scalar field is {full} bytes; `value` is the low {n} bytes only "
+                f"(a scalar renders as at most a 64-bit integer)")
     else:
         field["unreadable"] = True
     return field
@@ -1645,9 +1655,18 @@ def _pe_tls_callbacks(bv) -> dict[str, int] | None:
     tls_rva = u(opt + dd_off + 9 * 8, 4)   # data directory[9] = TLS
     if not tls_rva:
         return None
-    aocb = u(base + tls_rva + aocb_off, ptr_size)   # AddressOfCallBacks (a VA)
+    # AddressOfCallBacks is an absolute VA computed at link time against the
+    # PREFERRED ImageBase (PE32+ opt+24 / PE32 opt+28). When BN mapped the image
+    # at a different base (relocated / rebased), rebase the array VA into BN's
+    # address space, or the read below hits an unmapped preferred-base address and
+    # the callbacks are silently missed. A no-op when BN loaded at the preferred
+    # base (image_base == bv.start), the common case.
+    image_base = u(opt + (24 if magic == 0x20B else 28), ptr_size)
+    aocb = u(base + tls_rva + aocb_off, ptr_size)   # AddressOfCallBacks (preferred-base VA)
     if not aocb:
         return None
+    if image_base is not None:
+        aocb = aocb - image_base + base
     count = 0
     addr = aocb
     while count < 4096:
@@ -2089,6 +2108,13 @@ def _vc_slot_and_factory(caller, call_ins, ptr):
         rc = _vc_const(getattr(addr_expr, "right", None))
         if rc is not None:
             off, base = rc, getattr(addr_expr, "left", None)
+        else:
+            # MLIL_ADD is commutative; BN usually canonicalizes the constant to the
+            # right, but not always -- handle `[const + base]` too so a vtable slot
+            # with the offset on the LEFT is not mis-resolved to the whole ADD expr.
+            lc = _vc_const(getattr(addr_expr, "left", None))
+            if lc is not None:
+                off, base = lc, getattr(addr_expr, "right", None)
     # Best-effort factory trace: base (the vtable) is `[obj]`; obj is `factory()`.
     factory = None
     try:

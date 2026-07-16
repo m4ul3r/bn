@@ -1374,10 +1374,14 @@ class TaintEngine:
     def _reaching_writer(self, ssaf, mv, la, lw, seen, depth):
         """Walk the memory-SSA chain backward from version *mv* for the writer of
         address *la* = ``(base, offset)`` loaded at width *lw*. Returns
-        ``("store", defn)`` for a ``MLIL_STORE`` whose bytes cover or overlap the
-        loaded range, ``("source", call_defn, callee)`` for a modeled source call
-        that fills la's buffer, or None when the chain ends without a recoverable
-        writer (a genuinely unresolved field load, #158)."""
+        ``("store", defn)`` for a ``MLIL_STORE`` whose bytes FULLY COVER the loaded
+        range, ``("source", call_defn, callee)`` for a modeled source call that
+        fills la's buffer, or None when the chain ends without a recoverable writer
+        (a genuinely unresolved field load, #158). A partial overlap is NOT the
+        sole writer of the loaded value, so the walk continues past it to the
+        wider/earlier store -- mirroring the forward twin ``_walk_mem``; stopping
+        on overlap would report a narrow recent store as THE origin and mask a
+        wider tainted writer underneath (a backward false-clean)."""
         if mv is None or depth > 64:
             return None
         try:
@@ -1397,7 +1401,7 @@ class TaintEngine:
         if "STORE" in op:
             sa = self._addr_base_offset(ssaf, getattr(defn, "dest", None))
             if sa is not None and sa[0] == la[0] \
-                    and self._store_covers_load(sa[1], getattr(defn, "size", None), la[1], lw) != "disjoint":
+                    and self._store_covers_load(sa[1], getattr(defn, "size", None), la[1], lw) == "cover":
                 return ("store", defn)
             return self._reaching_writer(ssaf, getattr(defn, "src_memory", None), la, lw, seen, depth + 1)
         if "MEM_PHI" in op:
@@ -1980,10 +1984,29 @@ class TaintEngine:
             },
             "soundness": SOUNDNESS,
         }
-        # #559: carry the frontier diagnostic from the representative (first)
-        # per-callsite run when the whole attributed union reached no sink.
-        if not findings and base.get("diagnostics"):
-            out["diagnostics"] = base["diagnostics"]
+        # #559/F2: attach a zero-sink frontier diagnostic when the whole
+        # attributed union reached no sink -- but RECOMPUTE it over the UNIONED
+        # leaves/assumptions/truncated, not the first callsite's own gate. Copying
+        # base["diagnostics"] let a blocking frontier leaf emitted by callsite #2+
+        # coexist with safe_to_report_all_clear=True from callsite #1 -- a false
+        # all-clear on the default multi-callsite path that contradicts the same
+        # result's own leaves array. The descriptive tainted_values/last_use stay
+        # from the representative (first) run; the gate/frontier reflect the union.
+        if not findings:
+            base_diag = base.get("diagnostics") or {}
+            union_sub = {
+                "diag": {
+                    "tainted_values": base_diag.get("tainted_values", 0),
+                    "last_use": base_diag.get("last_use"),
+                },
+                "leaves": leaves,
+                "assumptions": assumptions,
+                "stats": {"truncated": truncated},
+            }
+            out["diagnostics"] = forward_zero_diagnostics(
+                union_sub,
+                seed_callsites=int(base_diag.get("source_callsites", len(callsite_addrs))),
+                truncated=truncated)
         return out
 
     def _follow_thunk_cached(self, fn: Any) -> Any | None:
@@ -3589,6 +3612,26 @@ class TaintEngine:
                             if self.unknown_call_policy != "stop":
                                 ret_tainted = True
                                 add_assumption(f"external {nm or hex(taddr)} has no model; return conservatively tainted")
+                            else:
+                                # F4/#562: `stop` deliberately does NOT propagate taint
+                                # through an unmodeled external -- but taint DID reach it,
+                                # so record an honest frontier leaf. Without this the gate
+                                # sees no `ret_tainted` and no "has no model" assumption and
+                                # reports a false all-clear at exactly the callsite the mode
+                                # was chosen to treat MORE conservatively (the escape signal
+                                # must not be silenced along with the propagation).
+                                _stop_leaf = {
+                                    "kind": "unmodeled_callee",
+                                    "address": hex(int(getattr(ins, "address", 0))),
+                                    "callee": {"name": str(nm or hex(taddr)),
+                                               "address": hex(int(taddr))},
+                                    "tainted_args": sorted(tainted_args.keys()),
+                                    "note": ("--unknown-call stop: taint reached this unmodeled "
+                                             "external and was NOT propagated through it; flow past "
+                                             "this call is not analyzed -- NOT an all-clear"),
+                                }
+                                if _stop_leaf not in leaves:
+                                    leaves.append(_stop_leaf)
                             resolved_names.append(report_name)
 
                     if ret_tainted and cons_return(ins, "return of resolved call propagates taint"):

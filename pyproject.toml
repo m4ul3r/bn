@@ -16,6 +16,11 @@ authors = [
 requires-python = ">=3.14"
 dependencies = []
 
+[project.urls]
+Repository = "https://github.com/m4ul3r/bn"
+Issues = "https://github.com/m4ul3r/bn/issues"
+Upstream = "https://github.com/banteg/bn"
+
 [project.scripts]
 bn = "bn.cli:main"
 bn-agent = "bn.headless:main"

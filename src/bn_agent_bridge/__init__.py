@@ -9,7 +9,18 @@ except ModuleNotFoundError as exc:
     root = (exc.name or "").split(".", 1)[0]
     if root not in ("binaryninja", "binaryninjaui"):
         raise
-    start_bridge = start_headless = None  # type: ignore[assignment]
+
+    def _bn_unavailable(*_args, **_kwargs):
+        # Bound in place of the real entry points when Binary Ninja is absent, so a
+        # stray package-level `start_bridge()`/`start_headless()` raises a clear
+        # message instead of a bare `NoneType is not callable`. (Real headless
+        # callers import from `.bridge` directly and get the import error there.)
+        raise RuntimeError(
+            "Binary Ninja is not available in this interpreter, so the bn bridge "
+            "cannot start. Run inside Binary Ninja's Python (the GUI plugin) or via "
+            "`bn-agent` with a licensed headless install.")
+
+    start_bridge = start_headless = _bn_unavailable  # type: ignore[assignment]
     ui = None
 else:
     # Auto-start only when loaded as a Binary Ninja GUI plugin.

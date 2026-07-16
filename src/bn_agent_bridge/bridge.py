@@ -624,7 +624,10 @@ class BridgeHandler(socketserver.StreamRequestHandler):
         else:
             try:
                 payload = json.loads(raw.decode("utf-8"))
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                # Invalid UTF-8 bytes raise UnicodeDecodeError, NOT JSONDecodeError;
+                # without catching it the worker thread died with no response and
+                # the client saw a misleading "empty response" (shared upstream bug).
                 response = _json_response(ok=False, error="Invalid JSON request")
             else:
                 if not isinstance(payload, dict):

@@ -485,6 +485,134 @@ def test_store_covers_load_range_relation():
     assert rel(8, 4, 0, 4) == "disjoint"
 
 
+def test_backward_narrow_store_does_not_mask_wider_tainted_writer(models):
+    # #562/F1: a recent narrow UNTAINTED store that only PARTIALLY overlaps the
+    # loaded range must NOT be reported as the reaching writer -- the slice must
+    # keep walking to the wider tainted store underneath. Regression for the
+    # width-aware `_reaching_writer`: stopping on "overlap" (not just "cover")
+    # masked the real writer and reported the narrow store's constant as origin.
+    MALLOC, READ_U32, MEMCPY = 0xa00, 0xa10, 0xa20
+    h = FVar("h", ident=80); t = FVar("t", ident=81); x = FVar("x", ident=82)
+    src = FVar("src", ident=83)
+    h1 = FSSA(h, 1); t1 = FSSA(t, 1); x1 = FSSA(x, 1); src0 = FSSA(src, 0)
+    malloc_call = FInstr(0, 0x10, "MLIL_CALL_SSA", "h#1 = malloc(0x10)", reads=[], writes=[h1],
+                         dest=FExpr("MLIL_CONST_PTR", hex(MALLOC), constant=MALLOC),
+                         params=[FExpr("MLIL_CONST", "0x10", constant=0x10)])
+    read_call = FInstr(1, 0x14, "MLIL_CALL_SSA", "t#1 = read_u32(src#0)", reads=[src0], writes=[t1],
+                       dest=FExpr("MLIL_CONST_PTR", hex(READ_U32), constant=READ_U32),
+                       params=[FExpr("MLIL_VAR_SSA", "src#0", reads=[src0])])
+    # wide 8-byte TAINTED store at [h#1 + 0]
+    wide = FInstr(2, 0x18, "MLIL_STORE_SSA", "[h#1] = t#1", reads=[h1, t1], writes=[],
+                  dest=FExpr("MLIL_VAR_SSA", "h#1", reads=[h1]),
+                  src=FExpr("MLIL_VAR_SSA", "t#1", reads=[t1]))
+    wide.size = 8; wide.src_memory = 0; wide.dest_memory = 1
+    # narrow 2-byte UNTAINTED store at [h#1 + 6] (overwrites only the top 2 bytes)
+    narrow_dest = FExpr("MLIL_ADD", "h#1 + 6", reads=[h1])
+    narrow_dest.left = FExpr("MLIL_VAR_SSA", "h#1", reads=[h1])
+    narrow_dest.right = FExpr("MLIL_CONST", "6", constant=6)
+    narrow = FInstr(3, 0x1c, "MLIL_STORE_SSA", "[h#1 + 6] = 0", reads=[h1], writes=[],
+                    dest=narrow_dest, src=FExpr("MLIL_CONST", "0", constant=0))
+    narrow.size = 2; narrow.src_memory = 1; narrow.dest_memory = 2
+    # 8-byte load of [h#1 + 0]
+    load_src = FExpr("MLIL_LOAD_SSA", "[h#1]", reads=[h1],
+                     src=FExpr("MLIL_VAR_SSA", "h#1", reads=[h1]), src_memory=2)
+    load_src.size = 8
+    load = FInstr(4, 0x20, "MLIL_SET_VAR_SSA", "x#1 = [h#1]", reads=[h1], writes=[x1], src=load_src)
+    sink = FInstr(5, 0x24, "MLIL_CALL_SSA", "memcpy(d, s, x#1)", reads=[x1], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", hex(MEMCPY), constant=MEMCPY),
+                  params=[FExpr("MLIL_VAR_SSA", "d", reads=[]),
+                          FExpr("MLIL_VAR_SSA", "s", reads=[]),
+                          FExpr("MLIL_VAR_SSA", "x#1", reads=[x1])])
+    ssa = FSSAFunc([malloc_call, read_call, wide, narrow, load, sink],
+                   mem_defs={1: wide, 2: narrow})
+    func = FFunc("g", 0x10, ssa, params=[src])
+    engine = te.TaintEngine(FBV({MALLOC: "malloc", READ_U32: "read_u32", MEMCPY: "memcpy"}), models)
+    result = engine.backward(func, [te.parse_locator("arg:memcpy:2")])
+    origins = [(sl["origin"]["kind"], sl["origin"].get("callee")) for sl in result["slices"]]
+    # the wide tainted writer's source (read_u32) must be reached; the narrow
+    # store's constant 0 must NOT be reported as the origin.
+    assert ("call", "read_u32") in origins, origins
+    assert not any(sl["origin"].get("value") == 0 for sl in result["slices"]), result["slices"]
+
+
+def test_forward_attributed_gate_recomputed_over_union_leaves(models):
+    # #562/F2: a blocking frontier leaf emitted by a LATER callsite must force
+    # safe_to_report_all_clear=False even when the FIRST callsite was clean. The
+    # attributed merge previously copied callsite #1's gate, yielding a false
+    # all-clear that contradicted its own union `leaves`.
+    engine = te.TaintEngine(FBV({}), models)
+    func = FFunc("parse", 0x10, FSSAFunc([]), params=[])
+    sources = [{"kind": "ret", "callee": "get_val"}]
+
+    def _run(leaves, safe):
+        return {
+            "direction": "forward", "function": {"name": "parse"}, "sources": sources,
+            "reached_sinks": [], "leaves": leaves, "assumptions": [],
+            "stats": {"functions_visited": 1, "max_depth": 0, "sinks": 0, "truncated": False},
+            "diagnostics": {"safe_to_report_all_clear": safe, "all_clear_reason": "x",
+                            "tainted_values": 1, "last_use": None, "source_callsites": 2},
+        }
+
+    clean = _run([], True)  # callsite #1: clean
+    dirty = _run([{"kind": "coarse_memory_store", "address": "0x24",
+                   "detail": "unkeyable store"}], False)  # callsite #2: blocking leaf
+    runs = iter([clean, dirty])
+
+    def fake_forward_run(f, s, *, max_depth, only_callsite_addr):
+        engine._funcs_visited = {0x10}
+        return next(runs)
+
+    engine._forward_run = fake_forward_run
+    out = engine._forward_attributed(func, sources, [0xA, 0xB], max_depth=8)
+
+    assert out["reached_sinks"] == []
+    assert any(l["kind"] == "coarse_memory_store" for l in out["leaves"])
+    assert out["diagnostics"]["safe_to_report_all_clear"] is False, out["diagnostics"]
+
+
+def test_forward_stop_policy_emits_unmodeled_frontier_leaf(models):
+    # F4/#562: under --unknown-call stop, taint reaching an unmodeled external must
+    # still surface an unmodeled_callee frontier leaf (and block the honesty gate),
+    # not be silently dropped into a false all-clear. `stop` means "don't propagate
+    # THROUGH it", not "pretend the flow ended cleanly".
+    n = FVar("n"); n0 = FSSA(n, 0)
+    EXT = 0xd00
+    call = FInstr(0, 0x10, "MLIL_CALL_SSA", "unknown_ext(n#0)", reads=[n0], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", hex(EXT), constant=EXT),
+                  params=[FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])])
+    ret = FInstr(1, 0x14, "MLIL_RET", "return", reads=[])
+    ssa = FSSAFunc([call, ret])
+    func = FFunc("f", 0x10, ssa, params=[n])
+    engine = te.TaintEngine(FBV({EXT: "unknown_ext"}), models, unknown_call_policy="stop")
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert any(l["kind"] == "unmodeled_callee" for l in result["leaves"]), result["leaves"]
+    diag = result.get("diagnostics") or {}
+    assert diag.get("safe_to_report_all_clear") is False, diag
+
+
+def test_forward_unkeyable_store_dest_emits_coarse_memory_leaf(models):
+    # (b)/#562: a modeled copy whose DEST pointer the engine cannot key (here the
+    # opaque return of get_buf()) must emit a coarse_memory_store honesty leaf, not
+    # silently drop the tainted write past a gate that would then read all-clear.
+    GETBUF, MEMCPY = 0xe00, 0xe10
+    dst = FVar("dst"); src = FVar("src"); n = FVar("n")
+    dst1 = FSSA(dst, 1); src0 = FSSA(src, 0); n0 = FSSA(n, 0)
+    getbuf = FInstr(0, 0x10, "MLIL_CALL_SSA", "dst#1 = get_buf()", reads=[], writes=[dst1],
+                    dest=FExpr("MLIL_CONST_PTR", hex(GETBUF), constant=GETBUF), params=[])
+    call = FInstr(1, 0x14, "MLIL_CALL_SSA", "memcpy(dst#1, src#0, n#0)",
+                  reads=[dst1, src0, n0], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", hex(MEMCPY), constant=MEMCPY),
+                  params=[FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1]),
+                          FExpr("MLIL_VAR_SSA", "src#0", reads=[src0]),
+                          FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])])
+    ret = FInstr(2, 0x18, "MLIL_RET", "return", reads=[])
+    ssa = FSSAFunc([getbuf, call, ret])
+    func = FFunc("f", 0x10, ssa, params=[dst, src, n])
+    engine = te.TaintEngine(FBV({GETBUF: "get_buf", MEMCPY: "memcpy"}), models)
+    result = engine.forward(func, [te.parse_locator("arg:memcpy:1")])
+    assert any(l["kind"] == "coarse_memory_store" for l in result["leaves"]), result["leaves"]
+
+
 def test_forward_no_flow_no_false_positive(models):
     # a function with no source->sink path must report zero sinks
     a = FVar("a"); r = FVar("r")
