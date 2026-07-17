@@ -2405,17 +2405,29 @@ class BinaryNinjaBridge:
         # view dirty until saved -- mark it so `close` can warn. A pure no-op
         # (every op already in the requested state) changes nothing, so it does
         # not dirty the view. (L15)
-        if isinstance(result, dict) and result.get("committed") and not result.get("preview"):
-            changed = any(
+        committed_change = (
+            isinstance(result, dict)
+            and result.get("committed")
+            and not result.get("preview")
+            and any(
                 isinstance(r, dict) and r.get("status") == "verified"
                 for r in (result.get("results") or [])
             )
-            if changed:
-                try:
-                    selector = a[0] if a else k.get("selector")
-                    self.targets.mark_dirty(self.targets.resolve(selector))
-                except Exception:
-                    pass
+        )
+        # A FAILED rollback (preview or live) can leave partial state live in the
+        # view while committed is False, so the committed check above never fires.
+        # bv.file.modified does not flip for these writes, so mark dirty here or
+        # `bn close` computes unsaved=false and silently discards the leftover
+        # renames/types/locals (#606). Identity check, not falsy: a clean result
+        # with no rolled_back key (rolled_back is None) must be unchanged, and a
+        # clean rollback (rolled_back True) leaves the view as before.
+        rollback_left_state = isinstance(result, dict) and result.get("rolled_back") is False
+        if committed_change or rollback_left_state:
+            try:
+                selector = a[0] if a else k.get("selector")
+                self.targets.mark_dirty(self.targets.resolve(selector))
+            except Exception:
+                pass
         return result
 
     def _op_rename_symbol(self, *a, **k):
