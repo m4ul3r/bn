@@ -3031,6 +3031,12 @@ def _render_mutation_text(value: Any) -> str:
         # "Preview verified and reverted." message would only repeat it. (A
         # restore-failure preview is success=False and renders above instead.)
         lines.append("preview: change applied + reverted")
+        # A non-default message carries real information the banner does not --
+        # e.g. the #582 has_user_type residue disclosure on an otherwise clean,
+        # exit-0 preview. Surface it so text mode never drops the caveat.
+        msg = value.get("message")
+        if msg and msg != "Preview verified and reverted.":
+            lines.append(msg)
         lines.append("")
 
     has_type_op = any(_is_type_result(r) for r in results)

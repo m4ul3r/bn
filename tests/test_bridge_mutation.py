@@ -2705,8 +2705,12 @@ def test_preview_local_rename_preserves_genuine_user_var(monkeypatch):
 
 # ===========================================================================
 # #582 -- preview of a proto set on a function with has_user_type False must
-# DISCLOSE the unrevertible flag (BN can't clear it), not claim clean revert.
-# Distinct from #581 (locals): proved with a proto-only batch.
+# DISCLOSE the unrevertible flag (BN can't clear it) WITHOUT failing the batch:
+# the prototype VALUE round-trips, so the preview still verifies at exit 0. The
+# flag is an invisible provenance artifact, not a value change, so treating it
+# as a rollback failure regressed the common AUTO-typed `proto set --preview`
+# (broke test_unnamed_params_verify_via_preview). Distinct from #581 (locals):
+# proved with a proto-only batch.
 # ===========================================================================
 
 def test_preview_proto_set_discloses_unrevertible_has_user_type(monkeypatch):
@@ -2732,9 +2736,14 @@ def test_preview_proto_set_discloses_unrevertible_has_user_type(monkeypatch):
 
     assert fn.has_user_type is True  # BN could not clear it
     assert result["preview"] is True
-    assert result["success"] is False       # not a clean revert
-    assert result["rolled_back"] is False
+    # The value reverted, so the preview VERIFIES and succeeds (exit 0): the
+    # residue is disclosed, not treated as a failed rollback (#582 regression fix).
+    assert result["success"] is True
+    assert result["rolled_back"] is True
+    assert result["prototype_user_type_residue"] is True
+    assert result["results"][0]["status"] == "verified"
     assert "has_user_type" in result["message"]
+    assert "reverted" in result["message"]
 
 
 def test_preview_proto_set_with_prior_user_type_reverts_cleanly(monkeypatch):
@@ -2764,6 +2773,8 @@ def test_preview_proto_set_with_prior_user_type_reverts_cleanly(monkeypatch):
     assert result["success"] is True
     assert result["rolled_back"] is True
     assert result["message"] == "Preview verified and reverted."
+    # No residue disclosure: re-asserting a genuine prior override is correct.
+    assert "prototype_user_type_residue" not in result
 
 
 def test_preview_locals_only_batch_reports_no_proto_residue(monkeypatch):

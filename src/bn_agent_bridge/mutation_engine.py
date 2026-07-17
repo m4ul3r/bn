@@ -726,9 +726,11 @@ def _prototype_user_type_residue(ctx, bv, results: list[dict[str, Any]]) -> bool
     """True if any ``set_prototype`` op on a function that had NO prior user type
     left it pinned with ``has_user_type`` after the revert (#582). BN's undo and
     ``set_auto_type`` both leave ``BNFunctionHasUserType`` set (verified live on
-    BN 5.4), so there is no supported clear -- surface the residue instead of
-    claiming a clean revert. A function with a genuine prior user type is
-    skipped: restoring that override is correct, not residue."""
+    BN 5.4), so there is no supported clear. Callers use this only to DISCLOSE the
+    residue in the message/result -- not to fail the batch: the prototype VALUE
+    round-trips exactly, so a preview still verifies and reverts (exit 0). A
+    function with a genuine prior user type is skipped: restoring that override is
+    correct, not residue."""
     for item in results:
         if not isinstance(item, dict) or item.get("op") != "set_prototype":
             continue
@@ -1841,9 +1843,16 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
             # #582: a proto set on a function that had NO prior user type pins
             # has_user_type, and neither BN's undo nor set_auto_type clears the
             # flag (verified live on BN 5.4). Detect that residue so a --preview
-            # does not falsely claim a clean revert.
+            # DISCLOSES it in the message instead of falsely claiming a pristine
+            # revert -- but do NOT fold it into `restored`. The prototype VALUE
+            # round-trips exactly (set_auto_type restores it); only the invisible
+            # provenance flag persists, and it is unclearable through any BN API.
+            # Failing the batch on it (the original #582 code) turned the common
+            # AUTO-typed `proto set --preview` into an exit-3 that left the view
+            # dirty and broke test_unnamed_params_verify_via_preview. `restored`
+            # tracks the reversible operations only; residue is surfaced separately.
             proto_residue = _prototype_user_type_residue(ctx, bv, results)
-            restored = undo_ok and restore_ok and drift_ok and not proto_residue
+            restored = undo_ok and restore_ok and drift_ok
         else:
             bv.commit_undo_actions(state)
 
@@ -1861,33 +1870,36 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
             output_results = _restamp_reverted_siblings(ctx, annotated_results, restored)
         message = None
         if preview:
-            if restored:
-                message = "Preview verified and reverted."
-            elif proto_residue:
-                message = (
-                    "Preview verified, but the function prototype override "
-                    "(has_user_type) could not be cleared on revert; BN will no "
-                    "longer re-derive that signature. The view is left modified."
-                )
-            else:
+            if not restored:
                 message = (
                     "Preview verified, but reverting a non-journaled change "
                     "(local variable or prototype) failed; the view may be left modified."
                 )
-        elif failed:
-            if restored:
-                message = "Rolled back because live-session verification failed."
             elif proto_residue:
+                # The value reverted cleanly; only the has_user_type flag persists
+                # (BN exposes no API to clear it). Disclose rather than claim a
+                # pristine revert, but this is NOT a failure -- the prototype text
+                # is byte-identical to before (#582).
                 message = (
-                    "Live-session verification failed; on revert the function "
-                    "prototype override (has_user_type) could not be cleared. "
-                    "The view is left modified."
+                    "Preview verified and the prototype value was reverted, but the "
+                    "function's has_user_type override cannot be cleared (a Binary "
+                    "Ninja limitation); BN will no longer re-derive that signature."
                 )
             else:
+                message = "Preview verified and reverted."
+        elif failed:
+            if not restored:
                 message = (
                     "Live-session verification failed AND reverting a non-journaled change "
                     "(local variable or prototype) failed; the view may be left modified."
                 )
+            elif proto_residue:
+                message = (
+                    "Rolled back because live-session verification failed; note that BN "
+                    "cannot clear the has_user_type override the applied prototype set."
+                )
+            else:
+                message = "Rolled back because live-session verification failed."
         else:
             message = "Applied and verified in the live Binary Ninja session."
         # A preview whose non-journaled restore failed left the view
@@ -1906,6 +1918,11 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
         }
         if preview or failed:
             result["rolled_back"] = restored
+        if proto_residue:
+            # Structured disclosure: `success` stays True (the value reverted), so
+            # automation that only keys off `success` still needs a signal that an
+            # unclearable has_user_type override was left behind (#582).
+            result["prototype_user_type_residue"] = True
         return result
     except Exception as exc:
         undo_ok = _revert_undo_safely(ctx, bv, state)
