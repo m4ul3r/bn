@@ -2422,7 +2422,15 @@ class BinaryNinjaBridge:
         # with no rolled_back key (rolled_back is None) must be unchanged, and a
         # clean rollback (rolled_back True) leaves the view as before.
         rollback_left_state = isinstance(result, dict) and result.get("rolled_back") is False
-        if committed_change or rollback_left_state:
+        # An unclearable has_user_type override (a proto set on an AUTO function
+        # that had to be reverted) leaves the view modified even though the
+        # prototype value round-tripped. It now also flips rolled_back to False,
+        # but key on the residue field explicitly too so `bn close` never silently
+        # discards it (#630).
+        residue_left_state = isinstance(result, dict) and bool(
+            result.get("prototype_user_type_residue")
+        )
+        if committed_change or rollback_left_state or residue_left_state:
             try:
                 selector = a[0] if a else k.get("selector")
                 self.targets.mark_dirty(self.targets.resolve(selector))

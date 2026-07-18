@@ -348,10 +348,13 @@ def test_rolled_back_sibling_reports_rollback_failed_when_revert_fails(monkeypat
     assert "rollback_failed" in FAILED_MUTATION_STATUSES
 
 
-def test_capture_and_restore_local_var_drift_reverts_propagated_siblings(monkeypatch):
-    """BN's create_user_var propagates a user name onto aliased siblings (naming
-    a stack var also renames the aliased register). The drift snapshot/restore
-    must put EVERY changed local back, not just the targeted one (#88)."""
+def test_restore_local_var_drift_unpins_propagated_auto_sibling(monkeypatch):
+    """BN's create_user_var propagates a USER override onto aliased siblings
+    (naming a stack var also renames the aliased register), and that propagation
+    is NOT journaled -- it survives the undo. The drift mop-up must DROP that
+    override (delete_user_var) so the AUTO sibling comes back AUTO, NOT re-pin it
+    with create_user_var (which restores the displayed name but leaves the var
+    USER while claiming a clean revert -- #630)."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
 
@@ -361,30 +364,71 @@ def test_capture_and_restore_local_var_drift_reverts_propagated_siblings(monkeyp
     fn = _FakeFunction(0x11744, "f")
     fn.stack_layout = [target]
     fn.hlil = types.SimpleNamespace(vars=[sibling])
-    settled: list[bool] = []
+    bv = _FakeMutationBV(functions=[fn])
+    fn.view = bv
 
-    class _Func(_FakeFunction):
-        def create_user_var(self, var, type_obj, name):
-            var.name = name
-            var.type = type_obj
-
-    fn.__class__ = _Func
-    bv = _FakeBV(functions=[fn])
-    bv.update_analysis_and_wait = lambda: settled.append(True)
-
+    # Snapshot BEFORE apply: both locals are AUTO.
     before = instance._capture_local_var_snapshots(bv, [fn])
-    assert before[0x11744][10] == ("var_8", "int32_t")
-    assert before[0x11744][20] == ("r2", "int32_t")
+    assert before[0x11744][10] == ("var_8", "int32_t", False)
+    assert before[0x11744][20] == ("r2", "int32_t", False)
 
-    # Simulate apply + propagation: target renamed AND sibling auto-renamed.
-    target.name = "Q8"
-    sibling.name = "Q8_1"
+    # The targeted var was already un-pinned by the per-op restore; the aliased
+    # sibling was left USER-pinned + renamed by BN's non-journaled propagation.
+    fn.create_user_var(sibling, "int32_t", "Q8_1")
+    assert fn.is_var_user_defined(sibling) is True
 
     ok = instance._restore_local_var_drift(bv, before)
     assert ok is True
-    assert target.name == "var_8"   # targeted var restored
-    assert sibling.name == "r2"     # propagated sibling restored too
-    assert settled == [True]        # reanalyzed exactly once (something drifted)
+    # Provenance restored to AUTO -- NOT re-pinned USER (the #630 bug).
+    assert fn.is_var_user_defined(sibling) is False
+    assert sibling.name == "r2"
+
+
+def test_restore_local_var_drift_replays_genuine_user_sibling(monkeypatch):
+    """Negative control: a sibling that ALREADY had a USER definition must be
+    RE-ASSERTED with create_user_var if it drifted -- restoring a genuine user
+    override is correct, not residue (#630)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    var = _FakeVariable(name="var_8", storage=-8, var_type="int32_t", identifier=10)
+    fn = _FakeFunction(0x11744, "f")
+    fn.stack_layout = [var]
+    bv = _FakeMutationBV(functions=[fn])
+    fn.view = bv
+
+    fn.create_user_var(var, "int32_t", "kept")  # genuine prior USER definition
+    before = instance._capture_local_var_snapshots(bv, [fn])
+    assert before[0x11744][10] == ("kept", "int32_t", True)
+
+    var.name = "drifted"  # a later op perturbed the displayed name
+    ok = instance._restore_local_var_drift(bv, before)
+    assert ok is True
+    assert var.name == "kept"
+    assert fn.is_var_user_defined(var) is True  # still a user var
+
+
+def test_restore_local_var_drift_leaves_reanalyzed_auto_name_alone(monkeypatch):
+    """An AUTO local that is STILL auto but whose name BN re-derived differently
+    is phantom drift (#581): the mop-up must not touch it (no create_user_var,
+    no delete_user_var) -- doing so would pin an AUTO var USER (#630)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    var = _FakeVariable(name="var_8", storage=-8, var_type="int32_t", identifier=10)
+    fn = _FakeFunction(0x11744, "f")
+    fn.stack_layout = [var]
+    bv = _FakeMutationBV(functions=[fn])
+    fn.view = bv
+
+    before = instance._capture_local_var_snapshots(bv, [fn])
+    var.name = "var_10"  # BN re-derived a different AUTO name; still AUTO
+    assert fn.is_var_user_defined(var) is False
+
+    ok = instance._restore_local_var_drift(bv, before)
+    assert ok is True
+    assert fn.is_var_user_defined(var) is False  # untouched, still AUTO
+    assert "refresh" not in bv.events  # nothing pinned/dropped -> no reanalysis
 
 
 def test_restore_local_var_drift_noop_when_nothing_changed(monkeypatch):
@@ -2479,6 +2523,36 @@ def test_verify_fail_all_ops_failed_none_restamped_reverted(monkeypatch):
     assert [r["status"] for r in result["results"]] == ["verification_failed", "verification_failed"]
 
 
+def test_noop_op_retains_noop_status_through_rollback(monkeypatch):
+    """A genuine no-op op (its requested state was already satisfied) changed
+    nothing, so a batch rollback triggered by a SIBLING's verification failure
+    must leave it 'noop', not restamp it 'reverted'/'rollback_failed' -- that
+    would corrupt the per-op status and the summary counts (#630)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+
+    def apply(bv_, op, restores=None):
+        return {"op": op["op"], "requested": {}}
+
+    calls = {"n": 0}
+
+    def verify(bv_, result):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {**result, "status": "noop"}   # already satisfied
+        return {**result, "status": "verification_failed", "message": "did not land"}
+
+    _mutation_with_stubs(monkeypatch, bridge, instance, bv, apply=apply, verify=verify)
+    monkeypatch.setattr(bridge.mutation_engine, "_revert_undo_safely", lambda ctx, bv_, s: True)
+    monkeypatch.setattr(bridge.mutation_engine, "_run_local_restores", lambda ctx, bv_, r: True)
+
+    result = instance._mutation("active", False, [{"op": "rename_symbol"}, {"op": "set_prototype"}])
+
+    assert result["results"][0]["status"] == "noop"   # unchanged, NOT reverted
+    assert result["results"][1]["status"] == "verification_failed"
+
+
 # ===========================================================================
 # #606 -- bridge._mutation marks the view dirty when rolled_back is False.
 # ===========================================================================
@@ -2552,6 +2626,67 @@ def test_mutation_not_dirty_on_pure_noop(monkeypatch):
         "results": [{"status": "noop"}],
     })
     assert marked == []
+
+
+def test_mutation_dirty_on_prototype_user_type_residue(monkeypatch):
+    """An unclearable has_user_type override left behind must mark the view dirty
+    so `bn close` warns, even though the prototype VALUE round-tripped (#630)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    marked = _dirty_probe(monkeypatch, bridge, instance, {
+        "committed": False, "preview": False, "rolled_back": False, "success": False,
+        "prototype_user_type_residue": True,
+        "results": [{"status": "rollback_failed"}],
+    })
+    assert marked == ["BV"]
+
+
+def test_end_to_end_clean_preview_leaves_view_unchanged_and_not_dirty(monkeypatch):
+    """A clean preview of a local rename, driven through the REAL _mutation path
+    (apply -> verify -> undo -> restores -> drift), must leave the variable back
+    at its original AUTO name/provenance AND not mark the view dirty (#630). Not a
+    fabricated envelope -- it proves the view is actually unchanged."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    me = bridge.mutation_engine
+
+    var = _FakeVariable(name="var_8", storage=-8, var_type="int32_t", identifier=10)
+    fn = _FakeFunction(0x401000, "f")
+    fn.stack_layout = [var]
+    bv = _FakeMutationBV(functions=[fn])
+    fn.view = bv
+
+    marked: list = []
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "mark_dirty", lambda b: marked.append(b))
+    # Wire the seam/peers so REAL _op_local_rename + restores + drift run; only the
+    # snapshot/diff machinery (irrelevant to this assertion) is stubbed out.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda _bv, ident: fn)
+    monkeypatch.setattr(me, "_guess_affected_functions", lambda ctx, b, ops: [fn])
+    monkeypatch.setattr(me, "_capture_function_snapshots", lambda ctx, b, fns: {})
+    monkeypatch.setattr(me, "_capture_type_snapshots", lambda ctx, b, ops: {})
+    monkeypatch.setattr(me, "_diff_snapshots", lambda ctx, before, after: [])
+    monkeypatch.setattr(me, "_diff_type_snapshots", lambda ctx, before, after: [])
+    monkeypatch.setattr(bridge.vars_mod, "_find_variable_selector", lambda _f, sel: (var, False))
+    monkeypatch.setattr(bridge.vars_mod, "_local_id", lambda _f, _v, is_parameter: "lid")
+    monkeypatch.setattr(me, "_find_var_for_restore",
+                        lambda ctx, _f, identifier, storage, is_parameter: var)
+    monkeypatch.setattr(me, "_verify_operation",
+                        lambda ctx, b, result: {**result, "status": "verified"})
+
+    result = instance._mutation(
+        "active", True,
+        [{"op": "local_rename", "function": "f", "variable": "var_8", "new_name": "probe"}],
+    )
+
+    assert result["success"] is True
+    assert result["rolled_back"] is True
+    assert "prototype_user_type_residue" not in result
+    # The view is actually unchanged: AUTO provenance and original name restored.
+    assert var.name == "var_8"
+    assert fn.is_var_user_defined(var) is False
+    assert marked == []  # a clean preview does not dirty the view
 
 
 # ===========================================================================
@@ -2637,6 +2772,54 @@ def test_verify_function_doc_comment_missing_fn_raises_verification_failed(monke
 
 
 # ===========================================================================
+# #630 -- tag verification must check the EXACT target function/address, not
+# just "any function containing the address" / a name fallback.
+# ===========================================================================
+
+def test_address_tag_add_records_function_start(monkeypatch):
+    """An address-scope tag add records the EXACT function it landed on (stable
+    start address) so verification can check that function, not any containing
+    one (#630)."""
+    bridge, instance, me, fn, bv = _tagged_bv(monkeypatch)
+    result = me._op_tag_add(instance.ctx, bv, {"op": "tag_add", "address": "0x401010", "type": "Bug"})
+    assert result["scope"] == "address"
+    assert result["function_start"] == "0x401000"
+
+
+def test_verify_address_tag_add_checks_exact_function_not_any_containing(monkeypatch):
+    """A matching tag on a DIFFERENT function that also contains the address must
+    NOT satisfy verification: the tag was added to a specific function (#630)."""
+    bridge, instance, me, fn, bv = _tagged_bv(monkeypatch)
+    # A second function that also contains 0x401010 but is NOT where the tag went.
+    other = _FakeFunction(0x401008, "sibling")
+    other.basic_blocks = [_FakeBasicBlock(0x401008, 0x401100)]
+    other.view = bv
+    bv.functions.append(other)
+
+    result = me._op_tag_add(instance.ctx, bv, {"op": "tag_add", "address": "0x401010", "type": "Bug"})
+    assert result["function_start"] == "0x401000"
+    # Put a matching tag on the OTHER function and remove it from the real target.
+    other.add_tag("Bug", "", 0x401010)
+    fn._address_tags[0x401010] = []
+    with pytest.raises(bridge.OperationFailure) as exc:
+        me._verify_tag_add(instance.ctx, bv, result)
+    assert exc.value.status == "verification_failed"
+
+
+def test_verify_function_tag_remove_treats_missing_function_as_removed(monkeypatch):
+    """A function-scope tag remove whose recorded start address no longer
+    resolves to a function verifies as removed (its tags are gone with it) --
+    it must NOT fall back to a name lookup, which would raise 'function not
+    found' (or match a DIFFERENT function) instead of cleanly verifying (#630)."""
+    bridge, instance, me, fn, bv = _tagged_bv(monkeypatch)
+    add = me._op_tag_add(instance.ctx, bv, {"op": "tag_add", "function": "handle_request", "type": "Bug"})
+    result = me._op_tag_remove(instance.ctx, bv, {"op": "tag_remove", "tag_id": add["tag_id"]})
+    bv.functions.clear()  # the function was deleted after the removal
+    verified = me._verify_tag_remove(instance.ctx, bv, result)
+    assert verified["status"] == "verified"  # gone -> its function tag cannot remain
+
+
+# ===========================================================================
 # #581 -- preview of a local rename/retype on an AUTO variable must NOT pin it
 # as USER: the restore uses delete_user_var, not create_user_var.
 # ===========================================================================
@@ -2704,77 +2887,140 @@ def test_preview_local_rename_preserves_genuine_user_var(monkeypatch):
 
 
 # ===========================================================================
-# #582 -- preview of a proto set on a function with has_user_type False must
-# DISCLOSE the unrevertible flag (BN can't clear it) WITHOUT failing the batch:
-# the prototype VALUE round-trips, so the preview still verifies at exit 0. The
-# flag is an invisible provenance artifact, not a value change, so treating it
-# as a rollback failure regressed the common AUTO-typed `proto set --preview`
-# (broke test_unnamed_params_verify_via_preview). Distinct from #581 (locals):
-# proved with a proto-only batch.
+# #630 -- a proto set pins has_user_type, and Binary Ninja exposes NO API to
+# clear it (verified live on BN 5.4: set_auto_type and revert_undo_actions both
+# leave the flag set, has_user_type has no setter, there is no delete_user_type).
+# has_user_type is behaviorally meaningful (once set, analysis will not re-derive
+# the signature), so it is NOT value-neutral metadata. The honest contract:
+#   * a --preview of a proto set on an AUTO function is REFUSED before any
+#     mutation (the view stays pristine) -- a preview that could not be cleanly
+#     reverted must not be performed and reported as a clean rollback; and
+#   * an INVOLUNTARY rollback of a live batch (a sibling op failed, or an apply
+#     failed) that had already pinned has_user_type reports success:false /
+#     rolled_back:false, discloses prototype_user_type_residue, and is dirty.
+# (Supersedes the earlier #582 "disclose but still report success" behavior,
+# which masked a real rollback failure.)
 # ===========================================================================
 
-def test_preview_proto_set_discloses_unrevertible_has_user_type(monkeypatch):
+def test_preview_proto_set_on_auto_function_is_refused_pristine(monkeypatch):
+    """A --preview of a prototype change on a function with no user type is
+    REFUSED before any mutation: BN cannot clear the has_user_type it would pin,
+    so the preview could not be cleanly reverted. The view is left PRISTINE --
+    no undo transaction is even opened -- rather than applied and reported as a
+    false clean rollback (#630)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "f")  # has_user_type False, type "int32_t()"
+    bv = _FakeMutationBV(functions=[fn])
+    fn.view = bv
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda _bv, ident: fn)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._mutation(
+            "active", True,
+            [{"op": "set_prototype", "identifier": "f", "prototype": "uint64_t f(int32_t a)"}],
+        )
+
+    assert exc.value.status == "unsupported"
+    assert "has_user_type" in exc.value.message
+    # The view is untouched: no mutation, no undo transaction opened.
+    assert fn.has_user_type is False
+    assert str(fn.type) == "int32_t()"
+    assert not _has_event(bv, "begin")
+
+
+def test_unrevertible_preview_prototypes_flags_only_auto_changing_ops(monkeypatch):
+    """The preflight flags a proto set that would pin has_user_type on an AUTO
+    function, and ONLY that -- a function with a prior user type, and a no-op set
+    (requested prototype already the current one), are both safe to preview (#630)."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     me = bridge.mutation_engine
+
+    auto_fn = _FakeFunction(0x401000, "auto_fn")            # AUTO, "int32_t()"
+    user_fn = _FakeFunction(0x402000, "user_fn")
+    user_fn.set_user_type("int32_t()")                     # genuine prior user type
+    noop_fn = _FakeFunction(0x403000, "noop_fn")           # AUTO, already "int32_t()"
+    bv = _FakeMutationBV(functions=[auto_fn, user_fn, noop_fn])
+    for fn in (auto_fn, user_fn, noop_fn):
+        fn.view = bv
+    monkeypatch.setattr(instance.ctx, "_find_function",
+                        lambda _bv, ident: {"auto_fn": auto_fn, "user_fn": user_fn,
+                                            "noop_fn": noop_fn}[ident])
+
+    flagged = me._unrevertible_preview_prototypes(
+        instance.ctx, bv,
+        [
+            {"op": "set_prototype", "identifier": "auto_fn", "prototype": "uint64_t auto_fn(int32_t a)"},
+            {"op": "set_prototype", "identifier": "user_fn", "prototype": "uint64_t user_fn(int32_t a)"},
+            {"op": "set_prototype", "identifier": "noop_fn", "prototype": "int32_t noop_fn()"},
+        ],
+    )
+    assert flagged == ["auto_fn"]
+
+
+def test_live_verify_fail_with_proto_on_auto_reports_residue_and_fails(monkeypatch):
+    """An INVOLUNTARY rollback -- a live batch where a proto-set-on-AUTO applied
+    but a sibling op failed verification -- must report success:false /
+    rolled_back:false and disclose the unclearable has_user_type residue, never a
+    false clean rollback (#630)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
     fn = _FakeFunction(0x401000, "f")  # has_user_type starts False
     bv = _FakeMutationBV(functions=[fn])
 
     def apply(bv_, op, restores=None):
-        fn.set_user_type("uint64_t f(int32_t a)")  # pins has_user_type True
-        restores.append(lambda: fn.set_auto_type("int32_t()"))  # value only; flag stays
-        return {"op": "set_prototype", "address": "0x401000",
-                "before_has_user_type": False, "status": "applied", "requested": {}}
+        if op["op"] == "set_prototype":
+            fn.set_user_type("uint64_t f(int32_t a)")  # pins has_user_type True
+            restores.append(lambda: fn.set_auto_type("int32_t()"))  # value only; flag stays
+            return {"op": "set_prototype", "address": "0x401000",
+                    "before_has_user_type": False, "requested": {}}
+        return {"op": "rename_symbol", "address": "0x401000", "requested": {}}
 
-    _mutation_with_stubs(
-        monkeypatch, bridge, instance, bv,
-        apply=apply,
-        verify=lambda bv_, result: {**result, "status": "verified"},
-    )
+    def verify(bv_, result):
+        if result["op"] == "set_prototype":
+            return {**result, "status": "verified"}
+        return {**result, "status": "verification_failed", "message": "rename did not land"}
 
-    result = instance._mutation("active", True, [{"op": "set_prototype"}])
+    _mutation_with_stubs(monkeypatch, bridge, instance, bv, apply=apply, verify=verify)
+
+    result = instance._mutation("active", False, [{"op": "set_prototype"}, {"op": "rename_symbol"}])
 
     assert fn.has_user_type is True  # BN could not clear it
-    assert result["preview"] is True
-    # The value reverted, so the preview VERIFIES and succeeds (exit 0): the
-    # residue is disclosed, not treated as a failed rollback (#582 regression fix).
-    assert result["success"] is True
-    assert result["rolled_back"] is True
+    assert result["success"] is False
+    assert result["rolled_back"] is False
     assert result["prototype_user_type_residue"] is True
-    assert result["results"][0]["status"] == "verified"
     assert "has_user_type" in result["message"]
-    assert "reverted" in result["message"]
 
 
-def test_preview_proto_set_with_prior_user_type_reverts_cleanly(monkeypatch):
-    """Negative control: a function that ALREADY had a user prototype reverts
-    cleanly -- restoring its genuine override is correct, not residue (#582)."""
+def test_apply_failure_with_proto_on_auto_discloses_residue(monkeypatch):
+    """The apply-failure path (a later op raised during apply) must ALSO disclose
+    proto residue and treat it as a failed rollback -- it previously reported
+    status 'reverted'/rolled_back True with no disclosure at all (#630)."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    me = bridge.mutation_engine
     fn = _FakeFunction(0x401000, "f")
-    fn.set_user_type("int32_t()")  # genuine prior user prototype
     bv = _FakeMutationBV(functions=[fn])
 
     def apply(bv_, op, restores=None):
+        if op["op"] == "boom":
+            raise bridge.OperationFailure("unsupported", "nope", requested={})
         fn.set_user_type("uint64_t f(int32_t a)")
-        restores.append(lambda: fn.set_user_type("int32_t()"))
+        restores.append(lambda: fn.set_auto_type("int32_t()"))
         return {"op": "set_prototype", "address": "0x401000",
-                "before_has_user_type": True, "status": "applied", "requested": {}}
+                "before_has_user_type": False, "requested": {}}
 
-    _mutation_with_stubs(
-        monkeypatch, bridge, instance, bv,
-        apply=apply,
-        verify=lambda bv_, result: {**result, "status": "verified"},
-    )
+    _mutation_with_stubs(monkeypatch, bridge, instance, bv, apply=apply)
 
-    result = instance._mutation("active", True, [{"op": "set_prototype"}])
+    result = instance._mutation("active", False, [{"op": "set_prototype"}, {"op": "boom"}])
 
-    assert result["success"] is True
-    assert result["rolled_back"] is True
-    assert result["message"] == "Preview verified and reverted."
-    # No residue disclosure: re-asserting a genuine prior override is correct.
-    assert "prototype_user_type_residue" not in result
+    assert fn.has_user_type is True
+    assert result["success"] is False
+    assert result["rolled_back"] is False
+    assert result["prototype_user_type_residue"] is True
+    assert result["results"][0]["status"] == "rollback_failed"
+    assert "has_user_type" in result["message"]
 
 
 def test_preview_locals_only_batch_reports_no_proto_residue(monkeypatch):

@@ -673,12 +673,17 @@ def _mark_unverified_results(
     later op failed, so the old generic ``unsupported`` was a lie (#118).
     ``reverted`` = cleanly rolled back (not a failure); ``rollback_failed`` =
     the revert itself failed, so the op may still be applied (a real failure
-    state, so it stays in ``FAILED_MUTATION_STATUSES``)."""
+    state, so it stays in ``FAILED_MUTATION_STATUSES``).
+
+    A genuine ``noop`` op (its requested state was already satisfied) changed
+    nothing, so a rollback leaves it exactly as observed -- keep it ``noop`` (#630)
+    rather than restamping it as reverted/rollback_failed and corrupting counts."""
     annotated = []
     for result in results:
         item = dict(result)
-        item["status"] = status
-        item["message"] = message
+        if item.get("status") != "noop":
+            item["status"] = status
+            item["message"] = message
         annotated.append(item)
     return annotated
 
@@ -689,11 +694,15 @@ def _has_failed_results(ctx, results: list[dict[str, Any]]) -> bool:
 
 
 
-# Success/in-progress per-op statuses that a full batch revert invalidates: once
-# the batch is rolled back these ops are no longer live, so they must be
-# re-stamped honestly (#602). A real failure status (verification_failed,
-# unsupported, ...) is left intact -- it is the reason for the rollback.
-_SUCCESS_CLASS_STATUSES = {"verified", "noop", "applied"}
+# Per-op statuses that a full batch revert invalidates: once the batch is rolled
+# back these ops are no longer live, so they must be re-stamped honestly (#602).
+# ``noop`` is DELIBERATELY excluded (#630): a genuine no-op op (its requested
+# state was already satisfied) changed nothing, so a rollback leaves it exactly
+# as observed -- restamping it "reverted"/"rollback_failed" would corrupt the
+# per-op status and the summary counts. A real failure status
+# (verification_failed, unsupported, ...) is likewise left intact -- it is the
+# reason for the rollback.
+_SUCCESS_CLASS_STATUSES = {"verified", "applied"}
 
 
 def _restamp_reverted_siblings(
@@ -720,6 +729,45 @@ def _restamp_reverted_siblings(
         else:
             output.append(item)
     return output
+
+
+def _unrevertible_preview_prototypes(ctx, bv, operations) -> list[str]:
+    """Names of functions a ``--preview`` set_prototype would pin ``has_user_type``
+    on while they carry NO user type today (#630).
+
+    Setting a prototype routes through ``set_user_type``, which pins
+    ``BNFunctionHasUserType``. Binary Ninja exposes NO API to clear it: verified
+    live on BN 5.4, ``set_auto_type`` and ``revert_undo_actions`` both restore the
+    prototype VALUE but leave the flag set, ``has_user_type`` has no setter, and
+    there is no ``delete_user_type``. The flag is behaviorally meaningful -- once
+    set, analysis will not re-derive the signature -- so it is NOT value-neutral
+    metadata. A ``--preview`` promises a clean, non-destructive revert, which is
+    impossible for these ops, so the batch is REFUSED before any mutation (leaving
+    the view pristine) rather than applied and then reported as a false clean
+    rollback. A function that already has a user type is fine: re-asserting its
+    genuine override on revert is correct, not residue. Detection mirrors
+    ``_op_set_prototype``'s change check (resolve + parse, read-only); a
+    resolution/parse failure is left for the apply path to surface with its
+    actionable error."""
+    flagged: list[str] = []
+    for op in operations:
+        if not isinstance(op, dict):
+            continue
+        if (op.get("op") or "rename_symbol") != "set_prototype":
+            continue
+        try:
+            fn = ctx._find_function(bv, op["identifier"])
+        except Exception:
+            continue
+        if fn is None or bool(getattr(fn, "has_user_type", False)):
+            continue
+        try:
+            expected_type, _ = _parse_type_or_hint(ctx, bv, op, op["prototype"], label="prototype")
+        except Exception:
+            continue
+        if str(fn.type) != str(expected_type):
+            flagged.append(str(getattr(fn, "name", None) or op.get("identifier")))
+    return flagged
 
 
 def _prototype_user_type_residue(ctx, bv, results: list[dict[str, Any]]) -> bool:
@@ -938,12 +986,21 @@ def _verify_tag_add(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
             present = any(t.type.name == type_name and t.data == data
                           for t in bv.get_tags_at(addr, auto=False))
         else:
-            # address scope: find the tag via the functions CONTAINING the
-            # stored address rather than re-resolving the (possibly renamed)
-            # function by name (#621). The tag address need not be the entry.
-            present = any(t.type.name == type_name and t.data == data
-                          for fn in bv.get_functions_containing(addr)
-                          for t in fn.get_tags_at(addr, auto=False))
+            # address scope: verify against the EXACT function the tag was added
+            # to (its recorded stable start address), not "any function containing
+            # addr" -- overlapping functions could otherwise let a match on a
+            # DIFFERENT function pass (#630). Fall back to the containing-functions
+            # sweep only for older result dicts that predate function_start (#621).
+            fn_start = item.get("function_start")
+            if fn_start is not None:
+                fn = bv.get_function_at(_parse_address(fn_start))
+                present = fn is not None and any(
+                    t.type.name == type_name and t.data == data
+                    for t in fn.get_tags_at(addr, auto=False))
+            else:
+                present = any(t.type.name == type_name and t.data == data
+                              for fn in bv.get_functions_containing(addr)
+                              for t in fn.get_tags_at(addr, auto=False))
     item["observed"] = {"present": present}
     if not present:
         raise OperationFailure(
@@ -964,13 +1021,18 @@ def _verify_tag_remove(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
     still_present = []
     for tgt in item["targets"]:
         if tgt["scope"] == "function":
-            # Prefer the stored start address (stable across a same-batch
-            # rename, #621); fall back to the name only for older result dicts
-            # that predate the address field.
-            fn = None
+            # Resolve the EXACT function by its stored start address (stable
+            # across a same-batch rename, #621). Only fall back to the name for
+            # older result dicts that predate the address field -- NOT when the
+            # stored address is present but resolves to nothing: a function gone
+            # from its start address has no function-scope tags left, so the
+            # removal verifies rather than matching a different function by name
+            # (#630).
             if tgt.get("address") is not None:
                 fn = bv.get_function_at(_parse_address(tgt["address"]))
-            if fn is None:
+                if fn is None:
+                    continue  # function gone -> its function tag cannot remain
+            else:
                 fn = ctx._find_function(bv, tgt["function"])
             ids = {str(t.id) for t in fn.get_function_tags(auto=False)}
         elif tgt["scope"] == "data":
@@ -1587,8 +1649,8 @@ def _find_var_for_restore(ctx, fn, identifier, storage, is_parameter):
 
 
 
-def _capture_local_var_snapshots(ctx, bv, functions) -> dict[int, dict[int, tuple[str, Any]]]:
-    """Snapshot every identifiable local's (name, type) per affected function.
+def _capture_local_var_snapshots(ctx, bv, functions) -> dict[int, dict[int, tuple[str, Any, bool]]]:
+    """Snapshot every identifiable local's (name, type, was_user) per function.
 
     BN's create_user_var/set_user_type PROPAGATE a user name/type onto
     aliased variables -- naming a stack var also names the register that
@@ -1597,16 +1659,26 @@ def _capture_local_var_snapshots(ctx, bv, functions) -> dict[int, dict[int, tupl
     per-op explicit restore (_run_local_restores) never reverts them, and a
     --preview or a rolled-back batch would leave them modified. Snapshotting
     the whole canonical set lets _restore_local_var_drift put every drifted
-    local back, not just the targeted one."""
-    snapshots: dict[int, dict[int, tuple[str, Any]]] = {}
+    local back, not just the targeted one.
+
+    ``was_user`` records each local's AUTO/USER provenance BEFORE apply so the
+    drift restore can pick the RIGHT inverse (#630): an AUTO local that BN
+    propagated a USER override onto must be un-pinned with ``delete_user_var``,
+    NOT re-pinned with ``create_user_var`` -- the latter restores the displayed
+    value but permanently stamps the var USER, so it comes back USER after a
+    preview/rollback that claimed a clean revert. Absent a way to read
+    provenance (exotic doubles), default USER so the value is at least replayed."""
+    snapshots: dict[int, dict[int, tuple[str, Any, bool]]] = {}
     for fn in functions:
-        entries: dict[int, tuple[str, Any]] = {}
+        entries: dict[int, tuple[str, Any, bool]] = {}
+        has_prov = hasattr(fn, "is_var_user_defined")
         try:
             for var, _ in vars_mod._iter_canonical_variables(fn):
                 identifier = vars_mod._variable_identifier(var)
                 if identifier is None:
                     continue  # can't re-resolve it after reanalysis
-                entries[identifier] = (str(var.name), var.type)
+                was_user = bool(fn.is_var_user_defined(var)) if has_prov else True
+                entries[identifier] = (str(var.name), var.type, was_user)
         except Exception as exc:
             bn.log_error(f"BN Agent Bridge: local var snapshot failed for {hex(int(fn.start))}: {exc!r}")
         snapshots[int(fn.start)] = entries
@@ -1639,20 +1711,57 @@ def _restore_local_var_drift(ctx, bv, snapshots) -> bool:
             ok = False
             bn.log_error(f"BN Agent Bridge: var-drift re-enumeration failed for {hex(int(fn_start))}: {exc!r}")
             continue
+        has_prov = hasattr(rfn, "is_var_user_defined")
         for var, _ in current:
             identifier = vars_mod._variable_identifier(var)
             if identifier is None or identifier not in entries:
                 continue
-            snap_name, snap_type = entries[identifier]
-            if str(var.name) == snap_name and str(var.type) == str(snap_type):
+            snap = entries[identifier]
+            snap_name, snap_type = snap[0], snap[1]
+            snap_was_user = snap[2] if len(snap) > 2 else True
+            drifted = not (str(var.name) == snap_name and str(var.type) == str(snap_type))
+            if snap_was_user:
+                # Genuine prior USER local: re-assert it exactly if it drifted.
+                if not drifted:
+                    continue
+                try:
+                    rfn.create_user_var(var, snap_type, snap_name)
+                    touched = True
+                except Exception as exc:
+                    ok = False
+                    bn.log_error(
+                        "BN Agent Bridge: failed to restore a propagated local "
+                        f"(identifier {identifier}) in {hex(int(fn_start))}: {exc!r}"
+                    )
+                continue
+            # Snapshot AUTO. A residual USER override -- BN propagated it onto this
+            # aliased sibling and neither the undo journal nor the targeted restore
+            # cleared it -- must be DROPPED so analysis re-derives the AUTO value.
+            # Re-pinning it with create_user_var (the pre-#630 behavior) would
+            # leave the var USER while claiming a clean revert. If the var is still
+            # AUTO, any name/type difference is BN's own re-derivation (phantom
+            # drift, #581) -- leave it untouched.
+            cur_is_user = bool(rfn.is_var_user_defined(var)) if has_prov else False
+            if not cur_is_user:
+                continue
+            delete = getattr(rfn, "delete_user_var", None)
+            if delete is None:
+                # No inverse to un-pin the propagated override: honest failure
+                # rather than a create_user_var re-pin that fakes a clean revert.
+                ok = False
+                bn.log_error(
+                    "BN Agent Bridge: cannot un-pin AUTO local "
+                    f"(identifier {identifier}) in {hex(int(fn_start))}: "
+                    "delete_user_var unavailable; view may be left modified"
+                )
                 continue
             try:
-                rfn.create_user_var(var, snap_type, snap_name)
+                delete(var)
                 touched = True
             except Exception as exc:
                 ok = False
                 bn.log_error(
-                    "BN Agent Bridge: failed to restore a propagated local "
+                    "BN Agent Bridge: failed to un-pin a propagated AUTO local "
                     f"(identifier {identifier}) in {hex(int(fn_start))}: {exc!r}"
                 )
     if touched:
@@ -1724,6 +1833,25 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
             "the instance. Run `bn refresh` first.",
             requested={"op": "mutation", "operations": len(operations)},
         )
+    # #630: a --preview of a prototype set on a function with no user type would
+    # pin has_user_type, which BN cannot clear -- so the preview could not honor
+    # its non-destructive contract. Refuse BEFORE touching the view (pristine, no
+    # residue) rather than apply and report a false clean rollback. Non-preview
+    # applies are unaffected: committing a prototype SHOULD leave it a user type.
+    if preview:
+        unrevertible = _unrevertible_preview_prototypes(ctx, bv, operations)
+        if unrevertible:
+            names = ", ".join(unrevertible)
+            raise OperationFailure(
+                "unsupported",
+                f"Cannot --preview a prototype change on {names}: setting a "
+                "prototype pins the function's has_user_type flag and Binary "
+                "Ninja exposes no API to clear it, so the preview could not be "
+                "cleanly reverted (it would leave the view modified). Re-run "
+                "without --preview to apply the change, or preview a function "
+                "that already has a user-defined prototype.",
+                requested={"op": "set_prototype", "functions": unrevertible},
+            )
     affected = _guess_affected_functions(ctx, bv, operations)
     # Partition for blast-radius attribution: a type op's reach is "functions
     # referencing the type"; a direct op targets one function. direct_starts are
@@ -1761,11 +1889,26 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
         undo_ok = _revert_undo_safely(ctx, bv, state)
         restore_ok = _run_local_restores(ctx, bv, restores)
         drift_ok = _restore_local_var_drift(ctx, bv, var_before)
-        reverted = undo_ok and restore_ok and drift_ok
-        if reverted:
+        # #630: an already-applied set_prototype on an AUTO function leaves an
+        # unclearable has_user_type override after revert. That is real residue,
+        # not a clean revert, so it must fail and be disclosed here too -- the
+        # apply-failure path previously reported status "reverted"/rolled_back
+        # True with no disclosure at all.
+        proto_residue = _prototype_user_type_residue(ctx, bv, results)
+        values_reverted = undo_ok and restore_ok and drift_ok
+        reverted = values_reverted and not proto_residue
+        if values_reverted and not proto_residue:
             message = "Rolled back before post-state verification because an operation failed to apply."
             result_note = "Rolled back before post-state verification."
             result_status = "reverted"
+        elif values_reverted and proto_residue:
+            message = (
+                "An operation failed to apply; the applied operations were rolled "
+                "back but BN cannot clear the has_user_type override an applied "
+                "prototype set, so the view is left modified."
+            )
+            result_note = "Rolled back, but an unclearable has_user_type override remains."
+            result_status = "rollback_failed"
         else:
             message = (
                 "An operation failed to apply AND the rollback itself failed; "
@@ -1773,7 +1916,7 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
             )
             result_note = "Rollback failed; this operation may still be applied."
             result_status = "rollback_failed"
-        return {
+        result = {
             "preview": preview,
             "success": False,
             "committed": False,
@@ -1788,6 +1931,9 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
                 "reflowed": 0,
             },
         }
+        if proto_residue:
+            result["prototype_user_type_residue"] = True
+        return result
 
     try:
         bv.update_analysis_and_wait()
@@ -1840,20 +1986,26 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
                         f"BN Agent Bridge: reanalysis before var-drift check failed: {exc!r}"
                     )
             drift_ok = _restore_local_var_drift(ctx, bv, var_before)
-            # #582: a proto set on a function that had NO prior user type pins
+            # #630: a proto set on a function that had NO prior user type pins
             # has_user_type, and neither BN's undo nor set_auto_type clears the
-            # flag (verified live on BN 5.4). Detect that residue so a --preview
-            # DISCLOSES it in the message instead of falsely claiming a pristine
-            # revert -- but do NOT fold it into `restored`. The prototype VALUE
-            # round-trips exactly (set_auto_type restores it); only the invisible
-            # provenance flag persists, and it is unclearable through any BN API.
-            # Failing the batch on it (the original #582 code) turned the common
-            # AUTO-typed `proto set --preview` into an exit-3 that left the view
-            # dirty and broke test_unnamed_params_verify_via_preview. `restored`
-            # tracks the reversible operations only; residue is surfaced separately.
+            # flag (verified live on BN 5.4) -- there is no BN API to clear it.
+            # has_user_type is behaviorally meaningful (once set, analysis will
+            # not re-derive the signature), NOT value-neutral metadata, so residue
+            # means the rollback is INCOMPLETE -- fold it into `restored` so the
+            # batch reports success:false / rolled_back:false and is marked dirty,
+            # never a false clean rollback. A --preview never reaches here for the
+            # AUTO-prototype case (it is refused before any mutation); this covers
+            # the INVOLUNTARY rollback of a live batch (a sibling op failed
+            # verification) that included a proto-set-on-AUTO op.
+            #
+            # `values_reverted` (the reversible ops) is tracked separately so the
+            # per-op restamp still reports a rename/local that DID revert as
+            # "reverted", not "rollback_failed".
             proto_residue = _prototype_user_type_residue(ctx, bv, results)
-            restored = undo_ok and restore_ok and drift_ok
+            values_reverted = undo_ok and restore_ok and drift_ok
+            restored = values_reverted and not proto_residue
         else:
+            values_reverted = True
             bv.commit_undo_actions(state)
 
         # Build the per-op output only once the revert outcome is known. On
@@ -1867,45 +2019,45 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
         elif preview:
             output_results = annotated_results
         else:
-            output_results = _restamp_reverted_siblings(ctx, annotated_results, restored)
+            output_results = _restamp_reverted_siblings(ctx, annotated_results, values_reverted)
         message = None
         if preview:
-            if not restored:
+            if not values_reverted:
                 message = (
                     "Preview verified, but reverting a non-journaled change "
                     "(local variable or prototype) failed; the view may be left modified."
                 )
             elif proto_residue:
-                # The value reverted cleanly; only the has_user_type flag persists
-                # (BN exposes no API to clear it). Disclose rather than claim a
-                # pristine revert, but this is NOT a failure -- the prototype text
-                # is byte-identical to before (#582).
+                # Value reverted, but has_user_type stuck (BN has no API to clear
+                # it), so the revert is INCOMPLETE and the view is left modified.
                 message = (
                     "Preview verified and the prototype value was reverted, but the "
-                    "function's has_user_type override cannot be cleared (a Binary "
-                    "Ninja limitation); BN will no longer re-derive that signature."
+                    "function's has_user_type override could NOT be cleared (Binary "
+                    "Ninja exposes no API to clear it); the view is left modified and "
+                    "BN will no longer re-derive that signature."
                 )
             else:
                 message = "Preview verified and reverted."
         elif failed:
-            if not restored:
+            if not values_reverted:
                 message = (
                     "Live-session verification failed AND reverting a non-journaled change "
                     "(local variable or prototype) failed; the view may be left modified."
                 )
             elif proto_residue:
                 message = (
-                    "Rolled back because live-session verification failed; note that BN "
-                    "cannot clear the has_user_type override the applied prototype set."
+                    "Live-session verification failed; the prototype value was rolled "
+                    "back but BN cannot clear the has_user_type override the applied "
+                    "prototype set, so the view is left modified."
                 )
             else:
                 message = "Rolled back because live-session verification failed."
         else:
             message = "Applied and verified in the live Binary Ninja session."
-        # A preview whose non-journaled restore failed left the view
-        # modified -- that is not a success, even if every operation
-        # verified. Automation keys off `success`; `restored` is only
-        # False on the preview/failed paths.
+        # A preview/rollback whose non-journaled restore failed OR that left an
+        # unclearable has_user_type override behind did NOT cleanly revert -- that
+        # is not a success, even if every operation verified. Automation keys off
+        # `success`; `restored` is only False on the preview/failed paths.
         result = {
             "preview": preview,
             "success": (not failed) and restored,
@@ -1919,9 +2071,8 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
         if preview or failed:
             result["rolled_back"] = restored
         if proto_residue:
-            # Structured disclosure: `success` stays True (the value reverted), so
-            # automation that only keys off `success` still needs a signal that an
-            # unclearable has_user_type override was left behind (#582).
+            # Structured disclosure of the unclearable has_user_type override, in
+            # addition to success:false / rolled_back:false (#630).
             result["prototype_user_type_residue"] = True
         return result
     except Exception as exc:
@@ -2095,6 +2246,11 @@ def _op_tag_add(ctx, bv, op: dict[str, Any]):
     tag = _find_new_tag(before_ids, fn.get_tags_at(addr, auto=False))
     return {"op": "tag_add", "tag_type": type_name, "data": data, "scope": "address",
             "address": hex(addr), "function": fn.name,
+            # Record the EXACT function the tag was added to (its stable start
+            # address) so verification checks that function, not "any function
+            # containing addr" -- overlapping functions could otherwise let a
+            # match on a DIFFERENT function pass verification (#630).
+            "function_start": hex(int(fn.start)),
             "tag_id": str(tag.id) if tag is not None else None,
             "message": f"Added tag {type_name!r} at {hex(addr)} in {fn.name}.",
             "requested": requested}
