@@ -613,6 +613,142 @@ def test_forward_unkeyable_store_dest_emits_coarse_memory_leaf(models):
     assert any(l["kind"] == "coarse_memory_store" for l in result["leaves"]), result["leaves"]
 
 
+# --------------------------------------------------------------------------
+# #577 (forward): the MODELED-call branch is the one place that emitted no
+# honesty signal when a modeled sink's OWN declared arg index is out of range
+# of the params BN recovered (an under-recovered arity -- e.g. an ARM-Thumb
+# `j_memcpy` typed `memcpy(int32_t)` that drops the length register). The
+# in-range sink loop `if argidx < len(params)` had no `else`, so a tainted
+# value passed there vanished and a zero-sink run falsely reported all-clear.
+# `backward` RAISES on this exact condition; `forward` swallowed it. The reg
+# bridge (`_reaching_arg_seeds_via_reg`, verified live) is stubbed here to
+# supply the dropped arg's MLIL var, mirroring the #433 backward tests.
+# --------------------------------------------------------------------------
+
+def _underrecovered_forward_sink_program(nparams=1):
+    """handler(n): len#1 = n#0 + 1; dst#1 = &dst; memcpy(<nparams args>).
+
+    With ``nparams=1`` the MLIL call exposes ONLY arg 0 (dst); memcpy's model
+    declares the length at arg 2, which is then out of range -- the shape an
+    under-recovered thunk prototype produces. ``n`` is param 0 (seeded), so
+    ``len#1`` is tainted-derived. Returns ``(func, len1)`` so the test can hand
+    ``len#1`` back as the register bridge's 'recovered' dropped-arg var."""
+    n = FVar("n"); length = FVar("len"); dst = FVar("dst")
+    n0 = FSSA(n, 0); len1 = FSSA(length, 1); dst1 = FSSA(dst, 1)
+    MEMCPY = 0x900
+    all_params = [
+        FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1]),
+        FExpr("MLIL_VAR_SSA", "&buf", reads=[]),
+        FExpr("MLIL_VAR_SSA", "len#1", reads=[len1]),
+    ]
+    call_reads = [dst1] if nparams == 1 else [dst1] + ([len1] if nparams >= 3 else [])
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "len#1 = n#0 + 1", reads=[n0], writes=[len1]),
+        FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "dst#1 = &dst", writes=[dst1],
+               src=FExpr("MLIL_ADDRESS_OF", "&dst", src=dst)),
+        FInstr(2, 0x18, "MLIL_CALL_SSA", "memcpy(...)", reads=call_reads, writes=[],
+               dest=FExpr("MLIL_CONST_PTR", hex(MEMCPY), constant=MEMCPY),
+               params=all_params[:nparams]),
+    ]
+    func = FFunc("handler", 0x10, FSSAFunc(instrs), params=[n])
+    return func, len1
+
+
+def test_forward_modeled_sink_arg_out_of_range_emits_under_recovered_leaf(models, monkeypatch):
+    # Positive: memcpy's length (arg 2) is out of range against the 1-param call,
+    # but a tainted value reaches it through arg register r2. The forward walk
+    # must emit a blocking `arg_under_recovered` leaf so the honesty gate
+    # withholds -- instead of silently skipping the invisible arg and reporting a
+    # clean zero-sink all-clear.
+    func, len1 = _underrecovered_forward_sink_program(nparams=1)
+    call_ins = func.mlil.ssa_form.instructions[2]
+    bv = FBV({0x900: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    monkeypatch.setattr(engine, "_reaching_arg_seeds_via_reg",
+                        lambda f, sites, idx: ("r2", [(len1, call_ins)]),
+                        raising=False)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert result["reached_sinks"] == [], result["reached_sinks"]
+    leaf = next((l for l in result["leaves"] if l["kind"] == "arg_under_recovered"), None)
+    assert leaf is not None, result["leaves"]
+    # Leaf conforms to the shared `arg_under_recovered` contract: `callee` is a
+    # {name,...} dict and the dropped index lives in `dropped_args` -- so the
+    # default text renderer does not crash on it (#577 regression).
+    assert isinstance(leaf["callee"], dict), leaf
+    assert leaf["callee"]["name"] == "memcpy"
+    assert leaf["dropped_args"] == [2]
+    assert leaf["recovered_params"] == 1
+    # The whole result renders through the default `bn taint forward` text path
+    # without raising (a string callee crashed `_leaf_group_key`).
+    from bn.formatters import _render_taint_text
+    rendered = _render_taint_text(result)
+    assert "arg_under_recovered" in rendered
+    assert "memcpy" in rendered
+    diag = result.get("diagnostics") or {}
+    assert diag.get("safe_to_report_all_clear") is False, diag
+
+
+def test_forward_modeled_sink_arg_out_of_range_no_leaf_when_untainted(models, monkeypatch):
+    # Negative control: same under-recovered shape, but the register bridge's
+    # recovered dropped-arg var is NOT tainted -- a merely-under-recovered but
+    # quiet sink must not cry wolf. No leaf, and the gate stays all-clear.
+    func, len1 = _underrecovered_forward_sink_program(nparams=1)
+    call_ins = func.mlil.ssa_form.instructions[2]
+    untainted = FSSA(FVar("cst"), 1)  # a value never in the tainted set
+    bv = FBV({0x900: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    monkeypatch.setattr(engine, "_reaching_arg_seeds_via_reg",
+                        lambda f, sites, idx: ("r2", [(untainted, call_ins)]),
+                        raising=False)
+    # seed a var that never reaches the call so nothing is tainted at the memcpy
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    # param 0 (n) IS tainted and flows to len#1, but the bridge here returns a
+    # DIFFERENT (untainted) recovered var, so the out-of-range branch must stay
+    # silent -- proves the leaf is gated on real taint, not on mere arity.
+    assert not any(l["kind"] == "arg_under_recovered" for l in result["leaves"]), result["leaves"]
+
+
+def test_forward_modeled_sink_full_arity_untainted_stays_all_clear(models):
+    # Negative control (a): FULL recovered arity, untainted length -> the
+    # out-of-range branch never fires, no leaf, all-clear True as today.
+    func, _ = _underrecovered_forward_sink_program(nparams=3)
+    bv = FBV({0x900: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    # seed a param that does NOT flow into the length: taint `dst`? there is no
+    # such param; instead seed nothing-relevant by tainting a var unused at the
+    # sink. Use a locator on param 0 but rewire so len#1 is not derived from it.
+    func2 = FFunc("handler", 0x10, FSSAFunc([
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "len#1 = 0x8", writes=[FSSA(FVar("len"), 1)]),
+        FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "dst#1 = &dst", writes=[FSSA(FVar("dst"), 1)],
+               src=FExpr("MLIL_ADDRESS_OF", "&dst", src=FVar("dst"))),
+        FInstr(2, 0x18, "MLIL_CALL_SSA", "memcpy(dst#1, &buf, len#1)", writes=[],
+               reads=[FSSA(FVar("dst"), 1), FSSA(FVar("len"), 1)],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_VAR_SSA", "dst#1", reads=[FSSA(FVar("dst"), 1)]),
+                       FExpr("MLIL_VAR_SSA", "&buf", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "len#1", reads=[FSSA(FVar("len"), 1)])]),
+    ]), params=[FVar("n")])
+    result = engine.forward(func2, [te.parse_locator("param:0")])
+    assert result["reached_sinks"] == [], result["reached_sinks"]
+    assert not any(l["kind"] == "arg_under_recovered" for l in result["leaves"]), result["leaves"]
+    diag = result.get("diagnostics") or {}
+    assert diag.get("safe_to_report_all_clear") is True, diag
+
+
+def test_forward_modeled_sink_full_arity_tainted_reports_sink_not_leaf(models):
+    # Negative control (b): FULL recovered arity, tainted in-range length -> the
+    # normal reached_sinks path is unchanged (a real sink is reported), and the
+    # out-of-range under-recovered leaf is NOT emitted.
+    func, _ = _underrecovered_forward_sink_program(nparams=3)
+    bv = FBV({0x900: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert len(result["reached_sinks"]) == 1, result["reached_sinks"]
+    assert result["reached_sinks"][0]["sink"]["callee"] == "memcpy"
+    assert result["reached_sinks"][0]["sink"]["tainted_arg_index"] == 2
+    assert not any(l["kind"] == "arg_under_recovered" for l in result["leaves"]), result["leaves"]
+
+
 def test_forward_no_flow_no_false_positive(models):
     # a function with no source->sink path must report zero sinks
     a = FVar("a"); r = FVar("r")

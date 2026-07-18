@@ -3190,6 +3190,68 @@ class TaintEngine:
                 if leaf not in leaves:
                     leaves.append(leaf)
 
+            def _note_under_recovered_sink_arg(argidx: int) -> None:
+                # #577: a modeled sink's OWN declared arg index (e.g. memcpy's
+                # length at arg 2) sits beyond the params BN recovered for this
+                # call -- an under-recovered arity, the shape an ARM-Thumb
+                # `j_memcpy` typed `memcpy(int32_t)` produces by dropping the
+                # length register. The in-range sink loop below never inspects
+                # it, and the modeled branch's trailing `continue` bypasses every
+                # other honesty path, so a tainted value passed there vanishes and
+                # a zero-sink run falsely reports all-clear. `backward` RAISES on
+                # this exact condition; the forward walk must at least disclose it.
+                # Recover the dropped arg through its calling-convention register
+                # (the #433 reg bridge) and, ONLY when it actually carries taint,
+                # emit a blocking `arg_under_recovered` leaf so the existing leaves
+                # gate withholds. Gating on real taint keeps a merely-under-
+                # recovered but quiet sink from crying wolf on every function that
+                # calls it. Deduped per call site by leaf identity.
+                try:
+                    reg, seeds = self._reaching_arg_seeds_via_reg(func, [ins], argidx)
+                except Exception:
+                    return
+                if not seeds:
+                    return
+
+                def _carries_taint(v: Any) -> bool:
+                    k = var_key(v); ver = getattr(v, "version", None)
+                    if (k, ver) in tainted or (k, None) in tainted:
+                        return True
+                    return self._var_buffer_tainted(ssaf, v, tainted, set(), 0)
+
+                if not any(_carries_taint(v) for v, _site in seeds):
+                    return
+                # Conform to the established `arg_under_recovered` leaf contract
+                # (see `_arg_under_recovered_leaf`): `callee` is a {name,address}
+                # dict and the dropped index lives in a `dropped_args` list, so the
+                # text renderer (`_leaf_group_key`/`_render_leaf_line`) and the JSON
+                # consumers treat this leaf identically to the descend-side one. A
+                # string callee here crashes the default `bn taint forward` text
+                # path (#577 renderer regression).
+                callee_name = mkey or name or "?"
+                callee: dict[str, Any] = {"name": callee_name}
+                if site_taddr is not None:
+                    callee["address"] = hex(int(site_taddr))
+                leaf = {
+                    "kind": "arg_under_recovered",
+                    "address": hex(int(getattr(ins, "address", 0))),
+                    "callee": callee,
+                    "recovered_params": len(params),
+                    "dropped_args": [argidx],
+                    "register": reg,
+                    "note": (
+                        f"a tainted value reaches arg {argidx} of the modeled sink "
+                        f"{callee_name} through its ABI register {reg}, but Binary "
+                        f"Ninja recovered only {len(params)} parameter(s) for this "
+                        f"call, so the sink's declared arg index is out of range and "
+                        f"the tainted flow into it was NOT reported -- a 'no sinks "
+                        f"reached' result here is not proof of safety. Recover the "
+                        f"real prototype and apply `bn proto set {callee_name} "
+                        f"\"<prototype>\"`, then re-run this taint query."),
+                }
+                if leaf not in leaves:
+                    leaves.append(leaf)
+
             sink = model.get("sink")
             # opt-in sinks (e.g. file_write) stay silent unless their gate was
             # enabled for this run; still a "modeled" call, so no fallback noise.
@@ -3331,6 +3393,13 @@ class TaintEngine:
                                         "corroborate with `taint backward`",
                                     }
                                 findings.append(self._make_finding(ins, mkey or name, argidx, eff_sink, ht, why))
+                    else:
+                        # #577: the sink's OWN declared arg index is out of range
+                        # of the recovered params -- disclose the under-recovered
+                        # arity instead of silently skipping it (which would let a
+                        # false all-clear survive when a tainted value is passed
+                        # there through the dropped ABI register).
+                        _note_under_recovered_sink_arg(argidx)
             for rule in model.get("propagates") or []:
                 to = rule.get("to")
                 frm = rule.get("from")
