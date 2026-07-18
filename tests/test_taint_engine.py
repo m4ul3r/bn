@@ -5735,9 +5735,11 @@ def _indirect_nonrecv_pointer_arg_func():
     # parse_pkt(ctx, pkt) where the buffer pointer `pkt = [G]` is loaded from a
     # global slot. parse_pkt is a CUSTOM parser (not recv-family), so the
     # recv-buffer misanchored leaf never fires -- only the #193 indirect-load
-    # caveat applies. unknown_call_policy="stop" keeps the unmodeled parse_pkt
-    # call from also escaping, so the indirect-slot leaf is the SOLE reason the
-    # gate must withhold.
+    # caveat applies. unknown_call_policy="stop" also emits its own
+    # unmodeled_callee leaf for the unmodeled parse_pkt call (F4/#576), so the
+    # indirect-slot leaf is not the sole withholding reason here -- this test's
+    # assertions target the source_seed_misanchored count specifically, not
+    # exclusivity of leaves.
     t = FVar("t"); t1 = FSSA(t, 1)
     instrs = [
         FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "t#1 = [G]", writes=[t1],
