@@ -25,7 +25,6 @@ API behaviour verified against /opt/binaryninja (see the design's spike):
   - expr ``.possible_values`` -> PossibleValueSet (``.type.name`` str)
 """
 from __future__ import annotations
-from __future__ import annotations
 
 from typing import Any
 
@@ -3901,6 +3900,13 @@ class TaintEngine:
                             leaves.append(leaf)
             if not changed:
                 break
+        else:
+            # #579 truncation honesty: the fixpoint exhausted `max_iters` WITHOUT
+            # a convergent `break` -- taint was still propagating on the final
+            # pass, so coverage is incomplete. Flag it so the zero-sink gate
+            # withholds the all-clear instead of reporting a silent (unsound)
+            # "no sinks reached" indistinguishable from a converged run.
+            self._truncated = True
 
         # #193 Part 1 honesty: for each registered recv-buffer slot that the fixpoint
         # did NOT correlate to a re-load, emit the deferred "may be missed" caveat --

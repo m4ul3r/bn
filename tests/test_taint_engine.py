@@ -5778,6 +5778,125 @@ def test_indirect_pointer_slot_nonrecv_arg_withholds_all_clear_193(models):
     assert "NOT an all-clear" in diag["all_clear_reason"]
 
 
+# --------------------------------------------------------------------------
+# #579 forward-fixpoint truncation honesty: exhausting max_iters (an
+# unconverged intraprocedural fixpoint) must set stats.truncated so the
+# zero-sink gate withholds the all-clear. Both halves get coverage: the
+# CONSUMER gate (forward_zero_diagnostics with truncated True/False) and the
+# PRODUCER (a real engine run whose reverse-ordered copy chain needs more
+# passes than a small max_iters budget to reach its would-be sink).
+# --------------------------------------------------------------------------
+
+def test_truncated_run_withholds_all_clear_579():
+    # #579 consumer positive control (zero coverage before this): a zero-sink
+    # run flagged truncated=True must fold safe_to_report_all_clear=False with a
+    # reason naming truncation -- an unconverged fixpoint is incomplete coverage,
+    # never an all-clear. Empty leaves/assumptions isolates truncation as the
+    # SOLE withholding reason.
+    sub = {"leaves": [], "assumptions": [], "diag": {"tainted_values": 3}}
+    diag = te.forward_zero_diagnostics(sub, seed_callsites=1, truncated=True)
+
+    assert diag["safe_to_report_all_clear"] is False
+    assert "truncated" in diag["all_clear_reason"]
+    assert "NOT an all-clear" in diag["all_clear_reason"]
+
+
+def test_untruncated_run_does_not_over_withhold_all_clear_579():
+    # #579 consumer negative control: the SAME zero-leaf/zero-assumption sub with
+    # truncated=False (a genuinely converged run) must STILL be an all-clear --
+    # the truncation gate must not over-trigger on ordinary convergent functions.
+    sub = {"leaves": [], "assumptions": [], "diag": {"tainted_values": 3}}
+    diag = te.forward_zero_diagnostics(sub, seed_callsites=1, truncated=False)
+
+    assert diag["safe_to_report_all_clear"] is True
+
+
+def _reverse_ordered_copy_chain():
+    # A copy chain whose MLIL instruction order runs OPPOSITE to its dataflow
+    # order, so the intraprocedural fixpoint propagates exactly one hop per pass:
+    #
+    #   dataflow:  a(param) -> c0 -> c1 -> c2 -> c3 -> memcpy(dst, src, c3)
+    #
+    # Laid out in reverse, the memcpy (which reads the length c3) comes FIRST and
+    # the seed assignment (c0 = a) LAST, so pass k only taints c_{k-1}. Reaching
+    # the length arg therefore needs one pass per hop plus one for the sink -- a
+    # small max_iters budget exhausts before the would-be memcpy sink is hit.
+    a = FVar("a")
+    c0 = FVar("c0"); c1 = FVar("c1"); c2 = FVar("c2"); c3 = FVar("c3")
+    a0 = FSSA(a, 0)
+    c0_1 = FSSA(c0, 1); c1_1 = FSSA(c1, 1); c2_1 = FSSA(c2, 1); c3_1 = FSSA(c3, 1)
+    MEMCPY = 0x401080
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "0x401080(&dst, &src, c3#1)",
+               reads=[c3_1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", hex(MEMCPY), constant=MEMCPY),
+               params=[FExpr("MLIL_VAR_SSA", "&dst", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "&src", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "c3#1", reads=[c3_1])]),
+        FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "c3#1 = c2#1", reads=[c2_1], writes=[c3_1]),
+        FInstr(2, 0x18, "MLIL_SET_VAR_SSA", "c2#1 = c1#1", reads=[c1_1], writes=[c2_1]),
+        FInstr(3, 0x1c, "MLIL_SET_VAR_SSA", "c1#1 = c0#1", reads=[c0_1], writes=[c1_1]),
+        FInstr(4, 0x20, "MLIL_SET_VAR_SSA", "c0#1 = a#0", reads=[a0], writes=[c0_1]),
+        FInstr(5, 0x24, "MLIL_RET", "return", reads=[]),
+    ]
+    return FFunc("copy_chain", 0x10, FSSAFunc(instrs), params=[a]), MEMCPY
+
+
+def test_forward_max_iters_exhaustion_sets_truncated_579(models):
+    # #579 producer positive: a >budget reverse-ordered chain to a would-be
+    # memcpy length sink. Under a small max_iters the fixpoint exhausts WITHOUT
+    # converging (one hop per pass, budget < hop count), so it must report
+    # stats.truncated=True and, for the zero-sink outcome, withhold the
+    # all-clear -- instead of the silent false all-clear #579 describes.
+    func, memcpy_addr = _reverse_ordered_copy_chain()
+    bv = FBV({memcpy_addr: "memcpy"})
+    engine = te.TaintEngine(bv, models, max_iters=2)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+
+    assert result["reached_sinks"] == []               # sink not reached in budget
+    assert result["stats"]["truncated"] is True
+    diag = result["diagnostics"]
+    assert diag["safe_to_report_all_clear"] is False
+    assert "truncated" in diag["all_clear_reason"]
+
+
+def test_forward_same_chain_converges_under_full_budget_579(models):
+    # #579 companion (same IL, opposite verdict): the identical reverse-ordered
+    # chain under a budget large enough to converge DOES reach the memcpy length
+    # sink -- proving the truncation is a budget artifact, not a dead flow. Not a
+    # truncated run (it converged), so truncated must be False here.
+    func, memcpy_addr = _reverse_ordered_copy_chain()
+    bv = FBV({memcpy_addr: "memcpy"})
+    engine = te.TaintEngine(bv, models, max_iters=256)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+
+    assert len(result["reached_sinks"]) == 1
+    assert result["reached_sinks"][0]["sink"]["callee"] == "memcpy"
+    assert result["reached_sinks"][0]["sink"]["class"] == "overflow_len"
+    assert result["stats"]["truncated"] is False
+
+
+def test_forward_convergent_run_not_truncated_579(models):
+    # #579 producer negative control: an ordinary one-hop seed-to-nothing chain
+    # under the DEFAULT max_iters converges in two passes (break, not exhaust),
+    # so truncated must be False and the clean run stays an all-clear -- the fix
+    # must not over-trigger truncation on normal convergent functions.
+    a = FVar("a"); c0 = FVar("c0")
+    a0 = FSSA(a, 0); c0_1 = FSSA(c0, 1)
+    ssa = FSSAFunc([
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "c0#1 = a#0", reads=[a0], writes=[c0_1]),
+        FInstr(1, 0x14, "MLIL_RET", "return", reads=[]),
+    ])
+    func = FFunc("one_hop", 0x10, ssa, params=[a])
+    engine = te.TaintEngine(FBV({}), models)   # default max_iters=256
+
+    result = engine.forward(func, [te.parse_locator("param:0")])
+
+    assert result["reached_sinks"] == []
+    assert result["stats"]["truncated"] is False
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
 def test_taint_reaches_unlifted_instruction_withholds_all_clear_206(models):
     # #206/#562 residual 2 (positive): a tainted value that REACHES an unlifted/
     # unimplemented instruction passes through an op BN could not model -- a silent
