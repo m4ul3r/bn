@@ -688,6 +688,47 @@ def test_forward_modeled_sink_arg_out_of_range_emits_under_recovered_leaf(models
     assert diag.get("safe_to_report_all_clear") is False, diag
 
 
+def test_forward_under_recovered_sink_leaf_matches_established_schema_576(models, monkeypatch):
+    # #576 review: the forward modeled-sink `arg_under_recovered` leaf must match
+    # the established descend-side `_arg_under_recovered_leaf` schema EXACTLY --
+    # `callee` is ALWAYS {name, address} and the leaf ALWAYS carries BOTH
+    # `dropped_args` and `stack_dropped_args` (empty when none). The forward path
+    # previously omitted `callee['address']` on the common direct-call site (it was
+    # set only when a resolved-indirect target address was threaded) and never
+    # emitted `stack_dropped_args`, so a consumer keying on the shared schema saw a
+    # divergent leaf. Direct call => the address must be the resolved call target,
+    # not dropped.
+    func, len1 = _underrecovered_forward_sink_program(nparams=1)
+    call_ins = func.mlil.ssa_form.instructions[2]
+    bv = FBV({0x900: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    monkeypatch.setattr(engine, "_reaching_arg_seeds_via_reg",
+                        lambda f, sites, idx: ("r2", [(len1, call_ins)]),
+                        raising=False)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    leaf = next((l for l in result["leaves"] if l["kind"] == "arg_under_recovered"), None)
+    assert leaf is not None, result["leaves"]
+
+    # callee is ALWAYS a {name, address} dict, address = resolved direct target.
+    assert isinstance(leaf["callee"], dict)
+    assert set(leaf["callee"]) == {"name", "address"}, leaf["callee"]
+    assert leaf["callee"]["name"] == "memcpy"
+    assert leaf["callee"]["address"] == "0x900"        # the direct-call target
+    # BOTH arg lists are always present; this register-recovered arg is not stack.
+    assert leaf["dropped_args"] == [2]
+    assert leaf["stack_dropped_args"] == []
+
+    # Key-parity with the established descend-side leaf: the forward leaf must
+    # carry at least the same core schema keys (it may add extras like `register`).
+    established = engine._arg_under_recovered_leaf(call_ins, func, [1], 1)
+    # The gated helper may return None on some fakes; only compare when it emits.
+    if established is not None:
+        core = {"kind", "address", "callee", "recovered_params",
+                "dropped_args", "stack_dropped_args", "note"}
+        assert core <= set(leaf), sorted(set(established) - set(leaf))
+        assert set(established["callee"]) == set(leaf["callee"])
+
+
 def test_forward_modeled_sink_arg_out_of_range_no_leaf_when_untainted(models, monkeypatch):
     # Negative control: same under-recovered shape, but the register bridge's
     # recovered dropped-arg var is NOT tainted -- a merely-under-recovered but
@@ -6031,6 +6072,50 @@ def test_forward_convergent_run_not_truncated_579(models):
     assert result["reached_sinks"] == []
     assert result["stats"]["truncated"] is False
     assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_truncation_cause_distinguishes_fixpoint_from_depth_576(models):
+    # #576 review: fixpoint-exhaustion and interprocedural max-depth truncation
+    # shared the SAME `_truncated` flag AND the same "@depth <max_depth>" render.
+    # A fixpoint-exhausted run has max_depth==0 (a same-function iteration limit),
+    # so it misreported as "truncated @depth 0" -- a depth-recursion message for a
+    # cause that is not depth recursion. Both causes must now carry a distinct,
+    # correctly-rendered `truncation_cause` so a consumer reports the right one.
+    from bn.formatters import _taint_forward_verdict
+
+    # (a) fixpoint exhaustion: reverse-ordered chain, budget < hop count.
+    fx_func, fx_memcpy = _reverse_ordered_copy_chain()
+    fx = te.TaintEngine(FBV({fx_memcpy: "memcpy"}), models, max_iters=2).forward(
+        fx_func, [te.parse_locator("param:0")])
+    # (b) interprocedural max-depth: tainted arg into an in-binary callee, but the
+    # depth bound (0) forbids descent.
+    md_func, md_bv = _frontier_depth_program()
+    md = te.TaintEngine(md_bv, models).forward(
+        md_func, [te.parse_locator("arg:recv:1")], max_depth=0)
+
+    assert fx["stats"]["truncated"] is True and md["stats"]["truncated"] is True
+    # The engine tags the two runs with different causes...
+    assert fx["stats"]["truncation_cause"] == ["fixpoint_exhausted"]
+    assert md["stats"]["truncation_cause"] == ["max_depth"]
+
+    # ...and that difference survives into the rendered verdict line: the fixpoint
+    # run names the iteration-budget remediation, the depth run the depth bound,
+    # and the fixpoint run NO LONGER renders the misleading "@depth 0".
+    fx_line = _taint_forward_verdict(fx)
+    md_line = _taint_forward_verdict(md)
+    assert fx_line != md_line
+    assert "fixpoint unconverged" in fx_line and "--max-iters" in fx_line
+    assert "@depth 0" not in fx_line
+    assert "@depth 0" in md_line and "--max-depth" in md_line
+    assert "fixpoint" not in md_line
+
+    # The zero-sink honesty gate reason carries the matching cause-specific hint.
+    # (The max-depth run additionally has a blocking `unmodeled_callee` frontier
+    # leaf, which the gate reports ahead of the truncation clause; the cause is
+    # still carried explicitly in the diagnostics block.)
+    assert "--max-iters" in fx["diagnostics"]["all_clear_reason"]
+    assert fx["diagnostics"]["truncation_cause"] == ["fixpoint_exhausted"]
+    assert md["diagnostics"]["truncation_cause"] == ["max_depth"]
 
 
 def test_taint_reaches_unlifted_instruction_withholds_all_clear_206(models):

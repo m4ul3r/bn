@@ -1802,6 +1802,14 @@ class TaintEngine:
         self._funcs_visited: set[int] = set()
         self._max_depth_seen = 0
         self._truncated = False
+        # #579/#576 review: taint truncation has DISTINCT causes that consumers
+        # must tell apart -- an intra-function fixpoint that exhausts its
+        # iteration budget ('fixpoint_exhausted') vs an interprocedural descent
+        # that hits the depth bound ('max_depth') vs the Python recursion guard
+        # ('recursion'). They share `self._truncated` for the gate, but each
+        # renders a different remediation, so the cause is tracked separately and
+        # carried through to stats/diagnostics/text.
+        self._truncation_causes: set[str] = set()
         self._only_callsite_addr = only_callsite_addr
         # #559: count the source callsites the seed actually matched, so a
         # zero-result query can report "matched N source callsites" instead of an
@@ -1816,6 +1824,7 @@ class TaintEngine:
             # SSA/call walks are cycle-guarded, but a pathological binary must
             # degrade to a bounded, honest result rather than crash the whole op.
             self._truncated = True
+            self._truncation_causes.add("recursion")
             sub = {"findings": [], "leaves": [], "assumptions": [
                 f"analysis of {func.name} truncated: Python recursion limit reached "
                 "while propagating taint (possible unresolved cycle); results incomplete"]}
@@ -1852,6 +1861,9 @@ class TaintEngine:
                 # `leaves` array length, and stats all cite the same number (#181).
                 "leaves": len(sub["leaves"]),
                 "truncated": self._truncated,
+                # Additive, distinguishes the truncation cause (fixpoint vs depth
+                # vs recursion) so a consumer reports the right one (#579/#576).
+                "truncation_cause": sorted(self._truncation_causes),
             },
             "soundness": SOUNDNESS,
         }
@@ -1878,7 +1890,8 @@ class TaintEngine:
         seed-callsite count."""
         return forward_zero_diagnostics(
             sub, seed_callsites=int(getattr(self, "_seed_callsites", 0)),
-            truncated=bool(getattr(self, "_truncated", False)))
+            truncated=bool(getattr(self, "_truncated", False)),
+            truncation_cause=sorted(getattr(self, "_truncation_causes", set())))
 
     def _attributable_callsites(self, func: Any, sources: list[dict[str, Any]]) -> list[int]:
         """Distinct call addresses to attribute a single ret/arg source across.
@@ -1920,6 +1933,7 @@ class TaintEngine:
         funcs_visited: set[int] = set()
         max_depth_seen = 0
         truncated = False
+        truncation_causes: set[str] = set()
 
         for addr in callsite_addrs:
             res = self._forward_run(func, sources, max_depth=max_depth, only_callsite_addr=addr)
@@ -1935,6 +1949,7 @@ class TaintEngine:
             union_assumptions.extend(res["assumptions"])
             max_depth_seen = max(max_depth_seen, res["stats"]["max_depth"])
             truncated = truncated or res["stats"]["truncated"]
+            truncation_causes |= set(res["stats"].get("truncation_cause") or [])
 
         # Union the per-callsite results back into the historical top-level shape.
         # Stats follow the pinned rule: max_depth = max across runs; functions_visited
@@ -1980,6 +1995,7 @@ class TaintEngine:
                 "leaves": len(leaves),
                 "frontier_total": len(union_leaves),
                 "truncated": truncated,
+                "truncation_cause": sorted(truncation_causes),
             },
             "soundness": SOUNDNESS,
         }
@@ -2005,7 +2021,7 @@ class TaintEngine:
             out["diagnostics"] = forward_zero_diagnostics(
                 union_sub,
                 seed_callsites=int(base_diag.get("source_callsites", len(callsite_addrs))),
-                truncated=truncated)
+                truncated=truncated, truncation_cause=sorted(truncation_causes))
         return out
 
     def _follow_thunk_cached(self, fn: Any) -> Any | None:
@@ -2829,6 +2845,7 @@ class TaintEngine:
             return out
         if depth + 1 > max_depth:
             self._truncated = True
+            self._truncation_causes.add("max_depth")
             out["reached_return"] = True
             out["assumptions"].append(
                 f"max interprocedural depth {max_depth} reached at {callee_fn.name}; not descended")
@@ -3222,22 +3239,31 @@ class TaintEngine:
                 if not any(_carries_taint(v) for v, _site in seeds):
                     return
                 # Conform to the established `arg_under_recovered` leaf contract
-                # (see `_arg_under_recovered_leaf`): `callee` is a {name,address}
-                # dict and the dropped index lives in a `dropped_args` list, so the
-                # text renderer (`_leaf_group_key`/`_render_leaf_line`) and the JSON
-                # consumers treat this leaf identically to the descend-side one. A
-                # string callee here crashes the default `bn taint forward` text
-                # path (#577 renderer regression).
+                # (see `_arg_under_recovered_leaf`): `callee` is ALWAYS a
+                # {name,address} dict and the leaf ALWAYS carries BOTH `dropped_args`
+                # and `stack_dropped_args` (empty when none), so the text renderer
+                # (`_leaf_group_key`/`_render_leaf_line`) and the JSON consumers treat
+                # this leaf identically to the descend-side one. A string callee or a
+                # missing address/stack field diverges from that schema (#576/#577).
+                # The address is the resolved call target: `site_taddr` for the
+                # resolved-indirect branch, else the direct-call target; "0x0" is the
+                # consistent sentinel the established path emits when unresolvable
+                # (`hex(int(getattr(callee_fn, "start", 0)))`). This modeled-sink arg
+                # was recovered through its ABI register (the #433 reg bridge), so it
+                # is register-passed -- `stack_dropped_args` is empty here.
                 callee_name = mkey or name or "?"
-                callee: dict[str, Any] = {"name": callee_name}
-                if site_taddr is not None:
-                    callee["address"] = hex(int(site_taddr))
+                taddr = site_taddr if site_taddr is not None else self._resolve_direct_target(ins)
+                callee: dict[str, Any] = {
+                    "name": callee_name,
+                    "address": hex(int(taddr)) if taddr is not None else "0x0",
+                }
                 leaf = {
                     "kind": "arg_under_recovered",
                     "address": hex(int(getattr(ins, "address", 0))),
                     "callee": callee,
                     "recovered_params": len(params),
                     "dropped_args": [argidx],
+                    "stack_dropped_args": [],
                     "register": reg,
                     "note": (
                         f"a tainted value reaches arg {argidx} of the modeled sink "
@@ -3976,6 +4002,7 @@ class TaintEngine:
             # withholds the all-clear instead of reporting a silent (unsound)
             # "no sinks reached" indistinguishable from a converged run.
             self._truncated = True
+            self._truncation_causes.add("fixpoint_exhausted")
 
         # #193 Part 1 honesty: for each registered recv-buffer slot that the fixpoint
         # did NOT correlate to a re-load, emit the deferred "may be missed" caveat --
