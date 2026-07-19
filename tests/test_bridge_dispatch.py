@@ -1642,6 +1642,55 @@ def test_serialize_error_keeps_user_facing_messages_clean(monkeypatch):
     assert bridge._serialize_error(value_error) == "Unknown operation: bogus"
 
 
+def test_dispatch_error_discloses_prototype_user_type_residue(monkeypatch):
+    """#630 round 3, FINDING 2: when a mutation raises AFTER pinning an unclearable
+    has_user_type override, the serialized error RESPONSE must DISCLOSE the residue
+    (prototype_user_type_residue / success:false / rolled_back:false + an
+    explanation) -- not just str(exc). An unattended control loop reads the raw
+    response and must SEE the view is left modified, rather than infer it from a
+    later close. The original error message is preserved."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    exc = RuntimeError("post-apply reanalysis exploded")
+    exc.prototype_user_type_residue = True
+
+    def _boom(op, params, target):
+        raise exc
+
+    monkeypatch.setattr(instance, "_dispatch_on_main", _boom)
+
+    resp = instance.dispatch({"op": "__residue_probe__", "params": {}, "target": "active"})
+
+    assert resp["ok"] is False
+    # Original error message/info preserved.
+    assert "post-apply reanalysis exploded" in resp["error"]
+    # Structured disclosure in the serialized result, readable by a raw JSON client.
+    result = resp["result"]
+    assert result is not None
+    assert result["prototype_user_type_residue"] is True
+    assert result["success"] is False
+    assert result["rolled_back"] is False
+    assert "has_user_type" in result["message"]
+
+
+def test_dispatch_error_without_residue_has_no_disclosure(monkeypatch):
+    """A plain error carries no residue disclosure -- the result stays None so the
+    residue field is never a false positive."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    def _boom(op, params, target):
+        raise RuntimeError("Function not found: foo")
+
+    monkeypatch.setattr(instance, "_dispatch_on_main", _boom)
+
+    resp = instance.dispatch({"op": "__probe__", "params": {}, "target": "active"})
+    assert resp["ok"] is False
+    assert resp["error"] == "Function not found: foo"
+    assert resp["result"] is None
+
+
 def test_serialize_error_prefixes_unexpected_exceptions(monkeypatch):
     bridge = _load_bridge(monkeypatch)
 

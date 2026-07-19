@@ -2977,7 +2977,17 @@ def _mutation_summary(value: Any) -> Any:
     # is in FAILED_MUTATION_STATUSES. Surface it so --summary never drops the error.
     if first_error is None and not success:
         first_error = value.get("message") or "mutation failed"
-    return {
+    # An unclearable has_user_type override left behind by a reverted proto-set on
+    # an AUTO function is behaviorally meaningful residue that a control loop must
+    # see even in the compact summary (#630): it means the view is left modified.
+    proto_residue = bool(value.get("prototype_user_type_residue"))
+    if proto_residue:
+        # Prefer the residue-explaining top-level message: a bare failed-row status
+        # ("rollback_failed") does not tell the loop what actually went wrong.
+        first_error = value.get("message") or first_error or (
+            "prototype has_user_type override could not be cleared"
+        )
+    summary = {
         "kind": "mutation_summary",
         # Top-level `ok` mirrors the read-command envelope so a uniform `jq '.ok'`
         # works across reads AND mutations (batch/mutation JSON used only
@@ -2996,10 +3006,14 @@ def _mutation_summary(value: Any) -> Any:
         "first_error": first_error,
         # The DB is left modified iff a live mutation actually CHANGED state
         # (committed AND something verified -- `committed` is True even for an
-        # all-noop mutation, which leaves the DB clean), or a failure's revert
-        # itself failed (rolled_back is explicitly False).
-        "dirty_after": (committed and verified > 0) or rolled_back is False,
+        # all-noop mutation, which leaves the DB clean), a failure's revert itself
+        # failed (rolled_back is explicitly False), or an unclearable
+        # has_user_type override was left behind (#630).
+        "dirty_after": (committed and verified > 0) or rolled_back is False or proto_residue,
     }
+    if proto_residue:
+        summary["prototype_user_type_residue"] = True
+    return summary
 
 
 def _render_mutation_summary_text(value: Any) -> str:
@@ -3059,6 +3073,12 @@ def _render_mutation_text(value: Any) -> str:
         # "Preview verified and reverted." message would only repeat it. (A
         # restore-failure preview is success=False and renders above instead.)
         lines.append("preview: change applied + reverted")
+        # A non-default message carries real information the banner does not --
+        # e.g. the #582 has_user_type residue disclosure on an otherwise clean,
+        # exit-0 preview. Surface it so text mode never drops the caveat.
+        msg = value.get("message")
+        if msg and msg != "Preview verified and reverted.":
+            lines.append(msg)
         lines.append("")
 
     has_type_op = any(_is_type_result(r) for r in results)

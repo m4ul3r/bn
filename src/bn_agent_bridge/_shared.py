@@ -87,6 +87,35 @@ def _serialize_error(exc: BaseException) -> str:
     return f"internal error: {type(exc).__name__}: {exc}"
 
 
+def _residue_error_disclosure(exc: BaseException) -> dict[str, Any] | None:
+    """Structured disclosure for the ``result`` field of an ``ok:false`` response
+    when the raised exception carries an unclearable ``has_user_type`` residue.
+
+    A mutation can raise AFTER an applied ``set_prototype`` pinned
+    ``BNFunctionHasUserType`` on an AUTO function -- BN exposes no API to clear it,
+    so the value revert leaves the view MODIFIED. The exception is annotated with
+    ``prototype_user_type_residue = True`` (see ``mutation_engine._mutation``), but
+    ``str(exc)`` alone does not disclose that residue. An unattended control loop
+    reads the raw response, so surface the residue there -- ``success:false`` /
+    ``rolled_back:false`` / ``prototype_user_type_residue:true`` plus an
+    explanation -- rather than forcing the caller to infer it from a later
+    ``close`` (#630 round 3). Returns None when there is no residue, so a plain
+    error response keeps ``result: null``."""
+    if not getattr(exc, "prototype_user_type_residue", False):
+        return None
+    return {
+        "success": False,
+        "rolled_back": False,
+        "prototype_user_type_residue": True,
+        "message": (
+            "An applied set_prototype pinned the function's has_user_type override "
+            "and Binary Ninja exposes no API to clear it, so the view is left "
+            "modified even though the operation did not complete. The unsaved "
+            "state must be reverted or discarded (e.g. reload the target)."
+        ),
+    }
+
+
 class OperationFailure(RuntimeError):
     def __init__(
         self,

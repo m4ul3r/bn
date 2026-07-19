@@ -39,6 +39,7 @@ from ._shared import (
     _json_response,
     _normalize_prototype,
     _parse_address,
+    _residue_error_disclosure,
     _run_on_main_thread,
     _serialize_error,
     _validate_bool,
@@ -932,7 +933,16 @@ class BinaryNinjaBridge:
                 result = self._dispatch_on_main(op, params, target)
             return _json_response(ok=True, result=result)
         except Exception as exc:
-            return _json_response(ok=False, error=_serialize_error(exc))
+            # When the failure carries an unclearable has_user_type residue, the
+            # caller-visible payload must DISCLOSE it (success:false /
+            # rolled_back:false / prototype_user_type_residue:true + explanation),
+            # not just str(exc) -- an unattended control loop reads the response
+            # and must see the view is left modified (#630 round 3).
+            return _json_response(
+                ok=False,
+                error=_serialize_error(exc),
+                result=_residue_error_disclosure(exc),
+            )
 
     @contextlib.contextmanager
     def _write_operation_lock(self):
@@ -2400,22 +2410,57 @@ class BinaryNinjaBridge:
         return mutation_engine._run_local_restores(self.ctx, *a, **k)
 
     def _mutation(self, *a, **k):
-        result = mutation_engine._mutation(self.ctx, *a, **k)
-        # A committed (non-preview) write that actually changed state leaves the
-        # view dirty until saved -- mark it so `close` can warn. A pure no-op
-        # (every op already in the requested state) changes nothing, so it does
-        # not dirty the view. (L15)
-        if isinstance(result, dict) and result.get("committed") and not result.get("preview"):
-            changed = any(
-                isinstance(r, dict) and r.get("status") == "verified"
-                for r in (result.get("results") or [])
-            )
-            if changed:
+        try:
+            result = mutation_engine._mutation(self.ctx, *a, **k)
+        except Exception as exc:
+            # #630 round 2: a post-apply exception path restores the prototype
+            # VALUE but cannot clear the has_user_type override an applied
+            # set_prototype pinned. That residue leaves the view modified even
+            # though _mutation raised (returns no result), so mark the view dirty
+            # here -- otherwise `close` reads bv.file.modified == false and reports
+            # no unsaved state. The original exception still propagates intact.
+            if getattr(exc, "prototype_user_type_residue", False):
                 try:
                     selector = a[0] if a else k.get("selector")
                     self.targets.mark_dirty(self.targets.resolve(selector))
                 except Exception:
                     pass
+            raise
+        # A committed (non-preview) write that actually changed state leaves the
+        # view dirty until saved -- mark it so `close` can warn. A pure no-op
+        # (every op already in the requested state) changes nothing, so it does
+        # not dirty the view. (L15)
+        committed_change = (
+            isinstance(result, dict)
+            and result.get("committed")
+            and not result.get("preview")
+            and any(
+                isinstance(r, dict) and r.get("status") == "verified"
+                for r in (result.get("results") or [])
+            )
+        )
+        # A FAILED rollback (preview or live) can leave partial state live in the
+        # view while committed is False, so the committed check above never fires.
+        # bv.file.modified does not flip for these writes, so mark dirty here or
+        # `bn close` computes unsaved=false and silently discards the leftover
+        # renames/types/locals (#606). Identity check, not falsy: a clean result
+        # with no rolled_back key (rolled_back is None) must be unchanged, and a
+        # clean rollback (rolled_back True) leaves the view as before.
+        rollback_left_state = isinstance(result, dict) and result.get("rolled_back") is False
+        # An unclearable has_user_type override (a proto set on an AUTO function
+        # that had to be reverted) leaves the view modified even though the
+        # prototype value round-tripped. It now also flips rolled_back to False,
+        # but key on the residue field explicitly too so `bn close` never silently
+        # discards it (#630).
+        residue_left_state = isinstance(result, dict) and bool(
+            result.get("prototype_user_type_residue")
+        )
+        if committed_change or rollback_left_state or residue_left_state:
+            try:
+                selector = a[0] if a else k.get("selector")
+                self.targets.mark_dirty(self.targets.resolve(selector))
+            except Exception:
+                pass
         return result
 
     def _op_rename_symbol(self, *a, **k):

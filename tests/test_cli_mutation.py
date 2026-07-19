@@ -37,6 +37,23 @@ def test_mutation_summary_committed_noop_is_not_dirty():
     assert noop["dirty_after"] is False
 
 
+def test_mutation_summary_surfaces_prototype_user_type_residue():
+    # #630: an unclearable has_user_type override left behind is behaviorally
+    # meaningful residue an unattended control loop must see even in the compact
+    # summary -- surface it and mark dirty_after.
+    from bn.formatters import _mutation_summary
+    out = _mutation_summary({
+        "success": False, "committed": False, "rolled_back": False,
+        "preview": False, "prototype_user_type_residue": True,
+        "message": "the has_user_type override could not be cleared",
+        "results": [{"status": "rollback_failed"}],
+    })
+    assert out["prototype_user_type_residue"] is True
+    assert out["dirty_after"] is True
+    assert out["success"] is False
+    assert "has_user_type" in out["first_error"]
+
+
 def test_mutation_summary_surfaces_top_level_message_error():
     # #408 review: a failure whose only explanation is the top-level `message`
     # (no result row in FAILED_MUTATION_STATUSES -- e.g. revert cleanup failed

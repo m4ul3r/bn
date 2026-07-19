@@ -176,19 +176,24 @@ class TestProtoSetUnnamedParams:
     must verify, not be reported verification_failed and reverted. BN auto-names
     unnamed params on readback (arg1, arg2, ...), so the readback text never
     matches the requested string -- only a real BN readback reproduces this, so
-    the mocked suite can't cover it."""
+    the mocked suite can't cover it.
+
+    These apply WITHOUT --preview (a committed proto set): setting a prototype
+    pins has_user_type, which BN cannot clear, so a --preview of a proto set on an
+    AUTO function is refused (see test_auto_prototype_preview_is_refused, #630) --
+    committing is the correct way to prove the unnamed/named acceptance."""
 
     def _first_fn(self, inst_id):
         out = _bn("--instance", inst_id, "function", "list", "--format", "json")
         return json.loads(out.stdout)["items"][0]["name"]
 
-    def test_unnamed_params_verify_via_preview(self):
+    def test_unnamed_params_verify(self):
         info = _session_start(str(HELLO_BINARY))
         inst_id = info["instance_id"]
         try:
             fn = self._first_fn(inst_id)
             res = _bn("--instance", inst_id, "proto", "set", fn,
-                      f"void {fn}(int32_t, char**, char**)", "--preview", "--format", "json")
+                      f"void {fn}(int32_t, char**, char**)", "--format", "json")
             parsed = json.loads(res.stdout)
             statuses = [r.get("status") for r in parsed["results"]]
             assert statuses == ["verified"], parsed
@@ -208,9 +213,40 @@ class TestProtoSetUnnamedParams:
         try:
             fn = self._first_fn(inst_id)
             res = _bn("--instance", inst_id, "proto", "set", fn,
-                      f"int32_t {fn}(int64_t argc, char** argv)", "--preview", "--format", "json")
+                      f"int32_t {fn}(int64_t argc, char** argv)", "--format", "json")
             parsed = json.loads(res.stdout)
             assert [r.get("status") for r in parsed["results"]] == ["verified"], parsed
+        finally:
+            _session_stop(inst_id)
+
+    def test_auto_prototype_preview_is_refused(self):
+        """#630: a --preview of a proto set on an AUTO function (no user type) is
+        REFUSED before any mutation, because BN cannot clear the has_user_type it
+        would pin, so the preview could not be cleanly reverted. Proves the honest
+        contract on live BN: refuse rather than apply and claim a clean rollback.
+        The view is left pristine -- the function stays AUTO."""
+        info = _session_start(str(HELLO_BINARY))
+        inst_id = info["instance_id"]
+        try:
+            fn = self._first_fn(inst_id)  # a fresh-analysis function is AUTO
+            res = _bn("--instance", inst_id, "proto", "set", fn,
+                      f"void {fn}(int32_t, char**, char**)", "--preview", "--format", "json")
+            # A refusal is a BridgeError -> CLI exit 2, specifically (not merely
+            # nonzero): the preflight raised before any mutation (#630 round 3).
+            assert res.returncode == 2, (res.returncode, res.stdout, res.stderr)
+            assert "has_user_type" in (res.stdout + res.stderr), (res.stdout, res.stderr)
+            # Pristine, checked against a source that ACTUALLY reflects has_user_type:
+            # `function info` never emits the flag, so asserting on its output is
+            # vacuous. Instead commit a real prototype set now and read the op's
+            # before_has_user_type -- it reports the function's provenance at the
+            # moment before this commit. If the refused preview had wrongly pinned
+            # has_user_type, before_has_user_type would be true and this fails.
+            commit = _bn("--instance", inst_id, "proto", "set", fn,
+                         f"void {fn}(int32_t, char**, char**)", "--format", "json")
+            commit_parsed = json.loads(commit.stdout)
+            proto_result = next(r for r in commit_parsed["results"]
+                                if r.get("op") == "set_prototype")
+            assert proto_result["before_has_user_type"] is False, commit_parsed
         finally:
             _session_stop(inst_id)
 
