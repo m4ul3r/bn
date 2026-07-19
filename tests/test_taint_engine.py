@@ -1739,6 +1739,42 @@ def test_forward_no_copy_note_when_source_is_already_a_sink(models):
         result["assumptions"]
 
 
+def test_forward_no_copy_note_when_dest_is_unkeyable(models):
+    # #578: the *arg:N -> *arg:0 copy-note assumption ("propagated to the
+    # destination, not itself flagged as a sink") must fire ONLY when the
+    # propagation into the destination actually SUCCEEDED. When the dest
+    # pointer is structurally unkeyable (here, the opaque return of a
+    # get_buf()-style call -- _buffer_target can't correlate it to a tracked
+    # buffer), _apply_to_token returns False and the assumption's own claim
+    # would be a lie: the taint did NOT reach the destination. The engine must
+    # instead surface a coarse_memory_store leaf and keep safe_to_report_all_clear
+    # False, not a false "propagated" assumption.
+    GETBUF, MEMCPY = 0xe00, 0xe10
+    dst = FVar("dst"); src = FVar("src"); n = FVar("n")
+    dst1 = FSSA(dst, 1); src0 = FSSA(src, 0); n0 = FSSA(n, 0)
+    getbuf = FInstr(0, 0x10, "MLIL_CALL_SSA", "dst#1 = get_buf()", reads=[], writes=[dst1],
+                    dest=FExpr("MLIL_CONST_PTR", hex(GETBUF), constant=GETBUF), params=[])
+    call = FInstr(1, 0x14, "MLIL_CALL_SSA", "memcpy(dst#1, src#0, n#0)",
+                  reads=[dst1, src0, n0], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", hex(MEMCPY), constant=MEMCPY),
+                  params=[FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1]),
+                          FExpr("MLIL_VAR_SSA", "src#0", reads=[src0]),
+                          FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])])
+    ret = FInstr(2, 0x18, "MLIL_RET", "return", reads=[])
+    ssa = FSSAFunc([getbuf, call, ret])
+    func = FFunc("f", 0x10, ssa, params=[dst, src, n])
+    engine = te.TaintEngine(FBV({GETBUF: "get_buf", MEMCPY: "memcpy"}), models)
+    result = engine.forward(func, [te.parse_locator("param:1")])
+    # the source (arg1) IS tainted (seeded param), but the dest is unkeyable ...
+    assert not any(
+        "propagated to the destination" in a or "not itself flagged as a sink" in a
+        for a in result["assumptions"]), result["assumptions"]
+    # ... so the tainted write must instead surface as a coarse_memory_store leaf ...
+    assert any(l["kind"] == "coarse_memory_store" for l in result["leaves"]), result["leaves"]
+    # ... and the run must not be allowed to claim a sound all-clear.
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False, result["diagnostics"]
+
+
 def test_forward_unconsumed_vararg_not_reported(models):
     # "%i.%i.%i" consumes 3 args (1,7,0xe); the tainted 4th vararg is never read
     # by the format -> provably dead -> must NOT be reported as a sprintf sink (#45).

@@ -3430,8 +3430,10 @@ class TaintEngine:
                 to = rule.get("to")
                 frm = rule.get("from")
                 hit = self._token_hit_node(ssaf, params, frm, tainted)
+                applied = False
                 if hit is not None:
-                    if self._apply_to_token(ssaf, ins, params, to, taint_node, name or "?", parents=[hit]):
+                    applied = self._apply_to_token(ssaf, ins, params, to, taint_node, name or "?", parents=[hit])
+                    if applied:
                         changed = True
                     else:
                         _note_unkeyed_store(to)
@@ -3447,7 +3449,7 @@ class TaintEngine:
                     # source-seed that lands here would report a bare "no sinks
                     # reached" even though backward/trace both reach it. Record the
                     # src-side copy so the three tools agree. Deduped per site.
-                    if isinstance(frm, str) and frm.startswith("*arg:") and to == "*arg:0":
+                    if applied and isinstance(frm, str) and frm.startswith("*arg:") and to == "*arg:0":
                         try:
                             src_i = int(frm.split("arg:", 1)[1])
                         except Exception:
