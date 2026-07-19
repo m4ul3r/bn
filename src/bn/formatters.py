@@ -2173,6 +2173,34 @@ def _render_taint_path(steps: list[Any]) -> list[str]:
     return out
 
 
+def _taint_truncation_note(stats: dict[str, Any]) -> str:
+    """Verdict-line truncation clause that names the CAUSE (#579/#576).
+
+    A fixpoint-exhaustion truncation and an interprocedural depth cutoff share
+    the run-level ``truncated`` flag but mean different things: the former's
+    ``max_depth`` stat is 0 (a same-function iteration limit), so the historical
+    ``truncated @depth 0`` misreported it as a depth-recursion cutoff. Render each
+    cause distinctly with its own remediation. When ``truncation_cause`` is absent
+    (an older bridge), preserve the historical ``@depth N`` wording verbatim."""
+    if not stats.get("truncated"):
+        return ""
+    causes = stats.get("truncation_cause") or []
+    if not causes:
+        return f" · truncated @depth {stats.get('max_depth')}"
+    parts: list[str] = []
+    if "max_depth" in causes:
+        parts.append(f"@depth {stats.get('max_depth')} "
+                     "(interprocedural depth bound; raise --max-depth)")
+    if "fixpoint_exhausted" in causes:
+        parts.append("fixpoint unconverged (intra-function iteration budget "
+                     "exhausted; raise --max-iters or narrow the source)")
+    if "recursion" in causes:
+        parts.append("recursion limit (possible unresolved cycle)")
+    if not parts:
+        return f" · truncated @depth {stats.get('max_depth')}"
+    return " · truncated " + "; ".join(parts)
+
+
 def _taint_forward_verdict(value: dict[str, Any]) -> str:
     """One-line verdict for a forward-taint result, derived from existing fields."""
     findings = value.get("reached_sinks") or []
@@ -2180,7 +2208,7 @@ def _taint_forward_verdict(value: dict[str, Any]) -> str:
     stats = value.get("stats") or {}
     fns = stats.get("functions_visited")
     fns_part = f" · taint crossed {fns} fn(s)" if fns else ""
-    trunc = f" · truncated @depth {stats.get('max_depth')}" if stats.get("truncated") else ""
+    trunc = _taint_truncation_note(stats)
     if findings:
         classes = ", ".join(sorted({(f.get("sink") or {}).get("class") or "?" for f in findings}))
         return f"verdict: {len(findings)} sink(s) reached ({classes}){fns_part}{trunc}"

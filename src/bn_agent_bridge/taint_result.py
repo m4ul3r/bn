@@ -104,12 +104,31 @@ def _assumption_has_weak_seed(assumptions: list[str]) -> bool:
     return False
 
 
+def _truncation_hint(truncation_cause: list[str] | None) -> str:
+    """Human remediation clause for a truncated run, keyed by cause (#579/#576).
+
+    The two causes need DIFFERENT next actions -- a fixpoint that exhausted its
+    per-function iteration budget is fixed with ``--max-iters``, while an
+    interprocedural depth cutoff is fixed with ``--max-depth`` -- so a consumer
+    that saw only "depth/recursion" was told the wrong remediation."""
+    causes = list(truncation_cause or [])
+    if "fixpoint_exhausted" in causes:
+        return ("intra-function fixpoint exhausted its iteration budget before "
+                "converging -- raise --max-iters or narrow the source")
+    if "max_depth" in causes:
+        return "interprocedural descent hit the depth bound -- raise --max-depth"
+    if "recursion" in causes:
+        return "Python recursion limit reached (possible unresolved cycle)"
+    return "depth/recursion cutoff"
+
+
 def _derive_all_clear(
     leaves: list[dict[str, Any]],
     assumptions: list[str],
     *,
     truncated: bool,
     unmodeled_reached: bool = False,
+    truncation_cause: list[str] | None = None,
 ) -> tuple[bool, str]:
     """The honesty claim gate for a ZERO-SINK forward result.
 
@@ -158,15 +177,16 @@ def _derive_all_clear(
             "escaped there, NOT an all-clear")
     if truncated:
         return False, (
-            "analysis truncated (depth/recursion) -- incomplete coverage, NOT an "
-            "all-clear")
+            f"analysis truncated ({_truncation_hint(truncation_cause)}) -- "
+            "incomplete coverage, NOT an all-clear")
     return True, (
         "no modeled sink and no tainted frontier in the analyzed region; still a "
         "may-analysis -- not a proof of safety")
 
 
 def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
-                             truncated: bool = False) -> dict[str, Any]:
+                             truncated: bool = False,
+                             truncation_cause: list[str] | None = None) -> dict[str, Any]:
     """Frontier diagnostics + honesty gate for a zero-sink forward run (#559/#562).
 
     Purely descriptive: seed reach (matched source callsites, tainted SSA
@@ -182,7 +202,9 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
     assumptions = sub.get("assumptions") or []
     # ``truncated`` is a run-level flag (depth/recursion cutoff); the engine
     # threads it explicitly since the sub-result carries no stats block.
-    truncated = bool(truncated or (sub.get("stats") or {}).get("truncated"))
+    stats = sub.get("stats") or {}
+    truncated = bool(truncated or stats.get("truncated"))
+    truncation_cause = list(truncation_cause or stats.get("truncation_cause") or [])
     by_kind: dict[str, int] = {}
     for lf in leaves:
         k = str(lf.get("kind", "?"))
@@ -232,13 +254,17 @@ def forward_zero_diagnostics(sub: dict[str, Any], *, seed_callsites: int,
 
     safe, reason = _derive_all_clear(
         leaves, assumptions, truncated=truncated,
-        unmodeled_reached=unmodeled_reached)
+        unmodeled_reached=unmodeled_reached, truncation_cause=truncation_cause)
 
     return {
         "source_callsites": int(seed_callsites),
         "tainted_values": tainted_values,
         "last_use": diag.get("last_use"),
         "unmodeled_calls_reached": unmodeled_reached,
+        # Additive: the distinct truncation cause(s), so a zero-sink consumer
+        # sees WHY coverage was incomplete and the matching remediation (#579/#576).
+        "truncated": truncated,
+        "truncation_cause": truncation_cause,
         "frontier": {
             "unresolved": unresolved_n,
             "coarse_memory": coarse_n,

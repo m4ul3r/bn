@@ -613,6 +613,183 @@ def test_forward_unkeyable_store_dest_emits_coarse_memory_leaf(models):
     assert any(l["kind"] == "coarse_memory_store" for l in result["leaves"]), result["leaves"]
 
 
+# --------------------------------------------------------------------------
+# #577 (forward): the MODELED-call branch is the one place that emitted no
+# honesty signal when a modeled sink's OWN declared arg index is out of range
+# of the params BN recovered (an under-recovered arity -- e.g. an ARM-Thumb
+# `j_memcpy` typed `memcpy(int32_t)` that drops the length register). The
+# in-range sink loop `if argidx < len(params)` had no `else`, so a tainted
+# value passed there vanished and a zero-sink run falsely reported all-clear.
+# `backward` RAISES on this exact condition; `forward` swallowed it. The reg
+# bridge (`_reaching_arg_seeds_via_reg`, verified live) is stubbed here to
+# supply the dropped arg's MLIL var, mirroring the #433 backward tests.
+# --------------------------------------------------------------------------
+
+def _underrecovered_forward_sink_program(nparams=1):
+    """handler(n): len#1 = n#0 + 1; dst#1 = &dst; memcpy(<nparams args>).
+
+    With ``nparams=1`` the MLIL call exposes ONLY arg 0 (dst); memcpy's model
+    declares the length at arg 2, which is then out of range -- the shape an
+    under-recovered thunk prototype produces. ``n`` is param 0 (seeded), so
+    ``len#1`` is tainted-derived. Returns ``(func, len1)`` so the test can hand
+    ``len#1`` back as the register bridge's 'recovered' dropped-arg var."""
+    n = FVar("n"); length = FVar("len"); dst = FVar("dst")
+    n0 = FSSA(n, 0); len1 = FSSA(length, 1); dst1 = FSSA(dst, 1)
+    MEMCPY = 0x900
+    all_params = [
+        FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1]),
+        FExpr("MLIL_VAR_SSA", "&buf", reads=[]),
+        FExpr("MLIL_VAR_SSA", "len#1", reads=[len1]),
+    ]
+    call_reads = [dst1] if nparams == 1 else [dst1] + ([len1] if nparams >= 3 else [])
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "len#1 = n#0 + 1", reads=[n0], writes=[len1]),
+        FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "dst#1 = &dst", writes=[dst1],
+               src=FExpr("MLIL_ADDRESS_OF", "&dst", src=dst)),
+        FInstr(2, 0x18, "MLIL_CALL_SSA", "memcpy(...)", reads=call_reads, writes=[],
+               dest=FExpr("MLIL_CONST_PTR", hex(MEMCPY), constant=MEMCPY),
+               params=all_params[:nparams]),
+    ]
+    func = FFunc("handler", 0x10, FSSAFunc(instrs), params=[n])
+    return func, len1
+
+
+def test_forward_modeled_sink_arg_out_of_range_emits_under_recovered_leaf(models, monkeypatch):
+    # Positive: memcpy's length (arg 2) is out of range against the 1-param call,
+    # but a tainted value reaches it through arg register r2. The forward walk
+    # must emit a blocking `arg_under_recovered` leaf so the honesty gate
+    # withholds -- instead of silently skipping the invisible arg and reporting a
+    # clean zero-sink all-clear.
+    func, len1 = _underrecovered_forward_sink_program(nparams=1)
+    call_ins = func.mlil.ssa_form.instructions[2]
+    bv = FBV({0x900: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    monkeypatch.setattr(engine, "_reaching_arg_seeds_via_reg",
+                        lambda f, sites, idx: ("r2", [(len1, call_ins)]),
+                        raising=False)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert result["reached_sinks"] == [], result["reached_sinks"]
+    leaf = next((l for l in result["leaves"] if l["kind"] == "arg_under_recovered"), None)
+    assert leaf is not None, result["leaves"]
+    # Leaf conforms to the shared `arg_under_recovered` contract: `callee` is a
+    # {name,...} dict and the dropped index lives in `dropped_args` -- so the
+    # default text renderer does not crash on it (#577 regression).
+    assert isinstance(leaf["callee"], dict), leaf
+    assert leaf["callee"]["name"] == "memcpy"
+    assert leaf["dropped_args"] == [2]
+    assert leaf["recovered_params"] == 1
+    # The whole result renders through the default `bn taint forward` text path
+    # without raising (a string callee crashed `_leaf_group_key`).
+    from bn.formatters import _render_taint_text
+    rendered = _render_taint_text(result)
+    assert "arg_under_recovered" in rendered
+    assert "memcpy" in rendered
+    diag = result.get("diagnostics") or {}
+    assert diag.get("safe_to_report_all_clear") is False, diag
+
+
+def test_forward_under_recovered_sink_leaf_matches_established_schema_576(models, monkeypatch):
+    # #576 review: the forward modeled-sink `arg_under_recovered` leaf must match
+    # the established descend-side `_arg_under_recovered_leaf` schema EXACTLY --
+    # `callee` is ALWAYS {name, address} and the leaf ALWAYS carries BOTH
+    # `dropped_args` and `stack_dropped_args` (empty when none). The forward path
+    # previously omitted `callee['address']` on the common direct-call site (it was
+    # set only when a resolved-indirect target address was threaded) and never
+    # emitted `stack_dropped_args`, so a consumer keying on the shared schema saw a
+    # divergent leaf. Direct call => the address must be the resolved call target,
+    # not dropped.
+    func, len1 = _underrecovered_forward_sink_program(nparams=1)
+    call_ins = func.mlil.ssa_form.instructions[2]
+    bv = FBV({0x900: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    monkeypatch.setattr(engine, "_reaching_arg_seeds_via_reg",
+                        lambda f, sites, idx: ("r2", [(len1, call_ins)]),
+                        raising=False)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    leaf = next((l for l in result["leaves"] if l["kind"] == "arg_under_recovered"), None)
+    assert leaf is not None, result["leaves"]
+
+    # callee is ALWAYS a {name, address} dict, address = resolved direct target.
+    assert isinstance(leaf["callee"], dict)
+    assert set(leaf["callee"]) == {"name", "address"}, leaf["callee"]
+    assert leaf["callee"]["name"] == "memcpy"
+    assert leaf["callee"]["address"] == "0x900"        # the direct-call target
+    # BOTH arg lists are always present; this register-recovered arg is not stack.
+    assert leaf["dropped_args"] == [2]
+    assert leaf["stack_dropped_args"] == []
+
+    # Key-parity with the established descend-side leaf: the forward leaf must
+    # carry at least the same core schema keys (it may add extras like `register`).
+    established = engine._arg_under_recovered_leaf(call_ins, func, [1], 1)
+    # The gated helper may return None on some fakes; only compare when it emits.
+    if established is not None:
+        core = {"kind", "address", "callee", "recovered_params",
+                "dropped_args", "stack_dropped_args", "note"}
+        assert core <= set(leaf), sorted(set(established) - set(leaf))
+        assert set(established["callee"]) == set(leaf["callee"])
+
+
+def test_forward_modeled_sink_arg_out_of_range_no_leaf_when_untainted(models, monkeypatch):
+    # Negative control: same under-recovered shape, but the register bridge's
+    # recovered dropped-arg var is NOT tainted -- a merely-under-recovered but
+    # quiet sink must not cry wolf. No leaf, and the gate stays all-clear.
+    func, len1 = _underrecovered_forward_sink_program(nparams=1)
+    call_ins = func.mlil.ssa_form.instructions[2]
+    untainted = FSSA(FVar("cst"), 1)  # a value never in the tainted set
+    bv = FBV({0x900: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    monkeypatch.setattr(engine, "_reaching_arg_seeds_via_reg",
+                        lambda f, sites, idx: ("r2", [(untainted, call_ins)]),
+                        raising=False)
+    # seed a var that never reaches the call so nothing is tainted at the memcpy
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    # param 0 (n) IS tainted and flows to len#1, but the bridge here returns a
+    # DIFFERENT (untainted) recovered var, so the out-of-range branch must stay
+    # silent -- proves the leaf is gated on real taint, not on mere arity.
+    assert not any(l["kind"] == "arg_under_recovered" for l in result["leaves"]), result["leaves"]
+
+
+def test_forward_modeled_sink_full_arity_untainted_stays_all_clear(models):
+    # Negative control (a): FULL recovered arity, untainted length -> the
+    # out-of-range branch never fires, no leaf, all-clear True as today.
+    func, _ = _underrecovered_forward_sink_program(nparams=3)
+    bv = FBV({0x900: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    # seed a param that does NOT flow into the length: taint `dst`? there is no
+    # such param; instead seed nothing-relevant by tainting a var unused at the
+    # sink. Use a locator on param 0 but rewire so len#1 is not derived from it.
+    func2 = FFunc("handler", 0x10, FSSAFunc([
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "len#1 = 0x8", writes=[FSSA(FVar("len"), 1)]),
+        FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "dst#1 = &dst", writes=[FSSA(FVar("dst"), 1)],
+               src=FExpr("MLIL_ADDRESS_OF", "&dst", src=FVar("dst"))),
+        FInstr(2, 0x18, "MLIL_CALL_SSA", "memcpy(dst#1, &buf, len#1)", writes=[],
+               reads=[FSSA(FVar("dst"), 1), FSSA(FVar("len"), 1)],
+               dest=FExpr("MLIL_CONST_PTR", "0x900", constant=0x900),
+               params=[FExpr("MLIL_VAR_SSA", "dst#1", reads=[FSSA(FVar("dst"), 1)]),
+                       FExpr("MLIL_VAR_SSA", "&buf", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "len#1", reads=[FSSA(FVar("len"), 1)])]),
+    ]), params=[FVar("n")])
+    result = engine.forward(func2, [te.parse_locator("param:0")])
+    assert result["reached_sinks"] == [], result["reached_sinks"]
+    assert not any(l["kind"] == "arg_under_recovered" for l in result["leaves"]), result["leaves"]
+    diag = result.get("diagnostics") or {}
+    assert diag.get("safe_to_report_all_clear") is True, diag
+
+
+def test_forward_modeled_sink_full_arity_tainted_reports_sink_not_leaf(models):
+    # Negative control (b): FULL recovered arity, tainted in-range length -> the
+    # normal reached_sinks path is unchanged (a real sink is reported), and the
+    # out-of-range under-recovered leaf is NOT emitted.
+    func, _ = _underrecovered_forward_sink_program(nparams=3)
+    bv = FBV({0x900: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert len(result["reached_sinks"]) == 1, result["reached_sinks"]
+    assert result["reached_sinks"][0]["sink"]["callee"] == "memcpy"
+    assert result["reached_sinks"][0]["sink"]["tainted_arg_index"] == 2
+    assert not any(l["kind"] == "arg_under_recovered" for l in result["leaves"]), result["leaves"]
+
+
 def test_forward_no_flow_no_false_positive(models):
     # a function with no source->sink path must report zero sinks
     a = FVar("a"); r = FVar("r")
@@ -5735,9 +5912,11 @@ def _indirect_nonrecv_pointer_arg_func():
     # parse_pkt(ctx, pkt) where the buffer pointer `pkt = [G]` is loaded from a
     # global slot. parse_pkt is a CUSTOM parser (not recv-family), so the
     # recv-buffer misanchored leaf never fires -- only the #193 indirect-load
-    # caveat applies. unknown_call_policy="stop" keeps the unmodeled parse_pkt
-    # call from also escaping, so the indirect-slot leaf is the SOLE reason the
-    # gate must withhold.
+    # caveat applies. unknown_call_policy="stop" also emits its own
+    # unmodeled_callee leaf for the unmodeled parse_pkt call (F4/#576), so the
+    # indirect-slot leaf is not the sole withholding reason here -- this test's
+    # assertions target the source_seed_misanchored count specifically, not
+    # exclusivity of leaves.
     t = FVar("t"); t1 = FSSA(t, 1)
     instrs = [
         FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "t#1 = [G]", writes=[t1],
@@ -5774,6 +5953,169 @@ def test_indirect_pointer_slot_nonrecv_arg_withholds_all_clear_193(models):
     assert diag["frontier"]["seed_misanchored"] == 1
     assert diag["safe_to_report_all_clear"] is False
     assert "NOT an all-clear" in diag["all_clear_reason"]
+
+
+# --------------------------------------------------------------------------
+# #579 forward-fixpoint truncation honesty: exhausting max_iters (an
+# unconverged intraprocedural fixpoint) must set stats.truncated so the
+# zero-sink gate withholds the all-clear. Both halves get coverage: the
+# CONSUMER gate (forward_zero_diagnostics with truncated True/False) and the
+# PRODUCER (a real engine run whose reverse-ordered copy chain needs more
+# passes than a small max_iters budget to reach its would-be sink).
+# --------------------------------------------------------------------------
+
+def test_truncated_run_withholds_all_clear_579():
+    # #579 consumer positive control (zero coverage before this): a zero-sink
+    # run flagged truncated=True must fold safe_to_report_all_clear=False with a
+    # reason naming truncation -- an unconverged fixpoint is incomplete coverage,
+    # never an all-clear. Empty leaves/assumptions isolates truncation as the
+    # SOLE withholding reason.
+    sub = {"leaves": [], "assumptions": [], "diag": {"tainted_values": 3}}
+    diag = te.forward_zero_diagnostics(sub, seed_callsites=1, truncated=True)
+
+    assert diag["safe_to_report_all_clear"] is False
+    assert "truncated" in diag["all_clear_reason"]
+    assert "NOT an all-clear" in diag["all_clear_reason"]
+
+
+def test_untruncated_run_does_not_over_withhold_all_clear_579():
+    # #579 consumer negative control: the SAME zero-leaf/zero-assumption sub with
+    # truncated=False (a genuinely converged run) must STILL be an all-clear --
+    # the truncation gate must not over-trigger on ordinary convergent functions.
+    sub = {"leaves": [], "assumptions": [], "diag": {"tainted_values": 3}}
+    diag = te.forward_zero_diagnostics(sub, seed_callsites=1, truncated=False)
+
+    assert diag["safe_to_report_all_clear"] is True
+
+
+def _reverse_ordered_copy_chain():
+    # A copy chain whose MLIL instruction order runs OPPOSITE to its dataflow
+    # order, so the intraprocedural fixpoint propagates exactly one hop per pass:
+    #
+    #   dataflow:  a(param) -> c0 -> c1 -> c2 -> c3 -> memcpy(dst, src, c3)
+    #
+    # Laid out in reverse, the memcpy (which reads the length c3) comes FIRST and
+    # the seed assignment (c0 = a) LAST, so pass k only taints c_{k-1}. Reaching
+    # the length arg therefore needs one pass per hop plus one for the sink -- a
+    # small max_iters budget exhausts before the would-be memcpy sink is hit.
+    a = FVar("a")
+    c0 = FVar("c0"); c1 = FVar("c1"); c2 = FVar("c2"); c3 = FVar("c3")
+    a0 = FSSA(a, 0)
+    c0_1 = FSSA(c0, 1); c1_1 = FSSA(c1, 1); c2_1 = FSSA(c2, 1); c3_1 = FSSA(c3, 1)
+    MEMCPY = 0x401080
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "0x401080(&dst, &src, c3#1)",
+               reads=[c3_1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", hex(MEMCPY), constant=MEMCPY),
+               params=[FExpr("MLIL_VAR_SSA", "&dst", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "&src", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "c3#1", reads=[c3_1])]),
+        FInstr(1, 0x14, "MLIL_SET_VAR_SSA", "c3#1 = c2#1", reads=[c2_1], writes=[c3_1]),
+        FInstr(2, 0x18, "MLIL_SET_VAR_SSA", "c2#1 = c1#1", reads=[c1_1], writes=[c2_1]),
+        FInstr(3, 0x1c, "MLIL_SET_VAR_SSA", "c1#1 = c0#1", reads=[c0_1], writes=[c1_1]),
+        FInstr(4, 0x20, "MLIL_SET_VAR_SSA", "c0#1 = a#0", reads=[a0], writes=[c0_1]),
+        FInstr(5, 0x24, "MLIL_RET", "return", reads=[]),
+    ]
+    return FFunc("copy_chain", 0x10, FSSAFunc(instrs), params=[a]), MEMCPY
+
+
+def test_forward_max_iters_exhaustion_sets_truncated_579(models):
+    # #579 producer positive: a >budget reverse-ordered chain to a would-be
+    # memcpy length sink. Under a small max_iters the fixpoint exhausts WITHOUT
+    # converging (one hop per pass, budget < hop count), so it must report
+    # stats.truncated=True and, for the zero-sink outcome, withhold the
+    # all-clear -- instead of the silent false all-clear #579 describes.
+    func, memcpy_addr = _reverse_ordered_copy_chain()
+    bv = FBV({memcpy_addr: "memcpy"})
+    engine = te.TaintEngine(bv, models, max_iters=2)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+
+    assert result["reached_sinks"] == []               # sink not reached in budget
+    assert result["stats"]["truncated"] is True
+    diag = result["diagnostics"]
+    assert diag["safe_to_report_all_clear"] is False
+    assert "truncated" in diag["all_clear_reason"]
+
+
+def test_forward_same_chain_converges_under_full_budget_579(models):
+    # #579 companion (same IL, opposite verdict): the identical reverse-ordered
+    # chain under a budget large enough to converge DOES reach the memcpy length
+    # sink -- proving the truncation is a budget artifact, not a dead flow. Not a
+    # truncated run (it converged), so truncated must be False here.
+    func, memcpy_addr = _reverse_ordered_copy_chain()
+    bv = FBV({memcpy_addr: "memcpy"})
+    engine = te.TaintEngine(bv, models, max_iters=256)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+
+    assert len(result["reached_sinks"]) == 1
+    assert result["reached_sinks"][0]["sink"]["callee"] == "memcpy"
+    assert result["reached_sinks"][0]["sink"]["class"] == "overflow_len"
+    assert result["stats"]["truncated"] is False
+
+
+def test_forward_convergent_run_not_truncated_579(models):
+    # #579 producer negative control: an ordinary one-hop seed-to-nothing chain
+    # under the DEFAULT max_iters converges in two passes (break, not exhaust),
+    # so truncated must be False and the clean run stays an all-clear -- the fix
+    # must not over-trigger truncation on normal convergent functions.
+    a = FVar("a"); c0 = FVar("c0")
+    a0 = FSSA(a, 0); c0_1 = FSSA(c0, 1)
+    ssa = FSSAFunc([
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "c0#1 = a#0", reads=[a0], writes=[c0_1]),
+        FInstr(1, 0x14, "MLIL_RET", "return", reads=[]),
+    ])
+    func = FFunc("one_hop", 0x10, ssa, params=[a])
+    engine = te.TaintEngine(FBV({}), models)   # default max_iters=256
+
+    result = engine.forward(func, [te.parse_locator("param:0")])
+
+    assert result["reached_sinks"] == []
+    assert result["stats"]["truncated"] is False
+    assert result["diagnostics"]["safe_to_report_all_clear"] is True
+
+
+def test_truncation_cause_distinguishes_fixpoint_from_depth_576(models):
+    # #576 review: fixpoint-exhaustion and interprocedural max-depth truncation
+    # shared the SAME `_truncated` flag AND the same "@depth <max_depth>" render.
+    # A fixpoint-exhausted run has max_depth==0 (a same-function iteration limit),
+    # so it misreported as "truncated @depth 0" -- a depth-recursion message for a
+    # cause that is not depth recursion. Both causes must now carry a distinct,
+    # correctly-rendered `truncation_cause` so a consumer reports the right one.
+    from bn.formatters import _taint_forward_verdict
+
+    # (a) fixpoint exhaustion: reverse-ordered chain, budget < hop count.
+    fx_func, fx_memcpy = _reverse_ordered_copy_chain()
+    fx = te.TaintEngine(FBV({fx_memcpy: "memcpy"}), models, max_iters=2).forward(
+        fx_func, [te.parse_locator("param:0")])
+    # (b) interprocedural max-depth: tainted arg into an in-binary callee, but the
+    # depth bound (0) forbids descent.
+    md_func, md_bv = _frontier_depth_program()
+    md = te.TaintEngine(md_bv, models).forward(
+        md_func, [te.parse_locator("arg:recv:1")], max_depth=0)
+
+    assert fx["stats"]["truncated"] is True and md["stats"]["truncated"] is True
+    # The engine tags the two runs with different causes...
+    assert fx["stats"]["truncation_cause"] == ["fixpoint_exhausted"]
+    assert md["stats"]["truncation_cause"] == ["max_depth"]
+
+    # ...and that difference survives into the rendered verdict line: the fixpoint
+    # run names the iteration-budget remediation, the depth run the depth bound,
+    # and the fixpoint run NO LONGER renders the misleading "@depth 0".
+    fx_line = _taint_forward_verdict(fx)
+    md_line = _taint_forward_verdict(md)
+    assert fx_line != md_line
+    assert "fixpoint unconverged" in fx_line and "--max-iters" in fx_line
+    assert "@depth 0" not in fx_line
+    assert "@depth 0" in md_line and "--max-depth" in md_line
+    assert "fixpoint" not in md_line
+
+    # The zero-sink honesty gate reason carries the matching cause-specific hint.
+    # (The max-depth run additionally has a blocking `unmodeled_callee` frontier
+    # leaf, which the gate reports ahead of the truncation clause; the cause is
+    # still carried explicitly in the diagnostics block.)
+    assert "--max-iters" in fx["diagnostics"]["all_clear_reason"]
+    assert fx["diagnostics"]["truncation_cause"] == ["fixpoint_exhausted"]
+    assert md["diagnostics"]["truncation_cause"] == ["max_depth"]
 
 
 def test_taint_reaches_unlifted_instruction_withholds_all_clear_206(models):
