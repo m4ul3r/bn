@@ -188,12 +188,15 @@ def _adrp_pagebase_is_spurious(adrp_il, following_ils, page_base: int) -> bool:
     An ``adrp xN, <page>`` produces the 4 KB page base; the real referent is
     ``page + offset`` from the paired ``add``/``ldr``/``str``. Given the adrp's
     LLIL instruction and the LLIL instructions that follow it in the same basic
-    block, the page base is *spurious* iff the first consumer of the destination
-    register offsets it by a NONZERO constant (so the true target is elsewhere in
-    the page). A zero offset, a direct use (function-pointer take), a redefinition
-    before use, or a non-``SET_REG`` ref (a call/branch) are all genuine -- the
-    rule only ever drops on positive nonzero-offset evidence, so it can never hide
-    a real caller."""
+    block, this scans the *whole* window up to a redefinition of the destination
+    register (not just the first consumer): the page base is *spurious* iff every
+    consumer seen offsets it by a NONZERO constant and none offsets it by zero or
+    uses it directly before the register is redefined (so the true target is
+    elsewhere in the page). A zero offset, a direct use (function-pointer take),
+    a redefinition before use, or a non-``SET_REG`` ref (a call/branch) are all
+    decisive genuine evidence and short-circuit the scan -- the rule only ever
+    drops on exhausting the window with nothing but nonzero-offset evidence, so
+    it can never hide a real caller behind an earlier nonzero-offset consumer."""
     if il_format._il_op_name(adrp_il) != "LLIL_SET_REG":
         return False
     if il_format._llil_constant_value(getattr(adrp_il, "src", None)) != int(page_base):
