@@ -233,10 +233,18 @@ class TestProtoSetUnnamedParams:
                       f"void {fn}(int32_t, char**, char**)", "--preview", "--format", "json")
             assert res.returncode != 0, res.stdout
             assert "has_user_type" in (res.stdout + res.stderr), (res.stdout, res.stderr)
-            # Pristine: the function still has no user type (preview never applied).
-            info_out = _bn("--instance", inst_id, "function", "info", fn, "--format", "json")
-            # has_user_type must be absent/false -- the preview did not pin it.
-            assert '"has_user_type": true' not in info_out.stdout.lower()
+            # Pristine, checked against a source that ACTUALLY reflects has_user_type:
+            # `function info` never emits the flag, so asserting on its output is
+            # vacuous. Instead commit a real prototype set now and read the op's
+            # before_has_user_type -- it reports the function's provenance at the
+            # moment before this commit. If the refused preview had wrongly pinned
+            # has_user_type, before_has_user_type would be true and this fails.
+            commit = _bn("--instance", inst_id, "proto", "set", fn,
+                         f"void {fn}(int32_t, char**, char**)", "--format", "json")
+            commit_parsed = json.loads(commit.stdout)
+            proto_result = next(r for r in commit_parsed["results"]
+                                if r.get("op") == "set_prototype")
+            assert proto_result["before_has_user_type"] is False, commit_parsed
         finally:
             _session_stop(inst_id)
 

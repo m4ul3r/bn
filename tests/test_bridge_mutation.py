@@ -2689,6 +2689,86 @@ def test_end_to_end_clean_preview_leaves_view_unchanged_and_not_dirty(monkeypatc
     assert marked == []  # a clean preview does not dirty the view
 
 
+def test_end_to_end_propagated_auto_sibling_drift_repaired_by_mutation(monkeypatch):
+    """#630 round 2, FINDING 3: a REAL propagated AUTO-sibling override, created
+    during a local-rename preview driven through the WHOLE _mutation path
+    (apply -> verify -> undo -> per-op restore -> drift mop-up), must be un-pinned
+    by _restore_local_var_drift's delete_user_var. Models BN 5.4: naming a stack
+    var ALSO pins the aliased register sibling (USER propagation), and that
+    propagation is NON-journaled -- it survives revert_undo_actions -- so the
+    per-op restore (which only touches the target) leaves it, and ONLY the drift
+    mop-up can drop it. Reverting that mop-up's delete_user_var to create_user_var
+    re-pins the sibling and FAILS this end-to-end test (not just the helper one)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    me = bridge.mutation_engine
+
+    target = _FakeVariable(name="var_8", storage=-8, var_type="int32_t", identifier=10)
+    sibling = _FakeVariable(name="r2", storage=2, var_type="int32_t", identifier=20,
+                            source_type="RegisterVariableSourceType")
+    fn = _FakeFunction(0x401000, "f")
+    fn.stack_layout = [target]
+    fn.hlil = types.SimpleNamespace(vars=[sibling])
+    bv = _FakeMutationBV(functions=[fn])
+    fn.view = bv
+
+    # Model BN's aliased USER propagation as NON-journaled: create_user_var on the
+    # stack target ALSO pins the aliased register sibling, and revert_undo_actions
+    # does NOT clear that propagated pin (so the drift mop-up is the only thing
+    # that can). real_create is the ORIGINAL bound method (no recursion).
+    real_create = fn.create_user_var
+    propagated = {"hit": False}
+
+    def propagating_create_user_var(var, var_type, name, ignore_disjoint_uses=False):
+        real_create(var, var_type, name)
+        if var is target:
+            real_create(sibling, sibling.type, name + "_1")  # aliased propagation
+            propagated["hit"] = True
+    fn.create_user_var = propagating_create_user_var
+
+    real_restore = fn.provenance_restore
+
+    def restore_preserving_propagation(snapshot):
+        real_restore(snapshot)                     # journaled state: both AUTO again
+        if propagated["hit"]:
+            real_create(sibling, sibling.type, "probe_1")  # non-journaled: survives undo
+    fn.provenance_restore = restore_preserving_propagation
+
+    marked: list = []
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "mark_dirty", lambda b: marked.append(b))
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda _bv, ident: fn)
+    monkeypatch.setattr(me, "_guess_affected_functions", lambda ctx, b, ops: [fn])
+    monkeypatch.setattr(me, "_capture_function_snapshots", lambda ctx, b, fns: {})
+    monkeypatch.setattr(me, "_capture_type_snapshots", lambda ctx, b, ops: {})
+    monkeypatch.setattr(me, "_diff_snapshots", lambda ctx, before, after: [])
+    monkeypatch.setattr(me, "_diff_type_snapshots", lambda ctx, before, after: [])
+    monkeypatch.setattr(bridge.vars_mod, "_find_variable_selector", lambda _f, sel: (target, False))
+    monkeypatch.setattr(bridge.vars_mod, "_local_id", lambda _f, _v, is_parameter: "lid")
+    monkeypatch.setattr(me, "_find_var_for_restore",
+                        lambda ctx, _f, identifier, storage, is_parameter: target)
+    monkeypatch.setattr(me, "_verify_operation",
+                        lambda ctx, b, result: {**result, "status": "verified"})
+
+    result = instance._mutation(
+        "active", True,
+        [{"op": "local_rename", "function": "f", "variable": "var_8", "new_name": "probe"}],
+    )
+
+    assert result["success"] is True
+    assert result["rolled_back"] is True
+    # The propagated sibling actually drifted through the real path and the drift
+    # mop-up repaired it: un-pinned back to AUTO with its re-derived name.
+    assert propagated["hit"] is True
+    assert fn.is_var_user_defined(sibling) is False
+    assert sibling.name == "r2"
+    # Target also back to AUTO, and a clean preview does not dirty the view.
+    assert fn.is_var_user_defined(target) is False
+    assert target.name == "var_8"
+    assert marked == []
+
+
 # ===========================================================================
 # #621 -- function-scoped comment/tag verify must resolve by stored start
 # address, so a same-batch rename does not false-fail verification.
@@ -3021,6 +3101,117 @@ def test_apply_failure_with_proto_on_auto_discloses_residue(monkeypatch):
     assert result["prototype_user_type_residue"] is True
     assert result["results"][0]["status"] == "rollback_failed"
     assert "has_user_type" in result["message"]
+
+
+def test_preview_rename_then_proto_set_on_auto_is_refused_pristine(monkeypatch):
+    """#630 round 2, FINDING 1: a preview batch that FIRST renames an AUTO
+    function and THEN sets its prototype BY THE NEW NAME must be REFUSED before
+    any mutation. The refusal preflight resolves in the PRE-mutation view, where
+    the new name does not yet exist, so without an in-batch rename map the proto
+    op is silently skipped and the irreversible has_user_type mutation slips past
+    --preview. Threading the rename through closes the hole: pristine, exit 2."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "orig_fini")  # AUTO, "int32_t()"
+    bv = _FakeMutationBV(functions=[fn])
+    fn.view = bv
+
+    # _find_function resolves by the function's CURRENT name: pre-mutation only
+    # "orig_fini" exists; "renamed_fini" resolves to nothing until the rename op
+    # runs. The preflight must map the proto op's new-name target back.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_find_function",
+                        lambda _bv, ident: fn if ident == fn.name else None)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._mutation(
+            "active", True,
+            [
+                {"op": "rename_symbol", "identifier": "orig_fini", "new_name": "renamed_fini"},
+                {"op": "set_prototype", "identifier": "renamed_fini",
+                 "prototype": "void renamed_fini(int32_t value)"},
+            ],
+        )
+
+    assert exc.value.status == "unsupported"
+    assert "has_user_type" in exc.value.message
+    # Pristine: no rename applied, no user type pinned, no undo transaction opened.
+    assert fn.name == "orig_fini"
+    assert fn.has_user_type is False
+    assert str(fn.type) == "int32_t()"
+    assert not _has_event(bv, "begin")
+
+
+def test_unrevertible_preview_prototypes_resolves_in_batch_rename(monkeypatch):
+    """Helper-level companion to FINDING 1: the preflight resolves a proto op
+    through an earlier in-batch rename (post-rename name -> pre-mutation identity)
+    and flags the AUTO function it targets (#630 round 2)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    me = bridge.mutation_engine
+
+    fn = _FakeFunction(0x401000, "orig")  # AUTO, "int32_t()"
+    bv = _FakeMutationBV(functions=[fn])
+    fn.view = bv
+    monkeypatch.setattr(instance.ctx, "_find_function",
+                        lambda _bv, ident: fn if ident == fn.name else None)
+
+    flagged = me._unrevertible_preview_prototypes(
+        instance.ctx, bv,
+        [
+            {"op": "rename_symbol", "identifier": "orig", "new_name": "renamed"},
+            {"op": "set_prototype", "identifier": "renamed",
+             "prototype": "uint64_t renamed(int32_t a)"},
+        ],
+    )
+    # Flagged under its pre-mutation identity -- the AUTO proto set is detected
+    # despite the later-in-batch new-name target.
+    assert flagged == ["orig"]
+
+
+def test_post_apply_exception_with_proto_on_auto_marks_dirty(monkeypatch):
+    """#630 round 2, FINDING 2: a NON-OperationFailure exception raised AFTER the
+    apply loop (e.g. post-apply reanalysis/snapshot blew up) restores the
+    prototype VALUE but leaves has_user_type pinned. That residue leaves the view
+    modified, so the exception path must disclose it and the bridge must mark the
+    view dirty -- otherwise `close` reads bv.file.modified == false and reports no
+    unsaved state. The original exception must still propagate unchanged."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    me = bridge.mutation_engine
+    fn = _FakeFunction(0x401000, "f")  # has_user_type starts False
+    bv = _FakeMutationBV(functions=[fn])
+    fn.view = bv
+
+    marked: list = []
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "mark_dirty", lambda b: marked.append(b))
+
+    def apply(bv_, op, restores=None):
+        fn.set_user_type("uint64_t f(int32_t a)")           # pins has_user_type True
+        restores.append(lambda: fn.set_auto_type("int32_t()"))  # value only; flag stays
+        return {"op": "set_prototype", "address": "0x401000",
+                "before_has_user_type": False, "requested": {}}
+
+    _mutation_with_stubs(monkeypatch, bridge, instance, bv, apply=apply)
+
+    # Blow up on the POST-apply snapshot only (the pre-apply `before` capture is
+    # the first call and must succeed so we actually reach the apply loop).
+    calls = {"n": 0}
+
+    def snap(ctx, b, fns):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise RuntimeError("post-apply snapshot exploded")
+        return {}
+
+    monkeypatch.setattr(me, "_capture_function_snapshots", snap)
+
+    with pytest.raises(RuntimeError, match="post-apply snapshot exploded"):
+        instance._mutation("active", False, [{"op": "set_prototype"}])
+
+    assert fn.has_user_type is True    # BN could not clear the flag
+    assert marked == [bv]              # view marked dirty despite the raise
 
 
 def test_preview_locals_only_batch_reports_no_proto_residue(monkeypatch):

@@ -2400,7 +2400,22 @@ class BinaryNinjaBridge:
         return mutation_engine._run_local_restores(self.ctx, *a, **k)
 
     def _mutation(self, *a, **k):
-        result = mutation_engine._mutation(self.ctx, *a, **k)
+        try:
+            result = mutation_engine._mutation(self.ctx, *a, **k)
+        except Exception as exc:
+            # #630 round 2: a post-apply exception path restores the prototype
+            # VALUE but cannot clear the has_user_type override an applied
+            # set_prototype pinned. That residue leaves the view modified even
+            # though _mutation raised (returns no result), so mark the view dirty
+            # here -- otherwise `close` reads bv.file.modified == false and reports
+            # no unsaved state. The original exception still propagates intact.
+            if getattr(exc, "prototype_user_type_residue", False):
+                try:
+                    selector = a[0] if a else k.get("selector")
+                    self.targets.mark_dirty(self.targets.resolve(selector))
+                except Exception:
+                    pass
+            raise
         # A committed (non-preview) write that actually changed state leaves the
         # view dirty until saved -- mark it so `close` can warn. A pure no-op
         # (every op already in the requested state) changes nothing, so it does

@@ -748,25 +748,68 @@ def _unrevertible_preview_prototypes(ctx, bv, operations) -> list[str]:
     genuine override on revert is correct, not residue. Detection mirrors
     ``_op_set_prototype``'s change check (resolve + parse, read-only); a
     resolution/parse failure is left for the apply path to surface with its
-    actionable error."""
+    actionable error.
+
+    A prototype op is resolved against the identity the function will have AFTER
+    earlier ops in the SAME batch (#630 round 2). A batch that first renames an
+    AUTO function and then sets its prototype by the NEW name would otherwise slip
+    past: the new-name identifier does not resolve in the PRE-mutation view, the
+    op is silently skipped here, and the irreversible ``has_user_type`` mutation is
+    performed under ``--preview``. An in-batch rename map (post-rename name ->
+    pre-mutation identity) closes that hole; when a proto op targets a name an
+    earlier rename produced but we still cannot resolve/type-check it, we REFUSE
+    rather than risk the unclearable mutation."""
+    # Post-rename display name -> pre-mutation identity, chained so a rename onto
+    # a name an earlier rename produced resolves back to the earliest identity.
+    rename_map: dict[str, str] = {}
+    for op in operations:
+        if not isinstance(op, dict):
+            continue
+        if (op.get("op") or "rename_symbol") != "rename_symbol":
+            continue
+        ident = op.get("identifier")
+        new_name = op.get("new_name")
+        if ident is None or new_name is None:
+            continue
+        rename_map[str(new_name)] = rename_map.get(str(ident), str(ident))
+
     flagged: list[str] = []
     for op in operations:
         if not isinstance(op, dict):
             continue
         if (op.get("op") or "rename_symbol") != "set_prototype":
             continue
+        identifier = op["identifier"]
+        # Resolve through in-batch renames so a proto op targeting an
+        # earlier-renamed AUTO function is still detected in the pre-mutation view.
+        renamed_in_batch = str(identifier) in rename_map
+        resolved_identifier = rename_map.get(str(identifier), identifier)
         try:
-            fn = ctx._find_function(bv, op["identifier"])
+            fn = ctx._find_function(bv, resolved_identifier)
         except Exception:
+            # An op targeting an in-batch-renamed function we still cannot resolve
+            # cannot be proven reversible -- refuse. A plain unresolvable
+            # identifier is left for the apply path to surface.
+            if renamed_in_batch:
+                flagged.append(str(identifier))
             continue
-        if fn is None or bool(getattr(fn, "has_user_type", False)):
+        if fn is None:
+            if renamed_in_batch:
+                flagged.append(str(identifier))
+            continue
+        if bool(getattr(fn, "has_user_type", False)):
             continue
         try:
             expected_type, _ = _parse_type_or_hint(ctx, bv, op, op["prototype"], label="prototype")
         except Exception:
+            # Cannot determine whether the prototype differs. If it targets an
+            # in-batch-renamed AUTO function, refuse rather than risk the
+            # irreversible mutation; otherwise defer to the apply path.
+            if renamed_in_batch:
+                flagged.append(str(getattr(fn, "name", None) or identifier))
             continue
         if str(fn.type) != str(expected_type):
-            flagged.append(str(getattr(fn, "name", None) or op.get("identifier")))
+            flagged.append(str(getattr(fn, "name", None) or identifier))
     return flagged
 
 
@@ -2079,10 +2122,32 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
         undo_ok = _revert_undo_safely(ctx, bv, state)
         restore_ok = _run_local_restores(ctx, bv, restores)
         drift_ok = _restore_local_var_drift(ctx, bv, var_before)
+        # #630 round 2: even when the value revert succeeds, an already-applied
+        # set_prototype on an AUTO function leaves an unclearable has_user_type
+        # override -- BN's undo and set_auto_type both restore the value but leave
+        # the flag pinned, and there is no API to clear it. That residue leaves the
+        # view MODIFIED, so disclose it on the raised error; the bridge shim keys
+        # off the attribute to mark the view dirty, or `close` would read
+        # bv.file.modified == false and wrongly report no unsaved state.
+        proto_residue = _prototype_user_type_residue(ctx, bv, results)
         if not (undo_ok and restore_ok and drift_ok):
-            raise RuntimeError(
+            err = RuntimeError(
                 f"{exc} (additionally, rollback failed; the view may be left partially modified)"
-            ) from exc
+            )
+            if proto_residue:
+                err.prototype_user_type_residue = True
+            raise err from exc
+        if proto_residue:
+            # Keep the original exception's information; annotate it so the bridge
+            # marks the view dirty. Isolate the attribute write from the re-raise so
+            # an exception whose type rejects attribute assignment (rare builtins)
+            # falls back to a wrapper rather than being mistaken for a set failure.
+            try:
+                exc.prototype_user_type_residue = True
+            except (AttributeError, TypeError):
+                err = RuntimeError(str(exc))
+                err.prototype_user_type_residue = True
+                raise err from exc
         raise
 
 
