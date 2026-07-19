@@ -731,9 +731,49 @@ def _restamp_reverted_siblings(
     return output
 
 
+# Batch op types that provably CANNOT change how a function or symbol resolves by
+# NAME or ADDRESS: comments, local-variable edits, struct-field edits, type
+# declarations and tags all leave the function/symbol namespace untouched, and
+# ``set_prototype`` sets a type through ``set_user_type`` WITHOUT renaming or
+# (re)defining any symbol (see ``_op_set_prototype``). Everything NOT on this
+# whitelist -- ``rename_symbol`` (a function rename, OR a ``define_user_symbol``
+# that creates a DataSymbol at an address), ``function_create`` (materializes a
+# function/symbol at an address), and any unknown/future op -- is treated as
+# possibly resolution-affecting. A WHITELIST (not a blocklist) is deliberate: a
+# newly added op defaults to "could move resolution" -> refuse, which is the safe
+# side of the #630 guard.
+_RESOLUTION_SAFE_OPS = frozenset({
+    "set_comment", "delete_comment", "set_prototype",
+    "local_rename", "local_retype",
+    "struct_field_set", "struct_field_rename", "struct_field_delete",
+    "types_declare",
+    "tag_add", "tag_remove", "tag_type_create", "tag_type_remove",
+})
+
+
+def _batch_changes_symbol_resolution(operations) -> bool:
+    """True if any op in *operations* could change function/symbol NAME-or-ADDRESS
+    resolution (a rename, a symbol/function create, or an unrecognized op).
+
+    Whitelist-based (see ``_RESOLUTION_SAFE_OPS``): an op whose kind is not on the
+    known-safe list -- including a malformed non-dict element or a missing ``op``
+    key -- defaults to "could affect resolution". This is the conservative,
+    sound-by-construction replacement for simulating BN's apply-time name
+    resolver (#630): we do not predict resolution, we refuse to prototype-preview
+    across it."""
+    for op in operations:
+        if not isinstance(op, dict):
+            # A malformed element is not provably safe -> treat conservatively.
+            return True
+        if str(op.get("op") or "") not in _RESOLUTION_SAFE_OPS:
+            return True
+    return False
+
+
 def _unrevertible_preview_prototypes(ctx, bv, operations) -> list[str]:
-    """Names of functions a ``--preview`` set_prototype would pin ``has_user_type``
-    on while they carry NO user type today (#630).
+    """Names/identifiers of functions a ``--preview`` set_prototype would
+    irreversibly pin ``has_user_type`` on (#630), for a batch that does NOT change
+    symbol resolution.
 
     Setting a prototype routes through ``set_user_type``, which pins
     ``BNFunctionHasUserType``. Binary Ninja exposes NO API to clear it: verified
@@ -742,170 +782,46 @@ def _unrevertible_preview_prototypes(ctx, bv, operations) -> list[str]:
     there is no ``delete_user_type``. The flag is behaviorally meaningful -- once
     set, analysis will not re-derive the signature -- so it is NOT value-neutral
     metadata. A ``--preview`` promises a clean, non-destructive revert, which is
-    impossible for these ops, so the batch is REFUSED before any mutation (leaving
-    the view pristine) rather than applied and then reported as a false clean
-    rollback. A function that already has a user type is fine: re-asserting its
-    genuine override on revert is correct, not residue. Detection mirrors
-    ``_op_set_prototype``'s change check (resolve + parse, read-only); a
-    resolution/parse failure is left for the apply path to surface with its
-    actionable error.
+    impossible for such an op, so the batch is REFUSED before any mutation
+    (pristine view) rather than applied and reported as a false clean rollback. A
+    function that already has a user type is fine: re-asserting its genuine
+    override on revert is correct, not residue.
 
-    A prototype op is resolved against the identity the function will have AFTER
-    earlier ops in the SAME batch, MIRRORING BN's real apply-time lookup: ops run
-    SEQUENTIALLY (in list order) and BN resolves function/symbol names
-    CASE-INSENSITIVELY (verified live on BN 5.4: ``_find_function`` falls back to a
-    case-folded match). A case-sensitive rename map built from ALL ops at once
-    misses two live bypasses (#630 round 3):
-
-      (a) CASE-FOLD: rename AUTO ``greet`` -> ``Round3Case`` then ``set_prototype
-          round3case`` -- the folded spelling resolves to the AUTO function at
-          apply time and pins ``has_user_type``, but a case-sensitive map skips it.
-      (b) FUTURE-RENAME HIJACK: ``set_prototype X`` (X is AUTO now) then LATER
-          rename a user-typed function onto X -- an all-ops map thinks the proto
-          targets the user function via the future rename and skips the refusal,
-          but the proto op runs FIRST, while X still denotes the AUTO function.
-
-    So each ``set_prototype`` at position *i* is resolved by applying ONLY the
-    function renames at positions ``< i`` (positional, not all ops) over a
-    simulated name view, using the same case-sensitive-then-case-insensitive
-    matching BN uses. If the resolved function is AUTO (no user type) and the
-    prototype differs, the op would irreversibly pin ``has_user_type`` under
-    ``--preview`` -- REFUSE. If the target is AMBIGUOUS under this resolution, or a
-    resolution/parse failure hits an identifier an earlier in-batch rename touched,
-    we also REFUSE (over-refusal is safe; an irreversible AUTO-prototype mutation
-    under ``--preview`` is not). A plain unresolvable identifier untouched by any
-    in-batch rename is left for the apply path to surface with its clean error."""
-    ops = [op for op in operations if isinstance(op, dict)]
-    if not any((op.get("op") or "rename_symbol") == "set_prototype" for op in ops):
+    Round-5 conservative rule: we STOP simulating BN's apply-time name resolution
+    (four review rounds proved every simulation loses to some resolution edge --
+    case-fold, future-rename hijack, raw ``FunctionSymbol`` aliases, in-batch data
+    symbols at a function address, stale impl/stub name forms). The caller has
+    already verified via :func:`_batch_changes_symbol_resolution` that NOTHING in
+    this batch moves function/symbol resolution, so the CURRENT view resolves each
+    ``set_prototype`` target to EXACTLY what the apply will hit. We therefore call
+    BN's REAL lookup (``ctx._find_function`` -- the same path apply uses, including
+    the raw-symbol-at-address fallback at seam.py ~129), never a simulation. A
+    target that resolves to an AUTO function (``has_user_type`` false) whose
+    prototype would DIFFER is flagged; so is one that is ambiguous or unresolvable
+    (we cannot PROVE it lands on a non-AUTO function). Over-flagging is safe; an
+    irreversible AUTO-prototype pin under ``--preview`` is not."""
+    proto_ops = [
+        op for op in operations
+        if isinstance(op, dict) and op.get("op") == "set_prototype"
+    ]
+    if not proto_ops:
         return []
 
-    functions = list(getattr(bv, "functions", None) or [])
-    # addr -> live function object, and addr -> its CURRENT simulated display name
-    # as earlier in-batch renames land. Functions are keyed by their (immutable)
-    # start address; renames only change names, never addresses.
-    fn_by_addr: dict[int, Any] = {}
-    sim_name: dict[int, str] = {}
-    for fn in functions:
-        try:
-            addr = int(fn.start)
-        except Exception:
-            continue
-        fn_by_addr[addr] = fn
-        sim_name[addr] = str(getattr(fn, "name", "") or "")
-
-    # Lower-cased names that an earlier in-batch rename produced OR renamed away
-    # from -- identifiers whose apply-time resolution SHIFTS relative to the
-    # pristine view. A resolution/parse miss on one of these must REFUSE (we can't
-    # prove reversibility); a miss on any other identifier is a plain unresolvable
-    # target left to the apply path.
-    rename_touched_ci: set[str] = set()
-
-    def _name_forms(fn) -> list[str]:
-        """Every spelling that resolves *fn* right now: its SIMULATED display name
-        (post earlier in-batch renames) plus the static forms BN also matches
-        (raw/mangled + demangled), which renames do not change."""
-        addr = int(fn.start)
-        forms = [sim_name.get(addr, str(getattr(fn, "name", "") or ""))]
-        try:
-            extra = ctx._function_name_forms(fn)
-        except Exception:
-            extra = []
-        for f in extra:
-            if f and str(f) not in forms:
-                forms.append(str(f))
-        return forms
-
-    def _dedupe(matches: list[Any]) -> list[Any]:
-        out: list[Any] = []
-        seen: set[int] = set()
-        for fn in matches:
-            try:
-                marker = int(fn.start)
-            except Exception:
-                continue
-            if marker in seen:
-                continue
-            seen.add(marker)
-            out.append(fn)
-        return out
-
-    def _resolve(identifier) -> tuple[str, Any]:
-        """Resolve *identifier* against the simulated view exactly as BN's
-        ``_find_function`` would: address first, then exact case-sensitive name,
-        then case-insensitive. Returns ('resolved', fn) / ('ambiguous', None) /
-        ('none', None)."""
-        try:
-            addr = _parse_address(identifier)
-        except Exception:
-            addr = None
-        if addr is not None:
-            fn = fn_by_addr.get(int(addr))
-            if fn is None:
-                try:
-                    fn = bv.get_function_at(int(addr))
-                except Exception:
-                    fn = None
-            return ("resolved", fn) if fn is not None else ("none", None)
-
-        text = str(identifier)
-        exact = _dedupe([fn for fn in functions if text in _name_forms(fn)])
-        if len(exact) == 1:
-            return ("resolved", exact[0])
-        if len(exact) > 1:
-            resolved = ctx._resolve_impl_over_stub(exact)
-            return ("resolved", resolved) if resolved is not None else ("ambiguous", None)
-
-        needle = text.lower()
-        folded = _dedupe(
-            [fn for fn in functions if needle in [f.lower() for f in _name_forms(fn)]]
-        )
-        if len(folded) == 1:
-            return ("resolved", folded[0])
-        if len(folded) > 1:
-            resolved = ctx._resolve_impl_over_stub(folded)
-            return ("resolved", resolved) if resolved is not None else ("ambiguous", None)
-        return ("none", None)
-
     flagged: list[str] = []
-    for op in ops:
-        kind = op.get("op") or "rename_symbol"
-        if kind == "rename_symbol":
-            ident = op.get("identifier")
-            new_name = op.get("new_name")
-            if ident is None or new_name is None:
-                continue
-            # Only function renames shift function-name resolution; a data-symbol
-            # rename never binds a function name.
-            if str(op.get("kind", "auto")) == "data":
-                continue
-            status, fn = _resolve(ident)
-            if status == "resolved" and fn is not None:
-                try:
-                    addr = int(fn.start)
-                except Exception:
-                    continue
-                rename_touched_ci.add(sim_name.get(addr, "").lower())
-                rename_touched_ci.add(str(new_name).lower())
-                sim_name[addr] = str(new_name)
-            continue
-        if kind != "set_prototype":
-            continue
+    for op in proto_ops:
         identifier = op.get("identifier")
         if identifier is None:
             continue
-        status, fn = _resolve(identifier)
-        touched = str(identifier).lower() in rename_touched_ci
-        if status == "ambiguous":
-            # Cannot prove which function the apply will hit -> refuse.
+        try:
+            fn = ctx._find_function(bv, identifier)
+        except Exception:
+            # Ambiguous or unresolvable under BN's REAL lookup: we cannot prove
+            # the target is a non-AUTO function, so an irreversible AUTO pin can't
+            # be ruled out -> refuse (over-refusal is safe).
             flagged.append(str(identifier))
             continue
-        if status == "none" or fn is None:
-            # Unresolvable under sequential+case-insensitive resolution. If an
-            # earlier in-batch rename touched this name, apply-time resolution
-            # shifted and we cannot prove reversibility -> refuse; otherwise it is
-            # a plain missing target, left for the apply path.
-            if touched:
-                flagged.append(str(identifier))
+        if fn is None:
+            flagged.append(str(identifier))
             continue
         if bool(getattr(fn, "has_user_type", False)):
             # A genuine prior user type: re-asserting it on revert is correct.
@@ -913,10 +829,9 @@ def _unrevertible_preview_prototypes(ctx, bv, operations) -> list[str]:
         try:
             expected_type, _ = _parse_type_or_hint(ctx, bv, op, op["prototype"], label="prototype")
         except Exception:
-            # Cannot determine whether the prototype differs. Refuse only when an
-            # in-batch rename touched the target; otherwise defer to the apply path.
-            if touched:
-                flagged.append(str(getattr(fn, "name", None) or identifier))
+            # Cannot determine whether the prototype differs from this AUTO
+            # function's current type, so cannot prove it is a no-op -> refuse.
+            flagged.append(str(getattr(fn, "name", None) or identifier))
             continue
         if str(fn.type) != str(expected_type):
             flagged.append(str(getattr(fn, "name", None) or identifier))
@@ -1992,6 +1907,36 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
     # residue) rather than apply and report a false clean rollback. Non-preview
     # applies are unaffected: committing a prototype SHOULD leave it a user type.
     if preview:
+        proto_ops = [
+            op for op in operations
+            if isinstance(op, dict) and op.get("op") == "set_prototype"
+        ]
+        # Round-5 conservative rule: if the same --preview batch also carries any
+        # op that could move function/symbol name-or-address resolution (a rename,
+        # a symbol/function create, or an unknown op), the target a set_prototype
+        # will hit at apply time cannot be PROVEN from the pre-mutation view, so
+        # reversibility of an AUTO-prototype pin can't be guaranteed. Refuse the
+        # whole preview up front rather than simulate BN's resolver (which four
+        # review rounds proved unsound). Over-refusal is acceptable here.
+        if proto_ops and _batch_changes_symbol_resolution(operations):
+            raise OperationFailure(
+                "unsupported",
+                "Cannot --preview a prototype change together with a rename or a "
+                "symbol/function create in the same batch: those ops change how "
+                "the prototype target resolves at apply time, so a clean, "
+                "reversible preview cannot be proven from the pre-mutation view "
+                "(setting a prototype pins the function's has_user_type flag, "
+                "which Binary Ninja exposes no API to clear). Apply the "
+                "symbol/rename changes and the prototype changes in separate "
+                "previews, or re-run without --preview to commit.",
+                requested={
+                    "op": "set_prototype",
+                    "reason": "batch_changes_symbol_resolution",
+                },
+            )
+        # No resolution-affecting op: current-view resolution == apply-time
+        # resolution, so resolve each proto target with BN's REAL lookup and
+        # refuse the ones that would irreversibly pin has_user_type.
         unrevertible = _unrevertible_preview_prototypes(ctx, bv, operations)
         if unrevertible:
             names = ", ".join(unrevertible)
