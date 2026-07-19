@@ -445,9 +445,32 @@ def test_disasm_linear_no_thumb_mask_on_arm64(monkeypatch):
     assert "Thumb" not in res["note"]
 
 
-def test_linear_decode_arch_rejects_mode_on_aarch64(monkeypatch):
+def test_linear_decode_arch_rejects_mode_on_arm64(monkeypatch):
     # #600: --mode arm|thumb must not force armv7/thumb2 decode on an AArch64
-    # target -- the wrong ISA entirely. The error must name the actual arch.
+    # target spelled "arm64" -- the wrong ISA entirely. Pre-fix this was a live
+    # bug: the old gate was a raw `cur.startswith("arm")`, and "arm64" DOES
+    # start with "arm", so the old code wrongly let --mode through and forced
+    # an armv7/thumb2 decode of an AArch64 target. (The "aarch64" spelling
+    # never exercised this bug -- "aarch64" does not start with "arm" -- so a
+    # test using that spelling alone passes identically with the fix reverted;
+    # this is the arch spelling that actually distinguishes fixed from broken.)
+    # The error must name the actual arch.
+    bridge = _load_bridge(monkeypatch)
+    rd = bridge.read_decompile
+
+    class _Ctx:
+        def _functions_containing(self, bv, addr):
+            return []
+
+    bv = type("BV", (), {"arch": type("A", (), {"name": "arm64"})()})()
+    with pytest.raises(ValueError, match="arm64"):
+        rd._linear_decode_arch(_Ctx(), bv, 0x401000, "arm")
+
+
+def test_linear_decode_arch_rejects_mode_on_aarch64(monkeypatch):
+    # Parity check for the other AArch64 spelling BN uses. Kept alongside the
+    # arm64 test above since both spellings must be covered, even though this
+    # one alone would not catch a reversion of the #600 fix.
     bridge = _load_bridge(monkeypatch)
     rd = bridge.read_decompile
 
