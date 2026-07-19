@@ -751,6 +751,33 @@ _RESOLUTION_SAFE_OPS = frozenset({
 })
 
 
+# Ops whose name IS recognized and whose resolution-affecting cause is a rename or
+# a symbol/function create -- used only to WORD the preview refusal accurately, so
+# an unknown/future op is not mislabelled as one of these (#630 follow-up).
+_KNOWN_RESOLUTION_AFFECTING_OPS = frozenset({"rename_symbol", "function_create"})
+
+
+def _resolution_affecting_op(operations):
+    """The FIRST batch element that could change function/symbol NAME-or-ADDRESS
+    resolution, as ``(op_name, is_known)``, or ``None`` when the whole batch is
+    resolution-safe.
+
+    ``op_name`` is the offending op's ``op`` value (or a placeholder describing a
+    malformed/absent one); ``is_known`` is True only for a recognized
+    rename/symbol-create (``_KNOWN_RESOLUTION_AFFECTING_OPS``). An unknown/future
+    op -- or a malformed element -- is resolution-affecting too (whitelist default)
+    but is NOT a rename/create, so callers must word its refusal differently."""
+    for op in operations:
+        if not isinstance(op, dict):
+            # A malformed element is not provably safe -> treat conservatively.
+            return ("<malformed batch element>", False)
+        name = str(op.get("op") or "")
+        if name not in _RESOLUTION_SAFE_OPS:
+            display = name or "<missing op key>"
+            return (display, name in _KNOWN_RESOLUTION_AFFECTING_OPS)
+    return None
+
+
 def _batch_changes_symbol_resolution(operations) -> bool:
     """True if any op in *operations* could change function/symbol NAME-or-ADDRESS
     resolution (a rename, a symbol/function create, or an unrecognized op).
@@ -760,14 +787,9 @@ def _batch_changes_symbol_resolution(operations) -> bool:
     key -- defaults to "could affect resolution". This is the conservative,
     sound-by-construction replacement for simulating BN's apply-time name
     resolver (#630): we do not predict resolution, we refuse to prototype-preview
-    across it."""
-    for op in operations:
-        if not isinstance(op, dict):
-            # A malformed element is not provably safe -> treat conservatively.
-            return True
-        if str(op.get("op") or "") not in _RESOLUTION_SAFE_OPS:
-            return True
-    return False
+    across it. Derived from :func:`_resolution_affecting_op` so the boolean gate
+    and the refusal wording never disagree about what counts."""
+    return _resolution_affecting_op(operations) is not None
 
 
 def _unrevertible_preview_prototypes(ctx, bv, operations) -> list[str]:
@@ -1918,20 +1940,37 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
         # reversibility of an AUTO-prototype pin can't be guaranteed. Refuse the
         # whole preview up front rather than simulate BN's resolver (which four
         # review rounds proved unsound). Over-refusal is acceptable here.
-        if proto_ops and _batch_changes_symbol_resolution(operations):
+        offending = _resolution_affecting_op(operations) if proto_ops else None
+        if offending is not None:
+            offending_op, is_known = offending
+            if is_known:
+                # A recognized rename / symbol-or-function create.
+                cause = (
+                    f"a rename or a symbol/function create ({offending_op})"
+                )
+            else:
+                # An unknown/future (or malformed) op: NOT a rename/create, but not
+                # on the resolution-safe whitelist either, so we cannot prove it
+                # leaves resolution untouched. Name it as such rather than falsely
+                # blaming a rename (#630 follow-up).
+                cause = (
+                    f"the operation {offending_op!r}, which is not on the "
+                    "resolution-safe whitelist and so may change how a symbol "
+                    "resolves"
+                )
             raise OperationFailure(
                 "unsupported",
-                "Cannot --preview a prototype change together with a rename or a "
-                "symbol/function create in the same batch: those ops change how "
-                "the prototype target resolves at apply time, so a clean, "
-                "reversible preview cannot be proven from the pre-mutation view "
-                "(setting a prototype pins the function's has_user_type flag, "
-                "which Binary Ninja exposes no API to clear). Apply the "
-                "symbol/rename changes and the prototype changes in separate "
-                "previews, or re-run without --preview to commit.",
+                f"Cannot --preview a prototype change together with {cause} in "
+                "the same batch: it can change how the prototype target resolves "
+                "at apply time, so a clean, reversible preview cannot be proven "
+                "from the pre-mutation view (setting a prototype pins the "
+                "function's has_user_type flag, which Binary Ninja exposes no API "
+                "to clear). Apply the other change(s) and the prototype change in "
+                "separate previews, or re-run without --preview to commit.",
                 requested={
                     "op": "set_prototype",
                     "reason": "batch_changes_symbol_resolution",
+                    "offending_op": offending_op,
                 },
             )
         # No resolution-affecting op: current-view resolution == apply-time

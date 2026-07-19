@@ -3359,10 +3359,19 @@ def test_preview_locals_only_batch_reports_no_proto_residue(monkeypatch):
 
 def test_preview_data_symbol_create_plus_proto_refused_pristine(monkeypatch):
     """Round-4 bypass (data symbol at a function address): a --preview batch that
-    creates a data symbol at an AUTO function's address (rename_symbol kind=data)
-    and then sets that function's prototype is REFUSED before any mutation. The
-    data-symbol create is a resolution-affecting op, so the batch cannot be proven
-    reversible from the pre-mutation view. Pristine, exit 2."""
+    creates a data symbol ``g_alias`` at an AUTO function's address (rename_symbol
+    kind=data) and then sets the prototype BY THAT NEW ALIAS NAME is REFUSED before
+    any mutation. At apply time ``set_prototype g_alias`` would resolve the fresh
+    data symbol back to the function at 0x401000 and pin its has_user_type; the OLD
+    simulation skipped kind=data renames, so ``g_alias`` resolved to nothing /
+    untouched and slipped past the refusal (the bypass). The conservative guard
+    refuses because the data-symbol create is a resolution-affecting op, so the
+    batch cannot be proven reversible from the pre-mutation view. Pristine, exit 2.
+
+    NOTE: the set_prototype MUST target the newly-created ``g_alias`` (not the
+    function's current ``sub_401000`` name) -- otherwise the guard's fallback
+    resolver would flag the still-AUTO ``sub_401000`` anyway and the test would
+    pass even with the redesign reverted (a vacuous guard)."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     fn = _FakeFunction(0x401000, "sub_401000")  # AUTO, "int32_t()"
@@ -3376,8 +3385,8 @@ def test_preview_data_symbol_create_plus_proto_refused_pristine(monkeypatch):
             [
                 {"op": "rename_symbol", "kind": "data", "identifier": "0x401000",
                  "new_name": "g_alias"},
-                {"op": "set_prototype", "identifier": "sub_401000",
-                 "prototype": "uint64_t sub_401000(int32_t a)"},
+                {"op": "set_prototype", "identifier": "g_alias",
+                 "prototype": "uint64_t g_alias(int32_t a)"},
             ],
         )
 
@@ -3426,30 +3435,51 @@ def test_preview_raw_alias_proto_on_auto_refused_via_real_lookup(monkeypatch):
 
 def test_preview_impl_stub_rename_then_proto_refused_pristine(monkeypatch):
     """Round-4 bypass (stale impl/stub name forms after an in-batch rename): a
-    --preview batch that renames a function and then sets a prototype is REFUSED
-    before any mutation -- the rename is resolution-affecting, so the post-rename
-    name forms BN would resolve at apply time are not predicted. Pristine, exit 2."""
+    USER-typed implementation and an AUTO import/PLT stub SHARE one name
+    (``process``). A --preview batch renames the implementation AWAY and then sets
+    the prototype by the OLD shared name -- which, once the rename lands, resolves
+    to the AUTO stub and pins ITS has_user_type. The OLD simulation kept the impl's
+    stale name forms and (via impl-over-stub dedup) resolved ``process`` to the
+    already USER-typed impl, so it skipped the refusal (the bypass). The
+    conservative guard refuses before any mutation -- the rename is
+    resolution-affecting, so the post-rename target BN would resolve at apply time
+    is not predicted. Pristine, exit 2.
+
+    Two same-named functions (impl USER-typed, stub AUTO+ImportedFunctionSymbol)
+    are load-bearing: with a single AUTO function the guard's fallback resolver
+    would flag it anyway and the test would pass even with the redesign reverted."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    fn = _FakeFunction(0x401000, "impl")  # AUTO, "int32_t()"
-    bv = _FakeMutationBV(functions=[fn])
-    fn.view = bv
+    # USER-typed real implementation at one address; AUTO PLT/import stub sharing
+    # the name at another. `set_prototype process` resolves to the impl TODAY but
+    # to the stub AFTER the rename lands -- the shift the guard refuses to reason
+    # across.
+    impl = _FakeFunction(0x401000, "process")
+    impl.set_user_type("int32_t()")  # genuine prior user type
+    stub = _FakeFunction(0x401800, "process")  # AUTO
+    stub.symbol = types.SimpleNamespace(
+        type=types.SimpleNamespace(name="ImportedFunctionSymbol"))
+    bv = _FakeMutationBV(functions=[impl, stub])
+    impl.view = stub.view = bv
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     with pytest.raises(bridge.OperationFailure) as exc:
         instance._mutation(
             "active", True,
             [
-                {"op": "rename_symbol", "identifier": "impl", "new_name": "handler"},
-                {"op": "set_prototype", "identifier": "handler",
-                 "prototype": "uint64_t handler(int32_t a)"},
+                {"op": "rename_symbol", "identifier": "process",
+                 "new_name": "process_impl"},
+                {"op": "set_prototype", "identifier": "process",
+                 "prototype": "uint64_t process(int32_t a)"},
             ],
         )
 
     assert exc.value.status == "unsupported"
     assert "separate previews" in exc.value.message
-    assert fn.name == "impl"
-    assert fn.has_user_type is False
+    # Pristine: nothing renamed, no user type pinned on the AUTO stub, no undo txn.
+    assert impl.name == "process" and stub.name == "process"
+    assert impl.has_user_type is True   # genuine prior type, untouched
+    assert stub.has_user_type is False  # the AUTO stub was never pinned
     assert not _has_event(bv, "begin")
 
 
@@ -3491,3 +3521,69 @@ def test_preview_proto_plus_safe_ops_on_user_typed_function_allowed(monkeypatch)
     assert result["rolled_back"] is True
     assert result["message"] == "Preview verified and reverted."
     assert "prototype_user_type_residue" not in result
+
+
+def test_preview_proto_plus_unknown_op_refusal_names_the_unknown_op(monkeypatch):
+    """Finding B: when the resolution-affecting op is an UNKNOWN/future op (not a
+    rename or a symbol/function create), the refusal message must name THAT cause
+    -- 'not on the resolution-safe whitelist' plus the op name -- rather than
+    falsely claiming the batch 'contains a rename or symbol/function create'. The
+    batch is still refused (unknown ops default to resolution-affecting), only the
+    stated cause has to be accurate."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "sub_401000")  # AUTO
+    bv = _FakeMutationBV(functions=[fn])
+    fn.view = bv
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._mutation(
+            "active", True,
+            [
+                {"op": "set_prototype", "identifier": "sub_401000",
+                 "prototype": "uint64_t sub_401000(int32_t a)"},
+                {"op": "reanalyze_region", "start": "0x401000"},  # unknown/future op
+            ],
+        )
+
+    msg = exc.value.message
+    assert exc.value.status == "unsupported"
+    # Accurate cause for an unknown op: names the op and the whitelist, and does
+    # NOT misattribute it to a rename / symbol-or-function create.
+    assert "reanalyze_region" in msg
+    assert "resolution-safe whitelist" in msg
+    assert "rename or a symbol/function create" not in msg
+    assert exc.value.requested.get("offending_op") == "reanalyze_region"
+    # Still pristine (refused before any mutation).
+    assert fn.has_user_type is False
+    assert not _has_event(bv, "begin")
+
+
+def test_preview_proto_plus_rename_refusal_still_names_rename_cause(monkeypatch):
+    """Finding B counterpart: a KNOWN resolution-affecting op (rename_symbol) keeps
+    the accurate 'a rename or a symbol/function create' wording -- the accurate
+    unknown-op path must not regress the accurate known-op path."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "sub_401000")  # AUTO
+    bv = _FakeMutationBV(functions=[fn])
+    fn.view = bv
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._mutation(
+            "active", True,
+            [
+                {"op": "rename_symbol", "identifier": "sub_401000",
+                 "new_name": "handler"},
+                {"op": "set_prototype", "identifier": "handler",
+                 "prototype": "uint64_t handler(int32_t a)"},
+            ],
+        )
+
+    msg = exc.value.message
+    assert exc.value.status == "unsupported"
+    assert "a rename or a symbol/function create (rename_symbol)" in msg
+    assert "separate previews" in msg
+    assert exc.value.requested.get("offending_op") == "rename_symbol"
