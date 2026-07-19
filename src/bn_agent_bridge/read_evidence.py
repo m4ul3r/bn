@@ -510,7 +510,7 @@ def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 
     if limit is not None and limit < 1:
         raise OperationFailure("invalid_request", f"Invalid limit: {limit}")
     bv = ctx._resolve_view(selector)
-    func = ctx._find_function(bv, identifier)
+    func = ctx._find_function(bv, identifier, contained=True)
     text = il_format._decompile_text(bv, func)
     warnings = list(il_format._render_warnings(text))
     this_caveat = _cpp_method_this_caveat(func, text)
@@ -543,7 +543,7 @@ def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 
         calls = calls[:limit]
     returned = len(calls)
 
-    return {
+    result = {
         "function": {
             "name": func.name,
             "address": hex(func.start),
@@ -561,6 +561,15 @@ def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 
         "has_more": offset + returned < matched,
         "warnings": warnings,
     }
+    # #626: annotate a mid-function (interior) request the same way the decompile
+    # READs do (#193 Part 4). Inlined via the seam's `_containment_meta` rather
+    # than importing read_decompile's `_annotate_containment`, to keep the
+    # read_evidence -> read_decompile module import one-way (read_decompile
+    # already lazy-imports read_evidence).
+    meta = ctx._containment_meta(identifier, func)
+    if meta:
+        result["resolved_from"] = meta
+    return result
 
 
 def _pointer_table_for_view(

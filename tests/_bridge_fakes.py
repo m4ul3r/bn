@@ -1562,7 +1562,7 @@ def _dataflow_values_instance(monkeypatch, ins):
     il = types.SimpleNamespace(instructions=[ins])
     func = types.SimpleNamespace(name="f", start=0x1000)
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda sel: object())
-    monkeypatch.setattr(instance.ctx, "_find_function", lambda bv, ident: func)
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda bv, ident, **kw: func)
     monkeypatch.setattr(bridge.il_format, "_il_function_for", lambda fn, view, ssa: il)
     return bridge, instance
 

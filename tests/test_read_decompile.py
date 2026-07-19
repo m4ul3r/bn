@@ -2207,6 +2207,149 @@ def test_read_verb_exact_start_has_no_resolved_from(monkeypatch):
     assert "resolved_from" not in result
 
 
+# --- #626: extend the mid-function (contained) contract to the evidence /
+# dataflow READ verbs (#193 Part 4 shipped only decompile/info/il/disasm/etc.).
+# A sink address reported by taint/trace lands mid-callee, and these verbs must
+# resolve it to the containing function the same way decompile already does.
+
+@pytest.mark.parametrize("call", [
+    pytest.param(lambda inst: inst._structured_il("active", "0x401010"), id="structured_il"),
+    pytest.param(lambda inst: inst._resolved_calls("active", "0x401010"), id="resolved_calls"),
+])
+def test_dataflow_reads_resolve_mid_function_address(monkeypatch, call):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _ = _mid_function_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    # The IL body is irrelevant here -- the point under test is that
+    # _find_function resolves the interior address (contained=True) and the
+    # result is annotated. Stub the IL so the handler runs to completion.
+    monkeypatch.setattr(
+        bridge.il_format, "_il_function_for",
+        lambda fn, view, ssa: types.SimpleNamespace(instructions=[]),
+    )
+
+    result = call(instance)
+
+    assert result["function"]["name"] == "parse_packet"
+    assert result["function"]["address"] == "0x401000"
+    assert result["resolved_from"] == {"requested_address": "0x401010", "offset": "+0x10"}
+
+
+@pytest.mark.parametrize("call", [
+    pytest.param(lambda inst: inst._structured_il("active", "0x401000"), id="structured_il"),
+    pytest.param(lambda inst: inst._resolved_calls("active", "0x401000"), id="resolved_calls"),
+])
+def test_dataflow_reads_exact_start_has_no_resolved_from(monkeypatch, call):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _ = _mid_function_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(
+        bridge.il_format, "_il_function_for",
+        lambda fn, view, ssa: types.SimpleNamespace(instructions=[]),
+    )
+
+    result = call(instance)
+
+    assert result["function"]["address"] == "0x401000"
+    assert "resolved_from" not in result
+
+
+def test_possible_values_resolves_mid_function_address(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _ = _mid_function_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    # An MLIL instruction begins at the interior address so the value-set read
+    # reaches its result (not an early no_instruction refusal): this proves the
+    # containment resolution happens before, not instead of, the real work.
+    ins = types.SimpleNamespace(
+        address=0x401010, possible_values=_pvs("ConstantValue", value=7), src=None,
+    )
+    monkeypatch.setattr(
+        bridge.il_format, "_il_function_for",
+        lambda fn, view, ssa: types.SimpleNamespace(instructions=[ins]),
+    )
+
+    result = instance._possible_values("active", "0x401010", "0x401010")
+
+    assert result["function"]["name"] == "parse_packet"
+    assert result["function"]["address"] == "0x401000"
+    assert result["possible_values"]["value"] == 7
+    assert result["resolved_from"] == {"requested_address": "0x401010", "offset": "+0x10"}
+
+
+def test_possible_values_exact_start_has_no_resolved_from(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _ = _mid_function_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    ins = types.SimpleNamespace(
+        address=0x401000, possible_values=_pvs("ConstantValue", value=7), src=None,
+    )
+    monkeypatch.setattr(
+        bridge.il_format, "_il_function_for",
+        lambda fn, view, ssa: types.SimpleNamespace(instructions=[ins]),
+    )
+
+    result = instance._possible_values("active", "0x401000", "0x401000")
+
+    assert result["function"]["address"] == "0x401000"
+    assert "resolved_from" not in result
+
+
+def test_defuse_resolves_mid_function_address(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _ = _mid_function_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    # Reach the full def/use body so resolved_from is only set after the
+    # variable lookup succeeds -- not a vacuous pass that skips var resolution.
+    il = types.SimpleNamespace(
+        instructions=[],
+        get_ssa_var_definition=lambda v: None,
+        get_ssa_var_uses=lambda v: [],
+    )
+    monkeypatch.setattr(bridge.il_format, "_il_function_for", lambda fn, view, ssa: il)
+    ssa_var = types.SimpleNamespace(var=types.SimpleNamespace(name="arg1", type="int"), version=0)
+    monkeypatch.setattr(
+        bridge.il_format, "_resolve_ssa_variable",
+        lambda func, il_, sel: (ssa_var, []),
+    )
+    monkeypatch.setattr(bridge.il_format, "_ssa_var_entry", lambda v: {"ssa": "arg1#0"})
+
+    result = instance._defuse("active", "0x401010", "arg1#0")
+
+    assert result["function"]["name"] == "parse_packet"
+    assert result["function"]["address"] == "0x401000"
+    assert result["resolved_from"] == {"requested_address": "0x401010", "offset": "+0x10"}
+
+
+def test_defuse_exact_start_has_no_resolved_from(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _ = _mid_function_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    il = types.SimpleNamespace(
+        instructions=[],
+        get_ssa_var_definition=lambda v: None,
+        get_ssa_var_uses=lambda v: [],
+    )
+    monkeypatch.setattr(bridge.il_format, "_il_function_for", lambda fn, view, ssa: il)
+    ssa_var = types.SimpleNamespace(var=types.SimpleNamespace(name="arg1", type="int"), version=0)
+    monkeypatch.setattr(
+        bridge.il_format, "_resolve_ssa_variable",
+        lambda func, il_, sel: (ssa_var, []),
+    )
+    monkeypatch.setattr(bridge.il_format, "_ssa_var_entry", lambda v: {"ssa": "arg1#0"})
+
+    result = instance._defuse("active", "0x401000", "arg1#0")
+
+    assert result["function"]["address"] == "0x401000"
+    assert "resolved_from" not in result
+
+
 def test_backward_slice_out_of_range_notes_stack_passed_varargs_324(monkeypatch):
     # #324: an --arg at/beyond the calling convention's integer-arg registers is
     # likely STACK-passed (BN's MLIL/HLIL call model omits those); the
@@ -2280,7 +2423,7 @@ def test_callgraph_result_carries_kind_envelope(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     func = types.SimpleNamespace(name="f", start=0x1000, caller_sites=[])
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda sel: object())
-    monkeypatch.setattr(instance.ctx, "_find_function", lambda bv, ident: func)
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda bv, ident, **kw: func)
 
     result = bridge.read_decompile._resolved_calls(
         instance.ctx, None, "f", direction="callers")
