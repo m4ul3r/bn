@@ -410,6 +410,58 @@ def test_linear_decode_arch_rejects_non_arm_mode(monkeypatch):
         rd._linear_decode_arch(_Ctx(), bv, 0x1000, "mips")
 
 
+def test_disasm_linear_no_thumb_mask_on_aarch64(monkeypatch):
+    # #600: "aarch64".startswith("arm") is true, so the classic ARM/Thumb Thumb-tag
+    # mask used to wrongly fire on AArch64 too. An odd linear start on an AArch64
+    # target is NOT a Thumb pointer tag (AArch64 has no Thumb mode) and must be
+    # left untouched.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        arch=_FakeArch(name="aarch64"),
+        memory={0x401000: b"\x90" * 8},
+        disassembly={a: "nop" for a in range(0x401000, 0x401008)},
+        instruction_lengths={a: 4 for a in range(0x401000, 0x401008)},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    res = instance._disasm(None, "0x401001", linear=1)
+    assert res["address"] == "0x401001"  # NOT masked
+    assert "Thumb" not in res["note"]
+
+
+def test_disasm_linear_no_thumb_mask_on_arm64(monkeypatch):
+    # Same as above but for BN's alternate AArch64 spelling "arm64".
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        arch=_FakeArch(name="arm64"),
+        memory={0x401000: b"\x90" * 8},
+        disassembly={a: "nop" for a in range(0x401000, 0x401008)},
+        instruction_lengths={a: 4 for a in range(0x401000, 0x401008)},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    res = instance._disasm(None, "0x401001", linear=1)
+    assert res["address"] == "0x401001"  # NOT masked
+    assert "Thumb" not in res["note"]
+
+
+def test_linear_decode_arch_rejects_mode_on_aarch64(monkeypatch):
+    # #600: --mode arm|thumb must not force armv7/thumb2 decode on an AArch64
+    # target -- the wrong ISA entirely. The error must name the actual arch.
+    bridge = _load_bridge(monkeypatch)
+    rd = bridge.read_decompile
+
+    class _Ctx:
+        def _functions_containing(self, bv, addr):
+            return []
+
+    bv = type("BV", (), {"arch": type("A", (), {"name": "aarch64"})()})()
+    with pytest.raises(ValueError, match="aarch64"):
+        rd._linear_decode_arch(_Ctx(), bv, 0x401000, "arm")
+    with pytest.raises(ValueError, match="aarch64"):
+        rd._linear_decode_arch(_Ctx(), bv, 0x401000, "thumb")
+
+
 def test_decompile_renders_pseudo_c(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
