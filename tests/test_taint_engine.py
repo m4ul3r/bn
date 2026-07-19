@@ -615,6 +615,40 @@ def test_forward_attributed_gate_recomputed_over_union_leaves(models):
     assert out["diagnostics"]["safe_to_report_all_clear"] is False, out["diagnostics"]
 
 
+def test_forward_attributed_source_callsites_is_total_not_first_run(models):
+    # #580: each per-callsite run is restricted via only_callsite_addr, so a
+    # real run's own diagnostics.source_callsites is scoped to ONE call
+    # address (typically 1) -- never the attributed total. The zero-sink
+    # diagnostics assembly previously did
+    #   seed_callsites=int(base_diag.get("source_callsites", len(callsite_addrs)))
+    # which let the first run's own (present) source_callsites=1 shadow the
+    # len(callsite_addrs) fallback, so a 2-callsite attributed union silently
+    # reported source_callsites=1 instead of 2.
+    engine = te.TaintEngine(FBV({}), models)
+    func = FFunc("parse", 0x10, FSSAFunc([]), params=[])
+    sources = [{"kind": "ret", "callee": "get_val"}]
+
+    def _run():
+        return {
+            "direction": "forward", "function": {"name": "parse"}, "sources": sources,
+            "reached_sinks": [], "leaves": [], "assumptions": [],
+            "stats": {"functions_visited": 1, "max_depth": 0, "sinks": 0, "truncated": False},
+            "diagnostics": {"safe_to_report_all_clear": True, "all_clear_reason": "x",
+                            "tainted_values": 1, "last_use": None, "source_callsites": 1},
+        }
+
+    runs = iter([_run(), _run()])
+
+    def fake_forward_run(f, s, *, max_depth, only_callsite_addr):
+        engine._funcs_visited = {0x10}
+        return next(runs)
+
+    engine._forward_run = fake_forward_run
+    out = engine._forward_attributed(func, sources, [0xA, 0xB], max_depth=8)
+
+    assert out["diagnostics"]["source_callsites"] == 2, out["diagnostics"]
+
+
 def test_forward_stop_policy_emits_unmodeled_frontier_leaf(models):
     # F4/#562: under --unknown-call stop, taint reaching an unmodeled external must
     # still surface an unmodeled_callee frontier leaf (and block the honesty gate),
