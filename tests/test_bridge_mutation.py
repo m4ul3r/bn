@@ -3169,6 +3169,137 @@ def test_unrevertible_preview_prototypes_resolves_in_batch_rename(monkeypatch):
     assert flagged == ["orig"]
 
 
+# ---------------------------------------------------------------------------
+# #630 round 3, FINDING 1: the AUTO-prototype preview refusal must mirror BN's
+# ACTUAL apply-time name resolution -- SEQUENTIAL (ops run in order) and
+# CASE-INSENSITIVE -- not a case-sensitive map built from ALL ops at once. Two
+# live bypasses of the round-2 preflight are closed here:
+#   (a) case-fold: rename AUTO `greet` -> `Round3Case`, then `set_prototype
+#       round3case` -- BN resolves the folded spelling to the AUTO function and
+#       pins has_user_type, but the case-sensitive map missed it; and
+#   (b) future-rename hijack: `set_prototype X` (X is AUTO now), then LATER
+#       rename a user-typed function onto X -- the all-ops map thought the proto
+#       targeted the user function via the future rename and skipped the refusal,
+#       but the proto op runs FIRST while X still denotes the AUTO function.
+# ---------------------------------------------------------------------------
+
+def test_unrevertible_preview_prototypes_case_insensitive_rename_hijack(monkeypatch):
+    """FINDING 1a (helper level): a rename that CASE-FOLDS an AUTO function's name
+    followed by a set_prototype targeting the folded spelling must be flagged. BN
+    resolves names case-INSENSITIVELY at apply time, so the proto pins
+    has_user_type on the AUTO function; a case-SENSITIVE map misses it."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    me = bridge.mutation_engine
+
+    fn = _FakeFunction(0x401000, "greet")  # AUTO, "int32_t()"
+    bv = _FakeMutationBV(functions=[fn])
+    fn.view = bv
+
+    flagged = me._unrevertible_preview_prototypes(
+        instance.ctx, bv,
+        [
+            {"op": "rename_symbol", "identifier": "greet", "new_name": "Round3Case"},
+            {"op": "set_prototype", "identifier": "round3case",
+             "prototype": "uint64_t round3case(int32_t a)"},
+        ],
+    )
+    # Flagged under its pre-mutation identity despite the case-folded new name.
+    assert flagged == ["greet"]
+
+
+def test_unrevertible_preview_prototypes_future_rename_does_not_hide_auto_proto(monkeypatch):
+    """FINDING 1b (helper level): a set_prototype on an AUTO function, followed by
+    a LATER rename of a DIFFERENT (user-typed) function onto that same name, must
+    still flag the proto op. Resolution is SEQUENTIAL: the proto op runs while the
+    name still denotes the AUTO function, so only renames BEFORE it may be applied
+    -- a future rename must not hide the AUTO target."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    me = bridge.mutation_engine
+
+    auto_fn = _FakeFunction(0x401000, "shared")   # AUTO, "int32_t()"
+    user_fn = _FakeFunction(0x402000, "impl")
+    user_fn.set_user_type("int32_t()")            # genuine prior user type
+    bv = _FakeMutationBV(functions=[auto_fn, user_fn])
+    for f in (auto_fn, user_fn):
+        f.view = bv
+
+    flagged = me._unrevertible_preview_prototypes(
+        instance.ctx, bv,
+        [
+            {"op": "set_prototype", "identifier": "shared",
+             "prototype": "uint64_t shared(int32_t a)"},
+            {"op": "rename_symbol", "identifier": "impl", "new_name": "shared"},
+        ],
+    )
+    assert flagged == ["shared"]
+
+
+def test_preview_case_folded_rename_then_proto_refused_pristine(monkeypatch):
+    """FINDING 1a end-to-end: a --preview batch that case-folds an AUTO function's
+    name and then sets its prototype by the folded spelling is REFUSED before any
+    mutation (OperationFailure 'unsupported' -> exit 2). The view stays pristine:
+    no rename, no pinned has_user_type, no undo transaction opened."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "greet")  # AUTO, "int32_t()"
+    bv = _FakeMutationBV(functions=[fn])
+    fn.view = bv
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._mutation(
+            "active", True,
+            [
+                {"op": "rename_symbol", "identifier": "greet", "new_name": "Round3Case"},
+                {"op": "set_prototype", "identifier": "round3case",
+                 "prototype": "uint64_t round3case(int32_t a)"},
+            ],
+        )
+
+    assert exc.value.status == "unsupported"  # -> BridgeError -> CLI exit 2
+    assert "has_user_type" in exc.value.message
+    assert fn.name == "greet"
+    assert fn.has_user_type is False
+    assert str(fn.type) == "int32_t()"
+    assert not _has_event(bv, "begin")
+
+
+def test_preview_future_rename_hijack_proto_refused_pristine(monkeypatch):
+    """FINDING 1b end-to-end: a --preview batch that sets a prototype on an AUTO
+    function and only LATER renames a user-typed function onto that name is
+    REFUSED before any mutation (exit 2), pristine -- the future rename must not
+    let the AUTO proto slip past --preview."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    auto_fn = _FakeFunction(0x401000, "shared")   # AUTO, "int32_t()"
+    user_fn = _FakeFunction(0x402000, "impl")
+    user_fn.set_user_type("int32_t()")            # genuine prior user type
+    bv = _FakeMutationBV(functions=[auto_fn, user_fn])
+    for f in (auto_fn, user_fn):
+        f.view = bv
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._mutation(
+            "active", True,
+            [
+                {"op": "set_prototype", "identifier": "shared",
+                 "prototype": "uint64_t shared(int32_t a)"},
+                {"op": "rename_symbol", "identifier": "impl", "new_name": "shared"},
+            ],
+        )
+
+    assert exc.value.status == "unsupported"  # -> BridgeError -> CLI exit 2
+    assert "has_user_type" in exc.value.message
+    assert auto_fn.name == "shared"
+    assert auto_fn.has_user_type is False
+    assert str(auto_fn.type) == "int32_t()"
+    assert user_fn.name == "impl"
+    assert not _has_event(bv, "begin")
+
+
 def test_post_apply_exception_with_proto_on_auto_marks_dirty(monkeypatch):
     """#630 round 2, FINDING 2: a NON-OperationFailure exception raised AFTER the
     apply loop (e.g. post-apply reanalysis/snapshot blew up) restores the

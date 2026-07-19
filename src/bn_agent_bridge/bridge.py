@@ -39,6 +39,7 @@ from ._shared import (
     _json_response,
     _normalize_prototype,
     _parse_address,
+    _residue_error_disclosure,
     _run_on_main_thread,
     _serialize_error,
     _validate_bool,
@@ -932,7 +933,16 @@ class BinaryNinjaBridge:
                 result = self._dispatch_on_main(op, params, target)
             return _json_response(ok=True, result=result)
         except Exception as exc:
-            return _json_response(ok=False, error=_serialize_error(exc))
+            # When the failure carries an unclearable has_user_type residue, the
+            # caller-visible payload must DISCLOSE it (success:false /
+            # rolled_back:false / prototype_user_type_residue:true + explanation),
+            # not just str(exc) -- an unattended control loop reads the response
+            # and must see the view is left modified (#630 round 3).
+            return _json_response(
+                ok=False,
+                error=_serialize_error(exc),
+                result=_residue_error_disclosure(exc),
+            )
 
     @contextlib.contextmanager
     def _write_operation_lock(self):

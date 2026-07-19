@@ -231,7 +231,9 @@ class TestProtoSetUnnamedParams:
             fn = self._first_fn(inst_id)  # a fresh-analysis function is AUTO
             res = _bn("--instance", inst_id, "proto", "set", fn,
                       f"void {fn}(int32_t, char**, char**)", "--preview", "--format", "json")
-            assert res.returncode != 0, res.stdout
+            # A refusal is a BridgeError -> CLI exit 2, specifically (not merely
+            # nonzero): the preflight raised before any mutation (#630 round 3).
+            assert res.returncode == 2, (res.returncode, res.stdout, res.stderr)
             assert "has_user_type" in (res.stdout + res.stderr), (res.stdout, res.stderr)
             # Pristine, checked against a source that ACTUALLY reflects has_user_type:
             # `function info` never emits the flag, so asserting on its output is

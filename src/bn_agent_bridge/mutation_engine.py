@@ -751,61 +751,171 @@ def _unrevertible_preview_prototypes(ctx, bv, operations) -> list[str]:
     actionable error.
 
     A prototype op is resolved against the identity the function will have AFTER
-    earlier ops in the SAME batch (#630 round 2). A batch that first renames an
-    AUTO function and then sets its prototype by the NEW name would otherwise slip
-    past: the new-name identifier does not resolve in the PRE-mutation view, the
-    op is silently skipped here, and the irreversible ``has_user_type`` mutation is
-    performed under ``--preview``. An in-batch rename map (post-rename name ->
-    pre-mutation identity) closes that hole; when a proto op targets a name an
-    earlier rename produced but we still cannot resolve/type-check it, we REFUSE
-    rather than risk the unclearable mutation."""
-    # Post-rename display name -> pre-mutation identity, chained so a rename onto
-    # a name an earlier rename produced resolves back to the earliest identity.
-    rename_map: dict[str, str] = {}
-    for op in operations:
-        if not isinstance(op, dict):
+    earlier ops in the SAME batch, MIRRORING BN's real apply-time lookup: ops run
+    SEQUENTIALLY (in list order) and BN resolves function/symbol names
+    CASE-INSENSITIVELY (verified live on BN 5.4: ``_find_function`` falls back to a
+    case-folded match). A case-sensitive rename map built from ALL ops at once
+    misses two live bypasses (#630 round 3):
+
+      (a) CASE-FOLD: rename AUTO ``greet`` -> ``Round3Case`` then ``set_prototype
+          round3case`` -- the folded spelling resolves to the AUTO function at
+          apply time and pins ``has_user_type``, but a case-sensitive map skips it.
+      (b) FUTURE-RENAME HIJACK: ``set_prototype X`` (X is AUTO now) then LATER
+          rename a user-typed function onto X -- an all-ops map thinks the proto
+          targets the user function via the future rename and skips the refusal,
+          but the proto op runs FIRST, while X still denotes the AUTO function.
+
+    So each ``set_prototype`` at position *i* is resolved by applying ONLY the
+    function renames at positions ``< i`` (positional, not all ops) over a
+    simulated name view, using the same case-sensitive-then-case-insensitive
+    matching BN uses. If the resolved function is AUTO (no user type) and the
+    prototype differs, the op would irreversibly pin ``has_user_type`` under
+    ``--preview`` -- REFUSE. If the target is AMBIGUOUS under this resolution, or a
+    resolution/parse failure hits an identifier an earlier in-batch rename touched,
+    we also REFUSE (over-refusal is safe; an irreversible AUTO-prototype mutation
+    under ``--preview`` is not). A plain unresolvable identifier untouched by any
+    in-batch rename is left for the apply path to surface with its clean error."""
+    ops = [op for op in operations if isinstance(op, dict)]
+    if not any((op.get("op") or "rename_symbol") == "set_prototype" for op in ops):
+        return []
+
+    functions = list(getattr(bv, "functions", None) or [])
+    # addr -> live function object, and addr -> its CURRENT simulated display name
+    # as earlier in-batch renames land. Functions are keyed by their (immutable)
+    # start address; renames only change names, never addresses.
+    fn_by_addr: dict[int, Any] = {}
+    sim_name: dict[int, str] = {}
+    for fn in functions:
+        try:
+            addr = int(fn.start)
+        except Exception:
             continue
-        if (op.get("op") or "rename_symbol") != "rename_symbol":
-            continue
-        ident = op.get("identifier")
-        new_name = op.get("new_name")
-        if ident is None or new_name is None:
-            continue
-        rename_map[str(new_name)] = rename_map.get(str(ident), str(ident))
+        fn_by_addr[addr] = fn
+        sim_name[addr] = str(getattr(fn, "name", "") or "")
+
+    # Lower-cased names that an earlier in-batch rename produced OR renamed away
+    # from -- identifiers whose apply-time resolution SHIFTS relative to the
+    # pristine view. A resolution/parse miss on one of these must REFUSE (we can't
+    # prove reversibility); a miss on any other identifier is a plain unresolvable
+    # target left to the apply path.
+    rename_touched_ci: set[str] = set()
+
+    def _name_forms(fn) -> list[str]:
+        """Every spelling that resolves *fn* right now: its SIMULATED display name
+        (post earlier in-batch renames) plus the static forms BN also matches
+        (raw/mangled + demangled), which renames do not change."""
+        addr = int(fn.start)
+        forms = [sim_name.get(addr, str(getattr(fn, "name", "") or ""))]
+        try:
+            extra = ctx._function_name_forms(fn)
+        except Exception:
+            extra = []
+        for f in extra:
+            if f and str(f) not in forms:
+                forms.append(str(f))
+        return forms
+
+    def _dedupe(matches: list[Any]) -> list[Any]:
+        out: list[Any] = []
+        seen: set[int] = set()
+        for fn in matches:
+            try:
+                marker = int(fn.start)
+            except Exception:
+                continue
+            if marker in seen:
+                continue
+            seen.add(marker)
+            out.append(fn)
+        return out
+
+    def _resolve(identifier) -> tuple[str, Any]:
+        """Resolve *identifier* against the simulated view exactly as BN's
+        ``_find_function`` would: address first, then exact case-sensitive name,
+        then case-insensitive. Returns ('resolved', fn) / ('ambiguous', None) /
+        ('none', None)."""
+        try:
+            addr = _parse_address(identifier)
+        except Exception:
+            addr = None
+        if addr is not None:
+            fn = fn_by_addr.get(int(addr))
+            if fn is None:
+                try:
+                    fn = bv.get_function_at(int(addr))
+                except Exception:
+                    fn = None
+            return ("resolved", fn) if fn is not None else ("none", None)
+
+        text = str(identifier)
+        exact = _dedupe([fn for fn in functions if text in _name_forms(fn)])
+        if len(exact) == 1:
+            return ("resolved", exact[0])
+        if len(exact) > 1:
+            resolved = ctx._resolve_impl_over_stub(exact)
+            return ("resolved", resolved) if resolved is not None else ("ambiguous", None)
+
+        needle = text.lower()
+        folded = _dedupe(
+            [fn for fn in functions if needle in [f.lower() for f in _name_forms(fn)]]
+        )
+        if len(folded) == 1:
+            return ("resolved", folded[0])
+        if len(folded) > 1:
+            resolved = ctx._resolve_impl_over_stub(folded)
+            return ("resolved", resolved) if resolved is not None else ("ambiguous", None)
+        return ("none", None)
 
     flagged: list[str] = []
-    for op in operations:
-        if not isinstance(op, dict):
+    for op in ops:
+        kind = op.get("op") or "rename_symbol"
+        if kind == "rename_symbol":
+            ident = op.get("identifier")
+            new_name = op.get("new_name")
+            if ident is None or new_name is None:
+                continue
+            # Only function renames shift function-name resolution; a data-symbol
+            # rename never binds a function name.
+            if str(op.get("kind", "auto")) == "data":
+                continue
+            status, fn = _resolve(ident)
+            if status == "resolved" and fn is not None:
+                try:
+                    addr = int(fn.start)
+                except Exception:
+                    continue
+                rename_touched_ci.add(sim_name.get(addr, "").lower())
+                rename_touched_ci.add(str(new_name).lower())
+                sim_name[addr] = str(new_name)
             continue
-        if (op.get("op") or "rename_symbol") != "set_prototype":
+        if kind != "set_prototype":
             continue
-        identifier = op["identifier"]
-        # Resolve through in-batch renames so a proto op targeting an
-        # earlier-renamed AUTO function is still detected in the pre-mutation view.
-        renamed_in_batch = str(identifier) in rename_map
-        resolved_identifier = rename_map.get(str(identifier), identifier)
-        try:
-            fn = ctx._find_function(bv, resolved_identifier)
-        except Exception:
-            # An op targeting an in-batch-renamed function we still cannot resolve
-            # cannot be proven reversible -- refuse. A plain unresolvable
-            # identifier is left for the apply path to surface.
-            if renamed_in_batch:
-                flagged.append(str(identifier))
+        identifier = op.get("identifier")
+        if identifier is None:
             continue
-        if fn is None:
-            if renamed_in_batch:
+        status, fn = _resolve(identifier)
+        touched = str(identifier).lower() in rename_touched_ci
+        if status == "ambiguous":
+            # Cannot prove which function the apply will hit -> refuse.
+            flagged.append(str(identifier))
+            continue
+        if status == "none" or fn is None:
+            # Unresolvable under sequential+case-insensitive resolution. If an
+            # earlier in-batch rename touched this name, apply-time resolution
+            # shifted and we cannot prove reversibility -> refuse; otherwise it is
+            # a plain missing target, left for the apply path.
+            if touched:
                 flagged.append(str(identifier))
             continue
         if bool(getattr(fn, "has_user_type", False)):
+            # A genuine prior user type: re-asserting it on revert is correct.
             continue
         try:
             expected_type, _ = _parse_type_or_hint(ctx, bv, op, op["prototype"], label="prototype")
         except Exception:
-            # Cannot determine whether the prototype differs. If it targets an
-            # in-batch-renamed AUTO function, refuse rather than risk the
-            # irreversible mutation; otherwise defer to the apply path.
-            if renamed_in_batch:
+            # Cannot determine whether the prototype differs. Refuse only when an
+            # in-batch rename touched the target; otherwise defer to the apply path.
+            if touched:
                 flagged.append(str(getattr(fn, "name", None) or identifier))
             continue
         if str(fn.type) != str(expected_type):
