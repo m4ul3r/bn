@@ -208,18 +208,24 @@ def _adrp_pagebase_is_spurious(adrp_il, following_ils, page_base: int) -> bool:
     for nxt in following_ils:
         body = getattr(nxt, "src", None) if il_format._il_op_name(nxt) == "LLIL_SET_REG" else nxt
         offset = _expr_reg_offset(body, dest)
+        if offset == 0:
+            return False  # zero-offset consumer -> decisive genuine evidence
         if offset is not None:
-            if offset == 0:
-                return False  # zero-offset consumer -> decisive genuine evidence
+            # A nonzero-offset consumer is not decisive by itself -- record it
+            # and keep scanning for a later zero-offset/direct-use consumer. But
+            # fall through to the redefinition check below: `add xN, xN, #k`
+            # BOTH consumes and REDEFINES xN, and after it xN no longer holds
+            # the page base.
             saw_nonzero_offset = True
-            # A nonzero-offset consumer is not decisive by itself -- keep
-            # scanning for a later zero-offset/direct-use consumer before
-            # this register gets redefined.
-            continue
-        if _expr_contains_reg(body, dest):
+        elif _expr_contains_reg(body, dest):
             return False  # pointer used as-is -> genuine &fn
+        # A redefinition of the tracked register stops the scan. This must run
+        # even when the same instruction consumed the register with a nonzero
+        # offset (add xN, xN, #k) -- otherwise a LATER zero-offset/direct use of
+        # the now-REDEFINED register would be wrongly credited to the stale
+        # page-base identity, and the redefinition check would be unreachable.
         if il_format._il_op_name(nxt) == "LLIL_SET_REG" and _reg_name(getattr(nxt, "dest", None)) == dest:
-            break  # page base redefined before use -> stop scanning
+            break  # page base redefined -> stop scanning
     return saw_nonzero_offset
 
 

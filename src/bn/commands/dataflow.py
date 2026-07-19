@@ -12,6 +12,7 @@ from ..formatters import (
     _render_taint_models_text,
     _render_taint_text,
     _render_values_text,
+    _resolution_note,
 )
 from ..transport import BridgeError
 
@@ -58,7 +59,7 @@ def _dataflow_defuse(args: argparse.Namespace) -> int:
         "defuse",
         {"identifier": args.identifier, "var": args.var},
         require_target=True,
-        text_renderer=_render_defuse_text,
+        text_renderer=lambda value: _resolution_note(value) + _render_defuse_text(value),
         stem="defuse",
     )
 
@@ -82,7 +83,7 @@ def _dataflow_callgraph(args: argparse.Namespace) -> int:
             "resolve_indirect": bool(args.resolve_indirect),
         },
         require_target=True,
-        text_renderer=_render_callgraph_text,
+        text_renderer=lambda value: _resolution_note(value) + _render_callgraph_text(value),
         stem="callgraph",
     )
 
@@ -100,7 +101,7 @@ def _dataflow_values(args: argparse.Namespace) -> int:
         "possible_values",
         {"identifier": args.identifier, "at": args.at},
         require_target=True,
-        text_renderer=_render_values_text,
+        text_renderer=lambda value: _resolution_note(value) + _render_values_text(value),
         stem="values",
     )
 

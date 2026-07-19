@@ -316,7 +316,8 @@ def _function_structured_il(args: argparse.Namespace) -> int:
         "structured_il",
         {"identifier": args.identifier, "view": args.view, "ssa": bool(args.ssa)},
         require_target=True,
-        text_renderer=lambda value: _slice_text_lines(_render_structured_il_text(value), lines_range),
+        text_renderer=lambda value: _resolution_note(value)
+        + _slice_text_lines(_render_structured_il_text(value), lines_range),
         stem="structured-il",
     )
 
@@ -630,7 +631,7 @@ def _evidence_function(args: argparse.Namespace) -> int:
         "function_evidence",
         params,
         require_target=True,
-        text_renderer=_render_function_evidence_text,
+        text_renderer=lambda value: _resolution_note(value) + _render_function_evidence_text(value),
         stem="function-evidence",
     )
 

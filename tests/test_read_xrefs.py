@@ -701,6 +701,32 @@ def test_adrp_pagebase_nonzero_then_redefinition_no_zero_is_spurious(monkeypatch
     assert _spurious(monkeypatch, adrp, [add_nonzero, redef], A) is True
 
 
+def test_adrp_pagebase_selfredefine_then_zero_offset_is_spurious(monkeypatch):
+    # `adrp x8, A` then `add x8, x8, #0x40` (REDEFINES x8 to A+0x40) then
+    # `add x2, x8, #0` (zero-offset use of the REDEFINED x8). The zero-offset
+    # consumer references A+0x40, NOT the original page base A, so the adrp
+    # page-base xref to a function starting at A is spurious. The middle
+    # instruction both consumes x8 (nonzero) AND redefines it, so tracking of
+    # the page-base identity must stop after it -- the later zero offset must
+    # not be credited to the stale page base.
+    A = 0x438000
+    adrp = _adrp("x8", A, 0)
+    add_redef = _set_reg("x8", _LOp("LLIL_ADD", [_reg("x8"), _const(0x40)]), 1)
+    add_zero = _set_reg("x2", _LOp("LLIL_ADD", [_reg("x8"), _const(0)]), 2)
+    assert _spurious(monkeypatch, adrp, [add_redef, add_zero], A) is True
+
+
+def test_adrp_pagebase_selfredefine_then_direct_use_is_spurious(monkeypatch):
+    # `adrp x8, A` then `add x8, x8, #0x40` (REDEFINES x8) then `mov x1, x8`
+    # (direct use of REDEFINED x8). The direct use takes &(A+0x40), not &A, so
+    # the page-base xref to A is spurious -- tracking must stop at the redefine.
+    A = 0x438000
+    adrp = _adrp("x8", A, 0)
+    add_redef = _set_reg("x8", _LOp("LLIL_ADD", [_reg("x8"), _const(0x40)]), 1)
+    direct = _set_reg("x1", _reg("x8"), 2)
+    assert _spurious(monkeypatch, adrp, [add_redef, direct], A) is True
+
+
 def test_setreg_const_not_pagebase_is_not_spurious(monkeypatch):
     # SET_REG to a constant that isn't the queried page base -> not our pattern.
     adrp = _adrp("x0", 0x439000, 0)

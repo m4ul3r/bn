@@ -76,15 +76,22 @@ class BridgeContext:
         # READ verbs should accept them so a sink address feeds straight into the
         # next command. It stays strict by default so a mutation can't rename or
         # retype the wrong (containing) function from a stray interior address.
-        looks_like_address = str(identifier).strip().lower().startswith("0x")
+        looks_like_hex = str(identifier).strip().lower().startswith("0x")
         addr = None
         try:
             addr = _parse_address(identifier)
         except ValueError:
-            if looks_like_address:
+            if looks_like_hex:
                 raise RuntimeError(
                     f"Invalid address {identifier!r}: expected a 0x-prefixed hex or decimal value"
                 ) from None
+        # A value that parsed via `_parse_address` is an address attempt -- either
+        # 0x-hex or a bare decimal, both documented address spellings. A decimal
+        # interior address must therefore resolve via containment and report an
+        # address miss like hex does, NOT silently degrade to a name search that
+        # ends in a misleading "Function not found" (#626 review). A malformed
+        # token (e.g. "foo") fails to parse -> addr is None -> name path below.
+        looks_like_address = addr is not None
         if addr is not None:
             try:
                 fn = bv.get_function_at(addr)

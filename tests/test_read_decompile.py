@@ -411,10 +411,14 @@ def test_linear_decode_arch_rejects_non_arm_mode(monkeypatch):
 
 
 def test_disasm_linear_no_thumb_mask_on_aarch64(monkeypatch):
-    # #600: "aarch64".startswith("arm") is true, so the classic ARM/Thumb Thumb-tag
-    # mask used to wrongly fire on AArch64 too. An odd linear start on an AArch64
-    # target is NOT a Thumb pointer tag (AArch64 has no Thumb mode) and must be
-    # left untouched.
+    # #600 parity check for BN's "aarch64" spelling: an odd linear start on an
+    # AArch64 target is NOT a Thumb pointer tag (AArch64 has no Thumb mode) and
+    # must be left untouched. NOTE this spelling alone does NOT catch a reversion
+    # of the #600 fix -- "aarch64".startswith("arm") is False, so the old raw
+    # startswith("arm")/("thumb") gate already left "aarch64" unmasked and this
+    # test passes identically with the fix reverted. The genuine regression guard
+    # is the sibling test using BN's "arm64" spelling, which DOES start with
+    # "arm" and so distinguishes the fixed gate from the broken one.
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV(
@@ -430,7 +434,10 @@ def test_disasm_linear_no_thumb_mask_on_aarch64(monkeypatch):
 
 
 def test_disasm_linear_no_thumb_mask_on_arm64(monkeypatch):
-    # Same as above but for BN's alternate AArch64 spelling "arm64".
+    # BN's alternate AArch64 spelling "arm64" -- the GENUINE #600 regression
+    # guard: "arm64".startswith("arm") is True, so the pre-fix raw gate wrongly
+    # masked bit 0 as a Thumb pointer tag here. Reverting the fix fails THIS test
+    # (the "aarch64"-spelled sibling stays green, so it can't guard the fix).
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV(
@@ -2157,6 +2164,27 @@ def test_find_function_resolves_contained_address_only_when_opted_in(monkeypatch
 
     # An exact start still resolves with contained=True (no behavior change).
     assert instance._find_function(bv, "0x401000", contained=True) is fn
+
+
+def test_find_function_resolves_decimal_contained_address(monkeypatch):
+    # #626 review (Finding 3): a decimal-spelled interior address (a documented
+    # address format) must resolve via containment exactly like the 0x-hex
+    # spelling -- not skip the containment branch and hard-error "No function
+    # found". 4198416 == 0x401010, an interior address of parse_packet.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, fn = _mid_function_bv()
+
+    assert 4198416 == 0x401010
+    resolved = instance._find_function(bv, "4198416", contained=True)
+    assert resolved is fn
+
+    # A decimal exact start resolves too (no regression).
+    assert instance._find_function(bv, "4198400", contained=True) is fn
+
+    # A decimal interior address WITHOUT contained stays strict, like hex.
+    with pytest.raises(RuntimeError, match="No function found at address 0x401010"):
+        instance._find_function(bv, "4198416")
 
 
 def test_find_function_contained_address_outside_any_function_still_errors(monkeypatch):
