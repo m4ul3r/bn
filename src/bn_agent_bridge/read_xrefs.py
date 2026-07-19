@@ -201,16 +201,23 @@ def _adrp_pagebase_is_spurious(adrp_il, following_ils, page_base: int) -> bool:
     dest = _reg_name(getattr(adrp_il, "dest", None))
     if not dest:
         return False
+    saw_nonzero_offset = False
     for nxt in following_ils:
         body = getattr(nxt, "src", None) if il_format._il_op_name(nxt) == "LLIL_SET_REG" else nxt
         offset = _expr_reg_offset(body, dest)
         if offset is not None:
-            return offset != 0
+            if offset == 0:
+                return False  # zero-offset consumer -> decisive genuine evidence
+            saw_nonzero_offset = True
+            # A nonzero-offset consumer is not decisive by itself -- keep
+            # scanning for a later zero-offset/direct-use consumer before
+            # this register gets redefined.
+            continue
         if _expr_contains_reg(body, dest):
             return False  # pointer used as-is -> genuine &fn
         if il_format._il_op_name(nxt) == "LLIL_SET_REG" and _reg_name(getattr(nxt, "dest", None)) == dest:
-            return False  # page base redefined before use -> not a ref
-    return False
+            break  # page base redefined before use -> stop scanning
+    return saw_nonzero_offset
 
 
 def _is_spurious_adrp_pagebase(bv, ref, address: int) -> bool:
