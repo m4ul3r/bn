@@ -3296,6 +3296,17 @@ class TaintEngine:
                 _sink_args = list(sink.get("tainted_args") or [])
                 if sink.get("len_arg") is not None and sink["len_arg"] not in _sink_args:
                     _sink_args.append(int(sink["len_arg"]))
+                # #615: an empty tainted_args with no len_arg is the existing
+                # catalog convention for an ALWAYS-unsafe API (e.g. gets()) --
+                # the loop below has nothing to iterate, so without this arm
+                # the sink never fires regardless of any taint reaching the
+                # call, a pure false negative. Report it unconditionally, once
+                # per call site, with no fabricated arg taint.
+                if not _sink_args and sink.get("len_arg") is None:
+                    sig = (addr, None) if site_taddr is None else (addr, None, site_taddr)
+                    if sig not in recorded_sinks:
+                        recorded_sinks.add(sig)
+                        findings.append(self._make_unconditional_finding(ins, mkey or name, sink))
                 for argidx in _sink_args:
                     if argidx < len(params):
                         ht = arg_taint(params[argidx])
@@ -4497,6 +4508,25 @@ class TaintEngine:
                 **({"format_constant": sink["format_constant"]} if sink.get("format_constant") is not None else {}),
                 **({"source_bound": sink["source_bound"]} if sink.get("source_bound") else {}),
                 **({"via": sink["via"]} if sink.get("via") else {}),
+            },
+            "path": path,
+        }
+
+    def _make_unconditional_finding(self, ins, callee, sink) -> dict[str, Any]:
+        """Build a finding for an always-unsafe sink (empty ``tainted_args``,
+        no ``len_arg``) that has no arg taint to chain -- no real taint node
+        exists to hand to :meth:`_reconstruct_path`, so this builds a single-step
+        path describing the always-unsafe API reached at this call site instead
+        (#615)."""
+        path = [_instr_dict(ins, reason=f"always-unsafe API {callee} reached",
+                            callee=callee)]
+        return {
+            "sink": {
+                "callee": callee,
+                "address": hex(int(getattr(ins, "address", 0))),
+                "tainted_arg_index": None,
+                "class": sink.get("class"),
+                "detail": sink.get("detail"),
             },
             "path": path,
         }

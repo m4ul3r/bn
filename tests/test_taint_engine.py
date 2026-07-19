@@ -824,6 +824,93 @@ def test_forward_modeled_sink_full_arity_tainted_reports_sink_not_leaf(models):
     assert not any(l["kind"] == "arg_under_recovered" for l in result["leaves"]), result["leaves"]
 
 
+def test_forward_unconditional_sink_gets_fires_without_prior_taint(models):
+    # #615: the builtin `gets` model advertises an always-unsafe sink via empty
+    # `tainted_args: []` (and no `len_arg`); apply_model previously only armed
+    # sinks by iterating tainted_args/len_arg, so an empty list meant zero
+    # iterations -> a pure false negative on any gets() triage, even with NO
+    # prior taint anywhere in the function.
+    buf = FVar("buf"); n = FVar("n")
+    instrs = [
+        FInstr(0, 0x401000, "MLIL_CALL_SSA", "gets(&buf)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x402000", constant=0x402000),
+               params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)]),
+    ]
+    func = FFunc("vuln_parse", 0x401000, FSSAFunc(instrs), params=[n])
+    bv = FBV({0x402000: "gets"})
+    engine = te.TaintEngine(bv, models)
+    # seed an unrelated param -- gets() must fire as an unconditional sink
+    # regardless of any prior taint reaching this call.
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    hits = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "gets"]
+    assert len(hits) == 1, result["reached_sinks"]
+    sink = hits[0]["sink"]
+    assert sink["class"] == "unbounded_input"
+    assert sink["address"] == "0x401000"
+    assert sink["tainted_arg_index"] is None, sink
+
+
+def test_forward_unconditional_sink_gets_dedups_across_fixpoint_iterations(models):
+    # (2) dedup must hold across the fixpoint loop's own passes, not just
+    # across the two-callsite case below.
+    buf = FVar("buf"); other = FVar("other")
+    other1 = FSSA(other, 1)
+    instrs = [
+        FInstr(0, 0x401000, "MLIL_CALL_SSA", "gets(&buf)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x402000", constant=0x402000),
+               params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)]),
+        # an unrelated tainted var so the fixpoint loop runs more than once
+        FInstr(1, 0x401010, "MLIL_SET_VAR_SSA", "other#1 = other#0 + 1",
+               writes=[other1], reads=[FSSA(other, 0)]),
+    ]
+    func = FFunc("vuln_parse2", 0x401000, FSSAFunc(instrs), params=[other])
+    bv = FBV({0x402000: "gets"})
+    engine = te.TaintEngine(bv, models, max_iters=6)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    hits = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "gets"]
+    assert len(hits) == 1, result["reached_sinks"]
+
+
+def test_forward_unconditional_sink_gets_two_callsites_two_findings(models):
+    # (3) two distinct gets() call sites in one function must produce two
+    # distinct findings, not one collapsed finding.
+    buf1 = FVar("buf1"); buf2 = FVar("buf2"); n = FVar("n")
+    instrs = [
+        FInstr(0, 0x401000, "MLIL_CALL_SSA", "gets(&buf1)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x402000", constant=0x402000),
+               params=[FExpr("MLIL_ADDRESS_OF", "&buf1", src=buf1)]),
+        FInstr(1, 0x401020, "MLIL_CALL_SSA", "gets(&buf2)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x402000", constant=0x402000),
+               params=[FExpr("MLIL_ADDRESS_OF", "&buf2", src=buf2)]),
+    ]
+    func = FFunc("vuln_parse3", 0x401000, FSSAFunc(instrs), params=[n])
+    bv = FBV({0x402000: "gets"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    hits = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "gets"]
+    addrs = sorted(h["sink"]["address"] for h in hits)
+    assert addrs == ["0x401000", "0x401020"], result["reached_sinks"]
+
+
+def test_forward_conditional_sink_untainted_still_produces_nothing(models):
+    # (4) a conditional sink (memcpy) with an untainted relevant arg must still
+    # produce zero findings -- the empty-tainted_args special case must not
+    # leak into the general arming loop.
+    dst = FVar("dst"); src = FVar("src"); n = FVar("n")
+    instrs = [
+        FInstr(0, 0x401000, "MLIL_CALL_SSA", "memcpy(&dst, &src, 0x10)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x402000", constant=0x402000),
+               params=[FExpr("MLIL_ADDRESS_OF", "&dst", src=dst),
+                       FExpr("MLIL_ADDRESS_OF", "&src", src=src),
+                       FExpr("MLIL_CONST", "0x10", constant=0x10)]),
+    ]
+    func = FFunc("safe_copy", 0x401000, FSSAFunc(instrs), params=[n])
+    bv = FBV({0x402000: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert result["reached_sinks"] == [], result["reached_sinks"]
+
+
 def test_forward_no_flow_no_false_positive(models):
     # a function with no source->sink path must report zero sinks
     a = FVar("a"); r = FVar("r")
