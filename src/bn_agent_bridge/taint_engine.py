@@ -2020,7 +2020,7 @@ class TaintEngine:
             }
             out["diagnostics"] = forward_zero_diagnostics(
                 union_sub,
-                seed_callsites=int(base_diag.get("source_callsites", len(callsite_addrs))),
+                seed_callsites=len(callsite_addrs),
                 truncated=truncated, truncation_cause=sorted(truncation_causes))
         return out
 
