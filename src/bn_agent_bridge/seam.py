@@ -402,14 +402,20 @@ class BridgeContext:
     def _containment_meta(self, identifier, func):
         """Describe a READ resolved via the `contained` address fallback.
 
-        Returns ``{"requested_address", "offset"}`` when ``identifier`` is a
-        0x address that landed *inside* ``func`` rather than at its start, so a
-        caller (e.g. a taint/trace sink address) is told it hit a mid-function
-        point instead of silently treating it as the entry. Returns None for an
-        exact start or a non-address identifier (no annotation needed).
+        Returns ``{"requested_address", "offset"}`` when ``identifier`` is an
+        address -- 0x-hex OR bare decimal, the two documented address spellings
+        -- that landed *inside* ``func`` rather than at its start, so a caller
+        (e.g. a taint/trace sink address) is told it hit a mid-function point
+        instead of silently treating it as the entry. Returns None for an exact
+        start or a non-address identifier (a name) -- no annotation needed.
+
+        The address parse MUST mirror :meth:`_find_function`'s (hex OR decimal
+        via ``_parse_address``): that method resolves a decimal interior address
+        to its container just like hex, so gating the disclosure on a ``0x``
+        prefix would let a decimal request resolve to a mid-function point while
+        SILENTLY dropping the resolved_from/offset -- naming the wrong (start)
+        context with no indication it was a containment hit (#626 review).
         """
-        if not str(identifier).strip().lower().startswith("0x"):
-            return None
         try:
             addr = _parse_address(identifier)
         except ValueError:

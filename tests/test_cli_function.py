@@ -7,6 +7,7 @@ import bn.cli
 import pytest
 
 from _cli_helpers import *  # noqa: F401,F403
+from _bridge_fakes import _FakeBasicBlock, _FakeBV, _FakeFunction, _load_bridge
 
 
 
@@ -186,6 +187,37 @@ def test_decompile_text_notes_mid_function_resolution(fake_transport, capsys):
     out, _ = capsys.readouterr()
     assert "0x401010 is inside parse_packet @ 0x401000 (+0x10)" in out
     assert "int parse_packet(void* arg1)" in out  # body still rendered below the note
+
+
+def test_decompile_text_notes_decimal_mid_function_resolution_end_to_end(monkeypatch, capsys):
+    # #626 review round 2 (Finding 1): the bridge-side bug was that a DECIMAL
+    # interior address resolved to its container but DROPPED resolved_from. This
+    # drives the CLI end-to-end through the REAL bridge dispatch (not a stubbed
+    # transport), so the decimal request genuinely exercises _containment_meta:
+    # text mode must show the resolution note for `decompile 4198416` exactly as
+    # it does for the equivalent hex `decompile 0x401010`.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "parse_packet")
+    fn.basic_blocks = [_FakeBasicBlock(0x401000, 0x401040)]
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, spawn_missing_named=False, **kwargs):
+        result = instance._dispatch_on_main(op, params or {}, target)
+        return {"ok": True, "result": result}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    assert 4198416 == 0x401010
+    rc = bn.cli.main(["decompile", "4198416", "--target", "active"])
+
+    assert rc == 0
+    out, _ = capsys.readouterr()
+    # requested_address is normalized to hex in the disclosure even though the
+    # user typed the decimal spelling.
+    assert "0x401010 is inside parse_packet @ 0x401000 (+0x10)" in out
 
 
 def test_decompile_text_has_no_note_for_exact_start(fake_transport, capsys):

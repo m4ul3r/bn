@@ -2235,6 +2235,56 @@ def test_read_verb_exact_start_has_no_resolved_from(monkeypatch):
     assert "resolved_from" not in result
 
 
+def test_containment_meta_decimal_matches_hex(monkeypatch):
+    # #626 review round 2 (Finding 1): _containment_meta gated the disclosure on a
+    # 0x prefix, so a DECIMAL interior address -- which _find_function already
+    # resolves to its container (hex OR decimal via _parse_address) -- silently
+    # dropped resolved_from/offset. The metadata for the decimal spelling must be
+    # IDENTICAL to the equivalent hex spelling.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _, fn = _mid_function_bv()
+    assert 4198416 == 0x401010  # interior of parse_packet (0x401000..0x401040)
+
+    hex_meta = instance.ctx._containment_meta("0x401010", fn)
+    dec_meta = instance.ctx._containment_meta("4198416", fn)
+    assert hex_meta == {"requested_address": "0x401010", "offset": "+0x10"}
+    assert dec_meta == hex_meta  # decimal discloses identically to hex
+
+    # A decimal EXACT start still has no disclosure (like the hex exact start).
+    assert instance.ctx._containment_meta("4198400", fn) is None
+    assert instance.ctx._containment_meta("0x401000", fn) is None
+    # A plain name is not an address -> no disclosure.
+    assert instance.ctx._containment_meta("parse_packet", fn) is None
+
+
+@pytest.mark.parametrize("call", [
+    pytest.param(lambda inst: inst._decompile("active", "4198416"), id="decompile"),
+    pytest.param(lambda inst: inst._function_info("active", "4198416"), id="function_info"),
+    pytest.param(lambda inst: inst._il("active", "4198416", "mlil", False), id="il"),
+    pytest.param(lambda inst: inst._disasm("active", "4198416"), id="disasm"),
+    pytest.param(lambda inst: inst._get_prototype("active", "4198416"), id="proto_get"),
+    pytest.param(lambda inst: inst._list_locals_for_function("active", "4198416"), id="local_list"),
+])
+def test_read_verbs_decimal_mid_address_discloses_like_hex(monkeypatch, call):
+    # #626 review round 2 (Finding 1): the INTERACTION the original tests missed --
+    # a DECIMAL interior-address request to a containment-enabled read must surface
+    # the SAME resolved_from as the equivalent hex request (4198416 == 0x401010),
+    # not resolve to the container while omitting the disclosure.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _ = _mid_function_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    assert 4198416 == 0x401010
+
+    result = call(instance)
+
+    assert result["function"]["name"] == "parse_packet"
+    assert result["function"]["address"] == "0x401000"
+    # requested_address is normalized to hex even though the request was decimal.
+    assert result["resolved_from"] == {"requested_address": "0x401010", "offset": "+0x10"}
+
+
 # --- #626: extend the mid-function (contained) contract to the evidence /
 # dataflow READ verbs (#193 Part 4 shipped only decompile/info/il/disasm/etc.).
 # A sink address reported by taint/trace lands mid-callee, and these verbs must
