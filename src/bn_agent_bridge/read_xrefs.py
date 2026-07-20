@@ -188,12 +188,15 @@ def _adrp_pagebase_is_spurious(adrp_il, following_ils, page_base: int) -> bool:
     An ``adrp xN, <page>`` produces the 4 KB page base; the real referent is
     ``page + offset`` from the paired ``add``/``ldr``/``str``. Given the adrp's
     LLIL instruction and the LLIL instructions that follow it in the same basic
-    block, the page base is *spurious* iff the first consumer of the destination
-    register offsets it by a NONZERO constant (so the true target is elsewhere in
-    the page). A zero offset, a direct use (function-pointer take), a redefinition
-    before use, or a non-``SET_REG`` ref (a call/branch) are all genuine -- the
-    rule only ever drops on positive nonzero-offset evidence, so it can never hide
-    a real caller."""
+    block, this scans the *whole* window up to a redefinition of the destination
+    register (not just the first consumer): the page base is *spurious* iff every
+    consumer seen offsets it by a NONZERO constant and none offsets it by zero or
+    uses it directly before the register is redefined (so the true target is
+    elsewhere in the page). A zero offset, a direct use (function-pointer take),
+    a redefinition before use, or a non-``SET_REG`` ref (a call/branch) are all
+    decisive genuine evidence and short-circuit the scan -- the rule only ever
+    drops on exhausting the window with nothing but nonzero-offset evidence, so
+    it can never hide a real caller behind an earlier nonzero-offset consumer."""
     if il_format._il_op_name(adrp_il) != "LLIL_SET_REG":
         return False
     if il_format._llil_constant_value(getattr(adrp_il, "src", None)) != int(page_base):
@@ -201,16 +204,29 @@ def _adrp_pagebase_is_spurious(adrp_il, following_ils, page_base: int) -> bool:
     dest = _reg_name(getattr(adrp_il, "dest", None))
     if not dest:
         return False
+    saw_nonzero_offset = False
     for nxt in following_ils:
         body = getattr(nxt, "src", None) if il_format._il_op_name(nxt) == "LLIL_SET_REG" else nxt
         offset = _expr_reg_offset(body, dest)
+        if offset == 0:
+            return False  # zero-offset consumer -> decisive genuine evidence
         if offset is not None:
-            return offset != 0
-        if _expr_contains_reg(body, dest):
+            # A nonzero-offset consumer is not decisive by itself -- record it
+            # and keep scanning for a later zero-offset/direct-use consumer. But
+            # fall through to the redefinition check below: `add xN, xN, #k`
+            # BOTH consumes and REDEFINES xN, and after it xN no longer holds
+            # the page base.
+            saw_nonzero_offset = True
+        elif _expr_contains_reg(body, dest):
             return False  # pointer used as-is -> genuine &fn
+        # A redefinition of the tracked register stops the scan. This must run
+        # even when the same instruction consumed the register with a nonzero
+        # offset (add xN, xN, #k) -- otherwise a LATER zero-offset/direct use of
+        # the now-REDEFINED register would be wrongly credited to the stale
+        # page-base identity, and the redefinition check would be unreachable.
         if il_format._il_op_name(nxt) == "LLIL_SET_REG" and _reg_name(getattr(nxt, "dest", None)) == dest:
-            return False  # page base redefined before use -> not a ref
-    return False
+            break  # page base redefined -> stop scanning
+    return saw_nonzero_offset
 
 
 def _is_spurious_adrp_pagebase(bv, ref, address: int) -> bool:

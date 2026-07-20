@@ -410,6 +410,88 @@ def test_linear_decode_arch_rejects_non_arm_mode(monkeypatch):
         rd._linear_decode_arch(_Ctx(), bv, 0x1000, "mips")
 
 
+def test_disasm_linear_no_thumb_mask_on_aarch64(monkeypatch):
+    # #600 parity check for BN's "aarch64" spelling: an odd linear start on an
+    # AArch64 target is NOT a Thumb pointer tag (AArch64 has no Thumb mode) and
+    # must be left untouched. NOTE this spelling alone does NOT catch a reversion
+    # of the #600 fix -- "aarch64".startswith("arm") is False, so the old raw
+    # startswith("arm")/("thumb") gate already left "aarch64" unmasked and this
+    # test passes identically with the fix reverted. The genuine regression guard
+    # is the sibling test using BN's "arm64" spelling, which DOES start with
+    # "arm" and so distinguishes the fixed gate from the broken one.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        arch=_FakeArch(name="aarch64"),
+        memory={0x401000: b"\x90" * 8},
+        disassembly={a: "nop" for a in range(0x401000, 0x401008)},
+        instruction_lengths={a: 4 for a in range(0x401000, 0x401008)},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    res = instance._disasm(None, "0x401001", linear=1)
+    assert res["address"] == "0x401001"  # NOT masked
+    assert "Thumb" not in res["note"]
+
+
+def test_disasm_linear_no_thumb_mask_on_arm64(monkeypatch):
+    # BN's alternate AArch64 spelling "arm64" -- the GENUINE #600 regression
+    # guard: "arm64".startswith("arm") is True, so the pre-fix raw gate wrongly
+    # masked bit 0 as a Thumb pointer tag here. Reverting the fix fails THIS test
+    # (the "aarch64"-spelled sibling stays green, so it can't guard the fix).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        arch=_FakeArch(name="arm64"),
+        memory={0x401000: b"\x90" * 8},
+        disassembly={a: "nop" for a in range(0x401000, 0x401008)},
+        instruction_lengths={a: 4 for a in range(0x401000, 0x401008)},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    res = instance._disasm(None, "0x401001", linear=1)
+    assert res["address"] == "0x401001"  # NOT masked
+    assert "Thumb" not in res["note"]
+
+
+def test_linear_decode_arch_rejects_mode_on_arm64(monkeypatch):
+    # #600: --mode arm|thumb must not force armv7/thumb2 decode on an AArch64
+    # target spelled "arm64" -- the wrong ISA entirely. Pre-fix this was a live
+    # bug: the old gate was a raw `cur.startswith("arm")`, and "arm64" DOES
+    # start with "arm", so the old code wrongly let --mode through and forced
+    # an armv7/thumb2 decode of an AArch64 target. (The "aarch64" spelling
+    # never exercised this bug -- "aarch64" does not start with "arm" -- so a
+    # test using that spelling alone passes identically with the fix reverted;
+    # this is the arch spelling that actually distinguishes fixed from broken.)
+    # The error must name the actual arch.
+    bridge = _load_bridge(monkeypatch)
+    rd = bridge.read_decompile
+
+    class _Ctx:
+        def _functions_containing(self, bv, addr):
+            return []
+
+    bv = type("BV", (), {"arch": type("A", (), {"name": "arm64"})()})()
+    with pytest.raises(ValueError, match="arm64"):
+        rd._linear_decode_arch(_Ctx(), bv, 0x401000, "arm")
+
+
+def test_linear_decode_arch_rejects_mode_on_aarch64(monkeypatch):
+    # Parity check for the other AArch64 spelling BN uses. Kept alongside the
+    # arm64 test above since both spellings must be covered, even though this
+    # one alone would not catch a reversion of the #600 fix.
+    bridge = _load_bridge(monkeypatch)
+    rd = bridge.read_decompile
+
+    class _Ctx:
+        def _functions_containing(self, bv, addr):
+            return []
+
+    bv = type("BV", (), {"arch": type("A", (), {"name": "aarch64"})()})()
+    with pytest.raises(ValueError, match="aarch64"):
+        rd._linear_decode_arch(_Ctx(), bv, 0x401000, "arm")
+    with pytest.raises(ValueError, match="aarch64"):
+        rd._linear_decode_arch(_Ctx(), bv, 0x401000, "thumb")
+
+
 def test_decompile_renders_pseudo_c(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -2084,6 +2166,27 @@ def test_find_function_resolves_contained_address_only_when_opted_in(monkeypatch
     assert instance._find_function(bv, "0x401000", contained=True) is fn
 
 
+def test_find_function_resolves_decimal_contained_address(monkeypatch):
+    # #626 review (Finding 3): a decimal-spelled interior address (a documented
+    # address format) must resolve via containment exactly like the 0x-hex
+    # spelling -- not skip the containment branch and hard-error "No function
+    # found". 4198416 == 0x401010, an interior address of parse_packet.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, fn = _mid_function_bv()
+
+    assert 4198416 == 0x401010
+    resolved = instance._find_function(bv, "4198416", contained=True)
+    assert resolved is fn
+
+    # A decimal exact start resolves too (no regression).
+    assert instance._find_function(bv, "4198400", contained=True) is fn
+
+    # A decimal interior address WITHOUT contained stays strict, like hex.
+    with pytest.raises(RuntimeError, match="No function found at address 0x401010"):
+        instance._find_function(bv, "4198416")
+
+
 def test_find_function_contained_address_outside_any_function_still_errors(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -2127,6 +2230,199 @@ def test_read_verb_exact_start_has_no_resolved_from(monkeypatch):
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._decompile("active", "0x401000")
+
+    assert result["function"]["address"] == "0x401000"
+    assert "resolved_from" not in result
+
+
+def test_containment_meta_decimal_matches_hex(monkeypatch):
+    # #626 review round 2 (Finding 1): _containment_meta gated the disclosure on a
+    # 0x prefix, so a DECIMAL interior address -- which _find_function already
+    # resolves to its container (hex OR decimal via _parse_address) -- silently
+    # dropped resolved_from/offset. The metadata for the decimal spelling must be
+    # IDENTICAL to the equivalent hex spelling.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _, fn = _mid_function_bv()
+    assert 4198416 == 0x401010  # interior of parse_packet (0x401000..0x401040)
+
+    hex_meta = instance.ctx._containment_meta("0x401010", fn)
+    dec_meta = instance.ctx._containment_meta("4198416", fn)
+    assert hex_meta == {"requested_address": "0x401010", "offset": "+0x10"}
+    assert dec_meta == hex_meta  # decimal discloses identically to hex
+
+    # A decimal EXACT start still has no disclosure (like the hex exact start).
+    assert instance.ctx._containment_meta("4198400", fn) is None
+    assert instance.ctx._containment_meta("0x401000", fn) is None
+    # A plain name is not an address -> no disclosure.
+    assert instance.ctx._containment_meta("parse_packet", fn) is None
+
+
+@pytest.mark.parametrize("call", [
+    pytest.param(lambda inst: inst._decompile("active", "4198416"), id="decompile"),
+    pytest.param(lambda inst: inst._function_info("active", "4198416"), id="function_info"),
+    pytest.param(lambda inst: inst._il("active", "4198416", "mlil", False), id="il"),
+    pytest.param(lambda inst: inst._disasm("active", "4198416"), id="disasm"),
+    pytest.param(lambda inst: inst._get_prototype("active", "4198416"), id="proto_get"),
+    pytest.param(lambda inst: inst._list_locals_for_function("active", "4198416"), id="local_list"),
+])
+def test_read_verbs_decimal_mid_address_discloses_like_hex(monkeypatch, call):
+    # #626 review round 2 (Finding 1): the INTERACTION the original tests missed --
+    # a DECIMAL interior-address request to a containment-enabled read must surface
+    # the SAME resolved_from as the equivalent hex request (4198416 == 0x401010),
+    # not resolve to the container while omitting the disclosure.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _ = _mid_function_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    assert 4198416 == 0x401010
+
+    result = call(instance)
+
+    assert result["function"]["name"] == "parse_packet"
+    assert result["function"]["address"] == "0x401000"
+    # requested_address is normalized to hex even though the request was decimal.
+    assert result["resolved_from"] == {"requested_address": "0x401010", "offset": "+0x10"}
+
+
+# --- #626: extend the mid-function (contained) contract to the evidence /
+# dataflow READ verbs (#193 Part 4 shipped only decompile/info/il/disasm/etc.).
+# A sink address reported by taint/trace lands mid-callee, and these verbs must
+# resolve it to the containing function the same way decompile already does.
+
+@pytest.mark.parametrize("call", [
+    pytest.param(lambda inst: inst._structured_il("active", "0x401010"), id="structured_il"),
+    pytest.param(lambda inst: inst._resolved_calls("active", "0x401010"), id="resolved_calls"),
+])
+def test_dataflow_reads_resolve_mid_function_address(monkeypatch, call):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _ = _mid_function_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    # The IL body is irrelevant here -- the point under test is that
+    # _find_function resolves the interior address (contained=True) and the
+    # result is annotated. Stub the IL so the handler runs to completion.
+    monkeypatch.setattr(
+        bridge.il_format, "_il_function_for",
+        lambda fn, view, ssa: types.SimpleNamespace(instructions=[]),
+    )
+
+    result = call(instance)
+
+    assert result["function"]["name"] == "parse_packet"
+    assert result["function"]["address"] == "0x401000"
+    assert result["resolved_from"] == {"requested_address": "0x401010", "offset": "+0x10"}
+
+
+@pytest.mark.parametrize("call", [
+    pytest.param(lambda inst: inst._structured_il("active", "0x401000"), id="structured_il"),
+    pytest.param(lambda inst: inst._resolved_calls("active", "0x401000"), id="resolved_calls"),
+])
+def test_dataflow_reads_exact_start_has_no_resolved_from(monkeypatch, call):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _ = _mid_function_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(
+        bridge.il_format, "_il_function_for",
+        lambda fn, view, ssa: types.SimpleNamespace(instructions=[]),
+    )
+
+    result = call(instance)
+
+    assert result["function"]["address"] == "0x401000"
+    assert "resolved_from" not in result
+
+
+def test_possible_values_resolves_mid_function_address(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _ = _mid_function_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    # An MLIL instruction begins at the interior address so the value-set read
+    # reaches its result (not an early no_instruction refusal): this proves the
+    # containment resolution happens before, not instead of, the real work.
+    ins = types.SimpleNamespace(
+        address=0x401010, possible_values=_pvs("ConstantValue", value=7), src=None,
+    )
+    monkeypatch.setattr(
+        bridge.il_format, "_il_function_for",
+        lambda fn, view, ssa: types.SimpleNamespace(instructions=[ins]),
+    )
+
+    result = instance._possible_values("active", "0x401010", "0x401010")
+
+    assert result["function"]["name"] == "parse_packet"
+    assert result["function"]["address"] == "0x401000"
+    assert result["possible_values"]["value"] == 7
+    assert result["resolved_from"] == {"requested_address": "0x401010", "offset": "+0x10"}
+
+
+def test_possible_values_exact_start_has_no_resolved_from(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _ = _mid_function_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    ins = types.SimpleNamespace(
+        address=0x401000, possible_values=_pvs("ConstantValue", value=7), src=None,
+    )
+    monkeypatch.setattr(
+        bridge.il_format, "_il_function_for",
+        lambda fn, view, ssa: types.SimpleNamespace(instructions=[ins]),
+    )
+
+    result = instance._possible_values("active", "0x401000", "0x401000")
+
+    assert result["function"]["address"] == "0x401000"
+    assert "resolved_from" not in result
+
+
+def test_defuse_resolves_mid_function_address(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _ = _mid_function_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    # Reach the full def/use body so resolved_from is only set after the
+    # variable lookup succeeds -- not a vacuous pass that skips var resolution.
+    il = types.SimpleNamespace(
+        instructions=[],
+        get_ssa_var_definition=lambda v: None,
+        get_ssa_var_uses=lambda v: [],
+    )
+    monkeypatch.setattr(bridge.il_format, "_il_function_for", lambda fn, view, ssa: il)
+    ssa_var = types.SimpleNamespace(var=types.SimpleNamespace(name="arg1", type="int"), version=0)
+    monkeypatch.setattr(
+        bridge.il_format, "_resolve_ssa_variable",
+        lambda func, il_, sel: (ssa_var, []),
+    )
+    monkeypatch.setattr(bridge.il_format, "_ssa_var_entry", lambda v: {"ssa": "arg1#0"})
+
+    result = instance._defuse("active", "0x401010", "arg1#0")
+
+    assert result["function"]["name"] == "parse_packet"
+    assert result["function"]["address"] == "0x401000"
+    assert result["resolved_from"] == {"requested_address": "0x401010", "offset": "+0x10"}
+
+
+def test_defuse_exact_start_has_no_resolved_from(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _ = _mid_function_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    il = types.SimpleNamespace(
+        instructions=[],
+        get_ssa_var_definition=lambda v: None,
+        get_ssa_var_uses=lambda v: [],
+    )
+    monkeypatch.setattr(bridge.il_format, "_il_function_for", lambda fn, view, ssa: il)
+    ssa_var = types.SimpleNamespace(var=types.SimpleNamespace(name="arg1", type="int"), version=0)
+    monkeypatch.setattr(
+        bridge.il_format, "_resolve_ssa_variable",
+        lambda func, il_, sel: (ssa_var, []),
+    )
+    monkeypatch.setattr(bridge.il_format, "_ssa_var_entry", lambda v: {"ssa": "arg1#0"})
+
+    result = instance._defuse("active", "0x401000", "arg1#0")
 
     assert result["function"]["address"] == "0x401000"
     assert "resolved_from" not in result
@@ -2205,7 +2501,7 @@ def test_callgraph_result_carries_kind_envelope(monkeypatch):
     instance = bridge.BinaryNinjaBridge()
     func = types.SimpleNamespace(name="f", start=0x1000, caller_sites=[])
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda sel: object())
-    monkeypatch.setattr(instance.ctx, "_find_function", lambda bv, ident: func)
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda bv, ident, **kw: func)
 
     result = bridge.read_decompile._resolved_calls(
         instance.ctx, None, "f", direction="callers")

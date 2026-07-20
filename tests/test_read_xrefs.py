@@ -657,6 +657,76 @@ def test_non_setreg_ref_is_never_spurious(monkeypatch):
     assert _spurious(monkeypatch, call, [], A) is False
 
 
+def test_adrp_pagebase_nonzero_then_zero_offset_is_genuine(monkeypatch):
+    # `adrp x8, A` then `add x1, x8, #0x40` (nonzero) then `add x2, x8, #0`
+    # (zero) in the same block -- the zero-offset consumer later in the scan
+    # window is decisive genuine evidence; must NOT drop despite the earlier
+    # nonzero consumer (#583, the literal repro: `add x1,x8,#0x40` then
+    # `add x2,x8,#0`).
+    A = 0x438000
+    adrp = _adrp("x8", A, 0)
+    add_nonzero = _set_reg("x1", _LOp("LLIL_ADD", [_reg("x8"), _const(0x40)]), 1)
+    add_zero = _set_reg("x2", _LOp("LLIL_ADD", [_reg("x8"), _const(0)]), 2)
+    assert _spurious(monkeypatch, adrp, [add_nonzero, add_zero], A) is False
+
+
+def test_adrp_pagebase_zero_then_nonzero_offset_is_genuine(monkeypatch):
+    # Order reversed from the case above -- already worked before the fix,
+    # must still retain.
+    A = 0x438000
+    adrp = _adrp("x8", A, 0)
+    add_zero = _set_reg("x2", _LOp("LLIL_ADD", [_reg("x8"), _const(0)]), 1)
+    add_nonzero = _set_reg("x1", _LOp("LLIL_ADD", [_reg("x8"), _const(0x40)]), 2)
+    assert _spurious(monkeypatch, adrp, [add_zero, add_nonzero], A) is False
+
+
+def test_adrp_pagebase_two_nonzero_offsets_no_zero_is_spurious(monkeypatch):
+    # Two nonzero-offset consumers, no zero-offset consumer anywhere -- must
+    # still drop (confirms the fix didn't become overly conservative).
+    A = 0x438000
+    adrp = _adrp("x8", A, 0)
+    add1 = _set_reg("x1", _LOp("LLIL_ADD", [_reg("x8"), _const(0x40)]), 1)
+    add2 = _set_reg("x2", _LOp("LLIL_ADD", [_reg("x8"), _const(0x60)]), 2)
+    assert _spurious(monkeypatch, adrp, [add1, add2], A) is True
+
+
+def test_adrp_pagebase_nonzero_then_redefinition_no_zero_is_spurious(monkeypatch):
+    # A nonzero-offset consumer followed by a redefinition of the page-base
+    # register with no zero-offset consumer before the redefinition -- must
+    # still drop.
+    A = 0x438000
+    adrp = _adrp("x8", A, 0)
+    add_nonzero = _set_reg("x1", _LOp("LLIL_ADD", [_reg("x8"), _const(0x40)]), 1)
+    redef = _set_reg("x8", _reg("x5"), 2)
+    assert _spurious(monkeypatch, adrp, [add_nonzero, redef], A) is True
+
+
+def test_adrp_pagebase_selfredefine_then_zero_offset_is_spurious(monkeypatch):
+    # `adrp x8, A` then `add x8, x8, #0x40` (REDEFINES x8 to A+0x40) then
+    # `add x2, x8, #0` (zero-offset use of the REDEFINED x8). The zero-offset
+    # consumer references A+0x40, NOT the original page base A, so the adrp
+    # page-base xref to a function starting at A is spurious. The middle
+    # instruction both consumes x8 (nonzero) AND redefines it, so tracking of
+    # the page-base identity must stop after it -- the later zero offset must
+    # not be credited to the stale page base.
+    A = 0x438000
+    adrp = _adrp("x8", A, 0)
+    add_redef = _set_reg("x8", _LOp("LLIL_ADD", [_reg("x8"), _const(0x40)]), 1)
+    add_zero = _set_reg("x2", _LOp("LLIL_ADD", [_reg("x8"), _const(0)]), 2)
+    assert _spurious(monkeypatch, adrp, [add_redef, add_zero], A) is True
+
+
+def test_adrp_pagebase_selfredefine_then_direct_use_is_spurious(monkeypatch):
+    # `adrp x8, A` then `add x8, x8, #0x40` (REDEFINES x8) then `mov x1, x8`
+    # (direct use of REDEFINED x8). The direct use takes &(A+0x40), not &A, so
+    # the page-base xref to A is spurious -- tracking must stop at the redefine.
+    A = 0x438000
+    adrp = _adrp("x8", A, 0)
+    add_redef = _set_reg("x8", _LOp("LLIL_ADD", [_reg("x8"), _const(0x40)]), 1)
+    direct = _set_reg("x1", _reg("x8"), 2)
+    assert _spurious(monkeypatch, adrp, [add_redef, direct], A) is True
+
+
 def test_setreg_const_not_pagebase_is_not_spurious(monkeypatch):
     # SET_REG to a constant that isn't the queried page base -> not our pattern.
     adrp = _adrp("x0", 0x439000, 0)

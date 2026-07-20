@@ -7,6 +7,7 @@ import bn.cli
 import pytest
 
 from _cli_helpers import *  # noqa: F401,F403
+from _bridge_fakes import _FakeBasicBlock, _FakeBV, _FakeFunction, _load_bridge
 
 
 
@@ -188,6 +189,37 @@ def test_decompile_text_notes_mid_function_resolution(fake_transport, capsys):
     assert "int parse_packet(void* arg1)" in out  # body still rendered below the note
 
 
+def test_decompile_text_notes_decimal_mid_function_resolution_end_to_end(monkeypatch, capsys):
+    # #626 review round 2 (Finding 1): the bridge-side bug was that a DECIMAL
+    # interior address resolved to its container but DROPPED resolved_from. This
+    # drives the CLI end-to-end through the REAL bridge dispatch (not a stubbed
+    # transport), so the decimal request genuinely exercises _containment_meta:
+    # text mode must show the resolution note for `decompile 4198416` exactly as
+    # it does for the equivalent hex `decompile 0x401010`.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "parse_packet")
+    fn.basic_blocks = [_FakeBasicBlock(0x401000, 0x401040)]
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, spawn_missing_named=False, **kwargs):
+        result = instance._dispatch_on_main(op, params or {}, target)
+        return {"ok": True, "result": result}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    assert 4198416 == 0x401010
+    rc = bn.cli.main(["decompile", "4198416", "--target", "active"])
+
+    assert rc == 0
+    out, _ = capsys.readouterr()
+    # requested_address is normalized to hex in the disclosure even though the
+    # user typed the decimal spelling.
+    assert "0x401010 is inside parse_packet @ 0x401000 (+0x10)" in out
+
+
 def test_decompile_text_has_no_note_for_exact_start(fake_transport, capsys):
     fake_transport({"decompile": {"ok": True, "result": {
         "text": "int parse_packet(void* arg1)\n{\n    ...\n}",
@@ -297,6 +329,87 @@ def test_disasm_count_exact_start_no_linear_steer(fake_transport, capsys):
     assert rc == 0
     out, _ = capsys.readouterr()
     assert "--linear" not in out
+
+
+# #626 review (Finding 2): the five function-scoped reads that gained
+# mid-function-address tolerance (structured-il, dataflow defuse/callgraph/values,
+# evidence function) must surface `resolved_from` in TEXT mode exactly like the
+# original six reads (decompile/il/...). Otherwise an agent that named a sink
+# address mid-callee silently gets a listing for a function whose start differs
+# from what it asked, which reads like the wrong answer.
+_MIDFN_TEXT_OPS = [
+    (
+        "structured_il",
+        ["function", "structured-il", "0x401010", "--target", "active"],
+        {
+            "function": {"name": "parse_packet", "address": "0x401000"},
+            "view": "mlil", "ssa": True,
+            "instructions": [
+                {"il_index": 0, "address": "0x401010", "op": "MLIL_SET_VAR", "text": "x = 1"},
+            ],
+        },
+    ),
+    (
+        "defuse",
+        ["dataflow", "defuse", "0x401010", "--var", "x", "--target", "active"],
+        {
+            "function": {"name": "parse_packet", "address": "0x401000"},
+            "variable": {"name": "x", "type": "int32_t"},
+            "uses": [],
+        },
+    ),
+    (
+        "resolved_calls",
+        ["dataflow", "callgraph", "0x401010", "--target", "active"],
+        {
+            "function": {"name": "parse_packet", "address": "0x401000"},
+            "callees": [], "callers": [],
+        },
+    ),
+    (
+        "possible_values",
+        ["dataflow", "values", "0x401010", "--at", "0x401010", "--target", "active"],
+        {
+            "function": {"name": "parse_packet", "address": "0x401000"},
+            "at": "0x401010", "expression": "x",
+            "possible_values": {"type": "ConstantValue", "value": 1, "raw": "<const 0x1>"},
+        },
+    ),
+    (
+        "function_evidence",
+        ["evidence", "function", "0x401010", "--target", "active"],
+        {
+            "function": {"name": "parse_packet", "address": "0x401000"},
+        },
+    ),
+]
+
+
+@pytest.mark.parametrize("op,argv,result", _MIDFN_TEXT_OPS,
+                         ids=[o[0] for o in _MIDFN_TEXT_OPS])
+def test_midfn_read_text_notes_resolution(fake_transport, capsys, op, argv, result):
+    payload = dict(result)
+    payload["resolved_from"] = {"requested_address": "0x401010", "offset": "+0x10"}
+    fake_transport({op: {"ok": True, "result": payload}})
+
+    rc = bn.cli.main(argv)
+
+    assert rc == 0
+    out, _ = capsys.readouterr()
+    assert "0x401010 is inside parse_packet @ 0x401000 (+0x10)" in out
+
+
+@pytest.mark.parametrize("op,argv,result", _MIDFN_TEXT_OPS,
+                         ids=[o[0] for o in _MIDFN_TEXT_OPS])
+def test_midfn_read_text_no_note_for_exact_start(fake_transport, capsys, op, argv, result):
+    # No resolved_from (exact start / name) -> no note.
+    fake_transport({op: {"ok": True, "result": dict(result)}})
+
+    rc = bn.cli.main(argv)
+
+    assert rc == 0
+    out, _ = capsys.readouterr()
+    assert "is inside" not in out
 
 
 def test_function_list_forwards_address_filters(fake_transport, capsys):

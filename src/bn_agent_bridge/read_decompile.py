@@ -328,6 +328,16 @@ _ARM_MODE_ARCHES = {
 }
 
 
+def _is_classic_arm_or_thumb_arch(name: str) -> bool:
+    """True for classic 32-bit ARM/Thumb arch names (armv7/thumb2 and variants);
+    False for AArch64 (#600 -- "arm64" starts with "arm" and would otherwise be
+    misclassified as classic ARM/Thumb) and for any non-ARM arch."""
+    n = (name or "").lower()
+    if "aarch64" in n or "arm64" in n:
+        return False
+    return n.startswith("arm") or n.startswith("thumb")
+
+
 def _linear_decode_arch(ctx, bv, address: int, mode):
     """The architecture to linearly decode at *address* (#382).
 
@@ -349,7 +359,7 @@ def _linear_decode_arch(ctx, bv, address: int, mode):
                 f"--mode must be 'arm' or 'thumb' (got {mode!r})"
             )
         cur = str(getattr(bv_arch, "name", "") or "")
-        if not (cur.startswith("arm") or cur.startswith("thumb")):
+        if not _is_classic_arm_or_thumb_arch(cur):
             raise ValueError(
                 f"--mode {mode} is only for ARM/Thumb targets (this target is "
                 f"{cur or 'unknown'})"
@@ -434,7 +444,7 @@ def _disasm_linear(ctx, bv, identifier, count: int, *, mode=None,
     # NEVER mask on non-ARM targets where odd code addresses are legitimate.
     thumb_tag_normalized = None
     bv_arch_name = str(getattr(getattr(bv, "arch", None), "name", "") or "")
-    if (address & 1) and (bv_arch_name.startswith("arm") or bv_arch_name.startswith("thumb")):
+    if (address & 1) and _is_classic_arm_or_thumb_arch(bv_arch_name):
         thumb_tag_normalized = address
         address &= ~1
     if not _address_is_mapped(bv, address):
@@ -584,7 +594,7 @@ def _address_is_mapped(bv, address: int) -> bool:
 
 def _structured_il(ctx, selector, identifier, *, view: str = "mlil", ssa: bool = True):
     bv = ctx._resolve_view(selector)
-    func = ctx._find_function(bv, identifier)
+    func = ctx._find_function(bv, identifier, contained=True)
     il = il_format._il_function_for(func, view, ssa)
     instructions = []
     try:
@@ -603,17 +613,19 @@ def _structured_il(ctx, selector, identifier, *, view: str = "mlil", ssa: bool =
             "operands_summary": [str(o) for o in (getattr(ins, "operands", None) or [])],
             "is_call": "CALL" in opn,
         })
-    return {
+    result = {
         "function": {"name": func.name, "address": hex(func.start)},
         "view": view,
         "ssa": ssa,
         "instructions": instructions,
     }
+    _annotate_containment(ctx, result, identifier, func)
+    return result
 
 
 def _defuse(ctx, selector, identifier, var_selector: str):
     bv = ctx._resolve_view(selector)
-    func = ctx._find_function(bv, identifier)
+    func = ctx._find_function(bv, identifier, contained=True)
     il = il_format._il_function_for(func, "mlil", True)
     ssa_var, other_versions = il_format._resolve_ssa_variable(func, il, var_selector)
 
@@ -642,7 +654,7 @@ def _defuse(ctx, selector, identifier, var_selector: str):
         for s in (getattr(definition, "src", None) or []):
             phi_sources.append(il_format._ssa_var_entry(s))
 
-    return {
+    result = {
         "function": {"name": func.name, "address": hex(func.start)},
         "variable": il_format._ssa_var_entry(ssa_var),
         "definition": _ref(definition),
@@ -651,6 +663,8 @@ def _defuse(ctx, selector, identifier, var_selector: str):
         "phi_sources": phi_sources,
         "other_versions": other_versions or [],
     }
+    _annotate_containment(ctx, result, identifier, func)
+    return result
 
 
 def _pvs_targets(ctx, bv, pvs) -> list[dict[str, Any]]:
@@ -707,7 +721,7 @@ def _pvs_targets(ctx, bv, pvs) -> list[dict[str, Any]]:
 
 def _resolved_calls(ctx, selector, identifier, *, direction: str = "both", resolve_indirect: bool = True):
     bv = ctx._resolve_view(selector)
-    func = ctx._find_function(bv, identifier)
+    func = ctx._find_function(bv, identifier, contained=True)
     # `kind` lets a consumer of the {kind, ...} family identify a callgraph read
     # (it is a composite callees+callers structure, not a flat items list) (#371.2).
     result: dict[str, Any] = {
@@ -776,12 +790,13 @@ def _resolved_calls(ctx, selector, identifier, *, direction: str = "both", resol
                 callers.append({"caller": {"address": hex(marker), "name": str(fn.name)}})
         result["callers"] = callers
 
+    _annotate_containment(ctx, result, identifier, func)
     return result
 
 
 def _possible_values(ctx, selector, identifier, at):
     bv = ctx._resolve_view(selector)
-    func = ctx._find_function(bv, identifier)
+    func = ctx._find_function(bv, identifier, contained=True)
     address = _parse_address(at)
     il = il_format._il_function_for(func, "mlil", True)
     target_ins = None
@@ -820,7 +835,7 @@ def _possible_values(ctx, selector, identifier, at):
         chosen, basis = src_pvs, "source_expression"
     else:
         chosen, basis = instr_pvs, "instruction"
-    return {
+    result = {
         "function": {"name": func.name, "address": hex(func.start)},
         "at": hex(address),
         "expression": str(target_ins) if target_ins is not None else None,
@@ -828,3 +843,5 @@ def _possible_values(ctx, selector, identifier, at):
         "source_expression": str(src_expr) if src_expr is not None else None,
         "possible_values": il_format._serialize_pvs(chosen),
     }
+    _annotate_containment(ctx, result, identifier, func)
+    return result

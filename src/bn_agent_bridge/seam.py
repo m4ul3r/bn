@@ -76,15 +76,22 @@ class BridgeContext:
         # READ verbs should accept them so a sink address feeds straight into the
         # next command. It stays strict by default so a mutation can't rename or
         # retype the wrong (containing) function from a stray interior address.
-        looks_like_address = str(identifier).strip().lower().startswith("0x")
+        looks_like_hex = str(identifier).strip().lower().startswith("0x")
         addr = None
         try:
             addr = _parse_address(identifier)
         except ValueError:
-            if looks_like_address:
+            if looks_like_hex:
                 raise RuntimeError(
                     f"Invalid address {identifier!r}: expected a 0x-prefixed hex or decimal value"
                 ) from None
+        # A value that parsed via `_parse_address` is an address attempt -- either
+        # 0x-hex or a bare decimal, both documented address spellings. A decimal
+        # interior address must therefore resolve via containment and report an
+        # address miss like hex does, NOT silently degrade to a name search that
+        # ends in a misleading "Function not found" (#626 review). A malformed
+        # token (e.g. "foo") fails to parse -> addr is None -> name path below.
+        looks_like_address = addr is not None
         if addr is not None:
             try:
                 fn = bv.get_function_at(addr)
@@ -395,14 +402,20 @@ class BridgeContext:
     def _containment_meta(self, identifier, func):
         """Describe a READ resolved via the `contained` address fallback.
 
-        Returns ``{"requested_address", "offset"}`` when ``identifier`` is a
-        0x address that landed *inside* ``func`` rather than at its start, so a
-        caller (e.g. a taint/trace sink address) is told it hit a mid-function
-        point instead of silently treating it as the entry. Returns None for an
-        exact start or a non-address identifier (no annotation needed).
+        Returns ``{"requested_address", "offset"}`` when ``identifier`` is an
+        address -- 0x-hex OR bare decimal, the two documented address spellings
+        -- that landed *inside* ``func`` rather than at its start, so a caller
+        (e.g. a taint/trace sink address) is told it hit a mid-function point
+        instead of silently treating it as the entry. Returns None for an exact
+        start or a non-address identifier (a name) -- no annotation needed.
+
+        The address parse MUST mirror :meth:`_find_function`'s (hex OR decimal
+        via ``_parse_address``): that method resolves a decimal interior address
+        to its container just like hex, so gating the disclosure on a ``0x``
+        prefix would let a decimal request resolve to a mid-function point while
+        SILENTLY dropping the resolved_from/offset -- naming the wrong (start)
+        context with no indication it was a containment hit (#626 review).
         """
-        if not str(identifier).strip().lower().startswith("0x"):
-            return None
         try:
             addr = _parse_address(identifier)
         except ValueError:

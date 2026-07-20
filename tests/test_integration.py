@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -545,6 +546,86 @@ class TestDisasmLinear:
             result = self._unwrap(json.loads(res.stdout))
             assert result.get("linear") is True
             assert result.get("instruction_count", 0) >= 1
+        finally:
+            _session_stop(inst_id)
+
+
+class TestDisasmLinearAArch64:
+    """#600 real-path guard. BN 5.4 registers the AArch64 architecture as
+    ``aarch64`` (never ``arm64`` -- it is not in ``Architecture`` at all), so the
+    mocked ``arm64``-spelled regression test in tests/test_read_decompile.py
+    cannot exercise the arch name the live linear-decode path actually sees. This
+    drives the REAL aarch64 path end to end through the bridge: an odd linear
+    start must NOT be masked as a Thumb function-pointer tag (AArch64 has no Thumb
+    mode), and ``--mode arm|thumb`` must be rejected naming the real arch.
+
+    NOTE on scope: this locks the real-path CONTRACT with the arch name BN
+    actually emits. It does not by itself distinguish the #600 fix from its
+    reversion, because for the real ``aarch64`` spelling BOTH the fixed gate and
+    the pre-fix raw ``startswith("arm")/("thumb")`` gate already classify it as
+    "not classic ARM/Thumb" (``"aarch64".startswith("arm")`` is False) -- i.e.
+    the fix is a no-op for this spelling and only changes behavior for the
+    synthetic ``arm64`` spelling BN never produces. The fix's mutation-sensitive
+    guard therefore lives in the mocked ``arm64`` test; this test guards the real
+    arch name against a future gate that WOULD mishandle it (e.g. a substring
+    ``"arch" in name`` check, since ``"aarch64"`` contains ``"arch"``).
+    """
+
+    @staticmethod
+    def _build_aarch64(tmp_path) -> Path:
+        cc = shutil.which("aarch64-linux-gnu-gcc")
+        if cc is None:
+            pytest.skip("aarch64-linux-gnu-gcc not available")
+        src = tmp_path / "probe.c"
+        src.write_text("int add(int a, int b){return a + b;}\nint main(){return add(1, 2);}\n")
+        out = tmp_path / "probe_aarch64"
+        proc = subprocess.run(
+            [cc, "-O0", "-no-pie", "-static", str(src), "-o", str(out)],
+            capture_output=True, text=True, timeout=120,
+        )
+        if proc.returncode != 0:
+            pytest.skip(f"aarch64 cross-compile failed: {proc.stderr}")
+        return out
+
+    @staticmethod
+    def _func_start(inst_id: str, name: str) -> int:
+        listing = _bn("--instance", inst_id, "function", "list", "--format", "json")
+        assert listing.returncode == 0, listing.stderr
+        funcs = TestDisasmLinear._items(json.loads(listing.stdout))
+        matches = [f for f in funcs if f["name"] == name]
+        assert matches, f"{name} not found among {len(funcs)} functions"
+        return int(matches[0]["address"], 16)
+
+    def test_aarch64_odd_linear_start_not_thumb_masked(self, tmp_path):
+        binary = self._build_aarch64(tmp_path)
+        info = _session_start(str(binary))
+        inst_id = info["instance_id"]
+        try:
+            start = self._func_start(inst_id, "add")
+            odd = start | 1  # poke bit 0 so a Thumb-masking gate would strip it
+            res = _bn("--instance", inst_id, "disasm", hex(odd), "--linear", "2", "--format", "json")
+            assert res.returncode == 0, f"{res.stdout}\n{res.stderr}"
+            result = TestDisasmLinear._unwrap(json.loads(res.stdout))
+            # Premise: the live arch name really is "aarch64", not "arm64".
+            assert result["decode_arch"] == "aarch64", result
+            # bit 0 preserved -- NOT masked back to the even address ...
+            assert int(result["address"], 16) == odd, result
+            # ... and no Thumb function-pointer-tag normalization was applied.
+            assert "Thumb" not in result["note"], result["note"]
+        finally:
+            _session_stop(inst_id)
+
+    def test_aarch64_rejects_arm_thumb_mode(self, tmp_path):
+        # --mode arm|thumb is only meaningful for classic 32-bit ARM/Thumb. On a
+        # real aarch64 target it must be rejected with the ACTUAL arch named.
+        binary = self._build_aarch64(tmp_path)
+        info = _session_start(str(binary))
+        inst_id = info["instance_id"]
+        try:
+            res = _bn("--instance", inst_id, "disasm", "add", "--linear", "2",
+                      "--mode", "arm", "--format", "json")
+            assert res.returncode != 0, res.stdout
+            assert "aarch64" in (res.stdout + res.stderr).lower(), (res.stdout, res.stderr)
         finally:
             _session_stop(inst_id)
 

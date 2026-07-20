@@ -607,6 +607,30 @@ def test_function_evidence_reports_calls_arguments_and_thunk_candidate(monkeypat
     assert thunk_result["thunk"]["target"]["function"]["name"] == "send_message"
 
 
+def test_function_evidence_resolves_mid_function_address(monkeypatch):
+    # #626: a sink address reported by taint/trace lands mid-callee. `evidence
+    # function` must resolve an interior address to the containing function --
+    # the same #193 Part 4 contract decompile/info/il already honor -- so the
+    # sink feeds straight into the next command instead of hitting a dead end.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "parse_packet")
+    fn.basic_blocks = [_FakeBasicBlock(0x401000, 0x401040)]  # spans 0x401000..0x401040
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_evidence("active", "0x401010", context=0)
+
+    assert result["function"]["name"] == "parse_packet"
+    assert result["function"]["address"] == "0x401000"
+    assert result["resolved_from"] == {"requested_address": "0x401010", "offset": "+0x10"}
+
+    # Exact start (and, by construction, a name identifier) carries no annotation.
+    exact = instance._function_evidence("active", "0x401000", context=0)
+    assert exact["function"]["address"] == "0x401000"
+    assert "resolved_from" not in exact
+
+
 def test_function_evidence_resolves_pointer_constant_arguments(monkeypatch):
     # ILX #2: append(&var, 0x2a4f4) should annotate the constant with "4" [.rodata].
     bridge = _load_bridge(monkeypatch)
@@ -1562,7 +1586,7 @@ def test_function_evidence_slicing_471(monkeypatch):
     monkeypatch.setattr(bridge.read_evidence, "_function_call_evidence",
                         lambda ctx, bv, func, context: [dict(c) for c in fake_calls])
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda sel: _FakeBV(functions=[_FakeFunction(0x402000, "dispatch")]))
-    monkeypatch.setattr(instance.ctx, "_find_function", lambda bv, ident: _FakeFunction(0x402000, "dispatch"))
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda bv, ident, **kw: _FakeFunction(0x402000, "dispatch"))
     monkeypatch.setattr(bridge.il_format, "_decompile_text", lambda bv, f: "")
     monkeypatch.setattr(bridge.il_format, "_render_warnings", lambda t: [])
     monkeypatch.setattr(bridge.il_format, "_function_metadata", lambda f: {})
