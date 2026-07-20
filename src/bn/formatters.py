@@ -2209,9 +2209,26 @@ def _taint_forward_verdict(value: dict[str, Any]) -> str:
     fns = stats.get("functions_visited")
     fns_part = f" · taint crossed {fns} fn(s)" if fns else ""
     trunc = _taint_truncation_note(stats)
-    if findings:
-        classes = ", ".join(sorted({(f.get("sink") or {}).get("class") or "?" for f in findings}))
-        return f"verdict: {len(findings)} sink(s) reached ({classes}){fns_part}{trunc}"
+    # #615/Finding-1: an always-unsafe (presence) sink is present at the call site
+    # but was NOT necessarily reached by the selected source -- report it as a
+    # distinct presence fact, never folded into "sink(s) reached" (which would
+    # imply the source propagated there).
+    reached = [f for f in findings if not f.get("unconditional")]
+    presence = [f for f in findings if f.get("unconditional")]
+
+    def _classes(fs: list[dict[str, Any]]) -> str:
+        return ", ".join(sorted({(f.get("sink") or {}).get("class") or "?" for f in fs}))
+
+    if reached:
+        base = f"verdict: {len(reached)} sink(s) reached ({_classes(reached)}){fns_part}{trunc}"
+        if presence:
+            base += (f" · {len(presence)} always-unsafe sink(s) present "
+                     f"({_classes(presence)}) — presence, not source-reached")
+        return base
+    if presence:
+        return (f"verdict: {len(presence)} always-unsafe sink(s) present "
+                f"({_classes(presence)}) — a presence finding at the call site, "
+                f"NOT reached by the selected source{fns_part}{trunc}")
     if leaves:
         return (f"verdict: NO modeled sink reached — {len(leaves)} tainted frontier(s) "
                 f"(NOT an all-clear){fns_part}{trunc}")
@@ -2258,6 +2275,11 @@ def _render_flow_line(f: dict[str, Any]) -> str:
     unresolved = "y" if m.get("traverses_unresolved") else "n"
     facts = f"{{steps={m.get('steps', '?')} fns={m.get('fns_spanned', '?')} unresolved={unresolved}}}"
     head = f"[{sink.get('class') or '?'}] {sink.get('callee', '?')} @ {sink.get('address')}{arg}"
+    # #615/Finding-1: a presence/always-unsafe finding carries no source->sink
+    # signature by design -- label it so its empty signature is not misread as a
+    # missing one, and it never looks like a source-reached flow.
+    if f.get("unconditional"):
+        sig = "always-unsafe sink present (presence, not source-reached)"
     return f"  {head}   {sig}   {facts}".rstrip()
 
 

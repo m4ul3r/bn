@@ -892,6 +892,64 @@ def test_forward_unconditional_sink_gets_two_callsites_two_findings(models):
     assert addrs == ["0x401000", "0x401020"], result["reached_sinks"]
 
 
+def test_forward_unconditional_sink_is_presence_not_source_attributed(models):
+    # #615/Finding-1 (BLOCKER): an always-unsafe sink (empty tainted_args, no
+    # len_arg -> tainted_arg_index=None) is a PRESENCE fact at the call site, NOT
+    # evidence the selected source propagated there. The finding must be flagged
+    # unconditional/presence, must carry NO source->sink flow signature (emitting
+    # one fabricates "selected param -> gets"), and must NOT be counted as a
+    # source-reached sink in stats. Here param:0 never reaches the gets() call.
+    buf = FVar("buf"); n = FVar("n")
+    instrs = [
+        FInstr(0, 0x401000, "MLIL_CALL_SSA", "gets(&buf)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x402000", constant=0x402000),
+               params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)]),
+    ]
+    func = FFunc("vuln_parse", 0x401000, FSSAFunc(instrs), params=[n])
+    bv = FBV({0x402000: "gets"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    hits = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "gets"]
+    assert len(hits) == 1, result["reached_sinks"]
+    f = hits[0]
+    # classified as a presence / always-unsafe finding ...
+    assert f.get("unconditional") is True, f
+    assert f["sink"].get("presence") is True, f["sink"]
+    assert f["sink"]["tainted_arg_index"] is None, f["sink"]
+    # ... with NO fabricated source->sink signature attributing it to param:0 ...
+    assert f.get("signature") is None, f.get("signature")
+    # ... and stats do NOT count it as a source-reached sink.
+    assert result["stats"]["sinks"] == 0, result["stats"]
+    assert result["stats"]["presence_sinks"] == 1, result["stats"]
+
+
+def test_forward_resolved_indirect_unconditional_sink_fires_without_taint(models):
+    # #615/Finding-2 (MAJOR): an indirect call that VSA-resolves to an always-
+    # unsafe modeled sink (gets) must fire unconditionally even when NO call
+    # argument carries the selected source's taint. Indirect processing exits on
+    # empty tainted_args BEFORE the resolved model is applied, so a resolved-
+    # indirect gets() with an unrelated source produced ZERO findings -- a false
+    # negative the direct-call path does not have. The finding must key per
+    # resolved target (site address) and read as an unconditional/presence fact.
+    buf = FVar("buf"); other = FVar("other")
+    pvs = FPVS("ConstantPointerValue", value=0x402000)   # resolves to gets
+    instrs = [
+        FInstr(0, 0x401000, "MLIL_CALL_SSA", "fp(&buf)", reads=[], writes=[],
+               dest=FExpr("MLIL_VAR_SSA", "fp#1", reads=[], possible_values=pvs),
+               params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)]),
+    ]
+    func = FFunc("indirect_gets", 0x401000, FSSAFunc(instrs), params=[other])
+    bv = FBV({0x402000: "gets"})
+    engine = te.TaintEngine(bv, models)
+    # seed an unrelated param -- the indirect call's own arg is untainted.
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    hits = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "gets"]
+    assert len(hits) == 1, result["reached_sinks"]
+    assert hits[0]["sink"]["tainted_arg_index"] is None, hits[0]["sink"]
+    assert hits[0].get("unconditional") is True, hits[0]
+    assert hits[0]["sink"]["address"] == "0x401000", hits[0]["sink"]
+
+
 def test_forward_conditional_sink_untainted_still_produces_nothing(models):
     # (4) a conditional sink (memcpy) with an untainted relevant arg must still
     # produce zero findings -- the empty-tainted_args special case must not
@@ -1894,6 +1952,40 @@ def test_forward_no_copy_note_when_dest_is_unkeyable(models):
     assert any(l["kind"] == "coarse_memory_store" for l in result["leaves"]), result["leaves"]
     # ... and the run must not be allowed to claim a sound all-clear.
     assert result["diagnostics"]["safe_to_report_all_clear"] is False, result["diagnostics"]
+
+
+def test_forward_copy_note_fires_when_dest_already_tainted(models):
+    # #578/Finding-3: the *arg:N -> *arg:0 copy note must fire whenever the copy
+    # genuinely propagates from tainted input into a KEYABLE destination -- even
+    # when that destination was ALREADY tainted by an earlier predecessor, so the
+    # copy creates NO new lattice entry. #578 gated the note on _apply_to_token()
+    # -> taint_node() returning True (a NEW entry); an already-tainted keyable
+    # dest returns False, wrongly SUPPRESSING a real copy note (a false negative
+    # distinct from the unkeyable-destination negative control above). Two memcpy
+    # copies from the same tainted source into the same keyable buffer: the first
+    # taints it, the second copies into an already-tainted dest -- BOTH are
+    # genuine copies from tainted input and BOTH must be noted.
+    buf = FVar("buf"); src = FVar("src"); n = FVar("n")
+    src1 = FSSA(src, 1); n1 = FSSA(n, 1)
+
+    def _cpy(idx, addr):
+        return FInstr(idx, addr, "MLIL_CALL_SSA", "memcpy(&buf, src#1, n#1)",
+                      reads=[src1, n1], writes=[],
+                      dest=FExpr("MLIL_CONST_PTR", "0x401080", constant=0x401080),
+                      params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                              FExpr("MLIL_VAR_SSA", "src#1", reads=[src1]),
+                              FExpr("MLIL_VAR_SSA", "n#1", reads=[n1])])
+
+    instrs = [_cpy(0, 0x100), _cpy(1, 0x110)]
+    func = FFunc("f", 0x100, FSSAFunc(instrs), params=[buf, src, n])  # param:1 = src
+    bv = FBV({0x401080: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:1")])
+    notes = [a for a in result["assumptions"] if "copied into the destination" in a]
+    # first copy into a fresh dest: note fires (creates new lattice state) ...
+    assert any("0x100" in a for a in notes), result["assumptions"]
+    # ... second copy into the now-already-tainted keyable dest: note STILL fires.
+    assert any("0x110" in a for a in notes), result["assumptions"]
 
 
 def test_forward_unconsumed_vararg_not_reported(models):

@@ -1841,11 +1841,28 @@ class TaintEngine:
             unique_findings.append(f)
         sources_echo = [self._describe_locator(s) for s in sources]
         for f in unique_findings:
+            if f.get("unconditional"):
+                # #615/Finding-1: a presence/always-unsafe finding did NOT
+                # necessarily see the selected source reach it. Deriving a
+                # source->sink flow signature here would fabricate propagation
+                # ("selected param -> unbounded input"), so emit NONE: attach only
+                # structural metrics (with no source attribution) and mark it as a
+                # presence fact. The absence of `signature` is the honest signal.
+                f["metrics"] = {"steps": len(f.get("path") or []),
+                                "fns_spanned": 1, "traverses_unresolved": False}
+                f["presence"] = True
+                continue
             fm, fs = derive_flow_facts(
                 direction="forward", path=f.get("path"), sink=f.get("sink"),
                 sources=sources_echo, leaves=sub["leaves"], fn_name=str(func.name))
             f["metrics"] = fm
             f["signature"] = fs
+        # Source-reached vs presence split for stats (#615/Finding-1): only
+        # source-reached sinks are attributable to the selected source; presence
+        # findings are counted separately so a consumer never reads an always-unsafe
+        # sink as proof the source propagated there.
+        source_reached = [f for f in unique_findings if not f.get("unconditional")]
+        presence_findings = [f for f in unique_findings if f.get("unconditional")]
         result = {
             "direction": "forward",
             "function": {"name": str(func.name), "address": hex(int(func.start))},
@@ -1856,7 +1873,10 @@ class TaintEngine:
             "stats": {
                 "functions_visited": len(self._funcs_visited),
                 "max_depth": self._max_depth_seen,
-                "sinks": len(unique_findings),
+                # Source-reached sinks only (#615/Finding-1); presence/always-unsafe
+                # sinks are counted in `presence_sinks`, never as source-reached.
+                "sinks": len(source_reached),
+                "presence_sinks": len(presence_findings),
                 # Authoritative unresolved-leaf count so the TEXT header, the JSON
                 # `leaves` array length, and stats all cite the same number (#181).
                 "leaves": len(sub["leaves"]),
@@ -1977,6 +1997,11 @@ class TaintEngine:
             f"independently ({len(callsite_addrs)} propagations); top-level reached_sinks/leaves "
             f"are the union, by_source has the per-callsite split")
 
+        # #615/Finding-1: keep presence/always-unsafe sinks out of the
+        # source-reached count here too (mirrors `_forward_run`).
+        source_reached = [f for f in findings if not f.get("unconditional")]
+        presence_findings = [f for f in findings if f.get("unconditional")]
+
         out = {
             "direction": "forward",
             "function": base["function"],
@@ -1988,7 +2013,8 @@ class TaintEngine:
             "stats": {
                 "functions_visited": len(funcs_visited),
                 "max_depth": max_depth_seen,
-                "sinks": len(findings),
+                "sinks": len(source_reached),
+                "presence_sinks": len(presence_findings),
                 # Authoritative deduped union leaf count (#181). frontier_total is
                 # the pre-dedup sum across per-callsite runs, so an agent can
                 # reconcile sum(by_source leaves) against the collapsed union.
@@ -3026,6 +3052,70 @@ class TaintEngine:
         the module-level :func:`targets_from_pvs`)."""
         return targets_from_pvs(pvs)
 
+    def _resolve_call_candidates(self, ins: Any, target: int | None) -> tuple[list[int], str | None]:
+        """Resolved target address(es) for a call and the resolution provenance.
+
+        The direct target if known, else an agent-supplied resolve-map override,
+        else the VSA possible-values of the call destination. Returns
+        ``(candidates, via)`` where ``via`` labels the indirect resolution source
+        (``"agent-map"`` / ``"value-set"``) or ``None`` for a direct call."""
+        if target is not None:
+            return [target], None
+        mapped = self.resolve_map.get(hex(int(getattr(ins, "address", 0))))
+        if mapped:
+            return ([int(x, 16) if isinstance(x, str) else int(x) for x in mapped], "agent-map")
+        candidates = self._call_targets_from_pvs(
+            getattr(getattr(ins, "dest", None), "possible_values", None))
+        return (candidates, "value-set" if candidates else None)
+
+    def _apply_unconditional_resolved_sinks(self, ins: Any, params: list[Any],
+                                            target: int | None,
+                                            apply_model, lookup_model) -> bool:
+        """Apply an always-unsafe modeled sink at a call with NO tainted argument.
+
+        #615/Finding-2: the direct-call path applies a modeled sink BEFORE the
+        empty-``tainted_args`` check, but a resolved-INDIRECT call reaches the
+        empty branch and would skip its resolved model, silently dropping a
+        resolved-indirect ``gets()`` reached with an unrelated source. For each
+        resolved candidate whose model is UNCONDITIONAL (empty ``tainted_args``
+        and no ``len_arg``), apply it so the presence finding fires -- keyed per
+        resolved target via ``site_taddr`` so it dedups with, and never collides
+        with, direct/arg-indexed findings. Returns whether any model changed
+        state. Conditional models (real ``tainted_args`` / a ``len_arg``) need
+        actual arg taint -- absent here -- so they are deliberately skipped."""
+        candidates, _via = self._resolve_call_candidates(ins, target)
+        changed = False
+        for taddr in candidates:
+            nm = self._callee_name(taddr)
+            mk, md = lookup_model(self.models, nm)
+            # Follow a single veneer/thunk to a modeled sink (j_gets -> gets).
+            if md is None:
+                cfn = function_at(self.bv, taddr)
+                if cfn is not None and not self._is_internal(cfn):
+                    resolved = self._follow_thunk_cached(cfn)
+                    if resolved is not None and resolved is not cfn:
+                        rnm = self._callee_name(int(getattr(resolved, "start", 0)))
+                        rmk, rmd = lookup_model(self.models, rnm)
+                        if rmd is not None:
+                            nm, mk, md = rnm, rmk, rmd
+            if md is None:
+                continue
+            msink = md.get("sink")
+            if msink is None:
+                continue
+            # Mirror apply_model's opt-in gating: a gated-off optional sink stays
+            # silent unless its class was enabled for this run.
+            if msink.get("optional"):
+                gate = msink.get("gate") or msink.get("class")
+                if gate not in self._enabled_sink_classes:
+                    continue
+            # Only the UNCONDITIONAL arm applies without arg taint.
+            if (msink.get("tainted_args") or []) or msink.get("len_arg") is not None:
+                continue
+            if apply_model(ins, params, md, mk, nm, site_taddr=taddr)[0]:
+                changed = True
+        return changed
+
     def _run_forward(self, func: Any, locators: list[dict[str, Any]], depth: int,
                      max_depth: int, *, top: bool) -> dict[str, Any]:
         ssaf = self._ssa_func(func)
@@ -3460,7 +3550,20 @@ class TaintEngine:
                     # source-seed that lands here would report a bare "no sinks
                     # reached" even though backward/trace both reach it. Record the
                     # src-side copy so the three tools agree. Deduped per site.
-                    if applied and isinstance(frm, str) and frm.startswith("*arg:") and to == "*arg:0":
+                    #
+                    # #578/Finding-3: gate the note on whether the copy GENUINELY
+                    # propagates from tainted input into a KEYABLE destination --
+                    # NOT on `applied` (taint_node() returning a NEW lattice entry).
+                    # A keyable dest already tainted by an earlier predecessor makes
+                    # taint_node()/`applied` return False even though this copy from
+                    # tainted input truly occurred; gating on `applied` there
+                    # suppresses a real copy note (a false negative). The genuine
+                    # "propagation did not occur" case is an UNKEYABLE dest
+                    # (_buffer_target None), which must still stay silent -- exactly
+                    # what `dest_keyable` distinguishes.
+                    dest_keyable = (to == "*arg:0" and len(params) > 0
+                                    and self._buffer_target(ssaf, params[0]) is not None)
+                    if dest_keyable and isinstance(frm, str) and frm.startswith("*arg:"):
                         try:
                             src_i = int(frm.split("arg:", 1)[1])
                         except Exception:
@@ -3599,6 +3702,19 @@ class TaintEngine:
                     # 3) no model: resolve the target(s) and descend.
                     tainted_args = {i: arg_taint(p) for i, p in enumerate(params) if arg_taint(p)}
                     if not tainted_args:
+                        # #615/Finding-2: even with NO tainted call argument, a call
+                        # that RESOLVES to an always-unsafe modeled sink (empty
+                        # tainted_args + no len_arg, e.g. gets) is a PRESENCE fact at
+                        # this call site. The direct-call path applies such a model
+                        # above (before this arg check); a resolved-INDIRECT call
+                        # reaches here and would `continue` past it, so a resolved-
+                        # indirect gets() with an unrelated source silently vanished.
+                        # Resolve the candidates and apply any UNCONDITIONAL model,
+                        # keyed per resolved target (site_taddr) so it dedups against
+                        # -- and never collides with -- direct/arg-indexed findings.
+                        if self._apply_unconditional_resolved_sinks(
+                                ins, params, target, apply_model, lookup_model):
+                            changed = True
                         # The MLIL call recovered no tainted arg -- but BN may have
                         # under-recovered the callee's arity (Thumb 0-arity miss /
                         # variadic), dropping a tainted arg-register value that never
@@ -3615,17 +3731,7 @@ class TaintEngine:
                         continue
                     processed_calls.add(call_key)
 
-                    if target is not None:
-                        candidates, via = [target], None
-                    else:
-                        mapped = self.resolve_map.get(hex(int(getattr(ins, "address", 0))))
-                        if mapped:
-                            candidates = [int(x, 16) if isinstance(x, str) else int(x) for x in mapped]
-                            via = "agent-map"
-                        else:
-                            candidates = self._call_targets_from_pvs(
-                                getattr(getattr(ins, "dest", None), "possible_values", None))
-                            via = "value-set" if candidates else None
+                    candidates, via = self._resolve_call_candidates(ins, target)
 
                     if not candidates:
                         leaf = {
@@ -4521,10 +4627,17 @@ class TaintEngine:
         path = [_instr_dict(ins, reason=f"always-unsafe API {callee} reached",
                             callee=callee)]
         return {
+            # #615/Finding-1: classify this as a PRESENCE finding -- an always-unsafe
+            # sink is present at this call site -- distinct from a "source-reached
+            # sink". The flag keeps it OUT of source-derived flow signatures and
+            # source->sink stats (see `_forward_run`), so it is never misreported as
+            # evidence the selected source propagated here.
+            "unconditional": True,
             "sink": {
                 "callee": callee,
                 "address": hex(int(getattr(ins, "address", 0))),
                 "tainted_arg_index": None,
+                "presence": True,
                 "class": sink.get("class"),
                 "detail": sink.get("detail"),
             },
