@@ -802,11 +802,17 @@ class BinaryNinjaBridge:
         bn.log_info(f"BN Agent Bridge listening on {self.socket_path}")
 
     def stop(self):  # pragma: no cover - requires GUI runtime
-        if self._server is not None:
-            with contextlib.suppress(Exception):
-                self._server.shutdown()
-            with contextlib.suppress(Exception):
-                self._server.server_close()
+        # If start() never bound a server (e.g. it lost the "another bridge is
+        # already serving" race and raised, or was never called), this instance
+        # doesn't own the files at these paths -- they may belong to a live
+        # sibling bridge. Only unlink once we know we're the one who created
+        # them.
+        if self._server is None:
+            return
+        with contextlib.suppress(Exception):
+            self._server.shutdown()
+        with contextlib.suppress(Exception):
+            self._server.server_close()
         if self.socket_path.exists():
             with contextlib.suppress(OSError):
                 self.socket_path.unlink()
@@ -3346,14 +3352,47 @@ def _start_bridge_command(_):  # pragma: no cover - GUI runtime
     start_bridge()
 
 
+def _restart_bridge_command(_):  # pragma: no cover - GUI runtime
+    restart_bridge()
+
+
 def start_bridge():  # pragma: no cover - GUI runtime
     global _bridge
     if ui is None:
         return
     if _bridge is not None:
         return
-    _bridge = BinaryNinjaBridge()
-    _bridge.start()
+    new_bridge = BinaryNinjaBridge()
+    new_bridge.start()
+    # Only publish the global once start() has succeeded -- a refused start
+    # (e.g. "another bridge is already serving") must never leave a zombie
+    # instance for atexit/_stop_bridge() to later invoke .stop() against,
+    # which could unlink a sibling bridge's live files.
+    _bridge = new_bridge
+
+
+def restart_bridge():  # pragma: no cover - GUI runtime
+    """Stop the currently-running bridge (if any) and start a fresh one.
+
+    Used by the "Restart Bridge" menu item so picking it up after an edit to
+    the plugin actually reloads it, instead of `start_bridge()`'s no-op when a
+    bridge is already running.
+    """
+    global _bridge
+    if ui is None:
+        return
+    if _bridge is not None:
+        with contextlib.suppress(Exception):
+            _bridge.stop()
+        _bridge = None
+    new_bridge = BinaryNinjaBridge()
+    try:
+        new_bridge.start()
+    except Exception as exc:
+        bn.log_error(f"BN Agent Bridge restart failed: {exc}")
+        raise
+    _bridge = new_bridge
+    bn.log_info("BN Agent Bridge restarted")
 
 
 def start_headless(
@@ -3424,5 +3463,5 @@ atexit.register(_stop_bridge)
 PluginCommand.register(
     "BN Agent Bridge\\Restart Bridge",
     "Restart the bn CLI socket bridge",
-    _start_bridge_command,
+    _restart_bridge_command,
 )

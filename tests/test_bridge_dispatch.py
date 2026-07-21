@@ -2404,3 +2404,156 @@ def test_write_project_marker_readonly_dir_is_a_note_not_error(monkeypatch, tmp_
         assert note is None or "marker" in note
     finally:
         ro.chmod(0o700)
+
+
+def test_stop_never_unlinks_files_when_server_never_bound(monkeypatch, tmp_path):
+    """A BinaryNinjaBridge whose start() never bound a server (e.g. it lost the
+    race and raised, or was never started) must leave any pre-existing files
+    at its socket/registry/log paths untouched when .stop() is called -- those
+    files may belong to a genuinely live sibling bridge (#585)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    instance.socket_path = tmp_path / "bridge.sock"
+    instance.registry_path = tmp_path / "bridge.json"
+    log_path = instance.registry_path.with_suffix(".log")
+
+    # Simulate "another live bridge's files" already on disk.
+    instance.socket_path.write_bytes(b"")
+    instance.registry_path.write_text("{}")
+    log_path.write_text("log")
+
+    assert instance._server is None
+    instance.stop()
+
+    assert instance.socket_path.exists()
+    assert instance.registry_path.exists()
+    assert log_path.exists()
+
+
+def test_stop_removes_its_own_files_after_successful_start(monkeypatch, tmp_path):
+    """Negative control: a bridge that DID successfully start() still cleans up
+    its own socket/registry/log on stop() -- the #585 fix must not regress the
+    happy path."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    instance.socket_path = tmp_path / "bridge.sock"
+    instance.registry_path = tmp_path / "bridge.json"
+    log_path = instance.registry_path.with_suffix(".log")
+
+    instance.start()
+    try:
+        assert instance._server is not None
+        assert instance.socket_path.exists()
+        assert instance.registry_path.exists()
+    finally:
+        instance.stop()
+
+    assert not instance.socket_path.exists()
+    assert not instance.registry_path.exists()
+    assert not log_path.exists()
+
+
+def test_start_bridge_does_not_leave_zombie_global_on_start_failure(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    fake_ui = types.SimpleNamespace()
+    monkeypatch.setattr(bridge, "ui", fake_ui)
+    monkeypatch.setattr(bridge, "_bridge", None)
+
+    def _boom(self):
+        raise RuntimeError("refusing to displace it")
+
+    monkeypatch.setattr(bridge.BinaryNinjaBridge, "start", _boom)
+
+    with pytest.raises(RuntimeError, match="refusing to displace"):
+        bridge.start_bridge()
+
+    assert bridge._bridge is None
+
+
+def test_start_bridge_remains_noop_when_bridge_already_set(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    fake_ui = types.SimpleNamespace()
+    monkeypatch.setattr(bridge, "ui", fake_ui)
+
+    sentinel = object()
+    monkeypatch.setattr(bridge, "_bridge", sentinel)
+
+    calls = []
+    monkeypatch.setattr(bridge.BinaryNinjaBridge, "__init__", lambda self, *a, **k: calls.append("init"))
+    monkeypatch.setattr(bridge.BinaryNinjaBridge, "start", lambda self: calls.append("start"))
+
+    bridge.start_bridge()
+
+    assert bridge._bridge is sentinel
+    assert calls == []
+
+
+def test_restart_bridge_stops_old_before_starting_new(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    fake_ui = types.SimpleNamespace()
+    monkeypatch.setattr(bridge, "ui", fake_ui)
+
+    calls = []
+
+    class _FakeOldBridge:
+        def stop(self):
+            calls.append("stop-old")
+
+    monkeypatch.setattr(bridge, "_bridge", _FakeOldBridge())
+
+    def _fake_start(self):
+        calls.append("start-new")
+
+    monkeypatch.setattr(bridge.BinaryNinjaBridge, "start", _fake_start)
+
+    bridge.restart_bridge()
+
+    assert calls == ["stop-old", "start-new"]
+    assert isinstance(bridge._bridge, bridge.BinaryNinjaBridge)
+
+
+def test_restart_bridge_noop_when_ui_is_none(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    monkeypatch.setattr(bridge, "ui", None)
+    sentinel = object()
+    monkeypatch.setattr(bridge, "_bridge", sentinel)
+
+    bridge.restart_bridge()
+
+    assert bridge._bridge is sentinel
+
+
+def test_restart_bridge_leaves_bridge_none_when_start_fails(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    fake_ui = types.SimpleNamespace()
+    monkeypatch.setattr(bridge, "ui", fake_ui)
+    monkeypatch.setattr(bridge, "_bridge", None)
+
+    def _boom(self):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(bridge.BinaryNinjaBridge, "start", _boom)
+
+    with pytest.raises(RuntimeError, match="boom"):
+        bridge.restart_bridge()
+
+    assert bridge._bridge is None
+
+
+def test_plugin_command_registers_restart_bridge_callback(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    fake_ui = types.SimpleNamespace()
+    monkeypatch.setattr(bridge, "ui", fake_ui)
+    monkeypatch.setattr(bridge, "_bridge", None)
+
+    calls = []
+
+    def _fake_start(self):
+        calls.append("start")
+
+    monkeypatch.setattr(bridge.BinaryNinjaBridge, "start", _fake_start)
+
+    bridge._restart_bridge_command(None)
+
+    assert calls == ["start"]
+    assert isinstance(bridge._bridge, bridge.BinaryNinjaBridge)
