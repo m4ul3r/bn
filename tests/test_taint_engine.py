@@ -336,6 +336,17 @@ def test_lookup_model_strips_decorations():
     assert name is None and model is None
 
 
+def test_lookup_model_resolves_pread_and_pread_chk_603():
+    # #603: pread must resolve like read/recv/recvfrom (bare, @plt-decorated),
+    # and pread_chk must resolve via its FORTIFY underscore-stripped key --
+    # this already worked before #603 and must keep working.
+    models = te.load_models()
+    assert te.lookup_model(models, "pread")[0] == "pread"
+    assert te.lookup_model(models, "pread@plt")[0] == "pread"
+    assert te.lookup_model(models, "pread_chk")[0] == "pread_chk"
+    assert te.lookup_model(models, "__pread_chk")[0] == "pread_chk"
+
+
 def test_chk_models_present_and_shaped():
     models = te.load_models()
     # FORTIFY variants resolve via the underscore-stripped key, NOT by collapsing
@@ -1317,6 +1328,57 @@ def _read_callsite_func():
     return FFunc("recv_handler", 0x10, FSSAFunc(instrs), params=[fd])
 
 
+def _pread_callsite_func():
+    # r#1 = pread(fd, &buf, 0x100, off); return r#1 -- mirrors _read_callsite_func
+    # but with the extra file-offset param pread takes (#603).
+    fd = FVar("fd"); buf = FVar("buf", typ="char[0x100]"); off = FVar("off"); r = FVar("r")
+    r1 = FSSA(r, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "r#1 = pread(fd, &buf, 0x100, off)",
+               writes=[r1],
+               dest=FExpr("MLIL_CONST_PTR", "0x901", constant=0x901),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[FSSA(fd, 0)]),
+                       FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       FExpr("MLIL_CONST", "0x100", constant=0x100),
+                       FExpr("MLIL_VAR_SSA", "off#0", reads=[FSSA(off, 0)])]),
+        FInstr(1, 0x14, "MLIL_RET", "return r#1", reads=[r1]),
+    ]
+    return FFunc("pread_handler", 0x10, FSSAFunc(instrs), params=[fd, off])
+
+
+def test_forward_pread_ret_source_emits_call_nudge_when_alone_603(models):
+    # #603: mirrors test_forward_ret_source_emits_call_nudge_when_alone for read.
+    # ret:pread seeds only the return value, but pread's model also fills the
+    # *arg:1 output buffer -- so a ret:-only source nudges the user toward
+    # call:pread to also taint that buffer, proving pread is fully modeled
+    # (both *arg:1 and ret), not just honesty-patched.
+    engine = te.TaintEngine(FBV({0x901: "pread"}), models)
+    result = engine.forward(_pread_callsite_func(), [te.parse_locator("ret:pread")])
+    assert any("call:pread" in a for a in result["assumptions"])
+
+
+def test_forward_pread_ret_source_suppresses_call_nudge_with_arg_sibling_603(models):
+    # #603: mirrors test_forward_ret_source_suppresses_call_nudge_with_arg_sibling.
+    # arg:pread:1 already seeds the *arg:1 output buffer, so the redundant
+    # call:pread nudge must be suppressed.
+    engine = te.TaintEngine(FBV({0x901: "pread"}), models)
+    result = engine.forward(_pread_callsite_func(),
+                            [te.parse_locator("ret:pread"),
+                             te.parse_locator("arg:pread:1")])
+    assert not any("call:pread" in a for a in result["assumptions"])
+
+
+def test_forward_call_pread_seeds_both_buffer_and_ret_603(models):
+    # #603: call:pread presets every model output at once -- both the *arg:1
+    # buffer and ret -- exactly as call:read does for read (#157). Proven here
+    # by the redundant ret:+call: sibling nudge suppression, same as read's.
+    engine = te.TaintEngine(FBV({0x901: "pread"}), models)
+    result = engine.forward(_pread_callsite_func(),
+                            [te.parse_locator("ret:pread"),
+                             te.parse_locator("call:pread")])
+    assert not any("call:pread" in a for a in result["assumptions"])
+
+
 def test_forward_ret_source_emits_call_nudge_when_alone(models):
     # ret:read seeds only the return value, but read's model also fills the
     # *arg:1 output buffer -- so a ret:-only source legitimately nudges the user
@@ -1493,6 +1555,50 @@ def test_recv_overflow_sink_on_with_class_499(models):
     r2 = engine.forward(func, [te.parse_locator("param:0")],
                         enabled_sink_classes={"file_write"})
     assert [s for s in r2["reached_sinks"] if s["sink"]["callee"] == "recv"] == []
+
+
+def _pread_sink_func():
+    # handler(n): pread(3, &buf, n, 0) -- mirrors _recv_sink_func for pread's
+    # attacker-controlled length arg (#603).
+    n = FVar("n", ident=1); n0 = FSSA(n, 0)
+    buf = FVar("buf")
+    rax = FVar("rax"); rax1 = FSSA(rax, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "rax#1 = pread(3, &buf, n#0, 0)", reads=[n0], writes=[rax1],
+               dest=FExpr("MLIL_CONST_PTR", "0x901", constant=0x901),
+               params=[FExpr("MLIL_CONST", "3", constant=3),
+                       FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       FExpr("MLIL_VAR_SSA", "n#0", reads=[n0]),
+                       FExpr("MLIL_CONST", "0", constant=0)]),
+    ]
+    return FFunc("pread_handler", 0x10, FSSAFunc(instrs), params=[n]), FBV({0x901: "pread"})
+
+
+def test_pread_overflow_sink_off_by_default_603(models):
+    # #603: mirrors test_recv_overflow_sink_off_by_default_499 -- the pread
+    # length sink is opt-in, so an attacker-length pread fires nothing by default.
+    func, bv = _pread_sink_func()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert [s for s in result["reached_sinks"] if s["sink"]["callee"] == "pread"] == []
+
+
+def test_pread_overflow_sink_on_with_class_603(models):
+    # #603: mirrors test_recv_overflow_sink_on_with_class_499 -- with
+    # --sink-class recv_overflow enabled, the same attacker-length pread fires,
+    # reported with the accurate overflow_len bug class, detail mentioning pread.
+    func, bv = _pread_sink_func()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")],
+                            enabled_sink_classes={"recv_overflow"})
+    sinks = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "pread"]
+    assert len(sinks) == 1
+    assert sinks[0]["class"] == "overflow_len"
+    assert "pread" in sinks[0]["detail"]
+    # an unrelated opt-in class leaves it silent (gated on recv_overflow, not its class)
+    r2 = engine.forward(func, [te.parse_locator("param:0")],
+                        enabled_sink_classes={"file_write"})
+    assert [s for s in r2["reached_sinks"] if s["sink"]["callee"] == "pread"] == []
 
 
 def _sprintf_vararg_func():
