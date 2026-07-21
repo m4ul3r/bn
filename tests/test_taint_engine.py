@@ -336,6 +336,51 @@ def test_lookup_model_strips_decorations():
     assert name is None and model is None
 
 
+def test_lookup_model_resolves_pread_and_pread_chk_603():
+    # #603: pread must resolve like read/recv/recvfrom (bare, @plt-decorated),
+    # and pread_chk must resolve via its FORTIFY underscore-stripped key --
+    # this already worked before #603 and must keep working.
+    models = te.load_models()
+    assert te.lookup_model(models, "pread")[0] == "pread"
+    assert te.lookup_model(models, "pread@plt")[0] == "pread"
+    assert te.lookup_model(models, "pread_chk")[0] == "pread_chk"
+    assert te.lookup_model(models, "__pread_chk")[0] == "pread_chk"
+
+
+def test_lookup_model_resolves_lfs64_aliases_603():
+    # #603 (FINDING 2): only GENUINE glibc LFS64 transitional symbols -- the
+    # `<name>64` aliases glibc emits under _FILE_OFFSET_BITS=64 /
+    # _LARGEFILE64_SOURCE for the off_t-taking I/O calls -- share their base
+    # model. pwrite64/pread64 must resolve to pwrite/pread, and the internal
+    # `__`-decorated spellings too (underscore-stripped first, then de-64'd).
+    models = te.load_models()
+    assert te.lookup_model(models, "pwrite64")[0] == "pwrite"
+    assert te.lookup_model(models, "pread64")[0] == "pread"
+    assert te.lookup_model(models, "__pwrite64")[0] == "pwrite"
+    assert te.lookup_model(models, "pwrite64@plt")[0] == "pwrite"
+    # the resolved alias carries the base model's sink, not an empty stub
+    assert te.lookup_model(models, "pwrite64")[1]["sink"]["class"] == "file_write"
+    # a name that merely ends in a two-digit run is NOT mangled into a base:
+    # `bswap_64` keeps its own model (endian intrinsic), not a strip to `bswap_`.
+    assert te.lookup_model(models, "bswap_64")[0] == "bswap_64"
+
+
+def test_lookup_model_lfs64_allowlist_rejects_user_64_symbols_603():
+    # #603 (FINDING 2, soundness): a generic strip-`64` rule is UNSOUND -- it
+    # aliases ANY `<name>64` whose de-suffixed base happens to be a model key,
+    # mis-modeling user symbols that merely end in "64". `read`/`write`/`close`
+    # are NOT off_t-taking LFS APIs (there is no glibc `read64`/`write64`/
+    # `close64`), so an internal `write64` serializer or `close64` command must
+    # NOT borrow the `write`/`close` model. Only the explicit LFS64 allowlist
+    # (pread64/pwrite64) aliases; everything else stays unmodeled.
+    models = te.load_models()
+    assert te.lookup_model(models, "write64")[0] is None
+    assert te.lookup_model(models, "read64")[0] is None
+    assert te.lookup_model(models, "close64")[0] is None
+    assert te.lookup_model(models, "__write64")[0] is None
+    assert te.lookup_model(models, "close64@plt")[0] is None
+
+
 def test_chk_models_present_and_shaped():
     models = te.load_models()
     # FORTIFY variants resolve via the underscore-stripped key, NOT by collapsing
@@ -1317,6 +1362,57 @@ def _read_callsite_func():
     return FFunc("recv_handler", 0x10, FSSAFunc(instrs), params=[fd])
 
 
+def _pread_callsite_func():
+    # r#1 = pread(fd, &buf, 0x100, off); return r#1 -- mirrors _read_callsite_func
+    # but with the extra file-offset param pread takes (#603).
+    fd = FVar("fd"); buf = FVar("buf", typ="char[0x100]"); off = FVar("off"); r = FVar("r")
+    r1 = FSSA(r, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "r#1 = pread(fd, &buf, 0x100, off)",
+               writes=[r1],
+               dest=FExpr("MLIL_CONST_PTR", "0x901", constant=0x901),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[FSSA(fd, 0)]),
+                       FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       FExpr("MLIL_CONST", "0x100", constant=0x100),
+                       FExpr("MLIL_VAR_SSA", "off#0", reads=[FSSA(off, 0)])]),
+        FInstr(1, 0x14, "MLIL_RET", "return r#1", reads=[r1]),
+    ]
+    return FFunc("pread_handler", 0x10, FSSAFunc(instrs), params=[fd, off])
+
+
+def test_forward_pread_ret_source_emits_call_nudge_when_alone_603(models):
+    # #603: mirrors test_forward_ret_source_emits_call_nudge_when_alone for read.
+    # ret:pread seeds only the return value, but pread's model also fills the
+    # *arg:1 output buffer -- so a ret:-only source nudges the user toward
+    # call:pread to also taint that buffer, proving pread is fully modeled
+    # (both *arg:1 and ret), not just honesty-patched.
+    engine = te.TaintEngine(FBV({0x901: "pread"}), models)
+    result = engine.forward(_pread_callsite_func(), [te.parse_locator("ret:pread")])
+    assert any("call:pread" in a for a in result["assumptions"])
+
+
+def test_forward_pread_ret_source_suppresses_call_nudge_with_arg_sibling_603(models):
+    # #603: mirrors test_forward_ret_source_suppresses_call_nudge_with_arg_sibling.
+    # arg:pread:1 already seeds the *arg:1 output buffer, so the redundant
+    # call:pread nudge must be suppressed.
+    engine = te.TaintEngine(FBV({0x901: "pread"}), models)
+    result = engine.forward(_pread_callsite_func(),
+                            [te.parse_locator("ret:pread"),
+                             te.parse_locator("arg:pread:1")])
+    assert not any("call:pread" in a for a in result["assumptions"])
+
+
+def test_forward_call_pread_seeds_both_buffer_and_ret_603(models):
+    # #603: call:pread presets every model output at once -- both the *arg:1
+    # buffer and ret -- exactly as call:read does for read (#157). Proven here
+    # by the redundant ret:+call: sibling nudge suppression, same as read's.
+    engine = te.TaintEngine(FBV({0x901: "pread"}), models)
+    result = engine.forward(_pread_callsite_func(),
+                            [te.parse_locator("ret:pread"),
+                             te.parse_locator("call:pread")])
+    assert not any("call:pread" in a for a in result["assumptions"])
+
+
 def test_forward_ret_source_emits_call_nudge_when_alone(models):
     # ret:read seeds only the return value, but read's model also fills the
     # *arg:1 output buffer -- so a ret:-only source legitimately nudges the user
@@ -1454,6 +1550,165 @@ def test_optional_sink_on_with_class(models):
     assert result2["reached_sinks"] == []
 
 
+def _pwrite_write_sink_func(callee: str = "pwrite"):
+    # dump(fd): read(fd, &buf, 0x40); pwrite(fd, &buf, 0x40, off) -- the tainted
+    # buffer filled by read() is handed to pwrite's DATA arg (arg1), so pwrite's
+    # opt-in file_write sink must fire. Mirrors _fwrite_func but for the pwrite
+    # entry (#603-4). `callee` lets the alias test reuse this exact shape under
+    # the LFS64 symbol spelling (pwrite64) to prove the alias arms the same sink.
+    buf = FVar("buf", typ="char[0x40]")
+    rsi = FVar("rsi"); rdi = FVar("rdi"); rax = FVar("rax"); off = FVar("off")
+    rsi1 = FSSA(rsi, 1); rdi1 = FSSA(rdi, 1); rax2 = FSSA(rax, 2); off1 = FSSA(off, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "rsi#1 = &buf", writes=[rsi1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "rax#2 = read(rdi#1, rsi#1, 0x40)",
+               reads=[rdi1, rsi1], writes=[rax2],
+               dest=FExpr("MLIL_CONST_PTR", "0x401070", constant=0x401070),
+               params=[FExpr("MLIL_VAR_SSA", "rdi#1", reads=[rdi1]),
+                       FExpr("MLIL_VAR_SSA", "rsi#1", reads=[rsi1]),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+        FInstr(2, 0x18, "MLIL_CALL_SSA", f"{callee}(rdi#1, &buf, 0x40, off#1)",
+               reads=[rdi1, off1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401090", constant=0x401090),
+               params=[FExpr("MLIL_VAR_SSA", "rdi#1", reads=[rdi1]),
+                       FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40),
+                       FExpr("MLIL_VAR_SSA", "off#1", reads=[off1])]),
+    ]
+    bv = FBV({0x401070: "read", 0x401090: callee})
+    return FFunc("dump", 0x10, FSSAFunc(instrs), params=[FVar("fd")]), bv
+
+
+def test_pwrite_file_write_sink_off_by_default_603(models):
+    # #603-4: pwrite's file_write sink is opt-in, so a tainted-buffer pwrite
+    # fires nothing by default (mirrors test_optional_sink_off_by_default).
+    func, bv = _pwrite_write_sink_func()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:read:1")])
+    assert result["reached_sinks"] == []
+
+
+def test_pwrite_file_write_sink_on_with_class_603(models):
+    # #603-4 (FINDING 1): with --sink-class file_write enabled, a tainted buffer
+    # written via pwrite() arms the file_write sink modeled on the new pwrite
+    # catalog entry. FAILS if the "pwrite" model is removed or typo'd (pwrite
+    # becomes an unmodeled external -> no file_write finding).
+    func, bv = _pwrite_write_sink_func()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:read:1")],
+                            enabled_sink_classes={"file_write"})
+    sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "pwrite"]
+    assert len(sinks) == 1
+    assert sinks[0]["sink"]["class"] == "file_write"
+    assert sinks[0]["sink"]["tainted_arg_index"] == 1
+    # an unrelated opt-in class leaves pwrite silent
+    result2 = engine.forward(func, [te.parse_locator("arg:read:1")],
+                             enabled_sink_classes={"net_write"})
+    assert [s for s in result2["reached_sinks"] if s["sink"]["callee"] == "pwrite"] == []
+
+
+def test_pwrite64_lfs_alias_arms_file_write_sink_603(models):
+    # #603 (FINDING 2): compiled with _FILE_OFFSET_BITS=64 the call goes to the
+    # LFS64 symbol `pwrite64`, not `pwrite`. The 64-bit-offset variant shares
+    # pwrite's semantics, so it must arm the SAME file_write sink -- otherwise a
+    # real x86-64 build silently produces zero findings for this bug class.
+    func, bv = _pwrite_write_sink_func(callee="pwrite64")
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:read:1")],
+                            enabled_sink_classes={"file_write"})
+    # The alias resolves to the base MODEL KEY, so the finding is reported under
+    # `pwrite` (the canonical convention, same as a mangled `_Znwm` reporting
+    # `Znwm`) -- i.e. it arms the identical sink as a bare `pwrite` call. Without
+    # the LFS64 canonicalization pwrite64 would be an unmodeled external and this
+    # file_write finding would NOT exist.
+    sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "pwrite"]
+    assert len(sinks) == 1
+    assert sinks[0]["sink"]["class"] == "file_write"
+    assert sinks[0]["sink"]["tainted_arg_index"] == 1
+
+
+def _internal_write64_serializer():
+    # serialize(v): write64(&out, off, v) -- `write64` is an INTERNAL integer
+    # serializer (arg0 dst, arg1 offset, arg2 value), NOT the glibc `write`
+    # syscall. It has a real in-binary body, so a generic strip-`64` rule would
+    # mis-model it as `write` and fire a FALSE file_write sink on the value arg.
+    out = FVar("out"); off = FVar("off"); v = FVar("v", ident=1)
+    v0 = FSSA(v, 0); off1 = FSSA(off, 1)
+    # internal body: dst[off] = val -- a benign store, no modeled sink.
+    dst = FVar("dst", ident=10); pv = FVar("pv", ident=11); pval = FVar("pval", ident=12)
+    dst0 = FSSA(dst, 0); pval0 = FSSA(pval, 0); slot1 = FSSA(FVar("slot", ident=13), 1)
+    write64_fn = FFunc("write64", 0x401090, FSSAFunc([
+        FInstr(0, 0x401094, "MLIL_SET_VAR_SSA", "slot#1 = pval#0", reads=[pval0], writes=[slot1]),
+    ]), params=[dst, pv, pval])
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "off#1 = 0", writes=[off1],
+               src=FExpr("MLIL_CONST", "0", constant=0)),
+        FInstr(1, 0x18, "MLIL_CALL_SSA", "write64(&out, off#1, v#0)",
+               reads=[off1, v0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401090", constant=0x401090),
+               params=[FExpr("MLIL_ADDRESS_OF", "&out", src=out),
+                       FExpr("MLIL_VAR_SSA", "off#1", reads=[off1]),
+                       FExpr("MLIL_VAR_SSA", "v#0", reads=[v0])]),
+    ]
+    bv = FBV({0x401090: "write64"}, funcs={0x401090: write64_fn})
+    return FFunc("serialize", 0x10, FSSAFunc(instrs), params=[v]), bv
+
+
+def test_internal_write64_not_aliased_to_write_no_false_file_write_603(models):
+    # #603 (FINDING 2, soundness): an internal `write64(dst, off, value)` must
+    # NOT borrow the glibc `write` file_write model. Under the old generic
+    # strip-`64` rule, the tainted `value` (arg2) would fire a FALSE file_write
+    # finding on a plain integer serializer. With the LFS64 allowlist there is
+    # no `write64` alias, so no file_write sink is reported.
+    func, bv = _internal_write64_serializer()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")],
+                            enabled_sink_classes={"file_write"})
+    assert [s for s in result["reached_sinks"] if s["sink"]["class"] == "file_write"] == []
+
+
+def _internal_close64_runs_system():
+    # dispatch(cmd): close64(cmd) -- `close64` is an INTERNAL routine that runs
+    # system(cmd), NOT the glibc `close` syscall. `close` has an EMPTY (benign)
+    # model, so a generic strip-`64` rule would treat close64 as modeled, SKIP
+    # descent into its body, miss the system() sink, and return a confident
+    # false all-clear. The allowlist leaves close64 unmodeled -> the engine
+    # descends and finds the command_injection.
+    cmd = FVar("cmd", ident=1); cmd0 = FSSA(cmd, 0)
+    p = FVar("p", ident=2); p0 = FSSA(p, 0)
+    close64_fn = FFunc("close64", 0x401080, FSSAFunc([
+        FInstr(0, 0x401084, "MLIL_CALL_SSA", "system(p#0)", reads=[p0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401090", constant=0x401090),
+               params=[FExpr("MLIL_VAR_SSA", "p#0", reads=[p0])]),
+    ]), params=[p])
+    instrs = [
+        FInstr(0, 0x18, "MLIL_CALL_SSA", "close64(cmd#0)", reads=[cmd0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401080", constant=0x401080),
+               params=[FExpr("MLIL_VAR_SSA", "cmd#0", reads=[cmd0])]),
+    ]
+    bv = FBV({0x401080: "close64", 0x401090: "system"}, funcs={0x401080: close64_fn})
+    return FFunc("dispatch", 0x10, FSSAFunc(instrs), params=[cmd]), bv
+
+
+def test_internal_close64_not_aliased_to_close_system_sink_found_603(models):
+    # #603 (FINDING 2, soundness): the confident-false-all-clear case. An
+    # internal `close64(cmd)` that calls system(cmd) must NOT alias to the
+    # benign empty `close` model (which would suppress descent). The system
+    # command_injection sink must still be found, and the run must not claim a
+    # clean all-clear.
+    func, bv = _internal_close64_runs_system()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    sinks = [s for s in result["reached_sinks"] if s["sink"]["class"] == "command_injection"]
+    assert sinks, "descent into close64 must reach the system() command_injection"
+    # the finding's path must go THROUGH close64 (i.e. the engine descended into
+    # its body) -- proof that close64 was not treated as the benign `close`
+    # model, which would have suppressed descent and yielded a false all-clear.
+    assert any("close64" in (st.get("reason") or "") for st in sinks[0]["path"])
+    assert sinks[0]["metrics"]["fns_spanned"] == 2
+
+
 def _recv_sink_func():
     # handler(n): recv(3, &buf, n) -- the LENGTH (arg2) written into buf is
     # attacker-controlled (param 0). recv is now an opt-in bounded-write sink (#499).
@@ -1493,6 +1748,50 @@ def test_recv_overflow_sink_on_with_class_499(models):
     r2 = engine.forward(func, [te.parse_locator("param:0")],
                         enabled_sink_classes={"file_write"})
     assert [s for s in r2["reached_sinks"] if s["sink"]["callee"] == "recv"] == []
+
+
+def _pread_sink_func():
+    # handler(n): pread(3, &buf, n, 0) -- mirrors _recv_sink_func for pread's
+    # attacker-controlled length arg (#603).
+    n = FVar("n", ident=1); n0 = FSSA(n, 0)
+    buf = FVar("buf")
+    rax = FVar("rax"); rax1 = FSSA(rax, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "rax#1 = pread(3, &buf, n#0, 0)", reads=[n0], writes=[rax1],
+               dest=FExpr("MLIL_CONST_PTR", "0x901", constant=0x901),
+               params=[FExpr("MLIL_CONST", "3", constant=3),
+                       FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       FExpr("MLIL_VAR_SSA", "n#0", reads=[n0]),
+                       FExpr("MLIL_CONST", "0", constant=0)]),
+    ]
+    return FFunc("pread_handler", 0x10, FSSAFunc(instrs), params=[n]), FBV({0x901: "pread"})
+
+
+def test_pread_overflow_sink_off_by_default_603(models):
+    # #603: mirrors test_recv_overflow_sink_off_by_default_499 -- the pread
+    # length sink is opt-in, so an attacker-length pread fires nothing by default.
+    func, bv = _pread_sink_func()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    assert [s for s in result["reached_sinks"] if s["sink"]["callee"] == "pread"] == []
+
+
+def test_pread_overflow_sink_on_with_class_603(models):
+    # #603: mirrors test_recv_overflow_sink_on_with_class_499 -- with
+    # --sink-class recv_overflow enabled, the same attacker-length pread fires,
+    # reported with the accurate overflow_len bug class, detail mentioning pread.
+    func, bv = _pread_sink_func()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")],
+                            enabled_sink_classes={"recv_overflow"})
+    sinks = [s["sink"] for s in result["reached_sinks"] if s["sink"]["callee"] == "pread"]
+    assert len(sinks) == 1
+    assert sinks[0]["class"] == "overflow_len"
+    assert "pread" in sinks[0]["detail"]
+    # an unrelated opt-in class leaves it silent (gated on recv_overflow, not its class)
+    r2 = engine.forward(func, [te.parse_locator("param:0")],
+                        enabled_sink_classes={"file_write"})
+    assert [s for s in r2["reached_sinks"] if s["sink"]["callee"] == "pread"] == []
 
 
 def _sprintf_vararg_func():

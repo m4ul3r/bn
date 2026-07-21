@@ -267,13 +267,52 @@ def _canonical_cxx_alloc(name: str) -> str | None:
     return None
 
 
+# Genuine glibc LFS64 transitional symbols -> their base name (#603). Built with
+# ``-D_FILE_OFFSET_BITS=64`` or ``-D_LARGEFILE64_SOURCE`` (the common default on
+# 64-bit Linux), glibc renames the ``off_t``-taking I/O calls to a ``64``-
+# suffixed alias that is semantically identical to its base -- only the offset
+# width differs -- so it shares the base's taint model. This is an EXPLICIT
+# ALLOWLIST of the real transitional pairs, NOT a generic strip-``64`` rule: a
+# blanket "drop the 64 and reuse whatever base matches" is unsound -- it
+# mis-models user symbols that merely end in "64". `read`/`write`/`close` are
+# NOT off_t-taking LFS APIs (there is no glibc `read64`/`write64`/`close64`), so
+# an internal `write64` serializer would falsely borrow the `write` file_write
+# sink and an internal `close64` running `system()` would falsely borrow the
+# benign empty `close` model (suppressing descent -> a confident false
+# all-clear). Only names on this list alias, and only when the base is itself a
+# real model key (enforced in ``lookup_model``). Restricted to the offset-taking
+# APIs this catalog actually models; add a pair here only when its base model is
+# present. Other genuine LFS64 symbols exist (lseek64, open64/openat64, mmap64,
+# ftruncate64/truncate64, preadv64/pwritev64) but are omitted until their base
+# is modeled.
+_LFS64_ALIASES: dict[str, str] = {
+    "pread64": "pread",
+    "pwrite64": "pwrite",
+}
+
+
+def _canonical_lfs64(name: str) -> str | None:
+    """Base-model key for a genuine glibc LFS64 transitional symbol on the
+    explicit allowlist, or None otherwise (#603).
+
+    Tried LAST in ``lookup_model``, so a name that carries its own model keeps
+    it; ``lookup_model`` additionally only ADOPTS the result when the base is a
+    real model key. *name* is expected already stripped of a leading ``_`` (as
+    ``lookup_model`` passes it), so the internal ``__pread64`` spelling resolves
+    too.
+    """
+    return _LFS64_ALIASES.get(name)
+
+
 def lookup_model(models: dict[str, Any], name: str | None) -> tuple[str | None, dict[str, Any] | None]:
     """Match a (possibly decorated) symbol name against the model DB.
 
     Tries the raw name, then the part before ``@`` (``memcpy@plt`` ->
     ``memcpy``), then with leading underscores stripped, then the canonical
     C++ allocator key (so mangled ``_Znam`` and demangled ``operator new[]``
-    both resolve to the ``Znam`` model -- #204).
+    both resolve to the ``Znam`` model -- #204), then the transitional LFS64
+    base key (so ``pwrite64`` / ``pread64`` resolve to ``pwrite`` / ``pread`` --
+    #603).
     """
     if not name:
         return None, None
@@ -287,6 +326,9 @@ def lookup_model(models: dict[str, Any], name: str | None) -> tuple[str | None, 
     alias = _canonical_cxx_alloc(stripped or base)
     if alias and alias not in candidates:
         candidates.append(alias)
+    lfs64 = _canonical_lfs64(stripped or base)
+    if lfs64 and lfs64 not in candidates:
+        candidates.append(lfs64)
     for cand in candidates:
         if cand in models:
             return cand, models[cand]

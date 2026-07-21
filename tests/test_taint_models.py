@@ -170,6 +170,21 @@ def test_builtin_catalog_covers_fortify_and_exec_sinks():
     # so retiring the name-regex net does not silently drop it from enumeration.
     src_syms = {s["symbol"] for s in build_catalog(models, role="source")["sources"]}
     assert "fscanf" in src_syms, "fscanf must be a modeled source"
+    # #603: pread must never silently drop out of the builtin source catalog
+    # (bn taint models) alongside read/recv/recvfrom.
+    assert "pread" in src_syms, "pread must be a modeled source"
+
+
+def test_recv_overflow_comment_names_pread_603():
+    # #603-2: the recv_overflow opt-in sink family doc comment must literally
+    # name pread alongside read/recv/recvfrom, not just leave it modeled with
+    # no discoverable mention in the explanatory text a reader greps first.
+    import json
+    from bn_agent_bridge.taint_models import _BUILTIN_MODELS
+
+    raw = json.loads(_BUILTIN_MODELS.read_text())
+    comment = raw["models"]["_comment_recv_overflow"]
+    assert "pread" in comment, comment
 
 
 # --- #555: catalog entries marked as NON-findings --------------------------
