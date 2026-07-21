@@ -267,29 +267,41 @@ def _canonical_cxx_alloc(name: str) -> str | None:
     return None
 
 
+# Genuine glibc LFS64 transitional symbols -> their base name (#603). Built with
+# ``-D_FILE_OFFSET_BITS=64`` or ``-D_LARGEFILE64_SOURCE`` (the common default on
+# 64-bit Linux), glibc renames the ``off_t``-taking I/O calls to a ``64``-
+# suffixed alias that is semantically identical to its base -- only the offset
+# width differs -- so it shares the base's taint model. This is an EXPLICIT
+# ALLOWLIST of the real transitional pairs, NOT a generic strip-``64`` rule: a
+# blanket "drop the 64 and reuse whatever base matches" is unsound -- it
+# mis-models user symbols that merely end in "64". `read`/`write`/`close` are
+# NOT off_t-taking LFS APIs (there is no glibc `read64`/`write64`/`close64`), so
+# an internal `write64` serializer would falsely borrow the `write` file_write
+# sink and an internal `close64` running `system()` would falsely borrow the
+# benign empty `close` model (suppressing descent -> a confident false
+# all-clear). Only names on this list alias, and only when the base is itself a
+# real model key (enforced in ``lookup_model``). Restricted to the offset-taking
+# APIs this catalog actually models; add a pair here only when its base model is
+# present. Other genuine LFS64 symbols exist (lseek64, open64/openat64, mmap64,
+# ftruncate64/truncate64, preadv64/pwritev64) but are omitted until their base
+# is modeled.
+_LFS64_ALIASES: dict[str, str] = {
+    "pread64": "pread",
+    "pwrite64": "pwrite",
+}
+
+
 def _canonical_lfs64(name: str) -> str | None:
-    """Canonical base-model key for a transitional LFS64 symbol -- the base name
-    plus a ``64`` suffix -- or None when *name* is not such a variant (#603).
+    """Base-model key for a genuine glibc LFS64 transitional symbol on the
+    explicit allowlist, or None otherwise (#603).
 
-    Built with ``-D_FILE_OFFSET_BITS=64`` or ``-D_LARGEFILE64_SOURCE`` (the
-    common default on 64-bit Linux), glibc renames every ``off_t``-taking I/O
-    call to a ``64``-suffixed alias: ``pread`` -> ``pread64``, ``pwrite`` ->
-    ``pwrite64``, ``lseek`` -> ``lseek64``, ``open`` -> ``open64``, and so on.
-    The 64-bit-offset variant is semantically identical to its base -- only the
-    offset width differs -- so it shares the base's taint model. Modeled as a
-    lookup canonicalization (like ``_canonical_cxx_alloc``) rather than
-    duplicating every base model under a ``<name>64`` key. lookup_model only
-    ADOPTS the result when the de-suffixed base is itself a real model key, so a
-    coincidental ``…64`` symbol whose base is unmodeled never spuriously aliases;
-    and it is tried LAST, so a name that carries its own ``…64`` model (e.g. the
-    endian intrinsic ``bswap_64``) keeps that model.
-
-    *name* is expected already stripped of a leading ``_`` (as ``lookup_model``
-    passes it), so the internal ``__pread64`` spelling resolves too.
+    Tried LAST in ``lookup_model``, so a name that carries its own model keeps
+    it; ``lookup_model`` additionally only ADOPTS the result when the base is a
+    real model key. *name* is expected already stripped of a leading ``_`` (as
+    ``lookup_model`` passes it), so the internal ``__pread64`` spelling resolves
+    too.
     """
-    if len(name) > 2 and name.endswith("64") and not name[-3].isdigit():
-        return name[:-2]
-    return None
+    return _LFS64_ALIASES.get(name)
 
 
 def lookup_model(models: dict[str, Any], name: str | None) -> tuple[str | None, dict[str, Any] | None]:

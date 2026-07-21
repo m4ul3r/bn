@@ -348,14 +348,14 @@ def test_lookup_model_resolves_pread_and_pread_chk_603():
 
 
 def test_lookup_model_resolves_lfs64_aliases_603():
-    # #603 (FINDING 2): transitional LFS64 symbols (base name + "64", emitted
-    # under _FILE_OFFSET_BITS=64 / _LARGEFILE64_SOURCE) share their base model.
-    # pwrite64/pread64 must resolve to pwrite/pread, and the internal `__`-
-    # decorated spellings too (underscore-stripped first, then de-64'd).
+    # #603 (FINDING 2): only GENUINE glibc LFS64 transitional symbols -- the
+    # `<name>64` aliases glibc emits under _FILE_OFFSET_BITS=64 /
+    # _LARGEFILE64_SOURCE for the off_t-taking I/O calls -- share their base
+    # model. pwrite64/pread64 must resolve to pwrite/pread, and the internal
+    # `__`-decorated spellings too (underscore-stripped first, then de-64'd).
     models = te.load_models()
     assert te.lookup_model(models, "pwrite64")[0] == "pwrite"
     assert te.lookup_model(models, "pread64")[0] == "pread"
-    assert te.lookup_model(models, "read64")[0] == "read"
     assert te.lookup_model(models, "__pwrite64")[0] == "pwrite"
     assert te.lookup_model(models, "pwrite64@plt")[0] == "pwrite"
     # the resolved alias carries the base model's sink, not an empty stub
@@ -363,6 +363,22 @@ def test_lookup_model_resolves_lfs64_aliases_603():
     # a name that merely ends in a two-digit run is NOT mangled into a base:
     # `bswap_64` keeps its own model (endian intrinsic), not a strip to `bswap_`.
     assert te.lookup_model(models, "bswap_64")[0] == "bswap_64"
+
+
+def test_lookup_model_lfs64_allowlist_rejects_user_64_symbols_603():
+    # #603 (FINDING 2, soundness): a generic strip-`64` rule is UNSOUND -- it
+    # aliases ANY `<name>64` whose de-suffixed base happens to be a model key,
+    # mis-modeling user symbols that merely end in "64". `read`/`write`/`close`
+    # are NOT off_t-taking LFS APIs (there is no glibc `read64`/`write64`/
+    # `close64`), so an internal `write64` serializer or `close64` command must
+    # NOT borrow the `write`/`close` model. Only the explicit LFS64 allowlist
+    # (pread64/pwrite64) aliases; everything else stays unmodeled.
+    models = te.load_models()
+    assert te.lookup_model(models, "write64")[0] is None
+    assert te.lookup_model(models, "read64")[0] is None
+    assert te.lookup_model(models, "close64")[0] is None
+    assert te.lookup_model(models, "__write64")[0] is None
+    assert te.lookup_model(models, "close64@plt")[0] is None
 
 
 def test_chk_models_present_and_shaped():
@@ -1610,6 +1626,87 @@ def test_pwrite64_lfs_alias_arms_file_write_sink_603(models):
     assert len(sinks) == 1
     assert sinks[0]["sink"]["class"] == "file_write"
     assert sinks[0]["sink"]["tainted_arg_index"] == 1
+
+
+def _internal_write64_serializer():
+    # serialize(v): write64(&out, off, v) -- `write64` is an INTERNAL integer
+    # serializer (arg0 dst, arg1 offset, arg2 value), NOT the glibc `write`
+    # syscall. It has a real in-binary body, so a generic strip-`64` rule would
+    # mis-model it as `write` and fire a FALSE file_write sink on the value arg.
+    out = FVar("out"); off = FVar("off"); v = FVar("v", ident=1)
+    v0 = FSSA(v, 0); off1 = FSSA(off, 1)
+    # internal body: dst[off] = val -- a benign store, no modeled sink.
+    dst = FVar("dst", ident=10); pv = FVar("pv", ident=11); pval = FVar("pval", ident=12)
+    dst0 = FSSA(dst, 0); pval0 = FSSA(pval, 0); slot1 = FSSA(FVar("slot", ident=13), 1)
+    write64_fn = FFunc("write64", 0x401090, FSSAFunc([
+        FInstr(0, 0x401094, "MLIL_SET_VAR_SSA", "slot#1 = pval#0", reads=[pval0], writes=[slot1]),
+    ]), params=[dst, pv, pval])
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "off#1 = 0", writes=[off1],
+               src=FExpr("MLIL_CONST", "0", constant=0)),
+        FInstr(1, 0x18, "MLIL_CALL_SSA", "write64(&out, off#1, v#0)",
+               reads=[off1, v0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401090", constant=0x401090),
+               params=[FExpr("MLIL_ADDRESS_OF", "&out", src=out),
+                       FExpr("MLIL_VAR_SSA", "off#1", reads=[off1]),
+                       FExpr("MLIL_VAR_SSA", "v#0", reads=[v0])]),
+    ]
+    bv = FBV({0x401090: "write64"}, funcs={0x401090: write64_fn})
+    return FFunc("serialize", 0x10, FSSAFunc(instrs), params=[v]), bv
+
+
+def test_internal_write64_not_aliased_to_write_no_false_file_write_603(models):
+    # #603 (FINDING 2, soundness): an internal `write64(dst, off, value)` must
+    # NOT borrow the glibc `write` file_write model. Under the old generic
+    # strip-`64` rule, the tainted `value` (arg2) would fire a FALSE file_write
+    # finding on a plain integer serializer. With the LFS64 allowlist there is
+    # no `write64` alias, so no file_write sink is reported.
+    func, bv = _internal_write64_serializer()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")],
+                            enabled_sink_classes={"file_write"})
+    assert [s for s in result["reached_sinks"] if s["sink"]["class"] == "file_write"] == []
+
+
+def _internal_close64_runs_system():
+    # dispatch(cmd): close64(cmd) -- `close64` is an INTERNAL routine that runs
+    # system(cmd), NOT the glibc `close` syscall. `close` has an EMPTY (benign)
+    # model, so a generic strip-`64` rule would treat close64 as modeled, SKIP
+    # descent into its body, miss the system() sink, and return a confident
+    # false all-clear. The allowlist leaves close64 unmodeled -> the engine
+    # descends and finds the command_injection.
+    cmd = FVar("cmd", ident=1); cmd0 = FSSA(cmd, 0)
+    p = FVar("p", ident=2); p0 = FSSA(p, 0)
+    close64_fn = FFunc("close64", 0x401080, FSSAFunc([
+        FInstr(0, 0x401084, "MLIL_CALL_SSA", "system(p#0)", reads=[p0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401090", constant=0x401090),
+               params=[FExpr("MLIL_VAR_SSA", "p#0", reads=[p0])]),
+    ]), params=[p])
+    instrs = [
+        FInstr(0, 0x18, "MLIL_CALL_SSA", "close64(cmd#0)", reads=[cmd0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401080", constant=0x401080),
+               params=[FExpr("MLIL_VAR_SSA", "cmd#0", reads=[cmd0])]),
+    ]
+    bv = FBV({0x401080: "close64", 0x401090: "system"}, funcs={0x401080: close64_fn})
+    return FFunc("dispatch", 0x10, FSSAFunc(instrs), params=[cmd]), bv
+
+
+def test_internal_close64_not_aliased_to_close_system_sink_found_603(models):
+    # #603 (FINDING 2, soundness): the confident-false-all-clear case. An
+    # internal `close64(cmd)` that calls system(cmd) must NOT alias to the
+    # benign empty `close` model (which would suppress descent). The system
+    # command_injection sink must still be found, and the run must not claim a
+    # clean all-clear.
+    func, bv = _internal_close64_runs_system()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    sinks = [s for s in result["reached_sinks"] if s["sink"]["class"] == "command_injection"]
+    assert sinks, "descent into close64 must reach the system() command_injection"
+    # the finding's path must go THROUGH close64 (i.e. the engine descended into
+    # its body) -- proof that close64 was not treated as the benign `close`
+    # model, which would have suppressed descent and yielded a false all-clear.
+    assert any("close64" in (st.get("reason") or "") for st in sinks[0]["path"])
+    assert sinks[0]["metrics"]["fns_spanned"] == 2
 
 
 def _recv_sink_func():
