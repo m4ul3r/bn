@@ -33,8 +33,8 @@ def test_choose_instance_multiple_with_no_selector_errors_before_target(monkeypa
     # not narrow to one instance -- BEFORE any target resolution runs.
     import types
     import bn.transport as t
-    insts = [types.SimpleNamespace(instance_id="aa11", pid=11, socket_path="/s/aa11", started_at=None),
-             types.SimpleNamespace(instance_id="bb22", pid=22, socket_path="/s/bb22", started_at=None)]
+    insts = [types.SimpleNamespace(instance_id="aa11", pid=11, socket_path="/s/aa11", started_at=None, wedged=False),
+             types.SimpleNamespace(instance_id="bb22", pid=22, socket_path="/s/bb22", started_at=None, wedged=False)]
     monkeypatch.setattr(t, "list_instances", lambda: insts)
     monkeypatch.setattr(t, "_resolve_from_markers", lambda instances: None)  # no marker
     with pytest.raises(BridgeError) as exc:
@@ -1653,3 +1653,99 @@ def test_find_instance_markers_walks_up_from_cwd(monkeypatch, tmp_path):
     monkeypatch.chdir(sub)
     found = dict(_p.find_instance_markers())
     assert found.get("rootinst") and found.get("nearinst")  # both, walking up
+
+
+# --- #636 FINDING 2: PID-reuse / process-identity ---------------------------
+
+def test_load_instance_reused_pid_is_reclaimed_not_wedged(tmp_path, monkeypatch):
+    """A registry names pid P with recorded start-time S, its socket is dead, and
+    P is now a DIFFERENT live process (start-time S' != S -- a recycled pid). The
+    recorded instance is provably gone, so its leftovers are reclaimed and the
+    unrelated live pid is NEVER surfaced as a (wedged) instance (#636 F2)."""
+    import bn.transport as t
+
+    reg_path = tmp_path / "reuse.json"
+    sock_path = tmp_path / "reuse.sock"
+    sock_path.write_text("", encoding="utf-8")
+    reg_path.write_text(json.dumps({
+        "pid": 4242, "socket_path": str(sock_path), "instance_id": "reuse",
+        "start_time": "111111",
+    }), encoding="utf-8")
+
+    monkeypatch.setattr(t, "_socket_is_live", lambda path, timeout=0.2: False)
+    monkeypatch.setattr(t, "_process_alive", lambda pid: True)          # pid is live...
+    monkeypatch.setattr(t, "_read_proc_start_time", lambda pid: "999999")  # ...but a different process
+
+    result = t._load_instance(reg_path)
+
+    assert result is None                       # not surfaced as an instance
+    assert not reg_path.exists()                # stale registry reclaimed
+    assert not sock_path.exists()               # orphan socket reclaimed
+
+
+def test_load_instance_matching_start_time_keeps_live_instance(tmp_path, monkeypatch):
+    """Negative control: recorded start-time MATCHES the live pid's start-time, so
+    it is the same process -- a dead socket means briefly-slow, files preserved
+    (never purged as a recycled pid)."""
+    import bn.transport as t
+
+    reg_path = tmp_path / "same.json"
+    sock_path = tmp_path / "same.sock"
+    sock_path.write_text("", encoding="utf-8")
+    reg_path.write_text(json.dumps({
+        "pid": 4242, "socket_path": str(sock_path), "instance_id": "same",
+        "start_time": "111111",
+    }), encoding="utf-8")
+
+    monkeypatch.setattr(t, "_socket_is_live", lambda path, timeout=0.2: False)
+    monkeypatch.setattr(t, "_process_alive", lambda pid: True)
+    monkeypatch.setattr(t, "_read_proc_start_time", lambda pid: "111111")  # same process
+
+    result = t._load_instance(reg_path)
+
+    assert result is None                # first unresponsive probe -> invisible
+    assert reg_path.exists()             # but NOT purged (it's genuinely alive)
+    assert sock_path.exists()
+
+
+def test_process_identity_matches_strict(tmp_path, monkeypatch):
+    """The strict signal gate: True only when pid is alive AND its start-time
+    matches the recorded one. A missing recorded start-time or an unreadable
+    live one is unprovable => False (fail safe -- never signal)."""
+    import bn.transport as t
+    from bn.transport import BridgeInstance
+
+    def _mk(start_time):
+        return BridgeInstance(
+            pid=4242, socket_path=tmp_path / "s.sock", registry_path=tmp_path / "s.json",
+            plugin_name="p", plugin_version="0", started_at=None, meta={},
+            instance_id="s", start_time=start_time,
+        )
+
+    monkeypatch.setattr(t, "_process_alive", lambda pid: True)
+    monkeypatch.setattr(t, "_read_proc_start_time", lambda pid: "111111")
+    assert t.process_identity_matches(_mk("111111")) is True     # same process
+    assert t.process_identity_matches(_mk("222222")) is False    # recycled pid
+    assert t.process_identity_matches(_mk(None)) is False        # unrecorded -> unprovable
+
+    monkeypatch.setattr(t, "_read_proc_start_time", lambda pid: None)  # unreadable
+    assert t.process_identity_matches(_mk("111111")) is False
+
+
+def test_multiple_instances_error_names_wedged_instance(tmp_path):
+    """#636 FINDING 3: the ambiguity error must identify WHICH instance is wedged
+    (by id + pid) so an operator knows which to `bn session stop`."""
+    from bn.transport import BridgeInstance, _multiple_instances_error
+
+    healthy = BridgeInstance(
+        pid=11, socket_path=tmp_path / "a.sock", registry_path=tmp_path / "a.json",
+        plugin_name="p", plugin_version="0", started_at=None, meta={}, instance_id="aa11",
+    )
+    wedged = BridgeInstance(
+        pid=22, socket_path=tmp_path / "b.sock", registry_path=tmp_path / "b.json",
+        plugin_name="p", plugin_version="0", started_at=None, meta={}, instance_id="bb22",
+        wedged=True,
+    )
+    msg = str(_multiple_instances_error([healthy, wedged]))
+    assert "bb22" in msg and "22" in msg
+    assert "wedged" in msg.lower()

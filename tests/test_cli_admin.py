@@ -1102,6 +1102,9 @@ def test_session_stop_kill_failure_reports_error_and_exits_nonzero(monkeypatch, 
 
     monkeypatch.setattr(bn.cli, "send_request", fail_send_request)
     monkeypatch.setattr(bn.cli, "list_instances", lambda: [_fake_bridge_instance("abc123")])
+    # Identity is verified (same process) so the SIGTERM fallback is reached; the
+    # kill itself then fails with EPERM.
+    monkeypatch.setattr(bn.cli, "process_identity_matches", lambda inst: True)
 
     def fail_kill(pid, sig):
         raise PermissionError(1, "Operation not permitted")
@@ -1127,6 +1130,9 @@ def test_session_stop_sigterm_fallback_reports_method(monkeypatch, capsys):
     # Convergence polling is covered by its own transport test; here we only
     # assert the SIGTERM dispatch + reported method, so simulate a clean teardown.
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: True)
+    # #636 F2: the SIGTERM fallback is now identity-gated -- signalling only
+    # proceeds when the recorded process is provably still this instance.
+    monkeypatch.setattr(bn.cli, "process_identity_matches", lambda inst: True)
 
     kills = []
     monkeypatch.setattr("os.kill", lambda pid, sig: kills.append((pid, sig)))
@@ -1138,6 +1144,60 @@ def test_session_stop_sigterm_fallback_reports_method(monkeypatch, capsys):
     parsed = json.loads(capsys.readouterr().out)
     assert parsed["stopped"] is True
     assert parsed["method"] == "sigterm"
+
+
+def test_session_stop_refuses_to_signal_reused_pid(monkeypatch, capsys):
+    """#636 FINDING 2 (MAJOR): when the socket is unreachable and the recorded
+    pid's start-time no longer matches (PID reused onto an unrelated process),
+    `session stop` must NOT SIGTERM that pid -- it fails safe and reports the
+    recorded process is gone. os.kill must never fire."""
+    from bn.transport import BridgeError
+
+    def fail_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
+        raise BridgeError("bridge unreachable")
+
+    monkeypatch.setattr(bn.cli, "send_request", fail_send_request)
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [_fake_bridge_instance("abc123")])
+    # Identity check fails => the pid was recycled onto some other process.
+    monkeypatch.setattr(bn.cli, "process_identity_matches", lambda inst: False)
+
+    kills = []
+    monkeypatch.setattr("os.kill", lambda pid, sig: kills.append((pid, sig)))
+
+    rc = bn.cli.main(["session", "stop", "abc123"])
+
+    assert kills == []                       # the unrelated pid is never signalled
+    err = capsys.readouterr().err.lower()
+    assert "pid" in err and ("reused" in err or "no longer" in err or "gone" in err)
+
+
+def test_session_list_json_surfaces_wedged(monkeypatch, capsys):
+    """#636 FINDING 3: `session list --format json` must expose each instance's
+    wedged status so an operator can see which one is stuck."""
+    healthy = _fake_bridge_instance("aa11", pid=11)
+    stuck = _fake_bridge_instance("bb22", pid=22)
+    stuck.wedged = True
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [healthy, stuck])
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    rc = bn.cli.main(["session", "list", "--format", "json"])
+    assert rc == 0
+    items = {i["instance_id"]: i for i in json.loads(capsys.readouterr().out)["items"]}
+    assert items["aa11"]["wedged"] is False
+    assert items["bb22"]["wedged"] is True
+
+
+def test_session_list_text_marks_wedged(monkeypatch, capsys):
+    """#636 FINDING 3: the text formatter must visibly flag a wedged instance."""
+    stuck = _fake_bridge_instance("bb22", pid=22)
+    stuck.wedged = True
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [stuck])
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    rc = bn.cli.main(["session", "list"])
+    assert rc == 0
+    out = capsys.readouterr().out.lower()
+    assert "bb22" in out and "wedged" in out
 
 
 def test_class_list_invokes_op(monkeypatch):

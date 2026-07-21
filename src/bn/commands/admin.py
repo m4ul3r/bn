@@ -365,6 +365,18 @@ def _session_stop(args: argparse.Namespace) -> int:
         # Fallback: SIGTERM the process directly.
         if inst is None:
             raise BridgeError(f"No bridge instance found with id: {target_id}")
+        # #636 F2: NEVER signal a pid we can't prove is still this instance. If
+        # the recorded start-time no longer matches the live pid, the process is
+        # gone and the pid has been recycled onto an unrelated process -- SIGTERM
+        # there would kill an innocent bystander. Fail safe: report it as gone.
+        if not cli.process_identity_matches(inst):
+            print(
+                f"error: bridge instance {target_id} (pid {inst.pid}) is no "
+                "longer running (its pid was reused by another process); "
+                "refusing to signal it. Nothing to stop.",
+                file=sys.stderr,
+            )
+            return 1
         try:
             os.kill(inst.pid, signal.SIGTERM)
         except OSError as exc:
@@ -386,8 +398,12 @@ def _session_stop(args: argparse.Namespace) -> int:
     # graceful teardown stalls, and report failure if it never converges.
     if inst is not None:
         if not cli.wait_for_teardown(inst, timeout=5.0):
-            with contextlib.suppress(OSError):
-                os.kill(inst.pid, signal.SIGKILL)
+            # #636 F2: only SIGKILL if the pid is still provably THIS instance.
+            # If identity no longer matches the process already exited (and the
+            # pid may have been reused) -- escalating would kill a stranger.
+            if cli.process_identity_matches(inst):
+                with contextlib.suppress(OSError):
+                    os.kill(inst.pid, signal.SIGKILL)
             if not cli.wait_for_teardown(inst, timeout=2.0):
                 result["stopped"] = False
                 result["error"] = (
@@ -448,11 +464,16 @@ def _session_restart(args: argparse.Namespace) -> int:
     try:
         cli.send_request("shutdown", instance_id=resolved_id)
     except BridgeError:
-        with contextlib.suppress(OSError):
-            os.kill(inst.pid, signal.SIGTERM)
+        # #636 F2: only SIGTERM the recorded pid if it is provably still this
+        # instance; a reused pid means the old process already exited, so there
+        # is nothing (of ours) to signal -- proceed straight to respawn.
+        if cli.process_identity_matches(inst):
+            with contextlib.suppress(OSError):
+                os.kill(inst.pid, signal.SIGTERM)
     if not cli.wait_for_teardown(inst, timeout=5.0):
-        with contextlib.suppress(OSError):
-            os.kill(inst.pid, signal.SIGKILL)
+        if cli.process_identity_matches(inst):
+            with contextlib.suppress(OSError):
+                os.kill(inst.pid, signal.SIGKILL)
         if not cli.wait_for_teardown(inst, timeout=2.0):
             raise BridgeError(
                 f"bridge instance {target_id} (pid {inst.pid}) did not tear down; "
@@ -521,6 +542,10 @@ def _running_instances_result() -> dict[str, Any]:
             "socket_path": str(inst.socket_path),
             "started_at": inst.started_at,
             "rss_mb": round(rss, 1) if rss is not None else None,
+            # #636 F3: surface wedged status so an operator can see which instance
+            # is stuck (process alive, socket unresponsive past the grace window)
+            # and needs `bn session stop <id>`.
+            "wedged": bool(inst.wedged),
         }
         # #80: the registry now records each instance's open binaries, so list them
         # here without an N-instance `target list` round-trip. Absent (older bridge

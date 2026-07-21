@@ -594,6 +594,10 @@ def _render_session_list_text(value: Any) -> str:
         head = str(item.get("selector") or item.get("instance_id") or "<unknown>")
         if item.get("sticky"):
             head += " [sticky]"
+        # #636 F3: flag a wedged instance so `session list` shows which one is
+        # stuck (process alive but socket unresponsive) and needs a stop.
+        if item.get("wedged"):
+            head += " [wedged]"
         parts = [head, f"pid={item.get('pid', '<unknown>')}"]
         rss = item.get("rss_mb")
         if rss is not None:

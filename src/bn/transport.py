@@ -104,6 +104,12 @@ class BridgeInstance:
     # or its loaded view would be orphaned) but must not be handed out for a
     # request -- callers surface it as an honest wedged error instead.
     wedged: bool = False
+    # The owning process's start-time (field 22 of /proc/<pid>/stat, as a raw
+    # string) captured by the bridge when it registered. Combined with the pid it
+    # uniquely identifies the process: a recycled pid gets a different start-time.
+    # None when the registry predates this field or the platform has no /proc --
+    # callers then treat identity as UNPROVABLE and fail safe (never signal). #636.
+    start_time: str | None = None
 
 
 def instance_selector(instance: BridgeInstance) -> str:
@@ -144,6 +150,10 @@ def _format_instance_choices(instances: list[BridgeInstance]) -> str:
         details = [f"pid={inst.pid}", f"socket={inst.socket_path}"]
         if inst.started_at:
             details.append(f"started={inst.started_at}")
+        # #636 F3: flag a wedged instance in the ambiguity listing so the operator
+        # can see exactly which id+pid to `bn session stop`.
+        if inst.wedged:
+            details.append("wedged")
         lines.append(f"- {selector} ({', '.join(details)})")
     return "\n".join(lines)
 
@@ -157,6 +167,77 @@ def _process_alive(pid: int) -> bool:
     except PermissionError:
         return True
     except OSError:
+        return False
+    return True
+
+
+def _read_proc_start_time(pid: int) -> str | None:
+    """Return the process start-time token for ``pid`` (field 22 of
+    ``/proc/<pid>/stat``), or None when it can't be read.
+
+    The value is the number of clock ticks after boot at which the process
+    started. Combined with the pid it uniquely identifies a running process: a
+    recycled pid gets a fresh start-time. Returned as the raw string so the
+    bridge (which writes its own) and the CLI (which reads a live pid's) compare
+    byte-for-byte. None on any failure -- a non-Linux host without /proc, a
+    permission error, or the process being gone -- so callers fail safe. #636.
+    """
+    try:
+        data = Path(f"/proc/{pid}/stat").read_bytes()
+    except OSError:
+        return None
+    # comm (field 2) is wrapped in parens and may itself contain spaces or ')',
+    # so split on the LAST ')': everything after it is the stable, space-delimited
+    # tail beginning at field 3 (state). starttime is field 22 -> index 19 there.
+    try:
+        tail = data[data.rindex(b")") + 1:].split()
+        return tail[19].decode("ascii")
+    except (ValueError, IndexError, UnicodeDecodeError):
+        return None
+
+
+def _process_identity_matches(pid: int, recorded_start_time: str | None) -> bool:
+    """Strict identity: True only if ``pid`` is alive AND its live start-time
+    equals ``recorded_start_time``. Used to gate signals (SIGTERM/SIGKILL): a
+    None recorded value or an unreadable live start-time is UNPROVABLE, so this
+    returns False and the caller must not signal (fail safe against PID reuse)."""
+    if recorded_start_time is None:
+        return False
+    if not _process_alive(pid):
+        return False
+    live = _read_proc_start_time(pid)
+    if live is None:
+        return False
+    return live == recorded_start_time
+
+
+def _pid_belongs_to_other_process(pid: int, recorded_start_time: str) -> bool:
+    """True only when we can POSITIVELY prove ``pid`` is now a DIFFERENT process
+    than the one recorded (its live start-time reads and differs). Used for
+    reclaim decisions: an unreadable live start-time is inconclusive -> False, so
+    we never purge files on a mere read hiccup. #636."""
+    live = _read_proc_start_time(pid)
+    if live is None:
+        return False
+    return live != recorded_start_time
+
+
+def process_identity_matches(instance: BridgeInstance) -> bool:
+    """Public strict-identity gate for an instance: never signal a pid this
+    returns False for (the recorded process is gone / the pid was reused)."""
+    return _process_identity_matches(instance.pid, instance.start_time)
+
+
+def _instance_process_alive(instance: BridgeInstance) -> bool:
+    """Whether the SPECIFIC process an instance recorded is still alive -- pid AND
+    (when recorded) start-time. A recycled pid (provably different start-time)
+    counts as gone, so teardown/convergence sees the instance's process as
+    departed rather than waiting on an unrelated live pid forever. #636."""
+    if not _process_alive(instance.pid):
+        return False
+    if instance.start_time is not None and _pid_belongs_to_other_process(
+        instance.pid, instance.start_time
+    ):
         return False
     return True
 
@@ -261,6 +342,7 @@ def _load_instance(path: Path) -> BridgeInstance | None:
     except (OSError, ValueError, KeyError, json.JSONDecodeError):
         return None
 
+    start_time = payload.get("start_time")
     marker_path = _wedge_marker_path(path)
 
     if not socket_path.exists():
@@ -270,9 +352,22 @@ def _load_instance(path: Path) -> BridgeInstance | None:
 
     wedged = False
     if not _socket_is_live(socket_path):
-        if not _process_alive(pid):
-            # Genuinely DEAD: the process is gone, so its leftover registry +
-            # orphaned socket are safe to reclaim (#587's real intent).
+        # A pid that is alive but is provably a DIFFERENT process than the one
+        # recorded (start-time mismatch -> the pid was recycled) means the real
+        # instance is gone; its leftover files are as stale as a plainly-dead
+        # pid's. Reclaim them rather than surfacing the unrelated live pid as a
+        # (wedged) instance (#636 F2). Fail safe: an unrecorded/unreadable
+        # start-time is inconclusive, so we fall back to plain liveness and never
+        # purge a genuinely-live instance on a read hiccup.
+        recycled = (
+            isinstance(start_time, str)
+            and _process_alive(pid)
+            and _pid_belongs_to_other_process(pid, start_time)
+        )
+        if not _process_alive(pid) or recycled:
+            # Genuinely DEAD (process gone, or pid reused onto an unrelated
+            # process): its leftover registry + orphaned socket are safe to
+            # reclaim (#587's real intent).
             _purge_stale_registry(path, socket_path)
             _clear_wedge_marker(marker_path)
             return None
@@ -313,6 +408,7 @@ def _load_instance(path: Path) -> BridgeInstance | None:
         meta=payload,
         instance_id=payload.get("instance_id"),
         wedged=wedged,
+        start_time=start_time if isinstance(start_time, str) else None,
     )
 
 
@@ -447,11 +543,18 @@ def _use_instance(instance: BridgeInstance) -> BridgeInstance:
 
 
 def _multiple_instances_error(instances: list[BridgeInstance]) -> BridgeError:
-    return BridgeError(
+    msg = (
         "Multiple Binary Ninja bridge instances are running; pass -i/--instance <id> "
         "or set BN_INSTANCE (single-agent only).\n"
         f"Instances:\n{_format_instance_choices(instances)}"
     )
+    # #636 F3: if any instance is wedged, call it out by id+pid so the operator
+    # knows precisely which one to reclaim with `bn session stop`.
+    wedged = [i for i in instances if i.wedged]
+    if wedged:
+        stuck = ", ".join(f"{instance_selector(i)} (pid {i.pid})" for i in wedged)
+        msg += f"\nWedged (unresponsive) instance(s): {stuck} -- stop with `bn session stop <id>`."
+    return BridgeError(msg)
 
 
 @contextlib.contextmanager
@@ -783,7 +886,7 @@ def wait_for_teardown(
     deadline = time.monotonic() + timeout
     while True:
         gone = (
-            not _process_alive(instance.pid)
+            not _instance_process_alive(instance)
             and _load_instance(instance.registry_path) is None
         )
         if gone:

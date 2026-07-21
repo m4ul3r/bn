@@ -6,6 +6,7 @@ import errno
 import hashlib
 import json
 import os
+import secrets
 import socket
 import socketserver
 import struct
@@ -802,6 +803,27 @@ def _function_name_summary(bv) -> dict[str, int]:
     }
 
 
+def _read_proc_start_time(pid: int) -> str | None:
+    """Return the process start-time token for ``pid`` (field 22 of
+    ``/proc/<pid>/stat``), or None when it can't be read.
+
+    Recorded in the registry so the CLI can tell THIS bridge process apart from a
+    later process that reuses its pid (start-times differ). Parsed identically to
+    the CLI's reader (``bn.transport._read_proc_start_time``) so the written value
+    and a live read compare byte-for-byte. None on any failure (non-Linux, no
+    /proc) -> the CLI then treats identity as unprovable and fails safe. #636.
+    """
+    try:
+        data = Path(f"/proc/{pid}/stat").read_bytes()
+    except OSError:
+        return None
+    try:
+        tail = data[data.rindex(b")") + 1:].split()
+        return tail[19].decode("ascii")
+    except (ValueError, IndexError, UnicodeDecodeError):
+        return None
+
+
 class BinaryNinjaBridge:
     def __init__(self, instance_id: str | None = None):
         self.instance_id = instance_id
@@ -811,6 +833,18 @@ class BinaryNinjaBridge:
         self.registry_path = bridge_registry_path(instance_id)
         self._server: ThreadedUnixServer | None = None
         self._thread: threading.Thread | None = None
+        # #636 ownership identity, all captured at start() (bind time):
+        #  - _ownership_token: a random nonce written into the registry; stop()
+        #    only unlinks the registry if the ON-DISK token still matches, so a
+        #    sibling that rebound the same path (its own token) is never clobbered.
+        #  - _bound_socket_ino: the inode of the socket file we bound; stop() only
+        #    unlinks the socket if the file at our path is STILL that exact inode,
+        #    so a sibling's freshly-bound socket (new inode) is never removed.
+        #  - _start_time: this process's /proc start-time, written to the registry
+        #    so the CLI can detect a reused pid before ever signalling it.
+        self._ownership_token: str | None = None
+        self._bound_socket_ino: int | None = None
+        self._start_time: str | None = _read_proc_start_time(os.getpid())
         self._target_lock = _ReadWriteLock()
         # Serializes write operations. Long chunked writers can hold this gate
         # while releasing _target_lock between chunks so reads stay responsive.
@@ -853,6 +887,15 @@ class BinaryNinjaBridge:
         # ignores Unix modes just keeps whatever bind() produced.
         with contextlib.suppress(OSError):
             os.chmod(self.socket_path, 0o600)
+        # #636: capture the identity of the socket file we just bound and mint a
+        # fresh ownership token BEFORE writing the registry, so stop() can prove
+        # (inode + token) that it is unlinking the exact file/registry THIS
+        # instance created -- never a sibling's rebind at the same path.
+        self._ownership_token = secrets.token_hex(16)
+        try:
+            self._bound_socket_ino = os.stat(self.socket_path).st_ino
+        except OSError:
+            self._bound_socket_ino = None
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         try:
@@ -870,29 +913,44 @@ class BinaryNinjaBridge:
             raise
         bn.log_info(f"BN Agent Bridge listening on {self.socket_path}")
 
-    def _registry_owned_by_other(self) -> bool:
-        """Whether the registry currently on disk at our path belongs to a
-        DIFFERENT running instance than this one.
+    def _registry_is_ours(self) -> bool:
+        """Whether the registry CURRENTLY on disk still carries THIS instance's
+        ownership token, re-read immediately before the unlink so the check and
+        the unlink are as close to atomic as feasible.
 
-        stop() infers file ownership from having bound a server, but a sibling
-        bridge can rebind the SAME socket_path/registry_path after we stop (a
-        reused instance id, a restart_bridge sequence). Its ``start()`` rewrites
-        the registry with ITS pid, so a stale second ``stop()`` on us must not
-        unlink files that now belong to that sibling -- doing so kills its live
-        socket/registry. An absent or unreadable registry names no identifiable
-        other owner (e.g. the #585 self-heal path unlinks a socket we just bound
-        before any registry was written), so it does NOT block cleanup here."""
+        A sibling bridge can rebind the SAME socket_path/registry_path after we
+        stop (a reused instance id, a restart_bridge sequence). Its ``start()``
+        rewrites the registry with ITS own token, so a stale second ``stop()`` on
+        us must find a token that no longer matches and leave the file alone --
+        unlinking it would kill the sibling's live registry. Anything that does
+        not positively prove our ownership -- a missing, unreadable, malformed, or
+        mid-write registry, or one carrying a different token -- returns False so
+        we FAIL SAFE and never unlink it (#636 F1)."""
+        token = self._ownership_token
+        if token is None:
+            return False
         try:
             payload = json.loads(self.registry_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return False
-        pid = payload.get("pid")
-        if isinstance(pid, int) and pid != os.getpid():
-            return True
-        iid = payload.get("instance_id")
-        if self.instance_id is not None and iid is not None and iid != self.instance_id:
-            return True
-        return False
+        return isinstance(payload, dict) and payload.get("ownership_token") == token
+
+    def _socket_is_ours(self) -> bool:
+        """Whether the socket file CURRENTLY at our path is the exact inode we
+        bound at start(). A sibling that rebound the path unlinked our file and
+        created its own (a new inode), so an inode mismatch means the socket is no
+        longer ours and must not be unlinked. Re-statted immediately before the
+        unlink to close the check/rebind race (#636 F1). Identifying the socket by
+        inode (not via the registry) is also what lets the #585 self-heal
+        teardown remove the socket it just bound even though no registry was ever
+        written."""
+        ino = self._bound_socket_ino
+        if ino is None:
+            return False
+        try:
+            return os.stat(self.socket_path).st_ino == ino
+        except OSError:
+            return False
 
     def stop(self):  # pragma: no cover - requires GUI runtime
         # If start() never bound a server (e.g. it lost the "another bridge is
@@ -913,26 +971,27 @@ class BinaryNinjaBridge:
             server.shutdown()
         with contextlib.suppress(Exception):
             server.server_close()
-        # Ownership check: if a sibling bridge has rebound the same paths since
-        # we bound them, its registry now records a different pid/instance id.
-        # Leave every file alone in that case rather than unlink a path that a
-        # different live instance owns.
-        if self._registry_owned_by_other():
-            return
-        if self.socket_path.exists():
+        # Unlink the SOCKET only if the file still at our path is the exact inode
+        # we bound. A sibling rebind holds a different inode, so this leaves its
+        # live socket untouched; the inode is also how the #585 self-heal path
+        # (no registry yet) still removes the socket it just bound.
+        if self._socket_is_ours():
             with contextlib.suppress(OSError):
                 self.socket_path.unlink()
-        if self.registry_path.exists():
+        # Unlink the REGISTRY (and its log) only if the token on disk is still
+        # ours. A sibling rebind rewrote it with its own token; a missing /
+        # malformed / mid-write registry proves no ownership -> fail safe, leave
+        # it. On a clean shutdown of our own registry there's no crash to
+        # diagnose, so we drop the log too rather than leave clutter; a crash
+        # skips stop() entirely (SIGKILL/segfault), preserving crash logs for
+        # `bn`'s empty-response diagnostic to point at.
+        if self._registry_is_ours():
             with contextlib.suppress(OSError):
                 self.registry_path.unlink()
-        # On a clean shutdown there's no crash to diagnose, so drop the log
-        # file too rather than leave it as clutter in the instances dir. A
-        # crash skips stop() entirely (SIGKILL/segfault), so crash logs are
-        # preserved for `bn`'s empty-response diagnostic to point at.
-        log_path = self.registry_path.with_suffix(".log")
-        if log_path.exists():
-            with contextlib.suppress(OSError):
-                log_path.unlink()
+            log_path = self.registry_path.with_suffix(".log")
+            if log_path.exists():
+                with contextlib.suppress(OSError):
+                    log_path.unlink()
 
     def _write_project_marker(self, workdir: str | None, no_marker: bool,
                               refresh_only: bool = False) -> str | None:
@@ -996,6 +1055,14 @@ class BinaryNinjaBridge:
             "plugin_build_id": PLUGIN_BUILD_ID,
             "started_at": datetime.now(timezone.utc).isoformat(),
         }
+        # #636 identity: the ownership token proves which process owns these files
+        # (stop() re-checks it before unlinking), and start_time lets the CLI
+        # detect a reused pid before ever signalling it. Both are captured once at
+        # start(); a re-write here (open-binary refresh) preserves them unchanged.
+        if self._ownership_token is not None:
+            payload["ownership_token"] = self._ownership_token
+        if self._start_time is not None:
+            payload["start_time"] = self._start_time
         if self.instance_id is not None:
             payload["instance_id"] = self.instance_id
         # #80: record the open binaries so `bn instance list` can show what each

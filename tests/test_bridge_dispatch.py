@@ -2592,6 +2592,78 @@ def test_stop_ownership_check_preserves_sibling_rebound_files(monkeypatch, tmp_p
     assert log_path.exists()
 
 
+def test_stop_preserves_sibling_files_after_rebind_race_inode_and_token(monkeypatch, tmp_path):
+    """#636 FINDING 1 (BLOCKER): the ownership check and the unlink are not atomic.
+    A binds+serves, then a sibling B rebinds the SAME socket/registry paths (new
+    inode + new ownership token). A stray A.stop() that runs with its server
+    reference still set must NOT unlink B's live socket/registry -- A verifies the
+    socket inode it bound and the ownership token it wrote are STILL the ones on
+    disk immediately before unlinking, and both now differ."""
+    import os
+
+    bridge = _load_bridge(monkeypatch)
+    a = bridge.BinaryNinjaBridge(instance_id="reused")
+    a.socket_path = tmp_path / "bridge.sock"
+    a.registry_path = tmp_path / "bridge.json"
+    log_path = a.registry_path.with_suffix(".log")
+
+    a.start()  # captures A's bound inode + ownership token
+    a_token = a._ownership_token
+    assert a_token is not None
+
+    # Simulate sibling B rebinding the same paths AFTER A's ownership check would
+    # have passed: replace the socket file (new inode) and rewrite the registry
+    # with B's token. A's in-memory server reference is left set to force the
+    # unlink path (the TOCTOU window this test guards).
+    a.socket_path.unlink()
+    a.socket_path.write_bytes(b"B-socket")          # brand-new inode
+    b_ino = os.stat(a.socket_path).st_ino
+    assert b_ino != a._bound_socket_ino
+    a.registry_path.write_text(json.dumps({
+        "pid": os.getpid(), "instance_id": "reused",
+        "socket_path": str(a.socket_path),
+        "ownership_token": "B-owns-this-now",
+    }))
+    log_path.write_text("B log")
+
+    a.stop()
+
+    # B's files survive: A unlinked neither the socket it no longer owns (inode
+    # mismatch) nor the registry whose token is now B's.
+    assert a.socket_path.exists()
+    assert os.stat(a.socket_path).st_ino == b_ino
+    assert a.registry_path.exists()
+    assert json.loads(a.registry_path.read_text())["ownership_token"] == "B-owns-this-now"
+    assert log_path.exists()
+
+
+def test_stop_does_not_unlink_registry_when_malformed(monkeypatch, tmp_path):
+    """#636 FINDING 1: codex saw a malformed / mid-write registry probe return
+    'not owned' and then the socket, registry AND log get deleted. A registry
+    that does not parse names no provable owner => stop() must treat ownership as
+    NOT ours and leave the registry (+ its log) in place (fail safe)."""
+    bridge = _load_bridge(monkeypatch)
+    inst = bridge.BinaryNinjaBridge(instance_id="reused")
+    inst.socket_path = tmp_path / "bridge.sock"
+    inst.registry_path = tmp_path / "bridge.json"
+    log_path = inst.registry_path.with_suffix(".log")
+
+    inst.start()
+    # Corrupt the registry to a half-written / malformed body after start().
+    inst.registry_path.write_text('{"pid": 4242, "ownership_to')  # truncated JSON
+    log_path.write_text("keep me")
+
+    inst.stop()
+
+    # Malformed => unprovable ownership => registry + log preserved.
+    assert inst.registry_path.exists()
+    assert inst.registry_path.read_text().startswith('{"pid": 4242')
+    assert log_path.exists()
+    # The socket, by contrast, is identified by the inode we bound (independent of
+    # the registry), so our own bound socket is still cleaned up.
+    assert not inst.socket_path.exists()
+
+
 def test_start_bridge_does_not_leave_zombie_global_on_start_failure(monkeypatch, tmp_path):
     bridge = _load_bridge(monkeypatch)
     fake_ui = types.SimpleNamespace()

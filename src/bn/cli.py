@@ -42,6 +42,7 @@ from .transport import (  # noqa: F401
     gc_instances,
     instance_selector,
     list_instances,
+    process_identity_matches,
     send_request,
     spawn_instance,
     validate_instance_id,
