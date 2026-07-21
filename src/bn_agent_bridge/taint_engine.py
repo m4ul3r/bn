@@ -1891,7 +1891,11 @@ class TaintEngine:
         # result an agent can misread as a clean breadth check. Attach a compact,
         # factual frontier diagnostic (NOT a verdict) explaining where the seed
         # went and why the frontier stopped.
-        if not unique_findings:
+        # #615/Finding-2 (round 2): gate on SOURCE-REACHED findings, not all
+        # findings -- a presence-only run (only always-unsafe facts, no source-
+        # reached sink) must still carry the #580 source diagnostics rather than
+        # have them suppressed by the presence findings.
+        if not source_reached:
             result["diagnostics"] = self._forward_zero_diagnostics(sub)
         return result
 
@@ -1960,8 +1964,15 @@ class TaintEngine:
             funcs_visited |= self._funcs_visited        # union of per-run visited sets
             if base is None:
                 base = res
+            # #615/Finding-2 (round 2): a presence/always-unsafe sink belongs to
+            # NO particular source -- every per-callsite re-run re-discovers it,
+            # so attributing it here double-lists the same sink under BOTH source
+            # entries and fakes a per-source flow. Keep presence facts out of
+            # per-source `reached_sinks` (they remain in the top-level union and
+            # `presence_sinks`).
             by_source[hex(addr)] = {
-                "reached_sinks": res["reached_sinks"],
+                "reached_sinks": [s for s in res["reached_sinks"]
+                                  if not s.get("unconditional")],
                 "leaves": res["leaves"],
             }
             union_findings.extend(res["reached_sinks"])
@@ -2033,7 +2044,11 @@ class TaintEngine:
         # all-clear on the default multi-callsite path that contradicts the same
         # result's own leaves array. The descriptive tainted_values/last_use stay
         # from the representative (first) run; the gate/frontier reflect the union.
-        if not findings:
+        # #615/Finding-2 (round 2): gate on SOURCE-REACHED findings, not the whole
+        # union -- a presence-only result (no source-reached sink) must still carry
+        # the #580 source diagnostics (source_callsites / last-propagated-use)
+        # rather than have them suppressed by the always-unsafe presence facts.
+        if not source_reached:
             base_diag = base.get("diagnostics") or {}
             union_sub = {
                 "diag": {
@@ -2889,7 +2904,22 @@ class TaintEngine:
         prefix.append(_instr_dict(ins, reason=note, tainted=[node_label(first_hit, why)],
                                   callee=getattr(callee_fn, "name", None)))
         for f in sub["findings"]:
-            out["findings"].append({"sink": f["sink"], "path": prefix + f["path"]})
+            # #615/Finding-1 (round 2): copy the WHOLE child finding so its
+            # classification travels up the call chain instead of being rebuilt
+            # from only {sink, path}. A presence/always-unsafe finding (e.g. a
+            # gets() unrelated to the caller's tainted arg) must stay a presence
+            # fact across the boundary -- never re-attributed to the caller's
+            # source, never given a flow signature, counted in `presence_sinks`.
+            child = dict(f)
+            if f.get("unconditional"):
+                # Do NOT prepend the caller's tainted-arg path prefix: that would
+                # fabricate a `param:N -> callee -> [sink]` flow into an always-
+                # unsafe API the tainted argument never reached. Keep its own
+                # single-step presence path (its address still locates the call).
+                out["findings"].append(child)
+            else:
+                child["path"] = prefix + f["path"]
+                out["findings"].append(child)
         out["leaves"] = list(sub["leaves"])
         # Disclose a PARTIAL arg drop: taint descended with the in-range args, but
         # any tainted arg beyond the callee's recovered arity was filtered out of
@@ -3083,7 +3113,11 @@ class TaintEngine:
         with, direct/arg-indexed findings. Returns whether any model changed
         state. Conditional models (real ``tainted_args`` / a ``len_arg``) need
         actual arg taint -- absent here -- so they are deliberately skipped."""
-        candidates, _via = self._resolve_call_candidates(ins, target)
+        # #615/Finding-3 (round 2): keep the resolution provenance (`via`) instead
+        # of discarding it -- a resolved-indirect presence finding must disclose
+        # HOW its target was resolved (agent-map / value-set), so an unproven
+        # resolve-map guess never reads like a proven/direct target.
+        candidates, via = self._resolve_call_candidates(ins, target)
         changed = False
         for taddr in candidates:
             nm = self._callee_name(taddr)
@@ -3112,7 +3146,7 @@ class TaintEngine:
             # Only the UNCONDITIONAL arm applies without arg taint.
             if (msink.get("tainted_args") or []) or msink.get("len_arg") is not None:
                 continue
-            if apply_model(ins, params, md, mk, nm, site_taddr=taddr)[0]:
+            if apply_model(ins, params, md, mk, nm, site_taddr=taddr, via=via)[0]:
                 changed = True
         return changed
 
@@ -3250,7 +3284,7 @@ class TaintEngine:
                 elem_key_cache[idx] = self._elem_field_key(ssaf, addr)
             return elem_key_cache[idx]
 
-        def apply_model(ins, params, model, mkey, name, *, site_taddr=None):
+        def apply_model(ins, params, model, mkey, name, *, site_taddr=None, via=None):
             """Apply a function model's sink-detection + taint propagation at a call
             site. Shared by the direct-call and resolved-indirect-external branches.
 
@@ -3396,7 +3430,17 @@ class TaintEngine:
                     sig = (addr, None) if site_taddr is None else (addr, None, site_taddr)
                     if sig not in recorded_sinks:
                         recorded_sinks.add(sig)
-                        findings.append(self._make_unconditional_finding(ins, mkey or name, sink))
+                        findings.append(
+                            self._make_unconditional_finding(ins, mkey or name, sink, via=via))
+                        # #615/Finding-3 (round 2): disclose the resolution
+                        # provenance for a resolved-INDIRECT presence sink exactly
+                        # as the ordinary resolved tainted-arg path does (3882),
+                        # so an unproven agent-map/value-set target is never
+                        # indistinguishable from a proven/direct one.
+                        if via:
+                            add_assumption(
+                                f"indirect call at {hex(addr)} resolved via {via} to: "
+                                f"{mkey or name}")
                 for argidx in _sink_args:
                     if argidx < len(params):
                         ht = arg_taint(params[argidx])
@@ -4618,12 +4662,17 @@ class TaintEngine:
             "path": path,
         }
 
-    def _make_unconditional_finding(self, ins, callee, sink) -> dict[str, Any]:
+    def _make_unconditional_finding(self, ins, callee, sink, *, via: str | None = None) -> dict[str, Any]:
         """Build a finding for an always-unsafe sink (empty ``tainted_args``,
         no ``len_arg``) that has no arg taint to chain -- no real taint node
         exists to hand to :meth:`_reconstruct_path`, so this builds a single-step
         path describing the always-unsafe API reached at this call site instead
-        (#615)."""
+        (#615).
+
+        ``via`` records the call-resolution provenance for a resolved-INDIRECT
+        presence sink (``"agent-map"`` / ``"value-set"``); it is attached to the
+        sink so a JSON consumer can tell an unproven resolved target from a
+        proven/direct one (#615/Finding-3)."""
         path = [_instr_dict(ins, reason=f"always-unsafe API {callee} reached",
                             callee=callee)]
         return {
@@ -4640,6 +4689,7 @@ class TaintEngine:
                 "presence": True,
                 "class": sink.get("class"),
                 "detail": sink.get("detail"),
+                **({"via": via} if via else {}),
             },
             "path": path,
         }

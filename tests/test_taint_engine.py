@@ -950,6 +950,146 @@ def test_forward_resolved_indirect_unconditional_sink_fires_without_taint(models
     assert hits[0]["sink"]["address"] == "0x401000", hits[0]["sink"]
 
 
+def test_forward_presence_marker_survives_interprocedural_descent(models):
+    # #615/Finding-1 (BLOCKER, round 2): a presence/always-unsafe sink found
+    # INSIDE a descended callee must stay a presence fact as it bubbles up across
+    # the call boundary. `_descend` rebuilt the child finding from only {sink,path},
+    # dropping the finding-level `unconditional` flag -- so at the caller the
+    # helper's gets() got a fabricated `param:0 -> helper -> [unbounded_input] gets`
+    # signature, was counted in stats.sinks (not presence_sinks), and read as
+    # "source reached." Here param:0 flows into helper but helper's gets(&local)
+    # is unrelated to that param -- it must remain PRESENCE across the frame.
+    x = FVar("x"); local = FVar("local")
+    helper_ssa = FSSAFunc([
+        FInstr(0, 0x2000, "MLIL_CALL_SSA", "gets(&local)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x1080", constant=0x1080),
+               params=[FExpr("MLIL_ADDRESS_OF", "&local", src=local)]),
+    ])
+    helper = FFunc("helper", 0x2000, helper_ssa, params=[x])
+
+    p = FVar("p"); p0 = FSSA(p, 0)
+    parent_ssa = FSSAFunc([
+        FInstr(0, 0x3000, "MLIL_CALL_SSA", "helper(p#0)", reads=[p0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_VAR_SSA", "p#0", reads=[p0])]),
+    ])
+    parent = FFunc("parent", 0x3000, parent_ssa, params=[p])
+
+    bv = FBV({0x1080: "gets"}, funcs={0x2000: helper})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(parent, [te.parse_locator("param:0")])
+
+    hits = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "gets"]
+    assert len(hits) == 1, result["reached_sinks"]
+    f = hits[0]
+    # PRESENCE across the call boundary: still flagged, still no source signature.
+    assert f.get("unconditional") is True, f
+    assert f["sink"].get("presence") is True, f["sink"]
+    assert f["sink"]["tainted_arg_index"] is None, f["sink"]
+    assert f.get("signature") is None, f.get("signature")
+    # NOT re-attributed to the caller's source: no fabricated param->helper->gets
+    # flow prefix on the path.
+    assert not any("calls helper" in (s.get("reason") or "")
+                   for s in (f.get("path") or [])), f.get("path")
+    # counted as presence, not source-reached, even though it lives a frame down.
+    assert result["stats"]["sinks"] == 0, result["stats"]
+    assert result["stats"]["presence_sinks"] == 1, result["stats"]
+
+
+def test_forward_presence_not_in_per_source_and_keeps_diagnostics(models):
+    # #615/Finding-2 (MAJOR, round 2): two independent read() callsites (source
+    # arg:read:1 -> per-source attribution kicks in) plus an unrelated gets(&local)
+    # presence sink. The presence finding must NOT be attributed to either source
+    # callsite (it belongs to no particular source), and because the only findings
+    # are presence facts the per-source diagnostics (#580 source_callsites, etc.)
+    # must STILL render rather than being suppressed by a nonempty findings list.
+    buf1 = FVar("buf1", typ="char[0x40]"); buf2 = FVar("buf2", typ="char[0x40]")
+    local = FVar("local"); fd = FVar("fd"); fd0 = FSSA(fd, 0)
+    r1 = FVar("r1"); r2 = FVar("r2"); r1_1 = FSSA(r1, 1); r2_1 = FSSA(r2, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "r1#1 = &buf1", writes=[r1_1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf1", src=buf1)),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "read(fd#0, r1#1, 0x40)", reads=[r1_1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[fd0]),
+                       FExpr("MLIL_VAR_SSA", "r1#1", reads=[r1_1]),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+        FInstr(2, 0x18, "MLIL_SET_VAR_SSA", "r2#1 = &buf2", writes=[r2_1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf2", src=buf2)),
+        FInstr(3, 0x1c, "MLIL_CALL_SSA", "read(fd#0, r2#1, 0x40)", reads=[r2_1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[fd0]),
+                       FExpr("MLIL_VAR_SSA", "r2#1", reads=[r2_1]),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+        FInstr(4, 0x24, "MLIL_CALL_SSA", "gets(&local)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x1080", constant=0x1080),
+               params=[FExpr("MLIL_ADDRESS_OF", "&local", src=local)]),
+    ]
+    func = FFunc("server", 0x10, FSSAFunc(instrs), params=[fd])
+    bv = FBV({0x2000: "read", 0x1080: "gets"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:read:1")])
+
+    # per-source attribution kicked in for the two read callsites.
+    assert "by_source" in result, result
+    assert set(result["by_source"].keys()) == {"0x14", "0x1c"}, result["by_source"]
+    # the gets presence fact belongs to NO source -- absent from every per-source
+    # reached_sinks (previously it was double-listed under BOTH entries).
+    for addr, br in result["by_source"].items():
+        assert all(s["sink"]["callee"] != "gets" for s in br["reached_sinks"]), (addr, br)
+    # top-level union still reports it once, as a presence fact.
+    gets_hits = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "gets"]
+    assert len(gets_hits) == 1 and gets_hits[0].get("unconditional") is True, gets_hits
+    assert result["stats"]["sinks"] == 0 and result["stats"]["presence_sinks"] == 1, result["stats"]
+    # presence-only findings must NOT suppress #580 source diagnostics.
+    diag = result.get("diagnostics") or {}
+    assert diag.get("source_callsites") == 2, diag
+
+    # text: presence-only output is NOT headed "flows" / "sink reached", and the
+    # source diagnostics still render.
+    from bn.formatters import _render_taint_text
+    rendered = _render_taint_text(result)
+    assert "flows (" not in rendered, rendered
+    assert "presence" in rendered.lower(), rendered
+    assert "source callsite" in rendered, rendered
+
+
+def test_forward_resolved_indirect_presence_discloses_via(models):
+    # #615/Finding-3 (MAJOR, round 2): a resolved-INDIRECT always-unsafe sink
+    # (gets, empty tainted_args) reached with an unrelated source must disclose
+    # HOW its target was resolved -- exactly as the ordinary resolved tainted-arg
+    # path does ("resolved via agent-map"/"value-set"). Previously the presence
+    # path discarded `via` (_via), so a stale resolve-map guess looked identical
+    # to a proven/direct target (assumptions was empty).
+    def _prog(dest_expr):
+        buf = FVar("buf"); other = FVar("other")
+        instrs = [
+            FInstr(0, 0x401000, "MLIL_CALL_SSA", "fp(&buf)", reads=[], writes=[],
+                   dest=dest_expr, params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)]),
+        ]
+        return FFunc("indirect_gets", 0x401000, FSSAFunc(instrs), params=[other])
+
+    # (a) value-set resolution.
+    pvs = FPVS("ConstantPointerValue", value=0x402000)   # resolves to gets
+    vs_dest = FExpr("MLIL_VAR_SSA", "fp#1", reads=[], possible_values=pvs)
+    bv = FBV({0x402000: "gets"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(_prog(vs_dest), [te.parse_locator("param:0")])
+    hits = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "gets"]
+    assert len(hits) == 1 and hits[0].get("unconditional") is True, result["reached_sinks"]
+    assert result["assumptions"], result
+    assert any("resolved via value-set" in a for a in result["assumptions"]), result["assumptions"]
+
+    # (b) agent-map resolution -- an UNPROVEN caller-supplied guess must be
+    # disclosed so it never reads as a direct/proven target.
+    am_dest = FExpr("MLIL_VAR_SSA", "fp#1", reads=[])   # no possible_values
+    engine2 = te.TaintEngine(bv, models, resolve_map={"0x401000": ["0x402000"]})
+    result2 = engine2.forward(_prog(am_dest), [te.parse_locator("param:0")])
+    hits2 = [s for s in result2["reached_sinks"] if s["sink"]["callee"] == "gets"]
+    assert len(hits2) == 1 and hits2[0].get("unconditional") is True, result2["reached_sinks"]
+    assert any("resolved via agent-map" in a for a in result2["assumptions"]), result2["assumptions"]
+
+
 def test_forward_conditional_sink_untainted_still_produces_nothing(models):
     # (4) a conditional sink (memcpy) with an untainted relevant arg must still
     # produce zero findings -- the empty-tainted_args special case must not

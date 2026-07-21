@@ -2333,26 +2333,47 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
         srcs = value.get("sources") or []
         lines.append("sources: " + (", ".join(_describe_loc(s) for s in srcs) or "<none>"))
         findings = list(value.get("reached_sinks") or [])
+        # #615/Finding-2: split source-reached flows from presence/always-unsafe
+        # facts. Only source-reached findings are "flows" (the selected source
+        # propagated to them); presence facts are reported under their own header
+        # so the output is never mislabeled "flows"/"sink reached", and they never
+        # suppress the source diagnostics below.
+        reached = [f for f in findings if not f.get("unconditional")]
+        presence = [f for f in findings if f.get("unconditional")]
         lines.append(_taint_forward_verdict(value))
-        if not findings and value.get("diagnostics"):
+        # Source diagnostics render whenever NO source-reached flow exists -- even
+        # if presence facts were found -- so a presence-only result still surfaces
+        # #580's source_callsites / last-propagated-use (previously any nonempty
+        # findings list, presence included, suppressed them entirely).
+        if not reached and value.get("diagnostics"):
             lines.extend(_render_forward_diagnostics(value["diagnostics"]))
-        if findings:
+
+        def _emit_finding(f: dict[str, Any]) -> None:
+            lines.append(_render_flow_line(f))
+            if full:
+                _detail = (f.get("sink") or {}).get('detail') or ''
+                if _detail:
+                    lines.append(f"      -- {_detail}")
+                _via = _taint_via_trail(value, f)
+                if _via:
+                    lines.append(f"    {_via}")
+                lines.extend(_render_taint_path(f.get("path") or []))
+
+        if reached:
             lines.append("")
-            lines.append(f"flows ({len(findings)}):")
-            for f in findings:
+            lines.append(f"flows ({len(reached)}):")
+            for f in reached:
                 # One compact line per flow by default (signature + metrics). Same-sink
                 # findings are already unique per (callee,address,arg), so distinct sink
                 # call-sites always render on their own line -- never folded behind a
                 # count. --full appends the sink detail, via: trail, and full SSA path.
-                lines.append(_render_flow_line(f))
-                if full:
-                    _detail = (f.get("sink") or {}).get('detail') or ''
-                    if _detail:
-                        lines.append(f"      -- {_detail}")
-                    _via = _taint_via_trail(value, f)
-                    if _via:
-                        lines.append(f"    {_via}")
-                    lines.extend(_render_taint_path(f.get("path") or []))
+                _emit_finding(f)
+        if presence:
+            lines.append("")
+            lines.append(f"presence — always-unsafe sink(s) at call site "
+                         f"({len(presence)}), NOT source-reached:")
+            for f in presence:
+                _emit_finding(f)
     else:
         sinks = value.get("sinks") or []
         lines.append("sinks: " + (", ".join(_describe_loc(s) for s in sinks) or "<none>"))
