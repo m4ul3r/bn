@@ -1071,6 +1071,41 @@ def test_preload_binary_marks_quick_views_for_honesty(monkeypatch, tmp_path):
     bridge._quick_loaded_views.clear()
 
 
+def test_preload_binary_closes_view_when_analysis_fails(monkeypatch, tmp_path):
+    """#609 parity: if a preload's update_analysis_and_wait() raises after load(),
+    the opened view is closed and not left registered -- mirroring the runtime
+    `bn load` close-on-failure guard."""
+    bridge = _load_bridge(monkeypatch)
+    bridge._headless_views.clear()
+    bridge._quick_loaded_views.clear()
+
+    closed: list[bool] = []
+
+    class _FailingBV:
+        def __init__(self, path):
+            self.functions = [object()]
+            self.view_type = "ELF"
+            self.file = types.SimpleNamespace(
+                filename=path,
+                close=lambda: closed.append(True),
+            )
+
+        def update_analysis_and_wait(self):
+            raise RuntimeError("analysis OOM")
+
+    binaryninja = sys.modules["binaryninja"]
+    binaryninja.load = lambda path, update_analysis=True: _FailingBV(path)
+
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+
+    with pytest.raises(RuntimeError, match="analysis OOM"):
+        bridge._preload_binary(str(raw), quick=False)
+
+    assert closed == [True], "preload did not close the view on analysis failure"
+    assert bridge._headless_views == []
+
+
 def test_preload_binary_full_analysis_not_marked_quick(monkeypatch, tmp_path):
     bridge = _load_bridge(monkeypatch)
     bridge._headless_views.clear()

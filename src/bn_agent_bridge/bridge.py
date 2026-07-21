@@ -5,11 +5,13 @@ import contextlib
 import errno
 import hashlib
 import json
+import math
 import os
 import socket
 import socketserver
 import tempfile
 import threading
+import time
 import weakref
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -69,6 +71,49 @@ ENGINE_BUILD_ID = build_id_for_package(Path(__file__).resolve().parent)
 # Upper bound on a single newline-terminated JSON request. Anything larger is
 # rejected with a clean error instead of being buffered without limit.
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
+
+# Idle reaper: cap the watcher poll interval so a long BN_IDLE_TIMEOUT doesn't
+# leave a stale process lingering far past its deadline, while a short timeout
+# still reaps promptly (poll = min(timeout, this)).
+_IDLE_REAPER_MAX_POLL_SECONDS = 30.0
+
+
+def _parse_idle_timeout(raw: str | None) -> float | None:
+    """Parse BN_IDLE_TIMEOUT into a positive seconds float, or None when disabled.
+
+    Mirrors BN_REQUEST_TIMEOUT's grammar (transport._resolve_timeout): unset,
+    empty/whitespace, ``none``/``off``, and ``0`` all DISABLE the reaper (None =
+    today's behavior: never self-shut-down). A positive number arms it. Anything
+    else -- a typo, a negative, inf/nan, or a positive magnitude that underflowed
+    to 0 -- raises, so a mistake fails loud instead of silently disabling.
+    """
+    if raw is None:
+        return None
+    text = raw.strip().lower()
+
+    def _reject() -> RuntimeError:
+        return RuntimeError(
+            f"BN_IDLE_TIMEOUT={raw!r} is not a valid idle timeout: expected a "
+            f"positive number of seconds, or one of 0/none/off/empty to disable it."
+        )
+
+    if text in ("", "none", "off"):
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        raise _reject() from None
+    if not math.isfinite(value):  # inf / nan parse as floats but aren't timeouts
+        raise _reject()
+    if value < 0 or math.copysign(1.0, value) < 0:  # negatives, incl. -0.0
+        raise _reject()
+    if value == 0.0:
+        # A literal 0 disables; a positive magnitude that underflowed to 0.0
+        # (e.g. 1e-325) is not a disable request -- reject it.
+        if any(d in text for d in "123456789"):
+            raise _reject()
+        return None
+    return value
 
 # Same-path load dedupe for the window where a BinaryView is open or analyzing
 # but not published in _headless_views yet (#400).
@@ -620,38 +665,57 @@ class BridgeHandler(socketserver.StreamRequestHandler):
             return
         op = None
         request_id = None
-        if len(raw) == MAX_REQUEST_BYTES and not raw.endswith(b"\n"):
-            response = _json_response(ok=False, error="request too large")
-        else:
-            try:
-                payload = json.loads(raw.decode("utf-8"))
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                # Invalid UTF-8 bytes raise UnicodeDecodeError, NOT JSONDecodeError;
-                # without catching it the worker thread died with no response and
-                # the client saw a misleading "empty response" (shared upstream bug).
-                response = _json_response(ok=False, error="Invalid JSON request")
+        # Idle-reaper accounting: count EVERY non-empty request as in-flight from
+        # here through the response write (leave_request runs in the finally, after
+        # the write), so the bridge is never deemed idle mid-response -- including
+        # for malformed requests, which get an error response but no dispatch. The
+        # getattr fallbacks keep the SimpleNamespace test fakes (and a GUI server
+        # without these methods) working: no bridge -> no accounting.
+        bridge = getattr(getattr(self, "server", None), "bridge", None)
+        enter_request = getattr(bridge, "_enter_request", None)
+        leave_request = getattr(bridge, "_leave_request", None)
+        counted = enter_request is not None
+        admitted = enter_request() if counted else True
+        try:
+            if len(raw) == MAX_REQUEST_BYTES and not raw.endswith(b"\n"):
+                response = _json_response(ok=False, error="request too large")
+            elif not admitted:
+                # The idle reaper latched shutdown between accept and admission --
+                # refuse cleanly instead of starting work into a process that is
+                # about to exit (#637 review).
+                response = _json_response(ok=False, error="bridge is shutting down")
             else:
-                if not isinstance(payload, dict):
-                    response = _json_response(
-                        ok=False, error="Invalid request: expected a JSON object"
-                    )
+                try:
+                    payload = json.loads(raw.decode("utf-8"))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    # Invalid UTF-8 bytes raise UnicodeDecodeError, NOT JSONDecodeError;
+                    # without catching it the worker thread died with no response and
+                    # the client saw a misleading "empty response" (shared upstream bug).
+                    response = _json_response(ok=False, error="Invalid JSON request")
                 else:
-                    op = payload.get("op")
-                    request_id = payload.get("id")
-                    bridge = self.server.bridge
-                    begin_request = getattr(bridge, "_begin_request", lambda _request_id: None)
-                    end_request = getattr(bridge, "_end_request", lambda _request_id: None)
-                    is_cancelled = getattr(
-                        bridge, "_is_request_cancelled", lambda _request_id: False,
-                    )
-                    begin_request(request_id)
-                    try:
-                        with _request_cancel_context(lambda: is_cancelled(request_id)):
-                            response = bridge.dispatch(payload)
-                    finally:
-                        end_request(request_id)
-        encoded = self._encode_response(response, op=op, request_id=request_id)
-        self._write_response(encoded, op=op, request_id=request_id)
+                    if not isinstance(payload, dict):
+                        response = _json_response(
+                            ok=False, error="Invalid request: expected a JSON object"
+                        )
+                    else:
+                        op = payload.get("op")
+                        request_id = payload.get("id")
+                        begin_request = getattr(bridge, "_begin_request", lambda _request_id: None)
+                        end_request = getattr(bridge, "_end_request", lambda _request_id: None)
+                        is_cancelled = getattr(
+                            bridge, "_is_request_cancelled", lambda _request_id: False,
+                        )
+                        begin_request(request_id)
+                        try:
+                            with _request_cancel_context(lambda: is_cancelled(request_id)):
+                                response = bridge.dispatch(payload)
+                        finally:
+                            end_request(request_id)
+            encoded = self._encode_response(response, op=op, request_id=request_id)
+            self._write_response(encoded, op=op, request_id=request_id)
+        finally:
+            if counted and leave_request is not None:
+                leave_request()
 
 
 class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
@@ -768,6 +832,16 @@ class BinaryNinjaBridge:
         self._active_requests: set[str] = set()
         self._cancelled_requests: set[str] = set()
         self._shutdown_event = threading.Event()
+        # Idle reaper (headless only, opt-in via BN_IDLE_TIMEOUT). `_inflight` is a
+        # server-generated counter of requests being served -- raised at admission
+        # and lowered only after the response is written, independent of the client
+        # request id -- so idle is never miscounted mid-response or for id-less
+        # requests. `_last_activity` (monotonic) is stamped when a request finishes.
+        # `_shutting_down` latches when the reaper decides to stop, so admission and
+        # the idle->shutdown decision are mutually exclusive under _request_state_lock.
+        self._inflight: int = 0
+        self._shutting_down: bool = False
+        self._last_activity: float = time.monotonic()
 
     def _socket_is_live(self) -> bool:
         """Whether something is currently accepting connections on our socket path."""
@@ -963,6 +1037,83 @@ class BinaryNinjaBridge:
             self._active_requests.discard(request_id)
             self._cancelled_requests.discard(request_id)
 
+    def _enter_request(self) -> bool:
+        """Count a received request as in-flight (for the idle reaper) and report
+        whether real work may be dispatched. ALWAYS increments _inflight -- even for
+        a malformed request or one arriving after shutdown latched -- so every
+        response, error responses included, is covered through its write and every
+        request resets the idle clock. Must ALWAYS be balanced by _leave_request().
+        Returns False when the reaper has already latched shutdown: the caller must
+        not dispatch, but must still write its (refusal) response and leave. Raising
+        _inflight under the same lock the reaper checks makes counting and the
+        idle->shutdown decision mutually exclusive (closes the check-then-set race)."""
+        with self._request_state_lock:
+            self._inflight += 1
+            return not self._shutting_down
+
+    def _leave_request(self) -> None:
+        """Balance a prior _enter_request and stamp the idle clock. Called only after
+        the response has been written, so encoding/transmit time counts as activity
+        and a bridge is never deemed idle mid-response."""
+        with self._request_state_lock:
+            if self._inflight > 0:
+                self._inflight -= 1
+            self._last_activity = time.monotonic()
+
+    def _try_idle_shutdown(self, now: float, timeout: float) -> bool:
+        """Atomically decide whether to self-shutdown. Returns True (and latches
+        _shutting_down so _enter_request refuses new work) only when nothing is in
+        flight AND the bridge has been idle >= timeout. A non-zero _inflight covers
+        any running update_analysis_and_wait() too, since analysis executes inside
+        its request's dispatch -- so this never fires mid-work."""
+        with self._request_state_lock:
+            if self._inflight > 0:
+                return False
+            if (now - self._last_activity) < timeout:
+                return False
+            self._shutting_down = True
+            return True
+
+    def _start_idle_reaper(self, timeout: float | None, *, poll_interval: float | None = None):
+        """Start the idle-watcher thread (headless only). Returns the Thread, or
+        None when ``timeout`` is None (disabled). The thread triggers a clean
+        shutdown via _shutdown_event -- the existing stop path unlinks the
+        registry/socket/log -- and exits promptly on any external shutdown."""
+        if timeout is None:
+            return None
+        interval = poll_interval if poll_interval is not None else min(timeout, _IDLE_REAPER_MAX_POLL_SECONDS)
+        # Reset the clock at arm time so a slow headless preload (which runs before
+        # the reaper starts) doesn't count against the first idle window.
+        with self._request_state_lock:
+            self._last_activity = time.monotonic()
+
+        def _loop() -> None:
+            while not self._shutdown_event.is_set():
+                # wait() doubles as the sleep and as prompt wake-up on external
+                # shutdown: it returns True the moment _shutdown_event is set.
+                if self._shutdown_event.wait(interval):
+                    return
+                if self._try_idle_shutdown(time.monotonic(), timeout):
+                    bn.log_info(
+                        f"BN Agent Bridge idle for >= {timeout}s (BN_IDLE_TIMEOUT); "
+                        "self-shutting down to reclaim memory"
+                    )
+                    self._shutdown_event.set()
+                    return
+
+        thread = threading.Thread(target=_loop, name="bn-idle-reaper", daemon=True)
+        thread.start()
+        return thread
+
+    def _maybe_start_idle_reaper(self):
+        """Arm the idle reaper from BN_IDLE_TIMEOUT if set. Default (unset) is a
+        no-op: the bridge keeps living until an explicit shutdown."""
+        timeout = _parse_idle_timeout(os.environ.get("BN_IDLE_TIMEOUT"))
+        if timeout is None:
+            return None
+        bn.log_info(f"BN Agent Bridge idle reaper armed: self-shutdown after {timeout}s idle")
+        return self._start_idle_reaper(timeout)
+
     def _is_request_cancelled(self, request_id: Any) -> bool:
         if not isinstance(request_id, str) or not request_id:
             return False
@@ -1102,6 +1253,16 @@ class BinaryNinjaBridge:
         # responding. The view is published (and only then visible to reads)
         # under the lock at the end, so no reader ever sees a half-analyzed
         # target.
+        # #609: track the view opened below so a failure between open and publish
+        # can close it. Initialized to None so an open-time failure (bv never
+        # assigned) doesn't trip the cleanup path with a NameError. `published`
+        # is a one-way latch set at the append point: once the view is handed to
+        # _headless_views it is owned there (closed via `bn close`), so a later
+        # failure must never close it -- inferring ownership from *current*
+        # membership would double-close a view a concurrent `bn close` already
+        # removed and freed (#637 review).
+        bv = None
+        published = False
         try:
             try:
                 with self._target_lock.write():
@@ -1186,6 +1347,7 @@ class BinaryNinjaBridge:
             with self._target_lock.write():
                 with _headless_views_lock:
                     _headless_views.append(bv)
+                    published = True  # latched: view now owned by _headless_views
                 targets = self.targets.refresh()
 
             # Keep the registry's open-binaries list current after a load (#80).
@@ -1207,6 +1369,21 @@ class BinaryNinjaBridge:
                 "notes": notes,
                 "targets": targets,
             }
+        except BaseException:
+            # #609: a view opened by binaryninja.load() above but not yet published
+            # (the unlocked update_analysis_and_wait() raised/OOM'd, a .bndb restore
+            # failed, or the load was cancelled) is otherwise left open, invisible to
+            # `bn target list`, and uncloseable via `bn close` -- a leaked ~1.7 GB
+            # view. Close it and drop it from the bookkeeping sets, then re-raise.
+            # Once `published` latches True the view is owned by _headless_views and
+            # closed via `bn close`, so never close it here (double-close). BaseException
+            # so a cancel/KeyboardInterrupt mid-analysis reclaims the view too.
+            if bv is not None and not published:
+                with contextlib.suppress(Exception):
+                    _run_on_main_thread(lambda: bv.file.close())
+                _quick_loaded_views.discard(bv)
+                _unanalyzed_views.discard(bv)
+            raise
         finally:
             with _load_in_progress_lock:
                 current = _load_in_progress.get(load_key)
@@ -3319,25 +3496,41 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
     if bv is None:
         bn.log_warn(f"Failed to open binary: {load_path}")
         return None
-    # #458 parity with _load_binary: a directly-named .bndb whose load() defaults
-    # to the raw container view must recover its analyzed view (or log a hard
-    # restore diagnostic), so `bn-agent <file>.bndb` doesn't silently preload a
-    # no-symbol target.
-    bndb_unanalyzed = False
-    if load_path.suffix == ".bndb":
-        bv, bndb_note, bndb_unanalyzed = _restore_bndb_analyzed_view(bv, load_path)
-        if bndb_note:
-            (bn.log_warn if bndb_note.startswith("WARNING:") else bn.log_info)(bndb_note)
-    quick_effective = quick and load_path.suffix != ".bndb"
-    if quick_effective:
-        _quick_loaded_views.add(bv)
-    else:
-        bv.update_analysis_and_wait()
-        _quick_loaded_views.discard(bv)
-    if bndb_unanalyzed:
-        _unanalyzed_views.add(bv)
-    with _headless_views_lock:
-        _headless_views.append(bv)
+    published = False
+    try:
+        # #458 parity with _load_binary: a directly-named .bndb whose load() defaults
+        # to the raw container view must recover its analyzed view (or log a hard
+        # restore diagnostic), so `bn-agent <file>.bndb` doesn't silently preload a
+        # no-symbol target.
+        bndb_unanalyzed = False
+        if load_path.suffix == ".bndb":
+            bv, bndb_note, bndb_unanalyzed = _restore_bndb_analyzed_view(bv, load_path)
+            if bndb_note:
+                (bn.log_warn if bndb_note.startswith("WARNING:") else bn.log_info)(bndb_note)
+        quick_effective = quick and load_path.suffix != ".bndb"
+        if quick_effective:
+            _quick_loaded_views.add(bv)
+        else:
+            bv.update_analysis_and_wait()
+            _quick_loaded_views.discard(bv)
+        if bndb_unanalyzed:
+            _unanalyzed_views.add(bv)
+        with _headless_views_lock:
+            _headless_views.append(bv)
+            published = True  # latched: view now owned by _headless_views
+    except BaseException:
+        # #609 parity with _load_binary: a view opened above but never registered
+        # (analysis raised/OOM'd, .bndb restore failed) is otherwise abandoned open.
+        # Close it and drop it from the bookkeeping sets, then re-raise. Once
+        # `published` latches True the view is owned by _headless_views, so never
+        # close it here (double-close, #637 review). `bv` may have been rebound to
+        # the restored analyzed view above; close whichever view is current.
+        if not published:
+            with contextlib.suppress(Exception):
+                _run_on_main_thread(lambda: bv.file.close())
+            _quick_loaded_views.discard(bv)
+            _unanalyzed_views.discard(bv)
+        raise
     bn.log_info(f"Loaded {load_path}{' (no analysis)' if quick_effective else ''}")
     return bv
 
@@ -3405,6 +3598,13 @@ def start_headless(
         _bridge._write_registry()
 
     try:
+        # Arm the idle reaper (opt-in via BN_IDLE_TIMEOUT) AFTER preload so a slow
+        # analysis doesn't count against the first idle window. Headless only -- the
+        # GUI plugin's start_bridge() never arms it (the GUI bridge is a thread inside
+        # BN's UI process and must not self-terminate). No-op when the env is unset.
+        # Inside the try so an invalid BN_IDLE_TIMEOUT fails loud but still runs
+        # _stop_bridge() cleanup rather than orphaning the started server (#637 review).
+        _bridge._maybe_start_idle_reaper()
         _bridge._shutdown_event.wait()
     except KeyboardInterrupt:
         pass
