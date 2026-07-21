@@ -798,7 +798,19 @@ class BinaryNinjaBridge:
         self._server = ThreadedUnixServer(str(self.socket_path), BridgeHandler, self)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
-        self._write_registry()
+        try:
+            self._write_registry()
+        except Exception:
+            # The socket is bound and the serve_forever thread is already live at
+            # this point. If a caller only publishes us to a module-global (or
+            # any other reference) after start() returns, an exception here would
+            # otherwise leave a fully-running server + bound socket file with no
+            # reference anywhere to stop() it -- worse than the pre-fix zombie
+            # global this guard was added to prevent (#585). Self-heal: tear down
+            # what we just brought up before propagating, exactly like stop().
+            with contextlib.suppress(Exception):
+                self.stop()
+            raise
         bn.log_info(f"BN Agent Bridge listening on {self.socket_path}")
 
     def stop(self):  # pragma: no cover - requires GUI runtime

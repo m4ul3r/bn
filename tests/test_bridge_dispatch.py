@@ -2453,6 +2453,35 @@ def test_stop_removes_its_own_files_after_successful_start(monkeypatch, tmp_path
     assert not log_path.exists()
 
 
+def test_start_self_heals_when_registry_write_fails_after_bind(monkeypatch, tmp_path):
+    """#585 follow-up: start() can bind the socket and spawn the serve_forever
+    thread, then _write_registry() raise (e.g. disk full/permission) -- a
+    failure mode the caller-publishes-after-return fix does nothing to guard,
+    since the socket + thread already exist before start() returns at all. The
+    instance must tear itself down (stop()) before propagating so no live
+    thread + bound socket is orphaned, regardless of whether any caller ever
+    gets a reference to publish."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    instance.socket_path = tmp_path / "bridge.sock"
+    instance.registry_path = tmp_path / "bridge.json"
+
+    def _boom(self):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(bridge.BinaryNinjaBridge, "_write_registry", _boom)
+
+    with pytest.raises(OSError, match="disk full"):
+        instance.start()
+
+    # Self-healed: no reference to `instance` was ever published anywhere, so
+    # if start() didn't clean up after itself, this would be a permanently
+    # orphaned live thread + bound socket that no future bridge could displace.
+    assert not instance.socket_path.exists()
+    assert not instance.registry_path.exists()
+    assert not instance._thread.is_alive()
+
+
 def test_start_bridge_does_not_leave_zombie_global_on_start_failure(monkeypatch, tmp_path):
     bridge = _load_bridge(monkeypatch)
     fake_ui = types.SimpleNamespace()
