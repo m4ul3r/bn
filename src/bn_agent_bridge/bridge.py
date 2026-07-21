@@ -870,18 +870,55 @@ class BinaryNinjaBridge:
             raise
         bn.log_info(f"BN Agent Bridge listening on {self.socket_path}")
 
+    def _registry_owned_by_other(self) -> bool:
+        """Whether the registry currently on disk at our path belongs to a
+        DIFFERENT running instance than this one.
+
+        stop() infers file ownership from having bound a server, but a sibling
+        bridge can rebind the SAME socket_path/registry_path after we stop (a
+        reused instance id, a restart_bridge sequence). Its ``start()`` rewrites
+        the registry with ITS pid, so a stale second ``stop()`` on us must not
+        unlink files that now belong to that sibling -- doing so kills its live
+        socket/registry. An absent or unreadable registry names no identifiable
+        other owner (e.g. the #585 self-heal path unlinks a socket we just bound
+        before any registry was written), so it does NOT block cleanup here."""
+        try:
+            payload = json.loads(self.registry_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        pid = payload.get("pid")
+        if isinstance(pid, int) and pid != os.getpid():
+            return True
+        iid = payload.get("instance_id")
+        if self.instance_id is not None and iid is not None and iid != self.instance_id:
+            return True
+        return False
+
     def stop(self):  # pragma: no cover - requires GUI runtime
         # If start() never bound a server (e.g. it lost the "another bridge is
         # already serving" race and raised, or was never called), this instance
         # doesn't own the files at these paths -- they may belong to a live
         # sibling bridge. Only unlink once we know we're the one who created
         # them.
-        if self._server is None:
+        server = self._server
+        if server is None:
             return
+        # Idempotency: drop our server reference BEFORE any unlink so a second
+        # stop() -- e.g. from a stale reference held after a sibling rebound our
+        # paths -- is a no-op and can never unlink files we no longer own. The
+        # _thread reference is left intact (the daemon exits once the server is
+        # shut down) so a caller can still observe that it has died.
+        self._server = None
         with contextlib.suppress(Exception):
-            self._server.shutdown()
+            server.shutdown()
         with contextlib.suppress(Exception):
-            self._server.server_close()
+            server.server_close()
+        # Ownership check: if a sibling bridge has rebound the same paths since
+        # we bound them, its registry now records a different pid/instance id.
+        # Leave every file alone in that case rather than unlink a path that a
+        # different live instance owns.
+        if self._registry_owned_by_other():
+            return
         if self.socket_path.exists():
             with contextlib.suppress(OSError):
                 self.socket_path.unlink()

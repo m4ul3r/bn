@@ -16,6 +16,7 @@ import pytest
 from bn.paths import bridge_registry_path, instances_dir
 from bn.transport import (
     BridgeError,
+    BridgeInstance,
     choose_instance,
     gc_instances,
     list_instances,
@@ -302,12 +303,14 @@ def test_load_instance_keeps_live_but_slow_process(tmp_path, monkeypatch):
     assert sock_path.exists()
 
 
-def test_load_instance_reclaims_permanently_wedged_process(tmp_path, monkeypatch):
-    # #587 review: a process that is alive but whose socket NEVER answers
-    # again (e.g. spinning forever holding the write lock) must eventually be
-    # reclaimable -- "process alive" alone can't excuse it forever, or a
-    # genuinely wedged instance's registry/socket are stuck until someone
-    # manually kills the pid or deletes the files by hand.
+def test_load_instance_surfaces_wedged_but_alive_never_reclaims(tmp_path, monkeypatch):
+    # #587-review BLOCKER: a process that is alive but whose socket NEVER
+    # answers again (busy under a long analysis / write lock, or a wedged
+    # listener) must NOT have its registry/socket reclaimed even past the grace
+    # window -- purging a LIVE instance's files orphans its loaded view (the
+    # process keeps running but becomes undiscoverable). Instead the instance is
+    # surfaced as `wedged` so an operator can see and stop it; its files are
+    # preserved throughout.
     import bn.transport as t
 
     reg_path = tmp_path / "wedged.json"
@@ -321,16 +324,15 @@ def test_load_instance_reclaims_permanently_wedged_process(tmp_path, monkeypatch
     monkeypatch.setattr(t, "_socket_is_live", lambda path, timeout=0.2: False)
     monkeypatch.setattr(t, "_process_alive", lambda pid: True)
 
-    # First probe: within the grace window -- kept, and a wedge marker is
-    # recorded so later probes know when the unresponsiveness started.
+    # First probe: within the grace window -- kept invisible, and a wedge marker
+    # is recorded so later probes know when the unresponsiveness started.
     result = t._load_instance(reg_path)
     assert result is None
     assert reg_path.exists() and sock_path.exists()
     marker_path = t._wedge_marker_path(reg_path)
     assert marker_path.exists()
 
-    # Still inside the grace window a moment later -- still kept (the
-    # freshly-written marker's timestamp is ~now).
+    # Still inside the grace window a moment later -- still invisible, still kept.
     result = t._load_instance(reg_path)
     assert result is None
     assert reg_path.exists() and sock_path.exists()
@@ -338,13 +340,47 @@ def test_load_instance_reclaims_permanently_wedged_process(tmp_path, monkeypatch
     # Simulate the grace window having elapsed by backdating the marker.
     marker_path.write_text(str(time.time() - t.WEDGE_GRACE_SECONDS - 1), encoding="utf-8")
 
-    # Past the grace window -- the process is still "alive" but has now been
-    # unresponsive long enough to be treated as permanently wedged: reclaimed.
+    # Past the grace window -- the process is still ALIVE, so its files are NEVER
+    # reclaimed. It is now surfaced as a discoverable-but-wedged instance.
     result = t._load_instance(reg_path)
-    assert result is None
-    assert not reg_path.exists()
-    assert not sock_path.exists()
-    assert not marker_path.exists()
+    assert result is not None
+    assert result.wedged is True
+    assert result.instance_id == "wedged"
+    assert reg_path.exists() and sock_path.exists()
+
+
+def test_choose_instance_wedged_single_raises_honest_error(tmp_path, monkeypatch):
+    # A lone wedged instance must not be silently handed to a request path
+    # (which would hang or hide the wedge). choose_instance surfaces an honest
+    # error naming the instance and how to reclaim it -- and never auto-spawns a
+    # duplicate around it.
+    import bn.transport as t
+
+    wedged = BridgeInstance(
+        pid=4321,
+        socket_path=tmp_path / "w.sock",
+        registry_path=tmp_path / "w.json",
+        plugin_name="bn_agent_bridge",
+        plugin_version="0",
+        started_at=None,
+        meta={},
+        instance_id="wedged",
+        wedged=True,
+    )
+    monkeypatch.setattr(t, "list_instances", lambda: [wedged])
+
+    spawned = []
+    monkeypatch.setattr(t, "_auto_spawn_locked", lambda: spawned.append(1))
+
+    with pytest.raises(BridgeError) as excinfo:
+        t.choose_instance()
+    assert "wedged" in str(excinfo.value).lower()
+    assert "bn session stop wedged" in str(excinfo.value)
+    assert not spawned  # never worked around it by spawning a duplicate
+
+    # Explicit -i <id> for the wedged instance surfaces the same honest error.
+    with pytest.raises(BridgeError):
+        t.choose_instance("wedged")
 
 
 def test_load_instance_slow_then_genuinely_dead_reclaims_immediately(tmp_path, monkeypatch):

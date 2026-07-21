@@ -98,6 +98,12 @@ class BridgeInstance:
     started_at: str | None
     meta: dict[str, Any]
     instance_id: str | None = None
+    # True when the owning process is still ALIVE but its socket has been
+    # unresponsive past WEDGE_GRACE_SECONDS. Such an instance is deliberately
+    # kept discoverable (its files are NEVER reclaimed while the process lives,
+    # or its loaded view would be orphaned) but must not be handed out for a
+    # request -- callers surface it as an honest wedged error instead.
+    wedged: bool = False
 
 
 def instance_selector(instance: BridgeInstance) -> str:
@@ -213,13 +219,16 @@ def _socket_is_live(socket_path: Path, timeout: float = 0.2) -> bool:
 
 
 # How long a live-process/dead-socket instance gets the benefit of the doubt
-# ("briefly slow") before it's reclaimed as "permanently wedged" (#587 review).
-# A process that spins forever holding the write lock (e.g. a native BN call
-# stuck in an infinite loop) never exits, so `_process_alive` alone would keep
-# its registry+socket around forever with no way for an operator/agent to
-# reclaim the slot short of manually killing the pid or deleting files by
-# hand. Once a registry has been observed unresponsive-but-alive for longer
-# than this, treat it the same as genuinely dead.
+# ("briefly slow", stays invisible) before it is surfaced as WEDGED (#587 review).
+# A process whose socket stops answering may just be busy (a long analysis, a
+# long-held write lock); we do not want a momentary probe miss to disrupt
+# discovery. Once it has been observed unresponsive-but-alive for longer than
+# this, we stop treating it as "briefly slow": it is surfaced as a wedged
+# instance so an operator/agent can see and reclaim it (`bn session stop <id>`
+# SIGTERMs the pid). Crucially, a LIVE process is NEVER purged -- unlinking a
+# live instance's registry/socket would orphan its loaded view (the process
+# keeps running but becomes undiscoverable). Only a genuinely DEAD instance's
+# leftover files are reclaimed.
 WEDGE_GRACE_SECONDS = 300.0
 
 
@@ -259,32 +268,40 @@ def _load_instance(path: Path) -> BridgeInstance | None:
         _clear_wedge_marker(marker_path)
         return None
 
+    wedged = False
     if not _socket_is_live(socket_path):
-        if _process_alive(pid):
-            # The owning process is still alive -- the socket is merely slow
-            # or wedged right now (e.g. stuck under a write lock), not dead.
-            # Leave the registry/socket in place so a subsequent probe can
-            # still find it, UNLESS it's been unresponsive for longer than
-            # WEDGE_GRACE_SECONDS -- at that point "briefly slow" no longer
-            # applies and it's treated as a permanently wedged slot that must
-            # still be reclaimable.
-            now = time.time()
-            first_seen = _read_wedge_first_seen(marker_path)
-            if first_seen is None:
-                _write_wedge_marker(marker_path, now)
-                return None
-            if now - first_seen < WEDGE_GRACE_SECONDS:
-                return None
+        if not _process_alive(pid):
+            # Genuinely DEAD: the process is gone, so its leftover registry +
+            # orphaned socket are safe to reclaim (#587's real intent).
             _purge_stale_registry(path, socket_path)
             _clear_wedge_marker(marker_path)
             return None
-        _purge_stale_registry(path, socket_path)
+        # The owning process is still ALIVE -- the socket is merely slow or
+        # wedged right now (busy under a write lock, mid long analysis, or a
+        # wedged listener), not dead. We must NEVER purge a live instance's
+        # files: unlinking them orphans its loaded view (the process keeps
+        # running but becomes undiscoverable), the #587-review BLOCKER. Leave
+        # the registry/socket in place so a subsequent probe still finds it.
+        now = time.time()
+        first_seen = _read_wedge_first_seen(marker_path)
+        if first_seen is None:
+            # First unresponsive probe: record when it started and stay out of
+            # the way (briefly slow -> invisible, files untouched).
+            _write_wedge_marker(marker_path, now)
+            return None
+        if now - first_seen < WEDGE_GRACE_SECONDS:
+            # Still inside the grace window -- still "briefly slow".
+            return None
+        # Unresponsive-but-alive past the grace window: surface it as WEDGED
+        # rather than reclaim it. It stays discoverable (visible in
+        # `bn instance list`, stoppable via `bn session stop <id>` which
+        # SIGTERMs the pid) and any request against it fails fast with an
+        # honest wedged error -- none of which orphan the live view.
+        wedged = True
+    else:
+        # Socket answered -- clear any stale wedge marker from an earlier
+        # transient blip so a future hang starts its grace period fresh.
         _clear_wedge_marker(marker_path)
-        return None
-
-    # Socket answered -- clear any stale wedge marker from an earlier
-    # transient blip so a future hang starts its grace period fresh.
-    _clear_wedge_marker(marker_path)
 
     return BridgeInstance(
         pid=pid,
@@ -295,6 +312,7 @@ def _load_instance(path: Path) -> BridgeInstance | None:
         started_at=payload.get("started_at"),
         meta=payload,
         instance_id=payload.get("instance_id"),
+        wedged=wedged,
     )
 
 
@@ -402,6 +420,32 @@ def _resolve_from_markers(instances: list[BridgeInstance]) -> BridgeInstance | N
     return None
 
 
+def _wedged_instance_error(instance: BridgeInstance) -> BridgeError:
+    selector = instance_selector(instance)
+    return BridgeError(
+        f"Binary Ninja bridge instance {selector} (pid {instance.pid}) appears "
+        f"wedged: its process is still running but its socket at "
+        f"{instance.socket_path} has been unresponsive for over "
+        f"{WEDGE_GRACE_SECONDS:.0f}s. Its loaded view is preserved (not "
+        f"reclaimed). Stop it with `bn session stop {selector}` (which SIGTERMs "
+        "the process), or investigate why it is stuck, then retry."
+    )
+
+
+def _use_instance(instance: BridgeInstance) -> BridgeInstance:
+    """Guard the hand-off of a resolved instance to a request path.
+
+    A wedged instance stays *discoverable* (so it shows up in `bn instance list`
+    and can be stopped), but must never be silently handed to a caller for a
+    request -- that would either hang or hide the wedge. Surface an honest error
+    instead so the operator reclaims it explicitly rather than the tool silently
+    working around (or reclaiming) a still-alive instance.
+    """
+    if instance.wedged:
+        raise _wedged_instance_error(instance)
+    return instance
+
+
 def _multiple_instances_error(instances: list[BridgeInstance]) -> BridgeError:
     return BridgeError(
         "Multiple Binary Ninja bridge instances are running; pass -i/--instance <id> "
@@ -440,11 +484,11 @@ def _auto_spawn_locked() -> BridgeInstance:
     with _spawn_lock():
         instances = list_instances()
         if len(instances) == 1:
-            return instances[0]
+            return _use_instance(instances[0])
         if instances:
             marked = _resolve_from_markers(instances)   # #80: marker disambiguates a spawn race
             if marked is not None:
-                return marked
+                return _use_instance(marked)
             raise _multiple_instances_error(instances)
         # Already under the spawn lock -- call the unlocked core directly, or a
         # second flock on the same file from this process would deadlock.
@@ -463,7 +507,7 @@ def choose_instance(
     if instance_id is not None:
         for inst in instances:
             if inst.instance_id == instance_id or instance_selector(inst) == instance_id:
-                return inst
+                return _use_instance(inst)
         if spawn_missing_named:
             # `bn load --instance <new-id>` brings the named bridge up itself,
             # matching the "auto-spawn headless if needed" model. Only load opts
@@ -475,13 +519,13 @@ def choose_instance(
             f"Start one with: bn session start --instance-id {instance_id}"
         )
     if len(instances) == 1:
-        return instances[0]
+        return _use_instance(instances[0])
     if instances:
         # #80: a project-local marker (walking up from cwd) disambiguates before
         # erroring -- so `cd project && bn ...` resolves the bridge that loaded it.
         marked = _resolve_from_markers(instances)
         if marked is not None:
-            return marked
+            return _use_instance(marked)
         raise _multiple_instances_error(instances)
     if auto_start:
         return _auto_spawn_locked()

@@ -2507,6 +2507,91 @@ def test_start_self_heals_when_registry_write_fails_after_bind(monkeypatch, tmp_
     assert not instance._thread.is_alive()
 
 
+def test_double_stop_after_sibling_rebind_is_safe_noop(monkeypatch, tmp_path):
+    """#612-review MAJOR: after a clean stop(), a stray SECOND stop() (from a
+    stale reference) must be an idempotent no-op -- even when a sibling bridge
+    has since rebound the SAME socket/registry paths (reused id / restart
+    sequencing). It must NOT unlink the sibling's live files."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(instance_id="reused")
+    instance.socket_path = tmp_path / "bridge.sock"
+    instance.registry_path = tmp_path / "bridge.json"
+
+    instance.start()
+    instance.stop()
+    # Idempotency: the server reference is dropped so a second stop() bails early.
+    assert instance._server is None
+    assert not instance.socket_path.exists()
+    assert not instance.registry_path.exists()
+
+    # A sibling now rebinds the very same paths.
+    sibling = bridge.BinaryNinjaBridge(instance_id="reused")
+    sibling.socket_path = instance.socket_path
+    sibling.registry_path = instance.registry_path
+    sibling.start()
+    try:
+        assert sibling.socket_path.exists()
+        assert sibling.registry_path.exists()
+        # The stale second stop() on the ORIGINAL instance must not touch the
+        # sibling's now-live files.
+        instance.stop()
+        assert sibling.socket_path.exists()
+        assert sibling.registry_path.exists()
+        assert sibling._server is not None
+    finally:
+        sibling.stop()
+
+    # And the sibling's own stop() still cleans up its files (no regression).
+    assert not sibling.socket_path.exists()
+    assert not sibling.registry_path.exists()
+
+
+def test_stop_ownership_check_preserves_sibling_rebound_files(monkeypatch, tmp_path):
+    """#612-review MAJOR (defense-in-depth): even with our server reference still
+    set (a stale caller that believes it's serving), stop() must VERIFY the
+    on-disk registry still records THIS process before unlinking. A sibling that
+    rebound the same paths wrote its own pid, so we leave every file intact."""
+    import os
+
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(instance_id="reused")
+    instance.socket_path = tmp_path / "bridge.sock"
+    instance.registry_path = tmp_path / "bridge.json"
+    log_path = instance.registry_path.with_suffix(".log")
+
+    # A sibling (different pid) currently owns the same paths.
+    instance.socket_path.write_bytes(b"")
+    instance.registry_path.write_text(json.dumps({
+        "pid": os.getpid() + 1,
+        "instance_id": "reused",  # same id reused -> pid is the discriminator
+        "socket_path": str(instance.socket_path),
+    }))
+    log_path.write_text("sibling log")
+
+    class _FakeServer:
+        def __init__(self):
+            self.calls = []
+
+        def shutdown(self):
+            self.calls.append("shutdown")
+
+        def server_close(self):
+            self.calls.append("close")
+
+    fake = _FakeServer()
+    instance._server = fake  # force the unlink path
+
+    instance.stop()
+
+    # Our server was torn down and the reference cleared (idempotent), but the
+    # sibling's files are preserved because the registry names a different pid.
+    assert fake.calls == ["shutdown", "close"]
+    assert instance._server is None
+    assert instance.socket_path.exists()
+    assert instance.registry_path.exists()
+    assert log_path.exists()
+
+
 def test_start_bridge_does_not_leave_zombie_global_on_start_failure(monkeypatch, tmp_path):
     bridge = _load_bridge(monkeypatch)
     fake_ui = types.SimpleNamespace()
