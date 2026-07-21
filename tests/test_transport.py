@@ -5,6 +5,8 @@ import json
 import os
 import socket
 import socketserver
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -200,6 +202,15 @@ def test_purge_keeps_log_sibling_for_diagnostics(tmp_path, monkeypatch):
     assert log_path.read_text(encoding="utf-8") == "native crash output\n"
 
 
+def _reaped_pid() -> int:
+    """A pid whose process has exited and been reaped, so the real
+    ``_process_alive`` returns False for it -- a genuine dead-instance
+    stand-in that needs no liveness monkeypatch."""
+    proc = subprocess.Popen([sys.executable, "-c", ""])
+    proc.wait()
+    return proc.pid
+
+
 def test_gc_instances_removes_dead_logs_and_orphans_keeps_live(tmp_path, monkeypatch):
     # #80 cache hygiene: the lazy purge keeps dead instances' .log breadcrumbs
     # forever (147 zero-byte logs measured on a real host). `gc_instances()`
@@ -217,7 +228,7 @@ def test_gc_instances_removes_dead_logs_and_orphans_keeps_live(tmp_path, monkeyp
     dead.bind(str(dead_sock)); dead.listen(1); dead.close()
     dead_log.write_text("crash output\n", encoding="utf-8")
     dead_reg.write_text(json.dumps({
-        "pid": os.getpid(), "socket_path": str(dead_sock), "instance_id": "dead",
+        "pid": _reaped_pid(), "socket_path": str(dead_sock), "instance_id": "dead",
         "plugin_name": "bn_agent_bridge", "plugin_version": "0",
     }), encoding="utf-8")
 
@@ -243,10 +254,9 @@ def test_gc_instances_removes_dead_logs_and_orphans_keeps_live(tmp_path, monkeyp
     spawn_lock = inst_dir / ".spawn.lock"
     spawn_lock.write_text("", encoding="utf-8")
 
-    # dead.json uses os.getpid() as a stand-in pid (there's no real dead pid
-    # to point at); mock liveness so the "dead" instance is actually treated
-    # as dead rather than "live but slow" (#587).
-    monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
+    # dead.json points at a genuinely-reaped pid, so the real liveness sweep
+    # (not a monkeypatched stub) confirms the owning process is gone and reaps
+    # it -- distinct from the live-but-slow grace-window path (#587).
     try:
         result = gc_instances()
     finally:
