@@ -229,10 +229,12 @@ def test_write_output_falls_back_to_full_output_when_spill_write_fails(
     # json is emitted compact now (#215), so the fallback full output is compact too.
     expected = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
 
-    def _boom(self, data):
+    # #612: spill writes go through _write_private_bytes (os.open at 0o600), not
+    # Path.write_bytes, so inject the disk-full failure there.
+    def _boom(path, data):
         raise OSError(28, "No space left on device")
 
-    monkeypatch.setattr(Path, "write_bytes", _boom)
+    monkeypatch.setattr("bn.output._write_private_bytes", _boom)
 
     rendered = write_output(
         payload,

@@ -18,7 +18,8 @@ from pathlib import Path
 from typing import Any
 
 from .paths import (
-    bridge_registry_path, bridge_socket_path, find_instance_markers, instances_dir,
+    bridge_registry_path, bridge_socket_path, ensure_private_dir, find_instance_markers,
+    instances_dir,
 )
 
 
@@ -360,8 +361,7 @@ def _spawn_lock():
     they could both pass the duplicate check and fork two children (#92). Held
     only for the spawn-and-register window, never around a request.
     """
-    inst_dir = instances_dir()
-    inst_dir.mkdir(parents=True, exist_ok=True)
+    inst_dir = ensure_private_dir(instances_dir())
     lock_path = inst_dir / ".spawn.lock"
     with open(lock_path, "w") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
@@ -611,8 +611,7 @@ def _spawn_instance_unlocked(
     elif any(inst.instance_id == instance_id or instance_selector(inst) == instance_id for inst in existing):
         raise BridgeError(f"Bridge instance already exists with id: {instance_id}")
 
-    inst_dir = instances_dir()
-    inst_dir.mkdir(parents=True, exist_ok=True)
+    inst_dir = ensure_private_dir(instances_dir())
 
     log_path = inst_dir / f"{instance_id}.log"
     log_file = open(log_path, "w")  # noqa: SIM115
