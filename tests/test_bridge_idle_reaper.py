@@ -2,6 +2,13 @@
 seconds of no request activity. Default off -- unset/none/off/0 keep today's
 behavior (the bridge lives until an explicit shutdown).
 
+In-flight work is tracked by a server-generated counter (_inflight) that the
+request handler raises at admission and lowers only after the response is
+written -- independent of the client's request id -- so the reaper never fires
+mid-request, mid-analysis, or mid-response, and the idle-to-shutdown latch is
+atomic with admission (a request either registers first and blocks shutdown, or
+shutdown latches first and the request is refused).
+
 All mocked; no real BN. Loop tests use tiny real timeouts and a bounded
 condition wait (never a fixed sleep) to stay fast and non-flaky.
 """
@@ -43,42 +50,70 @@ def test_parse_idle_timeout_rejects_invalid(monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# Idle decision (pure, injected clock)
+# In-flight accounting (server counter, independent of client id)
 # --------------------------------------------------------------------------
 
-def test_should_stop_when_idle_past_timeout_and_no_requests(monkeypatch):
+def test_enter_request_admits_and_counts(monkeypatch):
     _, inst = _instance(monkeypatch)
-    inst._last_activity = 100.0
-    inst._active_requests.clear()
-    assert inst._idle_reaper_should_stop(now=131.0, timeout=30.0) is True
+    assert inst._inflight == 0
+    assert inst._enter_request() is True
+    assert inst._inflight == 1
 
 
-def test_should_not_stop_before_timeout(monkeypatch):
+def test_leave_request_decrements_and_stamps_activity(monkeypatch):
     _, inst = _instance(monkeypatch)
-    inst._last_activity = 100.0
-    inst._active_requests.clear()
-    assert inst._idle_reaper_should_stop(now=115.0, timeout=30.0) is False
-
-
-def test_should_not_stop_while_request_in_flight(monkeypatch):
-    """The hard invariant: never reap while a request (which includes any running
-    update_analysis_and_wait) is in flight, no matter how far past the timeout."""
-    _, inst = _instance(monkeypatch)
-    inst._last_activity = 100.0
-    inst._begin_request("req-1")
-    assert inst._idle_reaper_should_stop(now=100.0 + 10_000.0, timeout=30.0) is False
-
-
-# --------------------------------------------------------------------------
-# Activity stamp
-# --------------------------------------------------------------------------
-
-def test_end_request_stamps_activity(monkeypatch):
-    _, inst = _instance(monkeypatch)
+    inst._enter_request()
     inst._last_activity = 0.0
-    inst._begin_request("r")
-    inst._end_request("r")
-    assert inst._last_activity > 0.0
+    inst._leave_request()
+    assert inst._inflight == 0
+    assert inst._last_activity > 0.0  # stamped AFTER the request completes
+
+
+# --------------------------------------------------------------------------
+# Idle decision + atomic shutdown latch
+# --------------------------------------------------------------------------
+
+def test_try_idle_shutdown_fires_when_idle_and_no_inflight(monkeypatch):
+    _, inst = _instance(monkeypatch)
+    inst._last_activity = 100.0
+    assert inst._try_idle_shutdown(now=131.0, timeout=30.0) is True
+    assert inst._shutting_down is True  # latched
+
+
+def test_try_idle_shutdown_not_before_timeout(monkeypatch):
+    _, inst = _instance(monkeypatch)
+    inst._last_activity = 100.0
+    assert inst._try_idle_shutdown(now=115.0, timeout=30.0) is False
+    assert inst._shutting_down is False
+
+
+def test_try_idle_shutdown_held_off_while_inflight(monkeypatch):
+    """The hard invariant: never latch shutdown while a request is in flight (which
+    includes any running update_analysis_and_wait), no matter how far past timeout."""
+    _, inst = _instance(monkeypatch)
+    inst._last_activity = 100.0
+    inst._enter_request()  # a request is in flight
+    assert inst._try_idle_shutdown(now=100.0 + 10_000.0, timeout=30.0) is False
+    assert inst._shutting_down is False
+
+
+def test_request_registered_first_blocks_shutdown(monkeypatch):
+    """F1 half A: a request that registers before the reaper wins -- shutdown is
+    refused because _inflight > 0."""
+    _, inst = _instance(monkeypatch)
+    inst._last_activity = 100.0
+    assert inst._enter_request() is True
+    assert inst._try_idle_shutdown(now=1_000.0, timeout=30.0) is False
+
+
+def test_shutdown_latched_first_refuses_new_requests(monkeypatch):
+    """F1 half B: once the reaper latches shutdown, a newly arriving request is
+    refused admission -- so it can never start work into a dying process."""
+    _, inst = _instance(monkeypatch)
+    inst._last_activity = 100.0
+    assert inst._try_idle_shutdown(now=1_000.0, timeout=30.0) is True
+    assert inst._enter_request() is False
+    assert inst._inflight == 0
 
 
 # --------------------------------------------------------------------------
@@ -87,7 +122,6 @@ def test_end_request_stamps_activity(monkeypatch):
 
 def test_start_idle_reaper_shuts_down_when_idle(monkeypatch):
     _, inst = _instance(monkeypatch)
-    inst._active_requests.clear()
     t = inst._start_idle_reaper(timeout=0.01, poll_interval=0.01)
     assert t is not None
     assert inst._shutdown_event.wait(2.0) is True
@@ -97,12 +131,12 @@ def test_start_idle_reaper_shuts_down_when_idle(monkeypatch):
 
 def test_start_idle_reaper_holds_while_busy_then_reaps_when_idle(monkeypatch):
     _, inst = _instance(monkeypatch)
-    inst._begin_request("busy")
+    inst._enter_request()  # busy
     t = inst._start_idle_reaper(timeout=0.01, poll_interval=0.01)
     # A request is in flight -> must not reap.
     assert inst._shutdown_event.wait(0.3) is False
     # Request completes; the bridge goes idle and the reaper fires.
-    inst._end_request("busy")
+    inst._leave_request()
     assert inst._shutdown_event.wait(2.0) is True
     t.join(timeout=2.0)
 
@@ -111,7 +145,7 @@ def test_start_idle_reaper_exits_on_external_shutdown(monkeypatch):
     """If shutdown is requested elsewhere (bn session stop), the reaper thread
     stops promptly instead of lingering until the next poll boundary."""
     _, inst = _instance(monkeypatch)
-    inst._begin_request("busy")  # keep it from self-reaping
+    inst._enter_request()  # keep it from self-reaping
     t = inst._start_idle_reaper(timeout=100.0, poll_interval=100.0)
     inst._shutdown_event.set()
     t.join(timeout=2.0)
@@ -131,7 +165,6 @@ def test_maybe_start_idle_reaper_disabled_by_default(monkeypatch):
 
 def test_maybe_start_idle_reaper_armed_by_env(monkeypatch):
     _, inst = _instance(monkeypatch)
-    inst._active_requests.clear()
     monkeypatch.setenv("BN_IDLE_TIMEOUT", "0.01")
     t = inst._maybe_start_idle_reaper()
     assert t is not None

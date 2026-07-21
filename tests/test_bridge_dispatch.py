@@ -583,6 +583,48 @@ def test_load_binary_closes_unpublished_view_when_analysis_fails(monkeypatch, tm
     assert bridge._load_in_progress == {}
 
 
+def test_load_binary_does_not_double_close_after_publish_failure(monkeypatch, tmp_path):
+    """#637 review (codex F4): once a view is published, a later failure (e.g.
+    _write_registry raising during the post-publish registry/marker writes) must
+    NOT close it -- even if a concurrent `bn close` has already removed it from
+    _headless_views. Inferring "was published" from *current* membership would
+    double-close a view BN already freed."""
+    bridge, instance, _ = _setup_load_test(monkeypatch)
+    raw = tmp_path / "app.bin"
+    raw.write_bytes(b"")
+
+    closed: list[bool] = []
+
+    class _BV:
+        def __init__(self, path):
+            self.functions = [object()]
+            self.view_type = "ELF"
+            self.analysis_updated = False
+            self.file = types.SimpleNamespace(
+                filename=path,
+                close=lambda: closed.append(True),
+            )
+
+        def update_analysis_and_wait(self):
+            self.analysis_updated = True
+
+    binaryninja = sys.modules["binaryninja"]
+    binaryninja.load = lambda path, update_analysis=True: _BV(path)
+
+    # Post-publish failure racing a concurrent close: the registry write raises,
+    # and by then a concurrent `bn close` has already removed+closed the view.
+    def failing_write_registry():
+        bridge._headless_views.clear()  # concurrent close removed it
+        raise OSError("disk full")
+
+    monkeypatch.setattr(instance, "_write_registry", failing_write_registry)
+
+    with pytest.raises(OSError, match="disk full"):
+        instance._load_binary(str(raw), prefer_bndb=False)
+
+    assert closed == [], "a published view was double-closed after a post-publish failure"
+
+
 def test_load_binary_does_not_close_published_view_on_success(monkeypatch, tmp_path):
     """The close-on-failure guard (#609) must never fire on the success path: a
     published view is owned by _headless_views and closed via `bn close`, so
@@ -2240,6 +2282,84 @@ def test_bridge_handler_serialization_fallback_survives_logging_failure(monkeypa
     response = json.loads(writer.data.decode("utf-8"))
     assert response["ok"] is False
     assert "serializ" in response["error"].lower()
+
+
+def test_bridge_handler_counts_request_inflight_until_response_written(monkeypatch):
+    """#637 review (F2): the idle reaper's in-flight counter must stay raised across
+    dispatch AND response encode/write, and the idle clock is stamped only after the
+    write -- so a bridge is never counted idle while a response is still going out."""
+    bridge = _load_bridge(monkeypatch)
+    inst = bridge.BinaryNinjaBridge()
+    seen: dict[str, int] = {}
+
+    def fake_dispatch(payload):
+        seen["inflight_during"] = inst._inflight
+        return {"ok": True, "result": None, "error": None}
+
+    inst.dispatch = fake_dispatch
+    inst._last_activity = 0.0
+
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.rfile = io.BytesIO(b'{"op": "noop", "id": "r1"}\n')
+    handler.server = types.SimpleNamespace(bridge=inst)
+    handler.wfile = _RecordingWriter()
+
+    handler.handle()
+
+    assert seen["inflight_during"] == 1       # counted during dispatch
+    assert inst._inflight == 0                 # released after the response
+    assert inst._last_activity > 0.0           # stamped only after the write
+    assert json.loads(handler.wfile.data.decode("utf-8"))["ok"] is True
+
+
+def test_bridge_handler_counts_inflight_for_idless_request(monkeypatch):
+    """#637 review (F3): a request without an `id` is still tracked -- the reaper's
+    counter is server-generated, independent of the client's (cancellation) id -- so
+    a raw client's id-less load can't be reaped mid-analysis."""
+    bridge = _load_bridge(monkeypatch)
+    inst = bridge.BinaryNinjaBridge()
+    seen: dict[str, int] = {}
+
+    def fake_dispatch(payload):
+        seen["inflight_during"] = inst._inflight
+        return {"ok": True, "result": None, "error": None}
+
+    inst.dispatch = fake_dispatch
+
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.rfile = io.BytesIO(b'{"op": "noop"}\n')  # NO id
+    handler.server = types.SimpleNamespace(bridge=inst)
+    handler.wfile = _RecordingWriter()
+
+    handler.handle()
+
+    assert seen["inflight_during"] == 1
+    assert inst._inflight == 0
+
+
+def test_bridge_handler_refuses_request_when_shutting_down(monkeypatch):
+    """#637 review (F1): once the idle reaper has latched shutdown, a request that
+    arrives in the gap is refused admission rather than dispatched into a dying
+    process -- and the client gets a clean error, not a dropped connection."""
+    bridge = _load_bridge(monkeypatch)
+    inst = bridge.BinaryNinjaBridge()
+    inst._shutting_down = True
+    called: list = []
+
+    inst.dispatch = lambda payload: called.append(payload) or {"ok": True, "result": None, "error": None}
+
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.rfile = io.BytesIO(b'{"op": "noop", "id": "r1"}\n')
+    handler.server = types.SimpleNamespace(bridge=inst)
+    handler.wfile = _RecordingWriter()
+
+    handler.handle()
+
+    assert called == []            # dispatch was NOT run
+    assert inst._inflight == 0     # nothing admitted
+    resp = json.loads(handler.wfile.data.decode("utf-8"))
+    assert resp["ok"] is False
+    assert "shutting down" in resp["error"].lower()
 
 
 def test_save_path_failure_restores_target_identity(monkeypatch, tmp_path):
