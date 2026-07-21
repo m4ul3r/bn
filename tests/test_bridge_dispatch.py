@@ -548,6 +548,75 @@ def test_load_binary_idempotent_preserves_quick_analysis_state(monkeypatch, tmp_
     bridge._quick_loaded_views.clear()
 
 
+def test_load_binary_closes_unpublished_view_when_analysis_fails(monkeypatch, tmp_path):
+    """#609: if update_analysis_and_wait() raises after a successful load(), the
+    opened BinaryView must be closed -- not left open, unpublished (absent from
+    _headless_views), and uncloseable via `bn close`."""
+    bridge, instance, _ = _setup_load_test(monkeypatch)
+    raw = tmp_path / "app.bin"
+    raw.write_bytes(b"")
+
+    closed: list[bool] = []
+
+    class _FailingBV:
+        def __init__(self, path):
+            self.functions = [object()]
+            self.view_type = "ELF"
+            self.file = types.SimpleNamespace(
+                filename=path,
+                close=lambda: closed.append(True),
+            )
+
+        def update_analysis_and_wait(self):
+            raise RuntimeError("analysis OOM")
+
+    binaryninja = sys.modules["binaryninja"]
+    binaryninja.load = lambda path, update_analysis=True: _FailingBV(path)
+
+    with pytest.raises(RuntimeError, match="analysis OOM"):
+        instance._load_binary(str(raw), prefer_bndb=False)
+
+    assert closed == [True], "unpublished view was not closed on analysis failure"
+    assert bridge._headless_views == [], "a failed load must not publish the view"
+    # The same-path in-flight waiter must still be cleared so a concurrent second
+    # loader is not left waiting on a load that already failed.
+    assert bridge._load_in_progress == {}
+
+
+def test_load_binary_does_not_close_published_view_on_success(monkeypatch, tmp_path):
+    """The close-on-failure guard (#609) must never fire on the success path: a
+    published view is owned by _headless_views and closed via `bn close`, so
+    _load_binary must not close it."""
+    bridge, instance, _ = _setup_load_test(monkeypatch)
+    raw = tmp_path / "ok.bin"
+    raw.write_bytes(b"")
+
+    closed: list[bool] = []
+
+    class _OkBV:
+        def __init__(self, path):
+            self.functions = [object()]
+            self.view_type = "ELF"
+            self.analysis_updated = False
+            self.file = types.SimpleNamespace(
+                filename=path,
+                close=lambda: closed.append(True),
+            )
+
+        def update_analysis_and_wait(self):
+            self.analysis_updated = True
+
+    binaryninja = sys.modules["binaryninja"]
+    binaryninja.load = lambda path, update_analysis=True: _OkBV(path)
+
+    result = instance._load_binary(str(raw), prefer_bndb=False)
+
+    assert result["loaded"] is True
+    assert closed == [], "success path must not close the published view"
+    assert len(bridge._headless_views) == 1
+    bridge._headless_views.clear()
+
+
 def test_load_bndb_recovers_analyzed_view_from_raw_default(monkeypatch, tmp_path):
     """#458: naming a .bndb whose load() defaults to the raw container view (0
     functions) must recover the analyzed view saved in the same database, not

@@ -1102,6 +1102,10 @@ class BinaryNinjaBridge:
         # responding. The view is published (and only then visible to reads)
         # under the lock at the end, so no reader ever sees a half-analyzed
         # target.
+        # #609: track the view opened below so a failure between open and publish
+        # can close it. Initialized to None so an open-time failure (bv never
+        # assigned) doesn't trip the cleanup path with a NameError.
+        bv = None
         try:
             try:
                 with self._target_lock.write():
@@ -1207,6 +1211,24 @@ class BinaryNinjaBridge:
                 "notes": notes,
                 "targets": targets,
             }
+        except BaseException:
+            # #609: a view opened by binaryninja.load() above but not yet published
+            # (the unlocked update_analysis_and_wait() raised/OOM'd, a .bndb restore
+            # failed, or the load was cancelled) is otherwise left open, invisible to
+            # `bn target list`, and uncloseable via `bn close` -- a leaked ~1.7 GB
+            # view. Close it and drop it from the bookkeeping sets, then re-raise. A
+            # *published* view is owned by _headless_views and closed via `bn close`,
+            # so never double-close it here. BaseException so a cancel/KeyboardInterrupt
+            # mid-analysis reclaims the view too.
+            if bv is not None:
+                with _headless_views_lock:
+                    published = any(v is bv for v in _headless_views)
+                if not published:
+                    with contextlib.suppress(Exception):
+                        _run_on_main_thread(lambda: bv.file.close())
+                    _quick_loaded_views.discard(bv)
+                    _unanalyzed_views.discard(bv)
+            raise
         finally:
             with _load_in_progress_lock:
                 current = _load_in_progress.get(load_key)
@@ -3319,25 +3341,40 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
     if bv is None:
         bn.log_warn(f"Failed to open binary: {load_path}")
         return None
-    # #458 parity with _load_binary: a directly-named .bndb whose load() defaults
-    # to the raw container view must recover its analyzed view (or log a hard
-    # restore diagnostic), so `bn-agent <file>.bndb` doesn't silently preload a
-    # no-symbol target.
-    bndb_unanalyzed = False
-    if load_path.suffix == ".bndb":
-        bv, bndb_note, bndb_unanalyzed = _restore_bndb_analyzed_view(bv, load_path)
-        if bndb_note:
-            (bn.log_warn if bndb_note.startswith("WARNING:") else bn.log_info)(bndb_note)
-    quick_effective = quick and load_path.suffix != ".bndb"
-    if quick_effective:
-        _quick_loaded_views.add(bv)
-    else:
-        bv.update_analysis_and_wait()
-        _quick_loaded_views.discard(bv)
-    if bndb_unanalyzed:
-        _unanalyzed_views.add(bv)
-    with _headless_views_lock:
-        _headless_views.append(bv)
+    try:
+        # #458 parity with _load_binary: a directly-named .bndb whose load() defaults
+        # to the raw container view must recover its analyzed view (or log a hard
+        # restore diagnostic), so `bn-agent <file>.bndb` doesn't silently preload a
+        # no-symbol target.
+        bndb_unanalyzed = False
+        if load_path.suffix == ".bndb":
+            bv, bndb_note, bndb_unanalyzed = _restore_bndb_analyzed_view(bv, load_path)
+            if bndb_note:
+                (bn.log_warn if bndb_note.startswith("WARNING:") else bn.log_info)(bndb_note)
+        quick_effective = quick and load_path.suffix != ".bndb"
+        if quick_effective:
+            _quick_loaded_views.add(bv)
+        else:
+            bv.update_analysis_and_wait()
+            _quick_loaded_views.discard(bv)
+        if bndb_unanalyzed:
+            _unanalyzed_views.add(bv)
+        with _headless_views_lock:
+            _headless_views.append(bv)
+    except BaseException:
+        # #609 parity with _load_binary: a view opened above but never registered
+        # (analysis raised/OOM'd, .bndb restore failed) is otherwise abandoned open.
+        # Close it and drop it from the bookkeeping sets, then re-raise. `bv` may
+        # have been rebound to the restored analyzed view above; close whichever
+        # view is current.
+        with _headless_views_lock:
+            published = any(v is bv for v in _headless_views)
+        if not published:
+            with contextlib.suppress(Exception):
+                _run_on_main_thread(lambda: bv.file.close())
+            _quick_loaded_views.discard(bv)
+            _unanalyzed_views.discard(bv)
+        raise
     bn.log_info(f"Loaded {load_path}{' (no analysis)' if quick_effective else ''}")
     return bv
 
