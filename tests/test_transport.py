@@ -6,6 +6,7 @@ import os
 import socket
 import socketserver
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -289,6 +290,85 @@ def test_load_instance_keeps_live_but_slow_process(tmp_path, monkeypatch):
     assert result is None
     assert reg_path.exists()
     assert sock_path.exists()
+
+
+def test_load_instance_reclaims_permanently_wedged_process(tmp_path, monkeypatch):
+    # #587 review: a process that is alive but whose socket NEVER answers
+    # again (e.g. spinning forever holding the write lock) must eventually be
+    # reclaimable -- "process alive" alone can't excuse it forever, or a
+    # genuinely wedged instance's registry/socket are stuck until someone
+    # manually kills the pid or deletes the files by hand.
+    import bn.transport as t
+
+    reg_path = tmp_path / "wedged.json"
+    sock_path = tmp_path / "wedged.sock"
+    sock_path.write_text("", encoding="utf-8")
+    reg_path.write_text(json.dumps({
+        "pid": os.getpid(), "socket_path": str(sock_path), "instance_id": "wedged",
+        "plugin_name": "bn_agent_bridge", "plugin_version": "0",
+    }), encoding="utf-8")
+
+    monkeypatch.setattr(t, "_socket_is_live", lambda path, timeout=0.2: False)
+    monkeypatch.setattr(t, "_process_alive", lambda pid: True)
+
+    # First probe: within the grace window -- kept, and a wedge marker is
+    # recorded so later probes know when the unresponsiveness started.
+    result = t._load_instance(reg_path)
+    assert result is None
+    assert reg_path.exists() and sock_path.exists()
+    marker_path = t._wedge_marker_path(reg_path)
+    assert marker_path.exists()
+
+    # Still inside the grace window a moment later -- still kept (the
+    # freshly-written marker's timestamp is ~now).
+    result = t._load_instance(reg_path)
+    assert result is None
+    assert reg_path.exists() and sock_path.exists()
+
+    # Simulate the grace window having elapsed by backdating the marker.
+    marker_path.write_text(str(time.time() - t.WEDGE_GRACE_SECONDS - 1), encoding="utf-8")
+
+    # Past the grace window -- the process is still "alive" but has now been
+    # unresponsive long enough to be treated as permanently wedged: reclaimed.
+    result = t._load_instance(reg_path)
+    assert result is None
+    assert not reg_path.exists()
+    assert not sock_path.exists()
+    assert not marker_path.exists()
+
+
+def test_load_instance_slow_then_genuinely_dead_reclaims_immediately(tmp_path, monkeypatch):
+    # #587 review: the lifecycle where a bridge is briefly slow (kept per the
+    # fix) and THEN actually dies (e.g. OOM-killed) before the wedge grace
+    # window elapses must still reclaim the slot on the very next probe --
+    # once the process is confirmed gone, "still inside the grace window"
+    # must not block the existing dead-process purge path.
+    import bn.transport as t
+
+    reg_path = tmp_path / "transition.json"
+    sock_path = tmp_path / "transition.sock"
+    sock_path.write_text("", encoding="utf-8")
+    reg_path.write_text(json.dumps({
+        "pid": os.getpid(), "socket_path": str(sock_path), "instance_id": "transition",
+        "plugin_name": "bn_agent_bridge", "plugin_version": "0",
+    }), encoding="utf-8")
+
+    monkeypatch.setattr(t, "_socket_is_live", lambda path, timeout=0.2: False)
+
+    # First probe: alive but slow -- kept, marker recorded.
+    monkeypatch.setattr(t, "_process_alive", lambda pid: True)
+    result = t._load_instance(reg_path)
+    assert result is None
+    assert reg_path.exists() and sock_path.exists()
+
+    # Process transitions to genuinely dead (still well inside the grace
+    # window) -- the very next probe must purge it immediately, not wait out
+    # the grace period.
+    monkeypatch.setattr(t, "_process_alive", lambda pid: False)
+    result = t._load_instance(reg_path)
+    assert result is None
+    assert not reg_path.exists()
+    assert not sock_path.exists()
 
 
 def test_load_instance_purges_dead_process(tmp_path, monkeypatch):

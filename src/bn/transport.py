@@ -211,6 +211,38 @@ def _socket_is_live(socket_path: Path, timeout: float = 0.2) -> bool:
         return False
 
 
+# How long a live-process/dead-socket instance gets the benefit of the doubt
+# ("briefly slow") before it's reclaimed as "permanently wedged" (#587 review).
+# A process that spins forever holding the write lock (e.g. a native BN call
+# stuck in an infinite loop) never exits, so `_process_alive` alone would keep
+# its registry+socket around forever with no way for an operator/agent to
+# reclaim the slot short of manually killing the pid or deleting files by
+# hand. Once a registry has been observed unresponsive-but-alive for longer
+# than this, treat it the same as genuinely dead.
+WEDGE_GRACE_SECONDS = 300.0
+
+
+def _wedge_marker_path(registry_path: Path) -> Path:
+    return registry_path.with_suffix(".wedged")
+
+
+def _read_wedge_first_seen(marker_path: Path) -> float | None:
+    try:
+        return float(marker_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _write_wedge_marker(marker_path: Path, first_seen: float) -> None:
+    with contextlib.suppress(OSError):
+        marker_path.write_text(str(first_seen), encoding="utf-8")
+
+
+def _clear_wedge_marker(marker_path: Path) -> None:
+    with contextlib.suppress(OSError):
+        marker_path.unlink()
+
+
 def _load_instance(path: Path) -> BridgeInstance | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -219,8 +251,11 @@ def _load_instance(path: Path) -> BridgeInstance | None:
     except (OSError, ValueError, KeyError, json.JSONDecodeError):
         return None
 
+    marker_path = _wedge_marker_path(path)
+
     if not socket_path.exists():
         _purge_stale_registry(path, socket_path)
+        _clear_wedge_marker(marker_path)
         return None
 
     if not _socket_is_live(socket_path):
@@ -228,10 +263,27 @@ def _load_instance(path: Path) -> BridgeInstance | None:
             # The owning process is still alive -- the socket is merely slow
             # or wedged right now (e.g. stuck under a write lock), not dead.
             # Leave the registry/socket in place so a subsequent probe can
-            # still find it; only purge instances that are actually gone.
+            # still find it, UNLESS it's been unresponsive for longer than
+            # WEDGE_GRACE_SECONDS -- at that point "briefly slow" no longer
+            # applies and it's treated as a permanently wedged slot that must
+            # still be reclaimable.
+            now = time.time()
+            first_seen = _read_wedge_first_seen(marker_path)
+            if first_seen is None:
+                _write_wedge_marker(marker_path, now)
+                return None
+            if now - first_seen < WEDGE_GRACE_SECONDS:
+                return None
+            _purge_stale_registry(path, socket_path)
+            _clear_wedge_marker(marker_path)
             return None
         _purge_stale_registry(path, socket_path)
+        _clear_wedge_marker(marker_path)
         return None
+
+    # Socket answered -- clear any stale wedge marker from an earlier
+    # transient blip so a future hang starts its grace period fresh.
+    _clear_wedge_marker(marker_path)
 
     return BridgeInstance(
         pid=pid,
@@ -311,13 +363,13 @@ def gc_instances() -> dict[str, Any]:
             # A .log/.sock whose registry is gone belongs to a dead/long-gone
             # instance -- the registry was purged (now or earlier) or never
             # existed (and, under the lock, is not a spawn in flight).
-            if entry.suffix in (".log", ".sock") and entry.stem not in live_stems:
+            if entry.suffix in (".log", ".sock", ".wedged") and entry.stem not in live_stems:
                 with contextlib.suppress(OSError):
                     entry.unlink()
                     summary["removed"].append(str(entry))
                     if entry.suffix == ".log":
                         summary["logs_removed"] += 1
-                    else:
+                    elif entry.suffix == ".sock":
                         summary["sockets_removed"] += 1
     return summary
 
