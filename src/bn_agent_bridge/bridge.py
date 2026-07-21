@@ -5,11 +5,13 @@ import contextlib
 import errno
 import hashlib
 import json
+import math
 import os
 import socket
 import socketserver
 import tempfile
 import threading
+import time
 import weakref
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -69,6 +71,49 @@ ENGINE_BUILD_ID = build_id_for_package(Path(__file__).resolve().parent)
 # Upper bound on a single newline-terminated JSON request. Anything larger is
 # rejected with a clean error instead of being buffered without limit.
 MAX_REQUEST_BYTES = 32 * 1024 * 1024
+
+# Idle reaper: cap the watcher poll interval so a long BN_IDLE_TIMEOUT doesn't
+# leave a stale process lingering far past its deadline, while a short timeout
+# still reaps promptly (poll = min(timeout, this)).
+_IDLE_REAPER_MAX_POLL_SECONDS = 30.0
+
+
+def _parse_idle_timeout(raw: str | None) -> float | None:
+    """Parse BN_IDLE_TIMEOUT into a positive seconds float, or None when disabled.
+
+    Mirrors BN_REQUEST_TIMEOUT's grammar (transport._resolve_timeout): unset,
+    empty/whitespace, ``none``/``off``, and ``0`` all DISABLE the reaper (None =
+    today's behavior: never self-shut-down). A positive number arms it. Anything
+    else -- a typo, a negative, inf/nan, or a positive magnitude that underflowed
+    to 0 -- raises, so a mistake fails loud instead of silently disabling.
+    """
+    if raw is None:
+        return None
+    text = raw.strip().lower()
+
+    def _reject() -> RuntimeError:
+        return RuntimeError(
+            f"BN_IDLE_TIMEOUT={raw!r} is not a valid idle timeout: expected a "
+            f"positive number of seconds, or one of 0/none/off/empty to disable it."
+        )
+
+    if text in ("", "none", "off"):
+        return None
+    try:
+        value = float(text)
+    except ValueError:
+        raise _reject() from None
+    if not math.isfinite(value):  # inf / nan parse as floats but aren't timeouts
+        raise _reject()
+    if value < 0 or math.copysign(1.0, value) < 0:  # negatives, incl. -0.0
+        raise _reject()
+    if value == 0.0:
+        # A literal 0 disables; a positive magnitude that underflowed to 0.0
+        # (e.g. 1e-325) is not a disable request -- reject it.
+        if any(d in text for d in "123456789"):
+            raise _reject()
+        return None
+    return value
 
 # Same-path load dedupe for the window where a BinaryView is open or analyzing
 # but not published in _headless_views yet (#400).
@@ -768,6 +813,9 @@ class BinaryNinjaBridge:
         self._active_requests: set[str] = set()
         self._cancelled_requests: set[str] = set()
         self._shutdown_event = threading.Event()
+        # Idle reaper clock (monotonic). Bumped whenever a request completes; the
+        # watcher (headless only, opt-in) compares it against BN_IDLE_TIMEOUT.
+        self._last_activity: float = time.monotonic()
 
     def _socket_is_live(self) -> bool:
         """Whether something is currently accepting connections on our socket path."""
@@ -962,6 +1010,59 @@ class BinaryNinjaBridge:
         with self._request_state_lock:
             self._active_requests.discard(request_id)
             self._cancelled_requests.discard(request_id)
+            # A completed request resets the idle clock: idle is measured from the
+            # last request, so a long analysis restarts the countdown once it ends.
+            self._last_activity = time.monotonic()
+
+    def _idle_reaper_should_stop(self, now: float, timeout: float) -> bool:
+        """True when the bridge has been idle at least ``timeout`` seconds AND no
+        request is in flight. A non-empty ``_active_requests`` covers any running
+        update_analysis_and_wait() too (it executes inside its request's dispatch),
+        so this single guard enforces "never reap mid-work"."""
+        with self._request_state_lock:
+            if self._active_requests:
+                return False
+            return (now - self._last_activity) >= timeout
+
+    def _start_idle_reaper(self, timeout: float | None, *, poll_interval: float | None = None):
+        """Start the idle-watcher thread (headless only). Returns the Thread, or
+        None when ``timeout`` is None (disabled). The thread triggers a clean
+        shutdown via _shutdown_event -- the existing stop path unlinks the
+        registry/socket/log -- and exits promptly on any external shutdown."""
+        if timeout is None:
+            return None
+        interval = poll_interval if poll_interval is not None else min(timeout, _IDLE_REAPER_MAX_POLL_SECONDS)
+        # Reset the clock at arm time so a slow headless preload (which runs before
+        # the reaper starts) doesn't count against the first idle window.
+        with self._request_state_lock:
+            self._last_activity = time.monotonic()
+
+        def _loop() -> None:
+            while not self._shutdown_event.is_set():
+                # wait() doubles as the sleep and as prompt wake-up on external
+                # shutdown: it returns True the moment _shutdown_event is set.
+                if self._shutdown_event.wait(interval):
+                    return
+                if self._idle_reaper_should_stop(time.monotonic(), timeout):
+                    bn.log_info(
+                        f"BN Agent Bridge idle for >= {timeout}s (BN_IDLE_TIMEOUT); "
+                        "self-shutting down to reclaim memory"
+                    )
+                    self._shutdown_event.set()
+                    return
+
+        thread = threading.Thread(target=_loop, name="bn-idle-reaper", daemon=True)
+        thread.start()
+        return thread
+
+    def _maybe_start_idle_reaper(self):
+        """Arm the idle reaper from BN_IDLE_TIMEOUT if set. Default (unset) is a
+        no-op: the bridge keeps living until an explicit shutdown."""
+        timeout = _parse_idle_timeout(os.environ.get("BN_IDLE_TIMEOUT"))
+        if timeout is None:
+            return None
+        bn.log_info(f"BN Agent Bridge idle reaper armed: self-shutdown after {timeout}s idle")
+        return self._start_idle_reaper(timeout)
 
     def _is_request_cancelled(self, request_id: Any) -> bool:
         if not isinstance(request_id, str) or not request_id:
@@ -3440,6 +3541,12 @@ def start_headless(
         # instance holds live targets. Rewrite it once after the preload loop so
         # `bn instance list` / discovery see the loaded binaries.
         _bridge._write_registry()
+
+    # Arm the idle reaper (opt-in via BN_IDLE_TIMEOUT) AFTER preload so a slow
+    # analysis doesn't count against the first idle window. Headless only -- the
+    # GUI plugin's start_bridge() never arms it (the GUI bridge is a thread inside
+    # BN's UI process and must not self-terminate). No-op when the env is unset.
+    _bridge._maybe_start_idle_reaper()
 
     try:
         _bridge._shutdown_event.wait()

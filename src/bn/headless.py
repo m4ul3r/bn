@@ -34,6 +34,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="bn-agent",
         description="Run the BN Agent Bridge in headless mode",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Environment:\n"
+            "  BN_IDLE_TIMEOUT   Seconds of no request activity after which this\n"
+            "                    headless bridge self-shuts-down to reclaim memory\n"
+            "                    (each loaded target holds ~1.7 GB). It never fires\n"
+            "                    while a request or analysis is in flight. Unset (the\n"
+            "                    default) / none / off / 0 disables it: the bridge\n"
+            "                    lives until `bn session stop`.\n"
+        ),
     )
     parser.add_argument(
         "binaries",
