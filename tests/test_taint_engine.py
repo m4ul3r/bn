@@ -347,6 +347,24 @@ def test_lookup_model_resolves_pread_and_pread_chk_603():
     assert te.lookup_model(models, "__pread_chk")[0] == "pread_chk"
 
 
+def test_lookup_model_resolves_lfs64_aliases_603():
+    # #603 (FINDING 2): transitional LFS64 symbols (base name + "64", emitted
+    # under _FILE_OFFSET_BITS=64 / _LARGEFILE64_SOURCE) share their base model.
+    # pwrite64/pread64 must resolve to pwrite/pread, and the internal `__`-
+    # decorated spellings too (underscore-stripped first, then de-64'd).
+    models = te.load_models()
+    assert te.lookup_model(models, "pwrite64")[0] == "pwrite"
+    assert te.lookup_model(models, "pread64")[0] == "pread"
+    assert te.lookup_model(models, "read64")[0] == "read"
+    assert te.lookup_model(models, "__pwrite64")[0] == "pwrite"
+    assert te.lookup_model(models, "pwrite64@plt")[0] == "pwrite"
+    # the resolved alias carries the base model's sink, not an empty stub
+    assert te.lookup_model(models, "pwrite64")[1]["sink"]["class"] == "file_write"
+    # a name that merely ends in a two-digit run is NOT mangled into a base:
+    # `bswap_64` keeps its own model (endian intrinsic), not a strip to `bswap_`.
+    assert te.lookup_model(models, "bswap_64")[0] == "bswap_64"
+
+
 def test_chk_models_present_and_shaped():
     models = te.load_models()
     # FORTIFY variants resolve via the underscore-stripped key, NOT by collapsing
@@ -1514,6 +1532,84 @@ def test_optional_sink_on_with_class(models):
     result2 = engine.forward(func, [te.parse_locator("arg:read:1")],
                              enabled_sink_classes={"net_write"})
     assert result2["reached_sinks"] == []
+
+
+def _pwrite_write_sink_func(callee: str = "pwrite"):
+    # dump(fd): read(fd, &buf, 0x40); pwrite(fd, &buf, 0x40, off) -- the tainted
+    # buffer filled by read() is handed to pwrite's DATA arg (arg1), so pwrite's
+    # opt-in file_write sink must fire. Mirrors _fwrite_func but for the pwrite
+    # entry (#603-4). `callee` lets the alias test reuse this exact shape under
+    # the LFS64 symbol spelling (pwrite64) to prove the alias arms the same sink.
+    buf = FVar("buf", typ="char[0x40]")
+    rsi = FVar("rsi"); rdi = FVar("rdi"); rax = FVar("rax"); off = FVar("off")
+    rsi1 = FSSA(rsi, 1); rdi1 = FSSA(rdi, 1); rax2 = FSSA(rax, 2); off1 = FSSA(off, 1)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_SET_VAR_SSA", "rsi#1 = &buf", writes=[rsi1],
+               src=FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "rax#2 = read(rdi#1, rsi#1, 0x40)",
+               reads=[rdi1, rsi1], writes=[rax2],
+               dest=FExpr("MLIL_CONST_PTR", "0x401070", constant=0x401070),
+               params=[FExpr("MLIL_VAR_SSA", "rdi#1", reads=[rdi1]),
+                       FExpr("MLIL_VAR_SSA", "rsi#1", reads=[rsi1]),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+        FInstr(2, 0x18, "MLIL_CALL_SSA", f"{callee}(rdi#1, &buf, 0x40, off#1)",
+               reads=[rdi1, off1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401090", constant=0x401090),
+               params=[FExpr("MLIL_VAR_SSA", "rdi#1", reads=[rdi1]),
+                       FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       FExpr("MLIL_CONST", "0x40", constant=0x40),
+                       FExpr("MLIL_VAR_SSA", "off#1", reads=[off1])]),
+    ]
+    bv = FBV({0x401070: "read", 0x401090: callee})
+    return FFunc("dump", 0x10, FSSAFunc(instrs), params=[FVar("fd")]), bv
+
+
+def test_pwrite_file_write_sink_off_by_default_603(models):
+    # #603-4: pwrite's file_write sink is opt-in, so a tainted-buffer pwrite
+    # fires nothing by default (mirrors test_optional_sink_off_by_default).
+    func, bv = _pwrite_write_sink_func()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:read:1")])
+    assert result["reached_sinks"] == []
+
+
+def test_pwrite_file_write_sink_on_with_class_603(models):
+    # #603-4 (FINDING 1): with --sink-class file_write enabled, a tainted buffer
+    # written via pwrite() arms the file_write sink modeled on the new pwrite
+    # catalog entry. FAILS if the "pwrite" model is removed or typo'd (pwrite
+    # becomes an unmodeled external -> no file_write finding).
+    func, bv = _pwrite_write_sink_func()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:read:1")],
+                            enabled_sink_classes={"file_write"})
+    sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "pwrite"]
+    assert len(sinks) == 1
+    assert sinks[0]["sink"]["class"] == "file_write"
+    assert sinks[0]["sink"]["tainted_arg_index"] == 1
+    # an unrelated opt-in class leaves pwrite silent
+    result2 = engine.forward(func, [te.parse_locator("arg:read:1")],
+                             enabled_sink_classes={"net_write"})
+    assert [s for s in result2["reached_sinks"] if s["sink"]["callee"] == "pwrite"] == []
+
+
+def test_pwrite64_lfs_alias_arms_file_write_sink_603(models):
+    # #603 (FINDING 2): compiled with _FILE_OFFSET_BITS=64 the call goes to the
+    # LFS64 symbol `pwrite64`, not `pwrite`. The 64-bit-offset variant shares
+    # pwrite's semantics, so it must arm the SAME file_write sink -- otherwise a
+    # real x86-64 build silently produces zero findings for this bug class.
+    func, bv = _pwrite_write_sink_func(callee="pwrite64")
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("arg:read:1")],
+                            enabled_sink_classes={"file_write"})
+    # The alias resolves to the base MODEL KEY, so the finding is reported under
+    # `pwrite` (the canonical convention, same as a mangled `_Znwm` reporting
+    # `Znwm`) -- i.e. it arms the identical sink as a bare `pwrite` call. Without
+    # the LFS64 canonicalization pwrite64 would be an unmodeled external and this
+    # file_write finding would NOT exist.
+    sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "pwrite"]
+    assert len(sinks) == 1
+    assert sinks[0]["sink"]["class"] == "file_write"
+    assert sinks[0]["sink"]["tainted_arg_index"] == 1
 
 
 def _recv_sink_func():

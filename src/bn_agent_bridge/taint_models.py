@@ -267,13 +267,40 @@ def _canonical_cxx_alloc(name: str) -> str | None:
     return None
 
 
+def _canonical_lfs64(name: str) -> str | None:
+    """Canonical base-model key for a transitional LFS64 symbol -- the base name
+    plus a ``64`` suffix -- or None when *name* is not such a variant (#603).
+
+    Built with ``-D_FILE_OFFSET_BITS=64`` or ``-D_LARGEFILE64_SOURCE`` (the
+    common default on 64-bit Linux), glibc renames every ``off_t``-taking I/O
+    call to a ``64``-suffixed alias: ``pread`` -> ``pread64``, ``pwrite`` ->
+    ``pwrite64``, ``lseek`` -> ``lseek64``, ``open`` -> ``open64``, and so on.
+    The 64-bit-offset variant is semantically identical to its base -- only the
+    offset width differs -- so it shares the base's taint model. Modeled as a
+    lookup canonicalization (like ``_canonical_cxx_alloc``) rather than
+    duplicating every base model under a ``<name>64`` key. lookup_model only
+    ADOPTS the result when the de-suffixed base is itself a real model key, so a
+    coincidental ``…64`` symbol whose base is unmodeled never spuriously aliases;
+    and it is tried LAST, so a name that carries its own ``…64`` model (e.g. the
+    endian intrinsic ``bswap_64``) keeps that model.
+
+    *name* is expected already stripped of a leading ``_`` (as ``lookup_model``
+    passes it), so the internal ``__pread64`` spelling resolves too.
+    """
+    if len(name) > 2 and name.endswith("64") and not name[-3].isdigit():
+        return name[:-2]
+    return None
+
+
 def lookup_model(models: dict[str, Any], name: str | None) -> tuple[str | None, dict[str, Any] | None]:
     """Match a (possibly decorated) symbol name against the model DB.
 
     Tries the raw name, then the part before ``@`` (``memcpy@plt`` ->
     ``memcpy``), then with leading underscores stripped, then the canonical
     C++ allocator key (so mangled ``_Znam`` and demangled ``operator new[]``
-    both resolve to the ``Znam`` model -- #204).
+    both resolve to the ``Znam`` model -- #204), then the transitional LFS64
+    base key (so ``pwrite64`` / ``pread64`` resolve to ``pwrite`` / ``pread`` --
+    #603).
     """
     if not name:
         return None, None
@@ -287,6 +314,9 @@ def lookup_model(models: dict[str, Any], name: str | None) -> tuple[str | None, 
     alias = _canonical_cxx_alloc(stripped or base)
     if alias and alias not in candidates:
         candidates.append(alias)
+    lfs64 = _canonical_lfs64(stripped or base)
+    if lfs64 and lfs64 not in candidates:
+        candidates.append(lfs64)
     for cand in candidates:
         if cand in models:
             return cand, models[cand]
