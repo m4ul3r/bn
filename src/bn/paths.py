@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import importlib.util
 import os
 import platform
 import re
+import stat
 import sys
 from pathlib import Path
 
@@ -42,6 +44,31 @@ def validate_instance_id(instance_id: str) -> str:
             "'_', '-', and '.' (no path separators, no '.'/'..', no absolute paths)."
         )
     return instance_id
+
+
+def ensure_private_dir(path: Path) -> Path:
+    """Create *path* (and any missing parents) owned-private to this user.
+
+    The leaf directory is created with ``mode=0o700`` and an already-existing
+    directory is tightened to ``0o700`` (compared via ``stat.S_IMODE``). This is
+    the single chokepoint for cache / instances / sessions / spills directory
+    creation (#612): agent artifacts -- decompiled output spills, bridge
+    registries, sticky session pins -- must not land group/world-readable under
+    a permissive ``umask``.
+
+    Mode enforcement is best-effort: platforms that ignore Unix permission bits
+    (e.g. Windows) simply keep whatever the OS grants, and any ``OSError`` from
+    the ``chmod`` (unsupported filesystem, foreign-owned dir) is swallowed so
+    directory setup never fails purely over a mode tweak. The ``mkdir`` itself is
+    NOT swallowed -- a genuine failure (permission denied, race) still raises, as
+    the previous bare ``mkdir(parents=True, exist_ok=True)`` calls did. Returns
+    *path* so call sites can chain (``ensure_private_dir(d) / "file"``).
+    """
+    path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with contextlib.suppress(OSError):
+        if stat.S_IMODE(path.stat().st_mode) != 0o700:
+            os.chmod(path, 0o700)
+    return path
 
 
 def repo_root() -> Path:
@@ -179,9 +206,7 @@ def spill_root() -> Path:
     # Lives under the per-user cache (not a shared /tmp dir) so multi-user
     # hosts don't hit permission collisions or leak decompiled artifacts
     # world-readably. Honors BN_CACHE_DIR via cache_home().
-    root = cache_home() / "spills"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    return ensure_private_dir(cache_home() / "spills")
 
 
 def taint_models_path() -> Path:

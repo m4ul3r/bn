@@ -7,7 +7,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from .paths import project_root, session_state_path, sessions_dir
+from .paths import ensure_private_dir, project_root, session_state_path, sessions_dir
 
 KEYS = ("instance_id", "target")
 
@@ -28,7 +28,7 @@ def update(**fields: Any) -> dict[str, Any]:
     file next to the state file, so concurrent updates (e.g. ``bn instance
     use`` and ``bn target use`` racing in the same project) can't lose writes.
     """
-    sessions_dir().mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(sessions_dir())
     lock_path = session_state_path().with_suffix(".lock")
     with open(lock_path, "w") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
@@ -45,7 +45,10 @@ def update(**fields: Any) -> dict[str, Any]:
 
 def _atomic_write(state: dict[str, Any]) -> None:
     path = session_state_path()
-    sessions_dir().mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(sessions_dir())
+    # tempfile.mkstemp opens with mode 0o600 (never widened by umask, which can
+    # only clear bits), so the sticky-pin file lands owner-only regardless of the
+    # ambient umask; the atomic replace preserves that mode (#612).
     fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=path.parent)
     try:
         with os.fdopen(fd, "w") as fh:

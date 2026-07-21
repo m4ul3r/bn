@@ -17,6 +17,22 @@ import pytest
 from _bridge_fakes import *  # noqa: F401,F403
 
 
+def _same_uid_conn():
+    """Fake accepted-socket whose SO_PEERCRED reports THIS process's uid, so the
+    #612 peer-credential gate in ``handle()`` lets the request through -- the
+    same-process/same-user case every handler test here models. Harmless on the
+    ``_write_response``-only tests that never read it."""
+    import os as _os
+    import struct as _struct
+
+    class _Conn:
+        def getsockopt(self, level, optname, buflen):
+            packed = _struct.pack("3i", _os.getpid(), _os.getuid(), _os.getgid())
+            return packed[:buflen]
+
+    return _Conn()
+
+
 def test_resolve_rename_target_rejects_ambiguous_function_identifier(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -275,6 +291,7 @@ def test_cancel_request_marks_only_active_requests(monkeypatch):
 
 
 def test_py_exec_non_serializable_result_falls_back_to_repr(monkeypatch):
+    monkeypatch.setenv("BN_ALLOW_PY_EXEC", "1")  # #612: py_exec is gated off by default
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV()
@@ -1719,6 +1736,7 @@ def test_bridge_handler_rejects_oversized_request(monkeypatch):
     monkeypatch.setattr(bridge, "MAX_REQUEST_BYTES", 16)
 
     handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.connection = _same_uid_conn()
     handler.rfile = io.BytesIO(b"x" * 64)  # no newline within the cap
     writer = _RecordingWriter()
     handler.wfile = writer
@@ -1737,6 +1755,7 @@ def test_bridge_handler_allows_request_exactly_at_cap_with_newline(monkeypatch):
 
     dispatched = []
     handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.connection = _same_uid_conn()
     handler.rfile = io.BytesIO(line)
     handler.server = types.SimpleNamespace(
         bridge=types.SimpleNamespace(
@@ -1757,6 +1776,7 @@ def test_bridge_handler_rejects_non_dict_json(monkeypatch):
 
     dispatched = []
     handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.connection = _same_uid_conn()
     handler.rfile = io.BytesIO(b"[1, 2, 3]\n")
     handler.server = types.SimpleNamespace(
         bridge=types.SimpleNamespace(dispatch=lambda payload: dispatched.append(payload))
@@ -1988,6 +2008,7 @@ def test_list_ops_return_paged_envelope_with_true_total(monkeypatch):
 
 
 def test_py_exec_reports_script_error_with_type_prefix(monkeypatch):
+    monkeypatch.setenv("BN_ALLOW_PY_EXEC", "1")  # #612: py_exec is gated off by default
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV()
@@ -2002,6 +2023,7 @@ def test_py_exec_reports_script_error_with_type_prefix(monkeypatch):
 
 
 def test_py_exec_systemexit_reported_not_worker_fault(monkeypatch):
+    monkeypatch.setenv("BN_ALLOW_PY_EXEC", "1")  # #612: py_exec is gated off by default
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV()
@@ -2098,6 +2120,7 @@ def test_bridge_handler_serialization_failure_returns_clean_error(monkeypatch):
             raise RuntimeError("dictionary changed size during iteration")
 
     handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.connection = _same_uid_conn()
     handler.rfile = io.BytesIO(b'{"op": "decompile", "id": "req-9"}\n')
     handler.server = types.SimpleNamespace(
         bridge=types.SimpleNamespace(
@@ -2129,6 +2152,7 @@ def test_bridge_handler_retries_transient_serialization_race(monkeypatch):
             return "recovered"
 
     handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.connection = _same_uid_conn()
     handler.rfile = io.BytesIO(b'{"op": "decompile", "id": "req-9"}\n')
     handler.server = types.SimpleNamespace(
         bridge=types.SimpleNamespace(
@@ -2159,6 +2183,7 @@ def test_bridge_handler_serialization_fallback_survives_logging_failure(monkeypa
             raise RuntimeError("dictionary changed size during iteration")
 
     handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.connection = _same_uid_conn()
     handler.rfile = io.BytesIO(b'{"op": "decompile", "id": "req-9"}\n')
     handler.server = types.SimpleNamespace(
         bridge=types.SimpleNamespace(

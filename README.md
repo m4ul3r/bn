@@ -381,6 +381,14 @@ bn batch apply manifest.json
 
 Batch apply verifies the live session by default. If any op fails to apply or fails post-state verification, the entire batch is reverted.
 
+## Security / Trust Boundary
+
+`bn` is built for a **same-user, single-host** trust model: the local agent running as your uid is trusted, and the bridge is **not** a multi-tenant API. Defense in depth is enforced so that boundary is defended, not just assumed:
+
+- **Peer-credential enforcement (Linux).** Every connection to the bridge socket is authenticated with `SO_PEERCRED` before any operation is dispatched; a peer whose uid does not match the bridge's own uid is rejected with an `ok: false` error and never reaches an op. The check is Linux-only (documented platform guarantee), fails closed if peer credentials can't be read, and is on by default. The single documented opt-out is `BN_SOCKET_ALLOW_ANY_UID=1` — set it only when you deliberately accept connections from other uids.
+- **Directory and socket mode enforcement.** The cache tree (`instances/`, `sessions/`, `spills/` under `BN_CACHE_DIR` / `~/.cache/bn`) is created `0o700`, and an already-existing directory is tightened to `0o700`. The bound Unix socket is `chmod`'d to `0o600`, and registry / session-pin / spill artifact files are written `0o600` regardless of your umask, so decompiled output and bridge metadata are never born group/world-readable. **`BN_CACHE_DIR` must point at a private, non-shared directory** — do not place it on a multi-user or networked filesystem.
+- **`py_exec` gate.** `bn py exec` runs arbitrary Python inside the Binary Ninja process with a live `bv` — that is full compromise of the bridge user. It is **disabled by default** and only runs when `BN_ALLOW_PY_EXEC=1` is set in the bridge process's environment; otherwise the bridge returns a clear denial error naming the enabling variable. Enable it only for a trusted single-user session; do not attempt to sandbox it as a substitute (the BN API surface makes in-process sandboxing a false guarantee).
+
 ## Troubleshooting
 
 Check bridge state:

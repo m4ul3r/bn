@@ -8,6 +8,8 @@ import json
 import os
 import socket
 import socketserver
+import struct
+import sys
 import tempfile
 import threading
 import weakref
@@ -48,8 +50,8 @@ from ._shared import (
 )
 from .op_registry import REGISTRY, op
 from .paths import (
-    PLUGIN_NAME, bridge_registry_path, bridge_socket_path, cache_home, instances_dir,
-    marker_name, project_root,
+    PLUGIN_NAME, bridge_registry_path, bridge_socket_path, cache_home, ensure_private_dir,
+    instances_dir, marker_name, project_root,
 )
 from .seam import BridgeContext
 from .version import VERSION, build_id_for_file, build_id_for_package
@@ -103,6 +105,45 @@ def _request_cancelled() -> bool:
         return bool(checker())
     except Exception:
         return False
+
+
+# Opt-out escape hatch for the Linux peer-uid check. The check is ON by default
+# (no env var needed for it to fire); this is only for the rare case where a
+# same-user check is genuinely in the way (documented in the README trust-model
+# section). It does NOT weaken py_exec, which has its own independent gate.
+SOCKET_ALLOW_ANY_UID_ENV = "BN_SOCKET_ALLOW_ANY_UID"
+
+
+def _check_peer_credentials(connection) -> str | None:
+    """Reject a Unix-socket peer whose uid differs from the bridge's own (#612).
+
+    Returns ``None`` when the connection is allowed to proceed to dispatch, or a
+    human-readable error string (which the caller surfaces as an ``ok: false``
+    JSON response) when it must be rejected before any op runs.
+
+    Only enforced on Linux, where ``SO_PEERCRED`` yields the peer's ``(pid, uid,
+    gid)``. On other platforms peercred has a different/absent API, so the check
+    is skipped (documented Linux-first guarantee). Fails closed: if ``SO_PEERCRED``
+    is unavailable or unparseable on Linux, the connection is rejected rather than
+    waved through. The explicit ``BN_SOCKET_ALLOW_ANY_UID=1`` opt-out disables it.
+    """
+    if sys.platform != "linux":
+        return None
+    if os.environ.get(SOCKET_ALLOW_ANY_UID_ENV) == "1":
+        return None
+    try:
+        raw = connection.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+        )
+        _pid, uid, _gid = struct.unpack("3i", raw)
+    except (OSError, struct.error, AttributeError):
+        return "peer credential check failed: SO_PEERCRED unavailable; rejecting connection"
+    if uid != os.getuid():
+        return (
+            f"peer uid mismatch: connection uid {uid} != bridge uid {os.getuid()}; "
+            "rejecting (same-user local access only; set BN_SOCKET_ALLOW_ANY_UID=1 to override)"
+        )
+    return None
 
 
 GO_RENAME_CHUNK_SIZE = 256
@@ -615,6 +656,16 @@ class BridgeHandler(socketserver.StreamRequestHandler):
         return b'{"error": "response serialization failed", "ok": false}'
 
     def handle(self):  # pragma: no cover - exercised from CLI
+        # #612: authenticate the peer BEFORE reading or dispatching anything. A
+        # uid mismatch (another local user connecting to our socket) is refused
+        # with a clean JSON error and dispatch is never reached.
+        peer_error = _check_peer_credentials(self.connection)
+        if peer_error is not None:
+            with contextlib.suppress(Exception):
+                bn.log_warn(f"BN Agent Bridge rejected connection: {peer_error}")
+            encoded = self._encode_response(_json_response(ok=False, error=peer_error))
+            self._write_response(encoded)
+            return
         raw = self.rfile.readline(MAX_REQUEST_BYTES)
         if not raw:
             return
@@ -783,7 +834,7 @@ class BinaryNinjaBridge:
         return True
 
     def start(self):  # pragma: no cover - requires GUI runtime
-        self.socket_path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(self.socket_path.parent)
         if self.socket_path.exists():
             # A stale socket file from a crashed bridge is safe to clear, but a
             # live one belongs to another bridge instance; unlinking it would
@@ -796,6 +847,12 @@ class BinaryNinjaBridge:
             self.socket_path.unlink()
 
         self._server = ThreadedUnixServer(str(self.socket_path), BridgeHandler, self)
+        # #612: tighten the freshly-bound socket to owner-only. Even with the
+        # peercred check this is defense-in-depth (a wrong-uid peer can't even
+        # connect() to a 0o600 socket owned by us). Best-effort: a platform that
+        # ignores Unix modes just keeps whatever bind() produced.
+        with contextlib.suppress(OSError):
+            os.chmod(self.socket_path, 0o600)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
         try:
@@ -885,6 +942,8 @@ class BinaryNinjaBridge:
             existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
             if any(line.strip() == ".bn-*" for line in existing.splitlines()):
                 return
+            # This is the project's .git/info dir, NOT our cache tree: leave its
+            # mode to git/the user, don't force 0o700 via ensure_private_dir.
             exclude.parent.mkdir(parents=True, exist_ok=True)
             sep = "" if (not existing or existing.endswith("\n")) else "\n"
             exclude.write_text(f"{existing}{sep}.bn-*\n", encoding="utf-8")
@@ -920,7 +979,10 @@ class BinaryNinjaBridge:
         payload["binaries"] = binaries
         # Write atomically (temp file + rename) so a concurrent reader never
         # sees a half-written registry and concludes no instance exists.
-        self.registry_path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_dir(self.registry_path.parent)
+        # tempfile.mkstemp opens at mode 0o600 (umask only clears bits, never
+        # adds), so the registry lands owner-only regardless of umask; os.replace
+        # preserves that mode (#612).
         fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=self.registry_path.parent)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -1322,6 +1384,8 @@ class BinaryNinjaBridge:
         def _attempt(dest: str, *, make_parent: bool = False) -> str:
             dp = Path(dest)
             if make_parent:
+                # User-chosen --out destination for a saved .bndb, NOT our cache
+                # tree: honor the caller's permissions, don't force 0o700.
                 dp.parent.mkdir(parents=True, exist_ok=True)
             if not dp.parent.exists():
                 raise RuntimeError(
@@ -3430,8 +3494,7 @@ def start_headless(
         import secrets
         instance_id = secrets.token_hex(4)
 
-    inst_dir = instances_dir()
-    inst_dir.mkdir(parents=True, exist_ok=True)
+    ensure_private_dir(instances_dir())
 
     _bridge = BinaryNinjaBridge(instance_id=instance_id)
     _bridge.start()

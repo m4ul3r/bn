@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from .paths import spill_root
+from .paths import ensure_private_dir, spill_root
 from .transport import BridgeError
 
 
@@ -121,12 +121,28 @@ def _summary(value: Any) -> dict[str, Any]:
 
 def _spill_path(stem: str, suffix: str) -> Path:
     now = datetime.now(timezone.utc)
-    directory = spill_root() / now.strftime("%Y%m%d")
-    directory.mkdir(parents=True, exist_ok=True)
+    # spill_root() is already private (0o700); tighten the per-day subdir too so a
+    # permissive umask can't leave decompiled artifacts group/world-readable (#612).
+    directory = ensure_private_dir(spill_root() / now.strftime("%Y%m%d"))
     # pid + random component: parallel agents spilling in the same second
     # must not clobber each other's artifacts.
     unique = f"{os.getpid()}-{secrets.token_hex(2)}"
     return directory / f"{stem}-{now.strftime('%H%M%S')}-{unique}{suffix}"
+
+
+def _write_private_bytes(path: Path, data: bytes) -> None:
+    """Write *data* to *path* created owner-only (``0o600``) regardless of umask.
+
+    Spill artifacts hold decompiled output from real targets, so they must never
+    be born group/world-readable under a permissive umask -- ``Path.write_bytes``
+    would open at ``0o666 & ~umask``. Opening with an explicit ``0o600`` creation
+    mode (umask can only clear bits, never add them) closes that window without a
+    create-then-chmod race (#612). Spill paths are freshly randomized names, so
+    ``O_CREAT`` always makes a new file and the mode is authoritative.
+    """
+    fd = os.open(path, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
 
 
 def estimate_tokens(encoded: bytes) -> int:
@@ -288,6 +304,10 @@ def write_output_result(
 
     if out_path is not None:
         try:
+            # A user-chosen --out destination, NOT a private cache dir: honor the
+            # caller's own umask/permissions here rather than forcing 0o700 on a
+            # directory they explicitly named (may be shared/intentionally group-
+            # readable). ensure_private_dir is only for our cache/spill tree.
             out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_bytes(encoded)
         except OSError as exc:
@@ -318,7 +338,7 @@ def write_output_result(
     suffix = ".ndjson" if fmt == "ndjson" else ".txt" if fmt == "text" else ".json"
     try:
         spill_path = _spill_path(stem, suffix)
-        spill_path.write_bytes(encoded)
+        _write_private_bytes(spill_path, encoded)
     except OSError as exc:
         # The rendered output is already in memory; losing it over a failed
         # spill write (disk full, permissions) would punish the user twice.
@@ -364,6 +384,8 @@ def write_bytes_result(
     if out_path is None:
         return OutputWriteResult(rendered="")
     try:
+        # User-chosen --out destination (see write_output_result): honor the
+        # caller's permissions, don't force 0o700 as ensure_private_dir would.
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_bytes(data)
     except OSError as exc:
