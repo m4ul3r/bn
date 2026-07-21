@@ -108,11 +108,15 @@ def test_request_registered_first_blocks_shutdown(monkeypatch):
 
 def test_shutdown_latched_first_refuses_new_requests(monkeypatch):
     """F1 half B: once the reaper latches shutdown, a newly arriving request is
-    refused admission -- so it can never start work into a dying process."""
+    refused DISPATCH -- so it can never start work into a dying process. The request
+    is still counted (so its error response is covered) and must be balanced by
+    _leave_request()."""
     _, inst = _instance(monkeypatch)
     inst._last_activity = 100.0
     assert inst._try_idle_shutdown(now=1_000.0, timeout=30.0) is True
-    assert inst._enter_request() is False
+    assert inst._enter_request() is False   # dispatch refused
+    assert inst._inflight == 1              # but counted for its response
+    inst._leave_request()
     assert inst._inflight == 0
 
 
@@ -170,3 +174,15 @@ def test_maybe_start_idle_reaper_armed_by_env(monkeypatch):
     assert t is not None
     assert inst._shutdown_event.wait(2.0) is True
     t.join(timeout=2.0)
+
+
+def test_maybe_start_idle_reaper_raises_on_invalid_env(monkeypatch):
+    """#637 re-review (F5): an invalid BN_IDLE_TIMEOUT must fail loud (not silently
+    disable). start_headless arms the reaper inside its try/finally, so this raise
+    still runs _stop_bridge() cleanup rather than orphaning the started server."""
+    _, inst = _instance(monkeypatch)
+    monkeypatch.setenv("BN_IDLE_TIMEOUT", "not-a-number")
+    with pytest.raises(RuntimeError, match="BN_IDLE_TIMEOUT"):
+        inst._maybe_start_idle_reaper()
+    # No watcher armed, no shutdown latched by a failed parse.
+    assert inst._shutdown_event.is_set() is False

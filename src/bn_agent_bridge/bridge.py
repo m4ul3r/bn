@@ -665,15 +665,25 @@ class BridgeHandler(socketserver.StreamRequestHandler):
             return
         op = None
         request_id = None
-        # Idle-reaper accounting: a request stays "in flight" from admission through
-        # the response write (leave_request runs in the finally, after the write), so
-        # the bridge is never counted idle mid-response. leave_request stays None on
-        # the parse-error paths (they never touch bridge state / never get admitted).
-        entered = False
-        leave_request = None
+        # Idle-reaper accounting: count EVERY non-empty request as in-flight from
+        # here through the response write (leave_request runs in the finally, after
+        # the write), so the bridge is never deemed idle mid-response -- including
+        # for malformed requests, which get an error response but no dispatch. The
+        # getattr fallbacks keep the SimpleNamespace test fakes (and a GUI server
+        # without these methods) working: no bridge -> no accounting.
+        bridge = getattr(getattr(self, "server", None), "bridge", None)
+        enter_request = getattr(bridge, "_enter_request", None)
+        leave_request = getattr(bridge, "_leave_request", None)
+        counted = enter_request is not None
+        admitted = enter_request() if counted else True
         try:
             if len(raw) == MAX_REQUEST_BYTES and not raw.endswith(b"\n"):
                 response = _json_response(ok=False, error="request too large")
+            elif not admitted:
+                # The idle reaper latched shutdown between accept and admission --
+                # refuse cleanly instead of starting work into a process that is
+                # about to exit (#637 review).
+                response = _json_response(ok=False, error="bridge is shutting down")
             else:
                 try:
                     payload = json.loads(raw.decode("utf-8"))
@@ -690,32 +700,21 @@ class BridgeHandler(socketserver.StreamRequestHandler):
                     else:
                         op = payload.get("op")
                         request_id = payload.get("id")
-                        bridge = self.server.bridge
                         begin_request = getattr(bridge, "_begin_request", lambda _request_id: None)
                         end_request = getattr(bridge, "_end_request", lambda _request_id: None)
                         is_cancelled = getattr(
                             bridge, "_is_request_cancelled", lambda _request_id: False,
                         )
-                        enter_request = getattr(bridge, "_enter_request", lambda: True)
-                        leave_request = getattr(bridge, "_leave_request", lambda: None)
-                        if not enter_request():
-                            # The idle reaper latched shutdown between accept and
-                            # admission -- refuse cleanly instead of starting work
-                            # into a process that is about to exit (#637 review).
-                            leave_request = None
-                            response = _json_response(ok=False, error="bridge is shutting down")
-                        else:
-                            entered = True
-                            begin_request(request_id)
-                            try:
-                                with _request_cancel_context(lambda: is_cancelled(request_id)):
-                                    response = bridge.dispatch(payload)
-                            finally:
-                                end_request(request_id)
+                        begin_request(request_id)
+                        try:
+                            with _request_cancel_context(lambda: is_cancelled(request_id)):
+                                response = bridge.dispatch(payload)
+                        finally:
+                            end_request(request_id)
             encoded = self._encode_response(response, op=op, request_id=request_id)
             self._write_response(encoded, op=op, request_id=request_id)
         finally:
-            if entered and leave_request is not None:
+            if counted and leave_request is not None:
                 leave_request()
 
 
@@ -1039,21 +1038,23 @@ class BinaryNinjaBridge:
             self._cancelled_requests.discard(request_id)
 
     def _enter_request(self) -> bool:
-        """Admit a request for idle-reaper accounting. Returns False if the reaper
-        has already latched shutdown -- in which case the caller MUST NOT dispatch,
-        so no work ever starts into a process that is about to exit. Raising
-        _inflight under the same lock the reaper checks makes admission and the
+        """Count a received request as in-flight (for the idle reaper) and report
+        whether real work may be dispatched. ALWAYS increments _inflight -- even for
+        a malformed request or one arriving after shutdown latched -- so every
+        response, error responses included, is covered through its write and every
+        request resets the idle clock. Must ALWAYS be balanced by _leave_request().
+        Returns False when the reaper has already latched shutdown: the caller must
+        not dispatch, but must still write its (refusal) response and leave. Raising
+        _inflight under the same lock the reaper checks makes counting and the
         idle->shutdown decision mutually exclusive (closes the check-then-set race)."""
         with self._request_state_lock:
-            if self._shutting_down:
-                return False
             self._inflight += 1
-            return True
+            return not self._shutting_down
 
     def _leave_request(self) -> None:
-        """Release a request admitted by _enter_request and stamp the idle clock.
-        Called only after the response has been written, so encoding/transmit time
-        counts as activity and a bridge is never deemed idle mid-response."""
+        """Balance a prior _enter_request and stamp the idle clock. Called only after
+        the response has been written, so encoding/transmit time counts as activity
+        and a bridge is never deemed idle mid-response."""
         with self._request_state_lock:
             if self._inflight > 0:
                 self._inflight -= 1

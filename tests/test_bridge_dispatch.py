@@ -2284,6 +2284,48 @@ def test_bridge_handler_serialization_fallback_survives_logging_failure(monkeypa
     assert "serializ" in response["error"].lower()
 
 
+class _InflightProbeWriter:
+    """Records the bridge's _inflight count at the moment the response is written,
+    so a test can prove the request is still counted DURING transmit."""
+
+    def __init__(self, inst):
+        self._inst = inst
+        self.inflight_at_write = None
+        self.data = b""
+
+    def write(self, data):
+        if self.inflight_at_write is None:
+            self.inflight_at_write = self._inst._inflight
+        self.data += data
+
+    def flush(self):
+        pass
+
+
+def test_bridge_handler_invalid_request_is_counted_during_its_write(monkeypatch):
+    """#637 re-review: a malformed request (no valid dict payload, so no dispatch)
+    must STILL be counted in-flight through its error-response write and reset the
+    idle clock -- otherwise the reaper can latch shutdown mid-error-response, and a
+    client streaming invalid requests looks idle. Proven by reading _inflight from
+    inside the write."""
+    bridge = _load_bridge(monkeypatch)
+    inst = bridge.BinaryNinjaBridge()
+    inst._last_activity = 0.0
+
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.rfile = io.BytesIO(b"not json at all\n")  # never becomes a dict -> no dispatch
+    handler.server = types.SimpleNamespace(bridge=inst)
+    handler.wfile = _InflightProbeWriter(inst)
+
+    handler.handle()
+
+    assert handler.wfile.inflight_at_write == 1, "invalid request not counted during its write"
+    assert inst._inflight == 0                      # balanced afterward
+    assert inst._last_activity > 0.0                # invalid traffic still counts as activity
+    resp = json.loads(handler.wfile.data.decode("utf-8"))
+    assert resp["ok"] is False
+
+
 def test_bridge_handler_counts_request_inflight_until_response_written(monkeypatch):
     """#637 review (F2): the idle reaper's in-flight counter must stay raised across
     dispatch AND response encode/write, and the idle clock is stamped only after the
