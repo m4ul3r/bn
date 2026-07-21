@@ -128,6 +128,7 @@ def test_list_instances_prunes_stale_registry_and_socket(tmp_path, monkeypatch):
     try:
         assert stale_socket_path.exists()
 
+        monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
         instances = list_instances()
 
         assert instances == []
@@ -188,6 +189,7 @@ def test_purge_keeps_log_sibling_for_diagnostics(tmp_path, monkeypatch):
         encoding="utf-8",
     )
 
+    monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
     instances = list_instances()
 
     assert instances == []
@@ -240,6 +242,10 @@ def test_gc_instances_removes_dead_logs_and_orphans_keeps_live(tmp_path, monkeyp
     spawn_lock = inst_dir / ".spawn.lock"
     spawn_lock.write_text("", encoding="utf-8")
 
+    # dead.json uses os.getpid() as a stand-in pid (there's no real dead pid
+    # to point at); mock liveness so the "dead" instance is actually treated
+    # as dead rather than "live but slow" (#587).
+    monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
     try:
         result = gc_instances()
     finally:
@@ -259,6 +265,53 @@ def test_gc_instances_removes_dead_logs_and_orphans_keeps_live(tmp_path, monkeyp
     assert result["registries_purged"] == 1          # dead.json
     assert result["logs_removed"] == 2               # dead.log + longgone.log
     assert result["sockets_removed"] == 1            # longgone.sock (dead.sock swept by liveness)
+
+
+def test_load_instance_keeps_live_but_slow_process(tmp_path, monkeypatch):
+    # #587: a live process whose socket happens to be unresponsive right now
+    # (e.g. wedged under a write lock) must NOT be purged -- only genuinely
+    # dead processes should lose their registry/socket files.
+    from bn.transport import _load_instance
+
+    reg_path = tmp_path / "slow.json"
+    sock_path = tmp_path / "slow.sock"
+    sock_path.write_text("", encoding="utf-8")
+    reg_path.write_text(json.dumps({
+        "pid": os.getpid(), "socket_path": str(sock_path), "instance_id": "slow",
+        "plugin_name": "bn_agent_bridge", "plugin_version": "0",
+    }), encoding="utf-8")
+
+    monkeypatch.setattr("bn.transport._socket_is_live", lambda path, timeout=0.2: False)
+    monkeypatch.setattr("bn.transport._process_alive", lambda pid: True)
+
+    result = _load_instance(reg_path)
+
+    assert result is None
+    assert reg_path.exists()
+    assert sock_path.exists()
+
+
+def test_load_instance_purges_dead_process(tmp_path, monkeypatch):
+    # Regression control: when the process is genuinely dead, existing purge
+    # behavior is unchanged -- both files still get removed.
+    from bn.transport import _load_instance
+
+    reg_path = tmp_path / "dead.json"
+    sock_path = tmp_path / "dead.sock"
+    sock_path.write_text("", encoding="utf-8")
+    reg_path.write_text(json.dumps({
+        "pid": 999999, "socket_path": str(sock_path), "instance_id": "dead",
+        "plugin_name": "bn_agent_bridge", "plugin_version": "0",
+    }), encoding="utf-8")
+
+    monkeypatch.setattr("bn.transport._socket_is_live", lambda path, timeout=0.2: False)
+    monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
+
+    result = _load_instance(reg_path)
+
+    assert result is None
+    assert not reg_path.exists()
+    assert not sock_path.exists()
 
 
 def test_gc_instances_on_empty_or_missing_dir_is_noop(tmp_path, monkeypatch):
@@ -1020,6 +1073,7 @@ def test_list_instances_prunes_stale_in_instances_dir(tmp_path, monkeypatch):
     )
 
     try:
+        monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
         instances = list_instances()
         assert not any(inst.instance_id == "deadbeef" for inst in instances)
         assert not registry_path.exists()

@@ -224,6 +224,12 @@ def _load_instance(path: Path) -> BridgeInstance | None:
         return None
 
     if not _socket_is_live(socket_path):
+        if _process_alive(pid):
+            # The owning process is still alive -- the socket is merely slow
+            # or wedged right now (e.g. stuck under a write lock), not dead.
+            # Leave the registry/socket in place so a subsequent probe can
+            # still find it; only purge instances that are actually gone.
+            return None
         _purge_stale_registry(path, socket_path)
         return None
 
