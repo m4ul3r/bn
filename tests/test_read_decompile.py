@@ -721,6 +721,60 @@ def test_decompile_force_analysis_no_data_warning_for_init_array_initializer(mon
     assert not any("data region" in w.lower() for w in result["warnings"])
 
 
+def test_function_list_defers_display_projection_to_the_returned_page(monkeypatch):
+    # Perf: display_name (a per-function symbol lookup) and size must be computed
+    # ONLY for the returned page, not the whole filtered set -- the same rule #411
+    # applied to basic_block_count. Otherwise a `function list --limit 1` over a
+    # 24k-function binary pays a full-set projection to return one row. We assert
+    # the projection helpers fire exactly `returned` times, and the page still
+    # carries all three display fields.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    funcs = [_FakeFunction(0x401000 + i * 0x1000, f"sub_{i}", total_bytes=16 * (i + 1))
+             for i in range(20)]
+    bv = _FakeBV(functions=funcs)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    disp_calls = {"n": 0}
+    size_calls = {"n": 0}
+    real_disp = bridge.il_format._display_name
+    real_size = bridge.il_format._function_size
+    monkeypatch.setattr(bridge.il_format, "_display_name",
+                        lambda fn: (disp_calls.__setitem__("n", disp_calls["n"] + 1), real_disp(fn))[1])
+    monkeypatch.setattr(bridge.il_format, "_function_size",
+                        lambda fn: (size_calls.__setitem__("n", size_calls["n"] + 1), real_size(fn))[1])
+
+    result = instance._list_functions("active", limit=3)
+
+    assert result["returned"] == 3 and result["total"] == 20
+    # display_name + size projected for the 3 returned rows only, not all 20.
+    assert disp_calls["n"] == 3
+    assert size_calls["n"] == 3
+    for it in result["items"]:
+        assert "display_name" in it and "size" in it and "basic_block_count" in it
+        assert "_fn" not in it
+
+
+def test_function_list_sort_by_size_still_ranks_the_full_set(monkeypatch):
+    # `--sort size` needs size for the WHOLE set to rank it, so the deferral must
+    # not break size ordering: the biggest function must lead regardless of which
+    # page it lands on. (Deferral is keyed on the sort mode for exactly this.)
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    small = _FakeFunction(0x401000, "small_fn", total_bytes=16)
+    huge = _FakeFunction(0x402000, "huge_fn", total_bytes=65536)
+    mid = _FakeFunction(0x403000, "mid_fn", total_bytes=4096)
+    bv = _FakeBV(functions=[small, huge, mid])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._list_functions("active", sort="size", limit=1)
+
+    # natural size sort is largest-first, and it survives paging to one row.
+    assert result["returned"] == 1
+    assert result["items"][0]["address"] == "0x402000"
+    assert result["items"][0]["size"] == 65536
+
+
 def test_list_functions_is_sorted_by_address(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

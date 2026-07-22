@@ -349,38 +349,66 @@ def _list_functions(
         # kept for back-compat.
         return {"kind": "functions", "count": len(functions), "total": len(functions),
                 **_analysis_state_fields(bv)}
+    # #411 established that per-page display projection (basic_block_count) must
+    # not be computed for the whole filtered set. display_name (a per-function
+    # symbol lookup) and size follow the same rule: neither is needed to build
+    # the full set here -- display_name is never a sort key, and size is only
+    # needed full-set for `--sort size`. Deferring them to the returned page
+    # (via _project_page_fields) is the difference between a `function list
+    # --limit 100` that demangles + sizes 100 functions and one that pays it for
+    # all 24k. `_fn` carries the live Function to the page projection, then drops.
+    include_size = sort == "size"  # sorting the FULL set by size needs it per-row
     items = [
         {
             "name": fn.name,
             "address": hex(fn.start),
             "raw_name": getattr(fn, "raw_name", fn.name),
-            "display_name": il_format._display_name(fn),
-            "size": il_format._function_size(fn),
-            "_fn": fn,   # transient: enrich the returned page only (perf), then drop
+            **({"size": il_format._function_size(fn)} if include_size else {}),
+            "_fn": fn,   # transient: page projection reads this, then drops it
         }
         for fn in functions
     ]
     _sort_function_items(items, sort, reverse)
     result = _paged_function_result(ctx, items, offset=offset, limit=limit)
     result.update(_analysis_state_fields(bv))
-    return _enrich_page_with_basic_block_count(result)
+    return _project_page_fields(result)
 
 
-def _enrich_page_with_basic_block_count(result: dict[str, Any]) -> dict[str, Any]:
-    """#411: `size` is a raw address span -- agents misread it as code complexity.
-    Add a real triage metric (basic_block_count) to each returned row, computed
-    ONLY for the page (the transient `_fn` is dropped) so a 24k-function list/
-    search doesn't pay it for every filtered function. Shared by both the
-    `function list` and `function search` triage paths so each carries the metric.
+def _project_page_fields(result: dict[str, Any]) -> dict[str, Any]:
+    """Compute the per-row DISPLAY projections for the returned page ONLY, then
+    drop the transient `_fn`.
+
+    #411 first moved basic_block_count here so a 24k-function list didn't
+    materialize block lists for every filtered function. display_name (a
+    per-function symbol/short_name lookup) and size (a `total_bytes`/basic-block
+    read) are the same shape of cost and are moved here too: `_list_functions`
+    no longer computes them for the whole filtered set, so a bounded page no
+    longer pays a full-set projection (measured ~540ms -> ~70ms for a 100-row
+    page on a ~6.5k-function target). Callers that genuinely need a field for
+    the FULL set -- `function search` matches on display_name, and both paths
+    sort/filter on size -- set it on the item before paging; those values are
+    preserved here (this only fills what the page is missing), so no field is
+    computed twice.
     """
     for it in result.get("items", []):
         fn = it.pop("_fn", None)
+        if fn is None:
+            # No live Function retained (defensive): keep the row well-formed
+            # with the same keys every consumer expects.
+            it.setdefault("display_name", it.get("name", ""))
+            it.setdefault("size", None)
+            it.setdefault("basic_block_count", None)
+            continue
+        if "display_name" not in it:
+            it["display_name"] = il_format._display_name(fn)
+        if "size" not in it:
+            it["size"] = il_format._function_size(fn)
         # BN's Function exposes no basic_block_count attribute -- len(basic_blocks)
         # is the count (materializes the block list, but only for the returned page).
         # Guard the access (mirrors il_format._function_size): one problematic
         # function on the page must not fail the whole list/search request (#411).
         try:
-            bbs = getattr(fn, "basic_blocks", None) if fn is not None else None
+            bbs = getattr(fn, "basic_blocks", None)
             it["basic_block_count"] = len(bbs) if bbs is not None else None
         except Exception:
             it["basic_block_count"] = None
@@ -495,4 +523,4 @@ def _search_functions(
     _sort_function_items(items, sort, reverse)
     result = _paged_function_result(ctx, items, offset=offset, limit=limit)
     result.update(_analysis_state_fields(bv))
-    return _enrich_page_with_basic_block_count(result)
+    return _project_page_fields(result)
