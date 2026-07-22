@@ -7,8 +7,9 @@ Covers the four independently-valuable defenses added in #612:
 * The bound Unix socket is chmod'd to 0o600.
 * ``_check_peer_credentials`` rejects a foreign-uid peer (Linux SO_PEERCRED)
   before any op dispatch.
-* ``py_exec`` is gated behind ``BN_ALLOW_PY_EXEC=1`` and never calls ``exec()``
-  when the gate is unset.
+
+``py_exec`` runs arbitrary code unconditionally -- the socket's owner-only
+trust boundary (peercred + 0o600 / 0o700) is the only gate.
 
 No real BN, no dogfood binaries: all fakes + tmp paths.
 """
@@ -313,42 +314,13 @@ def test_handle_allows_same_uid_peer_to_dispatch(monkeypatch):
 
 
 # --------------------------------------------------------------------------
-# py_exec gate
+# py_exec runs unconditionally (no env gate)
 # --------------------------------------------------------------------------
 
-def test_py_exec_denied_when_env_unset_never_calls_exec(monkeypatch):
-    import builtins
-
+def test_py_exec_runs_regardless_of_env(monkeypatch):
+    # There is no BN_ALLOW_PY_EXEC gate: whoever reaches the owner-only socket
+    # (peercred + 0o600 socket / 0o700 dir) is trusted to run arbitrary code.
     monkeypatch.delenv("BN_ALLOW_PY_EXEC", raising=False)
-    bridge = _load_bridge(monkeypatch)
-    instance = bridge.BinaryNinjaBridge()
-
-    # Spy on the arbitrary-code path and the view resolution: if the gate leaks,
-    # one of these fires. create_comments._py_exec calls the builtin exec()
-    # directly, so patching builtins.exec intercepts it.
-    exec_calls = []
-    real_exec = builtins.exec
-
-    def _spy_exec(*a, **k):
-        exec_calls.append(a)
-        return real_exec(*a, **k)
-
-    monkeypatch.setattr(builtins, "exec", _spy_exec)
-
-    resolved = []
-    monkeypatch.setattr(
-        instance.ctx, "_resolve_view", lambda selector: resolved.append(selector)
-    )
-
-    with pytest.raises(RuntimeError, match="BN_ALLOW_PY_EXEC"):
-        instance._py_exec("active", "result = 1 + 1")
-
-    assert exec_calls == []
-    assert resolved == []
-
-
-def test_py_exec_runs_when_env_set(monkeypatch):
-    monkeypatch.setenv("BN_ALLOW_PY_EXEC", "1")
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV()

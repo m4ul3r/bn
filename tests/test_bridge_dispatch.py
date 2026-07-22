@@ -291,7 +291,6 @@ def test_cancel_request_marks_only_active_requests(monkeypatch):
 
 
 def test_py_exec_non_serializable_result_falls_back_to_repr(monkeypatch):
-    monkeypatch.setenv("BN_ALLOW_PY_EXEC", "1")  # #612: py_exec is gated off by default
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV()
@@ -2119,7 +2118,6 @@ def test_list_ops_return_paged_envelope_with_true_total(monkeypatch):
 
 
 def test_py_exec_reports_script_error_with_type_prefix(monkeypatch):
-    monkeypatch.setenv("BN_ALLOW_PY_EXEC", "1")  # #612: py_exec is gated off by default
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV()
@@ -2134,7 +2132,6 @@ def test_py_exec_reports_script_error_with_type_prefix(monkeypatch):
 
 
 def test_py_exec_systemexit_reported_not_worker_fault(monkeypatch):
-    monkeypatch.setenv("BN_ALLOW_PY_EXEC", "1")  # #612: py_exec is gated off by default
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV()

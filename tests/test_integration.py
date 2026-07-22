@@ -42,13 +42,7 @@ _BN_CLI = [str(Path(sys.executable).parent / "bn")]
 # of os.environ would predate every fixture -- so the subprocesses these helpers
 # spawn would read the developer's real ~/.cache/bn instead of the isolated one.
 def _env() -> dict[str, str]:
-    # BN_ALLOW_PY_EXEC=1: the real-BN lane auto-spawns a headless bridge that
-    # inherits this env, and several regression probes here drive the target via
-    # `bn py exec` (e.g. #360's auto-skipped-address create). py_exec is gated
-    # OFF by default (#612), so without this the bridge would deny the probe, the
-    # 'ADDR=' line would be absent, and the test would silently degrade to a
-    # misleadingly-reasoned pytest.skip instead of exercising the regression.
-    return {**os.environ, "BN_NO_MARKERS": "1", "BN_ALLOW_PY_EXEC": "1"}
+    return {**os.environ, "BN_NO_MARKERS": "1"}
 
 
 def _bn(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
