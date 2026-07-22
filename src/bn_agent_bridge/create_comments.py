@@ -30,7 +30,6 @@ from __future__ import annotations
 
 import contextlib
 import io
-import os
 from typing import Any
 
 try:
@@ -404,26 +403,10 @@ def _normalize_py_result(ctx, value: Any) -> tuple[Any, list[str]]:
 
 
 # py_exec runs arbitrary Python inside the BN process with a live `bv` -- full
-# in-process code execution, i.e. complete compromise of the bridge user. It is
-# gated OFF by default and only enabled when this env var is exactly "1" in the
-# BRIDGE process environment (#612). The denial error names the enabling
-# mechanism so the CLI surfaces an actionable message instead of a bare failure.
-PY_EXEC_ALLOW_ENV = "BN_ALLOW_PY_EXEC"
-
-
-def _py_exec_allowed() -> bool:
-    return os.environ.get(PY_EXEC_ALLOW_ENV) == "1"
-
-
+# in-process code execution, i.e. complete compromise of the bridge user. It runs
+# unconditionally: the bridge trusts whoever can reach its owner-only socket
+# (peercred + 0o600 socket / 0o700 dir) to run arbitrary code as themselves.
 def _py_exec(ctx, selector: str | None, script: str):
-    if not _py_exec_allowed():
-        # Refuse BEFORE resolving the view or touching exec(): no BN state is
-        # read and the arbitrary-code path is never reached when disabled.
-        raise RuntimeError(
-            "py_exec is disabled: arbitrary in-process Python execution is off by "
-            f"default. Set {PY_EXEC_ALLOW_ENV}=1 in the bridge process environment "
-            "to enable it (full process compromise -- same-user local trust only)."
-        )
     bv = ctx._resolve_view(selector)
     stdout = io.StringIO()
     scope = {
