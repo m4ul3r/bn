@@ -2733,3 +2733,42 @@ def test_write_project_marker_readonly_dir_is_a_note_not_error(monkeypatch, tmp_
         assert note is None or "marker" in note
     finally:
         ro.chmod(0o700)
+
+
+def test_lens_read_ops_are_read_locked_and_py_exec_stays_write_locked(monkeypatch):
+    # The three py_exec programs bn-lens ran (CFG, data window, data symbols)
+    # are promoted to first-class READ ops precisely so they stop taking the
+    # exclusive writer lock; py_exec itself must remain write-locked because
+    # arbitrary python can mutate the view.
+    bridge = _load_bridge(monkeypatch)
+    for op_name in ("cfg", "data_vars", "data_symbols"):
+        assert op_name in bridge.READ_LOCKED_OPS
+        assert op_name not in bridge.WRITE_LOCKED_OPS
+    assert "py_exec" in bridge.WRITE_LOCKED_OPS
+
+
+def test_dispatch_routes_lens_read_ops(monkeypatch):
+    # End-to-end binder wiring: each promoted op is reachable through dispatch,
+    # not just as an instance method.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "handle_request", "int32_t handle_request()")
+    fn.basic_blocks = [_FakeCFGBlock(0x401000, lines=[_FakeCFGLine(0x401000, "ret")])]
+    fake_bn = sys.modules["binaryninja"]
+    bv = _FakeBV(
+        functions=[fn],
+        data_vars={0x2000: _FakeDataVariable(0x2000, _FakeType("int32_t", width=4))},
+        symbols=[fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x2000, "g_counter")],
+        memory={0x2000: b"\x07\x00\x00\x00"},
+        arch=_FakeArch(name="x86", address_size=4),
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    cfg = instance._dispatch_on_main("cfg", {"identifier": "handle_request", "view": "asm"}, None)
+    assert cfg["blocks"][0]["start"] == "0x401000"
+
+    window = instance._dispatch_on_main("data_vars", {"start": "0x2000", "end": "0x2100"}, None)
+    assert [r["a"] for r in window["vars"]] == ["0x2000"]
+
+    syms = instance._dispatch_on_main("data_symbols", {}, None)
+    assert syms["syms"] == [{"a": "0x2000", "n": "g_counter"}]

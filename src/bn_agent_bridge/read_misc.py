@@ -707,6 +707,108 @@ def _sections(ctx, selector: str | None, *, query: str | None = None,
     return result
 
 
+_DATA_VARS_DEFAULT_LIMIT = 400
+
+
+def _data_var_row(bv, dv, psz: int, mask: int) -> dict[str, Any]:
+    """One typed data variable as a compact row: `a`ddress, symbol `n`ame,
+    `t`ype, `w`idth, plus a decoded scalar `v`alue or -- for a single
+    pointer-sized pointer -- the target `p` (with `ps` symbol or `pstr` ASCII
+    preview) and the containing `sec`tion."""
+    addr = int(dv.address)
+    type_ = dv.type
+    try:
+        width = int(type_.width)
+    except Exception:
+        width = 0
+    sym = bv.get_symbol_at(addr)
+    type_text = str(type_)
+    row: dict[str, Any] = {
+        "a": hex(addr),
+        "n": sym.name if sym else "",
+        "t": type_text,
+        "w": width,
+    }
+    secs = bv.get_sections_at(addr)
+    if secs:
+        row["sec"] = secs[0].name
+    try:
+        # Only a pointer-*sized* pointer type is a single pointer. An array of
+        # pointers (e.g. `void* [8]`, width = 8*psz) also contains '*' but must
+        # NOT collapse to its first element -- leave it undecorated so the
+        # renderer shows the whole array as bytes instead of hiding elements.
+        if "*" in type_text and width == psz:
+            target = bv.read_int(addr, psz) & mask
+            row["p"] = hex(target)
+            tsym = bv.get_symbol_at(target)
+            if tsym:
+                row["ps"] = tsym.name
+            else:
+                preview = bv.get_ascii_string_at(target, 2)
+                if preview:
+                    row["pstr"] = preview.value[:48]
+        elif "*" not in type_text and 0 < width <= 8:
+            row["v"] = bv.read_int(addr, width)
+    except Exception:
+        pass  # unmapped slot: the row still lists the var, just undecorated
+    return row
+
+
+def _data_vars(ctx, selector: str | None, *, start, end, limit=None):
+    """Typed data variables in the half-open address window [start, end).
+
+    Seeks the window via ``get_next_data_var_after`` instead of scanning every
+    data var in the view (the py_exec predecessor was O(all data vars) per
+    call), and reports an honest ``has_more`` when the row cap truncated the
+    window -- page by re-issuing with ``start`` = last row's address + 1.
+    """
+    limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
+    if limit is None:
+        limit = _DATA_VARS_DEFAULT_LIMIT
+    bv = ctx._resolve_view(selector)
+    lo = _parse_address(start)
+    hi = _parse_address(end)
+    if hi <= lo:
+        raise OperationFailure(
+            "invalid_request",
+            f"empty window: end ({hex(hi)}) must be greater than start ({hex(lo)})",
+        )
+    psz = int(bv.address_size)
+    mask = (1 << (psz * 8)) - 1
+    if lo > 0:
+        dv = bv.get_next_data_var_after(lo - 1)
+    else:
+        dv = bv.get_data_var_at(0)
+        if dv is None:
+            dv = bv.get_next_data_var_after(0)
+    rows: list[dict[str, Any]] = []
+    has_more = False
+    while dv is not None and int(dv.address) < hi:
+        if len(rows) >= limit:
+            has_more = True
+            break
+        rows.append(_data_var_row(bv, dv, psz, mask))
+        dv = bv.get_next_data_var_after(int(dv.address))
+    return {"kind": "data_vars", "vars": rows, "has_more": has_more}
+
+
+def _data_symbols(ctx, selector: str | None):
+    """Every *named* DataSymbol as address + name -- includes internal symbols
+    the exports list omits, so a renamed data global stays addressable."""
+    bv = ctx._resolve_view(selector)
+    sym_type = getattr(bn, "SymbolType", None) and getattr(bn.SymbolType, "DataSymbol", None)
+    try:
+        symbols = bv.get_symbols_of_type(sym_type) if sym_type is not None else []
+    except Exception:
+        symbols = []
+    syms = [
+        {"a": hex(int(sym.address)), "n": sym.name}
+        for sym in symbols
+        if getattr(sym, "name", "")
+    ]
+    return {"kind": "data_symbols", "syms": syms}
+
+
 def _ascii_render(data: bytes) -> str:
     return "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in data)
 

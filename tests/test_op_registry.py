@@ -19,6 +19,9 @@ EXPECTED_READ = {
     "strings", "imports", "list_exports", "bundle_function", "get_comment", "list_comments",
     "sections", "read", "class_list", "class_show", "go_functions", "orient_digest",
     "list_tag_types", "get_tags", "list_tags",
+    # The three read-only py_exec programs bn-lens ran, promoted to
+    # first-class read ops so they stop taking the exclusive writer lock.
+    "cfg", "data_vars", "data_symbols",
 }
 EXPECTED_WRITE = {
     "py_exec", "function_create", "rename_symbol", "set_comment", "delete_comment",

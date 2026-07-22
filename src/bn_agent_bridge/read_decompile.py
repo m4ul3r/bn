@@ -300,6 +300,63 @@ def _il(ctx, selector: str | None, identifier, view: str, ssa: bool):
     return result
 
 
+_CFG_VIEWS = ("asm", "mlil", "hlil")
+
+
+def _cfg(ctx, selector: str | None, identifier, *, view: str = "asm"):
+    """Basic-block CFG of one function: blocks with rendered lines and outgoing
+    edges, at the asm, MLIL, or HLIL level.
+
+    Block identity contract (what bn-lens keys on): at IL levels `start` and
+    edge `to` are IL instruction INDEXES (hex), because first-line addresses
+    collide when one assembly instruction expands into several IL blocks; at
+    the asm level `start` is the block's start address. Each rendered line
+    keeps a real address in `a` at every level.
+    """
+    level = str(view or "asm").lower()
+    if level not in _CFG_VIEWS:
+        raise OperationFailure(
+            "invalid_request",
+            f"unknown cfg view {view!r}; expected one of: {', '.join(_CFG_VIEWS)}",
+        )
+    bv = ctx._resolve_view(selector)
+    func = ctx._find_function(bv, identifier, contained=True)
+    warnings: list[str] = []
+    fn = func
+    if level != "asm":
+        try:
+            fn = func.mlil if level == "mlil" else func.hlil
+        except Exception:
+            fn = None
+        if fn is None:
+            warnings.append(
+                f"{level} is not available for this function (analysis skipped or IL "
+                "not materialized); returning an empty CFG"
+            )
+    blocks = []
+    if fn is not None:
+        for bb in fn.basic_blocks:
+            insns = [
+                {"a": hex(line.address), "t": "".join(str(t) for t in line.tokens)}
+                for line in bb.disassembly_text
+            ]
+            edges = [
+                {"to": hex(edge.target.start), "k": edge.type.name}
+                for edge in bb.outgoing_edges
+                if edge.target is not None
+            ]
+            blocks.append({"start": hex(bb.start), "insns": insns, "edges": edges})
+    result = {
+        "kind": "cfg",
+        "function": {"name": func.name, "address": hex(func.start)},
+        "view": level,
+        "blocks": blocks,
+        "warnings": warnings,
+    }
+    _annotate_containment(ctx, result, identifier, func)
+    return result
+
+
 def _disasm(ctx, selector: str | None, identifier, linear=None, mode=None,
             snap_to_instruction: bool = False):
     bv = ctx._resolve_view(selector)

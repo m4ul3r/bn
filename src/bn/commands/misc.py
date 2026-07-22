@@ -6,9 +6,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ..cli import _call, _effective_limit, _int_or_hex, _mutate, _mutation_exit_code, _non_negative_int, _pick, arg, command, mutex, mutation_output_args, preview_arg
+from ..cli import (_call, _effective_limit, _int_or_hex, _mutate, _mutation_exit_code,
+                   _non_negative_int, _pick, _positive_int, arg, command, mutex,
+                   mutation_output_args, preview_arg)
 from ..formatters import (
     _mutation_summary,
+    _render_data_symbols_text,
+    _render_data_vars_text,
     _render_function_bundle_text,
     _render_go_functions_text,
     _render_go_functions_summary_text,
@@ -212,6 +216,51 @@ def _sections(args: argparse.Namespace) -> int:
         page_label="sections",
         paged_spill=True,
         stem="sections",
+    )
+
+
+@command("data", "vars",
+         help="Typed data variables in the half-open address window [start, end)",
+         target=True,
+         prefer_when="you want BN's typed view of a data region (widths, decoded values, "
+                     "pointer targets), not raw bytes; `read` gives the raw bytes",
+         see_also=("read", "sections", "data symbols"),
+         args=[
+             arg("--start", required=True,
+                 help="Window start address, inclusive (hex 0x.. or decimal)"),
+             arg("--end", required=True,
+                 help="Window end address, exclusive (hex 0x.. or decimal)"),
+             arg("--limit", type=_positive_int, default=None, metavar="N",
+                 help="Maximum rows to return (default 400); when truncated the result "
+                      "sets has_more and text mode prints a --start resume hint"),
+         ])
+def _data_vars(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "data_vars",
+        {"start": args.start, "end": args.end, "limit": args.limit},
+        require_target=True,
+        text_renderer=_render_data_vars_text,
+        stem="data-vars",
+    )
+
+
+@command("data", "symbols",
+         help="List every named data symbol (address + name), including internal ones "
+              "the exports list omits",
+         target=True,
+         prefer_when="you need addressable data globals (including renamed/internal ones); "
+                     "`exports` only shows the public surface",
+         see_also=("exports", "data vars"),
+         args=[])
+def _data_symbols(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "data_symbols",
+        {},
+        require_target=True,
+        text_renderer=_render_data_symbols_text,
+        stem="data-symbols",
     )
 
 

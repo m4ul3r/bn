@@ -1204,3 +1204,165 @@ def test_sections_wx_verdict_is_query_independent_461(monkeypatch):
     nomatch = instance._sections(None, query="zzznomatch")
     assert nomatch["items"] == []
     assert nomatch["wx_verdict"] == "wx_sections_present"
+
+
+# --- data_vars: windowed typed-data read op (promoted out of py_exec) --------
+
+
+def _data_window_bv():
+    ptr_t = _FakeType("char*", width=4)
+    arr_t = _FakeType("void* [4]", width=16)      # pointer ARRAY: must not collapse
+    int_t = _FakeType("int32_t", width=4)
+    big_t = _FakeType("struct config", width=64)  # too wide for a scalar value
+    bv = _FakeBV(
+        arch=_FakeArch(name="x86", address_size=4),
+        data_vars={
+            0x1000: _FakeDataVariable(0x1000, int_t),     # before window
+            0x2000: _FakeDataVariable(0x2000, int_t),     # == lo: included
+            0x2004: _FakeDataVariable(0x2004, ptr_t),     # -> named symbol
+            0x2008: _FakeDataVariable(0x2008, ptr_t),     # -> ascii string
+            0x2010: _FakeDataVariable(0x2010, arr_t),
+            0x2020: _FakeDataVariable(0x2020, big_t),
+            0x3000: _FakeDataVariable(0x3000, int_t),     # == hi: excluded
+        },
+        symbols=[
+            types.SimpleNamespace(address=0x2004, name="g_handler"),
+            types.SimpleNamespace(address=0x5000, name="on_message"),
+        ],
+        sections={".data": _FakeSection(".data", 0x2000, 0x2800)},
+        memory={
+            0x2000: (b"\x2a\x00\x00\x00"          # 0x2000: value 42
+                     b"\x00\x50\x00\x00"          # 0x2004: -> 0x5000 (on_message)
+                     b"\x00\x60\x00\x00"),        # 0x2008: -> 0x6000 ("hello")
+            0x6000: b"hello\x00",
+        },
+    )
+    return bv
+
+
+def test_data_vars_window_rows_carry_typed_fields(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _data_window_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._data_vars(None, start="0x2000", end="0x3000")
+
+    assert result["kind"] == "data_vars"
+    assert result["has_more"] is False
+    rows = {row["a"]: row for row in result["vars"]}
+    # Half-open window: 0x1000 (before) and 0x3000 (== end) excluded, lo included.
+    assert sorted(rows) == ["0x2000", "0x2004", "0x2008", "0x2010", "0x2020"]
+
+    scalar = rows["0x2000"]
+    assert scalar["t"] == "int32_t" and scalar["w"] == 4 and scalar["v"] == 42
+    assert scalar["sec"] == ".data"
+
+    to_sym = rows["0x2004"]
+    assert to_sym["n"] == "g_handler"
+    assert to_sym["p"] == "0x5000" and to_sym["ps"] == "on_message"
+
+    to_str = rows["0x2008"]
+    assert to_str["p"] == "0x6000" and to_str["pstr"] == "hello"
+    assert "ps" not in to_str
+
+    # A pointer ARRAY contains '*' but is wider than one pointer: it must keep
+    # all elements visible (no p/ps/v collapse to the first slot).
+    arr = rows["0x2010"]
+    assert arr["w"] == 16 and "p" not in arr and "v" not in arr
+
+    wide = rows["0x2020"]
+    assert "v" not in wide
+
+
+def test_data_vars_seeks_window_instead_of_scanning_all_vars(monkeypatch):
+    # The py_exec predecessor iterated sorted(bv.data_vars) across the WHOLE
+    # view; the op must seek via get_next_data_var_after and never visit
+    # addresses at/after the window end.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _data_window_bv()
+    visited = []
+    original = bv.get_next_data_var_after
+
+    def _tracked(address):
+        visited.append(int(address))
+        return original(address)
+
+    monkeypatch.setattr(bv, "get_next_data_var_after", _tracked)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    instance._data_vars(None, start="0x2000", end="0x3000")
+
+    assert visited, "op did not use the seek API at all"
+    assert min(visited) >= 0x2000 - 1, "seek started before the window"
+    assert max(visited) < 0x3000, "seek walked past the window end"
+
+
+def test_data_vars_has_more_is_honest_at_the_cap(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _data_window_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    capped = instance._data_vars(None, start="0x2000", end="0x3000", limit=2)
+    assert [r["a"] for r in capped["vars"]] == ["0x2000", "0x2004"]
+    assert capped["has_more"] is True
+
+    # Exactly limit rows left in the window: nothing was truncated.
+    exact = instance._data_vars(None, start="0x2000", end="0x3000", limit=5)
+    assert len(exact["vars"]) == 5
+    assert exact["has_more"] is False
+
+
+def test_data_vars_rejects_empty_window_and_bad_limit(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _data_window_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(bridge.OperationFailure):
+        instance._data_vars(None, start="0x3000", end="0x2000")
+    with pytest.raises(bridge.OperationFailure):
+        instance._data_vars(None, start="0x2000", end="0x3000", limit=0)
+
+
+def test_data_vars_unreadable_pointer_row_survives(monkeypatch):
+    # A pointer var whose slot bytes are unmapped must still produce a row
+    # (address/type/width), just without the p/ps/pstr decoration.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    ptr_t = _FakeType("char*", width=4)
+    bv = _FakeBV(arch=_FakeArch(name="x86", address_size=4),
+                 data_vars={0x2000: _FakeDataVariable(0x2000, ptr_t)},
+                 memory={0x9000: b"\x00"})  # 0x2000 unmapped
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._data_vars(None, start="0x2000", end="0x2100")
+
+    assert [r["a"] for r in result["vars"]] == ["0x2000"]
+    assert "p" not in result["vars"][0]
+
+
+# --- data_symbols: named DataSymbol listing (promoted out of py_exec) --------
+
+
+def test_data_symbols_lists_named_data_symbols_only(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    bv = _FakeBV(symbols=[
+        fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x2000, "g_state"),
+        fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x2010, "g_table"),
+        fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x2020, ""),          # unnamed
+        fake_bn.Symbol(fake_bn.SymbolType.FunctionSymbol, 0x4000, "main"),  # not data
+    ])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._data_symbols(None)
+
+    assert result["kind"] == "data_symbols"
+    assert result["syms"] == [
+        {"a": "0x2000", "n": "g_state"},
+        {"a": "0x2010", "n": "g_table"},
+    ]
