@@ -128,6 +128,15 @@ def validate_instance_id(instance_id: str) -> str:
             f"Invalid instance id: {instance_id!r}. Use only letters, digits, "
             "'_', '-', and '.' (no path separators, no '.'/'..', no absolute paths)."
         )
+    # An id whose socket path can't fit in sockaddr_un.sun_path must fail here,
+    # in the CLI, rather than as a bare `OSError: AF_UNIX path too long` from
+    # bind() inside the spawned bridge. A merely-long id is fine (the path helper
+    # compacts the basename); this only trips when the cache dir itself is too
+    # deep for any socket name.
+    try:
+        bridge_socket_path(instance_id)
+    except ValueError as exc:
+        raise BridgeError(str(exc)) from exc
     return instance_id
 
 

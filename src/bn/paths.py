@@ -208,11 +208,78 @@ def bridge_registry_path(instance_id: str | None = None) -> Path:
     return instances_dir() / f"{validate_instance_id(instance_id)}.json"
 
 
+# A Unix-domain socket address is a fixed-size `sockaddr_un.sun_path` char array
+# -- 108 bytes on Linux, 104 on the BSDs/macOS -- and bind() needs room for the
+# trailing NUL, so the usable path is one byte shorter. Nothing in the path
+# helpers used to bound this, so a deep BN_CACHE_DIR plus a descriptive instance
+# id produced a path the kernel rejects, surfacing as a bare
+# `OSError: AF_UNIX path too long` from bind() deep inside bridge startup --
+# after the CLI had already committed to the id.
+SOCKET_PATH_MAX_BYTES = 104 if platform.system() in ("Darwin", "FreeBSD", "OpenBSD", "NetBSD") else 108
+
+
+def socket_path_budget() -> int:
+    """Longest socket path, in bytes, that ``bind()`` will accept here."""
+    return SOCKET_PATH_MAX_BYTES - 1
+
+
+def _too_long(path: Path) -> bool:
+    return len(str(path).encode("utf-8", "surrogateescape")) > socket_path_budget()
+
+
+def _compact_socket_name(instance_id: str, budget: int) -> str:
+    """A ``<prefix>.<hash>.sock`` basename for *instance_id* fitting *budget* bytes.
+
+    The hash is taken over the FULL id, so distinct ids that share a truncated
+    prefix still get distinct sockets, and the mapping is deterministic -- the
+    CLI and the bridge each derive it independently and must agree.
+    """
+    digest = hashlib.sha256(instance_id.encode("utf-8")).hexdigest()[:8]
+    tail = f".{digest}.sock"
+    prefix_len = budget - len(tail)
+    if prefix_len >= 1:
+        # validate_instance_id restricts ids to ASCII, so chars == bytes here.
+        return f"{instance_id[:prefix_len]}{tail}"
+    # Too tight even for one readable character: drop the prefix and keep the
+    # full 8-hex digest rather than shortening it -- readability is worth less
+    # than a socket name that can't collide with another instance's.
+    if budget >= len(digest) + len(".sock"):
+        return f"{digest}.sock"
+    return ""
+
+
 def bridge_socket_path(instance_id: str | None = None) -> Path:
     if instance_id is None:
-        return cache_home() / f"{PLUGIN_NAME}.sock"
+        path = cache_home() / f"{PLUGIN_NAME}.sock"
+        if _too_long(path):
+            raise ValueError(_socket_too_long_message(path, instance_id=None))
+        return path
     # #523: see bridge_registry_path -- same basename enforcement.
-    return instances_dir() / f"{validate_instance_id(instance_id)}.sock"
+    path = instances_dir() / f"{validate_instance_id(instance_id)}.sock"
+    if not _too_long(path):
+        return path
+    # Shorten the *filename* rather than failing: the registry entry (a plain
+    # file, unaffected by the kernel limit) keeps the full id, so `bn instance
+    # list` and selectors still show what the user asked for.
+    directory = instances_dir()
+    budget = socket_path_budget() - len(str(directory).encode("utf-8", "surrogateescape")) - 1
+    name = _compact_socket_name(instance_id, budget)
+    if not name:
+        raise ValueError(_socket_too_long_message(path, instance_id=instance_id))
+    return directory / name
+
+
+def _socket_too_long_message(path: Path, *, instance_id: str | None) -> str:
+    actual = len(str(path).encode("utf-8", "surrogateescape"))
+    hint = (
+        "Point BN_CACHE_DIR at a shorter directory"
+        if instance_id is None
+        else "Use a shorter --instance-id, or point BN_CACHE_DIR at a shorter directory"
+    )
+    return (
+        f"Unix socket path is too long: {actual} bytes, limit "
+        f"{socket_path_budget()} ({path}). {hint}."
+    )
 
 
 def spill_root() -> Path:
