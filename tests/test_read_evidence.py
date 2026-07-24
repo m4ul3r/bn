@@ -1326,6 +1326,126 @@ def test_orient_digest_composes_subreads_and_handles_quick(monkeypatch):
     assert "unavailable" in d3["strings_sample"]
 
 
+class _StringsSection:
+    def __init__(self, name, start, end):
+        self.name = name; self.start = start; self.end = end
+
+
+class _FakeString:
+    def __init__(self, start, value):
+        self.start = start; self.value = value; self.length = len(value); self.type = 0
+
+
+class _StringsBV:
+    """The #646 ELF shape: the LOWEST string addresses are loader/linker metadata
+    (`.interp`, then `.dynstr` import names), and the domain literals live much
+    higher up in `.rodata`."""
+    def __init__(self, *, rodata=True):
+        self.strings = [
+            _FakeString(0x400240, "/lib/ld-linux-aarch64.so.1"),
+            _FakeString(0x400a10, "libwidget.so.1"),
+            _FakeString(0x400a20, "_ITM_deregisterTMCloneTable"),
+            _FakeString(0x400a3c, "__gmon_start__"),
+            _FakeString(0x400a65, "WIDGET_UpdateCertificate"),
+        ]
+        self.sections = {
+            ".interp": _StringsSection(".interp", 0x400240, 0x400260),
+            ".dynstr": _StringsSection(".dynstr", 0x400a00, 0x400b00),
+        }
+        if rodata:
+            self.strings += [
+                _FakeString(0x452100, "config parse failed: %s"),
+                _FakeString(0x452180, "Set Channel Index"),
+            ]
+            self.sections[".rodata"] = _StringsSection(".rodata", 0x452000, 0x460000)
+
+    def get_sections_at(self, addr):
+        addr = int(addr)
+        return [s for s in self.sections.values() if s.start <= addr < s.end]
+
+
+def _strings_ctx(bv):
+    class _Ctx:
+        def _resolve_view(self, s): return bv
+    return _Ctx()
+
+
+def test_strings_domain_sections_only_skips_elf_metadata_646(monkeypatch):
+    """#646: orient's strings sample took the first N strings in ADDRESS order, and
+    on an ELF the lowest string addresses are always `.interp` / `.dynstr`, so the
+    sample was deterministically the loader path, `__gmon_start__`, and imported
+    symbol names -- observed on 4 of 4 ELF targets, "strictly worse than random".
+    min_length=6 cannot help: `_ITM_deregisterTMCloneTable` is 27 characters."""
+    bridge = _load_bridge(monkeypatch)
+    read_misc = bridge.read_misc
+    bv = _StringsBV()
+
+    out = read_misc._strings(_strings_ctx(bv), None, query=None, offset=0, limit=3,
+                            min_length=6, domain_sections_only=True)
+    values = [i["value"] for i in out["items"]]
+    assert values == ["config parse failed: %s", "Set Channel Index"]
+    assert not any("gmon" in v or "ld-linux" in v or "ITM_" in v for v in values)
+
+    # Unfiltered, the head is exactly the metadata the bug reported.
+    head = read_misc._strings(_strings_ctx(bv), None, query=None, offset=0, limit=3,
+                              min_length=6)
+    assert head["items"][0]["value"] == "/lib/ld-linux-aarch64.so.1"
+
+
+def test_orient_prefers_rodata_and_discloses_sections_646(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    inst = bridge.BinaryNinjaBridge()
+    bv = _StringsBV()
+    monkeypatch.setattr(inst, "_target_info",
+                        lambda sel: {"basename": "x", "analyzed": True, "analysis_state": "full"})
+    monkeypatch.setattr(bridge.read_misc, "_imports", lambda ctx, sel, **k: {"total_symbols": 0})
+    monkeypatch.setattr(bridge.read_misc, "_sections", lambda ctx, sel, **k: {"items": [], "total": 0})
+    monkeypatch.setattr(bridge.read_listing, "_list_functions", lambda ctx, sel, **k: {"total": 3})
+    monkeypatch.setattr(inst, "_resolve_view", lambda sel: bv)
+    monkeypatch.setattr(inst.ctx, "_resolve_view", lambda sel: bv)
+
+    sample = inst._orient_digest(None)["strings_sample"]
+    assert [i["value"] for i in sample["items"]] == [
+        "config parse failed: %s", "Set Channel Index"]
+    # option (3): the sample is attributable.
+    assert sample["sample_sections"] == [".rodata"]
+
+
+def test_orient_strings_degrades_when_no_rodata_646(monkeypatch):
+    """#646 negative control: a view whose only strings ARE metadata still gets a
+    non-empty sample -- degrade, don't error (and don't report a false 'no strings')."""
+    bridge = _load_bridge(monkeypatch)
+    inst = bridge.BinaryNinjaBridge()
+    bv = _StringsBV(rodata=False)
+    monkeypatch.setattr(inst, "_target_info",
+                        lambda sel: {"basename": "x", "analyzed": True, "analysis_state": "full"})
+    monkeypatch.setattr(bridge.read_misc, "_imports", lambda ctx, sel, **k: {"total_symbols": 0})
+    monkeypatch.setattr(bridge.read_misc, "_sections", lambda ctx, sel, **k: {"items": [], "total": 0})
+    monkeypatch.setattr(bridge.read_listing, "_list_functions", lambda ctx, sel, **k: {"total": 3})
+    monkeypatch.setattr(inst, "_resolve_view", lambda sel: bv)
+    monkeypatch.setattr(inst.ctx, "_resolve_view", lambda sel: bv)
+
+    sample = inst._orient_digest(None)["strings_sample"]
+    assert sample["items"], "must fall back rather than report an empty sample"
+    assert sample["items"][0]["value"] == "/lib/ld-linux-aarch64.so.1"
+
+
+def test_strings_domain_filter_keeps_sectionless_views_646(monkeypatch):
+    """#646: a raw/monolithic firmware image with no named sections must not be
+    blinded by the filter."""
+    bridge = _load_bridge(monkeypatch)
+    read_misc = bridge.read_misc
+
+    class _RawBV:
+        strings = [_FakeString(0x80000000, "vxWorks boot")]
+        def get_sections_at(self, addr):
+            return []
+
+    out = read_misc._strings(_strings_ctx(_RawBV()), None, query=None, offset=0,
+                             limit=5, min_length=6, domain_sections_only=True)
+    assert [i["value"] for i in out["items"]] == ["vxWorks boot"]
+
+
 def test_render_orient_text_card(monkeypatch):
     from bn.formatters import _render_orient_text
     d = {"kind": "orient_digest", "target": {"basename": "foo"}, "analyzed": True,
@@ -1523,6 +1643,36 @@ def test_hlil_statement_recovers_outer_call_for_bare_nested_call_490(monkeypatch
                                        parent=bar, address=0xA, expr_index=12, instr_index=12)
     insn = _FakeLLILInstruction(0xA, _FakeConstPtr(0x1000), hlils=[getpid_call])
     assert il_format._hlil_statement_text(insn) == "foo(bar(getpid()))"
+
+
+def test_bare_void_call_statement_resolves_to_the_call_itself_644(monkeypatch):
+    """#644: a call whose return value is discarded (`memset(&buf, 0, n)`) IS the
+    statement -- its parent is the enclosing HighLevelILBlock, which the ancestor walk
+    treats as a hard boundary. Before the root fallback that nulled hlil_statement for
+    every bare call statement (the most common call shape: memcpy/strcpy/free/...)."""
+    bridge = _load_bridge(monkeypatch)
+    il_format = bridge.il_format
+    block = _FakeHLILInstruction("sink(d, s)\nbreak", class_name="HighLevelILBlock",
+                                 address=0xA, expr_index=9, instr_index=9)
+    call = _FakeHLILInstruction("sink(d, s)", class_name="HighLevelILCall",
+                                parent=block, address=0xA, expr_index=11, instr_index=11)
+    insn = _FakeLLILInstruction(0xA, _FakeConstPtr(0x1000), hlils=[call])
+    assert il_format._hlil_statement_text(insn) == "sink(d, s)"
+    assert il_format._hlil_statement_localization(insn) == ("sink(d, s)", None)
+
+
+def test_bare_call_statement_with_nonlocal_text_stays_null_644(monkeypatch):
+    """#644 negative control: the root fallback must not smuggle a non-local blob
+    through. A root whose own rendered text fails the localness filter still yields
+    None -- and reports `statement_not_local`, distinct from `no_local_statement`."""
+    bridge = _load_bridge(monkeypatch)
+    il_format = bridge.il_format
+    block = _FakeHLILInstruction("{...}", class_name="HighLevelILBlock",
+                                 address=0xA, expr_index=9, instr_index=9)
+    call = _FakeHLILInstruction("sink(\n" + "x" * 300 + "\n)", class_name="HighLevelILCall",
+                                parent=block, address=0xA, expr_index=11, instr_index=11)
+    insn = _FakeLLILInstruction(0xA, _FakeConstPtr(0x1000), hlils=[call])
+    assert il_format._hlil_statement_localization(insn) == (None, "statement_not_local")
 
 
 def test_call_arguments_candidates_scoped_to_callsite_476(monkeypatch):
@@ -1771,8 +1921,11 @@ class _SurfArch:
 
 
 class _SurfSection:
-    def __init__(self, name, start, end):
+    def __init__(self, name, start, end, semantics=None):
         self.name = name; self.start = start; self.end = end
+        # BN's SectionSemantics is an IntEnum whose str() is the NUMBER, so the
+        # production code reads `.name` -- model that, not a bare string (#647).
+        self.semantics = types.SimpleNamespace(name=semantics) if semantics else None
 
 
 class _SurfBV:
@@ -1785,7 +1938,13 @@ class _SurfBV:
     _VALS = [0x2000, 0x2010, 0x2020, 0x4000, 0]
 
     def __init__(self):
-        self.sections = {".data.rel.ro": _SurfSection(".data.rel.ro", 0x1000, 0x1000 + 8 * len(self._VALS))}
+        self.sections = {
+            ".data.rel.ro": _SurfSection(".data.rel.ro", 0x1000, 0x1000 + 8 * len(self._VALS),
+                                         "ReadOnlyDataSectionSemantics"),
+            # The pointer TARGETS live in code. Modelled explicitly because #647 tests
+            # the target's SECTION, not just its segment perms.
+            ".text": _SurfSection(".text", 0x2000, 0x6000, "ReadOnlyCodeSectionSemantics"),
+        }
         self.arch = _SurfArch()
         self._fns = {0x2000, 0x2010}
 
@@ -1805,7 +1964,8 @@ class _SurfBV:
         return "mov x0, x0" if 0x2020 <= a < 0x2100 else "undefined"   # code region vs data
 
     def get_sections_at(self, a):
-        return [self.sections[".data.rel.ro"]]
+        a = int(a)
+        return [s for s in self.sections.values() if s.start <= a < s.end]
 
 
 def test_hidden_surface_scan_503(monkeypatch):
@@ -1887,6 +2047,123 @@ def test_hidden_surface_x86_warns_decode_depth_weak_503(monkeypatch):
     out = re._hidden_surface(_Ctx(), None)
     assert out["summary"]["missing_function_candidates"] == 2
     assert any("variable-length ISA" in w and "code_likely" in w for w in out["warnings"])
+
+
+class _PieSurfBV:
+    """The #647 shape: a single-`LOAD` aarch64 PIE where the WHOLE image -- `.text`
+    and `.rodata` alike -- is mapped r-x, so a segment-perms-only test passes every
+    pointer into read-only DATA. The table here is a `{char *desc; char *usage;}`
+    help-row array whose slots point at string bodies in `.rodata`."""
+    address_size = 8
+    start = 0x400000
+    end = 0x500000
+    _VALS = [0x452100, 0x452180, 0x452200, 0x452280]   # all .rodata string bodies
+
+    def __init__(self, *, code_targets=False):
+        table_end = 0x460000 + 8 * len(self._VALS)
+        self.sections = {
+            ".text": _SurfSection(".text", 0x400000, 0x451000, "ReadOnlyCodeSectionSemantics"),
+            ".rodata": _SurfSection(".rodata", 0x451000, 0x460000, "ReadOnlyDataSectionSemantics"),
+            ".data": _SurfSection(".data", 0x460000, table_end, "ReadWriteDataSectionSemantics"),
+        }
+        self.arch = _SurfArch()
+        self._code_targets = code_targets
+
+    def read(self, addr, n):
+        if int(addr) == 0x460000:
+            vals = [v - 0x52000 for v in self._VALS] if self._code_targets else self._VALS
+            return b"".join(v.to_bytes(8, "little") for v in vals)[:n]
+        return b"\x00" * int(n)
+
+    def get_functions_containing(self, a):
+        return []
+
+    def get_segment_at(self, a):
+        # ONE r-x LOAD spanning the entire image -- the whole point of the bug.
+        return _SurfSeg(0x400000, 0x500000) if 0x400000 <= int(a) < 0x500000 else None
+
+    def get_disassembly(self, a):
+        return "mov x0, x0"          # decodes cleanly everywhere: no help from decode_depth
+
+    def get_sections_at(self, a):
+        a = int(a)
+        return [s for s in self.sections.values() if s.start <= a < s.end]
+
+
+def _pie_ctx(bv, *, strings=None):
+    class _Ctx:
+        def _resolve_view(self, s): return bv
+        def _pointer_size(self, b): return 8
+        def _byteorder(self, b): return "little"
+        def _address_context(self, b, addr):
+            value = (strings or {}).get(int(addr))
+            return {"string": {"value": value}} if value else {}
+    return _Ctx()
+
+
+def test_hidden_surface_rodata_pointers_are_not_code_647(monkeypatch):
+    """#647: `exec_target` tested SEGMENT perms only. On a single-`LOAD` aarch64 PIE
+    `.rodata` is mapped r-x, so a 514-row help-string table was reported as a
+    514-entry dispatch table with 514 missing functions -- a confident false positive
+    on exactly the stripped-firmware targets this command exists for. The `evidence
+    table` path in this same file already consulted section semantics."""
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_init_arrays", lambda ctx, sel, **kw: {"items": []})
+    bv = _PieSurfBV()
+
+    out = re._hidden_surface(_pie_ctx(bv), None)
+    assert out["candidate_tables"] == []
+    assert out["missing_function_candidates"] == []
+    assert out["summary"]["missing_function_candidates"] == 0
+
+
+def test_hidden_surface_pie_code_pointers_still_reported_647(monkeypatch):
+    """#647 positive control: the fix must not blind the scan on PIE binaries. The
+    same single-`LOAD` layout with a run of pointers into `.text` is still reported."""
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_init_arrays", lambda ctx, sel, **kw: {"items": []})
+    bv = _PieSurfBV(code_targets=True)
+
+    out = re._hidden_surface(_pie_ctx(bv), None)
+    assert len(out["candidate_tables"]) == 1
+    t = out["candidate_tables"][0]
+    assert t["entries"] == 4 and t["missing_functions"] == 4
+    assert out["summary"]["missing_function_candidates"] == 4
+
+
+def test_hidden_surface_candidate_string_preview_647(monkeypatch):
+    """#647 defence in depth: when a candidate resolves to a printable string, inline
+    it -- a slot rendering `-> "Set Channel Index"` is self-refuting where a bare
+    address costs a second command to disprove."""
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_init_arrays", lambda ctx, sel, **kw: {"items": []})
+    bv = _PieSurfBV(code_targets=True)
+    ctx = _pie_ctx(bv, strings={0x400100: "----- RF TEST MENU -----"})
+
+    cands = {c["address"]: c for c in re._hidden_surface(ctx, None)["missing_function_candidates"]}
+    assert cands["0x400100"]["string"] == "----- RF TEST MENU -----"
+    assert "string" not in cands["0x400180"]
+
+
+def test_hidden_surface_cap_warnings_disclose_totals_653(monkeypatch):
+    """#653.5: `capped at 128` gave no basis for deciding whether raising the cap was
+    worthwhile. Disclose the pre-cap total (and carry it in the summary)."""
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_init_arrays", lambda ctx, sel, **kw: {"items": []})
+    bv = _PieSurfBV(code_targets=True)
+
+    out = re._hidden_surface(_pie_ctx(bv), None, max_candidates=2)
+    assert out["summary"]["missing_function_candidates"] == 2
+    assert out["summary"]["missing_function_candidates_total"] == 4
+    assert any("capped at 2 of 4" in w for w in out["warnings"])
+    # Uncapped runs still report a total equal to the shown count.
+    full = re._hidden_surface(_pie_ctx(bv), None)
+    assert full["summary"]["missing_function_candidates_total"] == 4
+    assert not any("capped at" in w for w in full["warnings"])
 
 
 # --- #466 cross-target virtual-call slot extraction --------------------------
@@ -1994,7 +2271,10 @@ class _ThumbSurfBV:
 
     def __init__(self):
         end = 0x1000 + 4 * len(self._VALS)
-        self.sections = {".rodata": _SurfSection(".rodata", 0x1000, end)}
+        self.sections = {
+            ".rodata": _SurfSection(".rodata", 0x1000, end, "ReadOnlyDataSectionSemantics"),
+            ".text": _SurfSection(".text", 0x2000, 0x6000, "ReadOnlyCodeSectionSemantics"),
+        }
         self.arch = _SurfArch()
         self._fns = {0x2000, 0x2010, 0x2020}  # functions at the EVEN entries
 
@@ -2013,7 +2293,8 @@ class _ThumbSurfBV:
         return "mov r0, r0"
 
     def get_sections_at(self, a):
-        return [self.sections[".rodata"]]
+        a = int(a)
+        return [s for s in self.sections.values() if s.start <= a < s.end]
 
 
 def test_hidden_surface_thumb_miss_count_normalized_530(monkeypatch):
@@ -2165,6 +2446,12 @@ def test_function_evidence_marks_argument_confidence(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     callee = _FakeFunction(0x461746, "send_message")
+    # A recovered 2-parameter prototype: what EARNS the `authoritative` stamp. Without
+    # it the callee's arity is unknown and #648 correctly demotes to `inferred`.
+    callee.parameter_vars = [
+        _FakeVariable(name="code", storage=0, var_type="int32_t", identifier=1),
+        _FakeVariable(name="out", storage=1, var_type="void*", identifier=2),
+    ]
     caller = _FakeFunction(0x412470, "build_response")
     stmt = _FakeHLILInstruction("rc = send_message(6, &response)", class_name="HighLevelILVarInit",
                                 address=0x4124A0, expr_index=29, instr_index=29)
@@ -2189,6 +2476,113 @@ def test_function_evidence_marks_argument_confidence(monkeypatch):
     for cand in call["argument_candidates"]:
         assert cand["confidence"] == "low"
         assert cand["source"] in ("llil", "mlil", "hlil")
+
+
+def _arity_bv(monkeypatch, instance, *, callee_params, arg_texts, arg_regs=8):
+    """A direct call to `hw_get_version` where HLIL rendered *arg_texts*, with the
+    callee declaring *callee_params* parameters (#648)."""
+    callee = _FakeFunction(0x401100, "hw_get_version")
+    callee.parameter_vars = [
+        _FakeVariable(name=f"a{i}", storage=i, var_type="int64_t", identifier=i + 1)
+        for i in range(callee_params)
+    ]
+    callee.calling_convention = types.SimpleNamespace(
+        int_arg_regs=[f"x{i}" for i in range(arg_regs)])
+    caller = _FakeFunction(0x401400, "probe_device")
+    rendered = f"int32_t r = hw_get_version({', '.join(arg_texts)})"
+    stmt = _FakeHLILInstruction(rendered, class_name="HighLevelILVarInit",
+                                address=0x401400, expr_index=10, instr_index=10)
+    call_expr = _FakeHLILInstruction(f"hw_get_version({', '.join(arg_texts)})",
+                                     class_name="HighLevelILCall", parent=stmt,
+                                     address=0x401400, expr_index=11, instr_index=11)
+    call_expr.params = list(arg_texts)
+    call_insn = _FakeLLILInstruction(0x401400, _FakeConstPtr(0x401100), hlils=[call_expr])
+    call_insn.params = [_FakeReg("x0")]
+    caller.basic_blocks = [_FakeBasicBlock(0x401400, 0x401404)]
+    caller.low_level_il = [[call_insn]]
+    bv = _FakeBV(functions=[callee, caller], instruction_lengths={0x401400: 4},
+                 disassembly={0x401400: "bl hw_get_version"})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    return bv
+
+
+def test_argument_confidence_demoted_on_unknown_arity_callee_648(monkeypatch):
+    """#648: with no recovered prototype BN assumes every argument register is live,
+    so HLIL renders the NEIGHBOURING call's staging -- a log string and the stack
+    canary -- as arguments 2..5 of a 1-parameter vendor API. `authoritative` meant
+    "HLIL produced a list", not "the list is right"; #549 left this residual on the
+    canonical field. Confirmed wrong against upstream source on a second target."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _arity_bv(monkeypatch, instance, callee_params=0, arg_regs=6,
+              arg_texts=["&var_20", "1", '"get_version"', '"<<<< ENTER >>>>"',
+                         "__stack_chk_guard", "0"])
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    assert call["argument_source"] == "hlil"
+    assert call["argument_confidence"] != "authoritative"
+    assert call["argument_confidence"] == "inferred"
+    assert call["arity_unknown"] is True
+    # 6 recovered args on a 6-register ABI: BN is enumerating registers.
+    assert call["abi_register_saturated"] is True
+
+
+def test_argument_confidence_kept_for_known_prototype_648(monkeypatch):
+    """#648 negative control -- the assertion that keeps the fix from blanket-demoting
+    everything. `memset` has a bundled 3-parameter prototype, so its arguments really
+    ARE authoritative (verified live: BN reports 3 declared params for memset and 0
+    for an unprototyped stub)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _arity_bv(monkeypatch, instance, callee_params=3,
+              arg_texts=["&buf", "0", "0x100"])
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    assert call["argument_confidence"] == "authoritative"
+    assert call["arity_unknown"] is False
+    assert "abi_register_saturated" not in call
+
+
+def test_argument_confidence_zero_args_on_unknown_arity_not_demoted_648(monkeypatch):
+    """#648: a genuinely void callee rendering NO arguments agrees with its recovered
+    prototype -- nothing was invented, so it keeps `authoritative`. Demoting here
+    would flag every `f()` call in a stripped binary for no gain."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _arity_bv(monkeypatch, instance, callee_params=0, arg_texts=[])
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    assert call["arity_unknown"] is False
+    assert call["argument_confidence"] == "authoritative"
+
+
+def test_argument_confidence_unknown_arity_below_abi_width_648(monkeypatch):
+    """#648: the phantom-argument case that motivated the second confirmation --
+    `sock_process(a, b, a)` where upstream has TWO parameters. The count does NOT
+    saturate the ABI registers, so `abi_register_saturated` is absent, but the arity
+    is still unknown and the confidence must still be demoted."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _arity_bv(monkeypatch, instance, callee_params=0, arg_texts=["a", "b", "a"])
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    assert call["arity_unknown"] is True
+    assert call["argument_confidence"] == "inferred"
+    assert "abi_register_saturated" not in call
+
+
+def test_argument_confidence_user_prototype_is_authoritative_648(monkeypatch):
+    """#648: a user prototype pins the arity, so a `proto set`-corrected callee is
+    authoritative even with zero declared params -- the escape hatch the error text
+    points agents at."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _arity_bv(monkeypatch, instance, callee_params=0, arg_texts=["&var_20"])
+    bv.get_function_at(0x401100).set_user_type("int32_t hw_get_version(void*)")
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    assert call["arity_unknown"] is False
+    assert call["argument_confidence"] == "authoritative"
 
 
 # --- #558: variadic (scanf-family) under-recovery warning + recovery -------
@@ -2322,3 +2716,37 @@ def test_orient_surfaces_existing_annotations(monkeypatch):
     assert ea["comments"] == 1
     assert ea["analysis_cache_restored"] is True
     assert "predate this run" in ea["provenance_hint"]
+
+
+def test_class_list_zero_result_reports_its_inputs_653(monkeypatch):
+    """#653.6: `classes: 0 shown of 0` is correct on a C target and IDENTICAL to
+    what a clustering failure would print, so an agent could not tell "this target
+    is C" from "the lens failed" -- one spent two extra calls proving RTTI absence
+    by hand (`strings --regex '_ZTV|_ZTI'`). Report the empty inputs instead."""
+    bridge = _load_bridge(monkeypatch)
+    read_class = bridge.read_class
+
+    class _CBV:
+        functions = [_FakeFunction(0x401000, "parse_header"),
+                     _FakeFunction(0x401100, "main")]
+        def get_symbols(self):
+            return []
+
+    bv = _CBV()
+
+    class _Ctx:
+        def _resolve_view(self, s): return bv
+        def _bases_for(self, b, rec): return []
+
+    out = read_class._class_list(_Ctx(), None)
+    assert out["total"] == 0
+    assert out["inputs"] == {"demangled_cxx_methods": 0, "rtti_typeinfo_symbols": 0,
+                             "rtti_vtable_symbols": 0}
+
+    count = read_class._class_list(_Ctx(), None, count_only=True)
+    assert count["count"] == 0 and count["inputs"]["rtti_vtable_symbols"] == 0
+
+    from bn.formatters import _render_class_list_text
+    text = _render_class_list_text(out)
+    assert "demangled C++ symbols: 0" in text
+    assert "no C++ type evidence" in text

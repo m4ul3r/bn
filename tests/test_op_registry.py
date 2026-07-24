@@ -22,7 +22,7 @@ EXPECTED_READ = {
 }
 EXPECTED_WRITE = {
     "py_exec", "function_create", "rename_symbol", "set_comment", "delete_comment",
-    "set_prototype", "local_rename", "local_retype", "struct_field_set",
+    "set_prototype", "local_rename", "local_retype", "data_retype", "struct_field_set",
     "struct_field_rename", "struct_field_delete", "types_declare", "batch_apply",
     "close_binary", "save_database", "tag_add", "tag_remove",
     "tag_type_create", "tag_type_remove",

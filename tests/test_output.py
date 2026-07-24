@@ -345,3 +345,42 @@ def test_near_spill_flag_409(tmp_path, monkeypatch):
     res = write_output_result(payload, fmt="json", out_path=None, stem="functions",
                               spill_token_limit=int(tok / 0.9))
     assert res.spilled is False and res.near_spill is True
+
+
+def test_artifact_carries_target_and_instance_provenance_653(tmp_path):
+    """#653.8: two agents sharing a scratchpad both wrote `fns.json`; one silently
+    read the other's list -- a different target, a different binary -- and concluded
+    its own name recovery covered 6 of 1006 functions. Nothing in the artifact made
+    that detectable, so stamp WHICH target/instance produced it."""
+    from bn.output import write_output_result
+
+    out = tmp_path / "fns.json"
+    res = write_output_result({"kind": "functions", "items": [1, 2]}, fmt="json",
+                              out_path=out, stem="functions",
+                              provenance={"target": "firmware.bndb", "instance": "a1b2c3"})
+    assert res.artifact["target"] == "firmware.bndb"
+    assert res.artifact["instance"] == "a1b2c3"
+    # `sha256` remains the digest of THIS artifact's bytes (not the binary's).
+    assert len(res.artifact["sha256"]) == 64
+    assert "target: firmware.bndb" in res.rendered or '"target":"firmware.bndb"' in res.rendered
+
+
+def test_spill_envelope_carries_provenance_653(tmp_path, monkeypatch):
+    from bn.output import write_output_result
+
+    monkeypatch.setenv("BN_SPILL_TOKENS", "10")
+    res = write_output_result({"kind": "functions", "items": ["x" * 200]}, fmt="json",
+                              out_path=None, stem="functions",
+                              provenance={"target": "firmware.bndb", "instance": "a1b2c3"})
+    assert res.spilled is True
+    assert res.artifact["target"] == "firmware.bndb"
+    assert res.artifact["instance"] == "a1b2c3"
+
+
+def test_provenance_omits_unknown_values_653():
+    """A None target/instance must not stamp a misleading null."""
+    from bn.output import write_output_result
+
+    res = write_output_result({"kind": "x"}, fmt="json", out_path=None, stem="x",
+                              provenance={"target": None, "instance": None})
+    assert res.artifact is None      # small output: no artifact envelope at all

@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _pick, _positive_depth_int, _positive_int, arg, command, mutex, preview_arg, summary_arg
+from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _pick, _positive_depth_int, _positive_int, arg, command, mutex, mutation_output_args, preview_arg
 from ..formatters import (
     _render_call_descriptors_text,
     _render_surface_text,
@@ -53,6 +53,21 @@ from ..transport import BridgeError
              arg("--min-size", type=_positive_int, default=None, dest="min_size", metavar="N",
                  help="Only functions whose byte size is >= N (drop tiny PLT/GOT thunk "
                       "veneers, typically <= 16 bytes)"),
+         ],
+         mutex_groups=[
+             # #653.4: "how much of this binary is still sub_*?" -- the sizing question
+             # on a stripped target, which `--regex '^sub_'` cannot negate. Same
+             # partition `target info` counts, so the two numbers agree.
+             mutex(False,
+                   arg("--named", action="store_const", const=True, default=None,
+                       dest="named",
+                       help="Only functions with a meaningful name (excludes BN's "
+                            "auto-named sub_*/j_sub_* and import thunks)"),
+                   arg("--unnamed", action="store_const", const=False, default=None,
+                       dest="named",
+                       help="Only BN auto-named functions (sub_*/j_sub_*) -- how much "
+                            "of a stripped target is still unrecovered; excludes "
+                            "import thunks")),
          ])
 def _function_list(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
@@ -62,6 +77,8 @@ def _function_list(args: argparse.Namespace) -> int:
         params["max_address"] = args.max_address
     if getattr(args, "min_size", None) is not None:
         params["min_size"] = args.min_size
+    if getattr(args, "named", None) is not None:
+        params["named"] = bool(args.named)
     if args.offset:
         params["offset"] = args.offset
     if args.count:
@@ -155,7 +172,9 @@ def _function_search(args: argparse.Namespace) -> int:
             "search_functions",
             params,
             require_target=True,
-            text_renderer=_render_function_count_text,
+            # #653.1: matches, not the whole-binary function count.
+            text_renderer=lambda value: _render_function_count_text(
+                value, label="Matching functions"),
             stem="function-search-count",
             # --count is the "is my query matching anything?" use case, so the
             # auto-regex retry (and its 0-result fallback hint) is most useful
@@ -191,14 +210,22 @@ def _function_search(args: argparse.Namespace) -> int:
                arg("--verbose", "-v", action="store_true", default=False,
                    help="Show full parameter and local variable details"),
                arg("--demangle", action="store_true", default=False,
-                   help="Show the demangled C++ name in text (JSON always carries display_name)")])
+                   help="Show the demangled C++ name in text (JSON always carries display_name)"),
+               # #653.10: `--lines` slices a decompile blindly because the line
+               # numbers are unknowable until after the full decompile. Block ranges
+               # make a huge dispatcher targetable (`disasm --linear <block start>`,
+               # or `--lines` once you know where you are) without reading 6000
+               # lines first.
+               arg("--blocks", action="store_true", default=False,
+                   help="List basic-block address ranges (with edges), so a large "
+                        "function can be read a region at a time instead of whole")])
 def _function_info(args: argparse.Namespace) -> int:
     verbose = getattr(args, "verbose", False)
     demangle = getattr(args, "demangle", False)
     return _call(
         args,
         "function_info",
-        {"identifier": args.identifier},
+        {"identifier": args.identifier, "blocks": bool(getattr(args, "blocks", False))},
         require_target=True,
         text_renderer=lambda v: _render_function_info_text(v, verbose=verbose, demangle=demangle),
         stem="function-info",
@@ -209,7 +236,7 @@ def _function_info(args: argparse.Namespace) -> int:
          help="Create and analyze a function at an address auto-analysis missed",
          target=True, fmt="json",
          args=[
-             preview_arg("Create, verify, then revert without committing"), summary_arg(),
+             preview_arg("Create, verify, then revert without committing"), *mutation_output_args(),
              arg("address", help="Address of the function entry point (hex or decimal)"),
          ])
 def _function_create(args: argparse.Namespace) -> int:
@@ -273,8 +300,13 @@ def _decompile(args: argparse.Namespace) -> int:
 @command("il", help="Dump IL for a function", target=True,
          args=[
              arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
-             arg("--view", choices=("hlil", "mlil", "llil"), default="hlil",
-                 help="IL level to dump: hlil (default), mlil, or llil"),
+             # #653.2: "view" collides with BinaryView / `view id` -- how `target
+             # list` and every -t help string use the word -- so --level is the
+             # natural first guess and used to hard-error. Accept both.
+             arg("--view", "--level", dest="view", choices=("hlil", "mlil", "llil"),
+                 default="hlil",
+                 help="IL level to dump: hlil (default), mlil, or llil "
+                      "(--level is an accepted alias)"),
              arg("--ssa", action="store_true",
                  help="Emit the SSA form of the selected IL view"),
              arg("--lines", type=_parse_line_range, default=None, metavar="START:END",
@@ -300,8 +332,8 @@ def _il(args: argparse.Namespace) -> int:
          target=True,
          args=[
              arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
-             arg("--view", choices=("hlil", "mlil"), default="mlil",
-                 help="IL level (default: mlil)"),
+             arg("--view", "--level", dest="view", choices=("hlil", "mlil"), default="mlil",
+                 help="IL level (default: mlil; --level is an accepted alias)"),
              arg("--no-ssa", dest="ssa", action="store_false", default=True,
                  help="Emit non-SSA form (default: SSA)"),
              arg("--lines", type=_parse_line_range, default=None, metavar="START:END",

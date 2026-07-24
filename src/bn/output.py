@@ -196,6 +196,7 @@ def _artifact_payload(
     token_count: int,
     value: Any,
     spilled: bool,
+    provenance: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "ok": True,
@@ -208,6 +209,14 @@ def _artifact_payload(
         "sha256": hashlib.sha256(encoded).hexdigest(),
         "summary": _summary(value),
     }
+    # #653.8: WHICH target/instance produced this artifact. Two agents sharing a
+    # scratchpad both wrote `fns.json`; one silently read the other's list -- a
+    # different target, a different binary -- and concluded its own name recovery
+    # covered 6 of 1006 functions. Nothing in the artifact made that detectable.
+    # (`sha256` above is the digest of THIS artifact's bytes, not of the binary.)
+    for key, val in (provenance or {}).items():
+        if val is not None:
+            payload.setdefault(key, val)
     # Hoist the canonical logical total to the TOP LEVEL so `jq '.total'` returns
     # the real count whether or not the read spilled (#311). On a spilled
     # envelope the items live on disk at artifact_path, so `jq '.items'` reads
@@ -294,6 +303,7 @@ def write_output_result(
     out_path: Path | None,
     stem: str,
     spill_token_limit: int | None = None,
+    provenance: dict[str, Any] | None = None,
 ) -> OutputWriteResult:
     # #409: resolve the spill threshold from BN_SPILL_TOKENS when not explicitly set.
     if spill_token_limit is None:
@@ -321,6 +331,7 @@ def write_output_result(
             token_count=token_count,
             value=value,
             spilled=False,
+            provenance=provenance,
         )
         return OutputWriteResult(
             rendered=render_envelope(artifact, fmt),
@@ -354,6 +365,7 @@ def write_output_result(
         token_count=token_count,
         value=value,
         spilled=True,
+        provenance=provenance,
     )
     # #409: name the command-specific slicing knob + the threshold that tripped, so
     # the agent bounds the next read instead of re-running blind. BN_SPILL_TOKENS

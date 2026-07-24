@@ -409,6 +409,36 @@ def _list_row(rec: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _class_lens_inputs(ctx, bv) -> dict[str, int]:
+    """The raw inputs the class lens clusters from, so a ZERO-class result is
+    attributable (#653.6).
+
+    `classes: 0 shown of 0` is correct on a C target and identical to what a
+    clustering failure would print, so an agent had to spend extra calls proving
+    RTTI absence by hand (`strings --regex '_ZTV|_ZTI'`). Reporting the empty
+    inputs makes the absence self-evident. Only computed for the zero case, where
+    there is by definition no other work to do.
+    """
+    demangled = 0
+    for fn in (getattr(bv, "functions", None) or []):
+        try:
+            cls, _method = _split_qualified_method(il_format._display_name(fn))
+        except Exception:
+            continue
+        if cls is not None:
+            demangled += 1
+    try:
+        rtti = _rtti_symbol_maps(bv)
+    except Exception:
+        rtti = {}
+    return {
+        "demangled_cxx_methods": demangled,
+        "rtti_typeinfo_symbols": sum(
+            1 for syms in rtti.values() if syms.get("typeinfo") or syms.get("typeinfo_name")),
+        "rtti_vtable_symbols": sum(1 for syms in rtti.values() if syms.get("vtable")),
+    }
+
+
 def _class_list(
     ctx,
     selector: str | None,
@@ -459,7 +489,7 @@ def _class_list(
     # the domain-class count is honest.
     if count_only:
         artifact_count = sum(1 for r in candidates if _is_non_class_rtti_artifact(r))
-        return {
+        result = {
             "kind": "classes",
             "count": total,
             "total": total,
@@ -468,6 +498,9 @@ def _class_list(
             "no_stl": no_stl,
             "no_vendor": no_vendor,
         }
+        if total == 0:
+            result["inputs"] = _class_lens_inputs(ctx, bv)   # #653.6
+        return result
     page = candidates[offset:] if offset else candidates
     if limit is not None:
         page = page[:limit]
@@ -483,7 +516,7 @@ def _class_list(
             rec["bases"] = []
         rows.append(_list_row(rec))
     returned = len(rows)
-    return {
+    result = {
         "kind": "classes",
         "items": rows,
         "total": total,
@@ -499,6 +532,10 @@ def _class_list(
         "construction_vtables_suppressed": construction_vtables_suppressed,
         "thunks_suppressed": thunks_suppressed,
     }
+    if total == 0:
+        # #653.6: make "no classes" attributable -- C target vs failed clustering.
+        result["inputs"] = _class_lens_inputs(ctx, bv)
+    return result
 
 
 def _slot_is_code(target: dict[str, Any]) -> bool:

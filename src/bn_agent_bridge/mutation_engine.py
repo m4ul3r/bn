@@ -61,6 +61,7 @@ REQUIRED_FIELDS: dict[str, tuple[str, ...]] = {
     "set_prototype": ("identifier", "prototype"),
     "local_rename": ("function", "variable", "new_name"),
     "local_retype": ("function", "variable", "new_type"),
+    "data_retype": ("address", "new_type"),
     "struct_field_set": ("struct_name", "field_type", "offset", "field_name"),
     "struct_field_rename": ("struct_name", "old_name", "new_name"),
     "struct_field_delete": ("struct_name", "field_name"),
@@ -125,7 +126,7 @@ _VAR_DRIFT_OPS = {"local_rename", "local_retype", "set_prototype"}
 # verb spelling like `proto_set`/`rename_local` (#361).
 _BATCH_OP_NAMES = (
     "rename_symbol", "set_comment", "delete_comment", "set_prototype",
-    "local_rename", "local_retype", "struct_field_set", "struct_field_rename",
+    "local_rename", "local_retype", "data_retype", "struct_field_set", "struct_field_rename",
     "struct_field_delete", "types_declare", "function_create", "tag_add", "tag_remove",
     "tag_type_create", "tag_type_remove",
 )
@@ -263,6 +264,11 @@ def _functions_for_op(ctx, bv, op: dict[str, Any], *, type_limit: int | None):
                 functions = [ctx._find_function(bv, op["function"])]
             elif op.get("address"):
                 functions = ctx._functions_containing(bv, _parse_address(op["address"]))
+        elif kind == "data_retype":
+            # A global's type reflows every function that reads it, so the blast
+            # radius is the code xrefs to the address, not a single function (#649).
+            functions = list(ctx._functions_referencing(bv, _parse_address(op["address"]),
+                                                       limit=type_limit))
         elif kind.startswith("struct_") or kind == "types_declare":
             for type_name in _operation_type_names(ctx, bv, op):
                 functions.extend(_guess_type_affected_functions(ctx, bv, type_name, limit=type_limit))
@@ -966,6 +972,8 @@ def _verify_operation(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
             return _verify_local_rename(ctx, bv, result)
         if op == "local_retype":
             return _verify_local_retype(ctx, bv, result)
+        if op == "data_retype":
+            return _verify_data_retype(ctx, bv, result)
         if op == "struct_field_set":
             return _verify_struct_field_set(ctx, bv, result)
         if op == "struct_field_rename":
@@ -1588,6 +1596,85 @@ def _verify_declared_types(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
 
 
 
+def _suggest_field(provided: Any, missing: str) -> str | None:
+    """A provided key that looks like the *missing* required field, else None (#650).
+
+    The batch path has no argparse layer, so a guessed field name fails only at
+    APPLY time and -- the batch being atomic -- reverts every good op with it. One
+    dogfood agent rolled back 12 good ops over a field name; the fields are also
+    not mutually consistent across ops (``local_retype`` takes ``variable`` where
+    ``rename_symbol`` takes ``identifier``), so the guess is easy to make."""
+    if not isinstance(provided, dict):
+        return None
+    candidates = [str(k) for k in provided if k not in ("op", "preview", "target")]
+    matches = difflib.get_close_matches(missing, candidates, n=1, cutoff=0.6)
+    return matches[0] if matches else None
+
+
+def _validate_operation_request(ctx, op: dict[str, Any], *, index: int | None = None) -> str:
+    """Validate one manifest op's SHAPE and return its kind.
+
+    Split out of ``_apply_operation`` so a batch can check EVERY op before
+    applying ANY (#650): the batch is atomic, so a typo in op 13 used to roll back
+    12 good ops. Covers a missing/unknown op kind (with a did-you-mean), missing
+    required fields (with a did-you-mean drawn from the keys actually provided),
+    the one-of locator groups, and the enum-valued fields.
+    """
+    where = f"operation {index} " if index is not None else "operation "
+    # A missing `op` key must be its own invalid_request, NOT silently assumed
+    # to be a rename_symbol -- a typo'd/absent op kind would otherwise apply
+    # the wrong mutation (#48). Internal single-op callers always set `op`.
+    kind = op.get("op")
+    if not kind:
+        raise OperationFailure(
+            "invalid_request",
+            f"{where}is missing required field 'op' (the mutation kind, e.g. "
+            "'rename_symbol', 'set_comment', 'types_declare')",
+            requested=_operation_requested(ctx, op),
+        )
+    kind = str(kind)
+    if kind not in _BATCH_OP_NAMES:
+        # #361's did-you-mean, now reachable BEFORE anything is applied (#650).
+        match = _suggest_batch_op(kind)
+        hint = f" Did you mean {match!r}?" if match else ""
+        raise OperationFailure(
+            "unsupported",
+            f"Unsupported operation: {kind}.{hint} Valid op names: "
+            f"{', '.join(_BATCH_OP_NAMES)}.",
+            requested=_operation_requested(ctx, op),
+        )
+    # Validate required request fields up front so a malformed request is
+    # reported precisely (invalid_request, naming the field) and a KeyError
+    # raised deeper -- e.g. by BN internals inside a handler -- is no longer
+    # misreported as a missing request field.
+    for field in REQUIRED_FIELDS.get(kind, ()):
+        if field not in op:
+            near = _suggest_field(op, field)
+            hint = f" (got {near!r}; did you mean {field!r}?)" if near else ""
+            raise OperationFailure(
+                "invalid_request",
+                f"{where}{kind!r} is missing required field {field!r}{hint}",
+                requested=_operation_requested(ctx, op),
+            )
+    for group in REQUIRED_ONE_OF.get(kind, ()):
+        if not any(field in op for field in group):
+            raise OperationFailure(
+                "invalid_request",
+                f"{where}{kind!r} requires one of "
+                f"{' / '.join(repr(f) for f in group)}",
+                requested=_operation_requested(ctx, op),
+            )
+    for field, allowed in ENUM_FIELDS.get(kind, {}).items():
+        if field in op and str(op[field]) not in allowed:
+            raise OperationFailure(
+                "invalid_request",
+                f"{where}{kind!r} field {field!r} must be one of "
+                f"{' / '.join(repr(v) for v in allowed)}, got {str(op[field])!r}",
+                requested=_operation_requested(ctx, op),
+            )
+    return kind
+
+
 def _apply_operation(ctx, bv, op: dict[str, Any], restores: list | None = None):
     # A manifest op must be a JSON object; a non-object element (e.g.
     # "ops": ["foo"]) gets a clean invalid_request, not an AttributeError (#48).
@@ -1597,44 +1684,7 @@ def _apply_operation(ctx, bv, op: dict[str, Any], restores: list | None = None):
             f"each manifest operation must be a JSON object, got {type(op).__name__}",
         )
     _normalize_struct_alias(op)  # type_name -> struct_name alias for struct ops (M12)
-    # A missing `op` key must be its own invalid_request, NOT silently assumed
-    # to be a rename_symbol -- a typo'd/absent op kind would otherwise apply
-    # the wrong mutation (#48). Internal single-op callers always set `op`.
-    kind = op.get("op")
-    if not kind:
-        raise OperationFailure(
-            "invalid_request",
-            "operation is missing required field 'op' (the mutation kind, e.g. "
-            "'rename_symbol', 'set_comment', 'types_declare')",
-            requested=_operation_requested(ctx, op),
-        )
-    # Validate required request fields up front so a malformed request is
-    # reported precisely (invalid_request, naming the field) and a KeyError
-    # raised deeper -- e.g. by BN internals inside a handler -- is no longer
-    # misreported as a missing request field.
-    for field in REQUIRED_FIELDS.get(kind, ()):
-        if field not in op:
-            raise OperationFailure(
-                "invalid_request",
-                f"operation {kind!r} is missing required field {field!r}",
-                requested=_operation_requested(ctx, op),
-            )
-    for group in REQUIRED_ONE_OF.get(kind, ()):
-        if not any(field in op for field in group):
-            raise OperationFailure(
-                "invalid_request",
-                f"operation {kind!r} requires one of "
-                f"{' / '.join(repr(f) for f in group)}",
-                requested=_operation_requested(ctx, op),
-            )
-    for field, allowed in ENUM_FIELDS.get(kind, {}).items():
-        if field in op and str(op[field]) not in allowed:
-            raise OperationFailure(
-                "invalid_request",
-                f"operation {kind!r} field {field!r} must be one of "
-                f"{' / '.join(repr(v) for v in allowed)}, got {str(op[field])!r}",
-                requested=_operation_requested(ctx, op),
-            )
+    kind = _validate_operation_request(ctx, op)
     try:
         if kind == "rename_symbol":
             return _op_rename_symbol(ctx, bv, op)
@@ -1648,6 +1698,8 @@ def _apply_operation(ctx, bv, op: dict[str, Any], restores: list | None = None):
             return _op_local_rename(ctx, bv, op, restores)
         if kind == "local_retype":
             return _op_local_retype(ctx, bv, op, restores)
+        if kind == "data_retype":
+            return _op_data_retype(ctx, bv, op)
         if kind == "struct_field_set":
             return _op_struct_field_set(ctx, bv, op)
         if kind == "struct_field_rename":
@@ -1896,6 +1948,102 @@ def _run_local_restores(ctx, bv, restores) -> bool:
 
 
 
+def _normalized_locator(value: Any) -> Any:
+    """An address-or-name locator in a canonical form, so ``"0x401120"`` and
+    ``4198688`` are recognized as the same key (#652)."""
+    if value is None:
+        return None
+    try:
+        return ("addr", int(_parse_address(value)))
+    except Exception:
+        return ("name", str(value))
+
+
+# Per-op key identifying WHAT a manifest op writes, grouped so that only ops
+# verified against the SAME piece of state share a family (#652). local_rename and
+# local_retype touch one variable but verify different attributes, so they do not
+# conflict; set_comment and delete_comment do. Accumulative ops (tag_add /
+# tag_remove) and ops with no cheaply-derivable key (types_declare,
+# function_create) are deliberately absent -- listing them would reject legitimate
+# manifests, and a missed conflict still fails the way it does today.
+def _op_conflict_key(op: dict[str, Any]) -> tuple | None:
+    kind = op.get("op")
+    if kind in ("set_comment", "delete_comment"):
+        locator = op.get("function") if op.get("function") is not None else op.get("address")
+        return ("comment", _normalized_locator(locator))
+    if kind == "rename_symbol":
+        return ("symbol_name", _normalized_locator(op.get("identifier")))
+    if kind == "set_prototype":
+        return ("prototype", _normalized_locator(op.get("identifier")))
+    if kind == "local_rename":
+        return ("local_name", _normalized_locator(op.get("function")), str(op.get("variable")))
+    if kind == "local_retype":
+        return ("local_type", _normalized_locator(op.get("function")), str(op.get("variable")))
+    if kind == "data_retype":
+        return ("data_type", _normalized_locator(op.get("address")))
+    if kind == "struct_field_set":
+        return ("struct_field_set", str(op.get("struct_name")), _normalized_locator(op.get("offset")))
+    if kind == "struct_field_rename":
+        return ("struct_field_rename", str(op.get("struct_name")), str(op.get("old_name")))
+    if kind == "struct_field_delete":
+        return ("struct_field_delete", str(op.get("struct_name")), str(op.get("field_name")))
+    return None
+
+
+_CONFLICT_KEY_LABELS = {
+    "comment": "the comment at",
+    "symbol_name": "the symbol name of",
+    "prototype": "the prototype of",
+    "local_name": "the name of the local in",
+    "local_type": "the type of the local in",
+    "data_type": "the data-variable type at",
+    "struct_field_set": "the struct field at offset in",
+    "struct_field_rename": "the struct field name in",
+    "struct_field_delete": "the struct field in",
+}
+
+
+def _reject_duplicate_write_keys(ctx, operations: list[dict[str, Any]]) -> None:
+    """Refuse a manifest that writes the same key twice, up front (#652).
+
+    Every op is verified against the batch's END state, so under last-write-wins
+    the earlier op is judged against the later op's value, fails
+    ``verification_failed``, and takes the whole (atomic) batch down with it --
+    meaning such a manifest is structurally unappliable however correct its intent.
+    That is easy to hit when a manifest is machine-generated from two passes, which
+    is the recommended bulk workflow. An ``invalid_request`` before anything is
+    applied beats rolling back N good ops, and naming BOTH indices says what to fix.
+    """
+    first_seen: dict[tuple, int] = {}
+    for index, op in enumerate(operations):
+        if not isinstance(op, dict):
+            continue
+        key = _op_conflict_key(op)
+        if key is None:
+            continue
+        previous = first_seen.get(key)
+        if previous is None:
+            first_seen[key] = index
+            continue
+        label = _CONFLICT_KEY_LABELS.get(key[0], "the same state in")
+        locator = key[-1]
+        target = hex(locator[1]) if isinstance(locator, tuple) and locator[0] == "addr" else str(
+            locator[1] if isinstance(locator, tuple) else locator)
+        raise OperationFailure(
+            "invalid_request",
+            f"operations {previous} and {index} both write {label} {target}: every op "
+            f"is verified against the batch's END state, so operation {previous} would "
+            f"be judged against operation {index}'s value, fail verification, and roll "
+            f"the whole batch back. Keep one write per key (last-write-wins is not "
+            f"expressible in a single batch) or split them across two batches.",
+            requested={
+                "op": str(op.get("op")),
+                "conflicting_op_indices": [previous, index],
+                "conflict_key": target,
+            },
+        )
+
+
 def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[str, Any]]):
     if not operations:
         raise ValueError("Batch operation list is empty")
@@ -1905,6 +2053,8 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
     # under the same key the apply will, not just _apply_operation. (M12)
     for op in operations:
         _normalize_struct_alias(op)
+    # #652: reject a same-key-twice manifest BEFORE touching the view.
+    _reject_duplicate_write_keys(ctx, operations)
 
     bv = ctx._resolve_view(selector)
     # #479: every write op except the standalone function_create routes through
@@ -1989,6 +2139,15 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
                 "that already has a user-defined prototype.",
                 requested={"op": "set_prototype", "functions": unrevertible},
             )
+    # #650: validate EVERY op's shape before applying ANY. The batch is atomic, so a
+    # guessed op or field name in op 13 previously rolled back 12 good ops -- and with
+    # no argparse layer on this path, guessing is the norm, not the exception. Placed
+    # last among the pre-apply gates so the --quick refusal (target state) and the
+    # #630 preview refusals keep owning their more specific messages; still strictly
+    # before the first mutation, which is the property that matters.
+    for index, op in enumerate(operations):
+        if isinstance(op, dict):
+            _validate_operation_request(ctx, op, index=index)
     affected = _guess_affected_functions(ctx, bv, operations)
     # Partition for blast-radius attribution: a type op's reach is "functions
     # referencing the type"; a direct op targets one function. direct_starts are
@@ -2204,9 +2363,13 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
             "affected_functions": diffs,
             "affected_types": type_diffs,
             "affected_summary": {"referenced": referenced, "reflowed": reflowed},
+            # #652: `rolled_back` used to be present in every case EXCEPT success, so
+            # a parser written against a preview or a failure -- the cases you develop
+            # against -- raised KeyError on the happy path. Always emit it (False when
+            # committed), matching the read-command contract where paging keys are
+            # present regardless of outcome.
+            "rolled_back": restored if (preview or failed) else False,
         }
-        if preview or failed:
-            result["rolled_back"] = restored
         if proto_residue:
             # Structured disclosure of the unclearable has_user_type override, in
             # addition to success:false / rolled_back:false (#630).
@@ -2945,6 +3108,70 @@ def _op_local_retype(ctx, bv, op: dict[str, Any], restores: list | None = None):
         "requested": _operation_requested(ctx, op),
     }
 
+
+
+def _op_data_retype(ctx, bv, op: dict[str, Any]):
+    """Type a DATA variable at an address (#649).
+
+    Struct-typing a recovered global table is a routine RE move, and it had no
+    verified mutation path at all: `types declare` defines the struct but cannot
+    apply it, `symbol rename --kind data` renames without typing, and `struct field
+    set` edits a type rather than a variable's binding -- so the only way through
+    was `bn py exec`, i.e. no --preview, no readback verification, no batch
+    atomicity, no audit trail. ``define_user_data_var`` IS journaled in BN's undo
+    buffer (verified live: revert_undo_actions restores the prior auto type), so the
+    standard preview/rollback machinery covers it with no explicit restore."""
+    address = _parse_address(op["address"])
+    # A typo'd/unmapped address must be a clean invalid_request, not a data var
+    # defined into nowhere and then reported `verified` against itself. (An
+    # indeterminate view -- no is_valid_offset -- is not rejected; only an
+    # affirmative "unmapped" is, mirroring _require_mapped_address.)
+    is_valid = getattr(bv, "is_valid_offset", None)
+    if callable(is_valid):
+        try:
+            mapped = bool(is_valid(address))
+        except Exception:
+            mapped = True
+        if not mapped:
+            raise OperationFailure(
+                "invalid_request",
+                f"Address {hex(address)} is not mapped in this binary, so no data "
+                "variable can be defined there.",
+                requested=_operation_requested(ctx, op),
+            )
+    expected_type, _ = _parse_concrete_type(ctx, bv, op, op["new_type"], label="type")
+    before = bv.get_data_var_at(address)
+    before_type = str(before.type) if before is not None else None
+    before_auto = bool(getattr(before, "auto_discovered", True)) if before is not None else None
+    if before_type != str(expected_type):
+        bv.define_user_data_var(address, expected_type)
+    return {
+        "op": "data_retype",
+        "address": hex(address),
+        "before_type": before_type,
+        "before_auto_discovered": before_auto,
+        "expected_type": str(expected_type),
+        "requested": _operation_requested(ctx, op),
+    }
+
+
+def _verify_data_retype(ctx, bv, result: dict[str, Any]) -> dict[str, Any]:
+    item = dict(result)
+    address = _parse_address(item["address"])
+    expected = str(item["expected_type"])
+    data_var = bv.get_data_var_at(address)
+    observed = str(data_var.type) if data_var is not None else None
+    item["observed"] = {"address": item["address"], "type": observed}
+    if observed != expected:
+        raise OperationFailure(
+            "verification_failed",
+            f"Data variable type at {item['address']} did not land: requested "
+            f"{expected!r}, observed {observed!r}",
+            requested=item.get("requested"),
+            observed=item["observed"],
+        )
+    item["status"] = "noop" if item.get("before_type") == expected else "verified"
+    return item
 
 
 def _type_class_name(t: Any) -> str:

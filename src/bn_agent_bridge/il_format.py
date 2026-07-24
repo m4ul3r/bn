@@ -338,6 +338,7 @@ def _select_local_hlil_node(insn) -> Any | None:
     if not roots:
         return None
 
+    root_fallback = None
     for root in roots:
         current = root
         best_expression = None
@@ -387,7 +388,19 @@ def _select_local_hlil_node(insn) -> Any | None:
             return assignment_candidate
         if enclosing_call is not None:
             return enclosing_call
-    return None
+        # #644: a call whose return value is DISCARDED is itself the statement -- its
+        # parent is the enclosing HighLevelILBlock, a hard boundary, so the ancestor
+        # walk above finds nothing and every bare `memcpy(...)`/`free(...)` call
+        # statement reported no_local_statement. Fall back to the matched root: #475's
+        # address filter already proved this root belongs to THIS call, so it cannot
+        # leak a neighbor's statement. A non-local root is still returned here and
+        # rejected by the localization layer as `statement_not_local`, keeping #557's
+        # reason codes distinguishable.
+        if root_fallback is None or (
+            not _hlil_text_is_local(str(root_fallback)) and _hlil_text_is_local(str(root))
+        ):
+            root_fallback = root
+    return root_fallback
 
 
 def _hlil_statement_localization(insn) -> tuple[str | None, str | None]:
@@ -411,8 +424,9 @@ def _hlil_statement_localization(insn) -> tuple[str | None, str | None]:
     * ``statement_not_local`` -- a statement was selected but its rendered text
       is non-local (too long / multi-line, e.g. a whole-function blob), which
       the localness filter rejects.
-    * ``no_local_statement`` -- roots matched this address but the ancestor walk
-      produced no renderable enclosing statement (rare).
+    * ``no_local_statement`` -- roots matched this address but neither the
+      ancestor walk nor the #644 root fallback produced a node at all (only
+      reachable if the root list is empty after filtering, so genuinely rare).
     """
     roots = _hlil_call_roots(insn)
     if not roots:

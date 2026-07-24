@@ -109,6 +109,115 @@ def test_symbol_rename_summary_preserves_failure_exit_code(fake_transport, capsy
     assert out["failed_count"] == 1 and out["first_error"] == "name did not land"
 
 
+def _big_batch_result(ops=200, comment_len=400):
+    """A batch result whose full audit payload is far past the spill threshold --
+    every op echoes its comment body three times (requested / observed /
+    before_comment), the shape #645 measured at 261 KB for 115 ops."""
+    body = "x" * comment_len
+    return {"ok": True, "result": {
+        "success": True, "committed": True, "preview": False,
+        "results": [{"op": "set_comment", "status": "verified",
+                     "address": hex(0x401000 + i * 4),
+                     "requested": {"comment": body},
+                     "observed": {"comment": body},
+                     "before_comment": body} for i in range(ops)],
+        "affected_functions": [{"name": f"sub_{0x401000 + i * 4:x}", "diff": body}
+                               for i in range(ops)],
+        "affected_types": []}}
+
+
+def test_mutation_defaults_to_compact_status_line_645(fake_transport, capsys):
+    """#645: mutations defaulted to --format json and echoed every per-op diff,
+    `requested`, `observed`, and `before_*` field -- the largest avoidable token
+    burn in a write-heavy session (a `proto set` cost ~7 KB where the status line
+    costs 225 bytes). The compact status is now the default."""
+    fake_transport({"set_comment": {"ok": True, "result": {
+        "success": True, "committed": True, "preview": False,
+        "results": [{"op": "set_comment", "status": "verified", "address": "0x401120",
+                     "requested": {"comment": "x" * 500},
+                     "observed": {"comment": "x" * 500},
+                     "before_comment": "y" * 500}],
+        "affected_functions": [{"name": "handle_request", "diff": "z" * 2000}],
+        "affected_types": []}}})
+    rc = bn.cli.main(["comment", "set", "--target", "active", "0x401120", "note"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out.startswith("mutation: committed")
+    assert "verified=1" in out and "failed=0" in out
+    # None of the bulky audit fields reach stdout.
+    assert "requested" not in out and "before_comment" not in out and "diff" not in out
+    assert len(out) < 400
+
+
+def test_mutation_verbose_restores_full_payload_645(fake_transport, capsys):
+    """#645: the detail is opt-in, not gone."""
+    fake_transport({"set_comment": {"ok": True, "result": {
+        "success": True, "committed": True, "preview": False,
+        "results": [{"op": "set_comment", "status": "verified", "address": "0x401120"}],
+        "affected_functions": [{"address": "0x401120", "before_name": "a",
+                                "after_name": "b", "changed": True, "diff": "--- a\n+++ b"}],
+        "affected_types": []}}})
+    rc = bn.cli.main(["comment", "set", "--target", "active", "--verbose",
+                      "0x401120", "note"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "set_comment" in out and "[verified]" in out
+    assert not out.startswith("mutation: committed")
+
+
+def test_mutation_explicit_json_still_full_envelope_645(fake_transport, capsys):
+    """#645: `--format json` (explicit) is the documented full-envelope contract."""
+    fake_transport({"set_comment": {"ok": True, "result": {
+        "success": True, "committed": True, "preview": False,
+        "results": [{"op": "set_comment", "status": "verified", "address": "0x401120"}],
+        "affected_functions": [], "affected_types": []}}})
+    rc = bn.cli.main(["comment", "set", "--target", "active", "--format", "json",
+                      "0x401120", "note"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["results"][0]["status"] == "verified"
+    assert out["kind"] != "mutation_summary" if "kind" in out else True
+
+
+def test_mutation_summary_flag_still_accepted_645(fake_transport, capsys):
+    """#645: --summary/--quiet stay accepted for compatibility -- and still force
+    compactness under an explicit --format json."""
+    fake_transport({"set_comment": {"ok": True, "result": {
+        "success": True, "committed": True,
+        "results": [{"op": "set_comment", "status": "verified"}],
+        "affected_functions": [{"name": "x"}] * 40}}})
+    rc = bn.cli.main(["comment", "set", "--target", "active", "--quiet",
+                      "--format", "json", "0x401120", "note"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["kind"] == "mutation_summary" and "results" not in out
+
+
+def test_mutation_result_never_spills_to_an_envelope_645(fake_transport, capsys, monkeypatch):
+    """#645: a spilled 38-op batch put the SPILL ENVELOPE on stdout, so `json.loads`
+    raised and the agent could not confirm a batch that HAD committed. That is a
+    correctness problem, not a cost one: an atomic write whose outcome is unreadable
+    desyncs the agent's model of the BNDB from the BNDB. stdout must always carry the
+    parseable status; the detail goes to the artifact."""
+    import io
+
+    fake_transport({"batch_apply": _big_batch_result()})
+    monkeypatch.setenv("BN_SPILL_TOKENS", "500")
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(
+        {"ops": [{"op": "set_comment", "address": hex(0x401000 + i * 4), "comment": "x"}
+                 for i in range(200)]})))
+    rc = bn.cli.main(["batch", "apply", "--target", "active", "--format", "json", "-"])
+    captured = capsys.readouterr()
+    assert rc == 0
+    payload = json.loads(captured.out)          # would raise on a spill envelope
+    assert payload["kind"] == "mutation_summary"
+    assert payload["committed"] is True and payload["verified_count"] == 200
+    assert not payload.get("spilled")
+    # the detail is still reachable
+    assert payload["detail_artifact_path"].endswith((".json", ".ndjson", ".txt"))
+    assert "full mutation detail" in captured.err
+
+
 def test_symbol_rename_builds_preview_payload(fake_transport):
     calls = fake_transport({"rename_symbol": {"ok": True, "result": {"preview": True}}})
 
@@ -204,7 +313,7 @@ def test_symbol_rename_requires_target_when_multiple_targets_are_open(fake_trans
     )
 
 
-def test_function_create_builds_payload_and_defaults_to_json(fake_transport, capsys):
+def test_function_create_builds_payload_explicit_json(fake_transport, capsys):
     calls = fake_transport(
         {
             "function_create": {
@@ -230,12 +339,14 @@ def test_function_create_builds_payload_and_defaults_to_json(fake_transport, cap
         }
     )
 
-    rc = bn.cli.main(["function", "create", "--target", "123:1:7", "0x401000"])
+    rc = bn.cli.main(["function", "create", "--target", "123:1:7", "--format", "json",
+                      "0x401000"])
 
     assert rc == 0
     assert calls[-1]["op"] == "function_create"
     assert calls[-1]["target"] == "123:1:7"
     assert calls[-1]["params"] == {"address": "0x401000", "preview": False}
+    # #645: an EXPLICIT --format json still returns the full audit envelope.
     payload = json.loads(capsys.readouterr().out)
     assert payload["results"][0]["status"] == "verified"
 
@@ -266,7 +377,8 @@ def test_function_create_text_output_renders_verified_summary(fake_transport, ca
         }
     )
 
-    rc = bn.cli.main(["function", "create", "--target", "123:1:7", "--format", "text", "0x401000"])
+    rc = bn.cli.main(["function", "create", "--target", "123:1:7", "--format", "text",
+                      "--verbose", "0x401000"])
 
     assert rc == 0
     out = capsys.readouterr().out
@@ -493,6 +605,7 @@ def test_symbol_rename_text_format_renders_mutation_summary(monkeypatch, capsys)
             "--target",
             "active",
             "--preview",
+            "--verbose",
             "sub_401000",
             "player_update",
         ]
@@ -542,7 +655,8 @@ def test_symbol_rename_verification_failure_returns_nonzero(monkeypatch, capsys)
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
-    rc = bn.cli.main(["symbol", "rename", "--format", "text", "--target", "active", "sub_401000", "player_update"])
+    rc = bn.cli.main(["symbol", "rename", "--format", "text", "--verbose", "--target",
+                      "active", "sub_401000", "player_update"])
 
     assert rc == 3
     output = capsys.readouterr().out
@@ -998,3 +1112,36 @@ def test_comment_delete_accepts_positional_address(monkeypatch):
     assert captured["op"] == "delete_comment"
     assert captured["params"]["address"] == "0x1234"
     assert captured["params"]["function"] is None
+
+
+def test_data_retype_builds_payload_and_previews_649(fake_transport, capsys):
+    """#649: `bn data retype` drives the standard mutation loop, so a recovered
+    global table can be typed through --preview + verification instead of
+    `bn py exec` (which has no preview, readback, atomicity, or audit trail)."""
+    calls = fake_transport({"data_retype": {"ok": True, "result": {
+        "success": True, "committed": True, "preview": False,
+        "results": [{"op": "data_retype", "status": "verified", "address": "0x460000",
+                     "before_type": "void", "expected_type": "cmd_help_entry[257]"}],
+        "affected_functions": [], "affected_types": []}}})
+
+    rc = bn.cli.main(["data", "retype", "--target", "active", "0x460000",
+                      "cmd_help_entry[257]"])
+    assert rc == 0
+    assert calls[-1]["op"] == "data_retype"
+    assert calls[-1]["params"] == {"address": "0x460000",
+                                   "new_type": "cmd_help_entry[257]", "preview": False}
+    assert capsys.readouterr().out.startswith("mutation: committed")
+
+    rc = bn.cli.main(["data", "retype", "--target", "active", "--preview", "0x460000",
+                      "cmd_help_entry[257]"])
+    assert rc == 0
+    assert calls[-1]["params"]["preview"] is True
+
+
+def test_data_retype_verification_failure_exits_3_649(fake_transport):
+    fake_transport({"data_retype": {"ok": True, "result": {
+        "success": False, "committed": False, "rolled_back": True,
+        "results": [{"op": "data_retype", "status": "verification_failed",
+                     "message": "type did not land"}]}}})
+    rc = bn.cli.main(["data", "retype", "--target", "active", "0x460000", "uint32_t"])
+    assert rc == 3

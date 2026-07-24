@@ -33,6 +33,36 @@ def _json_response(*, ok: bool, result: Any = None, error: str | None = None) ->
     return {"ok": ok, "result": result, "error": error}
 
 
+# Symbol types whose NAME comes from relocations/imports, not from analysis or a
+# human. Counting these as "named" badly overstates how much real code is named
+# on a stripped binary (PLT import trampolines dominate it), so they get their
+# own bucket (#122). Compared by enum-member name to avoid importing the enum.
+IMPORT_SYMBOL_TYPE_NAMES = frozenset(
+    {"ImportedFunctionSymbol", "ImportAddressSymbol", "ExternalSymbol"}
+)
+
+
+def is_imported_function(fn) -> bool:
+    sym = getattr(fn, "symbol", None)
+    sym_type = getattr(sym, "type", None)
+    return getattr(sym_type, "name", None) in IMPORT_SYMBOL_TYPE_NAMES
+
+
+def is_auto_function_name(name: str) -> bool:
+    """True for BN's auto-generated function names -- ``sub_<hex>`` and the
+    ``j_sub_<hex>`` thunk variant. Everything else counts as a meaningful name.
+
+    Lives here, not in ``bridge.py``, so `target info`'s named/auto-named summary
+    and `function list --named/--unnamed` share ONE predicate: the two numbers
+    disagreeing (with neither queryable) is exactly what #653.4 reported.
+    """
+    core = name[2:] if name.startswith("j_") else name
+    if not core.startswith("sub_"):
+        return False
+    suffix = core[4:]
+    return bool(suffix) and all(c in "0123456789abcdefABCDEF" for c in suffix)
+
+
 def _symbol_type_name(fn: Any) -> str | None:
     """The symbol-type enum-member name of a function (e.g. ``FunctionSymbol``,
     ``ImportedFunctionSymbol``), or None. Guards the WHOLE access: BN's

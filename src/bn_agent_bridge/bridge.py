@@ -38,6 +38,7 @@ from . import read_types
 from . import read_xrefs
 from . import vars as vars_mod
 from ._shared import (
+    IMPORT_SYMBOL_TYPE_NAMES,
     OperationFailure,
     _artifact_summary,
     _json_response,
@@ -49,6 +50,8 @@ from ._shared import (
     _validate_bool,
     _validate_count,
     _write_json_artifact,
+    is_auto_function_name,
+    is_imported_function,
 )
 from .op_registry import REGISTRY, op
 from .paths import (
@@ -783,14 +786,10 @@ class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamSer
 # _VAR_DRIFT_OPS moved to mutation_engine.py with the mutation cluster (#33).
 
 
-def _is_auto_function_name(name: str) -> bool:
-    """True for BN's auto-generated function names -- ``sub_<hex>`` and the
-    ``j_sub_<hex>`` thunk variant. Everything else counts as a meaningful name."""
-    core = name[2:] if name.startswith("j_") else name
-    if not core.startswith("sub_"):
-        return False
-    suffix = core[4:]
-    return bool(suffix) and all(c in "0123456789abcdefABCDEF" for c in suffix)
+# Both predicates now live in _shared so `target info` and `function list
+# --named/--unnamed` cannot drift apart (#653.4). Kept as module-local aliases
+# because the bridge and its tests reference these names.
+_is_auto_function_name = is_auto_function_name
 
 
 def _is_go_rename_auto_name(name: str, address: int) -> bool:
@@ -798,19 +797,8 @@ def _is_go_rename_auto_name(name: str, address: int) -> bool:
     return name == f"sub_{address:x}" or name.startswith("nullsub_")
 
 
-# Symbol types whose NAME comes from relocations/imports, not from analysis or a
-# human. Counting these as "named" badly overstates how much real code is named
-# on a stripped binary (PLT import trampolines dominate it), so they get their
-# own bucket (#122). Compared by enum-member name to avoid importing the enum.
-_IMPORT_SYMBOL_TYPE_NAMES = frozenset(
-    {"ImportedFunctionSymbol", "ImportAddressSymbol", "ExternalSymbol"}
-)
-
-
-def _is_imported_function(fn) -> bool:
-    sym = getattr(fn, "symbol", None)
-    sym_type = getattr(sym, "type", None)
-    return getattr(sym_type, "name", None) in _IMPORT_SYMBOL_TYPE_NAMES
+_IMPORT_SYMBOL_TYPE_NAMES = IMPORT_SYMBOL_TYPE_NAMES
+_is_imported_function = is_imported_function
 
 
 def _segment_entries(bv) -> list[dict[str, Any]]:
@@ -2463,6 +2451,26 @@ class BinaryNinjaBridge:
         artifact = _write_json_artifact(out_path, bundle)
         return artifact or bundle
 
+    def _disclose_sample_sections(self, selector: str | None, sample) -> None:
+        """Tag an orient strings sample with the sections it was drawn from (#646),
+        so a useless sample is at least attributable. Best-effort."""
+        if not isinstance(sample, dict):
+            return
+        try:
+            bv = self._resolve_view(selector)
+            names: set[str] = set()
+            for item in sample.get("items") or []:
+                addr = item.get("address")
+                if not isinstance(addr, str):
+                    continue
+                for sec in bv.get_sections_at(int(addr, 16)) or []:
+                    name = str(getattr(sec, "name", "") or "")
+                    if name:
+                        names.add(name)
+            sample["sample_sections"] = sorted(names)
+        except Exception:
+            return
+
     def _orient_digest(self, selector: str | None, *, strings_limit: int = 20):
         """One internally-consistent orientation/triage digest (#169 Layer 2):
         target + analysis state, imports summary, a bounded strings sample,
@@ -2480,10 +2488,28 @@ class BinaryNinjaBridge:
         strings_min_length = 6
         if analyzed:
             try:
+                # #646: an unfiltered `offset=0, limit=N` over an address-ordered scan
+                # is the HEAD of the address space, and on an ELF the lowest string
+                # addresses are always `.interp` / `.gnu.hash` / `.dynsym` / `.dynstr`
+                # -- so the digest's highest-signal field deterministically carried the
+                # loader path, `__gmon_start__`, and imported symbol names, on 4 of 4
+                # ELF targets. min_length=6 cannot help (`_ITM_deregisterTMCloneTable`
+                # is 27 chars). Restrict the sample to sections that can hold DOMAIN
+                # literals -- the `bn strings --section .rodata` follow-up every agent
+                # paid for by hand.
                 strings_sample = read_misc._strings(
                     self.ctx, selector, query=None, offset=0,
                     limit=strings_limit, min_length=strings_min_length,
+                    domain_sections_only=True,
                 )
+                if not (strings_sample.get("items") if isinstance(strings_sample, dict) else None):
+                    # Degrade, don't error: a view whose only strings ARE metadata
+                    # still gets a sample rather than a misleading empty one.
+                    strings_sample = read_misc._strings(
+                        self.ctx, selector, query=None, offset=0,
+                        limit=strings_limit, min_length=strings_min_length,
+                    )
+                self._disclose_sample_sections(selector, strings_sample)
             except RuntimeError as exc:
                 strings_sample = {"unavailable": str(exc)}
         else:
@@ -2877,6 +2903,10 @@ def _bind_list_functions(bridge, params, target):
         count_only=_validate_bool(params.get("count_only"), label="count_only", default=False),
         sort=str(params.get("sort", "address")),
         reverse=_validate_bool(params.get("reverse"), label="reverse", default=False),
+        # #653.4: None = both partitions (the default); True/False = named/auto-named
+        # only, matching `target info`'s buckets.
+        named=(_validate_bool(params.get("named"), label="named", default=False)
+               if params.get("named") is not None else None),
     )
 
 
@@ -2913,7 +2943,10 @@ def _bind_callsites(bridge, params, target):
 
 @op("function_info", lock="read")
 def _bind_function_info(bridge, params, target):
-    return bridge._function_info(target, params["identifier"])
+    return bridge._function_info(
+        target, params["identifier"],
+        blocks=_validate_bool(params.get("blocks"), label="blocks", default=False),
+    )
 
 
 @op("get_prototype", lock="read")
@@ -3288,6 +3321,7 @@ def _bind_list_comments(bridge, params, target):
         # would do int(None) and crash a bare `comment list`. Matches the
         # strings/imports/sections/types binders.
         limit=int(params["limit"]) if params.get("limit") is not None else None,
+        scope=params.get("scope") or "all",
     )
 
 
@@ -3358,6 +3392,13 @@ def _bind_local_rename(bridge, params, target):
 @op("local_retype", lock="write")
 def _bind_local_retype(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "local_retype"}])
+
+
+@op("data_retype", lock="write")
+def _bind_data_retype(bridge, params, target):
+    # #649: typing a recovered data variable had no verified mutation path at all
+    # (py exec only -- no --preview, no readback, no batch atomicity).
+    return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "data_retype"}])
 
 
 @op("struct_field_set", lock="write")

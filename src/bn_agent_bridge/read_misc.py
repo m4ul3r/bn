@@ -161,10 +161,43 @@ def _paged_list_result(items: list[dict[str, Any]], *, offset: int,
     }
 
 
+# Sections that hold loader/linker METADATA strings rather than domain literals
+# (#646). Name-based on purpose: BN classifies `.dynstr` as ReadOnlyData exactly
+# like `.rodata` (verified against a live view), so a semantics-only test cannot
+# tell them apart -- and `.dynstr`/`.interp` sit at the LOWEST string addresses on
+# every ELF, so they own the head of any address-ordered sample.
+_METADATA_STRING_SECTIONS = (
+    ".interp", ".dynstr", ".dynsym", ".gnu.", ".hash", ".eh_frame", ".rela",
+    ".rel.", ".dynamic", ".strtab", ".symtab", ".shstrtab", ".comment", ".note",
+    ".plt", ".got", ".debug",
+)
+
+
+def _is_domain_string_section(bv, address: int) -> bool:
+    """Can the section at *address* hold domain literals, or is it ELF metadata?
+
+    True when there is no section knowledge at all (a raw/monolithic firmware
+    image), so the filter degrades to the old behaviour instead of blinding the
+    scan on its primary target class.
+    """
+    try:
+        secs = list(bv.get_sections_at(int(address)) or [])
+    except Exception:
+        return True
+    if not secs:
+        return True
+    return not any(
+        marker in str(getattr(sec, "name", "") or "").lower()
+        for sec in secs
+        for marker in _METADATA_STRING_SECTIONS
+    )
+
+
 def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None,
              min_length: int | None = None, max_length: int | None = None,
              section: str | None = None, no_crt: bool = False, regex: bool = False,
-             probable_format_strings: bool = False, count_only: bool = False):
+             probable_format_strings: bool = False, count_only: bool = False,
+             domain_sections_only: bool = False):
     offset = _validate_count(offset, label="offset", minimum=0)
     # allow_none mirrors the sibling list ops (imports/sections): limit=None
     # means "no limit", so a raw-socket / py exec caller can fetch every string.
@@ -211,6 +244,11 @@ def _strings(ctx, selector: str | None, *, query, offset: int, limit: int | None
             secs = bv.get_sections_at(address) if hasattr(bv, "get_sections_at") else []
             if not any(getattr(s, "name", "") == section for s in secs):
                 continue
+        # #646: drop loader/linker metadata strings (`.interp`, `.dynstr` import
+        # names, `__gmon_start__`) so an address-ordered head sample carries domain
+        # literals instead of the ELF preamble it deterministically starts with.
+        if domain_sections_only and not _is_domain_string_section(bv, address):
+            continue
         if no_crt:
             if _NO_CRT_PATTERNS.match(value):
                 continue

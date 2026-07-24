@@ -51,6 +51,8 @@ Target selection, sticky pins, instance/target resolution order, sessions/headle
    > ```
    >
    > Note: global **`-i/--instance` is routing** (which live bridge to talk to). **`--instance-id` on `session start` / `load` is spawn naming** (what ID the new bridge gets). They are distinct flags — `bn session start -i foo …` does **not** name the spawn `foo`; use `--instance-id foo` for that.
+   >
+   > `session start` prints the loaded target's selector (`target: <sel>   (pass -t <sel>; id …)`), so a fan-out agent does **not** need a follow-up `bn target list` just to learn what to pass to `-t` (#653).
 
 ## 2. Sessions & headless
 
@@ -58,7 +60,7 @@ The bridge runs as a GUI plugin or as a headless process; both speak the same pr
 
 ```bash
 bn load /path/to/binary.bndb [--instance-id <id>]   # auto-spawns a headless bridge if none is running
-bn session start /path/to/binary [--instance-id <id>]
+bn session start /path/to/binary [--instance-id <id>]   # prints the target SELECTOR to pass as -t
 bn session list                         # running instances + RSS + sticky marker
 bn session stop <id>                    # shut one down
 bn close [<path>]                       # close one (omit path → close all)
@@ -134,7 +136,8 @@ Requests time out after 600s by default so a wedged bridge can't hang the CLI; o
 Defaults:
 
 - Read commands → `--format text`.
-- Mutation, preview, setup, and export commands → `--format json`.
+- Mutations → a compact **text status line**; the full audit payload is opt-in via `--verbose`, an explicit `--format json`, or `--out` (see `reference/mutating.md`). A mutation result never spills, so `json.loads(stdout)` on a `batch apply` always works.
+- Setup and export commands → `--format json`.
 - `--format ndjson` is available where it makes sense.
 - `--out <path>` writes the full body to disk and returns an envelope on stdout.
 
@@ -144,7 +147,8 @@ Defaults:
 - `spilled` — `true` when the body was written to disk because of the threshold; `false` when `--out` was used.
 - `path` (text envelope) / `artifact_path` (JSON) — location on disk: `<cache>/spills/YYYYMMDD/<stem>-HHMMSS-<pid>-<rand>.<json|ndjson|txt>` (cache dir defaults to `~/.cache/bn`, override with `BN_CACHE_DIR`).
 - `format` — `json`, `ndjson`, or `text`.
-- `bytes`, `tokens` (estimate), `tokenizer` (`estimate`), `sha256` — size + integrity.
+- `bytes`, `tokens` (estimate), `tokenizer` (`estimate`), `sha256` — size + integrity. `sha256` is the digest of **this artifact's bytes**, not of the binary.
+- `target`, `instance` — **provenance**: which target and bridge instance produced the artifact (#653). Check them before trusting a `--out` file you didn't just write: two agents sharing a scratchpad both wrote `fns.json`, and one silently read the other's list — a different target, a different binary — with nothing in the file making that detectable.
 - `summary` — shape hint with `kind` and `count` / `chars` / `keys`.
 - `spill_token_limit` — the threshold that tripped (so you can see how far over you went).
 - `rerun` — the **command-specific slicing knob** to bound the next read (e.g. `--limit`/`--offset` for lists, `--lines` for `disasm`/`il`, `--address-window` for `evidence function`), so you re-run bounded instead of blind.

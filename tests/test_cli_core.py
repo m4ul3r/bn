@@ -18,7 +18,7 @@ def test_spill_warns_about_pipe_trap_when_stdout_is_a_pipe(monkeypatch, capsys):
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         return {"ok": True, "result": {"text": "long decompiled text"}}
 
-    def fake_write_output_result(value, *, fmt, out_path, stem):
+    def fake_write_output_result(value, *, fmt, out_path, stem, **kwargs):
         return _spill_artifact_namespace("/tmp/decompile.txt")
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
@@ -40,7 +40,7 @@ def test_scalar_spill_warning_points_at_artifact(monkeypatch, capsys):
         # type_info returns a dict (non-list) payload that can spill.
         return {"ok": True, "result": {"name": "Player", "decl": "struct Player { ... }"}}
 
-    def fake_write_output_result(value, *, fmt, out_path, stem):
+    def fake_write_output_result(value, *, fmt, out_path, stem, **kwargs):
         assert stem == "type-show"
         return _spill_artifact_namespace("/tmp/type-show.txt")
 
@@ -247,8 +247,11 @@ def test_entries_validator_hex_aware_and_rejects_zero(capsys):
 def test_removed_experimental_commands_are_not_present():
     parser = bn.cli.build_parser()
 
+    # #649: the `data` GROUP now exists, for the verified `data retype` mutation --
+    # but the paged data-LISTING read that was removed here stays removed.
     with pytest.raises(SystemExit):
-        parser.parse_args(["data"])
+        parser.parse_args(["data", "vars"])
+    assert parser.parse_args(["data", "retype", "0x460000", "uint32_t"]).format == "json"
     with pytest.raises(SystemExit):
         parser.parse_args(["bundle", "corpus"])
     with pytest.raises(SystemExit):
@@ -481,7 +484,7 @@ def test_paged_callsites_spill_hint_suggests_limit_offset(monkeypatch, capsys):
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         return {"ok": True, "result": [{"call": "0x1000", "caller_static": "0x1004"}]}
 
-    def fake_write_output_result(value, *, fmt, out_path, stem):
+    def fake_write_output_result(value, *, fmt, out_path, stem, **kwargs):
         assert stem == "callsites"
         return _spill_artifact_namespace("/tmp/callsites.txt")
 
@@ -530,7 +533,7 @@ def test_spill_emits_greppable_marker_on_piped_text(monkeypatch, capsys):
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
     monkeypatch.setattr(bn.cli, "write_output_result",
-                        lambda value, *, fmt, out_path, stem: _spill_artifact_namespace("/tmp/decompile.txt"))
+                        lambda value, *, fmt, out_path, stem, **kwargs: _spill_artifact_namespace("/tmp/decompile.txt"))
     monkeypatch.setattr(bn.cli, "_stdout_is_pipe", lambda: True, raising=False)
 
     rc = bn.cli.main(["decompile", "sub_401000", "--target", "active"])
@@ -548,7 +551,7 @@ def test_spill_json_pipe_has_no_marker(monkeypatch, capsys):
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
     monkeypatch.setattr(bn.cli, "write_output_result",
-                        lambda value, *, fmt, out_path, stem: _spill_artifact_namespace("/tmp/decompile.txt"))
+                        lambda value, *, fmt, out_path, stem, **kwargs: _spill_artifact_namespace("/tmp/decompile.txt"))
     monkeypatch.setattr(bn.cli, "_stdout_is_pipe", lambda: True, raising=False)
 
     rc = bn.cli.main(["decompile", "sub_401000", "--target", "active", "--format", "json"])
@@ -565,7 +568,7 @@ def test_spill_no_marker_when_not_piped(monkeypatch, capsys):
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
     monkeypatch.setattr(bn.cli, "write_output_result",
-                        lambda value, *, fmt, out_path, stem: _spill_artifact_namespace("/tmp/decompile.txt"))
+                        lambda value, *, fmt, out_path, stem, **kwargs: _spill_artifact_namespace("/tmp/decompile.txt"))
     monkeypatch.setattr(bn.cli, "_stdout_is_pipe", lambda: False, raising=False)
 
     rc = bn.cli.main(["decompile", "sub_401000", "--target", "active"])
@@ -1032,3 +1035,79 @@ def test_all_targets_flag_only_on_fanout_commands():
         with contextlib.suppress(SystemExit), contextlib.redirect_stdout(buf):
             cli.main(argv)
         assert ("--all-targets" in buf.getvalue()) is present, argv
+
+
+def test_local_list_json_carries_items_651(fake_transport, capsys):
+    """#651: `local list` returned its array under `locals` only, while the
+    reference documents `items` as ALWAYS the container -- the exception was
+    documented in #248 and then lost in the SKILL.md -> reference/ split. A wrong
+    key yields null, never an error, so `jq '.items[]'` on a function with 40
+    recovered locals silently read as "no recovered variables"."""
+    fake_transport({
+        "list_locals": {
+            "ok": True,
+            "result": {
+                "function": {"name": "handle_request", "address": "0x401120"},
+                "kind": "locals",
+                "items": [{"name": "var_c", "type": "char*", "is_parameter": False,
+                           "local_id": "0x401120:local:stack:-12:0:2"}],
+                "locals": [{"name": "var_c", "type": "char*", "is_parameter": False,
+                            "local_id": "0x401120:local:stack:-12:0:2"}],
+            },
+        },
+    })
+    rc = bn.cli.main(["local", "list", "--format", "json", "--target", "active",
+                      "handle_request"])
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["items"][0]["name"] == "var_c"
+    assert payload["locals"] == payload["items"]     # retained alias, same list
+
+
+def test_local_list_text_renders_from_items_651(fake_transport, capsys):
+    """The text renderer reads the canonical `items` container too."""
+    fake_transport({
+        "list_locals": {
+            "ok": True,
+            "result": {
+                "function": {"name": "handle_request", "address": "0x401120"},
+                "kind": "locals",
+                "items": [{"name": "len", "type": "int32_t", "is_parameter": True,
+                           "local_id": "0x401120:param:stack:4:0:1"}],
+            },
+        },
+    })
+    rc = bn.cli.main(["local", "list", "--format", "text", "--target", "active",
+                      "handle_request"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "(1 params, 0 locals)" in out and "len" in out
+
+
+def test_session_start_text_prints_the_target_selector_653(monkeypatch, capsys):
+    """#653.3: fan-out agents are required to pass -t on every command, so every
+    session began with a mandatory second `bn target list` call just to learn the
+    selector `session start` already had in hand."""
+    class _Inst:
+        instance_id = "a1b2c3"
+        pid = 4242
+        socket_path = "/tmp/a1b2c3.sock"
+
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda iid: _Inst())
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None,
+                          spawn_missing_named=False):
+        assert op == "load_binary"
+        return {"ok": True, "result": {
+            "path": "/bin/prog", "loaded": True, "analyzed": True, "notes": [],
+            "targets": [{"selector": "prog", "target_id": "4242:1:99", "basename": "prog",
+                         "active": True}]}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["session", "start", "/bin/prog"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "target: prog" in out
+    assert "-t prog" in out
+    assert "4242:1:99" in out

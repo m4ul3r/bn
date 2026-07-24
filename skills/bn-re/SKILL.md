@@ -11,7 +11,7 @@ Use this skill when the user wants to understand, reverse engineer, or analyze a
 
 Start broad, then narrow:
 
-> **One-shot triage (steps 1–3 in a single consistent read).** `bn evidence orient` composes target + analysis state, imports summary, a high-signal strings sample, function count, and sections into **one digest under a single read lock** — so nothing interleaves between the sub-reads the way separate commands would. Run it as the very first move on an unknown binary, then drill with the steps below. It samples higher-signal strings (min 6 chars) than `bn strings`, so its strings `total` is intentionally smaller.
+> **One-shot triage (steps 1–3 in a single consistent read).** `bn evidence orient` composes target + analysis state, imports summary, a high-signal strings sample, function count, and sections into **one digest under a single read lock** — so nothing interleaves between the sub-reads the way separate commands would. Run it as the very first move on an unknown binary, then drill with the steps below. It samples higher-signal strings (min 6 chars) than `bn strings`, so its strings `total` is intentionally smaller. The sample is drawn from sections that can hold **domain literals** and names them in `sample_sections`: an unfiltered address-ordered sample was deterministically the ELF preamble (`.interp`, `.dynstr` import names, `__gmon_start__`) on 4 of 4 ELF targets, since those sit at the lowest string addresses and a length filter cannot help (`_ITM_deregisterTMCloneTable` is 27 characters).
 
 1. **Orient** — get architecture, platform, and entry point:
    ```bash
@@ -122,11 +122,20 @@ Always preview first. Renaming propagates through decompilation and makes surrou
 Once a function's purpose is clear, fix the prototype and local types:
 ```bash
 bn proto get parse_config
-bn proto set parse_config "int32_t parse_config(char* buf, int32_t len)" --preview
+bn proto set parse_config "int32_t parse_config(char* buf, int32_t len)"   # apply live
+bn proto get parse_config                                                  # read it back
 bn local list parse_config
 bn local retype parse_config arg1 "char*"
 ```
 Correct prototypes propagate to all callers.
+
+**`proto set` cannot be previewed on a function that has no user prototype yet** — the
+common case on a stripped target. Setting a prototype pins BN's `has_user_type` flag
+and there is no API to clear it, so a preview could not honour its non-destructive
+contract; `bn` refuses up front instead of leaving residue behind (the error text
+explains this and tells you to re-run without `--preview`). Apply it live and read it
+back with `bn proto get`, as above. Once a function *does* carry a user prototype,
+`--preview` works normally on further changes.
 
 ### Phase 3: Struct reconstruction
 When you see repeated field accesses at fixed offsets from a pointer, that pointer is a struct. See the **Struct Reconstruction** section below.
@@ -181,7 +190,13 @@ Comment the *why* a name can't carry (assumptions, edge cases, cross-function re
 ```bash
 bn comment set --address 0x401000 "len isn't bounds-checked; attacker-controlled"
 bn comment set --address 0x402000 "TODO: arg2 looks like a callback — confirm signature"
+bn comment set --function handle_request "Dispatcher: opcode selects a handler"   # function doc
+bn comment list --query TODO                       # finds BOTH stores (address + function docs)
 ```
+`--function` writes the function's *documentation* comment (`fn.comment`, shown atop
+the function), a different store from address comments. `comment list` covers both by
+default, so a `TODO:` in a function doc is discoverable; `--scope address|function`
+narrows when you want only one.
 
 ## Struct Reconstruction
 

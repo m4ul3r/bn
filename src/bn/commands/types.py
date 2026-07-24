@@ -4,7 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from ..cli import _call, _effective_limit, _mutate, arg, command, preview_arg, summary_arg
+from ..cli import _call, _effective_limit, _mutate, arg, command, mutation_output_args, preview_arg
 from ..formatters import (
     _render_type_info_text,
     _render_type_list_text,
@@ -66,7 +66,7 @@ def _types_show(args: argparse.Namespace) -> int:
 
 @command("types", "declare", help="Import C declarations as user types", target=True, fmt="json",
          args=[
-             preview_arg(), summary_arg(),
+             preview_arg(), *mutation_output_args(),
              arg("--file", type=Path, help="Read declarations from a file"),
              arg("--stdin", action="store_true", help="Read declarations from stdin"),
              arg("declaration", nargs="?"),
@@ -130,7 +130,7 @@ def _struct_show(args: argparse.Namespace) -> int:
 
 @command("struct", "field", "set", help="Set or replace a field", target=True, fmt="json",
          args=[
-             preview_arg(), summary_arg(),
+             preview_arg(), *mutation_output_args(),
              arg("--no-overwrite", action="store_true"),
              arg("struct_name"),
              arg("offset"),
@@ -155,7 +155,7 @@ def _struct_field_set(args: argparse.Namespace) -> int:
 
 @command("struct", "field", "rename", help="Rename a field", target=True, fmt="json",
          args=[
-             preview_arg(), summary_arg(),
+             preview_arg(), *mutation_output_args(),
              arg("struct_name"),
              arg("old_name", help="Field name or offset (e.g. count or 0x8)"),
              arg("new_name"),
@@ -176,7 +176,7 @@ def _struct_field_rename(args: argparse.Namespace) -> int:
 
 @command("struct", "field", "delete", help="Delete a field", target=True, fmt="json",
          args=[
-             preview_arg(), summary_arg(),
+             preview_arg(), *mutation_output_args(),
              arg("struct_name"),
              arg("field_name", help="Field name or offset (e.g. count or 0x8)"),
          ])
@@ -190,4 +190,37 @@ def _struct_field_delete(args: argparse.Namespace) -> int:
         },
         preview=bool(args.preview),
         stem="struct-field-delete",
+    )
+
+
+@command("data", "retype", help="Set the type of a data variable at an address",
+         target=True, fmt="json",
+         prefer_when="after `types declare` defines a struct, bind it to the address "
+                     "of a recovered global/table (e.g. `cmd_entry[257]` at 0x460000) "
+                     "through the verified mutation path instead of `py exec`",
+         see_also=("types declare", "struct field set", "batch apply"),
+         args=[
+             preview_arg("Apply the type, capture diffs, then revert without committing"),
+             *mutation_output_args(),
+             arg("address", help="Address of the data variable (hex 0x.. or decimal)"),
+             arg("new_type",
+                 help="C type to bind at the address, e.g. 'uint32_t', 'char*', or a "
+                      "declared struct/array like 'cmd_entry[257]'. Declare named "
+                      "types first with `bn types declare`."),
+         ])
+def _data_retype(args: argparse.Namespace) -> int:
+    # #649: struct-typing a recovered global table is a routine RE move that had
+    # no first-class path -- `types declare` defines the struct but cannot apply
+    # it, `symbol rename --kind data` renames without typing, and `struct field
+    # set` edits a type rather than a variable's binding. The only way through was
+    # `py exec`, outside --preview / verification / batch atomicity.
+    return _mutate(
+        args,
+        "data_retype",
+        {
+            "address": args.address,
+            "new_type": args.new_type,
+        },
+        preview=bool(args.preview),
+        stem="data-retype",
     )
