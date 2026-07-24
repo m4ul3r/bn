@@ -220,6 +220,43 @@ def test_target_info_surfaces_image_base(monkeypatch):
     assert info["entry_point"] == "0x40b180"
 
 
+class _BigEndian:
+    """Stands in for BN's ``Endianness`` enum, which ``_byteorder`` classifies by
+    stringifying -- so the enum spelling has to be recognized, not just ``"big"``."""
+
+    def __str__(self):
+        return "Endianness.BigEndian"
+
+
+def test_target_info_surfaces_the_pointer_format(monkeypatch):
+    """target info exposes address_size + endianness, the two facts needed to
+    decode a raw word out of the view. `arch` is a label: a consumer that maps the
+    name to a width/byte order is guessing for every architecture it hasn't
+    enumerated, and a word decoded at the wrong width can collide with a real
+    address and print a confident wrong name."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV()  # default fake arch: 4-byte, no endianness attribute
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+
+    info = instance._target_info("active")
+
+    # Taken from the seam (which prefers bv.address_size, then arch's), not
+    # inferred from the arch name.
+    assert info["address_size"] == 4
+    assert info["endianness"] == "little"
+
+    be = _FakeBV(arch=_FakeArch(name="ppc64", address_size=8))
+    be.endianness = _BigEndian()
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: be)
+
+    info = instance._target_info("active")
+
+    assert info["address_size"] == 8
+    assert info["endianness"] == "big"
+
+
 def test_validate_count_enforces_minimum(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     # count flags require >= 1

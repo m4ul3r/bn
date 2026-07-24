@@ -1678,6 +1678,20 @@ class BinaryNinjaBridge:
             **(record or {}),
             "arch": str(getattr(bv, "arch", "")),
             "platform": str(getattr(bv, "platform", "")),
+            # The two facts needed to decode a raw word out of this target, which
+            # `arch` alone does not give: the name is a *label*, and a consumer that
+            # maps it to a width/byte order is guessing for every architecture it
+            # did not enumerate (SPARC, anything custom, a future BN arch). Both are
+            # already computed here for the evidence readers -- `_pointer_size`
+            # prefers `bv.address_size` and `_byteorder` reads `bv.endianness` --
+            # so publishing them costs nothing and removes the guess.
+            #
+            # Load-bearing for anything that symbolizes a pointer table out of a
+            # hex dump: a word decoded at the wrong width does not merely fail to
+            # match a symbol, it can collide with a real address and print a
+            # confident wrong name.
+            "address_size": self.ctx._pointer_size(bv),
+            "endianness": self.ctx._byteorder(bv),
             # Preferred/image base BN loaded the view at (#564). For a PIE ELF this
             # is BN's chosen preferred base (commonly 0x400000 on x86_64), NOT ELF
             # VA 0 -- dynamic tools need it to rebase a BN address to runtime
