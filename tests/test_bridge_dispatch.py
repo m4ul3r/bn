@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 import importlib
 import importlib.util
 import io
@@ -220,12 +221,46 @@ def test_target_info_surfaces_image_base(monkeypatch):
     assert info["entry_point"] == "0x40b180"
 
 
-class _BigEndian:
-    """Stands in for BN's ``Endianness`` enum, which ``_byteorder`` classifies by
-    stringifying -- so the enum spelling has to be recognized, not just ``"big"``."""
+class _Endianness(enum.IntEnum):
+    """BN's ``Endianness`` verbatim: an ``IntEnum`` with these two members.
 
-    def __str__(self):
-        return "Endianness.BigEndian"
+    The shape matters. Under Python 3.11+ ``str()`` on an IntEnum member is
+    ``int.__str__`` -- ``str(_Endianness.BigEndian) == "1"``, NOT
+    ``"Endianness.BigEndian"`` -- so classifying byte order by substring-matching
+    the stringified value reports *little* for every big-endian view. A stub whose
+    ``__str__`` spells the member name out hides exactly that bug.
+    """
+
+    LittleEndian = 0
+    BigEndian = 1
+
+
+def test_byteorder_classifies_bns_intenum_not_its_str(monkeypatch):
+    """A big-endian view must read as big-endian through BN's real enum type."""
+    bridge = _load_bridge(monkeypatch)
+    ctx = bridge.BinaryNinjaBridge().ctx
+
+    assert str(_Endianness.BigEndian) == "1"  # the trap this test exists for
+
+    be = _FakeBV()
+    be.endianness = _Endianness.BigEndian
+    assert ctx._byteorder(be) == "big"
+
+    le = _FakeBV()
+    le.endianness = _Endianness.LittleEndian
+    assert ctx._byteorder(le) == "little"
+
+    # The view's own value wins over the arch's, and a plain-string caller still
+    # classifies; a view reporting nothing falls back to little.
+    mixed = _FakeBV(arch=_FakeArch(name="ppc64", address_size=8))
+    mixed.arch.endianness = _Endianness.LittleEndian
+    mixed.endianness = _Endianness.BigEndian
+    assert ctx._byteorder(mixed) == "big"
+    assert ctx._byteorder(_FakeBV()) == "little"
+
+    text = _FakeBV()
+    text.endianness = "big"
+    assert ctx._byteorder(text) == "big"
 
 
 def test_target_info_surfaces_the_pointer_format(monkeypatch):
@@ -248,7 +283,7 @@ def test_target_info_surfaces_the_pointer_format(monkeypatch):
     assert info["endianness"] == "little"
 
     be = _FakeBV(arch=_FakeArch(name="ppc64", address_size=8))
-    be.endianness = _BigEndian()
+    be.endianness = _Endianness.BigEndian
     monkeypatch.setattr(instance.targets, "resolve", lambda selector: be)
 
     info = instance._target_info("active")
