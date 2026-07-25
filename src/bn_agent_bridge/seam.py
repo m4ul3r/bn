@@ -709,8 +709,20 @@ class BridgeContext:
     def _byteorder(self, bv) -> str:
         for obj in (bv, getattr(bv, "arch", None)):
             value = getattr(obj, "endianness", None)
-            text = str(value)
-            if "Big" in text or "big" in text:
+            if value is None:
+                continue
+            # BN's `Endianness` is an IntEnum, and since Python 3.11 `str()` on an
+            # IntEnum member yields the *number* ("1"), not "Endianness.BigEndian" --
+            # so a substring test on `str(value)` can never see a big-endian view and
+            # every BE target silently decodes little-endian. Classify by the enum's
+            # name (BN's spelling), then by its integer value (BigEndian == 1), and
+            # keep the text path last for plain-string callers/stubs.
+            name = getattr(value, "name", None)
+            if isinstance(name, str) and name:
+                return "big" if "big" in name.lower() else "little"
+            if isinstance(value, int) and not isinstance(value, bool):
+                return "big" if int(value) == 1 else "little"
+            if "big" in str(value).lower():
                 return "big"
         return "little"
 

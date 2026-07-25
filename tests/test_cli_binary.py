@@ -244,6 +244,36 @@ def test_target_info_renders_image_base():
     assert "image base" not in out2
 
 
+def test_target_info_renders_the_pointer_format():
+    """target info text surfaces pointer width + byte order so a reader decoding a
+    raw dump doesn't infer them from the arch name; absent when a bridge predating
+    the fields doesn't report them, and never rendered from a bogus width."""
+    from bn.formatters import _render_target_summary
+
+    out = _render_target_summary({
+        "selector": "svc", "arch": "ppc64",
+        "address_size": 8, "endianness": "big",
+    })
+    assert "pointer size: 8 bytes" in out
+    assert "endianness: big" in out
+
+    # Singular, because "1 bytes" reads as a formatting bug.
+    assert "pointer size: 1 byte\n" in _render_target_summary({
+        "selector": "svc", "address_size": 1, "endianness": "little",
+    })
+
+    # An older bridge reports neither field: the lines are simply omitted.
+    out2 = _render_target_summary({"selector": "svc", "arch": "ppc64"})
+    assert "pointer size" not in out2
+    assert "endianness" not in out2
+
+    # A width outside 1..8 is a payload surprise, not a target fact -- it must not
+    # render as a confident "0 bytes".
+    for bogus in (0, 9, -4, "8", True, None):
+        rendered = _render_target_summary({"selector": "svc", "address_size": bogus})
+        assert "pointer size" not in rendered, f"address_size={bogus!r}"
+
+
 def test_save_accepts_path_flag(monkeypatch, tmp_path):
     captured_params = {}
 

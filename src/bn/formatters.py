@@ -627,6 +627,18 @@ def _render_instance_find_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+def _pointer_size_label(size: Any) -> str:
+    """``4`` -> ``4 bytes``; anything not a usable byte count renders as nothing.
+
+    A bogus or absent width must not print as a confident ``0 bytes`` -- the
+    detail rows drop empty values, so an older bridge that doesn't report the
+    field simply omits the line.
+    """
+    if isinstance(size, bool) or not isinstance(size, int) or not 1 <= size <= 8:
+        return ""
+    return f"{size} byte{'s' if size != 1 else ''}"
+
+
 def _render_target_summary(value: dict[str, Any]) -> str:
     view_id = value.get("view_id")
     label = value.get("selector") or value.get("target_id") or "<unknown>"
@@ -652,6 +664,12 @@ def _render_target_summary(value: dict[str, Any]) -> str:
         ("file", value.get("filename")),
         ("arch", value.get("arch")),
         ("platform", value.get("platform")),
+        # Pointer width + byte order, so a text-mode reader decoding a raw dump
+        # doesn't have to infer them from the arch *name* (which says nothing for
+        # an architecture it hasn't memorized). Rendered as bytes, matching the
+        # `address_size` field rather than restating it in bits.
+        ("pointer size", _pointer_size_label(value.get("address_size"))),
+        ("endianness", value.get("endianness")),
         # Preferred/image base BN loaded at (#564) -- for a PIE binary this is the
         # rebase anchor a debugger handoff needs, so surface it beside entry.
         ("image base", value.get("image_base")),
