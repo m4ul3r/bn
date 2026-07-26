@@ -340,8 +340,13 @@ def _cfg(ctx, selector: str | None, identifier, *, view: str = "asm"):
                 {"a": hex(line.address), "t": "".join(str(t) for t in line.tokens)}
                 for line in bb.disassembly_text
             ]
+            # `edge.type` is a BranchType member, so `.name` is the readable
+            # kind -- but fall back to str() rather than raising the whole op if
+            # a core ever hands back a bare int (the same class of surprise as
+            # a relocation/symbol enum arriving unwrapped).
             edges = [
-                {"to": hex(edge.target.start), "k": edge.type.name}
+                {"to": hex(edge.target.start),
+                 "k": getattr(edge.type, "name", None) or str(edge.type)}
                 for edge in bb.outgoing_edges
                 if edge.target is not None
             ]

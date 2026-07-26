@@ -710,7 +710,72 @@ def _sections(ctx, selector: str | None, *, query: str | None = None,
 _DATA_VARS_DEFAULT_LIMIT = 400
 
 
-def _data_var_row(bv, dv, psz: int, mask: int) -> dict[str, Any]:
+def _is_pointer_type(type_, type_text: str) -> bool:
+    """Whether *type_* is a single pointer, for the data-var decode.
+
+    BN's ``type_class`` is authoritative when reachable, and it is needed in
+    BOTH directions. It confirms a typedef'd pointer whose declaration text
+    carries no ``*``; more importantly it DENIES a one-element pointer array --
+    ``void (*[0x1])()`` renders with a ``*`` and its width equals one pointer,
+    so the old ``"*" in text and width == psz`` test collapsed it to its first
+    element and hid that it was an array at all. Falls back to the rendered
+    text only when the enum isn't reachable, mirroring ``read_evidence``'s
+    pointer heuristic.
+    """
+    try:
+        pointer_class = bn.TypeClass.PointerTypeClass
+    except Exception:
+        pointer_class = None
+    observed = getattr(type_, "type_class", None)
+    if pointer_class is not None and observed is not None:
+        return observed == pointer_class
+    return "*" in type_text
+
+
+# Type classes whose bytes an integer read renders faithfully. Deliberately a
+# whitelist: an aggregate (array/struct) must show as itself rather than as its
+# first machine word, and a float's bit pattern read as an integer is a
+# meaningless number rather than the value the type promises.
+_SCALAR_TYPE_CLASS_NAMES = ("BoolTypeClass", "IntegerTypeClass",
+                            "EnumerationTypeClass", "WideCharTypeClass")
+
+
+def _is_scalar_type(type_, type_text: str) -> bool:
+    """Whether *type_*'s bytes can be reported as one integer `v`alue.
+
+    Uses BN's ``type_class`` when reachable; falls back to the rendered text,
+    where a ``*`` or a ``[`` marks the type as a pointer or an aggregate.
+    """
+    type_class = getattr(bn, "TypeClass", None)
+    observed = getattr(type_, "type_class", None)
+    if type_class is not None and observed is not None:
+        allowed = [getattr(type_class, name, None) for name in _SCALAR_TYPE_CLASS_NAMES]
+        return any(known is not None and observed == known for known in allowed)
+    return "*" not in type_text and "[" not in type_text
+
+
+def _type_is_signed(type_) -> bool:
+    """Whether *type_* is declared signed.
+
+    BN exposes ``Type.signed`` as a ``BoolWithConfidence`` (``bool()`` yields
+    the value) and leaves it None for non-integers. Anything without a usable
+    flag reads as UNSIGNED, which is the honest default here: ``read_int``
+    itself defaults to ``sign=True``, so a ``uint32_t`` holding 0xf0000000
+    would otherwise be reported as -268435456.
+    """
+    try:
+        signed = type_.signed
+    except Exception:
+        return False
+    if signed is None:
+        return False
+    try:
+        return bool(signed)
+    except Exception:
+        return False
+
+
+def _data_var_row(bv, dv, psz: int) -> dict[str, Any]:
     """One typed data variable as a compact row: `a`ddress, symbol `n`ame,
     `t`ype, `w`idth, plus a decoded scalar `v`alue or -- for a single
     pointer-sized pointer -- the target `p` (with `ps` symbol or `pstr` ASCII
@@ -732,23 +797,21 @@ def _data_var_row(bv, dv, psz: int, mask: int) -> dict[str, Any]:
     secs = bv.get_sections_at(addr)
     if secs:
         row["sec"] = secs[0].name
+    is_pointer = _is_pointer_type(type_, type_text)
     try:
-        # Only a pointer-*sized* pointer type is a single pointer. An array of
-        # pointers (e.g. `void* [8]`, width = 8*psz) also contains '*' but must
-        # NOT collapse to its first element -- leave it undecorated so the
-        # renderer shows the whole array as bytes instead of hiding elements.
-        if "*" in type_text and width == psz:
-            target = bv.read_int(addr, psz) & mask
-            row["p"] = hex(target)
-            tsym = bv.get_symbol_at(target)
+        # Every read below is explicitly signed/unsigned: bv.read_int defaults to
+        # sign=True, so leaving it implicit renders unsigned data as negative.
+        if is_pointer and width == psz:
+            row["p"] = hex(bv.read_int(addr, psz, sign=False))
+            tsym = bv.get_symbol_at(int(row["p"], 16))
             if tsym:
                 row["ps"] = tsym.name
             else:
-                preview = bv.get_ascii_string_at(target, 2)
+                preview = bv.get_ascii_string_at(int(row["p"], 16), 4)
                 if preview:
                     row["pstr"] = preview.value[:48]
-        elif "*" not in type_text and 0 < width <= 8:
-            row["v"] = bv.read_int(addr, width)
+        elif not is_pointer and 0 < width <= 8 and _is_scalar_type(type_, type_text):
+            row["v"] = bv.read_int(addr, width, sign=_type_is_signed(type_))
     except Exception:
         pass  # unmapped slot: the row still lists the var, just undecorated
     return row
@@ -774,7 +837,6 @@ def _data_vars(ctx, selector: str | None, *, start, end, limit=None):
             f"empty window: end ({hex(hi)}) must be greater than start ({hex(lo)})",
         )
     psz = int(bv.address_size)
-    mask = (1 << (psz * 8)) - 1
     if lo > 0:
         dv = bv.get_next_data_var_after(lo - 1)
     else:
@@ -787,26 +849,56 @@ def _data_vars(ctx, selector: str | None, *, start, end, limit=None):
         if len(rows) >= limit:
             has_more = True
             break
-        rows.append(_data_var_row(bv, dv, psz, mask))
+        rows.append(_data_var_row(bv, dv, psz))
         dv = bv.get_next_data_var_after(int(dv.address))
     return {"kind": "data_vars", "vars": rows, "has_more": has_more}
 
 
-def _data_symbols(ctx, selector: str | None):
+def _data_symbols(ctx, selector: str | None, *, offset: int = 0, limit=None):
     """Every *named* DataSymbol as address + name -- includes internal symbols
-    the exports list omits, so a renamed data global stays addressable."""
+    the exports list omits, so a renamed data global stays addressable.
+
+    Paging is OPT-IN: `limit=None` returns the whole set, because the primary
+    consumer builds a goto/search index over every data global in one call and
+    a silent default cap would drop exactly the renamed globals this read
+    exists to keep addressable. `offset`/`limit` are there so an oversized
+    view can still be walked in bounded pages, and the envelope reports the
+    true `total` either way.
+
+    The container stays `syms` (not the `items` of the paged list ops) because
+    it is an established client contract; the paging metadata is additive.
+    """
+    offset = _validate_count(offset, label="offset", minimum=0)
+    limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     bv = ctx._resolve_view(selector)
-    sym_type = getattr(bn, "SymbolType", None) and getattr(bn.SymbolType, "DataSymbol", None)
-    try:
-        symbols = bv.get_symbols_of_type(sym_type) if sym_type is not None else []
-    except Exception:
-        symbols = []
+    sym_type = getattr(getattr(bn, "SymbolType", None), "DataSymbol", None)
+    if sym_type is None:
+        raise OperationFailure(
+            "unsupported",
+            "this Binary Ninja build does not expose SymbolType.DataSymbol",
+        )
+    # No blanket try/except here: a failing get_symbols_of_type used to be
+    # flattened into an empty list, making a real BN error indistinguishable
+    # from "this binary has no data symbols" -- the silent-empty failure mode.
+    symbols = bv.get_symbols_of_type(sym_type)
     syms = [
         {"a": hex(int(sym.address)), "n": sym.name}
         for sym in symbols
         if getattr(sym, "name", "")
     ]
-    return {"kind": "data_symbols", "syms": syms}
+    total = len(syms)
+    page = syms[offset:]
+    if limit is not None:
+        page = page[:limit]
+    return {
+        "kind": "data_symbols",
+        "syms": page,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "returned": len(page),
+        "has_more": (offset + len(page)) < total,
+    }
 
 
 def _ascii_render(data: bytes) -> str:

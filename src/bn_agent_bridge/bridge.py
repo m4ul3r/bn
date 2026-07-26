@@ -3060,7 +3060,11 @@ def _bind_data_vars(bridge, params, target):
 
 @op("data_symbols", lock="read")
 def _bind_data_symbols(bridge, params, target):
-    return bridge._data_symbols(target)
+    return bridge._data_symbols(
+        target,
+        offset=int(params.get("offset") or 0),
+        limit=params.get("limit"),
+    )
 
 
 @op("disasm", lock="read")

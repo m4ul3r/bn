@@ -2787,10 +2787,19 @@ def _render_data_vars_text(value: Any) -> str:
 
 
 def _render_data_symbols_text(value: Any) -> str:
-    syms = value.get("syms") if isinstance(value, dict) else None
+    """Render the data_symbols listing, with a paging footer when the caller
+    asked for a bounded page (`--limit`/`--offset`) and more remain."""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    syms = value.get("syms")
     if not syms:
         return "none"
-    return "\n".join(f"{sym.get('a', '?')}  {sym.get('n', '')}" for sym in syms)
+    body = "\n".join(f"{sym.get('a', '?')}  {sym.get('n', '')}" for sym in syms)
+    if value.get("has_more"):
+        shown = int(value.get("offset") or 0) + len(syms)
+        body += (f"\n// showing {shown} of {value.get('total', '?')}"
+                 f"; resume with --offset {shown}")
+    return body
 
 
 def _render_sections_text(value: Any) -> str:

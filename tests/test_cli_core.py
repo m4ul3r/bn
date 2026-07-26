@@ -247,11 +247,20 @@ def test_entries_validator_hex_aware_and_rejects_zero(capsys):
 def test_removed_experimental_commands_are_not_present():
     parser = bn.cli.build_parser()
 
-    # #649: the `data` GROUP now exists, for the verified `data retype` mutation --
-    # but the paged data-LISTING read that was removed here stays removed.
-    with pytest.raises(SystemExit):
-        parser.parse_args(["data", "vars"])
+    # The `data` GROUP carries three subcommands after #649 + the lens read ops:
+    # the verified `data retype` mutation, and the read-locked `data vars` /
+    # `data symbols` reads. What stays removed is the un-windowed data LISTING
+    # that used to live here -- the group is a namespace with no handler of its
+    # own, and `data vars` requires an explicit address window, so neither can
+    # reintroduce a full-binary dump.
+    assert getattr(parser.parse_args(["data"]), "handler", None) is None
     assert parser.parse_args(["data", "retype", "0x460000", "uint32_t"]).format == "json"
+    assert parser.parse_args(["data", "symbols"]).handler is not None
+    assert parser.parse_args(["data", "vars", "--start", "0x400000", "--end", "0x401000"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["data", "vars"])          # the window is mandatory
+    with pytest.raises(SystemExit):
+        parser.parse_args(["data", "list"])          # the removed listing
     with pytest.raises(SystemExit):
         parser.parse_args(["bundle", "corpus"])
     with pytest.raises(SystemExit):

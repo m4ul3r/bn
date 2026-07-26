@@ -1210,9 +1210,13 @@ def test_sections_wx_verdict_is_query_independent_461(monkeypatch):
 
 
 def _data_window_bv():
-    ptr_t = _FakeType("char*", width=4)
-    arr_t = _FakeType("void* [4]", width=16)      # pointer ARRAY: must not collapse
-    int_t = _FakeType("int32_t", width=4)
+    ptr_t = _FakeType("char*", width=4, type_class="PointerTypeClass")
+    # A pointer ARRAY: its rendered text carries a '*' and (for the 1-element
+    # case) its width equals one pointer, so only the type_class distinguishes
+    # it from a real pointer.
+    arr_t = _FakeType("void* [4]", width=16, type_class="ArrayTypeClass")
+    arr1_t = _FakeType("void* [1]", width=4, type_class="ArrayTypeClass")
+    int_t = _FakeType("int32_t", width=4, type_class="IntegerTypeClass", signed=True)
     big_t = _FakeType("struct config", width=64)  # too wide for a scalar value
     bv = _FakeBV(
         arch=_FakeArch(name="x86", address_size=4),
@@ -1222,6 +1226,7 @@ def _data_window_bv():
             0x2004: _FakeDataVariable(0x2004, ptr_t),     # -> named symbol
             0x2008: _FakeDataVariable(0x2008, ptr_t),     # -> ascii string
             0x2010: _FakeDataVariable(0x2010, arr_t),
+            0x2018: _FakeDataVariable(0x2018, arr1_t),
             0x2020: _FakeDataVariable(0x2020, big_t),
             0x3000: _FakeDataVariable(0x3000, int_t),     # == hi: excluded
         },
@@ -1234,6 +1239,10 @@ def _data_window_bv():
             0x2000: (b"\x2a\x00\x00\x00"          # 0x2000: value 42
                      b"\x00\x50\x00\x00"          # 0x2004: -> 0x5000 (on_message)
                      b"\x00\x60\x00\x00"),        # 0x2008: -> 0x6000 ("hello")
+            # Readable on purpose: if the 1-element pointer array were treated
+            # as a pointer it WOULD decode to 0x5000/on_message, so the row
+            # staying undecorated is real evidence, not an unmapped-read artifact.
+            0x2018: b"\x00\x50\x00\x00",
             0x6000: b"hello\x00",
         },
     )
@@ -1252,7 +1261,7 @@ def test_data_vars_window_rows_carry_typed_fields(monkeypatch):
     assert result["has_more"] is False
     rows = {row["a"]: row for row in result["vars"]}
     # Half-open window: 0x1000 (before) and 0x3000 (== end) excluded, lo included.
-    assert sorted(rows) == ["0x2000", "0x2004", "0x2008", "0x2010", "0x2020"]
+    assert sorted(rows) == ["0x2000", "0x2004", "0x2008", "0x2010", "0x2018", "0x2020"]
 
     scalar = rows["0x2000"]
     assert scalar["t"] == "int32_t" and scalar["w"] == 4 and scalar["v"] == 42
@@ -1266,10 +1275,18 @@ def test_data_vars_window_rows_carry_typed_fields(monkeypatch):
     assert to_str["p"] == "0x6000" and to_str["pstr"] == "hello"
     assert "ps" not in to_str
 
-    # A pointer ARRAY contains '*' but is wider than one pointer: it must keep
-    # all elements visible (no p/ps/v collapse to the first slot).
+    # A pointer ARRAY contains '*' but is not a pointer: it must keep all
+    # elements visible (no p/ps/v collapse to the first slot).
     arr = rows["0x2010"]
     assert arr["w"] == 16 and "p" not in arr and "v" not in arr
+
+    # The sharp case: a ONE-element pointer array is pointer-WIDE and its text
+    # carries a '*', so a width+text heuristic collapses it to its first
+    # element and silently hides that it is an array. Only type_class separates
+    # them. Its slot is mapped and would decode to 0x5000/on_message if the
+    # decode were still text-driven.
+    arr1 = rows["0x2018"]
+    assert arr1["w"] == 4 and "p" not in arr1 and "ps" not in arr1 and "v" not in arr1
 
     wide = rows["0x2020"]
     assert "v" not in wide
@@ -1310,8 +1327,8 @@ def test_data_vars_has_more_is_honest_at_the_cap(monkeypatch):
     assert capped["has_more"] is True
 
     # Exactly limit rows left in the window: nothing was truncated.
-    exact = instance._data_vars(None, start="0x2000", end="0x3000", limit=5)
-    assert len(exact["vars"]) == 5
+    exact = instance._data_vars(None, start="0x2000", end="0x3000", limit=6)
+    assert len(exact["vars"]) == 6
     assert exact["has_more"] is False
 
 
@@ -1332,7 +1349,7 @@ def test_data_vars_unreadable_pointer_row_survives(monkeypatch):
     # (address/type/width), just without the p/ps/pstr decoration.
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    ptr_t = _FakeType("char*", width=4)
+    ptr_t = _FakeType("char*", width=4, type_class="PointerTypeClass")
     bv = _FakeBV(arch=_FakeArch(name="x86", address_size=4),
                  data_vars={0x2000: _FakeDataVariable(0x2000, ptr_t)},
                  memory={0x9000: b"\x00"})  # 0x2000 unmapped
@@ -1342,6 +1359,36 @@ def test_data_vars_unreadable_pointer_row_survives(monkeypatch):
 
     assert [r["a"] for r in result["vars"]] == ["0x2000"]
     assert "p" not in result["vars"][0]
+
+
+def test_data_vars_scalar_signedness_follows_the_declared_type(monkeypatch):
+    # bv.read_int defaults to sign=True, so an unsigned global whose top bit is
+    # set was rendered as a negative number (`uint32_t` 0xf0000000 -> the value
+    # -268435456). The decoded `v` must follow the TYPE's signedness, not
+    # read_int's default.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(
+        arch=_FakeArch(name="x86", address_size=4),
+        data_vars={
+            0x2000: _FakeDataVariable(0x2000, _FakeType("uint32_t", width=4,
+                                                type_class="IntegerTypeClass", signed=False)),
+            0x2004: _FakeDataVariable(0x2004, _FakeType("int32_t", width=4,
+                                                type_class="IntegerTypeClass", signed=True)),
+            # An integer the core left without a signedness flag: unsigned is
+            # the honest reading of the raw bytes.
+            0x2008: _FakeDataVariable(0x2008, _FakeType("flags_t", width=4,
+                                                type_class="IntegerTypeClass")),
+        },
+        memory={0x2000: b"\x00\x00\x00\xf0" b"\xff\xff\xff\xff" b"\x00\x00\x00\xf0"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    rows = {row["a"]: row for row in instance._data_vars(None, start="0x2000", end="0x2100")["vars"]}
+
+    assert rows["0x2000"]["v"] == 0xF0000000   # NOT -268435456
+    assert rows["0x2004"]["v"] == -1           # genuinely signed: -1, not 0xffffffff
+    assert rows["0x2008"]["v"] == 0xF0000000
 
 
 # --- data_symbols: named DataSymbol listing (promoted out of py_exec) --------
@@ -1366,3 +1413,54 @@ def test_data_symbols_lists_named_data_symbols_only(monkeypatch):
         {"a": "0x2000", "n": "g_state"},
         {"a": "0x2010", "n": "g_table"},
     ]
+    # Paging is opt-in: the default call returns the WHOLE set, because the
+    # consumer builds a goto/search index in one shot and a silent default cap
+    # would drop exactly the renamed globals this read exists to keep visible.
+    assert result["limit"] is None
+    assert result["total"] == 2 and result["returned"] == 2
+    assert result["has_more"] is False
+
+
+def test_data_symbols_pages_on_demand_with_an_honest_total(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    bv = _FakeBV(symbols=[
+        fake_bn.Symbol(fake_bn.SymbolType.DataSymbol, 0x2000 + i * 8, f"g_{i}")
+        for i in range(5)
+    ])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    page = instance._data_symbols(None, offset=1, limit=2)
+
+    assert [s["n"] for s in page["syms"]] == ["g_1", "g_2"]
+    assert page["total"] == 5          # the true total, not the page size
+    assert page["offset"] == 1 and page["limit"] == 2 and page["returned"] == 2
+    assert page["has_more"] is True
+
+    tail = instance._data_symbols(None, offset=3, limit=2)
+    assert [s["n"] for s in tail["syms"]] == ["g_3", "g_4"]
+    assert tail["has_more"] is False
+
+    with pytest.raises(bridge.OperationFailure):
+        instance._data_symbols(None, limit=0)
+    with pytest.raises(bridge.OperationFailure):
+        instance._data_symbols(None, offset=-1)
+
+
+def test_data_symbols_surfaces_a_lookup_failure_instead_of_reporting_none(monkeypatch):
+    # A blanket `except Exception: symbols = []` made a real BN failure
+    # indistinguishable from "this binary has no data symbols" -- the caller
+    # would drop every data hotspot and never learn why.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeBV(symbols=[])
+
+    def _boom(sym_type, *a, **k):
+        raise RuntimeError("core symbol table unavailable")
+
+    monkeypatch.setattr(bv, "get_symbols_of_type", _boom)
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(RuntimeError, match="core symbol table unavailable"):
+        instance._data_symbols(None)

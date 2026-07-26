@@ -252,12 +252,19 @@ def _data_vars(args: argparse.Namespace) -> int:
          prefer_when="you need addressable data globals (including renamed/internal ones); "
                      "`exports` only shows the public surface",
          see_also=("exports", "data vars"),
-         args=[])
+         args=[
+             arg("--limit", type=_positive_int, default=None, metavar="N",
+                 help="Maximum symbols to return (default: all of them -- an "
+                      "index build wants the whole set; page an oversized view "
+                      "with --limit/--offset)"),
+             arg("--offset", type=_non_negative_int, default=0, metavar="N",
+                 help="Skip the first N symbols (paging)"),
+         ])
 def _data_symbols(args: argparse.Namespace) -> int:
     return _call(
         args,
         "data_symbols",
-        {},
+        {"offset": args.offset, "limit": args.limit},
         require_target=True,
         text_renderer=_render_data_symbols_text,
         stem="data-symbols",

@@ -35,6 +35,22 @@ def _load_bridge(monkeypatch):
         GlobalBinding = "SymbolBinding.GlobalBinding"
         WeakBinding = "SymbolBinding.WeakBinding"
 
+    class TypeClass:
+        # Values match the strings _FakeType carries in its `type_class` field,
+        # so `type_.type_class == bn.TypeClass.PointerTypeClass` resolves under
+        # the mocks exactly as it does against a live core's IntEnum.
+        VoidTypeClass = "VoidTypeClass"
+        BoolTypeClass = "BoolTypeClass"
+        IntegerTypeClass = "IntegerTypeClass"
+        FloatTypeClass = "FloatTypeClass"
+        StructureTypeClass = "StructureTypeClass"
+        EnumerationTypeClass = "EnumerationTypeClass"
+        PointerTypeClass = "PointerTypeClass"
+        ArrayTypeClass = "ArrayTypeClass"
+        FunctionTypeClass = "FunctionTypeClass"
+        NamedTypeReferenceClass = "NamedTypeReferenceClass"
+        WideCharTypeClass = "WideCharTypeClass"
+
     class RelocationType:
         # The ELF GOT-slot reloc kinds the import classifier cares about (#478):
         # JUMP_SLOT (.rela.plt, callable function import) vs GLOB_DAT (.rela.dyn,
@@ -80,6 +96,7 @@ def _load_bridge(monkeypatch):
 
     fake_bn.SymbolType = SymbolType
     fake_bn.SymbolBinding = SymbolBinding
+    fake_bn.TypeClass = TypeClass
     fake_bn.RelocationType = RelocationType
     fake_bn.Symbol = Symbol
     fake_bn.QualifiedName = QualifiedName
@@ -701,7 +718,11 @@ class _FakeBV:
         later = sorted(a for a in self.data_vars if a > int(address))
         return self.data_vars[later[0]] if later else None
 
-    def read_int(self, address: int, size: int, sign: bool = False):
+    def read_int(self, address: int, size: int, sign: bool = True):
+        # `sign` DEFAULTS TO TRUE, exactly like BinaryView.read_int. An earlier
+        # sign=False default here made every mocked read unsigned, so a caller
+        # that forgot to pass sign= looked correct under test and rendered
+        # unsigned data as negative against a live view.
         data = self.read(int(address), int(size))
         if len(data) != int(size):
             raise ValueError(f"Couldn't read {size} bytes at {hex(address)}")
@@ -879,11 +900,15 @@ class _FakeBV:
 
 
 class _FakeType:
-    def __init__(self, decl: str, *, width: int = 0, members=None, type_class: str = "StructureTypeClass"):
+    def __init__(self, decl: str, *, width: int = 0, members=None, type_class: str = "StructureTypeClass",
+                 signed=None):
         self._decl = decl
         self.width = width
         self.members = list(members) if members is not None else None
         self.type_class = type_class
+        # BN models this as a BoolWithConfidence (bool() yields the value) and
+        # leaves it None for non-integers; None/absent must read as unsigned.
+        self.signed = signed
 
     def __str__(self):
         return self._decl
