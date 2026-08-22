@@ -14,7 +14,8 @@ def test_mutation_summary_transform_compacts_result():
     # audit payload.
     from bn.formatters import _mutation_summary
     ok = _mutation_summary({"success": True, "committed": True, "preview": False,
-                            "rolled_back": None,
+                            # post-#652: the success path emits rolled_back=False
+                            "rolled_back": False,
                             "results": [{"status": "verified"}, {"status": "noop"}]})
     assert ok["kind"] == "mutation_summary"
     assert ok["success"] is True and ok["committed"] is True
@@ -30,11 +31,40 @@ def test_mutation_summary_committed_noop_is_not_dirty():
     # #408 review: `committed` is True for ANY successful non-preview mutation,
     # including an all-noop (e.g. rename to the same name). A no-op changes nothing,
     # so dirty_after must be False -- not True just because it committed.
+    #
+    # The fixture carries `rolled_back: False`, the shape #652 introduced on the
+    # SUCCESS path. Pinning the pre-#652 `None` here is what let dirty_after
+    # regress unnoticed: `rolled_back is False` alone reads True on every
+    # all-noop commit, and an idempotent re-run is the common trigger.
     from bn.formatters import _mutation_summary
-    noop = _mutation_summary({"success": True, "committed": True, "rolled_back": None,
+    noop = _mutation_summary({"success": True, "committed": True, "rolled_back": False,
                               "results": [{"status": "noop"}]})
     assert noop["committed"] is True and noop["changed_count"] == 0
     assert noop["dirty_after"] is False
+
+    # Absent (pre-#652 bridge) must stay equivalent -- a mixed-version CLI/bridge
+    # pair should not disagree about whether the DB is dirty.
+    legacy = _mutation_summary({"success": True, "committed": True,
+                                "results": [{"status": "noop"}]})
+    assert legacy["dirty_after"] is False
+
+
+def test_mutation_summary_failed_revert_is_still_dirty():
+    # The other side of the #652 interaction: `rolled_back: False` on a NON-committed
+    # result means the revert itself failed, so state is left behind and dirty_after
+    # must stay True. Gating on `not committed` must not blunt this.
+    from bn.formatters import _mutation_summary
+    stuck = _mutation_summary({"success": False, "committed": False, "rolled_back": False,
+                               "results": [{"status": "verification_failed",
+                                            "message": "readback mismatch"}]})
+    assert stuck["dirty_after"] is True
+    assert stuck["first_error"] == "readback mismatch"
+
+    # A preview whose revert failed is equally dirty.
+    preview = _mutation_summary({"success": False, "committed": False, "preview": True,
+                                 "rolled_back": False,
+                                 "results": [{"status": "verified"}]})
+    assert preview["dirty_after"] is True
 
 
 def test_mutation_summary_surfaces_prototype_user_type_residue():
@@ -79,6 +109,42 @@ def test_go_rename_summary_emits_compact_status(fake_transport, capsys):
     assert out["kind"] == "mutation_summary"
     assert out["changed_count"] == 12 and out["committed"] is True
     assert "results" not in out and "affected_functions" not in out   # compacted
+
+
+def test_go_rename_full_json_carries_top_level_ok(fake_transport, capsys):
+    # #604: `go rename` hand-rolled its _call tail with `result_transform=None`, so
+    # the full (--verbose) JSON came back WITHOUT the top-level `ok` every other
+    # mutation emits under the #447 envelope contract. Routing it through _mutate
+    # -- which applies _add_mutation_ok on the detail path -- lands that key.
+    fake_transport({"go_rename": {"ok": True, "result": {
+        "success": True, "committed": True,
+        "results": [{"status": "verified", "op": "rename_symbol"}] * 3,
+        "affected_functions": [{"name": "sub_401000"}] * 3}}})
+    rc = bn.cli.main(["go", "rename", "--target", "active", "--verbose", "--format", "json"])
+    assert rc == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is True                      # the #447 key that was missing
+    assert out["committed"] is True
+    assert len(out["results"]) == 3               # --verbose keeps the full payload
+
+
+def test_go_rename_defaults_to_compact_status(fake_transport, capsys):
+    # #645 applies to go rename too: the compact status is the DEFAULT, detail is
+    # opt-in. It hand-rolled its own tail before, so --verbose/--diffs parsed but
+    # did nothing -- and go rename is the mutation most likely to emit a huge
+    # payload, since it renames every candidate in the binary.
+    fake_transport({"go_rename": {"ok": True, "result": {
+        "success": True, "committed": True,
+        "results": [{"status": "verified", "op": "rename_symbol"}] * 40,
+        "affected_functions": [{"name": "sub_401000"}] * 40}}})
+    # No flags at all: renders the compact TEXT status line, not a payload dump.
+    # (An explicit --format json is itself an opt-in to detail under #645, so it
+    # is deliberately not the way to observe the default.)
+    rc = bn.cli.main(["go", "rename", "--target", "active"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "mutation:" in out and "changed=40" in out
+    assert "affected_functions" not in out and "sub_401000" not in out
 
 
 def test_symbol_rename_summary_emits_compact_status(fake_transport, capsys):

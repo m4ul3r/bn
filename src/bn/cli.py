@@ -857,6 +857,7 @@ def _mutate(
     stem: str,
     require_target: bool = True,
     preview: bool | None = None,
+    detail_renderer: Any = None,
     **call_kwargs: Any,
 ) -> int:
     """:func:`_call` specialized for mutations.
@@ -899,7 +900,11 @@ def _mutate(
         op,
         params,
         require_target=require_target,
-        text_renderer=_render_mutation_summary_text if compact else _render_mutation_text,
+        # A mutation with a richer detail view of its own (e.g. `go rename`'s
+        # per-candidate breakdown) supplies it via *detail_renderer*; the compact
+        # status line stays shared so #645's default is identical everywhere.
+        text_renderer=(_render_mutation_summary_text if compact
+                       else (detail_renderer or _render_mutation_text)),
         result_exit_code=_mutation_exit_code,
         result_transform=_mutation_summary if compact else _add_mutation_ok,
         stem=stem,

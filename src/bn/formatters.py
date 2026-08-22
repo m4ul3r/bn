@@ -3084,9 +3084,18 @@ def _mutation_summary(value: Any) -> Any:
         # The DB is left modified iff a live mutation actually CHANGED state
         # (committed AND something verified -- `committed` is True even for an
         # all-noop mutation, which leaves the DB clean), a failure's revert itself
-        # failed (rolled_back is explicitly False), or an unclearable
-        # has_user_type override was left behind (#630).
-        "dirty_after": (committed and verified > 0) or rolled_back is False or proto_residue,
+        # failed, or an unclearable has_user_type override was left behind (#630).
+        #
+        # The revert test is `rolled_back is False AND not committed`, not
+        # `rolled_back is False` alone: #652 made the bridge emit `rolled_back`
+        # unconditionally (`restored if (preview or failed) else False`), so the
+        # SUCCESS path now carries an explicit False where the key used to be
+        # absent. Since `committed` is `(not preview) and (not failed)`, the key
+        # is meaningful exactly when `committed` is False -- gating on it is what
+        # keeps an all-noop commit (which reverts nothing) from reading dirty.
+        "dirty_after": ((committed and verified > 0)
+                        or (rolled_back is False and not committed)
+                        or proto_residue),
     }
     if proto_residue:
         summary["prototype_user_type_residue"] = True

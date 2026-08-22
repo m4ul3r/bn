@@ -268,15 +268,20 @@ def _go_functions(args: argparse.Namespace) -> int:
 def _go_rename(args: argparse.Namespace) -> int:
     # #408 review: go rename is a bulk mutation (success/committed/results +
     # _mutation_exit_code), so it honors --summary like the other mutations.
-    summary = bool(getattr(args, "summary", False))
-    return _call(
+    #
+    # It routes through _mutate rather than hand-rolling the tail so #645's
+    # compact-by-default applies here too. Hand-rolling meant --verbose/--diffs
+    # parsed but did nothing, and go rename is the mutation MOST likely to emit a
+    # huge payload -- it renames every candidate in the binary. Going through
+    # _mutate also lands the #447 top-level `ok` on the full JSON (#604), which
+    # the hand-rolled `result_transform=None` path omitted.
+    return _mutate(
         args,
         "go_rename",
-        {"preview": bool(args.preview)},
+        {},
+        preview=bool(args.preview),
         require_target=True,
-        text_renderer=_render_mutation_summary_text if summary else _render_go_rename_text,
-        result_exit_code=_mutation_exit_code,
-        result_transform=_mutation_summary if summary else None,
+        detail_renderer=_render_go_rename_text,
         stem="go-rename",
     )
 
