@@ -128,6 +128,15 @@ def validate_instance_id(instance_id: str) -> str:
             f"Invalid instance id: {instance_id!r}. Use only letters, digits, "
             "'_', '-', and '.' (no path separators, no '.'/'..', no absolute paths)."
         )
+    # An id whose socket path cannot fit in sockaddr_un.sun_path must fail HERE,
+    # in the CLI and before anything is spawned, rather than as a bare
+    # `OSError: AF_UNIX path too long` from bind() inside the bridge -- by which
+    # point the caller has already committed to the id and the real cause (a
+    # byte count) is nowhere in the message.
+    try:
+        bridge_socket_path(instance_id)
+    except ValueError as exc:
+        raise BridgeError(str(exc)) from exc
     return instance_id
 
 

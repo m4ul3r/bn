@@ -208,11 +208,58 @@ def bridge_registry_path(instance_id: str | None = None) -> Path:
     return instances_dir() / f"{validate_instance_id(instance_id)}.json"
 
 
+# A Unix-domain socket address is a fixed-size `sockaddr_un.sun_path` char array
+# -- 108 bytes on Linux, 104 on the BSDs/macOS -- and bind() needs room for the
+# trailing NUL, so the usable path is one byte shorter. Nothing bounded this, so
+# a deep BN_CACHE_DIR plus a descriptive instance id produced a path the kernel
+# rejects, surfacing as a bare `OSError: AF_UNIX path too long` from bind() deep
+# inside bridge startup -- after the CLI had already committed to the id.
+SOCKET_PATH_MAX_BYTES = 104 if platform.system() in ("Darwin", "FreeBSD", "OpenBSD", "NetBSD") else 108
+
+
+def socket_path_budget() -> int:
+    """Longest socket path, in bytes, that ``bind()`` will accept here."""
+    return SOCKET_PATH_MAX_BYTES - 1
+
+
+def _socket_path_too_long(path: Path) -> bool:
+    return len(str(path).encode("utf-8", "surrogateescape")) > socket_path_budget()
+
+
+def socket_too_long_message(path: Path, *, instance_id: str | None) -> str:
+    actual = len(str(path).encode("utf-8", "surrogateescape"))
+    hint = (
+        "Point BN_CACHE_DIR at a shorter directory"
+        if instance_id is None
+        else "Use a shorter --instance-id, or point BN_CACHE_DIR at a shorter directory"
+    )
+    return (
+        f"Unix socket path is too long: {actual} bytes, limit "
+        f"{socket_path_budget()} ({path}). {hint}."
+    )
+
+
 def bridge_socket_path(instance_id: str | None = None) -> Path:
+    """The bridge's socket path, or ValueError if it exceeds the kernel limit.
+
+    The socket basename stays byte-identical to the instance id. An earlier
+    revision compacted an over-budget name to ``<prefix>.<sha256-8>.sock``, but
+    that silently breaks `bn instance gc`: it reverse-maps sockets to instances
+    by comparing a socket's stem against the live registry stems (which keep the
+    full id), so a compacted socket reads as a registry-less orphan and gets
+    unlinked out from under a RUNNING bridge -- after which the missing socket
+    makes the liveness sweep purge the registry too, orphaning the process and
+    its BNDB. Refusing an impossible path is strictly better than inventing a
+    reachable one that other tooling cannot recognize.
+    """
     if instance_id is None:
-        return cache_home() / f"{PLUGIN_NAME}.sock"
-    # #523: see bridge_registry_path -- same basename enforcement.
-    return instances_dir() / f"{validate_instance_id(instance_id)}.sock"
+        path = cache_home() / f"{PLUGIN_NAME}.sock"
+    else:
+        # #523: see bridge_registry_path -- same basename enforcement.
+        path = instances_dir() / f"{validate_instance_id(instance_id)}.sock"
+    if _socket_path_too_long(path):
+        raise ValueError(socket_too_long_message(path, instance_id=instance_id))
+    return path
 
 
 def spill_root() -> Path:
