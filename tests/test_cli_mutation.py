@@ -153,6 +153,45 @@ def test_go_rename_summary_reads_its_own_counters_not_results():
     assert stuck["dirty_after"] is True and stuck["failed_count"] == 2
     assert stuck["first_error"] == "revert failed"
 
+    # `results` is NOT always empty here -- it carries the failure rows -- and the
+    # `unsupported` early return puts its ONLY explanation in results[0].message
+    # with no top-level `message`. A `failed=1` summary must never lose the reason.
+    unsupported = _go_rename_summary({
+        "kind": "go_rename", "success": False, "committed": False, "preview": False,
+        "rolled_back": True,
+        "results": [{"op": "rename_symbol", "status": "unsupported",
+                     "message": "BinaryView does not support get_function_at"}],
+        "go_renamed_candidates": 5, "go_verified_count": 0,
+        "go_failed_count": 1, "go_committed_count": 0,
+    })
+    assert unsupported["first_error"] == "BinaryView does not support get_function_at"
+    assert unsupported["failed_count"] == 1
+
+    # Partial failure whose rollback SUCCEEDED: everything reverted, so clean --
+    # but the reason still has to survive into the compact line.
+    reverted = _go_rename_summary({
+        "kind": "go_rename", "success": False, "committed": False, "preview": False,
+        "rolled_back": True,
+        "results": [{"op": "rename_symbol", "status": "verification_failed",
+                     "message": "Live rename readback disagreed"}],
+        "go_renamed_candidates": 9, "go_verified_count": 4,
+        "go_failed_count": 1, "go_committed_count": 0, "skipped_user_named": 0,
+    })
+    assert reverted["dirty_after"] is False
+    assert reverted["first_error"] == "Live rename readback disagreed"
+
+    # Partial failure whose rollback FAILED: renames are live in the view. This is
+    # the shape that must never read clean (cf. #656 on the bridge side).
+    stuck_partial = _go_rename_summary({
+        "kind": "go_rename", "success": False, "committed": False, "preview": False,
+        "rolled_back": False, "message": "Rollback failed; the view may be partially renamed",
+        "results": [{"op": "rename_symbol", "status": "verification_failed",
+                     "message": "Live rename failed"}],
+        "go_renamed_candidates": 9, "go_verified_count": 4,
+        "go_failed_count": 1, "go_committed_count": 0,
+    })
+    assert stuck_partial["dirty_after"] is True
+
     # Anything that is not a go_rename envelope falls through untouched.
     other = _go_rename_summary({"success": True, "committed": True,
                                 "results": [{"status": "verified"}]})

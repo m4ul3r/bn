@@ -3175,6 +3175,18 @@ def _mutation_summary(value: Any) -> Any:
     return summary
 
 
+def _first_go_rename_error(value: dict[str, Any]) -> str | None:
+    """The most specific failure explanation a go_rename result carries."""
+    for row in (value.get("results") or []):
+        if not isinstance(row, dict):
+            continue
+        message = row.get("message") or row.get("status")
+        if message:
+            return str(message)
+    message = value.get("message")
+    return str(message) if message else "go rename failed"
+
+
 def _go_rename_summary(value: Any) -> Any:
     """Compact status for `go rename`, which reports through its OWN counters.
 
@@ -3216,7 +3228,12 @@ def _go_rename_summary(value: Any) -> Any:
         "noop_count": skipped,
         "failed_count": failed,
         "rolled_back": (bool(rolled_back) if rolled_back is not None else None),
-        "first_error": (value.get("message") if failed else None),
+        # `results` is NOT always empty for this op -- it carries the failure rows
+        # (bridge `"results": failed_rows`), and the `unsupported` early return
+        # puts its only explanation in `results[0]["message"]` with no top-level
+        # `message` at all. Prefer the row, fall back to the envelope, so a
+        # `failed=1` summary is never left without a reason.
+        "first_error": _first_go_rename_error(value) if failed else None,
         "dirty_after": ((committed and committed_count > 0)
                         or (rolled_back is False and not committed)
                         or proto_residue),
