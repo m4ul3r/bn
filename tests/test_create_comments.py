@@ -426,6 +426,93 @@ def test_list_comments_returns_paging_envelope(monkeypatch):
     assert [i["comment"] for i in res["items"]] == ["first", "second"]
 
 
+def _scope_bv():
+    """A view carrying BOTH comment stores: 2 address comments and 2 function
+    docs (`fn.comment`), which live on the function object, not in
+    bv.address_comments."""
+    doc_a = _FakeFunction(0x1000, "handle_request")
+    doc_a.comment = "Dispatcher: opcode selects a handler; TODO: confirm shm bounds"
+    doc_b = _FakeFunction(0x2000, "parse_args")
+    doc_b.comment = "argv walker"
+    plain = _FakeFunction(0x3000, "sub_3000")  # no doc -> must not appear
+    bv = _FakeBV(functions=[doc_a, doc_b, plain])
+    bv.address_comments = {0x1120: "request fds arrive from the client",
+                           0x1180: "maps the client-shared request block"}
+    bv.get_functions_containing = lambda addr: [doc_a]
+    return bv
+
+
+def test_list_comments_includes_function_docs_643(monkeypatch):
+    """#643: `comment list` enumerated ONLY bv.address_comments, so every
+    function documentation comment written by `comment set --function` was
+    invisible to the sole discovery command -- the write reported `verified`
+    and the read reported nothing existed. #203 fixed the mirror direction
+    (`comment get --function` is a superset of both stores)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _scope_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    res = instance._list_comments("active")
+    assert res["total"] == 4
+    # Address-ordered across both stores; the function doc sorts first at its address.
+    assert [(i["address"], i["scope"]) for i in res["items"]] == [
+        ("0x1000", "function_doc"),
+        ("0x1120", "address"),
+        ("0x1180", "address"),
+        ("0x2000", "function_doc"),
+    ]
+
+    assert [i["scope"] for i in instance._list_comments("active", scope="address")["items"]] == [
+        "address", "address"]
+    assert [i["function"] for i in instance._list_comments("active", scope="function")["items"]] == [
+        "handle_request", "parse_args"]
+
+
+def test_list_comments_query_finds_todo_in_a_function_doc_643(monkeypatch):
+    """#643 regression for the reported workflow: the bn-re skill tells agents to
+    drop `TODO:` markers and resume via `comment list --query TODO`. A TODO in a
+    function doc -- the natural home for a function-level note -- returned `none`.
+    This is the exact assertion whose absence let the gap ship."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _scope_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    res = instance._list_comments("active", query="TODO")
+    assert res["total"] == 1
+    assert res["items"][0]["function"] == "handle_request"
+    assert res["items"][0]["scope"] == "function_doc"
+    assert "TODO" in res["items"][0]["comment"]
+
+    # --query still filters the address store, and --scope still narrows it.
+    assert instance._list_comments("active", query="TODO", scope="address")["total"] == 0
+
+
+def test_list_comments_rejects_unknown_scope_643(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _scope_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._list_comments("active", scope="functions")
+    assert exc.value.status == "invalid_request"
+    assert "functions" in str(exc.value)
+
+
+def test_bind_list_comments_forwards_scope_643(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _scope_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    # A raw client omitting `scope` gets the complete default, not address-only.
+    res = bridge._bind_list_comments(instance, {"query": None, "offset": 0, "limit": None}, "active")
+    assert res["total"] == 4
+    res = bridge._bind_list_comments(
+        instance, {"query": None, "offset": 0, "limit": None, "scope": "function"}, "active")
+    assert res["total"] == 2
+
+
 def test_bind_list_comments_tolerates_none_limit(monkeypatch):
     """The CLI sends `limit: None` (the --limit default) for a bare `comment
     list`, so the key is present with value None. The binder must read that as

@@ -135,7 +135,8 @@ def test_mutation_reverts_on_verification_failure(monkeypatch):
         },
     )
 
-    result = instance._mutation("active", False, [{"op": "rename_symbol"}])
+    result = instance._mutation("active", False, [
+        {"op": "rename_symbol", "identifier": "sub_401000", "new_name": "player_update"}])
 
     assert result["success"] is False
     assert result["committed"] is False
@@ -740,35 +741,33 @@ def test_batch_rename_rejects_invalid_kind(monkeypatch):
     assert result["op"] == "rename_symbol"
 
 
-def test_batch_invalid_op_rolls_back_prior_applied_op(monkeypatch):
-    """A manifest whose 2nd op is malformed (missing a required field) fails the
-    WHOLE batch: the 1st op's already-applied change is reverted (no partial
-    apply -- the undo state is reverted, never committed) and the failing op is
-    reported as a clean invalid_request (#173)."""
+def test_batch_invalid_op_is_rejected_before_anything_is_applied(monkeypatch):
+    """A manifest whose 2nd op is malformed (missing a required field) is rejected
+    UP FRONT as invalid_request, naming the op index and the field, with nothing
+    applied and nothing to roll back (#650, superseding #173's rollback contract:
+    one agent lost 12 good ops to a field name)."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeCommentMutationBV()
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
-    result = instance._mutation(
-        "active",
-        False,
-        [
-            {"op": "set_comment", "address": "0x1000", "comment": "first op applied"},
-            {"op": "set_comment", "address": "0x2000"},  # missing required 'comment'
-        ],
-    )
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._mutation(
+            "active",
+            False,
+            [
+                {"op": "set_comment", "address": "0x1000", "comment": "first op applied"},
+                {"op": "set_comment", "address": "0x2000"},  # missing required 'comment'
+            ],
+        )
 
-    assert result["success"] is False
-    assert result["committed"] is False
-    assert result["rolled_back"] is True
-    assert _has_event(bv, "revert")
+    assert exc.value.status == "invalid_request"
+    assert "operation 1" in exc.value.message
+    assert "comment" in exc.value.message
+    # No transaction was ever opened, so there is no partial apply to revert.
+    assert bv.get_comment_at(0x1000) == ""
+    assert not _has_event(bv, "begin")
     assert not _has_event(bv, "commit")
-
-    statuses = [r.get("status") for r in result["results"]]
-    assert statuses[0] == "reverted"          # 1st op applied, then rolled back
-    assert statuses[1] == "invalid_request"   # 2nd op rejected before apply
-    assert "comment" in result["results"][1].get("message", "")
 
 
 def test_preview_diff_truncated_to_stay_inline(monkeypatch):
@@ -2095,8 +2094,9 @@ def test_mutation_mixed_batch_scopes_blast_radius_and_tags_direct(monkeypatch):
     monkeypatch.setattr(me, "_verify_operation", lambda ctx, b, result: {**result, "status": "verified"})
     monkeypatch.setattr(me, "_annotate_operation_results", lambda ctx, results, type_diffs: results)
 
-    result = instance._mutation("active", False,
-                                [{"op": "types_declare"}, {"op": "set_prototype"}])
+    result = instance._mutation("active", False, [
+        {"op": "types_declare", "declaration": "struct ep { int a; };"},
+        {"op": "set_prototype", "identifier": "handler", "prototype": "void handler()"}])
 
     assert result["success"] is True
     assert _has_event(bv, "commit")
@@ -3587,3 +3587,368 @@ def test_preview_proto_plus_rename_refusal_still_names_rename_cause(monkeypatch)
     assert "a rename or a symbol/function create (rename_symbol)" in msg
     assert "separate previews" in msg
     assert exc.value.requested.get("offending_op") == "rename_symbol"
+
+
+# ===========================================================================
+# #652 -- batch apply output/validation contract.
+# ===========================================================================
+
+def test_rolled_back_present_on_the_success_path_652(monkeypatch):
+    """#652: `rolled_back` was present in every case EXCEPT success, so a parser
+    written against a preview or a failure -- the cases you develop against --
+    raised KeyError on the happy path. It is now always present (False when
+    committed), matching the read-command contract where paging keys are present
+    regardless of outcome."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+
+    def apply(bv_, op, restores=None):
+        return {"op": op["op"], "requested": {}}
+
+    def verify(bv_, result):
+        return {**result, "status": "verified"}
+
+    _mutation_with_stubs(monkeypatch, bridge, instance, bv, apply=apply, verify=verify)
+
+    live = instance._mutation("active", False, [{"op": "rename_symbol"}])
+    assert live["committed"] is True and live["success"] is True
+    assert live["rolled_back"] is False          # present, not absent
+
+    monkeypatch.setattr(bridge.mutation_engine, "_revert_undo_safely", lambda ctx, bv_, s: True)
+    monkeypatch.setattr(bridge.mutation_engine, "_run_local_restores", lambda ctx, bv_, r: True)
+    prev = instance._mutation("active", True, [{"op": "rename_symbol"}])
+    assert prev["rolled_back"] is True and prev["committed"] is False
+
+
+def test_duplicate_write_key_rejected_up_front_652(monkeypatch):
+    """#652: a manifest writing the same key twice can NEVER succeed -- every op is
+    verified against the batch's END state, so under last-write-wins op 0 is judged
+    against op 1's value, fails, and takes the whole atomic batch down. Easy to hit
+    when a manifest is machine-generated from two passes (the recommended bulk
+    workflow). Reject before applying anything, naming BOTH op indices."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+    applied = []
+
+    def apply(bv_, op, restores=None):
+        applied.append(op)
+        return {"op": op["op"], "requested": {}}
+
+    _mutation_with_stubs(monkeypatch, bridge, instance, bv, apply=apply,
+                         verify=lambda bv_, r: {**r, "status": "verified"})
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._mutation("active", False, [
+            {"op": "set_comment", "function": "handle_request", "comment": "first doc"},
+            {"op": "set_comment", "function": "handle_request", "comment": "second doc"},
+        ])
+    assert exc.value.status == "invalid_request"
+    assert "operations 0 and 1" in str(exc.value)
+    assert exc.value.requested["conflicting_op_indices"] == [0, 1]
+    assert applied == []          # nothing was applied, so nothing to roll back
+
+
+def test_duplicate_write_key_normalizes_addresses_652(monkeypatch):
+    """#652: `0x401120` and its decimal spelling are the same key."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+    _mutation_with_stubs(monkeypatch, bridge, instance, bv,
+                         apply=lambda bv_, op, restores=None: {"op": op["op"], "requested": {}},
+                         verify=lambda bv_, r: {**r, "status": "verified"})
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._mutation("active", False, [
+            {"op": "set_comment", "address": "0x401120", "comment": "a"},
+            {"op": "delete_comment", "address": str(0x401120)},
+        ])
+    assert exc.value.status == "invalid_request"
+    assert "0x401120" in str(exc.value)
+
+
+def test_distinct_and_accumulative_keys_still_apply_652(monkeypatch):
+    """#652 negative control -- the assertion that keeps the check from rejecting
+    legitimate manifests. Different addresses, different attributes of the same
+    variable (local_rename vs local_retype), and accumulative tag ops at one
+    address are all fine."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+    _mutation_with_stubs(monkeypatch, bridge, instance, bv,
+                         apply=lambda bv_, op, restores=None: {"op": op["op"], "requested": {}},
+                         verify=lambda bv_, r: {**r, "status": "verified"})
+
+    result = instance._mutation("active", False, [
+        {"op": "set_comment", "address": "0x401120", "comment": "a"},
+        {"op": "set_comment", "address": "0x401180", "comment": "b"},
+        {"op": "local_rename", "function": "f", "variable": "var_8", "new_name": "len"},
+        {"op": "local_retype", "function": "f", "variable": "var_8", "new_type": "int32_t"},
+        {"op": "tag_add", "address": "0x401120", "type": "Bookmarks"},
+        {"op": "tag_add", "address": "0x401120", "type": "Bugs"},
+    ])
+    assert result["success"] is True and len(result["results"]) == 6
+
+
+# ===========================================================================
+# #649 -- `data retype`: a verified mutation path for typing a data variable.
+# ===========================================================================
+
+class _FakeDataVar:
+    def __init__(self, type_text, *, auto_discovered=True):
+        self.type = _FakeType(type_text)
+        self.auto_discovered = auto_discovered
+
+    def __str__(self):
+        return f"<var {self.type}>"
+
+
+class _DataVarBV(_FakeMutationBV):
+    """A view modelling BN's data-variable surface, including the journaling
+    behaviour verified live: `define_user_data_var` IS captured by the undo
+    buffer, so `revert_undo_actions` restores the prior (auto) type."""
+
+    def __init__(self, *, data_vars=None, mapped=True, **kwargs):
+        super().__init__(**kwargs)
+        self._data_vars = dict(data_vars or {})
+        self._mapped = mapped
+        self._journaled_data: list[tuple[str, dict]] = []
+
+    def is_valid_offset(self, address):
+        return self._mapped
+
+    def parse_type_string(self, text):
+        return _FakeType(str(text)), None
+
+    def get_data_var_at(self, address):
+        return self._data_vars.get(int(address))
+
+    def define_user_data_var(self, address, type_obj):
+        self._data_vars[int(address)] = _FakeDataVar(str(type_obj), auto_discovered=False)
+
+    def begin_undo_actions(self):
+        state = super().begin_undo_actions()
+        self._journaled_data.append((state, dict(self._data_vars)))
+        return state
+
+    def _pop_data_journal(self, state):
+        for i in range(len(self._journaled_data) - 1, -1, -1):
+            if self._journaled_data[i][0] == state:
+                snapshot = self._journaled_data[i][1]
+                del self._journaled_data[i:]
+                return snapshot
+        return None
+
+    def revert_undo_actions(self, state):
+        snapshot = self._pop_data_journal(state)
+        if snapshot is not None:
+            self._data_vars = dict(snapshot)
+        super().revert_undo_actions(state)
+
+    def commit_undo_actions(self, state):
+        self._pop_data_journal(state)
+        super().commit_undo_actions(state)
+
+
+def _data_retype_instance(monkeypatch, bv):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    return bridge, instance
+
+
+def test_data_retype_applies_and_verifies_649(monkeypatch):
+    """#649: struct-typing a recovered global table is a routine RE move with no
+    verified path -- `types declare` defines the struct but cannot apply it,
+    `symbol rename --kind data` renames without typing, and `struct field set`
+    edits a type, not a variable's binding. The only way through was `py exec`:
+    no --preview, no readback, no batch atomicity, no audit trail."""
+    bv = _DataVarBV(data_vars={0x460000: _FakeDataVar("void")})
+    bridge, instance = _data_retype_instance(monkeypatch, bv)
+
+    result = instance._mutation("active", False, [
+        {"op": "data_retype", "address": "0x460000", "new_type": "cmd_help_entry[257]"}])
+
+    assert result["success"] is True and result["committed"] is True
+    op = result["results"][0]
+    assert op["status"] == "verified"
+    assert op["before_type"] == "void"
+    assert op["expected_type"] == "cmd_help_entry[257]"
+    # readback, not a claim: the view really carries the type now
+    assert str(bv.get_data_var_at(0x460000).type) == "cmd_help_entry[257]"
+    assert bv.get_data_var_at(0x460000).auto_discovered is False
+
+
+def test_data_retype_preview_applies_and_reverts_649(monkeypatch):
+    bv = _DataVarBV(data_vars={0x460000: _FakeDataVar("void")})
+    bridge, instance = _data_retype_instance(monkeypatch, bv)
+
+    result = instance._mutation("active", True, [
+        {"op": "data_retype", "address": "0x460000", "new_type": "uint32_t[4]"}])
+
+    assert result["preview"] is True and result["committed"] is False
+    assert result["rolled_back"] is True
+    assert result["results"][0]["status"] == "verified"   # it DID land, then reverted
+    # define_user_data_var is journaled (verified live), so the revert restores it
+    assert str(bv.get_data_var_at(0x460000).type) == "void"
+
+
+def test_data_retype_same_type_is_noop_649(monkeypatch):
+    bv = _DataVarBV(data_vars={0x460000: _FakeDataVar("uint32_t[4]")})
+    bridge, instance = _data_retype_instance(monkeypatch, bv)
+
+    result = instance._mutation("active", False, [
+        {"op": "data_retype", "address": "0x460000", "new_type": "uint32_t[4]"}])
+    assert result["results"][0]["status"] == "noop"
+    assert result["success"] is True
+
+
+def test_data_retype_unmapped_address_is_invalid_request_649(monkeypatch):
+    """A typo'd address must be a clean invalid_request, not a data var defined
+    into nowhere and then reported `verified` against itself."""
+    bv = _DataVarBV(data_vars={}, mapped=False)
+    bridge, instance = _data_retype_instance(monkeypatch, bv)
+
+    result = instance._mutation("active", False, [
+        {"op": "data_retype", "address": "0xdeadbeef", "new_type": "uint32_t"}])
+    assert result["success"] is False
+    assert result["results"][-1]["status"] == "invalid_request"
+    assert "not mapped" in result["results"][-1]["message"]
+
+
+def test_data_retype_undeclared_type_is_clean_error_649(monkeypatch):
+    """An undeclared type name is a clean invalid_request pointing at `types
+    declare`, not a traceback."""
+    bv = _DataVarBV(data_vars={0x460000: _FakeDataVar("void")})
+
+    def _boom(text):
+        raise RuntimeError("error: unknown type name 'cmd_help_entry'")
+
+    bv.parse_type_string = _boom
+    bridge, instance = _data_retype_instance(monkeypatch, bv)
+
+    result = instance._mutation("active", False, [
+        {"op": "data_retype", "address": "0x460000", "new_type": "cmd_help_entry[257]"}])
+    assert result["results"][-1]["status"] == "invalid_request"
+    message = result["results"][-1]["message"]
+    assert "could not parse type" in message and "types declare" in message
+    assert "Traceback" not in message
+
+
+def test_data_retype_verification_failure_rolls_back_649(monkeypatch):
+    """Readback is a real gate: if the type does not land, the batch fails and
+    reverts rather than reporting a false `verified`."""
+    bv = _DataVarBV(data_vars={0x460000: _FakeDataVar("void")})
+    bv.define_user_data_var = lambda address, type_obj: None   # silently ignores the write
+    bridge, instance = _data_retype_instance(monkeypatch, bv)
+
+    result = instance._mutation("active", False, [
+        {"op": "data_retype", "address": "0x460000", "new_type": "uint32_t[4]"}])
+    assert result["success"] is False and result["committed"] is False
+    assert result["results"][0]["status"] == "verification_failed"
+    assert result["results"][0]["observed"]["type"] == "void"
+
+
+def test_data_retype_composes_with_types_declare_in_one_batch_649(monkeypatch):
+    """#649: the natural pairing -- declare the struct and bind it to the address
+    in ONE atomic manifest."""
+    bv = _DataVarBV(data_vars={0x460000: _FakeDataVar("void")})
+    bridge, instance = _data_retype_instance(monkeypatch, bv)
+    me = bridge.mutation_engine
+    # Keep the types_declare half stubbed: this asserts COMPOSITION (both ops run
+    # under one transaction and one verification pass), not BN's C parser.
+    monkeypatch.setattr(me, "_op_types_declare",
+                        lambda ctx, bv_, op, *a, **k: {"op": "types_declare",
+                                                       "requested": {}, "defined_types": {}})
+    monkeypatch.setattr(me, "_verify_declared_types",
+                        lambda ctx, bv_, result: {**result, "status": "verified"})
+
+    result = instance._mutation("active", False, [
+        {"op": "types_declare", "declaration": "struct cmd_help_entry { char* desc; };"},
+        {"op": "data_retype", "address": "0x460000", "new_type": "cmd_help_entry[257]"},
+    ])
+    assert result["success"] is True and result["committed"] is True
+    assert [r["status"] for r in result["results"]] == ["verified", "verified"]
+
+
+def test_failing_data_retype_rolls_back_the_types_declare_649(monkeypatch):
+    """#649: the batch is atomic in both directions -- a failing data_retype must
+    revert the types_declare that preceded it."""
+    bv = _DataVarBV(data_vars={0x460000: _FakeDataVar("void")}, mapped=False)
+    bridge, instance = _data_retype_instance(monkeypatch, bv)
+    me = bridge.mutation_engine
+    declared = {}
+    monkeypatch.setattr(me, "_op_types_declare",
+                        lambda ctx, bv_, op, *a, **k: (declared.setdefault("applied", True),
+                                                       {"op": "types_declare", "requested": {},
+                                                        "defined_types": {}})[1])
+
+    result = instance._mutation("active", False, [
+        {"op": "types_declare", "declaration": "struct cmd_help_entry { char* desc; };"},
+        {"op": "data_retype", "address": "0xdeadbeef", "new_type": "cmd_help_entry[257]"},
+    ])
+    assert result["success"] is False and result["committed"] is False
+    assert result["rolled_back"] is True
+    assert declared["applied"] is True          # it HAD been applied...
+    assert _has_event(bv, "revert")             # ...and the transaction was reverted
+
+
+# ===========================================================================
+# #650 -- up-front batch op/field validation with did-you-mean.
+# ===========================================================================
+
+def test_batch_guessed_op_name_rejected_up_front_650(monkeypatch):
+    """#650: the batch path has no argparse layer, so a guessed op name failed only
+    at APPLY time -- and, the batch being atomic, took every good op with it. One
+    agent lost 2 rounds guessing `retype_local` vs `local_retype`. Reject before
+    anything is applied, with the did-you-mean #361 added."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeCommentMutationBV()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._mutation("active", False, [
+            {"op": "set_comment", "address": "0x1000", "comment": "good op"},
+            {"op": "retype_local", "function": "f", "variable": "v", "new_type": "int32_t"},
+        ])
+    assert exc.value.status == "unsupported"
+    assert "operation 1" in exc.value.message or "retype_local" in exc.value.message
+    assert "'local_retype'" in exc.value.message          # did you mean
+    assert bv.get_comment_at(0x1000) == ""                # the good op never ran
+    assert not _has_event(bv, "begin")
+
+
+def test_batch_guessed_field_name_hints_the_right_one_650(monkeypatch):
+    """#650: per-op required fields are not mutually consistent (`local_retype`
+    takes `variable` where `rename_symbol` takes `identifier`), so hint from the
+    keys actually provided instead of only naming the missing one."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeCommentMutationBV()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._mutation("active", False, [
+            {"op": "local_retype", "function": "f", "variables": "v", "new_type": "int32_t"}])
+    assert exc.value.status == "invalid_request"
+    assert "'variable'" in exc.value.message
+    assert "'variables'" in exc.value.message       # names what WAS provided
+
+
+def test_batch_validation_covers_every_op_before_the_first_apply_650(monkeypatch):
+    """The pass is over the WHOLE manifest: a bad op at index 13 is caught with the
+    twelve good ops still unapplied."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeCommentMutationBV()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    ops = [{"op": "set_comment", "address": hex(0x1000 + i * 4), "comment": f"note {i}"}
+           for i in range(12)]
+    ops.append({"op": "set_comment", "address": "0x2000"})     # index 12: no comment
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._mutation("active", False, ops)
+    assert "operation 12" in exc.value.message
+    assert all(bv.get_comment_at(0x1000 + i * 4) == "" for i in range(12))

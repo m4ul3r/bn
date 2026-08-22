@@ -200,6 +200,80 @@ def _callee_name_for_call(ctx, bv, dest_value, target) -> str | None:
     return None
 
 
+def _callee_function_for_call(ctx, bv, dest_value, target):
+    """The callee's BN function object for a DIRECT call, else None."""
+    if dest_value is not None:
+        getter = getattr(bv, "get_function_at", None)
+        fn = getter(int(dest_value)) if callable(getter) else None
+        if fn is not None:
+            return fn
+    if isinstance(target, dict):
+        fn_entry = target.get("function")
+        if isinstance(fn_entry, dict) and fn_entry.get("start") is not None:
+            getter = getattr(bv, "get_function_at", None)
+            start = _safe_int(fn_entry.get("start"))
+            if callable(getter) and start:
+                return getter(start)
+    return None
+
+
+def _abi_arg_register_count(bv, callee_fn) -> int | None:
+    """How many integer arguments this platform passes in registers, or None."""
+    cc = getattr(callee_fn, "calling_convention", None) if callee_fn is not None else None
+    if cc is None:
+        plat = getattr(bv, "platform", None)
+        cc = getattr(plat, "default_calling_convention", None)
+    regs = list(getattr(cc, "int_arg_regs", None) or [])
+    return len(regs) or None
+
+
+def _argument_arity_evidence(ctx, bv, dest_value, target,
+                             arguments: list[dict[str, Any]]) -> dict[str, Any]:
+    """Is the callee's ARITY known, or is HLIL enumerating ABI registers? (#648)
+
+    When a callee has no recovered prototype BN assumes every argument register is
+    live, and HLIL renders whatever happens to sit in them -- typically the NEXT
+    call's argument staging, up to and including the stack canary. #549 separated
+    canonical ``arguments`` from heuristic ``argument_candidates``; the residual was
+    that the canonical field still claimed ``authoritative`` when nothing was known
+    about the callee's arity. The distinguishing signal is available right here:
+    ``memset`` reports 3 declared parameters (a bundled library type, so its
+    ``authoritative`` stamp is EARNED), while an unprototyped vendor import reports
+    zero -- verified against a live BN view.
+
+    Returns ``{"arity_unknown": bool, ...}``; ``arity_unknown`` is False whenever the
+    callee cannot be resolved, so an indirect call keeps its previous reporting.
+    """
+    evidence: dict[str, Any] = {"arity_unknown": False}
+    callee_fn = _callee_function_for_call(ctx, bv, dest_value, target)
+    if callee_fn is None:
+        return evidence
+    if bool(getattr(callee_fn, "has_user_type", False)):
+        return evidence          # a user prototype pins the arity
+    func_type = getattr(callee_fn, "type", None)
+    declared = getattr(func_type, "parameters", None)
+    if declared is None:
+        declared = getattr(callee_fn, "parameter_vars", None)
+    try:
+        declared_count = len(declared) if declared is not None else 0
+    except TypeError:
+        declared_count = 0
+    if declared_count > 0 or il_format._function_is_variadic(callee_fn):
+        return evidence          # a recovered/bundled prototype (or a declared variadic)
+    # Zero declared parameters yet HLIL rendered arguments: the list is BN's
+    # register guess, not the callee's signature. A genuinely void callee rendering
+    # zero arguments agrees with its prototype and is left alone.
+    if not arguments:
+        return evidence
+    evidence["arity_unknown"] = True
+    abi_regs = _abi_arg_register_count(bv, callee_fn)
+    if abi_regs is not None and len(arguments) >= abi_regs:
+        # The strongest tell: the count saturates the ABI argument registers, i.e.
+        # BN is enumerating registers rather than reporting parameters.
+        evidence["abi_register_saturated"] = True
+    return evidence
+
+
 def _variadic_diagnostic(ctx, bv, dest_value, target, arg_source,
                          arguments: list[dict[str, Any]],
                          candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -354,6 +428,13 @@ def _function_call_evidence(ctx, bv, func, *, context: int) -> list[dict[str, An
         # from HLIL/ABI recovery; an mlil/llil fallback is itself heuristic. Surface
         # that trust level so downstream automation traces the right field.
         argument_confidence = "authoritative" if arg_source == "hlil" else "heuristic"
+        # #648: `authoritative` meant "HLIL produced a list", not "the list is right".
+        # On an unknown-arity callee HLIL invents ABI-register args (a neighbouring
+        # call's staging, the stack canary), so demote and flag it -- confirmed wrong
+        # against upstream source on a dogfood target.
+        arity = _argument_arity_evidence(ctx, bv, dest_value, target, arguments)
+        if arity["arity_unknown"] and argument_confidence == "authoritative":
+            argument_confidence = "inferred"
         # #557: expose WHY the HLIL statement is null (reason code) rather than a bare null.
         hlil_statement, hlil_reason = il_format._hlil_statement_localization(insn)
         # #558: under-recovered imported variadic (scanf/printf-family) calls.
@@ -372,6 +453,7 @@ def _function_call_evidence(ctx, bv, func, *, context: int) -> list[dict[str, An
                 "pre_branch_condition": il_format._hlil_pre_branch_condition(insn),
                 "argument_source": arg_source,
                 "argument_confidence": argument_confidence,
+                **arity,
                 "arguments": arguments,
                 "argument_candidates": argument_candidates,
                 "variadic": variadic,
@@ -1822,9 +1904,20 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
     def exec_target(addr: int) -> bool:
         try:
             seg = bv.get_segment_at(addr)
-            return bool(seg is not None and getattr(seg, "executable", False))
+            if seg is None or not getattr(seg, "executable", False):
+                return False
         except Exception:
             return False
+        # #647: an executable SEGMENT is not enough. On a single-`LOAD` aarch64 PIE the
+        # whole image -- `.rodata` included -- is mapped r-x, so every pointer into
+        # read-only DATA passed this test and a 514-row `{char *desc; char *usage;}` help
+        # table was reported as a 514-entry dispatch table with 514 missing functions.
+        # Consult the section the way the `evidence table` path already does. `None`
+        # (no section covers the address) keeps the old permissive answer, so the scan
+        # is not blinded on the raw/monolithic firmware images with no named sections
+        # that this command exists to serve.
+        code_like = _section_is_code_like(bv, addr)
+        return code_like is not False
 
     def norm_ptr(addr: int) -> int:
         # A Thumb function pointer is the even code address with the low bit set; the
@@ -1869,12 +1962,17 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
 
     # Deduped executable targets with no function -> the hidden-surface candidates.
     missing: dict[int, dict[str, Any]] = {}
+    # #653.5: distinct candidates the cap suppressed. Tracked (cheaply -- no decode
+    # probe) so the cap warning can disclose "128 of N" instead of a silent prefix
+    # that leaves no basis for deciding whether raising --max-candidates is worth it.
+    missing_over_cap: set[int] = set()
 
     def note_missing(addr: int, provenance: str) -> None:
         norm = norm_ptr(addr)
         if norm in missing or has_fn(norm):
             return
         if len(missing) >= max_candidates:
+            missing_over_cap.add(norm)
             return
         aligned, depth = _code_signals(addr)
         missing[norm] = {
@@ -1887,6 +1985,13 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
             "code_likely": bool(aligned and depth >= _STRONG_DECODE_DEPTH),
             "section": _section_name_at(bv, norm),
         }
+        # #647 defence in depth: a candidate that resolves to a printable string is
+        # self-refuting evidence -- inline it the way `evidence table` does, so a
+        # false lead reads as `-> "Set Channel Index\n"` instead of a bare address
+        # an agent has to spend a second command disproving.
+        preview = _string_preview_at(ctx, bv, norm)
+        if preview:
+            missing[norm]["string"] = preview
 
     # 1) init/ctor sections (reuse the existing evidence).
     init_sections: list[dict[str, Any]] = []
@@ -1931,6 +2036,7 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
                 "with disasm")
 
     candidate_tables: list[dict[str, Any]] = []
+    tables_over_cap = 0
     scanned = 0
     scan_capped = False
     for name, start, end in scan_regions:
@@ -1948,9 +2054,11 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
         run: list[int] = []
 
         def flush(run_addr: int, run_vals: list[int]) -> None:
+            nonlocal tables_over_cap
             if len(run_vals) < table_min_run:
                 return
             if len(candidate_tables) >= max_tables:
+                tables_over_cap += 1   # #653.5: disclose the total, not a silent prefix
                 return
             # Normalize each pointer before the miss count so a Thumb pointer
             # (stored as addr|1) is checked at its real even entry -- matching what
@@ -1989,10 +2097,15 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
             f"data scan capped at {max_scan_bytes} bytes; regions (or their tails) beyond "
             "the budget were not scanned -- on a monolithic image the pointer tables often "
             "sit in the TAIL, so raise --max-scan-bytes to cover the whole image")
+    tables_total = len(candidate_tables) + tables_over_cap
+    candidates_total = len(missing) + len(missing_over_cap)
     if len(candidate_tables) >= max_tables:
-        warnings.append(f"candidate tables capped at {max_tables} (--max-tables)")
+        warnings.append(
+            f"candidate tables capped at {max_tables} of {tables_total} (--max-tables)")
     if len(missing) >= max_candidates:
-        warnings.append(f"missing-function candidates capped at {max_candidates} (--max-candidates)")
+        warnings.append(
+            f"missing-function candidates capped at {max_candidates} of {candidates_total} "
+            "(--max-candidates)")
     if _variable_length_isa and missing:
         warnings.append(
             f"decode_depth is a WEAK code-vs-data discriminator on this variable-length ISA "
@@ -2009,6 +2122,9 @@ def _hidden_surface(ctx, selector: str | None, *, table_min_run: int = 3,
             "init_sections": len(init_sections),
             "candidate_tables": len(candidate_tables),
             "missing_function_candidates": len(missing),
+            # #653.5: the pre-cap totals, so a capped run is attributable.
+            "candidate_tables_total": tables_total,
+            "missing_function_candidates_total": candidates_total,
             # the high-confidence subset (aligned + long clean decode run) -- start here.
             "code_likely_candidates": sum(1 for m in missing.values() if m["code_likely"]),
         },
@@ -2029,6 +2145,60 @@ def _section_name_at(bv, addr: int) -> str | None:
         return str(secs[0].name) if secs else None
     except Exception:
         return None
+
+
+# Section-name markers, kept in sync with the `evidence table` warning at
+# `_table_for_view` -- that path already reasoned about code-like vs data-like
+# sections while the scan that GENERATES candidates only tested segment perms (#647).
+_CODE_SECTION_NAMES = {".text", "__text", ".init", ".fini"}
+_DATA_SECTION_MARKERS = (
+    "data", "rodata", "got", "rdata", "bss", "init_array", "fini_array",
+    "ctors", "dtors", "dynstr", "dynsym", "interp", "eh_frame", "gnu.hash",
+    "rela", "dynamic", "strtab", "symtab",
+)
+
+
+def _string_preview_at(ctx, bv, addr: int) -> str | None:
+    """The printable string at *addr*, if BN found one there (#647)."""
+    try:
+        context = ctx._address_context(bv, int(addr)) or {}
+    except Exception:
+        return None
+    string = context.get("string") or {}
+    value = string.get("value") if isinstance(string, dict) else None
+    return str(value) if value else None
+
+
+def _semantics_name(section) -> str:
+    # BN's SectionSemantics is an IntEnum, so str() yields the NUMBER ("1"), not
+    # the member name -- read `.name` (verified against a live BN 5.x view).
+    sem = getattr(section, "semantics", None)
+    return str(getattr(sem, "name", "") or "")
+
+
+def _section_is_code_like(bv, addr: int) -> bool | None:
+    """Is *addr* inside a section BN considers code? None == no section knowledge.
+
+    Semantics first (``ReadOnlyCode`` vs ``ReadOnly/ReadWriteData``), then the
+    section name as a fallback for views whose semantics are all ``Default``.
+    """
+    try:
+        secs = list(bv.get_sections_at(addr) or [])
+    except Exception:
+        return None
+    if not secs:
+        return None
+    verdict: bool | None = None
+    for sec in secs:
+        sem = _semantics_name(sec)
+        if "ReadOnlyCode" in sem:
+            return True
+        name = str(getattr(sec, "name", "") or "").lower()
+        if name in _CODE_SECTION_NAMES or name.startswith(".plt"):
+            return True
+        if "Data" in sem or any(marker in name for marker in _DATA_SECTION_MARKERS):
+            verdict = False
+    return verdict
 
 
 # --- #466 cross-target virtual-call resolution -------------------------------

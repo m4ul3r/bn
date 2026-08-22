@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from ..cli import _call, _mutate, _pick, arg, command, preview_arg, summary_arg
+from ..cli import _call, _mutate, _pick, arg, command, mutation_output_args, preview_arg
 from ..formatters import (
     _render_comment_list_text,
     _render_comment_text,
@@ -15,7 +15,7 @@ from ..transport import BridgeError
 _RENAME_ARGS = [
     arg("--kind", choices=("auto", "function", "data"), default="auto",
         help="Symbol kind to rename: auto-detect (default), function, or data"),
-    preview_arg(), summary_arg(),
+    preview_arg(), *mutation_output_args(),
     arg("identifier", help="Current symbol name or address (hex 0x.. or decimal)"),
     arg("new_name", help="New symbol name"),
 ]
@@ -47,12 +47,20 @@ def _symbol_rename(args: argparse.Namespace) -> int:
 
 
 @command("comment", "list", help="List comments", target=True, paged=True,
-         args=[arg("--query", help="Filter comments by substring")])
+         args=[arg("--query", help="Filter comments by substring"),
+               # #643: function docs (fn.comment) live off bv.address_comments, so
+               # listing only address comments made every `comment set --function`
+               # write undiscoverable. Both stores by default; the old
+               # address-only behaviour stays expressible.
+               arg("--scope", choices=["all", "address", "function"], default="all",
+                   help="Which comment store to list: address comments, function "
+                        "documentation comments (fn.comment), or both (default: all)")])
 def _comment_list(args: argparse.Namespace) -> int:
     return _call(
         args,
         "list_comments",
-        {"query": args.query, "offset": args.offset, "limit": args.limit},
+        {"query": args.query, "offset": args.offset, "limit": args.limit,
+         "scope": args.scope},
         require_target=True,
         text_renderer=_render_comment_list_text,
         # Bridge returns the {items,total,...} envelope and applies the page, so
@@ -98,7 +106,7 @@ def _comment_locator(args: argparse.Namespace, verb: str) -> tuple[str | None, s
 
 @command("comment", "set", help="Set a comment", target=True, fmt="json",
          args=[
-             preview_arg(), summary_arg(),
+             preview_arg(), *mutation_output_args(),
              arg("address", nargs="?",
                  help="Address to comment (hex 0x.. or decimal); alias for --address"),
              arg("comment", help="Comment text"),
@@ -155,7 +163,7 @@ def _comment_get(args: argparse.Namespace) -> int:
 
 
 @command("comment", "delete", help="Delete a comment", target=True, fmt="json",
-         args=[preview_arg(), summary_arg(), *_comment_locator_args()])
+         args=[preview_arg(), *mutation_output_args(), *_comment_locator_args()])
 def _comment_delete(args: argparse.Namespace) -> int:
     address, function = _comment_locator(args, "delete")
     return _mutate(
@@ -172,7 +180,7 @@ def _comment_delete(args: argparse.Namespace) -> int:
 
 @command("proto", "set", help="Set a prototype", target=True, fmt="json",
          args=[
-             preview_arg(), summary_arg(),
+             preview_arg(), *mutation_output_args(),
              arg("identifier", help="Function name or address (hex 0x.. or decimal)"),
              arg("prototype", help="Full C prototype string, e.g. \"int __cdecl f(Player* self)\""),
          ])
@@ -217,7 +225,7 @@ def _local_list(args: argparse.Namespace) -> int:
 
 @command("local", "rename", help="Rename a local", target=True, fmt="json",
          args=[
-             preview_arg(), summary_arg(),
+             preview_arg(), *mutation_output_args(),
              arg("function"),
              arg("variable", help="Stable local_id or legacy variable name"),
              arg("new_name"),
@@ -238,7 +246,7 @@ def _local_rename(args: argparse.Namespace) -> int:
 
 @command("local", "retype", help="Retype a local", target=True, fmt="json",
          args=[
-             preview_arg(), summary_arg(),
+             preview_arg(), *mutation_output_args(),
              arg("function"),
              arg("variable", help="Stable local_id or legacy variable name"),
              arg("new_type"),

@@ -40,7 +40,12 @@ except ModuleNotFoundError:  # importable without the Binary Ninja runtime (test
 from . import mutation_engine
 from . import read_misc
 from .bridge_state import require_analysis
-from ._shared import _parse_address, _require_mapped_address, _validate_count
+from ._shared import (
+    OperationFailure,
+    _parse_address,
+    _require_mapped_address,
+    _validate_count,
+)
 
 
 def _remove_created_function(ctx, bv, addr: int) -> bool:
@@ -352,6 +357,9 @@ def _get_comment(ctx, selector: str | None, address, function):
     }
 
 
+_COMMENT_SCOPES = ("all", "address", "function")
+
+
 def _list_comments(
     ctx,
     selector: str | None,
@@ -359,27 +367,59 @@ def _list_comments(
     query: str | None = None,
     offset: int = 0,
     limit: int | None = None,
+    scope: str = "all",
 ):
     # Re-enforce the count contract (see _sections) so a negative offset/
     # limit is a clean invalid_request, not a silent negative-slice (#100).
     offset = _validate_count(offset, label="offset", minimum=0)
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
+    scope = (scope or "all").lower()
+    if scope not in _COMMENT_SCOPES:
+        raise OperationFailure(
+            "invalid_request",
+            f"unknown comment scope {scope!r}; expected one of {', '.join(_COMMENT_SCOPES)}",
+        )
     bv = ctx._resolve_view(selector)
     needle = query.lower() if query else None
     items = []
-    for addr in sorted(bv.address_comments):
-        text = bv.address_comments[addr]
-        if not text:
-            continue
-        if needle and needle not in text.lower():
-            continue
-        funcs = bv.get_functions_containing(addr)
-        func_name = funcs[0].name if funcs else None
-        items.append({
-            "address": hex(addr),
-            "function": func_name,
-            "comment": text,
-        })
+    if scope in ("all", "address"):
+        for addr in sorted(bv.address_comments):
+            text = bv.address_comments[addr]
+            if not text:
+                continue
+            if needle and needle not in text.lower():
+                continue
+            funcs = bv.get_functions_containing(addr)
+            func_name = funcs[0].name if funcs else None
+            items.append({
+                "address": hex(addr),
+                "function": func_name,
+                "comment": text,
+                "scope": "address",
+            })
+    if scope in ("all", "function"):
+        # #643: function documentation comments (`fn.comment`, written by
+        # `comment set --function`) live on the function object, NOT in
+        # bv.address_comments -- so the ONLY discovery command could never see
+        # them and `comment list --query TODO` reported `none` for a TODO the
+        # write had just confirmed as `verified`. #203 made `comment get
+        # --function` a superset of both stores for exactly this reason; this is
+        # the mirror direction, so list is complete by default too.
+        for fn in getattr(bv, "functions", None) or []:
+            doc = str(getattr(fn, "comment", "") or "")
+            if not doc:
+                continue
+            if needle and needle not in doc.lower():
+                continue
+            items.append({
+                "address": hex(int(fn.start)),
+                "function": fn.name,
+                "comment": doc,
+                "scope": "function_doc",
+            })
+    # Address-ordered so paging is stable across the two stores; at a shared
+    # address the function doc sorts first (it describes the whole function).
+    items.sort(key=lambda item: (int(item["address"], 16), 0 if item["scope"] == "function_doc" else 1))
     # Honest paging envelope ({items,total,offset,limit,returned,has_more}),
     # matching strings/imports/sections/function-list (#122/#131). The helper
     # applies the offset/limit slice itself off the full filtered set.

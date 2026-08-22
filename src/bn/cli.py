@@ -21,7 +21,7 @@ from .formatters import (
     _render_mutation_text,
     _render_target_choices,
 )
-from .output import render_envelope, render_error, write_output_result
+from .output import render_envelope, render_error, render_value, write_output_result
 
 # The names below are re-exported through this module on purpose: command
 # handlers in bn.commands access them as `cli.<name>` so tests (and scripts)
@@ -396,15 +396,36 @@ def preview_arg(
 
 
 def summary_arg() -> tuple[tuple[str, ...], dict[str, Any]]:
-    """The shared ``--summary`` flag for mutation commands (#408): emit a compact,
-    schema-stable status object (changed/verified/noop/failed counts + rolled_back
-    + first_error + dirty_after) instead of the full audit payload, for an
-    unattended agent control loop. The detailed output stays the default."""
+    """The shared ``--summary`` / ``--quiet`` flag for mutation commands (#408).
+
+    Since #645 the compact status summary is the DEFAULT, so this flag only still
+    matters to force compactness under an explicit ``--format json`` / ``--out``.
+    Kept accepted (never an error) for compatibility with existing agent scripts."""
     return arg("--summary", "--quiet", action="store_true", default=False,
                dest="summary",
-               help="Emit a compact status summary (counts, first_error, dirty_after) "
-                    "instead of the full mutation audit payload (avoids spilling on a "
-                    "routine rename/comment batch)")
+               help="Force the compact status summary (counts, first_error, "
+                    "dirty_after) even under an explicit --format json or --out. The "
+                    "compact summary is already the default")
+
+
+def verbose_arg() -> tuple[tuple[str, ...], dict[str, Any]]:
+    """The shared ``--verbose`` / ``--diffs`` flag for mutation commands (#645).
+
+    Mutations used to default to ``--format json`` and echo every per-op diff,
+    ``requested``, ``observed``, and ``before_*`` field -- the single largest source
+    of avoidable token burn in a write-heavy session (a `proto set` cost ~7 KB where
+    the status line costs 225 bytes, a 115-op previewed batch cost 261 KB / 87k
+    tokens). The compact status line is now the default and the full audit payload
+    is opt-in through this flag or an explicit ``--format json`` / ``--out``."""
+    return arg("--verbose", "--diffs", action="store_true", default=False,
+               dest="verbose",
+               help="Emit the full mutation audit payload (per-op requested/observed "
+                    "state and diffs) instead of the compact status summary")
+
+
+def mutation_output_args() -> list[tuple[tuple[str, ...], dict[str, Any]]]:
+    """Both mutation output-shaping flags, for splatting into a command's args."""
+    return [summary_arg(), verbose_arg()]
 
 
 def command(
@@ -545,6 +566,8 @@ def _render_result(
     spill_label: str | None = None,
     spill_context: Any = None,
     paged: bool = False,
+    spill_status: tuple[Any, Callable[[Any], str] | None] | None = None,
+    provenance: dict[str, Any] | None = None,
 ) -> bool:
     """Render *value* to stdout; return True iff the output spilled to disk.
 
@@ -555,10 +578,36 @@ def _render_result(
         artifact = dict(value)
         artifact.setdefault("ok", True)
         artifact.setdefault("spilled", False)
+        for key, val in (provenance or {}).items():   # #653.8
+            if val is not None:
+                artifact.setdefault(key, val)
         sys.stdout.write(render_envelope(artifact, fmt))
         return bool(artifact.get("spilled"))
 
-    result = write_output_result(value, fmt=fmt, out_path=out_path, stem=stem)
+    result = write_output_result(value, fmt=fmt, out_path=out_path, stem=stem,
+                                provenance=provenance)
+    if result.spilled and result.artifact and spill_status is not None:
+        # #645: NEVER put a spill envelope on stdout for a mutation. A read that
+        # spills is recoverable (re-read the artifact); an atomic write whose result
+        # is unparseable is not -- the agent's model of the BNDB silently desyncs
+        # from the BNDB. The detail is already on disk; stdout keeps the small,
+        # parseable status (with a pointer to the detail).
+        artifact_path = result.artifact["artifact_path"]
+        status_value, status_renderer = spill_status
+        if isinstance(status_value, dict):
+            status_value = {**status_value, "detail_artifact_path": str(artifact_path)}
+        if fmt == "text" and status_renderer is not None:
+            rendered = status_renderer(status_value)
+            sys.stdout.write(rendered if rendered.endswith("\n") else rendered + "\n")
+        else:
+            sys.stdout.write(render_value(status_value, fmt))
+        print(
+            f"note: full mutation detail ({result.artifact.get('estimated_tokens')} est. "
+            f"tokens) written to {artifact_path}; stdout carries the parseable status "
+            f"summary. Re-run with --out FILE for the detail in a chosen location.",
+            file=sys.stderr,
+        )
+        return False
     if result.spilled and result.artifact:
         label = spill_label or stem.replace("_", " ")
         artifact = result.artifact
@@ -808,6 +857,7 @@ def _mutate(
     stem: str,
     require_target: bool = True,
     preview: bool | None = None,
+    detail_renderer: Any = None,
     **call_kwargs: Any,
 ) -> int:
     """:func:`_call` specialized for mutations.
@@ -824,15 +874,47 @@ def _mutate(
     # object for an unattended control loop. The exit code is unchanged (computed
     # on the full result); only the rendered/returned payload is compacted.
     summary = bool(getattr(args, "summary", False))
+    # #645: the compact status is now the DEFAULT. The full audit payload -- every
+    # per-op diff, `requested`, `observed`, `before_*` -- was the single largest
+    # source of avoidable token burn in a write-heavy session (a `proto set` cost
+    # ~7 KB vs 225 bytes; a 115-op previewed batch cost 261 KB / 87k tokens). Detail
+    # is opt-in: --verbose/--diffs, an explicit machine --format, or --out (where the
+    # payload lands in a file rather than the context window).
+    detail = (
+        bool(getattr(args, "verbose", False))
+        # --out puts the payload in a FILE, not the context window, so the caller
+        # who asked for a file gets the full detail in it.
+        or bool(getattr(args, "out", None))
+        or (bool(getattr(args, "_format_explicit", False))
+            and str(getattr(args, "format", "text")) in ("json", "ndjson"))
+    )
+    compact = summary or not detail
+    if not getattr(args, "_format_explicit", False):
+        # These commands declare fmt="json" for back-compat of the parser default;
+        # mutations now render as TEXT by default, mirroring the read commands.
+        # --format controls the MEDIUM, --verbose/--summary the DETAIL. An explicit
+        # --format still wins, and an --out extension is still inferred downstream.
+        setattr(args, "format", "text")
     return _call(
         args,
         op,
         params,
         require_target=require_target,
-        text_renderer=_render_mutation_summary_text if summary else _render_mutation_text,
+        # A mutation with a richer detail view of its own (e.g. `go rename`'s
+        # per-candidate breakdown) supplies it via *detail_renderer*; the compact
+        # status line stays shared so #645's default is identical everywhere.
+        text_renderer=(_render_mutation_summary_text if compact
+                       else (detail_renderer or _render_mutation_text)),
         result_exit_code=_mutation_exit_code,
-        result_transform=_mutation_summary if summary else _add_mutation_ok,
+        result_transform=_mutation_summary if compact else _add_mutation_ok,
         stem=stem,
+        # #645: an atomic write whose result is unreadable is a correctness problem,
+        # not a cost one -- a spilled 38-op batch put the spill envelope on stdout,
+        # so `json.loads` raised and the agent could not confirm a batch that HAD
+        # committed. Keep the parseable status on stdout no matter how big the
+        # detail payload is; the detail goes to the artifact.
+        spill_status=_mutation_summary,
+        spill_status_renderer=_render_mutation_summary_text,
         **call_kwargs,
     )
 
@@ -864,6 +946,8 @@ def _call(
     offset_hint_identifier: str | None = None,
     truncation_note: Callable[[Any], str | None] | None = None,
     op_default_timeout: float | None = None,
+    spill_status: Callable[[Any], Any] | None = None,
+    spill_status_renderer: Callable[[Any], str] | None = None,
 ) -> int:
     request_params = dict(params or {})
     # A long one-time op (load/refresh full analysis) raises its no-env default
@@ -965,6 +1049,16 @@ def _call(
         stem=stem,
         spill_label=page_label or op.replace("_", " "),
         spill_context=spill_context,
+        # #645: a mutation supplies a compact status to print INSTEAD of a spill
+        # envelope, so an atomic write's outcome is always parseable on stdout.
+        spill_status=(
+            (spill_status(spill_context), spill_status_renderer)
+            if spill_status is not None else None
+        ),
+        # #653.8: stamp WHICH target/instance produced the artifact, so a stale or
+        # foreign `--out` file is detectable by inspection rather than by
+        # recognising unrelated symbol names.
+        provenance={"target": target, "instance": getattr(args, "instance", None)},
         # paged_spill keeps the "--limit/--offset to page" spill hint for
         # commands (function list/search) that page bridge-side and so don't set
         # the client-side page_limit (#59).

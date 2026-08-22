@@ -399,6 +399,32 @@ class BridgeContext:
             fn = bv.get_function_at(address)
             return [fn] if fn is not None else []
 
+    def _functions_referencing(self, bv, address: int, *, limit: int | None = None):
+        """Distinct functions carrying a code xref to *address* -- the blast radius of
+        a data-variable retype, since typing a global reflows every reader (#649).
+        Best-effort: an empty list when the view exposes no code-ref API."""
+        get_refs = getattr(bv, "get_code_refs", None)
+        if not callable(get_refs):
+            return []
+        try:
+            refs = list(get_refs(int(address)) or [])
+        except Exception:
+            return []
+        out: list[Any] = []
+        seen: set[int] = set()
+        for ref in refs:
+            fn = getattr(ref, "function", None)
+            if fn is None:
+                continue
+            start = int(getattr(fn, "start", -1) or -1)
+            if start in seen:
+                continue
+            seen.add(start)
+            out.append(fn)
+            if limit is not None and len(out) >= limit:
+                break
+        return out
+
     def _containment_meta(self, identifier, func):
         """Describe a READ resolved via the `contained` address fallback.
 

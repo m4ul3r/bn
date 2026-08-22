@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 
-from ..cli import _call, _mutate, _pick, arg, command, preview_arg, summary_arg
+from ..cli import _call, _mutate, _pick, arg, command, mutation_output_args, preview_arg
 from ..formatters import _render_tag_get_text, _render_tag_list_text, _render_tag_types_text
 from ..transport import BridgeError
 
@@ -88,7 +88,7 @@ def _tag_list(args: argparse.Namespace) -> int:
 
 @command("tag", "add", help="Add a tag at an address or on a function", target=True, fmt="json",
          args=[
-             preview_arg(), summary_arg(),
+             preview_arg(), *mutation_output_args(),
              arg("address", nargs="?", help="Address to tag (hex 0x.. or decimal); alias for --address"),
              arg("--address", dest="address_flag", default=None, help="Address alias for the positional"),
              arg("--function", default=None, help="Tag the whole function (name or address)"),
@@ -126,7 +126,7 @@ def _tag_add(args: argparse.Namespace) -> int:
 
 @command("tag", "remove", help="Remove tag(s) by id, or by type at a location", target=True, fmt="json",
          args=[
-             preview_arg(), summary_arg(),
+             preview_arg(), *mutation_output_args(),
              arg("address", nargs="?", help="Address to remove tags at (hex 0x.. or decimal)"),
              arg("--address", dest="address_flag", default=None, help="Address alias for the positional"),
              arg("--function", default=None, help="Remove whole-function tags of this function"),
@@ -162,7 +162,7 @@ def _tag_remove(args: argparse.Namespace) -> int:
 
 
 @command("tag", "type", "create", help="Create a custom tag type", target=True, fmt="json",
-         args=[preview_arg(), summary_arg(),
+         args=[preview_arg(), *mutation_output_args(),
                arg("name", help="Tag type name"),
                arg("--icon", required=True, help="Emoji icon for the tag type, e.g. 🎯")])
 def _tag_type_create(args: argparse.Namespace) -> int:
@@ -172,7 +172,7 @@ def _tag_type_create(args: argparse.Namespace) -> int:
 
 
 @command("tag", "type", "remove", help="Remove a custom tag type", target=True, fmt="json",
-         args=[preview_arg(), summary_arg(),
+         args=[preview_arg(), *mutation_output_args(),
                arg("name", help="Custom tag type name (built-ins cannot be removed)")])
 def _tag_type_remove(args: argparse.Namespace) -> int:
     return _mutate(args, "tag_type_remove",

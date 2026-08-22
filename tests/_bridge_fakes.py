@@ -909,6 +909,13 @@ def _mutation_with_stubs(monkeypatch, bridge, instance, bv, *, apply, verify=Non
     monkeypatch.setattr(me, "_diff_snapshots", lambda ctx, before, after: [])
     monkeypatch.setattr(me, "_diff_type_snapshots", lambda ctx, before, after: [])
     monkeypatch.setattr(me, "_apply_operation", lambda ctx, *a, **k: apply(*a, **k))
+    # #650 hoisted per-op field validation out of _apply_operation into a pre-apply
+    # pass over the whole manifest. These tests deliberately stub the apply path to
+    # isolate the verify/revert machinery and pass SKELETAL ops ({"op": "rename_symbol"}),
+    # so stub the validator too -- exactly the semantics this helper had before the
+    # hoist. Validation has its own coverage (test_batch_op_parity_*, the #650 tests).
+    monkeypatch.setattr(me, "_validate_operation_request",
+                        lambda ctx, op, index=None: str(op.get("op") or ""))
     if verify is not None:
         monkeypatch.setattr(me, "_verify_operation", lambda ctx, *a, **k: verify(*a, **k))
 
@@ -930,6 +937,7 @@ def _mutation_with_stubs(monkeypatch, bridge, instance, bv, *, apply, verify=Non
 #   set_prototype       | identifier, prototype                     | --                   | --                            | --                  | bn proto set
 #   local_rename        | function, variable, new_name              | --                   | --                            | --                  | bn local rename
 #   local_retype        | function, variable, new_type              | --                   | --                            | --                  | bn local retype
+#   data_retype         | address, new_type                         | --                   | --                            | --                  | bn data retype
 #   struct_field_set    | struct_name, field_type, offset, field_name | --                 | --                            | overwrite_existing, type_name | bn struct field set
 #   struct_field_rename | struct_name, old_name, new_name           | --                   | --                            | type_name           | bn struct field rename
 #   struct_field_delete | struct_name, field_name                   | --                   | --                            | type_name           | bn struct field delete
@@ -941,6 +949,7 @@ _BATCH_OP_PARITY = {
     "set_prototype":       {"required": ("identifier", "prototype"),                         "one_of": (),                           "enum": {},                                     "cli": "bn proto set"},
     "local_rename":        {"required": ("function", "variable", "new_name"),                "one_of": (),                           "enum": {},                                     "cli": "bn local rename"},
     "local_retype":        {"required": ("function", "variable", "new_type"),                "one_of": (),                           "enum": {},                                     "cli": "bn local retype"},
+    "data_retype":         {"required": ("address", "new_type"),                             "one_of": (),                           "enum": {},                                     "cli": "bn data retype"},
     "struct_field_set":    {"required": ("struct_name", "field_type", "offset", "field_name"), "one_of": (),                         "enum": {},                                     "cli": "bn struct field set"},
     "struct_field_rename": {"required": ("struct_name", "old_name", "new_name"),             "one_of": (),                           "enum": {},                                     "cli": "bn struct field rename"},
     "struct_field_delete": {"required": ("struct_name", "field_name"),                       "one_of": (),                           "enum": {},                                     "cli": "bn struct field delete"},

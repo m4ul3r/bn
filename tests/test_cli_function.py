@@ -88,7 +88,7 @@ def test_function_list_warns_when_output_auto_spills(fake_transport, monkeypatch
         ], "total": 2, "offset": 0, "limit": 100, "returned": 2, "has_more": False},
     }})
 
-    def fake_write_output_result(value, *, fmt, out_path, stem):
+    def fake_write_output_result(value, *, fmt, out_path, stem, **kwargs):
         captured["value"] = value
         captured["fmt"] = fmt
         captured["out_path"] = out_path
@@ -135,7 +135,7 @@ def test_function_list_warns_when_output_auto_spills(fake_transport, monkeypatch
 def test_decompile_spill_warning_suggests_line_slicing(fake_transport, monkeypatch, capsys):
     fake_transport({"decompile": {"ok": True, "result": {"text": "long decompiled text"}}})
 
-    def fake_write_output_result(value, *, fmt, out_path, stem):
+    def fake_write_output_result(value, *, fmt, out_path, stem, **kwargs):
         assert stem == "decompile"
         return _spill_artifact_namespace("/tmp/decompile.txt")
 
@@ -157,7 +157,7 @@ def test_decompile_json_spill_warning_does_not_suggest_lines(fake_transport, mon
     # should point at --out / the artifact instead (#120).
     fake_transport({"decompile": {"ok": True, "result": {"text": "long decompiled text"}}})
 
-    def fake_write_output_result(value, *, fmt, out_path, stem):
+    def fake_write_output_result(value, *, fmt, out_path, stem, **kwargs):
         assert stem == "decompile"
         return _spill_artifact_namespace("/tmp/decompile.json")
 
@@ -1803,7 +1803,12 @@ def test_function_search_count_prints_total(monkeypatch, capsys):
     rc = bn.cli.main(["function", "search", "parse", "--count"])
 
     assert rc == 0
-    assert "Total functions: 17" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    # #653.1: the search form says MATCHES. It used to reuse `function list
+    # --count`'s "Total functions:" label, so "Total functions: 17" beside
+    # "Total functions: 175" read as a contradiction rather than matches-vs-total.
+    assert "Matching functions: 17" in out
+    assert "Total functions" not in out
 
 
 # --- Sticky instance/target ---
@@ -2114,3 +2119,74 @@ def test_render_message_lens_text_counts_table_window_items_303():
     }
     out = formatters._render_message_lens_text(value)
     assert "vtable window @ 0x403dc8 (3 slots)" in out
+
+
+# --- #653 dogfood papercuts -------------------------------------------------
+
+def test_il_accepts_level_as_view_alias_653(fake_transport, capsys):
+    """#653.2: `--view {hlil,mlil,llil}` collides with "view" as BinaryView /
+    `view id` -- how `target list` and every -t help string use the word -- so
+    `--level` is the natural first guess and used to hard-error."""
+    calls = fake_transport({"il": {"ok": True, "result": {"text": "1 @ 0x401000  nop"}}})
+    assert bn.cli.main(["il", "sub_401000", "--level", "mlil", "--target", "active"]) == 0
+    assert calls[-1]["params"]["view"] == "mlil"
+    assert bn.cli.main(["il", "sub_401000", "--view", "llil", "--target", "active"]) == 0
+    assert calls[-1]["params"]["view"] == "llil"
+
+
+def test_function_list_named_unnamed_filters_653(fake_transport):
+    """#653.4: "how much of this binary is still sub_*?" is THE sizing question on a
+    stripped target, and `function search --regex '^sub_' --count` cannot negate --
+    three agents dumped the full list and post-processed it with jq/python."""
+    calls = fake_transport({"list_functions": {"ok": True, "result": {
+        "items": [], "total": 0, "offset": 0, "limit": 100, "returned": 0,
+        "has_more": False}}})
+    assert bn.cli.main(["function", "list", "--unnamed", "--target", "active"]) == 0
+    assert calls[-1]["params"]["named"] is False
+    assert bn.cli.main(["function", "list", "--named", "--target", "active"]) == 0
+    assert calls[-1]["params"]["named"] is True
+    # Neither flag: the param is absent, so both partitions are listed.
+    assert bn.cli.main(["function", "list", "--target", "active"]) == 0
+    assert "named" not in calls[-1]["params"]
+
+
+def test_function_list_named_and_unnamed_are_mutually_exclusive_653():
+    parser = bn.cli.build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["function", "list", "--named", "--unnamed"])
+
+
+def test_function_info_blocks_lists_ranges_653(fake_transport, capsys):
+    """#653.10: `--lines` slices a decompile blindly because the line numbers are
+    unknowable until AFTER the full decompile -- so a 565-block / 6324-line
+    dispatcher forced every downstream question into grep/sed over a local file."""
+    calls = fake_transport({"function_info": {"ok": True, "result": {
+        "function": {"name": "dispatch", "address": "0x401000"},
+        "prototype": "void dispatch(uint32_t cmd)",
+        "size": 0x5c00, "xref_count": 3,
+        "basic_blocks": [
+            {"index": 0, "start": "0x401000", "end": "0x401020", "length": 0x20,
+             "outgoing": ["0x401020", "0x401100"], "incoming": []},
+            {"index": 1, "start": "0x401020", "end": "0x401040", "length": 0x20,
+             "outgoing": [], "incoming": ["0x401000"]},
+        ]}}})
+    rc = bn.cli.main(["function", "info", "dispatch", "--blocks", "--format", "text",
+                      "--target", "active"])
+    assert rc == 0
+    assert calls[-1]["params"] == {"identifier": "dispatch", "blocks": True}
+    out = capsys.readouterr().out
+    assert "basic blocks: 2" in out
+    assert "0x401000..0x401020" in out
+    assert "0x401100" in out          # the edge, so the next region is targetable
+    # rows are address-ordered; `blk N` is BN's CFG block index, labelled so the
+    # out-of-order numbering doesn't read as a sort bug.
+    assert "blk0" in out
+
+
+def test_function_info_omits_blocks_by_default_653(fake_transport, capsys):
+    calls = fake_transport({"function_info": {"ok": True, "result": {
+        "function": {"name": "dispatch", "address": "0x401000"},
+        "prototype": "void dispatch()", "size": 16, "xref_count": 0}}})
+    assert bn.cli.main(["function", "info", "dispatch", "--target", "active"]) == 0
+    assert calls[-1]["params"]["blocks"] is False
+    assert "basic blocks" not in capsys.readouterr().out

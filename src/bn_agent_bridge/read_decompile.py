@@ -178,7 +178,40 @@ def _decompile(ctx, selector: str | None, identifier, *, addresses: bool = False
     return result
 
 
-def _function_info(ctx, selector: str | None, identifier):
+def _basic_block_ranges(func) -> list[dict[str, Any]]:
+    """Address ranges of a function's basic blocks, with incoming/outgoing edges.
+
+    #653.10: a 23 KB / 565-block dispatch function decompiles to 6324 lines
+    (100k tokens), and `--lines` slices blindly because the line numbers are
+    unknowable until AFTER the full decompile -- so every downstream question
+    became grep/sed over a local file instead of a `bn` query. Block ranges make
+    `disasm --linear <addr>` / `--lines` targetable without reading the whole body
+    first, and on a jump-table dispatcher each case arm is its own block.
+    """
+    blocks = []
+    for index, block in enumerate(getattr(func, "basic_blocks", None) or []):
+        start = int(getattr(block, "start", 0) or 0)
+        end = int(getattr(block, "end", 0) or 0)
+        entry: dict[str, Any] = {
+            "index": index,
+            "start": hex(start),
+            "end": hex(end),
+            "length": max(0, end - start),
+        }
+        try:
+            entry["outgoing"] = [hex(int(e.target.start)) for e in (block.outgoing_edges or [])]
+        except Exception:
+            entry["outgoing"] = []
+        try:
+            entry["incoming"] = [hex(int(e.source.start)) for e in (block.incoming_edges or [])]
+        except Exception:
+            entry["incoming"] = []
+        blocks.append(entry)
+    blocks.sort(key=lambda b: int(b["start"], 16))
+    return blocks
+
+
+def _function_info(ctx, selector: str | None, identifier, *, blocks: bool = False):
     bv = ctx._resolve_view(selector)
     require_analysis(bv, "Function info")
     func = ctx._find_function(bv, identifier, contained=True)
@@ -205,6 +238,9 @@ def _function_info(ctx, selector: str | None, identifier):
         # (#206). count:0 means no unlifted instruction was found.
         "unimplemented_instructions": il_format._unimplemented_instructions(func),
     }
+    if blocks:
+        # #653.10: opt-in -- a 565-block function's ranges are themselves bulky.
+        result["basic_blocks"] = _basic_block_ranges(func)
     _annotate_containment(ctx, result, identifier, func)
     return result
 
@@ -234,6 +270,15 @@ def _list_locals_for_function(ctx, selector: str | None, identifier):
             "address": hex(func.start),
             "raw_name": getattr(func, "raw_name", func.name),
         },
+        # #651: `items` is documented as ALWAYS the data container, and `local list`
+        # was the one exception -- documented once in #248, then lost in the
+        # SKILL.md -> reference/ split. `jq '.items[]'` on a function with 40
+        # recovered locals silently reported nothing (a wrong key yields null, never
+        # an error). Emit `items` so the documented rule is true, and keep `locals`
+        # as a retained alias so existing scripts/skills keep working. Both are the
+        # same list object -- there is no second source of truth to drift.
+        "kind": "locals",
+        "items": variables,
         "locals": variables,
     }
     _annotate_containment(ctx, result, identifier, func)

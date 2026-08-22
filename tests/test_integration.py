@@ -19,6 +19,7 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 HELLO_BINARY = FIXTURES_DIR / "hello_x86_64"
 ADD_BINARY = FIXTURES_DIR / "add_x86_64"
 DISPATCH_BINARY = FIXTURES_DIR / "dispatch_table_x86_64"
+PARSER_BINARY = FIXTURES_DIR / "parser_x86_64"
 
 # The gate is BN availability *only* (#590). Gating on whether the generated
 # fixtures happen to exist made a fresh checkout report "27 skipped, exit 0"
@@ -1139,5 +1140,203 @@ class TestFunctionDocRoundtrip:
                                    "--format", "json").stdout)
             assert after["function_doc"] == "", after
             assert after["has_function_doc"] is False, after
+        finally:
+            _session_stop(inst)
+
+
+class TestBareVoidCallHlilStatement:
+    """Regression for #644: `hlil_statement` was null with reason
+    `no_local_statement` for EVERY call whose return value is discarded -- i.e.
+    every bare call STATEMENT, the most common shape in real code (memcpy, strcpy,
+    memset, sprintf, free). On one dogfood target that was 0 of 387 callsites
+    resolved, sending the agent back to `decompile` + manual address correlation.
+
+    Verified against real BN on this fixture before the fix: the `memcpy` call in
+    `parse_record` reported `hlil_statement: None`, reason `no_local_statement`,
+    while `bn il --view hlil` rendered the statement at the identical address."""
+
+    def test_discarded_return_call_resolves_its_statement(self):
+        info = _session_start(str(PARSER_BINARY))
+        inst = info["instance_id"]
+        try:
+            ev = json.loads(_bn("--instance", inst, "evidence", "function", "parse_record",
+                                "--format", "json").stdout)
+            calls = ev["calls"]
+            memcpy_calls = [
+                c for c in calls
+                if "memcpy" in str(((c.get("target") or {}).get("function") or {}).get("name", ""))
+            ]
+            assert memcpy_calls, f"no memcpy callsite found: {calls}"
+            for c in memcpy_calls:
+                # `memcpy(dst, src, n)` discards its return, so its HLIL parent is
+                # the enclosing Block -- the shape that used to null out.
+                assert c["hlil_statement"], (
+                    f"bare void call statement still unresolved: "
+                    f"reason={c['hlil_statement_reason']!r}")
+                assert "memcpy" in c["hlil_statement"]
+                assert c["hlil_statement_reason"] is None
+        finally:
+            _session_stop(inst)
+
+    def test_return_used_call_still_resolves(self):
+        """The #475/#490 shapes must keep working: `int k = parse_record(...)` has a
+        real assignment parent, and the ancestor walk (not the new root fallback)
+        must still be what answers it."""
+        info = _session_start(str(PARSER_BINARY))
+        inst = info["instance_id"]
+        try:
+            ev = json.loads(_bn("--instance", inst, "evidence", "function", "main",
+                                "--format", "json").stdout)
+            resolved = [c for c in ev["calls"]
+                        if "parse_record" in str(((c.get("target") or {}).get("function") or {})
+                                                 .get("name", ""))]
+            assert resolved, f"no parse_record callsite in main: {ev['calls']}"
+            assert all(c["hlil_statement"] for c in resolved)
+        finally:
+            _session_stop(inst)
+
+
+class TestArgumentArityConfidence:
+    """Regression for #648: `argument_confidence: authoritative` meant "HLIL
+    produced a list", not "the list is right" -- on an unknown-arity callee BN
+    assumes every argument register is live and HLIL renders whatever sits in them
+    (a neighbouring call's staging, the stack canary). This is the negative
+    control that keeps the fix from blanket-demoting everything: `memcpy` has a
+    bundled 3-parameter prototype, so its arguments really ARE authoritative."""
+
+    def test_known_prototype_callee_stays_authoritative(self):
+        info = _session_start(str(PARSER_BINARY))
+        inst = info["instance_id"]
+        try:
+            ev = json.loads(_bn("--instance", inst, "evidence", "function", "parse_record",
+                                "--format", "json").stdout)
+            memcpy_calls = [
+                c for c in ev["calls"]
+                if "memcpy" in str(((c.get("target") or {}).get("function") or {}).get("name", ""))
+            ]
+            assert memcpy_calls
+            for c in memcpy_calls:
+                assert c["argument_confidence"] == "authoritative", c
+                assert c["arity_unknown"] is False, c
+                assert "abi_register_saturated" not in c, c
+        finally:
+            _session_stop(inst)
+
+
+class TestDataRetypeRoundtrip:
+    """Regression for #649: typing a recovered data variable had NO verified
+    mutation path -- `types declare` defines a struct but cannot apply it,
+    `symbol rename --kind data` renames without typing, and `struct field set`
+    edits a type rather than a variable's binding -- so the only way through was
+    `bn py exec`: no --preview, no readback verification, no batch atomicity, no
+    audit trail. Only real BN exercises define_user_data_var + BNDB persistence."""
+
+    def _writable_data_address(self, inst: str) -> str:
+        secs = json.loads(_bn("--instance", inst, "sections", "--format", "json").stdout)
+        items = secs.get("items") if isinstance(secs, dict) else secs
+        by_name = {s.get("name"): s for s in items if isinstance(s, dict)}
+        for name in (".data", ".bss", ".rodata"):
+            if name in by_name:
+                return by_name[name]["start"]
+        raise AssertionError(f"no data section found: {list(by_name)}")
+
+    def test_declare_then_retype_verifies_and_persists(self, tmp_path):
+        prog = tmp_path / "prog"
+        prog.write_bytes(Path(DISPATCH_BINARY).read_bytes())
+        prog.chmod(0o755)
+        inst = None
+        try:
+            inst = _session_start(str(prog))["instance_id"]
+            addr = self._writable_data_address(inst)
+
+            declared = _bn("--instance", inst, "types", "declare",
+                           "struct bn649_entry { char* desc; char* usage; };",
+                           "--format", "json")
+            assert declared.returncode == 0, f"{declared.stdout}\n{declared.stderr}"
+
+            typed = _bn("--instance", inst, "data", "retype", addr, "bn649_entry[2]",
+                        "--format", "json")
+            assert typed.returncode == 0, f"{typed.stdout}\n{typed.stderr}"
+            row = json.loads(typed.stdout)["results"][0]
+            assert row["status"] == "verified", row
+            assert row["expected_type"] == "struct bn649_entry[0x2]", row
+
+            # Re-applying the SAME type is a noop -- i.e. a real readback, not a
+            # claim. This is also how persistence is checked below.
+            again = json.loads(_bn("--instance", inst, "data", "retype", addr,
+                                   "bn649_entry[2]", "--format", "json").stdout)
+            assert again["results"][0]["status"] == "noop", again
+
+            saved = _bn("--instance", inst, "save", "--format", "json")
+            assert saved.returncode == 0, f"{saved.stdout}\n{saved.stderr}"
+            _session_stop(inst)
+            inst = None
+
+            # Reopen and confirm the type survived the BNDB round trip: the same
+            # retype must still report `noop`, not `verified`.
+            inst = _session_start(str(prog))["instance_id"]
+            after = json.loads(_bn("--instance", inst, "data", "retype", addr,
+                                   "bn649_entry[2]", "--format", "json").stdout)
+            assert after["results"][0]["status"] == "noop", (
+                f"data-var type did not persist in the BNDB: {after}")
+        finally:
+            if inst:
+                _session_stop(inst)
+
+    def test_preview_reverts_the_data_var_type(self, tmp_path):
+        prog = tmp_path / "prog"
+        prog.write_bytes(Path(DISPATCH_BINARY).read_bytes())
+        prog.chmod(0o755)
+        inst = None
+        try:
+            inst = _session_start(str(prog))["instance_id"]
+            addr = self._writable_data_address(inst)
+
+            previewed = _bn("--instance", inst, "data", "retype", "--preview", addr,
+                            "uint64_t[4]", "--format", "json")
+            assert previewed.returncode == 0, f"{previewed.stdout}\n{previewed.stderr}"
+            payload = json.loads(previewed.stdout)
+            assert payload["results"][0]["status"] == "verified", payload
+            assert payload["committed"] is False and payload["rolled_back"] is True
+
+            # The preview reverted, so applying it live now must CHANGE the view
+            # (`verified`, not `noop`) -- proof the preview left nothing behind.
+            live = json.loads(_bn("--instance", inst, "data", "retype", addr,
+                                  "uint64_t[4]", "--format", "json").stdout)
+            assert live["results"][0]["status"] == "verified", live
+        finally:
+            if inst:
+                _session_stop(inst)
+
+
+class TestCommentListFunctionDocs:
+    """Regression for #643: `comment list` enumerated only bv.address_comments, so
+    a function doc written by `comment set --function` was invisible to the only
+    discovery command -- the write reported `verified` and `comment list --query
+    TODO` reported nothing existed, silently breaking the resume/handoff workflow
+    the bn-re skill prescribes."""
+
+    def test_function_doc_is_discoverable_by_query(self):
+        info = _session_start(str(HELLO_BINARY))
+        inst = info["instance_id"]
+        try:
+            listing = json.loads(_bn("--instance", inst, "function", "list",
+                                     "--limit", "1", "--format", "json").stdout)
+            fn_addr = (listing.get("items") or listing)[0]["address"]
+            doc = "Dispatcher; TODO643: confirm shm bounds"
+            assert _bn("--instance", inst, "comment", "set", "--function", fn_addr, doc,
+                       "--format", "json").returncode == 0
+
+            found = json.loads(_bn("--instance", inst, "comment", "list",
+                                   "--query", "TODO643", "--format", "json").stdout)
+            assert found["total"] == 1, found
+            assert found["items"][0]["scope"] == "function_doc", found
+            assert found["items"][0]["comment"] == doc, found
+
+            # --scope address is the old behaviour, still expressible.
+            narrowed = json.loads(_bn("--instance", inst, "comment", "list",
+                                      "--query", "TODO643", "--scope", "address",
+                                      "--format", "json").stdout)
+            assert narrowed["total"] == 0, narrowed
         finally:
             _session_stop(inst)

@@ -252,6 +252,24 @@ def _render_function_info_text(value: Any, verbose: bool = False, demangle: bool
         else:
             lines.append("locals: none")
 
+    blocks = value.get("basic_blocks")
+    if isinstance(blocks, list):
+        # #653.10: block ranges make a huge dispatcher readable a region at a time
+        # (`disasm --linear <start>` / `--lines` once you know where you are)
+        # instead of forcing a 6000-line decompile first.
+        lines.append("")
+        lines.append(f"basic blocks: {len(blocks)}")
+        for b in blocks:
+            if not isinstance(b, dict):
+                continue
+            out = ", ".join(b.get("outgoing") or []) or "-"
+            # Rows are ADDRESS-ordered (so they are targetable), while `index` is
+            # BN's own block index -- label it, or the out-of-order numbers read
+            # as a sort bug rather than as CFG order.
+            lines.append(
+                f"  blk{b.get('index', '?'):<4} {b.get('start', '?')}..{b.get('end', '?')}  "
+                f"{b.get('length', '?')} bytes  -> {out}")
+
     return _resolution_note(value) + "\n".join(lines)
 
 
@@ -283,7 +301,8 @@ def _render_local_list_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     function = value.get("function") or {}
-    all_items = list(value.get("locals") or [])
+    # #651: `items` is the canonical container; `locals` is the retained alias.
+    all_items = list(value.get("items") or value.get("locals") or [])
     params = [item for item in all_items if item.get("is_parameter")]
     locals_only = [item for item in all_items if not item.get("is_parameter")]
 
@@ -416,7 +435,11 @@ def _render_comment_list_text(value: Any) -> str:
         address = item.get("address", "<unknown>")
         func = item.get("function") or "<global>"
         comment = item.get("comment", "")
-        lines.append(f"{address}  {func}  {comment}")
+        # #643: mark function documentation comments so the two stores are
+        # distinguishable in one listing -- same `[doc]` marker `comment get
+        # --function` already uses.
+        prefix = "[doc] " if item.get("scope") == "function_doc" else ""
+        lines.append(f"{address}  {func}  {prefix}{comment}")
     return "\n".join(lines)
 
 
@@ -557,6 +580,14 @@ def _render_session_start_text(value: Any) -> str:
                 else:
                     mark = "  [not analyzed]" if item.get("analyzed") is False else ""
                     lines.append(f"- {item.get('path', '<unknown>')}{mark}")
+                    # #653.3: fan-out agents must pass -t on every command, so every
+                    # session began with a mandatory second `bn target list` call
+                    # just to learn the selector `session start` already knew.
+                    for tgt in item.get("targets") or []:
+                        if isinstance(tgt, dict) and tgt.get("selector"):
+                            lines.append(
+                                f"  target: {tgt['selector']}"
+                                f"   (pass -t {tgt['selector']}; id {tgt.get('target_id', '?')})")
                 for note in item.get("notes") or []:
                     lines.append(f"  note: {note}")
             else:
@@ -1023,11 +1054,16 @@ def _quick_partial_prefix(value: Any) -> str:
     return ""
 
 
-def _render_function_count_text(value: Any) -> str:
+def _render_function_count_text(value: Any, *, label: str = "Total functions") -> str:
     """Render a `function list/search --count` result, prefixing the quick-load
-    partiality warning when the count is partial (#437)."""
+    partiality warning when the count is partial (#437).
+
+    #653.1: `function search <q> --count` used the SAME "Total functions:" label as
+    the whole-binary `function list --count`, so "Total functions: 17" beside
+    "Total functions: 175" read as a contradiction rather than as matches vs total.
+    """
     count = value.get("count", 0) if isinstance(value, dict) else 0
-    return f"{_quick_partial_prefix(value)}Total functions: {count}"
+    return f"{_quick_partial_prefix(value)}{label}: {count}"
 
 
 def _render_function_list_text(value: Any, *, demangle: bool = False) -> str:
@@ -1428,6 +1464,14 @@ def _render_function_evidence_text(value: Any) -> str:
             lines.append("  arguments:" + (f" ({tag})" if tag else ""))
             for arg in args:
                 lines.append(f"    {arg.get('text', '')}{_render_resolved_arg(arg.get('resolved'))}")
+            if call.get("arity_unknown"):
+                # #648: the callee has no recovered prototype, so BN assumed every
+                # argument register was live and HLIL rendered whatever sat in them.
+                note = ("  arity: UNKNOWN — callee has no recovered prototype, so these "
+                        "arguments are BN's register guess, not its signature")
+                if call.get("abi_register_saturated"):
+                    note += "; the count saturates the ABI argument registers"
+                lines.append(note + ". Confirm with `bn proto get <callee>` / `proto set`.")
         variadic = call.get("variadic")
         if isinstance(variadic, dict) and variadic.get("is_variadic"):
             # #558: surface variadic under-recovery / recovered format string.
@@ -1517,9 +1561,19 @@ def _render_surface_text(value: Any) -> str:
             if isinstance(depth, int):
                 why.append(f"decode={depth}")
             tag = "code-likely" if c.get("code_likely") else "weak"
+            # #647: a candidate that resolves to a printable string is self-refuting --
+            # show it, so a false lead reads as `-> "Set Channel Index"` rather than a
+            # bare address the agent must spend a command disproving.
+            preview = c.get("string")
+            if preview:
+                text = str(preview)
+                clipped = text[:48]
+                suffix = "  -> " + _render_string_literal(clipped, truncated=len(text) > 48)
+            else:
+                suffix = ""
             lines.append(
                 f"  {c.get('address', '?')}  [{c.get('section') or '?'}]  "
-                f"via {c.get('provenance', '?')}  [{tag}: {', '.join(why)}]")
+                f"via {c.get('provenance', '?')}  [{tag}: {', '.join(why)}]{suffix}")
         lines.append("")
         lines.append("(candidates -- NOT confirmed functions. `decode` = clean instructions "
                      "before an undefined one; a low decode reliably means data. Start with the "
@@ -1851,7 +1905,12 @@ def _render_orient_text(value: Any) -> str:
         # `bn strings` total (which uses a lower default) (#357).
         mn = value.get("strings_min_length")
         filt = f"min-length {mn}; " if mn is not None else ""
-        lines.append(f"  strings ({filt}sample {len(items)} of {ss.get('total', len(items))}):")
+        # #646: name the sections the sample came from, so a low-signal sample is
+        # attributable instead of looking like the whole binary's flavour.
+        drawn = ss.get("sample_sections")
+        from_where = f"; from {', '.join(drawn)}" if drawn else ""
+        lines.append(
+            f"  strings ({filt}sample {len(items)} of {ss.get('total', len(items))}{from_where}):")
         for s in items[:15]:
             if isinstance(s, dict):
                 # `or ''` (not just the .get default) guards an explicit value:None.
@@ -3025,9 +3084,18 @@ def _mutation_summary(value: Any) -> Any:
         # The DB is left modified iff a live mutation actually CHANGED state
         # (committed AND something verified -- `committed` is True even for an
         # all-noop mutation, which leaves the DB clean), a failure's revert itself
-        # failed (rolled_back is explicitly False), or an unclearable
-        # has_user_type override was left behind (#630).
-        "dirty_after": (committed and verified > 0) or rolled_back is False or proto_residue,
+        # failed, or an unclearable has_user_type override was left behind (#630).
+        #
+        # The revert test is `rolled_back is False AND not committed`, not
+        # `rolled_back is False` alone: #652 made the bridge emit `rolled_back`
+        # unconditionally (`restored if (preview or failed) else False`), so the
+        # SUCCESS path now carries an explicit False where the key used to be
+        # absent. Since `committed` is `(not preview) and (not failed)`, the key
+        # is meaningful exactly when `committed` is False -- gating on it is what
+        # keeps an all-noop commit (which reverts nothing) from reading dirty.
+        "dirty_after": ((committed and verified > 0)
+                        or (rolled_back is False and not committed)
+                        or proto_residue),
     }
     if proto_residue:
         summary["prototype_user_type_residue"] = True
@@ -3331,6 +3399,22 @@ def _render_trace_frontiers(frontiers: Any) -> list[str]:
     return out
 
 
+def _class_inputs_note(value: Any) -> str:
+    """#653.6: on a ZERO-class result, print the empty inputs so the absence is
+    ATTRIBUTABLE -- "this target is C" reads identically to "the lens failed to
+    cluster" otherwise, and an agent had to prove RTTI absence by hand."""
+    inputs = value.get("inputs") if isinstance(value, dict) else None
+    if not isinstance(inputs, dict):
+        return ""
+    return (
+        f"\n  inputs: demangled C++ symbols: {inputs.get('demangled_cxx_methods', 0)}, "
+        f"RTTI typeinfo: {inputs.get('rtti_typeinfo_symbols', 0)}, "
+        f"vtable symbols: {inputs.get('rtti_vtable_symbols', 0)}"
+        " — zero across all three means the target has no C++ type evidence, "
+        "not that the lens failed"
+    )
+
+
 def _render_class_list_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -3340,7 +3424,7 @@ def _render_class_list_text(value: Any) -> str:
         n = value.get("count", 0)
         art = value.get("artifact_count") or 0
         tail = f" ({art} non-class RTTI/type artifact{'s' if art != 1 else ''})" if art else ""
-        return f"classes: {n}{tail}"
+        return f"classes: {n}{tail}{_class_inputs_note(value)}"
     rows = list(value.get("items") or value.get("classes") or [])
     total = value.get("total", len(rows))
     header = f"classes: {len(rows)} shown of {total}"
@@ -3360,6 +3444,7 @@ def _render_class_list_text(value: Any) -> str:
         hidden_parts.append(f"{ven} vendored")
     if hidden_parts:
         header += " (hidden: " + ", ".join(hidden_parts) + ")"
+    header += _class_inputs_note(value)
     lines = [header]
     for rec in rows:
         if not isinstance(rec, dict):

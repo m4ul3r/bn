@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ..cli import _call, _effective_limit, _int_or_hex, _mutate, _mutation_exit_code, _non_negative_int, _pick, arg, command, mutex, preview_arg, summary_arg
+from ..cli import _call, _effective_limit, _int_or_hex, _mutate, _mutation_exit_code, _non_negative_int, _pick, arg, command, mutex, mutation_output_args, preview_arg
 from ..formatters import (
     _mutation_summary,
     _render_function_bundle_text,
@@ -264,19 +264,24 @@ def _go_functions(args: argparse.Namespace) -> int:
                      "Go binary is navigable; safe to re-run (idempotent, skips named functions)",
          see_also=("go functions",),
          args=[preview_arg("Apply the renames, capture diffs, then revert without committing"),
-               summary_arg()])
+               *mutation_output_args()])
 def _go_rename(args: argparse.Namespace) -> int:
     # #408 review: go rename is a bulk mutation (success/committed/results +
     # _mutation_exit_code), so it honors --summary like the other mutations.
-    summary = bool(getattr(args, "summary", False))
-    return _call(
+    #
+    # It routes through _mutate rather than hand-rolling the tail so #645's
+    # compact-by-default applies here too. Hand-rolling meant --verbose/--diffs
+    # parsed but did nothing, and go rename is the mutation MOST likely to emit a
+    # huge payload -- it renames every candidate in the binary. Going through
+    # _mutate also lands the #447 top-level `ok` on the full JSON (#604), which
+    # the hand-rolled `result_transform=None` path omitted.
+    return _mutate(
         args,
         "go_rename",
-        {"preview": bool(args.preview)},
+        {},
+        preview=bool(args.preview),
         require_target=True,
-        text_renderer=_render_mutation_summary_text if summary else _render_go_rename_text,
-        result_exit_code=_mutation_exit_code,
-        result_transform=_mutation_summary if summary else None,
+        detail_renderer=_render_go_rename_text,
         stem="go-rename",
     )
 
@@ -403,7 +408,7 @@ def _py_exec(args: argparse.Namespace) -> int:
 @command("batch", "apply", help="Apply a JSON manifest", fmt="json", target=True,
          args=[
              preview_arg("Apply the whole batch, capture diffs, then revert without committing"),
-             summary_arg(),
+             *mutation_output_args(),
              arg("manifest", type=Path,
                  help=(
                      "JSON manifest source: a file path, or \"-\" to read from stdin. "

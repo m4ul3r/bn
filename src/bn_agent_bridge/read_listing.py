@@ -34,7 +34,13 @@ except ModuleNotFoundError:  # importable without the Binary Ninja runtime (test
 
 from . import il_format
 from . import read_misc
-from ._shared import OperationFailure, _parse_address, _validate_count
+from ._shared import (
+    OperationFailure,
+    _parse_address,
+    _validate_count,
+    is_auto_function_name,
+    is_imported_function,
+)
 from .bridge_state import require_analysis, _quick_loaded_views
 
 
@@ -334,6 +340,7 @@ def _list_functions(
     count_only: bool = False,
     sort: str = "address",
     reverse: bool = False,
+    named: bool | None = None,
 ):
     offset = _validate_count(offset, label="offset", minimum=0)
     limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
@@ -344,6 +351,19 @@ def _list_functions(
         # #446: drop tiny PLT/GOT thunk veneers (typically <= 16 bytes) that
         # otherwise list under the same name as the real body.
         functions = [fn for fn in functions if (il_format._function_size(fn) or 0) >= min_size]
+    if named is not None:
+        # #653.4: "how much of this binary is still sub_*?" is THE sizing question on
+        # a stripped target, and `function search --regex '^sub_' --count` has no
+        # negation -- three agents dumped the full list and post-processed it with
+        # jq/python instead. Partitioned exactly like `target info`'s named /
+        # auto-named / imported summary (one shared predicate, so the two numbers
+        # cannot disagree): import thunks are in NEITHER bucket, since their names
+        # come from relocations rather than from analysis or a human.
+        functions = [
+            fn for fn in functions
+            if not is_imported_function(fn)
+            and (not is_auto_function_name(str(getattr(fn, "name", "") or ""))) == named
+        ]
     if count_only:
         # `total` mirrors the list envelope's key for the same number; `count`
         # kept for back-compat.
@@ -364,6 +384,11 @@ def _list_functions(
             "address": hex(fn.start),
             "raw_name": getattr(fn, "raw_name", fn.name),
             **({"size": il_format._function_size(fn)} if include_size else {}),
+            # #653.4's `imported`/`auto_named` are page projections, NOT full-set
+            # fields: `is_imported_function` is a per-function `fn.symbol` lookup,
+            # the same cost #639 moved off the filtered set. Computing them here
+            # would hand back most of that win. The --named/--unnamed FILTER above
+            # reads the live Function directly, so it is unaffected.
             "_fn": fn,   # transient: page projection reads this, then drops it
         }
         for fn in functions
@@ -397,12 +422,20 @@ def _project_page_fields(result: dict[str, Any]) -> dict[str, Any]:
             # with the same keys every consumer expects.
             it.setdefault("display_name", it.get("name", ""))
             it.setdefault("size", None)
+            it.setdefault("imported", False)
+            it.setdefault("auto_named", False)
             it.setdefault("basic_block_count", None)
             continue
         if "display_name" not in it:
             it["display_name"] = il_format._display_name(fn)
         if "size" not in it:
             it["size"] = il_format._function_size(fn)
+        # #653.4: label the two partitions `target info` counts, so a listing is
+        # self-describing (an import thunk is neither named nor auto-named).
+        if "imported" not in it:
+            it["imported"] = is_imported_function(fn)
+        if "auto_named" not in it:
+            it["auto_named"] = is_auto_function_name(str(getattr(fn, "name", "") or ""))
         # BN's Function exposes no basic_block_count attribute -- len(basic_blocks)
         # is the count (materializes the block list, but only for the returned page).
         # Guard the access (mirrors il_format._function_size): one problematic
