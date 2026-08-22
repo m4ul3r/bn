@@ -2665,3 +2665,112 @@ def test_disasm_linear_no_boundary_warning_outside_function(monkeypatch):
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
     res = instance._disasm(None, "0x2001", linear=1)
     assert res["boundary_warning"] is None
+
+
+# --- cfg: first-class CFG read op (promoted out of py_exec for bn-lens) ------
+
+
+def _cfg_asm_bv():
+    fn = _FakeFunction(0x401000, "process_packet", "int32_t process_packet(char* buf)")
+    b2 = _FakeCFGBlock(0x401010, lines=[_FakeCFGLine(0x401010, "ret")])
+    b1 = _FakeCFGBlock(
+        0x401000,
+        lines=[_FakeCFGLine(0x401000, "cmp eax, 0x0"),
+               _FakeCFGLine(0x401004, "je 0x401010")],
+        edges=[_FakeCFGEdge(b2, "TrueBranch"),
+               _FakeCFGEdge(None, "IndirectBranch")],  # unresolved: must be dropped
+    )
+    fn.basic_blocks = [b1, b2]
+    return _FakeBV(functions=[fn]), fn
+
+
+def test_cfg_asm_blocks_lines_and_edges(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _fn = _cfg_asm_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "process_packet", view="asm")
+
+    assert result["kind"] == "cfg"
+    assert result["view"] == "asm"
+    assert result["function"] == {"name": "process_packet", "address": "0x401000"}
+    blocks = result["blocks"]
+    assert [b["start"] for b in blocks] == ["0x401000", "0x401010"]
+    assert blocks[0]["insns"] == [
+        {"a": "0x401000", "t": "cmp eax, 0x0"},
+        {"a": "0x401004", "t": "je 0x401010"},
+    ]
+    # The edge whose target is None (indirect/unresolved) is dropped, not rendered.
+    assert blocks[0]["edges"] == [{"to": "0x401010", "k": "TrueBranch"}]
+    assert blocks[1]["edges"] == []
+
+
+def test_cfg_il_levels_emit_il_instruction_indexes_not_addresses(monkeypatch):
+    # THE load-bearing contract for bn-lens: one assembly instruction can expand
+    # to several IL blocks whose first lines share the SAME address, so block
+    # `start` / edge `to` must be the IL instruction INDEX (hex), which is
+    # unique -- the lens keys block identity and edge routing on parse_hex(start).
+    # Per-line `a` stays a real address at every level.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "checked_div", "int32_t checked_div(int32_t a, int32_t b)")
+    ilb2 = _FakeCFGBlock(2, lines=[_FakeCFGLine(0x401000, "temp0 = a / b")])
+    ilb1 = _FakeCFGBlock(
+        0,
+        lines=[_FakeCFGLine(0x401000, "if (b == 0) trap")],
+        edges=[_FakeCFGEdge(ilb2, "FalseBranch")],
+    )
+    fn.mlil = _FakeILCFGFunction([ilb1, ilb2])
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "0x401000", view="mlil")
+
+    blocks = result["blocks"]
+    # Both blocks' first lines sit at 0x401000; starts stay distinct IL indexes.
+    assert [b["start"] for b in blocks] == ["0x0", "0x2"]
+    assert blocks[0]["edges"] == [{"to": "0x2", "k": "FalseBranch"}]
+    assert blocks[0]["insns"][0]["a"] == "0x401000"
+    assert blocks[1]["insns"][0]["a"] == "0x401000"
+
+
+def test_cfg_hlil_view_uses_hlil_function(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "main", "int32_t main()")
+    fn.hlil = _FakeILCFGFunction([_FakeCFGBlock(0, lines=[_FakeCFGLine(0x401000, "return 0")])])
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "main", view="hlil")
+
+    assert result["view"] == "hlil"
+    assert result["blocks"][0]["start"] == "0x0"
+    assert result["blocks"][0]["insns"] == [{"a": "0x401000", "t": "return 0"}]
+
+
+def test_cfg_il_unavailable_degrades_to_empty_blocks_with_warning(monkeypatch):
+    # Mirrors the proven py_exec behavior: IL not materialized -> empty CFG, not
+    # an error -- but now with an explicit warning instead of a silent [].
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "stub", "void stub()")  # no .mlil attribute at all
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._cfg(None, "stub", view="mlil")
+
+    assert result["blocks"] == []
+    assert any("mlil" in w for w in result["warnings"])
+
+
+def test_cfg_rejects_unknown_view(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, _fn = _cfg_asm_bv()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._cfg(None, "process_packet", view="llil")
+    assert "view" in str(exc.value)

@@ -2190,3 +2190,72 @@ def test_function_info_omits_blocks_by_default_653(fake_transport, capsys):
     assert bn.cli.main(["function", "info", "dispatch", "--target", "active"]) == 0
     assert calls[-1]["params"]["blocks"] is False
     assert "basic blocks" not in capsys.readouterr().out
+# --- function cfg -------------------------------------------------------------
+
+
+_CFG_RESULT = {
+    "ok": True,
+    "result": {
+        "kind": "cfg",
+        "function": {"name": "process_packet", "address": "0x401000"},
+        "view": "asm",
+        "blocks": [
+            {"start": "0x401000",
+             "insns": [{"a": "0x401000", "t": "cmp eax, 0x0"},
+                       {"a": "0x401004", "t": "je 0x401010"}],
+             "edges": [{"to": "0x401010", "k": "TrueBranch"},
+                       {"to": "0x401008", "k": "FalseBranch"}]},
+            {"start": "0x401010",
+             "insns": [{"a": "0x401010", "t": "ret"}],
+             "edges": []},
+        ],
+        "warnings": [],
+    },
+}
+
+
+def test_function_cfg_builds_request_and_renders_blocks(fake_transport, capsys):
+    calls = fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo_app.bndb"}]},
+        "cfg": _CFG_RESULT,
+    })
+
+    rc = bn.cli.main(["function", "cfg", "process_packet"])
+
+    assert rc == 0
+    assert [call["op"] for call in calls] == ["list_targets", "cfg"]
+    assert calls[1]["params"] == {"identifier": "process_packet", "view": "asm"}
+    out = capsys.readouterr().out
+    assert "process_packet @ 0x401000" in out
+    assert "block 0x401000" in out
+    assert "0x401004  je 0x401010" in out
+    assert "-> 0x401010 [TrueBranch]" in out
+    assert "block 0x401010" in out
+
+
+def test_function_cfg_forwards_view_and_renders_warnings(fake_transport, capsys):
+    empty = {
+        "ok": True,
+        "result": {"kind": "cfg", "function": {"name": "stub", "address": "0x401000"},
+                   "view": "mlil", "blocks": [],
+                   "warnings": ["mlil is not available for this function"]},
+    }
+    calls = fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo_app.bndb"}]},
+        "cfg": empty,
+    })
+
+    rc = bn.cli.main(["function", "cfg", "stub", "--view", "mlil"])
+
+    assert rc == 0
+    assert calls[1]["params"] == {"identifier": "stub", "view": "mlil"}
+    out = capsys.readouterr().out
+    assert "mlil is not available" in out
+
+
+def test_function_cfg_rejects_unknown_view(fake_transport, capsys):
+    fake_transport({})
+    with pytest.raises(SystemExit):
+        bn.cli.main(["function", "cfg", "main", "--view", "llil"])
+    err = capsys.readouterr().err
+    assert "llil" in err and "invalid choice" in err

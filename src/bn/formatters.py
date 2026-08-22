@@ -2729,6 +2729,79 @@ def _render_sections_rows(value: Any) -> str:
     return "\n".join(lines)
 
 
+def _render_cfg_text(value: Any) -> str:
+    """Render the cfg result: a function header, then each block's rendered
+    lines and outgoing edges. Block `start` / edge `to` are IL instruction
+    indexes at IL levels (the identity contract), so they are echoed verbatim."""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    func = value.get("function") or {}
+    parts = [f"{func.get('name', '?')} @ {func.get('address', '?')} ({value.get('view', '?')})"]
+    for warning in value.get("warnings") or []:
+        parts.append(f"// {warning}")
+    for block in value.get("blocks") or []:
+        parts.append("")
+        parts.append(f"block {block.get('start', '?')}")
+        for insn in block.get("insns") or []:
+            parts.append(f"  {insn.get('a', '?')}  {insn.get('t', '')}")
+        for edge in block.get("edges") or []:
+            parts.append(f"  -> {edge.get('to', '?')} [{edge.get('k', '?')}]")
+    return "\n".join(parts)
+
+
+def _render_data_vars_text(value: Any) -> str:
+    """Render the data_vars window: one row per typed data variable, with the
+    decoded scalar (`= v`), pointer target (`-> p sym` / `-> p "str"`), and
+    section, plus a resume hint when the row cap truncated the window."""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    rows = value.get("items") or []  # #275: was `vars`
+    lines = []
+    for row in rows:
+        cells = [str(row.get("a", "?")), str(row.get("t", "?")), f"w={row.get('w', '?')}"]
+        if row.get("n"):
+            cells.append(str(row["n"]))
+        if "v" in row:
+            cells.append(f"= {row['v']}")
+        if "p" in row:
+            target = f"-> {row['p']}"
+            if row.get("ps"):
+                target += f" {row['ps']}"
+            elif row.get("pstr") is not None:
+                target += f' "{row["pstr"]}"'
+            cells.append(target)
+        if row.get("sec"):
+            cells.append(f"[{row['sec']}]")
+        lines.append("  ".join(cells))
+    body = "\n".join(lines) if lines else "none"
+    if value.get("has_more"):
+        hint = ""
+        last = rows[-1].get("a") if rows else None
+        if isinstance(last, str):
+            try:
+                hint = f"; resume with --start {hex(int(last, 16) + 1)}"
+            except ValueError:
+                pass
+        body += f"\n// more data vars remain in the window{hint}"
+    return body
+
+
+def _render_data_symbols_text(value: Any) -> str:
+    """Render the data_symbols listing, with a paging footer when the caller
+    asked for a bounded page (`--limit`/`--offset`) and more remain."""
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    syms = value.get("items")  # #275: was `syms`
+    if not syms:
+        return "none"
+    body = "\n".join(f"{sym.get('a', '?')}  {sym.get('n', '')}" for sym in syms)
+    if value.get("has_more"):
+        shown = int(value.get("offset") or 0) + len(syms)
+        body += (f"\n// showing {shown} of {value.get('total', '?')}"
+                 f"; resume with --offset {shown}")
+    return body
+
+
 def _render_sections_text(value: Any) -> str:
     """Render sections: the paged {items, total, ...} envelope (with a footer),
     or a bare list for back-compat / internal callers (#122). Prefixes a W+X

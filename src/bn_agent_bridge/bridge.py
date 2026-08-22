@@ -1992,6 +1992,9 @@ class BinaryNinjaBridge:
     def _disasm(self, *a, **k):
         return read_decompile._disasm(self.ctx, *a, **k)
 
+    def _cfg(self, *a, **k):
+        return read_decompile._cfg(self.ctx, *a, **k)
+
     # ------------------------------------------------------------------
     # Structured data-flow primitives (def-use / value-set / call graph)
     # ------------------------------------------------------------------
@@ -2396,6 +2399,12 @@ class BinaryNinjaBridge:
 
     def _ascii_render(self, *a, **k):
         return read_misc._ascii_render(*a, **k)
+
+    def _data_vars(self, *a, **k):
+        return read_misc._data_vars(self.ctx, *a, **k)
+
+    def _data_symbols(self, *a, **k):
+        return read_misc._data_symbols(self.ctx, *a, **k)
 
     def _read(self, *a, **k):
         return read_misc._read(self.ctx, *a, **k)
@@ -3032,6 +3041,30 @@ def _bind_taint(bridge, params, target):
 @op("taint_models", lock="read")
 def _bind_taint_models(bridge, params, target):
     return bridge._taint_models(target, params)
+
+
+@op("cfg", lock="read")
+def _bind_cfg(bridge, params, target):
+    return bridge._cfg(target, params["identifier"], view=str(params.get("view", "asm")))
+
+
+@op("data_vars", lock="read")
+def _bind_data_vars(bridge, params, target):
+    return bridge._data_vars(
+        target,
+        start=params["start"],
+        end=params["end"],
+        limit=params.get("limit"),
+    )
+
+
+@op("data_symbols", lock="read")
+def _bind_data_symbols(bridge, params, target):
+    return bridge._data_symbols(
+        target,
+        offset=int(params.get("offset") or 0),
+        limit=params.get("limit"),
+    )
 
 
 @op("disasm", lock="read")

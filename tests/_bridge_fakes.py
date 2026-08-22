@@ -35,6 +35,22 @@ def _load_bridge(monkeypatch):
         GlobalBinding = "SymbolBinding.GlobalBinding"
         WeakBinding = "SymbolBinding.WeakBinding"
 
+    class TypeClass:
+        # Values match the strings _FakeType carries in its `type_class` field,
+        # so `type_.type_class == bn.TypeClass.PointerTypeClass` resolves under
+        # the mocks exactly as it does against a live core's IntEnum.
+        VoidTypeClass = "VoidTypeClass"
+        BoolTypeClass = "BoolTypeClass"
+        IntegerTypeClass = "IntegerTypeClass"
+        FloatTypeClass = "FloatTypeClass"
+        StructureTypeClass = "StructureTypeClass"
+        EnumerationTypeClass = "EnumerationTypeClass"
+        PointerTypeClass = "PointerTypeClass"
+        ArrayTypeClass = "ArrayTypeClass"
+        FunctionTypeClass = "FunctionTypeClass"
+        NamedTypeReferenceClass = "NamedTypeReferenceClass"
+        WideCharTypeClass = "WideCharTypeClass"
+
     class RelocationType:
         # The ELF GOT-slot reloc kinds the import classifier cares about (#478):
         # JUMP_SLOT (.rela.plt, callable function import) vs GLOB_DAT (.rela.dyn,
@@ -80,6 +96,7 @@ def _load_bridge(monkeypatch):
 
     fake_bn.SymbolType = SymbolType
     fake_bn.SymbolBinding = SymbolBinding
+    fake_bn.TypeClass = TypeClass
     fake_bn.RelocationType = RelocationType
     fake_bn.Symbol = Symbol
     fake_bn.QualifiedName = QualifiedName
@@ -613,9 +630,56 @@ class _FakeTag:
         self.id = tag_id
 
 
+class _FakeCFGLine:
+    """One rendered DisassemblyTextLine: a real address plus a token list."""
+
+    def __init__(self, address: int, text: str):
+        self.address = address
+        self.tokens = [text]
+
+
+class _FakeCFGEdge:
+    """A BasicBlockEdge: `target` is a block (or None for indirect/unresolved),
+    `type` mirrors BN's BranchType enum member (carries `.name`)."""
+
+    def __init__(self, target, kind: str = "UnconditionalBranch"):
+        self.target = target
+        self.type = _FakeOperation(kind)
+
+
+class _FakeCFGBlock:
+    """A basic block as the cfg op consumes it: `start` is a real address for
+    asm-level blocks and an IL instruction INDEX for MLIL/HLIL blocks --
+    matching live BN, where `MediumLevelILBasicBlock.start` is an instruction
+    index, not an address."""
+
+    def __init__(self, start: int, lines=None, edges=None):
+        self.start = start
+        self.disassembly_text = list(lines or [])
+        self.outgoing_edges = list(edges or [])
+
+
+class _FakeILCFGFunction:
+    """The object behind `Function.mlil` / `Function.hlil` for cfg tests: just
+    the IL-level basic blocks."""
+
+    def __init__(self, basic_blocks):
+        self.basic_blocks = list(basic_blocks)
+
+
+class _FakeDataVariable:
+    """A DataVariable: an address plus its BN type (str() = declaration,
+    `.width` = byte size)."""
+
+    def __init__(self, address: int, type_):
+        self.address = address
+        self.type = type_
+
+
 class _FakeBV:
     def __init__(self, *, functions=None, symbols=None, types_=None, qualified_types_=None, arch=None, disassembly=None, instruction_lengths=None,
-                 strings=None, sections=None, segments=None, memory=None, code_refs=None, data_refs=None, comments=None, relocations=None):
+                 strings=None, sections=None, segments=None, memory=None, code_refs=None, data_refs=None, comments=None, relocations=None,
+                 data_vars=None):
         self.functions = list(functions or [])
         self._comments = dict(comments or {})
         self._symbols = list(symbols or [])
@@ -640,6 +704,36 @@ class _FakeBV:
         # tag state: {name: _FakeTagType}, data/address tags {addr: [_FakeTag]}
         self._tag_types: dict[str, _FakeTagType] = {}
         self._data_tags: dict[int, list[_FakeTag]] = {}
+        # {address: _FakeDataVariable} -- mirrors bv.data_vars' mapping shape.
+        self.data_vars = dict(data_vars or {})
+
+    @property
+    def address_size(self) -> int:
+        return getattr(self.arch, "address_size", 8)
+
+    def get_data_var_at(self, address: int):
+        return self.data_vars.get(int(address))
+
+    def get_next_data_var_after(self, address: int):
+        later = sorted(a for a in self.data_vars if a > int(address))
+        return self.data_vars[later[0]] if later else None
+
+    def read_int(self, address: int, size: int, sign: bool = True):
+        # `sign` DEFAULTS TO TRUE, exactly like BinaryView.read_int. An earlier
+        # sign=False default here made every mocked read unsigned, so a caller
+        # that forgot to pass sign= looked correct under test and rendered
+        # unsigned data as negative against a live view.
+        data = self.read(int(address), int(size))
+        if len(data) != int(size):
+            raise ValueError(f"Couldn't read {size} bytes at {hex(address)}")
+        return int.from_bytes(data, "little", signed=sign)
+
+    def get_ascii_string_at(self, address: int, min_length: int = 4):
+        raw = self.read(int(address), 256)
+        text = raw.split(b"\x00", 1)[0]
+        if len(text) < int(min_length) or not all(0x20 <= b < 0x7F for b in text):
+            return None
+        return types.SimpleNamespace(value=text.decode("ascii"), start=int(address), length=len(text))
 
     def get_function_at(self, address: int):
         for fn in self.functions:
@@ -806,11 +900,15 @@ class _FakeBV:
 
 
 class _FakeType:
-    def __init__(self, decl: str, *, width: int = 0, members=None, type_class: str = "StructureTypeClass"):
+    def __init__(self, decl: str, *, width: int = 0, members=None, type_class: str = "StructureTypeClass",
+                 signed=None):
         self._decl = decl
         self.width = width
         self.members = list(members) if members is not None else None
         self.type_class = type_class
+        # BN models this as a BoolWithConfidence (bool() yields the value) and
+        # leaves it None for non-integers; None/absent must read as unsigned.
+        self.signed = signed
 
     def __str__(self):
         return self._decl
@@ -1587,4 +1685,4 @@ def _stub_code_context(monkeypatch, instance, function_entry):
     monkeypatch.setattr(instance.ctx, "_address_is_code", lambda bv, a: True)
 
 
-__all__ = ['_load_bridge', '_FakeFunction', '_FakeBasicBlock', '_FakeInstructionInfo', '_FakeArch', '_FakeOperation', '_FakeConstPtr', '_FakeReg', '_FakeHLILInstructionNode', '_FAKE_HLIL_TYPES', '_FakeHLILInstruction', '_FakeLLILInstruction', '_FakeVariable', '_FakeStringRef', '_FakeCodeRef', '_FakeSection', '_FakeSegment', '_FakeBV', '_FakeReloc', '_FakeType', '_FakeMember', '_FakeMutationBV', '_has_event', '_ParseResult', '_FakeSymbol', '_mutation_with_stubs', '_BATCH_OP_PARITY', '_minimal_valid_op', '_FakeCommentMutationBV', '_install_fake_pseudo_c', '_callsites_items', '_FakeFunctionCreateBV', '_local_retype_result', '_LoadBV', '_setup_load_test', '_FakeFileBV', '_register_views', '_ClosableBV', 'SSAVariable', '_FakeSSAVariable', '_FakeMLILInsn', '_FakeSSAFunction', '_FakeBlock', '_FakeMLILFunction', '_RecordingWriter', '_SaveBV', '_RehomingSaveBV', '_RehomingFailSaveBV', '_RestoreFailFile', '_RestoreFailSaveBV', '_FieldRefBV', '_FakeStructMember', '_FakeStructBuilder', '_struct_instance', '_AddableStructBuilder', '_struct_set_instance', '_pvs', '_dataflow_values_instance', '_stub_code_context']
+__all__ = ['_load_bridge', '_FakeCFGLine', '_FakeCFGEdge', '_FakeCFGBlock', '_FakeILCFGFunction', '_FakeDataVariable', '_FakeFunction', '_FakeBasicBlock', '_FakeInstructionInfo', '_FakeArch', '_FakeOperation', '_FakeConstPtr', '_FakeReg', '_FakeHLILInstructionNode', '_FAKE_HLIL_TYPES', '_FakeHLILInstruction', '_FakeLLILInstruction', '_FakeVariable', '_FakeStringRef', '_FakeCodeRef', '_FakeSection', '_FakeSegment', '_FakeBV', '_FakeReloc', '_FakeType', '_FakeMember', '_FakeMutationBV', '_has_event', '_ParseResult', '_FakeSymbol', '_mutation_with_stubs', '_BATCH_OP_PARITY', '_minimal_valid_op', '_FakeCommentMutationBV', '_install_fake_pseudo_c', '_callsites_items', '_FakeFunctionCreateBV', '_local_retype_result', '_LoadBV', '_setup_load_test', '_FakeFileBV', '_register_views', '_ClosableBV', 'SSAVariable', '_FakeSSAVariable', '_FakeMLILInsn', '_FakeSSAFunction', '_FakeBlock', '_FakeMLILFunction', '_RecordingWriter', '_SaveBV', '_RehomingSaveBV', '_RehomingFailSaveBV', '_RestoreFailFile', '_RestoreFailSaveBV', '_FieldRefBV', '_FakeStructMember', '_FakeStructBuilder', '_struct_instance', '_AddableStructBuilder', '_struct_set_instance', '_pvs', '_dataflow_values_instance', '_stub_code_context']

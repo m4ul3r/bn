@@ -901,3 +901,99 @@ def test_valid_py_exec_still_parses(capsys):
     parser = bn.cli.build_parser()
     ns = parser.parse_args(["py", "exec", "1+1", "--target", "active"])
     assert getattr(ns, "code_pos", None) == "1+1"
+
+
+# --- data vars / data symbols -------------------------------------------------
+
+
+def test_data_vars_builds_request_and_renders_rows(fake_transport, capsys):
+    calls = fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo_app.bndb"}]},
+        "data_vars": {
+            "ok": True,
+            "result": {"kind": "data_vars", "has_more": False, "items": [
+                {"a": "0x2000", "n": "", "t": "int32_t", "w": 4, "v": 42, "sec": ".data"},
+                {"a": "0x2004", "n": "g_handler", "t": "char*", "w": 4,
+                 "p": "0x5000", "ps": "on_message", "sec": ".data"},
+                {"a": "0x2008", "n": "", "t": "char*", "w": 4,
+                 "p": "0x6000", "pstr": "hello", "sec": ".data"},
+            ]},
+        },
+    })
+
+    rc = bn.cli.main(["data", "vars", "--start", "0x2000", "--end", "0x3000"])
+
+    assert rc == 0
+    assert [call["op"] for call in calls] == ["list_targets", "data_vars"]
+    assert calls[1]["params"] == {"start": "0x2000", "end": "0x3000", "limit": None}
+    out = capsys.readouterr().out
+    assert "0x2000" in out and "= 42" in out
+    assert "g_handler" in out and "-> 0x5000 on_message" in out
+    assert '-> 0x6000 "hello"' in out
+
+
+def test_data_vars_forwards_limit_and_notes_truncation(fake_transport, capsys):
+    calls = fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo_app.bndb"}]},
+        "data_vars": {
+            "ok": True,
+            "result": {"kind": "data_vars", "has_more": True, "items": [
+                {"a": "0x2000", "n": "", "t": "int32_t", "w": 4, "v": 1},
+            ]},
+        },
+    })
+
+    rc = bn.cli.main(["data", "vars", "--start", "0x2000", "--end", "0x3000", "--limit", "1"])
+
+    assert rc == 0
+    assert calls[1]["params"] == {"start": "0x2000", "end": "0x3000", "limit": 1}
+    out = capsys.readouterr().out
+    assert "more data vars remain" in out
+    assert "0x2001" in out  # resume hint: last address + 1
+
+
+def test_data_symbols_lists_address_name_pairs(fake_transport, capsys):
+    calls = fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo_app.bndb"}]},
+        "data_symbols": {
+            "ok": True,
+            "result": {"kind": "data_symbols", "total": 2, "offset": 0, "limit": None,
+                       "returned": 2, "has_more": False, "items": [
+                           {"a": "0x2000", "n": "g_state"},
+                           {"a": "0x2010", "n": "g_table"},
+                       ]},
+        },
+    })
+
+    rc = bn.cli.main(["data", "symbols"])
+
+    assert rc == 0
+    assert [call["op"] for call in calls] == ["list_targets", "data_symbols"]
+    # Unbounded by default: the index build wants every data global in one call.
+    assert calls[1]["params"] == {"offset": 0, "limit": None}
+    out = capsys.readouterr().out
+    assert "0x2000  g_state" in out
+    assert "0x2010  g_table" in out
+    assert "showing" not in out  # nothing truncated: no paging footer
+
+
+def test_data_symbols_pages_and_prints_a_resume_footer(fake_transport, capsys):
+    calls = fake_transport({
+        "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo_app.bndb"}]},
+        "data_symbols": {
+            "ok": True,
+            "result": {"kind": "data_symbols", "total": 900, "offset": 0, "limit": 2,
+                       "returned": 2, "has_more": True, "items": [
+                           {"a": "0x2000", "n": "g_state"},
+                           {"a": "0x2010", "n": "g_table"},
+                       ]},
+        },
+    })
+
+    rc = bn.cli.main(["data", "symbols", "--limit", "2"])
+
+    assert rc == 0
+    assert calls[1]["params"] == {"offset": 0, "limit": 2}
+    out = capsys.readouterr().out
+    assert "showing 2 of 900" in out
+    assert "--offset 2" in out

@@ -7,6 +7,7 @@ from typing import Any
 from ..cli import _call, _depth_int, _effective_limit, _mutate, _non_negative_int, _parse_line_range, _pick, _positive_depth_int, _positive_int, arg, command, mutex, mutation_output_args, preview_arg
 from ..formatters import (
     _render_call_descriptors_text,
+    _render_cfg_text,
     _render_surface_text,
     _render_callsites_text,
     _disasm_linear_steer_note,
@@ -436,6 +437,31 @@ def _disasm(args: argparse.Namespace) -> int:
         + _disasm_linear_steer_note(value, sliced=sliced)
         + _slice_text_lines(base(value), lines_range, flag=slice_flag),
         stem="disasm",
+    )
+
+
+@command("function", "cfg",
+         help="Basic-block CFG of a function: blocks with rendered lines and outgoing edges",
+         target=True,
+         prefer_when="you need block/edge structure (branch topology, loops) rather than a "
+                     "flat listing; disasm/decompile lose the edges",
+         see_also=("decompile", "il", "disasm"),
+         args=[
+             arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
+             arg("--view", choices=("asm", "mlil", "hlil"), default="asm",
+                 help="Rendering level (default asm). At IL levels block start / edge "
+                      "targets are IL instruction indexes (hex), not addresses -- "
+                      "first-line addresses collide when one instruction expands to "
+                      "several IL blocks; per-line addresses stay real at every level"),
+         ])
+def _function_cfg(args: argparse.Namespace) -> int:
+    return _call(
+        args,
+        "cfg",
+        {"identifier": args.identifier, "view": args.view},
+        require_target=True,
+        text_renderer=lambda value: _resolution_note(value) + _render_cfg_text(value),
+        stem="cfg",
     )
 
 
