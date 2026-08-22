@@ -3175,6 +3175,55 @@ def _mutation_summary(value: Any) -> Any:
     return summary
 
 
+def _go_rename_summary(value: Any) -> Any:
+    """Compact status for `go rename`, which reports through its OWN counters.
+
+    `_mutation_summary` derives every count from `results[]`. `go_rename` leaves
+    that array empty and reports via `go_renamed_candidates` /
+    `go_verified_count` / `go_committed_count` / `go_failed_count`, so running it
+    through the generic summary rendered `changed=0 verified=0 noop=0
+    failed=0 dirty_after=False` for a run that renamed 1783 functions -- and a
+    caller reading `dirty_after=False` closes without saving and silently
+    discards every recovered name. Map the go_* counters onto the same
+    schema-stable keys instead.
+    """
+    if not isinstance(value, dict) or value.get("kind") != "go_rename":
+        return _mutation_summary(value)
+    committed = bool(value.get("committed", False))
+    preview = bool(value.get("preview", False))
+    candidates = int(value.get("go_renamed_candidates") or 0)
+    committed_count = int(value.get("go_committed_count") or 0)
+    verified = int(value.get("go_verified_count") or 0)
+    failed = int(value.get("go_failed_count") or 0)
+    skipped = int(value.get("skipped_user_named") or 0)
+    rolled_back = value.get("rolled_back")
+    proto_residue = bool(value.get("prototype_user_type_residue", False))
+    success = bool(value.get("success", True)) and not failed
+    # On a preview nothing is committed, so the actionable count is what WOULD
+    # change; live, it is what actually did.
+    changed = committed_count if committed else candidates
+    return {
+        "kind": "mutation_summary",
+        "ok": success,
+        "success": success,
+        "committed": committed,
+        "preview": preview,
+        "op_count": candidates,
+        "changed_count": changed,
+        "verified_count": verified,
+        # Already-user-named functions are deliberately left alone: no change,
+        # not a failure -- the same meaning `noop` carries elsewhere.
+        "noop_count": skipped,
+        "failed_count": failed,
+        "rolled_back": (bool(rolled_back) if rolled_back is not None else None),
+        "first_error": (value.get("message") if failed else None),
+        "dirty_after": ((committed and committed_count > 0)
+                        or (rolled_back is False and not committed)
+                        or proto_residue),
+        "skipped_user_named": skipped,
+    }
+
+
 def _render_mutation_summary_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)

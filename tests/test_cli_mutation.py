@@ -111,6 +111,66 @@ def test_go_rename_summary_emits_compact_status(fake_transport, capsys):
     assert "results" not in out and "affected_functions" not in out   # compacted
 
 
+def test_go_rename_summary_reads_its_own_counters_not_results():
+    # REGRESSION: `go_rename` reports through go_* counters and leaves `results`
+    # EMPTY. Routing it through the generic `_mutation_summary` -- which derives
+    # every count from `results[]` -- rendered a run that renamed 1783 functions
+    # as `changed=0 verified=0 noop=0 failed=0 dirty_after=False`.
+    #
+    # `dirty_after=False` is the dangerous half: a caller reads "nothing changed",
+    # closes without saving, and silently discards every recovered name. Verified
+    # live against a real Go binary before the fix.
+    from bn.formatters import _go_rename_summary
+    live = _go_rename_summary({
+        "kind": "go_rename", "success": True, "committed": True, "preview": False,
+        "results": [],                      # <- always empty for this op
+        "go_renamed_candidates": 1783, "go_committed_count": 1783,
+        "go_verified_count": 1783, "go_failed_count": 0,
+        "skipped_user_named": 1, "defined_count": 1784,
+    })
+    assert live["changed_count"] == 1783 and live["verified_count"] == 1783
+    assert live["noop_count"] == 1          # already-user-named: skipped, not failed
+    assert live["failed_count"] == 0
+    assert live["dirty_after"] is True      # 1783 renames ARE unsaved state
+
+    # A preview commits nothing, so the actionable count is what WOULD change and
+    # the DB stays clean.
+    prev = _go_rename_summary({
+        "kind": "go_rename", "success": True, "committed": False, "preview": True,
+        "results": [], "rolled_back": True,
+        "go_renamed_candidates": 1783, "go_committed_count": 0,
+        "go_verified_count": 1783, "go_failed_count": 0, "skipped_user_named": 1,
+    })
+    assert prev["changed_count"] == 1783 and prev["dirty_after"] is False
+
+    # A preview whose revert FAILED leaves state behind.
+    stuck = _go_rename_summary({
+        "kind": "go_rename", "success": False, "committed": False, "preview": True,
+        "results": [], "rolled_back": False, "message": "revert failed",
+        "go_renamed_candidates": 5, "go_committed_count": 0,
+        "go_verified_count": 5, "go_failed_count": 2, "skipped_user_named": 0,
+    })
+    assert stuck["dirty_after"] is True and stuck["failed_count"] == 2
+    assert stuck["first_error"] == "revert failed"
+
+    # Anything that is not a go_rename envelope falls through untouched.
+    other = _go_rename_summary({"success": True, "committed": True,
+                                "results": [{"status": "verified"}]})
+    assert other["changed_count"] == 1
+
+
+def test_go_rename_default_text_reports_real_counts(fake_transport, capsys):
+    # End-to-end through the CLI: the DEFAULT (compact) render must not zero out.
+    fake_transport({"go_rename": {"ok": True, "result": {
+        "kind": "go_rename", "success": True, "committed": True, "preview": False,
+        "results": [], "go_renamed_candidates": 1783, "go_committed_count": 1783,
+        "go_verified_count": 1783, "go_failed_count": 0, "skipped_user_named": 1}}})
+    assert bn.cli.main(["go", "rename", "--target", "active"]) == 0
+    out = capsys.readouterr().out
+    assert "changed=1783" in out and "dirty_after=True" in out
+    assert "changed=0" not in out
+
+
 def test_go_rename_full_json_carries_top_level_ok(fake_transport, capsys):
     # #604: `go rename` hand-rolled its _call tail with `result_transform=None`, so
     # the full (--verbose) JSON came back WITHOUT the top-level `ok` every other

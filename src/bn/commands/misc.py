@@ -17,6 +17,7 @@ from ..formatters import (
     _render_go_functions_text,
     _render_go_functions_summary_text,
     _render_go_rename_text,
+    _go_rename_summary,
     _render_imports_summary_text,
     _render_mutation_summary_text,
     _render_name_address_list_text,
@@ -338,6 +339,7 @@ def _go_rename(args: argparse.Namespace) -> int:
         preview=bool(args.preview),
         require_target=True,
         detail_renderer=_render_go_rename_text,
+        summary_transform=_go_rename_summary,
         stem="go-rename",
     )
 
