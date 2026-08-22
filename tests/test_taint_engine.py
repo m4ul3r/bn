@@ -2108,6 +2108,40 @@ def test_forward_no_copy_note_when_dest_is_unkeyable(models):
     assert result["diagnostics"]["safe_to_report_all_clear"] is False, result["diagnostics"]
 
 
+def test_forward_copy_note_fires_when_dest_already_tainted(models):
+    # #578/Finding-3: the *arg:N -> *arg:0 copy note must fire whenever the copy
+    # genuinely propagates from tainted input into a KEYABLE destination -- even
+    # when that destination was ALREADY tainted by an earlier predecessor, so the
+    # copy creates NO new lattice entry. #578 gated the note on _apply_to_token()
+    # -> taint_node() returning True (a NEW entry); an already-tainted keyable
+    # dest returns False, wrongly SUPPRESSING a real copy note (a false negative
+    # distinct from the unkeyable-destination negative control above). Two memcpy
+    # copies from the same tainted source into the same keyable buffer: the first
+    # taints it, the second copies into an already-tainted dest -- BOTH are
+    # genuine copies from tainted input and BOTH must be noted.
+    buf = FVar("buf"); src = FVar("src"); n = FVar("n")
+    src1 = FSSA(src, 1); n1 = FSSA(n, 1)
+
+    def _cpy(idx, addr):
+        return FInstr(idx, addr, "MLIL_CALL_SSA", "memcpy(&buf, src#1, n#1)",
+                      reads=[src1, n1], writes=[],
+                      dest=FExpr("MLIL_CONST_PTR", "0x401080", constant=0x401080),
+                      params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                              FExpr("MLIL_VAR_SSA", "src#1", reads=[src1]),
+                              FExpr("MLIL_VAR_SSA", "n#1", reads=[n1])])
+
+    instrs = [_cpy(0, 0x100), _cpy(1, 0x110)]
+    func = FFunc("f", 0x100, FSSAFunc(instrs), params=[buf, src, n])  # param:1 = src
+    bv = FBV({0x401080: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:1")])
+    notes = [a for a in result["assumptions"] if "copied into the destination" in a]
+    # first copy into a fresh dest: note fires (creates new lattice state) ...
+    assert any("0x100" in a for a in notes), result["assumptions"]
+    # ... second copy into the now-already-tainted keyable dest: note STILL fires.
+    assert any("0x110" in a for a in notes), result["assumptions"]
+
+
 def test_forward_unconsumed_vararg_not_reported(models):
     # "%i.%i.%i" consumes 3 args (1,7,0xe); the tainted 4th vararg is never read
     # by the format -> provably dead -> must NOT be reported as a sprintf sink (#45).
