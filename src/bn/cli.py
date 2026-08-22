@@ -917,6 +917,8 @@ def _mutate(
         # so `json.loads` raised and the agent could not confirm a batch that HAD
         # committed. Keep the parseable status on stdout no matter how big the
         # detail payload is; the detail goes to the artifact.
+        # _call evaluates this against the ALREADY-transformed result, so both
+        # transforms short-circuit on a `mutation_summary` envelope.
         spill_status=(summary_transform or _mutation_summary),
         spill_status_renderer=_render_mutation_summary_text,
         **call_kwargs,

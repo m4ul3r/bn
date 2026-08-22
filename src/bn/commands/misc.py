@@ -19,7 +19,6 @@ from ..formatters import (
     _render_go_rename_text,
     _go_rename_summary,
     _render_imports_summary_text,
-    _render_mutation_summary_text,
     _render_name_address_list_text,
     _render_py_exec_text,
     _render_read_text,
