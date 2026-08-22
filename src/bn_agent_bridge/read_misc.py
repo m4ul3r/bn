@@ -851,7 +851,8 @@ def _data_vars(ctx, selector: str | None, *, start, end, limit=None):
             break
         rows.append(_data_var_row(bv, dv, psz))
         dv = bv.get_next_data_var_after(int(dv.address))
-    return {"kind": "data_vars", "vars": rows, "has_more": has_more}
+    # #275: `items` is the universal data container, `kind` the discriminator.
+    return {"kind": "data_vars", "items": rows, "has_more": has_more}
 
 
 def _data_symbols(ctx, selector: str | None, *, offset: int = 0, limit=None):
@@ -886,19 +887,10 @@ def _data_symbols(ctx, selector: str | None, *, offset: int = 0, limit=None):
         for sym in symbols
         if getattr(sym, "name", "")
     ]
-    total = len(syms)
-    page = syms[offset:]
-    if limit is not None:
-        page = page[:limit]
-    return {
-        "kind": "data_symbols",
-        "syms": page,
-        "total": total,
-        "offset": offset,
-        "limit": limit,
-        "returned": len(page),
-        "has_more": (offset + len(page)) < total,
-    }
+    # #275: `items` is the universal data container and `kind` the discriminator.
+    # This used to hand-roll a byte-identical envelope under the name `syms`,
+    # which every generic consumer (and the paging footer) has to special-case.
+    return _paged_list_result(syms, offset=offset, limit=limit, kind="data_symbols")
 
 
 def _ascii_render(data: bytes) -> str:

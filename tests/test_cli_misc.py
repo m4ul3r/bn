@@ -911,7 +911,7 @@ def test_data_vars_builds_request_and_renders_rows(fake_transport, capsys):
         "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo_app.bndb"}]},
         "data_vars": {
             "ok": True,
-            "result": {"kind": "data_vars", "has_more": False, "vars": [
+            "result": {"kind": "data_vars", "has_more": False, "items": [
                 {"a": "0x2000", "n": "", "t": "int32_t", "w": 4, "v": 42, "sec": ".data"},
                 {"a": "0x2004", "n": "g_handler", "t": "char*", "w": 4,
                  "p": "0x5000", "ps": "on_message", "sec": ".data"},
@@ -937,7 +937,7 @@ def test_data_vars_forwards_limit_and_notes_truncation(fake_transport, capsys):
         "list_targets": {"ok": True, "result": [{"target_id": "1:1:1", "selector": "demo_app.bndb"}]},
         "data_vars": {
             "ok": True,
-            "result": {"kind": "data_vars", "has_more": True, "vars": [
+            "result": {"kind": "data_vars", "has_more": True, "items": [
                 {"a": "0x2000", "n": "", "t": "int32_t", "w": 4, "v": 1},
             ]},
         },
@@ -958,7 +958,7 @@ def test_data_symbols_lists_address_name_pairs(fake_transport, capsys):
         "data_symbols": {
             "ok": True,
             "result": {"kind": "data_symbols", "total": 2, "offset": 0, "limit": None,
-                       "returned": 2, "has_more": False, "syms": [
+                       "returned": 2, "has_more": False, "items": [
                            {"a": "0x2000", "n": "g_state"},
                            {"a": "0x2010", "n": "g_table"},
                        ]},
@@ -983,7 +983,7 @@ def test_data_symbols_pages_and_prints_a_resume_footer(fake_transport, capsys):
         "data_symbols": {
             "ok": True,
             "result": {"kind": "data_symbols", "total": 900, "offset": 0, "limit": 2,
-                       "returned": 2, "has_more": True, "syms": [
+                       "returned": 2, "has_more": True, "items": [
                            {"a": "0x2000", "n": "g_state"},
                            {"a": "0x2010", "n": "g_table"},
                        ]},

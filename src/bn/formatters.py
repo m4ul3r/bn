@@ -2755,7 +2755,7 @@ def _render_data_vars_text(value: Any) -> str:
     section, plus a resume hint when the row cap truncated the window."""
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    rows = value.get("vars") or []
+    rows = value.get("items") or []  # #275: was `vars`
     lines = []
     for row in rows:
         cells = [str(row.get("a", "?")), str(row.get("t", "?")), f"w={row.get('w', '?')}"]
@@ -2791,7 +2791,7 @@ def _render_data_symbols_text(value: Any) -> str:
     asked for a bounded page (`--limit`/`--offset`) and more remain."""
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    syms = value.get("syms")
+    syms = value.get("items")  # #275: was `syms`
     if not syms:
         return "none"
     body = "\n".join(f"{sym.get('a', '?')}  {sym.get('n', '')}" for sym in syms)

@@ -1259,7 +1259,7 @@ def test_data_vars_window_rows_carry_typed_fields(monkeypatch):
 
     assert result["kind"] == "data_vars"
     assert result["has_more"] is False
-    rows = {row["a"]: row for row in result["vars"]}
+    rows = {row["a"]: row for row in result["items"]}
     # Half-open window: 0x1000 (before) and 0x3000 (== end) excluded, lo included.
     assert sorted(rows) == ["0x2000", "0x2004", "0x2008", "0x2010", "0x2018", "0x2020"]
 
@@ -1323,12 +1323,12 @@ def test_data_vars_has_more_is_honest_at_the_cap(monkeypatch):
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     capped = instance._data_vars(None, start="0x2000", end="0x3000", limit=2)
-    assert [r["a"] for r in capped["vars"]] == ["0x2000", "0x2004"]
+    assert [r["a"] for r in capped["items"]] == ["0x2000", "0x2004"]
     assert capped["has_more"] is True
 
     # Exactly limit rows left in the window: nothing was truncated.
     exact = instance._data_vars(None, start="0x2000", end="0x3000", limit=6)
-    assert len(exact["vars"]) == 6
+    assert len(exact["items"]) == 6
     assert exact["has_more"] is False
 
 
@@ -1357,8 +1357,8 @@ def test_data_vars_unreadable_pointer_row_survives(monkeypatch):
 
     result = instance._data_vars(None, start="0x2000", end="0x2100")
 
-    assert [r["a"] for r in result["vars"]] == ["0x2000"]
-    assert "p" not in result["vars"][0]
+    assert [r["a"] for r in result["items"]] == ["0x2000"]
+    assert "p" not in result["items"][0]
 
 
 def test_data_vars_scalar_signedness_follows_the_declared_type(monkeypatch):
@@ -1384,7 +1384,7 @@ def test_data_vars_scalar_signedness_follows_the_declared_type(monkeypatch):
     )
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
-    rows = {row["a"]: row for row in instance._data_vars(None, start="0x2000", end="0x2100")["vars"]}
+    rows = {row["a"]: row for row in instance._data_vars(None, start="0x2000", end="0x2100")["items"]}
 
     assert rows["0x2000"]["v"] == 0xF0000000   # NOT -268435456
     assert rows["0x2004"]["v"] == -1           # genuinely signed: -1, not 0xffffffff
@@ -1409,7 +1409,7 @@ def test_data_symbols_lists_named_data_symbols_only(monkeypatch):
     result = instance._data_symbols(None)
 
     assert result["kind"] == "data_symbols"
-    assert result["syms"] == [
+    assert result["items"] == [
         {"a": "0x2000", "n": "g_state"},
         {"a": "0x2010", "n": "g_table"},
     ]
@@ -1433,13 +1433,13 @@ def test_data_symbols_pages_on_demand_with_an_honest_total(monkeypatch):
 
     page = instance._data_symbols(None, offset=1, limit=2)
 
-    assert [s["n"] for s in page["syms"]] == ["g_1", "g_2"]
+    assert [s["n"] for s in page["items"]] == ["g_1", "g_2"]
     assert page["total"] == 5          # the true total, not the page size
     assert page["offset"] == 1 and page["limit"] == 2 and page["returned"] == 2
     assert page["has_more"] is True
 
     tail = instance._data_symbols(None, offset=3, limit=2)
-    assert [s["n"] for s in tail["syms"]] == ["g_3", "g_4"]
+    assert [s["n"] for s in tail["items"]] == ["g_3", "g_4"]
     assert tail["has_more"] is False
 
     with pytest.raises(bridge.OperationFailure):
