@@ -615,6 +615,40 @@ def test_forward_attributed_gate_recomputed_over_union_leaves(models):
     assert out["diagnostics"]["safe_to_report_all_clear"] is False, out["diagnostics"]
 
 
+def test_forward_attributed_source_callsites_is_total_not_first_run(models):
+    # #580: each per-callsite run is restricted via only_callsite_addr, so a
+    # real run's own diagnostics.source_callsites is scoped to ONE call
+    # address (typically 1) -- never the attributed total. The zero-sink
+    # diagnostics assembly previously did
+    #   seed_callsites=int(base_diag.get("source_callsites", len(callsite_addrs)))
+    # which let the first run's own (present) source_callsites=1 shadow the
+    # len(callsite_addrs) fallback, so a 2-callsite attributed union silently
+    # reported source_callsites=1 instead of 2.
+    engine = te.TaintEngine(FBV({}), models)
+    func = FFunc("parse", 0x10, FSSAFunc([]), params=[])
+    sources = [{"kind": "ret", "callee": "get_val"}]
+
+    def _run():
+        return {
+            "direction": "forward", "function": {"name": "parse"}, "sources": sources,
+            "reached_sinks": [], "leaves": [], "assumptions": [],
+            "stats": {"functions_visited": 1, "max_depth": 0, "sinks": 0, "truncated": False},
+            "diagnostics": {"safe_to_report_all_clear": True, "all_clear_reason": "x",
+                            "tainted_values": 1, "last_use": None, "source_callsites": 1},
+        }
+
+    runs = iter([_run(), _run()])
+
+    def fake_forward_run(f, s, *, max_depth, only_callsite_addr):
+        engine._funcs_visited = {0x10}
+        return next(runs)
+
+    engine._forward_run = fake_forward_run
+    out = engine._forward_attributed(func, sources, [0xA, 0xB], max_depth=8)
+
+    assert out["diagnostics"]["source_callsites"] == 2, out["diagnostics"]
+
+
 def test_forward_stop_policy_emits_unmodeled_frontier_leaf(models):
     # F4/#562: under --unknown-call stop, taint reaching an unmodeled external must
     # still surface an unmodeled_callee frontier leaf (and block the honesty gate),
@@ -2036,6 +2070,76 @@ def test_forward_no_copy_note_when_source_is_already_a_sink(models):
     # ... so no redundant copy note is emitted for it
     assert not any("copied into the destination" in a for a in result["assumptions"]), \
         result["assumptions"]
+
+
+def test_forward_no_copy_note_when_dest_is_unkeyable(models):
+    # #578: the *arg:N -> *arg:0 copy-note assumption ("propagated to the
+    # destination, not itself flagged as a sink") must fire ONLY when the
+    # propagation into the destination actually SUCCEEDED. When the dest
+    # pointer is structurally unkeyable (here, the opaque return of a
+    # get_buf()-style call -- _buffer_target can't correlate it to a tracked
+    # buffer), _apply_to_token returns False and the assumption's own claim
+    # would be a lie: the taint did NOT reach the destination. The engine must
+    # instead surface a coarse_memory_store leaf and keep safe_to_report_all_clear
+    # False, not a false "propagated" assumption.
+    GETBUF, MEMCPY = 0xe00, 0xe10
+    dst = FVar("dst"); src = FVar("src"); n = FVar("n")
+    dst1 = FSSA(dst, 1); src0 = FSSA(src, 0); n0 = FSSA(n, 0)
+    getbuf = FInstr(0, 0x10, "MLIL_CALL_SSA", "dst#1 = get_buf()", reads=[], writes=[dst1],
+                    dest=FExpr("MLIL_CONST_PTR", hex(GETBUF), constant=GETBUF), params=[])
+    call = FInstr(1, 0x14, "MLIL_CALL_SSA", "memcpy(dst#1, src#0, n#0)",
+                  reads=[dst1, src0, n0], writes=[],
+                  dest=FExpr("MLIL_CONST_PTR", hex(MEMCPY), constant=MEMCPY),
+                  params=[FExpr("MLIL_VAR_SSA", "dst#1", reads=[dst1]),
+                          FExpr("MLIL_VAR_SSA", "src#0", reads=[src0]),
+                          FExpr("MLIL_VAR_SSA", "n#0", reads=[n0])])
+    ret = FInstr(2, 0x18, "MLIL_RET", "return", reads=[])
+    ssa = FSSAFunc([getbuf, call, ret])
+    func = FFunc("f", 0x10, ssa, params=[dst, src, n])
+    engine = te.TaintEngine(FBV({GETBUF: "get_buf", MEMCPY: "memcpy"}), models)
+    result = engine.forward(func, [te.parse_locator("param:1")])
+    # the source (arg1) IS tainted (seeded param), but the dest is unkeyable ...
+    assert not any(
+        "propagated to the destination" in a or "not itself flagged as a sink" in a
+        for a in result["assumptions"]), result["assumptions"]
+    # ... so the tainted write must instead surface as a coarse_memory_store leaf ...
+    assert any(l["kind"] == "coarse_memory_store" for l in result["leaves"]), result["leaves"]
+    # ... and the run must not be allowed to claim a sound all-clear.
+    assert result["diagnostics"]["safe_to_report_all_clear"] is False, result["diagnostics"]
+
+
+def test_forward_copy_note_fires_when_dest_already_tainted(models):
+    # #578/Finding-3: the *arg:N -> *arg:0 copy note must fire whenever the copy
+    # genuinely propagates from tainted input into a KEYABLE destination -- even
+    # when that destination was ALREADY tainted by an earlier predecessor, so the
+    # copy creates NO new lattice entry. #578 gated the note on _apply_to_token()
+    # -> taint_node() returning True (a NEW entry); an already-tainted keyable
+    # dest returns False, wrongly SUPPRESSING a real copy note (a false negative
+    # distinct from the unkeyable-destination negative control above). Two memcpy
+    # copies from the same tainted source into the same keyable buffer: the first
+    # taints it, the second copies into an already-tainted dest -- BOTH are
+    # genuine copies from tainted input and BOTH must be noted.
+    buf = FVar("buf"); src = FVar("src"); n = FVar("n")
+    src1 = FSSA(src, 1); n1 = FSSA(n, 1)
+
+    def _cpy(idx, addr):
+        return FInstr(idx, addr, "MLIL_CALL_SSA", "memcpy(&buf, src#1, n#1)",
+                      reads=[src1, n1], writes=[],
+                      dest=FExpr("MLIL_CONST_PTR", "0x401080", constant=0x401080),
+                      params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                              FExpr("MLIL_VAR_SSA", "src#1", reads=[src1]),
+                              FExpr("MLIL_VAR_SSA", "n#1", reads=[n1])])
+
+    instrs = [_cpy(0, 0x100), _cpy(1, 0x110)]
+    func = FFunc("f", 0x100, FSSAFunc(instrs), params=[buf, src, n])  # param:1 = src
+    bv = FBV({0x401080: "memcpy"})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:1")])
+    notes = [a for a in result["assumptions"] if "copied into the destination" in a]
+    # first copy into a fresh dest: note fires (creates new lattice state) ...
+    assert any("0x100" in a for a in notes), result["assumptions"]
+    # ... second copy into the now-already-tainted keyable dest: note STILL fires.
+    assert any("0x110" in a for a in notes), result["assumptions"]
 
 
 def test_forward_unconsumed_vararg_not_reported(models):

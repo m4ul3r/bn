@@ -2020,7 +2020,7 @@ class TaintEngine:
             }
             out["diagnostics"] = forward_zero_diagnostics(
                 union_sub,
-                seed_callsites=int(base_diag.get("source_callsites", len(callsite_addrs))),
+                seed_callsites=len(callsite_addrs),
                 truncated=truncated, truncation_cause=sorted(truncation_causes))
         return out
 
@@ -3430,8 +3430,10 @@ class TaintEngine:
                 to = rule.get("to")
                 frm = rule.get("from")
                 hit = self._token_hit_node(ssaf, params, frm, tainted)
+                applied = False
                 if hit is not None:
-                    if self._apply_to_token(ssaf, ins, params, to, taint_node, name or "?", parents=[hit]):
+                    applied = self._apply_to_token(ssaf, ins, params, to, taint_node, name or "?", parents=[hit])
+                    if applied:
                         changed = True
                     else:
                         _note_unkeyed_store(to)
@@ -3447,7 +3449,19 @@ class TaintEngine:
                     # source-seed that lands here would report a bare "no sinks
                     # reached" even though backward/trace both reach it. Record the
                     # src-side copy so the three tools agree. Deduped per site.
-                    if isinstance(frm, str) and frm.startswith("*arg:") and to == "*arg:0":
+                    # Gate on whether this rule propagates from tainted input into a
+                    # KEYABLE destination -- NOT on `applied` (taint_node() returning
+                    # a NEW lattice entry). A keyable dest already tainted by an
+                    # earlier predecessor makes taint_node()/`applied` return False
+                    # even though this copy from tainted input truly occurred, so
+                    # gating on `applied` suppresses a real copy note -- a false
+                    # negative, which is the worst outcome this engine can produce.
+                    # The genuine "propagation did not occur" case is an UNKEYABLE
+                    # dest (_buffer_target None), which must still stay silent --
+                    # exactly what `dest_keyable` distinguishes.
+                    dest_keyable = (to == "*arg:0" and len(params) > 0
+                                    and self._buffer_target(ssaf, params[0]) is not None)
+                    if dest_keyable and isinstance(frm, str) and frm.startswith("*arg:"):
                         try:
                             src_i = int(frm.split("arg:", 1)[1])
                         except Exception:
