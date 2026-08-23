@@ -1467,7 +1467,14 @@ class BinaryNinjaBridge:
         # silently wins (all over path closed everything despite a named file,
         # #85; target over path/all silently ignored the other operand). A
         # destructive op must not guess which operand the caller meant.
-        bare_target = target is None or str(target).strip() in ("", "active")
+        #
+        # Only an ABSENT target is bare. A non-None empty/whitespace selector
+        # is an error (below), never folded into bare -- otherwise a raw
+        # {"target": ""} closed the single open target exactly like the
+        # `-t ""` the CLI rejects. The volatile literal "active" is a GIVEN
+        # selector too: it conflicts with path/all like any other, and on its
+        # own it goes through the sole-target gate (never the focused tab).
+        bare_target = target is None
         if all_ and path is not None:
             raise RuntimeError(
                 "Pass either a path or all=true, not both: a named path closes "
@@ -1491,6 +1498,14 @@ class BinaryNinjaBridge:
                 "close_binary: empty path; pass a real path, an explicit target "
                 "selector, or all=true."
             )
+        # Likewise a raw {"target": ""} (or whitespace) is neither a selector
+        # nor a bare request; it must not resolve to the single open target.
+        if not bare_target and not str(target).strip():
+            raise RuntimeError(
+                "close_binary: empty target selector; pass a selector from "
+                "list_targets, a path, or all=true (omit the target entirely to "
+                "close the single open target)."
+            )
 
         # Resolve a target selector *before* taking _headless_views_lock:
         # resolve() -> refresh() -> _collect_open_views() re-acquires that lock,
@@ -1503,19 +1518,21 @@ class BinaryNinjaBridge:
         # while the equivalent `save` refused. Only an explicit path or all=true
         # opts out of resolution; an explicit non-bare selector always resolves.
         #
-        # Round 2: a BARE selector (absent / "" / "active") deliberately does
-        # NOT go through targets.resolve()'s convenience branch. That branch
-        # returns the FOCUSED GUI tab with no count check (save's focused-tab
-        # convenience), so on a multi-tab GUI bridge a bare close would tear
-        # down whichever tab happened to have focus. A destructive close refuses
-        # unless exactly ONE target is open, focus notwithstanding, and closes
-        # that one by its target_id so the same resolver path serves both.
-        if not bare_target:
-            target_bv = self.targets.resolve(target)
-        elif path is None and not all_:
+        # Round 2: a BARE request (no target) and the volatile "active" literal
+        # deliberately do NOT go through targets.resolve()'s convenience branch.
+        # That branch returns the FOCUSED GUI tab with no count check (save's
+        # focused-tab convenience), so on a multi-tab GUI bridge a bare close
+        # would tear down whichever tab happened to have focus. A destructive
+        # close refuses unless exactly ONE target is open, focus notwithstanding,
+        # and closes that one by its target_id so the same resolver path serves
+        # both. (The CLI never forwards "active" for close; this covers raw
+        # clients.)
+        if path is not None or all_:
+            target_bv = None
+        elif bare_target or str(target).strip() == "active":
             target_bv = self._resolve_sole_target_for_close()
         else:
-            target_bv = None
+            target_bv = self.targets.resolve(target)
 
         # Target-based close takes priority and must succeed even when
         # _headless_views is empty: GUI-opened views resolve fine but are not
@@ -1572,18 +1589,19 @@ class BinaryNinjaBridge:
     def _resolve_sole_target_for_close(self):
         """Resolve a bare close to the single open target, else refuse.
 
-        Unlike ``targets.resolve(None)`` this never consults the focused GUI tab:
-        with more than one target open the request is ambiguous and a
-        destructive close must not pick one. With exactly one open it resolves
-        that one by its ``target_id`` (never the volatile ``active`` literal)."""
+        Serves both an absent target and the volatile ``active`` literal. Unlike
+        ``targets.resolve(None)`` this never consults the focused GUI tab: with
+        more than one target open the request is ambiguous and a destructive
+        close must not pick one. With exactly one open it resolves that one by
+        its ``target_id`` (never the ``active`` literal)."""
         targets = self.targets.refresh()
         if not targets:
             raise RuntimeError("No BinaryView targets are open")
         if len(targets) > 1:
             lines = [
-                "A bare close_binary refuses when multiple targets are open "
-                f"({len(targets)}): pass an explicit target selector, a path, "
-                "or all=true to close every target.",
+                "close_binary without an explicit target selector refuses when "
+                f"multiple targets are open ({len(targets)}): pass a target "
+                "selector, a path, or all=true to close every target.",
                 "Open targets:",
             ]
             for item in targets:

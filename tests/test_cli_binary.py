@@ -837,3 +837,62 @@ def test_load_forwards_workdir_and_marker_optout(monkeypatch, tmp_path):
     monkeypatch.setenv("BN_NO_MARKERS", "0")
     rc = bn.cli.main(["load", str(binpath)])
     assert rc == 0 and captured["no_marker"] is False
+
+
+def test_close_empty_path_errors_without_closing(fake_transport, monkeypatch, capsys):
+    # `bn close ""` -- an unset shell variable expanding to an empty positional
+    # -- used to be truthiness-tested, so it silently became a BARE close and
+    # tore down the sole open target. Same hazard class as `-t ""`: the empty
+    # operand is an error, with one target open as with several, and nothing
+    # is sent.
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    one = {"ok": True, "result": [{"target_id": "123:1:7", "selector": "foo.bndb", "view_id": "1"}]}
+    for listing in (one, _TWO_TARGETS):
+        for path in ("", "   "):
+            calls = fake_transport({
+                "list_targets": listing,
+                "close_binary": {"ok": True, "result": {"closed": [{"path": "/tmp/foo", "unsaved": False}]}},
+            })
+
+            rc = bn.cli.main(["close", path, "--format", "text"])
+
+            assert rc == 2, (path, listing)
+            assert calls == [], (path, listing)
+            err = capsys.readouterr().err
+            assert "path is empty" in err, (path, listing)
+
+
+def test_close_empty_path_with_all_is_rejected_as_conflict(fake_transport, monkeypatch, capsys):
+    # `bn close "" --all` used to bypass the path+--all guard (empty path is
+    # falsy) and close EVERYTHING. The empty positional is still a given
+    # operand: it conflicts with --all exactly like a real path would.
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    calls = fake_transport({
+        "list_targets": _TWO_TARGETS,
+        "close_binary": {"ok": True, "result": {"closed": []}},
+    })
+
+    rc = bn.cli.main(["close", "", "--all", "--format", "text"])
+
+    assert rc == 2
+    assert calls == []
+    err = capsys.readouterr().err
+    assert "not both" in err and "--all" in err
+
+
+def test_close_target_with_empty_path_is_rejected_as_conflict(fake_transport, monkeypatch, capsys):
+    # `bn close -t alpha.so ""` used to drop the (falsy) path silently and
+    # close alpha.so. The empty positional conflicts with --target like a real
+    # path would; nothing is sent.
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    calls = fake_transport({
+        "list_targets": _TWO_TARGETS,
+        "close_binary": {"ok": True, "result": {"closed": []}},
+    })
+
+    rc = bn.cli.main(["close", "-t", "alpha.so", "", "--format", "text"])
+
+    assert rc == 2
+    assert calls == []
+    err = capsys.readouterr().err
+    assert "not both" in err and "--target" in err

@@ -82,18 +82,24 @@ def _close(args: argparse.Namespace) -> int:
     if getattr(args, "_sticky_target", False):
         args.target = None
     explicit_target = getattr(args, "target", None)
+    # Presence, not truthiness: `bn close ""` (an unset shell variable expanding
+    # to an empty positional) is an operand that was GIVEN, so it must take
+    # part in the conflict checks below and then be rejected as empty -- not
+    # collapse into a bare close (which would tear down the sole open target),
+    # and `bn close "" --all` must not slip past the path+--all guard.
+    explicit_path = getattr(args, "path", None)
     # The three ways to say what to close -- `-t`, a path, `--all` -- are
     # mutually exclusive. The bridge gives a target priority over a path and
     # --all, and --all priority over a path, so any pair would silently drop one
     # operand (`bn close <path> --all` closed EVERYTHING despite naming a file,
     # #85). A destructive op must not guess which one was meant: reject every
     # combination before sending anything.
-    if args.path and args.all:
+    if explicit_path is not None and args.all:
         raise BridgeError(
             "Pass a path or --all, not both: a named path closes only that "
             "target; --all closes every loaded target."
         )
-    if explicit_target is not None and args.path:
+    if explicit_target is not None and explicit_path is not None:
         raise BridgeError(
             "Pass --target or a path, not both: --target closes that target; "
             "a path closes the loaded binary at that path."
@@ -111,9 +117,16 @@ def _close(args: argparse.Namespace) -> int:
             "--target is empty: pass a selector from `bn target list`, a path, "
             "or --all (omit --target entirely to close the single open target)."
         )
+    # Same for an empty positional: `bn close ""` must not become a bare close.
+    if explicit_path is not None and not str(explicit_path).strip():
+        raise BridgeError(
+            "path is empty: pass a real path, a --target selector from "
+            "`bn target list`, or --all (omit the path entirely to close the "
+            "single open target)."
+        )
     params: dict[str, Any] = {}
-    if args.path:
-        params["path"] = str(Path(args.path).expanduser().resolve())
+    if explicit_path is not None:
+        params["path"] = str(Path(explicit_path).expanduser().resolve())
     if args.all:
         params["all"] = True
     # #664: a bare `bn close` closes the single open target and refuses under
@@ -128,7 +141,7 @@ def _close(args: argparse.Namespace) -> int:
     # binary. View ids are never reused, so any interleaving turns the pinned
     # id into a safe unknown-selector error. `-t active` is the same volatile
     # literal spelled explicitly and is pinned the same way.
-    if not (args.all or args.path) and (
+    if not (args.all or explicit_path is not None) and (
         explicit_target is None or str(explicit_target).strip() == "active"
     ):
         args.target = _pinned_sole_target(args)
