@@ -1365,6 +1365,44 @@ def test_resolve_cache_stem_requires_16_hex_digest(monkeypatch):
     bridge._headless_views.clear()
 
 
+@pytest.mark.parametrize("selector", [None, "", "active"])
+def test_resolve_no_active_multi_target_raises_target_hint(monkeypatch, selector):
+    # #663: headless with several targets open and no active view, resolve()
+    # must raise the actionable -t hint + open-target list -- for every
+    # no-selector spelling it collapses (None, "", "active") -- not the bare
+    # "No active BinaryView is selected" error. Raising it here (not in the
+    # CLI) fixes every client from the same refresh() snapshot.
+    bridge = _load_bridge(monkeypatch)
+    bv1 = _FakeFileBV("/corpus/libparse.so.bndb", session_id="1")
+    bv2 = _FakeFileBV("/corpus/svcmain.bndb", session_id="2")
+    _register_views(bridge, bv1, bv2)
+    manager = bridge.TargetManager()
+
+    with pytest.raises(Exception) as exc:
+        manager.resolve(selector)
+
+    message = str(exc.value)
+    assert "No active BinaryView is selected and multiple targets are open" in message
+    assert "-t <selector>" in message
+    assert "Open targets:" in message
+    # Entries render the -t form so copy-pasting a line is a correct retry --
+    # save's positional is an OUTPUT PATH, so a bare selector is a footgun.
+    assert "-t libparse.so.bndb" in message
+    assert "-t svcmain.bndb" in message
+    bridge._headless_views.clear()
+
+
+def test_resolve_no_selector_single_target_still_returns_view(monkeypatch):
+    # The enriched multi-target error must not disturb the single-target
+    # implicit resolution bare `bn save` relies on.
+    bridge = _load_bridge(monkeypatch)
+    bv = _FakeFileBV("/corpus/svcmain.bndb", session_id="1")
+    _register_views(bridge, bv)
+    manager = bridge.TargetManager()
+    assert manager.resolve(None) is bv
+    bridge._headless_views.clear()
+
+
 def _close_on_watchdog(instance, *, timeout: float = 5.0, **kwargs):
     """Run _close_binary on a watchdog thread so a deadlock regression (e.g. a
     _write_registry()/resolve() call re-acquiring the non-reentrant

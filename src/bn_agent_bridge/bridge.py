@@ -215,6 +215,27 @@ def _format_unknown_target_error(selector: Any, targets: list[dict[str, Any]]) -
     return "\n".join(lines)
 
 
+def _format_no_active_target_error(targets: list[dict[str, Any]]) -> str:
+    # #663: several targets open, none active (headless has no focused tab), and
+    # the request carried no selector. Entries render the `-t` form because for
+    # some commands (`bn save`) the positional is an output path, so echoing a
+    # bare selector invites `bn save <selector>` -- a silent wrong-file write.
+    lines = [
+        "No active BinaryView is selected and multiple targets are open.",
+        "Pass -t <selector> (--target) to choose one.",
+        "Open targets:",
+    ]
+    for target in targets:
+        lines.append(
+            f"  -t {target.get('selector', '')}"
+            f"  view_id={target.get('view_id', '')}"
+            f"  target_id={target.get('target_id', '')}"
+            f"  {target.get('filename', '')}"
+        )
+    lines.append("note: view_id / target_id are stable across `bn save`")
+    return "\n".join(lines)
+
+
 # REQUIRED_FIELDS / REQUIRED_ONE_OF moved to mutation_engine.py with the
 # mutation cluster they validate (issue #33 Stage 4).
 
@@ -607,7 +628,7 @@ class TargetManager:
         if selector in (None, "", "active"):
             active = self._default_view()
             if active is None:
-                raise RuntimeError("No active BinaryView is selected and multiple targets are open")
+                raise RuntimeError(_format_no_active_target_error(targets))
             return active
 
         with self._lock:

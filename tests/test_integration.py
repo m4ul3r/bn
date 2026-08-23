@@ -172,6 +172,43 @@ class TestSavePathIdentity:
         finally:
             _session_stop(inst)
 
+    def test_bare_save_multi_target_gets_target_hint(self, tmp_path):
+        # #663 end-to-end: bare `bn save` with two targets open in one headless
+        # instance (no active view) must exit 2 with the bridge's -t hint +
+        # open-target list -- the live behavior the mocked lanes structurally
+        # cannot see (their fakes hard-code the very message under test).
+        info = _session_start(str(HELLO_BINARY), str(ADD_BINARY))
+        inst = info["instance_id"]
+        try:
+            result = _bn("--instance", inst, "save")
+            assert result.returncode == 2, (result.stdout, result.stderr)
+            err = result.stderr
+            assert "No active BinaryView is selected and multiple targets are open" in err
+            assert "Pass -t <selector> (--target) to choose one." in err
+            assert "Open targets:" in err
+            # Prefix-matches both the raw and the .bndb-restored selector spelling.
+            assert "-t hello_x86_64" in err
+            assert "-t add_x86_64" in err
+
+            # The equivalent no-selector spellings the bridge collapses get the
+            # same hint -- `-t active` is a documented copy-paste footgun (#366).
+            for spelling in ("active", ""):
+                result = _bn("--instance", inst, "save", "--target", spelling)
+                assert result.returncode == 2, (spelling, result.stdout, result.stderr)
+                assert "Open targets:" in result.stderr, spelling
+
+            # An explicit selector still saves.
+            listing = json.loads(
+                _bn("--instance", inst, "target", "list", "--format", "json").stdout)["items"]
+            sel = listing[0].get("selector") or listing[0].get("basename")
+            out = str(tmp_path / "explicit.bndb")
+            saved = _bn("--instance", inst, "save", "--target", sel, "--path", out,
+                        "--format", "json")
+            assert saved.returncode == 0, saved.stderr
+            assert json.loads(saved.stdout).get("saved") is True
+        finally:
+            _session_stop(inst)
+
 
 class TestProtoSetUnnamedParams:
     """Regression for #254: a `proto set` whose prototype omits parameter names

@@ -291,56 +291,53 @@ def test_save_accepts_path_flag(monkeypatch, tmp_path):
     assert captured_params["path"] == str(out.expanduser().resolve())
 
 
-def test_save_multi_target_gets_requires_target_hint(monkeypatch, capsys):
-    # #663: bare `bn save` under multiple open targets (headless: no active
-    # view) must raise the same actionable hint + open-target list that
-    # target-required commands produce, not the bridge's bare "No active
-    # BinaryView" error.
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False, **kwargs):
-        if op == "save_database":
-            assert target is None
-            raise bn.cli.BridgeError(
-                "No active BinaryView is selected and multiple targets are open"
-            )
-        assert op == "list_targets"
-        return {
-            "ok": True,
-            "result": [
-                {"selector": "libparse.so", "target_id": "42:1:1", "view_id": "1"},
-                {"selector": "svcmain", "target_id": "42:1:2", "view_id": "2"},
-            ],
-        }
+def test_save_multi_target_surfaces_bridge_hint_without_recovery(monkeypatch, capsys):
+    # #663: the bridge itself raises the actionable -t hint + open-target list
+    # (see test_bridge_dispatch's resolve tests, which pin the message). The
+    # CLI must surface it verbatim with exit 2 and make NO recovery round-trip
+    # -- a second list_targets could stall behind the writer-priority lock,
+    # race the target set, or auto-spawn a fresh bridge from an error path.
+    calls = []
+    bridge_hint = (
+        "No active BinaryView is selected and multiple targets are open.\n"
+        "Pass -t <selector> (--target) to choose one.\n"
+        "Open targets:\n"
+        "  -t libparse.so  view_id=1  target_id=42:1:1  /corpus/libparse.so\n"
+        "  -t svcmain  view_id=2  target_id=42:1:2  /corpus/svcmain\n"
+        "note: view_id / target_id are stable across `bn save`"
+    )
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, spawn_missing_named=False, **kwargs):
+        calls.append(op)
+        assert target is None
+        raise bn.cli.BridgeError(bridge_hint)
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
     rc = bn.cli.main(["save"])
 
     assert rc == 2
+    assert calls == ["save_database"]
     err = capsys.readouterr().err
-    assert "This command requires --target when multiple targets are open." in err
+    assert "Pass -t <selector> (--target) to choose one." in err
     assert "Open targets:" in err
-    assert "libparse.so" in err
-    assert "svcmain" in err
-    assert "No active BinaryView is selected" not in err
+    assert "-t libparse.so" in err
+    assert "-t svcmain" in err
 
 
-def test_save_with_explicit_target_unaffected_by_multi_target_hint(monkeypatch):
-    # `bn save -t <target>` must keep passing the selector straight through
-    # without ever consulting list_targets (#663).
-    calls = []
-
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False, **kwargs):
-        calls.append(op)
-        assert op == "save_database"
-        assert target == "svcmain"
-        return {"ok": True, "result": {"path": "/tmp/svcmain.bndb", "saved": True}}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+def test_save_with_explicit_target_passes_selector_through(fake_transport):
+    # `bn save -t <target>` sends exactly one op with the selector intact;
+    # the fixture's unmapped-op AssertionError proves nothing else is consulted.
+    calls = fake_transport({
+        "save_database": {"ok": True, "result": {"path": "/tmp/svcmain.bndb", "saved": True}},
+    })
 
     rc = bn.cli.main(["save", "-t", "svcmain"])
 
     assert rc == 0
-    assert calls == ["save_database"]
+    assert [c["op"] for c in calls] == ["save_database"]
+    assert calls[0]["target"] == "svcmain"
 
 
 def test_close_warns_on_unsaved_changes(fake_transport, capsys):
