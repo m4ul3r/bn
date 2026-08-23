@@ -3244,10 +3244,14 @@ def _go_rename_summary(value: Any) -> Any:
         "success": success,
         "committed": committed,
         "preview": preview,
-        # Candidates and skipped-because-user-named are disjoint sets, so the
-        # total considered is their sum -- keeping verified+noop+failed <=
+        # NOT disjoint sets: the wire `skipped_user_named` FOLDS apply-time
+        # "changed underneath us" skips in (bridge: skipped_total =
+        # skipped_user_named + skipped_during_apply) while those same rows stay
+        # inside go_renamed_candidates. Distinct functions considered =
+        # candidates + scan-time-only skips -- keeping verified+noop+failed <=
         # op_count, the invariant every other mutation summary holds.
-        "op_count": candidates + skipped,
+        "op_count": candidates + skipped
+                    - int(value.get("skipped_changed_during_apply") or 0),
         "changed_count": changed,
         "verified_count": verified,
         # Already-user-named functions are deliberately left alone: no change,

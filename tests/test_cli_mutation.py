@@ -148,15 +148,21 @@ def test_go_rename_summary_reads_its_own_counters():
     })
     assert prev["changed_count"] == 1783 and prev["dirty_after"] is False
 
-    # A preview whose revert FAILED leaves state behind.
+    # A preview whose revert FAILED leaves state behind. Real bridge shape:
+    # every rename verified (zero failure rows -- the bridge's results[] always
+    # equals the failure rows), the revert then failed, and the ONLY
+    # explanation is the top-level message (the exact fallback the gate-on-
+    # not-success comment in _go_rename_summary defends).
     stuck = _go_rename_summary({
         "kind": "go_rename", "success": False, "committed": False, "preview": True,
-        "results": [], "rolled_back": False, "message": "revert failed",
+        "results": [], "rolled_back": False,
+        "message": "Preview rollback failed; the view may be partially renamed",
         "go_renamed_candidates": 5, "go_committed_count": 0,
-        "go_verified_count": 5, "go_failed_count": 2, "skipped_user_named": 0,
+        "go_verified_count": 5, "go_failed_count": 0, "skipped_user_named": 0,
     })
-    assert stuck["dirty_after"] is True and stuck["failed_count"] == 2
-    assert stuck["first_error"] == "revert failed"
+    assert stuck["dirty_after"] is True and stuck["failed_count"] == 0
+    assert stuck["first_error"] == (
+        "Preview rollback failed; the view may be partially renamed")
 
     # `results` is NOT always empty here -- it carries the failure rows -- and the
     # `unsupported` early return puts its ONLY explanation in results[0].message
@@ -250,7 +256,7 @@ def test_go_rename_preview_counts_match_the_detail_renderer():
         "kind": "go_rename", "success": True, "committed": False, "preview": True,
         "rolled_back": True, "results": [], "go_renamed_candidates": 10,
         "go_verified_count": 7, "go_failed_count": 0, "go_committed_count": 0,
-        "skipped_user_named": 0, "skipped_changed_during_apply": 3,
+        "skipped_user_named": 3, "skipped_changed_during_apply": 3,
     }
     assert _go_rename_summary(envelope)["changed_count"] == 7
     assert "7 would rename" in _render_go_rename_text(envelope)
@@ -1384,3 +1390,21 @@ def test_data_retype_verification_failure_exits_3_649(fake_transport):
                      "message": "type did not land"}]}}})
     rc = bn.cli.main(["data", "retype", "--target", "active", "0x460000", "uint32_t"])
     assert rc == 3
+
+
+def test_go_rename_op_count_does_not_double_count_apply_time_skips():
+    # The wire `skipped_user_named` FOLDS apply-time "changed underneath us"
+    # skips in (bridge: skipped_total = skipped_user_named + skipped_during_apply)
+    # while those same rows stay inside go_renamed_candidates -- summing the two
+    # wire counters therefore counted every apply-time skip twice: 10 candidates
+    # + 2 scan-time user-named functions is 12 distinct functions, not 15.
+    from bn.formatters import _go_rename_summary
+    summary = _go_rename_summary({
+        "kind": "go_rename", "success": True, "committed": True, "preview": False,
+        "results": [], "go_renamed_candidates": 10, "go_committed_count": 7,
+        "go_verified_count": 7, "go_failed_count": 0,
+        "skipped_user_named": 5, "skipped_changed_during_apply": 3,
+    })
+    assert summary["op_count"] == 12
+    assert summary["noop_count"] == 5
+    assert summary["changed_count"] == 7
