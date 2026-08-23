@@ -1454,3 +1454,31 @@ def test_explicit_empty_instance_is_rejected_not_pin_filled(fake_transport, monk
     assert rc == 2
     assert calls == []
     assert "--instance is empty" in capsys.readouterr().err
+
+
+def test_session_stop_rejects_explicit_empty_positional(fake_transport, monkeypatch, capsys):
+    # #690 r4: `bn session stop "$ID"` with $ID unset must NOT fall through to
+    # the sticky-pin-filled -i and shut down the PINNED bridge.
+    calls = fake_transport({})
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {"instance_id": "pinned-inst"})
+
+    rc = bn.cli.main(["session", "stop", ""])
+
+    assert rc == 2
+    assert calls == []
+    err = capsys.readouterr().err
+    assert "instance id is empty" in err
+
+
+def test_close_empty_instance_gets_the_actionable_message(fake_transport, monkeypatch, capsys):
+    # #690 r4: close peeks list_targets BEFORE _call, so the empty-instance
+    # rejection must fire on the peek path too -- with the same actionable
+    # message every other command gets, not transport's generic one.
+    calls = fake_transport({})
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    rc = bn.cli.main(["close", "-i", ""])
+
+    assert rc == 2
+    assert calls == []
+    assert "--instance is empty" in capsys.readouterr().err

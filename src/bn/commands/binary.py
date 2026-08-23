@@ -37,6 +37,11 @@ from ..formatters import (
          ])
 def _load(args: argparse.Namespace) -> int:
     import os
+    # `bn load "$BIN"` with $BIN unset resolves "" to the cwd DIRECTORY, which
+    # passes the bridge's exists() check and fails confusingly bridge-side --
+    # same unset-shell-var doctrine as close/save (#690 r4).
+    if not str(args.path).strip():
+        raise BridgeError("path is empty: pass the binary or .bndb file to load")
     _env = (os.environ.get("BN_NO_MARKERS") or "").strip().lower()
     no_marker = bool(args.no_marker) or (_env not in ("", "0", "false", "no", "off"))
     return _call(
@@ -149,12 +154,13 @@ def _close(args: argparse.Namespace) -> int:
         try:
             # Looked up on ``bn.cli`` at call time so tests patch one seam.
             args.target = cli._implicit_target(args)
-        except BridgeError as exc:
-            if explicit_target == "active" and "requires --target" in str(exc):
+        except cli.MultiTargetError as exc:
+            if explicit_target == "active":
                 raise BridgeError(
                     f"{exc}\nnote: `-t active` follows the GUI selection, "
                     "which is not honored for close: pass a concrete "
-                    "selector, a path, or --all."
+                    "selector, a path, or --all (closes every bn-loaded "
+                    "target)."
                 ) from None
             raise
     return _call(

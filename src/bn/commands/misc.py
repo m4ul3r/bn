@@ -538,6 +538,16 @@ def _batch_apply(args: argparse.Namespace) -> int:
     inst = getattr(args, "instance", None)
     if inst and manifest.get("target") == inst:
         manifest.pop("target", None)
+    # #690 r4: an explicit-but-empty manifest target (an unset shell variable
+    # templated into the file) is an error -- it must not ride the focused-tab
+    # convenience bridge-side, and a sticky pin must not silently paper over it.
+    manifest_target = manifest.get("target")
+    if manifest_target is not None and not str(manifest_target).strip():
+        raise BridgeError(
+            f'Manifest ({source}) target is empty: set a selector from '
+            '`bn target list`, or drop the "target" key to use the single '
+            "open target"
+        )
     # Accept -t/--target like every other target-required mutate command (#308).
     # CLI -t WINS over a manifest "target" (#366): it is the explicit per-invocation
     # selector, so a fan-out agent that copies the documented {"target":"active"}

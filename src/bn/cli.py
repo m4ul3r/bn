@@ -807,6 +807,28 @@ def _spill_next_step_hint(
     return "rerun with --out <path> to write it to a file, or read that artifact to inspect the full output"
 
 
+class MultiTargetError(BridgeError):
+    """Refusal because several targets are open and no selector was given.
+
+    A distinct type so callers (close's `-t active` note) can match the
+    condition without sniffing message prose."""
+
+
+def _require_nonempty_instance(args: argparse.Namespace) -> None:
+    """Reject an explicit-but-empty --instance before anything is sent.
+
+    Fires for `-i ""` and for an empty exported BN_INSTANCE (the root flag
+    defaults from the environment); the pin never substitutes for either
+    (see _apply_sticky_defaults)."""
+    instance = getattr(args, "instance", None)
+    if instance is not None and not str(instance).strip():
+        raise BridgeError(
+            "--instance is empty: pass an instance id from `bn session list`, "
+            "or omit -i (and unset an empty BN_INSTANCE) to use the default "
+            "instance"
+        )
+
+
 def _implicit_target(args: argparse.Namespace) -> str:
     """Resolve the single open target to its pinned ``target_id``, else refuse.
 
@@ -816,6 +838,7 @@ def _implicit_target(args: argparse.Namespace) -> str:
     on a DIFFERENT binary (#690 R3). View ids are never reused, so a stale
     pinned id fails as a safe unknown-selector error instead.
     """
+    _require_nonempty_instance(args)
     response = send_request(
         "list_targets",
         params={},
@@ -823,8 +846,6 @@ def _implicit_target(args: argparse.Namespace) -> str:
         instance_id=getattr(args, "instance", None),
     )
     result = response.get("result") if isinstance(response, dict) else None
-    if isinstance(result, dict):
-        result = result.get("items")  # tolerate a {kind, items} envelope
     if not isinstance(result, list):
         raise BridgeError(
             "malformed bridge reply to list_targets (no target list); the "
@@ -834,7 +855,7 @@ def _implicit_target(args: argparse.Namespace) -> str:
     if not targets:
         raise BridgeError("No BinaryView targets are open")
     if len(targets) > 1:
-        raise BridgeError(
+        raise MultiTargetError(
             "This command requires --target when multiple targets are open.\n"
             f"Open targets:\n{_render_target_choices(targets)}"
         )
@@ -982,14 +1003,7 @@ def _call(
     spill_status: Callable[[Any], Any] | None = None,
     spill_status_renderer: Callable[[Any], str] | None = None,
 ) -> int:
-    # An explicit-but-empty instance (an unset shell variable, `-i ""`) is
-    # never pin-filled (see _apply_sticky_defaults) and never forwarded.
-    instance = getattr(args, "instance", None)
-    if instance is not None and not str(instance).strip():
-        raise BridgeError(
-            "--instance is empty: pass an instance id from `bn session list`, "
-            "or omit -i to use the default instance"
-        )
+    _require_nonempty_instance(args)
     request_params = dict(params or {})
     # A long one-time op (load/refresh full analysis) raises its no-env default
     # client timeout so it isn't abandoned at the 600s read-op default on a very
@@ -1029,6 +1043,11 @@ def _call(
         spawn_missing_named=spawn_missing_named,
         **timeout_kwargs,
     )
+    if not isinstance(response, dict) or "result" not in response:
+        raise BridgeError(
+            "malformed bridge reply (no result); the bridge may be stale -- "
+            "restart it and retry"
+        )
     result = response["result"]
     # Auto-regex fallback (#291.3): a metacharacter query that matched nothing
     # literally is almost always meant as a pattern. Retry it once as a regex and
@@ -1143,7 +1162,13 @@ def _fanout_call(
     # Only a -t passed on the CLI counts as explicit (applies to every instance). A
     # STICKY target pin (filled by _apply_sticky_defaults, which sets _sticky_target)
     # is NOT explicit -- it must not suppress the multi-target auto-survey (#368).
-    explicit_target = bool(getattr(args, "target", None)) and not getattr(
+    fan_target = getattr(args, "target", None)
+    if fan_target is not None and not str(fan_target).strip():
+        raise BridgeError(
+            "--target is empty: pass a selector from `bn target list`, or "
+            "omit --target to survey every target"
+        )
+    explicit_target = bool(fan_target) and not getattr(
         args, "_sticky_target", False
     )
     if fan_instances:

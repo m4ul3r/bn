@@ -3322,7 +3322,7 @@ def test_close_binary_padded_active_is_unknown_selector(monkeypatch, tmp_path):
     _register_views(bridge, bv)
 
     with pytest.raises(RuntimeError) as exc:
-        instance._close_binary(target=" active ")
+        _close_on_watchdog(instance, target=" active ")
     assert "nknown target selector" in str(exc.value)
     assert not bv.closed
     assert bridge._headless_views == [bv]
@@ -3349,4 +3349,60 @@ def test_close_binary_rejects_non_string_target_and_path(monkeypatch, tmp_path):
         instance._close_binary(path=123)
     assert "must be a string" in str(exc.value)
     assert not bv.closed
+    bridge._headless_views.clear()
+
+
+def test_close_binary_binder_rejects_params_nested_target(monkeypatch, tmp_path):
+    # #690 r4: path and all DO live in params, so a raw client plausibly nests
+    # target there too. Silently dropping it turned a close-by-selector into a
+    # BARE close (sole-target gate) -- a wrong-target close. Reject the
+    # misplaced key instead.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    bv = _ClosableBV("/proj/alpha.so", session_id="11")
+    _register_views(bridge, bv)
+
+    response = instance.dispatch(
+        {"op": "close_binary", "params": {"target": "beta.so"}, "id": "r1"})
+
+    assert response["ok"] is False
+    assert "top level" in response["error"]
+    assert not bv.closed
+    bridge._headless_views.clear()
+
+
+def test_batch_apply_binder_rejects_empty_manifest_target(monkeypatch, tmp_path):
+    # #690 r4: {"target": ""} in a raw batch_apply manifest must error, not
+    # collapse by truthiness into the focused-tab convenience.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    bv = _FakeFileBV("/proj/alpha.so", session_id="11")
+    _register_views(bridge, bv)
+
+    for bad in ("", "   ", 7):
+        response = instance.dispatch(
+            {"op": "batch_apply", "params": {"target": bad, "ops": []}, "id": "r1"})
+        assert response["ok"] is False, bad
+        assert "target" in response["error"], bad
+    bridge._headless_views.clear()
+
+
+def test_save_database_rejects_non_string_and_empty_operands(monkeypatch, tmp_path):
+    # #690 r4: the sibling WRITE op gets the same raw-client guards as close --
+    # resolve(1) would str-coerce onto view_id "1" (wrong-target .bndb write),
+    # and an empty path mixed presence/truthiness (suppressing the #214 cache
+    # fallback while saving to the default path).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    bv = _FakeFileBV("/proj/alpha.so", session_id="1")
+    _register_views(bridge, bv)
+
+    for kwargs in ({"target": 1}, {"target": ""}, {"target": "  "},
+                   {"target": None, "path": 123}, {"target": None, "path": ""}):
+        with pytest.raises(RuntimeError) as exc:
+            instance._save_database(**kwargs)
+        assert "save_database" in str(exc.value), kwargs
     bridge._headless_views.clear()

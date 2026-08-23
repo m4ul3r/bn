@@ -1621,14 +1621,15 @@ class BinaryNinjaBridge:
         self._write_registry()
         return {"closed": closed}
 
-    def _resolve_sole_target_for_close(self):
+    def _resolve_sole_target_for_close(self) -> Any:
         """Resolve a bare close to the single open target, else refuse.
 
         Serves both an absent target and the volatile ``active`` literal. Unlike
         ``targets.resolve(None)`` this never consults the focused GUI tab: with
         more than one target open the request is ambiguous and a destructive
-        close must not pick one. With exactly one open it resolves that one by
-        its ``target_id`` (never the ``active`` literal)."""
+        close must not pick one. With exactly one open, the view is taken
+        straight from the same ``refresh()`` snapshot the ==1 decision used
+        (a record lookup by ``view_id``, not a second resolver pass)."""
         targets = self.targets.refresh()
         if not targets:
             raise RuntimeError("No BinaryView targets are open")
@@ -1636,8 +1637,8 @@ class BinaryNinjaBridge:
             lines = [
                 "close_binary needs a concrete target when multiple targets "
                 f"are open ({len(targets)}): pass a target selector, a path, "
-                'or all=true to close every target. The volatile "active" '
-                "selector is not honored for close.",
+                "or all=true to close every bn-loaded target. The volatile "
+                '"active" selector is not honored for close.',
             ]
             lines.extend(_open_target_lines(targets))
             raise RuntimeError("\n".join(lines))
@@ -1650,12 +1651,39 @@ class BinaryNinjaBridge:
             record = manager._records.get(row["view_id"])
             view = record.ref() if record is not None else None
         if view is None:
+            # The sole view died between the snapshot and the lookup (GUI tab
+            # closed / GC). Say so -- an unknown-selector error listing that
+            # same target as open would contradict itself.
             raise RuntimeError(
-                _format_unknown_target_error(row.get("target_id"), targets)
+                "close_binary: the open target closed while resolving; "
+                "nothing was closed -- rerun to see the current state"
             )
         return view
 
     def _save_database(self, target: str | None, path: str | None = None):
+        # Same raw-client guards as close (#690 r4): save is the sibling WRITE
+        # op, so a coerced non-string target (resolve(1) matches view_id "1")
+        # or an explicit-but-empty operand must error, not write the wrong (or
+        # a whitespace-named) .bndb to disk.
+        if target is not None:
+            if not isinstance(target, str):
+                raise RuntimeError(
+                    "save_database: target must be a string selector from "
+                    "list_targets"
+                )
+            if not target.strip():
+                raise RuntimeError(
+                    "save_database: empty target selector; pass a selector "
+                    "from list_targets or omit the target entirely"
+                )
+        if path is not None:
+            if not isinstance(path, str):
+                raise RuntimeError("save_database: path must be a string")
+            if not path.strip():
+                raise RuntimeError(
+                    "save_database: empty path; pass a real output path or "
+                    "omit it to save to the default <filename>.bndb"
+                )
         bv = self.targets.resolve(target)
         filename = getattr(bv.file, "filename", "")
         explicit = path is not None
@@ -3016,6 +3044,14 @@ def _bind_load_binary(bridge, params, target):
 
 @op("close_binary", lock="write")
 def _bind_close_binary(bridge, params, target):
+    # The selector rides the TOP-LEVEL request key. path/all DO live in
+    # params, so a params-nested "target" is a plausible client mistake --
+    # silently dropping it would execute a BARE close (#690 r4).
+    if "target" in params:
+        raise ValueError(
+            "close_binary: pass \"target\" at the top level of the request, "
+            "not inside params"
+        )
     return bridge._close_binary(
         params.get("path"),
         target,
@@ -3587,9 +3623,20 @@ def _bind_batch_apply(bridge, params, target):
     manifest = dict(params)
     preview = _validate_bool(manifest.get("preview"), label="preview", default=False)
     # Keep None as None so the single-open-target default still applies;
-    # str(None) would become the bogus selector "None".
-    chosen = manifest.get("target") or target
-    target = str(chosen) if chosen is not None else None
+    # str(None) would become the bogus selector "None". Presence, not
+    # truthiness (#690 r4): an explicit-but-empty manifest target must error,
+    # never collapse into the focused-tab convenience.
+    manifest_target = manifest.get("target")
+    chosen = manifest_target if manifest_target is not None else target
+    if chosen is not None:
+        if not isinstance(chosen, str):
+            raise ValueError("batch_apply: target must be a string selector")
+        if not chosen.strip():
+            raise ValueError(
+                "batch_apply: target is empty; set a selector from "
+                "list_targets or drop the key to use the single open target"
+            )
+    target = chosen
     operations = list(manifest.get("ops") or [])
     return bridge._mutation(target, preview, operations)
 

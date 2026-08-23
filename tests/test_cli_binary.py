@@ -1015,10 +1015,11 @@ def test_close_explicit_active_refusal_explains_active(fake_transport, monkeypat
 
 
 def test_bare_close_survives_malformed_list_targets_reply(monkeypatch, capsys):
-    # #690 r3: the target_id peek must fail as a clean BridgeError (exit 2) on
-    # a stale bridge's odd list_targets shapes -- never a raw traceback on the
-    # cleanup path. Covered shapes: missing result, {kind, items} envelope
-    # (must WORK), and a row without target_id.
+    # #690 r3/r4: the target_id peek must fail as a clean BridgeError (exit
+    # 2) on a stale bridge's odd list_targets shapes -- never a raw traceback
+    # on the cleanup path. The list_targets OP has always returned a bare
+    # array (the {kind, items} envelope exists only in CLI output), so a dict
+    # result is malformed like any other non-list.
     monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
 
     shapes = [
@@ -1026,7 +1027,7 @@ def test_bare_close_survives_malformed_list_targets_reply(monkeypatch, capsys):
         ({"ok": True, "result": None}, 2, None),                   # null result
         ({"ok": True, "result": {"kind": "targets", "items": [
             {"target_id": "123:1:7", "selector": "foo.bndb"}]}},
-         0, "123:1:7"),                                            # envelope tolerated
+         2, None),                                    # dict result = malformed
         ({"ok": True, "result": [{"selector": "foo.bndb"}]}, 2, None),  # no target_id
     ]
     for reply, want_rc, want_target in shapes:

@@ -997,3 +997,36 @@ def test_data_symbols_pages_and_prints_a_resume_footer(fake_transport, capsys):
     out = capsys.readouterr().out
     assert "showing 2 of 900" in out
     assert "--offset 2" in out
+
+
+def test_batch_rejects_explicit_empty_manifest_target(fake_transport, monkeypatch, capsys, tmp_path):
+    # #690 r4: a manifest {"target": ""} (an unset shell variable templated
+    # into the file) must error like `-t ""` does -- not ride the focused-tab
+    # convenience, and not be silently overwritten by a sticky pin.
+    import json as _json
+    manifest = tmp_path / "batch.json"
+    manifest.write_text(_json.dumps({"target": "", "ops": [{"op": "rename_symbol"}]}))
+    for sticky in ({}, {"target": "beta.so"}):
+        calls = fake_transport({})
+        monkeypatch.setattr(bn.cli.session_state, "read", lambda s=sticky: s)
+
+        rc = bn.cli.main(["batch", "apply", str(manifest)])
+
+        assert rc == 2, sticky
+        assert calls == [], sticky
+        err = capsys.readouterr().err
+        assert "Manifest" in err and "target is empty" in err, sticky
+
+
+def test_fanout_all_instances_rejects_explicit_empty_target(fake_transport, monkeypatch, capsys):
+    # #690 r4: the --all-instances fan-out branch returns before
+    # _resolve_target, so it needs the same explicit-empty rejection -- the
+    # empty selector must not be silently discarded into an auto-survey.
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    calls = fake_transport({})
+
+    rc = bn.cli.main(["function", "list", "--all-instances", "-t", ""])
+
+    assert rc == 2
+    assert calls == []
+    assert "--target is empty" in capsys.readouterr().err
