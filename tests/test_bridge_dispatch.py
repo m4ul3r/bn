@@ -3040,7 +3040,7 @@ def test_close_binary_bare_request_refuses_under_multiple_gui_tabs_despite_focus
     assert len(bridge._collect_open_views()) == 2
     assert bridge.TargetManager()._default_view() is focused
 
-    with pytest.raises(Exception) as exc:
+    with pytest.raises(RuntimeError) as exc:
         _close_on_watchdog(instance, target=target)
 
     if target is None or target.strip():
@@ -3136,7 +3136,7 @@ def test_close_binary_pinned_target_id_errors_when_view_was_replaced(monkeypatch
     newcomer = _ClosableBV("/proj/newcomer.so", session_id="33")
     _register_views(bridge, newcomer)
 
-    with pytest.raises(Exception) as exc:
+    with pytest.raises(RuntimeError) as exc:
         _close_on_watchdog(instance, target=pinned)
     assert "Unknown target selector" in str(exc.value)
     assert not newcomer.closed
@@ -3155,7 +3155,7 @@ def test_close_binary_rejects_empty_path(monkeypatch, tmp_path):
     _register_views(bridge, bv_a, bv_b)
 
     for empty in ("", "   "):
-        with pytest.raises(Exception) as exc:
+        with pytest.raises(RuntimeError) as exc:
             _close_on_watchdog(instance, path=empty)
         assert "empty path" in str(exc.value).lower()
         assert not bv_a.closed and not bv_b.closed
@@ -3177,7 +3177,7 @@ def test_close_binary_rejects_target_with_path(monkeypatch, tmp_path):
     bv_b = _ClosableBV("/proj/beta.so", session_id="22")
     _register_views(bridge, bv_a, bv_b)
 
-    with pytest.raises(Exception) as exc:
+    with pytest.raises(RuntimeError) as exc:
         _close_on_watchdog(instance, path="/proj/beta.so", target="alpha.so")
     assert "not both" in str(exc.value)
     assert not bv_a.closed and not bv_b.closed
@@ -3194,7 +3194,7 @@ def test_close_binary_rejects_target_with_all(monkeypatch, tmp_path):
     bv_b = _ClosableBV("/proj/beta.so", session_id="22")
     _register_views(bridge, bv_a, bv_b)
 
-    with pytest.raises(Exception) as exc:
+    with pytest.raises(RuntimeError) as exc:
         _close_on_watchdog(instance, target="alpha.so", all_=True)
     assert "not both" in str(exc.value)
     assert not bv_a.closed and not bv_b.closed
@@ -3223,7 +3223,7 @@ def test_close_binary_rejects_empty_target_with_single_target(monkeypatch, tmp_p
     _register_views(bridge, only)
     assert len(instance.targets.refresh()) == 1
 
-    with pytest.raises(Exception) as exc:
+    with pytest.raises(RuntimeError) as exc:
         _close_on_watchdog(instance, target=empty)
     assert "empty target" in str(exc.value).lower()
     assert not only.closed
@@ -3255,7 +3255,7 @@ def test_close_binary_rejects_empty_target_on_single_gui_tab(monkeypatch, tmp_pa
     _gui_with_focused_tab(monkeypatch, bridge, only)
     assert bridge.TargetManager()._default_view() is only
 
-    with pytest.raises(Exception) as exc:
+    with pytest.raises(RuntimeError) as exc:
         _close_on_watchdog(instance, target="")
     assert "empty target" in str(exc.value).lower()
     assert not only.closed
@@ -3275,10 +3275,10 @@ def test_close_binary_given_selector_conflicts_with_path_and_all(monkeypatch, tm
     bv_b = _ClosableBV("/proj/beta.so", session_id="22")
     _register_views(bridge, bv_a, bv_b)
 
-    with pytest.raises(Exception) as exc:
+    with pytest.raises(RuntimeError) as exc:
         _close_on_watchdog(instance, target=selector, path="/proj/beta.so")
     assert "not both" in str(exc.value)
-    with pytest.raises(Exception) as exc:
+    with pytest.raises(RuntimeError) as exc:
         _close_on_watchdog(instance, target=selector, all_=True)
     assert "not both" in str(exc.value)
     assert not bv_a.closed and not bv_b.closed
@@ -3307,4 +3307,46 @@ def test_close_binary_active_literal_single_target_closes_by_target_id(monkeypat
 
     assert [c["path"] for c in result["closed"]] == ["/proj/only.so"]
     assert only.closed
+    bridge._headless_views.clear()
+
+
+def test_close_binary_padded_active_is_unknown_selector(monkeypatch, tmp_path):
+    # #690 r3 (R2): only the EXACT "active" literal enters the sole-target
+    # gate. Padded spellings were a safe unknown-selector error pre-round-2;
+    # the strip() collapse made them destructive. They must refuse and close
+    # nothing -- at any target count.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    bv = _ClosableBV("/proj/alpha.so", session_id="11")
+    _register_views(bridge, bv)
+
+    with pytest.raises(RuntimeError) as exc:
+        instance._close_binary(target=" active ")
+    assert "nknown target selector" in str(exc.value)
+    assert not bv.closed
+    assert bridge._headless_views == [bv]
+    bridge._headless_views.clear()
+
+
+def test_close_binary_rejects_non_string_target_and_path(monkeypatch, tmp_path):
+    # #690 r3: raw clients can send any JSON type. A non-string target must be
+    # a clean refusal, not a destructive close via view_id coercion
+    # (resolve(1) matched view_id "1"); a non-string path must be a clean
+    # refusal, not a TypeError from Path().
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    bv = _ClosableBV("/proj/alpha.so", session_id="1")
+    _register_views(bridge, bv)
+
+    with pytest.raises(RuntimeError) as exc:
+        instance._close_binary(target=1)
+    assert "must be a string" in str(exc.value)
+    assert not bv.closed
+
+    with pytest.raises(RuntimeError) as exc:
+        instance._close_binary(path=123)
+    assert "must be a string" in str(exc.value)
+    assert not bv.closed
     bridge._headless_views.clear()

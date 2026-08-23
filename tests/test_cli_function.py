@@ -25,7 +25,7 @@ def test_function_list_uses_implicit_target_when_single_target_is_open(fake_tran
     assert rc == 0
     assert [call["op"] for call in calls] == ["list_targets", "list_functions"]
     assert calls[1]["params"] == {"limit": 100}
-    assert calls[1]["target"] == "active"
+    assert calls[1]["target"] == "123:1:7"  # implicit resolution pins the target_id (#690 R3)
     output = capsys.readouterr().out
     assert output == "0x401000  sub_401000\n"
     assert '"name"' not in output

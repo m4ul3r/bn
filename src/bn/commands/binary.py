@@ -9,7 +9,6 @@ from ..cli import _call, _pick, arg, command
 from ..transport import BridgeError, REFRESH_REQUEST_TIMEOUT
 from ..formatters import (
     _render_close_text,
-    _render_target_choices,
     _render_load_text,
     _render_refresh_text,
     _render_save_text,
@@ -69,7 +68,7 @@ def _load(args: argparse.Namespace) -> int:
 
 @command("close", help="Close a loaded binary", target=True,
          args=[
-             arg("path", nargs="?", help="Path to close (omit to close the selected target)"),
+             arg("path", nargs="?", help="Path to close (omit to close the single open target)"),
              arg("--all", action="store_true", help="Close all loaded binaries"),
          ])
 def _close(args: argparse.Namespace) -> int:
@@ -139,12 +138,25 @@ def _close(args: argparse.Namespace) -> int:
     # which the bridge would re-resolve at close time -- a concurrent close/load
     # between peek and close would land the destructive close on a DIFFERENT
     # binary. View ids are never reused, so any interleaving turns the pinned
-    # id into a safe unknown-selector error. `-t active` is the same volatile
-    # literal spelled explicitly and is pinned the same way.
+    # id into a safe unknown-selector error. Round 3: the pinning lives in the
+    # shared cli._implicit_target (every implicit resolution pins now, #690 R3)
+    # and only the EXACT "active" literal is intercepted -- a padded ' active '
+    # was a safe unknown-selector error before round 2 and must stay one, not
+    # become a destructive sole-target close.
     if not (args.all or explicit_path is not None) and (
-        explicit_target is None or str(explicit_target).strip() == "active"
+        explicit_target is None or explicit_target == "active"
     ):
-        args.target = _pinned_sole_target(args)
+        try:
+            # Looked up on ``bn.cli`` at call time so tests patch one seam.
+            args.target = cli._implicit_target(args)
+        except BridgeError as exc:
+            if explicit_target == "active" and "requires --target" in str(exc):
+                raise BridgeError(
+                    f"{exc}\nnote: `-t active` follows the GUI selection, "
+                    "which is not honored for close: pass a concrete "
+                    "selector, a path, or --all."
+                ) from None
+            raise
     return _call(
         args,
         "close_binary",
@@ -153,33 +165,6 @@ def _close(args: argparse.Namespace) -> int:
         text_renderer=_render_close_text,
         stem="close",
     )
-
-
-def _pinned_sole_target(args: argparse.Namespace) -> str:
-    """Return the ``target_id`` of the single open target, else refuse.
-
-    Same refusal/hint as the generic implicit resolution, but the selector sent
-    to the bridge is the stable ``target_id`` from the peek row, never the
-    re-resolved ``active`` literal (see :func:`_close`)."""
-    # Looked up on ``bn.cli`` at call time (not imported) so tests patch one seam.
-    response = cli.send_request(
-        "list_targets",
-        params={},
-        target=None,
-        instance_id=getattr(args, "instance", None),
-    )
-    targets = list(response["result"])
-    if not targets:
-        raise BridgeError("No BinaryView targets are open")
-    if len(targets) > 1:
-        raise BridgeError(
-            "This command requires --target when multiple targets are open.\n"
-            f"Open targets:\n{_render_target_choices(targets)}"
-        )
-    target_id = targets[0].get("target_id")
-    if not target_id:
-        raise BridgeError("Bridge listed the open target without a target_id; rerun with an explicit --target")
-    return str(target_id)
 
 
 @command("save", help="Save the current analysis database (.bndb)", target=True,
@@ -191,6 +176,13 @@ def _pinned_sole_target(args: argparse.Namespace) -> str:
 def _save(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
     out_path = _pick(args.path, getattr(args, "path_flag", None), "save path", required=False)
+    # Presence, not truthiness: `bn save "$OUT"` with $OUT unset must error,
+    # not silently save to the default path (#690 r3, same doctrine as close).
+    if out_path is not None and not str(out_path).strip():
+        raise BridgeError(
+            "path is empty: pass a real output path, or omit it to save to "
+            "the default <filename>.bndb"
+        )
     if out_path:
         params["path"] = str(Path(out_path).expanduser().resolve())
     return _call(

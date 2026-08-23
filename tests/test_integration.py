@@ -190,20 +190,24 @@ class TestSavePathIdentity:
             assert "-t hello_x86_64" in err
             assert "-t add_x86_64" in err
 
-            # The equivalent no-selector spellings the bridge collapses get the
-            # same hint -- `-t active` is a documented copy-paste footgun
-            # (#366). Assert the discriminating first line, not just "Open
-            # targets:", which the unknown-selector error also prints: if the
-            # bridge collapse regressed, `-t active` would fall through to
-            # "Unknown target selector" and a looser assert would stay green.
-            # (`-t ""` reaches the bridge only pin-free, as here: with a
-            # sticky `bn target use` pin the CLI substitutes the pin for an
-            # empty selector before the request is sent.)
-            for spelling in ("active", ""):
-                result = _bn("--instance", inst, "save", "--target", spelling)
-                assert result.returncode == 2, (spelling, result.stdout, result.stderr)
-                assert "No active BinaryView is selected and multiple targets are open" \
-                    in result.stderr, spelling
+            # `-t active` (the documented copy-paste footgun, #366) collapses
+            # bridge-side to the same hint. Assert the discriminating first
+            # line, not just "Open targets:", which the unknown-selector error
+            # also prints: if the bridge collapse regressed, `-t active` would
+            # fall through to "Unknown target selector" and a looser assert
+            # would stay green.
+            result = _bn("--instance", inst, "save", "--target", "active")
+            assert result.returncode == 2, (result.stdout, result.stderr)
+            assert "No active BinaryView is selected and multiple targets are open" \
+                in result.stderr
+
+            # `-t ""` is an explicit-but-empty selector (an unset shell
+            # variable): #690 r3 rejects it CLI-side for every command -- it is
+            # never pin-filled and never forwarded (the bridge would collapse
+            # it to the focused view with no count check).
+            result = _bn("--instance", inst, "save", "--target", "")
+            assert result.returncode == 2, (result.stdout, result.stderr)
+            assert "--target is empty" in result.stderr
 
             # Explicit-selector save on this same session shape is pinned by
             # test_save_path_keeps_original_selector above.

@@ -1440,3 +1440,17 @@ def test_instance_find_across_multiple_instances_and_old_bridge(monkeypatch, cap
     data = json.loads(capsys.readouterr().out)
     assert {i["instance_id"] for i in data["items"]} == {"inst_a", "inst_b"}
     assert data["count"] == 2
+
+
+def test_explicit_empty_instance_is_rejected_not_pin_filled(fake_transport, monkeypatch, capsys):
+    # #690 r3: `-i "$INST"` with $INST unset must not silently route the
+    # command to the pinned instance (the same unset-shell-var doctrine the
+    # r2 close guards follow for -t and the path).
+    calls = fake_transport({})
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {"instance_id": "pinned-inst"})
+
+    rc = bn.cli.main(["function", "list", "-i", ""])
+
+    assert rc == 2
+    assert calls == []
+    assert "--instance is empty" in capsys.readouterr().err

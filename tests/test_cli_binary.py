@@ -145,7 +145,7 @@ def test_refresh_uses_implicit_target_when_single_target_is_open(fake_transport,
 
     assert rc == 0
     assert [call["op"] for call in calls] == ["list_targets", "refresh"]
-    assert calls[1]["target"] == "active"
+    assert calls[1]["target"] == "123:1:7"  # implicit resolution pins the target_id (#690 R3)
     output = capsys.readouterr().out
     assert "refreshed: true" in output
     assert "SnailMail_unwrapped.exe.bndb" in output
@@ -926,3 +926,126 @@ def test_close_target_with_empty_path_is_rejected_as_conflict(fake_transport, mo
     assert calls == []
     err = capsys.readouterr().err
     assert "not both" in err and "--target" in err
+
+
+def test_save_rejects_explicit_empty_target(fake_transport, monkeypatch, capsys):
+    # #690 r3 (R1): the sticky is-None doctrine means an explicit-but-empty
+    # selector is never pin-filled -- so it must be REJECTED centrally, not
+    # forwarded. Pre-r3, `bn save -t ""` sent target="" and the bridge's
+    # resolve("") returned the focused GUI tab with no count check: a silent
+    # wrong-target disk write from an unset shell variable.
+    for sticky in ({}, {"target": "beta.so"}):
+        calls = fake_transport({})
+        monkeypatch.setattr(bn.cli.session_state, "read", lambda s=sticky: s)
+
+        rc = bn.cli.main(["save", "-t", ""])
+
+        assert rc == 2, sticky
+        assert calls == [], sticky  # nothing reaches the bridge
+        err = capsys.readouterr().err
+        assert "--target is empty" in err, sticky
+
+
+def test_function_list_rejects_whitespace_target(fake_transport, monkeypatch, capsys):
+    # The central rejection covers every command and the whitespace spelling.
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    calls = fake_transport({})
+
+    rc = bn.cli.main(["function", "list", "-t", "   "])
+
+    assert rc == 2
+    assert calls == []
+    assert "--target is empty" in capsys.readouterr().err
+
+
+def test_save_rejects_explicit_empty_path(fake_transport, monkeypatch, capsys):
+    # Same unset-shell-var doctrine for save's positional: `bn save "$OUT"`
+    # with $OUT unset must not silently save to the default path.
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    calls = fake_transport({})
+
+    rc = bn.cli.main(["save", ""])
+
+    assert rc == 2
+    assert calls == []
+    assert "path is empty" in capsys.readouterr().err
+
+
+def test_close_padded_active_is_forwarded_not_collapsed(fake_transport, monkeypatch, capsys):
+    # #690 r3 (R2): only the EXACT literal "active" is intercepted for close.
+    # A padded " active " was a safe unknown-selector error pre-round-2; the
+    # strip() collapse turned it into a destructive sole-target close. It must
+    # be forwarded verbatim so the bridge rejects it as unknown.
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    calls = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, spawn_missing_named=False, **kwargs):
+        calls.append({"op": op, "target": target})
+        raise bn.cli.BridgeError("Unknown target selector:  active ")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["close", "-t", " active ", "--format", "text"])
+
+    assert rc == 2
+    assert [c["op"] for c in calls] == ["close_binary"]
+    assert calls[0]["target"] == " active "
+    assert "Unknown target selector" in capsys.readouterr().err
+
+
+def test_close_explicit_active_refusal_explains_active(fake_transport, monkeypatch, capsys):
+    # #690 r3: when the user DID pass `-t active` and close refuses under
+    # multiple targets, the generic "requires --target" hint alone is
+    # misleading (they passed --target). The refusal must say the volatile
+    # `active` spelling is not honored for close.
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    calls = fake_transport({
+        "list_targets": _TWO_TARGETS,
+        "close_binary": {"ok": True, "result": {"closed": []}},
+    })
+
+    rc = bn.cli.main(["close", "-t", "active", "--format", "text"])
+
+    assert rc == 2
+    assert [c["op"] for c in calls] == ["list_targets"]
+    err = capsys.readouterr().err
+    assert "requires --target when multiple targets are open" in err
+    assert "active" in err and "not honored" in err
+
+
+def test_bare_close_survives_malformed_list_targets_reply(monkeypatch, capsys):
+    # #690 r3: the target_id peek must fail as a clean BridgeError (exit 2) on
+    # a stale bridge's odd list_targets shapes -- never a raw traceback on the
+    # cleanup path. Covered shapes: missing result, {kind, items} envelope
+    # (must WORK), and a row without target_id.
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    shapes = [
+        ({"ok": True}, 2, None),                                   # no result key
+        ({"ok": True, "result": None}, 2, None),                   # null result
+        ({"ok": True, "result": {"kind": "targets", "items": [
+            {"target_id": "123:1:7", "selector": "foo.bndb"}]}},
+         0, "123:1:7"),                                            # envelope tolerated
+        ({"ok": True, "result": [{"selector": "foo.bndb"}]}, 2, None),  # no target_id
+    ]
+    for reply, want_rc, want_target in shapes:
+        calls = []
+
+        def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                              instance_id=None, spawn_missing_named=False,
+                              _reply=reply, **kwargs):
+            calls.append({"op": op, "target": target})
+            if op == "list_targets":
+                return _reply
+            assert op == "close_binary"
+            return {"ok": True, "result": {"closed": [{"path": "/tmp/foo", "unsaved": False}]}}
+
+        monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+        rc = bn.cli.main(["close", "--format", "text"])
+        capsys.readouterr()
+
+        assert rc == want_rc, reply
+        if want_target is not None:
+            assert calls[-1]["target"] == want_target, reply

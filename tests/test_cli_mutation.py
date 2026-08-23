@@ -348,7 +348,7 @@ def test_symbol_rename_uses_implicit_target_when_single_target_is_open(fake_tran
 
     assert rc == 0
     assert [call["op"] for call in calls] == ["list_targets", "rename_symbol"]
-    assert calls[1]["target"] == "active"
+    assert calls[1]["target"] == "123:1:7"  # implicit resolution pins the target_id (#690 R3)
 
 
 def test_symbol_rename_requires_target_when_multiple_targets_are_open(fake_transport, capsys):
@@ -618,7 +618,7 @@ def test_comment_get_uses_implicit_target_when_single_target_is_open(fake_transp
 
     assert rc == 0
     assert [call["op"] for call in calls] == ["list_targets", "get_comment"]
-    assert calls[1]["target"] == "active"
+    assert calls[1]["target"] == "123:1:7"  # implicit resolution pins the target_id (#690 R3)
     assert capsys.readouterr().out == "interesting branch\n"
 
 

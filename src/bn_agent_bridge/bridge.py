@@ -1497,6 +1497,16 @@ class BinaryNinjaBridge:
         # selector too: it conflicts with path/all like any other, and on its
         # own it goes through the sole-target gate (never the focused tab).
         bare_target = target is None
+        # Raw clients can send any JSON type. A non-string target must not
+        # reach resolve() (resolve(1) matches view_id "1" -- a destructive
+        # close via coercion); a non-string path must not reach Path().
+        if target is not None and not isinstance(target, str):
+            raise RuntimeError(
+                "close_binary: target must be a string selector from "
+                "list_targets"
+            )
+        if path is not None and not isinstance(path, str):
+            raise RuntimeError("close_binary: path must be a string")
         if all_ and path is not None:
             raise RuntimeError(
                 "Pass either a path or all=true, not both: a named path closes "
@@ -1551,7 +1561,10 @@ class BinaryNinjaBridge:
         # clients.)
         if path is not None or all_:
             target_bv = None
-        elif bare_target or str(target).strip() == "active":
+        elif bare_target or target == "active":
+            # EXACT literal only (#690 r3): a padded " active " was a safe
+            # unknown-selector error before round 2 and must stay one -- the
+            # strip() collapse made a rejected spelling destructive.
             target_bv = self._resolve_sole_target_for_close()
         else:
             target_bv = self.targets.resolve(target)
@@ -1621,21 +1634,26 @@ class BinaryNinjaBridge:
             raise RuntimeError("No BinaryView targets are open")
         if len(targets) > 1:
             lines = [
-                "close_binary without an explicit target selector refuses when "
-                f"multiple targets are open ({len(targets)}): pass a target "
-                "selector, a path, or all=true to close every target.",
-                "Open targets:",
+                "close_binary needs a concrete target when multiple targets "
+                f"are open ({len(targets)}): pass a target selector, a path, "
+                'or all=true to close every target. The volatile "active" '
+                "selector is not honored for close.",
             ]
-            for item in targets:
-                marker = "*" if item.get("active") else " "
-                lines.append(
-                    f"  {marker} {item.get('selector', '')}"
-                    f"  view_id={item.get('view_id', '')}"
-                    f"  target_id={item.get('target_id', '')}"
-                    f"  {item.get('filename', '')}"
-                )
+            lines.extend(_open_target_lines(targets))
             raise RuntimeError("\n".join(lines))
-        return self.targets.resolve(targets[0]["target_id"])
+        # Look the view up from the snapshot the ==1 decision was made on --
+        # a second resolve() would re-refresh, so the count gate and the
+        # actual close could examine different target sets.
+        row = targets[0]
+        manager = self.targets
+        with manager._lock:
+            record = manager._records.get(row["view_id"])
+            view = record.ref() if record is not None else None
+        if view is None:
+            raise RuntimeError(
+                _format_unknown_target_error(row.get("target_id"), targets)
+            )
+        return view
 
     def _save_database(self, target: str | None, path: str | None = None):
         bv = self.targets.resolve(target)
