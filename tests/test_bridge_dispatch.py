@@ -1378,7 +1378,7 @@ def test_resolve_no_active_multi_target_raises_target_hint(monkeypatch, selector
     _register_views(bridge, bv1, bv2)
     manager = bridge.TargetManager()
 
-    with pytest.raises(Exception) as exc:
+    with pytest.raises(RuntimeError) as exc:
         manager.resolve(selector)
 
     message = str(exc.value)
@@ -1389,6 +1389,77 @@ def test_resolve_no_active_multi_target_raises_target_hint(monkeypatch, selector
     # save's positional is an OUTPUT PATH, so a bare selector is a footgun.
     assert "-t libparse.so.bndb" in message
     assert "-t svcmain.bndb" in message
+    assert "view_id=" in message
+    assert "target_id=" in message
+    assert "view_id / target_id are stable across `bn save`" in message
+    bridge._headless_views.clear()
+
+
+def test_resolve_no_active_hint_shell_quotes_awkward_selectors(monkeypatch):
+    # The -t entries are a copy-paste contract: a selector with a space must
+    # come out shell-quoted, or pasting the line splits it and the tail lands
+    # in save's positional OUTPUT PATH -- the very wrong-file write the -t
+    # form exists to prevent. Safe selectors stay unquoted.
+    bridge = _load_bridge(monkeypatch)
+    bv1 = _FakeFileBV("/corpus/app v2/svcmain.bndb", session_id="1")
+    bv2 = _FakeFileBV("/corpus/app v1/svcmain.bndb", session_id="2")
+    bv3 = _FakeFileBV("/corpus/libparse.so.bndb", session_id="3")
+    _register_views(bridge, bv1, bv2, bv3)
+    manager = bridge.TargetManager()
+
+    with pytest.raises(RuntimeError) as exc:
+        manager.resolve(None)
+
+    message = str(exc.value)
+    assert "-t 'app v2/svcmain.bndb'" in message
+    assert "-t 'app v1/svcmain.bndb'" in message
+    assert "-t libparse.so.bndb" in message
+    bridge._headless_views.clear()
+
+
+def test_unknown_selector_hint_renders_paste_safe_t_rows(monkeypatch):
+    # Same paste-safety contract on the sibling unknown-selector listing: a
+    # typoed `bn save -t <typo>` shows entries a user will copy, so they must
+    # carry the -t prefix (and quoting) too, not bare selectors.
+    bridge = _load_bridge(monkeypatch)
+    bv1 = _FakeFileBV("/corpus/libparse.so.bndb", session_id="1")
+    # Colliding basenames force the parent-dir path suffix -- with a space --
+    # as the selector, so the quoting contract is exercised here too.
+    bv2 = _FakeFileBV("/corpus/app v2/svcmain.bndb", session_id="2")
+    bv3 = _FakeFileBV("/corpus/app v1/svcmain.bndb", session_id="3")
+    _register_views(bridge, bv1, bv2, bv3)
+    manager = bridge.TargetManager()
+
+    with pytest.raises(RuntimeError) as exc:
+        manager.resolve("libprase")
+
+    message = str(exc.value)
+    assert message.startswith("Unknown target selector: libprase")
+    assert "-t libparse.so.bndb" in message
+    assert "-t 'app v2/svcmain.bndb'" in message
+    bridge._headless_views.clear()
+
+
+def test_dispatch_envelope_carries_multiline_target_hint(monkeypatch):
+    # #663: the hint is only useful if the full multi-line message survives
+    # dispatch()'s {ok:false, error} serialization. The real-BN lane pins this
+    # end-to-end but skips without a BN install (and there is no CI), so pin
+    # it in the mocked lane: a real op through dispatch(), no monkeypatched
+    # internals.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv1 = _FakeFileBV("/corpus/libparse.so.bndb", session_id="1")
+    bv2 = _FakeFileBV("/corpus/svcmain.bndb", session_id="2")
+    _register_views(bridge, bv1, bv2)
+
+    resp = instance.dispatch({"op": "save_database", "params": {}, "target": None})
+
+    assert resp["ok"] is False
+    error = resp["error"]
+    assert "No active BinaryView is selected and multiple targets are open" in error
+    assert "\nOpen targets:\n" in error
+    assert "-t libparse.so.bndb" in error
+    assert "-t svcmain.bndb" in error
     bridge._headless_views.clear()
 
 

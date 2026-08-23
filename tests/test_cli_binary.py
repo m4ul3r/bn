@@ -277,9 +277,12 @@ def test_target_info_renders_the_pointer_format():
 def test_save_accepts_path_flag(monkeypatch, tmp_path):
     captured_params = {}
 
+    captured = {}
+
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False, **kwargs):
         assert op == "save_database"
         captured_params.update(params or {})
+        captured["target"] = target
         return {"ok": True, "result": {"path": params.get("path"), "saved": True}}
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
@@ -289,29 +292,24 @@ def test_save_accepts_path_flag(monkeypatch, tmp_path):
 
     assert rc == 0
     assert captured_params["path"] == str(out.expanduser().resolve())
+    assert captured["target"] == "active"  # -t passes straight through (#663)
 
 
-def test_save_multi_target_surfaces_bridge_hint_without_recovery(monkeypatch, capsys):
+def test_save_multi_target_surfaces_bridge_error_without_recovery(monkeypatch, capsys):
     # #663: the bridge itself raises the actionable -t hint + open-target list
-    # (see test_bridge_dispatch's resolve tests, which pin the message). The
-    # CLI must surface it verbatim with exit 2 and make NO recovery round-trip
-    # -- a second list_targets could stall behind the writer-priority lock,
-    # race the target set, or auto-spawn a fresh bridge from an error path.
+    # (test_bridge_dispatch pins that message; asserting a copy of it here
+    # would only validate this test's own fixture). What the CLI owes the
+    # bridge error is surfacing it verbatim with exit 2 and making NO recovery
+    # round-trip -- a second list_targets could stall behind the
+    # writer-priority lock, race the target set, or auto-spawn a fresh bridge
+    # from an error path.
     calls = []
-    bridge_hint = (
-        "No active BinaryView is selected and multiple targets are open.\n"
-        "Pass -t <selector> (--target) to choose one.\n"
-        "Open targets:\n"
-        "  -t libparse.so  view_id=1  target_id=42:1:1  /corpus/libparse.so\n"
-        "  -t svcmain  view_id=2  target_id=42:1:2  /corpus/svcmain\n"
-        "note: view_id / target_id are stable across `bn save`"
-    )
 
     def fake_send_request(op, *, params=None, target=None, timeout=30.0,
                           instance_id=None, spawn_missing_named=False, **kwargs):
         calls.append(op)
         assert target is None
-        raise bn.cli.BridgeError(bridge_hint)
+        raise bn.cli.BridgeError("multi-line bridge error\nsecond line sentinel")
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
@@ -320,24 +318,7 @@ def test_save_multi_target_surfaces_bridge_hint_without_recovery(monkeypatch, ca
     assert rc == 2
     assert calls == ["save_database"]
     err = capsys.readouterr().err
-    assert "Pass -t <selector> (--target) to choose one." in err
-    assert "Open targets:" in err
-    assert "-t libparse.so" in err
-    assert "-t svcmain" in err
-
-
-def test_save_with_explicit_target_passes_selector_through(fake_transport):
-    # `bn save -t <target>` sends exactly one op with the selector intact;
-    # the fixture's unmapped-op AssertionError proves nothing else is consulted.
-    calls = fake_transport({
-        "save_database": {"ok": True, "result": {"path": "/tmp/svcmain.bndb", "saved": True}},
-    })
-
-    rc = bn.cli.main(["save", "-t", "svcmain"])
-
-    assert rc == 0
-    assert [c["op"] for c in calls] == ["save_database"]
-    assert calls[0]["target"] == "svcmain"
+    assert "multi-line bridge error\nsecond line sentinel" in err
 
 
 def test_close_warns_on_unsaved_changes(fake_transport, capsys):
