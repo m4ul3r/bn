@@ -746,7 +746,7 @@ def test_close_ignores_sticky_target_pin(fake_transport, monkeypatch, capsys):
 
     assert rc == 0
     assert [c["op"] for c in calls] == ["list_targets", "close_binary"]
-    assert calls[-1]["target"] == "active"  # pin dropped, single target resolved
+    assert calls[-1]["target"] == "123:1:7"  # pin dropped, single target pinned by id
     assert "all" not in (calls[-1]["params"] or {})
 
 

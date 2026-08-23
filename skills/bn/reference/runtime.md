@@ -69,7 +69,7 @@ bn instance gc                          # reap dead instances' leftover logs/soc
 
 `bn instance gc` is housekeeping: a crashed/SIGKILLed bridge leaves its `.log` (and sometimes its socket) behind in `~/.cache/bn/instances/`, and the lazy liveness sweep keeps those breadcrumbs forever, so the directory accumulates dead logs over time. `bn instance gc` removes the logs and orphan sockets of instances that no longer have a live registry — it never touches a running instance or the shared spawn lock — and reports what it reaped (`--format json` for the counts).
 
-A bare `bn close` resolves its target like every other target-required command: with one target open it closes that one; with several open it refuses with the open-target list (pass `-t <selector>`, a path, or `--all`). It never closes everything implicitly — only `--all` does (#664).
+A bare `bn close` closes the single open target; with several open it refuses with the open-target list (pass `-t <selector>`, a path, or `--all`). It never closes everything implicitly — only `--all` does (#664). Because close is destructive, it is stricter than `bn save`: on a multi-tab GUI bridge a bare close does **not** fall back to the focused tab (save does), the CLI pins the exact `target_id` it observed rather than sending `active` (so a concurrent close/load between the lookup and the close yields an unknown-selector error instead of closing a different binary), `-t ""` is an error, and `-t` cannot be combined with a path or `--all`.
 
 `bn close` reports each closed view as `{path, unsaved}`. If a view had unsaved mutations, stdout warns — run `bn save` *first* if you care about annotations:
 

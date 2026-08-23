@@ -1523,7 +1523,10 @@ def _apply_sticky_defaults(args: argparse.Namespace) -> None:
         if sticky_instance:
             args.instance = sticky_instance
             args._sticky_instance = True
-    if not getattr(args, "target", None):
+    # Only an ABSENT -t is filled from the pin. An explicit `-t ""` stays as
+    # given so the handler can tell "no selector" from "empty selector" (close
+    # must reject the latter instead of letting a pin paper over it).
+    if getattr(args, "target", None) is None:
         sticky_target = state.get("target")
         if sticky_target:
             args.target = sticky_target

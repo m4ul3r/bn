@@ -4,10 +4,12 @@ import argparse
 from pathlib import Path
 from typing import Any
 
+from .. import cli
 from ..cli import _call, _pick, arg, command
 from ..transport import BridgeError, REFRESH_REQUEST_TIMEOUT
 from ..formatters import (
     _render_close_text,
+    _render_target_choices,
     _render_load_text,
     _render_refresh_text,
     _render_save_text,
@@ -75,38 +77,96 @@ def _close(args: argparse.Namespace) -> int:
     # which target a bare `close` tears down, and a stale pin must not make
     # cleanup fail -- close needs to stay robust. `_call` resolves `args.target`
     # into the request target, so drop any sticky-injected value and let the
-    # standard resolution below decide (single open target -> that one;
-    # multiple -> refuse with the open-target list).
+    # resolution below decide (single open target -> that one; multiple ->
+    # refuse with the open-target list).
     if getattr(args, "_sticky_target", False):
         args.target = None
-    # A named path and --all are mutually exclusive: the bridge gives --all
-    # priority, so `bn close <path> --all` would silently close EVERY target
-    # despite naming one file. Reject the combination instead of surprising the
-    # user in a multi-target session (#85).
+    explicit_target = getattr(args, "target", None)
+    # The three ways to say what to close -- `-t`, a path, `--all` -- are
+    # mutually exclusive. The bridge gives a target priority over a path and
+    # --all, and --all priority over a path, so any pair would silently drop one
+    # operand (`bn close <path> --all` closed EVERYTHING despite naming a file,
+    # #85). A destructive op must not guess which one was meant: reject every
+    # combination before sending anything.
     if args.path and args.all:
         raise BridgeError(
             "Pass a path or --all, not both: a named path closes only that "
             "target; --all closes every loaded target."
+        )
+    if explicit_target is not None and args.path:
+        raise BridgeError(
+            "Pass --target or a path, not both: --target closes that target; "
+            "a path closes the loaded binary at that path."
+        )
+    if explicit_target is not None and args.all:
+        raise BridgeError(
+            "Pass --target or --all, not both: --target closes only that "
+            "target; --all closes every loaded target."
+        )
+    # `-t ""` is neither an explicit selector nor a bare close. It used to fall
+    # into the implicit-resolution branch (`not target`) and tear down the
+    # single open target; an empty selector on a destructive op is an error.
+    if explicit_target is not None and not str(explicit_target).strip():
+        raise BridgeError(
+            "--target is empty: pass a selector from `bn target list`, a path, "
+            "or --all (omit --target entirely to close the single open target)."
         )
     params: dict[str, Any] = {}
     if args.path:
         params["path"] = str(Path(args.path).expanduser().resolve())
     if args.all:
         params["all"] = True
+    # #664: a bare `bn close` closes the single open target and refuses under
+    # several (same hint + open-target list as every other target-required
+    # command). Previously close skipped resolution and the bridge treated "no
+    # target" as close-ALL, the inverse of `bn save`'s refusal.
+    #
+    # Round 2 (TOCTOU): the implicit resolution PINS the target_id observed in
+    # the list_targets peek instead of sending the volatile literal `active`,
+    # which the bridge would re-resolve at close time -- a concurrent close/load
+    # between peek and close would land the destructive close on a DIFFERENT
+    # binary. View ids are never reused, so any interleaving turns the pinned
+    # id into a safe unknown-selector error. `-t active` is the same volatile
+    # literal spelled explicitly and is pinned the same way.
+    if not (args.all or args.path) and (
+        explicit_target is None or str(explicit_target).strip() == "active"
+    ):
+        args.target = _pinned_sole_target(args)
     return _call(
         args,
         "close_binary",
         params,
-        # #664: a bare/empty selector resolves exactly like every other
-        # target-required command -- a single open target is closed implicitly,
-        # multiple open targets require an explicit -t (same hint + open-target
-        # list). Previously close skipped resolution and the bridge treated
-        # "no target" as close-ALL, the inverse of `bn save`'s refusal. Only an
-        # explicit path or --all opts out of target resolution.
-        require_target=not (args.all or args.path),
+        require_target=False,
         text_renderer=_render_close_text,
         stem="close",
     )
+
+
+def _pinned_sole_target(args: argparse.Namespace) -> str:
+    """Return the ``target_id`` of the single open target, else refuse.
+
+    Same refusal/hint as the generic implicit resolution, but the selector sent
+    to the bridge is the stable ``target_id`` from the peek row, never the
+    re-resolved ``active`` literal (see :func:`_close`)."""
+    # Looked up on ``bn.cli`` at call time (not imported) so tests patch one seam.
+    response = cli.send_request(
+        "list_targets",
+        params={},
+        target=None,
+        instance_id=getattr(args, "instance", None),
+    )
+    targets = list(response["result"])
+    if not targets:
+        raise BridgeError("No BinaryView targets are open")
+    if len(targets) > 1:
+        raise BridgeError(
+            "This command requires --target when multiple targets are open.\n"
+            f"Open targets:\n{_render_target_choices(targets)}"
+        )
+    target_id = targets[0].get("target_id")
+    if not target_id:
+        raise BridgeError("Bridge listed the open target without a target_id; rerun with an explicit --target")
+    return str(target_id)
 
 
 @command("save", help="Save the current analysis database (.bndb)", target=True,

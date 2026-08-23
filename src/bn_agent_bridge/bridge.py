@@ -1461,14 +1461,35 @@ class BinaryNinjaBridge:
                 "unsaved": bool(getattr(bv.file, "modified", False)) or self.targets.is_dirty(bv),
             }
 
-        # A named path and all=true are mutually exclusive. The CLI already
-        # rejects the combination, but a raw socket client could send both;
-        # without this guard the all-branch silently wins and closes everything
-        # despite a named path (#85).
+        # The three ways to name what to close -- a target selector, a path,
+        # all=true -- are mutually exclusive. The CLI rejects every pair, but a
+        # raw socket client can send any combination; without these guards one
+        # silently wins (all over path closed everything despite a named file,
+        # #85; target over path/all silently ignored the other operand). A
+        # destructive op must not guess which operand the caller meant.
+        bare_target = target is None or str(target).strip() in ("", "active")
         if all_ and path is not None:
             raise RuntimeError(
                 "Pass either a path or all=true, not both: a named path closes "
                 "only that target; all=true closes every loaded target."
+            )
+        if not bare_target and path is not None:
+            raise RuntimeError(
+                "Pass either a target or a path, not both: a target selector "
+                "closes that target; a path closes the loaded binary at that path."
+            )
+        if not bare_target and all_:
+            raise RuntimeError(
+                "Pass either a target or all=true, not both: a target selector "
+                "closes only that target; all=true closes every loaded target."
+            )
+        # A raw {"path": ""} is neither a real path nor a bare request: it must
+        # not slip past the bare-close refusal below (path is not None) into the
+        # by-path branch and resolve to cwd. Reject it outright.
+        if path is not None and not str(path).strip():
+            raise RuntimeError(
+                "close_binary: empty path; pass a real path, an explicit target "
+                "selector, or all=true."
             )
 
         # Resolve a target selector *before* taking _headless_views_lock:
@@ -1476,15 +1497,23 @@ class BinaryNinjaBridge:
         # which is non-reentrant, so resolving while holding it deadlocks.
         #
         # #664: a request with NO explicit path and NO all=true is a close of
-        # "the selected target", so it goes through the same resolver as
-        # save_database -- None / "" / "active" all mean "the single open
-        # target, else refuse". A bare request used to fall through to the
+        # "the selected target". A bare request used to fall through to the
         # close-everything branch below, so a CLI (or raw socket client) that
         # omitted the target under multiple open targets tore down all of them
         # while the equivalent `save` refused. Only an explicit path or all=true
-        # opts out of resolution; an explicit non-None selector always resolves.
-        if target is not None or (path is None and not all_):
+        # opts out of resolution; an explicit non-bare selector always resolves.
+        #
+        # Round 2: a BARE selector (absent / "" / "active") deliberately does
+        # NOT go through targets.resolve()'s convenience branch. That branch
+        # returns the FOCUSED GUI tab with no count check (save's focused-tab
+        # convenience), so on a multi-tab GUI bridge a bare close would tear
+        # down whichever tab happened to have focus. A destructive close refuses
+        # unless exactly ONE target is open, focus notwithstanding, and closes
+        # that one by its target_id so the same resolver path serves both.
+        if not bare_target:
             target_bv = self.targets.resolve(target)
+        elif path is None and not all_:
+            target_bv = self._resolve_sole_target_for_close()
         else:
             target_bv = None
 
@@ -1539,6 +1568,34 @@ class BinaryNinjaBridge:
         # by-path close paths (must be OUTSIDE the lock; see the note above) (#80).
         self._write_registry()
         return {"closed": closed}
+
+    def _resolve_sole_target_for_close(self):
+        """Resolve a bare close to the single open target, else refuse.
+
+        Unlike ``targets.resolve(None)`` this never consults the focused GUI tab:
+        with more than one target open the request is ambiguous and a
+        destructive close must not pick one. With exactly one open it resolves
+        that one by its ``target_id`` (never the volatile ``active`` literal)."""
+        targets = self.targets.refresh()
+        if not targets:
+            raise RuntimeError("No BinaryView targets are open")
+        if len(targets) > 1:
+            lines = [
+                "A bare close_binary refuses when multiple targets are open "
+                f"({len(targets)}): pass an explicit target selector, a path, "
+                "or all=true to close every target.",
+                "Open targets:",
+            ]
+            for item in targets:
+                marker = "*" if item.get("active") else " "
+                lines.append(
+                    f"  {marker} {item.get('selector', '')}"
+                    f"  view_id={item.get('view_id', '')}"
+                    f"  target_id={item.get('target_id', '')}"
+                    f"  {item.get('filename', '')}"
+                )
+            raise RuntimeError("\n".join(lines))
+        return self.targets.resolve(targets[0]["target_id"])
 
     def _save_database(self, target: str | None, path: str | None = None):
         bv = self.targets.resolve(target)
