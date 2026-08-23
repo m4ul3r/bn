@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import shlex
 import socket
 import socketserver
 import struct
@@ -197,21 +198,42 @@ def _check_peer_credentials(connection) -> str | None:
 GO_RENAME_CHUNK_SIZE = 256
 
 
-def _format_unknown_target_error(selector: Any, targets: list[dict[str, Any]]) -> str:
-    lines = [f"Unknown target selector: {selector}"]
-    if not targets:
-        lines.append("No BinaryView targets are open.")
-        return "\n".join(lines)
-    lines.append("Open targets:")
+def _open_target_lines(targets: list[dict[str, Any]]) -> list[str]:
+    # Shared "Open targets:" listing for the resolver errors. Entries render
+    # the `-t` form, shell-quoted, because they are a copy-paste contract: for
+    # some commands (`bn save`) the positional is an output path, so echoing a
+    # bare selector invites `bn save <selector>` -- a silent wrong-file write
+    # -- and an unquoted selector with a space splits into exactly that shape.
+    lines = ["Open targets:"]
     for target in targets:
         marker = "*" if target.get("active") else " "
         lines.append(
-            f"  {marker} {target.get('selector', '')}"
+            f"  {marker} -t {shlex.quote(str(target.get('selector', '')))}"
             f"  view_id={target.get('view_id', '')}"
             f"  target_id={target.get('target_id', '')}"
             f"  {target.get('filename', '')}"
         )
     lines.append("note: view_id / target_id are stable across `bn save`")
+    return lines
+
+
+def _format_unknown_target_error(selector: Any, targets: list[dict[str, Any]]) -> str:
+    lines = [f"Unknown target selector: {selector}"]
+    if not targets:
+        lines.append("No BinaryView targets are open.")
+        return "\n".join(lines)
+    lines.extend(_open_target_lines(targets))
+    return "\n".join(lines)
+
+
+def _format_no_active_target_error(targets: list[dict[str, Any]]) -> str:
+    # #663: several targets open, none active (headless has no focused tab),
+    # and the request carried no selector.
+    lines = [
+        "No active BinaryView is selected and multiple targets are open.",
+        "Pass -t <selector> (--target) to choose one.",
+    ]
+    lines.extend(_open_target_lines(targets))
     return "\n".join(lines)
 
 
@@ -607,7 +629,7 @@ class TargetManager:
         if selector in (None, "", "active"):
             active = self._default_view()
             if active is None:
-                raise RuntimeError("No active BinaryView is selected and multiple targets are open")
+                raise RuntimeError(_format_no_active_target_error(targets))
             return active
 
         with self._lock:
