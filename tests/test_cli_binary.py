@@ -291,6 +291,58 @@ def test_save_accepts_path_flag(monkeypatch, tmp_path):
     assert captured_params["path"] == str(out.expanduser().resolve())
 
 
+def test_save_multi_target_gets_requires_target_hint(monkeypatch, capsys):
+    # #663: bare `bn save` under multiple open targets (headless: no active
+    # view) must raise the same actionable hint + open-target list that
+    # target-required commands produce, not the bridge's bare "No active
+    # BinaryView" error.
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False, **kwargs):
+        if op == "save_database":
+            assert target is None
+            raise bn.cli.BridgeError(
+                "No active BinaryView is selected and multiple targets are open"
+            )
+        assert op == "list_targets"
+        return {
+            "ok": True,
+            "result": [
+                {"selector": "libparse.so", "target_id": "42:1:1", "view_id": "1"},
+                {"selector": "svcmain", "target_id": "42:1:2", "view_id": "2"},
+            ],
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["save"])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "This command requires --target when multiple targets are open." in err
+    assert "Open targets:" in err
+    assert "libparse.so" in err
+    assert "svcmain" in err
+    assert "No active BinaryView is selected" not in err
+
+
+def test_save_with_explicit_target_unaffected_by_multi_target_hint(monkeypatch):
+    # `bn save -t <target>` must keep passing the selector straight through
+    # without ever consulting list_targets (#663).
+    calls = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False, **kwargs):
+        calls.append(op)
+        assert op == "save_database"
+        assert target == "svcmain"
+        return {"ok": True, "result": {"path": "/tmp/svcmain.bndb", "saved": True}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["save", "-t", "svcmain"])
+
+    assert rc == 0
+    assert calls == ["save_database"]
+
+
 def test_close_warns_on_unsaved_changes(fake_transport, capsys):
     fake_transport({
         "close_binary": {

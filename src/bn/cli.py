@@ -980,14 +980,25 @@ def _call(
         require_target=require_target,
         allow_implicit_target=allow_implicit_target,
     )
-    response = send_request(
-        op,
-        params=request_params,
-        target=target,
-        instance_id=getattr(args, "instance", None),
-        spawn_missing_named=spawn_missing_named,
-        **timeout_kwargs,
-    )
+    try:
+        response = send_request(
+            op,
+            params=request_params,
+            target=target,
+            instance_id=getattr(args, "instance", None),
+            spawn_missing_named=spawn_missing_named,
+            **timeout_kwargs,
+        )
+    except BridgeError as exc:
+        # A require_target=False command (e.g. `save`) sends target=None and
+        # lets the bridge pick the active view. Headless with several targets
+        # open has no active view, so the bridge answers with a bare "no active
+        # BinaryView" error (#663). Re-raise it as the same actionable
+        # hint + open-target list that target-required commands produce.
+        if target is None and "No active BinaryView is selected" in str(exc):
+            _implicit_target(args)  # raises the multi-target hint; returns only
+            # if the target set changed underneath us -- fall through then.
+        raise
     result = response["result"]
     # Auto-regex fallback (#291.3): a metacharacter query that matched nothing
     # literally is almost always meant as a pattern. Retry it once as a regex and
