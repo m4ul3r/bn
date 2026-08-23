@@ -10,15 +10,14 @@ from ..cli import (_call, _effective_limit, _int_or_hex, _mutate, _mutation_exit
                    _non_negative_int, _pick, _positive_int, arg, command, mutex,
                    mutation_output_args, preview_arg)
 from ..formatters import (
-    _mutation_summary,
     _render_data_symbols_text,
     _render_data_vars_text,
     _render_function_bundle_text,
     _render_go_functions_text,
     _render_go_functions_summary_text,
     _render_go_rename_text,
+    _go_rename_summary,
     _render_imports_summary_text,
-    _render_mutation_summary_text,
     _render_name_address_list_text,
     _render_py_exec_text,
     _render_read_text,
@@ -338,6 +337,7 @@ def _go_rename(args: argparse.Namespace) -> int:
         preview=bool(args.preview),
         require_target=True,
         detail_renderer=_render_go_rename_text,
+        summary_transform=_go_rename_summary,
         stem="go-rename",
     )
 

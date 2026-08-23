@@ -912,6 +912,7 @@ def _mutate(
     require_target: bool = True,
     preview: bool | None = None,
     detail_renderer: Any = None,
+    summary_transform: Any = None,
     **call_kwargs: Any,
 ) -> int:
     """:func:`_call` specialized for mutations.
@@ -960,14 +961,19 @@ def _mutate(
         text_renderer=(_render_mutation_summary_text if compact
                        else (detail_renderer or _render_mutation_text)),
         result_exit_code=_mutation_exit_code,
-        result_transform=_mutation_summary if compact else _add_mutation_ok,
+        # A mutation whose result does not report through `results[]` supplies its
+        # own compact transform; everything else shares `_mutation_summary`.
+        result_transform=((summary_transform or _mutation_summary) if compact
+                          else _add_mutation_ok),
         stem=stem,
         # #645: an atomic write whose result is unreadable is a correctness problem,
         # not a cost one -- a spilled 38-op batch put the spill envelope on stdout,
         # so `json.loads` raised and the agent could not confirm a batch that HAD
         # committed. Keep the parseable status on stdout no matter how big the
         # detail payload is; the detail goes to the artifact.
-        spill_status=_mutation_summary,
+        # _call evaluates this against the ALREADY-transformed result, so both
+        # transforms short-circuit on a `mutation_summary` envelope.
+        spill_status=(summary_transform or _mutation_summary),
         spill_status_renderer=_render_mutation_summary_text,
         **call_kwargs,
     )

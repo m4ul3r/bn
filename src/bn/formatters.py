@@ -3111,6 +3111,13 @@ def _mutation_summary(value: Any) -> Any:
     The detailed result stays available without --summary."""
     if not isinstance(value, dict):
         return value
+    # Idempotent: `_call` evaluates `spill_status` against the ALREADY-transformed
+    # result, so on the compact path this runs on its own output. Without this
+    # guard the second pass sees no `results` and re-zeroes every count -- today
+    # only wasted work (a ~200-byte summary never crosses the spill threshold),
+    # but a spilled mutation would print an all-zero status.
+    if value.get("kind") == "mutation_summary":
+        return value
     results = [r for r in (value.get("results") or []) if isinstance(r, dict)]
     failed = [r for r in results if r.get("status") in FAILED_MUTATION_STATUSES]
     verified = sum(1 for r in results if r.get("status") == "verified")
@@ -3173,6 +3180,92 @@ def _mutation_summary(value: Any) -> Any:
     if proto_residue:
         summary["prototype_user_type_residue"] = True
     return summary
+
+
+def _first_go_rename_error(value: dict[str, Any]) -> str | None:
+    """The most specific failure explanation a go_rename result carries."""
+    for row in (value.get("results") or []):
+        if not isinstance(row, dict):
+            continue
+        message = row.get("message") or row.get("status")
+        if message:
+            return str(message)
+    message = value.get("message")
+    return str(message) if message else "go rename failed"
+
+
+def _go_rename_summary(value: Any) -> Any:
+    """Compact status for `go rename`, which reports through its OWN counters.
+
+    `_mutation_summary` derives every count from `results[]`. For this op that
+    array holds only the FAILURE rows (bridge `"results": failed_rows`), while
+    the work done is reported via `go_renamed_candidates` / `go_verified_count`
+    / `go_committed_count` / `go_failed_count` / `skipped_user_named`. Running it
+    through the generic summary therefore rendered a run that renamed 1783
+    functions as `changed=0 ... dirty_after=False`, and a caller reading that
+    closes without saving and silently discards every recovered name.
+    """
+    if not isinstance(value, dict) or value.get("kind") != "go_rename":
+        return _mutation_summary(value)
+    committed = bool(value.get("committed", False))
+    preview = bool(value.get("preview", False))
+    candidates = int(value.get("go_renamed_candidates") or 0)
+    committed_count = int(value.get("go_committed_count") or 0)
+    verified = int(value.get("go_verified_count") or 0)
+    failed = int(value.get("go_failed_count") or 0)
+    skipped = int(value.get("skipped_user_named") or 0)
+    rolled_back = value.get("rolled_back")
+    success = bool(value.get("success", True)) and not failed
+
+    # `changed` is what is LIVE in the view when the call returns, never the plan:
+    #   committed -> what actually landed;
+    #   preview   -> what WOULD land, i.e. the rows that verified (NOT the
+    #                candidate count, which over-reports every candidate the
+    #                apply skipped because it changed underneath us);
+    #   otherwise -> a live run that failed and was reverted: nothing landed.
+    # Reporting `candidates` in that last case is the mirror image of the bug
+    # this function exists to fix, and `_render_go_rename_text` already refuses
+    # to claim "N renamed" for rows that passed readback before a revert.
+    if committed:
+        changed = committed_count
+    elif preview:
+        changed = verified
+    else:
+        changed = 0
+
+    # Gate on `not success`, not on `failed`: a revert that fails AFTER every
+    # rename verified produces zero failure rows, and its only explanation is the
+    # top-level message. `_mutation_summary` has the same fallback.
+    first_error = _first_go_rename_error(value) if not success else None
+
+    return {
+        "kind": "mutation_summary",
+        "ok": success,
+        "success": success,
+        "committed": committed,
+        "preview": preview,
+        # NOT disjoint sets: the wire `skipped_user_named` FOLDS apply-time
+        # "changed underneath us" skips in (bridge: skipped_total =
+        # skipped_user_named + skipped_during_apply) while those same rows stay
+        # inside go_renamed_candidates. Distinct functions considered =
+        # candidates + scan-time-only skips -- keeping verified+noop+failed <=
+        # op_count, the invariant every other mutation summary holds.
+        "op_count": candidates + skipped
+                    - int(value.get("skipped_changed_during_apply") or 0),
+        "changed_count": changed,
+        "verified_count": verified,
+        # Already-user-named functions are deliberately left alone: no change,
+        # which is what `noop` means elsewhere.
+        "noop_count": skipped,
+        "failed_count": failed,
+        "rolled_back": (bool(rolled_back) if rolled_back is not None else None),
+        "first_error": first_error,
+        # Live state exists iff renames actually landed, or a revert failed and
+        # left them behind. (`prototype_user_type_residue` is a proto-set concept
+        # and never appears on a go_rename envelope, so it is not tested here.)
+        "dirty_after": ((committed and committed_count > 0)
+                        or (rolled_back is False and not committed)),
+    }
 
 
 def _render_mutation_summary_text(value: Any) -> str:

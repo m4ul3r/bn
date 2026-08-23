@@ -99,9 +99,14 @@ def test_mutation_summary_surfaces_top_level_message_error():
 def test_go_rename_summary_emits_compact_status(fake_transport, capsys):
     # #408 review: go rename is a bulk mutation, so --summary is accepted and emits
     # the same compact status object as the single-op mutations.
+    # A REAL go_rename envelope: `kind` set, `results` empty, counts in go_*.
+    # The old fixture here had no `kind` and a results[] full of verified rows --
+    # a shape the bridge never emits -- so it exercised the fall-through branch
+    # and would have passed against a sabotaged transform.
     fake_transport({"go_rename": {"ok": True, "result": {
-        "success": True, "committed": True,
-        "results": [{"status": "verified", "op": "rename_symbol"}] * 12,
+        "kind": "go_rename", "success": True, "committed": True, "preview": False,
+        "results": [], "go_renamed_candidates": 12, "go_committed_count": 12,
+        "go_verified_count": 12, "go_failed_count": 0, "skipped_user_named": 0,
         "affected_functions": [{"name": "sub_401000"}] * 12}}})
     rc = bn.cli.main(["go", "rename", "--target", "active", "--summary", "--format", "json"])
     assert rc == 0
@@ -111,21 +116,194 @@ def test_go_rename_summary_emits_compact_status(fake_transport, capsys):
     assert "results" not in out and "affected_functions" not in out   # compacted
 
 
+def test_go_rename_summary_reads_its_own_counters():
+    # REGRESSION: `go_rename` reports through go_* counters and leaves `results`
+    # EMPTY. Routing it through the generic `_mutation_summary` -- which derives
+    # every count from `results[]` -- rendered a run that renamed 1783 functions
+    # as `changed=0 verified=0 noop=0 failed=0 dirty_after=False`.
+    #
+    # `dirty_after=False` is the dangerous half: a caller reads "nothing changed",
+    # closes without saving, and silently discards every recovered name. Verified
+    # live against a real Go binary before the fix.
+    from bn.formatters import _go_rename_summary
+    live = _go_rename_summary({
+        "kind": "go_rename", "success": True, "committed": True, "preview": False,
+        "results": [],                      # empty on success; FAILURE rows land here
+        "go_renamed_candidates": 1783, "go_committed_count": 1783,
+        "go_verified_count": 1783, "go_failed_count": 0,
+        "skipped_user_named": 1, "defined_count": 1784,
+    })
+    assert live["changed_count"] == 1783 and live["verified_count"] == 1783
+    assert live["noop_count"] == 1          # already-user-named: skipped, not failed
+    assert live["failed_count"] == 0
+    assert live["dirty_after"] is True      # 1783 renames ARE unsaved state
+
+    # A preview commits nothing, so the actionable count is what WOULD change and
+    # the DB stays clean.
+    prev = _go_rename_summary({
+        "kind": "go_rename", "success": True, "committed": False, "preview": True,
+        "results": [], "rolled_back": True,
+        "go_renamed_candidates": 1783, "go_committed_count": 0,
+        "go_verified_count": 1783, "go_failed_count": 0, "skipped_user_named": 1,
+    })
+    assert prev["changed_count"] == 1783 and prev["dirty_after"] is False
+
+    # A preview whose revert FAILED leaves state behind. Real bridge shape:
+    # every rename verified (zero failure rows -- the bridge's results[] always
+    # equals the failure rows), the revert then failed, and the ONLY
+    # explanation is the top-level message (the exact fallback the gate-on-
+    # not-success comment in _go_rename_summary defends).
+    stuck = _go_rename_summary({
+        "kind": "go_rename", "success": False, "committed": False, "preview": True,
+        "results": [], "rolled_back": False,
+        "message": "Preview rollback failed; the view may be partially renamed",
+        "go_renamed_candidates": 5, "go_committed_count": 0,
+        "go_verified_count": 5, "go_failed_count": 0, "skipped_user_named": 0,
+    })
+    assert stuck["dirty_after"] is True and stuck["failed_count"] == 0
+    assert stuck["first_error"] == (
+        "Preview rollback failed; the view may be partially renamed")
+
+    # `results` is NOT always empty here -- it carries the failure rows -- and the
+    # `unsupported` early return puts its ONLY explanation in results[0].message
+    # with no top-level `message`. A `failed=1` summary must never lose the reason.
+    unsupported = _go_rename_summary({
+        "kind": "go_rename", "success": False, "committed": False, "preview": False,
+        "rolled_back": True,
+        "results": [{"op": "rename_symbol", "status": "unsupported",
+                     "message": "BinaryView does not support get_function_at"}],
+        "go_renamed_candidates": 5, "go_verified_count": 0,
+        "go_failed_count": 1, "go_committed_count": 0,
+    })
+    assert unsupported["first_error"] == "BinaryView does not support get_function_at"
+    assert unsupported["failed_count"] == 1
+
+    # Partial failure whose rollback SUCCEEDED: everything reverted, so clean --
+    # but the reason still has to survive into the compact line.
+    reverted = _go_rename_summary({
+        "kind": "go_rename", "success": False, "committed": False, "preview": False,
+        "rolled_back": True,
+        "results": [{"op": "rename_symbol", "status": "verification_failed",
+                     "message": "Live rename readback disagreed"}],
+        "go_renamed_candidates": 9, "go_verified_count": 4,
+        "go_failed_count": 1, "go_committed_count": 0, "skipped_user_named": 0,
+    })
+    assert reverted["dirty_after"] is False
+    assert reverted["first_error"] == "Live rename readback disagreed"
+
+    # Partial failure whose rollback FAILED: renames are live in the view. This is
+    # the shape that must never read clean (cf. #656 on the bridge side).
+    stuck_partial = _go_rename_summary({
+        "kind": "go_rename", "success": False, "committed": False, "preview": False,
+        "rolled_back": False, "message": "Rollback failed; the view may be partially renamed",
+        "results": [{"op": "rename_symbol", "status": "verification_failed",
+                     "message": "Live rename failed"}],
+        "go_renamed_candidates": 9, "go_verified_count": 4,
+        "go_failed_count": 1, "go_committed_count": 0,
+    })
+    assert stuck_partial["dirty_after"] is True
+
+    # Anything that is not a go_rename envelope falls through untouched.
+    other = _go_rename_summary({"success": True, "committed": True,
+                                "results": [{"status": "verified"}]})
+    assert other["changed_count"] == 1
+
+
+def test_go_rename_summary_never_claims_reverted_renames_landed():
+    # The MIRROR IMAGE of the bug this transform fixes: a LIVE run that failed and
+    # was fully reverted has committed=False, so reporting the candidate count as
+    # `changed` claims 1783 renames landed when nothing did. `changed` must always
+    # describe what is live in the view on return, never the plan.
+    from bn.formatters import _go_rename_summary
+    reverted = _go_rename_summary({
+        "kind": "go_rename", "success": False, "committed": False, "preview": False,
+        "rolled_back": True,
+        "results": [{"op": "rename_symbol", "status": "verification_failed",
+                     "message": "readback disagreed"}],
+        "go_renamed_candidates": 1783, "go_verified_count": 499,
+        "go_failed_count": 1, "go_committed_count": 0, "skipped_user_named": 1,
+    })
+    assert reverted["changed_count"] == 0        # NOT 1783 -- nothing landed
+    assert reverted["dirty_after"] is False
+    assert reverted["first_error"] == "readback disagreed"
+
+
+def test_go_rename_summary_reports_failure_with_no_failure_rows():
+    # A revert that fails AFTER every rename verified produces ZERO failure rows,
+    # so go_failed_count is 0 and its only explanation is the top-level message.
+    # Gating first_error on `failed` would drop it while the view is left
+    # partially renamed -- the worst combination.
+    from bn.formatters import _go_rename_summary
+    stuck = _go_rename_summary({
+        "kind": "go_rename", "success": False, "committed": False, "preview": True,
+        "rolled_back": False, "results": [],
+        "message": "Preview rollback failed; the view may be partially renamed",
+        "go_renamed_candidates": 1783, "go_verified_count": 1783,
+        "go_failed_count": 0, "go_committed_count": 0, "skipped_user_named": 1,
+    })
+    assert stuck["failed_count"] == 0
+    assert stuck["dirty_after"] is True
+    assert stuck["first_error"] == "Preview rollback failed; the view may be partially renamed"
+
+
+def test_go_rename_preview_counts_match_the_detail_renderer():
+    # A preview reports what WOULD land (the verified rows), not the candidate
+    # count -- candidates over-report every entry the apply skipped because the
+    # function changed underneath it, and would disagree with the detail
+    # renderer's own "N would rename".
+    from bn.formatters import _go_rename_summary, _render_go_rename_text
+    envelope = {
+        "kind": "go_rename", "success": True, "committed": False, "preview": True,
+        "rolled_back": True, "results": [], "go_renamed_candidates": 10,
+        "go_verified_count": 7, "go_failed_count": 0, "go_committed_count": 0,
+        "skipped_user_named": 3, "skipped_changed_during_apply": 3,
+    }
+    assert _go_rename_summary(envelope)["changed_count"] == 7
+    assert "7 would rename" in _render_go_rename_text(envelope)
+
+
+def test_mutation_summary_transforms_are_idempotent():
+    # `_call` evaluates spill_status against the ALREADY-transformed result, so a
+    # second pass must not re-zero the counts. Harmless today only because a
+    # ~200-byte summary never crosses the spill threshold.
+    from bn.formatters import _go_rename_summary, _mutation_summary
+    go = {"kind": "go_rename", "success": True, "committed": True, "preview": False,
+          "results": [], "go_renamed_candidates": 1783, "go_committed_count": 1783,
+          "go_verified_count": 1783, "go_failed_count": 0, "skipped_user_named": 1}
+    assert _go_rename_summary(_go_rename_summary(go)) == _go_rename_summary(go)
+    plain = {"success": True, "committed": True, "results": [{"status": "verified"}]}
+    assert _mutation_summary(_mutation_summary(plain)) == _mutation_summary(plain)
+    assert _mutation_summary(_mutation_summary(plain))["changed_count"] == 1
+
+
+def test_go_rename_default_text_reports_real_counts(fake_transport, capsys):
+    # End-to-end through the CLI: the DEFAULT (compact) render must not zero out.
+    fake_transport({"go_rename": {"ok": True, "result": {
+        "kind": "go_rename", "success": True, "committed": True, "preview": False,
+        "results": [], "go_renamed_candidates": 1783, "go_committed_count": 1783,
+        "go_verified_count": 1783, "go_failed_count": 0, "skipped_user_named": 1}}})
+    assert bn.cli.main(["go", "rename", "--target", "active"]) == 0
+    out = capsys.readouterr().out
+    assert "changed=1783" in out and "dirty_after=True" in out
+    assert "changed=0" not in out
+
+
 def test_go_rename_full_json_carries_top_level_ok(fake_transport, capsys):
     # #604: `go rename` hand-rolled its _call tail with `result_transform=None`, so
     # the full (--verbose) JSON came back WITHOUT the top-level `ok` every other
     # mutation emits under the #447 envelope contract. Routing it through _mutate
     # -- which applies _add_mutation_ok on the detail path -- lands that key.
     fake_transport({"go_rename": {"ok": True, "result": {
-        "success": True, "committed": True,
-        "results": [{"status": "verified", "op": "rename_symbol"}] * 3,
+        "kind": "go_rename", "success": True, "committed": True, "preview": False,
+        "results": [], "go_renamed_candidates": 3, "go_committed_count": 3,
+        "go_verified_count": 3, "go_failed_count": 0, "skipped_user_named": 0,
         "affected_functions": [{"name": "sub_401000"}] * 3}}})
     rc = bn.cli.main(["go", "rename", "--target", "active", "--verbose", "--format", "json"])
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
     assert out["ok"] is True                      # the #447 key that was missing
     assert out["committed"] is True
-    assert len(out["results"]) == 3               # --verbose keeps the full payload
+    assert out["go_committed_count"] == 3         # --verbose keeps the full payload
 
 
 def test_go_rename_defaults_to_compact_status(fake_transport, capsys):
@@ -134,8 +312,9 @@ def test_go_rename_defaults_to_compact_status(fake_transport, capsys):
     # did nothing -- and go rename is the mutation most likely to emit a huge
     # payload, since it renames every candidate in the binary.
     fake_transport({"go_rename": {"ok": True, "result": {
-        "success": True, "committed": True,
-        "results": [{"status": "verified", "op": "rename_symbol"}] * 40,
+        "kind": "go_rename", "success": True, "committed": True, "preview": False,
+        "results": [], "go_renamed_candidates": 40, "go_committed_count": 40,
+        "go_verified_count": 40, "go_failed_count": 0, "skipped_user_named": 0,
         "affected_functions": [{"name": "sub_401000"}] * 40}}})
     # No flags at all: renders the compact TEXT status line, not a payload dump.
     # (An explicit --format json is itself an opt-in to detail under #645, so it
@@ -1211,3 +1390,21 @@ def test_data_retype_verification_failure_exits_3_649(fake_transport):
                      "message": "type did not land"}]}}})
     rc = bn.cli.main(["data", "retype", "--target", "active", "0x460000", "uint32_t"])
     assert rc == 3
+
+
+def test_go_rename_op_count_does_not_double_count_apply_time_skips():
+    # The wire `skipped_user_named` FOLDS apply-time "changed underneath us"
+    # skips in (bridge: skipped_total = skipped_user_named + skipped_during_apply)
+    # while those same rows stay inside go_renamed_candidates -- summing the two
+    # wire counters therefore counted every apply-time skip twice: 10 candidates
+    # + 2 scan-time user-named functions is 12 distinct functions, not 15.
+    from bn.formatters import _go_rename_summary
+    summary = _go_rename_summary({
+        "kind": "go_rename", "success": True, "committed": True, "preview": False,
+        "results": [], "go_renamed_candidates": 10, "go_committed_count": 7,
+        "go_verified_count": 7, "go_failed_count": 0,
+        "skipped_user_named": 5, "skipped_changed_during_apply": 3,
+    })
+    assert summary["op_count"] == 12
+    assert summary["noop_count"] == 5
+    assert summary["changed_count"] == 7
