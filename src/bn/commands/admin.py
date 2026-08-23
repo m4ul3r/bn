@@ -343,7 +343,15 @@ def _session_stop(args: argparse.Namespace) -> int:
     # #456: accept the id positionally OR via -i/--instance (every other command is
     # driven with -i/--instance, so `session stop -i <id>` is the natural
     # cleanup shape). The positional wins when both are given.
-    target_id = getattr(args, "instance_id", None) or getattr(args, "instance", None)
+    # Presence, not truthiness (#690 r4): `bn session stop "$ID"` with $ID
+    # unset must error, not fall through to the sticky-pin-filled -i and shut
+    # down the PINNED bridge.
+    positional = getattr(args, "instance_id", None)
+    target_id = positional if positional is not None else getattr(args, "instance", None)
+    if target_id is not None and not str(target_id).strip():
+        raise BridgeError(
+            "session stop: instance id is empty; pass an id from `bn session list`"
+        )
     if not target_id:
         raise BridgeError(
             "session stop requires an instance id: `bn session stop <id>` "

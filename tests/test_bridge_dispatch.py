@@ -1483,12 +1483,19 @@ def _close_on_watchdog(instance, *, timeout: float = 5.0, **kwargs):
     out: dict = {}
 
     def go():
-        out["result"] = instance._close_binary(**kwargs)
+        try:
+            out["result"] = instance._close_binary(**kwargs)
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread
+            out["exc"] = exc
 
     t = threading.Thread(target=go, daemon=True)
     t.start()
     t.join(timeout=timeout)
     assert not t.is_alive(), f"_close_binary({kwargs}) deadlocked (lock re-acquired under views lock?)"
+    # Re-raise on the caller's thread so `pytest.raises(...)` around this helper
+    # sees the bridge's refusal, not a KeyError on the missing result.
+    if "exc" in out:
+        raise out["exc"]
     return out["result"]
 
 
@@ -1549,6 +1556,93 @@ def test_close_binary_by_path_still_matches(monkeypatch, tmp_path):
     assert bv_b.closed and not bv_a.closed
     assert bv_b not in bridge._headless_views and bv_a in bridge._headless_views
     bridge._headless_views.clear()
+
+
+@pytest.mark.parametrize("target", [None, "active"])
+def test_close_binary_bare_request_under_multiple_targets_refuses(monkeypatch, tmp_path, target):
+    # #664: a close_binary request with no path, no all=true and no explicit
+    # selector (absent / null / the volatile "active" literal) used to fall
+    # through to the close-ALL branch while the equivalent save_database
+    # refused. Under multiple open targets it now refuses with the open-target
+    # list and closes NOTHING -- for raw socket clients, not just the CLI. (An
+    # empty "" selector is rejected outright as empty; see
+    # test_close_binary_rejects_empty_target_with_single_target.)
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    bv_a = _ClosableBV("/proj/alpha.so", session_id="11")
+    bv_b = _ClosableBV("/proj/beta.so", session_id="22")
+    _register_views(bridge, bv_a, bv_b)
+
+    out: dict = {}
+
+    def go():
+        try:
+            instance._close_binary(target=target)
+        except Exception as exc:  # noqa: BLE001 - assert on it below
+            out["exc"] = exc
+
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    t.join(timeout=5.0)
+    assert not t.is_alive(), "bare _close_binary deadlocked"
+
+    assert "exc" in out, f"bare close_binary(target={target!r}) did not refuse"
+    assert "multiple targets are open" in str(out["exc"])
+    assert not bv_a.closed and not bv_b.closed
+    assert bridge._headless_views == [bv_a, bv_b]
+    bridge._headless_views.clear()
+
+
+def test_close_binary_bare_request_under_multiple_targets_refuses_via_dispatch(monkeypatch, tmp_path):
+    # Same guarantee through the real dispatch() path a socket client hits: a
+    # request with NO target key at all must not close everything (#664).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    bv_a = _ClosableBV("/proj/alpha.so", session_id="11")
+    bv_b = _ClosableBV("/proj/beta.so", session_id="22")
+    _register_views(bridge, bv_a, bv_b)
+
+    response = instance.dispatch({"op": "close_binary", "params": {}, "id": "req-1"})
+
+    assert response["ok"] is False
+    assert "multiple targets are open" in response["error"]
+    assert not bv_a.closed and not bv_b.closed
+    assert bridge._headless_views == [bv_a, bv_b]
+    bridge._headless_views.clear()
+
+
+@pytest.mark.parametrize("target", [None, "active"])
+def test_close_binary_bare_request_single_target_closes_it(monkeypatch, tmp_path, target):
+    # #664 counterpart: with exactly one open target, an absent selector and
+    # the "active" literal still resolve to it and close it (the single-target
+    # convenience is unchanged). An empty "" selector is NOT a bare spelling:
+    # it errors (test_close_binary_rejects_empty_target_with_single_target).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    bv = _ClosableBV("/proj/alpha.so", session_id="11")
+    _register_views(bridge, bv)
+
+    result = _close_on_watchdog(instance, target=target)
+
+    assert [c["path"] for c in result["closed"]] == ["/proj/alpha.so"]
+    assert bv.closed
+    assert bridge._headless_views == []
+
+
+def test_close_binary_bare_request_with_no_targets_reports_none_open(monkeypatch, tmp_path):
+    # The old "No binaries are currently loaded" guard is preserved in spirit:
+    # a bare close with nothing open is a clean error, not a crash.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    _register_views(bridge)
+
+    with pytest.raises(Exception) as exc:
+        instance._close_binary()
+    assert "No BinaryView targets are open" in str(exc.value)
 
 
 def test_close_binary_rejects_path_and_all_together(monkeypatch):
@@ -2881,3 +2975,434 @@ def test_dispatch_routes_lens_read_ops(monkeypatch):
 
     syms = instance._dispatch_on_main("data_symbols", {}, None)
     assert syms["items"] == [{"a": "0x2000", "n": "g_counter"}]
+
+
+def _gui_with_focused_tab(monkeypatch, bridge, focused, *others):
+    """Install a fake binaryninjaui that reports *focused* as the active tab's
+    view and every view as an open tab. Mirrors a multi-tab GUI bridge: the
+    resolver's focused-tab convenience (`_default_view`) returns *focused* even
+    though several targets are open. The views are deliberately NOT placed in
+    _headless_views so only the GUI walk sees them, exactly as GUI-opened tabs."""
+
+    class _Frame:
+        def __init__(self, view):
+            self._view = view
+
+        def getCurrentBinaryView(self):
+            return self._view
+
+    views = [focused, *others]
+
+    class _Context:
+        def getCurrentViewFrame(self):
+            return _Frame(focused)
+
+        def getTabs(self):
+            return [f"tab-{i}" for i in range(len(views))]
+
+        def getViewFrameForTab(self, tab):
+            return _Frame(views[int(tab.split("-")[1])])
+
+        def getViewForTab(self, tab):
+            return None
+
+    context = _Context()
+    fake_ui = types.SimpleNamespace(
+        UIContext=types.SimpleNamespace(
+            allContexts=lambda: [context],
+            activeContext=lambda: context,
+        )
+    )
+    monkeypatch.setattr(bridge, "ui", fake_ui)
+    bridge._headless_views.clear()
+    return fake_ui
+
+
+@pytest.mark.parametrize("target", [None, "active", "", "  "])
+def test_close_binary_bare_request_refuses_under_multiple_gui_tabs_despite_focus(monkeypatch, tmp_path, target):
+    # #664 round 2 (B1): on a MULTI-TAB GUI bridge the generic resolver's
+    # None/""/"active" branch returns the FOCUSED tab with no count check (the
+    # `bn save` focused-tab convenience). A destructive close must not inherit
+    # that: a bare/ambiguous close_binary under >1 open targets REFUSES, focus
+    # notwithstanding. This runs WITH binaryninjaui present (the GUI path is
+    # exactly where the hole shipped), not with it deleted. An absent target
+    # and the volatile "active" literal refuse with the open-target list; an
+    # empty/whitespace selector refuses as an empty selector (it is never
+    # folded into bare). Either way nothing closes.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    focused = _ClosableBV("/proj/focused.so", session_id="11")
+    other = _ClosableBV("/proj/other.so", session_id="22")
+    _gui_with_focused_tab(monkeypatch, bridge, focused, other)
+    # Sanity: the GUI walk sees both tabs and the convenience resolver WOULD
+    # pick the focused one -- that is the hole this test pins shut for close.
+    assert len(bridge._collect_open_views()) == 2
+    assert bridge.TargetManager()._default_view() is focused
+
+    with pytest.raises(RuntimeError) as exc:
+        _close_on_watchdog(instance, target=target)
+
+    if target is None or target.strip():
+        assert "multiple targets are open" in str(exc.value)
+        assert "focused.so" in str(exc.value) and "other.so" in str(exc.value)
+    else:
+        assert "empty target" in str(exc.value).lower()
+    assert not focused.closed and not other.closed
+
+
+def test_close_binary_bare_request_refuses_under_multiple_gui_tabs_via_dispatch(monkeypatch, tmp_path):
+    # Same guarantee through dispatch(): a raw socket client sending
+    # {"op": "close_binary", "params": {}} with no target key on a multi-tab
+    # GUI bridge must not close the focused tab.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    focused = _ClosableBV("/proj/focused.so", session_id="11")
+    other = _ClosableBV("/proj/other.so", session_id="22")
+    _gui_with_focused_tab(monkeypatch, bridge, focused, other)
+
+    response = instance.dispatch({"op": "close_binary", "params": {}, "id": "req-1"})
+
+    assert response["ok"] is False
+    assert "multiple targets are open" in response["error"]
+    assert not focused.closed and not other.closed
+
+
+def test_save_database_bare_request_still_uses_focused_gui_tab(monkeypatch, tmp_path):
+    # The focused-tab convenience is save's to keep: with the same multi-tab
+    # GUI fixture a bare save_database still resolves to the focused tab, so
+    # the close refusal is close-specific, not a resolver-wide regression.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    focused = _SaveBV(str(tmp_path / "focused.bndb"))
+    other = _SaveBV(str(tmp_path / "other.bndb"))
+    focused.file.session_id = "11"
+    other.file.session_id = "22"
+    _gui_with_focused_tab(monkeypatch, bridge, focused, other)
+
+    result = instance._save_database(None)
+
+    assert result["path"] == str(tmp_path / "focused.bndb")
+
+
+def test_close_binary_bare_request_single_gui_tab_closes_it(monkeypatch, tmp_path):
+    # Counterpart: one GUI tab open -> the bare close still closes it (the
+    # single-target convenience survives on the GUI bridge too).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    only = _ClosableBV("/proj/only.so", session_id="11")
+    _gui_with_focused_tab(monkeypatch, bridge, only)
+
+    result = _close_on_watchdog(instance)
+
+    assert [c["path"] for c in result["closed"]] == ["/proj/only.so"]
+    assert only.closed
+
+
+def test_close_binary_explicit_target_under_multiple_gui_tabs_closes_only_it(monkeypatch, tmp_path):
+    # An explicit selector keeps working under multiple GUI tabs, and closes
+    # exactly that one -- not the focused tab.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    focused = _ClosableBV("/proj/focused.so", session_id="11")
+    other = _ClosableBV("/proj/other.so", session_id="22")
+    _gui_with_focused_tab(monkeypatch, bridge, focused, other)
+
+    result = _close_on_watchdog(instance, target="other.so")
+
+    assert [c["path"] for c in result["closed"]] == ["/proj/other.so"]
+    assert other.closed and not focused.closed
+
+
+def test_close_binary_pinned_target_id_errors_when_view_was_replaced(monkeypatch, tmp_path):
+    # #664 round 2 (B2, TOCTOU): the CLI pins the target_id it observed in its
+    # list_targets peek. If the view is closed and another loaded between the
+    # peek and the close, the pinned id matches NOTHING (view ids are never
+    # reused) -> a safe unknown-selector error instead of closing the newcomer.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    first = _ClosableBV("/proj/first.so", session_id="11")
+    _register_views(bridge, first)
+    pinned = instance.targets.refresh()[0]["target_id"]
+
+    # Interleaving: someone closes `first` and loads a different binary.
+    _close_on_watchdog(instance, target=pinned)
+    assert first.closed
+    newcomer = _ClosableBV("/proj/newcomer.so", session_id="33")
+    _register_views(bridge, newcomer)
+
+    with pytest.raises(RuntimeError) as exc:
+        _close_on_watchdog(instance, target=pinned)
+    assert "Unknown target selector" in str(exc.value)
+    assert not newcomer.closed
+    bridge._headless_views.clear()
+
+
+def test_close_binary_rejects_empty_path(monkeypatch, tmp_path):
+    # A raw {"path": ""} is neither a real path nor a bare request; it must not
+    # slip past the bare-close refusal (path is not None) into the by-path
+    # branch, nor resolve cwd. Reject it outright; nothing closes.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    bv_a = _ClosableBV("/proj/alpha.so", session_id="11")
+    bv_b = _ClosableBV("/proj/beta.so", session_id="22")
+    _register_views(bridge, bv_a, bv_b)
+
+    for empty in ("", "   "):
+        with pytest.raises(RuntimeError) as exc:
+            _close_on_watchdog(instance, path=empty)
+        assert "empty path" in str(exc.value).lower()
+        assert not bv_a.closed and not bv_b.closed
+
+    response = instance.dispatch({"op": "close_binary", "params": {"path": ""}, "id": "r"})
+    assert response["ok"] is False
+    assert "empty path" in response["error"].lower()
+    assert bridge._headless_views == [bv_a, bv_b]
+    bridge._headless_views.clear()
+
+
+def test_close_binary_rejects_target_with_path(monkeypatch, tmp_path):
+    # target + path: the target used to win and the path was silently ignored.
+    # Mirror the path+all guard: contradictory -> error, nothing closes.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    bv_a = _ClosableBV("/proj/alpha.so", session_id="11")
+    bv_b = _ClosableBV("/proj/beta.so", session_id="22")
+    _register_views(bridge, bv_a, bv_b)
+
+    with pytest.raises(RuntimeError) as exc:
+        _close_on_watchdog(instance, path="/proj/beta.so", target="alpha.so")
+    assert "not both" in str(exc.value)
+    assert not bv_a.closed and not bv_b.closed
+    bridge._headless_views.clear()
+
+
+def test_close_binary_rejects_target_with_all(monkeypatch, tmp_path):
+    # target + all=true: the target used to win and all=true was silently
+    # discarded. Contradictory -> error, nothing closes.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    bv_a = _ClosableBV("/proj/alpha.so", session_id="11")
+    bv_b = _ClosableBV("/proj/beta.so", session_id="22")
+    _register_views(bridge, bv_a, bv_b)
+
+    with pytest.raises(RuntimeError) as exc:
+        _close_on_watchdog(instance, target="alpha.so", all_=True)
+    assert "not both" in str(exc.value)
+    assert not bv_a.closed and not bv_b.closed
+
+    response = instance.dispatch(
+        {"op": "close_binary", "params": {"all": True}, "target": "alpha.so", "id": "r"}
+    )
+    assert response["ok"] is False
+    assert "not both" in response["error"]
+    assert bridge._headless_views == [bv_a, bv_b]
+    bridge._headless_views.clear()
+
+
+@pytest.mark.parametrize("empty", ["", "   ", "\t"])
+def test_close_binary_rejects_empty_target_with_single_target(monkeypatch, tmp_path, empty):
+    # A raw {"target": ""} (or whitespace) is neither a selector nor a bare
+    # request. It used to be folded into "bare" and, with exactly ONE target
+    # open, closed it -- the bridge-side twin of the `-t ""` the CLI rejects.
+    # Mirror the {"path": ""} guard: error, nothing closes. Exercised with a
+    # single open target, where the bare path WOULD have succeeded, so the
+    # refusal is discriminating.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    only = _ClosableBV("/proj/only.so", session_id="11")
+    _register_views(bridge, only)
+    assert len(instance.targets.refresh()) == 1
+
+    with pytest.raises(RuntimeError) as exc:
+        _close_on_watchdog(instance, target=empty)
+    assert "empty target" in str(exc.value).lower()
+    assert not only.closed
+
+    response = instance.dispatch(
+        {"op": "close_binary", "params": {}, "target": empty, "id": "r"}
+    )
+    assert response["ok"] is False
+    assert "empty target" in response["error"].lower()
+    assert not only.closed
+    assert bridge._headless_views == [only]
+
+    # Control: the genuinely bare request (no target key at all) still closes
+    # the single open target, so the refusal is about the empty selector.
+    result = _close_on_watchdog(instance)
+    assert [c["path"] for c in result["closed"]] == ["/proj/only.so"]
+    assert only.closed
+    bridge._headless_views.clear()
+
+
+def test_close_binary_rejects_empty_target_on_single_gui_tab(monkeypatch, tmp_path):
+    # Same guard on a GUI bridge with one focused tab: {"target": ""} must not
+    # reach the focused-tab convenience resolver (its ""-branch returns the
+    # focused view) and close it.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    only = _ClosableBV("/proj/only.so", session_id="11")
+    _gui_with_focused_tab(monkeypatch, bridge, only)
+    assert bridge.TargetManager()._default_view() is only
+
+    with pytest.raises(RuntimeError) as exc:
+        _close_on_watchdog(instance, target="")
+    assert "empty target" in str(exc.value).lower()
+    assert not only.closed
+
+
+@pytest.mark.parametrize("selector", ["", "   ", "active"])
+def test_close_binary_given_selector_conflicts_with_path_and_all(monkeypatch, tmp_path, selector):
+    # {"target": ""|"active"} together with path / all=true used to be folded
+    # into "bare", so the selector was silently discarded and the path / all
+    # operand won -- while the CLI errors on the same pairs. Any GIVEN
+    # selector, volatile or empty, conflicts with path and all: error, nothing
+    # closes.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    bv_a = _ClosableBV("/proj/alpha.so", session_id="11")
+    bv_b = _ClosableBV("/proj/beta.so", session_id="22")
+    _register_views(bridge, bv_a, bv_b)
+
+    with pytest.raises(RuntimeError) as exc:
+        _close_on_watchdog(instance, target=selector, path="/proj/beta.so")
+    assert "not both" in str(exc.value)
+    with pytest.raises(RuntimeError) as exc:
+        _close_on_watchdog(instance, target=selector, all_=True)
+    assert "not both" in str(exc.value)
+    assert not bv_a.closed and not bv_b.closed
+
+    for params in ({"path": "/proj/beta.so"}, {"all": True}):
+        response = instance.dispatch(
+            {"op": "close_binary", "params": params, "target": selector, "id": "r"}
+        )
+        assert response["ok"] is False, (selector, params)
+        assert "not both" in response["error"], (selector, params)
+    assert bridge._headless_views == [bv_a, bv_b]
+    bridge._headless_views.clear()
+
+
+def test_close_binary_active_literal_single_target_closes_by_target_id(monkeypatch, tmp_path):
+    # Raw {"target": "active"} with exactly one target open still closes it:
+    # it goes through the sole-target gate (refuses under several, see the
+    # multi-tab GUI test), not the focused-tab resolver.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    only = _ClosableBV("/proj/only.so", session_id="11")
+    _register_views(bridge, only)
+
+    result = _close_on_watchdog(instance, target="active")
+
+    assert [c["path"] for c in result["closed"]] == ["/proj/only.so"]
+    assert only.closed
+    bridge._headless_views.clear()
+
+
+def test_close_binary_padded_active_is_unknown_selector(monkeypatch, tmp_path):
+    # #690 r3 (R2): only the EXACT "active" literal enters the sole-target
+    # gate. Padded spellings were a safe unknown-selector error pre-round-2;
+    # the strip() collapse made them destructive. They must refuse and close
+    # nothing -- at any target count.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    bv = _ClosableBV("/proj/alpha.so", session_id="11")
+    _register_views(bridge, bv)
+
+    with pytest.raises(RuntimeError) as exc:
+        _close_on_watchdog(instance, target=" active ")
+    assert "nknown target selector" in str(exc.value)
+    assert not bv.closed
+    assert bridge._headless_views == [bv]
+    bridge._headless_views.clear()
+
+
+def test_close_binary_rejects_non_string_target_and_path(monkeypatch, tmp_path):
+    # #690 r3: raw clients can send any JSON type. A non-string target must be
+    # a clean refusal, not a destructive close via view_id coercion
+    # (resolve(1) matched view_id "1"); a non-string path must be a clean
+    # refusal, not a TypeError from Path().
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    bv = _ClosableBV("/proj/alpha.so", session_id="1")
+    _register_views(bridge, bv)
+
+    with pytest.raises(RuntimeError) as exc:
+        instance._close_binary(target=1)
+    assert "must be a string" in str(exc.value)
+    assert not bv.closed
+
+    with pytest.raises(RuntimeError) as exc:
+        instance._close_binary(path=123)
+    assert "must be a string" in str(exc.value)
+    assert not bv.closed
+    bridge._headless_views.clear()
+
+
+def test_close_binary_binder_rejects_params_nested_target(monkeypatch, tmp_path):
+    # #690 r4: path and all DO live in params, so a raw client plausibly nests
+    # target there too. Silently dropping it turned a close-by-selector into a
+    # BARE close (sole-target gate) -- a wrong-target close. Reject the
+    # misplaced key instead.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    bv = _ClosableBV("/proj/alpha.so", session_id="11")
+    _register_views(bridge, bv)
+
+    response = instance.dispatch(
+        {"op": "close_binary", "params": {"target": "beta.so"}, "id": "r1"})
+
+    assert response["ok"] is False
+    assert "top level" in response["error"]
+    assert not bv.closed
+    bridge._headless_views.clear()
+
+
+def test_batch_apply_binder_rejects_empty_manifest_target(monkeypatch, tmp_path):
+    # #690 r4: {"target": ""} in a raw batch_apply manifest must error, not
+    # collapse by truthiness into the focused-tab convenience.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    bv = _FakeFileBV("/proj/alpha.so", session_id="11")
+    _register_views(bridge, bv)
+
+    for bad in ("", "   ", 7):
+        response = instance.dispatch(
+            {"op": "batch_apply", "params": {"target": bad, "ops": []}, "id": "r1"})
+        assert response["ok"] is False, bad
+        assert "target" in response["error"], bad
+    bridge._headless_views.clear()
+
+
+def test_save_database_rejects_non_string_and_empty_operands(monkeypatch, tmp_path):
+    # #690 r4: the sibling WRITE op gets the same raw-client guards as close --
+    # resolve(1) would str-coerce onto view_id "1" (wrong-target .bndb write),
+    # and an empty path mixed presence/truthiness (suppressing the #214 cache
+    # fallback while saving to the default path).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    bv = _FakeFileBV("/proj/alpha.so", session_id="1")
+    _register_views(bridge, bv)
+
+    for kwargs in ({"target": 1}, {"target": ""}, {"target": "  "},
+                   {"target": None, "path": 123}, {"target": None, "path": ""}):
+        with pytest.raises(RuntimeError) as exc:
+            instance._save_database(**kwargs)
+        assert "save_database" in str(exc.value), kwargs
+    bridge._headless_views.clear()

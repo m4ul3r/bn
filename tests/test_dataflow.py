@@ -549,7 +549,7 @@ def test_taint_models_present_auto_selects_single_target(monkeypatch, capsys):
     rc = bn.cli.main(["taint", "models", "--present"])
     assert rc == 0
     call = [c for c in calls if c["op"] == "taint_models"][0]
-    assert call["target"] == "active"                    # single open target auto-selected
+    assert call["target"] == "1:1:1"                     # single open target pinned by target_id (#690 R3)
     assert call["params"] == {"present": True}
 
 
