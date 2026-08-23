@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 from typing import Any
 
+from .. import cli
 from ..cli import _call, _pick, arg, command
 from ..transport import BridgeError, REFRESH_REQUEST_TIMEOUT
 from ..formatters import (
@@ -36,6 +37,11 @@ from ..formatters import (
          ])
 def _load(args: argparse.Namespace) -> int:
     import os
+    # `bn load "$BIN"` with $BIN unset resolves "" to the cwd DIRECTORY, which
+    # passes the bridge's exists() check and fails confusingly bridge-side --
+    # same unset-shell-var doctrine as close/save (#690 r4).
+    if not str(args.path).strip():
+        raise BridgeError("path is empty: pass the binary or .bndb file to load")
     _env = (os.environ.get("BN_NO_MARKERS") or "").strip().lower()
     no_marker = bool(args.no_marker) or (_env not in ("", "0", "false", "no", "off"))
     return _call(
@@ -67,7 +73,7 @@ def _load(args: argparse.Namespace) -> int:
 
 @command("close", help="Close a loaded binary", target=True,
          args=[
-             arg("path", nargs="?", help="Path to close (omit to close the selected target)"),
+             arg("path", nargs="?", help="Path to close (omit to close the single open target)"),
              arg("--all", action="store_true", help="Close all loaded binaries"),
          ])
 def _close(args: argparse.Namespace) -> int:
@@ -75,35 +81,93 @@ def _close(args: argparse.Namespace) -> int:
     # which target a bare `close` tears down, and a stale pin must not make
     # cleanup fail -- close needs to stay robust. `_call` resolves `args.target`
     # into the request target, so drop any sticky-injected value and let the
-    # standard resolution below decide (single open target -> that one;
-    # multiple -> refuse with the open-target list).
+    # resolution below decide (single open target -> that one; multiple ->
+    # refuse with the open-target list).
     if getattr(args, "_sticky_target", False):
         args.target = None
-    # A named path and --all are mutually exclusive: the bridge gives --all
-    # priority, so `bn close <path> --all` would silently close EVERY target
-    # despite naming one file. Reject the combination instead of surprising the
-    # user in a multi-target session (#85).
-    if args.path and args.all:
+    explicit_target = getattr(args, "target", None)
+    # Presence, not truthiness: `bn close ""` (an unset shell variable expanding
+    # to an empty positional) is an operand that was GIVEN, so it must take
+    # part in the conflict checks below and then be rejected as empty -- not
+    # collapse into a bare close (which would tear down the sole open target),
+    # and `bn close "" --all` must not slip past the path+--all guard.
+    explicit_path = getattr(args, "path", None)
+    # The three ways to say what to close -- `-t`, a path, `--all` -- are
+    # mutually exclusive. The bridge gives a target priority over a path and
+    # --all, and --all priority over a path, so any pair would silently drop one
+    # operand (`bn close <path> --all` closed EVERYTHING despite naming a file,
+    # #85). A destructive op must not guess which one was meant: reject every
+    # combination before sending anything.
+    if explicit_path is not None and args.all:
         raise BridgeError(
             "Pass a path or --all, not both: a named path closes only that "
             "target; --all closes every loaded target."
         )
+    if explicit_target is not None and explicit_path is not None:
+        raise BridgeError(
+            "Pass --target or a path, not both: --target closes that target; "
+            "a path closes the loaded binary at that path."
+        )
+    if explicit_target is not None and args.all:
+        raise BridgeError(
+            "Pass --target or --all, not both: --target closes only that "
+            "target; --all closes every loaded target."
+        )
+    # `-t ""` is neither an explicit selector nor a bare close. It used to fall
+    # into the implicit-resolution branch (`not target`) and tear down the
+    # single open target; an empty selector on a destructive op is an error.
+    if explicit_target is not None and not str(explicit_target).strip():
+        raise BridgeError(
+            "--target is empty: pass a selector from `bn target list`, a path, "
+            "or --all (omit --target entirely to close the single open target)."
+        )
+    # Same for an empty positional: `bn close ""` must not become a bare close.
+    if explicit_path is not None and not str(explicit_path).strip():
+        raise BridgeError(
+            "path is empty: pass a real path, a --target selector from "
+            "`bn target list`, or --all (omit the path entirely to close the "
+            "single open target)."
+        )
     params: dict[str, Any] = {}
-    if args.path:
-        params["path"] = str(Path(args.path).expanduser().resolve())
+    if explicit_path is not None:
+        params["path"] = str(Path(explicit_path).expanduser().resolve())
     if args.all:
         params["all"] = True
+    # #664: a bare `bn close` closes the single open target and refuses under
+    # several (same hint + open-target list as every other target-required
+    # command). Previously close skipped resolution and the bridge treated "no
+    # target" as close-ALL, the inverse of `bn save`'s refusal.
+    #
+    # Round 2 (TOCTOU): the implicit resolution PINS the target_id observed in
+    # the list_targets peek instead of sending the volatile literal `active`,
+    # which the bridge would re-resolve at close time -- a concurrent close/load
+    # between peek and close would land the destructive close on a DIFFERENT
+    # binary. View ids are never reused, so any interleaving turns the pinned
+    # id into a safe unknown-selector error. Round 3: the pinning lives in the
+    # shared cli._implicit_target (every implicit resolution pins now, #690 R3)
+    # and only the EXACT "active" literal is intercepted -- a padded ' active '
+    # was a safe unknown-selector error before round 2 and must stay one, not
+    # become a destructive sole-target close.
+    if not (args.all or explicit_path is not None) and (
+        explicit_target is None or explicit_target == "active"
+    ):
+        try:
+            # Looked up on ``bn.cli`` at call time so tests patch one seam.
+            args.target = cli._implicit_target(args)
+        except cli.MultiTargetError as exc:
+            if explicit_target == "active":
+                raise BridgeError(
+                    f"{exc}\nnote: `-t active` follows the GUI selection, "
+                    "which is not honored for close: pass a concrete "
+                    "selector, a path, or --all (closes every bn-loaded "
+                    "target)."
+                ) from None
+            raise
     return _call(
         args,
         "close_binary",
         params,
-        # #664: a bare/empty selector resolves exactly like every other
-        # target-required command -- a single open target is closed implicitly,
-        # multiple open targets require an explicit -t (same hint + open-target
-        # list). Previously close skipped resolution and the bridge treated
-        # "no target" as close-ALL, the inverse of `bn save`'s refusal. Only an
-        # explicit path or --all opts out of target resolution.
-        require_target=not (args.all or args.path),
+        require_target=False,
         text_renderer=_render_close_text,
         stem="close",
     )
@@ -118,6 +182,13 @@ def _close(args: argparse.Namespace) -> int:
 def _save(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
     out_path = _pick(args.path, getattr(args, "path_flag", None), "save path", required=False)
+    # Presence, not truthiness: `bn save "$OUT"` with $OUT unset must error,
+    # not silently save to the default path (#690 r3, same doctrine as close).
+    if out_path is not None and not str(out_path).strip():
+        raise BridgeError(
+            "path is empty: pass a real output path, or omit it to save to "
+            "the default <filename>.bndb"
+        )
     if out_path:
         params["path"] = str(Path(out_path).expanduser().resolve())
     return _call(

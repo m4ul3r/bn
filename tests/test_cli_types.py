@@ -23,7 +23,7 @@ def test_types_show_uses_type_info_and_text_renderer(fake_transport, capsys):
     assert calls[-1]["op"] == "type_info"
     assert calls[-1]["params"]["type_name"] == "Player"
     assert calls[-1]["params"]["require_struct"] is False
-    assert calls[-1]["target"] == "active"
+    assert calls[-1]["target"] == "active"  # explicit -t active passes through for reads
     output = capsys.readouterr().out
     assert output.startswith("struct Player")
     assert '"decl"' not in output
@@ -39,7 +39,7 @@ def test_types_declare_uses_implicit_target_when_single_target_is_open(fake_tran
 
     assert rc == 0
     assert [call["op"] for call in calls] == ["list_targets", "types_declare"]
-    assert calls[1]["target"] == "active"
+    assert calls[1]["target"] == "123:1:7"  # implicit resolution pins the target_id (#690 R3)
     assert "typedef struct Player" in calls[1]["params"]["declaration"]
 
 

@@ -7,6 +7,7 @@ import hashlib
 import json
 import math
 import os
+import shlex
 import socket
 import socketserver
 import struct
@@ -197,21 +198,42 @@ def _check_peer_credentials(connection) -> str | None:
 GO_RENAME_CHUNK_SIZE = 256
 
 
-def _format_unknown_target_error(selector: Any, targets: list[dict[str, Any]]) -> str:
-    lines = [f"Unknown target selector: {selector}"]
-    if not targets:
-        lines.append("No BinaryView targets are open.")
-        return "\n".join(lines)
-    lines.append("Open targets:")
+def _open_target_lines(targets: list[dict[str, Any]]) -> list[str]:
+    # Shared "Open targets:" listing for the resolver errors. Entries render
+    # the `-t` form, shell-quoted, because they are a copy-paste contract: for
+    # some commands (`bn save`) the positional is an output path, so echoing a
+    # bare selector invites `bn save <selector>` -- a silent wrong-file write
+    # -- and an unquoted selector with a space splits into exactly that shape.
+    lines = ["Open targets:"]
     for target in targets:
         marker = "*" if target.get("active") else " "
         lines.append(
-            f"  {marker} {target.get('selector', '')}"
+            f"  {marker} -t {shlex.quote(str(target.get('selector', '')))}"
             f"  view_id={target.get('view_id', '')}"
             f"  target_id={target.get('target_id', '')}"
             f"  {target.get('filename', '')}"
         )
     lines.append("note: view_id / target_id are stable across `bn save`")
+    return lines
+
+
+def _format_unknown_target_error(selector: Any, targets: list[dict[str, Any]]) -> str:
+    lines = [f"Unknown target selector: {selector}"]
+    if not targets:
+        lines.append("No BinaryView targets are open.")
+        return "\n".join(lines)
+    lines.extend(_open_target_lines(targets))
+    return "\n".join(lines)
+
+
+def _format_no_active_target_error(targets: list[dict[str, Any]]) -> str:
+    # #663: several targets open, none active (headless has no focused tab),
+    # and the request carried no selector.
+    lines = [
+        "No active BinaryView is selected and multiple targets are open.",
+        "Pass -t <selector> (--target) to choose one.",
+    ]
+    lines.extend(_open_target_lines(targets))
     return "\n".join(lines)
 
 
@@ -607,7 +629,7 @@ class TargetManager:
         if selector in (None, "", "active"):
             active = self._default_view()
             if active is None:
-                raise RuntimeError("No active BinaryView is selected and multiple targets are open")
+                raise RuntimeError(_format_no_active_target_error(targets))
             return active
 
         with self._lock:
@@ -1461,14 +1483,60 @@ class BinaryNinjaBridge:
                 "unsaved": bool(getattr(bv.file, "modified", False)) or self.targets.is_dirty(bv),
             }
 
-        # A named path and all=true are mutually exclusive. The CLI already
-        # rejects the combination, but a raw socket client could send both;
-        # without this guard the all-branch silently wins and closes everything
-        # despite a named path (#85).
+        # The three ways to name what to close -- a target selector, a path,
+        # all=true -- are mutually exclusive. The CLI rejects every pair, but a
+        # raw socket client can send any combination; without these guards one
+        # silently wins (all over path closed everything despite a named file,
+        # #85; target over path/all silently ignored the other operand). A
+        # destructive op must not guess which operand the caller meant.
+        #
+        # Only an ABSENT target is bare. A non-None empty/whitespace selector
+        # is an error (below), never folded into bare -- otherwise a raw
+        # {"target": ""} closed the single open target exactly like the
+        # `-t ""` the CLI rejects. The volatile literal "active" is a GIVEN
+        # selector too: it conflicts with path/all like any other, and on its
+        # own it goes through the sole-target gate (never the focused tab).
+        bare_target = target is None
+        # Raw clients can send any JSON type. A non-string target must not
+        # reach resolve() (resolve(1) matches view_id "1" -- a destructive
+        # close via coercion); a non-string path must not reach Path().
+        if target is not None and not isinstance(target, str):
+            raise RuntimeError(
+                "close_binary: target must be a string selector from "
+                "list_targets"
+            )
+        if path is not None and not isinstance(path, str):
+            raise RuntimeError("close_binary: path must be a string")
         if all_ and path is not None:
             raise RuntimeError(
                 "Pass either a path or all=true, not both: a named path closes "
                 "only that target; all=true closes every loaded target."
+            )
+        if not bare_target and path is not None:
+            raise RuntimeError(
+                "Pass either a target or a path, not both: a target selector "
+                "closes that target; a path closes the loaded binary at that path."
+            )
+        if not bare_target and all_:
+            raise RuntimeError(
+                "Pass either a target or all=true, not both: a target selector "
+                "closes only that target; all=true closes every loaded target."
+            )
+        # A raw {"path": ""} is neither a real path nor a bare request: it must
+        # not slip past the bare-close refusal below (path is not None) into the
+        # by-path branch and resolve to cwd. Reject it outright.
+        if path is not None and not str(path).strip():
+            raise RuntimeError(
+                "close_binary: empty path; pass a real path, an explicit target "
+                "selector, or all=true."
+            )
+        # Likewise a raw {"target": ""} (or whitespace) is neither a selector
+        # nor a bare request; it must not resolve to the single open target.
+        if not bare_target and not str(target).strip():
+            raise RuntimeError(
+                "close_binary: empty target selector; pass a selector from "
+                "list_targets, a path, or all=true (omit the target entirely to "
+                "close the single open target)."
             )
 
         # Resolve a target selector *before* taking _headless_views_lock:
@@ -1476,17 +1544,30 @@ class BinaryNinjaBridge:
         # which is non-reentrant, so resolving while holding it deadlocks.
         #
         # #664: a request with NO explicit path and NO all=true is a close of
-        # "the selected target", so it goes through the same resolver as
-        # save_database -- None / "" / "active" all mean "the single open
-        # target, else refuse". A bare request used to fall through to the
+        # "the selected target". A bare request used to fall through to the
         # close-everything branch below, so a CLI (or raw socket client) that
         # omitted the target under multiple open targets tore down all of them
         # while the equivalent `save` refused. Only an explicit path or all=true
-        # opts out of resolution; an explicit non-None selector always resolves.
-        if target is not None or (path is None and not all_):
-            target_bv = self.targets.resolve(target)
-        else:
+        # opts out of resolution; an explicit non-bare selector always resolves.
+        #
+        # Round 2: a BARE request (no target) and the volatile "active" literal
+        # deliberately do NOT go through targets.resolve()'s convenience branch.
+        # That branch returns the FOCUSED GUI tab with no count check (save's
+        # focused-tab convenience), so on a multi-tab GUI bridge a bare close
+        # would tear down whichever tab happened to have focus. A destructive
+        # close refuses unless exactly ONE target is open, focus notwithstanding,
+        # and closes that one by its target_id so the same resolver path serves
+        # both. (The CLI never forwards "active" for close; this covers raw
+        # clients.)
+        if path is not None or all_:
             target_bv = None
+        elif bare_target or target == "active":
+            # EXACT literal only (#690 r3): a padded " active " was a safe
+            # unknown-selector error before round 2 and must stay one -- the
+            # strip() collapse made a rejected spelling destructive.
+            target_bv = self._resolve_sole_target_for_close()
+        else:
+            target_bv = self.targets.resolve(target)
 
         # Target-based close takes priority and must succeed even when
         # _headless_views is empty: GUI-opened views resolve fine but are not
@@ -1540,7 +1621,69 @@ class BinaryNinjaBridge:
         self._write_registry()
         return {"closed": closed}
 
+    def _resolve_sole_target_for_close(self) -> Any:
+        """Resolve a bare close to the single open target, else refuse.
+
+        Serves both an absent target and the volatile ``active`` literal. Unlike
+        ``targets.resolve(None)`` this never consults the focused GUI tab: with
+        more than one target open the request is ambiguous and a destructive
+        close must not pick one. With exactly one open, the view is taken
+        straight from the same ``refresh()`` snapshot the ==1 decision used
+        (a record lookup by ``view_id``, not a second resolver pass)."""
+        targets = self.targets.refresh()
+        if not targets:
+            raise RuntimeError("No BinaryView targets are open")
+        if len(targets) > 1:
+            lines = [
+                "close_binary needs a concrete target when multiple targets "
+                f"are open ({len(targets)}): pass a target selector, a path, "
+                "or all=true to close every bn-loaded target. The volatile "
+                '"active" selector is not honored for close.',
+            ]
+            lines.extend(_open_target_lines(targets))
+            raise RuntimeError("\n".join(lines))
+        # Look the view up from the snapshot the ==1 decision was made on --
+        # a second resolve() would re-refresh, so the count gate and the
+        # actual close could examine different target sets.
+        row = targets[0]
+        manager = self.targets
+        with manager._lock:
+            record = manager._records.get(row["view_id"])
+            view = record.ref() if record is not None else None
+        if view is None:
+            # The sole view died between the snapshot and the lookup (GUI tab
+            # closed / GC). Say so -- an unknown-selector error listing that
+            # same target as open would contradict itself.
+            raise RuntimeError(
+                "close_binary: the open target closed while resolving; "
+                "nothing was closed -- rerun to see the current state"
+            )
+        return view
+
     def _save_database(self, target: str | None, path: str | None = None):
+        # Same raw-client guards as close (#690 r4): save is the sibling WRITE
+        # op, so a coerced non-string target (resolve(1) matches view_id "1")
+        # or an explicit-but-empty operand must error, not write the wrong (or
+        # a whitespace-named) .bndb to disk.
+        if target is not None:
+            if not isinstance(target, str):
+                raise RuntimeError(
+                    "save_database: target must be a string selector from "
+                    "list_targets"
+                )
+            if not target.strip():
+                raise RuntimeError(
+                    "save_database: empty target selector; pass a selector "
+                    "from list_targets or omit the target entirely"
+                )
+        if path is not None:
+            if not isinstance(path, str):
+                raise RuntimeError("save_database: path must be a string")
+            if not path.strip():
+                raise RuntimeError(
+                    "save_database: empty path; pass a real output path or "
+                    "omit it to save to the default <filename>.bndb"
+                )
         bv = self.targets.resolve(target)
         filename = getattr(bv.file, "filename", "")
         explicit = path is not None
@@ -2901,6 +3044,14 @@ def _bind_load_binary(bridge, params, target):
 
 @op("close_binary", lock="write")
 def _bind_close_binary(bridge, params, target):
+    # The selector rides the TOP-LEVEL request key. path/all DO live in
+    # params, so a params-nested "target" is a plausible client mistake --
+    # silently dropping it would execute a BARE close (#690 r4).
+    if "target" in params:
+        raise ValueError(
+            "close_binary: pass \"target\" at the top level of the request, "
+            "not inside params"
+        )
     return bridge._close_binary(
         params.get("path"),
         target,
@@ -3472,9 +3623,20 @@ def _bind_batch_apply(bridge, params, target):
     manifest = dict(params)
     preview = _validate_bool(manifest.get("preview"), label="preview", default=False)
     # Keep None as None so the single-open-target default still applies;
-    # str(None) would become the bogus selector "None".
-    chosen = manifest.get("target") or target
-    target = str(chosen) if chosen is not None else None
+    # str(None) would become the bogus selector "None". Presence, not
+    # truthiness (#690 r4): an explicit-but-empty manifest target must error,
+    # never collapse into the focused-tab convenience.
+    manifest_target = manifest.get("target")
+    chosen = manifest_target if manifest_target is not None else target
+    if chosen is not None:
+        if not isinstance(chosen, str):
+            raise ValueError("batch_apply: target must be a string selector")
+        if not chosen.strip():
+            raise ValueError(
+                "batch_apply: target is empty; set a selector from "
+                "list_targets or drop the key to use the single open target"
+            )
+    target = chosen
     operations = list(manifest.get("ops") or [])
     return bridge._mutation(target, preview, operations)
 
