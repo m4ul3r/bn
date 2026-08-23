@@ -729,15 +729,50 @@ def test_session_start_partial_failure_keeps_bridge_but_exits_nonzero(monkeypatc
 
 
 def test_close_ignores_sticky_target_pin(fake_transport, monkeypatch, capsys):
-    # A sticky pin must NOT turn a bare `close` (documented close-all) into
-    # close-one, and a stale pin must not make cleanup fail.
-    calls = fake_transport({"close_binary": {"ok": True, "result": {"closed": []}}})
+    # A sticky pin must NOT pick which target a bare `close` tears down, and a
+    # stale pin must not make cleanup fail. The pin is dropped and the bare
+    # selector then resolves like any target-required command: with a single
+    # open target it closes that one (#664 -- it no longer means close-all).
+    calls = fake_transport({
+        "list_targets": {
+            "ok": True,
+            "result": [{"target_id": "123:1:7", "selector": "foo.bndb"}],
+        },
+        "close_binary": {"ok": True, "result": {"closed": []}},
+    })
     monkeypatch.setattr(bn.cli.session_state, "read", lambda: {"target": "stale_pin"})
 
     rc = bn.cli.main(["close", "--format", "text"])
 
     assert rc == 0
-    assert calls[-1]["target"] is None  # pin ignored -> close-all
+    assert [c["op"] for c in calls] == ["list_targets", "close_binary"]
+    assert calls[-1]["target"] == "active"  # pin dropped, single target resolved
+    assert "all" not in (calls[-1]["params"] or {})
+
+
+def test_close_with_sticky_pin_under_multiple_targets_refuses(fake_transport, monkeypatch, capsys):
+    # #664: the sticky pin is still dropped for `close`, but under multiple open
+    # targets that bare selector now REFUSES with the --target hint instead of
+    # falling through to a close-all. Nothing is closed.
+    calls = fake_transport({
+        "list_targets": {
+            "ok": True,
+            "result": [
+                {"target_id": "123:1:7", "selector": "alpha.so", "view_id": "1"},
+                {"target_id": "123:2:9", "selector": "beta.so", "view_id": "2"},
+            ],
+        },
+        "close_binary": {"ok": True, "result": {"closed": []}},
+    })
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {"target": "alpha.so"})
+
+    rc = bn.cli.main(["close", "--format", "text"])
+
+    assert rc == 2
+    assert [c["op"] for c in calls] == ["list_targets"]
+    err = capsys.readouterr().err
+    assert "requires --target when multiple targets are open" in err
+    assert "alpha.so" in err and "beta.so" in err
 
 
 def test_instance_use_writes_state(tmp_session, monkeypatch, capsys):

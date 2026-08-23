@@ -67,14 +67,16 @@ def _load(args: argparse.Namespace) -> int:
 
 @command("close", help="Close a loaded binary", target=True,
          args=[
-             arg("path", nargs="?", help="Path to close (omit to close all)"),
+             arg("path", nargs="?", help="Path to close (omit to close the selected target)"),
              arg("--all", action="store_true", help="Close all loaded binaries"),
          ])
 def _close(args: argparse.Namespace) -> int:
-    # Only honor an explicit -t/--target. A sticky pin must not turn a bare
-    # `close` (documented as close-all) into close-one, and a stale pin must
-    # not make cleanup fail -- close needs to stay robust. `_call` resolves
-    # `args.target` into the request target, so drop any sticky-injected value.
+    # Only honor an explicit -t/--target. A sticky pin must not silently pick
+    # which target a bare `close` tears down, and a stale pin must not make
+    # cleanup fail -- close needs to stay robust. `_call` resolves `args.target`
+    # into the request target, so drop any sticky-injected value and let the
+    # standard resolution below decide (single open target -> that one;
+    # multiple -> refuse with the open-target list).
     if getattr(args, "_sticky_target", False):
         args.target = None
     # A named path and --all are mutually exclusive: the bridge gives --all
@@ -84,7 +86,7 @@ def _close(args: argparse.Namespace) -> int:
     if args.path and args.all:
         raise BridgeError(
             "Pass a path or --all, not both: a named path closes only that "
-            "target; --all (or a bare `bn close`) closes every loaded target."
+            "target; --all closes every loaded target."
         )
     params: dict[str, Any] = {}
     if args.path:
@@ -95,7 +97,13 @@ def _close(args: argparse.Namespace) -> int:
         args,
         "close_binary",
         params,
-        require_target=False,
+        # #664: a bare/empty selector resolves exactly like every other
+        # target-required command -- a single open target is closed implicitly,
+        # multiple open targets require an explicit -t (same hint + open-target
+        # list). Previously close skipped resolution and the bridge treated
+        # "no target" as close-ALL, the inverse of `bn save`'s refusal. Only an
+        # explicit path or --all opts out of target resolution.
+        require_target=not (args.all or args.path),
         text_renderer=_render_close_text,
         stem="close",
     )

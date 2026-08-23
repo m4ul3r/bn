@@ -291,8 +291,21 @@ def test_save_accepts_path_flag(monkeypatch, tmp_path):
     assert captured_params["path"] == str(out.expanduser().resolve())
 
 
+_TWO_TARGETS = {
+    "ok": True,
+    "result": [
+        {"target_id": "123:1:7", "selector": "alpha.so", "view_id": "1"},
+        {"target_id": "123:2:9", "selector": "beta.so", "view_id": "2"},
+    ],
+}
+
+
 def test_close_warns_on_unsaved_changes(fake_transport, capsys):
     fake_transport({
+        "list_targets": {
+            "ok": True,
+            "result": [{"target_id": "123:1:7", "selector": "foo.bndb"}],
+        },
         "close_binary": {
             "ok": True,
             "result": {
@@ -312,6 +325,10 @@ def test_close_warns_on_unsaved_changes(fake_transport, capsys):
 
 def test_close_silent_when_clean(fake_transport, capsys):
     fake_transport({
+        "list_targets": {
+            "ok": True,
+            "result": [{"target_id": "123:1:7", "selector": "foo.bndb"}],
+        },
         "close_binary": {
             "ok": True,
             "result": {
@@ -349,6 +366,121 @@ def test_close_all_flag_sets_param(fake_transport, monkeypatch, capsys):
 
     assert rc == 0
     assert calls[-1]["params"].get("all") is True
+
+
+def test_close_bare_single_target_resolves_to_active(fake_transport, monkeypatch, capsys):
+    # #664: with ONE target open, bare `bn close` (and its equivalent spellings
+    # `-t ""` / `-t active`) closes that one target through the same resolution
+    # as every other target-required command. `-t active` is passed through
+    # verbatim (the bridge resolver accepts it); the other two resolve client-side.
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    for argv, expected in (
+        (["close"], "active"),
+        (["close", "-t", ""], "active"),
+        (["close", "-t", "active"], "active"),
+    ):
+        calls = fake_transport({
+            "list_targets": {
+                "ok": True,
+                "result": [{"target_id": "123:1:7", "selector": "foo.bndb"}],
+            },
+            "close_binary": {"ok": True, "result": {"closed": [{"path": "/tmp/foo", "unsaved": False}]}},
+        })
+
+        rc = bn.cli.main([*argv, "--format", "text"])
+
+        assert rc == 0, argv
+        assert calls[-1]["op"] == "close_binary", argv
+        assert calls[-1]["target"] == expected, argv
+        assert "all" not in (calls[-1]["params"] or {}), argv
+        assert "closed: /tmp/foo" in capsys.readouterr().out
+
+
+def test_close_bare_multiple_targets_requires_target(fake_transport, monkeypatch, capsys):
+    # #664: bare `bn close` under multiple open targets used to close ALL of
+    # them (the bridge treated "no target" as close-all) while `bn save`
+    # refused. It now refuses with the same actionable hint + open-target list
+    # as every other target-required command, and never sends close_binary.
+    # `-t ""` is the same selector spelled differently and must behave the same.
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    for argv in (["close"], ["close", "-t", ""]):
+        calls = fake_transport({
+            "list_targets": _TWO_TARGETS,
+            "close_binary": {"ok": True, "result": {"closed": []}},
+        })
+
+        rc = bn.cli.main([*argv, "--format", "text"])
+
+        assert rc == 2, argv
+        assert [c["op"] for c in calls] == ["list_targets"], argv
+        err = capsys.readouterr().err
+        assert "requires --target when multiple targets are open" in err, argv
+        assert "alpha.so" in err and "beta.so" in err, argv
+
+
+def test_close_active_selector_multiple_targets_is_forwarded_to_bridge(fake_transport, monkeypatch, capsys):
+    # #664: `-t active` is an explicit (truthy) selector, so the CLI forwards it
+    # and the BRIDGE resolver refuses it under multiple targets -- exactly as
+    # `bn save -t active` does (covered bridge-side in test_bridge_dispatch).
+    # It must never be rewritten into a close-all request.
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    calls = fake_transport({
+        "close_binary": {
+            "ok": False,
+            "error": "No active BinaryView is selected and multiple targets are open",
+        },
+    })
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False, **kwargs):
+        calls.append({"op": op, "params": params, "target": target})
+        raise bn.cli.BridgeError("No active BinaryView is selected and multiple targets are open")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["close", "-t", "active", "--format", "text"])
+
+    assert rc == 2
+    assert [c["op"] for c in calls] == ["close_binary"]
+    assert calls[-1]["target"] == "active"
+    assert "all" not in (calls[-1]["params"] or {})
+    assert "multiple targets are open" in capsys.readouterr().err
+
+
+def test_close_explicit_target_multiple_targets_skips_implicit_resolution(fake_transport, monkeypatch, capsys):
+    # `bn close -t <target>` keeps working under multiple targets: an explicit
+    # selector is forwarded as-is with no list_targets round-trip.
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    calls = fake_transport({
+        "list_targets": _TWO_TARGETS,
+        "close_binary": {"ok": True, "result": {"closed": [{"path": "/proj/beta.so", "unsaved": False}]}},
+    })
+
+    rc = bn.cli.main(["close", "-t", "beta.so", "--format", "text"])
+
+    assert rc == 0
+    assert [c["op"] for c in calls] == ["close_binary"]
+    assert calls[-1]["target"] == "beta.so"
+
+
+def test_close_path_and_all_skip_target_resolution(fake_transport, monkeypatch, capsys):
+    # `bn close <path>` and `bn close --all` keep their explicit semantics under
+    # multiple targets: neither consults list_targets nor requires -t.
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+    for argv, expect_params in (
+        (["close", "/tmp/one-binary"], {"path": str(__import__("pathlib").Path("/tmp/one-binary").resolve())}),
+        (["close", "--all"], {"all": True}),
+    ):
+        calls = fake_transport({
+            "list_targets": _TWO_TARGETS,
+            "close_binary": {"ok": True, "result": {"closed": []}},
+        })
+
+        rc = bn.cli.main([*argv, "--format", "text"])
+
+        assert rc == 0, argv
+        assert [c["op"] for c in calls] == ["close_binary"], argv
+        assert calls[-1]["target"] is None, argv
+        assert calls[-1]["params"] == expect_params, argv
 
 
 def test_close_rejects_path_and_all_together(monkeypatch, capsys):

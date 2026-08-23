@@ -1474,7 +1474,19 @@ class BinaryNinjaBridge:
         # Resolve a target selector *before* taking _headless_views_lock:
         # resolve() -> refresh() -> _collect_open_views() re-acquires that lock,
         # which is non-reentrant, so resolving while holding it deadlocks.
-        target_bv = self.targets.resolve(target) if target is not None else None
+        #
+        # #664: a request with NO explicit path and NO all=true is a close of
+        # "the selected target", so it goes through the same resolver as
+        # save_database -- None / "" / "active" all mean "the single open
+        # target, else refuse". A bare request used to fall through to the
+        # close-everything branch below, so a CLI (or raw socket client) that
+        # omitted the target under multiple open targets tore down all of them
+        # while the equivalent `save` refused. Only an explicit path or all=true
+        # opts out of resolution; an explicit non-None selector always resolves.
+        if target is not None or (path is None and not all_):
+            target_bv = self.targets.resolve(target)
+        else:
+            target_bv = None
 
         # Target-based close takes priority and must succeed even when
         # _headless_views is empty: GUI-opened views resolve fine but are not
@@ -1498,8 +1510,9 @@ class BinaryNinjaBridge:
             if not _headless_views:
                 raise RuntimeError("No binaries are currently loaded")
 
-            # --all closes everything
-            if all_ or path is None:
+            # all=true closes everything (a bare request never reaches here:
+            # it resolved to a single target above or raised, #664)
+            if all_:
                 closed = []
                 for bv in _headless_views:
                     closed.append(_snapshot(bv))
