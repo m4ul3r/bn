@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import weakref
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -695,6 +696,13 @@ class BridgeHandler(socketserver.StreamRequestHandler):
         completed by then -- and only if it still fails, degrade to a clean
         ``{ok: false}`` error instead of dropping the connection with no response.
         """
+        identity = getattr(
+            getattr(getattr(self, "server", None), "bridge", None),
+            "bridge_identity",
+            None,
+        )
+        if identity is not None:
+            response = {**response, "bridge_identity": dict(identity)}
         for attempt in (1, 2):
             try:
                 return json.dumps(response, sort_keys=True, default=str).encode("utf-8")
@@ -717,8 +725,13 @@ class BridgeHandler(socketserver.StreamRequestHandler):
                     )
                 except Exception:  # noqa: BLE001
                     pass
+                fallback = _json_response(
+                    ok=False, error=f"response serialization failed: {detail}"
+                )
+                if identity is not None:
+                    fallback["bridge_identity"] = dict(identity)
                 return json.dumps(
-                    _json_response(ok=False, error=f"response serialization failed: {detail}"),
+                    fallback,
                     sort_keys=True,
                     default=str,
                 ).encode("utf-8")
@@ -776,17 +789,41 @@ class BridgeHandler(socketserver.StreamRequestHandler):
                     else:
                         op = payload.get("op")
                         request_id = payload.get("id")
-                        begin_request = getattr(bridge, "_begin_request", lambda _request_id: None)
-                        end_request = getattr(bridge, "_end_request", lambda _request_id: None)
-                        is_cancelled = getattr(
-                            bridge, "_is_request_cancelled", lambda _request_id: False,
-                        )
-                        begin_request(request_id)
-                        try:
-                            with _request_cancel_context(lambda: is_cancelled(request_id)):
-                                response = bridge.dispatch(payload)
-                        finally:
-                            end_request(request_id)
+                        expected_identity = getattr(bridge, "bridge_identity", None)
+                        actual_identity = payload.get("_bridge_identity")
+                        if (
+                            expected_identity is not None
+                            and actual_identity != expected_identity
+                        ):
+                            response = _json_response(
+                                ok=False,
+                                error=(
+                                    "bridge identity mismatch: "
+                                    f"expected {expected_identity!r}, "
+                                    f"received {actual_identity!r}; "
+                                    "request was not dispatched"
+                                ),
+                            )
+                        else:
+                            begin_request = getattr(
+                                bridge, "_begin_request", lambda _request_id: None
+                            )
+                            end_request = getattr(
+                                bridge, "_end_request", lambda _request_id: None
+                            )
+                            is_cancelled = getattr(
+                                bridge,
+                                "_is_request_cancelled",
+                                lambda _request_id: False,
+                            )
+                            begin_request(request_id)
+                            try:
+                                with _request_cancel_context(
+                                    lambda: is_cancelled(request_id)
+                                ):
+                                    response = bridge.dispatch(payload)
+                            finally:
+                                end_request(request_id)
             encoded = self._encode_response(response, op=op, request_id=request_id)
             self._write_response(encoded, op=op, request_id=request_id)
         finally:
@@ -879,6 +916,7 @@ def _function_name_summary(bv) -> dict[str, int]:
 class BinaryNinjaBridge:
     def __init__(self, instance_id: str | None = None):
         self.instance_id = instance_id
+        self.instance_token = str(uuid.uuid4())
         self.targets = TargetManager()
         self.ctx = BridgeContext(self.targets)
         self.socket_path = bridge_socket_path(instance_id)
@@ -903,6 +941,14 @@ class BinaryNinjaBridge:
         self._inflight: int = 0
         self._shutting_down: bool = False
         self._last_activity: float = time.monotonic()
+
+    @property
+    def bridge_identity(self) -> dict[str, Any]:
+        return {
+            "instance_id": self.instance_id,
+            "pid": os.getpid(),
+            "token": self.instance_token,
+        }
 
     def _socket_is_live(self) -> bool:
         """Whether something is currently accepting connections on our socket path."""
@@ -1037,6 +1083,7 @@ class BinaryNinjaBridge:
         }
         if self.instance_id is not None:
             payload["instance_id"] = self.instance_id
+        payload["instance_token"] = self.instance_token
         # #80: record the open binaries so `bn instance list` can show what each
         # instance holds without an N-instance `target list` round-trip -- the
         # biggest usability win for the many-bridges case. Best-effort: a registry
@@ -1475,12 +1522,15 @@ class BinaryNinjaBridge:
 
     def _close_binary(self, path: str | None = None, target: str | None = None, all_: bool = False):
         def _snapshot(bv) -> dict[str, Any]:
-            # BN's bv.file.modified does not flip True after our verified
-            # mutations, so OR in the bridge's own committed-but-unsaved tracking
-            # (L15) -- otherwise close silently discards annotations.
+            # Binary Ninja's generic modified bit also covers analysis/cache
+            # churn on a read-only session. `unsaved` is specifically the
+            # bridge's committed mutation ledger; preserve the raw engine bit
+            # separately for diagnostics without falsely warning about discarded
+            # user mutations.
             return {
                 "path": str(getattr(bv.file, "filename", "")),
-                "unsaved": bool(getattr(bv.file, "modified", False)) or self.targets.is_dirty(bv),
+                "unsaved": self.targets.is_dirty(bv),
+                "file_modified": bool(getattr(bv.file, "modified", False)),
             }
 
         # The three ways to name what to close -- a target selector, a path,

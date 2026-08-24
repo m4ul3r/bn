@@ -195,7 +195,11 @@ def _install_tree(source: Path, dest: Path, *, mode: str, force: bool) -> None:
             shutil.rmtree(dest)
 
     if mode == "copy":
-        shutil.copytree(source, dest)
+        shutil.copytree(
+            source,
+            dest,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        )
     else:
         os.symlink(source, dest, target_is_directory=True)
 
@@ -263,6 +267,8 @@ def _default_skill_install_roots() -> list[Path]:
     roots = [cli.claude_skills_dir()]
     if cli.codex_home().is_dir():
         roots.append(cli.codex_skills_dir())
+    if cli.omp_config_root().exists() or cli.omp_agent_dir().exists():
+        roots.append(cli.omp_skills_dir())
     return roots
 
 

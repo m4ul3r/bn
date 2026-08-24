@@ -9,6 +9,17 @@ import pytest
 from _cli_helpers import *  # noqa: F401,F403
 
 
+@pytest.fixture(autouse=True)
+def _isolate_omp_skill_destination(monkeypatch, tmp_path):
+    config_root = tmp_path / "absent-omp-config"
+    agent_dir = config_root / "agent"
+    monkeypatch.setattr(bn.cli, "omp_config_root", lambda: config_root, raising=False)
+    monkeypatch.setattr(bn.cli, "omp_agent_dir", lambda: agent_dir, raising=False)
+    monkeypatch.setattr(
+        bn.cli, "omp_skills_dir", lambda: agent_dir / "skills", raising=False
+    )
+
+
 def test_skills_source_dir_prefers_repo_then_falls_back_to_prefix(monkeypatch, tmp_path):
     # #83: editable checkout uses repo skills/; a wheel install (no repo skills/)
     # falls back to the install prefix where the data files land.
@@ -79,6 +90,29 @@ def test_skill_install_copy_mode(tmp_path):
     assert (destination / "bn" / "agents" / "openai.yaml").exists()
     assert (destination / "bn-re" / "SKILL.md").exists()
     assert (destination / "bn-vr" / "SKILL.md").exists()
+    assert (destination / "bn-kernel" / "SKILL.md").exists()
+
+
+def test_skill_install_copy_omits_python_bytecode(tmp_path, monkeypatch):
+    source_root = tmp_path / "bundled-skills"
+    skill = source_root / "sample"
+    cache = skill / "__pycache__"
+    cache.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: sample\n---\n")
+    (skill / "adapter.py").write_text("VALUE = 1\n")
+    (cache / "adapter.cpython-314.pyc").write_bytes(b"stale bytecode")
+    (skill / "adapter.pyo").write_bytes(b"stale bytecode")
+    destination = tmp_path / "installed"
+    monkeypatch.setattr(bn.cli, "skills_source_dir", lambda: source_root)
+
+    rc = bn.cli.main(
+        ["skill", "install", "--mode", "copy", "--dest", str(destination)]
+    )
+
+    assert rc == 0
+    assert (destination / "sample" / "adapter.py").exists()
+    assert not (destination / "sample" / "__pycache__").exists()
+    assert not (destination / "sample" / "adapter.pyo").exists()
 
 
 def test_skill_install_defaults_to_claude_only_without_codex_home(tmp_path, monkeypatch):
@@ -171,6 +205,100 @@ def test_skill_install_custom_dest_still_fails_when_destination_exists(tmp_path)
 
     assert rc == 2
 
+
+
+def test_omp_path_resolution_follows_profiles_and_agent_override(monkeypatch, tmp_path):
+    import bn.paths as paths
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for name in (
+        "PI_CONFIG_DIR",
+        "OMP_PROFILE",
+        "PI_PROFILE",
+        "PI_CODING_AGENT_DIR",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert paths.omp_config_root() == tmp_path / ".omp"
+    assert paths.omp_agent_dir() == tmp_path / ".omp" / "agent"
+    assert paths.omp_skills_dir() == tmp_path / ".omp" / "agent" / "skills"
+
+    monkeypatch.setenv("PI_CONFIG_DIR", ".custom-omp")
+    monkeypatch.setenv("PI_PROFILE", "fallback")
+    monkeypatch.setenv("OMP_PROFILE", "  preferred  ")
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", "~/ignored-agent")
+    assert paths.omp_config_root() == tmp_path / ".custom-omp"
+    assert paths.omp_agent_dir() == (
+        tmp_path / ".custom-omp" / "profiles" / "preferred" / "agent"
+    )
+
+    monkeypatch.setenv("OMP_PROFILE", "  ")
+    assert paths.omp_agent_dir() == tmp_path / "ignored-agent"
+
+    monkeypatch.setenv("OMP_PROFILE", "default")
+    assert paths.omp_agent_dir() == tmp_path / "ignored-agent"
+
+
+def test_skill_install_adds_default_omp_profile_when_root_exists(
+    tmp_path, monkeypatch
+):
+    claude_root = tmp_path / "claude" / "skills"
+    codex_home = tmp_path / "codex"
+    omp_config = tmp_path / ".omp"
+    omp_agent = omp_config / "agent"
+    omp_root = omp_agent / "skills"
+    omp_config.mkdir()
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: claude_root)
+    monkeypatch.setattr(bn.cli, "codex_home", lambda: codex_home)
+    monkeypatch.setattr(bn.cli, "omp_config_root", lambda: omp_config)
+    monkeypatch.setattr(bn.cli, "omp_agent_dir", lambda: omp_agent)
+    monkeypatch.setattr(bn.cli, "omp_skills_dir", lambda: omp_root)
+
+    rc = bn.cli.main(["skill", "install", "--mode", "copy"])
+
+    assert rc == 0
+    assert (omp_root / "bn-kernel" / "SKILL.md").exists()
+    assert (omp_root / "bn" / "SKILL.md").exists()
+
+
+def test_skill_install_adds_omp_when_only_agent_directory_exists(
+    tmp_path, monkeypatch
+):
+    claude_root = tmp_path / "claude" / "skills"
+    codex_home = tmp_path / "codex"
+    omp_config = tmp_path / "missing-config"
+    omp_agent = tmp_path / "custom-agent"
+    omp_root = omp_agent / "skills"
+    omp_agent.mkdir()
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: claude_root)
+    monkeypatch.setattr(bn.cli, "codex_home", lambda: codex_home)
+    monkeypatch.setattr(bn.cli, "omp_config_root", lambda: omp_config)
+    monkeypatch.setattr(bn.cli, "omp_agent_dir", lambda: omp_agent)
+    monkeypatch.setattr(bn.cli, "omp_skills_dir", lambda: omp_root)
+
+    assert bn.cli.main(["skill", "install", "--mode", "copy"]) == 0
+    assert (omp_root / "bn-kernel" / "SKILL.md").exists()
+
+
+def test_skill_install_explicit_destination_never_writes_omp(
+    tmp_path, monkeypatch
+):
+    explicit = tmp_path / "explicit"
+    omp_config = tmp_path / ".omp"
+    omp_agent = omp_config / "agent"
+    omp_root = omp_agent / "skills"
+    omp_config.mkdir()
+    monkeypatch.setattr(bn.cli, "omp_config_root", lambda: omp_config)
+    monkeypatch.setattr(bn.cli, "omp_agent_dir", lambda: omp_agent)
+    monkeypatch.setattr(bn.cli, "omp_skills_dir", lambda: omp_root)
+
+    rc = bn.cli.main(
+        ["skill", "install", "--mode", "copy", "--dest", str(explicit)]
+    )
+
+    assert rc == 0
+    assert (explicit / "bn-kernel" / "SKILL.md").exists()
+    assert not omp_root.exists()
 
 def test_version_flag_prints_version(capsys):
     # `bn --version` is a real affordance, not "unrecognized arguments" (#49).

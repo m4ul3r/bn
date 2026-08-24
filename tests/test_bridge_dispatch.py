@@ -374,6 +374,48 @@ def test_py_exec_non_serializable_result_falls_back_to_repr(monkeypatch):
     assert result["warnings"]
 
 
+def test_py_exec_marks_view_dirty_when_script_changes_modified_bit(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = types.SimpleNamespace(file=types.SimpleNamespace(modified=False))
+    marked = []
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx.targets, "mark_dirty", lambda view: marked.append(view))
+
+    result = instance._py_exec("active", "bv.file.modified = True; result = 1")
+
+    assert marked == [bv]
+    assert result["dirty"] is True
+
+
+def test_py_exec_read_only_script_stays_clean(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = types.SimpleNamespace(file=types.SimpleNamespace(modified=False))
+    marked = []
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx.targets, "mark_dirty", lambda view: marked.append(view))
+
+    result = instance._py_exec("active", "result = 1 + 1")
+
+    assert marked == []
+    assert result["dirty"] is False
+
+
+def test_py_exec_explicit_mark_dirty_handles_preexisting_modified_bit(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = types.SimpleNamespace(file=types.SimpleNamespace(modified=True))
+    marked = []
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx.targets, "mark_dirty", lambda view: marked.append(view))
+
+    result = instance._py_exec("active", "mark_dirty(); result = 3")
+
+    assert marked == [bv]
+    assert result["dirty"] is True
+
+
 def test_read_write_lock_blocks_reader_until_writer_releases(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     lock = bridge._ReadWriteLock()
@@ -1525,6 +1567,29 @@ def test_close_binary_by_target_selector_does_not_deadlock(monkeypatch, tmp_path
     bridge._headless_views.clear()
 
 
+def test_close_read_only_view_does_not_report_unsaved_mutations(
+    monkeypatch, tmp_path
+):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    bv = _ClosableBV("/proj/read-only.bndb", session_id="11")
+    bv.file.modified = True  # Binary Ninja analysis/cache churn, not a bn mutation.
+    _register_views(bridge, bv)
+
+    result = _close_on_watchdog(instance, target="read-only.bndb")
+
+    assert result["closed"] == [
+        {
+            "path": "/proj/read-only.bndb",
+            "unsaved": False,
+            "file_modified": True,
+        }
+    ]
+    assert bv.closed
+    bridge._headless_views.clear()
+
+
 def test_close_binary_all_flag_closes_everything(monkeypatch, tmp_path):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -2156,6 +2221,56 @@ def test_bridge_handler_allows_request_exactly_at_cap_with_newline(monkeypatch):
     assert json.loads(writer.data.decode("utf-8"))["ok"] is True
 
 
+@pytest.mark.parametrize(
+    ("operation", "params"),
+    [
+        ("load_binary", {"path": "/tmp/foreign.bin"}),
+        ("save_database", {"path": "/tmp/foreign.bndb"}),
+    ],
+)
+def test_bridge_handler_rejects_foreign_identity_before_dispatch(
+    monkeypatch, operation, params
+):
+    bridge = _load_bridge(monkeypatch)
+    dispatched = []
+    expected_identity = {
+        "instance_id": "expected",
+        "pid": 1234,
+        "token": "expected-token",
+    }
+    line = json.dumps(
+        {
+            "id": "mutating-request",
+            "op": operation,
+            "params": params,
+            "_bridge_identity": {
+                "instance_id": "foreign",
+                "pid": 5678,
+                "token": "foreign-token",
+            },
+        }
+    ).encode() + b"\n"
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.connection = _same_uid_conn()
+    handler.rfile = io.BytesIO(line)
+    handler.server = types.SimpleNamespace(
+        bridge=types.SimpleNamespace(
+            bridge_identity=expected_identity,
+            dispatch=lambda payload: dispatched.append(payload),
+        )
+    )
+    writer = _RecordingWriter()
+    handler.wfile = writer
+
+    handler.handle()
+
+    response = json.loads(writer.data.decode("utf-8"))
+    assert response["ok"] is False
+    assert "bridge identity mismatch" in response["error"]
+    assert response["bridge_identity"] == expected_identity
+    assert dispatched == []
+
+
 def test_bridge_handler_rejects_non_dict_json(monkeypatch):
     bridge = _load_bridge(monkeypatch)
 
@@ -2640,7 +2755,12 @@ def test_bridge_handler_counts_request_inflight_until_response_written(monkeypat
     inst._last_activity = 0.0
 
     handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
-    handler.rfile = io.BytesIO(b'{"op": "noop", "id": "r1"}\n')
+    handler.rfile = io.BytesIO(
+        json.dumps(
+            {"op": "noop", "id": "r1", "_bridge_identity": inst.bridge_identity}
+        ).encode("utf-8")
+        + b"\n"
+    )
     handler.server = types.SimpleNamespace(bridge=inst)
     handler.wfile = _RecordingWriter()
     handler.connection = _same_uid_conn()  # satisfy #612 peercred gate
@@ -2668,7 +2788,12 @@ def test_bridge_handler_counts_inflight_for_idless_request(monkeypatch):
     inst.dispatch = fake_dispatch
 
     handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
-    handler.rfile = io.BytesIO(b'{"op": "noop"}\n')  # NO id
+    handler.rfile = io.BytesIO(
+        json.dumps({"op": "noop", "_bridge_identity": inst.bridge_identity}).encode(
+            "utf-8"
+        )
+        + b"\n"
+    )  # NO id
     handler.server = types.SimpleNamespace(bridge=inst)
     handler.wfile = _RecordingWriter()
     handler.connection = _same_uid_conn()  # satisfy #612 peercred gate

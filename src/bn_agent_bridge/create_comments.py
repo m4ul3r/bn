@@ -449,39 +449,61 @@ def _normalize_py_result(ctx, value: Any) -> tuple[Any, list[str]]:
 def _py_exec(ctx, selector: str | None, script: str):
     bv = ctx._resolve_view(selector)
     stdout = io.StringIO()
+    explicitly_dirty = False
+
+    def modified() -> bool:
+        try:
+            return bool(getattr(bv.file, "modified", False))
+        except Exception:
+            return False
+
+    def mark_dirty() -> None:
+        nonlocal explicitly_dirty
+        explicitly_dirty = True
+
+    before_modified = modified()
     scope = {
         "bn": bn,
         "binaryninja": bn,
         "bv": bv,
+        "mark_dirty": mark_dirty,
         "result": None,
     }
-    with contextlib.redirect_stdout(stdout):
-        try:
-            exec(script, scope, scope)
-        except (SystemExit, KeyboardInterrupt) as exc:
-            # These are BaseException, not Exception, so the broad handler below
-            # would let them through and unwind the worker thread -- the client
-            # then sees a misleading "empty response / worker faulted" instead of
-            # the real cause. A snippet calling sys.exit()/raising SystemExit (or
-            # a stray KeyboardInterrupt) is the user's own bug, not a bridge
-            # fault, so report it cleanly and keep the worker alive (#387).
-            code = getattr(exc, "code", None)
-            detail = f" (code {code!r})" if isinstance(exc, SystemExit) else ""
-            raise RuntimeError(
-                f"py exec snippet raised {type(exc).__name__}{detail}; "
-                "the worker was protected"
-            ) from exc
-        except Exception as exc:  # noqa: BLE001 - user script errors are user-facing
-            # Report every script failure the same way -- "TypeName: message".
-            # Previously a ValueError surfaced as a bare message while a
-            # NameError was tagged "internal error: NameError:", because only
-            # some builtins are whitelisted as user-facing. The user's own
-            # script raised this, so it is always a user-facing error.
-            raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
+    dirty = False
+    try:
+        with contextlib.redirect_stdout(stdout):
+            try:
+                exec(script, scope, scope)
+            except (SystemExit, KeyboardInterrupt) as exc:
+                # These are BaseException, not Exception, so the broad handler below
+                # would let them through and unwind the worker thread -- the client
+                # then sees a misleading "empty response / worker faulted" instead of
+                # the real cause. A snippet calling sys.exit()/raising SystemExit (or
+                # a stray KeyboardInterrupt) is the user's own bug, not a bridge
+                # fault, so report it cleanly and keep the worker alive (#387).
+                code = getattr(exc, "code", None)
+                detail = f" (code {code!r})" if isinstance(exc, SystemExit) else ""
+                raise RuntimeError(
+                    f"py exec snippet raised {type(exc).__name__}{detail}; "
+                    "the worker was protected"
+                ) from exc
+            except Exception as exc:  # noqa: BLE001 - user script errors are user-facing
+                # Report every script failure the same way -- "TypeName: message".
+                # Previously a ValueError surfaced as a bare message while a
+                # NameError was tagged "internal error: NameError:", because only
+                # some builtins are whitelisted as user-facing. The user's own
+                # script raised this, so it is always a user-facing error.
+                raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
+    finally:
+        dirty = explicitly_dirty or (not before_modified and modified())
+        if dirty:
+            ctx.targets.mark_dirty(bv)
+
     result_value, warnings = _normalize_py_result(ctx, scope.get("result"))
     result = {
         "stdout": stdout.getvalue(),
         "result": result_value,
         "warnings": warnings,
+        "dirty": dirty,
     }
     return result

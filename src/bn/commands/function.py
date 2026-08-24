@@ -478,11 +478,14 @@ def _function_cfg(args: argparse.Namespace) -> int:
              arg("--any", nargs="+", dest="any_symbols", metavar="SYMBOL",
                  help="Batch-probe several symbols (a sink sweep); absent symbols are "
                       "reported, not errors"),
+             arg("--fn-pointer-scan", action="store_true",
+                 help="Also scan stored function pointers for references"),
          ])
 def _xrefs(args: argparse.Namespace) -> int:
     field_spec = getattr(args, "field_spec", None)
     identifier = getattr(args, "identifier", None)
     any_symbols = getattr(args, "any_symbols", None)
+    fn_pointer_scan = getattr(args, "fn_pointer_scan", False)
     if any_symbols:
         # #410: accept comma-separated lists as well as space-separated, so
         # `--any read,recv,memcpy` (or `read, recv, memcpy`) probes three symbols
@@ -492,6 +495,10 @@ def _xrefs(args: argparse.Namespace) -> int:
         any_symbols = [t for chunk in any_symbols
                        for s in (chunk.split(",") if "," in chunk else [chunk])
                        if (t := s.strip())]
+    if fn_pointer_scan and (any_symbols or field_spec):
+        raise BridgeError(
+            "xrefs --fn-pointer-scan requires an identifier, not --any or --field"
+        )
     if any_symbols:
         if identifier or field_spec:
             raise BridgeError("xrefs --any takes only the symbol list, not an identifier or --field")
@@ -536,6 +543,8 @@ def _xrefs(args: argparse.Namespace) -> int:
     # caller-group display cap, so it must fetch the full set -- don't forward
     # offset/limit to the op or the renderer would group only a slice.
     params: dict[str, Any] = {"identifier": identifier}
+    if fn_pointer_scan:
+        params["fn_pointer_scan"] = True
     limit = _effective_limit(args)
     if args.format != "text":
         if args.offset:
@@ -601,7 +610,7 @@ def _load_within_identifiers(path: Path) -> list[str]:
     return identifiers
 
 
-@command("callsites", help="Find direct native callsites and exact caller_static addresses",
+@command("callsites", help="Find direct native callsites and exact caller_static addresses (all callers by default)",
          target=True, paged=True,
          prefer_when="exact caller->callsite address mapping; "
                      "use xrefs for general or data cross-references",
@@ -615,9 +624,9 @@ def _load_within_identifiers(path: Path) -> list[str]:
          ],
          mutex_groups=[
              mutex(False,
-                   arg("--within", help="Containing function to search for callsites"),
+                   arg("--within", help="Restrict callsite search to one containing function"),
                    arg("--within-file", type=Path,
-                       help="Text file with one containing-function identifier per line (hex addresses accepted)")),
+                       help="Restrict callsite search to functions listed in a UTF-8 text file")),
          ])
 def _callsites(args: argparse.Namespace) -> int:
     if args.within is not None:
@@ -629,12 +638,7 @@ def _callsites(args: argparse.Namespace) -> int:
         if not within_identifiers:
             raise BridgeError(f"Scope file did not contain any function identifiers: {args.within_file}")
     else:
-        raise BridgeError(
-            "bn callsites needs a scope. Options:\n"
-            f"  single caller:  bn callsites {args.callee} --within <function>\n"
-            f"  many callers:   bn callsites {args.callee} --within-file <path>\n"
-            f"  list callers:   bn xrefs {args.callee}"
-        )
+        within_identifiers = []
 
     # #454: page high-fan-in callsite surveys bridge-side, like xrefs/function list.
     params: dict[str, Any] = {

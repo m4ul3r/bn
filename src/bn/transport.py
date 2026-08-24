@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -98,6 +99,7 @@ class BridgeInstance:
     started_at: str | None
     meta: dict[str, Any]
     instance_id: str | None = None
+    instance_token: str | None = None
 
 
 def instance_selector(instance: BridgeInstance) -> str:
@@ -229,6 +231,15 @@ def _load_instance(path: Path) -> BridgeInstance | None:
     except (OSError, ValueError, KeyError, json.JSONDecodeError):
         return None
 
+    instance_id = payload.get("instance_id")
+    if path.parent == instances_dir() and instance_id != path.stem:
+        # The registry filename is the caller's explicit selector. Never trust a
+        # payload that claims a different identity, and never unlink the socket
+        # named by that foreign payload.
+        with contextlib.suppress(OSError):
+            path.unlink()
+        return None
+
     if not socket_path.exists():
         _purge_stale_registry(path, socket_path)
         return None
@@ -245,7 +256,8 @@ def _load_instance(path: Path) -> BridgeInstance | None:
         plugin_version=str(payload.get("plugin_version", "0")),
         started_at=payload.get("started_at"),
         meta=payload,
-        instance_id=payload.get("instance_id"),
+        instance_id=instance_id,
+        instance_token=payload.get("instance_token"),
     )
 
 
@@ -439,24 +451,71 @@ def choose_instance(
     raise BridgeError("No running Binary Ninja bridge instances found")
 
 
+
+
+def _instance_identity(instance: BridgeInstance) -> dict[str, Any]:
+    token = instance.instance_token
+    if not isinstance(token, str) or not token:
+        raise BridgeError(
+            f"Bridge instance {instance_selector(instance)!r} has no identity token; "
+            "the bridge is stale -- restart it and retry"
+        )
+    return {
+        "instance_id": instance.instance_id,
+        "pid": instance.pid,
+        "token": token,
+    }
+
+
+def _verify_socket_peer_pid(sock: socket.socket, instance: BridgeInstance) -> None:
+    if not hasattr(socket, "SO_PEERCRED"):
+        return
+    getter = getattr(sock, "getsockopt", None)
+    if not callable(getter):
+        return
+    try:
+        raw = getter(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
+        peer_pid, _uid, _gid = struct.unpack("3i", raw)
+    except (OSError, ValueError, struct.error):
+        return
+    if peer_pid != instance.pid:
+        raise BridgeError(
+            f"Bridge socket peer pid mismatch for instance {instance_selector(instance)!r}: "
+            f"registry pid {instance.pid}, socket peer pid {peer_pid}; refusing to send the request"
+        )
+
+
+def _verify_response_identity(
+    response: dict[str, Any],
+    expected: dict[str, Any],
+) -> None:
+    actual = response.get("bridge_identity")
+    if actual != expected:
+        raise BridgeError(
+            "Binary Ninja bridge identity mismatch: "
+            f"expected {expected!r}, received {actual!r}; "
+            "refusing data from a different or stale bridge"
+        )
 def _send_cancel_request(instance: BridgeInstance, request_id: str) -> None:
     payload = {
         "id": str(uuid.uuid4()),
         "op": "cancel_request",
         "params": {"request_id": request_id},
+        "_bridge_identity": _instance_identity(instance),
     }
     encoded = (json.dumps(payload) + "\n").encode("utf-8")
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
             sock.settimeout(CANCEL_REQUEST_TIMEOUT)
             sock.connect(str(instance.socket_path))
+            _verify_socket_peer_pid(sock, instance)
             sock.sendall(encoded)
             with contextlib.suppress(OSError):
                 sock.shutdown(socket.SHUT_WR)
             with contextlib.suppress(OSError):
                 while sock.recv(65536):
                     pass
-    except OSError:
+    except (OSError, BridgeError):
         pass
 
 
@@ -470,10 +529,12 @@ def _send_request_to_instance(
     default_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
     connect_retries: int = 4,
 ) -> dict[str, Any]:
+    expected_identity = _instance_identity(instance)
     payload: dict[str, Any] = {
         "id": str(uuid.uuid4()),
         "op": op,
         "params": params or {},
+        "_bridge_identity": expected_identity,
     }
     if target is not None:
         payload["target"] = target
@@ -489,6 +550,7 @@ def _send_request_to_instance(
                 if timeout is not None:
                     sock.settimeout(timeout)
                 sock.connect(str(instance.socket_path))
+                _verify_socket_peer_pid(sock, instance)
                 sock.sendall(encoded)
                 with contextlib.suppress(OSError):
                     sock.shutdown(socket.SHUT_WR)
@@ -541,6 +603,7 @@ def _send_request_to_instance(
     if not isinstance(response, dict):
         raise BridgeError("Binary Ninja bridge returned a malformed response")
 
+    _verify_response_identity(response, expected_identity)
     if response.get("ok"):
         return response
 

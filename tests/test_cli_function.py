@@ -505,18 +505,28 @@ def test_callsites_both_scope_flags_still_rejected():
         )
 
 
-def test_callsites_missing_scope_raises_actionable_error(fake_transport, capsys):
-    fake_transport()
+def test_callsites_missing_scope_routes_all_callers(fake_transport):
+    calls = fake_transport(
+        {
+            "callsites": {
+                "ok": True,
+                "result": {
+                    "kind": "callsites",
+                    "items": [],
+                    "total": 0,
+                    "offset": 0,
+                    "limit": None,
+                    "returned": 0,
+                    "has_more": False,
+                },
+            }
+        }
+    )
 
     rc = bn.cli.main(["callsites", "crt_rand", "--target", "active"])
 
-    # BridgeError surfaces as a nonzero exit with a human-facing message.
-    assert rc != 0
-    combined = capsys.readouterr()
-    text = combined.err + combined.out
-    assert "--within" in text
-    assert "--within-file" in text
-    assert "bn xrefs crt_rand" in text
+    assert rc == 0
+    assert calls[-1]["params"]["within_identifiers"] == []
 
 
 def test_function_info_uses_active_target_and_text_renderer(fake_transport, capsys):
@@ -1542,6 +1552,26 @@ def test_xrefs_json_limit_pages_instead_of_erroring(monkeypatch, capsys):
     assert rc == 0
     assert captured["op"] == "xrefs"
     assert captured["params"].get("limit") == 3
+
+
+def test_xrefs_function_pointer_scan_routes_to_bridge(monkeypatch, capsys):
+    captured = _capture_xrefs_call(monkeypatch)
+
+    rc = bn.cli.main(
+        [
+            "xrefs",
+            "sub_401000",
+            "--target",
+            "active",
+            "--format",
+            "json",
+            "--fn-pointer-scan",
+        ]
+    )
+
+    assert rc == 0
+    assert captured["op"] == "xrefs"
+    assert captured["params"]["fn_pointer_scan"] is True
 
 
 def test_evidence_xrefs_json_limit_pages_instead_of_erroring(monkeypatch, capsys):

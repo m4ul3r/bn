@@ -71,7 +71,7 @@ bn instance gc                          # reap dead instances' leftover logs/soc
 
 A bare `bn close` closes the single open target; with several open it refuses with the open-target list (pass `-t <selector>`, a path, or `--all`). It never closes everything implicitly — only `--all` does (#664). Because close is destructive, it is stricter than `bn save`: on a multi-tab GUI bridge a bare close does **not** fall back to the focused tab (save does), the CLI pins the exact `target_id` it observed rather than sending `active` (so a concurrent close/load between the lookup and the close yields an unknown-selector error instead of closing a different binary), an empty `-t ""` or empty positional path `""` (e.g. an unset shell variable) is an error rather than a bare close, and `-t` cannot be combined with a path or `--all`. The bridge enforces the same rules for raw socket clients: a non-null empty `target`, an empty `path`, and any `target`+`path`/`all` pair are rejected.
 
-`bn close` reports each closed view as `{path, unsaved}`. If a view had unsaved mutations, stdout warns — run `bn save` *first* if you care about annotations:
+`bn close` reports each closed view as `{path, unsaved, file_modified}`. `unsaved` means a committed bn mutation is not saved; only that condition triggers the stdout warning. `file_modified` preserves Binary Ninja's broader analysis/cache-dirty bit for diagnostics without falsely labeling a read-only session as discarded user mutations.
 
 ```bash
 bn save                                  # saves to <filename>.bndb
@@ -93,7 +93,7 @@ Pass `--no-bndb` to force loading the raw binary even when a sibling `.bndb` exi
 
 > **Global BNDB cache (read-only mounts).** Auto-prefer isn't limited to a *sibling* `.bndb`. When the target's directory is not writable (a read-only firmware mount), a prior `bn save` falls back to a **global content-hash-keyed cache** at `~/.cache/bn/bndb/<stem>.<hash>.bndb` (override the cache root with `BN_CACHE_DIR`). A later `bn load <raw>` / `bn session start <raw>` **auto-restores from that cache** — carrying every prior rename/comment — and prints `note: restored cached database …; pass --no-bndb to load the raw bytes`. Two consequences for a "recover names on an unknown binary" task: (1) the view can come back **already annotated** from an earlier run, so you can't tell your recovery from a previous one — check the note (or `--no-bndb`) before claiming a clean slate; (2) a multi-MB target that "loads in seconds" is a **cache hit, not a fast cold analysis** — don't read it as a timing/perf observation. Use `--no-bndb` for a pristine, un-annotated analysis.
 
-`bn load` blocks until analysis completes (the bridge runs `update_analysis_and_wait()` and the CLI socket has no timeout). Plan for it on large binaries.
+`bn load` blocks until analysis completes (`update_analysis_and_wait()`). Full loads can take seconds to minutes under contention; do not rely on a fixed load time. Each headless bridge can consume hundreds of MB, and a large/complex BNDB may be OOM-killed. Bound fan-out concurrency, monitor RSS with `bn session list`, and stop unused instances promptly.
 
 **Quick load (`--quick` / `--no-analysis`).** `bn load --quick` and `bn session start --quick` skip that analysis pass (~1s instead of waiting for the full function set), at the cost of a **capability boundary** — the container is parsed but the code is not yet analyzed:
 

@@ -44,6 +44,7 @@ class _Handler(socketserver.StreamRequestHandler):
         if not raw:
             return
         payload = json.loads(raw.decode("utf-8"))
+        self.server.requests.append(payload)
         response = {
             "ok": True,
             "result": {
@@ -51,12 +52,19 @@ class _Handler(socketserver.StreamRequestHandler):
                 "target": payload.get("target"),
                 "params": payload.get("params"),
             },
+            "bridge_identity": getattr(
+                self.server, "bridge_identity", payload.get("_bridge_identity")
+            ),
         }
         self.wfile.write(json.dumps(response).encode("utf-8"))
 
 
 class _Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
+    def __init__(self, *args, **kwargs):
+        self.requests = []
+        self.bridge_identity = None
+        super().__init__(*args, **kwargs)
 
     def server_close(self):
         # Closing an AF_UNIX socket does not remove its filesystem pathname;
@@ -73,6 +81,12 @@ def test_send_request_uses_registry_and_socket(tmp_path, monkeypatch):
     registry_path.parent.mkdir(parents=True, exist_ok=True)
 
     server = _Server(str(socket_path), _Handler)
+    token = "test-instance-token"
+    server.bridge_identity = {
+        "instance_id": None,
+        "pid": pid,
+        "token": token,
+    }
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
@@ -83,6 +97,7 @@ def test_send_request_uses_registry_and_socket(tmp_path, monkeypatch):
                 "socket_path": str(socket_path),
                 "plugin_name": "bn_agent_bridge",
                 "plugin_version": "0.1.0",
+                "instance_token": token,
             }
         ),
         encoding="utf-8",
@@ -101,6 +116,121 @@ def test_send_request_uses_registry_and_socket(tmp_path, monkeypatch):
         server.shutdown()
         server.server_close()
 
+
+
+def test_send_request_rejects_foreign_response_identity(tmp_path, monkeypatch):
+    import bn.transport as transport
+
+    socket_path = tmp_path / "foreign.sock"
+    server = _Server(str(socket_path), _Handler)
+    server.bridge_identity = {
+        "instance_id": "foreign",
+        "pid": os.getpid(),
+        "token": "foreign-token",
+    }
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    instance = transport.BridgeInstance(
+        pid=os.getpid(),
+        socket_path=socket_path,
+        registry_path=tmp_path / "expected.json",
+        plugin_name="bn_agent_bridge",
+        plugin_version="1",
+        started_at=None,
+        meta={},
+        instance_id="expected",
+        instance_token="expected-token",
+    )
+    monkeypatch.setattr(transport, "choose_instance", lambda *args, **kwargs: instance)
+
+    try:
+        with pytest.raises(BridgeError, match="bridge identity mismatch"):
+            send_request("target_info", instance_id="expected")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_send_request_rejects_tokenless_registry_before_dispatch(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    socket_path = tmp_path / "legacy.sock"
+    server = _Server(str(socket_path), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    registry = bridge_registry_path("legacy")
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "socket_path": str(socket_path),
+                "instance_id": "legacy",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        with pytest.raises(BridgeError, match="identity token"):
+            send_request("target_info", instance_id="legacy")
+        assert server.requests == []
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_send_request_rejects_foreign_socket_pid_before_dispatch(tmp_path, monkeypatch):
+    import bn.transport as transport
+
+    socket_path = tmp_path / "foreign-pid.sock"
+    server = _Server(str(socket_path), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    instance = transport.BridgeInstance(
+        pid=os.getpid() + 100000,
+        socket_path=socket_path,
+        registry_path=tmp_path / "expected.json",
+        plugin_name="bn_agent_bridge",
+        plugin_version="1",
+        started_at=None,
+        meta={},
+        instance_id="expected",
+        instance_token="expected-token",
+    )
+    monkeypatch.setattr(transport, "choose_instance", lambda *args, **kwargs: instance)
+
+    try:
+        with pytest.raises(BridgeError, match="socket peer pid"):
+            send_request("load_binary", instance_id="expected")
+        assert server.requests == []
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_list_instances_rejects_registry_filename_identity_mismatch(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    socket_path = tmp_path / "foreign.sock"
+    server = _Server(str(socket_path), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    registry = instances_dir() / "expected.json"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(
+        json.dumps(
+            {
+                "pid": os.getpid(),
+                "socket_path": str(socket_path),
+                "instance_id": "foreign",
+                "instance_token": "foreign-token",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        assert list_instances() == []
+        assert not registry.exists()
+        assert socket_path.exists()
+    finally:
+        server.shutdown()
+        server.server_close()
 
 def test_list_instances_prunes_stale_registry_and_socket(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
@@ -151,6 +281,7 @@ def test_send_request_wraps_socket_errors(tmp_path, monkeypatch):
         plugin_version="0.1.0",
         started_at=None,
         meta={},
+        instance_token="test-token",
     )
     monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None, **kw: instance)
 
@@ -363,6 +494,7 @@ def test_send_request_empty_response_reports_dead_process(tmp_path, monkeypatch)
         plugin_version="0.1.0",
         started_at=None,
         meta={},
+        instance_token="test-token",
         instance_id="ghost",
     )
     monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None, **kw: instance)
@@ -392,6 +524,7 @@ def test_send_request_empty_response_reports_live_process(tmp_path, monkeypatch)
         plugin_version="0.1.0",
         started_at=None,
         meta={},
+        instance_token="test-token",
         instance_id="ghost",
     )
     monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None, **kw: instance)
@@ -417,6 +550,7 @@ def test_send_request_retries_transient_connect_failures(tmp_path, monkeypatch):
         plugin_version="0.1.0",
         started_at=None,
         meta={},
+        instance_token="test-token",
     )
     monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None, **kw: instance)
 
@@ -446,7 +580,14 @@ def test_send_request_retries_transient_connect_failures(tmp_path, monkeypatch):
         def recv(self, size):
             if not hasattr(self, "_sent"):
                 self._sent = True
-                return json.dumps({"ok": True, "result": {"pong": True}}).encode("utf-8")
+                request = json.loads(self.payload.decode("utf-8"))
+                return json.dumps(
+                    {
+                        "ok": True,
+                        "result": {"pong": True},
+                        "bridge_identity": request["_bridge_identity"],
+                    }
+                ).encode("utf-8")
             return b""
 
     monkeypatch.setattr("bn.transport.socket.socket", lambda *args, **kwargs: _FakeSocket())
@@ -483,7 +624,14 @@ def _make_timeout_probe_socket():
         def recv(self, size):
             if not hasattr(self, "_sent"):
                 self._sent = True
-                return json.dumps({"ok": True, "result": {"pong": True}}).encode("utf-8")
+                request = json.loads(self.payload.decode("utf-8"))
+                return json.dumps(
+                    {
+                        "ok": True,
+                        "result": {"pong": True},
+                        "bridge_identity": request["_bridge_identity"],
+                    }
+                ).encode("utf-8")
             return b""
 
     return _FakeSocket
@@ -500,6 +648,7 @@ def _make_instance(tmp_path):
         plugin_version="0.1.0",
         started_at=None,
         meta={},
+        instance_token="test-token",
     )
 
 
@@ -678,6 +827,7 @@ def test_send_request_reports_timeout_waiting_for_response(tmp_path, monkeypatch
         plugin_version="0.1.0",
         started_at=None,
         meta={},
+        instance_token="test-token",
     )
     monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None, **kw: instance)
 
@@ -720,6 +870,7 @@ def test_send_request_timeout_sends_cancel_request(tmp_path, monkeypatch):
         plugin_version="0.1.0",
         started_at=None,
         meta={},
+        instance_token="test-token",
     )
     monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None, **kw: instance)
     sent_payloads = []
@@ -776,6 +927,7 @@ def test_timeout_message_shows_subsecond_value(tmp_path, monkeypatch):
         plugin_version="0.1.0",
         started_at=None,
         meta={},
+        instance_token="test-token",
     )
     monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None, **kw: instance)
 

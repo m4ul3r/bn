@@ -400,6 +400,42 @@ def test_callsites_within_file_scope_preserves_file_order_and_dedupes(monkeypatc
     assert [row["call_index"] for row in rows] == [0, 0]
 
 
+def test_callsites_empty_scope_discovers_all_callers_and_dedupes(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    callee = _FakeFunction(0x461746, "crt_rand")
+    alpha = _FakeFunction(0x401000, "alpha")
+    alpha.basic_blocks = [_FakeBasicBlock(0x401010, 0x401016)]
+    alpha.low_level_il = [[_FakeLLILInstruction(0x401010, _FakeConstPtr(0x461746))]]
+    beta = _FakeFunction(0x402000, "beta")
+    beta.basic_blocks = [_FakeBasicBlock(0x402020, 0x402026)]
+    beta.low_level_il = [[_FakeLLILInstruction(0x402020, _FakeConstPtr(0x461746))]]
+    bv = _FakeBV(
+        functions=[callee, beta, alpha],
+        instruction_lengths={0x401010: 5, 0x402020: 5},
+        disassembly={0x401010: "call crt_rand", 0x402020: "call crt_rand"},
+        code_refs={
+            0x461746: [
+                _FakeCodeRef(0x402020, beta),
+                _FakeCodeRef(0x401010, alpha),
+                _FakeCodeRef(0x401011, alpha),
+            ]
+        },
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    rows = _callsites_items(
+        instance,
+        "active",
+        "crt_rand",
+        within_identifiers=[],
+        context=0,
+    )
+
+    assert [row["containing_function"]["name"] for row in rows] == ["alpha", "beta"]
+    assert [row["within_query"] for row in rows] == ["alpha", "beta"]
+
+
 def test_callsites_ignores_indirect_calls_and_returns_null_context_when_unmapped(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

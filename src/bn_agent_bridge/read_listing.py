@@ -167,6 +167,42 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int,
     return rows
 
 
+def _all_caller_functions(
+    bv,
+    callee_addresses: set[int],
+) -> list[tuple[str, Any]]:
+    callers: dict[int, Any] = {}
+    get_code_refs = getattr(bv, "get_code_refs", None)
+    if not callable(get_code_refs):
+        return []
+    for address in sorted(callee_addresses):
+        try:
+            refs = list(get_code_refs(address) or [])
+        except Exception:
+            continue
+        for ref in refs:
+            functions = []
+            direct = getattr(ref, "function", None)
+            if direct is not None:
+                functions = [direct]
+            else:
+                try:
+                    functions = list(
+                        bv.get_functions_containing(int(getattr(ref, "address")))
+                        or []
+                    )
+                except Exception:
+                    functions = []
+            for function in functions:
+                start = int(getattr(function, "start", -1))
+                if start >= 0:
+                    callers.setdefault(start, function)
+    return [
+        (str(getattr(function, "name", "") or hex(start)), function)
+        for start, function in sorted(callers.items())
+    ]
+
+
 def _callsites(
     ctx,
     selector: str | None,
@@ -191,7 +227,12 @@ def _callsites(
         stub_addrs = frozenset(int(s.start) for s in ctx._same_name_stub_functions(bv, callee))
     except Exception:
         stub_addrs = frozenset()
-    scope_functions = ctx._resolve_scope_functions(bv, within_identifiers)
+    if within_identifiers:
+        scope_functions = ctx._resolve_scope_functions(bv, within_identifiers)
+    else:
+        scope_functions = _all_caller_functions(
+            bv, {int(callee.start), *stub_addrs}
+        )
     # #558: an imported variadic (scanf/printf-family) callee's HLIL callsite text
     # can show only the fixed argument; attach a steer to the argument-recovery views.
     variadic_hint = _callee_variadic_hint(callee)
