@@ -33,18 +33,13 @@ TRANSIENT_SOCKET_ERRNOS = {
     errno.ENOENT,
 }
 
-# Hard ceiling on how long a request may sit with no bytes arriving before the
-# CLI gives up, so a wedged bridge (e.g. a py_exec stuck under the write lock)
-# can't hang every CLI invocation forever. Generous because legitimate ops
-# (load/refresh with update_analysis_and_wait) can run for minutes. Override
-# with BN_REQUEST_TIMEOUT=<seconds>; 0/none/off/empty disables the timeout entirely.
+# Normal CLI requests retain the public 600-second ceiling. bn-kernel applies
+# its tighter 120-second default explicitly at the Session/Client boundary.
+# BN_REQUEST_TIMEOUT overrides either path; 0/none/off/empty disables it.
 DEFAULT_REQUEST_TIMEOUT = 600.0
-# The one-time full analysis (load/refresh -> update_analysis_and_wait) on a very
-# large binary (~180k functions) can run far past the 600s read-op default, and
-# hitting the client timeout there abandons a still-running analysis (#321). Give
-# those ops a much larger default client timeout; BN_REQUEST_TIMEOUT still wins
-# when the user sets it (including 0/none to disable entirely for a huge load).
+# Full analysis operations keep a larger default; BN_REQUEST_TIMEOUT still wins.
 REFRESH_REQUEST_TIMEOUT = 3600.0
+SPAWN_LOCK_TIMEOUT = 30.0
 CANCEL_REQUEST_TIMEOUT = 0.25
 
 
@@ -223,7 +218,11 @@ def _socket_is_live(socket_path: Path, timeout: float = 0.2) -> bool:
         return False
 
 
-def _load_instance(path: Path) -> BridgeInstance | None:
+def _load_instance(
+    path: Path,
+    *,
+    socket_timeout: float = 0.2,
+) -> BridgeInstance | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         socket_path = Path(payload["socket_path"])
@@ -244,7 +243,7 @@ def _load_instance(path: Path) -> BridgeInstance | None:
         _purge_stale_registry(path, socket_path)
         return None
 
-    if not _socket_is_live(socket_path):
+    if not _socket_is_live(socket_path, timeout=socket_timeout):
         _purge_stale_registry(path, socket_path)
         return None
 
@@ -261,13 +260,26 @@ def _load_instance(path: Path) -> BridgeInstance | None:
     )
 
 
-def list_instances() -> list[BridgeInstance]:
+def list_instances(*, timeout: float | None = None) -> list[BridgeInstance]:
     instances: list[BridgeInstance] = []
+    deadline = time.monotonic() + timeout if timeout is not None else None
+
+    def load(path: Path) -> BridgeInstance | None:
+        if deadline is None:
+            socket_timeout = 0.2
+        else:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise BridgeError(
+                    "Timed out selecting a bridge instance while scanning registries"
+                )
+            socket_timeout = min(0.2, remaining)
+        return _load_instance(path, socket_timeout=socket_timeout)
 
     # Legacy fixed registry (GUI mode or old headless)
     fixed_registry = bridge_registry_path()
     if fixed_registry.exists():
-        instance = _load_instance(fixed_registry)
+        instance = load(fixed_registry)
         if instance is not None:
             instances.append(instance)
 
@@ -275,7 +287,7 @@ def list_instances() -> list[BridgeInstance]:
     inst_dir = instances_dir()
     if inst_dir.is_dir():
         for reg_file in sorted(inst_dir.glob("*.json")):
-            instance = _load_instance(reg_file)
+            instance = load(reg_file)
             if instance is not None:
                 instances.append(instance)
 
@@ -374,44 +386,68 @@ def _multiple_instances_error(instances: list[BridgeInstance]) -> BridgeError:
 
 
 @contextlib.contextmanager
-def _spawn_lock():
-    """Exclusive flock serializing ALL spawns (auto and named) by this host.
-
-    A single process-wide lock file is intentional: flock is per-open-file, so
-    a named spawn and a concurrent auto-spawn must contend on the *same* file or
-    they could both pass the duplicate check and fork two children (#92). Held
-    only for the spawn-and-register window, never around a request.
-    """
+def _spawn_lock(timeout: float | None = SPAWN_LOCK_TIMEOUT):
+    """Exclusive, bounded flock serializing all bridge spawns on this host."""
     inst_dir = ensure_private_dir(instances_dir())
     lock_path = inst_dir / ".spawn.lock"
     with open(lock_path, "w") as lock_file:
-        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        if timeout is None:
+            fcntl.flock(lock_file, fcntl.LOCK_EX)
+        else:
+            if timeout < 0:
+                raise ValueError("spawn lock timeout must be non-negative")
+            deadline = time.monotonic() + timeout
+            while True:
+                try:
+                    fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise BridgeError(
+                            f"Timed out waiting for the bridge spawn lock after "
+                            f"{timeout:g}s; another bridge is still starting. "
+                            "Retry with an explicit existing -i/--instance."
+                        ) from None
+                    time.sleep(min(0.05, remaining))
         try:
             yield
         finally:
             fcntl.flock(lock_file, fcntl.LOCK_UN)
 
 
-def _auto_spawn_locked() -> BridgeInstance:
-    """Serialize auto-spawn across concurrent CLI processes.
+def _remaining_deadline(deadline: float | None, context: str) -> float | None:
+    if deadline is None:
+        return None
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise BridgeError(f"Timed out {context}")
+    return remaining
 
-    Without this lock, two CLIs racing on an empty registry each spawn a
-    bridge, after which every bare command fails with "Multiple instances
-    are running" until a human cleans up. The registry is re-checked under
-    the lock because the previous holder may have spawned while we waited.
-    """
-    with _spawn_lock():
-        instances = list_instances()
+
+def _auto_spawn_locked(timeout: float | None = SPAWN_LOCK_TIMEOUT) -> BridgeInstance:
+    """Serialize auto-spawn and keep lock, discovery, and registration bounded."""
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    remaining = _remaining_deadline(deadline, "waiting to auto-start a bridge")
+    lock_timeout = (
+        min(SPAWN_LOCK_TIMEOUT, remaining)
+        if remaining is not None
+        else SPAWN_LOCK_TIMEOUT
+    )
+    with _spawn_lock(timeout=lock_timeout):
+        remaining = _remaining_deadline(deadline, "auto-starting a bridge")
+        instances = list_instances(timeout=remaining)
         if len(instances) == 1:
             return instances[0]
         if instances:
-            marked = _resolve_from_markers(instances)   # #80: marker disambiguates a spawn race
+            marked = _resolve_from_markers(instances)
             if marked is not None:
                 return marked
             raise _multiple_instances_error(instances)
-        # Already under the spawn lock -- call the unlocked core directly, or a
-        # second flock on the same file from this process would deadlock.
-        return _spawn_instance_unlocked()
+        remaining = _remaining_deadline(deadline, "auto-starting a bridge")
+        return _spawn_instance_unlocked(
+            timeout=remaining if remaining is not None else 15.0
+        )
 
 
 def choose_instance(
@@ -419,35 +455,41 @@ def choose_instance(
     *,
     auto_start: bool = True,
     spawn_missing_named: bool = False,
+    timeout: float | None = None,
 ) -> BridgeInstance:
     if instance_id is not None:
         validate_instance_id(instance_id)
-    instances = list_instances()
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    instances = list_instances(
+        timeout=_remaining_deadline(deadline, "selecting a bridge instance")
+    )
     if instance_id is not None:
         for inst in instances:
             if inst.instance_id == instance_id or instance_selector(inst) == instance_id:
                 return inst
         if spawn_missing_named:
-            # `bn load --instance <new-id>` brings the named bridge up itself,
-            # matching the "auto-spawn headless if needed" model. Only load opts
-            # in; other commands keep failing fast so a typo'd id can't silently
-            # spawn an empty process.
-            return spawn_instance(instance_id)
+            remaining = _remaining_deadline(
+                deadline, "starting the requested bridge instance"
+            )
+            return spawn_instance(
+                instance_id,
+                timeout=remaining if remaining is not None else 15.0,
+            )
         raise BridgeError(
             f"No bridge instance found with id: {instance_id}. "
-            f"Start one with: bn session start --instance-id {instance_id}"
+            f"Start one with: bn session start /path/to/binary --instance-id {instance_id}"
         )
     if len(instances) == 1:
         return instances[0]
     if instances:
-        # #80: a project-local marker (walking up from cwd) disambiguates before
-        # erroring -- so `cd project && bn ...` resolves the bridge that loaded it.
         marked = _resolve_from_markers(instances)
         if marked is not None:
             return marked
         raise _multiple_instances_error(instances)
     if auto_start:
-        return _auto_spawn_locked()
+        return _auto_spawn_locked(
+            timeout=_remaining_deadline(deadline, "auto-starting a bridge")
+        )
     raise BridgeError("No running Binary Ninja bridge instances found")
 
 
@@ -526,6 +568,7 @@ def _send_request_to_instance(
     params: dict[str, Any] | None = None,
     target: str | None = None,
     timeout: float | None = None,
+    timeout_display: float | None = None,
     default_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
     connect_retries: int = 4,
 ) -> dict[str, Any]:
@@ -541,14 +584,22 @@ def _send_request_to_instance(
 
     encoded = (json.dumps(payload) + "\n").encode("utf-8")
     timeout = _resolve_timeout(timeout, default=default_timeout)
+    deadline = time.monotonic() + timeout if timeout is not None else None
 
     chunks: list[bytes] = []
     last_error: OSError | None = None
     for attempt in range(connect_retries):
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                last_error = TimeoutError("end-to-end request deadline expired")
+                break
+        else:
+            remaining = None
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                if timeout is not None:
-                    sock.settimeout(timeout)
+                if remaining is not None:
+                    sock.settimeout(remaining)
                 sock.connect(str(instance.socket_path))
                 _verify_socket_peer_pid(sock, instance)
                 sock.sendall(encoded)
@@ -567,7 +618,17 @@ def _send_request_to_instance(
                 _send_cancel_request(instance, str(payload["id"]))
             if exc.errno not in TRANSIENT_SOCKET_ERRNOS or attempt == connect_retries - 1:
                 break
-            time.sleep(0.05 * (attempt + 1))
+            delay = 0.05 * (attempt + 1)
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    last_error = TimeoutError("end-to-end request deadline expired")
+                    break
+                if delay >= remaining:
+                    time.sleep(remaining)
+                    last_error = TimeoutError("end-to-end request deadline expired")
+                    break
+            time.sleep(delay)
 
     if last_error is not None and chunks:
         # Bytes arrived and then the connection failed: a timeout or reset
@@ -582,11 +643,18 @@ def _send_request_to_instance(
             # `:g` keeps the real value for a sub-second timeout (0.01 -> "0.01s")
             # instead of rounding to "0.0s" (#370.3), while a whole-second value
             # still reads cleanly (30.0 -> "30s").
-            timeout_suffix = f" after {timeout:g}s" if timeout is not None else ""
+            shown_timeout = timeout if timeout_display is None else timeout_display
+            timeout_suffix = (
+                f" after {shown_timeout:g}s"
+                if shown_timeout is not None
+                else ""
+            )
             raise BridgeError(
                 f"Timed out waiting for Binary Ninja bridge pid {instance.pid} at {instance.socket_path}"
-                f"{timeout_suffix} (op '{op}'). The bridge may be busy with a long analysis; "
-                "raise or disable the limit with BN_REQUEST_TIMEOUT=<seconds|0>."
+                f"{timeout_suffix} (op '{op}'). The bridge may be busy with analysis; "
+                f"inspect progress with `bn -i {instance_selector(instance)} target info`, "
+                "then raise or disable the limit with "
+                "BN_REQUEST_TIMEOUT=<seconds|0> if the operation is intentionally long."
             ) from last_error
         raise BridgeError(
             f"Failed to contact Binary Ninja bridge pid {instance.pid} at {instance.socket_path}: {last_error}"
@@ -594,7 +662,6 @@ def _send_request_to_instance(
 
     if not chunks:
         raise _empty_response_error(instance, op)
-
     try:
         response = json.loads(b"".join(chunks).decode("utf-8"))
     except json.JSONDecodeError as exc:
@@ -650,16 +717,16 @@ def spawn_instance(
     timeout: float = 15.0,
     poll_interval: float = 0.2,
 ) -> BridgeInstance:
-    """Spawn a new bn-agent headless process and wait for it to register.
-
-    Serialized against all other spawns by a host-wide lock so two concurrent
-    named spawns of the same id can't both fork a child (#92 Problem A).
-    """
+    """Spawn a bridge within one lock-and-registration deadline."""
     if instance_id is not None and instance_id != "default":
         validate_instance_id(instance_id)
-    with _spawn_lock():
+    deadline = time.monotonic() + timeout
+    with _spawn_lock(timeout=timeout):
+        remaining = _remaining_deadline(deadline, "starting a bridge instance")
         return _spawn_instance_unlocked(
-            instance_id, timeout=timeout, poll_interval=poll_interval
+            instance_id,
+            timeout=remaining if remaining is not None else timeout,
+            poll_interval=poll_interval,
         )
 
 
@@ -670,7 +737,10 @@ def _spawn_instance_unlocked(
     poll_interval: float = 0.2,
 ) -> BridgeInstance:
     """Spawn-and-register core. MUST run under _spawn_lock()."""
-    existing = list_instances()
+    deadline = time.monotonic() + timeout
+    existing = list_instances(
+        timeout=_remaining_deadline(deadline, "checking existing bridge instances")
+    )
     if instance_id is None:
         existing_selectors = {instance_selector(inst) for inst in existing}
         while True:
@@ -699,10 +769,12 @@ def _spawn_instance_unlocked(
     log_file.close()
 
     reg_path = bridge_registry_path(instance_id)
-    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if reg_path.exists():
-            inst = _load_instance(reg_path)
+            remaining = _remaining_deadline(deadline, "waiting for bridge registration")
+            inst = _load_instance(
+                reg_path, socket_timeout=min(0.2, remaining or 0.2)
+            )
             if inst is not None:
                 # Verify the registered process is the child WE spawned. A
                 # different live pid means a stale registry slipped past the
@@ -723,7 +795,8 @@ def _spawn_instance_unlocked(
                 f"exited with code {exit_code} before registering."
                 f"{_log_tail(log_path)}"
             )
-        time.sleep(poll_interval)
+        remaining = _remaining_deadline(deadline, "waiting for bridge registration")
+        time.sleep(min(poll_interval, remaining or poll_interval))
 
     # The child is still running but never registered. Kill it so a slow
     # starter can't register later and show up as a surprise extra instance.
@@ -782,13 +855,27 @@ def send_request(
     # default_timeout lets a long one-time op (load/refresh) raise the no-env
     # default without overriding an explicit BN_REQUEST_TIMEOUT (#321).
     timeout = _resolve_timeout(timeout, default=default_timeout)
-    instance = choose_instance(instance_id, spawn_missing_named=spawn_missing_named)
+    requested_timeout = timeout
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    instance = choose_instance(
+        instance_id,
+        spawn_missing_named=spawn_missing_named,
+        timeout=timeout,
+    )
+    if deadline is not None:
+        timeout = deadline - time.monotonic()
+        if timeout <= 0:
+            raise BridgeError(
+                f"Timed out selecting a bridge instance for op {op!r}; "
+                "the end-to-end request deadline expired before connecting"
+            )
     return _send_request_to_instance(
         instance,
         op,
         params=params,
         target=target,
         timeout=timeout,
+        timeout_display=requested_timeout,
         default_timeout=default_timeout,
         connect_retries=connect_retries,
     )

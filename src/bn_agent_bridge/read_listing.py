@@ -462,15 +462,20 @@ def _project_page_fields(result: dict[str, Any]) -> dict[str, Any]:
             # No live Function retained (defensive): keep the row well-formed
             # with the same keys every consumer expects.
             it.setdefault("display_name", it.get("name", ""))
-            it.setdefault("size", None)
+            size = it.get("size")
+            size_known = isinstance(size, int) and not isinstance(size, bool) and size >= 0
+            it["size"] = size if size_known else 0
+            it["size_known"] = size_known
             it.setdefault("imported", False)
             it.setdefault("auto_named", False)
             it.setdefault("basic_block_count", None)
             continue
         if "display_name" not in it:
             it["display_name"] = il_format._display_name(fn)
-        if "size" not in it:
-            it["size"] = il_format._function_size(fn)
+        size = it.get("size") if "size" in it else il_format._function_size(fn)
+        size_known = isinstance(size, int) and not isinstance(size, bool) and size >= 0
+        it["size"] = size if size_known else 0
+        it["size_known"] = size_known
         # #653.4: label the two partitions `target info` counts, so a listing is
         # self-describing (an import thunk is neither named nor auto-named).
         if "imported" not in it:

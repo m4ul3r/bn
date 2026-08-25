@@ -1,4 +1,5 @@
 from __future__ import annotations
+import time
 
 from typing import Any
 
@@ -101,7 +102,8 @@ def test_collect_aggregates_pages_and_preserves_first_page_metadata(monkeypatch)
     ]
     assert all(call["instance_id"] == "worker" for call in calls)
     assert all(call["target"] == "sample" for call in calls)
-    assert all(call["timeout"] == 3 for call in calls)
+    timeouts = [call["timeout"] for call in calls]
+    assert 0 < timeouts[1] <= timeouts[0] <= 3
 
 
 def test_collect_stops_at_total_limit_and_reports_remaining_rows(monkeypatch):
@@ -210,3 +212,95 @@ def test_public_exports_are_exact():
     import bn
 
     assert bn.__all__ == ["Client", "main", "VERSION"]
+
+
+def test_collect_rejects_silent_truncation_metadata(monkeypatch):
+    monkeypatch.setattr(
+        client_module,
+        "send_request",
+        lambda *args, **kwargs: {
+            "result": {
+                "items": [],
+                "returned": 0,
+                "total": 3,
+                "has_more": False,
+            }
+        },
+    )
+
+    with pytest.raises(BridgeError, match="strings.*total.*has_more"):
+        Client().collect("strings")
+
+
+def test_collect_accepts_empty_page_beyond_total(monkeypatch):
+    monkeypatch.setattr(
+        client_module,
+        "send_request",
+        lambda *args, **kwargs: {
+            "result": {
+                "items": [],
+                "returned": 0,
+                "offset": 100,
+                "total": 50,
+                "has_more": False,
+            }
+        },
+    )
+
+    assert Client().collect("strings", {"offset": 100}) == {
+        "items": [],
+        "returned": 0,
+        "offset": 100,
+        "total": 50,
+        "has_more": False,
+    }
+
+
+def test_collect_uses_one_end_to_end_timeout_budget(monkeypatch):
+    calls = []
+
+    def fake_send_request(op, **kwargs):
+        calls.append(kwargs["timeout"])
+        time.sleep(0.02)
+        offset = kwargs["params"]["offset"]
+        return {
+            "result": {
+                "items": [{"i": offset}],
+                "returned": 1,
+                "offset": offset,
+                "total": 2,
+                "has_more": offset == 0,
+            }
+        }
+
+    monkeypatch.setattr(client_module, "send_request", fake_send_request)
+
+    result = Client(timeout=0.1).collect("strings", page_size=1)
+
+    assert result["returned"] == 2
+    assert len(calls) == 2
+    assert 0 < calls[1] < calls[0] <= 0.1
+
+
+def test_collect_honors_environment_timeout(monkeypatch):
+    calls = []
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "0.05")
+
+    def fake_send_request(op, **kwargs):
+        calls.append(kwargs["timeout"])
+        return {
+            "result": {
+                "items": [],
+                "returned": 0,
+                "offset": 0,
+                "total": 0,
+                "has_more": False,
+            }
+        }
+
+    monkeypatch.setattr(client_module, "send_request", fake_send_request)
+
+    Client().collect("strings")
+
+    assert len(calls) == 1
+    assert 0 < calls[0] <= 0.05

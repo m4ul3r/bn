@@ -8,7 +8,9 @@ import inspect
 import re
 import os
 import shutil
+import threading
 import tempfile
+import time
 import warnings
 import weakref
 from collections.abc import Mapping, Sequence
@@ -60,7 +62,201 @@ def _flatten_function_info(payload: Any) -> Any:
         **{key: value for key, value in payload.items() if key != "function"},
         **payload["function"],
     }
+
+
+def _require_collection(
+    op: str,
+    value: Any,
+    payload: Any,
+    *,
+    required_keys: tuple[str, ...] = (),
+) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+        raise BnError(
+            f"{op} payload contract violation: expected a paged object with items",
+            returncode=0,
+            argv=(op,),
+        )
+    if not isinstance(value, list):
+        raise BnError(
+            f"{op} return contract violation: expected a list",
+            returncode=0,
+            argv=(op,),
+        )
+    payload_items = payload["items"]
+    if value != payload_items:
+        raise BnError(
+            f"{op} payload contract violation: returned rows differ from payload items",
+            returncode=0,
+            argv=(op,),
+        )
+    total = payload.get("total")
+    has_more = payload.get("has_more")
+    if (
+        not isinstance(has_more, bool)
+        or (
+            total is not None
+            and (
+                not isinstance(total, int)
+                or isinstance(total, bool)
+                or total < len(value)
+                or (not has_more and total > len(value) + int(payload.get("offset", 0)))
+            )
+        )
+    ):
+        raise BnError(
+            f"{op} payload contract violation: inconsistent total/has_more metadata",
+            returncode=0,
+            argv=(op,),
+        )
+    for index, row in enumerate(value):
+        if not isinstance(row, Mapping):
+            raise BnError(
+                f"{op} row contract violation at index {index}: expected an object",
+                returncode=0,
+                argv=(op,),
+            )
+        if isinstance(row.get("items"), list) and "has_more" in row:
+            raise BnError(
+                f"{op} row contract violation at index {index}: nested page envelope",
+                returncode=0,
+                argv=(op,),
+            )
+        missing = [key for key in required_keys if key not in row]
+        if missing:
+            raise BnError(
+                f"{op} row contract violation at index {index}: "
+                f"missing {', '.join(missing)}",
+                returncode=0,
+                argv=(op,),
+            )
+    return value
+
+
+def _require_text(op: str, value: Any, payload: Any) -> str:
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(payload.get("text"), str)
+        or not payload["text"].strip()
+        or not isinstance(value, str)
+        or value != payload["text"]
+    ):
+        raise BnError(
+            f"{op} text contract violation: expected a non-empty payload['text'] string",
+            returncode=0,
+            argv=(op,),
+        )
+    return value
+
+
+def _require_decompile(value: Any, payload: Any) -> str:
+    text = _require_text("decompile", value, payload)
+    warnings_value = payload.get("warnings") if isinstance(payload, dict) else []
+    warnings_text = " ".join(
+        str(warning).lower() for warning in (warnings_value or [])
+    )
+    incomplete = bool(payload.get("analysis_skipped")) or any(
+        marker in warnings_text
+        for marker in (
+            "incomplete stub",
+            "skipped analysis",
+            "taking too long to analyze",
+        )
+    )
+    if incomplete:
+        raise BnError(
+            "decompile incomplete placeholder detected; retry with "
+            "force_analysis=True and verify the resulting body",
+            returncode=0,
+            argv=("decompile",),
+        )
+    return text
+
+
+def _require_callsites(value: Any, payload: Any) -> list[dict[str, Any]]:
+    rows = _require_collection(
+        "callsites",
+        value,
+        payload,
+        required_keys=(
+            "callee",
+            "containing_function",
+            "call_addr",
+            "caller_static",
+        ),
+    )
+    for index, row in enumerate(rows):
+        callee = row["callee"]
+        containing = row["containing_function"]
+        nested_ok = all(
+            isinstance(part, Mapping)
+            and isinstance(part.get("name"), str)
+            and bool(part["name"])
+            and isinstance(part.get("address"), str)
+            and part["address"].startswith("0x")
+            for part in (callee, containing)
+        )
+        addresses_ok = all(
+            isinstance(row.get(key), str) and row[key].startswith("0x")
+            for key in ("call_addr", "caller_static")
+        )
+        if not nested_ok or not addresses_ok:
+            raise BnError(
+                f"callsites row contract violation at index {index}: "
+                "callee/containing_function and addresses must be attributed "
+                "objects with 0x-prefixed addresses",
+                returncode=0,
+                argv=("callsites",),
+            )
+    return rows
 _ACTIVE_SESSIONS = weakref.WeakSet()
+_ACTIVE_SCOPED_CALLBACKS: set[int] = set()
+_ACTIVE_SCOPED_BINDINGS: dict[int, tuple[str | None, str | None]] = {}
+_SCOPED_CALLBACK_LOCK = threading.Lock()
+_SCOPED_BINDING_ATTRIBUTE = "__bn_kernel_binding__"
+_FUNCTION_FILTERS = frozenset(
+    {"min_address", "max_address", "min_size", "offset", "sort", "reverse", "named"}
+)
+_SEARCH_FILTERS = frozenset(
+    {
+        "regex",
+        "exact",
+        "word",
+        "min_address",
+        "max_address",
+        "min_size",
+        "offset",
+        "sort",
+        "reverse",
+    }
+)
+_STRING_FILTERS = frozenset(
+    {
+        "query",
+        "offset",
+        "min_length",
+        "max_length",
+        "section",
+        "no_crt",
+        "regex",
+        "probable_format_strings",
+    }
+)
+_IMPORT_FILTERS = frozenset({"query", "regex", "offset", "include_got"})
+_SECTION_FILTERS = frozenset({"query", "offset"})
+
+
+def _validate_filters(
+    helper: str,
+    filters: Mapping[str, Any],
+    allowed: frozenset[str],
+) -> dict[str, Any]:
+    unknown = sorted(set(filters) - allowed)
+    if unknown:
+        raise TypeError(
+            f"{helper} got unexpected keyword argument(s): {', '.join(unknown)}"
+        )
+    return dict(filters)
 _WARNED_BINDING_PAIRS: set[frozenset[tuple[str | None, str | None]]] = set()
 
 
@@ -197,7 +393,7 @@ class Session:
         instance: str | None = None,
         target: str | None = None,
         *,
-        timeout: float = 600.0,
+        timeout: float = 120.0,
         backend: BackendChoice = "auto",
     ) -> None:
         if backend not in {"auto", "cli", "native"}:
@@ -290,6 +486,11 @@ class Session:
                     returncode=124,
                     argv=argv,
                 ) from None
+            except asyncio.CancelledError:
+                if process.returncode is None:
+                    process.kill()
+                await process.communicate()
+                raise
 
             stdout_text = stdout_bytes.decode(errors="replace").strip()
             stderr_text = stderr_bytes.decode(errors="replace").strip()
@@ -387,6 +588,7 @@ class Session:
         *args: str,
         page: int = 500,
         limit: int | None = None,
+        timeout: float | None = None,
         **flags: Any,
     ) -> list[dict[str, Any]]:
         """Collect a paged CLI read without printing or spilling its rows."""
@@ -421,13 +623,23 @@ class Session:
         actual_argv: tuple[str, ...] = tuple(str(arg) for arg in args)
         bridge_has_more = False
         operation = " ".join(str(arg) for arg in args)
+        effective_timeout = self.timeout if timeout is None else timeout
+        deadline = time.monotonic() + effective_timeout
 
         while True:
             remaining = None if limit is None else limit - len(items)
             page_size = page if remaining is None else min(page, remaining)
+            timeout_remaining = deadline - time.monotonic()
+            if timeout_remaining <= 0:
+                raise BnError(
+                    f"bn {operation} timed out after {effective_timeout:g}s",
+                    returncode=124,
+                    argv=actual_argv,
+                )
             payload = await self.run(
                 *args,
                 unwrap=False,
+                timeout=timeout_remaining,
                 limit=page_size,
                 offset=offset,
                 **flags,
@@ -463,6 +675,48 @@ class Session:
                     returncode=0,
                     argv=actual_argv,
                 )
+            returned = payload.get("returned")
+            if returned is not None and (
+                not isinstance(returned, int)
+                or isinstance(returned, bool)
+                or returned != len(page_items)
+            ):
+                raise BnError(
+                    f"malformed {operation} page: returned must equal items length",
+                    returncode=0,
+                    argv=actual_argv,
+                )
+            total = payload.get("total")
+            if total is not None:
+                page_end = offset + len(page_items)
+                if (
+                    not isinstance(total, int)
+                    or isinstance(total, bool)
+                    or total < 0
+                    or (bool(page_items) and page_end > total)
+                ):
+                    raise BnError(
+                        f"malformed {operation} page: invalid total {total!r}",
+                        returncode=0,
+                        argv=actual_argv,
+                    )
+                if (
+                    aggregate is not None
+                    and aggregate.get("total") is not None
+                    and aggregate.get("total") != total
+                ):
+                    raise BnError(
+                        f"malformed {operation} page: total changed across pages",
+                        returncode=0,
+                        argv=actual_argv,
+                    )
+                if not bridge_has_more and page_end < total:
+                    raise BnError(
+                        f"malformed {operation} page: total={total} requires "
+                        "has_more=true at this offset",
+                        returncode=0,
+                        argv=actual_argv,
+                    )
             if aggregate is None:
                 aggregate = dict(payload)
 
@@ -489,12 +743,27 @@ class Session:
         )
         return items
 
-    async def _native_request(self, op: str, params: dict[str, Any]) -> Any:
+    async def _native_request(
+        self,
+        op: str,
+        params: dict[str, Any],
+        *,
+        timeout: float | None = None,
+    ) -> Any:
         from bn.transport import BridgeError as NativeBridgeError
 
+        client = (
+            self._client
+            if timeout is None
+            else _load_native_client(self.instance, self.target, timeout)
+        )
         try:
-            payload = await asyncio.to_thread(self._client.request, op, params)
+            payload = await asyncio.to_thread(client.request, op, params)
         except NativeBridgeError as exc:
+            if "timed out" in str(exc).lower():
+                raise BnError(
+                    str(exc), returncode=124, argv=(op,)
+                ) from exc
             raise BridgeError(
                 str(exc), returncode=2, argv=(op,)
             ) from exc
@@ -503,29 +772,62 @@ class Session:
         return value
 
     async def _native_collect(
-        self, op: str, params: dict[str, Any], limit: int | None
+        self,
+        op: str,
+        params: dict[str, Any],
+        limit: int | None,
+        *,
+        timeout: float | None = None,
     ) -> list[dict[str, Any]]:
         from bn.transport import BridgeError as NativeBridgeError
 
+        if timeout is None:
+            client = self._client
+        else:
+            from bn import Client as NativeClient
+
+            client = (
+                _load_native_client(self.instance, self.target, timeout)
+                if isinstance(self._client, NativeClient)
+                else self._client
+            )
         try:
             payload = await asyncio.to_thread(
-                self._client.collect, op, params, limit=limit
+                client.collect, op, params, limit=limit
             )
         except NativeBridgeError as exc:
+            if "timed out" in str(exc).lower():
+                raise BnError(
+                    str(exc), returncode=124, argv=(op,)
+                ) from exc
             raise BridgeError(
                 str(exc), returncode=2, argv=(op,)
             ) from exc
-        value = _unwrap(payload)
+        value = _require_collection(op, _unwrap(payload), payload)
         self.last = Result(value, payload, (), (op,), "native")
         return value
 
-    async def info(self, *, verbose: bool = False) -> dict[str, Any]:
+    async def info(
+        self,
+        *,
+        verbose: bool = False,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
         if self.backend == "native":
-            return await self._native_request("target_info", {"verbose": verbose})
-        return await self.run("target", "info", unwrap=False, verbose=verbose)
+            return await self._native_request(
+                "target_info", {"verbose": verbose}, timeout=timeout
+            )
+        return await self.run(
+            "target", "info", unwrap=False, verbose=verbose, timeout=timeout
+        )
 
-    async def assert_target(self, expected: str | Path) -> dict[str, Any]:
-        info = await self.info()
+    async def assert_target(
+        self,
+        expected: str | Path,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        info = await self.info(timeout=timeout)
         expected_text = str(expected)
         expected_path = Path(expected_text).expanduser()
         observed_filename = str(info.get("filename") or info.get("file") or "")
@@ -542,11 +844,16 @@ class Session:
                 if observed_filename
                 else ""
             )
+            matches = observed_value == expected_value
         else:
             expected_value = expected_path.name
             observed_value = observed_basename
+            matches = expected_value in {
+                observed_basename,
+                Path(observed_basename).stem,
+            }
 
-        if observed_value != expected_value:
+        if not matches:
             raise BridgeError(
                 "target identity mismatch: "
                 f"expected {expected_value!r}, received {observed_value!r}; "
@@ -592,24 +899,61 @@ class Session:
         return digest
 
     async def functions(
-        self, *, limit: int | None = None, **filters: Any
+        self,
+        *,
+        limit: int | None = None,
+        timeout: float | None = None,
+        **filters: Any,
     ) -> list[dict[str, Any]]:
+        params = _validate_filters("functions", filters, _FUNCTION_FILTERS)
         if self.backend == "native":
-            return await self._native_collect("list_functions", dict(filters), limit)
-        return await self.all("function", "list", limit=limit, **filters)
+            value = await self._native_collect(
+                "list_functions", params, limit, timeout=timeout
+            )
+        else:
+            value = await self.all(
+                "function", "list", limit=limit, timeout=timeout, **params
+            )
+        payload = self.last.payload if self.last is not None else None
+        return _require_collection("list_functions", value, payload)
 
     async def search(
-        self, query: str, *, limit: int | None = None, **filters: Any
+        self,
+        query: str,
+        *,
+        limit: int | None = None,
+        timeout: float | None = None,
+        **filters: Any,
     ) -> list[dict[str, Any]]:
+        validated = _validate_filters("search", filters, _SEARCH_FILTERS)
+        effective_timeout = self.timeout if timeout is None else timeout
+        deadline = time.monotonic() + effective_timeout
         if self.backend == "native":
-            params = {"query": query, **filters}
+            params = {"query": query, **validated}
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise BnError(
+                    f"search timed out after {effective_timeout:g}s",
+                    returncode=124,
+                    argv=("search_functions",),
+                )
             value = await self._native_collect(
-                "search_functions", params, limit
+                "search_functions", params, limit, timeout=remaining
             )
             payload = self.last.payload if self.last is not None else None
-            if _should_retry_as_regex(query, payload, filters):
+            if _should_retry_as_regex(query, payload, validated):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise BnError(
+                        f"search timed out after {effective_timeout:g}s",
+                        returncode=124,
+                        argv=("search_functions",),
+                    )
                 value = await self._native_collect(
-                    "search_functions", {**params, "regex": True}, limit
+                    "search_functions",
+                    {**params, "regex": True},
+                    limit,
+                    timeout=remaining,
                 )
                 retry_payload = (
                     dict(self.last.payload)
@@ -625,8 +969,18 @@ class Session:
                     ("search_functions",),
                     "native",
                 )
-            return value
-        return await self.all("function", "search", query, limit=limit, **filters)
+            payload = self.last.payload if self.last is not None else None
+            return _require_collection("search_functions", value, payload)
+        value = await self.all(
+            "function",
+            "search",
+            query,
+            limit=limit,
+            timeout=timeout,
+            **validated,
+        )
+        payload = self.last.payload if self.last is not None else None
+        return _require_collection("search_functions", value, payload)
 
     async def function_info(
         self, identifier: str, *, blocks: bool = False
@@ -658,7 +1012,7 @@ class Session:
         force_analysis: bool = False,
     ) -> str:
         if self.backend == "native":
-            return await self._native_request(
+            value = await self._native_request(
                 "decompile",
                 {
                     "identifier": identifier,
@@ -666,12 +1020,15 @@ class Session:
                     "force_analysis": force_analysis,
                 },
             )
-        return await self.run(
-            "decompile",
-            identifier,
-            addresses=addresses,
-            force_analysis=force_analysis,
-        )
+        else:
+            value = await self.run(
+                "decompile",
+                identifier,
+                addresses=addresses,
+                force_analysis=force_analysis,
+            )
+        payload = self.last.payload if self.last is not None else None
+        return _require_decompile(value, payload)
 
     async def disasm(
         self,
@@ -680,7 +1037,17 @@ class Session:
         linear: int | None = None,
         mode: str | None = None,
         snap_to_instruction: bool = False,
+        count: int | None = None,
+        lines: tuple[int, int] | None = None,
     ) -> str:
+        if sum(option is not None for option in (linear, count, lines)) > 1:
+            raise ValueError("linear, count, and lines are mutually exclusive")
+        if count is not None and count < 1:
+            raise ValueError("count must be at least 1")
+        if lines is not None and (
+            len(lines) != 2 or lines[0] < 1 or lines[1] < lines[0]
+        ):
+            raise ValueError("lines must be a 1-indexed inclusive (start, end) tuple")
         params = {
             "identifier": identifier,
             "linear": linear,
@@ -688,14 +1055,31 @@ class Session:
             "snap_to_instruction": snap_to_instruction,
         }
         if self.backend == "native":
-            return await self._native_request("disasm", params)
-        return await self.run(
-            "disasm",
-            identifier,
-            linear=linear,
-            mode=mode,
-            snap_to_instruction=snap_to_instruction,
-        )
+            value = await self._native_request("disasm", params)
+        else:
+            value = await self.run(
+                "disasm",
+                identifier,
+                linear=linear,
+                mode=mode,
+                snap_to_instruction=snap_to_instruction,
+            )
+        payload = self.last.payload if self.last is not None else None
+        text = _require_text("disasm", value, payload)
+        text_lines = text.splitlines()
+        if count is not None:
+            text = "\n".join(text_lines[:count])
+        elif lines is not None:
+            text = "\n".join(text_lines[lines[0] - 1 : lines[1]])
+        if self.last is not None:
+            self.last = Result(
+                text,
+                self.last.payload,
+                self.last.notes,
+                self.last.argv,
+                self.last.backend,
+            )
+        return text
 
     async def il(
         self,
@@ -714,6 +1098,7 @@ class Session:
         identifier: str,
         *,
         limit: int | None = None,
+        timeout: float | None = None,
         fn_pointer_scan: bool = False,
     ) -> list[dict[str, Any]]:
         params = {
@@ -721,11 +1106,14 @@ class Session:
             "fn_pointer_scan": fn_pointer_scan,
         }
         if self.backend == "native":
-            return await self._native_collect("xrefs", params, limit)
+            return await self._native_collect(
+                "xrefs", params, limit, timeout=timeout
+            )
         return await self.all(
             "xrefs",
             identifier,
             limit=limit,
+            timeout=timeout,
             fn_pointer_scan=fn_pointer_scan,
         )
 
@@ -746,10 +1134,11 @@ class Session:
         within: str | Sequence[str] | None = None,
         context: int = 3,
         limit: int | None = None,
+        timeout: float | None = None,
     ) -> list[dict[str, Any]]:
         identifiers = [] if within is None else self._within_identifiers(within)
         if self.backend == "native":
-            return await self._native_collect(
+            value = await self._native_collect(
                 "callsites",
                 {
                     "callee": callee,
@@ -757,63 +1146,103 @@ class Session:
                     "context": context,
                 },
                 limit,
+                timeout=timeout,
             )
-        if not identifiers:
-            return await self.all(
+        elif not identifiers:
+            value = await self.all(
                 "callsites",
                 callee,
                 context=context,
+                timeout=timeout,
                 limit=limit,
             )
-        if len(identifiers) == 1:
-            return await self.all(
+        elif len(identifiers) == 1:
+            value = await self.all(
                 "callsites",
                 callee,
                 within=identifiers[0],
                 context=context,
+                timeout=timeout,
                 limit=limit,
             )
-
-        scope_file = tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", delete=False
-        )
-        scope_path = Path(scope_file.name)
-        try:
-            os.chmod(scope_path, 0o600)
-            scope_file.write("".join(f"{identifier}\n" for identifier in identifiers))
-            scope_file.close()
-            return await self.all(
-                "callsites",
-                callee,
-                within_file=str(scope_path),
-                context=context,
-                limit=limit,
+        else:
+            scope_file = tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", delete=False
             )
-        finally:
-            if not scope_file.closed:
+            scope_path = Path(scope_file.name)
+            try:
+                os.chmod(scope_path, 0o600)
+                scope_file.write(
+                    "".join(f"{identifier}\n" for identifier in identifiers)
+                )
                 scope_file.close()
-            scope_path.unlink(missing_ok=True)
+                value = await self.all(
+                    "callsites",
+                    callee,
+                    within_file=str(scope_path),
+                    context=context,
+                    timeout=timeout,
+                    limit=limit,
+                )
+            finally:
+                if not scope_file.closed:
+                    scope_file.close()
+                scope_path.unlink(missing_ok=True)
+        payload = self.last.payload if self.last is not None else None
+        return _require_callsites(value, payload)
 
     async def strings(
-        self, *, limit: int | None = None, **filters: Any
+        self,
+        *,
+        limit: int | None = None,
+        timeout: float | None = None,
+        **filters: Any,
     ) -> list[dict[str, Any]]:
+        params = _validate_filters("strings", filters, _STRING_FILTERS)
         if self.backend == "native":
-            return await self._native_collect("strings", dict(filters), limit)
-        return await self.all("strings", limit=limit, **filters)
+            value = await self._native_collect(
+                "strings", params, limit, timeout=timeout
+            )
+        else:
+            value = await self.all(
+                "strings", limit=limit, timeout=timeout, **params
+            )
+        payload = self.last.payload if self.last is not None else None
+        return _require_collection(
+            "strings", value, payload, required_keys=("value",)
+        )
 
     async def imports(
-        self, *, limit: int | None = None, **filters: Any
+        self,
+        *,
+        limit: int | None = None,
+        timeout: float | None = None,
+        **filters: Any,
     ) -> list[dict[str, Any]]:
+        params = _validate_filters("imports", filters, _IMPORT_FILTERS)
         if self.backend == "native":
-            return await self._native_collect("imports", dict(filters), limit)
-        return await self.all("imports", limit=limit, **filters)
+            return await self._native_collect(
+                "imports", params, limit, timeout=timeout
+            )
+        return await self.all(
+            "imports", limit=limit, timeout=timeout, **params
+        )
 
     async def sections(
-        self, *, limit: int | None = None, **filters: Any
+        self,
+        *,
+        limit: int | None = None,
+        timeout: float | None = None,
+        **filters: Any,
     ) -> list[dict[str, Any]]:
+        params = _validate_filters("sections", filters, _SECTION_FILTERS)
         if self.backend == "native":
-            return await self._native_collect("sections", dict(filters), limit)
-        return await self.all("sections", limit=limit, **filters)
+            return await self._native_collect(
+                "sections", params, limit, timeout=timeout
+            )
+        return await self.all(
+            "sections", limit=limit, timeout=timeout, **params
+        )
 
 
 async def scoped(
@@ -821,21 +1250,76 @@ async def scoped(
     *,
     instance: str | None = None,
     target: str | None = None,
-    timeout: float = 600.0,
+    timeout: float = 120.0,
     backend: BackendChoice = "auto",
 ) -> Any:
-    bound = Session(instance, target, timeout=timeout, backend=backend)
-    value = callback(bound)
-    if inspect.isawaitable(value):
-        return await value
-    return value
+    binding = (instance, target)
+    callback_binding = getattr(callback, _SCOPED_BINDING_ATTRIBUTE, None)
+    if callback_binding is not None and callback_binding != binding:
+        raise BnError(
+            "scoped callback binding mismatch: this callback was already bound "
+            f"to {callback_binding!r}, not {binding!r}; define a fresh async "
+            "callback for each target",
+            returncode=2,
+            argv=("scoped",),
+        )
+    try:
+        setattr(callback, _SCOPED_BINDING_ATTRIBUTE, binding)
+    except (AttributeError, TypeError) as exc:
+        raise TypeError("scoped callback must be a mutable Python callable") from exc
+
+    callback_id = id(callback)
+    with _SCOPED_CALLBACK_LOCK:
+        foreign_active = {
+            active_binding
+            for active_binding in _ACTIVE_SCOPED_BINDINGS.values()
+            if active_binding != binding
+        }
+        if foreign_active:
+            raise BnError(
+                "scoped refused a foreign active scoped binding in this shared "
+                f"interpreter: requested {binding!r}, active "
+                f"{sorted(foreign_active, key=repr)!r}",
+                returncode=2,
+                argv=("scoped",),
+            )
+        if callback_id in _ACTIVE_SCOPED_CALLBACKS:
+            raise BnError(
+                "scoped callback is already active in this shared interpreter",
+                returncode=2,
+                argv=("scoped",),
+            )
+        _ACTIVE_SCOPED_CALLBACKS.add(callback_id)
+        _ACTIVE_SCOPED_BINDINGS[callback_id] = binding
+    try:
+        bound = Session(instance, target, timeout=timeout, backend=backend)
+        if (bound.instance, bound.target) != binding:
+            raise BnError(
+                "scoped Session binding changed before callback execution",
+                returncode=2,
+                argv=("scoped",),
+            )
+        value = callback(bound)
+        if inspect.isawaitable(value):
+            value = await value
+        if isinstance(value, Session):
+            raise BnError(
+                "scoped callback must not return its Session into shared globals",
+                returncode=2,
+                argv=("scoped",),
+            )
+        return value
+    finally:
+        with _SCOPED_CALLBACK_LOCK:
+            _ACTIVE_SCOPED_CALLBACKS.discard(callback_id)
+            _ACTIVE_SCOPED_BINDINGS.pop(callback_id, None)
 
 
 def session(
     instance: str | None = None,
     target: str | None = None,
     *,
-    timeout: float = 600.0,
+    timeout: float = 120.0,
     backend: BackendChoice = "auto",
 ) -> Session:
     return Session(instance, target, timeout=timeout, backend=backend)
@@ -855,6 +1339,15 @@ def brief(
 ) -> str:
     if n < 0:
         raise ValueError("n must be non-negative")
+    if (
+        isinstance(rows, (str, bytes, Mapping))
+        or not isinstance(rows, Sequence)
+        or any(not isinstance(row, Mapping) for row in rows)
+    ):
+        raise TypeError(
+            "brief expects a sequence of row mappings; for a paged payload pass "
+            "payload['items'], and do not pass plain text"
+        )
     if not rows:
         return "(0 rows)"
 

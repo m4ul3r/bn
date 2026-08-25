@@ -42,6 +42,16 @@ def _load(args: argparse.Namespace) -> int:
     # same unset-shell-var doctrine as close/save (#690 r4).
     if not str(args.path).strip():
         raise BridgeError("path is empty: pass the binary or .bndb file to load")
+    explicitly_routed = bool(
+        getattr(args, "_explicit_instance", False)
+        or getattr(args, "_explicit_instance_id", False)
+    )
+    if not explicitly_routed and len(cli.list_instances()) > 1:
+        raise BridgeError(
+            "bn load refuses ambient instance routing while multiple bridges are "
+            "running. Pass an explicit -i/--instance for an existing bridge, or "
+            "--instance-id to create a named bridge."
+        )
     _env = (os.environ.get("BN_NO_MARKERS") or "").strip().lower()
     no_marker = bool(args.no_marker) or (_env not in ("", "0", "false", "no", "off"))
     return _call(

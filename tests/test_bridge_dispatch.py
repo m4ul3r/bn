@@ -210,6 +210,7 @@ def test_target_info_surfaces_image_base(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV()
+    bv.file = types.SimpleNamespace(filename="/tmp/sample.bndb")
     bv.start = 0x400000
     bv.entry_point = 0x40B180
     monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
@@ -219,6 +220,7 @@ def test_target_info_surfaces_image_base(monkeypatch):
 
     assert info["image_base"] == "0x400000"
     assert info["entry_point"] == "0x40b180"
+    assert info["path"] == str(bv.file.filename)
 
 
 class _Endianness(enum.IntEnum):

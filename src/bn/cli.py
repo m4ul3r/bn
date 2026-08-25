@@ -1590,6 +1590,32 @@ def _protect_flag_like_option_values(
     return out
 
 
+def _explicit_instance_options(argv: list[str]) -> tuple[bool, bool]:
+    instance = False
+    instance_id = False
+    index = 0
+    while index < len(argv):
+        item = argv[index]
+        if item == "--":
+            break
+        if item in {"-i", "--instance"}:
+            instance = True
+            index += 2
+            continue
+        if item.startswith("--instance=") or (
+            item.startswith("-i") and not item.startswith("--") and len(item) > 2
+        ):
+            instance = True
+        if item == "--instance-id":
+            instance_id = True
+            index += 2
+            continue
+        if item.startswith("--instance-id="):
+            instance_id = True
+        index += 1
+    return instance, instance_id
+
+
 def _apply_sticky_defaults(args: argparse.Namespace) -> None:
     """Fill unset --instance / --target from per-project sticky state."""
     state = session_state.read()
@@ -1619,6 +1645,10 @@ def main(argv: list[str] | None = None) -> int:
     # before args.format exists) can still emit a JSON error envelope.
     _MACHINE_ERROR_FORMAT = _requested_output_format(parse_argv)
     args = parser.parse_args(_protect_flag_like_option_values(parser, parse_argv))
+    (
+        args._explicit_instance,
+        args._explicit_instance_id,
+    ) = _explicit_instance_options(parse_argv)
     handler: Callable[[argparse.Namespace], int] | None = getattr(args, "handler", None)
     if handler is None:
         selected_parser = getattr(args, "_parser", parser)

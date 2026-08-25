@@ -1868,8 +1868,12 @@ class BinaryNinjaBridge:
                 break
         quick = bv in _quick_loaded_views
         unanalyzed = bv in _unanalyzed_views
+        filename = str(getattr(getattr(bv, "file", None), "filename", "") or "")
         info = {
             **(record or {}),
+            "path": filename,
+            "filename": filename,
+            "basename": Path(filename).name if filename else None,
             "arch": str(getattr(bv, "arch", "")),
             "platform": str(getattr(bv, "platform", "")),
             # The two facts needed to decode a raw word out of this target, which

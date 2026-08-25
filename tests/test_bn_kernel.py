@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import sys
+import subprocess
 import threading
 import time
 import warnings
@@ -61,10 +62,75 @@ json.dump({"argv": argv}, open(out, "w"))
 def _clear_bn_bin(monkeypatch):
     monkeypatch.delenv("BN_BIN", raising=False)
     bn_kernel._ACTIVE_SESSIONS.clear()
+    bn_kernel._ACTIVE_SCOPED_CALLBACKS.clear()
+    bn_kernel._ACTIVE_SCOPED_BINDINGS.clear()
     bn_kernel._WARNED_BINDING_PAIRS.clear()
     yield
     bn_kernel._ACTIVE_SESSIONS.clear()
+    bn_kernel._ACTIVE_SCOPED_CALLBACKS.clear()
+    bn_kernel._ACTIVE_SCOPED_BINDINGS.clear()
     bn_kernel._WARNED_BINDING_PAIRS.clear()
+
+
+def test_bootstrap_restores_module_after_sys_modules_loss():
+    bootstrap = (
+        Path(__file__).resolve().parents[1] / "skills" / "bn-kernel" / "bootstrap.py"
+    )
+    code = (
+        "import pathlib, sys\n"
+        f"source = pathlib.Path({str(bootstrap)!r}).read_text()\n"
+        f"first_globals = {{'skill_dir': pathlib.Path({str(bootstrap.parent)!r})}}\n"
+        "exec(compile(source, 'bootstrap.py', 'exec'), first_globals, first_globals)\n"
+        "assert first_globals['bn_kernel'].__name__ == 'bn_kernel'\n"
+        "sys.modules.pop('bn_kernel', None)\n"
+        f"second_globals = {{'skill_dir': pathlib.Path({str(bootstrap.parent)!r})}}\n"
+        "exec(compile(source, 'bootstrap.py', 'exec'), second_globals, second_globals)\n"
+        "assert second_globals['bn_kernel'].__name__ == 'bn_kernel'\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", code],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_bootstrap_evicts_stale_module_and_bytecode():
+    bootstrap = (
+        Path(__file__).resolve().parents[1] / "skills" / "bn-kernel" / "bootstrap.py"
+    )
+    code = (
+        "import pathlib, sys\n"
+        f"skill_dir = pathlib.Path({str(bootstrap.parent)!r})\n"
+        f"source = pathlib.Path({str(bootstrap)!r}).read_text()\n"
+        "ns = {'skill_dir': skill_dir}\n"
+        "exec(compile(source, 'bootstrap.py', 'exec'), ns, ns)\n"
+        "stale = ns['bn_kernel']\n"
+        "stale.__bn_kernel_source_hash__ = 'stale'\n"
+        "stale.Session = object()\n"
+        "cache = skill_dir / 'src' / 'bn_kernel' / '__pycache__'\n"
+        "cache.mkdir(exist_ok=True)\n"
+        "(cache / 'stale.pyc').write_bytes(b'stale')\n"
+        "ns2 = {'skill_dir': skill_dir}\n"
+        "exec(compile(source, 'bootstrap.py', 'exec'), ns2, ns2)\n"
+        "assert ns2['bn_kernel'] is not stale\n"
+        "assert hasattr(ns2['bn_kernel'].Session, 'disasm')\n"
+        "assert not (cache / 'stale.pyc').exists()\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", code],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 def test_run_reads_complete_json_artifact_and_unwraps_items(monkeypatch, tmp_path):
     payload = {
@@ -377,6 +443,69 @@ def test_all_rejects_zero_progress(monkeypatch, tmp_path):
         _run(bn_kernel.Session(backend="cli").all("strings"))
 
 
+
+
+def test_all_rejects_per_page_returned_mismatch(monkeypatch, tmp_path):
+    payload = {
+        "items": [{"value": "x"}],
+        "returned": 0,
+        "total": 1,
+        "has_more": False,
+    }
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, _payload_script(payload))))
+
+    with pytest.raises(bn_kernel.BnError, match="returned.*items"):
+        _run(bn_kernel.Session(backend="cli").all("strings"))
+
+
+def test_all_rejects_total_change_on_later_page(monkeypatch, tmp_path):
+    script = """
+import json, sys
+argv = sys.argv[1:]
+out = argv[argv.index("--out") + 1]
+offset = int(argv[argv.index("--offset") + 1])
+payload = (
+    {"items": [{"value": "a"}], "returned": 1, "total": 2, "has_more": True}
+    if offset == 0
+    else {"items": [{"value": "b"}], "returned": 1, "total": 3, "has_more": False}
+)
+json.dump(payload, open(out, "w"))
+"""
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+
+    with pytest.raises(bn_kernel.BnError, match="total changed"):
+        _run(bn_kernel.Session(backend="cli").all("strings", page=1))
+
+
+def test_all_timeout_is_one_end_to_end_budget(monkeypatch, tmp_path):
+    script = """
+import json, sys, time
+argv = sys.argv[1:]
+out = argv[argv.index("--out") + 1]
+offset = int(argv[argv.index("--offset") + 1])
+time.sleep(0.03)
+json.dump(
+    {
+        "items": [{"value": str(offset)}],
+        "returned": 1,
+        "offset": offset,
+        "total": 2,
+        "has_more": offset == 0,
+    },
+    open(out, "w"),
+)
+"""
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+    started = time.monotonic()
+
+    with pytest.raises(bn_kernel.BnError, match="timed out"):
+        _run(
+            bn_kernel.Session(timeout=1, backend="cli").all(
+                "strings", page=1, timeout=0.05
+            )
+        )
+
+    assert time.monotonic() - started < 0.1
 class FakeClient:
     def __init__(self):
         self.calls: list[tuple[str, str, dict[str, Any], dict[str, Any]]] = []
@@ -402,11 +531,26 @@ class FakeClient:
     ):
         self.thread_ids.append(threading.get_ident())
         self.calls.append(("collect", op, dict(params or {}), {"limit": limit}))
+        item = {"op": op}
+        if op == "strings":
+            item["value"] = "sample"
+        if op == "callsites":
+            item.update(
+                {
+                    "callee": {"name": "sink", "address": "0x2000"},
+                    "containing_function": {
+                        "name": "caller",
+                        "address": "0x1000",
+                    },
+                    "call_addr": "0x1010",
+                    "caller_static": "0x1015",
+                }
+            )
         return {
-            "items": [{"op": op}],
+            "items": [item],
             "offset": 0,
             "returned": 1,
-            "has_more": limit == 1,
+            "has_more": True,
             "total": 8,
         }
 
@@ -488,6 +632,81 @@ def test_scoped_passes_function_local_session_to_sync_and_async_callbacks():
     ) == ("worker", "sample", "cli")
 
 
+def test_scoped_rejects_callback_rebound_to_different_target():
+    async def work(session):
+        return session.instance
+
+    assert _run(
+        bn_kernel.scoped(work, instance="agent-a", target="one", backend="cli")
+    ) == "agent-a"
+
+    with pytest.raises(bn_kernel.BnError, match="callback binding mismatch"):
+        _run(
+            bn_kernel.scoped(
+                work,
+                instance="agent-b",
+                target="two",
+                backend="cli",
+            )
+        )
+
+
+def test_scoped_allows_inactive_retained_session_from_other_target():
+    retained = bn_kernel.Session(
+        instance="agent-a", target="one", backend="cli"
+    )
+
+    async def local(session):
+        return session.instance
+
+    with pytest.warns(RuntimeWarning, match="shared retained kernel namespace"):
+        result = _run(
+            bn_kernel.scoped(
+                local,
+                instance="agent-b",
+                target="two",
+                backend="cli",
+            )
+        )
+
+    assert result == "agent-b"
+    assert retained.instance == "agent-a"
+
+
+def test_scoped_rejects_concurrent_foreign_binding():
+    async def scenario():
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def first(session):
+            entered.set()
+            await release.wait()
+            return session.instance
+
+        async def second(session):
+            return session.instance
+
+        task = asyncio.create_task(
+            bn_kernel.scoped(
+                first, instance="agent-a", target="one", backend="cli"
+            )
+        )
+        await entered.wait()
+        try:
+            with pytest.raises(bn_kernel.BnError, match="foreign active scoped"):
+                await bn_kernel.scoped(
+                    second,
+                    instance="agent-b",
+                    target="two",
+                    backend="cli",
+                )
+        finally:
+            release.set()
+            await task
+
+    _run(scenario())
+
+
 def test_native_request_runs_off_event_loop_thread_and_updates_last():
     session, client = _native_session()
     loop_thread = threading.get_ident()
@@ -505,6 +724,109 @@ def test_native_request_runs_off_event_loop_thread_and_updates_last():
         backend="native",
     )
 
+
+@pytest.mark.parametrize("method", ["request", "collect"])
+def test_native_operations_have_caller_visible_timeout(method):
+    session = bn_kernel.Session(instance="worker", timeout=0.01, backend="native")
+
+    class TimeoutClient:
+        def request(self, op, params=None):
+            raise NativeBridgeError("timed out waiting for bridge response")
+
+        def collect(self, op, params=None, *, limit=None):
+            raise NativeBridgeError("timed out waiting for bridge response")
+
+    session._client = TimeoutClient()
+    operation = session.info() if method == "request" else session.strings()
+
+    with pytest.raises(bn_kernel.BnError, match="timed out") as caught:
+        _run(operation)
+
+    assert caught.value.returncode == 124
+
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"items": [], "returned": 0, "total": 3, "has_more": False},
+        {"items": None, "returned": 0, "total": 0, "has_more": False},
+        [],
+        None,
+    ],
+)
+def test_strings_rejects_silent_empty_or_shape_drift(payload):
+    session = bn_kernel.Session(instance="worker", backend="native")
+
+    class StringsClient:
+        def collect(self, op, params=None, *, limit=None):
+            assert op == "strings"
+            return payload
+
+    session._client = StringsClient()
+
+    with pytest.raises(bn_kernel.BnError, match="strings.*contract"):
+        _run(session.strings())
+
+
+
+@pytest.mark.parametrize("payload", [[{"name": "main"}], {"items": "bad"}])
+def test_functions_rejects_collection_shape_drift(payload):
+    session = bn_kernel.Session(instance="worker", backend="native")
+
+    class FunctionsClient:
+        def collect(self, op, params=None, *, limit=None):
+            assert op == "list_functions"
+            return payload
+
+    session._client = FunctionsClient()
+    with pytest.raises(bn_kernel.BnError, match="list_functions.*contract"):
+        _run(session.functions())
+
+
+def test_strings_timeout_is_control_not_bridge_filter(monkeypatch):
+    session = bn_kernel.Session(instance="worker", backend="native")
+    loaded = []
+
+    class RecordingClient:
+        def collect(self, op, params=None, *, limit=None):
+            assert op == "strings"
+            assert params == {"query": "fmt"}
+            return {
+                "items": [{"value": "sample"}],
+                "offset": 0,
+                "returned": 1,
+                "total": 1,
+                "has_more": False,
+            }
+
+    def load_client(instance, target, timeout):
+        loaded.append((instance, target, timeout))
+        return RecordingClient()
+
+    monkeypatch.setattr(bn_kernel, "_load_native_client", load_client)
+
+    assert _run(session.strings(query="fmt", timeout=2)) == [
+        {"value": "sample"}
+    ]
+    assert loaded == [("worker", None, 2)]
+
+
+@pytest.mark.parametrize(
+    ("method", "args"),
+    [
+        ("functions", ()),
+        ("search", ("query",)),
+        ("strings", ()),
+        ("imports", ()),
+        ("sections", ()),
+    ],
+)
+def test_curated_helpers_reject_unknown_kwargs(method, args):
+    session = bn_kernel.Session(instance="worker", backend="native")
+
+    with pytest.raises(TypeError, match="unexpected keyword.*typo"):
+        _run(getattr(session, method)(*args, typo=True))
 
 @pytest.mark.parametrize(
     ("method", "args", "kwargs", "kind", "operation", "params", "call_kwargs"),
@@ -574,6 +896,45 @@ def test_native_search_retries_zero_hit_regex_like_query_and_discloses():
     assert "regex" in session.last.notes[0]
 
 
+def test_search_regex_fallback_shares_one_timeout_budget(monkeypatch):
+    session = bn_kernel.Session(instance="worker", backend="native")
+    loaded_timeouts = []
+    calls = []
+
+    class SearchClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        def collect(self, op, params=None, *, limit=None):
+            calls.append(dict(params or {}))
+            time.sleep(0.02)
+            if params.get("regex"):
+                return {
+                    "items": [{"name": "ParseRecord"}],
+                    "offset": 0,
+                    "returned": 1,
+                    "total": 1,
+                    "has_more": False,
+                }
+            return {
+                "items": [],
+                "offset": 0,
+                "returned": 0,
+                "total": 0,
+                "has_more": False,
+            }
+
+    def load_client(instance, target, timeout):
+        loaded_timeouts.append(timeout)
+        return SearchClient(timeout)
+
+    monkeypatch.setattr(bn_kernel, "_load_native_client", load_client)
+
+    assert _run(session.search("Parse|Decode", timeout=0.1))
+    assert len(calls) == 2
+    assert 0 < loaded_timeouts[1] < loaded_timeouts[0] <= 0.1
+
+
 @pytest.mark.parametrize(
     "query,filters,payload",
     [
@@ -597,12 +958,82 @@ def test_native_search_does_not_retry_when_cli_would_not(query, filters, payload
             self.calls.append((op, dict(params or {}), limit))
             return payload
 
+
+
     client = SearchClient()
     session._client = client
 
     _run(session.search(query, **filters))
 
     assert len(client.calls) == 1
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"text": None},
+        {"decompiled": "body under undocumented key"},
+        {},
+        None,
+    ],
+)
+def test_decompile_rejects_missing_text_contract(payload):
+    session = bn_kernel.Session(instance="worker", backend="native")
+
+    class DecompileClient:
+        def request(self, op, params=None):
+            assert op == "decompile"
+            return payload
+
+    session._client = DecompileClient()
+
+    with pytest.raises(bn_kernel.BnError, match="decompile.*text contract"):
+        _run(session.decompile("main"))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "text": "int big_fn() {\n// This function is taking too long to analyze\n}",
+            "analysis_skipped": False,
+            "warnings": ["decompile is an incomplete stub"],
+        },
+        {
+            "text": "int big_fn() {\n}",
+            "analysis_skipped": True,
+            "warnings": [],
+        },
+    ],
+)
+def test_decompile_rejects_analysis_placeholder(payload):
+    session = bn_kernel.Session(instance="worker", backend="native")
+
+    class PlaceholderClient:
+        def request(self, op, params=None):
+            return payload
+
+    session._client = PlaceholderClient()
+
+    with pytest.raises(bn_kernel.BnError, match="incomplete.*force_analysis"):
+        _run(session.decompile("big_fn"))
+
+
+def test_disasm_supports_bounded_local_ranges_and_preserves_payload():
+    session = bn_kernel.Session(instance="worker", backend="native")
+    payload = {"text": "0x1 one\n0x2 two\n0x3 three\n0x4 four"}
+
+    class DisasmClient:
+        def request(self, op, params=None):
+            assert op == "disasm"
+            return payload
+
+    session._client = DisasmClient()
+
+    assert _run(session.disasm("main", count=2)) == "0x1 one\n0x2 two"
+    assert session.last is not None
+    assert session.last.payload == payload
+    assert _run(session.disasm("main", lines=(2, 3))) == "0x2 two\n0x3 three"
+    with pytest.raises(ValueError, match="count.*lines"):
+        _run(session.disasm("main", count=1, lines=(1, 1)))
 def test_function_info_flattens_helper_value_but_preserves_raw_payload(
     monkeypatch, tmp_path
 ):
@@ -629,6 +1060,8 @@ def test_function_info_flattens_helper_value_but_preserves_raw_payload(
         "name": "main",
         "address": "0x401000",
         "raw_name": "main",
+
+
         "display_name": "main",
         "size": 24,
         "parameters": [],
@@ -641,6 +1074,21 @@ def test_function_info_flattens_helper_value_but_preserves_raw_payload(
     assert _run(cli.function_info("main")) == value
     assert cli.last is not None
     assert cli.last.payload == payload
+def test_decompile_allows_legitimate_placeholder_like_program_text():
+    session = bn_kernel.Session(instance="worker", backend="native")
+    payload = {
+        "text": 'int main() { puts("Loading..."); return 0; }',
+        "analysis_skipped": False,
+        "warnings": [],
+    }
+
+    class DecompileClient:
+        def request(self, op, params=None):
+            return payload
+
+    session._client = DecompileClient()
+
+    assert _run(session.decompile("main")) == payload["text"]
 
 
 def test_native_bridge_errors_use_adapter_error_family():
@@ -672,7 +1120,54 @@ def test_native_assert_target_accepts_basename_and_full_path(tmp_path):
     session._client = IdentityClient()
 
     assert _run(session.assert_target(filename.name))["filename"] == str(filename)
+    assert _run(session.assert_target("sample"))["basename"] == filename.name
     assert _run(session.assert_target(filename))["basename"] == filename.name
+
+
+def test_assert_target_accepts_shorter_caller_timeout(monkeypatch):
+    session = bn_kernel.Session(instance="worker", timeout=1, backend="native")
+    requested_timeouts = []
+
+    class TimeoutIdentityClient:
+        def request(self, op, params=None):
+            raise NativeBridgeError("Timed out waiting for bridge response")
+
+    def load_client(instance, target, timeout):
+        requested_timeouts.append(timeout)
+        return TimeoutIdentityClient()
+
+    monkeypatch.setattr(bn_kernel, "_load_native_client", load_client)
+
+    with pytest.raises(bn_kernel.BnError, match="Timed out") as caught:
+        _run(session.assert_target("sample.bndb", timeout=0.01))
+
+    assert caught.value.returncode == 124
+    assert requested_timeouts == [0.01]
+
+
+def test_assert_target_cli_timeout_kills_subprocess(monkeypatch, tmp_path):
+    marker = tmp_path / "pid"
+    script = f"""
+import os, time
+open({str(marker)!r}, "w").write(str(os.getpid()))
+time.sleep(30)
+"""
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+    session = bn_kernel.Session(instance="worker", timeout=5, backend="cli")
+
+    with pytest.raises(bn_kernel.BnError, match="timed out"):
+        _run(session.assert_target("sample.bndb", timeout=0.05))
+
+    assert marker.exists()
+    pid = int(marker.read_text())
+    try:
+        with pytest.raises(ProcessLookupError):
+            os.kill(pid, 0)
+    finally:
+        try:
+            os.kill(pid, 9)
+        except ProcessLookupError:
+            pass
 
 
 def test_assert_target_rejects_foreign_target_on_native_and_cli(
@@ -753,12 +1248,51 @@ def test_callsites_rejects_empty_scope(within):
         _run(session.callsites("sink", within=within))
 
 
+@pytest.mark.parametrize(
+    "row",
+    [
+        {"call_addr": "0x10", "caller_static": "0x15"},
+        {
+            "call_addr": "0x10",
+            "caller_static": "0x15",
+            "containing_function": None,
+            "callee": {"name": "sink", "address": "0x20"},
+        },
+        {
+            "call_addr": "10",
+            "caller_static": "15",
+            "containing_function": {"name": "caller", "address": "0x1"},
+            "callee": {"name": "sink", "address": "0x20"},
+        },
+    ],
+)
+def test_callsites_rejects_unattributed_or_noncanonical_rows(row):
+    session = bn_kernel.Session(instance="worker", backend="native")
+
+    class CallsitesClient:
+        def collect(self, op, params=None, *, limit=None):
+            return {
+                "items": [row],
+                "offset": 0,
+                "returned": 1,
+                "total": 1,
+                "has_more": False,
+            }
+
+    session._client = CallsitesClient()
+
+    with pytest.raises(bn_kernel.BnError, match="callsites.*row contract"):
+        _run(session.callsites("sink"))
+
+
 def test_callsites_without_scope_uses_all_callers_on_native_and_cli(
     monkeypatch, tmp_path
 ):
     native, client = _native_session()
 
-    assert _run(native.callsites("sink", limit=2)) == [{"op": "callsites"}]
+    native_rows = _run(native.callsites("sink", limit=2))
+    assert len(native_rows) == 1
+    assert native_rows[0]["op"] == "callsites"
     assert client.calls == [
         (
             "collect",
@@ -776,7 +1310,14 @@ def test_callsites_without_scope_uses_all_callers_on_native_and_cli(
 import json, sys
 argv = sys.argv[1:]
 out = argv[argv.index("--out") + 1]
-json.dump({"items": [{"argv": argv}], "has_more": False, "total": 1}, open(out, "w"))
+row = {
+    "argv": argv,
+    "callee": {"name": "sink", "address": "0x2000"},
+    "containing_function": {"name": "caller", "address": "0x1000"},
+    "call_addr": "0x1010",
+    "caller_static": "0x1015",
+}
+json.dump({"items": [row], "has_more": False, "total": 1}, open(out, "w"))
 """
     monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
     cli = bn_kernel.Session(instance="worker", target="sample", backend="cli")
@@ -790,7 +1331,14 @@ def test_cli_callsites_uses_within_for_single_scope(monkeypatch, tmp_path):
 import json, sys
 argv = sys.argv[1:]
 out = argv[argv.index("--out") + 1]
-json.dump({"items": [{"argv": argv}], "has_more": False, "total": 1}, open(out, "w"))
+row = {
+    "argv": argv,
+    "callee": {"name": "sink", "address": "0x2000"},
+    "containing_function": {"name": "caller", "address": "0x1000"},
+    "call_addr": "0x1010",
+    "caller_static": "0x1015",
+}
+json.dump({"items": [row], "has_more": False, "total": 1}, open(out, "w"))
 """
     monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
     session = bn_kernel.Session(backend="cli")
@@ -808,9 +1356,16 @@ import json, os, stat, sys
 argv = sys.argv[1:]
 out = argv[argv.index("--out") + 1]
 scope = argv[argv.index("--within-file") + 1]
-json.dump({"items": [{"scope": scope, "content": open(scope).read(),
-                       "mode": stat.S_IMODE(os.stat(scope).st_mode)}],
-           "has_more": False, "total": 1}, open(out, "w"))
+row = {
+    "scope": scope,
+    "content": open(scope).read(),
+    "mode": stat.S_IMODE(os.stat(scope).st_mode),
+    "callee": {"name": "sink", "address": "0x2000"},
+    "containing_function": {"name": "caller", "address": "0x1000"},
+    "call_addr": "0x1010",
+    "caller_static": "0x1015",
+}
+json.dump({"items": [row], "has_more": False, "total": 1}, open(out, "w"))
 """
     monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
     session = bn_kernel.Session(backend="cli")
@@ -890,3 +1445,16 @@ def test_brief_is_bounded_and_reports_exact_remainder():
     assert bn_kernel.brief(rows, "name", n=0) == "... 3 more of 3"
     with pytest.raises(ValueError, match="n must be non-negative"):
         bn_kernel.brief(rows, n=-1)
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        {"items": []},
+        "plain text",
+        ["row text"],
+    ],
+)
+def test_brief_rejects_non_row_payloads_with_actionable_error(rows):
+    with pytest.raises(TypeError, match="brief.*row mappings"):
+        bn_kernel.brief(rows)

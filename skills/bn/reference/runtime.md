@@ -50,7 +50,7 @@ Target selection, sticky pins, instance/target resolution order, sessions/headle
    > bn -i dogfood-1 -t <sel> xrefs main
    > ```
    >
-   > Note: global **`-i/--instance` is routing** (which live bridge to talk to). **`--instance-id` on `session start` / `load` is spawn naming** (what ID the new bridge gets). They are distinct flags — `bn session start -i foo …` does **not** name the spawn `foo`; use `--instance-id foo` for that.
+   > Note: global **`-i/--instance` is routing**, not spawn naming. `bn -i foo session start …` is rejected because it previously minted a random instance while looking named. Use `bn session start /path/to/binary --instance-id foo`.
    >
    > `session start` prints the loaded target's selector (`target: <sel>   (pass -t <sel>; id …)`), so a fan-out agent does **not** need a follow-up `bn target list` just to learn what to pass to `-t` (#653).
 
@@ -66,6 +66,8 @@ bn session stop <id>                    # shut one down
 bn close [<path>] [-t <sel>] [--all]    # close one: by path, by -t selector, or the single open target; --all closes every target
 bn instance gc                          # reap dead instances' leftover logs/sockets in ~/.cache/bn
 ```
+
+When multiple bridge instances exist, flagless `bn load <path>` refuses ambient marker/env/sticky routing. Pass `-i/--instance` to load into an existing bridge or `--instance-id` to create a named one. This destructive lifecycle boundary never guesses among concurrent agents.
 
 `bn instance gc` is housekeeping: a crashed/SIGKILLed bridge leaves its `.log` (and sometimes its socket) behind in `~/.cache/bn/instances/`, and the lazy liveness sweep keeps those breadcrumbs forever, so the directory accumulates dead logs over time. `bn instance gc` removes the logs and orphan sockets of instances that no longer have a live registry — it never touches a running instance or the shared spawn lock — and reports what it reaped (`--format json` for the counts).
 

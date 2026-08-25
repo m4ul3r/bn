@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import time
 from typing import Any
 
-from .transport import BridgeError, send_request
+from .transport import BridgeError, _resolve_timeout, send_request
 
 _MALFORMED_REPLY = (
     "malformed bridge reply (no result); the bridge may be stale -- restart it and retry"
@@ -38,19 +39,28 @@ class Client:
     def timeout(self) -> float | None:
         return self._timeout
 
-    def request(
-        self, op: str, params: Mapping[str, Any] | None = None
+    def _request(
+        self,
+        op: str,
+        params: Mapping[str, Any] | None,
+        *,
+        timeout: float | None,
     ) -> Any:
         response = send_request(
             op,
             params=dict(params or {}),
             instance_id=self.instance,
             target=self.target,
-            timeout=self.timeout,
+            timeout=timeout,
         )
         if not isinstance(response, dict) or "result" not in response:
             raise BridgeError(_MALFORMED_REPLY)
         return response["result"]
+
+    def request(
+        self, op: str, params: Mapping[str, Any] | None = None
+    ) -> Any:
+        return self._request(op, params, timeout=self.timeout)
 
     def collect(
         self,
@@ -83,6 +93,12 @@ class Client:
         items: list[Any] = []
         aggregate: dict[str, Any] | None = None
         bridge_has_more = False
+        effective_timeout = _resolve_timeout(self.timeout)
+        deadline = (
+            time.monotonic() + effective_timeout
+            if effective_timeout is not None
+            else None
+        )
 
         while True:
             remaining = None if limit is None else limit - len(items)
@@ -91,7 +107,15 @@ class Client:
             page_params["offset"] = offset
             page_params["limit"] = request_limit
 
-            page = self.request(op, page_params)
+            page_timeout = None
+            if deadline is not None:
+                page_timeout = deadline - time.monotonic()
+                if page_timeout <= 0:
+                    raise BridgeError(
+                        f"Timed out collecting {op!r}; the end-to-end "
+                        "collection deadline expired"
+                    )
+            page = self._request(op, page_params, timeout=page_timeout)
             if not isinstance(page, dict):
                 raise BridgeError(f"malformed {op} page: expected an object")
             page_items = page.get("items")
@@ -102,6 +126,39 @@ class Client:
                 raise BridgeError(f"malformed {op} page: has_more must be a boolean")
             if bridge_has_more and not page_items:
                 raise BridgeError(f"malformed {op} page: has_more with an empty page")
+            returned = page.get("returned")
+            if returned is not None and (
+                not isinstance(returned, int)
+                or isinstance(returned, bool)
+                or returned != len(page_items)
+            ):
+                raise BridgeError(
+                    f"malformed {op} page: returned must equal items length"
+                )
+            total = page.get("total")
+            if total is not None:
+                if (
+                    not isinstance(total, int)
+                    or isinstance(total, bool)
+                    or total < 0
+                    or (bool(page_items) and total < offset + len(page_items))
+                ):
+                    raise BridgeError(
+                        f"malformed {op} page: invalid total {total!r}"
+                    )
+                if not bridge_has_more and offset + len(page_items) < total:
+                    raise BridgeError(
+                        f"malformed {op} page: total={total} requires "
+                        "has_more=true at this offset"
+                    )
+                if (
+                    aggregate is not None
+                    and aggregate.get("total") is not None
+                    and aggregate.get("total") != total
+                ):
+                    raise BridgeError(
+                        f"malformed {op} page: total changed across pages"
+                    )
 
             if aggregate is None:
                 aggregate = dict(page)

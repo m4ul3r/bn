@@ -286,6 +286,14 @@ def _default_skill_install_roots() -> list[Path]:
          ])
 def _session_start(args: argparse.Namespace) -> int:
     import os
+    if getattr(args, "_explicit_instance", False):
+        selected = getattr(args, "instance", None)
+        suffix = f" {selected}" if selected else " NAME"
+        raise cli.BridgeError(
+            "global -i/--instance selects an existing bridge and does not name "
+            "a new `session start` instance. Use "
+            f"`bn session start <binary> --instance-id{suffix}`."
+        )
     instance_id = getattr(args, "instance_id", None)
     instance = cli.spawn_instance(instance_id)
 

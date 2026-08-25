@@ -789,18 +789,24 @@ def _structured_disasm_entries(bv, func) -> list[dict[str, Any]]:
 
 def _disasm_text(bv, func) -> str:
     arch = getattr(func, "arch", None)
-    lines = []
+    entries = []
     for block in list(func.basic_blocks):
-        addr = block.start
-        while addr < block.end:
-            length = max(1, _instruction_length(bv, int(addr), arch=arch))
+        addr = int(block.start)
+        end = int(block.end)
+        while addr < end:
+            length = max(1, _instruction_length(bv, addr, arch=arch))
             entry = _disasm_entry(bv, addr, arch=arch)
-            disasm = entry["text"]
             raw = bv.read(addr, length)
-            hex_bytes = raw.hex(" ") if raw else ""
-            lines.append(f"{addr:08x}  {hex_bytes:<16} {disasm}")
+            text = entry["text"]
+            if not text:
+                text = ".byte " + ", ".join(f"0x{byte:02x}" for byte in raw)
+            entries.append((addr, raw, text))
             addr += length
-    return "\n".join(lines)
+    entries.sort(key=lambda item: item[0])
+    return "\n".join(
+        f"0x{addr:08x}  {(raw.hex(' ') if raw else ''):<16} {text}"
+        for addr, raw, text in entries
+    )
 
 
 def _function_signature(func) -> str:
@@ -904,7 +910,12 @@ def _analysis_stub_warning(func, text: str, *, forced: bool = False) -> str | No
     a distinctive-phrase text match is kept as a fallback.
     """
     skipped = bool(getattr(func, "analysis_skipped", False))
-    placeholder = "taking too long to analyze" in text
+    lowered = text.lower()
+    placeholder = (
+        len(text) <= 512
+        and "this function is taking too long to analyze" in lowered
+        and ("loading..." in lowered or "loading…" in lowered)
+    )
     if not (skipped or placeholder):
         return None
     reason = None

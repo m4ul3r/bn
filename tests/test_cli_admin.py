@@ -738,6 +738,21 @@ def test_session_stop_sends_shutdown(monkeypatch, capsys):
     assert parsed["instance_id"] == "abc123"
 
 
+def test_session_start_rejects_global_instance_selector(monkeypatch, capsys):
+    monkeypatch.setattr(
+        bn.cli,
+        "spawn_instance",
+        lambda *args, **kwargs: pytest.fail("session start spawned random instance"),
+    )
+
+    rc = bn.cli.main(["-i", "named", "session", "start", "/bin/ls"])
+
+    assert rc == 2
+    error = capsys.readouterr().err
+    assert "--instance-id named" in error
+    assert "does not name" in error
+
+
 def test_session_start_spawns_instance(monkeypatch, capsys):
     from bn.transport import BridgeInstance
 

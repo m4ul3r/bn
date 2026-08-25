@@ -6,6 +6,7 @@ import os
 import socket
 import socketserver
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -31,7 +32,7 @@ def test_choose_instance_multiple_with_no_selector_errors_before_target(monkeypa
     import bn.transport as t
     insts = [types.SimpleNamespace(instance_id="aa11", pid=11, socket_path="/s/aa11", started_at=None),
              types.SimpleNamespace(instance_id="bb22", pid=22, socket_path="/s/bb22", started_at=None)]
-    monkeypatch.setattr(t, "list_instances", lambda: insts)
+    monkeypatch.setattr(t, "list_instances", lambda **kwargs: insts)
     monkeypatch.setattr(t, "_resolve_from_markers", lambda instances: None)  # no marker
     with pytest.raises(BridgeError) as exc:
         choose_instance(auto_start=False)
@@ -455,6 +456,43 @@ def test_gc_holds_spawn_lock_so_it_cannot_reap_an_in_flight_spawn(tmp_path, monk
     assert "result" in box
 
 
+def test_spawn_lock_timeout_is_bounded_and_actionable(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    from bn.transport import _spawn_lock
+
+    errors = []
+
+    def contend():
+        try:
+            with _spawn_lock(timeout=0.05):
+                raise AssertionError("contender unexpectedly acquired lock")
+        except BaseException as exc:
+            errors.append(exc)
+
+    with _spawn_lock():
+        worker = threading.Thread(target=contend)
+        worker.start()
+        worker.join(timeout=1)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], BridgeError)
+    assert "spawn lock" in str(errors[0]).lower()
+    assert "0.05s" in str(errors[0])
+
+
+def test_send_request_budget_covers_spawn_lock_contention(tmp_path, monkeypatch):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    from bn.transport import _spawn_lock
+
+    started = time.monotonic()
+    with _spawn_lock():
+        with pytest.raises(BridgeError, match="Timed out"):
+            send_request("ping", timeout=0.01)
+
+    assert time.monotonic() - started < 0.1
+
+
 def _empty_reply_socket():
     class _FakeSocket:
         def __enter__(self):
@@ -598,6 +636,49 @@ def test_send_request_retries_transient_connect_failures(tmp_path, monkeypatch):
     assert _FakeSocket.attempts == 2
 
 
+def test_transient_connect_retries_obey_end_to_end_deadline(
+    tmp_path, monkeypatch
+):
+    from bn.transport import BridgeInstance
+
+    instance = BridgeInstance(
+        pid=999,
+        socket_path=tmp_path / "bridge.sock",
+        registry_path=tmp_path / "bridge.json",
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at=None,
+        meta={},
+        instance_token="test-token",
+    )
+    monkeypatch.setattr(
+        "bn.transport.choose_instance", lambda instance_id=None, **kw: instance
+    )
+
+    class RefusingSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def connect(self, path):
+            raise ConnectionRefusedError(errno.ECONNREFUSED, "Connection refused")
+
+    monkeypatch.setattr(
+        "bn.transport.socket.socket", lambda *args, **kwargs: RefusingSocket()
+    )
+    started = time.monotonic()
+
+    with pytest.raises(BridgeError, match="Timed out"):
+        send_request("ping", timeout=0.01)
+
+    assert time.monotonic() - started < 0.1
+
+
 def _make_timeout_probe_socket():
     class _FakeSocket:
         timeouts: list[float] = []
@@ -664,7 +745,59 @@ def test_send_request_applies_default_timeout(tmp_path, monkeypatch):
     response = send_request("ping")
 
     assert response["result"]["pong"] is True
-    assert fake_socket.timeouts == [DEFAULT_REQUEST_TIMEOUT]
+    assert fake_socket.timeouts == pytest.approx([DEFAULT_REQUEST_TIMEOUT], rel=1e-5)
+
+
+def test_send_request_timeout_budget_includes_instance_selection(
+    tmp_path, monkeypatch
+):
+    import bn.transport as transport
+
+    instance = _make_instance(tmp_path)
+    captured = {}
+
+    def choose(*args, **kwargs):
+        time.sleep(0.03)
+        return instance
+
+    def send(instance, op, **kwargs):
+        captured["timeout"] = kwargs["timeout"]
+        return {
+            "ok": True,
+            "result": {},
+            "bridge_identity": {
+                "instance_id": instance.instance_id,
+                "pid": instance.pid,
+                "token": instance.instance_token,
+            },
+        }
+
+    monkeypatch.setattr(transport, "choose_instance", choose)
+    monkeypatch.setattr(transport, "_send_request_to_instance", send)
+
+    transport.send_request("ping", timeout=0.1)
+
+    assert 0 < captured["timeout"] < 0.09
+
+
+def test_send_request_timeout_can_expire_during_instance_selection(
+    monkeypatch,
+):
+    import bn.transport as transport
+
+    def choose(*args, **kwargs):
+        time.sleep(0.02)
+        return object()
+
+    monkeypatch.setattr(transport, "choose_instance", choose)
+    monkeypatch.setattr(
+        transport,
+        "_send_request_to_instance",
+        lambda *args, **kwargs: pytest.fail("request sent after deadline"),
+    )
+
+    with pytest.raises(BridgeError, match="selecting a bridge instance"):
+        transport.send_request("ping", timeout=0.001)
 
 
 def test_send_request_timeout_env_override(tmp_path, monkeypatch):
@@ -676,7 +809,7 @@ def test_send_request_timeout_env_override(tmp_path, monkeypatch):
 
     send_request("ping")
 
-    assert fake_socket.timeouts == [42.5]
+    assert fake_socket.timeouts == pytest.approx([42.5], rel=1e-5)
 
 
 def test_send_request_timeout_env_zero_disables(tmp_path, monkeypatch):
@@ -1200,7 +1333,7 @@ def test_spawn_instance_rejects_duplicate_id(monkeypatch, tmp_path):
         meta={},
         instance_id="aaaa1111",
     )
-    monkeypatch.setattr("bn.transport.list_instances", lambda: [existing])
+    monkeypatch.setattr("bn.transport.list_instances", lambda **kwargs: [existing])
 
     with pytest.raises(BridgeError, match="Bridge instance already exists with id: aaaa1111"):
         spawn_instance("aaaa1111")
@@ -1232,9 +1365,9 @@ def test_spawn_instance_starts_new_instance_when_other_instances_exist(monkeypat
     )
     bridge_registry_path("newid").parent.mkdir(parents=True, exist_ok=True)
     bridge_registry_path("newid").write_text("{}", encoding="utf-8")
-    monkeypatch.setattr("bn.transport.list_instances", lambda: [existing])
+    monkeypatch.setattr("bn.transport.list_instances", lambda **kwargs: [existing])
     monkeypatch.setattr("bn.transport._find_bn_agent", lambda: ["bn-agent"])
-    monkeypatch.setattr("bn.transport._load_instance", lambda path: created)
+    monkeypatch.setattr("bn.transport._load_instance", lambda path, **kwargs: created)
 
     popen_calls = []
 
@@ -1254,7 +1387,7 @@ def test_spawn_instance_starts_new_instance_when_other_instances_exist(monkeypat
 
 def test_spawn_instance_reports_exit_code_and_log_when_child_dies(monkeypatch, tmp_path):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
-    monkeypatch.setattr("bn.transport.list_instances", lambda: [])
+    monkeypatch.setattr("bn.transport.list_instances", lambda **kwargs: [])
     monkeypatch.setattr("bn.transport._find_bn_agent", lambda: ["bn-agent"])
 
     class _FakePopen:
@@ -1282,7 +1415,7 @@ def test_spawn_instance_reports_exit_code_and_log_when_child_dies(monkeypatch, t
 
 def test_spawn_instance_terminates_child_on_registration_timeout(monkeypatch, tmp_path):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
-    monkeypatch.setattr("bn.transport.list_instances", lambda: [])
+    monkeypatch.setattr("bn.transport.list_instances", lambda **kwargs: [])
     monkeypatch.setattr("bn.transport._find_bn_agent", lambda: ["bn-agent"])
 
     lifecycle: list[str] = []
@@ -1319,7 +1452,7 @@ def test_choose_instance_spawn_missing_named_spawns_new(tmp_path, monkeypatch):
     spawned = {}
     sentinel = object()
 
-    def fake_spawn(instance_id):
+    def fake_spawn(instance_id, **kwargs):
         spawned["id"] = instance_id
         return sentinel
 
@@ -1331,7 +1464,10 @@ def test_choose_instance_spawn_missing_named_spawns_new(tmp_path, monkeypatch):
     assert spawned["id"] == "brandnew"
 
     # default: a missing named id still fails fast, and the error points the way.
-    with pytest.raises(BridgeError, match="session start --instance-id brandnew") as exc:
+    with pytest.raises(
+        BridgeError,
+        match="session start /path/to/binary --instance-id brandnew",
+    ) as exc:
         choose_instance("brandnew")
     assert "No bridge instance found with id: brandnew" in str(exc.value)
 
@@ -1572,7 +1708,7 @@ def test_send_request_load_refresh_use_larger_default(tmp_path, monkeypatch):
     monkeypatch.setattr("bn.transport.socket.socket", lambda *args, **kwargs: fake_socket())
 
     send_request("refresh", default_timeout=REFRESH_REQUEST_TIMEOUT)
-    assert fake_socket.timeouts == [REFRESH_REQUEST_TIMEOUT]
+    assert fake_socket.timeouts == pytest.approx([REFRESH_REQUEST_TIMEOUT], rel=1e-5)
 
 
 # -- #80: project-local instance markers ----------------------------------

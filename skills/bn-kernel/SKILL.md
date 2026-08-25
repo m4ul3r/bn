@@ -13,19 +13,17 @@ Resolve `<skill-dir>` to the **absolute directory shown when this skill loads**,
 
 ```python
 from pathlib import Path
-import sys
 
 skill_dir = Path("<absolute-installed-skill-dir>")
-sys.path.insert(0, str(skill_dir / "src"))
-previous = sys.dont_write_bytecode
-sys.dont_write_bytecode = True
-try:
-    import bn_kernel
-finally:
-    sys.dont_write_bytecode = previous
+exec((skill_dir / "bootstrap.py").read_text(encoding="utf-8"))
 ```
 
-Do not assume the skill's Python module is installed into OMP's interpreter. The adapter requires only a working `bn` executable on `PATH`; when the interpreter can also import `bn.Client`, `backend='auto'` selects the native transport.
+The bootstrap is idempotent: rerun it after an eval-kernel exit/reset. It hashes
+the installed source, evicts stale `bn_kernel*` modules, removes stale
+`__pycache__`, reimports, and validates required API signatures. A signature
+mismatch fails loudly. It cannot preserve an in-flight cell when a sibling kills
+the shared Python process; true crash isolation requires a per-subagent OMP
+kernel.
 
 ## Bind explicitly
 
@@ -34,16 +32,16 @@ bind both and assert the observed target before trusting any rows:
 
 ```python
 s = bn_kernel.session(instance="analysis-1", target="<target-selector>")
-await s.assert_target("<expected-basename-or-absolute-path>")
+await s.assert_target("<name-or-name.bndb-or-absolute-path>", timeout=30)
 s.backend
 ```
 
 > **Concurrent sibling task agents:** OMP currently shares one retained eval
-> namespace across those siblings. Module globals such as `s`, `rows`, `lines`,
-> and `decomp` can be rebound by another agent between cells. Distinct live
-> bindings emit a runtime warning, but a warning cannot isolate Python globals.
-> Use the direct `bn -i/-t` CLI for parallel agents. If kernel use is required,
-> complete the whole operation in one function-local callback:
+> namespace across those siblings. Module globals can be rebound between cells.
+> Ordinary inactive `Session` objects may be retained for inspecting `.last` and
+> still emit cross-binding warnings. `scoped()` fails closed only on a foreign
+> concurrently active scope, callback reuse for another target, or overlapping
+> use of the same callback. Give each target a fresh, uniquely named `async def`.
 
 ```python
 async def analyze_cell(bound):
@@ -62,25 +60,31 @@ print(count)
 print(preview)
 ```
 
-`scoped()` keeps the session and bulk rows function-local; do not return the
-session or bulk collections into shared globals. True per-subagent namespaces
-must be provided by the OMP harness.
+`scoped()` keeps the session and bulk rows function-local, refuses returning its
+Session, and fails closed on foreign active scopes or callback-binding reuse.
+Sequential scopes may coexist with inactive retained Sessions. Do not return bulk
+collections into shared globals; process isolation remains a harness requirement.
 
-Use `backend='cli'` to force the zero-extra-install executable path for reproducibility. Use `backend='native'` to diagnose whether the OMP interpreter can import the supported `bn.Client`; its error explains how to fall back.
+Native reads are bounded to 120 seconds by default. Collection helpers accept an
+explicit `timeout=` that applies to the whole multi-page operation; unknown
+keywords raise `TypeError` rather than becoming silent bridge filters. Timeout
+errors point to `bn -i NAME target info` for analysis progress.
 
 Prefer these curated helpers for list-shaped and common reads:
 
 - `await s.info(verbose=False)`
-- `await s.functions(...)`, `await s.search(query, ...)` (case-insensitive substring; regex-like zero-hit queries retry as regex like the CLI)
-- `await s.function_info(identifier, blocks=False)` (identity fields are flattened at top level; `s.last.payload` keeps the raw nested bridge shape)
-- `await s.decompile(identifier)`, `await s.disasm(identifier)`, `await s.il(identifier)`
-- `await s.xrefs(identifier, ...)`
-- `await s.callsites(callee, ...)` for all callers, or restrict with `within="caller"` / `within=[...]`
-- `await s.strings(...)`, `await s.imports(...)`, `await s.sections(...)`
+- `await s.functions(timeout=..., ...)`, `await s.search(query, timeout=..., ...)` always return row lists; every row has integer `size` plus `size_known`, and `s.last.payload` is the paged envelope.
+- `await s.function_info(identifier, blocks=False)` flattens identity fields at top level while preserving the raw nested payload.
+- `await s.decompile(identifier)` returns non-empty `payload['text']`; function identity remains under `s.last.payload['function']`. Skipped/“taking too long” placeholders raise and direct you to `force_analysis=True`.
+- `await s.disasm(identifier, count=N)` / `lines=(START, END)` returns an address-ordered, bounded string with `0x`-prefixed addresses.
+- `await s.il(identifier)`, `await s.xrefs(identifier, timeout=..., ...)`
+- `await s.callsites(callee, timeout=..., ...)` always returns attributed rows.
+- `await s.strings(timeout=..., ...)`, `await s.imports(timeout=..., ...)`, `await s.sections(timeout=..., ...)`
 
-`Session.last.payload` retains the complete response and pagination metadata. `brief()` formats bounded output. Large variables stay out of the transcript only while you do **not** print or display them; inspect counts, selected fields, and bounded slices instead.
-
-Normal Python filtering, joins, counts, and regexes over retained variables make no additional bridge request. Keep the rows in variables across cells rather than fetching them again.
+Collection and text helpers reject malformed, nested, or silently truncated
+payloads instead of returning an empty/list/dict/`None` shape that can be
+misread as “no findings.” `brief()` accepts only a sequence of row mappings;
+pass `s.last.payload['items']`, never the payload dict or plain text.
 
 ## Generic commands and mutations
 
@@ -96,6 +100,14 @@ payload = await s.run("evidence", "orient", unwrap=False)
 ## Load cost and memory
 
 Full loads run Binary Ninja analysis to completion. They can take seconds to minutes under contention, not a fixed few seconds. Each headless bridge can consume hundreds of MB; a large or complex BNDB may be OOM-killed. Bound fan-out concurrency, watch RSS with `bn session list`, use `--quick` for container-level triage, and stop instances promptly.
+
+## OMP harness escalation
+
+The skill can detect and contain foreign bindings, but it cannot make one shared
+Python process safe for sibling task agents. A sibling exit 130 can still destroy
+other agents' in-flight state. OMP owners must provide per-subagent kernel
+processes or namespaces; do not weaken `scoped()`/`assert_target()` to work around
+that harness boundary.
 
 ## Accuracy boundary
 

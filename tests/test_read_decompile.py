@@ -60,6 +60,31 @@ def test_list_locals_returns_stable_ids(monkeypatch):
     assert result["locals"][1]["local_id"].startswith("0x401000:local:")
 
 
+def test_function_disasm_is_address_ordered_and_0x_prefixed(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    function = _FakeFunction(0x1000, "target")
+    function.basic_blocks = [
+        _FakeBasicBlock(0x2000, 0x2002),
+        _FakeBasicBlock(0x1000, 0x1002),
+        _FakeBasicBlock(0x3000, 0x3001),
+    ]
+    bv = _FakeBV(
+        memory={
+            0x1000: b"\x90\x90",
+            0x2000: b"\x90\x90",
+            0x3000: b"\xff",
+        },
+        disassembly={0x1000: "first", 0x2000: "second", 0x3000: ""},
+        instruction_lengths={0x1000: 2, 0x2000: 2, 0x3000: 1},
+    )
+
+    text = bridge.il_format._disasm_text(bv, function)
+    addresses = [line.split()[0] for line in text.splitlines()]
+
+    assert addresses == ["0x00001000", "0x00002000", "0x00003000"]
+    assert ".byte 0xff" in text
+
+
 def test_list_locals_skips_stack_aliases_for_parameters(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -608,6 +633,7 @@ def test_decompile_warns_on_placeholder_text_when_flag_clear(monkeypatch):
             [(0x401000, "int32_t big_fn()")],
             [(0x401000, "{")],
             [(0x401000, "    // This function is taking too long to analyze")],
+            [(0x401000, "    // Loading...")],
             [(0x401000, "}")],
         ],
     )
@@ -616,6 +642,14 @@ def test_decompile_warns_on_placeholder_text_when_flag_clear(monkeypatch):
 
     assert result["analysis_skipped"] is False
     assert any("incomplete stub" in w for w in result["warnings"])
+
+
+def test_analysis_stub_warning_ignores_legitimate_phrase_in_program_text(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    fn = _FakeFunction(0x401000, "real_fn")
+    text = 'int real_fn() { puts("This function is taking too long to analyze"); }'
+
+    assert bridge.il_format._analysis_stub_warning(fn, text) is None
 
 
 def test_decompile_force_analysis_reanalyzes_and_clears_warning(monkeypatch):
@@ -848,7 +882,9 @@ def test_function_list_basic_block_count_guards_bad_function(monkeypatch):
                 raise RuntimeError("analysis artifact: basic_blocks unavailable")
             return super().__getattribute__(attr)
 
-    good = _FakeFunction(0x401000, "ok_fn"); good.basic_blocks = [object()] * 3
+    good = _FakeFunction(0x401000, "ok_fn")
+    good.basic_blocks = [object()] * 3
+    good.total_bytes = 32
     bad = _ExplodingFunction(0x402000, "bad_fn")
     bv = _FakeBV(functions=[good, bad])
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
@@ -857,6 +893,10 @@ def test_function_list_basic_block_count_guards_bad_function(monkeypatch):
     by = {it["address"]: it for it in result["items"]}
     assert by["0x401000"]["basic_block_count"] == 3
     assert by["0x402000"]["basic_block_count"] is None   # guarded, not a crash
+    assert by["0x401000"]["size"] == 32
+    assert by["0x401000"]["size_known"] is True
+    assert by["0x402000"]["size"] == 0
+    assert by["0x402000"]["size_known"] is False
     assert result["total"] == 2                          # whole request succeeded
 
 

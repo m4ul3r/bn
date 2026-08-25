@@ -28,6 +28,15 @@ def test_target_flag_accepted_before_subcommand():
         assert args.instance == expected_instance, argv
 
 
+def test_instance_provenance_stops_at_option_terminator():
+    assert bn.cli._explicit_instance_options(
+        ["load", "--", "--instance-id"]
+    ) == (False, False)
+    assert bn.cli._explicit_instance_options(
+        ["session", "start", "--", "-i-not-an-option"]
+    ) == (False, False)
+
+
 def test_instance_short_flag_accepted():
     parser = bn.cli.build_parser()
 
@@ -697,6 +706,28 @@ def test_load_no_bndb_flag_disables_prefer_bndb(fake_transport, tmp_path):
 
     assert rc == 0
     assert calls[-1]["params"]["prefer_bndb"] is False
+
+
+def test_load_refuses_ambient_routing_with_multiple_instances(
+    fake_transport, monkeypatch, tmp_path, capsys
+):
+    raw = tmp_path / "foo.so"
+    raw.write_bytes(b"")
+    calls = fake_transport()
+    monkeypatch.setattr(
+        bn.cli,
+        "list_instances",
+        lambda: [
+            types.SimpleNamespace(instance_id="one"),
+            types.SimpleNamespace(instance_id="two"),
+        ],
+    )
+
+    rc = bn.cli.main(["load", str(raw)])
+
+    assert rc == 2
+    assert calls == []
+    assert "explicit -i/--instance" in capsys.readouterr().err
 
 
 def test_load_quick_flag_sets_quick_param(monkeypatch, tmp_path):
