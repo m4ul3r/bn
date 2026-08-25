@@ -917,6 +917,7 @@ class BinaryNinjaBridge:
     def __init__(self, instance_id: str | None = None):
         self.instance_id = instance_id
         self.instance_token = str(uuid.uuid4())
+        self._marker_paths: set[str] = set()
         self.targets = TargetManager()
         self.ctx = BridgeContext(self.targets)
         self.socket_path = bridge_socket_path(instance_id)
@@ -1007,6 +1008,10 @@ class BinaryNinjaBridge:
         if self.socket_path.exists():
             with contextlib.suppress(OSError):
                 self.socket_path.unlink()
+        for marker_path in tuple(self._marker_paths):
+            with contextlib.suppress(OSError):
+                Path(marker_path).unlink()
+        self._marker_paths.clear()
         if self.registry_path.exists():
             with contextlib.suppress(OSError):
                 self.registry_path.unlink()
@@ -1048,6 +1053,7 @@ class BinaryNinjaBridge:
                 "pid": os.getpid(),
                 "created_at": datetime.now(timezone.utc).isoformat(),
             }), encoding="utf-8")
+            self._marker_paths.add(str(marker))
         except OSError as exc:
             return f"could not write project marker in {root} ({exc}); resolve with -i"
         self._git_exclude_marker(root)
@@ -1100,6 +1106,7 @@ class BinaryNinjaBridge:
         except Exception:
             binaries = []
         payload["binaries"] = binaries
+        payload["marker_paths"] = sorted(self._marker_paths)
         # Write atomically (temp file + rename) so a concurrent reader never
         # sees a half-written registry and concludes no instance exists.
         ensure_private_dir(self.registry_path.parent)
@@ -1479,12 +1486,15 @@ class BinaryNinjaBridge:
                     published = True  # latched: view now owned by _headless_views
                 targets = self.targets.refresh()
 
-            # Keep the registry's open-binaries list current after a load (#80).
-            self._write_registry()
-            marker_note = self._write_project_marker(workdir, no_marker,
-                                                     refresh_only=marker_refresh_only)
+            marker_note = self._write_project_marker(
+                workdir,
+                no_marker,
+                refresh_only=marker_refresh_only,
+            )
             if marker_note:
                 notes.append(marker_note)
+            # Persist both the open-binary and marker-path inventories.
+            self._write_registry()
             return {
                 "loaded": True,
                 "path": str(load_path),
@@ -3287,9 +3297,16 @@ def _bind_data_symbols(bridge, params, target):
 
 @op("disasm", lock="read")
 def _bind_disasm(bridge, params, target):
-    return bridge._disasm(target, params["identifier"], linear=params.get("linear"),
-                          mode=params.get("mode"),
-                          snap_to_instruction=params.get("snap_to_instruction", False))
+    return bridge._disasm(
+        target,
+        params["identifier"],
+        linear=params.get("linear"),
+        mode=params.get("mode"),
+        snap_to_instruction=params.get("snap_to_instruction", False),
+        line_start=params.get("line_start"),
+        line_end=params.get("line_end"),
+        strict_range=params.get("strict_range", False),
+    )
 
 
 @op("function_evidence", lock="read")

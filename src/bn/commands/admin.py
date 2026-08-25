@@ -33,7 +33,7 @@ from ..formatters import (
     _render_target_list_text,
     _render_target_use_text,
 )
-from ..transport import BridgeError
+from ..transport import BridgeError, _resolve_timeout
 
 
 @command("capabilities",
@@ -295,6 +295,7 @@ def _session_start(args: argparse.Namespace) -> int:
             f"`bn session start <binary> --instance-id{suffix}`."
         )
     instance_id = getattr(args, "instance_id", None)
+    _resolve_timeout(None)
     instance = cli.spawn_instance(instance_id)
 
     binaries = getattr(args, "binaries", None) or []
@@ -338,21 +339,55 @@ def _session_start(args: argparse.Namespace) -> int:
 
     # If the caller asked to preload binaries but none loaded, the freshly
     # spawned bridge is an empty zombie they'd have to hunt down and stop. Shut
-    # it down and exit non-zero so the failure is visible to scripts.
     if binaries and not successes:
+        cleanup_errors: list[str] = []
         try:
             cli.send_request("shutdown", instance_id=instance.instance_id)
-        except BridgeError:
-            pass
-        result["stopped"] = True
+        except BridgeError as exc:
+            cleanup_errors.append(f"shutdown request failed: {exc}")
+            try:
+                os.kill(instance.pid, signal.SIGTERM)
+            except OSError as signal_exc:
+                cleanup_errors.append(f"SIGTERM failed: {signal_exc}")
+        stopped = cli.wait_for_teardown(instance, timeout=5.0)
+        if not stopped:
+            try:
+                os.kill(instance.pid, signal.SIGKILL)
+            except OSError as exc:
+                cleanup_errors.append(f"SIGKILL failed: {exc}")
+            stopped = cli.wait_for_teardown(instance, timeout=2.0)
+        result["stopped"] = stopped
+        if cleanup_errors:
+            result["cleanup_errors"] = cleanup_errors
+        if not stopped:
+            result["cleanup_error"] = (
+                f"bridge instance {instance.instance_id} (pid {instance.pid}) "
+                "did not fully tear down"
+            )
 
     cli._emit_result(args, result, text_renderer=_render_session_start_text, stem="session-start")
     return 1 if failures else 0
 
 
-@command("session", "stop", help="Stop a running bridge session",
-         args=[arg("instance_id", nargs="?", metavar="instance",
-                   help="Instance ID to stop (positional, or pass -i/--instance <id>)")])
+@command(
+    "session",
+    "stop",
+    help="Stop a running bridge session",
+    args=[
+        arg(
+            "instance_id",
+            nargs="?",
+            metavar="instance",
+            help="Instance ID to stop (positional, or pass -i/--instance <id>)",
+        ),
+        arg(
+            "--instance-id",
+            dest="instance_id_flag",
+            default=None,
+            help="Instance ID to stop (alias for the positional or -i/--instance)",
+        ),
+    ],
+)
 def _session_stop(args: argparse.Namespace) -> int:
     # #456: accept the id positionally OR via -i/--instance (every other command is
     # driven with -i/--instance, so `session stop -i <id>` is the natural
@@ -361,7 +396,14 @@ def _session_stop(args: argparse.Namespace) -> int:
     # unset must error, not fall through to the sticky-pin-filled -i and shut
     # down the PINNED bridge.
     positional = getattr(args, "instance_id", None)
-    target_id = positional if positional is not None else getattr(args, "instance", None)
+    alias = getattr(args, "instance_id_flag", None)
+    target_id = (
+        positional
+        if positional is not None
+        else alias
+        if alias is not None
+        else getattr(args, "instance", None)
+    )
     if target_id is not None and not str(target_id).strip():
         raise BridgeError(
             "session stop: instance id is empty; pass an id from `bn session list`"
@@ -427,7 +469,19 @@ def _session_stop(args: argparse.Namespace) -> int:
     removed = cli.remove_instance_markers(marker_id)
     if not removed and marker_id != target_id:
         removed = cli.remove_instance_markers(target_id)
-    result["marker_removed"] = [str(p) for p in removed]
+    if inst is not None and isinstance(inst.meta, dict):
+        for raw_path in inst.meta.get("marker_paths", []) or []:
+            marker_path = Path(str(raw_path))
+            if marker_path.name != f".bn-{inst.instance_id}":
+                continue
+            try:
+                marker_path.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                continue
+            removed.append(marker_path)
+    result["marker_removed"] = [str(path) for path in dict.fromkeys(removed)]
 
     cli._emit_result(args, result, text_renderer=_render_session_stop_text, stem="session-stop")
     return 0
@@ -527,8 +581,8 @@ def _rss_mb(pid: int) -> float | None:
     return None
 
 
-def _running_instances_result() -> dict[str, Any]:
-    """Snapshot every running bridge instance (shared by session/instance list)."""
+def _running_instances_result(selector_filter: str | None = None) -> dict[str, Any]:
+    """Snapshot running bridge instances, optionally selecting one."""
     instances = cli.list_instances()
     sticky_id = cli.session_state.read().get("instance_id")
     entries = []
@@ -536,6 +590,11 @@ def _running_instances_result() -> dict[str, Any]:
     for inst in instances:
         rss = _rss_mb(inst.pid)
         selector = cli.instance_selector(inst)
+        if selector_filter and selector_filter not in {
+            inst.instance_id,
+            selector,
+        }:
+            continue
         entry: dict[str, Any] = {
             "selector": selector,
             "instance_id": inst.instance_id,
@@ -562,7 +621,12 @@ def _running_instances_result() -> dict[str, Any]:
 
 @command("session", "list", help="List running bridge sessions")
 def _session_list(args: argparse.Namespace) -> int:
-    result: Any = _running_instances_result()
+    selector_filter = (
+        getattr(args, "instance", None)
+        if getattr(args, "_explicit_instance", False)
+        else None
+    )
+    result: Any = _running_instances_result(selector_filter)
     cli._emit_result(args, result, text_renderer=_render_session_list_text, stem="session-list")
     return 0
 

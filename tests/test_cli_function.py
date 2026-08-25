@@ -1315,6 +1315,20 @@ def test_session_start_all_loads_fail_stops_bridge_and_exits_nonzero(monkeypatch
     assert parsed["stopped"] is True
 
 
+def test_session_start_rejects_invalid_timeout_before_spawn(monkeypatch, capsys):
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "not-a-timeout")
+    monkeypatch.setattr(
+        bn.cli,
+        "spawn_instance",
+        lambda *args, **kwargs: pytest.fail("spawned before environment validation"),
+    )
+
+    rc = bn.cli.main(["session", "start", "--instance-id", "worker"])
+
+    assert rc == 2
+    assert "BN_REQUEST_TIMEOUT" in capsys.readouterr().err
+
+
 def test_il_lines_slices_output_with_header(fake_transport, capsys):
     fake_transport({"il": {"ok": True, "result": {"text": "line1\nline2\nline3\nline4\nline5"}}})
 
@@ -1329,7 +1343,7 @@ def test_il_lines_slices_output_with_header(fake_transport, capsys):
 
 
 def test_disasm_lines_slices_output_with_header(fake_transport, capsys):
-    fake_transport({"disasm": {"ok": True, "result": {"text": "aaa\nbbb\nccc\nddd"}}})
+    fake_transport({"disasm": {"ok": True, "result": {"text": "aaa\nbbb", "total_lines": 4, "line_range": {"start": 1, "end": 2}}}})
 
     rc = bn.cli.main(["disasm", "0x1000", "--target", "active", "--lines", "1:2"])
 
@@ -1876,7 +1890,7 @@ def test_structured_il_lines_slices_output_with_header(monkeypatch, capsys):
 
 def test_disasm_count_shows_first_n_instructions(fake_transport, capsys):
     # disasm text is one instruction per line, so `--count 2` is the first two.
-    fake_transport({"disasm": {"ok": True, "result": {"text": "aaa\nbbb\nccc\nddd"}}})
+    fake_transport({"disasm": {"ok": True, "result": {"text": "aaa\nbbb", "total_lines": 4, "line_range": {"start": 1, "end": 2}}}})
     rc = bn.cli.main(["disasm", "0x1000", "--target", "active", "--count", "2"])
     assert rc == 0
     out = capsys.readouterr().out
@@ -1886,7 +1900,7 @@ def test_disasm_count_shows_first_n_instructions(fake_transport, capsys):
 
 
 def test_disasm_count_caps_at_total(fake_transport, capsys):
-    fake_transport({"disasm": {"ok": True, "result": {"text": "aaa\nbbb"}}})
+    fake_transport({"disasm": {"ok": True, "result": {"text": "aaa\nbbb", "total_lines": 2, "line_range": {"start": 1, "end": 2}}}})
     rc = bn.cli.main(["disasm", "0x1000", "--target", "active", "--count", "9"])
     assert rc == 0
     out = capsys.readouterr().out
@@ -1981,7 +1995,7 @@ def test_disasm_linear_rejects_non_positive(capsys):
 def test_disasm_limit_is_alias_for_count(fake_transport, capsys):
     # #312: disasm accepts --limit as an alias for --count (first N instructions),
     # matching xrefs/strings/function list.
-    fake_transport({"disasm": {"ok": True, "result": {"text": "aaa\nbbb\nccc\nddd"}}})
+    fake_transport({"disasm": {"ok": True, "result": {"text": "aaa\nbbb", "total_lines": 4, "line_range": {"start": 1, "end": 2}}}})
     rc = bn.cli.main(["disasm", "0x1000", "--target", "active", "--limit", "2"])
     assert rc == 0
     out = capsys.readouterr().out
@@ -2086,13 +2100,14 @@ def test_function_search_no_retry_for_invalid_regex(monkeypatch, capsys):
 # --- #291.3 review (M1): JSON consumers get an in-band regex-fallback marker ---
 
 
-def test_function_search_json_marks_regex_fallback(monkeypatch, capsys):
+@pytest.mark.parametrize("query", ["Parse|Process|Decode", "Parse.Process"])
+def test_function_search_json_marks_regex_fallback(monkeypatch, capsys, query):
     """An agent reading --format json on stdout (and not stderr) must be able to
     tell the result set came from a regex fallback, not a literal match -- so the
     retry adds an in-band `regex_fallback` marker (#291.3 review M1)."""
     monkeypatch.setattr(bn.cli, "send_request", _literal_zero_regex_match)
     monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
-    rc = bn.cli.main(["function", "search", "Parse|Process|Decode", "--format", "json"])
+    rc = bn.cli.main(["function", "search", query, "--format", "json"])
     assert rc == 0
     out, _ = capsys.readouterr()
     data = json.loads(out)
@@ -2124,13 +2139,20 @@ def test_function_search_json_no_marker_when_literal_matches(monkeypatch, capsys
 # --- #291.2 review (m2): --count error names --count, not --lines ---
 
 
-def test_disasm_count_on_empty_disasm_names_count_flag(fake_transport, capsys):
-    fake_transport({"disasm": {"ok": True, "result": {"text": ""}}})
+def test_disasm_count_on_empty_disasm_reports_one_indexed_range(monkeypatch, capsys):
+    from bn.transport import BridgeError
+
+    def fail(*args, **kwargs):
+        raise BridgeError(
+            "disasm line range 1:5 is outside the 1:0 listing; "
+            "these are 1-indexed line numbers, not addresses"
+        )
+
+    monkeypatch.setattr(bn.cli, "send_request", fail)
     rc = bn.cli.main(["disasm", "0x1000", "--target", "active", "--count", "5"])
     assert rc == 2
     _, err = capsys.readouterr()
-    assert "--count" in err
-    assert "--lines" not in err
+    assert "1-indexed line numbers, not addresses" in err
 
 
 def test_render_message_lens_text_counts_table_window_items_303():

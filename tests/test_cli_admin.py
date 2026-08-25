@@ -665,6 +665,13 @@ def test_session_list_shows_instances(monkeypatch, capsys):
     assert "rss_mb" in parsed["items"][0]
     assert "total_rss_mb" in parsed
 
+    rc = bn.cli.main(
+        ["session", "list", "-i", "bbbb2222", "--format", "json"]
+    )
+    assert rc == 0
+    filtered = json.loads(capsys.readouterr().out)
+    assert [item["instance_id"] for item in filtered["items"]] == ["bbbb2222"]
+
 
 def test_remove_instance_markers_matches_only_the_id(tmp_path):
     # #436: session stop must clean up the instance's own `.bn-<id>` marker and
@@ -693,7 +700,48 @@ def test_session_stop_removes_marker(monkeypatch, capsys, tmp_path):
     assert not (tmp_path / ".bn-abc123").exists()
 
 
-def test_session_stop_accepts_instance_flag(monkeypatch, capsys):
+def test_session_stop_removes_recorded_marker_outside_cwd(
+    monkeypatch, capsys, tmp_path
+):
+    from bn.transport import BridgeInstance
+
+    origin = tmp_path / "origin"
+    caller = tmp_path / "caller"
+    origin.mkdir()
+    caller.mkdir()
+    marker = origin / ".bn-abc123"
+    marker.write_text("")
+    instance = BridgeInstance(
+        pid=111,
+        socket_path=tmp_path / "bridge.sock",
+        registry_path=tmp_path / "bridge.json",
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at="2026-01-01T00:00:00Z",
+        meta={"marker_paths": [str(marker)]},
+        instance_id="abc123",
+    )
+    monkeypatch.chdir(caller)
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [instance])
+    monkeypatch.setattr(
+        bn.cli,
+        "send_request",
+        lambda op, **kwargs: {"ok": True, "result": {}},
+    )
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda *args, **kwargs: True)
+
+    rc = bn.cli.main(
+        ["session", "stop", "abc123", "--format", "json"]
+    )
+
+    assert rc == 0
+    assert not marker.exists()
+    result = json.loads(capsys.readouterr().out)
+    assert str(marker) in result["marker_removed"]
+
+
+@pytest.mark.parametrize("flag", ["--instance", "--instance-id"])
+def test_session_stop_accepts_instance_flag(monkeypatch, capsys, flag):
     # #456: after threading --instance through every command, cleanup naturally
     # tries `session stop --instance <id>`; accept it as an alias for the positional.
     seen = {}
@@ -707,7 +755,7 @@ def test_session_stop_accepts_instance_flag(monkeypatch, capsys):
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
     monkeypatch.setattr(bn.cli, "list_instances", lambda: [])
 
-    rc = bn.cli.main(["session", "stop", "--instance", "abc123", "--format", "json"])
+    rc = bn.cli.main(["session", "stop", flag, "abc123", "--format", "json"])
     assert rc == 0
     assert seen["op"] == "shutdown" and seen["instance_id"] == "abc123"
 

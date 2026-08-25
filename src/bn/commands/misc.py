@@ -159,10 +159,33 @@ def _imports(args: argparse.Namespace) -> int:
     )
 
 
-@command("exports", help="List exported symbols (a binary's public API)", target=True, paged=True,
-         fanout=True,
-         args=[arg("--count", action="store_true", default=False,
-                   help="Show the total export count instead of listing")])
+_EXPORT_ARGS = [
+    arg(
+        "--count",
+        action="store_true",
+        default=False,
+        help="Show the total export count instead of listing",
+    )
+]
+
+
+@command(
+    "exports",
+    help="List exported symbols (a binary's public API)",
+    target=True,
+    paged=True,
+    fanout=True,
+    args=_EXPORT_ARGS,
+)
+@command(
+    "exports",
+    "list",
+    help="List exported symbols (alias for `exports`)",
+    target=True,
+    paged=True,
+    fanout=True,
+    args=_EXPORT_ARGS,
+)
 def _exports(args: argparse.Namespace) -> int:
     if args.count:
         return _call(

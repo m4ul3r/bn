@@ -41,6 +41,9 @@ def _module_matches_source(module) -> bool:
     )
 
 
+_bootstrap_action = "reused"
+
+
 bn_kernel = sys.modules.get("bn_kernel")
 if not _module_matches_source(bn_kernel):
     for _module_name in tuple(sys.modules):
@@ -58,9 +61,15 @@ if not _module_matches_source(bn_kernel):
     finally:
         sys.dont_write_bytecode = _previous_dont_write_bytecode
     bn_kernel.__bn_kernel_source_hash__ = _source_hash
+    _bootstrap_action = "reloaded"
 
 if not _module_matches_source(bn_kernel):
     raise RuntimeError(
         "bn_kernel bootstrap loaded a stale or incompatible module; restart the "
         "eval kernel before continuing"
     )
+
+print(
+    "bn_kernel bootstrap: "
+    f"{_bootstrap_action}; source={_source_path}; sha256={_source_hash[:12]}"
+)

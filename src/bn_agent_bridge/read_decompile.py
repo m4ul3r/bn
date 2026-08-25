@@ -363,21 +363,19 @@ def _cfg(ctx, selector: str | None, identifier, *, view: str = "asm"):
 
 
 def _disasm(ctx, selector: str | None, identifier, linear=None, mode=None,
-            snap_to_instruction: bool = False):
+            snap_to_instruction=False, line_start=None, line_end=None,
+            strict_range=False):
     bv = ctx._resolve_view(selector)
     if linear is not None:
+        if line_start is not None or line_end is not None:
+            raise OperationFailure(
+                "invalid_range", "disasm line ranges cannot be combined with linear mode"
+            )
         return _disasm_linear(ctx, bv, identifier, int(linear), mode=mode,
                               snap_to_instruction=bool(snap_to_instruction))
     try:
         func = ctx._find_function(bv, identifier, contained=True)
     except Exception as exc:
-        # An address BN never made part of a function is exactly the stripped-lane
-        # case --linear exists for: point there instead of at a dead end (#314).
-        # Fire ONLY for that specific "no function here" dead end at an address
-        # (hex or decimal) -- not for an ambiguous overlap, a bad selector, or a
-        # name-not-found, where the --linear hint would mislead. A fresh
-        # RuntimeError (not type(exc)(...)) avoids assuming the original
-        # exception's constructor takes a single string.
         looks_like_address = True
         try:
             _parse_address(identifier)
@@ -389,9 +387,42 @@ def _disasm(ctx, selector: str | None, identifier, linear=None, mode=None,
                 f"membership, use `disasm {identifier} --linear N`."
             ) from exc
         raise
+
+    full_text = il_format._disasm_text(bv, func)
+    all_lines = full_text.splitlines()
+    total_lines = len(all_lines)
+    returned_text = full_text
+    selected_range = None
+    if line_start is not None or line_end is not None:
+        try:
+            start = int(line_start)
+            end = int(line_end)
+        except (TypeError, ValueError) as exc:
+            raise OperationFailure(
+                "invalid_range", "disasm lines must be 1-indexed integer START:END"
+            ) from exc
+        if start < 1 or end < start:
+            raise OperationFailure(
+                "invalid_range",
+                f"disasm lines must satisfy 1 <= START <= END, got {start}:{end}",
+            )
+        if start > total_lines or (strict_range and end > total_lines):
+            raise OperationFailure(
+                "invalid_range",
+                f"disasm line range {start}:{end} is outside the "
+                f"1:{total_lines} listing; these are 1-indexed line numbers, "
+                "not addresses",
+            )
+        end = min(end, total_lines)
+        returned_text = "\n".join(all_lines[start - 1:end])
+        selected_range = {"start": start, "end": end}
+
     result = {
         "function": {"name": func.name, "address": hex(func.start)},
-        "text": il_format._disasm_text(bv, func),
+        "text": returned_text,
+        "total_lines": total_lines,
+        "returned_lines": len(returned_text.splitlines()) if returned_text else 0,
+        "line_range": selected_range,
     }
     _annotate_containment(ctx, result, identifier, func)
     return result
@@ -614,7 +645,7 @@ def _disasm_linear(ctx, bv, identifier, count: int, *, mode=None,
             "length": int(length),
             "text": text,
         })
-        lines.append(f"{addr:08x}  {hex_bytes:<16} {text}")
+        lines.append(f"{hex(addr)}  {hex_bytes:<16} {text}")
         addr += length
     # Recompute containment at the FINAL (possibly snapped) start address.
     in_function = None

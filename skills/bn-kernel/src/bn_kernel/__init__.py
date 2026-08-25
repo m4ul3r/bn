@@ -34,7 +34,20 @@ __all__ = [
 Backend = Literal["cli", "native"]
 BackendChoice = Literal["auto", "cli", "native"]
 _TEXT_KEYS = ("text", "listing", "body")
-_REGEX_METACHARS = "|()[]{}*+?^$\\"
+_REGEX_METACHARS = ".|()[]{}*+?^$\\"
+
+
+def _timeout_message(operation: str, budget: float, detail: str = "") -> str:
+    message = (
+        f"{operation} timed out after {budget:.6g}s "
+        "(requested end-to-end budget)"
+    )
+    guidance_marker = "The bridge may"
+    if guidance_marker in detail:
+        detail = detail[detail.index(guidance_marker) :]
+    elif "timed out" in detail.lower():
+        detail = ""
+    return f"{message}. {detail}" if detail else message
 
 
 def _should_retry_as_regex(
@@ -62,6 +75,39 @@ def _flatten_function_info(payload: Any) -> Any:
         **{key: value for key, value in payload.items() if key != "function"},
         **payload["function"],
     }
+
+
+def _require_function_info(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict) or not isinstance(payload.get("function"), dict):
+        raise BnError(
+            "function_info payload contract violation: expected a function object",
+            returncode=0,
+            argv=("function_info",),
+        )
+    value = _flatten_function_info(payload)
+    assert isinstance(value, dict)
+    size = value.get("size")
+    size_known = value.get("size_known")
+    valid_size = (
+        isinstance(size_known, bool)
+        and (
+            (not size_known and size is None)
+            or (
+                size_known
+                and isinstance(size, int)
+                and not isinstance(size, bool)
+                and size >= 0
+            )
+        )
+    )
+    if not valid_size or not isinstance(value.get("imported"), bool):
+        raise BnError(
+            "function_info payload contract violation: expected size, "
+            "size_known, and imported metadata",
+            returncode=0,
+            argv=("function_info",),
+        )
+    return value
 
 
 def _require_collection(
@@ -131,6 +177,29 @@ def _require_collection(
                 argv=(op,),
             )
     return value
+
+
+def _require_function_rows(op: str, value: Any, payload: Any) -> list[dict[str, Any]]:
+    rows = _require_collection(
+        op,
+        value,
+        payload,
+        required_keys=("size", "size_known"),
+    )
+    for index, row in enumerate(rows):
+        if (
+            not isinstance(row["size"], int)
+            or isinstance(row["size"], bool)
+            or row["size"] < 0
+            or not isinstance(row["size_known"], bool)
+        ):
+            raise BnError(
+                f"{op} row contract violation at index {index}: "
+                "size must be a non-negative integer and size_known a boolean",
+                returncode=0,
+                argv=(op,),
+            )
+    return rows
 
 
 def _require_text(op: str, value: Any, payload: Any) -> str:
@@ -271,20 +340,19 @@ def _register_session(session: Session) -> None:
         (other for other in active_bindings if other != binding),
         key=repr,
     )
-    if distinct:
+    if distinct and not _WARNED_BINDING_PAIRS:
         pair = frozenset((binding, distinct[0]))
-        if pair not in _WARNED_BINDING_PAIRS:
-            _WARNED_BINDING_PAIRS.add(pair)
-            warnings.warn(
-                "multiple distinct bn_kernel Session bindings are live in one "
-                "shared retained kernel namespace. Concurrent sibling OMP task "
-                "agents can overwrite module globals such as s/rows/lines and "
-                "silently read another target. Use `await bn_kernel.scoped(...)` "
-                "with function-local variables, or use the direct bn CLI for "
-                "parallel agents.",
-                RuntimeWarning,
-                stacklevel=3,
-            )
+        _WARNED_BINDING_PAIRS.add(pair)
+        warnings.warn(
+            "multiple distinct bn_kernel Session bindings are live in one "
+            "shared retained kernel namespace. Concurrent sibling OMP task "
+            "agents can overwrite module globals such as s/rows/lines and "
+            "silently read another target. Use `await bn_kernel.scoped(...)` "
+            "with function-local variables, or use the direct bn CLI for "
+            "parallel agents.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
     _ACTIVE_SESSIONS.add(session)
 
 
@@ -440,6 +508,7 @@ class Session:
         **flags: Any,
     ) -> Any:
         """Run any bn CLI command and return its complete artifact-backed result."""
+        self.last = None
 
         executable = _bn_executable()
         argv = self._root_argv()
@@ -447,12 +516,12 @@ class Session:
         argv.extend(_flags(flags))
         output_format = "text" if raw else "json"
 
-        temporary = tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", delete=False
-        )
-        output_path = Path(temporary.name)
-        temporary.close()
-        os.chmod(output_path, 0o600)
+        temporary = tempfile.TemporaryFile(mode="w+b")
+        output_fd = temporary.fileno()
+        fd_root = Path("/proc/self/fd")
+        if not fd_root.is_dir():
+            fd_root = Path("/dev/fd")
+        output_path = fd_root / str(output_fd)
 
         stderr_text = ""
         body = ""
@@ -467,6 +536,7 @@ class Session:
                     str(output_path),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
+                    pass_fds=(output_fd,),
                 )
             except OSError as exc:
                 raise BnError(
@@ -482,7 +552,7 @@ class Session:
                 process.kill()
                 await process.communicate()
                 raise BnError(
-                    f"bn {' '.join(argv)} timed out after {deadline}s",
+                    _timeout_message(f"bn {' '.join(argv)}", deadline),
                     returncode=124,
                     argv=argv,
                 ) from None
@@ -501,9 +571,10 @@ class Session:
                     returncode=process.returncode,
                     argv=argv,
                 )
-            body = output_path.read_text(encoding="utf-8", errors="replace")
+            temporary.seek(0)
+            body = temporary.read().decode(encoding="utf-8", errors="replace")
         finally:
-            output_path.unlink(missing_ok=True)
+            temporary.close()
 
         if raw:
             payload: Any = body
@@ -535,6 +606,7 @@ class Session:
         *command: str,
         timeout: float | None = None,
     ) -> str:
+        self.last = None
         executable = _bn_executable()
         argv = self._root_argv()
         argv.extend(str(part) for part in command)
@@ -559,7 +631,7 @@ class Session:
             process.kill()
             await process.communicate()
             raise BnError(
-                f"bn {' '.join(argv)} timed out after {deadline}s",
+                _timeout_message(f"bn {' '.join(argv)}", deadline),
                 returncode=124,
                 argv=argv,
             ) from None
@@ -567,9 +639,19 @@ class Session:
         stdout_text = stdout_bytes.decode(errors="replace")
         stderr_text = stderr_bytes.decode(errors="replace").strip()
         if process.returncode:
+            error_lines = [
+                line.strip()
+                for line in stderr_text.splitlines()
+                if ": error:" in line or line.lstrip().startswith("error:")
+            ]
+            message = (
+                error_lines[-1]
+                if error_lines
+                else stderr_text or stdout_text.strip() or "bn failed"
+            )
             error_type = _EXIT_ERRORS.get(process.returncode, BnError)
             raise error_type(
-                stderr_text or stdout_text.strip() or "bn failed",
+                message,
                 returncode=process.returncode,
                 argv=argv,
             )
@@ -592,6 +674,7 @@ class Session:
         **flags: Any,
     ) -> list[dict[str, Any]]:
         """Collect a paged CLI read without printing or spilling its rows."""
+        self.last = None
 
         if page < 1:
             raise ValueError("page must be at least 1")
@@ -631,25 +714,37 @@ class Session:
             page_size = page if remaining is None else min(page, remaining)
             timeout_remaining = deadline - time.monotonic()
             if timeout_remaining <= 0:
+                self.last = None
                 raise BnError(
                     f"bn {operation} timed out after {effective_timeout:g}s",
                     returncode=124,
                     argv=actual_argv,
                 )
-            payload = await self.run(
-                *args,
-                unwrap=False,
-                timeout=timeout_remaining,
-                limit=page_size,
-                offset=offset,
-                **flags,
-            )
+            try:
+                payload = await self.run(
+                    *args,
+                    unwrap=False,
+                    timeout=timeout_remaining,
+                    limit=page_size,
+                    offset=offset,
+                    **flags,
+                )
+            except BnError as exc:
+                self.last = None
+                if exc.returncode == 124:
+                    raise BnError(
+                        _timeout_message(operation, effective_timeout, str(exc)),
+                        returncode=124,
+                        argv=actual_argv,
+                    ) from exc
+                raise
             page_result = self.last
             if page_result is not None:
                 notes.extend(page_result.notes)
                 actual_argv = page_result.argv
 
             if not isinstance(payload, dict):
+                self.last = None
                 raise BnError(
                     f"bn {operation} is not a paged collection",
                     returncode=0,
@@ -658,18 +753,21 @@ class Session:
             page_items = payload.get("items")
             bridge_has_more = payload.get("has_more")
             if not isinstance(page_items, list):
+                self.last = None
                 raise BnError(
                     f"malformed {operation} page: items must be a list",
                     returncode=0,
                     argv=actual_argv,
                 )
             if not isinstance(bridge_has_more, bool):
+                self.last = None
                 raise BnError(
                     f"malformed {operation} page: has_more must be a boolean",
                     returncode=0,
                     argv=actual_argv,
                 )
             if bridge_has_more and not page_items:
+                self.last = None
                 raise BnError(
                     f"malformed {operation} page: has_more with an empty page",
                     returncode=0,
@@ -681,6 +779,7 @@ class Session:
                 or isinstance(returned, bool)
                 or returned != len(page_items)
             ):
+                self.last = None
                 raise BnError(
                     f"malformed {operation} page: returned must equal items length",
                     returncode=0,
@@ -695,6 +794,7 @@ class Session:
                     or total < 0
                     or (bool(page_items) and page_end > total)
                 ):
+                    self.last = None
                     raise BnError(
                         f"malformed {operation} page: invalid total {total!r}",
                         returncode=0,
@@ -705,12 +805,14 @@ class Session:
                     and aggregate.get("total") is not None
                     and aggregate.get("total") != total
                 ):
+                    self.last = None
                     raise BnError(
                         f"malformed {operation} page: total changed across pages",
                         returncode=0,
                         argv=actual_argv,
                     )
                 if not bridge_has_more and page_end < total:
+                    self.last = None
                     raise BnError(
                         f"malformed {operation} page: total={total} requires "
                         "has_more=true at this offset",
@@ -750,6 +852,7 @@ class Session:
         *,
         timeout: float | None = None,
     ) -> Any:
+        self.last = None
         from bn.transport import BridgeError as NativeBridgeError
 
         client = (
@@ -761,8 +864,11 @@ class Session:
             payload = await asyncio.to_thread(client.request, op, params)
         except NativeBridgeError as exc:
             if "timed out" in str(exc).lower():
+                budget = self.timeout if timeout is None else timeout
                 raise BnError(
-                    str(exc), returncode=124, argv=(op,)
+                    _timeout_message(op, budget, str(exc)),
+                    returncode=124,
+                    argv=(op,),
                 ) from exc
             raise BridgeError(
                 str(exc), returncode=2, argv=(op,)
@@ -779,6 +885,7 @@ class Session:
         *,
         timeout: float | None = None,
     ) -> list[dict[str, Any]]:
+        self.last = None
         from bn.transport import BridgeError as NativeBridgeError
 
         if timeout is None:
@@ -797,8 +904,11 @@ class Session:
             )
         except NativeBridgeError as exc:
             if "timed out" in str(exc).lower():
+                budget = self.timeout if timeout is None else timeout
                 raise BnError(
-                    str(exc), returncode=124, argv=(op,)
+                    _timeout_message(op, budget, str(exc)),
+                    returncode=124,
+                    argv=(op,),
                 ) from exc
             raise BridgeError(
                 str(exc), returncode=2, argv=(op,)
@@ -863,10 +973,15 @@ class Session:
             )
         return info
 
-    async def assert_unannotated(self) -> dict[str, Any]:
+    async def assert_unannotated(
+        self,
+        *,
+        allow_contaminated: bool = False,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
         if self.backend == "native":
             digest = await self._native_request(
-                "orient_digest", {"strings_limit": 1}
+                "orient_digest", {"strings_limit": 1}, timeout=timeout
             )
         else:
             digest = await self.run(
@@ -874,6 +989,7 @@ class Session:
                 "orient",
                 unwrap=False,
                 strings_limit=1,
+                timeout=timeout,
             )
         annotations = (
             digest.get("existing_annotations", {})
@@ -884,15 +1000,37 @@ class Session:
             key: int(annotations.get(key, 0) or 0)
             for key in ("comments", "function_comments", "user_symbols")
         }
-        if counts["comments"] + counts["function_comments"]:
+        if counts["comments"] + counts["function_comments"] and not allow_contaminated:
             argv = self.last.argv if self.last is not None else ("orient_digest",)
+            locations = [
+                *annotations.get("comment_locations", []),
+                *annotations.get("function_comment_locations", []),
+            ]
+            rendered_locations = ", ".join(
+                " ".join(
+                    part
+                    for part in (
+                        str(item.get("address", "")),
+                        str(item.get("name", "")),
+                    )
+                    if part
+                )
+                for item in locations[:5]
+                if isinstance(item, dict)
+            )
+            location_note = (
+                f" First locations: {rendered_locations}."
+                if rendered_locations
+                else ""
+            )
             raise BridgeError(
                 "inherited comments detected: "
                 f"comments={counts['comments']}, "
                 f"function_comments={counts['function_comments']}; "
-                "refusing contaminated benchmark data. "
-                "User symbols are reported but not rejected because raw binaries "
-                "can legitimately carry them.",
+                "refusing contaminated benchmark data."
+                f"{location_note} Pass allow_contaminated=True to inspect the "
+                "digest and proceed explicitly. User symbols are reported but "
+                "not rejected because raw binaries can legitimately carry them.",
                 returncode=2,
                 argv=argv,
             )
@@ -915,7 +1053,7 @@ class Session:
                 "function", "list", limit=limit, timeout=timeout, **params
             )
         payload = self.last.payload if self.last is not None else None
-        return _require_collection("list_functions", value, payload)
+        return _require_function_rows("list_functions", value, payload)
 
     async def search(
         self,
@@ -932,8 +1070,9 @@ class Session:
             params = {"query": query, **validated}
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                self.last = None
                 raise BnError(
-                    f"search timed out after {effective_timeout:g}s",
+                    _timeout_message("search", effective_timeout),
                     returncode=124,
                     argv=("search_functions",),
                 )
@@ -944,17 +1083,30 @@ class Session:
             if _should_retry_as_regex(query, payload, validated):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    self.last = None
                     raise BnError(
-                        f"search timed out after {effective_timeout:g}s",
+                        _timeout_message("search", effective_timeout),
                         returncode=124,
                         argv=("search_functions",),
                     )
-                value = await self._native_collect(
-                    "search_functions",
-                    {**params, "regex": True},
-                    limit,
-                    timeout=remaining,
-                )
+                try:
+                    value = await self._native_collect(
+                        "search_functions",
+                        {**params, "regex": True},
+                        limit,
+                        timeout=remaining,
+                    )
+                except BnError as exc:
+                    self.last = None
+                    if exc.returncode == 124:
+                        raise BnError(
+                            _timeout_message(
+                                "search", effective_timeout, str(exc)
+                            ),
+                            returncode=124,
+                            argv=("search_functions",),
+                        ) from exc
+                    raise
                 retry_payload = (
                     dict(self.last.payload)
                     if self.last is not None
@@ -969,31 +1121,61 @@ class Session:
                     ("search_functions",),
                     "native",
                 )
-            payload = self.last.payload if self.last is not None else None
-            return _require_collection("search_functions", value, payload)
-        value = await self.all(
-            "function",
-            "search",
-            query,
-            limit=limit,
-            timeout=timeout,
-            **validated,
-        )
+        else:
+            value = await self.all(
+                "function",
+                "search",
+                query,
+                limit=limit,
+                timeout=timeout,
+                **validated,
+            )
         payload = self.last.payload if self.last is not None else None
-        return _require_collection("search_functions", value, payload)
+        rows = _require_function_rows("search_functions", value, payload)
+        if (
+            isinstance(payload, dict)
+            and payload.get("total") == 0
+            and "regex_fallback" not in payload
+        ):
+            normalized = dict(payload)
+            normalized["regex_fallback"] = False
+            notes = (
+                (*self.last.notes, "0 literal matches; no regex fallback attempted")
+                if self.last is not None
+                else ("0 literal matches; no regex fallback attempted",)
+            )
+            self.last = Result(
+                rows,
+                normalized,
+                notes,
+                self.last.argv if self.last is not None else ("search_functions",),
+                self.last.backend if self.last is not None else self.backend,
+            )
+        return rows
 
     async def function_info(
-        self, identifier: str, *, blocks: bool = False
+        self,
+        identifier: str,
+        *,
+        blocks: bool = False,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         if self.backend == "native":
             payload = await self._native_request(
-                "function_info", {"identifier": identifier, "blocks": blocks}
+                "function_info",
+                {"identifier": identifier, "blocks": blocks},
+                timeout=timeout,
             )
         else:
             payload = await self.run(
-                "function", "info", identifier, unwrap=False, blocks=blocks
+                "function",
+                "info",
+                identifier,
+                unwrap=False,
+                blocks=blocks,
+                timeout=timeout,
             )
-        value = _flatten_function_info(payload)
+        value = _require_function_info(payload)
         if self.last is not None:
             self.last = Result(
                 value,
@@ -1010,6 +1192,7 @@ class Session:
         *,
         addresses: bool = False,
         force_analysis: bool = False,
+        timeout: float | None = None,
     ) -> str:
         if self.backend == "native":
             value = await self._native_request(
@@ -1019,6 +1202,7 @@ class Session:
                     "addresses": addresses,
                     "force_analysis": force_analysis,
                 },
+                timeout=timeout,
             )
         else:
             value = await self.run(
@@ -1026,6 +1210,7 @@ class Session:
                 identifier,
                 addresses=addresses,
                 force_analysis=force_analysis,
+                timeout=timeout,
             )
         payload = self.last.payload if self.last is not None else None
         return _require_decompile(value, payload)
@@ -1039,6 +1224,7 @@ class Session:
         snap_to_instruction: bool = False,
         count: int | None = None,
         lines: tuple[int, int] | None = None,
+        timeout: float | None = None,
     ) -> str:
         if sum(option is not None for option in (linear, count, lines)) > 1:
             raise ValueError("linear, count, and lines are mutually exclusive")
@@ -1054,8 +1240,18 @@ class Session:
             "mode": mode,
             "snap_to_instruction": snap_to_instruction,
         }
+        if count is not None:
+            params.update({"line_start": 1, "line_end": count, "strict_range": False})
+        elif lines is not None:
+            params.update(
+                {
+                    "line_start": lines[0],
+                    "line_end": lines[1],
+                    "strict_range": True,
+                }
+            )
         if self.backend == "native":
-            value = await self._native_request("disasm", params)
+            value = await self._native_request("disasm", params, timeout=timeout)
         else:
             value = await self.run(
                 "disasm",
@@ -1063,23 +1259,12 @@ class Session:
                 linear=linear,
                 mode=mode,
                 snap_to_instruction=snap_to_instruction,
+                count=count,
+                lines=(f"{lines[0]}:{lines[1]}" if lines is not None else None),
+                timeout=timeout,
             )
         payload = self.last.payload if self.last is not None else None
-        text = _require_text("disasm", value, payload)
-        text_lines = text.splitlines()
-        if count is not None:
-            text = "\n".join(text_lines[:count])
-        elif lines is not None:
-            text = "\n".join(text_lines[lines[0] - 1 : lines[1]])
-        if self.last is not None:
-            self.last = Result(
-                text,
-                self.last.payload,
-                self.last.notes,
-                self.last.argv,
-                self.last.backend,
-            )
-        return text
+        return _require_text("disasm", value, payload)
 
     async def il(
         self,
@@ -1087,11 +1272,14 @@ class Session:
         *,
         view: Literal["hlil", "mlil", "llil"] = "hlil",
         ssa: bool = False,
+        timeout: float | None = None,
     ) -> str:
         params = {"identifier": identifier, "view": view, "ssa": ssa}
         if self.backend == "native":
-            return await self._native_request("il", params)
-        return await self.run("il", identifier, view=view, ssa=ssa)
+            return await self._native_request("il", params, timeout=timeout)
+        return await self.run(
+            "il", identifier, view=view, ssa=ssa, timeout=timeout
+        )
 
     async def xrefs(
         self,
@@ -1101,6 +1289,10 @@ class Session:
         timeout: float | None = None,
         fn_pointer_scan: bool = False,
     ) -> list[dict[str, Any]]:
+        if not isinstance(identifier, str) or not identifier:
+            raise ValueError(
+                "xrefs identifier must be a non-empty function name or address"
+            )
         params = {
             "identifier": identifier,
             "fn_pointer_scan": fn_pointer_scan,
@@ -1133,7 +1325,7 @@ class Session:
         *,
         within: str | Sequence[str] | None = None,
         context: int = 3,
-        limit: int | None = None,
+        limit: int | None = 100,
         timeout: float | None = None,
     ) -> list[dict[str, Any]]:
         identifiers = [] if within is None else self._within_identifiers(within)
@@ -1352,9 +1544,26 @@ def brief(
         return "(0 rows)"
 
     selected_keys = keys or tuple(rows[0].keys())[:4]
+
+    def value_at(row: Mapping[str, Any], key: str, index: int) -> Any:
+        if key in row:
+            return row[key]
+        value: Any = row
+        for part in key.split("."):
+            if not isinstance(value, Mapping) or part not in value:
+                raise KeyError(
+                    f"brief key {key!r} is missing at row {index}; "
+                    "use dotted paths such as 'callee.name' for nested fields"
+                )
+            value = value[part]
+        return value
+
     lines = [
-        "  ".join(str(row.get(key, "")) for key in selected_keys)
-        for row in rows[:n]
+        "  ".join(
+            str(value_at(row, key, index))
+            for key in selected_keys
+        )
+        for index, row in enumerate(rows[:n])
     ]
     remaining = len(rows) - min(n, len(rows))
     if remaining:

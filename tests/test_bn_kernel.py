@@ -97,6 +97,9 @@ def test_bootstrap_restores_module_after_sys_modules_loss():
     )
 
     assert result.returncode == 0, result.stderr
+    assert result.stdout.count("bn_kernel bootstrap: reloaded") == 2
+    assert f"source={bootstrap.parent / 'src' / 'bn_kernel' / '__init__.py'}" in result.stdout
+    assert "sha256=" in result.stdout
 
 
 def test_bootstrap_evicts_stale_module_and_bytecode():
@@ -195,6 +198,7 @@ def test_run_orders_root_flags_and_converts_keyword_flags(monkeypatch, tmp_path)
         "20",
     ]
     assert argv[argv.index("--format") + 1] == "json"
+    assert argv[argv.index("--out") + 1].startswith(("/proc/self/fd/", "/dev/fd/"))
     assert Path(argv[argv.index("--out") + 1]).exists() is False
 
 
@@ -276,6 +280,25 @@ sys.exit(1)
 
     with pytest.raises(bn_kernel.CliError, match="unknown command group"):
         _run(bn_kernel.Session(backend="cli").help("unknown"))
+
+
+def test_help_error_omits_argparse_usage_blob(monkeypatch, tmp_path):
+    script = """
+import sys
+sys.stderr.write(
+    "usage: bn [-h] {function,evidence}\\n"
+    "bn: error: argument command: invalid choice: 'search'\\n"
+)
+sys.exit(1)
+"""
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+
+    with pytest.raises(bn_kernel.CliError) as caught:
+        _run(bn_kernel.Session(backend="cli").help("search"))
+
+    assert str(caught.value) == (
+        "bn: error: argument command: invalid choice: 'search'"
+    )
 @pytest.mark.parametrize(
     ("rc", "exception"),
     [
@@ -506,6 +529,36 @@ json.dump(
         )
 
     assert time.monotonic() - started < 0.1
+
+
+def test_all_invalidates_last_after_mid_pagination_failure(monkeypatch, tmp_path):
+    script = """
+import json, sys
+argv = sys.argv[1:]
+offset = int(argv[argv.index("--offset") + 1])
+out = argv[argv.index("--out") + 1]
+if offset == 0:
+    json.dump(
+        {
+            "items": [{"value": "first"}],
+            "offset": 0,
+            "returned": 1,
+            "total": 2,
+            "has_more": True,
+        },
+        open(out, "w"),
+    )
+else:
+    sys.stderr.write("second page failed")
+    sys.exit(2)
+"""
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+    session = bn_kernel.Session(backend="cli")
+
+    with pytest.raises(bn_kernel.BridgeError, match="second page failed"):
+        _run(session.all("strings", page=1))
+
+    assert session.last is None
 class FakeClient:
     def __init__(self):
         self.calls: list[tuple[str, str, dict[str, Any], dict[str, Any]]] = []
@@ -517,7 +570,12 @@ class FakeClient:
         if op == "target_info":
             return {"arch": "x86"}
         if op == "function_info":
-            return {"name": "main"}
+            return {
+                "function": {"name": "main"},
+                "size": 12,
+                "size_known": True,
+                "imported": False,
+            }
         if op in {"decompile", "disasm", "il"}:
             return {"text": f"{op} text"}
         raise AssertionError(op)
@@ -532,6 +590,8 @@ class FakeClient:
         self.thread_ids.append(threading.get_ident())
         self.calls.append(("collect", op, dict(params or {}), {"limit": limit}))
         item = {"op": op}
+        if op in {"list_functions", "search_functions"}:
+            item.update({"size": 12, "size_known": True})
         if op == "strings":
             item["value"] = "sample"
         if op == "callsites":
@@ -770,7 +830,20 @@ def test_strings_rejects_silent_empty_or_shape_drift(payload):
 
 
 
-@pytest.mark.parametrize("payload", [[{"name": "main"}], {"items": "bad"}])
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [{"name": "main"}],
+        {"items": "bad"},
+        {
+            "items": [{"name": "main", "address": "0x1000"}],
+            "offset": 0,
+            "returned": 1,
+            "total": 1,
+            "has_more": False,
+        },
+    ],
+)
 def test_functions_rejects_collection_shape_drift(payload):
     session = bn_kernel.Session(instance="worker", backend="native")
 
@@ -861,7 +934,9 @@ def test_native_helper_text_and_items_have_same_return_shapes():
     session, _ = _native_session()
 
     assert _run(session.decompile("main")) == "decompile text"
-    assert _run(session.functions(limit=1)) == [{"op": "list_functions"}]
+    assert _run(session.functions(limit=1)) == [
+        {"op": "list_functions", "size": 12, "size_known": True}
+    ]
 
 
 def test_native_search_retries_zero_hit_regex_like_query_and_discloses():
@@ -875,7 +950,7 @@ def test_native_search_retries_zero_hit_regex_like_query_and_discloses():
             self.calls.append((op, dict(params or {}), limit))
             if params.get("regex"):
                 return {
-                    "items": [{"name": "ParseRecord"}],
+                    "items": [{"name": "ParseRecord", "size": 12, "size_known": True}],
                     "total": 1,
                     "has_more": False,
                 }
@@ -885,7 +960,7 @@ def test_native_search_retries_zero_hit_regex_like_query_and_discloses():
     session._client = client
 
     assert _run(session.search("Parse|Decode", limit=5)) == [
-        {"name": "ParseRecord"}
+        {"name": "ParseRecord", "size": 12, "size_known": True}
     ]
     assert client.calls == [
         ("search_functions", {"query": "Parse|Decode"}, 5),
@@ -894,6 +969,42 @@ def test_native_search_retries_zero_hit_regex_like_query_and_discloses():
     assert session.last is not None
     assert session.last.payload["regex_fallback"] is True
     assert "regex" in session.last.notes[0]
+
+
+def test_native_search_retries_dotted_regex_query_and_marks_plain_zero():
+    session = bn_kernel.Session(instance="worker", backend="native")
+
+    class SearchClient:
+        def __init__(self):
+            self.calls = []
+
+        def collect(self, op, params=None, *, limit=None):
+            self.calls.append(dict(params or {}))
+            return {
+                "items": [],
+                "offset": 0,
+                "returned": 0,
+                "total": 0,
+                "has_more": False,
+            }
+
+    client = SearchClient()
+    session._client = client
+
+    assert _run(session.search("Parse.Record")) == []
+    assert client.calls == [
+        {"query": "Parse.Record"},
+        {"query": "Parse.Record", "regex": True},
+    ]
+    assert session.last is not None
+    assert session.last.payload["regex_fallback"] is True
+
+    client.calls.clear()
+    assert _run(session.search("NoSuchLiteral")) == []
+    assert client.calls == [{"query": "NoSuchLiteral"}]
+    assert session.last is not None
+    assert session.last.payload["regex_fallback"] is False
+    assert "no regex fallback" in session.last.notes[-1]
 
 
 def test_search_regex_fallback_shares_one_timeout_budget(monkeypatch):
@@ -910,7 +1021,9 @@ def test_search_regex_fallback_shares_one_timeout_budget(monkeypatch):
             time.sleep(0.02)
             if params.get("regex"):
                 return {
-                    "items": [{"name": "ParseRecord"}],
+                    "items": [
+                        {"name": "ParseRecord", "size": 12, "size_known": True}
+                    ],
                     "offset": 0,
                     "returned": 1,
                     "total": 1,
@@ -942,7 +1055,17 @@ def test_search_regex_fallback_shares_one_timeout_budget(monkeypatch):
         ("Parse|Decode", {"exact": True}, {"items": [], "total": 0, "has_more": False}),
         ("Parse|Decode", {"regex": True}, {"items": [], "total": 0, "has_more": False}),
         ("[invalid", {}, {"items": [], "total": 0, "has_more": False}),
-        ("Parse|Decode", {}, {"items": [{"name": "literal"}], "total": 1, "has_more": False}),
+        (
+            "Parse|Decode",
+            {},
+            {
+                "items": [
+                    {"name": "literal", "size": 12, "size_known": True}
+                ],
+                "total": 1,
+                "has_more": False,
+            },
+        ),
     ],
 )
 
@@ -957,7 +1080,6 @@ def test_native_search_does_not_retry_when_cli_would_not(query, filters, payload
         def collect(self, op, params=None, *, limit=None):
             self.calls.append((op, dict(params or {}), limit))
             return payload
-
 
 
     client = SearchClient()
@@ -1017,20 +1139,33 @@ def test_decompile_rejects_analysis_placeholder(payload):
         _run(session.decompile("big_fn"))
 
 
-def test_disasm_supports_bounded_local_ranges_and_preserves_payload():
+def test_disasm_supports_bridge_ranges_and_preserves_metadata():
     session = bn_kernel.Session(instance="worker", backend="native")
-    payload = {"text": "0x1 one\n0x2 two\n0x3 three\n0x4 four"}
+    full_text = "0x1 one\n0x2 two\n0x3 three\n0x4 four"
 
     class DisasmClient:
         def request(self, op, params=None):
             assert op == "disasm"
-            return payload
+            lines = full_text.splitlines()
+            start = params.get("line_start")
+            end = params.get("line_end")
+            selected = lines if start is None else lines[start - 1 : min(end, len(lines))]
+            return {
+                "text": "\n".join(selected),
+                "total_lines": len(lines),
+                "returned_lines": len(selected),
+                "line_range": (
+                    {"start": start, "end": min(end, len(lines))}
+                    if start is not None
+                    else None
+                ),
+            }
 
     session._client = DisasmClient()
 
     assert _run(session.disasm("main", count=2)) == "0x1 one\n0x2 two"
     assert session.last is not None
-    assert session.last.payload == payload
+    assert session.last.payload["line_range"] == {"start": 1, "end": 2}
     assert _run(session.disasm("main", lines=(2, 3))) == "0x2 two\n0x3 three"
     with pytest.raises(ValueError, match="count.*lines"):
         _run(session.disasm("main", count=1, lines=(1, 1)))
@@ -1045,6 +1180,8 @@ def test_function_info_flattens_helper_value_but_preserves_raw_payload(
             "display_name": "main",
         },
         "size": 24,
+        "size_known": True,
+        "imported": False,
         "parameters": [],
     }
     native = bn_kernel.Session(instance="worker", backend="native")
@@ -1064,6 +1201,8 @@ def test_function_info_flattens_helper_value_but_preserves_raw_payload(
 
         "display_name": "main",
         "size": 24,
+        "size_known": True,
+        "imported": False,
         "parameters": [],
     }
     assert native.last is not None
@@ -1138,7 +1277,7 @@ def test_assert_target_accepts_shorter_caller_timeout(monkeypatch):
 
     monkeypatch.setattr(bn_kernel, "_load_native_client", load_client)
 
-    with pytest.raises(bn_kernel.BnError, match="Timed out") as caught:
+    with pytest.raises(bn_kernel.BnError, match="timed out") as caught:
         _run(session.assert_target("sample.bndb", timeout=0.01))
 
     assert caught.value.returncode == 124
@@ -1215,6 +1354,34 @@ def test_assert_unannotated_rejects_inherited_state(annotations):
 
     with pytest.raises(bn_kernel.BridgeError, match="inherited comments"):
         _run(session.assert_unannotated())
+
+
+def test_assert_unannotated_locates_and_can_explicitly_allow_contamination():
+    session = bn_kernel.Session(instance="worker", backend="native")
+    digest = {
+        "existing_annotations": {
+            "comments": 1,
+            "comment_locations": [
+                {"address": "0x1234", "comment": "inherited note"}
+            ],
+            "function_comments": 0,
+            "function_comment_locations": [],
+            "user_symbols": 0,
+        }
+    }
+
+    class OrientClient:
+        def request(self, op, params=None):
+            return digest
+
+    session._client = OrientClient()
+
+    with pytest.raises(bn_kernel.BridgeError, match="0x1234"):
+        _run(session.assert_unannotated())
+    assert (
+        _run(session.assert_unannotated(allow_contaminated=True))
+        == digest
+    )
 
 
 def test_assert_unannotated_returns_digest_and_preserves_last():
@@ -1385,14 +1552,16 @@ out = argv[argv.index("--out") + 1]
 if "decompile" in argv:
     payload = {"text": "decompile text"}
 else:
-    payload = {"items": [{"op": "list_functions"}], "has_more": False, "total": 1}
+    payload = {"items": [{"op": "list_functions", "size": 12, "size_known": True}], "has_more": False, "total": 1}
 json.dump(payload, open(out, "w"))
 """
     monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
     session = bn_kernel.Session(backend="cli")
 
     assert _run(session.decompile("main")) == "decompile text"
-    assert _run(session.functions(limit=1)) == [{"op": "list_functions"}]
+    assert _run(session.functions(limit=1)) == [
+        {"op": "list_functions", "size": 12, "size_known": True}
+    ]
 
 
 def test_cli_xrefs_forwards_function_pointer_scan(monkeypatch, tmp_path):
@@ -1445,6 +1614,16 @@ def test_brief_is_bounded_and_reports_exact_remainder():
     assert bn_kernel.brief(rows, "name", n=0) == "... 3 more of 3"
     with pytest.raises(ValueError, match="n must be non-negative"):
         bn_kernel.brief(rows, n=-1)
+    assert bn_kernel.brief(
+        [{"callee": {"name": "sink"}, "call_addr": "0x1000"}],
+        "callee.name",
+        "call_addr",
+    ) == "sink  0x1000"
+    with pytest.raises(KeyError, match="brief key 'callee.address'.*row 0"):
+        bn_kernel.brief(
+            [{"callee": {"name": "sink"}}],
+            "callee.address",
+        )
 
 
 @pytest.mark.parametrize(

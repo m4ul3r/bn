@@ -880,16 +880,18 @@ def test_resolve_timeout_rejects_float_underflow(monkeypatch):
             _resolve_timeout(None)
 
 
-def test_resolve_timeout_positive_default_and_explicit(monkeypatch):
+def test_resolve_timeout_environment_is_validated_and_overrides_explicit(monkeypatch):
     from bn.transport import _resolve_timeout, DEFAULT_REQUEST_TIMEOUT
 
     monkeypatch.setenv("BN_REQUEST_TIMEOUT", "42.5")
     assert _resolve_timeout(None) == 42.5
+    assert _resolve_timeout(12.0) == 42.5
     monkeypatch.delenv("BN_REQUEST_TIMEOUT", raising=False)
     assert _resolve_timeout(None) == DEFAULT_REQUEST_TIMEOUT
-    # an explicit timeout arg always wins and is never re-validated against the env
-    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "abc")
     assert _resolve_timeout(12.0) == 12.0
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "abc")
+    with pytest.raises(BridgeError, match="BN_REQUEST_TIMEOUT"):
+        _resolve_timeout(12.0)
 
 
 def test_invalid_timeout_is_rejected_before_choosing_an_instance(monkeypatch, tmp_path):
@@ -907,9 +909,24 @@ def test_invalid_timeout_is_rejected_before_choosing_an_instance(monkeypatch, tm
 
     with pytest.raises(BridgeError, match="BN_REQUEST_TIMEOUT"):
         send_request("list_targets")
-
     # Fresh cache stays empty: nothing was spawned.
     assert list_instances() == []
+
+
+
+def test_stopped_bridge_fails_before_opening_socket(monkeypatch, tmp_path):
+    import bn.transport as transport
+
+    instance = _make_instance(tmp_path)
+    monkeypatch.setattr(transport, "_process_state", lambda pid: "T")
+    monkeypatch.setattr(
+        transport.socket,
+        "socket",
+        lambda *args, **kwargs: pytest.fail("socket opened for stopped bridge"),
+    )
+
+    with pytest.raises(BridgeError, match="bridge_stopped.*kill -CONT"):
+        transport._send_request_to_instance(instance, "target_info", timeout=30)
 
 
 def test_send_request_partial_response_reports_real_error(tmp_path, monkeypatch):

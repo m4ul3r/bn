@@ -355,6 +355,19 @@ def _function_structured_il(args: argparse.Namespace) -> int:
     )
 
 
+def _render_disasm_text(value: Any) -> str:
+    text = _text_field("text")(value)
+    if not isinstance(value, dict):
+        return text
+    selected = value.get("line_range")
+    total = value.get("total_lines")
+    if not isinstance(selected, dict) or not isinstance(total, int):
+        return text
+    start = selected.get("start")
+    end = selected.get("end")
+    return f"// lines {start}-{end} of {total}\n{text}"
+
+
 @command("disasm", help="Disassemble a function (slice with --lines or --count)", target=True,
          args=[
              arg("identifier", help="Function name or entry address (hex 0x.. or decimal)"),
@@ -420,22 +433,25 @@ def _disasm(args: argparse.Namespace) -> int:
     count = getattr(args, "count", None)
     lines_range = getattr(args, "lines", None)
     if count is not None:
-        # disasm is one instruction per line, so "first N instructions" is the
-        # 1-indexed window 1..N -- reuse the shared slicer (header + spill).
         lines_range = (1, count)
-    slice_flag = "--count" if count is not None else "--lines"
+    params = {"identifier": args.identifier}
     if lines_range is not None:
-        _require_text_format(args, slice_flag)
-    base = _text_field("text")
+        params.update(
+            {
+                "line_start": lines_range[0],
+                "line_end": lines_range[1],
+                "strict_range": count is None,
+            }
+        )
     sliced = lines_range is not None
     return _call(
         args,
         "disasm",
-        {"identifier": args.identifier},
+        params,
         require_target=True,
         text_renderer=lambda value: _resolution_note(value)
         + _disasm_linear_steer_note(value, sliced=sliced)
-        + _slice_text_lines(base(value), lines_range, flag=slice_flag),
+        + _render_disasm_text(value),
         stem="disasm",
     )
 

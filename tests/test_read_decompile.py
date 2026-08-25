@@ -81,8 +81,31 @@ def test_function_disasm_is_address_ordered_and_0x_prefixed(monkeypatch):
     text = bridge.il_format._disasm_text(bv, function)
     addresses = [line.split()[0] for line in text.splitlines()]
 
-    assert addresses == ["0x00001000", "0x00002000", "0x00003000"]
+    assert addresses == ["0x1000", "0x2000", "0x3000"]
     assert ".byte 0xff" in text
+
+
+def test_function_disasm_rejects_out_of_range_line_window(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    function = _FakeFunction(0x1000, "target")
+    function.basic_blocks = [_FakeBasicBlock(0x1000, 0x1002)]
+    bv = _FakeBV(
+        functions=[function],
+        memory={0x1000: b"\x90\x90"},
+        disassembly={0x1000: "nop"},
+        instruction_lengths={0x1000: 2},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(Exception, match="1-indexed line numbers, not addresses"):
+        instance._disasm(
+            "active",
+            "target",
+            line_start=0x1000,
+            line_end=0x1001,
+            strict_range=True,
+        )
 
 
 def test_list_locals_skips_stack_aliases_for_parameters(monkeypatch):
@@ -208,7 +231,7 @@ def test_disasm_linear_walks_arbitrary_non_function_address(monkeypatch):
     assert res["instruction_count"] == 3
     assert [e["address"] for e in res["instructions"]] == ["0x1000", "0x1002", "0x1004"]
     assert all(e["text"] == "nop" for e in res["instructions"])
-    assert "00001000" in res["text"] and "nop" in res["text"]
+    assert "0x1000" in res["text"] and "nop" in res["text"]
     assert "not function-bounded" in res["note"]
 
 
@@ -568,9 +591,9 @@ def test_decompile_pseudo_c_with_address_gutter(monkeypatch):
     result = instance._decompile("active", "player_update", addresses=True)
 
     assert result["text"] == (
-        "00401000        int32_t player_update(int32_t arg1)\n"
+        "0x401000        int32_t player_update(int32_t arg1)\n"
         "\n"
-        "00401004            return arg1 + 1;"
+        "0x401004            return arg1 + 1;"
     )
 
 

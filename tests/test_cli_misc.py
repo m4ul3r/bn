@@ -243,6 +243,30 @@ def test_imports_json_carries_paging_envelope(fake_transport, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["total"] == 512 and payload["has_more"] is True
     assert payload["items"][0]["name"] == "printf"
+
+
+def test_exports_list_alias_routes_to_export_enumerator(fake_transport, capsys):
+    calls = fake_transport(
+        {
+            "list_exports": {
+                "ok": True,
+                "result": {
+                    "items": [],
+                    "offset": 0,
+                    "returned": 0,
+                    "total": 0,
+                    "has_more": False,
+                },
+            }
+        }
+    )
+
+    rc = bn.cli.main(
+        ["exports", "list", "--target", "active", "--format", "json"]
+    )
+
+    assert rc == 0
+    assert calls[-1]["op"] == "list_exports"
 @pytest.mark.parametrize("manifest, expected", [
     pytest.param(None, "Manifest file not found", id="missing-file"),
     pytest.param("{not valid json", "Invalid JSON in manifest", id="invalid-json"),

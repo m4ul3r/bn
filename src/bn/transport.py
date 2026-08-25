@@ -40,45 +40,41 @@ DEFAULT_REQUEST_TIMEOUT = 600.0
 # Full analysis operations keep a larger default; BN_REQUEST_TIMEOUT still wins.
 REFRESH_REQUEST_TIMEOUT = 3600.0
 SPAWN_LOCK_TIMEOUT = 30.0
+DEFAULT_SPAWN_TIMEOUT = 60.0
 CANCEL_REQUEST_TIMEOUT = 0.25
 
 
-def _resolve_timeout(timeout: float | None, *, default: float | None = DEFAULT_REQUEST_TIMEOUT) -> float | None:
-    if timeout is not None:
-        return timeout
+def _resolve_timeout(
+    timeout: float | None,
+    *,
+    default: float | None = DEFAULT_REQUEST_TIMEOUT,
+) -> float | None:
     raw = os.environ.get("BN_REQUEST_TIMEOUT")
     if raw is None:
-        return default
+        return timeout if timeout is not None else default
     text = raw.strip().lower()
 
     def _reject() -> BridgeError:
-        # Fail loud: a typo'd / out-of-range value silently falling back to the
-        # 600s default (or silently disabling) left the user believing they'd set
-        # a short timeout when they hadn't (#255).
         return BridgeError(
             f"BN_REQUEST_TIMEOUT={raw!r} is not a valid timeout: expected a "
-            f"positive number of seconds, or one of 0/none/off/empty to disable it."
+            "positive number of seconds, or one of 0/none/off/empty to disable it."
         )
 
-    # Empty/whitespace-only and the explicit sentinels disable the timeout entirely.
+    # Validate and apply the environment override even when a caller supplied a
+    # timeout. This keeps CLI and native/kernel backends consistent and prevents
+    # a malformed global setting from being hidden by an explicit default.
     if text in ("", "none", "off"):
         return None
     try:
         value = float(text)
     except ValueError:
         raise _reject() from None
-    if not math.isfinite(value):  # inf / nan parse as floats but aren't timeouts
+    if not math.isfinite(value):
         raise _reject()
-    # Reject negatives -- including a value that underflowed to -0.0 (e.g.
-    # -1e-325), where `value < 0` is False but the sign bit is still set.
     if value < 0 or math.copysign(1.0, value) < 0:
         raise _reject()
     if value == 0.0:
-        # A literal 0 disables (a 0-second socket timeout would make every request
-        # fail non-blocking), matching the documented sentinel. But a positive
-        # magnitude that underflowed to 0.0 (e.g. 1e-325) is not a "disable"
-        # request -- reject it so it can't silently turn the timeout off.
-        if any(d in text for d in "123456789"):
+        if any(digit in text for digit in "123456789"):
             raise _reject()
         return None
     return value
@@ -159,6 +155,19 @@ def _process_alive(pid: int) -> bool:
     except OSError:
         return False
     return True
+
+
+def _process_state(pid: int) -> str | None:
+    """Return Linux /proc state, or None when unavailable."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    close = stat.rfind(")")
+    if close < 0:
+        return None
+    fields = stat[close + 1 :].strip().split()
+    return fields[0] if fields else None
 
 
 def _empty_response_error(instance: BridgeInstance, op: str | None) -> BridgeError:
@@ -446,7 +455,9 @@ def _auto_spawn_locked(timeout: float | None = SPAWN_LOCK_TIMEOUT) -> BridgeInst
             raise _multiple_instances_error(instances)
         remaining = _remaining_deadline(deadline, "auto-starting a bridge")
         return _spawn_instance_unlocked(
-            timeout=remaining if remaining is not None else 15.0
+            timeout=(
+                remaining if remaining is not None else DEFAULT_SPAWN_TIMEOUT
+            )
         )
 
 
@@ -473,7 +484,9 @@ def choose_instance(
             )
             return spawn_instance(
                 instance_id,
-                timeout=remaining if remaining is not None else 15.0,
+                timeout=(
+                    remaining if remaining is not None else DEFAULT_SPAWN_TIMEOUT
+                ),
             )
         raise BridgeError(
             f"No bridge instance found with id: {instance_id}. "
@@ -572,6 +585,19 @@ def _send_request_to_instance(
     default_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
     connect_retries: int = 4,
 ) -> dict[str, Any]:
+    process_state = _process_state(instance.pid)
+    if process_state in {"T", "t"}:
+        raise BridgeError(
+            f"bridge_stopped: Binary Ninja bridge instance "
+            f"{instance_selector(instance)!r} (pid {instance.pid}) is stopped; "
+            f"resume it with `kill -CONT {instance.pid}` or restart the instance"
+        )
+    if process_state in {"Z", "X", "x"}:
+        raise BridgeError(
+            f"bridge_not_running: Binary Ninja bridge instance "
+            f"{instance_selector(instance)!r} (pid {instance.pid}) is in "
+            f"process state {process_state}; restart the instance"
+        )
     expected_identity = _instance_identity(instance)
     payload: dict[str, Any] = {
         "id": str(uuid.uuid4()),
@@ -700,6 +726,14 @@ def _log_tail(log_path: Path, lines: int = 20) -> str:
     return f"\nLast output from {log_path}:\n" + "\n".join(f"  {line}" for line in tail)
 
 
+def _append_spawn_diagnostic(log_path: Path, message: str) -> None:
+    try:
+        with log_path.open("a", encoding="utf-8") as stream:
+            stream.write(f"\n[bn-cli] {message}\n")
+    except OSError:
+        pass
+
+
 def _reap_child(proc: subprocess.Popen) -> None:
     """Terminate a spawned child that won't be used, escalating to SIGKILL."""
     proc.terminate()
@@ -714,10 +748,27 @@ def _reap_child(proc: subprocess.Popen) -> None:
 def spawn_instance(
     instance_id: str | None = None,
     *,
-    timeout: float = 15.0,
+    timeout: float | None = None,
     poll_interval: float = 0.2,
 ) -> BridgeInstance:
     """Spawn a bridge within one lock-and-registration deadline."""
+    if timeout is None:
+        raw_timeout = os.environ.get("BN_SPAWN_TIMEOUT")
+        if raw_timeout is None:
+            timeout = DEFAULT_SPAWN_TIMEOUT
+        else:
+            try:
+                timeout = float(raw_timeout)
+            except ValueError:
+                raise BridgeError(
+                    f"BN_SPAWN_TIMEOUT={raw_timeout!r} is not a valid positive "
+                    "number of seconds"
+                ) from None
+            if not math.isfinite(timeout) or timeout <= 0:
+                raise BridgeError(
+                    f"BN_SPAWN_TIMEOUT={raw_timeout!r} is not a valid positive "
+                    "number of seconds"
+                )
     if instance_id is not None and instance_id != "default":
         validate_instance_id(instance_id)
     deadline = time.monotonic() + timeout
@@ -733,7 +784,7 @@ def spawn_instance(
 def _spawn_instance_unlocked(
     instance_id: str | None = None,
     *,
-    timeout: float = 15.0,
+    timeout: float = DEFAULT_SPAWN_TIMEOUT,
     poll_interval: float = 0.2,
 ) -> BridgeInstance:
     """Spawn-and-register core. MUST run under _spawn_lock()."""
@@ -790,22 +841,26 @@ def _spawn_instance_unlocked(
                 return inst
         exit_code = proc.poll()
         if exit_code is not None:
-            raise BridgeError(
+            message = (
                 f"Auto-started bn-agent (pid {proc.pid}, instance {instance_id}) "
                 f"exited with code {exit_code} before registering."
-                f"{_log_tail(log_path)}"
             )
+            _append_spawn_diagnostic(log_path, message)
+            raise BridgeError(f"{message}{_log_tail(log_path)}")
         remaining = _remaining_deadline(deadline, "waiting for bridge registration")
         time.sleep(min(poll_interval, remaining or poll_interval))
 
     # The child is still running but never registered. Kill it so a slow
     # starter can't register later and show up as a surprise extra instance.
-    _reap_child(proc)
-
-    raise BridgeError(
+    message = (
         f"Auto-started bn-agent (pid {proc.pid}, instance {instance_id}) "
-        f"did not register within {timeout:.0f}s and was terminated. Check {log_path}"
+        f"did not register within {timeout:g}s and was terminated. "
+        f"Check {log_path}. Retry the same command; on a heavily loaded host, "
+        "set BN_SPAWN_TIMEOUT=<seconds> to allow more startup time."
     )
+    _append_spawn_diagnostic(log_path, message)
+    _reap_child(proc)
+    raise BridgeError(message)
 
 
 def wait_for_teardown(

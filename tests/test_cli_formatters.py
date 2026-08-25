@@ -127,7 +127,6 @@ def test_lines_range_rejects_zero_index_with_helpful_error(monkeypatch, capsys):
         ["decompile", "sub_401000", "--format", "json", "--lines", "1:5"],
         ["decompile", "sub_401000", "--format", "ndjson", "--lines", "1:5"],
         ["il", "sub_401000", "--format", "json", "--lines", "1:5"],
-        ["disasm", "sub_401000", "--format", "json", "--lines", "1:5"],
     ],
 )
 def test_lines_flag_rejected_outside_text_mode(monkeypatch, capsys, argv):
@@ -139,6 +138,41 @@ def test_lines_flag_rejected_outside_text_mode(monkeypatch, capsys, argv):
     err = capsys.readouterr().err
     assert "--lines only applies to --format text" in err
     assert "Traceback" not in err
+
+
+def test_disasm_json_lines_are_sliced_by_bridge(fake_transport, capsys):
+    calls = fake_transport(
+        {
+            "disasm": {
+                "ok": True,
+                "result": {
+                    "text": "line two",
+                    "total_lines": 4,
+                    "returned_lines": 1,
+                    "line_range": {"start": 2, "end": 2},
+                },
+            }
+        }
+    )
+
+    rc = bn.cli.main(
+        [
+            "disasm",
+            "sub_401000",
+            "--format",
+            "json",
+            "--lines",
+            "2:2",
+            "--target",
+            "active",
+        ]
+    )
+
+    assert rc == 0
+    assert calls[-1]["params"]["line_start"] == 2
+    assert calls[-1]["params"]["line_end"] == 2
+    assert calls[-1]["params"]["strict_range"] is True
+    assert json.loads(capsys.readouterr().out)["text"] == "line two"
 
 
 def test_json_format_error_emits_json_to_stdout(monkeypatch, capsys):

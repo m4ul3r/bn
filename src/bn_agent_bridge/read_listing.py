@@ -25,6 +25,7 @@ import THIS module one-way (design spec §3.2).
 from __future__ import annotations
 
 import re
+from types import SimpleNamespace
 from typing import Any
 
 try:
@@ -211,8 +212,8 @@ def _callsites(
     within_identifiers: list[Any],
     context: int = 3,
     offset: int = 0,
-    limit: int | None = None,
-) -> list[dict[str, Any]]:
+    limit: int | None = 100,
+) -> dict[str, Any]:
     if context < 0:
         raise OperationFailure("invalid_context", f"Invalid callsite context size: {context}")
     offset = _validate_count(offset, label="offset", minimum=0)
@@ -220,7 +221,56 @@ def _callsites(
 
     bv = ctx._resolve_view(selector)
     require_analysis(bv, "Callsites")
-    callee = ctx._find_function(bv, callee_identifier)
+    callee_symbol_only = False
+    try:
+        callee = ctx._find_function(bv, callee_identifier)
+    except Exception:
+        getter = getattr(bv, "get_symbols_by_name", None)
+        symbols = (
+            list(getter(str(callee_identifier)) or [])
+            if callable(getter) and callee_identifier
+            else []
+        )
+        if not symbols:
+            raw_getter = getattr(bv, "get_symbol_by_raw_name", None)
+            raw_symbol = (
+                raw_getter(str(callee_identifier))
+                if callable(raw_getter) and callee_identifier
+                else None
+            )
+            if raw_symbol is not None:
+                symbols = [raw_symbol]
+        imported = []
+        allowed_types = {
+            getattr(getattr(bn, "SymbolType", None), name, None)
+            for name in (
+                "ImportedFunctionSymbol",
+                "ImportedDataSymbol",
+                "ImportAddressSymbol",
+                "ExternalSymbol",
+            )
+        }
+        for symbol in symbols:
+            symbol_type = getattr(symbol, "type", None)
+            type_name = str(getattr(symbol_type, "name", symbol_type))
+            if symbol_type in allowed_types or type_name in {
+                "ImportedFunctionSymbol",
+                "ImportedDataSymbol",
+                "ImportAddressSymbol",
+                "ExternalSymbol",
+            }:
+                imported.append(symbol)
+        if not imported:
+            raise
+        symbol = min(imported, key=lambda item: int(getattr(item, "address", 0)))
+        callee = SimpleNamespace(
+            name=str(
+                getattr(symbol, "short_name", "")
+                or getattr(symbol, "name", callee_identifier)
+            ),
+            start=int(getattr(symbol, "address", 0)),
+        )
+        callee_symbol_only = True
     # #286: an exported callee's intra-lib callers route through its same-name PLT
     # stub, so a call targeting the stub must count as a call to the callee.
     try:
@@ -238,19 +288,56 @@ def _callsites(
     variadic_hint = _callee_variadic_hint(callee)
 
     rows = []
-    for within_query, func in scope_functions:
+    callers_scanned = 0
+    scan_truncated = False
+    row_scan_target = offset + limit + 1 if limit is not None else None
+    for scope_index, (within_query, func) in enumerate(scope_functions):
         function_rows = _callsites_within_function(
             ctx, bv, callee, func, context=context, stub_addrs=stub_addrs,
             variadic_hint=variadic_hint)
+        callers_scanned += 1
         for call_index, row in enumerate(function_rows):
             row["call_index"] = call_index
             row["within_query"] = str(within_query)
         rows.extend(function_rows)
-    # Honest paging envelope for JSON parity (#131 / item 11): callsites is a
-    # flat row list, so wrap it like the sibling list ops. #454: on a high-fan-in
-    # sink, page bridge-side with --limit/--offset (the true total + remainder stay
-    # in the envelope), same contract as xrefs / function list.
-    return read_misc._paged_list_result(rows, offset=offset, limit=limit, kind="callsites")
+        if (
+            row_scan_target is not None
+            and len(rows) >= row_scan_target
+            and scope_index + 1 < len(scope_functions)
+        ):
+            scan_truncated = True
+            break
+
+    if scan_truncated:
+        assert limit is not None
+        page = rows[offset:offset + limit]
+        return {
+            "kind": "callsites",
+            "items": page,
+            "offset": offset,
+            "limit": limit,
+            "returned": len(page),
+            "total": None,
+            "total_lower_bound": len(rows),
+            "has_more": True,
+            "scan_truncated": True,
+            "callers_scanned": callers_scanned,
+            "caller_total": len(scope_functions),
+            "callee_symbol_only": callee_symbol_only,
+        }
+
+    result = read_misc._paged_list_result(
+        rows, offset=offset, limit=limit, kind="callsites"
+    )
+    result.update(
+        {
+            "scan_truncated": False,
+            "callers_scanned": callers_scanned,
+            "caller_total": len(scope_functions),
+            "callee_symbol_only": callee_symbol_only,
+        }
+    )
+    return result
 
 
 def _annotation_summary(ctx, bv) -> dict[str, Any]:
@@ -263,38 +350,77 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
     string attribute per function (the per-function address-comment map is NOT
     materialized, to keep this a fast triage read)."""
     comments = 0
+    comment_locations: list[dict[str, Any]] = []
     try:
         address_comments = getattr(bv, "address_comments", None)
         if address_comments is not None:
             comments = len(address_comments)
+            for address, text in list(address_comments.items())[:20]:
+                comment_locations.append(
+                    {
+                        "address": hex(int(address)),
+                        "comment": str(text)[:160],
+                    }
+                )
     except Exception:
         comments = 0
+        comment_locations = []
 
     function_comments = 0
+    function_comment_locations: list[dict[str, Any]] = []
     for fn in list(getattr(bv, "functions", []) or []):
         try:
-            if str(getattr(fn, "comment", "") or "").strip():
+            text = str(getattr(fn, "comment", "") or "").strip()
+            if text:
                 function_comments += 1
+                if len(function_comment_locations) < 20:
+                    function_comment_locations.append(
+                        {
+                            "name": str(getattr(fn, "name", "")),
+                            "address": hex(int(getattr(fn, "start", 0))),
+                            "comment": text[:160],
+                        }
+                    )
         except Exception:
             continue
 
     user_symbols = 0
+    user_symbol_locations: list[dict[str, Any]] = []
     try:
         getter = getattr(bv, "get_symbols", None)
         symbols = getter() if callable(getter) else list(getattr(bv, "symbols", []) or [])
         for symbol in symbols:
-            # BN marks analysis-generated symbols auto=True; a user (or prior dogfood
-            # run) name has auto=False. Count only the latter so auto names don't
-            # inflate the inherited-annotation baseline.
             if getattr(symbol, "auto", None) is False:
                 user_symbols += 1
+                if len(user_symbol_locations) < 20:
+                    user_symbol_locations.append(
+                        {
+                            "name": str(
+                                getattr(symbol, "raw_name", "")
+                                or getattr(symbol, "name", "")
+                            ),
+                            "address": hex(int(getattr(symbol, "address", 0))),
+                        }
+                    )
     except Exception:
         user_symbols = 0
+        user_symbol_locations = []
 
     return {
         "comments": comments,
+        "comment_locations": comment_locations,
         "function_comments": function_comments,
+        "function_comment_locations": function_comment_locations,
         "user_symbols": user_symbols,
+        "user_symbol_locations": user_symbol_locations,
+        "locations_truncated": any(
+            count > len(locations)
+            for count, locations in (
+                (comments, comment_locations),
+                (function_comments, function_comment_locations),
+                (user_symbols, user_symbol_locations),
+            )
+        ),
     }
 
 

@@ -691,10 +691,10 @@ def _emit_result(
     _render_result(result, fmt=fmt, out_path=args.out, stem=stem)
 
 
-# Regex metacharacters that make a literal substring query silently match
-# nothing without --regex. Deliberately EXCLUDES '.' -- it is too common in
-# legitimate literal names/strings (std::x, a.b.c) to flag (#122).
-_REGEX_METACHARS = "|()[]{}*+?^$\\"
+# Regex metacharacters that make a literal substring query likely to be a
+# pattern. Dot is included: the fleet demonstrated regex-shaped dotted queries
+# returning a misleading zero with no fallback.
+_REGEX_METACHARS = ".|()[]{}*+?^$\\"
 
 
 def _maybe_regex_hint(args: argparse.Namespace, result: Any, query: str | None) -> None:
