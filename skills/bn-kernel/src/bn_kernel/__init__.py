@@ -44,10 +44,14 @@ def _timeout_message(operation: str, budget: float, detail: str = "") -> str:
     )
     guidance_marker = "The bridge may"
     if guidance_marker in detail:
-        detail = detail[detail.index(guidance_marker) :]
-    elif "timed out" in detail.lower():
-        detail = ""
-    return f"{message}. {detail}" if detail else message
+        guidance = detail[detail.index(guidance_marker) :]
+    else:
+        guidance = (
+            "The bridge may be busy with analysis; inspect progress with "
+            "`bn -i NAME target info`, then raise or disable the limit with "
+            "BN_REQUEST_TIMEOUT=<seconds|0> if the operation is intentionally long."
+        )
+    return f"{message}. {guidance}"
 
 
 def _should_retry_as_regex(
@@ -57,14 +61,21 @@ def _should_retry_as_regex(
 ) -> bool:
     if filters.get("regex") or filters.get("exact"):
         return False
-    if not isinstance(payload, dict) or payload.get("total") != 0:
+    if not isinstance(payload, dict):
         return False
     if not any(character in query for character in _REGEX_METACHARS):
         return False
+    if payload.get("total") != 0 and query != ".":
+        return False
     try:
         re.compile(query)
-    except re.error:
-        return False
+    except re.error as exc:
+        raise BnError(
+            f"invalid regex-like search query {query!r}: {exc}; "
+            "pass exact=True to search for it literally",
+            returncode=2,
+            argv=("search_functions",),
+        ) from exc
     return True
 
 
@@ -464,6 +475,16 @@ class Session:
         timeout: float = 120.0,
         backend: BackendChoice = "auto",
     ) -> None:
+        configured_backend = os.environ.get("BN_BACKEND")
+        if configured_backend is not None:
+            env_backend = configured_backend.strip().lower()
+            if env_backend not in {"auto", "cli", "native"}:
+                raise ValueError(
+                    f"BN_BACKEND={configured_backend!r} is invalid; "
+                    "expected auto, cli, or native"
+                )
+            if backend == "auto":
+                backend = env_backend
         if backend not in {"auto", "cli", "native"}:
             raise ValueError("backend must be 'auto', 'cli', or 'native'")
         self.instance = instance
@@ -605,12 +626,18 @@ class Session:
         self,
         *command: str,
         timeout: float | None = None,
+        full: bool = False,
     ) -> str:
         self.last = None
         executable = _bn_executable()
         argv = self._root_argv()
-        argv.extend(str(part) for part in command)
-        argv.append("--help-full")
+        command_path = tuple(str(part) for part in command)
+        aliases = {
+            ("search",): ("function", "search"),
+            ("function_info",): ("function", "info"),
+        }
+        argv.extend(aliases.get(command_path, command_path))
+        argv.append("--help-full" if full else "--help")
         try:
             process = await asyncio.create_subprocess_exec(
                 executable,
@@ -836,6 +863,10 @@ class Session:
         aggregate["has_more"] = bool(
             bridge_has_more and limit is not None and len(items) >= limit
         )
+        if limit is None:
+            aggregate.pop("limit", None)
+        else:
+            aggregate["limit"] = limit
         self.last = Result(
             value=items,
             payload=aggregate,
@@ -860,11 +891,20 @@ class Session:
             if timeout is None
             else _load_native_client(self.instance, self.target, timeout)
         )
+        budget = self.timeout if timeout is None else timeout
         try:
-            payload = await asyncio.to_thread(client.request, op, params)
+            payload = await asyncio.wait_for(
+                asyncio.to_thread(client.request, op, params),
+                timeout=budget,
+            )
+        except asyncio.TimeoutError:
+            raise BnError(
+                _timeout_message(op, budget),
+                returncode=124,
+                argv=(op,),
+            ) from None
         except NativeBridgeError as exc:
             if "timed out" in str(exc).lower():
-                budget = self.timeout if timeout is None else timeout
                 raise BnError(
                     _timeout_message(op, budget, str(exc)),
                     returncode=124,
@@ -898,13 +938,22 @@ class Session:
                 if isinstance(self._client, NativeClient)
                 else self._client
             )
+        budget = self.timeout if timeout is None else timeout
         try:
-            payload = await asyncio.to_thread(
-                client.collect, op, params, limit=limit
+            payload = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.collect, op, params, limit=limit
+                ),
+                timeout=budget,
             )
+        except asyncio.TimeoutError:
+            raise BnError(
+                _timeout_message(op, budget),
+                returncode=124,
+                argv=(op,),
+            ) from None
         except NativeBridgeError as exc:
             if "timed out" in str(exc).lower():
-                budget = self.timeout if timeout is None else timeout
                 raise BnError(
                     _timeout_message(op, budget, str(exc)),
                     returncode=124,
@@ -916,6 +965,13 @@ class Session:
         value = _require_collection(op, _unwrap(payload), payload)
         self.last = Result(value, payload, (), (op,), "native")
         return value
+
+    def _validated(self, validator, *args, **kwargs):
+        try:
+            return validator(*args, **kwargs)
+        except Exception:
+            self.last = None
+            raise
 
     async def info(
         self,
@@ -1053,7 +1109,9 @@ class Session:
                 "function", "list", limit=limit, timeout=timeout, **params
             )
         payload = self.last.payload if self.last is not None else None
-        return _require_function_rows("list_functions", value, payload)
+        return self._validated(
+            _require_function_rows, "list_functions", value, payload
+        )
 
     async def search(
         self,
@@ -1080,7 +1138,7 @@ class Session:
                 "search_functions", params, limit, timeout=remaining
             )
             payload = self.last.payload if self.last is not None else None
-            if _should_retry_as_regex(query, payload, validated):
+            if self._validated(_should_retry_as_regex, query, payload, validated):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     self.last = None
@@ -1131,7 +1189,9 @@ class Session:
                 **validated,
             )
         payload = self.last.payload if self.last is not None else None
-        rows = _require_function_rows("search_functions", value, payload)
+        rows = self._validated(
+            _require_function_rows, "search_functions", value, payload
+        )
         if (
             isinstance(payload, dict)
             and payload.get("total") == 0
@@ -1175,7 +1235,7 @@ class Session:
                 blocks=blocks,
                 timeout=timeout,
             )
-        value = _require_function_info(payload)
+        value = self._validated(_require_function_info, payload)
         if self.last is not None:
             self.last = Result(
                 value,
@@ -1192,6 +1252,7 @@ class Session:
         *,
         addresses: bool = False,
         force_analysis: bool = False,
+        include_annotations: bool = False,
         timeout: float | None = None,
     ) -> str:
         if self.backend == "native":
@@ -1201,6 +1262,7 @@ class Session:
                     "identifier": identifier,
                     "addresses": addresses,
                     "force_analysis": force_analysis,
+                    "include_annotations": include_annotations,
                 },
                 timeout=timeout,
             )
@@ -1210,10 +1272,11 @@ class Session:
                 identifier,
                 addresses=addresses,
                 force_analysis=force_analysis,
+                include_annotations=include_annotations,
                 timeout=timeout,
             )
         payload = self.last.payload if self.last is not None else None
-        return _require_decompile(value, payload)
+        return self._validated(_require_decompile, value, payload)
 
     async def disasm(
         self,
@@ -1264,7 +1327,7 @@ class Session:
                 timeout=timeout,
             )
         payload = self.last.payload if self.last is not None else None
-        return _require_text("disasm", value, payload)
+        return self._validated(_require_text, "disasm", value, payload)
 
     async def il(
         self,
@@ -1381,12 +1444,12 @@ class Session:
                     scope_file.close()
                 scope_path.unlink(missing_ok=True)
         payload = self.last.payload if self.last is not None else None
-        return _require_callsites(value, payload)
+        return self._validated(_require_callsites, value, payload)
 
     async def strings(
         self,
         *,
-        limit: int | None = None,
+        limit: int | None = 100,
         timeout: float | None = None,
         **filters: Any,
     ) -> list[dict[str, Any]]:
@@ -1400,8 +1463,12 @@ class Session:
                 "strings", limit=limit, timeout=timeout, **params
             )
         payload = self.last.payload if self.last is not None else None
-        return _require_collection(
-            "strings", value, payload, required_keys=("value",)
+        return self._validated(
+            _require_collection,
+            "strings",
+            value,
+            payload,
+            required_keys=("value",),
         )
 
     async def imports(
@@ -1461,29 +1528,35 @@ async def scoped(
         raise TypeError("scoped callback must be a mutable Python callable") from exc
 
     callback_id = id(callback)
-    with _SCOPED_CALLBACK_LOCK:
-        foreign_active = {
-            active_binding
-            for active_binding in _ACTIVE_SCOPED_BINDINGS.values()
-            if active_binding != binding
-        }
-        if foreign_active:
-            raise BnError(
-                "scoped refused a foreign active scoped binding in this shared "
-                f"interpreter: requested {binding!r}, active "
-                f"{sorted(foreign_active, key=repr)!r}",
-                returncode=2,
-                argv=("scoped",),
-            )
-        if callback_id in _ACTIVE_SCOPED_CALLBACKS:
-            raise BnError(
-                "scoped callback is already active in this shared interpreter",
-                returncode=2,
-                argv=("scoped",),
-            )
-        _ACTIVE_SCOPED_CALLBACKS.add(callback_id)
-        _ACTIVE_SCOPED_BINDINGS[callback_id] = binding
+    registered = False
     try:
+        with _SCOPED_CALLBACK_LOCK:
+            foreign_active = {
+                active_binding
+                for active_binding in _ACTIVE_SCOPED_BINDINGS.values()
+                if active_binding != binding
+            }
+            if foreign_active:
+                raise BnError(
+                    "scoped refused a foreign active scoped binding in this shared "
+                    f"interpreter: requested {binding!r}, active "
+                    f"{sorted(foreign_active, key=repr)!r}",
+                    returncode=2,
+                    argv=("scoped",),
+                )
+            if callback_id in _ACTIVE_SCOPED_CALLBACKS:
+                raise BnError(
+                    "scoped callback is already active in this shared interpreter",
+                    returncode=2,
+                    argv=("scoped",),
+                )
+            # Arm cleanup before either registry mutation. An asynchronous
+            # cancellation injected between the add/set bytecodes must not leave
+            # a foreign-active binding behind for the process lifetime.
+            registered = True
+            _ACTIVE_SCOPED_CALLBACKS.add(callback_id)
+            _ACTIVE_SCOPED_BINDINGS[callback_id] = binding
+
         bound = Session(instance, target, timeout=timeout, backend=backend)
         if (bound.instance, bound.target) != binding:
             raise BnError(
@@ -1502,9 +1575,10 @@ async def scoped(
             )
         return value
     finally:
-        with _SCOPED_CALLBACK_LOCK:
-            _ACTIVE_SCOPED_CALLBACKS.discard(callback_id)
-            _ACTIVE_SCOPED_BINDINGS.pop(callback_id, None)
+        if registered:
+            with _SCOPED_CALLBACK_LOCK:
+                _ACTIVE_SCOPED_CALLBACKS.discard(callback_id)
+                _ACTIVE_SCOPED_BINDINGS.pop(callback_id, None)
 
 
 def session(

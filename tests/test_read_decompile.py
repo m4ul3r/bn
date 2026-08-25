@@ -597,6 +597,47 @@ def test_decompile_pseudo_c_with_address_gutter(monkeypatch):
     )
 
 
+def test_decompile_redacts_annotation_bodies_unless_explicitly_included(
+    monkeypatch
+):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    function = _FakeFunction(0x401000, "parse_record")
+    function.basic_blocks = [_FakeBasicBlock(0x401000, 0x401002)]
+    function.comment = "inherited function note"
+    bv = _FakeBV(
+        functions=[function],
+        comments={0x401000: "inherited address note"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(
+        bridge.il_format,
+        "_decompile_text",
+        lambda *args, **kwargs: (
+            "void parse_record() {\n"
+            "    // inherited function note\n"
+            "    // inherited address note\n"
+            "}"
+        ),
+    )
+
+    redacted = instance._decompile("active", "parse_record")
+    included = instance._decompile(
+        "active", "parse_record", include_annotations=True
+    )
+
+    assert "inherited function note" not in redacted["text"]
+    assert "inherited address note" not in redacted["text"]
+    assert redacted["comments"] == {}
+    assert redacted["annotation_summary"] == {
+        "comment_count": 2,
+        "redacted": True,
+    }
+    assert "inherited function note" in included["text"]
+    assert "inherited address note" in included["text"]
+    assert included["comments"] == {"0x401000": "inherited address note"}
+
+
 def test_decompile_falls_back_to_hlil_when_pseudo_c_unavailable(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -814,8 +855,7 @@ def test_function_list_defers_display_projection_to_the_returned_page(monkeypatc
 
 def test_function_list_sort_by_size_still_ranks_the_full_set(monkeypatch):
     # `--sort size` needs size for the WHOLE set to rank it, so the deferral must
-    # not break size ordering: the biggest function must lead regardless of which
-    # page it lands on. (Deferral is keyed on the sort mode for exactly this.)
+    # not break ascending size ordering regardless of which page a row lands on.
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     small = _FakeFunction(0x401000, "small_fn", total_bytes=16)
@@ -826,10 +866,10 @@ def test_function_list_sort_by_size_still_ranks_the_full_set(monkeypatch):
 
     result = instance._list_functions("active", sort="size", limit=1)
 
-    # natural size sort is largest-first, and it survives paging to one row.
+    # Natural ordering is ascending, like address/name and Python's sorted().
     assert result["returned"] == 1
-    assert result["items"][0]["address"] == "0x402000"
-    assert result["items"][0]["size"] == 65536
+    assert result["items"][0]["address"] == "0x401000"
+    assert result["items"][0]["size"] == 16
 
 
 def test_list_functions_is_sorted_by_address(monkeypatch):
@@ -945,9 +985,8 @@ def test_function_list_envelope_kind_and_no_functions_alias(monkeypatch):
 
 
 def test_function_list_rows_carry_size_and_sort_by_size(monkeypatch):
-    # The dogfood's most-repeated friction: no size field forces per-function
-    # info loops / write-locked py exec to find large functions. Expose `size`
-    # on every row and a `--sort size` that ranks largest-first.
+    # Expose size on every row and keep the default sort direction consistent
+    # with address/name; --reverse/--desc requests largest-first.
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     small = _FakeFunction(0x1000, "small_fn"); small.total_bytes = 16
@@ -962,7 +1001,7 @@ def test_function_list_rows_carry_size_and_sort_by_size(monkeypatch):
     assert by_name["big_fn"]["size"] == 4096
 
     ranked = instance._list_functions("active", sort="size")
-    assert [r["name"] for r in ranked["items"]] == ["big_fn", "mid_fn", "small_fn"]
+    assert [r["name"] for r in ranked["items"]] == ["small_fn", "mid_fn", "big_fn"]
 
 
 def test_function_search_rows_carry_size(monkeypatch):
@@ -988,9 +1027,9 @@ def test_list_functions_binder_forwards_sort(monkeypatch):
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     res = bridge._bind_list_functions(instance, {"sort": "size"}, "active")
-    assert [r["name"] for r in res["items"]] == ["big_fn", "small_fn"]
+    assert [r["name"] for r in res["items"]] == ["small_fn", "big_fn"]
     res2 = bridge._bind_search_functions(instance, {"query": "_fn", "sort": "size"}, "active")
-    assert [r["name"] for r in res2["items"]] == ["big_fn", "small_fn"]
+    assert [r["name"] for r in res2["items"]] == ["small_fn", "big_fn"]
 
 
 def test_function_binders_tolerate_none_limit(monkeypatch):
@@ -2401,10 +2440,19 @@ def test_containment_meta_decimal_matches_hex(monkeypatch):
     hex_meta = instance.ctx._containment_meta("0x401010", fn)
     dec_meta = instance.ctx._containment_meta("4198416", fn)
     assert hex_meta == {"requested_address": "0x401010", "offset": "+0x10"}
-    assert dec_meta == hex_meta  # decimal discloses identically to hex
+    assert dec_meta == {
+        "requested_address": "0x401010",
+        "offset": "+0x10",
+        "input_format": "decimal",
+    }
 
-    # A decimal EXACT start still has no disclosure (like the hex exact start).
-    assert instance.ctx._containment_meta("4198400", fn) is None
+    # An exact bare-decimal address is disclosed so it cannot be mistaken for a
+    # digit-only symbol name; exact 0x input remains unremarkable.
+    assert instance.ctx._containment_meta("4198400", fn) == {
+        "requested_address": "0x401000",
+        "offset": "+0x0",
+        "input_format": "decimal",
+    }
     assert instance.ctx._containment_meta("0x401000", fn) is None
     # A plain name is not an address -> no disclosure.
     assert instance.ctx._containment_meta("parse_packet", fn) is None
@@ -2434,7 +2482,11 @@ def test_read_verbs_decimal_mid_address_discloses_like_hex(monkeypatch, call):
     assert result["function"]["name"] == "parse_packet"
     assert result["function"]["address"] == "0x401000"
     # requested_address is normalized to hex even though the request was decimal.
-    assert result["resolved_from"] == {"requested_address": "0x401010", "offset": "+0x10"}
+    assert result["resolved_from"] == {
+        "requested_address": "0x401010",
+        "offset": "+0x10",
+        "input_format": "decimal",
+    }
 
 
 # --- #626: extend the mid-function (contained) contract to the evidence /

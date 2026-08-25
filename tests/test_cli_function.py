@@ -1043,6 +1043,18 @@ def test_render_callsites_text_footer_when_paged():
     # No footer when everything fits.
     env_full = {**env, "total": 1, "has_more": False}
     assert "showing" not in formatters._render_callsites_text(env_full)
+    bounded = {
+        **env,
+        "total": None,
+        "total_lower_bound": 2,
+        "scan_truncated": True,
+        "callers_scanned": 2,
+        "caller_total": 47,
+    }
+    bounded_text = formatters._render_callsites_text(bounded)
+    assert "at least 2 callsites" in bounded_text
+    assert "scanned 2 of 47 callers" in bounded_text
+    assert "exact total not computed" in bounded_text
 
 
 def test_callsites_routes_within_scope_and_renders_text(fake_transport, capsys):
@@ -1145,11 +1157,13 @@ def test_target_summary_text_shows_function_counts():
         "named_function_count": 87,
         "unnamed_function_count": 313,
         "imported_function_count": 12,
+        "import_symbol_count": 19,
     })
     assert "412 functions" in out
     assert "87 named" in out
     assert "313 auto-named" in out
     assert "12 imported" in out
+    assert "19 symbols, 12 callable function targets" in out
 
 
 def test_function_search_auto_retries_regex_then_discloses_when_still_empty(monkeypatch, capsys):
@@ -1313,6 +1327,104 @@ def test_session_start_all_loads_fail_stops_bridge_and_exits_nonzero(monkeypatch
     assert "shutdown" in ops
     parsed = json.loads(capsys.readouterr().out)
     assert parsed["stopped"] is True
+
+
+def test_session_start_rejects_load_success_without_open_target(
+    monkeypatch, capsys
+):
+    from bn.transport import BridgeInstance
+    from pathlib import Path
+
+    fake_inst = BridgeInstance(
+        pid=999,
+        socket_path=Path("/tmp/test-empty.sock"),
+        registry_path=Path("/tmp/test-empty.json"),
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at="2026-01-01T00:00:00Z",
+        meta={},
+        instance_id="empty9",
+    )
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: fake_inst)
+    ops = []
+
+    def fake_send_request(op, **kwargs):
+        ops.append(op)
+        if op == "load_binary":
+            return {
+                "ok": True,
+                "result": {"loaded": True, "targets": []},
+            }
+        if op == "shutdown":
+            return {"ok": True, "result": {"shutting_down": True}}
+        raise AssertionError(op)
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(
+        ["session", "start", "/tmp/sample.bin", "--format", "json"]
+    )
+
+    assert rc == 1
+    assert ops == ["load_binary", "shutdown"]
+    result = json.loads(capsys.readouterr().out)
+    assert result["stopped"] is True
+    assert "without an open target" in result["loaded"][0]["error"]
+
+
+def test_session_start_detach_queues_load_and_returns_poll_command(
+    monkeypatch, capsys
+):
+    from pathlib import Path
+    from bn.transport import BridgeInstance
+
+    instance = BridgeInstance(
+        pid=999,
+        socket_path=Path("/tmp/detached.sock"),
+        registry_path=Path("/tmp/detached.json"),
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at="2026-01-01T00:00:00Z",
+        meta={},
+        instance_id="detached9",
+    )
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: instance)
+    seen = []
+
+    def fake_send_request(op, **kwargs):
+        seen.append(op)
+        assert op == "load_binary_async"
+        return {
+            "ok": True,
+            "result": {
+                "job_id": "job123",
+                "state": "queued",
+                "path": kwargs["params"]["path"],
+                "status_command": "bn -i detached9 session status job123",
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(
+        [
+            "session",
+            "start",
+            "/tmp/sample.bndb",
+            "--instance-id",
+            "detached9",
+            "--detach",
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 0
+    assert seen == ["load_binary_async"]
+    result = json.loads(capsys.readouterr().out)
+    assert result["detached"] is True
+    assert result["loaded"][0]["job_id"] == "job123"
+    assert result.get("stopped") is None
 
 
 def test_session_start_rejects_invalid_timeout_before_spawn(monkeypatch, capsys):
@@ -2073,28 +2185,40 @@ def test_function_search_no_retry_when_literal_matches(monkeypatch, capsys):
     assert "retried" not in err.lower()
 
 
-def test_function_search_no_retry_for_invalid_regex(monkeypatch, capsys):
-    """An unbalanced metachar query can't compile as a regex; don't retry (the
-    plain 'add --regex' hint still fires)."""
+def test_function_search_rejects_invalid_regex_like_literal(monkeypatch, capsys):
     seen = []
 
-    def fake(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+    def fake(op, *, params=None, target=None, timeout=30.0, instance_id=None,
+             spawn_missing_named=False):
         if op == "list_targets":
-            return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "a.bndb"}]}
+            return {
+                "ok": True,
+                "result": [{"target_id": "1:1:1", "selector": "a.bndb"}],
+            }
         if op == "search_functions":
             seen.append(bool(params.get("regex")))
-            return {"ok": True, "result": {"kind": "functions", "items": [], "total": 0,
-                                           "offset": 0, "limit": 100, "returned": 0,
-                                           "has_more": False}}
+            return {
+                "ok": True,
+                "result": {
+                    "kind": "functions",
+                    "items": [],
+                    "total": 0,
+                    "offset": 0,
+                    "limit": 100,
+                    "returned": 0,
+                    "has_more": False,
+                },
+            }
         raise AssertionError(op)
 
     monkeypatch.setattr(bn.cli, "send_request", fake)
     monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
     rc = bn.cli.main(["function", "search", "func[("])
-    assert rc == 0
-    assert seen == [False]  # invalid regex -> no retry attempted
-    _, err = capsys.readouterr()
-    assert "--regex" in err  # the plain hint still fires as the fallback
+
+    assert rc == 2
+    assert seen == [False]
+    assert "invalid regex-like" in capsys.readouterr().err
 
 
 # --- #291.3 review (M1): JSON consumers get an in-band regex-fallback marker ---
@@ -2113,6 +2237,87 @@ def test_function_search_json_marks_regex_fallback(monkeypatch, capsys, query):
     data = json.loads(out)
     assert data.get("regex_fallback") is True
     assert data.get("total") == 3
+
+
+def test_function_search_dot_retries_after_nonzero_literal_subset(
+    monkeypatch, capsys
+):
+    seen = []
+
+    def fake(op, *, params=None, target=None, timeout=30.0, instance_id=None,
+             spawn_missing_named=False):
+        if op == "list_targets":
+            return {
+                "ok": True,
+                "result": [{"target_id": "1:1:1", "selector": "a.bndb"}],
+            }
+        if op == "search_functions":
+            is_regex = bool(params.get("regex"))
+            seen.append(is_regex)
+            names = ["first", "second"] if is_regex else ["literal.dot"]
+            items = [
+                {"name": name, "address": hex(index + 0x1000)}
+                for index, name in enumerate(names)
+            ]
+            return {
+                "ok": True,
+                "result": {
+                    "kind": "functions",
+                    "items": items,
+                    "total": len(items),
+                    "offset": 0,
+                    "limit": 100,
+                    "returned": len(items),
+                    "has_more": False,
+                },
+            }
+        raise AssertionError(op)
+
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    rc = bn.cli.main(["function", "search", ".", "--format", "json"])
+
+    assert rc == 0
+    assert seen == [False, True]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["regex_fallback"] is True
+    assert payload["total"] == 2
+
+
+def test_function_search_plain_zero_marks_no_fallback(monkeypatch, capsys):
+    def fake(op, *, params=None, target=None, timeout=30.0, instance_id=None,
+             spawn_missing_named=False):
+        if op == "list_targets":
+            return {
+                "ok": True,
+                "result": [{"target_id": "1:1:1", "selector": "a.bndb"}],
+            }
+        if op == "search_functions":
+            return {
+                "ok": True,
+                "result": {
+                    "kind": "functions",
+                    "items": [],
+                    "total": 0,
+                    "offset": 0,
+                    "limit": 100,
+                    "returned": 0,
+                    "has_more": False,
+                },
+            }
+        raise AssertionError(op)
+
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    rc = bn.cli.main(
+        ["function", "search", "NoSuchLiteral", "--format", "json"]
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["regex_fallback"] is False
 
 
 def test_function_search_json_no_marker_when_literal_matches(monkeypatch, capsys):
@@ -2216,7 +2421,7 @@ def test_function_info_blocks_lists_ranges_653(fake_transport, capsys):
         "function": {"name": "dispatch", "address": "0x401000"},
         "prototype": "void dispatch(uint32_t cmd)",
         "size": 0x5c00, "xref_count": 3,
-        "basic_blocks": [
+        "blocks": [
             {"index": 0, "start": "0x401000", "end": "0x401020", "length": 0x20,
              "outgoing": ["0x401020", "0x401100"], "incoming": []},
             {"index": 1, "start": "0x401020", "end": "0x401040", "length": 0x20,

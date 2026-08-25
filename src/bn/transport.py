@@ -248,13 +248,20 @@ def _load_instance(
             path.unlink()
         return None
 
+    process_state = _process_state(pid)
+    owner_alive = _process_alive(pid) and process_state not in {"Z", "X", "x"}
     if not socket_path.exists():
-        _purge_stale_registry(path, socket_path)
-        return None
-
-    if not _socket_is_live(socket_path, timeout=socket_timeout):
-        _purge_stale_registry(path, socket_path)
-        return None
+        if not owner_alive:
+            _purge_stale_registry(path, socket_path)
+            return None
+    elif not _socket_is_live(socket_path, timeout=socket_timeout):
+        # A stopped or overloaded live bridge may not accept before the probe
+        # timeout (its accept backlog can be full). Never convert temporary
+        # unresponsiveness into destructive discovery cleanup: request dispatch
+        # will report bridge_stopped or the real socket failure.
+        if not owner_alive:
+            _purge_stale_registry(path, socket_path)
+            return None
 
     return BridgeInstance(
         pid=pid,

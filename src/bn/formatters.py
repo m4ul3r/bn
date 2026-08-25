@@ -252,7 +252,7 @@ def _render_function_info_text(value: Any, verbose: bool = False, demangle: bool
         else:
             lines.append("locals: none")
 
-    blocks = value.get("basic_blocks")
+    blocks = value.get("blocks")
     if isinstance(blocks, list):
         # #653.10: block ranges make a huge dispatcher readable a region at a time
         # (`disasm --linear <start>` / `--lines` once you know where you are)
@@ -577,12 +577,17 @@ def _render_session_start_text(value: Any) -> str:
                 error = item.get("error")
                 if error:
                     lines.append(f"- {item.get('path', '<unknown>')} [error: {error}]")
+                elif value.get("detached"):
+                    lines.append(
+                        f"- {item.get('path', '<unknown>')} "
+                        f"[job {item.get('job_id', '?')} "
+                        f"{item.get('state', 'queued')}]"
+                    )
+                    if item.get("status_command"):
+                        lines.append(f"  poll: {item['status_command']}")
                 else:
                     mark = "  [not analyzed]" if item.get("analyzed") is False else ""
                     lines.append(f"- {item.get('path', '<unknown>')}{mark}")
-                    # #653.3: fan-out agents must pass -t on every command, so every
-                    # session began with a mandatory second `bn target list` call
-                    # just to learn the selector `session start` already knew.
                     for tgt in item.get("targets") or []:
                         if isinstance(tgt, dict) and tgt.get("selector"):
                             lines.append(
@@ -595,6 +600,32 @@ def _render_session_start_text(value: Any) -> str:
     if value.get("stopped"):
         lines.append("")
         lines.append("session stopped: no binaries loaded successfully")
+    return "\n".join(lines)
+
+
+def _render_session_status_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    items = list(value.get("items") or [])
+    if not items:
+        return "no load jobs"
+    lines = []
+    for item in items:
+        if not isinstance(item, dict):
+            lines.append(_render_fallback_text(item))
+            continue
+        lines.append(
+            f"{item.get('job_id', '<unknown>')}  "
+            f"{item.get('state', '<unknown>')}  "
+            f"{item.get('path', '<unknown>')}"
+        )
+        if item.get("error"):
+            lines.append(f"  error: {item['error']}")
+        result = item.get("result")
+        if isinstance(result, dict):
+            for target in result.get("targets") or []:
+                if isinstance(target, dict) and target.get("selector"):
+                    lines.append(f"  target: {target['selector']}")
     return "\n".join(lines)
 
 
@@ -737,6 +768,17 @@ def _render_target_summary(value: dict[str, Any]) -> str:
                 parts.append(f"{imported} imported")
             summary += f" ({', '.join(parts)})"
         lines.append(f"\tfunctions: {summary}")
+    import_symbols = value.get("import_symbol_count")
+    if import_symbols is not None:
+        imported_functions = value.get("imported_function_count")
+        callable_suffix = (
+            f", {imported_functions} callable function targets"
+            if imported_functions is not None
+            else ""
+        )
+        lines.append(
+            f"\timports: {import_symbols} symbols{callable_suffix}"
+        )
     # Segment-level detail only when present -- target info --verbose adds it;
     # target list rows do not, so this stays out of the list view. (F21)
     segments = value.get("segments")
@@ -1959,9 +2001,17 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
     # paging metadata (#454: callsites now pages bridge-side like xrefs) so a
     # truncated high-fan-in survey states the true total + remainder in a footer.
     total = None
+    lower_bound = None
+    callers_scanned = None
+    caller_total = None
+    scan_truncated = False
     has_more = False
     if isinstance(value, dict) and "items" in value:
         total = value.get("total")
+        lower_bound = value.get("total_lower_bound")
+        callers_scanned = value.get("callers_scanned")
+        caller_total = value.get("caller_total")
+        scan_truncated = bool(value.get("scan_truncated"))
         has_more = bool(value.get("has_more"))
         value = value.get("items") or []
     if not isinstance(value, list):
@@ -2035,6 +2085,17 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
         body += (
             f"\n\n... showing {len(value)} of {total} callsites; "
             "use --offset/--limit to page (or --format json for all)"
+        )
+    elif has_more and scan_truncated and isinstance(lower_bound, int):
+        scan = (
+            f"; scanned {callers_scanned} of {caller_total} callers"
+            if isinstance(callers_scanned, int) and isinstance(caller_total, int)
+            else ""
+        )
+        body += (
+            f"\n\n... showing {len(value)} rows; at least {lower_bound} "
+            f"callsites{scan}; exact total not computed to keep the scan bounded. "
+            "Use --offset/--limit to page."
         )
     return body
 

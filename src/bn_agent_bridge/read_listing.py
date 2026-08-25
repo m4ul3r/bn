@@ -449,6 +449,9 @@ def _analysis_state_fields(bv: Any) -> dict[str, Any]:
     return {"analysis_state": "quick" if quick else "full", "partial": quick}
 
 
+_FUNCTION_SORTS = ("address", "size", "name")
+
+
 def _filtered_functions(
     ctx,
     bv,
@@ -456,7 +459,9 @@ def _filtered_functions(
     min_address: Any = None,
     max_address: Any = None,
 ) -> list[Any]:
-    lower, upper = _parse_function_address_bounds(ctx, min_address, max_address)
+    lower, upper = _parse_function_address_bounds(
+        ctx, min_address, max_address
+    )
     functions = []
     for fn in list(bv.functions):
         address = int(fn.start)
@@ -469,29 +474,29 @@ def _filtered_functions(
     return functions
 
 
-_FUNCTION_SORTS = ("address", "size", "name")
-
-
-def _sort_function_items(items: list[dict[str, Any]], sort: str,
-                         reverse: bool = False) -> list[dict[str, Any]]:
-    """Order function-listing rows. 'address' (default) keeps the bridge's
-    natural start-address order; 'size' ranks largest-first (the common
-    'find the biggest function' triage step that otherwise needs a write-locked
-    py exec); 'name' is case-insensitive. ``reverse`` flips the NATURAL order of
-    the chosen sort, so e.g. ``--sort size --reverse`` surfaces the SMALLEST
-    functions and ``--sort address --reverse`` walks high->low (#221)."""
+def _sort_function_items(
+    items: list[dict[str, Any]],
+    sort: str,
+    reverse: bool = False,
+) -> list[dict[str, Any]]:
+    """Order address, size, or name ascending unless ``reverse`` is set."""
     if sort not in _FUNCTION_SORTS:
         raise OperationFailure(
             "invalid_request",
             f"Invalid sort '{sort}'; choose one of {', '.join(_FUNCTION_SORTS)}",
         )
     if sort == "size":
-        # natural = largest first; reverse -> smallest first
-        items.sort(key=lambda it: (it.get("size") or 0), reverse=not reverse)
+        items.sort(key=lambda item: (item.get("size") or 0), reverse=reverse)
     elif sort == "name":
-        items.sort(key=lambda it: str(it.get("name", "")).lower(), reverse=reverse)
-    elif reverse:  # 'address': natural is the start-address order; flip it
-        items.sort(key=lambda it: int(str(it.get("address", "0x0")), 16), reverse=True)
+        items.sort(
+            key=lambda item: str(item.get("name", "")).lower(),
+            reverse=reverse,
+        )
+    elif reverse:
+        items.sort(
+            key=lambda item: int(str(item.get("address", "0x0")), 16),
+            reverse=True,
+        )
     return items
 
 

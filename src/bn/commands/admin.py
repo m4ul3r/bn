@@ -28,6 +28,7 @@ from ..formatters import (
     _render_pin_clear_text,
     _render_session_list_text,
     _render_session_start_text,
+    _render_session_status_text,
     _render_session_stop_text,
     _render_skill_install_text,
     _render_target_list_text,
@@ -56,6 +57,61 @@ def _capabilities(args: argparse.Namespace) -> int:
     ]
     result = {"kind": "capabilities", "items": items, "count": len(items)}
     cli._emit_result(args, result, text_renderer=_render_capabilities_text, stem="capabilities")
+    return 0
+
+
+def _render_help_index_text(value: Any) -> str:
+    items = value.get("items", []) if isinstance(value, dict) else []
+    if isinstance(value, dict) and value.get("family"):
+        lines = [
+            f"{item.get('command')}: {item.get('help', '')}"
+            for item in items
+            if isinstance(item, dict)
+        ]
+        return "\n".join(lines) or "no commands in that family"
+    groups = ", ".join(value.get("groups", [])) if isinstance(value, dict) else ""
+    return (
+        f"command families: {groups}\n"
+        "use `bn <family> --help` for concise grammar\n"
+        "machine-readable catalog: `bn capabilities --format json`"
+    )
+
+
+@command(
+    "help",
+    help="Show command families or one family's commands",
+    args=[arg("family", nargs="?", help="Optional command family")],
+)
+def _help_index(args: argparse.Namespace) -> int:
+    family = getattr(args, "family", None)
+    specs = sorted(cli._COMMANDS, key=lambda spec: spec["path"])
+    if family:
+        specs = [spec for spec in specs if spec["path"][0] == family]
+        if not specs:
+            raise BridgeError(
+                f"unknown command family {family!r}; run `bn help` to list families"
+            )
+    items = [
+        {
+            "command": " ".join(spec["path"]),
+            "help": spec.get("help", ""),
+        }
+        for spec in specs
+    ]
+    result = {
+        "kind": "help",
+        "family": family,
+        "groups": sorted({spec["path"][0] for spec in cli._COMMANDS}),
+        "items": items,
+        "count": len(items),
+        "capabilities_command": "bn capabilities --format json",
+    }
+    cli._emit_result(
+        args,
+        result,
+        text_renderer=_render_help_index_text,
+        stem="help",
+    )
     return 0
 
 
@@ -280,6 +336,9 @@ def _default_skill_install_roots() -> list[Path]:
                  help="Don't auto-prefer a sibling .bndb file"),
              arg("--quick", "--no-analysis", action="store_true",
                  help="Preload without full analysis (fast); run `bn refresh` for full analysis"),
+             arg("--detach", action="store_true", default=False,
+                 help="Queue BNDB loading in the bridge and return immediately; "
+                      "poll with `bn -i ID session status`"),
              arg("--no-marker", action="store_true", default=False, dest="no_marker",
                  help="Don't drop a project-local `.bn-<id>` marker (#80); markers let a bare "
                       "`bn` in this project resolve this instance among many (env: BN_NO_MARKERS)"),
@@ -294,11 +353,14 @@ def _session_start(args: argparse.Namespace) -> int:
             "a new `session start` instance. Use "
             f"`bn session start <binary> --instance-id{suffix}`."
         )
+    binaries = getattr(args, "binaries", None) or []
+    detached = bool(getattr(args, "detach", False))
+    if detached and not binaries:
+        raise BridgeError("session start --detach requires at least one binary path")
     instance_id = getattr(args, "instance_id", None)
     _resolve_timeout(None)
     instance = cli.spawn_instance(instance_id)
 
-    binaries = getattr(args, "binaries", None) or []
     prefer_bndb = not args.no_bndb
     quick = bool(getattr(args, "quick", False))
     # Mirror `bn load`: pass our cwd + the marker preference so the bridge drops a
@@ -312,7 +374,7 @@ def _session_start(args: argparse.Namespace) -> int:
         resolved = str(Path(binary).expanduser().resolve())
         try:
             resp = cli.send_request(
-                "load_binary",
+                "load_binary_async" if detached else "load_binary",
                 params={
                     "path": resolved,
                     "prefer_bndb": prefer_bndb,
@@ -322,7 +384,37 @@ def _session_start(args: argparse.Namespace) -> int:
                 },
                 instance_id=instance.instance_id,
             )
-            loaded.append(resp["result"])
+            item = resp.get("result") if isinstance(resp, dict) else None
+            valid = (
+                isinstance(item, dict)
+                and (
+                    (
+                        detached
+                        and isinstance(item.get("job_id"), str)
+                        and item.get("state") in {"queued", "running"}
+                    )
+                    or (
+                        not detached
+                        and item.get("loaded") is True
+                        and isinstance(item.get("targets"), list)
+                        and bool(item["targets"])
+                    )
+                )
+            )
+            if not valid:
+                loaded.append(
+                    {
+                        "path": resolved,
+                        "error": (
+                            "detached load was not queued; the new bridge will be stopped"
+                            if detached
+                            else "load returned success without an open target; "
+                            "the new bridge will be stopped"
+                        ),
+                    }
+                )
+            else:
+                loaded.append(item)
         except BridgeError as exc:
             loaded.append({"path": resolved, "error": str(exc)})
 
@@ -333,6 +425,7 @@ def _session_start(args: argparse.Namespace) -> int:
         "instance_id": instance.instance_id,
         "pid": instance.pid,
         "socket_path": str(instance.socket_path),
+        "detached": detached,
     }
     if loaded:
         result["loaded"] = loaded
@@ -367,6 +460,34 @@ def _session_start(args: argparse.Namespace) -> int:
 
     cli._emit_result(args, result, text_renderer=_render_session_start_text, stem="session-start")
     return 1 if failures else 0
+
+
+@command(
+    "session",
+    "status",
+    help="Poll detached binary load jobs",
+    args=[arg("job_id", nargs="?", help="Optional detached load job ID")],
+)
+def _session_status(args: argparse.Namespace) -> int:
+    instance_id = getattr(args, "instance", None)
+    if not instance_id:
+        raise BridgeError(
+            "session status requires -i/--instance <id> from session start"
+        )
+    response = cli.send_request(
+        "load_status",
+        params={"job_id": getattr(args, "job_id", None)},
+        instance_id=instance_id,
+    )
+    if not isinstance(response, dict) or not isinstance(response.get("result"), dict):
+        raise BridgeError("malformed load_status response")
+    cli._emit_result(
+        args,
+        response["result"],
+        text_renderer=_render_session_status_text,
+        stem="session-status",
+    )
+    return 0
 
 
 @command(
@@ -477,6 +598,9 @@ def _session_stop(args: argparse.Namespace) -> int:
             try:
                 marker_path.unlink()
             except FileNotFoundError:
+                # A clean bridge stop removes its own tracked markers before the
+                # CLI can unlink them. Still report the recorded path as cleared.
+                removed.append(marker_path)
                 continue
             except OSError:
                 continue

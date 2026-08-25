@@ -60,12 +60,15 @@ The bridge runs as a GUI plugin or as a headless process; both speak the same pr
 
 ```bash
 bn load /path/to/binary.bndb [--instance-id <id>]   # auto-spawns a headless bridge if none is running
-bn session start /path/to/binary [--instance-id <id>]   # prints the target SELECTOR to pass as -t
-bn session list [-i <id>]               # all running instances, or filter one
-bn session stop <id>                    # aliases: --instance-id <id>, -i <id>
-bn close [<path>] [-t <sel>] [--all]    # close one: by path, by -t selector, or the single open target; --all closes every target
-bn exports [list]                        # public exported symbols; `list` is an alias
-bn instance gc                          # reap dead instances' leftover logs/sockets in ~/.cache/bn
+bn session start /path/to/binary [--instance-id <id>]   # synchronous preload
+bn session start /path/to/large.bndb --instance-id <id> --detach
+bn -i <id> session status [<job-id>]     # queued/running/complete/failed
+bn session list [-i <id>]                # all running instances, or filter one
+bn session stop <id>                     # aliases: --instance-id <id>, -i <id>
+bn close [<path>] [-t <sel>] [--all]     # close one or explicitly --all
+bn exports [list]                         # public exported symbols
+bn help [family]                          # concise index; advertises capabilities
+bn instance gc                            # reap dead instance cache residue
 ```
 
 When multiple bridge instances exist, flagless `bn load <path>` refuses ambient marker/env/sticky routing. Pass `-i/--instance` to load into an existing bridge or `--instance-id` to create a named one. This destructive lifecycle boundary never guesses among concurrent agents.
@@ -74,7 +77,7 @@ When multiple bridge instances exist, flagless `bn load <path>` refuses ambient 
 
 A bare `bn close` closes the single open target; with several open it refuses with the open-target list (pass `-t <selector>`, a path, or `--all`). It never closes everything implicitly — only `--all` does (#664). Because close is destructive, it is stricter than `bn save`: on a multi-tab GUI bridge a bare close does **not** fall back to the focused tab (save does), the CLI pins the exact `target_id` it observed rather than sending `active` (so a concurrent close/load between the lookup and the close yields an unknown-selector error instead of closing a different binary), an empty `-t ""` or empty positional path `""` (e.g. an unset shell variable) is an error rather than a bare close, and `-t` cannot be combined with a path or `--all`. The bridge enforces the same rules for raw socket clients: a non-null empty `target`, an empty `path`, and any `target`+`path`/`all` pair are rejected.
 
-`bn close` reports each closed view as `{path, unsaved, file_modified}`. `unsaved` means a committed bn mutation is not saved; only that condition triggers the stdout warning. `file_modified` preserves Binary Ninja's broader analysis/cache-dirty bit for diagnostics without falsely labeling a read-only session as discarded user mutations.
+`bn close` reports each closed view as `{path, unsaved, engine_modified}`. `unsaved` is the sole persistence/cleanliness signal: it means a committed bn mutation was not saved and is the only condition that triggers the discard warning. `engine_modified` is Binary Ninja's broader analysis/cache bit; it can be true after a strictly read-only session and must not be interpreted as user mutation.
 
 ```bash
 bn save                                  # saves to <filename>.bndb
@@ -132,9 +135,9 @@ After `bn refresh` (or `--force-analysis` on a single function) every row promot
 
 **Fan-out (`--all-instances` / `--all-targets`).** Whole-target **read survey** commands (`imports`, `sections`, `strings`, `exports`, `types`, `function list`/`search`, `class list`, `go functions`, `target info`, `evidence orient`) accept `--all-instances` (run across **every running bridge instance**) and `--all-targets` (run across **every target open in an instance**); combine them for every instance × target. The result is one `{kind: "fanout", instances: […]}` aggregate (text: a section per (instance, target) via the command's own renderer; JSON for machine use). Without `--all-targets`, each instance resolves its own target by the normal rule — an explicit `-t` applies to all, otherwise the per-instance implicit single target; an instance with no/ambiguous target becomes an `ok:false` row rather than failing the whole command (the command exits non-zero only if **every** result failed). It's an explicit allow-list (the `fanout=True` command flag), **not** every text command — mutations and side-effecting commands (`save`/`close`/`refresh`/`py exec`/`load`) never get it, so a write can't be fanned. Per-function reads (`decompile`/`xrefs`/…) aren't fannable either (their identifier wouldn't resolve in another instance). Use it for cross-instance / cross-target surveys instead of a shell `for` loop. The per-(instance, target) reads run **concurrently** (bounded worker pool), so a slow instance no longer serializes the rest; each row carries `duration_ms` and the aggregate includes a `slow_rows` summary (text: a `slowest:` line) so a long survey reads as progress, not a wedge (#417).
 
-Requests time out after 600s by default so a wedged bridge can't hang the CLI; override with `BN_REQUEST_TIMEOUT=<seconds>` (`0`/`none`/`off`/empty disable). The environment value is validated and applied consistently even when a native/kernel caller supplied its own default. A non-numeric, negative, non-finite, or underflow-to-zero value (e.g. `1e-325`) is rejected before instance selection or spawning. The one-time full analysis ops (`bn load` without `--quick`, and `bn refresh`) use a larger **3600s** default instead; `BN_REQUEST_TIMEOUT` still overrides it. Bridge registration allows 60s by default and records failures in the instance log; set `BN_SPAWN_TIMEOUT=<positive-seconds>` on a heavily loaded host.
+Requests time out after 600s by default; override with `BN_REQUEST_TIMEOUT=<seconds>` (`0`/`none`/`off`/empty disable). Invalid values fail before instance selection or spawning. Full synchronous `load`/`refresh` defaults to 3600s, but genuinely large BNDBs can exceed any practical foreground budget. Prefer `session start --detach`, poll `session status`, then read the selector from `target list`; a failed detached job preserves its error in bridge state. Bridge registration allows 60s by default and records failures in the instance log; set `BN_SPAWN_TIMEOUT=<positive-seconds>` on a heavily loaded host.
 
-**Very large binaries (~100k+ functions).** The full initial analysis can run far past even the 3600s default. A client-side timeout does **not** stop the bridge — the analysis keeps running server-side — but the CLI invocation returns an error. The robust path: `bn load --quick` (fast, container parsed) → then run the long analysis with the timeout disabled and back the CLI call into the background, e.g. `BN_REQUEST_TIMEOUT=0 bn refresh -i <id> &`, and poll `bn target info -i <id>` until `analysis_state` is `"full"`. **`bn refresh` no longer blocks concurrent reads** (#321): it holds only the write gate around the analysis, not the exclusive target lock, so `target info` / `function list` / any read on another connection stays responsive *while the refresh runs* — the poll returns in well under a second instead of queuing behind the whole analysis. `target info` also carries a pollable **`analysis_progress`** (`{state, count, total}`, text: an `analysis progress:` line) that advances through BN's phases (`DisassembleState` → `AnalyzeState` → …) so a long analysis reads as live movement, not a wedge. If a `load`/`refresh` does time out client-side, re-issue it (or poll) rather than restarting the instance — the bridge is still analyzing. (A genuinely stopped instance after a huge load is usually the OS OOM-killing the bridge process, reported as such, not a timeout.)
+**Very large binaries (~100k+ functions).** Use detached start rather than a background shell: the bridge registers before analysis, `session status` survives the initiating CLI process, and the completed job returns target selectors or a retained error. `--quick` helps raw/container triage but cannot remove analysis already stored in a pre-analyzed BNDB. While a target is open, `target info` carries pollable `analysis_progress` and reads remain responsive during `refresh`.
 
 ## 3. Output & context
 

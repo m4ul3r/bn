@@ -204,6 +204,30 @@ def test_target_info_surfaces_analysis_progress(monkeypatch):
     assert info["analysis_progress"] == {"state": "AnalyzeState", "count": 1112, "total": 1939}
 
 
+def test_target_info_reconciles_import_symbol_and_function_counts(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    imported_function = fake_bn.Symbol(
+        fake_bn.SymbolType.ImportedFunctionSymbol, 0x1000, "receive_record"
+    )
+    imported_data = fake_bn.Symbol(
+        fake_bn.SymbolType.ImportedDataSymbol, 0x2000, "global_state"
+    )
+    bv = _FakeBV(symbols=[imported_function, imported_data])
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+
+    info = instance._target_info("active")
+
+    assert info["import_symbol_count"] == 2
+    assert info["imported_function_count"] == 0
+    assert info["import_count_definition"] == {
+        "import_symbol_count": "rows returned by imports",
+        "imported_function_count": "callable imported function targets",
+    }
+
+
 def test_target_info_surfaces_image_base(monkeypatch):
     """#564: target info exposes image_base from bv.start so dynamic tools can
     rebase a BN address to runtime instead of guessing the preferred base."""
@@ -639,6 +663,44 @@ def test_load_binary_no_sibling(monkeypatch, tmp_path):
     assert result["notes"] == []
     bridge._headless_views.clear()
 
+
+
+def test_detached_load_job_exposes_pollable_progress(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(instance_id="worker")
+    binary = tmp_path / "sample.bndb"
+    binary.write_bytes(b"")
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_load(path, **kwargs):
+        started.set()
+        assert release.wait(2)
+        return {
+            "loaded": True,
+            "path": path,
+            "targets": [{"selector": "sample.bndb"}],
+        }
+
+    monkeypatch.setattr(instance, "_load_binary", slow_load)
+
+    queued = instance._load_binary_async(str(binary))
+    assert started.wait(1)
+    running = instance._load_status(queued["job_id"])["items"][0]
+    assert running["state"] == "running"
+    assert running["result"] is None
+
+    release.set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        completed = instance._load_status(queued["job_id"])["items"][0]
+        if completed["state"] == "complete":
+            break
+        time.sleep(0.01)
+
+    assert completed["state"] == "complete"
+    assert completed["result"]["targets"] == [{"selector": "sample.bndb"}]
+    assert "session status" in queued["status_command"]
 
 def test_load_binary_idempotent_returns_existing_view(monkeypatch, tmp_path):
     """Re-loading an already-open path must return the existing target, not open a
@@ -1585,7 +1647,7 @@ def test_close_read_only_view_does_not_report_unsaved_mutations(
         {
             "path": "/proj/read-only.bndb",
             "unsaved": False,
-            "file_modified": True,
+            "engine_modified": True,
         }
     ]
     assert bv.closed

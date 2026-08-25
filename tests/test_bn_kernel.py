@@ -61,6 +61,7 @@ json.dump({"argv": argv}, open(out, "w"))
 @pytest.fixture(autouse=True)
 def _clear_bn_bin(monkeypatch):
     monkeypatch.delenv("BN_BIN", raising=False)
+    monkeypatch.delenv("BN_BACKEND", raising=False)
     bn_kernel._ACTIVE_SESSIONS.clear()
     bn_kernel._ACTIVE_SCOPED_CALLBACKS.clear()
     bn_kernel._ACTIVE_SCOPED_BINDINGS.clear()
@@ -135,6 +136,42 @@ def test_bootstrap_evicts_stale_module_and_bytecode():
 
     assert result.returncode == 0, result.stderr
 
+
+def test_bootstrap_without_path_context_fails_actionably():
+    bootstrap = (
+        Path(__file__).resolve().parents[1] / "skills" / "bn-kernel" / "bootstrap.py"
+    )
+    namespace = {"__builtins__": __builtins__}
+
+    with pytest.raises(RuntimeError, match="set skill_dir.*absolute"):
+        exec(
+            compile(bootstrap.read_text(encoding="utf-8"), "bootstrap.py", "exec"),
+            namespace,
+            namespace,
+        )
+
+
+def test_bootstrap_removes_foreign_bn_kernel_source_path(tmp_path):
+    bootstrap = (
+        Path(__file__).resolve().parents[1] / "skills" / "bn-kernel" / "bootstrap.py"
+    )
+    foreign_src = tmp_path / "foreign" / "src"
+    foreign_package = foreign_src / "bn_kernel"
+    foreign_package.mkdir(parents=True)
+    (foreign_package / "__init__.py").write_text("FOREIGN = True\n")
+    original_path = list(sys.path)
+    sys.path.insert(0, str(foreign_src))
+    namespace = {"skill_dir": bootstrap.parent}
+    try:
+        exec(
+            compile(bootstrap.read_text(encoding="utf-8"), "bootstrap.py", "exec"),
+            namespace,
+            namespace,
+        )
+        assert str(foreign_src) not in sys.path
+        assert sys.path[0] == str(bootstrap.parent / "src")
+    finally:
+        sys.path[:] = original_path
 def test_run_reads_complete_json_artifact_and_unwraps_items(monkeypatch, tmp_path):
     payload = {
         "kind": "functions",
@@ -265,9 +302,22 @@ sys.stdout.write("usage: bn evidence {orient,surface,calls}\\n")
         "-t",
         "sample",
         "evidence",
-        "--help-full",
+        "--help",
     )
     assert session.last.backend == "cli"
+
+
+def test_help_maps_kernel_search_helper_to_cli_family(monkeypatch, tmp_path):
+    script = """
+import json, sys
+sys.stdout.write(json.dumps(sys.argv[1:]))
+"""
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+    session = bn_kernel.Session(backend="cli")
+
+    argv = json.loads(_run(session.help("search")))
+
+    assert argv[-3:] == ["function", "search", "--help"]
 
 
 def test_help_maps_cli_error(monkeypatch, tmp_path):
@@ -388,7 +438,8 @@ out = argv[argv.index("--out") + 1]
 offset = int(argv[argv.index("--offset") + 1])
 limit = int(argv[argv.index("--limit") + 1])
 rows = [{"i": i} for i in range(offset, min(offset + limit, 7))]
-json.dump({"items": rows, "offset": offset, "returned": len(rows), "total": 7,
+json.dump({"items": rows, "offset": offset, "limit": limit,
+           "returned": len(rows), "total": 7,
            "has_more": offset + len(rows) < 7, "kind": "rows"}, open(out, "w"))
 """
     monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
@@ -429,6 +480,7 @@ json.dump({"items": rows, "total": 100, "has_more": True}, open(out, "w"))
     assert session.last.payload["offset"] == 10
     assert session.last.payload["returned"] == 5
     assert session.last.payload["has_more"] is True
+    assert session.last.payload["limit"] == 5
 
 
 def test_all_zero_limit_makes_no_cli_call(monkeypatch):
@@ -641,6 +693,17 @@ def test_backend_selection_rejects_invalid_value():
         bn_kernel.Session(backend="other")  # type: ignore[arg-type]
 
 
+def test_backend_environment_is_validated_and_applies_to_auto(monkeypatch):
+    monkeypatch.setenv("BN_BACKEND", "nonsense")
+    with pytest.raises(ValueError, match="BN_BACKEND.*auto.*cli.*native"):
+        bn_kernel.Session()
+    with pytest.raises(ValueError, match="BN_BACKEND"):
+        bn_kernel.Session(backend="cli")
+
+    monkeypatch.setenv("BN_BACKEND", "cli")
+    assert bn_kernel.Session().backend == "cli"
+
+
 def test_auto_does_not_hide_broken_native_import(monkeypatch):
     def broken(*args):
         raise RuntimeError("broken package")
@@ -767,6 +830,32 @@ def test_scoped_rejects_concurrent_foreign_binding():
     _run(scenario())
 
 
+def test_scoped_cancellation_during_registration_cleans_binding(monkeypatch):
+    class CancelAfterSet(dict):
+        def __setitem__(self, key, value):
+            super().__setitem__(key, value)
+            raise asyncio.CancelledError
+
+    bindings = CancelAfterSet()
+    monkeypatch.setattr(bn_kernel, "_ACTIVE_SCOPED_BINDINGS", bindings)
+
+    async def callback(session):
+        return session.instance
+
+    with pytest.raises(asyncio.CancelledError):
+        _run(
+            bn_kernel.scoped(
+                callback,
+                instance="worker",
+                target="sample",
+                backend="cli",
+            )
+        )
+
+    assert bindings == {}
+    assert bn_kernel._ACTIVE_SCOPED_CALLBACKS == set()
+
+
 def test_native_request_runs_off_event_loop_thread_and_updates_last():
     session, client = _native_session()
     loop_thread = threading.get_ident()
@@ -803,6 +892,34 @@ def test_native_operations_have_caller_visible_timeout(method):
         _run(operation)
 
     assert caught.value.returncode == 124
+    message = str(caught.value)
+    assert "requested end-to-end budget" in message
+    assert "bn -i NAME target info" in message
+
+
+@pytest.mark.parametrize("method", ["request", "collect"])
+def test_native_timeout_enforces_wall_clock_budget(method):
+    session = bn_kernel.Session(instance="worker", timeout=0.03, backend="native")
+
+    class SlowClient:
+        def request(self, op, params=None):
+            time.sleep(0.2)
+            return {"arch": "x86"}
+
+        def collect(self, op, params=None, *, limit=None):
+            time.sleep(0.2)
+            return {"items": [], "total": 0, "has_more": False}
+
+    session._client = SlowClient()
+    async def scenario():
+        operation = session.info() if method == "request" else session.strings()
+        started = time.monotonic()
+        with pytest.raises(bn_kernel.BnError, match="timed out after 0.03s"):
+            await operation
+        return time.monotonic() - started
+
+    assert _run(scenario()) < 0.1
+    assert session.last is None
 
 
 
@@ -827,6 +944,7 @@ def test_strings_rejects_silent_empty_or_shape_drift(payload):
 
     with pytest.raises(bn_kernel.BnError, match="strings.*contract"):
         _run(session.strings())
+    assert session.last is None
 
 
 
@@ -855,6 +973,7 @@ def test_functions_rejects_collection_shape_drift(payload):
     session._client = FunctionsClient()
     with pytest.raises(bn_kernel.BnError, match="list_functions.*contract"):
         _run(session.functions())
+    assert session.last is None
 
 
 def test_strings_timeout_is_control_not_bridge_filter(monkeypatch):
@@ -885,6 +1004,18 @@ def test_strings_timeout_is_control_not_bridge_filter(monkeypatch):
     assert loaded == [("worker", None, 2)]
 
 
+def test_strings_defaults_to_bounded_page_but_allows_explicit_full_collection():
+    session, client = _native_session()
+
+    _run(session.strings())
+    _run(session.strings(limit=None))
+
+    assert client.calls[-2:] == [
+        ("collect", "strings", {}, {"limit": 100}),
+        ("collect", "strings", {}, {"limit": None}),
+    ]
+
+
 @pytest.mark.parametrize(
     ("method", "args"),
     [
@@ -907,7 +1038,7 @@ def test_curated_helpers_reject_unknown_kwargs(method, args):
         ("functions", (), {"limit": 4, "min_size": 20}, "collect", "list_functions", {"min_size": 20}, {"limit": 4}),
         ("search", ("parse",), {"limit": 3, "exact": True}, "collect", "search_functions", {"query": "parse", "exact": True}, {"limit": 3}),
         ("function_info", ("main",), {"blocks": True}, "request", "function_info", {"identifier": "main", "blocks": True}, {}),
-        ("decompile", ("main",), {"addresses": True, "force_analysis": True}, "request", "decompile", {"identifier": "main", "addresses": True, "force_analysis": True}, {}),
+        ("decompile", ("main",), {"addresses": True, "force_analysis": True}, "request", "decompile", {"identifier": "main", "addresses": True, "force_analysis": True, "include_annotations": False}, {}),
         ("disasm", ("main",), {"linear": 4, "mode": "bytes", "snap_to_instruction": True}, "request", "disasm", {"identifier": "main", "linear": 4, "mode": "bytes", "snap_to_instruction": True}, {}),
         ("il", ("main",), {"view": "mlil", "ssa": True}, "request", "il", {"identifier": "main", "view": "mlil", "ssa": True}, {}),
         ("xrefs", ("main",), {"limit": 2, "fn_pointer_scan": True}, "collect", "xrefs", {"identifier": "main", "fn_pointer_scan": True}, {"limit": 2}),
@@ -1007,6 +1138,52 @@ def test_native_search_retries_dotted_regex_query_and_marks_plain_zero():
     assert "no regex fallback" in session.last.notes[-1]
 
 
+def test_native_search_dot_retries_even_when_literal_dot_matches_subset():
+    session = bn_kernel.Session(instance="worker", backend="native")
+    calls = []
+
+    class SearchClient:
+        def collect(self, op, params=None, *, limit=None):
+            calls.append(dict(params or {}))
+            if params.get("regex"):
+                rows = [
+                    {"name": "first", "size": 12, "size_known": True},
+                    {"name": "second", "size": 12, "size_known": True},
+                ]
+            else:
+                rows = [
+                    {"name": "literal.dot", "size": 12, "size_known": True}
+                ]
+            return {
+                "items": rows,
+                "offset": 0,
+                "returned": len(rows),
+                "total": len(rows),
+                "has_more": False,
+            }
+
+    session._client = SearchClient()
+
+    assert len(_run(session.search("."))) == 2
+    assert calls == [{"query": "."}, {"query": ".", "regex": True}]
+    assert session.last is not None
+    assert session.last.payload["regex_fallback"] is True
+
+
+def test_native_search_rejects_invalid_regex_like_literal():
+    session = bn_kernel.Session(instance="worker", backend="native")
+
+    class SearchClient:
+        def collect(self, op, params=None, *, limit=None):
+            return {"items": [], "total": 0, "has_more": False}
+
+    session._client = SearchClient()
+
+    with pytest.raises(bn_kernel.BnError, match="invalid regex-like.*exact=True"):
+        _run(session.search("[invalid"))
+    assert session.last is None
+
+
 def test_search_regex_fallback_shares_one_timeout_budget(monkeypatch):
     session = bn_kernel.Session(instance="worker", backend="native")
     loaded_timeouts = []
@@ -1054,7 +1231,6 @@ def test_search_regex_fallback_shares_one_timeout_budget(monkeypatch):
         ("plain", {}, {"items": [], "total": 0, "has_more": False}),
         ("Parse|Decode", {"exact": True}, {"items": [], "total": 0, "has_more": False}),
         ("Parse|Decode", {"regex": True}, {"items": [], "total": 0, "has_more": False}),
-        ("[invalid", {}, {"items": [], "total": 0, "has_more": False}),
         (
             "Parse|Decode",
             {},
@@ -1450,6 +1626,7 @@ def test_callsites_rejects_unattributed_or_noncanonical_rows(row):
 
     with pytest.raises(bn_kernel.BnError, match="callsites.*row contract"):
         _run(session.callsites("sink"))
+    assert session.last is None
 
 
 def test_callsites_without_scope_uses_all_callers_on_native_and_cli(

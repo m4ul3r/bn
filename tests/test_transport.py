@@ -235,6 +235,7 @@ def test_list_instances_rejects_registry_filename_identity_mismatch(tmp_path, mo
 
 def test_list_instances_prunes_stale_registry_and_socket(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
     registry_path = bridge_registry_path()
     registry_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -271,6 +272,40 @@ def test_list_instances_prunes_stale_registry_and_socket(tmp_path, monkeypatch):
         stale_socket_path.unlink(missing_ok=True)
 
 
+def test_list_instances_preserves_live_stopped_bridge_when_probe_fails(
+    tmp_path, monkeypatch
+):
+    import bn.transport as transport
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    registry_path = bridge_registry_path()
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    socket_path = tmp_path / "stopped.sock"
+    socket_path.touch()
+    registry_path.write_text(
+        json.dumps(
+            {
+                "pid": 4242,
+                "socket_path": str(socket_path),
+                "plugin_name": "bn_agent_bridge",
+                "plugin_version": "0.1.0",
+                "instance_token": "stopped-token",
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(transport, "_socket_is_live", lambda *args, **kwargs: False)
+    monkeypatch.setattr(transport, "_process_alive", lambda pid: True)
+    monkeypatch.setattr(transport, "_process_state", lambda pid: "T")
+
+    instances = list_instances()
+
+    assert len(instances) == 1
+    assert instances[0].pid == 4242
+    assert registry_path.exists()
+    assert socket_path.exists()
+
+
 def test_send_request_wraps_socket_errors(tmp_path, monkeypatch):
     from bn.transport import BridgeError, BridgeInstance
 
@@ -292,6 +327,7 @@ def test_send_request_wraps_socket_errors(tmp_path, monkeypatch):
 
 def test_purge_keeps_log_sibling_for_diagnostics(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
     inst_dir = instances_dir()
     inst_dir.mkdir(parents=True, exist_ok=True)
 
@@ -331,6 +367,7 @@ def test_purge_keeps_log_sibling_for_diagnostics(tmp_path, monkeypatch):
 
 def test_gc_instances_removes_dead_logs_and_orphans_keeps_live(tmp_path, monkeypatch):
     # #80 cache hygiene: the lazy purge keeps dead instances' .log breadcrumbs
+    monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
     # forever (147 zero-byte logs measured on a real host). `gc_instances()`
     # reaps logs + orphan sockets of dead/gone instances while leaving a live
     # instance and the spawn lock untouched.
@@ -1300,6 +1337,7 @@ def test_choose_instance_no_match_raises(tmp_path, monkeypatch):
 
 def test_list_instances_prunes_stale_in_instances_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
     inst_dir = instances_dir()
     inst_dir.mkdir(parents=True, exist_ok=True)
 

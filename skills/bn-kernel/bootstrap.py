@@ -10,16 +10,34 @@ import sys
 from pathlib import Path
 
 _configured_skill_dir = globals().get("skill_dir")
-_skill_dir = (
-    Path(_configured_skill_dir)
-    if _configured_skill_dir is not None
-    else Path(__file__).resolve().parent
-)
+if _configured_skill_dir is None:
+    _bootstrap_file = globals().get("__file__")
+    if not _bootstrap_file:
+        raise RuntimeError(
+            "bn_kernel bootstrap cannot locate its skill directory; set skill_dir "
+            "to the absolute installed bn-kernel skill path before exec"
+        )
+    _skill_dir = Path(_bootstrap_file).resolve().parent
+else:
+    _skill_dir = Path(_configured_skill_dir).expanduser().resolve()
+
 _source_path = _skill_dir / "src" / "bn_kernel" / "__init__.py"
 _source_hash = hashlib.sha256(_source_path.read_bytes()).hexdigest()
 _source_dir = str(_skill_dir / "src")
-if _source_dir not in sys.path:
-    sys.path.insert(0, _source_dir)
+_source_resolved = _source_path.resolve()
+
+_clean_path = []
+for _entry in sys.path:
+    try:
+        _candidate = (Path(_entry) / "bn_kernel" / "__init__.py").resolve()
+    except (OSError, RuntimeError):
+        _clean_path.append(_entry)
+        continue
+    if _candidate.exists() and _candidate != _source_resolved:
+        continue
+    if str(Path(_entry).resolve()) != str(Path(_source_dir).resolve()):
+        _clean_path.append(_entry)
+sys.path[:] = [_source_dir, *_clean_path]
 
 
 def _module_matches_source(module) -> bool:

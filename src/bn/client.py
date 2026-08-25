@@ -177,4 +177,8 @@ class Client:
         aggregate["has_more"] = bool(
             bridge_has_more and limit is not None and len(items) >= limit
         )
+        if limit is None:
+            aggregate.pop("limit", None)
+        else:
+            aggregate["limit"] = limit
         return aggregate

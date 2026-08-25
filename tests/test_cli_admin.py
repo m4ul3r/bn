@@ -673,6 +673,47 @@ def test_session_list_shows_instances(monkeypatch, capsys):
     assert [item["instance_id"] for item in filtered["items"]] == ["bbbb2222"]
 
 
+def test_session_status_polls_detached_load_job(monkeypatch, capsys):
+    calls = []
+
+    def fake_send_request(op, **kwargs):
+        calls.append((op, kwargs))
+        return {
+            "ok": True,
+            "result": {
+                "kind": "load_jobs",
+                "items": [
+                    {
+                        "job_id": "job123",
+                        "state": "running",
+                        "path": "/tmp/sample.bndb",
+                    }
+                ],
+                "count": 1,
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(
+        [
+            "session",
+            "status",
+            "job123",
+            "-i",
+            "worker",
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 0
+    assert calls[0][0] == "load_status"
+    assert calls[0][1]["params"] == {"job_id": "job123"}
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["items"][0]["state"] == "running"
+
+
 def test_remove_instance_markers_matches_only_the_id(tmp_path):
     # #436: session stop must clean up the instance's own `.bn-<id>` marker and
     # leave unrelated markers (other sessions) in place.
@@ -723,11 +764,11 @@ def test_session_stop_removes_recorded_marker_outside_cwd(
     )
     monkeypatch.chdir(caller)
     monkeypatch.setattr(bn.cli, "list_instances", lambda: [instance])
-    monkeypatch.setattr(
-        bn.cli,
-        "send_request",
-        lambda op, **kwargs: {"ok": True, "result": {}},
-    )
+    def fake_shutdown(op, **kwargs):
+        marker.unlink(missing_ok=True)  # bridge clean-shutdown path removed it
+        return {"ok": True, "result": {}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_shutdown)
     monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda *args, **kwargs: True)
 
     rc = bn.cli.main(
@@ -853,7 +894,7 @@ def test_session_start_passes_workdir_and_no_marker_to_load(monkeypatch, capsys,
 
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         calls.append((op, params))
-        return {"ok": True, "result": {"path": params.get("path"), "loaded": True}}
+        return {"ok": True, "result": {"path": params.get("path"), "loaded": True, "targets": [{"selector": "x.bndb"}]}}
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
@@ -873,7 +914,7 @@ def test_session_start_no_marker_flag_suppresses_marker(monkeypatch, capsys, tmp
 
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         calls.append((op, params))
-        return {"ok": True, "result": {"path": params.get("path"), "loaded": True}}
+        return {"ok": True, "result": {"path": params.get("path"), "loaded": True, "targets": [{"selector": "x.bndb"}]}}
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
@@ -904,7 +945,7 @@ def test_session_start_partial_failure_keeps_bridge_but_exits_nonzero(monkeypatc
         ops.append(op)
         if op == "load_binary":
             if "good" in params["path"]:
-                return {"ok": True, "result": {"path": params["path"], "loaded": True}}
+                return {"ok": True, "result": {"path": params["path"], "loaded": True, "targets": [{"selector": "good.so"}]}}
             raise BridgeError(f"File not found: {params['path']}")
         raise AssertionError(f"unexpected op: {op}")
 
@@ -1309,7 +1350,7 @@ def test_session_start_no_bndb_propagates_to_each_load(monkeypatch, tmp_path):
 
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured.append(dict(params or {}))
-        return {"ok": True, "result": {"loaded": True, "path": params["path"], "notes": [], "targets": []}}
+        return {"ok": True, "result": {"loaded": True, "path": params["path"], "notes": [], "targets": [{"selector": __import__("pathlib").Path(params["path"]).name}]}}
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
     rc = bn.cli.main(["session", "start", "--no-bndb", str(a), str(b)])
@@ -1503,6 +1544,26 @@ def test_capabilities_text_groups_commands_with_routing_hints(capsys):
     assert "callsites" in out and "xrefs" in out
     assert "prefer when:" in out
     assert "see also:" in out
+
+
+def test_help_command_advertises_machine_catalog(capsys):
+    rc = bn.cli.main(["help", "--format", "json"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["kind"] == "help"
+    assert "function" in payload["groups"]
+    assert payload["capabilities_command"] == "bn capabilities --format json"
+
+
+def test_help_command_filters_one_family(capsys):
+    rc = bn.cli.main(["help", "function"])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "function list:" in output
+    assert "function search:" in output
+    assert "machine-readable catalog" not in output
 
 
 def _inst_with_binaries(binaries):

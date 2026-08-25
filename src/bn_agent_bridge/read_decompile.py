@@ -134,24 +134,41 @@ def _thunk_veneer_warning(ctx, bv, func) -> str | None:
             "real function body; the apparent self-call is the resolved target.")
 
 
-def _decompile(ctx, selector: str | None, identifier, *, addresses: bool = False, force_analysis: bool = False):
+def _decompile(
+    ctx,
+    selector: str | None,
+    identifier,
+    *,
+    addresses: bool = False,
+    force_analysis: bool = False,
+    include_annotations: bool = False,
+):
     bv = ctx._resolve_view(selector)
     func = ctx._find_function(bv, identifier, contained=True)
     forced = False
     if force_analysis and bool(getattr(func, "analysis_skipped", False)):
         func = _force_function_analysis(ctx, bv, func)
         forced = True
+
+    comments = il_format._comment_map(bv, func)
+    function_comment = str(getattr(func, "comment", "") or "")
+    annotation_bodies = [
+        *comments.values(),
+        *([function_comment] if function_comment else []),
+    ]
     text = il_format._decompile_text(bv, func, addresses=addresses)
+    if not include_annotations:
+        for body in sorted(
+            {body for body in annotation_bodies if body},
+            key=len,
+            reverse=True,
+        ):
+            text = text.replace(body, "<annotation redacted>")
+
     warnings = il_format._render_warnings(text)
     stub = il_format._analysis_stub_warning(func, text, forced=forced)
     if stub:
         warnings.append(stub)
-    # #446: a PLT/GOT veneer decompiles as an apparent infinite self-recursion
-    # (`return foo();`) because the trampoline resolves back to the same symbol
-    # name. Emit a thunk warning naming the real target instead of leaving the
-    # reader to misread a 4-instruction jump as recursion. Gated on the tailcall
-    # render (the exact confusing case) so a normal decompile pays nothing; the
-    # detector then confirms the small jump-to-target shape.
     if "/* tailcall */" in text:
         thunk_warn = _thunk_veneer_warning(ctx, bv, func)
         if thunk_warn:
@@ -160,19 +177,19 @@ def _decompile(ctx, selector: str | None, identifier, *, addresses: bool = False
         data_warn = _forced_data_region_warning(bv, func)
         if data_warn:
             warnings.append(data_warn)
-    comments = il_format._comment_map(bv, func)
     result = {
         "function": {"name": func.name, "address": hex(func.start)},
         "text": text,
-        "comments": comments,
+        "comments": comments if include_annotations else {},
+        "annotation_summary": {
+            "comment_count": len(annotation_bodies),
+            "redacted": not include_annotations,
+        },
         "warnings": warnings,
         "analysis_skipped": bool(getattr(func, "analysis_skipped", False)),
-        # `analysis_force_requested` echoes the --force-analysis flag; `analysis_forced`
-        # is True only when a reanalysis actually ran this call. On a second forced
-        # decompile the function is no longer skipped, so nothing reruns and
-        # analysis_forced is False -- the echo tells callers the flag wasn't ignored.
         "analysis_force_requested": bool(force_analysis),
         "analysis_forced": forced,
+        "include_annotations": bool(include_annotations),
     }
     _annotate_containment(ctx, result, identifier, func)
     return result
@@ -240,7 +257,7 @@ def _function_info(ctx, selector: str | None, identifier, *, blocks: bool = Fals
     }
     if blocks:
         # #653.10: opt-in -- a 565-block function's ranges are themselves bulky.
-        result["basic_blocks"] = _basic_block_ranges(func)
+        result["blocks"] = _basic_block_ranges(func)
     _annotate_containment(ctx, result, identifier, func)
     return result
 

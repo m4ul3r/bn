@@ -727,14 +727,19 @@ def _should_retry_as_regex(args: argparse.Namespace, result: Any, query: str) ->
     unescaped metacharacters that both matched nothing and compiles is retried."""
     if getattr(args, "regex", False) or getattr(args, "exact", False):
         return False
-    if not isinstance(result, dict) or result.get("total") != 0:
+    if not isinstance(result, dict):
         return False
     if not any(ch in query for ch in _REGEX_METACHARS):
         return False
+    if result.get("total") != 0 and query != ".":
+        return False
     try:
         re.compile(query)
-    except re.error:
-        return False
+    except re.error as exc:
+        raise BridgeError(
+            f"invalid regex-like search query {query!r}: {exc}; "
+            "pass --exact to search for it literally"
+        ) from exc
     return True
 
 
@@ -1086,6 +1091,17 @@ def _call(
             file=sys.stderr,
         )
         regex_hint_query = None  # the retry supersedes the add-`--regex` nudge
+    elif (
+        regex_fallback_query is not None
+        and isinstance(result, dict)
+        and result.get("total") == 0
+    ):
+        result["regex_fallback"] = False
+        print(
+            f'note: "{regex_fallback_query}" matched no function literally; '
+            "no regex fallback was attempted.",
+            file=sys.stderr,
+        )
     # Exit code is computed on the ORIGINAL result (it reads the full results
     # list); a result_transform (e.g. #408 --summary) only changes what is
     # rendered, never the verification-aware exit code.

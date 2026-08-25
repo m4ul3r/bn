@@ -122,7 +122,8 @@ def test_escalation_is_stored(op_registry):
 def test_registry_covers_every_dispatch_op(op_registry):
     REGISTRY = op_registry.REGISTRY
     expected = EXPECTED_READ | EXPECTED_WRITE | {
-        "cancel_request", "load_binary", "go_rename", "shutdown", "refresh",
+        "cancel_request", "load_binary", "load_binary_async", "load_status",
+        "go_rename", "shutdown", "refresh",
     }
     assert REGISTRY.names() == expected
 

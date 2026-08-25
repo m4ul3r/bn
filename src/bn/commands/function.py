@@ -46,9 +46,9 @@ from ..transport import BridgeError
              arg("--count", action="store_true", default=False,
                  help="Show total function count instead of listing"),
              arg("--sort", choices=["address", "size", "name"], default="address",
-                 help="Order results: address (default), size (largest first), or name"),
+                 help="Order results ascending by address (default), size, or name"),
              arg("--reverse", "--desc", action="store_true", default=False, dest="reverse",
-                 help="Reverse the sort's natural order (e.g. --sort size --reverse = smallest first)"),
+                 help="Reverse the sort (e.g. --sort size --reverse = largest first)"),
              arg("--demangle", action="store_true", default=False,
                  help="Show demangled C++ names in text (JSON always carries display_name)"),
              arg("--min-size", type=_positive_int, default=None, dest="min_size", metavar="N",
@@ -129,9 +129,9 @@ def _function_list(args: argparse.Namespace) -> int:
              arg("--count", action="store_true", default=False,
                  help="Show match count instead of listing"),
              arg("--sort", choices=["address", "size", "name"], default="address",
-                 help="Order results: address (default), size (largest first), or name"),
+                 help="Order results ascending by address (default), size, or name"),
              arg("--reverse", "--desc", action="store_true", default=False, dest="reverse",
-                 help="Reverse the sort's natural order (e.g. --sort size --reverse = smallest first)"),
+                 help="Reverse the sort (e.g. --sort size --reverse = largest first)"),
              arg("--demangle", action="store_true", default=False,
                  help="Show demangled C++ names in text (JSON always carries display_name)"),
              arg("--min-size", type=_positive_int, default=None, dest="min_size", metavar="N",
@@ -271,6 +271,8 @@ def _require_text_format(args: argparse.Namespace, flag: str) -> None:
              arg("--force-analysis", action="store_true", default=False,
                  help="If Binary Ninja skipped this function (e.g. too large), override the skip "
                       "and reanalyze it before decompiling (may be slow; takes the write lock)"),
+             arg("--include-annotations", action="store_true", default=False,
+                 help="Include inherited comment bodies in text/JSON (default: redact)"),
          ])
 def _decompile(args: argparse.Namespace) -> int:
     lines_range = getattr(args, "lines", None)
@@ -291,6 +293,7 @@ def _decompile(args: argparse.Namespace) -> int:
             "identifier": args.identifier,
             "addresses": args.addresses,
             "force_analysis": args.force_analysis,
+            "include_annotations": bool(args.include_annotations),
         },
         require_target=True,
         text_renderer=_render_decompile_text,

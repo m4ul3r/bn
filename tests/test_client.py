@@ -60,6 +60,7 @@ def test_collect_aggregates_pages_and_preserves_first_page_metadata(monkeypatch)
                     "returned": 2,
                     "has_more": True,
                     "total": 13,
+                    "limit": 2,
                     "kind": "functions",
                 }
             },
@@ -129,6 +130,7 @@ def test_collect_stops_at_total_limit_and_reports_remaining_rows(monkeypatch):
         "total": 5,
         "offset": 0,
         "returned": 3,
+        "limit": 3,
     }
     assert calls == [{"offset": 0, "limit": 2}, {"offset": 2, "limit": 1}]
 

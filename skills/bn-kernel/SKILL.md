@@ -20,12 +20,12 @@ exec((skill_dir / "bootstrap.py").read_text(encoding="utf-8"))
 
 The bootstrap is idempotent: rerun it after an eval-kernel exit/reset. Every run
 prints `reused` or `reloaded`, the absolute source path, and its source hash. It
-puts that source first on `sys.path`, evicts stale `bn_kernel*` modules, removes
-stale `__pycache__`, reimports, and validates required API signatures. If the
-printed source is not this installed skill directory, stop; rerun the bootstrap
-with the correct absolute `skill_dir`, then use a fresh eval kernel if provenance
-still differs. It cannot preserve an in-flight cell when a sibling kills the
-shared Python process; true crash isolation requires a per-subagent OMP kernel.
+removes foreign `bn_kernel` source roots from `sys.path`, puts this source first,
+evicts stale modules/bytecode, and validates required API signatures. Always set
+the absolute `skill_dir`; an exec context with neither `skill_dir` nor `__file__`
+fails with that exact recovery instruction instead of a `NameError`. It cannot
+preserve an in-flight cell when a sibling kills the shared Python process; true
+crash isolation requires a per-subagent OMP kernel.
 
 ## Bind explicitly
 
@@ -75,6 +75,10 @@ Session, and fails closed on foreign active scopes or callback-binding reuse.
 Sequential scopes may coexist with inactive retained Sessions. Do not return bulk
 collections into shared globals; process isolation remains a harness requirement.
 
+`BN_BACKEND=auto|cli|native` selects the default backend; invalid values fail
+before client construction. An explicit non-`auto` `backend=` argument wins over
+a valid environment default.
+
 Native reads are bounded to 120 seconds by default. Every curated expensive read
 accepts `timeout=`: `info`, `assert_target`, `assert_unannotated`, `functions`,
 `search`, `function_info`, `decompile`, `disasm`, `il`, `xrefs`, `callsites`,
@@ -85,15 +89,15 @@ budget and retain the `bn -i NAME target info` analysis-progress guidance.
 
 Prefer these curated helpers for list-shaped and common reads:
 
-- `await s.info(verbose=False)`; the function total is `function_count`, not `functions`.
-- `await s.functions(timeout=..., ...)`, `await s.search(query, timeout=..., ...)` always return row lists; every row has integer `size` plus `size_known`, and `s.last.payload` is the paged envelope. `search` matches function names/display names only; it does not search decompiled bodies or strings.
-- `await s.function_info(identifier, blocks=False)` returns flattened `name`, `address`, `size`, `size_known`, and `imported` fields; the original bridge shape remains in `s.last.payload`, with identity nested under `payload['function']`.
-- `await s.decompile(identifier)` returns the non-empty `payload['text']` string, not the payload dict; function identity remains under `s.last.payload['function']`. Skipped/“taking too long” placeholders raise and direct you to `force_analysis=True`.
-- `await s.disasm(identifier, count=N)` / `lines=(START, END)` returns an address-ordered, bridge-sliced string with canonical `0x` addresses. `lines` is a 1-indexed inclusive text-line range, never an address range; out-of-range windows raise.
+- `await s.info(verbose=False)` exposes `function_count`, `import_symbol_count` (the exact `imports` row count), and `imported_function_count` (callable imported targets); do not compare the latter two as if they were the same population.
+- `await s.functions(timeout=..., ...)`, `await s.search(query, timeout=..., ...)` always return row lists; every row has integer `size` plus `size_known`, and `s.last.payload` is the paged envelope. Address/name/size sorts are ascending; pass `reverse=True` for descending/largest-first. Search matches function names/display names only. Regex-shaped zero hits disclose `regex_fallback=True|False` on both backends; `"."` is treated as the all-names regex even when literal dots exist, invalid regex-like input raises, and `exact=True` forces a literal.
+- `await s.function_info(identifier, blocks=False)` returns flattened `name`, `address`, `size`, `size_known`, and `imported`; `blocks=True` adds `blocks`. Raw identity remains under `s.last.payload['function']`.
+- `await s.decompile(identifier)` returns the non-empty text string with inherited annotation bodies redacted. Use `include_annotations=True` only after an explicit contamination decision. Skipped placeholders raise and direct you to `force_analysis=True`.
+- `await s.disasm(identifier, count=N)` / `lines=(START, END)` returns an address-ordered, bridge-sliced string with canonical `0x` addresses. `lines` is a 1-indexed inclusive text-line range, never an address range; out-of-range windows raise. Bare-decimal function addresses remain supported but are disclosed as `resolved_from.input_format='decimal'`; prefer `0x`.
 - `await s.il(identifier)`, `await s.xrefs(identifier, timeout=..., ...)`
-- `await s.callsites(callee, timeout=..., ...)` defaults to 100 rows and discloses a bounded high-fan-in scan in `s.last.payload`.
-- `await s.strings(timeout=..., ...)`, `await s.imports(timeout=..., ...)`, `await s.sections(timeout=..., ...)`
-- `await s.assert_unannotated()` reports offending comment locations; `allow_contaminated=True` is the explicit bypass and returns the digest.
+- `await s.callsites(callee, timeout=..., ...)` defaults to 100 rows. A bounded high-fan-in payload may have `total=None`; read `total_lower_bound`, `callers_scanned`, `caller_total`, and `scan_truncated` instead of treating null as zero.
+- `await s.strings(timeout=..., ...)` defaults to 100 rows to avoid latency cliffs; pass `limit=None` explicitly for a full collection. `imports` and `sections` retain explicit `limit=` control.
+- `await s.assert_unannotated()` reports offending comment locations; `allow_contaminated=True` is the explicit bypass and returns the full orientation digest.
 
 Collection and text helpers reject malformed, nested, or silently truncated
 payloads instead of returning an empty/list/dict/`None` shape that can be
@@ -107,24 +111,31 @@ never the payload dict or plain text.
 Discover command-family grammar in-band before guessing arguments:
 
 ```python
-print(await s.help("evidence"))
-catalog = await s.run("capabilities", unwrap=False)  # machine-readable command index
+print(await s.help("evidence"))          # concise by default
+print(await s.help("evidence", full=True))
+print(await s.help("search"))            # maps to `function search`
+catalog = await s.run("capabilities", unwrap=False)
 payload = await s.run("evidence", "orient", unwrap=False)
 ```
 
-`help()` captures concise argparse help directly and makes no bridge request;
-unknown command paths raise only the terminal argparse error rather than its
-full usage blob. Use `capabilities` when code needs a machine-readable command
-catalog. `Session.run()` always uses the CLI artifact path, even when
-`s.backend == 'native'`, so it preserves the complete command surface without
-duplicating the command registry. Before any mutation/save escape hatch, call
-`await s.assert_target("<expected>")`. Continue to follow the `bn` skill's
-preview, verification, readback, and save loop for every mutation. Use the CLI
-directly for session start/list/stop, load, close, refresh, and save.
+`help()` makes no bridge request. Use `full=True` only for the expanded grammar;
+use `capabilities` when code needs a machine-readable catalog. `Session.run()`
+always uses the CLI artifact path, even when `s.backend == 'native'`. Before any
+mutation/save escape hatch, call `await s.assert_target("<expected>")` and follow
+the `bn` skill's preview, verification, readback, and save loop.
+
+Use the CLI for lifecycle. For large BNDBs, queue loading instead of tying it to
+a single command budget:
+
+```bash
+bn session start /path/to/large.bndb --instance-id worker --detach
+bn -i worker session status              # or append the returned job id
+bn -i worker target list                 # selector after state=complete
+```
  
 ## Load cost and memory
 
-Full loads run Binary Ninja analysis to completion. They can take seconds to minutes under contention, not a fixed few seconds. Each headless bridge can consume hundreds of MB; a large or complex BNDB may be OOM-killed. Bound fan-out concurrency, watch RSS with `bn session list`, use `--quick` for container-level triage, and stop instances promptly.
+Full loads can take many minutes and each bridge can consume hundreds of MB. Detached start registers the bridge first and exposes queued/running/complete/failed load state through `session status`; it is the recovery path when a synchronous cold load would exceed 120 seconds. Bound fan-out concurrency, watch RSS with `bn session list`, use `--quick` for raw/container triage (it cannot skip analysis already stored inside a BNDB), and stop instances promptly.
 
 ## OMP harness escalation
 

@@ -918,6 +918,8 @@ class BinaryNinjaBridge:
         self.instance_id = instance_id
         self.instance_token = str(uuid.uuid4())
         self._marker_paths: set[str] = set()
+        self._load_jobs_lock = threading.Lock()
+        self._load_jobs: dict[str, dict[str, Any]] = {}
         self.targets = TargetManager()
         self.ctx = BridgeContext(self.targets)
         self.socket_path = bridge_socket_path(instance_id)
@@ -1329,6 +1331,91 @@ class BinaryNinjaBridge:
             "targets": targets,
         }
 
+    def _load_binary_async(
+        self,
+        path: str,
+        *,
+        prefer_bndb: bool = True,
+        quick: bool = False,
+        workdir: str | None = None,
+        no_marker: bool = False,
+    ) -> dict[str, Any]:
+        resolved = Path(path).expanduser().resolve()
+        if not resolved.exists():
+            raise RuntimeError(f"File not found: {resolved}")
+        job_id = uuid.uuid4().hex
+        created_at = datetime.now(timezone.utc).isoformat()
+        job = {
+            "job_id": job_id,
+            "state": "queued",
+            "path": str(resolved),
+            "created_at": created_at,
+            "started_at": None,
+            "finished_at": None,
+            "error": None,
+            "result": None,
+        }
+        with self._load_jobs_lock:
+            self._load_jobs[job_id] = job
+
+        def worker() -> None:
+            with self._load_jobs_lock:
+                job["state"] = "running"
+                job["started_at"] = datetime.now(timezone.utc).isoformat()
+            try:
+                result = self._load_binary(
+                    str(resolved),
+                    prefer_bndb=prefer_bndb,
+                    quick=quick,
+                    workdir=workdir,
+                    no_marker=no_marker,
+                )
+            except BaseException as exc:
+                with self._load_jobs_lock:
+                    job["state"] = "failed"
+                    job["error"] = f"{type(exc).__name__}: {exc}"
+                    job["finished_at"] = datetime.now(timezone.utc).isoformat()
+            else:
+                with self._load_jobs_lock:
+                    job["state"] = "complete"
+                    job["result"] = result
+                    job["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+        threading.Thread(
+            target=worker,
+            name=f"bn-load-{job_id[:8]}",
+            daemon=True,
+        ).start()
+        return {
+            "job_id": job_id,
+            "state": "queued",
+            "path": str(resolved),
+            "status_command": (
+                f"bn -i {self.instance_id} session status {job_id}"
+                if self.instance_id
+                else f"bn session status {job_id}"
+            ),
+        }
+
+    def _load_status(self, job_id: str | None = None) -> dict[str, Any]:
+        with self._load_jobs_lock:
+            if job_id is not None:
+                job = self._load_jobs.get(str(job_id))
+                if job is None:
+                    raise RuntimeError(f"Unknown load job: {job_id}")
+                items = [dict(job)]
+            else:
+                items = [
+                    dict(job)
+                    for _key, job in sorted(self._load_jobs.items())
+                ]
+        return {
+            "kind": "load_jobs",
+            "items": items,
+            "count": len(items),
+        }
+
+
     def _load_binary(self, path: str, *, prefer_bndb: bool = True, quick: bool = False,
                      workdir: str | None = None, no_marker: bool = False,
                      marker_refresh_only: bool = False):
@@ -1540,7 +1627,7 @@ class BinaryNinjaBridge:
             return {
                 "path": str(getattr(bv.file, "filename", "")),
                 "unsaved": self.targets.is_dirty(bv),
-                "file_modified": bool(getattr(bv.file, "modified", False)),
+                "engine_modified": bool(getattr(bv.file, "modified", False)),
             }
 
         # The three ways to name what to close -- a target selector, a path,
@@ -1879,6 +1966,16 @@ class BinaryNinjaBridge:
         quick = bv in _quick_loaded_views
         unanalyzed = bv in _unanalyzed_views
         filename = str(getattr(getattr(bv, "file", None), "filename", "") or "")
+        try:
+            import_symbol_count = int(
+                read_misc._imports(
+                    self.ctx,
+                    selector,
+                    count_only=True,
+                ).get("count", 0)
+            )
+        except Exception:
+            import_symbol_count = None
         info = {
             **(record or {}),
             "path": filename,
@@ -1922,6 +2019,11 @@ class BinaryNinjaBridge:
             "analysis_progress": _analysis_progress(bv),
             # Function-count summary every agent reaches for (#122).
             **_function_name_summary(bv),
+            "import_symbol_count": import_symbol_count,
+            "import_count_definition": {
+                "import_symbol_count": "rows returned by imports",
+                "imported_function_count": "callable imported function targets",
+            },
         }
         # --verbose surfaces the segment map (r/w/x ranges) so reaching for it on
         # target info -- the natural reflex, since function info accepts it -- is
@@ -3106,6 +3208,30 @@ def _bind_load_binary(bridge, params, target):
     )
 
 
+@op("load_binary_async", lock="none")
+def _bind_load_binary_async(bridge, params, target):
+    return bridge._load_binary_async(
+        str(params["path"]),
+        prefer_bndb=_validate_bool(
+            params.get("prefer_bndb"),
+            label="prefer_bndb",
+            default=True,
+        ),
+        quick=_validate_bool(params.get("quick"), label="quick", default=False),
+        workdir=params.get("workdir"),
+        no_marker=_validate_bool(
+            params.get("no_marker"),
+            label="no_marker",
+            default=False,
+        ),
+    )
+
+
+@op("load_status", lock="none")
+def _bind_load_status(bridge, params, target):
+    return bridge._load_status(params.get("job_id"))
+
+
 @op("close_binary", lock="write")
 def _bind_close_binary(bridge, params, target):
     # The selector rides the TOP-LEVEL request key. path/all DO live in
@@ -3204,6 +3330,11 @@ def _bind_decompile(bridge, params, target):
         params["identifier"],
         addresses=_validate_bool(params.get("addresses"), label="addresses", default=False),
         force_analysis=_validate_bool(params.get("force_analysis"), label="force_analysis", default=False),
+        include_annotations=_validate_bool(
+            params.get("include_annotations"),
+            label="include_annotations",
+            default=False,
+        ),
     )
 
 
