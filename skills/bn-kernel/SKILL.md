@@ -75,6 +75,46 @@ Session, and fails closed on foreign active scopes or callback-binding reuse.
 Sequential scopes may coexist with inactive retained Sessions. Do not return bulk
 collections into shared globals; process isolation remains a harness requirement.
 
+## Parallel bn-kernel subagents
+
+When two or more concurrent children will use bn-kernel, launch them from an
+Eval cell with `agent()` inside `parallel()`. Eval-agent children receive
+independent retained kernels on current OMP releases; ordinary `task` children
+inherit one eval session and can overwrite globals/modules or kill sibling
+cells. A direct-CLI-only fleet may still use an ordinary task batch.
+
+Give every child a self-contained assignment, a unique bridge instance and
+target, and require a bounded summary rather than returning its Session or bulk
+rows:
+
+```python
+results = await parallel([
+    lambda: agent(
+        "Use bn-kernel. Analyze target A via instance bnk-a and its exact "
+        "selector. Use direct bn only for lifecycle, keep state function-local "
+        "with scoped(), and return a bounded summary.",
+        label="A",
+    ),
+    lambda: agent(
+        "Use bn-kernel. Analyze target B via instance bnk-b and its exact "
+        "selector. Use direct bn only for lifecycle, keep state function-local "
+        "with scoped(), and return a bounded summary.",
+        label="B",
+    ),
+    lambda: agent(
+        "Use bn-kernel. Analyze target C via instance bnk-c and its exact "
+        "selector. Use direct bn only for lifecycle, keep state function-local "
+        "with scoped(), and return a bounded summary.",
+        label="C",
+    ),
+])
+```
+
+This is the required current workaround for parallel retained-kernel analysis;
+it does not replace explicit binding, `assert_target()`, `assert_unannotated()`,
+or cleanup. If ordinary task children gain per-agent retained-kernel isolation
+in a future OMP release, either launch path becomes safe.
+
 `BN_BACKEND=auto|cli|native` selects the default backend; invalid values fail
 before client construction. An explicit non-`auto` `backend=` argument wins over
 a valid environment default.
