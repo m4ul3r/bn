@@ -2889,3 +2889,138 @@ def test_cfg_rejects_unknown_view(monkeypatch):
     with pytest.raises(bridge.OperationFailure) as exc:
         instance._cfg(None, "process_packet", view="llil")
     assert "view" in str(exc.value)
+
+
+# --- Cross-surface decimal-disclosure parity ------------------------------
+#
+# The skill promises that a bare-decimal address is accepted everywhere a
+# function identifier is accepted, and disclosed with ONE envelope shape. Agents
+# reported observing different keys on different surfaces, so this enumerates
+# EVERY containment-enabled read and drives the same four spellings through each
+# one. It is behavioral: each entry runs the real handler and reads the real
+# payload, so a new read that forgets `_annotate_containment` (or annotates with
+# its own key set) fails here rather than being caught by a source grep.
+
+def _containment_surface_calls():
+    """(id, callable(instance, identifier)) for every containment-enabled read."""
+    return [
+        ("decompile", lambda inst, ident: inst._decompile("active", ident)),
+        ("function_info", lambda inst, ident: inst._function_info("active", ident)),
+        ("proto_get", lambda inst, ident: inst._get_prototype("active", ident)),
+        ("local_list", lambda inst, ident: inst._list_locals_for_function("active", ident)),
+        ("il", lambda inst, ident: inst._il("active", ident, "mlil", False)),
+        ("cfg", lambda inst, ident: inst._cfg("active", ident)),
+        ("disasm", lambda inst, ident: inst._disasm("active", ident)),
+        ("structured_il", lambda inst, ident: inst._structured_il("active", ident)),
+        ("resolved_calls", lambda inst, ident: inst._resolved_calls("active", ident)),
+        ("defuse", lambda inst, ident: inst._defuse("active", ident, "arg1#0")),
+        # `at` names the instruction to inspect and is always an address; the
+        # identifier under test is the FUNCTION selector, which is what carries
+        # the containment disclosure.
+        ("possible_values", lambda inst, ident: inst._possible_values("active", ident, "0x401000")),
+        ("evidence_function", lambda inst, ident: inst._function_evidence("active", ident, context=0)),
+    ]
+
+
+def _containment_instance(monkeypatch):
+    """A bridge bound to parse_packet @ 0x401000..0x401040 with just enough IL
+    stubbing that every surface reaches its result instead of refusing early."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    # A block that satisfies BOTH the containment span (`end`) and `cfg`'s
+    # disassembly-line reader, so one fixture drives every surface.
+    block = _FakeCFGBlock(
+        0x401000,
+        lines=[_FakeCFGLine(0x401000, "push rbp"), _FakeCFGLine(0x401010, "ret")],
+    )
+    block.end = 0x401040
+    fn = _FakeFunction(0x401000, "parse_packet")
+    fn.basic_blocks = [block]
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    # An MLIL instruction at each candidate address so `possible_values` resolves
+    # a real value-set rather than short-circuiting on "no instruction here".
+    instructions = [
+        types.SimpleNamespace(
+            address=address,
+            possible_values=_pvs("ConstantValue", value=7),
+            src=None,
+        )
+        for address in (0x401000, 0x401010)
+    ]
+    il = types.SimpleNamespace(
+        instructions=instructions,
+        get_ssa_var_definition=lambda v: None,
+        get_ssa_var_uses=lambda v: [],
+    )
+    monkeypatch.setattr(bridge.il_format, "_il_function_for", lambda fn, view, ssa: il)
+    ssa_var = types.SimpleNamespace(
+        var=types.SimpleNamespace(name="arg1", type="int"), version=0
+    )
+    monkeypatch.setattr(
+        bridge.il_format, "_resolve_ssa_variable", lambda func, il_, sel: (ssa_var, [])
+    )
+    monkeypatch.setattr(bridge.il_format, "_ssa_var_entry", lambda v: {"ssa": "arg1#0"})
+    return instance
+
+
+assert 4198416 == 0x401010 and 4198400 == 0x401000
+
+
+@pytest.mark.parametrize(
+    "surface,call", _containment_surface_calls(), ids=[c[0] for c in _containment_surface_calls()]
+)
+def test_every_containment_read_discloses_decimal_interior_identically(monkeypatch, surface, call):
+    instance = _containment_instance(monkeypatch)
+
+    hex_result = call(instance, "0x401010")
+    dec_result = call(instance, "4198416")
+
+    assert hex_result["function"]["address"] == "0x401000", surface
+    assert dec_result["function"]["address"] == "0x401000", surface
+    # ONE documented shape, requested_address normalized to hex on both, and the
+    # decimal spelling is the only difference between them.
+    assert hex_result["resolved_from"] == {
+        "requested_address": "0x401010",
+        "offset": "+0x10",
+    }, surface
+    assert dec_result["resolved_from"] == {
+        "requested_address": "0x401010",
+        "offset": "+0x10",
+        "input_format": "decimal",
+    }, surface
+
+
+@pytest.mark.parametrize(
+    "surface,call", _containment_surface_calls(), ids=[c[0] for c in _containment_surface_calls()]
+)
+def test_every_containment_read_discloses_decimal_exact_start_identically(monkeypatch, surface, call):
+    # A digit-only token that lands exactly on the start is still disclosed, so
+    # it can never be silently mistaken for a symbol named "4198400" -- with a
+    # zero offset, which is what tells a reader it was NOT a containment hit.
+    instance = _containment_instance(monkeypatch)
+
+    result = call(instance, "4198400")
+
+    assert result["function"]["address"] == "0x401000", surface
+    assert result["resolved_from"] == {
+        "requested_address": "0x401000",
+        "offset": "+0x0",
+        "input_format": "decimal",
+    }, surface
+
+
+@pytest.mark.parametrize(
+    "surface,call", _containment_surface_calls(), ids=[c[0] for c in _containment_surface_calls()]
+)
+@pytest.mark.parametrize("identifier", ["0x401000", "parse_packet"])
+def test_every_containment_read_leaves_exact_hex_and_names_unannotated(
+    monkeypatch, surface, call, identifier
+):
+    instance = _containment_instance(monkeypatch)
+
+    result = call(instance, identifier)
+
+    assert result["function"]["address"] == "0x401000", surface
+    assert "resolved_from" not in result, surface

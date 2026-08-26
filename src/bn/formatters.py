@@ -122,12 +122,21 @@ def _slice_text_lines(
 
 
 def _resolution_note(value: Any) -> str:
-    """A leading note when a function-scoped read resolved an interior address
-    to its containing function (#193 Part 4).
+    """A leading note when a function-scoped read annotated how it resolved the
+    requested address (#193 Part 4).
 
-    Without it, text-mode output for a mid-function address (e.g. a taint/trace
-    sink) silently shows a function whose start differs from what was asked,
-    which reads like the wrong answer. Returns '' when not applicable.
+    Two distinct disclosures share one `resolved_from` envelope, and text mode
+    must say exactly what the JSON says:
+
+    * a non-zero offset means an INTERIOR address resolved to its containing
+      function -- without the note, text output silently shows a function whose
+      start differs from what was asked, which reads like the wrong answer;
+    * ``input_format: decimal`` means a digit-only token was read as an address
+      rather than a symbol name. At offset ``+0x0`` that is the ONLY news: the
+      read answered for exactly the function the caller named, so claiming
+      containment there contradicts the payload.
+
+    Returns '' when not applicable.
     """
     if not isinstance(value, dict):
         return ""
@@ -137,10 +146,34 @@ def _resolution_note(value: Any) -> str:
     function = _as_dict(value.get("function"))
     name = function.get("name", "?")
     address = function.get("address", "?")
+    requested = resolved_from.get("requested_address")
+    decimal = resolved_from.get("input_format") == "decimal"
+    spelling = " (decimal input)" if decimal else ""
+    if _is_exact_start(resolved_from):
+        if not decimal:
+            return ""
+        return (
+            f"// bn: decimal input resolved to {requested}, the exact start of "
+            f"{name}\n"
+        )
     return (
-        f"// bn: {resolved_from.get('requested_address')} is inside {name} "
+        f"// bn: {requested}{spelling} is inside {name} "
         f"@ {address} ({resolved_from.get('offset')}); showing the containing function\n"
     )
+
+
+def _is_exact_start(resolved_from: dict[str, Any]) -> bool:
+    """True when a `resolved_from` disclosure names the function's own start.
+
+    Only a bare-decimal exact request is disclosed with a zero offset (so a
+    digit-only token can't be mistaken for a symbol name); every containment
+    resolution carries a non-zero offset.
+    """
+    offset = str(resolved_from.get("offset") or "")
+    try:
+        return int(offset.replace("+", "").replace("-", "") or "1", 16) == 0
+    except ValueError:
+        return False
 
 
 def _disasm_linear_steer_note(value: Any, *, sliced: bool) -> str:
@@ -151,12 +184,15 @@ def _disasm_linear_steer_note(value: Any, *, sliced: bool) -> str:
     an xref address silently gets the prologue. Point at `--linear`, which
     decodes N instructions from the exact address regardless of function
     membership. Fires only when a slice is active AND the address resolved
-    mid-function -- an exact start or a whole-function dump has no trap.
+    mid-function -- an exact start or a whole-function dump has no trap. A
+    bare-decimal EXACT start also carries `resolved_from` (offset +0x0) purely to
+    disclose the spelling, and there the slice already begins at the requested
+    address, so the steer would be false advice.
     """
     if not sliced or not isinstance(value, dict):
         return ""
     resolved_from = value.get("resolved_from")
-    if not isinstance(resolved_from, dict):
+    if not isinstance(resolved_from, dict) or _is_exact_start(resolved_from):
         return ""
     addr = resolved_from.get("requested_address", "?")
     return (
@@ -626,6 +662,13 @@ def _render_session_status_text(value: Any) -> str:
             for target in result.get("targets") or []:
                 if isinstance(target, dict) and target.get("selector"):
                     lines.append(f"  target: {target['selector']}")
+    # A job-specific poll that has NOT finished names the exact command to
+    # re-run, so text mode never leaves the caller reconstructing it. Terminal
+    # jobs drop the hint: re-polling a finished job is pure waste and would
+    # contradict `terminal: true`.
+    status_command = value.get("status_command")
+    if status_command and value.get("terminal") is False:
+        lines.append(f"  poll: {status_command}")
     return "\n".join(lines)
 
 

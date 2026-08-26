@@ -42,6 +42,7 @@ from . import vars as vars_mod
 from ._shared import (
     IMPORT_SYMBOL_TYPE_NAMES,
     OperationFailure,
+    _annotate_row_fields,
     _artifact_summary,
     _json_response,
     _normalize_prototype,
@@ -83,6 +84,12 @@ MAX_REQUEST_BYTES = 32 * 1024 * 1024
 # leave a stale process lingering far past its deadline, while a short timeout
 # still reaps promptly (poll = min(timeout, this)).
 _IDLE_REAPER_MAX_POLL_SECONDS = 30.0
+
+# Detached-load job states that will never change again, mapped to their success
+# verdict. The single source of truth for the `terminal`/`succeeded` fields of a
+# job-specific `session status`, so a poller never has to re-derive terminality
+# from the state string.
+_TERMINAL_LOAD_STATES: dict[str, bool] = {"complete": True, "failed": False}
 
 
 def _parse_idle_timeout(raw: str | None) -> float | None:
@@ -1271,7 +1278,10 @@ class BinaryNinjaBridge:
         spec = REGISTRY.spec(op)
         if spec is None:
             raise ValueError(f"Unknown operation: {op}")
-        return spec.binder(self, params, target)
+        # One choke point for the in-band row-field hint: every collection read,
+        # over either backend, gains `row_fields` without its handler (or the CLI
+        # and kernel downstream) re-declaring anything.
+        return _annotate_row_fields(spec.binder(self, params, target))
 
     def _doctor(self):
         return {
@@ -1390,30 +1400,56 @@ class BinaryNinjaBridge:
             "job_id": job_id,
             "state": "queued",
             "path": str(resolved),
-            "status_command": (
-                f"bn -i {self.instance_id} session status {job_id}"
-                if self.instance_id
-                else f"bn session status {job_id}"
-            ),
+            "status_command": self._load_status_command(job_id),
         }
 
     def _load_status(self, job_id: str | None = None) -> dict[str, Any]:
+        """Poll detached load jobs.
+
+        Naming a job returns the single-job contract: the top-level
+        ``state``/``terminal``/``succeeded`` verdict a polling agent needs plus
+        the canonical record under ``job``. Omitting the id keeps the population
+        collection, where a single terminal/succeeded verdict would be a lie.
+        """
         with self._load_jobs_lock:
             if job_id is not None:
                 job = self._load_jobs.get(str(job_id))
                 if job is None:
                     raise RuntimeError(f"Unknown load job: {job_id}")
-                items = [dict(job)]
+                record = dict(job)
             else:
-                items = [
-                    dict(job)
-                    for _key, job in sorted(self._load_jobs.items())
-                ]
+                return {
+                    "kind": "load_jobs",
+                    "items": [
+                        dict(job)
+                        for _key, job in sorted(self._load_jobs.items())
+                    ],
+                    "count": len(self._load_jobs),
+                }
+        state = record.get("state")
+        terminal = state in _TERMINAL_LOAD_STATES
         return {
-            "kind": "load_jobs",
-            "items": items,
-            "count": len(items),
+            "kind": "load_job",
+            "job_id": record.get("job_id"),
+            "state": state,
+            "terminal": terminal,
+            # None while the load is still in flight: a False here would read as
+            # "the load failed" and make a poll loop tear down a healthy bridge.
+            "succeeded": _TERMINAL_LOAD_STATES.get(state) if terminal else None,
+            "job": record,
+            "status_command": self._load_status_command(record.get("job_id")),
+            # `items` stays the universal data container (#275) so the envelope
+            # doctrine and every existing items[0] reader keep working.
+            "items": [record],
+            "count": 1,
         }
+
+    def _load_status_command(self, job_id: Any) -> str:
+        return (
+            f"bn -i {self.instance_id} session status {job_id}"
+            if self.instance_id
+            else f"bn session status {job_id}"
+        )
 
 
     def _load_binary(self, path: str, *, prefer_bndb: bool = True, quick: bool = False,

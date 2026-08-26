@@ -33,6 +33,70 @@ def _json_response(*, ok: bool, result: Any = None, error: str | None = None) ->
     return {"ok": ok, "result": result, "error": error}
 
 
+# Row keys per collection `kind`. Collection rows differ ON PURPOSE -- functions
+# key on address/size, sections on start/end/length, callsites nest
+# callee/containing_function -- and an agent filtering rows locally had no
+# in-band way to learn which schema it was holding: `brief(rows, "address")` on
+# sections was the only feedback, after the read had already been paid for.
+#
+# This map exists ONLY for the empty-page case, where there is no runtime row to
+# read the schema off. Populated pages derive the hint from their own rows, so a
+# renamed or added key can never leave a populated read advertising a stale
+# schema; `test_declared_row_fields_match_the_rows_the_bridge_builds` holds the
+# declarations to the same standard for the empty case.
+_DECLARED_ROW_FIELDS: dict[str, tuple[str, ...]] = {
+    "functions": (
+        "address", "name", "raw_name", "display_name", "size", "size_known",
+        "imported", "auto_named", "basic_block_count",
+    ),
+    "strings": ("address", "value", "chars", "length", "type"),
+    "imports": ("address", "name", "raw_name", "kind", "library", "namespace"),
+    "exports": (
+        "address", "name", "raw_name", "display_name", "kind", "binding",
+        "ordinal",
+    ),
+    "sections": ("name", "start", "end", "length", "semantics"),
+    "xrefs": ("address", "kind", "function", "caller_function", "context"),
+    "callsites": (
+        "callee", "containing_function", "call_addr", "call_kind",
+        "caller_static", "instruction_length", "call_instruction",
+        "previous_instructions", "next_instructions", "hlil_statement",
+        "hlil_statement_reason", "pre_branch_condition", "callee_variadic",
+    ),
+}
+
+
+def _annotate_row_fields(result: Any) -> Any:
+    """Attach `row_fields` to a collection envelope, in place.
+
+    Applied once at the dispatch boundary so every collection read -- current and
+    future, CLI and native -- carries the hint without a second catalog for the
+    CLI or the kernel to re-declare. Declared keys lead (a stable documented
+    order), then any key an actual row carries, so an undeclared `kind` still
+    self-describes from its rows. Non-collection results are returned untouched:
+    a row hint on `decompile` text would be a lie.
+    """
+    if not isinstance(result, dict) or "row_fields" in result:
+        return result
+    kind = result.get("kind")
+    items = result.get("items")
+    if not isinstance(kind, str) or not isinstance(items, list):
+        return result
+    fields = list(_DECLARED_ROW_FIELDS.get(kind, ()))
+    seen = set(fields)
+    for row in items:
+        if not isinstance(row, dict):
+            # Not a row collection (e.g. a list of strings): no field hint.
+            return result
+        for key in row:
+            if key not in seen:
+                seen.add(key)
+                fields.append(key)
+    if fields:
+        result["row_fields"] = fields
+    return result
+
+
 # Symbol types whose NAME comes from relocations/imports, not from analysis or a
 # human. Counting these as "named" badly overstates how much real code is named
 # on a stripped binary (PLT import trampolines dominate it), so they get their

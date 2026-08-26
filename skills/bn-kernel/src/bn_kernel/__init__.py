@@ -415,6 +415,25 @@ class Result:
                 return total
         return None
 
+    @property
+    def row_fields(self) -> list[str] | None:
+        """The read's own row-key declaration, or None when it published none.
+
+        Read straight off the payload the bridge returned, so there is no second
+        catalog here to drift from the rows: collection schemas differ on purpose
+        (functions key on address/size, sections on start/end/length, callsites
+        nest callee/containing_function) and this is how to learn which one you
+        are holding without a failed `brief()` or a trip through the source.
+        """
+        if not isinstance(self.payload, Mapping):
+            return None
+        fields = self.payload.get("row_fields")
+        if not isinstance(fields, list) or not all(
+            isinstance(field, str) for field in fields
+        ):
+            return None
+        return list(fields)
+
 
 def _unwrap(payload: Any) -> Any:
     if isinstance(payload, dict):
@@ -1600,6 +1619,29 @@ async def run(
     return await Session(instance, target).run(*args, **kwargs)
 
 
+def _missing_key_message(row: Mapping[str, Any], key: str, index: int) -> str:
+    """Name what the row ACTUALLY has when a `brief()` key misses.
+
+    Collection row schemas differ on purpose (functions key on address/size,
+    sections on start/end/length, callsites nest callee/containing_function), so
+    a bare KeyError plus generic dotted-path advice sent agents back to re-run a
+    read -- or to the source -- just to learn the key names. List them.
+
+    Dotted-path guidance is offered only when this row actually nests, and names
+    the nesting keys instead of an unrelated example.
+    """
+    available = ", ".join(repr(name) for name in row) or "(row has no keys)"
+    message = (
+        f"brief key {key!r} is missing at row {index}; "
+        f"available keys: {available}"
+    )
+    nested = [name for name, value in row.items() if isinstance(value, Mapping)]
+    if nested:
+        paths = ", ".join(f"{name}.*" for name in nested)
+        message += f"; use dotted paths for the nested mappings: {paths}"
+    return message
+
+
 def brief(
     rows: Sequence[Mapping[str, Any]], *keys: str, n: int = 10
 ) -> str:
@@ -1625,10 +1667,7 @@ def brief(
         value: Any = row
         for part in key.split("."):
             if not isinstance(value, Mapping) or part not in value:
-                raise KeyError(
-                    f"brief key {key!r} is missing at row {index}; "
-                    "use dotted paths such as 'callee.name' for nested fields"
-                )
+                raise KeyError(_missing_key_message(row, key, index))
             value = value[part]
         return value
 

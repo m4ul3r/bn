@@ -1081,3 +1081,101 @@ def test_bare_close_survives_malformed_list_targets_reply(monkeypatch, capsys):
         assert rc == want_rc, reply
         if want_target is not None:
             assert calls[-1]["target"] == want_target, reply
+
+
+# --- `bn target close SELECTOR` -------------------------------------------
+#
+# Dogfood agents reached for `bn target close` first (it is where `target
+# list`/`use`/`info` live) and got an argparse error, then guessed their way to
+# `bn close -t`. The explicit subcommand exists so the discovery path that
+# agents actually take leads somewhere, and it must delegate to the canonical
+# close so unsaved-safety and selector validation cannot drift.
+
+def test_target_close_forwards_the_selector_to_canonical_close(fake_transport, monkeypatch, capsys):
+    calls = fake_transport({
+        "close_binary": {"ok": True, "result": {"closed": [{"path": "/tmp/foo.bndb", "unsaved": False}]}}
+    })
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    rc = bn.cli.main(["target", "close", "foo.bndb", "--format", "text"])
+
+    assert rc == 0
+    assert calls[-1]["op"] == "close_binary"
+    assert calls[-1]["target"] == "foo.bndb"
+    # One concrete target, never a fan-out.
+    assert "all" not in calls[-1]["params"]
+    assert "path" not in calls[-1]["params"]
+    assert "closed: /tmp/foo.bndb" in capsys.readouterr().out
+
+
+def test_target_close_preserves_unsaved_warning(fake_transport, monkeypatch, capsys):
+    # The whole reason close is not a one-liner: it warns when the view it tore
+    # down had unsaved analysis. The alias must not lose that.
+    fake_transport({
+        "close_binary": {"ok": True, "result": {"closed": [{"path": "/tmp/foo.bndb", "unsaved": True}]}}
+    })
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    rc = bn.cli.main(["target", "close", "foo.bndb", "--format", "text"])
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "unsaved" in out.lower()
+    assert "bn save" in out
+
+
+def test_target_close_rejects_an_empty_selector_without_closing(fake_transport, monkeypatch, capsys):
+    # `bn target close "$SEL"` with SEL unset must error, never fall through to
+    # a bare close that tears down whatever single target happens to be open.
+    calls = fake_transport({"close_binary": {"ok": True, "result": {"closed": []}}})
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    rc = bn.cli.main(["target", "close", ""])
+
+    assert rc != 0
+    assert not [call for call in calls if call["op"] == "close_binary"]
+    err = capsys.readouterr().err
+    assert "selector is empty" in err
+    # The recovery must be phrased in THIS command's vocabulary: `--target` is
+    # not an option here, so pointing at it would be dead advice.
+    assert "--target" not in err
+    assert "bn target list" in err
+
+
+def test_target_close_requires_a_selector(fake_transport, capsys):
+    # No ambient selector: omitting the argument is an argparse error, not an
+    # implicit "close whatever is pinned/open".
+    fake_transport({})
+    with pytest.raises(SystemExit):
+        bn.cli.main(["target", "close"])
+    assert "selector" in capsys.readouterr().err.lower()
+
+
+def test_target_close_ignores_a_sticky_pin(fake_transport, monkeypatch, capsys):
+    # A sticky `target use` pin must never decide what a destructive close tears
+    # down; the named selector is the only input.
+    calls = fake_transport({
+        "close_binary": {"ok": True, "result": {"closed": [{"path": "/tmp/beta", "unsaved": False}]}}
+    })
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {"target": "alpha.bndb"})
+
+    rc = bn.cli.main(["target", "close", "beta.bndb", "--format", "text"])
+
+    assert rc == 0
+    assert calls[-1]["target"] == "beta.bndb"
+
+
+def test_target_close_is_advertised_by_help_and_capabilities(fake_transport, capsys):
+    fake_transport({})
+
+    assert bn.cli.main(["help", "target"]) == 0
+    assert "target close" in capsys.readouterr().out
+
+    assert bn.cli.main(["capabilities", "--format", "json"]) == 0
+    catalog = json.loads(capsys.readouterr().out)
+    entry = next(
+        item for item in catalog["items"] if item["command"] == "target close"
+    )
+    assert entry["group"] == "target"
+    assert "close" in entry["help"].lower()
+    assert "close" in entry["see_also"]

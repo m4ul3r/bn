@@ -702,6 +702,110 @@ def test_detached_load_job_exposes_pollable_progress(monkeypatch, tmp_path):
     assert completed["result"]["targets"] == [{"selector": "sample.bndb"}]
     assert "session status" in queued["status_command"]
 
+
+def test_job_specific_load_status_exposes_top_level_machine_fields(monkeypatch, tmp_path):
+    # A single-job poll is the hot loop of every detached load: the agent asks
+    # "is it done, and did it work?". Before this contract it had to index
+    # items[0] and re-derive terminality from the state string by hand, which is
+    # exactly the inference that produced wasted poll loops in the VIBE24 run.
+    # The job-specific query must answer both questions at the TOP level.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(instance_id="worker")
+    binary = tmp_path / "sample.bndb"
+    binary.write_bytes(b"")
+    release = threading.Event()
+    started = threading.Event()
+
+    def slow_load(path, **kwargs):
+        started.set()
+        assert release.wait(2)
+        return {"loaded": True, "path": path, "targets": [{"selector": "sample.bndb"}]}
+
+    monkeypatch.setattr(instance, "_load_binary", slow_load)
+    queued = instance._load_binary_async(str(binary))
+    job_id = queued["job_id"]
+    assert started.wait(1)
+
+    running = instance._load_status(job_id)
+    assert running["kind"] == "load_job"
+    assert running["job_id"] == job_id
+    assert running["state"] == "running"
+    assert running["terminal"] is False
+    # Non-terminal success is UNKNOWN, not False -- a False here would read as
+    # "the load failed" and make a polling agent tear down a healthy bridge.
+    assert running["succeeded"] is None
+    # The canonical record stays addressable, and the collection container is
+    # retained so the #275 `items` envelope doctrine still holds.
+    assert running["job"]["state"] == "running"
+    assert running["items"] == [running["job"]]
+    assert running["count"] == 1
+    # The text renderer needs the poll command from the payload, not guesswork.
+    assert running["status_command"] == f"bn -i worker session status {job_id}"
+
+    release.set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        done = instance._load_status(job_id)
+        if done["terminal"]:
+            break
+        time.sleep(0.01)
+
+    assert done["state"] == "complete"
+    assert done["terminal"] is True
+    assert done["succeeded"] is True
+    assert done["job"]["result"]["targets"] == [{"selector": "sample.bndb"}]
+
+
+def test_job_specific_load_status_reports_failure_without_ambiguity(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(instance_id="worker")
+    binary = tmp_path / "sample.bndb"
+    binary.write_bytes(b"")
+
+    def failing_load(path, **kwargs):
+        raise RuntimeError("analysis blew up")
+
+    monkeypatch.setattr(instance, "_load_binary", failing_load)
+    job_id = instance._load_binary_async(str(binary))["job_id"]
+
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        failed = instance._load_status(job_id)
+        if failed["terminal"]:
+            break
+        time.sleep(0.01)
+
+    assert failed["state"] == "failed"
+    assert failed["terminal"] is True
+    assert failed["succeeded"] is False
+    assert "analysis blew up" in failed["job"]["error"]
+
+
+def test_load_status_collection_keeps_its_envelope_and_unknown_job_fails_loudly(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(instance_id="worker")
+    binary = tmp_path / "sample.bndb"
+    binary.write_bytes(b"")
+    monkeypatch.setattr(
+        instance,
+        "_load_binary",
+        lambda path, **kwargs: {"loaded": True, "path": path, "targets": []},
+    )
+    instance._load_binary_async(str(binary))
+
+    listing = instance._load_status()
+    assert listing["kind"] == "load_jobs"
+    assert listing["count"] == 1
+    # Listing all jobs answers about a POPULATION: a single terminal/succeeded
+    # verdict would be a lie, so those fields must stay off the collection.
+    assert "terminal" not in listing and "succeeded" not in listing
+
+    # A typo'd job id must not look like "no jobs yet" (which a poll loop would
+    # retry forever).
+    with pytest.raises(RuntimeError, match="Unknown load job: nope"):
+        instance._load_status("nope")
+
+
 def test_load_binary_idempotent_returns_existing_view(monkeypatch, tmp_path):
     """Re-loading an already-open path must return the existing target, not open a
     second BinaryView that makes the basename/filename selectors ambiguous (#355)."""
@@ -3595,3 +3699,118 @@ def test_save_database_rejects_non_string_and_empty_operands(monkeypatch, tmp_pa
             instance._save_database(**kwargs)
         assert "save_database" in str(exc.value), kwargs
     bridge._headless_views.clear()
+
+
+# --- in-band row-field discovery -----------------------------------------
+#
+# Collection rows have deliberately different schemas (functions: address/size,
+# sections: start/end/length, callsites: nested callee/containing_function), and
+# agents had no way to learn them except a failed read or the source. The hint
+# rides the envelope every collection already returns, attached once at the
+# dispatch boundary: no second command catalog, and nothing for the CLI or the
+# kernel to re-declare.
+
+ROW_FIELD_OPS = [
+    ("list_functions", {}, ("address", "name", "size", "size_known")),
+    ("strings", {}, ("address", "value", "length", "type")),
+    ("imports", {}, ("address", "name", "kind")),
+    ("sections", {}, ("name", "start", "end", "length", "semantics")),
+    ("xrefs", {"identifier": "0x401000"}, ("address", "function", "kind")),
+    ("callsites", {"callee": "memcpy"}, ("callee", "containing_function", "call_addr", "caller_static")),
+]
+
+
+def _row_field_bv():
+    fake_bn = sys.modules["binaryninja"]
+    fn = _FakeFunction(0x401000, "parse_packet")
+    fn.basic_blocks = [_FakeBasicBlock(0x401000, 0x401040)]
+    callee = _FakeFunction(0x402000, "memcpy")
+    imp = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x403000, "printf")
+    imp.short_name = "printf"
+    imp.namespace = "libc"
+    return _FakeBV(
+        functions=[fn, callee],
+        strings=[_FakeStringRef(0x500000, 5, "alpha")],
+        sections={".text": _FakeSection(".text", 0x401000, 0x402000, 1)},
+        symbols=[imp],
+        code_refs={0x401000: [_FakeCodeRef(0x401020, fn)]},
+    )
+
+
+@pytest.mark.parametrize("op,params,expected", ROW_FIELD_OPS, ids=[o[0] for o in ROW_FIELD_OPS])
+def test_collection_payloads_declare_their_row_fields(monkeypatch, op, params, expected):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: _row_field_bv())
+
+    result = instance._dispatch_on_main(op, dict(params), "active")
+
+    row_fields = result["row_fields"]
+    assert isinstance(row_fields, list)
+    missing = [key for key in expected if key not in row_fields]
+    assert not missing, f"{op} row_fields missing {missing}: {row_fields}"
+    # Every key the hint advertises must be readable off a real row when the
+    # page has one, or the hint is worse than nothing.
+    for row in result["items"]:
+        assert set(row) <= set(row_fields), f"{op} row key not advertised: {set(row) - set(row_fields)}"
+
+
+@pytest.mark.parametrize("op,params,expected", ROW_FIELD_OPS, ids=[o[0] for o in ROW_FIELD_OPS])
+def test_empty_collections_still_declare_their_row_fields(monkeypatch, op, params, expected):
+    # The case that actually bites: a zero-hit read is exactly when an agent
+    # needs to know what a row WOULD look like, and there is no runtime row to
+    # infer it from.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    # `callsites` needs its callee to EXIST (an unknown callee is a different
+    # error), so that one op gets a view holding only the uncalled callee; every
+    # other op reads a genuinely empty view.
+    def empty_view(selector):
+        if op == "callsites":
+            return _FakeBV(functions=[_FakeFunction(0x402000, "memcpy")])
+        return _FakeBV()
+
+    monkeypatch.setattr(instance.ctx, "_resolve_view", empty_view)
+
+    result = instance._dispatch_on_main(op, dict(params), "active")
+
+    assert result["items"] == []
+    missing = [key for key in expected if key not in result["row_fields"]]
+    assert not missing, f"{op} empty-page row_fields missing {missing}"
+
+
+def test_row_fields_is_not_attached_to_non_collection_results(monkeypatch):
+    # `decompile` returns text, not rows; a row hint there would be a lie.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "parse_packet")
+    fn.basic_blocks = [_FakeBasicBlock(0x401000, 0x401040)]
+    monkeypatch.setattr(
+        instance.ctx, "_resolve_view", lambda selector: _FakeBV(functions=[fn])
+    )
+
+    result = instance._dispatch_on_main("decompile", {"identifier": "parse_packet"}, "active")
+
+    assert "row_fields" not in result
+
+
+def test_declared_row_fields_match_the_rows_the_bridge_builds(monkeypatch):
+    # Drift guard: the declared fallback (used for empty pages) must equal what a
+    # populated page actually returns, so an added/renamed row key cannot leave a
+    # stale declaration shipping to agents.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: _row_field_bv())
+
+    declared = sys.modules["bn_test_bridge._shared"]._DECLARED_ROW_FIELDS
+    checked = 0
+    for op, params, _expected in ROW_FIELD_OPS:
+        result = instance._dispatch_on_main(op, dict(params), "active")
+        kind = result["kind"]
+        if kind not in declared or not result["items"]:
+            continue
+        observed = {key for row in result["items"] for key in row}
+        undeclared = observed - set(declared[kind])
+        assert not undeclared, f"{kind}: row keys not declared: {sorted(undeclared)}"
+        checked += 1
+    assert checked >= 4, "drift guard did not exercise enough populated collections"

@@ -1814,3 +1814,288 @@ def test_brief_is_bounded_and_reports_exact_remainder():
 def test_brief_rejects_non_row_payloads_with_actionable_error(rows):
     with pytest.raises(TypeError, match="brief.*row mappings"):
         bn_kernel.brief(rows)
+
+
+def test_brief_missing_key_error_lists_the_actual_row_keys():
+    # The exact VIBE24 failure: `brief(sections_rows, "address", "size")` raised
+    # KeyError('address'), suggested dotted paths, and never mentioned that
+    # section rows use start/end/length/name -- so the agent had to re-run a read
+    # just to discover the schema. Row schemas differ ON PURPOSE across
+    # collections; the error is the only place that can say which one you hit.
+    rows = [{"start": "0x1000", "end": "0x2000", "length": 4096, "name": ".text"}]
+
+    with pytest.raises(KeyError) as exc:
+        bn_kernel.brief(rows, "address", "size")
+
+    message = str(exc.value)
+    assert "brief key 'address' is missing at row 0" in message
+    assert "available keys" in message
+    for key in ("start", "end", "length", "name"):
+        assert f"'{key}'" in message
+    # Flat rows have no nested mappings, so dotted-path advice would be noise
+    # that sends the reader looking for a nesting level that does not exist.
+    assert "dotted" not in message
+
+
+def test_brief_missing_key_error_keeps_dotted_guidance_when_rows_nest():
+    # callsites rows DO nest (callee/containing_function), so here the dotted
+    # path is the actual fix and must still be offered -- naming the specific
+    # nested keys rather than a generic example.
+    rows = [{
+        "callee": {"name": "memcpy", "address": "0x1000"},
+        "containing_function": {"name": "parse", "address": "0x2000"},
+        "call_addr": "0x1010",
+    }]
+
+    with pytest.raises(KeyError) as exc:
+        bn_kernel.brief(rows, "name")
+
+    message = str(exc.value)
+    assert "available keys" in message
+    assert "'callee'" in message and "'call_addr'" in message
+    assert "dotted" in message
+    assert "callee.*" in message and "containing_function.*" in message
+
+
+def test_brief_nested_miss_reports_the_row_keys_too():
+    rows = [{"callee": {"name": "memcpy"}, "call_addr": "0x1010"}]
+
+    with pytest.raises(KeyError) as exc:
+        bn_kernel.brief(rows, "callee.address")
+
+    message = str(exc.value)
+    assert "brief key 'callee.address' is missing at row 0" in message
+    assert "available keys" in message
+    assert "'callee'" in message
+
+
+def test_result_exposes_the_row_field_hint_from_the_payload():
+    # The hint rides the payload the bridge already returns, so there is no
+    # second catalog to drift: whatever the read declared is what `.row_fields`
+    # reports, and a payload without the hint reports None rather than guessing.
+    with_hint = bn_kernel.Result(
+        value=[{"start": "0x1000"}],
+        payload={"kind": "sections", "items": [{"start": "0x1000"}],
+                 "row_fields": ["name", "start", "end", "length", "semantics"]},
+        notes=(),
+        argv=("sections",),
+        backend="cli",
+    )
+    assert with_hint.row_fields == [
+        "name", "start", "end", "length", "semantics",
+    ]
+
+    without_hint = bn_kernel.Result(
+        value=[], payload={"kind": "sections", "items": []}, notes=(),
+        argv=("sections",), backend="cli",
+    )
+    assert without_hint.row_fields is None
+
+    text_payload = bn_kernel.Result(
+        value="listing", payload="listing", notes=(), argv=("disasm",), backend="cli",
+    )
+    assert text_payload.row_fields is None
+
+
+# --- `Session.last is None` after a failed operation ----------------------
+#
+# The VIBE24 report called stale success state a footgun: after a read failed,
+# `s.last` could still hold the PREVIOUS read's rows, and an agent inspecting
+# `s.last.payload` for diagnostics would silently read someone else's data as if
+# it belonged to the failed call. These reproduce the five representative failure
+# shapes -- request, mid-pagination, function row contract, callsite
+# attribution, invalid regex-like query -- on both backends and pin the contract:
+# a failed operation leaves NO `last`, and it is not enough that the call raised.
+#
+# The precondition matters: each session first performs a SUCCESSFUL read, so a
+# passing assertion proves the failure actively cleared state rather than there
+# never having been any.
+
+def _seeded_cli_session(monkeypatch, tmp_path, script: str) -> bn_kernel.Session:
+    """A CLI-backed session whose `last` already holds a successful result."""
+    seed = _fake_bn(
+        tmp_path,
+        _payload_script({
+            "kind": "strings", "items": [{"address": "0x1", "value": "seed"}],
+            "offset": 0, "limit": None, "returned": 1, "total": 1,
+            "has_more": False,
+        }),
+    )
+    monkeypatch.setenv("BN_BIN", str(seed))
+    session = bn_kernel.Session(backend="cli")
+    _run(session.strings())
+    assert session.last is not None and session.last.value
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path / "second", script)))
+    return session
+
+
+@pytest.fixture
+def second_dir(tmp_path):
+    (tmp_path / "second").mkdir()
+    return tmp_path
+
+
+def test_last_cleared_after_request_failure(monkeypatch, second_dir):
+    session = _seeded_cli_session(monkeypatch, second_dir, """
+import sys
+sys.stderr.write("bridge refused the request")
+sys.exit(2)
+""")
+
+    with pytest.raises(bn_kernel.BridgeError, match="bridge refused"):
+        _run(session.functions())
+
+    assert session.last is None
+
+
+def test_last_cleared_after_mid_pagination_failure(monkeypatch, second_dir):
+    session = _seeded_cli_session(monkeypatch, second_dir, """
+import json, sys
+argv = sys.argv[1:]
+out = argv[argv.index("--out") + 1]
+offset = int(argv[argv.index("--offset") + 1]) if "--offset" in argv else 0
+if offset == 0:
+    json.dump(
+        {"kind": "strings", "items": [{"address": "0x1", "value": "page-one"}],
+         "offset": 0, "limit": 1, "returned": 1, "total": 4, "has_more": True},
+        open(out, "w"),
+    )
+else:
+    sys.stderr.write("page two exploded")
+    sys.exit(2)
+""")
+
+    with pytest.raises(bn_kernel.BridgeError, match="page two exploded"):
+        _run(session.all("strings", page=1))
+
+    # The first page SUCCEEDED and its rows are gone: a partial collection that
+    # survived as `last` would look like a complete answer.
+    assert session.last is None
+
+
+def test_last_cleared_after_function_row_contract_failure(monkeypatch, second_dir):
+    session = _seeded_cli_session(monkeypatch, second_dir, _payload_script({
+        "kind": "functions",
+        # Rows without the size/size_known contract: a successful bn exit with a
+        # payload the kernel refuses to vouch for.
+        "items": [{"address": "0x401000", "name": "parse"}],
+        "offset": 0, "limit": None, "returned": 1, "total": 1, "has_more": False,
+    }))
+
+    with pytest.raises(bn_kernel.BnError, match="row contract violation"):
+        _run(session.functions())
+
+    # bn exited 0, so `last` was legitimately populated before validation ran.
+    # It must not survive the contract rejection.
+    assert session.last is None
+
+
+def test_last_cleared_after_callsite_attribution_failure(monkeypatch, second_dir):
+    session = _seeded_cli_session(monkeypatch, second_dir, _payload_script({
+        "kind": "callsites",
+        # call_addr present but unattributed: no containing_function, so the row
+        # cannot support a source-to-sink claim.
+        "items": [{"callee": {"name": "sink", "address": "0x2000"},
+                   "call_addr": "0x1010"}],
+        "offset": 0, "limit": None, "returned": 1, "total": 1, "has_more": False,
+    }))
+
+    with pytest.raises(bn_kernel.BnError, match="callsites row contract violation"):
+        _run(session.callsites("sink"))
+
+    assert session.last is None
+
+
+def test_last_cleared_after_invalid_regex_like_search_on_both_backends(monkeypatch, second_dir):
+    # Native: the kernel itself owns the gate, and it fires AFTER a successful
+    # zero-hit literal pass has already populated `last`.
+    # Same (instance, target) binding as the CLI session below: the point under
+    # test is `last` invalidation, not the cross-binding warning.
+    session = bn_kernel.Session(backend="native")
+
+    class ZeroHitClient:
+        def collect(self, op, params=None, *, limit=None):
+            return {"items": [], "total": 0, "has_more": False}
+
+    session._client = ZeroHitClient()
+    assert _run(session.search("NoSuchLiteral")) == []
+    assert session.last is not None
+
+    with pytest.raises(bn_kernel.BnError, match="invalid regex-like search query"):
+        _run(session.search("[invalid"))
+    assert session.last is None
+
+    # CLI: the gate lives in `bn` itself (bn.cli._should_retry_as_regex), which
+    # exits 2 rather than reporting a confident empty result. The kernel must
+    # propagate that and drop the previous read's rows -- the fake mirrors the
+    # real CLI's refusal for this query shape.
+    cli_session = _seeded_cli_session(monkeypatch, second_dir, """
+import sys
+sys.stderr.write("invalid regex-like search query '[invalid': unterminated "
+                 "character set at position 0; pass --exact to search for it literally")
+sys.exit(2)
+""")
+
+    with pytest.raises(bn_kernel.BnError, match="invalid regex-like search query"):
+        _run(cli_session.search("[invalid"))
+    assert cli_session.last is None
+
+
+def test_last_cleared_after_native_request_and_contract_failures():
+    # Same contract on the native backend, where `last` is set from an in-process
+    # client rather than a CLI artifact.
+    session, client = _native_session()
+    _run(session.decompile("main"))
+    assert session.last is not None
+
+    def failing_request(op, params=None):
+        raise NativeBridgeError("native bridge refused")
+
+    client.request = failing_request
+    with pytest.raises(bn_kernel.BnError, match="native bridge refused"):
+        _run(session.decompile("main"))
+    assert session.last is None
+
+    session, client = _native_session()
+    _run(session.functions())
+    assert session.last is not None
+
+    def bad_rows(op, params=None, *, limit=None):
+        return {"items": [{"address": "0x401000"}], "offset": 0, "returned": 1,
+                "total": 1, "has_more": False}
+
+    client.collect = bad_rows
+    with pytest.raises(bn_kernel.BnError, match="row contract violation"):
+        _run(session.functions())
+    assert session.last is None
+
+
+def test_assert_unannotated_keeps_its_successful_payload():
+    # The other half of the contract: clearing `last` on failure must not throw
+    # away a payload that DID succeed. A contamination refusal is a policy
+    # verdict on a good orientation read, and the digest behind it is exactly
+    # what an agent needs to decide whether to proceed.
+    session = bn_kernel.Session(instance="worker", target="sample", backend="native")
+
+    class OrientClient:
+        def request(self, op, params=None):
+            assert op == "orient_digest"
+            return {
+                "kind": "orient_digest",
+                "target": {"basename": "sample.bndb"},
+                "function_count": 3,
+                "existing_annotations": {
+                    "comments": 2,
+                    "function_comments": 0,
+                    "comment_locations": [
+                        {"address": "0x401000", "name": "parse_packet"},
+                    ],
+                },
+            }
+
+    session._client = OrientClient()
+    with pytest.raises(bn_kernel.BnError, match="0x401000"):
+        _run(session.assert_unannotated())
+
+    assert session.last is not None
+    assert session.last.payload["existing_annotations"]["comments"] == 2

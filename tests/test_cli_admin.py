@@ -714,6 +714,55 @@ def test_session_status_polls_detached_load_job(monkeypatch, capsys):
     assert payload["items"][0]["state"] == "running"
 
 
+def test_session_status_job_passes_through_machine_fields(monkeypatch, capsys):
+    # The CLI must not re-derive or flatten the bridge's job verdict; whatever
+    # top-level state/terminal/succeeded contract the bridge publishes is what
+    # `--format json` hands the polling agent.
+    def fake_send_request(op, **kwargs):
+        return {
+            "ok": True,
+            "result": {
+                "kind": "load_job",
+                "job_id": "job123",
+                "state": "complete",
+                "terminal": True,
+                "succeeded": True,
+                "job": {"job_id": "job123", "state": "complete", "path": "/tmp/s.bndb"},
+                "items": [{"job_id": "job123", "state": "complete", "path": "/tmp/s.bndb"}],
+                "count": 1,
+                "status_command": "bn -i worker session status job123",
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(
+        ["session", "status", "job123", "-i", "worker", "--format", "json"]
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["job_id"] == "job123"
+    assert payload["state"] == "complete"
+    assert payload["terminal"] is True
+    assert payload["succeeded"] is True
+    assert payload["job"]["path"] == "/tmp/s.bndb"
+
+
+def test_session_status_unknown_job_fails_loudly(monkeypatch, capsys):
+    # A bad job id is an error, not an empty poll result: silently returning
+    # "no jobs" would make a status loop spin until its own deadline.
+    def fake_send_request(op, **kwargs):
+        raise bn.transport.BridgeError("Unknown load job: nope")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["session", "status", "nope", "-i", "worker"])
+
+    assert rc != 0
+    assert "Unknown load job: nope" in capsys.readouterr().err
+
+
 def test_remove_instance_markers_matches_only_the_id(tmp_path):
     # #436: session stop must clean up the instance's own `.bn-<id>` marker and
     # leave unrelated markers (other sessions) in place.

@@ -194,8 +194,9 @@ def test_decompile_text_notes_decimal_mid_function_resolution_end_to_end(monkeyp
     # interior address resolved to its container but DROPPED resolved_from. This
     # drives the CLI end-to-end through the REAL bridge dispatch (not a stubbed
     # transport), so the decimal request genuinely exercises _containment_meta:
-    # text mode must show the resolution note for `decompile 4198416` exactly as
-    # it does for the equivalent hex `decompile 0x401010`.
+    # text mode must show the resolution note for `decompile 4198416` -- and,
+    # since the payload also records `input_format: decimal`, name that spelling
+    # instead of leaving text and JSON disagreeing about what was requested.
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     fn = _FakeFunction(0x401000, "parse_packet")
@@ -216,8 +217,9 @@ def test_decompile_text_notes_decimal_mid_function_resolution_end_to_end(monkeyp
     assert rc == 0
     out, _ = capsys.readouterr()
     # requested_address is normalized to hex in the disclosure even though the
-    # user typed the decimal spelling.
-    assert "0x401010 is inside parse_packet @ 0x401000 (+0x10)" in out
+    # user typed the decimal spelling, and the decimal spelling itself is named.
+    assert "is inside parse_packet @ 0x401000 (+0x10)" in out
+    assert "0x401010 (decimal input)" in out
 
 
 def test_decompile_text_has_no_note_for_exact_start(fake_transport, capsys):
@@ -2516,3 +2518,110 @@ def test_function_cfg_rejects_unknown_view(fake_transport, capsys):
         bn.cli.main(["function", "cfg", "main", "--view", "llil"])
     err = capsys.readouterr().err
     assert "llil" in err and "invalid choice" in err
+
+
+# --- decimal disclosure: text and JSON must say the same thing ------------
+
+def _real_bridge_cli(monkeypatch):
+    """Route `bn.cli.send_request` through the REAL bridge dispatch over a
+    parse_packet @ 0x401000..0x401040 view, so a decimal request genuinely
+    exercises `_containment_meta` instead of a canned transport payload."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "parse_packet")
+    fn.basic_blocks = [_FakeBasicBlock(0x401000, 0x401040)]
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, spawn_missing_named=False, **kwargs):
+        return {"ok": True, "result": instance._dispatch_on_main(op, params or {}, target)}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+
+DECIMAL_SURFACE_ARGV = [
+    pytest.param(["decompile", "{ident}"], id="decompile"),
+    pytest.param(["function", "info", "{ident}"], id="function_info"),
+    pytest.param(["proto", "get", "{ident}"], id="proto_get"),
+    pytest.param(["local", "list", "{ident}"], id="local_list"),
+    pytest.param(["il", "{ident}"], id="il"),
+    pytest.param(["disasm", "{ident}"], id="disasm"),
+]
+
+
+@pytest.mark.parametrize("argv", DECIMAL_SURFACE_ARGV)
+def test_decimal_interior_json_and_text_agree(monkeypatch, capsys, argv):
+    # JSON carries the documented three-key envelope...
+    _real_bridge_cli(monkeypatch)
+    base = [part.format(ident="4198416") for part in argv]
+    assert bn.cli.main([*base, "--target", "active", "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["resolved_from"] == {
+        "requested_address": "0x401010",
+        "offset": "+0x10",
+        "input_format": "decimal",
+    }
+
+    # ...and text mode discloses BOTH facts it encodes: the containment hit and
+    # that a digit-only token was read as an address. Text used to drop the
+    # decimal half entirely, so an agent in the default mode never saw the
+    # disclosure the skill promises.
+    assert bn.cli.main([*base, "--target", "active"]) == 0
+    out = capsys.readouterr().out
+    assert "0x401010" in out and "is inside parse_packet @ 0x401000 (+0x10)" in out
+    assert "decimal" in out
+
+
+@pytest.mark.parametrize("argv", DECIMAL_SURFACE_ARGV)
+def test_decimal_exact_start_json_and_text_agree(monkeypatch, capsys, argv):
+    _real_bridge_cli(monkeypatch)
+    base = [part.format(ident="4198400") for part in argv]
+    assert bn.cli.main([*base, "--target", "active", "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["resolved_from"] == {
+        "requested_address": "0x401000",
+        "offset": "+0x0",
+        "input_format": "decimal",
+    }
+
+    assert bn.cli.main([*base, "--target", "active"]) == 0
+    out = capsys.readouterr().out
+    # offset +0x0 means the request named the exact start; text must not claim a
+    # containment redirect it did not perform.
+    assert "is inside" not in out
+    assert "showing the containing function" not in out
+    assert "decimal input resolved to 0x401000" in out
+
+
+@pytest.mark.parametrize("identifier", ["0x401000", "parse_packet"])
+@pytest.mark.parametrize("argv", DECIMAL_SURFACE_ARGV)
+def test_exact_hex_and_name_stay_unannotated_end_to_end(monkeypatch, capsys, argv, identifier):
+    _real_bridge_cli(monkeypatch)
+    base = [part.format(ident=identifier) for part in argv]
+    assert bn.cli.main([*base, "--target", "active", "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "resolved_from" not in payload
+
+    assert bn.cli.main([*base, "--target", "active"]) == 0
+    out = capsys.readouterr().out
+    assert "is inside" not in out and "decimal" not in out
+
+
+def test_disasm_count_at_a_decimal_exact_start_does_not_steer_to_linear(monkeypatch, capsys):
+    # `--count` slices from the function start; at offset +0x0 that IS the
+    # requested address, so the `--linear` steer would be false advice.
+    _real_bridge_cli(monkeypatch)
+    assert bn.cli.main(
+        ["disasm", "4198400", "--target", "active", "--count", "1"]
+    ) == 0
+    out = capsys.readouterr().out
+    assert "--linear" not in out
+    # The decimal spelling is still disclosed.
+    assert "decimal input resolved to 0x401000" in out
+
+    assert bn.cli.main(
+        ["disasm", "4198416", "--target", "active", "--count", "1"]
+    ) == 0
+    interior = capsys.readouterr().out
+    assert "--linear" in interior

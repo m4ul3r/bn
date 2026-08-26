@@ -66,6 +66,7 @@ bn -i <id> session status [<job-id>]     # queued/running/complete/failed
 bn session list [-i <id>]                # all running instances, or filter one
 bn session stop <id>                     # aliases: --instance-id <id>, -i <id>
 bn close [<path>] [-t <sel>] [--all]     # close one or explicitly --all
+bn target close <sel>                    # close exactly that target (alias for `close -t <sel>`)
 bn exports [list]                         # public exported symbols
 bn help [family]                          # concise index; advertises capabilities
 bn instance gc                            # reap dead instance cache residue
@@ -78,6 +79,43 @@ When multiple bridge instances exist, flagless `bn load <path>` refuses ambient 
 A bare `bn close` closes the single open target; with several open it refuses with the open-target list (pass `-t <selector>`, a path, or `--all`). It never closes everything implicitly — only `--all` does (#664). Because close is destructive, it is stricter than `bn save`: on a multi-tab GUI bridge a bare close does **not** fall back to the focused tab (save does), the CLI pins the exact `target_id` it observed rather than sending `active` (so a concurrent close/load between the lookup and the close yields an unknown-selector error instead of closing a different binary), an empty `-t ""` or empty positional path `""` (e.g. an unset shell variable) is an error rather than a bare close, and `-t` cannot be combined with a path or `--all`. The bridge enforces the same rules for raw socket clients: a non-null empty `target`, an empty `path`, and any `target`+`path`/`all` pair are rejected.
 
 `bn close` reports each closed view as `{path, unsaved, engine_modified}`. `unsaved` is the sole persistence/cleanliness signal: it means a committed bn mutation was not saved and is the only condition that triggers the discard warning. `engine_modified` is Binary Ninja's broader analysis/cache bit; it can be true after a strictly read-only session and must not be interpreted as user mutation.
+
+**`session status <job-id>` JSON contract.** Naming a job returns the single-job
+shape, so a polling agent never has to index `items[0]` or re-derive terminality
+from the state string:
+
+```json
+{
+  "kind": "load_job",
+  "job_id": "<hex>",
+  "state": "queued|running|complete|failed",
+  "terminal": false,
+  "succeeded": null,
+  "job": { "job_id": "...", "state": "...", "path": "...", "created_at": "...",
+           "started_at": null, "finished_at": null, "error": null, "result": null },
+  "status_command": "bn -i <id> session status <job-id>",
+  "items": [ { "...": "the same job record" } ],
+  "count": 1
+}
+```
+
+`terminal` is true only for `complete`/`failed`. `succeeded` is `true` for
+`complete`, `false` for `failed`, and **`null` while non-terminal** — a `false`
+there would read as "the load failed" and make a poll loop tear down a healthy
+bridge. The poll loop is `terminal == false` → sleep → re-run `status_command`.
+An unknown job id is an **error**, not an empty result, so a typo cannot spin a
+status loop until its own deadline. Omitting the job id keeps the population
+collection (`kind: "load_jobs"`, `items`, `count`) with no `terminal`/`succeeded`
+verdict, because one verdict over many jobs would be a lie. Text mode prints
+`<job-id>  <state>  <path>` plus a `poll:` line naming the exact command while
+the job is still running.
+
+**`bn target close <selector>`** closes exactly the target that selector names.
+It is the discoverable spelling of `bn close -t <selector>` and delegates to the
+same implementation, so unsaved warnings, selector resolution, and the refusal to
+forward the volatile `active` literal are identical. It accepts no path and no
+`--all`, so it can never widen into closing everything; an empty selector is an
+error. Use `bn close --all` when you really do mean every loaded target.
 
 ```bash
 bn save                                  # saves to <filename>.bndb
