@@ -406,10 +406,9 @@ def _session_start(args: argparse.Namespace) -> int:
                     {
                         "path": resolved,
                         "error": (
-                            "detached load was not queued; the new bridge will be stopped"
+                            "detached load was not queued"
                             if detached
-                            else "load returned success without an open target; "
-                            "the new bridge will be stopped"
+                            else "load returned success without an open target"
                         ),
                     }
                 )

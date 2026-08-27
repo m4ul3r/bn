@@ -152,19 +152,199 @@ def test_collect_exact_limit_does_not_claim_more_when_bridge_is_finished(monkeyp
     assert result["has_more"] is False
 
 
-def test_collect_zero_limit_makes_no_bridge_call(monkeypatch):
-    def unexpected(*args, **kwargs):
-        raise AssertionError("bridge called")
-
-    monkeypatch.setattr(client_module, "send_request", unexpected)
-
-    assert Client().collect("sections", {"offset": "7"}, limit=0) == {
-        "items": [],
+def test_collect_zero_limit_probes_one_row_and_discards_it(monkeypatch):
+    """`limit=0` must issue exactly one real bridge request with WIRE `limit=1`
+    (the bridge enforces `minimum=1`), validate that probed row through the
+    normal page contract, then discard it -- the caller sees zero rows but the
+    schema metadata (kind/total/row_fields) survives, and a probed row flips
+    `has_more` true even when the bridge under-reports it."""
+    calls: list[dict[str, Any]] = []
+    page = {
+        "kind": "sections",
+        "items": [{"name": "sec0", "start": 4096, "end": 4160}],
         "offset": 7,
-        "returned": 0,
+        "limit": 1,
+        "returned": 1,
+        "total": 8,
         "has_more": False,
-        "total": None,
+        "row_fields": ["name", "start", "end", "length", "semantics"],
     }
+
+    def fake_send_request(op: str, **kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs["params"])
+        return {"result": dict(page)}
+
+    monkeypatch.setattr(client_module, "send_request", fake_send_request)
+
+    result = Client().collect("sections", {"offset": "7"}, limit=0)
+
+    assert calls == [{"offset": 7, "limit": 1}]
+    assert result["items"] == []
+    assert result["offset"] == 7
+    assert result["returned"] == 0
+    assert result["limit"] == 0
+    assert result["kind"] == "sections"
+    assert result["total"] == 8
+    # The bridge said has_more=False, but the probe found a row: from the
+    # caller's zero-row position there IS more to fetch.
+    assert result["has_more"] is True
+    assert result["row_fields"] == ["name", "start", "end", "length", "semantics"]
+
+
+def test_collect_zero_limit_probe_finds_no_rows(monkeypatch):
+    """When the probe itself comes back empty, `has_more` falls through to the
+    bridge's own (also-false) value -- there is nothing at this offset at all."""
+    calls: list[dict[str, Any]] = []
+    page = {
+        "kind": "sections",
+        "items": [],
+        "offset": 5,
+        "limit": 1,
+        "returned": 0,
+        "total": 5,
+        "has_more": False,
+        "row_fields": ["name", "start", "end"],
+    }
+
+    def fake_send_request(op: str, **kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs["params"])
+        return {"result": dict(page)}
+
+    monkeypatch.setattr(client_module, "send_request", fake_send_request)
+
+    result = Client().collect("sections", {"offset": "5"}, limit=0)
+
+    assert calls == [{"offset": 5, "limit": 1}]
+    assert result["items"] == []
+    assert result["returned"] == 0
+    assert result["has_more"] is False
+
+
+@pytest.mark.parametrize(
+    "row_fields",
+    [None, "name", [1, 2], ["name", 2]],
+    ids=["missing", "not-a-list", "non-string-items", "mixed-types"],
+)
+def test_collect_zero_limit_requires_row_fields(monkeypatch, row_fields):
+    page = {
+        "kind": "sections",
+        "items": [{"name": "sec0"}],
+        "offset": 0,
+        "limit": 1,
+        "returned": 1,
+        "total": 3,
+        "has_more": True,
+    }
+    if row_fields is not None:
+        page["row_fields"] = row_fields
+
+    monkeypatch.setattr(
+        client_module,
+        "send_request",
+        lambda *args, **kwargs: {"result": dict(page)},
+    )
+
+    with pytest.raises(BridgeError, match="row_fields"):
+        Client().collect("sections", limit=0)
+
+
+def test_collect_zero_limit_empty_page_undeclared_kind_omits_row_fields(monkeypatch):
+    """An undeclared `kind` (outside `_DECLARED_ROW_FIELDS`) with an empty probe
+    page has no row to derive a schema from, so the bridge's real
+    `_annotate_row_fields` leaves `row_fields` off entirely. That must not be
+    treated as malformed: the caller still gets an honest, if schema-less,
+    envelope instead of a spurious error."""
+    from bn_agent_bridge._shared import _annotate_row_fields
+
+    raw = {
+        "kind": "types",
+        "items": [],
+        "offset": 3,
+        "limit": 1,
+        "returned": 0,
+        "total": 0,
+        "has_more": False,
+    }
+    page = _annotate_row_fields(dict(raw))
+    assert "row_fields" not in page  # pins the real bridge behaviour this defends
+
+    calls: list[dict[str, Any]] = []
+
+    def fake_send_request(op: str, **kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs["params"])
+        return {"result": dict(page)}
+
+    monkeypatch.setattr(client_module, "send_request", fake_send_request)
+
+    result = Client().collect("types", {"offset": "3"}, limit=0)
+
+    assert calls == [{"offset": 3, "limit": 1}]
+    assert result["items"] == []
+    assert result["returned"] == 0
+    assert result["limit"] == 0
+    assert result["kind"] == "types"
+    assert result["total"] == 0
+    assert result["has_more"] is False
+    assert "row_fields" not in result
+
+
+def test_collect_zero_limit_empty_page_declared_kind_keeps_row_fields(monkeypatch):
+    """A declared kind's row_fields tuple is populated even with zero rows, so
+    the empty-probe path must still surface it."""
+    from bn_agent_bridge._shared import _annotate_row_fields, _DECLARED_ROW_FIELDS
+
+    raw = {
+        "kind": "sections",
+        "items": [],
+        "offset": 0,
+        "limit": 1,
+        "returned": 0,
+        "total": 0,
+        "has_more": False,
+    }
+    page = _annotate_row_fields(dict(raw))
+    assert page["row_fields"] == list(_DECLARED_ROW_FIELDS["sections"])
+
+    monkeypatch.setattr(
+        client_module,
+        "send_request",
+        lambda *args, **kwargs: {"result": dict(page)},
+    )
+
+    result = Client().collect("sections", limit=0)
+
+    assert result["row_fields"] == list(_DECLARED_ROW_FIELDS["sections"])
+
+
+@pytest.mark.parametrize(
+    "row_fields",
+    ["name", [1, 2], ["name", 2]],
+    ids=["not-a-list", "non-string-items", "mixed-types"],
+)
+def test_collect_zero_limit_empty_page_malformed_row_fields_raises(monkeypatch, row_fields):
+    """A present-but-malformed `row_fields` on an EMPTY probe page must still
+    raise -- only a genuinely ABSENT `row_fields` is legitimate for an empty
+    page (undeclared kind). The malformed shapes must not slip through the
+    `if probed_items:` gate just because the probe found no row."""
+    page = {
+        "kind": "sections",
+        "items": [],
+        "offset": 0,
+        "limit": 1,
+        "returned": 0,
+        "total": 0,
+        "has_more": False,
+        "row_fields": row_fields,
+    }
+
+    monkeypatch.setattr(
+        client_module,
+        "send_request",
+        lambda *args, **kwargs: {"result": dict(page)},
+    )
+
+    with pytest.raises(BridgeError, match="row_fields"):
+        Client().collect("sections", limit=0)
 
 
 @pytest.mark.parametrize(

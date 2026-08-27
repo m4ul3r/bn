@@ -102,13 +102,21 @@ from the state string:
 `terminal` is true only for `complete`/`failed`. `succeeded` is `true` for
 `complete`, `false` for `failed`, and **`null` while non-terminal** — a `false`
 there would read as "the load failed" and make a poll loop tear down a healthy
-bridge. The poll loop is `terminal == false` → sleep → re-run `status_command`.
+bridge. The poll loop is `terminal == false` → sleep → re-run `status_command`
+**when it is non-null**; a `null` means this bridge cannot be named on a fresh
+command line, so keep polling through the client or connection you already have
+bound to it, or treat the command as unavailable. Only a bridge started with an
+instance id (`--instance-id`, i.e. any headless bridge) can publish the exact
+re-runnable command; a GUI-loaded bridge has no unambiguous CLI selector, so it
+publishes `status_command: null` rather than a command that cannot address it.
+The key is always present, so `null` and "field missing" stay distinguishable.
 An unknown job id is an **error**, not an empty result, so a typo cannot spin a
 status loop until its own deadline. Omitting the job id keeps the population
 collection (`kind: "load_jobs"`, `items`, `count`) with no `terminal`/`succeeded`
-verdict, because one verdict over many jobs would be a lie. Text mode prints
-`<job-id>  <state>  <path>` plus a `poll:` line naming the exact command while
-the job is still running.
+verdict, because one verdict over many jobs would be a lie, and whose items are
+the raw job records without a `status_command` of their own. Text mode prints
+`<job-id>  <state>  <path>`, plus a `poll:` line naming the exact command while
+the job is still running and a command is available.
 
 **`bn target close <selector>`** closes exactly the target that selector names.
 It is the discoverable spelling of `bn close -t <selector>` and delegates to the

@@ -583,6 +583,27 @@ def _validate_page(
     return items, has_more, total
 
 
+def _require_row_fields(op: str, payload: dict[str, Any]) -> None:
+    """Require a `row_fields: list[str]` schema annotation on a probed page.
+
+    The bridge enforces `limit >= 1`, so a caller-visible `limit=0` "give me
+    the schema, not the rows" request is a one-row PROBE at the wire level.
+    The probed row proves the schema; without a well-formed `row_fields` the
+    caller has no way to know what columns to expect once it does ask for
+    real rows.
+    """
+    row_fields = payload.get("row_fields")
+    if not isinstance(row_fields, list) or not all(
+        isinstance(field, str) for field in row_fields
+    ):
+        raise BnError(
+            f"malformed {op} page: a limit=0 metadata page must publish "
+            f"row_fields as a list of strings (got {row_fields!r})",
+            returncode=0,
+            argv=(op,),
+        )
+
+
 def _unbounded_collection_error(op: str) -> BnError:
     """Refuse a collection with nothing left that can terminate it."""
     return BnError(
@@ -1087,30 +1108,8 @@ class Session:
             raise ValueError("limit must be non-negative")
 
         initial_offset = int(flags.pop("offset", 0))
-        if limit == 0:
-            payload = {
-                "items": [],
-                "offset": initial_offset,
-                "returned": 0,
-                "has_more": False,
-                "total": None,
-            }
-            self.last = Result(
-                value=[],
-                payload=payload,
-                notes=(),
-                argv=tuple(self._root_argv() + [str(arg) for arg in args]),
-                backend="cli",
-            )
-            return []
-
         offset = initial_offset
-        items: list[dict[str, Any]] = []
-        aggregate: dict[str, Any] | None = None
-        notes: list[str] = []
         actual_argv: tuple[str, ...] = tuple(str(arg) for arg in args)
-        bridge_has_more = False
-        seen_total: Any = _UNSEEN
         operation = " ".join(str(arg) for arg in args)
         # One end-to-end budget for the WHOLE multi-page collection, with
         # BN_REQUEST_TIMEOUT applied exactly once here. `None` means the documented
@@ -1124,6 +1123,85 @@ class Session:
             else time.monotonic() + effective_timeout
         )
 
+        if limit == 0:
+            # The bridge's `minimum=1` contract stands, so the caller's zero-row
+            # "just the schema" request becomes a discarded one-row probe on the
+            # wire: request limit=1 at the caller's offset, validate it through
+            # the normal page contract, then throw the row away. `has_more`
+            # folds in whether the probe found a row at all -- that alone
+            # proves more exists at this offset even if the bridge is wrong
+            # about `has_more` (the `or bridge_has_more` term is defensive).
+            timeout_remaining = None
+            if deadline is not None:
+                timeout_remaining = deadline - time.monotonic()
+                if timeout_remaining <= 0:
+                    self.last = None
+                    raise BnError(
+                        _timeout_message(operation, effective_timeout),
+                        returncode=124,
+                        argv=actual_argv,
+                    )
+            try:
+                payload = await self._run_resolved(
+                    *args,
+                    unwrap=False,
+                    budget=timeout_remaining,
+                    limit=1,
+                    offset=offset,
+                    **flags,
+                )
+            except BnError as exc:
+                self.last = None
+                if exc.returncode == 124:
+                    raise BnError(
+                        _timeout_message(
+                            operation, effective_timeout or 0.0, str(exc)
+                        ),
+                        returncode=124,
+                        argv=actual_argv,
+                    ) from exc
+                raise
+            page_result = self.last
+            notes: list[str] = []
+            if page_result is not None:
+                notes.extend(page_result.notes)
+                actual_argv = page_result.argv
+
+            try:
+                probed_items, bridge_has_more, total = _validate_page(
+                    operation,
+                    payload,
+                    requested_offset=offset,
+                    requested_limit=1,
+                )
+                if probed_items or "row_fields" in payload:
+                    _require_row_fields(operation, payload)
+            except BnError:
+                self.last = None
+                raise
+
+            aggregate = dict(payload)
+            aggregate["items"] = []
+            aggregate["offset"] = initial_offset
+            aggregate["returned"] = 0
+            aggregate["total"] = total
+            aggregate["has_more"] = bool(probed_items) or bridge_has_more
+            aggregate["limit"] = 0
+            self.last = Result(
+                value=[],
+                payload=aggregate,
+                notes=tuple(notes),
+                argv=actual_argv,
+                backend="cli",
+            )
+            return []
+
+        items: list[dict[str, Any]] = []
+        aggregate: dict[str, Any] | None = None
+        notes = []
+        bridge_has_more = False
+        seen_total: Any = _UNSEEN
+
         while True:
             remaining = None if limit is None else limit - len(items)
             page_size = page if remaining is None else min(page, remaining)
@@ -1133,7 +1211,7 @@ class Session:
                 if timeout_remaining <= 0:
                     self.last = None
                     raise BnError(
-                        f"bn {operation} timed out after {effective_timeout:g}s",
+                        _timeout_message(operation, effective_timeout),
                         returncode=124,
                         argv=actual_argv,
                     )

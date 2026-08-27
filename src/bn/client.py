@@ -96,6 +96,25 @@ def _validate_page(
     return items, has_more, total
 
 
+def _require_row_fields(op: str, page: dict[str, Any]) -> None:
+    """Require a `row_fields: list[str]` schema annotation on a probed page.
+
+    The bridge enforces `limit >= 1`, so a caller-visible `limit=0` "give me
+    the schema, not the rows" request is a one-row PROBE at the wire level.
+    The probed row proves the schema; without a well-formed `row_fields` the
+    caller has no way to know what columns to expect once it does ask for
+    real rows.
+    """
+    row_fields = page.get("row_fields")
+    if not isinstance(row_fields, list) or not all(
+        isinstance(field, str) for field in row_fields
+    ):
+        raise BridgeError(
+            f"malformed {op} page: a limit=0 metadata page must publish "
+            f"row_fields as a list of strings (got {row_fields!r})"
+        )
+
+
 class Client:
     """Synchronous, explicitly bound client for the Binary Ninja bridge."""
 
@@ -175,20 +194,7 @@ class Client:
             raise ValueError("params must not contain limit")
 
         initial_offset = int(base_params.get("offset", 0))
-        if limit == 0:
-            return {
-                "items": [],
-                "offset": initial_offset,
-                "returned": 0,
-                "has_more": False,
-                "total": None,
-            }
-
         offset = initial_offset
-        items: list[Any] = []
-        aggregate: dict[str, Any] | None = None
-        bridge_has_more = False
-        seen_total: Any = _UNSEEN
         # `resolved=True` says self.timeout is ALREADY the remaining slice of a
         # budget someone else resolved (bn-kernel's two-phase search). Re-applying
         # BN_REQUEST_TIMEOUT here would hand this phase the full env value again.
@@ -201,6 +207,46 @@ class Client:
             else None
         )
 
+        if limit == 0:
+            # The bridge's `minimum=1` contract stands, so the caller's zero-row
+            # "just the schema" request becomes a discarded one-row probe on the
+            # wire: request limit=1 at the caller's offset, validate it through
+            # the normal page contract, then throw the row away. `has_more`
+            # folds in whether the probe found a row at all -- that alone
+            # proves more exists at this offset even if the bridge is wrong
+            # about `has_more` (the `or bridge_has_more` term is defensive).
+            page_timeout = None
+            if deadline is not None:
+                page_timeout = deadline - time.monotonic()
+                if page_timeout <= 0:
+                    raise BridgeError(
+                        f"Timed out collecting {op!r}; the end-to-end "
+                        "collection deadline expired"
+                    )
+            page_params = dict(base_params)
+            page_params["offset"] = offset
+            page_params["limit"] = 1
+            page = self._request(
+                op, page_params, timeout=page_timeout, resolved=True
+            )
+            probed_items, bridge_has_more, total = _validate_page(
+                op, page, requested_offset=offset, requested_limit=1
+            )
+            if probed_items or "row_fields" in page:
+                _require_row_fields(op, page)
+            aggregate = dict(page)
+            aggregate["items"] = []
+            aggregate["offset"] = initial_offset
+            aggregate["returned"] = 0
+            aggregate["total"] = total
+            aggregate["has_more"] = bool(probed_items) or bridge_has_more
+            aggregate["limit"] = 0
+            return aggregate
+
+        items: list[Any] = []
+        aggregate: dict[str, Any] | None = None
+        bridge_has_more = False
+        seen_total: Any = _UNSEEN
         while True:
             remaining = None if limit is None else limit - len(items)
             request_limit = page_size if remaining is None else min(page_size, remaining)

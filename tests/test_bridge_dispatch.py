@@ -756,6 +756,48 @@ def test_job_specific_load_status_exposes_top_level_machine_fields(monkeypatch, 
     assert done["job"]["result"]["targets"] == [{"selector": "sample.bndb"}]
 
 
+def test_gui_bridge_status_command_is_none_in_envelopes(monkeypatch, tmp_path):
+    # A GUI-loaded bridge has no instance id, so there is no unambiguous
+    # CLI-addressable selector for it -- a `bn session status <job>` command
+    # would name a bridge that can't be reliably picked out again. Both the
+    # helper and every envelope that embeds it must say so honestly with
+    # `None`, not a command that cannot actually be run.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(instance_id=None)
+    assert instance._load_status_command("job123") is None
+
+    binary = tmp_path / "sample.bndb"
+    binary.write_bytes(b"")
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_load(path, **kwargs):
+        started.set()
+        assert release.wait(2)
+        return {"loaded": True, "path": path, "targets": [{"selector": "sample.bndb"}]}
+
+    monkeypatch.setattr(instance, "_load_binary", slow_load)
+
+    queued = instance._load_binary_async(str(binary))
+    assert started.wait(1)
+    assert queued["status_command"] is None
+
+    job_id = queued["job_id"]
+    running = instance._load_status(job_id)
+    assert running["status_command"] is None
+
+    release.set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        done = instance._load_status(job_id)
+        if done["terminal"]:
+            break
+        time.sleep(0.01)
+
+    assert done["state"] == "complete"
+    assert done["status_command"] is None
+
+
 def test_job_specific_load_status_reports_failure_without_ambiguity(monkeypatch, tmp_path):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge(instance_id="worker")

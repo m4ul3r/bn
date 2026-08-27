@@ -161,11 +161,34 @@ requested, and reject any cross-page `total` transition (`null`→int, int→`nu
 a changed int). Progress is otherwise tracked by the caller's own arithmetic, so a
 bridge that ignores pagination would silently return duplicate rows.
 
+**`limit=0` asks for the schema, not the rows.** Passing `limit=0` to a curated
+collection helper (or to `Session.all()` / `bn.Client.collect()`) performs exactly
+ONE real request and returns no rows. The bridge enforces `limit >= 1`, so on the
+wire this is an internal one-row **probe** at your requested `offset`; the probed
+row is validated through the normal page contract and then discarded. It is never
+returned to you and never lands in `s.last.value`. The envelope you get back
+reports `returned=0` and `limit=0`, keeps the bridge-owned `kind`, `total` and
+`row_fields`, and reports `has_more=true` whenever the probe found a row — from a
+zero-row position, that row alone proves more exists at this offset.
+
+`row_fields` may legitimately be **absent** from a `limit=0` envelope: the bridge
+derives it from a declared schema or from an actual row, so an *empty* collection
+of a kind it does not pre-declare has neither source. The pre-declared kinds are
+`functions`, `strings`, `imports`, `exports`, `sections`, `xrefs` and `callsites`;
+an empty `types`, `tags`, `comments` or similar read can come back without it.
+A `row_fields` that IS present is always validated as a list of strings. Treat
+absence as "no schema available yet", not as an error — ask for a real row instead.
+
+This is a programmatic-only shape. Wire-level `bn <paged command> --limit 0` stays
+rejected at parse time (exit 2), because the bridge would reject a zero limit and
+the CLI declines to round-trip to that error.
+
 **Row keys differ per collection, and you never have to guess.** `functions`
 rows key on `address`/`size`, `sections` on `start`/`end`/`length`, `callsites`
-nest `callee`/`containing_function`. Every collection payload carries the key
-list in band, including on a **zero-hit** page (exactly when there is no row to
-read the schema off):
+nest `callee`/`containing_function`. Collection payloads carry the key list in
+band, including on a **zero-hit** page for any pre-declared kind — exactly when
+there is no row to read the schema off (the caveat above applies: an empty page of
+a kind the bridge does not pre-declare has no schema to publish):
 
 ```python
 rows = await s.sections(limit=None)
@@ -178,6 +201,12 @@ print(bn_kernel.brief(rows, *s.last.row_fields[:3]))
 plain text. A missing key raises a `KeyError` that **lists the row's actual
 top-level keys**, and adds dotted-path guidance (`brief(rows, "callee.name",
 "call_addr")`) only when that row really does nest mappings.
+
+Curated address fields are canonical hexadecimal strings (`"0x401000"`), not
+integers. Use `int(row["address"], 0)` for arithmetic; do not call `hex()` on
+an address returned by bn-kernel. This holds for `functions.address`,
+`sections.start`/`end`, `callsites.call_addr`, and containment's
+`requested_address` alike.
 
 **Bare-decimal addresses, one disclosure shape.** Every containment-enabled read
 (`decompile`, `function_info`, `il`, `disasm`, `cfg`, `proto get`, `local list`,
@@ -240,13 +269,23 @@ bn -i worker target list                           # selector once terminal
 **Poll on the job, not on the collection.** `session status <job-id>` returns
 `kind: "load_job"` with top-level `job_id`, `state`
 (`queued|running|complete|failed`), `terminal`, `succeeded`, the canonical record
-under `job`, and the exact `status_command` to re-run. Loop on
+under `job`, and `status_command`. Loop on
 `terminal == false`; do **not** re-derive terminality from the state string, and
 do not read `succeeded` as a failure while it is `null` (non-terminal means
 unknown, not failed). `succeeded` is `true` for `complete` and `false` for
 `failed`. An unknown job id is a loud error, not an empty result. Omitting the id
 returns the population collection (`kind: "load_jobs"`, `items`, `count`) with no
-`terminal`/`succeeded` — one verdict over many jobs would be a lie.
+`terminal`/`succeeded` — one verdict over many jobs would be a lie — and its items
+are the raw job records, which carry no `status_command`.
+
+`status_command` is the exact command to re-run, but only a bridge that has an
+instance id can name itself on a fresh command line. Any headless bridge does
+(that is what `--instance-id` sets, and the detached-start flow above always
+sets it). A GUI-loaded bridge does not: it has no unambiguous CLI selector, so it
+publishes `status_command: null` instead of a command that cannot address it. The
+key is always present, so `null` is distinguishable from a missing field. On
+`null`, poll through the client or connection you already have bound to that
+bridge, or treat the command as unavailable — do not synthesize one.
 
 Poll from **bash**, never from an eval cell wait loop: an eval cell that blocks on
 a load burns the harness cell timeout and can take the retained kernel with it.

@@ -717,14 +717,36 @@ def _maybe_regex_hint(args: argparse.Namespace, result: Any, query: str | None) 
 
 
 def _should_retry_as_regex(args: argparse.Namespace, result: Any, query: str) -> bool:
-    """True when a literal search of *query* found nothing and the query looks like
-    a regex that compiles -- the caller should re-run it as a pattern (#291.3).
+    """True when a literal search of *query* found nothing (or *query* is the
+    literal string `"."`) and *query* looks like a regex that compiles -- the
+    caller should re-run it as a pattern (#291.3).
 
     A first-pass alternation like `Parse|Process|Decode` is taken literally and
     returns a confident (misleading) `none`; auto-retrying it as a regex removes
-    the trap. Guarded so we never change a search that DID match, and never turn a
-    clean 0-result into a regex-compile error: only an explicit-literal query with
-    unescaped metacharacters that both matched nothing and compiles is retried."""
+    the trap. Branches, in order:
+
+    - An explicit `--regex` or `--exact` on *args* short-circuits to `False`:
+      the caller already chose literal-vs-pattern matching, so there is nothing
+      to retry.
+    - *result* must be the `{..., "total": ...}` envelope dict; anything else
+      (e.g. a raw list) is `False`.
+    - *query* must contain at least one character from `_REGEX_METACHARS`
+      (`.|()[]{}*+?^$\\`); this is a raw membership test against the query
+      string, not an escape-aware scan, so an escaped metacharacter like `\\.`
+      still counts.
+    - Special-cased `"."`: for every other query, a non-zero `total` means the
+      literal search DID match and short-circuits to `False` (never turn a hit
+      into a regex-compile error). The literal query `"."` is exempt from that
+      guard -- it proceeds to the regex-compile check even when the literal
+      search already matched, because a literal `.` search is itself
+      misleading (it "matches" every name containing a dot) and the caller
+      wants the true any-name-regex behavior instead.
+    - The surviving query must compile as a regex. A regex-shaped query that
+      does NOT compile raises `BridgeError` (guiding the caller to `--exact`)
+      instead of returning `False`, so a clean 0-result never silently retries
+      into a swallowed exception.
+
+    Only a query that clears every guard above and compiles returns `True`."""
     if getattr(args, "regex", False) or getattr(args, "exact", False):
         return False
     if not isinstance(result, dict):

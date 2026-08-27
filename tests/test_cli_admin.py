@@ -974,7 +974,7 @@ def test_session_start_no_marker_flag_suppresses_marker(monkeypatch, capsys, tmp
 
 
 def test_session_start_partial_failure_keeps_bridge_but_exits_nonzero(monkeypatch, capsys):
-    from bn.transport import BridgeError, BridgeInstance
+    from bn.transport import BridgeInstance
 
     fake_inst = BridgeInstance(
         pid=999,
@@ -995,7 +995,10 @@ def test_session_start_partial_failure_keeps_bridge_but_exits_nonzero(monkeypatc
         if op == "load_binary":
             if "good" in params["path"]:
                 return {"ok": True, "result": {"path": params["path"], "loaded": True, "targets": [{"selector": "good.so"}]}}
-            raise BridgeError(f"File not found: {params['path']}")
+            # Malformed success (no open target) -- NOT a transport-level
+            # BridgeError -- this is the branch whose error text used to
+            # predict teardown the bridge never actually performs.
+            return {"ok": True, "result": {"path": params["path"], "loaded": True, "targets": []}}
         raise AssertionError(f"unexpected op: {op}")
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
@@ -1007,6 +1010,13 @@ def test_session_start_partial_failure_keeps_bridge_but_exits_nonzero(monkeypatc
     assert "shutdown" not in ops
     parsed = json.loads(capsys.readouterr().out)
     assert "stopped" not in parsed
+    bad_error = next(
+        item["error"] for item in parsed["loaded"] if item["path"].endswith("bad.so")
+    )
+    # The bridge survives partial success -- the per-binary error text must
+    # not predict a teardown that never happens.
+    assert "will be stopped" not in bad_error
+    assert "stopped" not in bad_error
 
 
 def test_close_ignores_sticky_target_pin(fake_transport, monkeypatch, capsys):

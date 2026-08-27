@@ -638,6 +638,76 @@ def test_decompile_redacts_annotation_bodies_unless_explicitly_included(
     assert included["comments"] == {"0x401000": "inherited address note"}
 
 
+@pytest.mark.parametrize("body,code", [
+    ("1", "value = 1;"),
+    ("buf", "char* buf = input;"),
+    ("end", 'char* label = "weekend";'),
+])
+def test_decompile_redacts_only_rendered_comment_lines(monkeypatch, body, code):
+    # A short comment body like "1", "buf", or "end" is a substring of
+    # unrelated code (`value = 1;`, `char* buf`, `"weekend"`); redaction must
+    # rewrite only the rendered comment LINE, never bare-substring the body
+    # out of surrounding code.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    function = _FakeFunction(0x401000, "parse_record")
+    function.basic_blocks = [_FakeBasicBlock(0x401000, 0x401002)]
+    bv = _FakeBV(functions=[function], comments={0x401000: body})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    text = f"void parse_record() {{\n    // {body}\n    {code}\n}}"
+    monkeypatch.setattr(
+        bridge.il_format, "_decompile_text", lambda *args, **kwargs: text
+    )
+
+    result = instance._decompile("active", "parse_record")
+
+    assert f"// {body}" not in result["text"]
+    assert "// <annotation redacted>" in result["text"]
+    assert code in result["text"]
+
+
+def test_decompile_redacts_every_line_of_multiline_annotation(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    function = _FakeFunction(0x401000, "parse_record")
+    function.basic_blocks = [_FakeBasicBlock(0x401000, 0x401002)]
+    function.comment = "first line\nsecond line"
+    bv = _FakeBV(functions=[function])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    text = (
+        "void parse_record() {\n"
+        "    // first line\n"
+        "    // second line\n"
+        "    do_thing();\n"
+        "}"
+    )
+    monkeypatch.setattr(
+        bridge.il_format, "_decompile_text", lambda *args, **kwargs: text
+    )
+
+    result = instance._decompile("active", "parse_record")
+
+    assert "first line" not in result["text"]
+    assert "second line" not in result["text"]
+    assert result["text"].count("// <annotation redacted>") == 2
+    assert "do_thing();" in result["text"]
+
+
+def test_redact_rendered_annotations_preserves_address_gutter():
+    # The `--addresses` gutter form: a 0x-prefixed address, whitespace, then
+    # the rendered line. Redaction must preserve the gutter and the `//`
+    # prefix, rewriting only the comment body.
+    text = (
+        "0x401000        // secret note\n"
+        "0x401004            value = 1;"
+    )
+    redacted = read_decompile._redact_rendered_annotations(text, ["secret note"])
+    assert redacted == (
+        "0x401000        // <annotation redacted>\n"
+        "0x401004            value = 1;"
+    )
+
+
 def test_decompile_falls_back_to_hlil_when_pseudo_c_unavailable(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

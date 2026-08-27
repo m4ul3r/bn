@@ -1208,11 +1208,22 @@ class BinaryNinjaBridge:
     def _try_idle_shutdown(self, now: float, timeout: float) -> bool:
         """Atomically decide whether to self-shutdown. Returns True (and latches
         _shutting_down so _enter_request refuses new work) only when nothing is in
-        flight AND the bridge has been idle >= timeout. A non-zero _inflight covers
-        any running update_analysis_and_wait() too, since analysis executes inside
-        its request's dispatch -- so this never fires mid-work."""
+        flight, no detached load job is still queued/running, AND the bridge has
+        been idle >= timeout. A non-zero _inflight covers every operation that runs
+        inside a request's own dispatch (including update_analysis_and_wait there),
+        but a detached load job (started via load_binary_async) runs on its own
+        worker thread outside any request's dispatch, so _load_jobs must be
+        checked too or the reaper could shut down mid-load (#694)."""
         with self._request_state_lock:
             if self._inflight > 0:
+                return False
+            with self._load_jobs_lock:
+                load_active = any(
+                    job.get("state") not in _TERMINAL_LOAD_STATES
+                    for job in self._load_jobs.values()
+                )
+            if load_active:
+                self._last_activity = now
                 return False
             if (now - self._last_activity) < timeout:
                 return False
@@ -1444,12 +1455,13 @@ class BinaryNinjaBridge:
             "count": 1,
         }
 
-    def _load_status_command(self, job_id: Any) -> str:
-        return (
-            f"bn -i {self.instance_id} session status {job_id}"
-            if self.instance_id
-            else f"bn session status {job_id}"
-        )
+    def _load_status_command(self, job_id: Any) -> str | None:
+        # A GUI-loaded bridge has no instance id, and therefore no
+        # unambiguous CLI-addressable selector -- there is no `bn session
+        # status` invocation that can reliably name it back.
+        if not self.instance_id:
+            return None
+        return f"bn -i {self.instance_id} session status {job_id}"
 
 
     def _load_binary(self, path: str, *, prefer_bndb: bool = True, quick: bool = False,

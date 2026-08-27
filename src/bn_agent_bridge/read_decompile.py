@@ -29,6 +29,8 @@ Import direction is one-way: this module imports ``il_format``, ``vars``,
 """
 from __future__ import annotations
 
+import re
+
 from typing import Any
 
 try:
@@ -134,6 +136,37 @@ def _thunk_veneer_warning(ctx, bv, func) -> str | None:
             "real function body; the apparent self-call is the resolved target.")
 
 
+_COMMENT_LINE_RE = re.compile(
+    r"^(?P<prefix>(?:0x[0-9a-fA-F]+\s+)?\s*//\s*)(?P<body>.*?)(?P<trailing>\s*)$"
+)
+
+
+def _redact_rendered_annotations(text: str, annotation_bodies: list[str]) -> str:
+    """Redact *text* by rewriting whole rendered comment LINES whose body
+    exactly matches one of *annotation_bodies* (or one of its own lines, for
+    multiline bodies) to ``<annotation redacted>``, instead of bare
+    ``str.replace()``-ing the annotation body out of the text -- which
+    corrupts code whenever the body is a short token that also occurs inside
+    unrelated code (e.g. a comment body of `1`, `buf`, or `end`).
+    """
+    bodies = {
+        line.strip()
+        for body in annotation_bodies
+        for line in str(body).splitlines()
+        if line.strip()
+    }
+    out = []
+    for line in text.splitlines(keepends=True):
+        ending = "\n" if line.endswith("\n") else ""
+        content = line[:-1] if ending else line
+        match = _COMMENT_LINE_RE.fullmatch(content)
+        if match and match.group("body").strip() in bodies:
+            content = f"{match.group('prefix')}<annotation redacted>"
+        out.append(content + ending)
+    return "".join(out)
+
+
+
 def _decompile(
     ctx,
     selector: str | None,
@@ -158,12 +191,7 @@ def _decompile(
     ]
     text = il_format._decompile_text(bv, func, addresses=addresses)
     if not include_annotations:
-        for body in sorted(
-            {body for body in annotation_bodies if body},
-            key=len,
-            reverse=True,
-        ):
-            text = text.replace(body, "<annotation redacted>")
+        text = _redact_rendered_annotations(text, annotation_bodies)
 
     warnings = il_format._render_warnings(text)
     stub = il_format._analysis_stub_warning(func, text, forced=forced)

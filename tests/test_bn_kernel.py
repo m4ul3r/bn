@@ -501,19 +501,168 @@ json.dump({"items": rows, "offset": offset, "total": 100, "has_more": True},
     assert session.last.payload["limit"] == 5
 
 
-def test_all_zero_limit_makes_no_cli_call(monkeypatch):
-    monkeypatch.setenv("BN_BIN", "/does/not/exist")
+def test_all_zero_limit_probes_one_row_and_discards_it(monkeypatch, tmp_path):
+    """`limit=0` must issue exactly one real CLI request with WIRE `--limit 1`
+    (the bridge enforces `minimum=1`), validate that probed row through the
+    normal page contract, then discard it -- the caller sees zero rows but the
+    schema metadata (kind/total/row_fields) survives, and a probed row flips
+    `has_more` true even when the bridge under-reports it."""
+    counter = tmp_path / "pages.count"
+    script = _page_script(
+        'page = {"kind": "sections", "items": [{"name": "sec0"}], "offset": offset,\n'
+        '        "limit": limit, "returned": 1, "total": 5, "has_more": False,\n'
+        '        "row_fields": ["name", "start", "end", "length", "semantics"]}',
+        counter=counter,
+        cap=1,
+    )
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
     session = bn_kernel.Session(backend="cli")
 
-    assert _run(session.all("strings", limit=0, offset=4)) == []
+    rows = _run(session.all("sections", limit=0, offset=4))
+
+    assert rows == []
+    assert counter.read_text() == "1"
     assert session.last is not None
-    assert session.last.payload == {
+    assert session.last.payload["offset"] == 4
+    assert session.last.payload["returned"] == 0
+    assert session.last.payload["limit"] == 0
+    assert session.last.payload["kind"] == "sections"
+    assert session.last.payload["total"] == 5
+    # The bridge said has_more=False, but the probe found a row: from the
+    # caller's zero-row position there IS more to fetch.
+    assert session.last.payload["has_more"] is True
+    assert session.last.payload["row_fields"] == [
+        "name", "start", "end", "length", "semantics",
+    ]
+    assert session.last.value == []
+
+
+def test_all_zero_limit_probe_finds_no_rows(monkeypatch, tmp_path):
+    """When the probe itself comes back empty, `has_more` falls through to the
+    bridge's own (also-false) value -- there is nothing at this offset at all.
+    Also pins the wire-level limit to 1, not 0."""
+    seen_limit = tmp_path / "seen_limit"
+    script = _page_script(
+        f'open({str(seen_limit)!r}, "w").write(str(limit))\n'
+        'page = {"kind": "sections", "items": [], "offset": offset, "limit": limit,\n'
+        '        "returned": 0, "total": 5, "has_more": False,\n'
+        '        "row_fields": ["name", "start", "end"]}'
+    )
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+    session = bn_kernel.Session(backend="cli")
+
+    rows = _run(session.all("sections", limit=0, offset=5))
+
+    assert rows == []
+    assert seen_limit.read_text() == "1"
+    assert session.last is not None
+    assert session.last.payload["returned"] == 0
+    assert session.last.payload["limit"] == 0
+    assert session.last.payload["has_more"] is False
+
+
+def test_all_zero_limit_requires_row_fields(monkeypatch, tmp_path):
+    script = _page_script(
+        'page = {"kind": "sections", "items": [{"name": "sec0"}], "offset": offset,\n'
+        '        "limit": limit, "returned": 1, "total": 3, "has_more": True}'
+    )
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+    session = bn_kernel.Session(backend="cli")
+
+    with pytest.raises(bn_kernel.BnError, match="row_fields"):
+        _run(session.all("sections", limit=0))
+
+    assert session.last is None
+
+
+def test_all_zero_limit_empty_page_undeclared_kind_omits_row_fields(monkeypatch, tmp_path):
+    """Same real-bridge-behaviour pin as the client test: an undeclared `kind`
+    (outside `_DECLARED_ROW_FIELDS`) with an empty probe page has no row to
+    derive a schema from, so the bridge's real `_annotate_row_fields` leaves
+    `row_fields` off entirely. That must not be treated as malformed."""
+    from bn_agent_bridge._shared import _annotate_row_fields
+
+    raw = {
+        "kind": "types",
         "items": [],
-        "offset": 4,
+        "offset": 6,
+        "limit": 1,
         "returned": 0,
+        "total": 0,
         "has_more": False,
-        "total": None,
     }
+    page = _annotate_row_fields(dict(raw))
+    assert "row_fields" not in page  # pins the real bridge behaviour this defends
+
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, _payload_script(page))))
+    session = bn_kernel.Session(backend="cli")
+
+    rows = _run(session.all("types", limit=0, offset=6))
+
+    assert rows == []
+    assert session.last is not None
+    assert session.last.payload["offset"] == 6
+    assert session.last.payload["returned"] == 0
+    assert session.last.payload["limit"] == 0
+    assert session.last.payload["kind"] == "types"
+    assert session.last.payload["has_more"] is False
+    assert "row_fields" not in session.last.payload
+
+
+def test_all_zero_limit_empty_page_declared_kind_keeps_row_fields(monkeypatch, tmp_path):
+    """A declared kind's row_fields tuple is populated even with zero rows, so
+    the empty-probe path must still surface it."""
+    from bn_agent_bridge._shared import _annotate_row_fields, _DECLARED_ROW_FIELDS
+
+    raw = {
+        "kind": "sections",
+        "items": [],
+        "offset": 0,
+        "limit": 1,
+        "returned": 0,
+        "total": 0,
+        "has_more": False,
+    }
+    page = _annotate_row_fields(dict(raw))
+    assert page["row_fields"] == list(_DECLARED_ROW_FIELDS["sections"])
+
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, _payload_script(page))))
+    session = bn_kernel.Session(backend="cli")
+
+    rows = _run(session.all("sections", limit=0))
+
+    assert rows == []
+    assert session.last.payload["row_fields"] == list(_DECLARED_ROW_FIELDS["sections"])
+
+
+@pytest.mark.parametrize(
+    "row_fields",
+    ["name", [1, 2], ["name", 2]],
+    ids=["not-a-list", "non-string-items", "mixed-types"],
+)
+def test_all_zero_limit_empty_page_malformed_row_fields_raises(monkeypatch, tmp_path, row_fields):
+    """A present-but-malformed `row_fields` on an EMPTY probe page must still
+    raise -- only a genuinely ABSENT `row_fields` is legitimate for an empty
+    page (undeclared kind). The malformed shapes must not slip through the
+    `if probed_items:` gate just because the probe found no row, and the raise
+    must still clear `Session.last`."""
+    page = {
+        "kind": "sections",
+        "items": [],
+        "offset": 0,
+        "limit": 1,
+        "returned": 0,
+        "total": 0,
+        "has_more": False,
+        "row_fields": row_fields,
+    }
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, _payload_script(page))))
+    session = bn_kernel.Session(backend="cli")
+
+    with pytest.raises(bn_kernel.BnError, match="row_fields"):
+        _run(session.all("sections", limit=0))
+
+    assert session.last is None
 
 
 @pytest.mark.parametrize(
@@ -602,6 +751,54 @@ json.dump(
         )
 
     assert time.monotonic() - started < 0.1
+
+
+def test_all_between_page_timeout_carries_shared_guidance(monkeypatch, tmp_path):
+    """The between-page deadline check (fired BEFORE launching the next page's
+    subprocess, not from a slow subprocess's own asyncio.wait_for) used to raise
+    a short hand-written message with no analysis-progress guidance. It must
+    carry the same `_timeout_message` text every other bn-kernel timeout does."""
+    counter = tmp_path / "pages.count"
+    script = _page_script(
+        'page = {"items": [{"value": str(offset)}], "offset": offset,\n'
+        '        "returned": 1, "has_more": True, "total": None}',
+        counter=counter,
+        cap=1,
+    )
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+    # `time.monotonic()` is called twice directly inside `Session.all()`: once to
+    # anchor the deadline, once per loop iteration to compute the remaining
+    # budget. Faking it globally would also feed asyncio's own event-loop clock
+    # (same `time` module) and crash unrelated internals, so intercept only the
+    # calls whose caller frame is `Session.all` itself and let everything else
+    # (subprocess spawn/wait) run on real time. Schedule: first call resolves the
+    # deadline anchor; the second (before page 1) leaves the full budget; the
+    # third (before page 2, i.e. between pages) reads as far past the deadline --
+    # without any subprocess ever actually stalling.
+    import inspect
+
+    real_monotonic = bn_kernel.time.monotonic
+    schedule = iter([0.0, 0.0, 100.0])
+
+    def fake_monotonic():
+        caller = inspect.currentframe().f_back
+        if caller is not None and caller.f_code.co_name == "all" and caller.f_code.co_filename == bn_kernel.__file__:
+            try:
+                return next(schedule)
+            except StopIteration:
+                pass
+        return real_monotonic()
+
+    monkeypatch.setattr(bn_kernel.time, "monotonic", fake_monotonic)
+    session = bn_kernel.Session(timeout=1, backend="cli")
+
+    with pytest.raises(bn_kernel.BnError) as excinfo:
+        _run(session.all("strings", page=1, timeout=5))
+
+    message = str(excinfo.value)
+    assert "requested end-to-end budget" in message
+    assert "bn -i NAME target info" in message
+    assert counter.read_text() == "1"
 
 
 def test_all_invalidates_last_after_mid_pagination_failure(monkeypatch, tmp_path):
