@@ -10,6 +10,17 @@ import pytest
 
 
 def test_wheel_excludes_python_bytecode_from_bridge_package(tmp_path):
+    """No bytecode in the wheel -- from the module trees OR the skills data tree.
+
+    `skills/` ships as install-prefix data (`tool.uv.build-backend.data`), which is
+    a different inclusion path from the `src/` modules, so it needs its own
+    sentinels: a config that filters the module trees can still ship
+    `<name>-<version>.data/data/bn-kernel/__pycache__/...`.
+
+    The copy deliberately ignores `__pycache__` so the tree starts bytecode-free
+    and every leak is attributable to a sentinel planted below, not to whatever a
+    local test run happened to leave in the worktree.
+    """
     uv = shutil.which("uv")
     if uv is None:
         pytest.skip("uv is required to build the wheel")
@@ -20,15 +31,32 @@ def test_wheel_excludes_python_bytecode_from_bridge_package(tmp_path):
     for name in ("pyproject.toml", "README.md", "LICENSE"):
         shutil.copy2(repo / name, tree / name)
     for name in ("src", "skills"):
-        shutil.copytree(repo / name, tree / name, symlinks=True)
+        shutil.copytree(
+            repo / name,
+            tree / name,
+            symlinks=True,
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc", "*.pyo"),
+        )
 
-    pycache = tree / "src" / "bn_agent_bridge" / "__pycache__"
-    # exist_ok: copytree above may have already carried a __pycache__ from the
-    # repo's working tree (present after any local test run), so don't assume the
-    # copied tree is bytecode-free -- just ensure our sentinel is in it.
-    pycache.mkdir(exist_ok=True)
-    (pycache / "sentinel.cpython-314.pyc").write_bytes(b"not real bytecode")
-    (tree / "src" / "bn_agent_bridge" / "sentinel.pyo").write_bytes(b"not real bytecode")
+    sentinel = b"not real bytecode"
+    bytecode_dirs = (
+        # module tree (src-layout package)
+        tree / "src" / "bn_agent_bridge" / "__pycache__",
+        # data tree: the skill root, where `bootstrap.py` sits next to SKILL.md
+        tree / "skills" / "bn-kernel" / "__pycache__",
+        # data tree, nested: the importable kernel source inside the skill
+        tree / "skills" / "bn-kernel" / "src" / "bn_kernel" / "__pycache__",
+    )
+    for directory in bytecode_dirs:
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "bootstrap.cpython-314.pyc").write_bytes(sentinel)
+    loose_bytecode = (
+        tree / "src" / "bn_agent_bridge" / "sentinel.pyo",
+        tree / "skills" / "bn-kernel" / "sentinel.pyo",
+        tree / "skills" / "bn-kernel" / "sentinel.pyc",
+    )
+    for path in loose_bytecode:
+        path.write_bytes(sentinel)
 
     out_dir = tmp_path / "dist"
     env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
@@ -51,5 +79,19 @@ def test_wheel_excludes_python_bytecode_from_bridge_package(tmp_path):
         name for name in names
         if "/__pycache__/" in name or name.endswith((".pyc", ".pyo"))
     ]
-    assert leaked == []
+    assert leaked == [], leaked
+
+    # The exclude must not pass by nuking the trees it is filtering.
     assert any(name == "bn_agent_bridge/plugin.json" for name in names)
+    expected_data = {
+        "bn-kernel/SKILL.md",
+        "bn-kernel/bootstrap.py",
+        "bn-kernel/scripts/smoke.py",
+        "bn-kernel/src/bn_kernel/__init__.py",
+    }
+    shipped_data = {
+        name.split(".data/data/", 1)[1]
+        for name in names
+        if ".data/data/" in name
+    }
+    assert expected_data <= shipped_data, expected_data - shipped_data

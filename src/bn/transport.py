@@ -591,6 +591,7 @@ def _send_request_to_instance(
     timeout_display: float | None = None,
     default_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
     connect_retries: int = 4,
+    resolved: bool = False,
 ) -> dict[str, Any]:
     process_state = _process_state(instance.pid)
     if process_state in {"T", "t"}:
@@ -616,7 +617,12 @@ def _send_request_to_instance(
         payload["target"] = target
 
     encoded = (json.dumps(payload) + "\n").encode("utf-8")
-    timeout = _resolve_timeout(timeout, default=default_timeout)
+    # BN_REQUEST_TIMEOUT is one end-to-end budget, applied exactly once. A caller
+    # that already resolved it (send_request, or a paginating Client.collect) hands
+    # down the *remaining* slice; re-resolving here would restore the full env
+    # value and let a multi-page collection run for a multiple of its own budget.
+    if not resolved:
+        timeout = _resolve_timeout(timeout, default=default_timeout)
     deadline = time.monotonic() + timeout if timeout is not None else None
 
     chunks: list[bytes] = []
@@ -908,15 +914,23 @@ def send_request(
     connect_retries: int = 4,
     instance_id: str | None = None,
     spawn_missing_named: bool = False,
+    resolved: bool = False,
 ) -> dict[str, Any]:
     # Validate/resolve the timeout BEFORE choosing an instance: choose_instance()
     # auto-spawns a headless bridge when none is running, so a bad
     # BN_REQUEST_TIMEOUT must fail here -- not after a stray random instance has
-    # already been spawned into the cache (#255 review). _resolve_timeout is
-    # idempotent, so the resolved value re-resolves to itself downstream.
+    # already been spawned into the cache (#255 review).
     # default_timeout lets a long one-time op (load/refresh) raise the no-env
     # default without overriding an explicit BN_REQUEST_TIMEOUT (#321).
-    timeout = _resolve_timeout(timeout, default=default_timeout)
+    #
+    # `resolved=True` means the caller already applied BN_REQUEST_TIMEOUT once and
+    # `timeout` is the *remaining* slice of that single end-to-end budget (see
+    # Client.collect). Re-resolving it -- here, in choose_instance's share, or in
+    # _send_request_to_instance -- would hand every page a fresh copy of the full
+    # env value, so a collection could run for a multiple of its declared budget
+    # and the child bridge's cancellation would be scheduled off the wrong number.
+    if not resolved:
+        timeout = _resolve_timeout(timeout, default=default_timeout)
     requested_timeout = timeout
     deadline = time.monotonic() + timeout if timeout is not None else None
     instance = choose_instance(
@@ -940,4 +954,5 @@ def send_request(
         timeout_display=requested_timeout,
         default_timeout=default_timeout,
         connect_retries=connect_retries,
+        resolved=True,
     )

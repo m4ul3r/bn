@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import importlib
 import inspect
+import os
 import shutil
 import sys
+import uuid
 from pathlib import Path
 
 _configured_skill_dir = globals().get("skill_dir")
@@ -67,9 +69,27 @@ if not _module_matches_source(bn_kernel):
     for _module_name in tuple(sys.modules):
         if _module_name == "bn_kernel" or _module_name.startswith("bn_kernel."):
             sys.modules.pop(_module_name, None)
+    # Evict stale bytecode by ATOMICALLY CLAIMING the whole directory, then
+    # deleting only what we claimed. Every fresh eval-agent process takes this
+    # branch and a shared installed skill points them all at one __pycache__, so
+    # an exists()->rmtree() pair races and the loser dies inside rmtree.
+    #
+    # rename() is atomic: exactly one process can move the directory. Losing it
+    # with FileNotFoundError is benign -- a sibling already evicted the cache, so
+    # no stale bytecode remains. Everything else stays loud, including a failure
+    # to remove the claimed tree: that path is private to this process, so a
+    # FileNotFoundError from inside it is a real bug, not the sibling race, and
+    # swallowing it could leave stale bytecode that wins the import below.
     _cache_dir = _source_path.parent / "__pycache__"
-    if _cache_dir.exists():
-        shutil.rmtree(_cache_dir)
+    _claimed = _cache_dir.with_name(
+        f"__pycache__.evict-{os.getpid()}-{uuid.uuid4().hex}"
+    )
+    try:
+        _cache_dir.rename(_claimed)
+    except FileNotFoundError:
+        pass
+    else:
+        shutil.rmtree(_claimed)
     importlib.invalidate_caches()
 
     _previous_dont_write_bytecode = sys.dont_write_bytecode

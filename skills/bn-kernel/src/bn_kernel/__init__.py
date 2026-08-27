@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import math
 import inspect
 import re
 import os
@@ -35,6 +37,58 @@ Backend = Literal["cli", "native"]
 BackendChoice = Literal["auto", "cli", "native"]
 _TEXT_KEYS = ("text", "listing", "body")
 _REGEX_METACHARS = ".|()[]{}*+?^$\\"
+_ENV_REQUEST_TIMEOUT = "BN_REQUEST_TIMEOUT"
+
+
+def _env_timeout_override() -> tuple[bool, float | None]:
+    """Read BN_REQUEST_TIMEOUT as ``(is_set, seconds_or_None_to_disable)``.
+
+    Mirrors ``bn.transport._resolve_timeout`` deliberately instead of importing it:
+    the CLI backend must stay zero-install, so this module cannot depend on the
+    ``bn`` package being importable in the kernel interpreter.
+    """
+    raw = os.environ.get(_ENV_REQUEST_TIMEOUT)
+    if raw is None:
+        return False, None
+    text = raw.strip().lower()
+
+    def _reject() -> BnError:
+        return BnError(
+            f"{_ENV_REQUEST_TIMEOUT}={raw!r} is not a valid timeout: expected a "
+            "positive number of seconds, or one of 0/none/off/empty to disable it.",
+            returncode=2,
+            argv=(_ENV_REQUEST_TIMEOUT,),
+        )
+
+    if text in ("", "none", "off"):
+        return True, None
+    try:
+        value = float(text)
+    except ValueError:
+        raise _reject() from None
+    if not math.isfinite(value) or value < 0 or math.copysign(1.0, value) < 0:
+        raise _reject()
+    if value == 0.0:
+        if any(digit in text for digit in "123456789"):
+            raise _reject()
+        return True, None
+    return True, value
+
+
+def _resolve_budget(timeout: float | None) -> float | None:
+    """The single end-to-end budget for one operation, env override applied once.
+
+    ``None`` means "no deadline" -- the documented 0/none/off spelling. Callers
+    resolve exactly once and then pass the shrinking remainder down, so a
+    multi-page collection cannot silently re-expand to the full env value per page.
+    """
+    present, value = _env_timeout_override()
+    return value if present else timeout
+
+
+def _format_child_budget(budget: float | None) -> str:
+    """Render a resolved budget for the child `bn` process's own env override."""
+    return "0" if budget is None else f"{budget:.6g}"
 
 
 def _timeout_message(operation: str, budget: float, detail: str = "") -> str:
@@ -289,6 +343,258 @@ def _require_callsites(value: Any, payload: Any) -> list[dict[str, Any]]:
                 argv=("callsites",),
             )
     return rows
+
+
+_ORIENT_COUNTERS = ("comments", "function_comments", "user_symbols")
+
+
+def _require_orient_digest(payload: Any) -> dict[str, Any]:
+    """Fail closed on any orientation digest this gate cannot actually read.
+
+    ``assert_unannotated`` is the contamination gate for benchmark and dogfood
+    inputs, so an unreadable digest must never collapse to "zero comments" and be
+    certified clean. A stale or version-skewed bridge that renames, drops, or
+    retypes ``existing_annotations`` is exactly the case that would otherwise
+    convert contaminated data into a confident pass.
+    """
+    if not isinstance(payload, Mapping):
+        raise BnError(
+            "orient digest contract violation: expected a mapping payload, got "
+            f"{type(payload).__name__}",
+            returncode=0,
+            argv=("orient_digest",),
+        )
+    annotations = payload.get("existing_annotations")
+    if not isinstance(annotations, Mapping):
+        raise BnError(
+            "orient digest contract violation: existing_annotations must be a "
+            f"mapping, got {type(annotations).__name__}",
+            returncode=0,
+            argv=("orient_digest",),
+        )
+    counts: dict[str, int] = {}
+    for key in _ORIENT_COUNTERS:
+        value = annotations.get(key)
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value < 0
+        ):
+            raise BnError(
+                "orient digest contract violation: annotation counter "
+                f"{key!r} must be a non-negative integer, got {value!r}",
+                returncode=0,
+                argv=("orient_digest",),
+            )
+        counts[key] = value
+    return counts
+
+
+_TARGET_INFO_COUNTS = (
+    "function_count",
+    "named_function_count",
+    "unnamed_function_count",
+    "imported_function_count",
+)
+
+
+def _require_target_info(payload: Any) -> dict[str, Any]:
+    """Require the canonical `target_info` shape, not merely "a nonempty mapping".
+
+    A nonempty-mapping check accepts any *other* bridge payload -- an `il` result,
+    an evidence digest -- and then answers every documented question
+    (``function_count``, ``basename``, the import counts) with a silent "absent".
+    These keys are exactly what ``bridge.py`` ``_target_info`` always publishes
+    (``_function_name_summary`` plus filename/basename/import_symbol_count), so
+    requiring them is a real answer-or-fail contract.
+    """
+    if not isinstance(payload, Mapping):
+        raise BnError(
+            "target info contract violation: expected a mapping, got "
+            f"{type(payload).__name__}",
+            returncode=0,
+            argv=("target_info",),
+        )
+    for key in ("filename", "basename"):
+        if key not in payload:
+            raise BnError(
+                f"target info contract violation: missing {key}; this is not a "
+                "target_info payload",
+                returncode=0,
+                argv=("target_info",),
+            )
+        value = payload[key]
+        if value is not None and not isinstance(value, str):
+            raise BnError(
+                f"target info contract violation: {key} must be a string or null, "
+                f"got {value!r}",
+                returncode=0,
+                argv=("target_info",),
+            )
+    for key in _TARGET_INFO_COUNTS:
+        if key not in payload:
+            raise BnError(
+                f"target info contract violation: missing {key}; this is not a "
+                "target_info payload",
+                returncode=0,
+                argv=("target_info",),
+            )
+        value = payload[key]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise BnError(
+                f"target info contract violation: {key} must be a non-negative "
+                f"integer, got {value!r}",
+                returncode=0,
+                argv=("target_info",),
+            )
+    # The bridge deliberately publishes None here when the imports count raises,
+    # so null is a real value for this key alone -- absent still is not.
+    if "import_symbol_count" not in payload:
+        raise BnError(
+            "target info contract violation: missing import_symbol_count; this is "
+            "not a target_info payload",
+            returncode=0,
+            argv=("target_info",),
+        )
+    import_symbol_count = payload["import_symbol_count"]
+    if import_symbol_count is not None and (
+        not isinstance(import_symbol_count, int)
+        or isinstance(import_symbol_count, bool)
+        or import_symbol_count < 0
+    ):
+        raise BnError(
+            "target info contract violation: import_symbol_count must be a "
+            f"non-negative integer or null, got {import_symbol_count!r}",
+            returncode=0,
+            argv=("target_info",),
+        )
+    return dict(payload)
+
+
+# Distinguishes "no page has reported a total yet" from "a page reported None",
+# which `.get("total")` on an aggregate cannot.
+_UNSEEN: Any = object()
+
+
+def _validate_page(
+    op: str,
+    payload: Any,
+    *,
+    requested_offset: int,
+    requested_limit: int,
+    previous_total: Any = _UNSEEN,
+) -> tuple[list[Any], bool, int | None]:
+    """Reject a page that cannot be trusted to advance a collection.
+
+    ``all()`` tracks progress with its own arithmetic, so an unchecked page lets a
+    stale bridge duplicate rows forever (echoing one offset) or over-deliver past
+    the requested limit -- both of which read as data, not as an error.
+    """
+    if not isinstance(payload, dict):
+        raise BnError(
+            f"bn {op} is not a paged collection",
+            returncode=0,
+            argv=(op,),
+        )
+    items = payload.get("items")
+    if not isinstance(items, list):
+        raise BnError(
+            f"malformed {op} page: items must be a list", returncode=0, argv=(op,)
+        )
+    has_more = payload.get("has_more")
+    if not isinstance(has_more, bool):
+        raise BnError(
+            f"malformed {op} page: has_more must be a boolean",
+            returncode=0,
+            argv=(op,),
+        )
+    if has_more and not items:
+        raise BnError(
+            f"malformed {op} page: has_more with an empty page",
+            returncode=0,
+            argv=(op,),
+        )
+    if len(items) > requested_limit:
+        raise BnError(
+            f"malformed {op} page: returned {len(items)} items for requested "
+            f"limit {requested_limit}",
+            returncode=0,
+            argv=(op,),
+        )
+    # Every current bridge envelope publishes `offset`. Requiring it is the only
+    # way to detect a bridge that ignores pagination: with a known `total` a
+    # repeated page 1 that simply omits `offset` passes every other check and the
+    # caller silently receives duplicates.
+    echoed_offset = payload.get("offset")
+    if not isinstance(echoed_offset, int) or isinstance(echoed_offset, bool):
+        raise BnError(
+            f"malformed {op} page: did not publish an integer offset "
+            f"(got {echoed_offset!r}); cannot confirm pagination advanced",
+            returncode=0,
+            argv=(op,),
+        )
+    if echoed_offset != requested_offset:
+        raise BnError(
+            f"malformed {op} page: echoed offset {echoed_offset} for requested "
+            f"offset {requested_offset}; the bridge is not honoring pagination",
+            returncode=0,
+            argv=(op,),
+        )
+    returned = payload.get("returned")
+    if returned is not None and (
+        not isinstance(returned, int)
+        or isinstance(returned, bool)
+        or returned != len(items)
+    ):
+        raise BnError(
+            f"malformed {op} page: returned must equal items length",
+            returncode=0,
+            argv=(op,),
+        )
+    total = payload.get("total")
+    if total is not None and (
+        not isinstance(total, int)
+        or isinstance(total, bool)
+        or total < 0
+        or (bool(items) and requested_offset + len(items) > total)
+    ):
+        raise BnError(
+            f"malformed {op} page: invalid total {total!r}",
+            returncode=0,
+            argv=(op,),
+        )
+    # Checked outside the `total is not None` guard on purpose: None->int and
+    # int->None are transitions too, and `_UNSEEN` is what distinguishes "no page
+    # has reported a total yet" from "a page reported None".
+    if previous_total is not _UNSEEN and previous_total != total:
+        raise BnError(
+            f"malformed {op} page: total changed across pages "
+            f"({previous_total!r} -> {total!r})",
+            returncode=0,
+            argv=(op,),
+        )
+    if total is not None and not has_more and requested_offset + len(items) < total:
+        raise BnError(
+            f"malformed {op} page: total={total} requires has_more=true at "
+            "this offset",
+            returncode=0,
+            argv=(op,),
+        )
+    return items, has_more, total
+
+
+def _unbounded_collection_error(op: str) -> BnError:
+    """Refuse a collection with nothing left that can terminate it."""
+    return BnError(
+        f"refusing to collect {op!r}: the collection is intrinsically unbounded "
+        "(no limit=, no request deadline because BN_REQUEST_TIMEOUT is disabled, "
+        "and the bridge reported total=null while claiming more pages). Pass an "
+        "explicit limit= or re-enable BN_REQUEST_TIMEOUT.",
+        returncode=0,
+        argv=(op,),
+    )
+
+
 _ACTIVE_SESSIONS = weakref.WeakSet()
 _ACTIVE_SCOPED_CALLBACKS: set[int] = set()
 _ACTIVE_SCOPED_BINDINGS: dict[int, tuple[str | None, str | None]] = {}
@@ -337,6 +643,8 @@ def _validate_filters(
             f"{helper} got unexpected keyword argument(s): {', '.join(unknown)}"
         )
     return dict(filters)
+
+
 _WARNED_BINDING_PAIRS: set[frozenset[tuple[str | None, str | None]]] = set()
 
 
@@ -351,8 +659,14 @@ def _register_session(session: Session) -> None:
         (other for other in active_bindings if other != binding),
         key=repr,
     )
-    if distinct and not _WARNED_BINDING_PAIRS:
-        pair = frozenset((binding, distinct[0]))
+    # Scan EVERY live distinct binding for the first pair not already reported,
+    # not just the lowest-sorting one: with {A,B} and {A,C} recorded, re-creating C
+    # while B is live would short-circuit on the known {A,C} and never disclose the
+    # novel {A,C}/{B,C} overlap. Sorting only makes the choice deterministic.
+    for other in distinct:
+        pair = frozenset((binding, other))
+        if pair in _WARNED_BINDING_PAIRS:
+            continue
         _WARNED_BINDING_PAIRS.add(pair)
         warnings.warn(
             "multiple distinct bn_kernel Session bindings are live in one "
@@ -364,6 +678,10 @@ def _register_session(session: Session) -> None:
             RuntimeWarning,
             stacklevel=3,
         )
+        # At most one warning per registration: one disclosure is enough to send
+        # the reader to scoped()/the direct CLI, and the remaining pairs stay
+        # unrecorded so a later registration can still surface them.
+        break
     _ACTIVE_SESSIONS.add(session)
 
 
@@ -445,6 +763,19 @@ def _unwrap(payload: Any) -> Any:
             if isinstance(value, str):
                 return value
     return payload
+
+
+def _terminate(process: Any) -> None:
+    """Kill a child that may already have exited.
+
+    `wait_for` can time out microseconds before the child reaps itself, and a
+    tighter per-page budget makes that window easy to hit; a bare `process.kill()`
+    then raises ProcessLookupError and masks the real timeout.
+    """
+    if process.returncode is not None:
+        return
+    with contextlib.suppress(ProcessLookupError):
+        process.kill()
 
 
 def _flags(flags: Mapping[str, Any]) -> list[str]:
@@ -548,6 +879,28 @@ class Session:
         **flags: Any,
     ) -> Any:
         """Run any bn CLI command and return its complete artifact-backed result."""
+        return await self._run_resolved(
+            *args,
+            raw=raw,
+            unwrap=unwrap,
+            budget=_resolve_budget(self.timeout if timeout is None else timeout),
+            **flags,
+        )
+
+    async def _run_resolved(
+        self,
+        *args: str,
+        raw: bool = False,
+        unwrap: bool = True,
+        budget: float | None,
+        **flags: Any,
+    ) -> Any:
+        """Spawn bn with an ALREADY-RESOLVED end-to-end budget.
+
+        `budget` has had BN_REQUEST_TIMEOUT applied exactly once by the caller;
+        `None` means the override disabled the deadline. A paginating caller passes
+        its shrinking remainder here so the env value is not re-applied per page.
+        """
         self.last = None
 
         executable = _bn_executable()
@@ -563,6 +916,13 @@ class Session:
             fd_root = Path("/dev/fd")
         output_path = fd_root / str(output_fd)
 
+        # The child re-reads BN_REQUEST_TIMEOUT from its own environment, so it must
+        # be told the REMAINING budget. Inheriting the original value would let the
+        # bridge-side cancellation be scheduled off a deadline this page has already
+        # spent, delaying cancellation long after we stopped waiting.
+        child_env = dict(os.environ)
+        child_env[_ENV_REQUEST_TIMEOUT] = _format_child_budget(budget)
+
         stderr_text = ""
         body = ""
         try:
@@ -577,28 +937,27 @@ class Session:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                     pass_fds=(output_fd,),
+                    env=child_env,
                 )
             except OSError as exc:
                 raise BnError(
                     f"could not execute bn: {exc}", returncode=127, argv=argv
                 ) from exc
 
-            deadline = self.timeout if timeout is None else timeout
             try:
                 stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    process.communicate(), timeout=deadline
+                    process.communicate(), timeout=budget
                 )
             except asyncio.TimeoutError:
-                process.kill()
+                _terminate(process)
                 await process.communicate()
                 raise BnError(
-                    _timeout_message(f"bn {' '.join(argv)}", deadline),
+                    _timeout_message(f"bn {' '.join(argv)}", budget or 0.0),
                     returncode=124,
                     argv=argv,
                 ) from None
             except asyncio.CancelledError:
-                if process.returncode is None:
-                    process.kill()
+                _terminate(process)
                 await process.communicate()
                 raise
 
@@ -674,7 +1033,7 @@ class Session:
                 process.communicate(), timeout=deadline
             )
         except asyncio.TimeoutError:
-            process.kill()
+            _terminate(process)
             await process.communicate()
             raise BnError(
                 _timeout_message(f"bn {' '.join(argv)}", deadline),
@@ -751,26 +1110,38 @@ class Session:
         notes: list[str] = []
         actual_argv: tuple[str, ...] = tuple(str(arg) for arg in args)
         bridge_has_more = False
+        seen_total: Any = _UNSEEN
         operation = " ".join(str(arg) for arg in args)
-        effective_timeout = self.timeout if timeout is None else timeout
-        deadline = time.monotonic() + effective_timeout
+        # One end-to-end budget for the WHOLE multi-page collection, with
+        # BN_REQUEST_TIMEOUT applied exactly once here. `None` means the documented
+        # 0/none/off spelling disabled the deadline entirely.
+        effective_timeout = _resolve_budget(
+            self.timeout if timeout is None else timeout
+        )
+        deadline = (
+            None
+            if effective_timeout is None
+            else time.monotonic() + effective_timeout
+        )
 
         while True:
             remaining = None if limit is None else limit - len(items)
             page_size = page if remaining is None else min(page, remaining)
-            timeout_remaining = deadline - time.monotonic()
-            if timeout_remaining <= 0:
-                self.last = None
-                raise BnError(
-                    f"bn {operation} timed out after {effective_timeout:g}s",
-                    returncode=124,
-                    argv=actual_argv,
-                )
+            timeout_remaining = None
+            if deadline is not None:
+                timeout_remaining = deadline - time.monotonic()
+                if timeout_remaining <= 0:
+                    self.last = None
+                    raise BnError(
+                        f"bn {operation} timed out after {effective_timeout:g}s",
+                        returncode=124,
+                        argv=actual_argv,
+                    )
             try:
-                payload = await self.run(
+                payload = await self._run_resolved(
                     *args,
                     unwrap=False,
-                    timeout=timeout_remaining,
+                    budget=timeout_remaining,
                     limit=page_size,
                     offset=offset,
                     **flags,
@@ -779,7 +1150,9 @@ class Session:
                 self.last = None
                 if exc.returncode == 124:
                     raise BnError(
-                        _timeout_message(operation, effective_timeout, str(exc)),
+                        _timeout_message(
+                            operation, effective_timeout or 0.0, str(exc)
+                        ),
                         returncode=124,
                         argv=actual_argv,
                     ) from exc
@@ -789,82 +1162,25 @@ class Session:
                 notes.extend(page_result.notes)
                 actual_argv = page_result.argv
 
-            if not isinstance(payload, dict):
-                self.last = None
-                raise BnError(
-                    f"bn {operation} is not a paged collection",
-                    returncode=0,
-                    argv=actual_argv,
+            try:
+                page_items, bridge_has_more, total = _validate_page(
+                    operation,
+                    payload,
+                    requested_offset=offset,
+                    requested_limit=page_size,
+                    previous_total=seen_total,
                 )
-            page_items = payload.get("items")
-            bridge_has_more = payload.get("has_more")
-            if not isinstance(page_items, list):
-                self.last = None
-                raise BnError(
-                    f"malformed {operation} page: items must be a list",
-                    returncode=0,
-                    argv=actual_argv,
-                )
-            if not isinstance(bridge_has_more, bool):
-                self.last = None
-                raise BnError(
-                    f"malformed {operation} page: has_more must be a boolean",
-                    returncode=0,
-                    argv=actual_argv,
-                )
-            if bridge_has_more and not page_items:
-                self.last = None
-                raise BnError(
-                    f"malformed {operation} page: has_more with an empty page",
-                    returncode=0,
-                    argv=actual_argv,
-                )
-            returned = payload.get("returned")
-            if returned is not None and (
-                not isinstance(returned, int)
-                or isinstance(returned, bool)
-                or returned != len(page_items)
-            ):
-                self.last = None
-                raise BnError(
-                    f"malformed {operation} page: returned must equal items length",
-                    returncode=0,
-                    argv=actual_argv,
-                )
-            total = payload.get("total")
-            if total is not None:
-                page_end = offset + len(page_items)
+                seen_total = total
                 if (
-                    not isinstance(total, int)
-                    or isinstance(total, bool)
-                    or total < 0
-                    or (bool(page_items) and page_end > total)
+                    bridge_has_more
+                    and limit is None
+                    and deadline is None
+                    and total is None
                 ):
-                    self.last = None
-                    raise BnError(
-                        f"malformed {operation} page: invalid total {total!r}",
-                        returncode=0,
-                        argv=actual_argv,
-                    )
-                if (
-                    aggregate is not None
-                    and aggregate.get("total") is not None
-                    and aggregate.get("total") != total
-                ):
-                    self.last = None
-                    raise BnError(
-                        f"malformed {operation} page: total changed across pages",
-                        returncode=0,
-                        argv=actual_argv,
-                    )
-                if not bridge_has_more and page_end < total:
-                    self.last = None
-                    raise BnError(
-                        f"malformed {operation} page: total={total} requires "
-                        "has_more=true at this offset",
-                        returncode=0,
-                        argv=actual_argv,
-                    )
+                    raise _unbounded_collection_error(operation)
+            except BnError:
+                self.last = None
+                raise
             if aggregate is None:
                 aggregate = dict(payload)
 
@@ -879,6 +1195,7 @@ class Session:
         aggregate["items"] = items
         aggregate["offset"] = initial_offset
         aggregate["returned"] = len(items)
+        aggregate["total"] = seen_total
         aggregate["has_more"] = bool(
             bridge_has_more and limit is not None and len(items) >= limit
         )
@@ -910,7 +1227,8 @@ class Session:
             if timeout is None
             else _load_native_client(self.instance, self.target, timeout)
         )
-        budget = self.timeout if timeout is None else timeout
+        # One resolved end-to-end budget; None means BN_REQUEST_TIMEOUT disabled it.
+        budget = _resolve_budget(self.timeout if timeout is None else timeout)
         try:
             payload = await asyncio.wait_for(
                 asyncio.to_thread(client.request, op, params),
@@ -918,14 +1236,14 @@ class Session:
             )
         except asyncio.TimeoutError:
             raise BnError(
-                _timeout_message(op, budget),
+                _timeout_message(op, budget or 0.0),
                 returncode=124,
                 argv=(op,),
             ) from None
         except NativeBridgeError as exc:
             if "timed out" in str(exc).lower():
                 raise BnError(
-                    _timeout_message(op, budget, str(exc)),
+                    _timeout_message(op, budget or 0.0, str(exc)),
                     returncode=124,
                     argv=(op,),
                 ) from exc
@@ -943,38 +1261,48 @@ class Session:
         limit: int | None,
         *,
         timeout: float | None = None,
+        resolved: bool = False,
     ) -> list[dict[str, Any]]:
         self.last = None
         from bn.transport import BridgeError as NativeBridgeError
 
-        if timeout is None:
-            client = self._client
-        else:
-            from bn import Client as NativeClient
+        # `resolved=True`: `timeout` is already the remaining slice of one
+        # end-to-end budget (search's literal->regex phases share it). Re-resolving
+        # it -- here or inside Client.collect -- would give each phase a fresh copy
+        # of BN_REQUEST_TIMEOUT and let the pair spend the budget twice.
+        budget = (
+            timeout
+            if resolved
+            else _resolve_budget(self.timeout if timeout is None else timeout)
+        )
 
-            client = (
-                _load_native_client(self.instance, self.target, timeout)
-                if isinstance(self._client, NativeClient)
-                else self._client
-            )
-        budget = self.timeout if timeout is None else timeout
+        from bn import Client as NativeClient
+
+        # A None budget means "no deadline" (BN_REQUEST_TIMEOUT disabled), so there
+        # is nothing to hand down and the session's own client is right.
+        client = self._client
+        if budget is not None and isinstance(self._client, NativeClient):
+            client = _load_native_client(self.instance, self.target, budget)
+        collect_kwargs: dict[str, Any] = {"limit": limit}
+        if resolved and budget is not None and isinstance(client, NativeClient):
+            collect_kwargs["resolved"] = True
         try:
             payload = await asyncio.wait_for(
                 asyncio.to_thread(
-                    client.collect, op, params, limit=limit
+                    lambda: client.collect(op, params, **collect_kwargs)
                 ),
                 timeout=budget,
             )
         except asyncio.TimeoutError:
             raise BnError(
-                _timeout_message(op, budget),
+                _timeout_message(op, budget or 0.0),
                 returncode=124,
                 argv=(op,),
             ) from None
         except NativeBridgeError as exc:
             if "timed out" in str(exc).lower():
                 raise BnError(
-                    _timeout_message(op, budget, str(exc)),
+                    _timeout_message(op, budget or 0.0, str(exc)),
                     returncode=124,
                     argv=(op,),
                 ) from exc
@@ -998,13 +1326,16 @@ class Session:
         verbose: bool = False,
         timeout: float | None = None,
     ) -> dict[str, Any]:
+        self.last = None
         if self.backend == "native":
-            return await self._native_request(
+            payload = await self._native_request(
                 "target_info", {"verbose": verbose}, timeout=timeout
             )
-        return await self.run(
-            "target", "info", unwrap=False, verbose=verbose, timeout=timeout
-        )
+        else:
+            payload = await self.run(
+                "target", "info", unwrap=False, verbose=verbose, timeout=timeout
+            )
+        return self._validated(_require_target_info, payload)
 
     async def assert_target(
         self,
@@ -1012,6 +1343,7 @@ class Session:
         *,
         timeout: float | None = None,
     ) -> dict[str, Any]:
+        self.last = None
         info = await self.info(timeout=timeout)
         expected_text = str(expected)
         expected_path = Path(expected_text).expanduser()
@@ -1039,6 +1371,10 @@ class Session:
             }
 
         if not matches:
+            # A foreign target is a failure, not the documented contamination
+            # exception: leaving its digest in `last` invites a read of another
+            # binary's rows. `assert_unannotated` stays the sole exception.
+            self.last = None
             raise BridgeError(
                 "target identity mismatch: "
                 f"expected {expected_value!r}, received {observed_value!r}; "
@@ -1054,6 +1390,7 @@ class Session:
         allow_contaminated: bool = False,
         timeout: float | None = None,
     ) -> dict[str, Any]:
+        self.last = None
         if self.backend == "native":
             digest = await self._native_request(
                 "orient_digest", {"strings_limit": 1}, timeout=timeout
@@ -1066,15 +1403,12 @@ class Session:
                 strings_limit=1,
                 timeout=timeout,
             )
-        annotations = (
-            digest.get("existing_annotations", {})
-            if isinstance(digest, dict)
-            else {}
-        )
-        counts = {
-            key: int(annotations.get(key, 0) or 0)
-            for key in ("comments", "function_comments", "user_symbols")
-        }
+        # Fail CLOSED before reading counters. A digest shape this gate cannot
+        # parse must never collapse to "zero comments" and certify contaminated
+        # data as clean; `allow_contaminated` waives the contamination policy, not
+        # the payload contract.
+        counts = self._validated(_require_orient_digest, digest)
+        annotations = digest["existing_annotations"]
         if counts["comments"] + counts["function_comments"] and not allow_contaminated:
             argv = self.last.argv if self.last is not None else ("orient_digest",)
             locations = [
@@ -1118,6 +1452,7 @@ class Session:
         timeout: float | None = None,
         **filters: Any,
     ) -> list[dict[str, Any]]:
+        self.last = None
         params = _validate_filters("functions", filters, _FUNCTION_FILTERS)
         if self.backend == "native":
             value = await self._native_collect(
@@ -1140,13 +1475,22 @@ class Session:
         timeout: float | None = None,
         **filters: Any,
     ) -> list[dict[str, Any]]:
+        self.last = None
         validated = _validate_filters("search", filters, _SEARCH_FILTERS)
-        effective_timeout = self.timeout if timeout is None else timeout
-        deadline = time.monotonic() + effective_timeout
         if self.backend == "native":
+            # The two-phase literal->regex retry shares one budget; the CLI branch
+            # is single-phase and lets `all()` own its own deadline.
+            effective_timeout = _resolve_budget(
+                self.timeout if timeout is None else timeout
+            )
             params = {"query": query, **validated}
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            deadline = (
+                None
+                if effective_timeout is None
+                else time.monotonic() + effective_timeout
+            )
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
                 self.last = None
                 raise BnError(
                     _timeout_message("search", effective_timeout),
@@ -1154,12 +1498,12 @@ class Session:
                     argv=("search_functions",),
                 )
             value = await self._native_collect(
-                "search_functions", params, limit, timeout=remaining
+                "search_functions", params, limit, timeout=remaining, resolved=True
             )
             payload = self.last.payload if self.last is not None else None
             if self._validated(_should_retry_as_regex, query, payload, validated):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
                     self.last = None
                     raise BnError(
                         _timeout_message("search", effective_timeout),
@@ -1172,6 +1516,7 @@ class Session:
                         {**params, "regex": True},
                         limit,
                         timeout=remaining,
+                        resolved=True,
                     )
                 except BnError as exc:
                     self.last = None
@@ -1308,6 +1653,7 @@ class Session:
         lines: tuple[int, int] | None = None,
         timeout: float | None = None,
     ) -> str:
+        self.last = None
         if sum(option is not None for option in (linear, count, lines)) > 1:
             raise ValueError("linear, count, and lines are mutually exclusive")
         if count is not None and count < 1:
@@ -1356,12 +1702,20 @@ class Session:
         ssa: bool = False,
         timeout: float | None = None,
     ) -> str:
+        self.last = None
         params = {"identifier": identifier, "view": view, "ssa": ssa}
         if self.backend == "native":
-            return await self._native_request("il", params, timeout=timeout)
-        return await self.run(
-            "il", identifier, view=view, ssa=ssa, timeout=timeout
-        )
+            value = await self._native_request("il", params, timeout=timeout)
+        else:
+            value = await self.run(
+                "il", identifier, view=view, ssa=ssa, timeout=timeout
+            )
+        # Validate AFTER the backend branch, like every other curated helper: a
+        # validator attached inside one branch is a shape guarantee on one backend
+        # only, and `-> str` returning a mapping is exactly the "looks like no
+        # findings" shape this module exists to reject.
+        payload = self.last.payload if self.last is not None else None
+        return self._validated(_require_text, "il", value, payload)
 
     async def xrefs(
         self,
@@ -1371,6 +1725,7 @@ class Session:
         timeout: float | None = None,
         fn_pointer_scan: bool = False,
     ) -> list[dict[str, Any]]:
+        self.last = None
         if not isinstance(identifier, str) or not identifier:
             raise ValueError(
                 "xrefs identifier must be a non-empty function name or address"
@@ -1380,16 +1735,19 @@ class Session:
             "fn_pointer_scan": fn_pointer_scan,
         }
         if self.backend == "native":
-            return await self._native_collect(
+            value = await self._native_collect(
                 "xrefs", params, limit, timeout=timeout
             )
-        return await self.all(
-            "xrefs",
-            identifier,
-            limit=limit,
-            timeout=timeout,
-            fn_pointer_scan=fn_pointer_scan,
-        )
+        else:
+            value = await self.all(
+                "xrefs",
+                identifier,
+                limit=limit,
+                timeout=timeout,
+                fn_pointer_scan=fn_pointer_scan,
+            )
+        payload = self.last.payload if self.last is not None else None
+        return self._validated(_require_collection, "xrefs", value, payload)
 
     @staticmethod
     def _within_identifiers(within: str | Sequence[str]) -> list[str]:
@@ -1410,6 +1768,7 @@ class Session:
         limit: int | None = 100,
         timeout: float | None = None,
     ) -> list[dict[str, Any]]:
+        self.last = None
         identifiers = [] if within is None else self._within_identifiers(within)
         if self.backend == "native":
             value = await self._native_collect(
@@ -1472,6 +1831,7 @@ class Session:
         timeout: float | None = None,
         **filters: Any,
     ) -> list[dict[str, Any]]:
+        self.last = None
         params = _validate_filters("strings", filters, _STRING_FILTERS)
         if self.backend == "native":
             value = await self._native_collect(
@@ -1497,14 +1857,18 @@ class Session:
         timeout: float | None = None,
         **filters: Any,
     ) -> list[dict[str, Any]]:
+        self.last = None
         params = _validate_filters("imports", filters, _IMPORT_FILTERS)
         if self.backend == "native":
-            return await self._native_collect(
+            value = await self._native_collect(
                 "imports", params, limit, timeout=timeout
             )
-        return await self.all(
-            "imports", limit=limit, timeout=timeout, **params
-        )
+        else:
+            value = await self.all(
+                "imports", limit=limit, timeout=timeout, **params
+            )
+        payload = self.last.payload if self.last is not None else None
+        return self._validated(_require_collection, "imports", value, payload)
 
     async def sections(
         self,
@@ -1513,14 +1877,18 @@ class Session:
         timeout: float | None = None,
         **filters: Any,
     ) -> list[dict[str, Any]]:
+        self.last = None
         params = _validate_filters("sections", filters, _SECTION_FILTERS)
         if self.backend == "native":
-            return await self._native_collect(
+            value = await self._native_collect(
                 "sections", params, limit, timeout=timeout
             )
-        return await self.all(
-            "sections", limit=limit, timeout=timeout, **params
-        )
+        else:
+            value = await self.all(
+                "sections", limit=limit, timeout=timeout, **params
+            )
+        payload = self.last.payload if self.last is not None else None
+        return self._validated(_require_collection, "sections", value, payload)
 
 
 async def scoped(

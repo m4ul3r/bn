@@ -1816,3 +1816,75 @@ def test_find_instance_markers_walks_up_from_cwd(monkeypatch, tmp_path):
     monkeypatch.chdir(sub)
     found = dict(_p.find_instance_markers())
     assert found.get("rootinst") and found.get("nearinst")  # both, walking up
+
+
+def test_send_request_still_lets_the_env_override_win_for_a_single_request(
+    monkeypatch, tmp_path
+):
+    import bn.transport as transport
+
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "5")
+    instance = _make_instance(tmp_path)
+    seen: list[float | None] = []
+    monkeypatch.setattr(transport, "choose_instance", lambda *a, **k: instance)
+    monkeypatch.setattr(
+        transport,
+        "_send_request_to_instance",
+        lambda inst, op, **kwargs: seen.append(kwargs["timeout"])
+        or {"ok": True, "result": {}},
+    )
+
+    send_request("target_info", timeout=0.5)
+
+    assert seen and 4.0 < seen[0] <= 5.0
+
+
+def test_send_request_forwards_a_preresolved_budget_without_re_expanding_it(
+    monkeypatch, tmp_path
+):
+    """A paginating caller resolves BN_REQUEST_TIMEOUT once, then hands down the
+    shrinking remainder. Re-resolving here restores the full env value and lets a
+    multi-page collection overrun its own declared end-to-end budget."""
+    import bn.transport as transport
+
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "5")
+    instance = _make_instance(tmp_path)
+    seen: list[float | None] = []
+    selection: list[float | None] = []
+
+    def choose(instance_id=None, **kwargs):
+        selection.append(kwargs.get("timeout"))
+        return instance
+
+    monkeypatch.setattr(transport, "choose_instance", choose)
+    monkeypatch.setattr(
+        transport,
+        "_send_request_to_instance",
+        lambda inst, op, **kwargs: seen.append(kwargs["timeout"])
+        or {"ok": True, "result": {}},
+    )
+
+    send_request("target_info", timeout=0.5, resolved=True)
+
+    assert seen and 0 < seen[0] <= 0.5
+    assert selection and 0 < selection[0] <= 0.5
+
+
+def test_send_request_to_instance_does_not_re_resolve_a_preresolved_budget(
+    monkeypatch, tmp_path
+):
+    import bn.transport as transport
+
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "600")
+    instance = _make_instance(tmp_path)
+    monkeypatch.setattr(transport, "_process_state", lambda pid: "S")
+    fake_socket = _make_timeout_probe_socket()
+    monkeypatch.setattr(
+        transport.socket, "socket", lambda *args, **kwargs: fake_socket()
+    )
+
+    transport._send_request_to_instance(
+        instance, "ping", timeout=0.25, resolved=True, connect_retries=1
+    )
+
+    assert fake_socket.timeouts == pytest.approx([0.25], rel=1e-5)

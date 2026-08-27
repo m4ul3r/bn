@@ -58,6 +58,23 @@ json.dump({"argv": argv}, open(out, "w"))
 """
 
 
+def _canonical_target_info(**overrides):
+    """The shape `target_info` actually returns: bridge.py `_function_name_summary`
+    plus filename/basename/import_symbol_count."""
+    payload = {
+        "kind": "target",
+        "filename": "/tmp/sample.bndb",
+        "basename": "sample.bndb",
+        "function_count": 3,
+        "named_function_count": 2,
+        "unnamed_function_count": 0,
+        "imported_function_count": 1,
+        "import_symbol_count": 4,
+    }
+    payload.update(overrides)
+    return payload
+
+
 @pytest.fixture(autouse=True)
 def _clear_bn_bin(monkeypatch):
     monkeypatch.delenv("BN_BIN", raising=False)
@@ -468,7 +485,8 @@ out = argv[argv.index("--out") + 1]
 offset = int(argv[argv.index("--offset") + 1])
 limit = int(argv[argv.index("--limit") + 1])
 rows = [{"i": i} for i in range(offset, offset + limit)]
-json.dump({"items": rows, "total": 100, "has_more": True}, open(out, "w"))
+json.dump({"items": rows, "offset": offset, "total": 100, "has_more": True},
+          open(out, "w"))
 """
     monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
     session = bn_kernel.Session(backend="cli")
@@ -523,6 +541,7 @@ def test_all_rejects_zero_progress(monkeypatch, tmp_path):
 def test_all_rejects_per_page_returned_mismatch(monkeypatch, tmp_path):
     payload = {
         "items": [{"value": "x"}],
+        "offset": 0,
         "returned": 0,
         "total": 1,
         "has_more": False,
@@ -540,9 +559,11 @@ argv = sys.argv[1:]
 out = argv[argv.index("--out") + 1]
 offset = int(argv[argv.index("--offset") + 1])
 payload = (
-    {"items": [{"value": "a"}], "returned": 1, "total": 2, "has_more": True}
+    {"items": [{"value": "a"}], "offset": 0, "returned": 1, "total": 2,
+     "has_more": True}
     if offset == 0
-    else {"items": [{"value": "b"}], "returned": 1, "total": 3, "has_more": False}
+    else {"items": [{"value": "b"}], "offset": offset, "returned": 1, "total": 3,
+          "has_more": False}
 )
 json.dump(payload, open(out, "w"))
 """
@@ -620,7 +641,7 @@ class FakeClient:
         self.thread_ids.append(threading.get_ident())
         self.calls.append(("request", op, dict(params or {}), {}))
         if op == "target_info":
-            return {"arch": "x86"}
+            return _canonical_target_info(arch="x86")
         if op == "function_info":
             return {
                 "function": {"name": "main"},
@@ -862,12 +883,13 @@ def test_native_request_runs_off_event_loop_thread_and_updates_last():
 
     value = _run(session.info(verbose=True))
 
-    assert value == {"arch": "x86"}
+    expected = _canonical_target_info(arch="x86")
+    assert value == expected
     assert client.thread_ids and client.thread_ids[0] != loop_thread
     assert client.calls == [("request", "target_info", {"verbose": True}, {})]
     assert session.last == bn_kernel.Result(
-        value={"arch": "x86"},
-        payload={"arch": "x86"},
+        value=expected,
+        payload=expected,
         notes=(),
         argv=("target_info",),
         backend="native",
@@ -1430,7 +1452,9 @@ def test_native_assert_target_accepts_basename_and_full_path(tmp_path):
     class IdentityClient:
         def request(self, op, params=None):
             assert op == "target_info"
-            return {"basename": filename.name, "filename": str(filename)}
+            return _canonical_target_info(
+                basename=filename.name, filename=str(filename)
+            )
 
     session._client = IdentityClient()
 
@@ -1492,19 +1516,19 @@ def test_assert_target_rejects_foreign_target_on_native_and_cli(
 
     class IdentityClient:
         def request(self, op, params=None):
-            return {
-                "basename": "foreign.bndb",
-                "filename": str(tmp_path / "foreign.bndb"),
-            }
+            return _canonical_target_info(
+                basename="foreign.bndb",
+                filename=str(tmp_path / "foreign.bndb"),
+            )
 
     native._client = IdentityClient()
     with pytest.raises(bn_kernel.BridgeError, match="target identity mismatch"):
         _run(native.assert_target("expected.bndb"))
 
-    payload = {
-        "basename": "foreign.bndb",
-        "filename": str(tmp_path / "foreign.bndb"),
-    }
+    payload = _canonical_target_info(
+        basename="foreign.bndb",
+        filename=str(tmp_path / "foreign.bndb"),
+    )
     monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, _payload_script(payload))))
     cli = bn_kernel.Session(instance="worker", backend="cli")
     with pytest.raises(bn_kernel.BridgeError, match="target identity mismatch"):
@@ -1661,7 +1685,8 @@ row = {
     "call_addr": "0x1010",
     "caller_static": "0x1015",
 }
-json.dump({"items": [row], "has_more": False, "total": 1}, open(out, "w"))
+json.dump({"items": [row], "offset": 0, "has_more": False, "total": 1},
+          open(out, "w"))
 """
     monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
     cli = bn_kernel.Session(instance="worker", target="sample", backend="cli")
@@ -1682,7 +1707,8 @@ row = {
     "call_addr": "0x1010",
     "caller_static": "0x1015",
 }
-json.dump({"items": [row], "has_more": False, "total": 1}, open(out, "w"))
+json.dump({"items": [row], "offset": 0, "has_more": False, "total": 1},
+          open(out, "w"))
 """
     monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
     session = bn_kernel.Session(backend="cli")
@@ -1709,7 +1735,8 @@ row = {
     "call_addr": "0x1010",
     "caller_static": "0x1015",
 }
-json.dump({"items": [row], "has_more": False, "total": 1}, open(out, "w"))
+json.dump({"items": [row], "offset": 0, "has_more": False, "total": 1},
+          open(out, "w"))
 """
     monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
     session = bn_kernel.Session(backend="cli")
@@ -1729,7 +1756,7 @@ out = argv[argv.index("--out") + 1]
 if "decompile" in argv:
     payload = {"text": "decompile text"}
 else:
-    payload = {"items": [{"op": "list_functions", "size": 12, "size_known": True}], "has_more": False, "total": 1}
+    payload = {"items": [{"op": "list_functions", "size": 12, "size_known": True}], "offset": 0, "has_more": False, "total": 1}
 json.dump(payload, open(out, "w"))
 """
     monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
@@ -1746,7 +1773,8 @@ def test_cli_xrefs_forwards_function_pointer_scan(monkeypatch, tmp_path):
 import json, sys
 argv = sys.argv[1:]
 out = argv[argv.index("--out") + 1]
-json.dump({"items": [{"argv": argv}], "has_more": False, "total": 1}, open(out, "w"))
+json.dump({"items": [{"argv": argv}], "offset": 0, "has_more": False, "total": 1},
+          open(out, "w"))
 """
     monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
     session = bn_kernel.Session(backend="cli")
@@ -2084,9 +2112,13 @@ def test_assert_unannotated_keeps_its_successful_payload():
                 "kind": "orient_digest",
                 "target": {"basename": "sample.bndb"},
                 "function_count": 3,
+                # The bridge always publishes all three counters
+                # (read_listing.py `_existing_annotations`), and the gate now
+                # requires them so an unreadable digest cannot pass as clean.
                 "existing_annotations": {
                     "comments": 2,
                     "function_comments": 0,
+                    "user_symbols": 0,
                     "comment_locations": [
                         {"address": "0x401000", "name": "parse_packet"},
                     ],
@@ -2099,3 +2131,754 @@ def test_assert_unannotated_keeps_its_successful_payload():
 
     assert session.last is not None
     assert session.last.payload["existing_annotations"]["comments"] == 2
+
+
+# -- #694 pre-review blockers -------------------------------------------------
+
+
+def _shape_session(payload):
+    """A native session whose single fake op always returns *payload*."""
+    session = bn_kernel.Session(instance="worker", target="sample", backend="native")
+
+    class OnePayload:
+        def request(self, op, params=None):
+            return payload
+
+        def collect(self, op, params=None, *, limit=None):
+            return payload
+
+    session._client = OnePayload()
+    return session
+
+
+def _seeded_native_session():
+    """A native session whose `last` already holds a real successful page."""
+    session, client = _native_session()
+    rows = _run(session.functions(limit=1))
+    assert rows and session.last is not None
+    return session
+
+
+MALFORMED_DIGESTS = [
+    ("digest is a list", ["orient"]),
+    ("digest is a string", "orientation unavailable"),
+    ("digest is null", None),
+    ("no existing_annotations", {"kind": "orient", "entry": "0x401000"}),
+    ("existing_annotations is a list", {"existing_annotations": ["comments"]}),
+    ("existing_annotations is null", {"existing_annotations": None}),
+    (
+        "counter is not an integer",
+        {"existing_annotations": {"comments": "2", "function_comments": 0,
+                                  "user_symbols": 0}},
+    ),
+    (
+        "counter is a bool",
+        {"existing_annotations": {"comments": True, "function_comments": 0,
+                                  "user_symbols": 0}},
+    ),
+    (
+        "counter is negative",
+        {"existing_annotations": {"comments": -1, "function_comments": 0,
+                                  "user_symbols": 0}},
+    ),
+    (
+        "counter is missing",
+        {"existing_annotations": {"comments": 0, "function_comments": 0}},
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "label,payload", MALFORMED_DIGESTS, ids=[case[0] for case in MALFORMED_DIGESTS]
+)
+def test_assert_unannotated_fails_closed_on_a_malformed_digest(label, payload):
+    """The contamination gate must never certify a shape it cannot read. Silently
+    treating an unreadable digest as `comments=0` reports contaminated data clean."""
+    session = _shape_session(payload)
+
+    with pytest.raises(bn_kernel.BnError, match="orient digest contract violation"):
+        _run(session.assert_unannotated())
+
+    assert session.last is None
+
+
+@pytest.mark.parametrize(
+    "label,payload", MALFORMED_DIGESTS, ids=[case[0] for case in MALFORMED_DIGESTS]
+)
+def test_assert_unannotated_rejects_malformed_digest_even_when_bypassed(
+    label, payload
+):
+    """`allow_contaminated=True` waives the contamination *policy*, not the payload
+    contract; an unreadable digest is still an unreadable digest."""
+    session = _shape_session(payload)
+
+    with pytest.raises(bn_kernel.BnError, match="orient digest contract violation"):
+        _run(session.assert_unannotated(allow_contaminated=True))
+
+    assert session.last is None
+
+
+def test_assert_unannotated_accepts_a_well_formed_clean_digest():
+    session = _shape_session(
+        {
+            "kind": "orient",
+            "existing_annotations": {
+                "comments": 0,
+                "function_comments": 0,
+                "user_symbols": 7,
+            },
+        }
+    )
+
+    digest = _run(session.assert_unannotated())
+
+    assert digest["existing_annotations"]["user_symbols"] == 7
+    assert session.last is not None
+
+
+PREFLIGHT_CASES = [
+    ("functions unknown kwarg", lambda s: s.functions(bogus=1), TypeError),
+    ("search unknown kwarg", lambda s: s.search("parse", bogus=1), TypeError),
+    ("strings unknown kwarg", lambda s: s.strings(bogus=1), TypeError),
+    ("imports unknown kwarg", lambda s: s.imports(bogus=1), TypeError),
+    ("sections unknown kwarg", lambda s: s.sections(bogus=1), TypeError),
+    (
+        "disasm count and lines",
+        lambda s: s.disasm("main", count=2, lines=(1, 2)),
+        ValueError,
+    ),
+    ("disasm zero count", lambda s: s.disasm("main", count=0), ValueError),
+    ("disasm line zero", lambda s: s.disasm("main", lines=(0, 5)), ValueError),
+    ("xrefs empty identifier", lambda s: s.xrefs(""), ValueError),
+    ("callsites empty within", lambda s: s.callsites("sink", within=[]), ValueError),
+]
+
+
+@pytest.mark.parametrize(
+    "label,call,error", PREFLIGHT_CASES, ids=[case[0] for case in PREFLIGHT_CASES]
+)
+def test_preflight_validation_error_clears_last(label, call, error):
+    """A raise must never leave the previous read's rows behind as `last`. Preflight
+    checks fire before the backend method that clears it, so they need their own."""
+    session = _seeded_native_session()
+
+    with pytest.raises(error):
+        _run(call(session))
+
+    assert session.last is None
+
+
+def test_assert_target_mismatch_clears_last(tmp_path):
+    """A foreign target is a failure, not the documented `assert_unannotated`
+    contamination exception; leaving the foreign digest in `last` invites a read
+    of another binary's rows."""
+    session = _shape_session(
+        _canonical_target_info(
+            filename="/tmp/actual.bndb", basename="actual.bndb"
+        )
+    )
+
+    with pytest.raises(bn_kernel.BridgeError, match="target identity mismatch"):
+        _run(session.assert_target("expected.bndb"))
+
+    assert session.last is None
+
+
+SHAPE_CASES = [
+    ("info non-mapping", "info", lambda s: s.info(), ["not", "a", "mapping"]),
+    ("info empty mapping", "info", lambda s: s.info(), {}),
+    (
+        "info bad counter",
+        "info",
+        lambda s: s.info(),
+        {"filename": "/tmp/sample.bndb", "function_count": -3},
+    ),
+    ("il non-mapping", "il", lambda s: s.il("main"), ["hlil"]),
+    ("il no text key", "il", lambda s: s.il("main"), {"kind": "il", "view": "hlil"}),
+    ("il empty text", "il", lambda s: s.il("main"), {"text": "   "}),
+    (
+        "xrefs rows are not mappings",
+        "xrefs",
+        lambda s: s.xrefs("main"),
+        {"items": ["0x401000"], "offset": 0, "returned": 1, "has_more": False,
+         "total": 1},
+    ),
+    (
+        "imports rows are not mappings",
+        "imports",
+        lambda s: s.imports(),
+        {"items": ["printf"], "offset": 0, "returned": 1, "has_more": False,
+         "total": 1},
+    ),
+    (
+        "sections rows nest a page envelope",
+        "sections",
+        lambda s: s.sections(),
+        {"items": [{"items": [], "has_more": False}], "offset": 0, "returned": 1,
+         "has_more": False, "total": 1},
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "label,helper,call,payload", SHAPE_CASES, ids=[case[0] for case in SHAPE_CASES]
+)
+def test_native_helper_shape_parity_rejects_malformed_payloads(
+    label, helper, call, payload
+):
+    session = _shape_session(payload)
+
+    with pytest.raises(bn_kernel.BnError):
+        _run(call(session))
+
+    assert session.last is None
+
+
+@pytest.mark.parametrize(
+    "label,helper,call,payload", SHAPE_CASES, ids=[case[0] for case in SHAPE_CASES]
+)
+def test_cli_helper_shape_parity_rejects_malformed_payloads(
+    monkeypatch, tmp_path, label, helper, call, payload
+):
+    """The CLI backend reached its rows through a different code path, so the
+    validators have to sit after the backend branch, not inside one of them."""
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, _payload_script(payload))))
+    session = bn_kernel.Session(instance="worker", target="sample", backend="cli")
+
+    with pytest.raises(bn_kernel.BnError):
+        _run(call(session))
+
+    assert session.last is None
+
+
+def test_cross_binding_warning_fires_once_per_distinct_pair():
+    """One warning per novel pair, and per registration.
+
+    Steps 1-3 build up bindings A, B, C, recording {A,B} then {A,C}. Step 4
+    re-registers C while B is live: {A,C} is already known, so a check that only
+    consulted the lowest-sorting binding short-circuited there and never disclosed
+    the novel {B,C} overlap. Step 5 proves the disclosure does not then repeat once
+    every relevant pair is recorded.
+    """
+    alpha = ("bnk-a", "alpha.bndb")
+    bravo = ("bnk-b", "bravo.bndb")
+    charlie = ("bnk-c", "charlie.bndb")
+    held = []
+    counts = []
+
+    for instance, target in [alpha, bravo, charlie, charlie, charlie]:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            held.append(
+                bn_kernel.Session(instance=instance, target=target, backend="cli")
+            )
+        counts.append(
+            len([item for item in caught if item.category is RuntimeWarning])
+        )
+
+    #        A   B    C    C(novel {B,C})   C(all pairs known)
+    assert counts == [0, 1, 1, 1, 0]
+    assert bn_kernel._WARNED_BINDING_PAIRS == {
+        frozenset((alpha, bravo)),
+        frozenset((alpha, charlie)),
+        frozenset((bravo, charlie)),
+    }
+
+
+def test_cross_binding_warning_is_not_repeated_for_a_known_pair():
+    with warnings.catch_warnings(record=True):
+        warnings.simplefilter("always")
+        held = [
+            bn_kernel.Session(instance="bnk-a", target="alpha.bndb", backend="cli"),
+            bn_kernel.Session(instance="bnk-b", target="bravo.bndb", backend="cli"),
+        ]
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        held.append(
+            bn_kernel.Session(instance="bnk-b", target="bravo.bndb", backend="cli")
+        )
+
+    assert [item for item in caught if item.category is RuntimeWarning] == []
+
+
+def _page_script(body: str, *, counter: Path | None = None, cap: int = 0) -> str:
+    """A fake `bn` that emits one page per call.
+
+    `counter`/`cap` add a persistent page guard so a regression test for an
+    *unbounded* loop fails fast on the old implementation instead of paging
+    forever until the harness times out.
+    """
+    guard = ""
+    if counter is not None:
+        guard = f"""
+try:
+    seen = int(open({str(counter)!r}).read() or "0")
+except OSError:
+    seen = 0
+open({str(counter)!r}, "w").write(str(seen + 1))
+if seen + 1 > {cap}:
+    sys.stderr.write("page guard tripped after {cap} pages")
+    sys.exit(1)
+"""
+    return f"""
+import json, os, sys
+argv = sys.argv[1:]
+out = argv[argv.index("--out") + 1]
+limit = int(argv[argv.index("--limit") + 1])
+offset = int(argv[argv.index("--offset") + 1])
+{guard}
+{body}
+json.dump(page, open(out, "w"))
+"""
+
+
+def test_all_rejects_a_page_whose_offset_does_not_echo_the_request(
+    monkeypatch, tmp_path
+):
+    script = _page_script(
+        'page = {"items": [{"value": "a"}, {"value": "b"}], "offset": 0,\n'
+        '        "returned": 2, "has_more": True, "total": None}'
+    )
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+    session = bn_kernel.Session(backend="cli")
+
+    with pytest.raises(bn_kernel.BnError, match=r"offset 0 for requested offset 2"):
+        _run(session.all("strings", page=2, limit=6))
+
+    assert session.last is None
+
+
+def test_all_rejects_a_page_larger_than_the_requested_page_size(monkeypatch, tmp_path):
+    script = _page_script(
+        'page = {"items": [{"value": str(i)} for i in range(limit * 3)],\n'
+        '        "offset": offset, "returned": limit * 3, "has_more": False,\n'
+        '        "total": limit * 3}'
+    )
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+    session = bn_kernel.Session(backend="cli")
+
+    with pytest.raises(
+        bn_kernel.BnError, match=r"returned 6 items for requested limit 2"
+    ):
+        _run(session.all("strings", page=2, limit=2))
+
+    assert session.last is None
+
+
+def test_all_refuses_an_intrinsically_unbounded_collection(monkeypatch, tmp_path):
+    counter = tmp_path / "pages.count"
+    script = _page_script(
+        'page = {"items": [{"value": str(offset)}], "offset": offset,\n'
+        '        "returned": 1, "has_more": True, "total": None}',
+        counter=counter,
+        cap=6,
+    )
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "off")
+    session = bn_kernel.Session(backend="cli")
+
+    with pytest.raises(bn_kernel.BnError, match="intrinsically unbounded"):
+        _run(session.all("strings", page=1))
+
+    assert int(counter.read_text()) == 1
+
+    assert session.last is None
+
+
+def test_all_keeps_a_bounded_collection_working_without_a_deadline(
+    monkeypatch, tmp_path
+):
+    """`callsites` defaults to a finite limit; disabling the request timeout must
+    not turn that supported shape into a refusal."""
+    script = _page_script(
+        'page = {"items": [{"value": str(offset)}], "offset": offset,\n'
+        '        "returned": 1, "has_more": True, "total": None}'
+    )
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "0")
+    session = bn_kernel.Session(backend="cli")
+
+    rows = _run(session.all("callsites", "sink", page=1, limit=3))
+
+    assert [row["value"] for row in rows] == ["0", "1", "2"]
+    assert session.last is not None
+    assert session.last.payload["has_more"] is True
+
+
+def test_all_applies_the_env_override_to_its_outer_multi_page_deadline(
+    monkeypatch, tmp_path
+):
+    """BN_REQUEST_TIMEOUT is the end-to-end budget. The CLI fallback computed its
+    outer deadline from `self.timeout` alone, so N slow pages could each stay under
+    the env limit while the collection blew far past it."""
+    script = _page_script(
+        "import time\n"
+        "time.sleep(0.25)\n"
+        'page = {"items": [{"value": str(offset)}], "offset": offset,\n'
+        '        "returned": 1, "has_more": True, "total": 100}'
+    )
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "0.6")
+    session = bn_kernel.Session(backend="cli")
+    session.timeout = 60.0
+
+    started = time.monotonic()
+    with pytest.raises(bn_kernel.BnError) as caught:
+        _run(session.all("strings", page=1, limit=8))
+    elapsed = time.monotonic() - started
+
+    assert caught.value.returncode == 124
+    assert elapsed < 2.5, elapsed
+    assert session.last is None
+
+
+def test_run_hands_the_remaining_budget_to_the_child_process(monkeypatch, tmp_path):
+    """The child re-reads BN_REQUEST_TIMEOUT from its own environment, so a page
+    must be told the remaining budget or bridge cancellation waits for the
+    original full value."""
+    script = _page_script(
+        'page = {"items": [{"value": os.environ.get("BN_REQUEST_TIMEOUT", "unset")}],\n'
+        '        "offset": offset, "returned": 1, "has_more": offset < 2,\n'
+        '        "total": 3}'
+    )
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "30")
+    session = bn_kernel.Session(backend="cli")
+
+    rows = _run(session.all("strings", page=1))
+
+    budgets = [float(row["value"]) for row in rows]
+    assert len(budgets) == 3
+    assert all(budget <= 30.0 for budget in budgets)
+    assert budgets[0] > budgets[1] > budgets[2], budgets
+
+
+def test_run_disables_the_child_budget_when_the_env_override_is_off(
+    monkeypatch, tmp_path
+):
+    script = _payload_script({"text": "ok"})
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "none")
+    session = bn_kernel.Session(backend="cli")
+
+    assert _run(session.run("target", "info")) == "ok"
+
+
+def test_session_rejects_an_invalid_env_request_timeout(monkeypatch, tmp_path):
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, _payload_script({"a": 1}))))
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "banana")
+    session = bn_kernel.Session(backend="cli")
+
+    with pytest.raises(bn_kernel.BnError, match="BN_REQUEST_TIMEOUT"):
+        _run(session.run("target", "info"))
+
+
+def _bootstrap_child_code(cache_stub: str = "") -> str:
+    bootstrap = (
+        Path(__file__).resolve().parents[1] / "skills" / "bn-kernel" / "bootstrap.py"
+    )
+    return (
+        "import pathlib, shutil, sys\n"
+        f"{cache_stub}"
+        f"source = pathlib.Path({str(bootstrap)!r}).read_text()\n"
+        f"scope = {{'skill_dir': pathlib.Path({str(bootstrap.parent)!r})}}\n"
+        "exec(compile(source, 'bootstrap.py', 'exec'), scope, scope)\n"
+        "assert scope['bn_kernel'].__name__ == 'bn_kernel'\n"
+    )
+
+
+def test_bootstrap_tolerates_losing_the_cache_claim_race():
+    """Eviction is an atomic claim-by-rename. Losing the top-level rename means a
+    sibling already claimed the directory, so no stale bytecode remains here."""
+    stub = (
+        "import pathlib as _pl\n"
+        "def _lost(self, target):\n"
+        "    raise FileNotFoundError(2, 'No such file or directory', str(self))\n"
+        "_pl.Path.rename = _lost\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", _bootstrap_child_code(stub)],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "bn_kernel bootstrap:" in result.stdout
+
+
+def test_bootstrap_propagates_a_permission_failure_claiming_the_cache():
+    """A permission failure means stale bytecode may still be on disk and win the
+    import; that must stay loud rather than be swallowed with the race."""
+    stub = (
+        "import pathlib as _pl\n"
+        "def _denied(self, target):\n"
+        "    raise PermissionError(13, 'Permission denied', str(self))\n"
+        "_pl.Path.rename = _denied\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", _bootstrap_child_code(stub)],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "PermissionError" in result.stderr
+
+
+def test_bootstrap_does_not_swallow_a_failure_removing_the_claimed_cache():
+    """After a successful claim the directory is private to this process, so a
+    FileNotFoundError from inside the tree is a real bug, not the sibling race --
+    swallowing it here is what would let stale bytecode survive unnoticed."""
+    stub = (
+        "import pathlib as _pl\n"
+        "_pl.Path.rename = lambda self, target: None\n"
+        "def _vanished(path, *args, **kwargs):\n"
+        "    raise FileNotFoundError(2, 'No such file or directory', str(path))\n"
+        "shutil.rmtree = _vanished\n"
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", _bootstrap_child_code(stub)],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "FileNotFoundError" in result.stderr
+
+
+def test_bootstrap_survives_concurrent_cache_eviction(tmp_path):
+    """Every fresh eval-agent process takes the eviction branch. With a shared
+    installed skill they race on one __pycache__ directory."""
+    import shutil as _shutil
+
+    source_skill = (
+        Path(__file__).resolve().parents[1] / "skills" / "bn-kernel"
+    )
+    skill = tmp_path / "bn-kernel"
+    _shutil.copytree(
+        source_skill, skill, ignore=_shutil.ignore_patterns("__pycache__")
+    )
+    cache = skill / "src" / "bn_kernel" / "__pycache__"
+    cache.mkdir(parents=True)
+    for index in range(1500):
+        (cache / f"stale_{index}.pyc").write_bytes(b"\x00" * 64)
+
+    barrier = tmp_path / "GO"
+    worker = tmp_path / "worker.py"
+    worker.write_text(
+        "import pathlib, time\n"
+        f"barrier = pathlib.Path({str(barrier)!r})\n"
+        "while not barrier.exists():\n"
+        "    time.sleep(0.002)\n"
+        f"skill_dir = {str(skill)!r}\n"
+        f"exec(open({str(skill / 'bootstrap.py')!r}).read())\n"
+    )
+
+    processes = [
+        subprocess.Popen(
+            [sys.executable, "-I", str(worker)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(12)
+    ]
+    time.sleep(0.4)
+    barrier.write_text("go")
+
+    failures = []
+    for process in processes:
+        _out, err = process.communicate(timeout=180)
+        if process.returncode != 0:
+            failures.append(err.strip().splitlines()[-1:] or ["(no stderr)"])
+
+    assert not failures, failures
+    assert not cache.exists()
+
+
+# -- #694 remediation round 2 -------------------------------------------------
+
+
+def test_native_search_shares_one_budget_across_literal_and_regex_phases(monkeypatch):
+    """`search` resolves BN_REQUEST_TIMEOUT once, but `_native_collect` used to
+    re-resolve each remaining slice back to the full env value, so a two-phase
+    literal->regex search could spend the budget twice.
+
+    Margins are deliberately loose: a 0.5s budget against 0.3s phases leaves phase
+    one 0.2s of slack under CI load, while the old behaviour still needed ~0.6s
+    (0.3s per phase, each with a freshly re-expanded budget) and so still fails.
+    """
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "0.5")
+    session = bn_kernel.Session(instance="worker", backend="native")
+
+    class SlowSearchClient:
+        def __init__(self):
+            self.phases: list[bool] = []
+
+        def collect(self, op, params=None, *, limit=None):
+            self.phases.append(bool((params or {}).get("regex")))
+            time.sleep(0.3)
+            return {
+                "items": [],
+                "offset": 0,
+                "returned": 0,
+                "total": 0,
+                "has_more": False,
+            }
+
+    client = SlowSearchClient()
+    session._client = client
+
+    started = time.monotonic()
+    with pytest.raises(bn_kernel.BnError) as caught:
+        _run(session.search("."))
+    elapsed = time.monotonic() - started
+
+    assert caught.value.returncode == 124
+    assert client.phases == [False, True]
+    assert elapsed < 1.2, elapsed
+    assert session.last is None
+
+
+def test_all_requires_the_page_to_echo_an_integer_offset(monkeypatch, tmp_path):
+    """A bridge repeating page 1 while omitting `offset` slipped past every other
+    check when `total` was known, so a bounded collection returned duplicates."""
+    script = _page_script(
+        'page = {"items": [{"value": "a"}, {"value": "b"}], "returned": 2,\n'
+        '        "has_more": True, "total": 4}'
+    )
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+    session = bn_kernel.Session(backend="cli")
+
+    with pytest.raises(bn_kernel.BnError, match="did not publish an integer offset"):
+        _run(session.all("strings", page=2, limit=4))
+
+    assert session.last is None
+
+
+@pytest.mark.parametrize(
+    "echoed", ['"0"', "True", "None"], ids=["str", "bool", "null"]
+)
+def test_all_rejects_a_non_integer_echoed_offset(monkeypatch, tmp_path, echoed):
+    script = _page_script(
+        'page = {"items": [{"value": "a"}], "returned": 1, "has_more": False,\n'
+        f'        "total": 1, "offset": {echoed}}}'
+    )
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+    session = bn_kernel.Session(backend="cli")
+
+    with pytest.raises(bn_kernel.BnError, match="integer offset"):
+        _run(session.all("strings", page=2, limit=4))
+
+    assert session.last is None
+
+
+TOTAL_TRANSITIONS = [
+    (
+        "none to int",
+        '{"items": [{"value": "a"}], "offset": 0, "returned": 1, "has_more": True}',
+        '{"items": [{"value": "b"}], "offset": 1, "returned": 1, "has_more": True,'
+        ' "total": 5}',
+    ),
+    (
+        "int to none",
+        '{"items": [{"value": "a"}], "offset": 0, "returned": 1, "has_more": True,'
+        ' "total": 5}',
+        '{"items": [{"value": "b"}], "offset": 1, "returned": 1, "has_more": True}',
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "label,first,second",
+    TOTAL_TRANSITIONS,
+    ids=[case[0] for case in TOTAL_TRANSITIONS],
+)
+def test_all_rejects_any_cross_page_total_transition(
+    monkeypatch, tmp_path, label, first, second
+):
+    """Reading the previous total off the first-page aggregate made a
+    None<->int transition invisible: `aggregate.get("total")` is None both when the
+    bridge published no total and when it published one that later changed."""
+    script = _page_script(
+        f"page = {first} if offset == 0 else {second}"
+    )
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+    session = bn_kernel.Session(backend="cli")
+
+    with pytest.raises(bn_kernel.BnError, match="total changed across pages"):
+        _run(session.all("strings", page=1, limit=2))
+
+    assert session.last is None
+
+
+@pytest.mark.parametrize(
+    "dropped",
+    [
+        "filename",
+        "basename",
+        "function_count",
+        "named_function_count",
+        "unnamed_function_count",
+        "imported_function_count",
+        "import_symbol_count",
+    ],
+)
+def test_info_requires_every_canonical_target_key(dropped):
+    payload = _canonical_target_info()
+    payload.pop(dropped)
+    session = _shape_session(payload)
+
+    with pytest.raises(bn_kernel.BnError, match="target info contract violation"):
+        _run(session.info())
+
+    assert session.last is None
+
+
+INVALID_TARGET_INFO = [
+    ("foreign payload", None),
+    ("filename wrong type", {"filename": 17}),
+    ("basename wrong type", {"basename": ["sample.bndb"]}),
+    ("count is a bool", {"function_count": True}),
+    ("count is a string", {"named_function_count": "2"}),
+    ("count is negative", {"imported_function_count": -1}),
+    ("import_symbol_count is a string", {"import_symbol_count": "4"}),
+]
+
+
+@pytest.mark.parametrize(
+    "label,overrides",
+    INVALID_TARGET_INFO,
+    ids=[case[0] for case in INVALID_TARGET_INFO],
+)
+def test_info_rejects_invalid_canonical_target_values(label, overrides):
+    payload = (
+        {"kind": "il", "view": "hlil", "function": {"name": "main"}}
+        if overrides is None
+        else _canonical_target_info(**overrides)
+    )
+    session = _shape_session(payload)
+
+    with pytest.raises(bn_kernel.BnError, match="target info contract violation"):
+        _run(session.info())
+
+    assert session.last is None
+
+
+def test_info_accepts_the_canonical_payload_and_a_null_import_count():
+    session = _shape_session(_canonical_target_info())
+    assert _run(session.info())["function_count"] == 3
+
+    # The bridge deliberately publishes None when the imports count raises
+    # (bridge.py `_target_info`), so None must stay valid for that key alone.
+    null_count = _shape_session(_canonical_target_info(import_symbol_count=None))
+    assert _run(null_count.info())["import_symbol_count"] is None
+
+    null_names = _shape_session(
+        _canonical_target_info(filename=None, basename=None)
+    )
+    assert _run(null_names.info())["basename"] is None

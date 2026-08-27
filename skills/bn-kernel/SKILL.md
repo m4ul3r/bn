@@ -119,29 +119,47 @@ in a future OMP release, either launch path becomes safe.
 before client construction. An explicit non-`auto` `backend=` argument wins over
 a valid environment default.
 
+Both backends are POSIX-only and Linux-first, like `bn` itself: the bridge speaks
+`AF_UNIX`, its peer check needs `SO_PEERCRED`, and the CLI backend hands the child
+`bn` its artifact through `/proc/self/fd` (falling back to `/dev/fd`) plus
+`pass_fds`. There is no Windows path.
+
 Native reads are bounded to 120 seconds by default. Every curated expensive read
 accepts `timeout=`: `info`, `assert_target`, `assert_unannotated`, `functions`,
 `search`, `function_info`, `decompile`, `disasm`, `il`, `xrefs`, `callsites`,
 `strings`, `imports`, and `sections`. Collection timeouts apply to the whole
-multi-page/fallback operation. Unknown keywords raise `TypeError` rather than
+multi-page/fallback operation. `BN_REQUEST_TIMEOUT` overrides that budget and is
+applied exactly once as one end-to-end deadline: every page of a collection gets
+the shrinking remainder, never a fresh copy of the full value, and the child `bn`
+is told the remainder so bridge-side cancellation is not scheduled off a budget
+the collection already spent. The documented `0`/`none`/`off` spelling disables
+the deadline; a collection with no `limit=`, no deadline, and a `total=null` page
+that still claims `has_more` is then refused as intrinsically unbounded rather
+than paged forever. Unknown keywords raise `TypeError` rather than
 becoming silent bridge filters. Timeout errors report the requested end-to-end
 budget and retain the `bn -i NAME target info` analysis-progress guidance.
 
 Prefer these curated helpers for list-shaped and common reads:
 
-- `await s.info(verbose=False)` exposes `function_count`, `import_symbol_count` (the exact `imports` row count), and `imported_function_count` (callable imported targets); do not compare the latter two as if they were the same population.
+- `await s.info(verbose=False)` exposes `function_count`, `import_symbol_count` (the exact `imports` row count), and `imported_function_count` (callable imported targets); do not compare the latter two as if they were the same population. It requires the canonical `target_info` shape rather than "some mapping", so another payload cannot answer every one of those questions with a silent "absent": `filename` and `basename` must be present as strings or null; `function_count`, `named_function_count`, `unnamed_function_count` and `imported_function_count` must be present non-negative integers; `import_symbol_count` must be present and either a non-negative integer or `null` (the bridge uses `null` when the imports count fails).
 - `await s.functions(timeout=..., ...)`, `await s.search(query, timeout=..., ...)` always return row lists; every row has integer `size` plus `size_known`, and `s.last.payload` is the paged envelope. Address/name/size sorts are ascending; pass `reverse=True` for descending/largest-first. Search matches function names/display names only. Regex-shaped zero hits disclose `regex_fallback=True|False` on both backends; `"."` is treated as the all-names regex even when literal dots exist, invalid regex-like input raises, and `exact=True` forces a literal.
 - `await s.function_info(identifier, blocks=False)` returns flattened `name`, `address`, `size`, `size_known`, and `imported`; `blocks=True` adds `blocks`. Raw identity remains under `s.last.payload['function']`.
 - `await s.decompile(identifier)` returns the non-empty text string with inherited annotation bodies redacted. Use `include_annotations=True` only after an explicit contamination decision. Skipped placeholders raise and direct you to `force_analysis=True`.
 - `await s.disasm(identifier, count=N)` / `lines=(START, END)` returns an address-ordered, bridge-sliced string with canonical `0x` addresses. `lines` is a 1-indexed inclusive text-line range, never an address range; out-of-range windows raise.
-- `await s.il(identifier)`, `await s.xrefs(identifier, timeout=..., ...)`
+- `await s.il(identifier)` returns the non-empty text string, `await s.xrefs(identifier, timeout=..., ...)` a validated row collection.
 - `await s.callsites(callee, timeout=..., ...)` defaults to 100 rows. A bounded high-fan-in payload may have `total=None`; read `total_lower_bound`, `callers_scanned`, `caller_total`, and `scan_truncated` instead of treating null as zero.
 - `await s.strings(timeout=..., ...)` defaults to 100 rows to avoid latency cliffs; pass `limit=None` explicitly for a full collection. `imports` and `sections` retain explicit `limit=` control.
-- `await s.assert_unannotated()` reports offending comment locations; `allow_contaminated=True` is the explicit bypass and returns the full orientation digest.
+- `await s.assert_unannotated()` reports offending comment locations; `allow_contaminated=True` is the explicit bypass and returns the full orientation digest. It fails **closed**: the digest must be a mapping whose `existing_annotations` is a mapping carrying non-negative integer `comments`, `function_comments` and `user_symbols`. An unreadable digest raises instead of collapsing to "zero comments", and `allow_contaminated=True` waives the contamination *policy*, never that payload contract.
 
-Collection and text helpers reject malformed, nested, or silently truncated
-payloads instead of returning an empty/list/dict/`None` shape that can be
+Every collection and text helper validates **after** the backend branch, so `cli`
+and `native` enforce the same shape: malformed, nested, or silently truncated
+payloads raise instead of returning an empty/list/dict/`None` shape that can be
 misread as “no findings.”
+
+Paged reads also require each page to publish an integer `offset` equal to the one
+requested, and reject any cross-page `total` transition (`null`→int, int→`null`, or
+a changed int). Progress is otherwise tracked by the caller's own arithmetic, so a
+bridge that ignores pagination would silently return duplicate rows.
 
 **Row keys differ per collection, and you never have to guess.** `functions`
 rows key on `address`/`size`, `sections` on `start`/`end`/`length`, `callsites`
