@@ -204,12 +204,37 @@ def test_target_info_surfaces_analysis_progress(monkeypatch):
     assert info["analysis_progress"] == {"state": "AnalyzeState", "count": 1112, "total": 1939}
 
 
+def test_target_info_reconciles_import_symbol_and_function_counts(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    imported_function = fake_bn.Symbol(
+        fake_bn.SymbolType.ImportedFunctionSymbol, 0x1000, "receive_record"
+    )
+    imported_data = fake_bn.Symbol(
+        fake_bn.SymbolType.ImportedDataSymbol, 0x2000, "global_state"
+    )
+    bv = _FakeBV(symbols=[imported_function, imported_data])
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "refresh", lambda: [])
+
+    info = instance._target_info("active")
+
+    assert info["import_symbol_count"] == 2
+    assert info["imported_function_count"] == 0
+    assert info["import_count_definition"] == {
+        "import_symbol_count": "rows returned by imports",
+        "imported_function_count": "callable imported function targets",
+    }
+
+
 def test_target_info_surfaces_image_base(monkeypatch):
     """#564: target info exposes image_base from bv.start so dynamic tools can
     rebase a BN address to runtime instead of guessing the preferred base."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV()
+    bv.file = types.SimpleNamespace(filename="/tmp/sample.bndb")
     bv.start = 0x400000
     bv.entry_point = 0x40B180
     monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
@@ -219,6 +244,7 @@ def test_target_info_surfaces_image_base(monkeypatch):
 
     assert info["image_base"] == "0x400000"
     assert info["entry_point"] == "0x40b180"
+    assert info["path"] == str(bv.file.filename)
 
 
 class _Endianness(enum.IntEnum):
@@ -372,6 +398,48 @@ def test_py_exec_non_serializable_result_falls_back_to_repr(monkeypatch):
 
     assert isinstance(result["result"], str)
     assert result["warnings"]
+
+
+def test_py_exec_marks_view_dirty_when_script_changes_modified_bit(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = types.SimpleNamespace(file=types.SimpleNamespace(modified=False))
+    marked = []
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx.targets, "mark_dirty", lambda view: marked.append(view))
+
+    result = instance._py_exec("active", "bv.file.modified = True; result = 1")
+
+    assert marked == [bv]
+    assert result["dirty"] is True
+
+
+def test_py_exec_read_only_script_stays_clean(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = types.SimpleNamespace(file=types.SimpleNamespace(modified=False))
+    marked = []
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx.targets, "mark_dirty", lambda view: marked.append(view))
+
+    result = instance._py_exec("active", "result = 1 + 1")
+
+    assert marked == []
+    assert result["dirty"] is False
+
+
+def test_py_exec_explicit_mark_dirty_handles_preexisting_modified_bit(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = types.SimpleNamespace(file=types.SimpleNamespace(modified=True))
+    marked = []
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx.targets, "mark_dirty", lambda view: marked.append(view))
+
+    result = instance._py_exec("active", "mark_dirty(); result = 3")
+
+    assert marked == [bv]
+    assert result["dirty"] is True
 
 
 def test_read_write_lock_blocks_reader_until_writer_releases(monkeypatch):
@@ -594,6 +662,190 @@ def test_load_binary_no_sibling(monkeypatch, tmp_path):
     assert result["path"] == str(raw)
     assert result["notes"] == []
     bridge._headless_views.clear()
+
+
+
+def test_detached_load_job_exposes_pollable_progress(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(instance_id="worker")
+    binary = tmp_path / "sample.bndb"
+    binary.write_bytes(b"")
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_load(path, **kwargs):
+        started.set()
+        assert release.wait(2)
+        return {
+            "loaded": True,
+            "path": path,
+            "targets": [{"selector": "sample.bndb"}],
+        }
+
+    monkeypatch.setattr(instance, "_load_binary", slow_load)
+
+    queued = instance._load_binary_async(str(binary))
+    assert started.wait(1)
+    running = instance._load_status(queued["job_id"])["items"][0]
+    assert running["state"] == "running"
+    assert running["result"] is None
+
+    release.set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        completed = instance._load_status(queued["job_id"])["items"][0]
+        if completed["state"] == "complete":
+            break
+        time.sleep(0.01)
+
+    assert completed["state"] == "complete"
+    assert completed["result"]["targets"] == [{"selector": "sample.bndb"}]
+    assert "session status" in queued["status_command"]
+
+
+def test_job_specific_load_status_exposes_top_level_machine_fields(monkeypatch, tmp_path):
+    # A single-job poll is the hot loop of every detached load: the agent asks
+    # "is it done, and did it work?". Before this contract it had to index
+    # items[0] and re-derive terminality from the state string by hand, which is
+    # exactly the inference that produced wasted poll loops in the VIBE24 run.
+    # The job-specific query must answer both questions at the TOP level.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(instance_id="worker")
+    binary = tmp_path / "sample.bndb"
+    binary.write_bytes(b"")
+    release = threading.Event()
+    started = threading.Event()
+
+    def slow_load(path, **kwargs):
+        started.set()
+        assert release.wait(2)
+        return {"loaded": True, "path": path, "targets": [{"selector": "sample.bndb"}]}
+
+    monkeypatch.setattr(instance, "_load_binary", slow_load)
+    queued = instance._load_binary_async(str(binary))
+    job_id = queued["job_id"]
+    assert started.wait(1)
+
+    running = instance._load_status(job_id)
+    assert running["kind"] == "load_job"
+    assert running["job_id"] == job_id
+    assert running["state"] == "running"
+    assert running["terminal"] is False
+    # Non-terminal success is UNKNOWN, not False -- a False here would read as
+    # "the load failed" and make a polling agent tear down a healthy bridge.
+    assert running["succeeded"] is None
+    # The canonical record stays addressable, and the collection container is
+    # retained so the #275 `items` envelope doctrine still holds.
+    assert running["job"]["state"] == "running"
+    assert running["items"] == [running["job"]]
+    assert running["count"] == 1
+    # The text renderer needs the poll command from the payload, not guesswork.
+    assert running["status_command"] == f"bn -i worker session status {job_id}"
+
+    release.set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        done = instance._load_status(job_id)
+        if done["terminal"]:
+            break
+        time.sleep(0.01)
+
+    assert done["state"] == "complete"
+    assert done["terminal"] is True
+    assert done["succeeded"] is True
+    assert done["job"]["result"]["targets"] == [{"selector": "sample.bndb"}]
+
+
+def test_gui_bridge_status_command_is_none_in_envelopes(monkeypatch, tmp_path):
+    # A GUI-loaded bridge has no instance id, so there is no unambiguous
+    # CLI-addressable selector for it -- a `bn session status <job>` command
+    # would name a bridge that can't be reliably picked out again. Both the
+    # helper and every envelope that embeds it must say so honestly with
+    # `None`, not a command that cannot actually be run.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(instance_id=None)
+    assert instance._load_status_command("job123") is None
+
+    binary = tmp_path / "sample.bndb"
+    binary.write_bytes(b"")
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_load(path, **kwargs):
+        started.set()
+        assert release.wait(2)
+        return {"loaded": True, "path": path, "targets": [{"selector": "sample.bndb"}]}
+
+    monkeypatch.setattr(instance, "_load_binary", slow_load)
+
+    queued = instance._load_binary_async(str(binary))
+    assert started.wait(1)
+    assert queued["status_command"] is None
+
+    job_id = queued["job_id"]
+    running = instance._load_status(job_id)
+    assert running["status_command"] is None
+
+    release.set()
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        done = instance._load_status(job_id)
+        if done["terminal"]:
+            break
+        time.sleep(0.01)
+
+    assert done["state"] == "complete"
+    assert done["status_command"] is None
+
+
+def test_job_specific_load_status_reports_failure_without_ambiguity(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(instance_id="worker")
+    binary = tmp_path / "sample.bndb"
+    binary.write_bytes(b"")
+
+    def failing_load(path, **kwargs):
+        raise RuntimeError("analysis blew up")
+
+    monkeypatch.setattr(instance, "_load_binary", failing_load)
+    job_id = instance._load_binary_async(str(binary))["job_id"]
+
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        failed = instance._load_status(job_id)
+        if failed["terminal"]:
+            break
+        time.sleep(0.01)
+
+    assert failed["state"] == "failed"
+    assert failed["terminal"] is True
+    assert failed["succeeded"] is False
+    assert "analysis blew up" in failed["job"]["error"]
+
+
+def test_load_status_collection_keeps_its_envelope_and_unknown_job_fails_loudly(monkeypatch, tmp_path):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge(instance_id="worker")
+    binary = tmp_path / "sample.bndb"
+    binary.write_bytes(b"")
+    monkeypatch.setattr(
+        instance,
+        "_load_binary",
+        lambda path, **kwargs: {"loaded": True, "path": path, "targets": []},
+    )
+    instance._load_binary_async(str(binary))
+
+    listing = instance._load_status()
+    assert listing["kind"] == "load_jobs"
+    assert listing["count"] == 1
+    # Listing all jobs answers about a POPULATION: a single terminal/succeeded
+    # verdict would be a lie, so those fields must stay off the collection.
+    assert "terminal" not in listing and "succeeded" not in listing
+
+    # A typo'd job id must not look like "no jobs yet" (which a poll loop would
+    # retry forever).
+    with pytest.raises(RuntimeError, match="Unknown load job: nope"):
+        instance._load_status("nope")
 
 
 def test_load_binary_idempotent_returns_existing_view(monkeypatch, tmp_path):
@@ -1525,6 +1777,29 @@ def test_close_binary_by_target_selector_does_not_deadlock(monkeypatch, tmp_path
     bridge._headless_views.clear()
 
 
+def test_close_read_only_view_does_not_report_unsaved_mutations(
+    monkeypatch, tmp_path
+):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    bv = _ClosableBV("/proj/read-only.bndb", session_id="11")
+    bv.file.modified = True  # Binary Ninja analysis/cache churn, not a bn mutation.
+    _register_views(bridge, bv)
+
+    result = _close_on_watchdog(instance, target="read-only.bndb")
+
+    assert result["closed"] == [
+        {
+            "path": "/proj/read-only.bndb",
+            "unsaved": False,
+            "engine_modified": True,
+        }
+    ]
+    assert bv.closed
+    bridge._headless_views.clear()
+
+
 def test_close_binary_all_flag_closes_everything(monkeypatch, tmp_path):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -2156,6 +2431,56 @@ def test_bridge_handler_allows_request_exactly_at_cap_with_newline(monkeypatch):
     assert json.loads(writer.data.decode("utf-8"))["ok"] is True
 
 
+@pytest.mark.parametrize(
+    ("operation", "params"),
+    [
+        ("load_binary", {"path": "/tmp/foreign.bin"}),
+        ("save_database", {"path": "/tmp/foreign.bndb"}),
+    ],
+)
+def test_bridge_handler_rejects_foreign_identity_before_dispatch(
+    monkeypatch, operation, params
+):
+    bridge = _load_bridge(monkeypatch)
+    dispatched = []
+    expected_identity = {
+        "instance_id": "expected",
+        "pid": 1234,
+        "token": "expected-token",
+    }
+    line = json.dumps(
+        {
+            "id": "mutating-request",
+            "op": operation,
+            "params": params,
+            "_bridge_identity": {
+                "instance_id": "foreign",
+                "pid": 5678,
+                "token": "foreign-token",
+            },
+        }
+    ).encode() + b"\n"
+    handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
+    handler.connection = _same_uid_conn()
+    handler.rfile = io.BytesIO(line)
+    handler.server = types.SimpleNamespace(
+        bridge=types.SimpleNamespace(
+            bridge_identity=expected_identity,
+            dispatch=lambda payload: dispatched.append(payload),
+        )
+    )
+    writer = _RecordingWriter()
+    handler.wfile = writer
+
+    handler.handle()
+
+    response = json.loads(writer.data.decode("utf-8"))
+    assert response["ok"] is False
+    assert "bridge identity mismatch" in response["error"]
+    assert response["bridge_identity"] == expected_identity
+    assert dispatched == []
+
+
 def test_bridge_handler_rejects_non_dict_json(monkeypatch):
     bridge = _load_bridge(monkeypatch)
 
@@ -2640,7 +2965,12 @@ def test_bridge_handler_counts_request_inflight_until_response_written(monkeypat
     inst._last_activity = 0.0
 
     handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
-    handler.rfile = io.BytesIO(b'{"op": "noop", "id": "r1"}\n')
+    handler.rfile = io.BytesIO(
+        json.dumps(
+            {"op": "noop", "id": "r1", "_bridge_identity": inst.bridge_identity}
+        ).encode("utf-8")
+        + b"\n"
+    )
     handler.server = types.SimpleNamespace(bridge=inst)
     handler.wfile = _RecordingWriter()
     handler.connection = _same_uid_conn()  # satisfy #612 peercred gate
@@ -2668,7 +2998,12 @@ def test_bridge_handler_counts_inflight_for_idless_request(monkeypatch):
     inst.dispatch = fake_dispatch
 
     handler = bridge.BridgeHandler.__new__(bridge.BridgeHandler)
-    handler.rfile = io.BytesIO(b'{"op": "noop"}\n')  # NO id
+    handler.rfile = io.BytesIO(
+        json.dumps({"op": "noop", "_bridge_identity": inst.bridge_identity}).encode(
+            "utf-8"
+        )
+        + b"\n"
+    )  # NO id
     handler.server = types.SimpleNamespace(bridge=inst)
     handler.wfile = _RecordingWriter()
     handler.connection = _same_uid_conn()  # satisfy #612 peercred gate
@@ -3406,3 +3741,239 @@ def test_save_database_rejects_non_string_and_empty_operands(monkeypatch, tmp_pa
             instance._save_database(**kwargs)
         assert "save_database" in str(exc.value), kwargs
     bridge._headless_views.clear()
+
+
+# --- in-band row-field discovery -----------------------------------------
+#
+# Collection rows have deliberately different schemas (functions: address/size,
+# sections: start/end/length, callsites: nested callee/containing_function), and
+# agents had no way to learn them except a failed read or the source. The hint
+# rides the envelope every collection already returns, attached once at the
+# dispatch boundary: no second command catalog, and nothing for the CLI or the
+# kernel to re-declare.
+
+ROW_FIELD_OPS = [
+    ("list_functions", {}, ("address", "name", "size", "size_known")),
+    ("strings", {}, ("address", "value", "length", "type")),
+    ("imports", {}, ("address", "name", "kind")),
+    ("sections", {}, ("name", "start", "end", "length", "semantics")),
+    ("xrefs", {"identifier": "0x401000"}, ("address", "function", "kind")),
+    ("callsites", {"callee": "memcpy"}, ("callee", "containing_function", "call_addr", "caller_static")),
+]
+
+
+def _row_field_bv():
+    fake_bn = sys.modules["binaryninja"]
+    fn = _FakeFunction(0x401000, "parse_packet")
+    fn.basic_blocks = [_FakeBasicBlock(0x401000, 0x401040)]
+    callee = _FakeFunction(0x402000, "memcpy")
+    imp = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, 0x403000, "printf")
+    imp.short_name = "printf"
+    imp.namespace = "libc"
+    return _FakeBV(
+        functions=[fn, callee],
+        strings=[_FakeStringRef(0x500000, 5, "alpha")],
+        sections={".text": _FakeSection(".text", 0x401000, 0x402000, 1)},
+        symbols=[imp],
+        code_refs={0x401000: [_FakeCodeRef(0x401020, fn)]},
+    )
+
+
+@pytest.mark.parametrize("op,params,expected", ROW_FIELD_OPS, ids=[o[0] for o in ROW_FIELD_OPS])
+def test_collection_payloads_declare_their_row_fields(monkeypatch, op, params, expected):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: _row_field_bv())
+
+    result = instance._dispatch_on_main(op, dict(params), "active")
+
+    row_fields = result["row_fields"]
+    assert isinstance(row_fields, list)
+    missing = [key for key in expected if key not in row_fields]
+    assert not missing, f"{op} row_fields missing {missing}: {row_fields}"
+    # Every key the hint advertises must be readable off a real row when the
+    # page has one, or the hint is worse than nothing.
+    for row in result["items"]:
+        assert set(row) <= set(row_fields), f"{op} row key not advertised: {set(row) - set(row_fields)}"
+
+
+@pytest.mark.parametrize("op,params,expected", ROW_FIELD_OPS, ids=[o[0] for o in ROW_FIELD_OPS])
+def test_empty_collections_still_declare_their_row_fields(monkeypatch, op, params, expected):
+    # The case that actually bites: a zero-hit read is exactly when an agent
+    # needs to know what a row WOULD look like, and there is no runtime row to
+    # infer it from.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    # `callsites` needs its callee to EXIST (an unknown callee is a different
+    # error), so that one op gets a view holding only the uncalled callee; every
+    # other op reads a genuinely empty view.
+    def empty_view(selector):
+        if op == "callsites":
+            return _FakeBV(functions=[_FakeFunction(0x402000, "memcpy")])
+        return _FakeBV()
+
+    monkeypatch.setattr(instance.ctx, "_resolve_view", empty_view)
+
+    result = instance._dispatch_on_main(op, dict(params), "active")
+
+    assert result["items"] == []
+    missing = [key for key in expected if key not in result["row_fields"]]
+    assert not missing, f"{op} empty-page row_fields missing {missing}"
+
+
+def test_row_fields_is_not_attached_to_non_collection_results(monkeypatch):
+    # `decompile` returns text, not rows; a row hint there would be a lie.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "parse_packet")
+    fn.basic_blocks = [_FakeBasicBlock(0x401000, 0x401040)]
+    monkeypatch.setattr(
+        instance.ctx, "_resolve_view", lambda selector: _FakeBV(functions=[fn])
+    )
+
+    result = instance._dispatch_on_main("decompile", {"identifier": "parse_packet"}, "active")
+
+    assert "row_fields" not in result
+
+
+def test_declared_row_fields_match_the_rows_the_bridge_builds(monkeypatch):
+    # Drift guard: the declared fallback (used for empty pages) must equal what a
+    # populated page actually returns, so an added/renamed row key cannot leave a
+    # stale declaration shipping to agents.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: _row_field_bv())
+
+    declared = sys.modules["bn_test_bridge._shared"]._DECLARED_ROW_FIELDS
+    checked = 0
+    for op, params, _expected in ROW_FIELD_OPS:
+        result = instance._dispatch_on_main(op, dict(params), "active")
+        kind = result["kind"]
+        if kind not in declared or not result["items"]:
+            continue
+        observed = {key for row in result["items"] for key in row}
+        undeclared = observed - set(declared[kind])
+        assert not undeclared, f"{kind}: row keys not declared: {sorted(undeclared)}"
+        checked += 1
+    assert checked >= 4, "drift guard did not exercise enough populated collections"
+
+
+def test_declared_row_fields_cover_conditional_producer_keys(monkeypatch):
+    # #694 item 9: several row keys are only set on SOME rows of a kind (a
+    # relocation-recovered import's `provenance`, a segment-backed section's
+    # permission fields, a fn-pointer-scan hit's `function_pointer`/
+    # `thumb_pointer`, a callsite's `call_index`/`within_query`/
+    # `callee_variadic`). `test_declared_row_fields_match_the_rows_the_bridge_builds`
+    # only exercises the UNCONDITIONAL keys (its shared fixture never triggers
+    # any of these paths), so it cannot catch a declaration that omits one of
+    # them. Drive each conditional path directly and hold it to the same
+    # undeclared-key bar.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    declared = sys.modules["bn_test_bridge._shared"]._DECLARED_ROW_FIELDS
+    fake_bn = sys.modules["binaryninja"]
+
+    # imports: a relocation-only external symbol recovered with no PLT/GOT
+    # symbol entry at all -- the only path that sets `provenance`.
+    jump_slot = fake_bn.RelocationType.ELFJumpSlotRelocationType
+    reloc_symbol = fake_bn.Symbol(fake_bn.SymbolType.ExternalSymbol, 0, "dispatch_record")
+    relocation = _FakeReloc(jump_slot, reloc_symbol)
+    relocation.address = 0x3000
+    imports_bv = _FakeBV()
+    imports_bv.relocations = [relocation]
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: imports_bv)
+    imports_result = instance._imports(None)
+    imports_observed = {key for row in imports_result["items"] for key in row}
+    assert "provenance" in imports_observed
+    assert not imports_observed - set(declared["imports"]), (
+        f"imports: row keys not declared: {sorted(imports_observed - set(declared['imports']))}"
+    )
+
+    # sections: a segment-backed section carries the permission projection.
+    sections_bv = _FakeBV(
+        sections={".text": _FakeSection(".text", 0x401000, 0x402000, 1)},
+        segments={0x401000: _FakeSegment(readable=True, writable=True, executable=True)},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: sections_bv)
+    sections_result = instance._sections(None)
+    sections_observed = {key for row in sections_result["items"] for key in row}
+    assert {"readable", "writable", "executable", "writable_executable", "permission_source"} <= sections_observed
+    assert not sections_observed - set(declared["sections"]), (
+        f"sections: row keys not declared: {sorted(sections_observed - set(declared['sections']))}"
+    )
+
+    # xrefs: a fn-pointer-scan hit stored as a thumb-tagged (addr|1) pointer.
+    func_addr = 0x401000
+    target = _FakeFunction(func_addr, "callback_only")
+    target.basic_blocks = [_FakeBasicBlock(func_addr, func_addr + 0x10)]
+    blob = bytearray(0x100)
+    blob[0x40:0x44] = (func_addr | 1).to_bytes(4, "little")
+    xrefs_bv = _FakeBV(
+        functions=[target],
+        arch=_FakeArch(name="armv7", address_size=4),
+        code_refs={func_addr: []},
+        data_refs={func_addr: []},
+        sections={".data.rel.ro": _FakeSection(".data.rel.ro", 0x420000, 0x420100)},
+        segments={0x420040: _FakeSegment(readable=True)},
+        memory={0x420000: bytes(blob)},
+    )
+    xrefs_result = instance._xrefs_to_address(xrefs_bv, func_addr, fn_pointer_scan=True)
+    xrefs_observed = {key for row in xrefs_result["data_refs"] for key in row}
+    assert {"function_pointer", "thumb_pointer"} <= xrefs_observed
+    assert not xrefs_observed - set(declared["xrefs"]), (
+        f"xrefs: row keys not declared: {sorted(xrefs_observed - set(declared['xrefs']))}"
+    )
+
+    # callsites: a variadic callee (`callee_variadic`) called from >=1 in-scope
+    # caller, which also always carries `call_index`/`within_query`.
+    callee = _FakeFunction(0x461746, "printf")
+    caller = _FakeFunction(0x412470, "format_and_send")
+    caller.basic_blocks = [_FakeBasicBlock(0x41249C, 0x4124D8)]
+    caller.low_level_il = [[_FakeLLILInstruction(0x4124A0, _FakeConstPtr(0x461746))]]
+    callsites_bv = _FakeBV(
+        functions=[callee, caller],
+        instruction_lengths={0x4124A0: 5},
+        disassembly={0x4124A0: "call printf"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: callsites_bv)
+    callsites_result = instance._callsites(None, "printf", within_identifiers=["format_and_send"])
+    callsites_observed = {key for row in callsites_result["items"] for key in row}
+    assert {"call_index", "within_query", "callee_variadic"} <= callsites_observed
+    assert not callsites_observed - set(declared["callsites"]), (
+        f"callsites: row keys not declared: {sorted(callsites_observed - set(declared['callsites']))}"
+    )
+
+
+_PREVIOUSLY_MISSING_ROW_FIELDS: dict[str, tuple[str, ...]] = {
+    "callsites": ("call_index", "within_query"),
+    "imports": ("provenance",),
+    "sections": ("readable", "writable", "executable", "writable_executable", "permission_source"),
+    "xrefs": ("function_pointer", "thumb_pointer"),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(_PREVIOUSLY_MISSING_ROW_FIELDS))
+def test_empty_page_row_fields_include_previously_missing_optional_keys(monkeypatch, kind):
+    # #694 item 9: a zero-hit page is exactly when there is no row to infer the
+    # schema from, so `row_fields` falls back to `_DECLARED_ROW_FIELDS` alone
+    # (`_annotate_row_fields`). It must still advertise every optional key a
+    # POPULATED page of this kind could carry -- omitting them here is the bug.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    op = "list_functions" if kind == "functions" else kind
+    op_params = {"callee": "memcpy"} if kind == "callsites" else (
+        {"identifier": "0x401000"} if kind == "xrefs" else {}
+    )
+
+    def empty_view(selector):
+        if kind == "callsites":
+            return _FakeBV(functions=[_FakeFunction(0x402000, "memcpy")])
+        return _FakeBV()
+
+    monkeypatch.setattr(instance.ctx, "_resolve_view", empty_view)
+
+    result = instance._dispatch_on_main(op, dict(op_params), "active")
+
+    assert result["items"] == []
+    missing = [key for key in _PREVIOUSLY_MISSING_ROW_FIELDS[kind] if key not in result["row_fields"]]
+    assert not missing, f"{kind}: empty-page row_fields missing {missing}"

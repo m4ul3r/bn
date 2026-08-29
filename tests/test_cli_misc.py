@@ -243,6 +243,30 @@ def test_imports_json_carries_paging_envelope(fake_transport, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload["total"] == 512 and payload["has_more"] is True
     assert payload["items"][0]["name"] == "printf"
+
+
+def test_exports_list_alias_routes_to_export_enumerator(fake_transport, capsys):
+    calls = fake_transport(
+        {
+            "list_exports": {
+                "ok": True,
+                "result": {
+                    "items": [],
+                    "offset": 0,
+                    "returned": 0,
+                    "total": 0,
+                    "has_more": False,
+                },
+            }
+        }
+    )
+
+    rc = bn.cli.main(
+        ["exports", "list", "--target", "active", "--format", "json"]
+    )
+
+    assert rc == 0
+    assert calls[-1]["op"] == "list_exports"
 @pytest.mark.parametrize("manifest, expected", [
     pytest.param(None, "Manifest file not found", id="missing-file"),
     pytest.param("{not valid json", "Invalid JSON in manifest", id="invalid-json"),
@@ -444,14 +468,33 @@ def test_strings_query_value_can_look_like_flag(monkeypatch, capsys):
     assert captured_queries == ["-h", "--"]
 
 
-def test_strings_query_value_can_be_a_known_sibling_flag(monkeypatch, capsys):
-    # #102: a protected data option must accept ANY following flag-like token as
-    # its literal value, including ones that collide with KNOWN sibling options
-    # (--regex, --format, --target). `bn strings --query --format` searches for
-    # the literal "--format". A user wanting --query <val> --regex uses = syntax.
+def test_strings_query_value_rejects_known_sibling_flag(monkeypatch, capsys):
+    """#694 item 14: a KNOWN sibling flag right after --query is a usage error,
+    not a silent literal search for the flag text -- a `--query --regex` typo
+    used to return a confident, wrong "no matches for '--regex'" instead of
+    telling the caller they forgot to reorder their flags."""
+    def fake_send_request(op, **kwargs):
+        raise AssertionError(f"send_request must not be called: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    with pytest.raises(SystemExit) as exc:
+        bn.cli.main(["strings", "--target", "active", "--query", "--regex"])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "argument --query: expected a value but found the known flag '--regex'" in err
+    assert "--query=--regex" in err
+
+
+def test_strings_query_explicit_equals_still_searches_literal_flag_text(monkeypatch, capsys):
+    """The explicit `--query=<value>` spelling is the documented escape hatch:
+    it must still search for the literal flag text even when that text
+    collides with a known sibling option (unaffected by the new sibling-flag
+    rejection, which only applies to the SPACE-separated form)."""
     captured_queries = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None,
+                          spawn_missing_named=False):
         if op == "strings":
             captured_queries.append(params["query"])
             return {"ok": True, "result": []}
@@ -459,10 +502,26 @@ def test_strings_query_value_can_be_a_known_sibling_flag(monkeypatch, capsys):
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
-    assert bn.cli.main(["strings", "--target", "active", "--query", "--regex"]) == 0
-    assert bn.cli.main(["strings", "--target", "active", "--query", "--format"]) == 0
-    assert bn.cli.main(["strings", "--target", "active", "--query", "--limit"]) == 0
-    assert captured_queries == ["--regex", "--format", "--limit"]
+    rc = bn.cli.main(["strings", "--target", "active", "--query=--format"])
+
+    assert rc == 0
+    assert captured_queries == ["--format"]
+
+
+def test_py_exec_code_value_rejects_known_sibling_flag(monkeypatch, capsys):
+    """--code (`bn py exec`) is protected the same way --query is (#694 item 14):
+    a known sibling flag right after it is a usage error, not a literal-value
+    guess."""
+    def fake_send_request(op, **kwargs):
+        raise AssertionError(f"send_request must not be called: {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    with pytest.raises(SystemExit) as exc:
+        bn.cli.main(["py", "exec", "--target", "active", "--code", "--format"])
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert "argument --code: expected a value but found the known flag '--format'" in err
 
 
 # --- I5: sections CLI ---

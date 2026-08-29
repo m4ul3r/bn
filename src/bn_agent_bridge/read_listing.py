@@ -25,6 +25,7 @@ import THIS module one-way (design spec §3.2).
 from __future__ import annotations
 
 import re
+from types import SimpleNamespace
 from typing import Any
 
 try:
@@ -167,6 +168,42 @@ def _callsites_within_function(ctx, bv, callee, func, *, context: int,
     return rows
 
 
+def _all_caller_functions(
+    bv,
+    callee_addresses: set[int],
+) -> list[tuple[str, Any]]:
+    callers: dict[int, Any] = {}
+    get_code_refs = getattr(bv, "get_code_refs", None)
+    if not callable(get_code_refs):
+        return []
+    for address in sorted(callee_addresses):
+        try:
+            refs = list(get_code_refs(address) or [])
+        except Exception:
+            continue
+        for ref in refs:
+            functions = []
+            direct = getattr(ref, "function", None)
+            if direct is not None:
+                functions = [direct]
+            else:
+                try:
+                    functions = list(
+                        bv.get_functions_containing(int(getattr(ref, "address")))
+                        or []
+                    )
+                except Exception:
+                    functions = []
+            for function in functions:
+                start = int(getattr(function, "start", -1))
+                if start >= 0:
+                    callers.setdefault(start, function)
+    return [
+        (str(getattr(function, "name", "") or hex(start)), function)
+        for start, function in sorted(callers.items())
+    ]
+
+
 def _callsites(
     ctx,
     selector: str | None,
@@ -175,8 +212,8 @@ def _callsites(
     within_identifiers: list[Any],
     context: int = 3,
     offset: int = 0,
-    limit: int | None = None,
-) -> list[dict[str, Any]]:
+    limit: int | None = 100,
+) -> dict[str, Any]:
     if context < 0:
         raise OperationFailure("invalid_context", f"Invalid callsite context size: {context}")
     offset = _validate_count(offset, label="offset", minimum=0)
@@ -184,32 +221,130 @@ def _callsites(
 
     bv = ctx._resolve_view(selector)
     require_analysis(bv, "Callsites")
-    callee = ctx._find_function(bv, callee_identifier)
+    callee_symbol_only = False
+    try:
+        callee = ctx._find_function(bv, callee_identifier)
+    except Exception:
+        getter = getattr(bv, "get_symbols_by_name", None)
+        symbols = (
+            list(getter(str(callee_identifier)) or [])
+            if callable(getter) and callee_identifier
+            else []
+        )
+        if not symbols:
+            raw_getter = getattr(bv, "get_symbol_by_raw_name", None)
+            raw_symbol = (
+                raw_getter(str(callee_identifier))
+                if callable(raw_getter) and callee_identifier
+                else None
+            )
+            if raw_symbol is not None:
+                symbols = [raw_symbol]
+        imported = []
+        allowed_types = {
+            getattr(getattr(bn, "SymbolType", None), name, None)
+            for name in (
+                "ImportedFunctionSymbol",
+                "ImportedDataSymbol",
+                "ImportAddressSymbol",
+                "ExternalSymbol",
+            )
+        }
+        for symbol in symbols:
+            symbol_type = getattr(symbol, "type", None)
+            type_name = str(getattr(symbol_type, "name", symbol_type))
+            if symbol_type in allowed_types or type_name in {
+                "ImportedFunctionSymbol",
+                "ImportedDataSymbol",
+                "ImportAddressSymbol",
+                "ExternalSymbol",
+            }:
+                imported.append(symbol)
+        if not imported:
+            raise
+        symbol = min(imported, key=lambda item: int(getattr(item, "address", 0)))
+        callee = SimpleNamespace(
+            name=str(
+                getattr(symbol, "short_name", "")
+                or getattr(symbol, "name", callee_identifier)
+            ),
+            start=int(getattr(symbol, "address", 0)),
+        )
+        callee_symbol_only = True
     # #286: an exported callee's intra-lib callers route through its same-name PLT
     # stub, so a call targeting the stub must count as a call to the callee.
     try:
         stub_addrs = frozenset(int(s.start) for s in ctx._same_name_stub_functions(bv, callee))
     except Exception:
         stub_addrs = frozenset()
-    scope_functions = ctx._resolve_scope_functions(bv, within_identifiers)
+    if within_identifiers:
+        scope_functions = ctx._resolve_scope_functions(bv, within_identifiers)
+    else:
+        scope_functions = _all_caller_functions(
+            bv, {int(callee.start), *stub_addrs}
+        )
     # #558: an imported variadic (scanf/printf-family) callee's HLIL callsite text
     # can show only the fixed argument; attach a steer to the argument-recovery views.
     variadic_hint = _callee_variadic_hint(callee)
 
     rows = []
-    for within_query, func in scope_functions:
+    callers_scanned = 0
+    scan_truncated = False
+    row_scan_target = offset + limit + 1 if limit is not None else None
+    for scope_index, (within_query, func) in enumerate(scope_functions):
         function_rows = _callsites_within_function(
             ctx, bv, callee, func, context=context, stub_addrs=stub_addrs,
             variadic_hint=variadic_hint)
+        callers_scanned += 1
         for call_index, row in enumerate(function_rows):
             row["call_index"] = call_index
             row["within_query"] = str(within_query)
         rows.extend(function_rows)
-    # Honest paging envelope for JSON parity (#131 / item 11): callsites is a
-    # flat row list, so wrap it like the sibling list ops. #454: on a high-fan-in
-    # sink, page bridge-side with --limit/--offset (the true total + remainder stay
-    # in the envelope), same contract as xrefs / function list.
-    return read_misc._paged_list_result(rows, offset=offset, limit=limit, kind="callsites")
+        if (
+            row_scan_target is not None
+            and len(rows) >= row_scan_target
+            and scope_index + 1 < len(scope_functions)
+        ):
+            scan_truncated = True
+            break
+
+    # Producer side of the monotone `total` contract (#694 item 3): `total`
+    # stays `null` here while the caller scan is capped, becomes the exact
+    # count once a later page's scan completes without truncation, and never
+    # regresses from an int back to `null` or to a different int. The client
+    # page validators (`src/bn/client.py` and
+    # `skills/bn-kernel/src/bn_kernel/__init__.py`) enforce that monotonicity
+    # across pages of one collection.
+    if scan_truncated:
+        assert limit is not None
+        page = rows[offset:offset + limit]
+        return {
+            "kind": "callsites",
+            "items": page,
+            "offset": offset,
+            "limit": limit,
+            "returned": len(page),
+            "total": None,
+            "total_lower_bound": len(rows),
+            "has_more": True,
+            "scan_truncated": True,
+            "callers_scanned": callers_scanned,
+            "caller_total": len(scope_functions),
+            "callee_symbol_only": callee_symbol_only,
+        }
+
+    result = read_misc._paged_list_result(
+        rows, offset=offset, limit=limit, kind="callsites"
+    )
+    result.update(
+        {
+            "scan_truncated": False,
+            "callers_scanned": callers_scanned,
+            "caller_total": len(scope_functions),
+            "callee_symbol_only": callee_symbol_only,
+        }
+    )
+    return result
 
 
 def _annotation_summary(ctx, bv) -> dict[str, Any]:
@@ -222,38 +357,77 @@ def _annotation_summary(ctx, bv) -> dict[str, Any]:
     string attribute per function (the per-function address-comment map is NOT
     materialized, to keep this a fast triage read)."""
     comments = 0
+    comment_locations: list[dict[str, Any]] = []
     try:
         address_comments = getattr(bv, "address_comments", None)
         if address_comments is not None:
             comments = len(address_comments)
+            for address, text in list(address_comments.items())[:20]:
+                comment_locations.append(
+                    {
+                        "address": hex(int(address)),
+                        "comment": str(text)[:160],
+                    }
+                )
     except Exception:
         comments = 0
+        comment_locations = []
 
     function_comments = 0
+    function_comment_locations: list[dict[str, Any]] = []
     for fn in list(getattr(bv, "functions", []) or []):
         try:
-            if str(getattr(fn, "comment", "") or "").strip():
+            text = str(getattr(fn, "comment", "") or "").strip()
+            if text:
                 function_comments += 1
+                if len(function_comment_locations) < 20:
+                    function_comment_locations.append(
+                        {
+                            "name": str(getattr(fn, "name", "")),
+                            "address": hex(int(getattr(fn, "start", 0))),
+                            "comment": text[:160],
+                        }
+                    )
         except Exception:
             continue
 
     user_symbols = 0
+    user_symbol_locations: list[dict[str, Any]] = []
     try:
         getter = getattr(bv, "get_symbols", None)
         symbols = getter() if callable(getter) else list(getattr(bv, "symbols", []) or [])
         for symbol in symbols:
-            # BN marks analysis-generated symbols auto=True; a user (or prior dogfood
-            # run) name has auto=False. Count only the latter so auto names don't
-            # inflate the inherited-annotation baseline.
             if getattr(symbol, "auto", None) is False:
                 user_symbols += 1
+                if len(user_symbol_locations) < 20:
+                    user_symbol_locations.append(
+                        {
+                            "name": str(
+                                getattr(symbol, "raw_name", "")
+                                or getattr(symbol, "name", "")
+                            ),
+                            "address": hex(int(getattr(symbol, "address", 0))),
+                        }
+                    )
     except Exception:
         user_symbols = 0
+        user_symbol_locations = []
 
     return {
         "comments": comments,
+        "comment_locations": comment_locations,
         "function_comments": function_comments,
+        "function_comment_locations": function_comment_locations,
         "user_symbols": user_symbols,
+        "user_symbol_locations": user_symbol_locations,
+        "locations_truncated": any(
+            count > len(locations)
+            for count, locations in (
+                (comments, comment_locations),
+                (function_comments, function_comment_locations),
+                (user_symbols, user_symbol_locations),
+            )
+        ),
     }
 
 
@@ -282,6 +456,9 @@ def _analysis_state_fields(bv: Any) -> dict[str, Any]:
     return {"analysis_state": "quick" if quick else "full", "partial": quick}
 
 
+_FUNCTION_SORTS = ("address", "size", "name")
+
+
 def _filtered_functions(
     ctx,
     bv,
@@ -289,7 +466,9 @@ def _filtered_functions(
     min_address: Any = None,
     max_address: Any = None,
 ) -> list[Any]:
-    lower, upper = _parse_function_address_bounds(ctx, min_address, max_address)
+    lower, upper = _parse_function_address_bounds(
+        ctx, min_address, max_address
+    )
     functions = []
     for fn in list(bv.functions):
         address = int(fn.start)
@@ -302,29 +481,29 @@ def _filtered_functions(
     return functions
 
 
-_FUNCTION_SORTS = ("address", "size", "name")
-
-
-def _sort_function_items(items: list[dict[str, Any]], sort: str,
-                         reverse: bool = False) -> list[dict[str, Any]]:
-    """Order function-listing rows. 'address' (default) keeps the bridge's
-    natural start-address order; 'size' ranks largest-first (the common
-    'find the biggest function' triage step that otherwise needs a write-locked
-    py exec); 'name' is case-insensitive. ``reverse`` flips the NATURAL order of
-    the chosen sort, so e.g. ``--sort size --reverse`` surfaces the SMALLEST
-    functions and ``--sort address --reverse`` walks high->low (#221)."""
+def _sort_function_items(
+    items: list[dict[str, Any]],
+    sort: str,
+    reverse: bool = False,
+) -> list[dict[str, Any]]:
+    """Order address, size, or name ascending unless ``reverse`` is set."""
     if sort not in _FUNCTION_SORTS:
         raise OperationFailure(
             "invalid_request",
             f"Invalid sort '{sort}'; choose one of {', '.join(_FUNCTION_SORTS)}",
         )
     if sort == "size":
-        # natural = largest first; reverse -> smallest first
-        items.sort(key=lambda it: (it.get("size") or 0), reverse=not reverse)
+        items.sort(key=lambda item: (item.get("size") or 0), reverse=reverse)
     elif sort == "name":
-        items.sort(key=lambda it: str(it.get("name", "")).lower(), reverse=reverse)
-    elif reverse:  # 'address': natural is the start-address order; flip it
-        items.sort(key=lambda it: int(str(it.get("address", "0x0")), 16), reverse=True)
+        items.sort(
+            key=lambda item: str(item.get("name", "")).lower(),
+            reverse=reverse,
+        )
+    elif reverse:
+        items.sort(
+            key=lambda item: int(str(item.get("address", "0x0")), 16),
+            reverse=True,
+        )
     return items
 
 
@@ -421,15 +600,20 @@ def _project_page_fields(result: dict[str, Any]) -> dict[str, Any]:
             # No live Function retained (defensive): keep the row well-formed
             # with the same keys every consumer expects.
             it.setdefault("display_name", it.get("name", ""))
-            it.setdefault("size", None)
+            size = it.get("size")
+            size_known = isinstance(size, int) and not isinstance(size, bool) and size >= 0
+            it["size"] = size if size_known else 0
+            it["size_known"] = size_known
             it.setdefault("imported", False)
             it.setdefault("auto_named", False)
             it.setdefault("basic_block_count", None)
             continue
         if "display_name" not in it:
             it["display_name"] = il_format._display_name(fn)
-        if "size" not in it:
-            it["size"] = il_format._function_size(fn)
+        size = it.get("size") if "size" in it else il_format._function_size(fn)
+        size_known = isinstance(size, int) and not isinstance(size, bool) and size >= 0
+        it["size"] = size if size_known else 0
+        it["size_known"] = size_known
         # #653.4: label the two partitions `target info` counts, so a listing is
         # self-describing (an import thunk is neither named nor auto-named).
         if "imported" not in it:

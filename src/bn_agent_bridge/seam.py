@@ -426,21 +426,12 @@ class BridgeContext:
         return out
 
     def _containment_meta(self, identifier, func):
-        """Describe a READ resolved via the `contained` address fallback.
+        """Describe address resolution for function-scoped reads.
 
-        Returns ``{"requested_address", "offset"}`` when ``identifier`` is an
-        address -- 0x-hex OR bare decimal, the two documented address spellings
-        -- that landed *inside* ``func`` rather than at its start, so a caller
-        (e.g. a taint/trace sink address) is told it hit a mid-function point
-        instead of silently treating it as the entry. Returns None for an exact
-        start or a non-address identifier (a name) -- no annotation needed.
-
-        The address parse MUST mirror :meth:`_find_function`'s (hex OR decimal
-        via ``_parse_address``): that method resolves a decimal interior address
-        to its container just like hex, so gating the disclosure on a ``0x``
-        prefix would let a decimal request resolve to a mid-function point while
-        SILENTLY dropping the resolved_from/offset -- naming the wrong (start)
-        context with no indication it was a containment hit (#626 review).
+        Interior hex/decimal inputs carry the normalized address and function
+        offset. Exact bare-decimal inputs are also disclosed with offset zero so
+        a digit-only token can never be silently mistaken for a symbol name.
+        Exact ``0x`` starts and ordinary names need no annotation.
         """
         try:
             addr = _parse_address(identifier)
@@ -448,12 +439,22 @@ class BridgeContext:
             return None
         if addr is None:
             return None
+        decimal_input = (
+            isinstance(identifier, str)
+            and identifier.strip().isdigit()
+        )
         start = int(func.start)
-        if int(addr) == start:
+        if int(addr) == start and not decimal_input:
             return None
         delta = int(addr) - start
         sign = "+" if delta >= 0 else "-"
-        return {"requested_address": hex(int(addr)), "offset": f"{sign}{hex(abs(delta))}"}
+        result = {
+            "requested_address": hex(int(addr)),
+            "offset": f"{sign}{hex(abs(delta))}",
+        }
+        if decimal_input:
+            result["input_format"] = "decimal"
+        return result
 
     def _sections_at(self, bv, address: int) -> list[dict[str, Any]]:
         try:

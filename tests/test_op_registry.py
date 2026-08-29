@@ -22,6 +22,10 @@ EXPECTED_READ = {
     # The three read-only py_exec programs bn-lens ran, promoted to
     # first-class read ops so they stop taking the exclusive writer lock.
     "cfg", "data_vars", "data_symbols",
+    # #694: `session restart` hands back the project markers of the process it
+    # replaced. Marker files plus the registry payload (which enumerates open
+    # targets) are a READ of BN state, never a mutation of it.
+    "restore_markers",
 }
 EXPECTED_WRITE = {
     "py_exec", "function_create", "rename_symbol", "set_comment", "delete_comment",
@@ -122,7 +126,8 @@ def test_escalation_is_stored(op_registry):
 def test_registry_covers_every_dispatch_op(op_registry):
     REGISTRY = op_registry.REGISTRY
     expected = EXPECTED_READ | EXPECTED_WRITE | {
-        "cancel_request", "load_binary", "go_rename", "shutdown", "refresh",
+        "cancel_request", "load_binary", "load_binary_async", "load_status",
+        "go_rename", "shutdown", "refresh",
     }
     assert REGISTRY.names() == expected
 

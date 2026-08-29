@@ -50,7 +50,7 @@ Target selection, sticky pins, instance/target resolution order, sessions/headle
    > bn -i dogfood-1 -t <sel> xrefs main
    > ```
    >
-   > Note: global **`-i/--instance` is routing** (which live bridge to talk to). **`--instance-id` on `session start` / `load` is spawn naming** (what ID the new bridge gets). They are distinct flags — `bn session start -i foo …` does **not** name the spawn `foo`; use `--instance-id foo` for that.
+   > Note: global **`-i/--instance` is routing**, not spawn naming. `bn -i foo session start …` is rejected because it previously minted a random instance while looking named. Use `bn session start /path/to/binary --instance-id foo`.
    >
    > `session start` prints the loaded target's selector (`target: <sel>   (pass -t <sel>; id …)`), so a fan-out agent does **not** need a follow-up `bn target list` just to learn what to pass to `-t` (#653).
 
@@ -60,18 +60,70 @@ The bridge runs as a GUI plugin or as a headless process; both speak the same pr
 
 ```bash
 bn load /path/to/binary.bndb [--instance-id <id>]   # auto-spawns a headless bridge if none is running
-bn session start /path/to/binary [--instance-id <id>]   # prints the target SELECTOR to pass as -t
-bn session list                         # running instances + RSS + sticky marker
-bn session stop <id>                    # shut one down
-bn close [<path>] [-t <sel>] [--all]    # close one: by path, by -t selector, or the single open target; --all closes every target
-bn instance gc                          # reap dead instances' leftover logs/sockets in ~/.cache/bn
+bn session start /path/to/binary [--instance-id <id>]   # synchronous preload
+bn session start /path/to/large.bndb --instance-id <id> --detach
+bn -i <id> session status [<job-id>]     # queued/running/complete/failed
+bn session list [-i <id>]                # all running instances, or filter one
+bn session stop <id>                     # aliases: --instance-id <id>, -i <id>
+bn close [<path>] [-t <sel>] [--all]     # close one or explicitly --all
+bn target close <sel>                    # close exactly that target (alias for `close -t <sel>`)
+bn exports [list]                         # public exported symbols
+bn help [family]                          # concise index; advertises capabilities
+bn instance gc                            # reap dead instance cache residue
 ```
+
+When multiple bridge instances exist, flagless `bn load <path>` refuses ambient marker/env/sticky routing. Pass `-i/--instance` to load into an existing bridge or `--instance-id` to create a named one. This destructive lifecycle boundary never guesses among concurrent agents.
 
 `bn instance gc` is housekeeping: a crashed/SIGKILLed bridge leaves its `.log` (and sometimes its socket) behind in `~/.cache/bn/instances/`, and the lazy liveness sweep keeps those breadcrumbs forever, so the directory accumulates dead logs over time. `bn instance gc` removes the logs and orphan sockets of instances that no longer have a live registry — it never touches a running instance or the shared spawn lock — and reports what it reaped (`--format json` for the counts).
 
 A bare `bn close` closes the single open target; with several open it refuses with the open-target list (pass `-t <selector>`, a path, or `--all`). It never closes everything implicitly — only `--all` does (#664). Because close is destructive, it is stricter than `bn save`: on a multi-tab GUI bridge a bare close does **not** fall back to the focused tab (save does), the CLI pins the exact `target_id` it observed rather than sending `active` (so a concurrent close/load between the lookup and the close yields an unknown-selector error instead of closing a different binary), an empty `-t ""` or empty positional path `""` (e.g. an unset shell variable) is an error rather than a bare close, and `-t` cannot be combined with a path or `--all`. The bridge enforces the same rules for raw socket clients: a non-null empty `target`, an empty `path`, and any `target`+`path`/`all` pair are rejected.
 
-`bn close` reports each closed view as `{path, unsaved}`. If a view had unsaved mutations, stdout warns — run `bn save` *first* if you care about annotations:
+`bn close` reports each closed view as `{path, unsaved, engine_modified}`. `unsaved` is the sole persistence/cleanliness signal: it means a committed bn mutation was not saved and is the only condition that triggers the discard warning. `engine_modified` is Binary Ninja's broader analysis/cache bit; it can be true after a strictly read-only session and must not be interpreted as user mutation.
+
+**`session status <job-id>` JSON contract.** Naming a job returns the single-job
+shape, so a polling agent never has to index `items[0]` or re-derive terminality
+from the state string:
+
+```json
+{
+  "kind": "load_job",
+  "job_id": "<hex>",
+  "state": "queued|running|complete|failed",
+  "terminal": false,
+  "succeeded": null,
+  "job": { "job_id": "...", "state": "...", "path": "...", "created_at": "...",
+           "started_at": null, "finished_at": null, "error": null, "result": null },
+  "status_command": "bn -i <id> session status <job-id>",
+  "items": [ { "...": "the same job record" } ],
+  "count": 1
+}
+```
+
+`terminal` is true only for `complete`/`failed`. `succeeded` is `true` for
+`complete`, `false` for `failed`, and **`null` while non-terminal** — a `false`
+there would read as "the load failed" and make a poll loop tear down a healthy
+bridge. The poll loop is `terminal == false` → sleep → re-run `status_command`
+**when it is non-null**; a `null` means this bridge cannot be named on a fresh
+command line, so keep polling through the client or connection you already have
+bound to it, or treat the command as unavailable. Only a bridge started with an
+instance id (`--instance-id`, i.e. any headless bridge) can publish the exact
+re-runnable command; a GUI-loaded bridge has no unambiguous CLI selector, so it
+publishes `status_command: null` rather than a command that cannot address it.
+The key is always present, so `null` and "field missing" stay distinguishable.
+An unknown job id is an **error**, not an empty result, so a typo cannot spin a
+status loop until its own deadline. Omitting the job id keeps the population
+collection (`kind: "load_jobs"`, `items`, `count`) with no `terminal`/`succeeded`
+verdict, because one verdict over many jobs would be a lie, and whose items are
+the raw job records without a `status_command` of their own. Text mode prints
+`<job-id>  <state>  <path>`, plus a `poll:` line naming the exact command while
+the job is still running and a command is available.
+
+**`bn target close <selector>`** closes exactly the target that selector names.
+It is the discoverable spelling of `bn close -t <selector>` and delegates to the
+same implementation, so unsaved warnings, selector resolution, and the refusal to
+forward the volatile `active` literal are identical. It accepts no path and no
+`--all`, so it can never widen into closing everything; an empty selector is an
+error. Use `bn close --all` when you really do mean every loaded target.
 
 ```bash
 bn save                                  # saves to <filename>.bndb
@@ -93,7 +145,7 @@ Pass `--no-bndb` to force loading the raw binary even when a sibling `.bndb` exi
 
 > **Global BNDB cache (read-only mounts).** Auto-prefer isn't limited to a *sibling* `.bndb`. When the target's directory is not writable (a read-only firmware mount), a prior `bn save` falls back to a **global content-hash-keyed cache** at `~/.cache/bn/bndb/<stem>.<hash>.bndb` (override the cache root with `BN_CACHE_DIR`). A later `bn load <raw>` / `bn session start <raw>` **auto-restores from that cache** — carrying every prior rename/comment — and prints `note: restored cached database …; pass --no-bndb to load the raw bytes`. Two consequences for a "recover names on an unknown binary" task: (1) the view can come back **already annotated** from an earlier run, so you can't tell your recovery from a previous one — check the note (or `--no-bndb`) before claiming a clean slate; (2) a multi-MB target that "loads in seconds" is a **cache hit, not a fast cold analysis** — don't read it as a timing/perf observation. Use `--no-bndb` for a pristine, un-annotated analysis.
 
-`bn load` blocks until analysis completes (the bridge runs `update_analysis_and_wait()` and the CLI socket has no timeout). Plan for it on large binaries.
+`bn load` blocks until analysis completes (`update_analysis_and_wait()`). Full loads can take seconds to minutes under contention; do not rely on a fixed load time. Each headless bridge can consume hundreds of MB, and a large/complex BNDB may be OOM-killed. Bound fan-out concurrency, monitor RSS with `bn session list`, and stop unused instances promptly.
 
 **Quick load (`--quick` / `--no-analysis`).** `bn load --quick` and `bn session start --quick` skip that analysis pass (~1s instead of waiting for the full function set), at the cost of a **capability boundary** — the container is parsed but the code is not yet analyzed:
 
@@ -125,13 +177,23 @@ After `bn refresh` (or `--force-analysis` on a single function) every row promot
 
 `-i/--instance` is accepted on every subcommand (short form **`-i <id>`** preferred for agents; long form `--instance`; env `BN_INSTANCE` as single-agent convenience only). On `bn load`, `--instance-id` is an accepted alias that names the bridge instance to auto-spawn — the same spelling as `bn session start --instance-id`, so you can use `--instance-id <id>` consistently across both. Global `-i` does **not** replace `--instance-id` for spawn naming.
 
-**Project markers (`.bn-<id>`, #80).** `bn load` drops a `.bn-<instance_id>` pointer file in the **project root** of your cwd (walking up to the nearest `.git`, else cwd). When **multiple** bridges are running and you haven't selected one, instance resolution walks up from cwd and a marker matching a live instance picks it — so `cd project && bn …` resolves the bridge that loaded its binary instead of erroring "multiple instances". It's a fallback **below** an explicit `-i`/`BN_INSTANCE`/sticky pin (those still win), the registry stays authoritative (a marker only resolves to a *live* instance; a stale one is unlinked on read), and `.bn-*` is added to `.git/info/exclude` so it doesn't dirty `git status`. Opt out with `--no-marker` or `BN_NO_MARKERS=1`. (Caveat: with no `.git` ancestor the marker lands in cwd itself, so loading with cwd in a system dir like `/usr/bin` would drop it there — use `--no-marker` or run from a project dir.)
+**Project markers (`.bn-<id>`, #80).** `bn load` drops a `.bn-<instance_id>` pointer file in the **project root** of your cwd (walking up to the nearest `.git`, else cwd). When **multiple** bridges are running and you haven't selected one, instance resolution walks up from cwd and a marker matching a live instance picks it — so `cd project && bn …` resolves the bridge that loaded its binary instead of erroring "multiple instances". It's a fallback **below** an explicit `-i`/`BN_INSTANCE`/sticky pin (those still win), the registry stays authoritative (a marker only resolves to a *live* instance; a stale one is unlinked on read), and `.bn-*` is added to `.git/info/exclude` so it doesn't dirty `git status`. Each bridge records every marker path it creates; clean shutdown and `session stop` remove those markers even when stop runs from another cwd. `session restart` **restores** them: it reads the stopped process's recorded marker paths, respawns, and has the new bridge re-publish each one (same path, new body, ownership recorded again), so a restart run from an unrelated cwd no longer drops the marker that resolved a bare `bn` in the original project root (#694). A marker whose project root has since disappeared, or one belonging to another instance id, is reported as skipped on stderr rather than re-created somewhere new; a failed restore is a warning, not a failed restart. Opt out with `--no-marker` or `BN_NO_MARKERS=1`.
+
+**Stopping is identity-checked and atomically signalled (#694).** `session start` cleanup, `session stop` and `session restart` first ask the bridge to shut down over the socket. Only if that fails do they signal the registry's pid, and then only through a **pinned** process: the pid is pinned with `os.pidfd_open`, its identity verified through that pin, and every signal of the `SIGTERM` → wait → `SIGKILL` escalation sent through the same pin. Pinning is what makes it safe — a pidfd holds a reference to the kernel's process record, so the pid cannot be recycled while the pin is held and the signal can never land on a different process. A `/proc` check followed by `os.kill` could not offer that: the verified process can exit and its pid be reused between the two steps.
+
+Identity is `(boot id, pid, process start time)`. Start times count from boot, so they are unique only *within* a boot while registries live in a persistent cache (`~/.cache/bn`); without the kernel boot id an old registry could falsely match a brand-new process after a reboot. A registry written under a different boot id is therefore treated as positively stale, and one that records no identity — or only half of one, e.g. written by an older bridge — is **never** proven.
+
+When the pid cannot be proven, or the interpreter provides no pidfd (availability is a property of the CPython build, not just the kernel — the interpreters `uv` installs have no `os.pidfd_open`), the command **refuses to signal at all**, names the pid, and tells you to confirm with `ps -p <pid>` and stop it by hand. That is deliberate: there is no safe non-atomic fallback. The `SIGKILL` escalation is gated identically, and teardown convergence treats a recycled pid as gone rather than escalating against it.
+
+**Unreachable bridges are hidden, not advertised.** The bridge binds its socket *before* writing its registry, so "registry, no socket" is never a live bridge starting up. Such an entry is dropped from normal discovery — `bn session list`, instance resolution and every request path — because nothing can be dispatched to it; if its owner is dead or unproven the record is purged outright, and it is purged as soon as a proven owner exits. While that owner is alive the record survives for **lifecycle lookups only**: `session stop` / `session restart` resolve it (marked `unreachable`) so the live process still holding memory can be stopped, and spawn collision detection consults it too, so a new bridge can never reuse that instance id, bind over its socket path and orphan the process.
+
+An explicit-but-empty selector is always an error, never "everything": `bn session list -i ''` (e.g. an unset shell variable) is rejected instead of silently listing every session, the same doctrine `bn session stop ""` and `bn close -t ""` already follow.
 
 **Fan-out (`--all-instances` / `--all-targets`).** Whole-target **read survey** commands (`imports`, `sections`, `strings`, `exports`, `types`, `function list`/`search`, `class list`, `go functions`, `target info`, `evidence orient`) accept `--all-instances` (run across **every running bridge instance**) and `--all-targets` (run across **every target open in an instance**); combine them for every instance × target. The result is one `{kind: "fanout", instances: […]}` aggregate (text: a section per (instance, target) via the command's own renderer; JSON for machine use). Without `--all-targets`, each instance resolves its own target by the normal rule — an explicit `-t` applies to all, otherwise the per-instance implicit single target; an instance with no/ambiguous target becomes an `ok:false` row rather than failing the whole command (the command exits non-zero only if **every** result failed). It's an explicit allow-list (the `fanout=True` command flag), **not** every text command — mutations and side-effecting commands (`save`/`close`/`refresh`/`py exec`/`load`) never get it, so a write can't be fanned. Per-function reads (`decompile`/`xrefs`/…) aren't fannable either (their identifier wouldn't resolve in another instance). Use it for cross-instance / cross-target surveys instead of a shell `for` loop. The per-(instance, target) reads run **concurrently** (bounded worker pool), so a slow instance no longer serializes the rest; each row carries `duration_ms` and the aggregate includes a `slow_rows` summary (text: a `slowest:` line) so a long survey reads as progress, not a wedge (#417).
 
-Requests time out after 600s by default so a wedged bridge can't hang the CLI; override with `BN_REQUEST_TIMEOUT=<seconds>` (`0`/`none`/`off`/empty disable). A non-numeric, negative, non-finite, or underflow-to-zero value (e.g. `1e-325`) is rejected with a clear error rather than silently falling back to the default or silently disabling the timeout. The one-time full analysis ops (`bn load` without `--quick`, and `bn refresh`) use a larger **3600s** default instead, since that pass legitimately runs for many minutes on a large binary; `BN_REQUEST_TIMEOUT` still overrides it when set.
+Requests time out after 600s by default; override with `BN_REQUEST_TIMEOUT=<seconds>` (`0`/`none`/`off`/empty disable). Invalid values fail before instance selection or spawning. Full synchronous `load`/`refresh` defaults to 3600s, but genuinely large BNDBs can exceed any practical foreground budget. Prefer `session start --detach`, poll `session status`, then read the selector from `target list`; a failed detached job preserves its error in bridge state. Bridge registration has its **own** budget, separate from the request budget: 60s by default, `BN_SPAWN_TIMEOUT=<positive-seconds>` to change it, capped by whatever is left of the request deadline. That applies to an auto-started bridge too, so a child that never registers fails in its spawn budget instead of holding an ordinary request for the full 600s (or a load/refresh for 3600s) (#694). Registration failures are recorded in the instance log.
 
-**Very large binaries (~100k+ functions).** The full initial analysis can run far past even the 3600s default. A client-side timeout does **not** stop the bridge — the analysis keeps running server-side — but the CLI invocation returns an error. The robust path: `bn load --quick` (fast, container parsed) → then run the long analysis with the timeout disabled and back the CLI call into the background, e.g. `BN_REQUEST_TIMEOUT=0 bn refresh -i <id> &`, and poll `bn target info -i <id>` until `analysis_state` is `"full"`. **`bn refresh` no longer blocks concurrent reads** (#321): it holds only the write gate around the analysis, not the exclusive target lock, so `target info` / `function list` / any read on another connection stays responsive *while the refresh runs* — the poll returns in well under a second instead of queuing behind the whole analysis. `target info` also carries a pollable **`analysis_progress`** (`{state, count, total}`, text: an `analysis progress:` line) that advances through BN's phases (`DisassembleState` → `AnalyzeState` → …) so a long analysis reads as live movement, not a wedge. If a `load`/`refresh` does time out client-side, re-issue it (or poll) rather than restarting the instance — the bridge is still analyzing. (A genuinely stopped instance after a huge load is usually the OS OOM-killing the bridge process, reported as such, not a timeout.)
+**Very large binaries (~100k+ functions).** Use detached start rather than a background shell: the bridge registers before analysis, `session status` survives the initiating CLI process, and the completed job returns target selectors or a retained error. `--quick` helps raw/container triage but cannot remove analysis already stored in a pre-analyzed BNDB. While a target is open, `target info` carries pollable `analysis_progress` and reads remain responsive during `refresh`.
 
 ## 3. Output & context
 

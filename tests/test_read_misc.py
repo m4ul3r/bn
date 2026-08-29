@@ -499,6 +499,36 @@ def test_imports_healthy_jump_slot_not_reclassified_478(monkeypatch):
     assert got_kinds == ["address", "function"]
 
 
+def test_imports_recovers_relocation_only_external_symbol(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    jump_slot = fake_bn.RelocationType.ELFJumpSlotRelocationType
+    symbol = fake_bn.Symbol(
+        fake_bn.SymbolType.ExternalSymbol, 0, "dispatch_record"
+    )
+    relocation = _FakeReloc(jump_slot, symbol)
+    relocation.address = 0x3000
+    bv = _FakeBV()
+    bv.relocations = [relocation]
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._imports(None)
+
+    assert result["items"] == [
+        {
+            "name": "dispatch_record",
+            "address": "0x3000",
+            "library": None,
+            "namespace": "",
+            "raw_name": "dispatch_record",
+            "kind": "function",
+            "provenance": "relocation",
+        }
+    ]
+    assert result["relocation_recovered"] == 1
+
+
 def test_imports_query_and_regex_filter(monkeypatch):
     # #450: filter the import survey so a sink sweep doesn't need full paging + jq.
     bridge = _load_bridge(monkeypatch)

@@ -42,6 +42,16 @@ def _load(args: argparse.Namespace) -> int:
     # same unset-shell-var doctrine as close/save (#690 r4).
     if not str(args.path).strip():
         raise BridgeError("path is empty: pass the binary or .bndb file to load")
+    explicitly_routed = bool(
+        getattr(args, "_explicit_instance", False)
+        or getattr(args, "_explicit_instance_id", False)
+    )
+    if not explicitly_routed and len(cli.list_instances()) > 1:
+        raise BridgeError(
+            "bn load refuses ambient instance routing while multiple bridges are "
+            "running. Pass an explicit -i/--instance for an existing bridge, or "
+            "--instance-id to create a named bridge."
+        )
     _env = (os.environ.get("BN_NO_MARKERS") or "").strip().lower()
     no_marker = bool(args.no_marker) or (_env not in ("", "0", "false", "no", "off"))
     return _call(
@@ -171,6 +181,48 @@ def _close(args: argparse.Namespace) -> int:
         text_renderer=_render_close_text,
         stem="close",
     )
+
+
+@command("target", "close", help="Close one open target by selector", fmt="text",
+         prefer_when="you have a selector from `bn target list` and want that one "
+                     "target gone; `close` is the same operation with --target/a "
+                     "path/--all",
+         see_also=("close", "target list", "session stop"),
+         args=[
+             arg("selector",
+                 help="Target selector to close (see `bn target list`)"),
+         ])
+def _target_close(args: argparse.Namespace) -> int:
+    """Close exactly the named target.
+
+    Discoverability, not new behavior: `target list`/`use`/`info` live under
+    `target`, so agents look for the close verb there first and previously got an
+    argparse error before guessing `bn close -t`. This delegates to the canonical
+    `close` handler -- same unsaved warnings, same selector resolution, same
+    renderer -- so the two spellings cannot drift.
+    """
+    selector = getattr(args, "selector", None)
+    # Presence, not truthiness: `bn target close "$SEL"` with SEL unset expands
+    # to an empty operand that must ERROR, never degrade into "close whatever is
+    # open". The canonical handler rejects an empty selector too, but phrases the
+    # recovery in terms of `--target`/a path/`--all` -- none of which this parser
+    # accepts -- so the check is stated here in this command's own vocabulary.
+    if selector is None or not str(selector).strip():
+        raise BridgeError(
+            "selector is empty: pass a target selector from `bn target list` "
+            "(use `bn close --all` to close every loaded target)."
+        )
+    args.target = selector
+    # `active` follows the GUI selection and is re-resolved bridge-side, so it is
+    # never a safe name for a destructive close; the canonical handler already
+    # refuses to forward it and resolves a concrete target instead.
+    # This spelling closes ONE named target and nothing else: neither operand
+    # that could widen or redirect the close is reachable from this parser, so
+    # pin them off before delegating.
+    args.path = None
+    args.all = False
+    args._sticky_target = False
+    return _close(args)
 
 
 @command("save", help="Save the current analysis database (.bndb)", target=True,

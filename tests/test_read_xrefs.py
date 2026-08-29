@@ -977,6 +977,14 @@ def test_callsites_full_path_sees_through_stub_and_no_cross_stub_fp(monkeypatch)
     # caller2 calls a DIFFERENT function's stub -> no match for get_param
     miss = instance._callsites(None, "get_param", within_identifiers=["caller2"])
     assert miss["items"] == []
+    # Unscoped/all-callers mode must derive callers from the exported symbol's
+    # same-name stub references without admitting a different export's stub.
+    all_callers = instance._callsites(
+        None, "get_param", within_identifiers=[]
+    )
+    assert [row["containing_function"]["name"] for row in all_callers["items"]] == [
+        "caller"
+    ]
 
 
 def test_function_pointer_data_refs_alignment_and_dedup(monkeypatch):

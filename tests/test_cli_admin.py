@@ -9,6 +9,17 @@ import pytest
 from _cli_helpers import *  # noqa: F401,F403
 
 
+@pytest.fixture(autouse=True)
+def _isolate_omp_skill_destination(monkeypatch, tmp_path):
+    config_root = tmp_path / "absent-omp-config"
+    agent_dir = config_root / "agent"
+    monkeypatch.setattr(bn.cli, "omp_config_root", lambda: config_root, raising=False)
+    monkeypatch.setattr(bn.cli, "omp_agent_dir", lambda: agent_dir, raising=False)
+    monkeypatch.setattr(
+        bn.cli, "omp_skills_dir", lambda: agent_dir / "skills", raising=False
+    )
+
+
 def test_skills_source_dir_prefers_repo_then_falls_back_to_prefix(monkeypatch, tmp_path):
     # #83: editable checkout uses repo skills/; a wheel install (no repo skills/)
     # falls back to the install prefix where the data files land.
@@ -79,6 +90,29 @@ def test_skill_install_copy_mode(tmp_path):
     assert (destination / "bn" / "agents" / "openai.yaml").exists()
     assert (destination / "bn-re" / "SKILL.md").exists()
     assert (destination / "bn-vr" / "SKILL.md").exists()
+    assert (destination / "bn-kernel" / "SKILL.md").exists()
+
+
+def test_skill_install_copy_omits_python_bytecode(tmp_path, monkeypatch):
+    source_root = tmp_path / "bundled-skills"
+    skill = source_root / "sample"
+    cache = skill / "__pycache__"
+    cache.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: sample\n---\n")
+    (skill / "adapter.py").write_text("VALUE = 1\n")
+    (cache / "adapter.cpython-314.pyc").write_bytes(b"stale bytecode")
+    (skill / "adapter.pyo").write_bytes(b"stale bytecode")
+    destination = tmp_path / "installed"
+    monkeypatch.setattr(bn.cli, "skills_source_dir", lambda: source_root)
+
+    rc = bn.cli.main(
+        ["skill", "install", "--mode", "copy", "--dest", str(destination)]
+    )
+
+    assert rc == 0
+    assert (destination / "sample" / "adapter.py").exists()
+    assert not (destination / "sample" / "__pycache__").exists()
+    assert not (destination / "sample" / "adapter.pyo").exists()
 
 
 def test_skill_install_defaults_to_claude_only_without_codex_home(tmp_path, monkeypatch):
@@ -171,6 +205,100 @@ def test_skill_install_custom_dest_still_fails_when_destination_exists(tmp_path)
 
     assert rc == 2
 
+
+
+def test_omp_path_resolution_follows_profiles_and_agent_override(monkeypatch, tmp_path):
+    import bn.paths as paths
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for name in (
+        "PI_CONFIG_DIR",
+        "OMP_PROFILE",
+        "PI_PROFILE",
+        "PI_CODING_AGENT_DIR",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    assert paths.omp_config_root() == tmp_path / ".omp"
+    assert paths.omp_agent_dir() == tmp_path / ".omp" / "agent"
+    assert paths.omp_skills_dir() == tmp_path / ".omp" / "agent" / "skills"
+
+    monkeypatch.setenv("PI_CONFIG_DIR", ".custom-omp")
+    monkeypatch.setenv("PI_PROFILE", "fallback")
+    monkeypatch.setenv("OMP_PROFILE", "  preferred  ")
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", "~/ignored-agent")
+    assert paths.omp_config_root() == tmp_path / ".custom-omp"
+    assert paths.omp_agent_dir() == (
+        tmp_path / ".custom-omp" / "profiles" / "preferred" / "agent"
+    )
+
+    monkeypatch.setenv("OMP_PROFILE", "  ")
+    assert paths.omp_agent_dir() == tmp_path / "ignored-agent"
+
+    monkeypatch.setenv("OMP_PROFILE", "default")
+    assert paths.omp_agent_dir() == tmp_path / "ignored-agent"
+
+
+def test_skill_install_adds_default_omp_profile_when_root_exists(
+    tmp_path, monkeypatch
+):
+    claude_root = tmp_path / "claude" / "skills"
+    codex_home = tmp_path / "codex"
+    omp_config = tmp_path / ".omp"
+    omp_agent = omp_config / "agent"
+    omp_root = omp_agent / "skills"
+    omp_config.mkdir()
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: claude_root)
+    monkeypatch.setattr(bn.cli, "codex_home", lambda: codex_home)
+    monkeypatch.setattr(bn.cli, "omp_config_root", lambda: omp_config)
+    monkeypatch.setattr(bn.cli, "omp_agent_dir", lambda: omp_agent)
+    monkeypatch.setattr(bn.cli, "omp_skills_dir", lambda: omp_root)
+
+    rc = bn.cli.main(["skill", "install", "--mode", "copy"])
+
+    assert rc == 0
+    assert (omp_root / "bn-kernel" / "SKILL.md").exists()
+    assert (omp_root / "bn" / "SKILL.md").exists()
+
+
+def test_skill_install_adds_omp_when_only_agent_directory_exists(
+    tmp_path, monkeypatch
+):
+    claude_root = tmp_path / "claude" / "skills"
+    codex_home = tmp_path / "codex"
+    omp_config = tmp_path / "missing-config"
+    omp_agent = tmp_path / "custom-agent"
+    omp_root = omp_agent / "skills"
+    omp_agent.mkdir()
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: claude_root)
+    monkeypatch.setattr(bn.cli, "codex_home", lambda: codex_home)
+    monkeypatch.setattr(bn.cli, "omp_config_root", lambda: omp_config)
+    monkeypatch.setattr(bn.cli, "omp_agent_dir", lambda: omp_agent)
+    monkeypatch.setattr(bn.cli, "omp_skills_dir", lambda: omp_root)
+
+    assert bn.cli.main(["skill", "install", "--mode", "copy"]) == 0
+    assert (omp_root / "bn-kernel" / "SKILL.md").exists()
+
+
+def test_skill_install_explicit_destination_never_writes_omp(
+    tmp_path, monkeypatch
+):
+    explicit = tmp_path / "explicit"
+    omp_config = tmp_path / ".omp"
+    omp_agent = omp_config / "agent"
+    omp_root = omp_agent / "skills"
+    omp_config.mkdir()
+    monkeypatch.setattr(bn.cli, "omp_config_root", lambda: omp_config)
+    monkeypatch.setattr(bn.cli, "omp_agent_dir", lambda: omp_agent)
+    monkeypatch.setattr(bn.cli, "omp_skills_dir", lambda: omp_root)
+
+    rc = bn.cli.main(
+        ["skill", "install", "--mode", "copy", "--dest", str(explicit)]
+    )
+
+    assert rc == 0
+    assert (explicit / "bn-kernel" / "SKILL.md").exists()
+    assert not omp_root.exists()
 
 def test_version_flag_prints_version(capsys):
     # `bn --version` is a real affordance, not "unrecognized arguments" (#49).
@@ -321,6 +449,9 @@ def test_session_restart_respawns_and_reloads_targets(monkeypatch, capsys):
     old = type("FakeInstance", (), {
         "instance_id": "keep-me", "pid": 500,
         "socket_path": __import__("pathlib").Path("/tmp/old.sock"),
+        # #694: restart reads the registry payload to recover the project markers
+        # the stopped process owned; this instance owned none.
+        "meta": {},
     })()
     new = BridgeInstance(
         pid=999, socket_path=__import__("pathlib").Path("/tmp/new.sock"),
@@ -334,7 +465,8 @@ def test_session_restart_respawns_and_reloads_targets(monkeypatch, capsys):
         calls.append((op, instance_id, params))
         return {"ok": True, "result": {"path": (params or {}).get("path")}}
 
-    monkeypatch.setattr(bn.cli, "list_instances", lambda: [old])
+    monkeypatch.setattr(bn.cli, "list_instances", lambda **kw: [old])
+    monkeypatch.setattr(bn.cli, "find_lifecycle_instance", lambda target: old)
     monkeypatch.setattr(bn.cli, "instance_selector", lambda i: getattr(i, "instance_id", ""))
     monkeypatch.setattr(
         bn.cli, "_send_request_to_instance",
@@ -537,6 +669,103 @@ def test_session_list_shows_instances(monkeypatch, capsys):
     assert "rss_mb" in parsed["items"][0]
     assert "total_rss_mb" in parsed
 
+    rc = bn.cli.main(
+        ["session", "list", "-i", "bbbb2222", "--format", "json"]
+    )
+    assert rc == 0
+    filtered = json.loads(capsys.readouterr().out)
+    assert [item["instance_id"] for item in filtered["items"]] == ["bbbb2222"]
+
+
+def test_session_status_polls_detached_load_job(monkeypatch, capsys):
+    calls = []
+
+    def fake_send_request(op, **kwargs):
+        calls.append((op, kwargs))
+        return {
+            "ok": True,
+            "result": {
+                "kind": "load_jobs",
+                "items": [
+                    {
+                        "job_id": "job123",
+                        "state": "running",
+                        "path": "/tmp/sample.bndb",
+                    }
+                ],
+                "count": 1,
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(
+        [
+            "session",
+            "status",
+            "job123",
+            "-i",
+            "worker",
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 0
+    assert calls[0][0] == "load_status"
+    assert calls[0][1]["params"] == {"job_id": "job123"}
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["items"][0]["state"] == "running"
+
+
+def test_session_status_job_passes_through_machine_fields(monkeypatch, capsys):
+    # The CLI must not re-derive or flatten the bridge's job verdict; whatever
+    # top-level state/terminal/succeeded contract the bridge publishes is what
+    # `--format json` hands the polling agent.
+    def fake_send_request(op, **kwargs):
+        return {
+            "ok": True,
+            "result": {
+                "kind": "load_job",
+                "job_id": "job123",
+                "state": "complete",
+                "terminal": True,
+                "succeeded": True,
+                "job": {"job_id": "job123", "state": "complete", "path": "/tmp/s.bndb"},
+                "items": [{"job_id": "job123", "state": "complete", "path": "/tmp/s.bndb"}],
+                "count": 1,
+                "status_command": "bn -i worker session status job123",
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(
+        ["session", "status", "job123", "-i", "worker", "--format", "json"]
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["job_id"] == "job123"
+    assert payload["state"] == "complete"
+    assert payload["terminal"] is True
+    assert payload["succeeded"] is True
+    assert payload["job"]["path"] == "/tmp/s.bndb"
+
+
+def test_session_status_unknown_job_fails_loudly(monkeypatch, capsys):
+    # A bad job id is an error, not an empty poll result: silently returning
+    # "no jobs" would make a status loop spin until its own deadline.
+    def fake_send_request(op, **kwargs):
+        raise bn.transport.BridgeError("Unknown load job: nope")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["session", "status", "nope", "-i", "worker"])
+
+    assert rc != 0
+    assert "Unknown load job: nope" in capsys.readouterr().err
+
 
 def test_remove_instance_markers_matches_only_the_id(tmp_path):
     # #436: session stop must clean up the instance's own `.bn-<id>` marker and
@@ -565,7 +794,49 @@ def test_session_stop_removes_marker(monkeypatch, capsys, tmp_path):
     assert not (tmp_path / ".bn-abc123").exists()
 
 
-def test_session_stop_accepts_instance_flag(monkeypatch, capsys):
+def test_session_stop_removes_recorded_marker_outside_cwd(
+    monkeypatch, capsys, tmp_path
+):
+    from bn.transport import BridgeInstance
+
+    origin = tmp_path / "origin"
+    caller = tmp_path / "caller"
+    origin.mkdir()
+    caller.mkdir()
+    marker = origin / ".bn-abc123"
+    marker.write_text("")
+    instance = BridgeInstance(
+        pid=111,
+        socket_path=tmp_path / "bridge.sock",
+        registry_path=tmp_path / "bridge.json",
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at="2026-01-01T00:00:00Z",
+        meta={"marker_paths": [str(marker)]},
+        instance_id="abc123",
+    )
+    monkeypatch.chdir(caller)
+    monkeypatch.setattr(bn.cli, "list_instances", lambda **kw: [instance])
+    monkeypatch.setattr(bn.cli, "find_lifecycle_instance", lambda target: instance)
+    def fake_shutdown(op, **kwargs):
+        marker.unlink(missing_ok=True)  # bridge clean-shutdown path removed it
+        return {"ok": True, "result": {}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_shutdown)
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda *args, **kwargs: True)
+
+    rc = bn.cli.main(
+        ["session", "stop", "abc123", "--format", "json"]
+    )
+
+    assert rc == 0
+    assert not marker.exists()
+    result = json.loads(capsys.readouterr().out)
+    assert str(marker) in result["marker_removed"]
+
+
+@pytest.mark.parametrize("flag", ["--instance", "--instance-id"])
+def test_session_stop_accepts_instance_flag(monkeypatch, capsys, flag):
     # #456: after threading --instance through every command, cleanup naturally
     # tries `session stop --instance <id>`; accept it as an alias for the positional.
     seen = {}
@@ -579,7 +850,7 @@ def test_session_stop_accepts_instance_flag(monkeypatch, capsys):
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
     monkeypatch.setattr(bn.cli, "list_instances", lambda: [])
 
-    rc = bn.cli.main(["session", "stop", "--instance", "abc123", "--format", "json"])
+    rc = bn.cli.main(["session", "stop", flag, "abc123", "--format", "json"])
     assert rc == 0
     assert seen["op"] == "shutdown" and seen["instance_id"] == "abc123"
 
@@ -608,6 +879,21 @@ def test_session_stop_sends_shutdown(monkeypatch, capsys):
     parsed = json.loads(stdout)
     assert parsed["stopped"] is True
     assert parsed["instance_id"] == "abc123"
+
+
+def test_session_start_rejects_global_instance_selector(monkeypatch, capsys):
+    monkeypatch.setattr(
+        bn.cli,
+        "spawn_instance",
+        lambda *args, **kwargs: pytest.fail("session start spawned random instance"),
+    )
+
+    rc = bn.cli.main(["-i", "named", "session", "start", "/bin/ls"])
+
+    assert rc == 2
+    error = capsys.readouterr().err
+    assert "--instance-id named" in error
+    assert "does not name" in error
 
 
 def test_session_start_spawns_instance(monkeypatch, capsys):
@@ -662,7 +948,7 @@ def test_session_start_passes_workdir_and_no_marker_to_load(monkeypatch, capsys,
 
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         calls.append((op, params))
-        return {"ok": True, "result": {"path": params.get("path"), "loaded": True}}
+        return {"ok": True, "result": {"path": params.get("path"), "loaded": True, "targets": [{"selector": "x.bndb"}]}}
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
@@ -682,7 +968,7 @@ def test_session_start_no_marker_flag_suppresses_marker(monkeypatch, capsys, tmp
 
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         calls.append((op, params))
-        return {"ok": True, "result": {"path": params.get("path"), "loaded": True}}
+        return {"ok": True, "result": {"path": params.get("path"), "loaded": True, "targets": [{"selector": "x.bndb"}]}}
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
@@ -693,7 +979,7 @@ def test_session_start_no_marker_flag_suppresses_marker(monkeypatch, capsys, tmp
 
 
 def test_session_start_partial_failure_keeps_bridge_but_exits_nonzero(monkeypatch, capsys):
-    from bn.transport import BridgeError, BridgeInstance
+    from bn.transport import BridgeInstance
 
     fake_inst = BridgeInstance(
         pid=999,
@@ -713,8 +999,11 @@ def test_session_start_partial_failure_keeps_bridge_but_exits_nonzero(monkeypatc
         ops.append(op)
         if op == "load_binary":
             if "good" in params["path"]:
-                return {"ok": True, "result": {"path": params["path"], "loaded": True}}
-            raise BridgeError(f"File not found: {params['path']}")
+                return {"ok": True, "result": {"path": params["path"], "loaded": True, "targets": [{"selector": "good.so"}]}}
+            # Malformed success (no open target) -- NOT a transport-level
+            # BridgeError -- this is the branch whose error text used to
+            # predict teardown the bridge never actually performs.
+            return {"ok": True, "result": {"path": params["path"], "loaded": True, "targets": []}}
         raise AssertionError(f"unexpected op: {op}")
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
@@ -726,6 +1015,13 @@ def test_session_start_partial_failure_keeps_bridge_but_exits_nonzero(monkeypatc
     assert "shutdown" not in ops
     parsed = json.loads(capsys.readouterr().out)
     assert "stopped" not in parsed
+    bad_error = next(
+        item["error"] for item in parsed["loaded"] if item["path"].endswith("bad.so")
+    )
+    # The bridge survives partial success -- the per-binary error text must
+    # not predict a teardown that never happens.
+    assert "will be stopped" not in bad_error
+    assert "stopped" not in bad_error
 
 
 def test_close_ignores_sticky_target_pin(fake_transport, monkeypatch, capsys):
@@ -1118,7 +1414,7 @@ def test_session_start_no_bndb_propagates_to_each_load(monkeypatch, tmp_path):
 
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured.append(dict(params or {}))
-        return {"ok": True, "result": {"loaded": True, "path": params["path"], "notes": [], "targets": []}}
+        return {"ok": True, "result": {"loaded": True, "path": params["path"], "notes": [], "targets": [{"selector": __import__("pathlib").Path(params["path"]).name}]}}
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
     rc = bn.cli.main(["session", "start", "--no-bndb", str(a), str(b)])
@@ -1127,52 +1423,6 @@ def test_session_start_no_bndb_propagates_to_each_load(monkeypatch, tmp_path):
     assert len(captured) == 2
     assert all(item["prefer_bndb"] is False for item in captured)
     assert {item["path"] for item in captured} == {str(a), str(b)}
-
-
-def test_session_stop_kill_failure_reports_error_and_exits_nonzero(monkeypatch, capsys):
-    from bn.transport import BridgeError
-
-    def fail_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
-        raise BridgeError("bridge unreachable")
-
-    monkeypatch.setattr(bn.cli, "send_request", fail_send_request)
-    monkeypatch.setattr(bn.cli, "list_instances", lambda: [_fake_bridge_instance("abc123")])
-
-    def fail_kill(pid, sig):
-        raise PermissionError(1, "Operation not permitted")
-
-    monkeypatch.setattr("os.kill", fail_kill)
-
-    rc = bn.cli.main(["session", "stop", "abc123"])
-
-    assert rc == 1
-    captured = capsys.readouterr()
-    assert "failed to stop bridge instance abc123" in captured.err
-    assert "stopped" not in captured.out
-
-
-def test_session_stop_sigterm_fallback_reports_method(monkeypatch, capsys):
-    from bn.transport import BridgeError
-
-    def fail_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None):
-        raise BridgeError("bridge unreachable")
-
-    monkeypatch.setattr(bn.cli, "send_request", fail_send_request)
-    monkeypatch.setattr(bn.cli, "list_instances", lambda: [_fake_bridge_instance("abc123")])
-    # Convergence polling is covered by its own transport test; here we only
-    # assert the SIGTERM dispatch + reported method, so simulate a clean teardown.
-    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: True)
-
-    kills = []
-    monkeypatch.setattr("os.kill", lambda pid, sig: kills.append((pid, sig)))
-
-    rc = bn.cli.main(["session", "stop", "abc123", "--format", "json"])
-
-    assert rc == 0
-    assert kills == [(111, __import__("signal").SIGTERM)]
-    parsed = json.loads(capsys.readouterr().out)
-    assert parsed["stopped"] is True
-    assert parsed["method"] == "sigterm"
 
 
 def test_class_list_invokes_op(monkeypatch):
@@ -1312,6 +1562,26 @@ def test_capabilities_text_groups_commands_with_routing_hints(capsys):
     assert "callsites" in out and "xrefs" in out
     assert "prefer when:" in out
     assert "see also:" in out
+
+
+def test_help_command_advertises_machine_catalog(capsys):
+    rc = bn.cli.main(["help", "--format", "json"])
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["kind"] == "help"
+    assert "function" in payload["groups"]
+    assert payload["capabilities_command"] == "bn capabilities --format json"
+
+
+def test_help_command_filters_one_family(capsys):
+    rc = bn.cli.main(["help", "function"])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert "function list:" in output
+    assert "function search:" in output
+    assert "machine-readable catalog" not in output
 
 
 def _inst_with_binaries(binaries):
@@ -1482,3 +1752,518 @@ def test_close_empty_instance_gets_the_actionable_message(fake_transport, monkey
     assert rc == 2
     assert calls == []
     assert "--instance is empty" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# #694: stop/restart must prove the pid is still the bridge before signalling
+# --------------------------------------------------------------------------
+
+
+class _FakeSignaller:
+    """Stand-in for transport.BridgeProcessSignal: records every send.
+
+    Signalling is atomic now (pin the pid, verify identity through the pin, send
+    through the same pin), so the CLI's remaining job is routing refusals and
+    escalations. That routing is what these tests pin down; the pin itself is
+    covered in tests/test_transport.py.
+    """
+
+    instances: list["_FakeSignaller"] = []
+
+    def __init__(self, instance, refusal=None):
+        self.instance = instance
+        self.refusal = refusal
+        self.sent: list[int] = []
+        self.closed = False
+        _FakeSignaller.instances.append(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close()
+
+    def close(self):
+        self.closed = True
+
+    def send(self, sig):
+        if self.refusal is not None:
+            return self.refusal
+        self.sent.append(sig)
+        return None
+
+
+def _fake_signaller(monkeypatch, refusal=None):
+    """Install the fake signaller; returns the list of created signallers."""
+    _FakeSignaller.instances = []
+    monkeypatch.setattr(
+        bn.cli,
+        "BridgeProcessSignal",
+        lambda instance: _FakeSignaller(instance, refusal=refusal),
+    )
+    return _FakeSignaller.instances
+
+
+def _unreachable_fake_instance(instance_id="abc123", pid=111):
+    inst = _fake_bridge_instance(instance_id, pid=pid)  # noqa: F405
+    inst.unreachable = True
+    return inst
+
+
+def test_session_stop_sigterm_fallback_sends_through_the_verified_pin(monkeypatch, capsys):
+    import signal as signal_mod
+
+    from bn.transport import BridgeError
+
+    def fail_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, **kwargs):
+        raise BridgeError("bridge unreachable")
+
+    monkeypatch.setattr(bn.cli, "send_request", fail_send_request)
+    monkeypatch.setattr(
+        bn.cli, "find_lifecycle_instance", lambda target: _fake_bridge_instance("abc123")  # noqa: F405
+    )
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: True)
+    signallers = _fake_signaller(monkeypatch)
+    monkeypatch.setattr("os.kill", lambda pid, sig: pytest.fail("raw os.kill is banned"))
+
+    rc = bn.cli.main(["session", "stop", "abc123", "--format", "json"])
+
+    assert rc == 0
+    assert len(signallers) == 1                      # one pin for the whole stop
+    assert signallers[0].sent == [signal_mod.SIGTERM]
+    assert signallers[0].closed is True
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["stopped"] is True and parsed["method"] == "sigterm"
+
+
+def test_session_stop_escalates_sigkill_through_the_same_pin(monkeypatch, capsys):
+    import signal as signal_mod
+
+    monkeypatch.setattr(
+        bn.cli,
+        "send_request",
+        lambda op, **kwargs: {"ok": True, "result": {"shutting_down": True}},
+    )
+    monkeypatch.setattr(
+        bn.cli, "find_lifecycle_instance", lambda target: _fake_bridge_instance("abc123")  # noqa: F405
+    )
+    converged = iter([False, True])
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: next(converged))
+    signallers = _fake_signaller(monkeypatch)
+
+    rc = bn.cli.main(["session", "stop", "abc123", "--format", "json"])
+
+    assert rc == 0
+    assert len(signallers) == 1                      # SAME pin, never reopened
+    assert signallers[0].sent == [signal_mod.SIGKILL]
+    assert json.loads(capsys.readouterr().out)["method"] == "sigkill"
+
+
+def test_session_stop_reports_a_refused_sigterm_and_signals_nothing(monkeypatch, capsys):
+    from bn.transport import BridgeError
+
+    def fail_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, **kwargs):
+        raise BridgeError("bridge unreachable")
+
+    monkeypatch.setattr(bn.cli, "send_request", fail_send_request)
+    monkeypatch.setattr(
+        bn.cli, "find_lifecycle_instance", lambda target: _fake_bridge_instance("abc123")  # noqa: F405
+    )
+    signallers = _fake_signaller(
+        monkeypatch,
+        refusal=(
+            "refusing to signal pid 111 for bridge instance 'abc123': the identity "
+            "recorded at startup (boot id plus process start time) does not match "
+            "the pinned process, so the bridge exited and its pid was reused"
+        ),
+    )
+
+    rc = bn.cli.main(["session", "stop", "abc123"])
+
+    assert rc == 1
+    assert signallers[0].sent == []
+    err = capsys.readouterr().err
+    assert "refusing to signal pid 111" in err
+    assert "reused" in err
+
+
+def test_session_stop_reports_a_refused_sigkill_escalation(monkeypatch, capsys):
+    monkeypatch.setattr(
+        bn.cli,
+        "send_request",
+        lambda op, **kwargs: {"ok": True, "result": {"shutting_down": True}},
+    )
+    monkeypatch.setattr(
+        bn.cli, "find_lifecycle_instance", lambda target: _fake_bridge_instance("abc123")  # noqa: F405
+    )
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: False)
+    signallers = _fake_signaller(
+        monkeypatch, refusal="refusing to signal pid 111: no verifiable process identity"
+    )
+
+    rc = bn.cli.main(["session", "stop", "abc123", "--format", "json"])
+
+    assert rc == 1
+    assert signallers[0].sent == []
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["stopped"] is False
+    assert "did not fully tear down" in parsed["error"]
+    assert "no verifiable process identity" in parsed["error"]
+
+
+def test_session_stop_resolves_an_unreachable_bridge(monkeypatch, capsys):
+    # A socket-less bridge is hidden from `session list` (nothing can be
+    # dispatched to it), but stopping the live process it names is exactly what a
+    # user needs -- so stop resolves it through the lifecycle lookup (#694).
+    import signal as signal_mod
+
+    from bn.transport import BridgeError
+
+    lookups: list[str] = []
+
+    def fail_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, **kwargs):
+        raise BridgeError("No bridge instance found with id: abc123")
+
+    monkeypatch.setattr(bn.cli, "send_request", fail_send_request)
+    monkeypatch.setattr(
+        bn.cli, "list_instances", lambda **kw: pytest.fail("must use the lifecycle lookup")
+    )
+    monkeypatch.setattr(
+        bn.cli,
+        "find_lifecycle_instance",
+        lambda target: lookups.append(target) or _unreachable_fake_instance("abc123"),
+    )
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: True)
+    signallers = _fake_signaller(monkeypatch)
+
+    rc = bn.cli.main(["session", "stop", "abc123", "--format", "json"])
+
+    assert rc == 0
+    assert lookups == ["abc123"]
+    assert signallers[0].sent == [signal_mod.SIGTERM]
+    assert json.loads(capsys.readouterr().out)["method"] == "sigterm"
+
+
+def test_session_restart_refuses_when_the_signal_is_not_delivered(monkeypatch, capsys):
+    from bn.transport import BridgeError
+
+    def fail_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, **kwargs):
+        raise BridgeError("bridge unreachable")
+
+    monkeypatch.setattr(bn.cli, "send_request", fail_send_request)
+    monkeypatch.setattr(
+        bn.cli, "find_lifecycle_instance", lambda target: _fake_bridge_instance("res1")  # noqa: F405
+    )
+    monkeypatch.setattr(
+        bn.cli, "_send_request_to_instance", lambda *a, **k: {"ok": True, "result": []}
+    )
+    monkeypatch.setattr(
+        bn.cli,
+        "spawn_instance",
+        lambda instance_id=None: pytest.fail("must not respawn after refusing"),
+    )
+    signallers = _fake_signaller(
+        monkeypatch,
+        refusal="refusing to signal pid 111 for bridge instance 'res1': its pid was reused",
+    )
+
+    rc = bn.cli.main(["session", "restart", "res1"])
+
+    assert rc == 2
+    assert signallers[0].sent == []
+    err = capsys.readouterr().err
+    assert "refusing to signal pid 111" in err
+    assert "left as it is" in err
+
+
+def test_session_restart_escalates_through_one_pin(monkeypatch, capsys):
+    import pathlib
+    import signal as signal_mod
+
+    from bn.transport import BridgeError, BridgeInstance
+
+    def send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, **kwargs):
+        if op == "shutdown":
+            raise BridgeError("bridge unreachable")
+        return {"ok": True, "result": {"loaded": True, "path": "/tmp/app.bin", "targets": []}}
+
+    new_instance = BridgeInstance(
+        pid=5151,
+        socket_path=pathlib.Path("/tmp/res1.sock"),
+        registry_path=pathlib.Path("/tmp/res1.json"),
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at=None,
+        meta={},
+        instance_id="res1",
+    )
+    monkeypatch.setattr(bn.cli, "send_request", send_request)
+    monkeypatch.setattr(
+        bn.cli, "find_lifecycle_instance", lambda target: _fake_bridge_instance("res1")  # noqa: F405
+    )
+    monkeypatch.setattr(
+        bn.cli, "_send_request_to_instance", lambda *a, **k: {"ok": True, "result": []}
+    )
+    converged = iter([False, True])
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: next(converged))
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: new_instance)
+    signallers = _fake_signaller(monkeypatch)
+
+    assert bn.cli.main(["session", "restart", "res1", "--format", "json"]) == 0
+    assert len(signallers) == 1
+    assert signallers[0].sent == [signal_mod.SIGTERM, signal_mod.SIGKILL]
+    assert signallers[0].closed is True
+
+
+def _failing_start_instance():
+    import pathlib
+
+    from bn.transport import BridgeInstance
+
+    return BridgeInstance(
+        pid=7777,
+        socket_path=pathlib.Path("/tmp/start1.sock"),
+        registry_path=pathlib.Path("/tmp/start1.json"),
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at=None,
+        meta={},
+        instance_id="start1",
+    )
+
+
+def _failing_start_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, **kwargs):
+    from bn.transport import BridgeError
+
+    raise BridgeError("load failed" if op.startswith("load_binary") else "shutdown refused")
+
+
+def test_session_start_cleanup_signals_through_the_verified_pin(monkeypatch, capsys, tmp_path):
+    # The all-preloads-failed cleanup is a fallback signalling path too: it used
+    # raw os.kill and could terminate a recycled pid (#694).
+    import signal as signal_mod
+
+    binary = tmp_path / "app.bin"
+    binary.write_bytes(b"\x7fELF")
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: _failing_start_instance())
+    monkeypatch.setattr(bn.cli, "send_request", _failing_start_send_request)
+    converged = iter([False, True])
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: next(converged))
+    signallers = _fake_signaller(monkeypatch)
+    monkeypatch.setattr("os.kill", lambda pid, sig: pytest.fail("raw os.kill is banned"))
+
+    rc = bn.cli.main(["session", "start", str(binary), "--format", "json"])
+
+    assert rc == 1
+    assert len(signallers) == 1                      # one pin for TERM + KILL
+    assert signallers[0].sent == [signal_mod.SIGTERM, signal_mod.SIGKILL]
+    assert signallers[0].closed is True
+    assert json.loads(capsys.readouterr().out)["stopped"] is True
+
+
+def test_session_start_cleanup_reports_a_refused_signal(monkeypatch, capsys, tmp_path):
+    binary = tmp_path / "app.bin"
+    binary.write_bytes(b"\x7fELF")
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: _failing_start_instance())
+    monkeypatch.setattr(bn.cli, "send_request", _failing_start_send_request)
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: False)
+    signallers = _fake_signaller(
+        monkeypatch, refusal="refusing to signal pid 7777: no verifiable process identity"
+    )
+
+    rc = bn.cli.main(["session", "start", str(binary), "--format", "json"])
+
+    assert rc == 1
+    assert signallers[0].sent == []
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["stopped"] is False
+    errors = " ".join(parsed["cleanup_errors"])
+    assert "SIGTERM not sent" in errors and "SIGKILL not sent" in errors
+    assert "no verifiable process identity" in errors
+
+
+# --------------------------------------------------------------------------
+# #694: a restart restores the project markers of the process it replaced
+# --------------------------------------------------------------------------
+
+
+def _restart_bridge_stubs(monkeypatch, marker_paths, *, restore_result=None, restore_error=None):
+    """Wire a restart whose old instance owned *marker_paths*. Returns the calls."""
+    import pathlib
+
+    from bn.transport import BridgeError, BridgeInstance
+
+    old = _fake_bridge_instance("keep1", pid=4242)  # noqa: F405
+    old.meta["marker_paths"] = [str(path) for path in marker_paths]
+    new = BridgeInstance(
+        pid=5151,
+        socket_path=pathlib.Path("/tmp/keep1.sock"),
+        registry_path=pathlib.Path("/tmp/keep1.json"),
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at="2026-01-01T00:00:00Z",
+        meta={},
+        instance_id="keep1",
+    )
+    calls: list[tuple[str, dict]] = []
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, **kwargs):
+        calls.append((op, dict(params or {})))
+        if op == "shutdown":
+            return {"ok": True, "result": {"shutting_down": True}}
+        if op == "load_binary":
+            return {"ok": True, "result": {"loaded": True, "path": params["path"], "notes": [], "targets": []}}
+        if op == "restore_markers":
+            if restore_error is not None:
+                raise BridgeError(restore_error)
+            return {
+                "ok": True,
+                "result": restore_result
+                if restore_result is not None
+                else {
+                    "instance_id": "keep1",
+                    "restored": [p["path"] if isinstance(p, dict) else p for p in params["paths"]],
+                    "skipped": [],
+                },
+            }
+        raise AssertionError(f"unexpected op {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli, "list_instances", lambda **kw: [old])
+    monkeypatch.setattr(bn.cli, "find_lifecycle_instance", lambda target: old)
+    monkeypatch.setattr(
+        bn.cli,
+        "_send_request_to_instance",
+        lambda inst, op, **kwargs: {
+            "ok": True,
+            "result": [{"filename": "/tmp/app.bin", "analysis_state": "full"}],
+        },
+    )
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kw: True)
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: new)
+    return calls
+
+
+def test_session_restart_restores_the_original_project_marker(monkeypatch, capsys, tmp_path):
+    # The stopped bridge unlinks its own `.bn-<id>` markers and the reload only
+    # refreshes a marker in the CLI's cwd, so a restart from anywhere else used to
+    # drop the marker that resolves a bare `bn` in the original project root.
+    marker = tmp_path / "project" / ".bn-keep1"
+    marker.parent.mkdir()
+    monkeypatch.delenv("BN_NO_MARKERS", raising=False)
+    calls = _restart_bridge_stubs(monkeypatch, [marker])
+
+    rc = bn.cli.main(["session", "restart", "keep1", "--format", "json"])
+
+    assert rc == 0
+    restore = [params for op, params in calls if op == "restore_markers"]
+    assert restore == [{"paths": [str(marker)]}]
+    parsed = json.loads(capsys.readouterr().out)
+    assert parsed["markers"]["restored"] == [str(marker)]
+    # The marker request is sent AFTER the respawn, so it lands on the new bridge.
+    assert [op for op, _ in calls].index("restore_markers") > [
+        op for op, _ in calls
+    ].index("load_binary")
+
+
+def test_session_restart_ignores_foreign_marker_paths_from_the_registry(monkeypatch, tmp_path):
+    # Only this instance's own marker name is handed back; a stray path for a
+    # different instance is never re-created under our id.
+    mine = tmp_path / ".bn-keep1"
+    foreign = tmp_path / ".bn-other9"
+    monkeypatch.delenv("BN_NO_MARKERS", raising=False)
+    calls = _restart_bridge_stubs(monkeypatch, [foreign, mine])
+
+    assert bn.cli.main(["session", "restart", "keep1", "--format", "json"]) == 0
+
+    restore = [params for op, params in calls if op == "restore_markers"]
+    assert restore == [{"paths": [str(mine)]}]
+
+
+def test_session_restart_skips_marker_restore_when_markers_are_disabled(monkeypatch, tmp_path):
+    monkeypatch.setenv("BN_NO_MARKERS", "1")
+    calls = _restart_bridge_stubs(monkeypatch, [tmp_path / ".bn-keep1"])
+
+    assert bn.cli.main(["session", "restart", "keep1", "--format", "json"]) == 0
+
+    assert [op for op, _ in calls if op == "restore_markers"] == []
+
+
+def test_session_restart_reports_a_failed_marker_restore_without_failing(monkeypatch, capsys, tmp_path):
+    # A restart whose targets came back is a successful restart; a marker that
+    # could not be restored is a warning plus a structured field, not exit 1.
+    monkeypatch.delenv("BN_NO_MARKERS", raising=False)
+    _restart_bridge_stubs(
+        monkeypatch, [tmp_path / ".bn-keep1"], restore_error="op restore_markers unknown"
+    )
+
+    rc = bn.cli.main(["session", "restart", "keep1", "--format", "json"])
+
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "could not restore project marker" in captured.err
+    assert json.loads(captured.out)["markers"]["error"] == "op restore_markers unknown"
+
+
+def test_session_restart_warns_about_each_skipped_marker(monkeypatch, capsys, tmp_path):
+    monkeypatch.delenv("BN_NO_MARKERS", raising=False)
+    marker = tmp_path / ".bn-keep1"
+    _restart_bridge_stubs(
+        monkeypatch,
+        [marker],
+        restore_result={
+            "instance_id": "keep1",
+            "restored": [],
+            "skipped": [{"path": str(marker), "reason": "parent directory does not exist"}],
+        },
+    )
+
+    assert bn.cli.main(["session", "restart", "keep1", "--format", "json"]) == 0
+    assert "parent directory does not exist" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------
+# #694: an explicit empty instance selector is an error, never "list them all"
+# --------------------------------------------------------------------------
+
+
+def test_session_list_rejects_an_explicit_empty_instance(monkeypatch, capsys):
+    # The selector filter is truthiness-based, so `-i ''` silently disabled it and
+    # listed EVERY session -- the opposite of what an explicit selector asks for.
+    listed = []
+    monkeypatch.setattr(
+        bn.cli,
+        "list_instances",
+        lambda: listed.append(True) or [_fake_bridge_instance("abc123")],  # noqa: F405
+    )
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    rc = bn.cli.main(["session", "list", "-i", ""])
+
+    assert rc == 2
+    assert listed == []
+    assert "--instance is empty" in capsys.readouterr().err
+
+
+def test_instance_list_rejects_an_explicit_empty_instance(monkeypatch, capsys):
+    monkeypatch.setattr(
+        bn.cli, "list_instances", lambda: pytest.fail("must not enumerate instances")
+    )
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    assert bn.cli.main(["instance", "list", "-i", ""]) == 2
+    assert "--instance is empty" in capsys.readouterr().err
+
+
+def test_session_list_with_an_explicit_selector_still_filters(monkeypatch, capsys):
+    monkeypatch.setattr(
+        bn.cli,
+        "list_instances",
+        lambda: [_fake_bridge_instance("abc123"), _fake_bridge_instance("zz9999")],  # noqa: F405
+    )
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    assert bn.cli.main(["session", "list", "-i", "zz9999", "--format", "json"]) == 0
+
+    items = json.loads(capsys.readouterr().out)["items"]
+    assert [item["instance_id"] for item in items] == ["zz9999"]

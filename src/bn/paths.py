@@ -102,6 +102,31 @@ def codex_home() -> Path:
     return Path.home() / ".codex"
 
 
+def omp_config_root() -> Path:
+    config_dir = os.environ.get("PI_CONFIG_DIR") or ".omp"
+    return Path.home() / config_dir
+
+
+def omp_agent_dir() -> Path:
+    if "OMP_PROFILE" in os.environ:
+        profile = os.environ["OMP_PROFILE"].strip()
+    else:
+        profile = os.environ.get("PI_PROFILE", "").strip()
+
+    config_root = omp_config_root()
+    if profile and profile != "default":
+        return config_root / "profiles" / profile / "agent"
+
+    configured_agent = os.environ.get("PI_CODING_AGENT_DIR")
+    if configured_agent:
+        return Path(configured_agent).expanduser()
+    return config_root / "agent"
+
+
+def omp_skills_dir() -> Path:
+    return omp_agent_dir() / "skills"
+
+
 def cache_home() -> Path:
     env = os.environ.get("BN_CACHE_DIR")
     if env:

@@ -5,11 +5,12 @@ description: "Use the local bn CLI for Binary Ninja reversing through the bn bri
 
 # bn
 
-Use this skill for reverse-engineering work against a Binary Ninja database via the local `bn` CLI. The bridge runs as a GUI plugin or a headless process; the CLI auto-spawns a headless instance on first use.
+Use this skill for reverse-engineering work against a Binary Ninja database via the local `bn` CLI: lifecycle, small reads, command discovery, verified mutations, and every concurrent fan-out agent. In a single-agent OMP session, list-shaped or locally filtered reads can use **`bn-kernel`** so complete results remain in retained Python variables instead of entering the transcript. The bridge runs as a GUI plugin or a headless process; the CLI auto-spawns a headless instance on first use.
 
 > **Route to a methodology first — this skill is the HOW; the methodology is the WHAT.**
 > - **Open-ended understanding / mapping a binary** → invoke the **`bn-re`** skill first. For a *long* survey spanning many functions, **dispatch the `bn-re` subagent** instead of running inline — it keeps the decompiler/xref token-flood out of your context and returns a distilled map (recovered state persists in the BNDB, read it back via `bn`).
 > - **Finding bugs / security audit / attack surface** → invoke the **`bn-vr`** skill first; likewise **dispatch the `bn-vr` subagent** for a long audit spanning many sinks.
+> - **List-shaped / multi-function / grep-like reads in a single-agent OMP session** → invoke **`bn-kernel`** first. Concurrent sibling task agents currently share eval globals, so they must use this direct CLI with explicit `-i/-t` instead.
 > - Then come back here for command syntax.
 
 ## Reference (load on demand)
@@ -25,6 +26,11 @@ The full command catalog lives in three files **in this skill's directory** — 
 One open target: omit `-t`. Multiple open: pass `-t <selector>` (from `bn target list`; matches selector / target_id / view_id / filename / basename), before *or* after the subcommand.
 
 > **Parallel / fan-out agents — HARD rule.** Sticky pins (`instance use` / `target use`) are one shared file per git repo, so concurrent agents clobber each other. Fan-out agents **MUST** pass **`-i/--instance` and `-t/--target`** explicitly on **every** command and **MUST NOT** call `instance use` / `target use` / `*clear`. Prefer one dedicated instance per agent, then use the short flags everywhere:
+>
+> OMP sibling task agents also share one retained eval namespace. They **MUST NOT**
+> keep `bn_kernel` sessions or bulk rows in module globals during fan-out; another
+> sibling can silently overwrite them between cells. Use the direct CLI in this
+> section until the harness provides per-subagent Python namespaces.
 >
 > ```bash
 > bn session start /path/to/bin --instance-id dogfood-1   # spawn name (not global -i)

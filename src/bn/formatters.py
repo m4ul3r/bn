@@ -122,12 +122,21 @@ def _slice_text_lines(
 
 
 def _resolution_note(value: Any) -> str:
-    """A leading note when a function-scoped read resolved an interior address
-    to its containing function (#193 Part 4).
+    """A leading note when a function-scoped read annotated how it resolved the
+    requested address (#193 Part 4).
 
-    Without it, text-mode output for a mid-function address (e.g. a taint/trace
-    sink) silently shows a function whose start differs from what was asked,
-    which reads like the wrong answer. Returns '' when not applicable.
+    Two distinct disclosures share one `resolved_from` envelope, and text mode
+    must say exactly what the JSON says:
+
+    * a non-zero offset means an INTERIOR address resolved to its containing
+      function -- without the note, text output silently shows a function whose
+      start differs from what was asked, which reads like the wrong answer;
+    * ``input_format: decimal`` means a digit-only token was read as an address
+      rather than a symbol name. At offset ``+0x0`` that is the ONLY news: the
+      read answered for exactly the function the caller named, so claiming
+      containment there contradicts the payload.
+
+    Returns '' when not applicable.
     """
     if not isinstance(value, dict):
         return ""
@@ -137,10 +146,34 @@ def _resolution_note(value: Any) -> str:
     function = _as_dict(value.get("function"))
     name = function.get("name", "?")
     address = function.get("address", "?")
+    requested = resolved_from.get("requested_address")
+    decimal = resolved_from.get("input_format") == "decimal"
+    spelling = " (decimal input)" if decimal else ""
+    if _is_exact_start(resolved_from):
+        if not decimal:
+            return ""
+        return (
+            f"// bn: decimal input resolved to {requested}, the exact start of "
+            f"{name}\n"
+        )
     return (
-        f"// bn: {resolved_from.get('requested_address')} is inside {name} "
+        f"// bn: {requested}{spelling} is inside {name} "
         f"@ {address} ({resolved_from.get('offset')}); showing the containing function\n"
     )
+
+
+def _is_exact_start(resolved_from: dict[str, Any]) -> bool:
+    """True when a `resolved_from` disclosure names the function's own start.
+
+    Only a bare-decimal exact request is disclosed with a zero offset (so a
+    digit-only token can't be mistaken for a symbol name); every containment
+    resolution carries a non-zero offset.
+    """
+    offset = str(resolved_from.get("offset") or "")
+    try:
+        return int(offset.replace("+", "").replace("-", "") or "1", 16) == 0
+    except ValueError:
+        return False
 
 
 def _disasm_linear_steer_note(value: Any, *, sliced: bool) -> str:
@@ -151,12 +184,15 @@ def _disasm_linear_steer_note(value: Any, *, sliced: bool) -> str:
     an xref address silently gets the prologue. Point at `--linear`, which
     decodes N instructions from the exact address regardless of function
     membership. Fires only when a slice is active AND the address resolved
-    mid-function -- an exact start or a whole-function dump has no trap.
+    mid-function -- an exact start or a whole-function dump has no trap. A
+    bare-decimal EXACT start also carries `resolved_from` (offset +0x0) purely to
+    disclose the spelling, and there the slice already begins at the requested
+    address, so the steer would be false advice.
     """
     if not sliced or not isinstance(value, dict):
         return ""
     resolved_from = value.get("resolved_from")
-    if not isinstance(resolved_from, dict):
+    if not isinstance(resolved_from, dict) or _is_exact_start(resolved_from):
         return ""
     addr = resolved_from.get("requested_address", "?")
     return (
@@ -252,7 +288,7 @@ def _render_function_info_text(value: Any, verbose: bool = False, demangle: bool
         else:
             lines.append("locals: none")
 
-    blocks = value.get("basic_blocks")
+    blocks = value.get("blocks")
     if isinstance(blocks, list):
         # #653.10: block ranges make a huge dispatcher readable a region at a time
         # (`disasm --linear <start>` / `--lines` once you know where you are)
@@ -577,12 +613,17 @@ def _render_session_start_text(value: Any) -> str:
                 error = item.get("error")
                 if error:
                     lines.append(f"- {item.get('path', '<unknown>')} [error: {error}]")
+                elif value.get("detached"):
+                    lines.append(
+                        f"- {item.get('path', '<unknown>')} "
+                        f"[job {item.get('job_id', '?')} "
+                        f"{item.get('state', 'queued')}]"
+                    )
+                    if item.get("status_command"):
+                        lines.append(f"  poll: {item['status_command']}")
                 else:
                     mark = "  [not analyzed]" if item.get("analyzed") is False else ""
                     lines.append(f"- {item.get('path', '<unknown>')}{mark}")
-                    # #653.3: fan-out agents must pass -t on every command, so every
-                    # session began with a mandatory second `bn target list` call
-                    # just to learn the selector `session start` already knew.
                     for tgt in item.get("targets") or []:
                         if isinstance(tgt, dict) and tgt.get("selector"):
                             lines.append(
@@ -595,6 +636,39 @@ def _render_session_start_text(value: Any) -> str:
     if value.get("stopped"):
         lines.append("")
         lines.append("session stopped: no binaries loaded successfully")
+    return "\n".join(lines)
+
+
+def _render_session_status_text(value: Any) -> str:
+    if not isinstance(value, dict):
+        return _render_fallback_text(value)
+    items = list(value.get("items") or [])
+    if not items:
+        return "no load jobs"
+    lines = []
+    for item in items:
+        if not isinstance(item, dict):
+            lines.append(_render_fallback_text(item))
+            continue
+        lines.append(
+            f"{item.get('job_id', '<unknown>')}  "
+            f"{item.get('state', '<unknown>')}  "
+            f"{item.get('path', '<unknown>')}"
+        )
+        if item.get("error"):
+            lines.append(f"  error: {item['error']}")
+        result = item.get("result")
+        if isinstance(result, dict):
+            for target in result.get("targets") or []:
+                if isinstance(target, dict) and target.get("selector"):
+                    lines.append(f"  target: {target['selector']}")
+    # A job-specific poll that has NOT finished names the exact command to
+    # re-run, so text mode never leaves the caller reconstructing it. Terminal
+    # jobs drop the hint: re-polling a finished job is pure waste and would
+    # contradict `terminal: true`.
+    status_command = value.get("status_command")
+    if status_command and value.get("terminal") is False:
+        lines.append(f"  poll: {status_command}")
     return "\n".join(lines)
 
 
@@ -737,6 +811,17 @@ def _render_target_summary(value: dict[str, Any]) -> str:
                 parts.append(f"{imported} imported")
             summary += f" ({', '.join(parts)})"
         lines.append(f"\tfunctions: {summary}")
+    import_symbols = value.get("import_symbol_count")
+    if import_symbols is not None:
+        imported_functions = value.get("imported_function_count")
+        callable_suffix = (
+            f", {imported_functions} callable function targets"
+            if imported_functions is not None
+            else ""
+        )
+        lines.append(
+            f"\timports: {import_symbols} symbols{callable_suffix}"
+        )
     # Segment-level detail only when present -- target info --verbose adds it;
     # target list rows do not, so this stays out of the list view. (F21)
     segments = value.get("segments")
@@ -1959,9 +2044,17 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
     # paging metadata (#454: callsites now pages bridge-side like xrefs) so a
     # truncated high-fan-in survey states the true total + remainder in a footer.
     total = None
+    lower_bound = None
+    callers_scanned = None
+    caller_total = None
+    scan_truncated = False
     has_more = False
     if isinstance(value, dict) and "items" in value:
         total = value.get("total")
+        lower_bound = value.get("total_lower_bound")
+        callers_scanned = value.get("callers_scanned")
+        caller_total = value.get("caller_total")
+        scan_truncated = bool(value.get("scan_truncated"))
         has_more = bool(value.get("has_more"))
         value = value.get("items") or []
     if not isinstance(value, list):
@@ -2035,6 +2128,17 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
         body += (
             f"\n\n... showing {len(value)} of {total} callsites; "
             "use --offset/--limit to page (or --format json for all)"
+        )
+    elif has_more and scan_truncated and isinstance(lower_bound, int):
+        scan = (
+            f"; scanned {callers_scanned} of {caller_total} callers"
+            if isinstance(callers_scanned, int) and isinstance(caller_total, int)
+            else ""
+        )
+        body += (
+            f"\n\n... showing {len(value)} rows; at least {lower_bound} "
+            f"callsites{scan}; exact total not computed to keep the scan bounded. "
+            "Use --offset/--limit to page."
         )
     return body
 

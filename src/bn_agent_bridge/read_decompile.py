@@ -29,6 +29,8 @@ Import direction is one-way: this module imports ``il_format``, ``vars``,
 """
 from __future__ import annotations
 
+import re
+
 from typing import Any
 
 try:
@@ -134,24 +136,67 @@ def _thunk_veneer_warning(ctx, bv, func) -> str | None:
             "real function body; the apparent self-call is the resolved target.")
 
 
-def _decompile(ctx, selector: str | None, identifier, *, addresses: bool = False, force_analysis: bool = False):
+_COMMENT_LINE_RE = re.compile(
+    r"^(?P<prefix>(?:0x[0-9a-fA-F]+\s+)?\s*//\s*)(?P<body>.*?)(?P<trailing>\s*)$"
+)
+
+
+def _redact_rendered_annotations(text: str, annotation_bodies: list[str]) -> str:
+    """Redact *text* by rewriting whole rendered comment LINES whose body
+    exactly matches one of *annotation_bodies* (or one of its own lines, for
+    multiline bodies) to ``<annotation redacted>``, instead of bare
+    ``str.replace()``-ing the annotation body out of the text -- which
+    corrupts code whenever the body is a short token that also occurs inside
+    unrelated code (e.g. a comment body of `1`, `buf`, or `end`).
+    """
+    bodies = {
+        line.strip()
+        for body in annotation_bodies
+        for line in str(body).splitlines()
+        if line.strip()
+    }
+    out = []
+    for line in text.splitlines(keepends=True):
+        ending = "\n" if line.endswith("\n") else ""
+        content = line[:-1] if ending else line
+        match = _COMMENT_LINE_RE.fullmatch(content)
+        if match and match.group("body").strip() in bodies:
+            content = f"{match.group('prefix')}<annotation redacted>"
+        out.append(content + ending)
+    return "".join(out)
+
+
+
+def _decompile(
+    ctx,
+    selector: str | None,
+    identifier,
+    *,
+    addresses: bool = False,
+    force_analysis: bool = False,
+    include_annotations: bool = False,
+):
     bv = ctx._resolve_view(selector)
     func = ctx._find_function(bv, identifier, contained=True)
     forced = False
     if force_analysis and bool(getattr(func, "analysis_skipped", False)):
         func = _force_function_analysis(ctx, bv, func)
         forced = True
+
+    comments = il_format._comment_map(bv, func)
+    function_comment = str(getattr(func, "comment", "") or "")
+    annotation_bodies = [
+        *comments.values(),
+        *([function_comment] if function_comment else []),
+    ]
     text = il_format._decompile_text(bv, func, addresses=addresses)
+    if not include_annotations:
+        text = _redact_rendered_annotations(text, annotation_bodies)
+
     warnings = il_format._render_warnings(text)
     stub = il_format._analysis_stub_warning(func, text, forced=forced)
     if stub:
         warnings.append(stub)
-    # #446: a PLT/GOT veneer decompiles as an apparent infinite self-recursion
-    # (`return foo();`) because the trampoline resolves back to the same symbol
-    # name. Emit a thunk warning naming the real target instead of leaving the
-    # reader to misread a 4-instruction jump as recursion. Gated on the tailcall
-    # render (the exact confusing case) so a normal decompile pays nothing; the
-    # detector then confirms the small jump-to-target shape.
     if "/* tailcall */" in text:
         thunk_warn = _thunk_veneer_warning(ctx, bv, func)
         if thunk_warn:
@@ -160,19 +205,19 @@ def _decompile(ctx, selector: str | None, identifier, *, addresses: bool = False
         data_warn = _forced_data_region_warning(bv, func)
         if data_warn:
             warnings.append(data_warn)
-    comments = il_format._comment_map(bv, func)
     result = {
         "function": {"name": func.name, "address": hex(func.start)},
         "text": text,
-        "comments": comments,
+        "comments": comments if include_annotations else {},
+        "annotation_summary": {
+            "comment_count": len(annotation_bodies),
+            "redacted": not include_annotations,
+        },
         "warnings": warnings,
         "analysis_skipped": bool(getattr(func, "analysis_skipped", False)),
-        # `analysis_force_requested` echoes the --force-analysis flag; `analysis_forced`
-        # is True only when a reanalysis actually ran this call. On a second forced
-        # decompile the function is no longer skipped, so nothing reruns and
-        # analysis_forced is False -- the echo tells callers the flag wasn't ignored.
         "analysis_force_requested": bool(force_analysis),
         "analysis_forced": forced,
+        "include_annotations": bool(include_annotations),
     }
     _annotate_containment(ctx, result, identifier, func)
     return result
@@ -240,7 +285,7 @@ def _function_info(ctx, selector: str | None, identifier, *, blocks: bool = Fals
     }
     if blocks:
         # #653.10: opt-in -- a 565-block function's ranges are themselves bulky.
-        result["basic_blocks"] = _basic_block_ranges(func)
+        result["blocks"] = _basic_block_ranges(func)
     _annotate_containment(ctx, result, identifier, func)
     return result
 
@@ -363,21 +408,19 @@ def _cfg(ctx, selector: str | None, identifier, *, view: str = "asm"):
 
 
 def _disasm(ctx, selector: str | None, identifier, linear=None, mode=None,
-            snap_to_instruction: bool = False):
+            snap_to_instruction=False, line_start=None, line_end=None,
+            strict_range=False):
     bv = ctx._resolve_view(selector)
     if linear is not None:
+        if line_start is not None or line_end is not None:
+            raise OperationFailure(
+                "invalid_range", "disasm line ranges cannot be combined with linear mode"
+            )
         return _disasm_linear(ctx, bv, identifier, int(linear), mode=mode,
                               snap_to_instruction=bool(snap_to_instruction))
     try:
         func = ctx._find_function(bv, identifier, contained=True)
     except Exception as exc:
-        # An address BN never made part of a function is exactly the stripped-lane
-        # case --linear exists for: point there instead of at a dead end (#314).
-        # Fire ONLY for that specific "no function here" dead end at an address
-        # (hex or decimal) -- not for an ambiguous overlap, a bad selector, or a
-        # name-not-found, where the --linear hint would mislead. A fresh
-        # RuntimeError (not type(exc)(...)) avoids assuming the original
-        # exception's constructor takes a single string.
         looks_like_address = True
         try:
             _parse_address(identifier)
@@ -389,9 +432,42 @@ def _disasm(ctx, selector: str | None, identifier, linear=None, mode=None,
                 f"membership, use `disasm {identifier} --linear N`."
             ) from exc
         raise
+
+    full_text = il_format._disasm_text(bv, func)
+    all_lines = full_text.splitlines()
+    total_lines = len(all_lines)
+    returned_text = full_text
+    selected_range = None
+    if line_start is not None or line_end is not None:
+        try:
+            start = int(line_start)
+            end = int(line_end)
+        except (TypeError, ValueError) as exc:
+            raise OperationFailure(
+                "invalid_range", "disasm lines must be 1-indexed integer START:END"
+            ) from exc
+        if start < 1 or end < start:
+            raise OperationFailure(
+                "invalid_range",
+                f"disasm lines must satisfy 1 <= START <= END, got {start}:{end}",
+            )
+        if start > total_lines or (strict_range and end > total_lines):
+            raise OperationFailure(
+                "invalid_range",
+                f"disasm line range {start}:{end} is outside the "
+                f"1:{total_lines} listing; these are 1-indexed line numbers, "
+                "not addresses",
+            )
+        end = min(end, total_lines)
+        returned_text = "\n".join(all_lines[start - 1:end])
+        selected_range = {"start": start, "end": end}
+
     result = {
         "function": {"name": func.name, "address": hex(func.start)},
-        "text": il_format._disasm_text(bv, func),
+        "text": returned_text,
+        "total_lines": total_lines,
+        "returned_lines": len(returned_text.splitlines()) if returned_text else 0,
+        "line_range": selected_range,
     }
     _annotate_containment(ctx, result, identifier, func)
     return result
@@ -614,7 +690,7 @@ def _disasm_linear(ctx, bv, identifier, count: int, *, mode=None,
             "length": int(length),
             "text": text,
         })
-        lines.append(f"{addr:08x}  {hex_bytes:<16} {text}")
+        lines.append(f"{hex(addr)}  {hex_bytes:<16} {text}")
         addr += length
     # Recompute containment at the FINAL (possibly snapped) start address.
     in_function = None

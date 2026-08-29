@@ -31,7 +31,14 @@ dev = [
 ]
 
 [build-system]
-requires = ["uv_build>=0.9.18,<0.10.0"]
+# uv_build < 0.11.29 applied NO excludes -- not `wheel-exclude`, not
+# `source-exclude`, not even its own documented `__pycache__`/`*.pyc`/`*.pyo`
+# defaults -- to `tool.uv.build-backend.data` trees. Because `skills/` ships as
+# install-prefix data, any local bytecode under it landed in the wheel as
+# `bn-<version>.data/data/bn-kernel/__pycache__/...`. 0.11.29 is the first
+# release that filters the data tree; the range spans both known-good minors so
+# a 0.11.x or 0.12.x uv can use its bundled backend instead of downloading one.
+requires = ["uv_build>=0.11.29,<0.13"]
 build-backend = "uv_build"
 
 # The bridge is a normal src-layout package so wheel builds apply Python package
@@ -43,7 +50,13 @@ data = "skills"
 
 [tool.uv.build-backend]
 module-name = ["bn", "bn_agent_bridge"]
-wheel-exclude = ["**/__pycache__", "**/*.pyc", "**/*.pyo"]
+# Excludes are UNANCHORED and use the PEP 639 reduced glob syntax, so bare
+# `__pycache__` already matches at every depth; the previous `**/`-prefixed
+# spelling was not the documented form. `source-exclude` is listed alongside
+# `wheel-exclude` because uv applies source excludes to wheels as well, which
+# keeps a source-tree build and an sdist->wheel build carrying the same files.
+source-exclude = ["__pycache__", "*.pyc", "*.pyo"]
+wheel-exclude = ["__pycache__", "*.pyc", "*.pyo"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -481,6 +481,58 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
             emitted_names.add(raw_name)
             if entry_kind in ("function", "data"):
                 func_data_names.add(raw_name)
+    relocation_recovered = 0
+    jump_slot_type = getattr(
+        getattr(bn, "RelocationType", None),
+        "ELFJumpSlotRelocationType",
+        None,
+    )
+    try:
+        relocations = list(getattr(bv, "relocations", []) or [])
+    except Exception:
+        relocations = []
+    for relocation in relocations:
+        symbol = getattr(relocation, "symbol", None)
+        if symbol is None:
+            continue
+        raw_name = str(
+            getattr(symbol, "raw_name", "")
+            or getattr(symbol, "name", "")
+        )
+        if not raw_name or raw_name in defined_names or raw_name in emitted_names:
+            continue
+        info = getattr(relocation, "info", None)
+        relocation_type = (
+            getattr(info, "type", None)
+            if info is not None
+            else getattr(relocation, "type", None)
+        )
+        entry_kind = "function" if relocation_type == jump_slot_type else "external"
+        address = int(
+            getattr(
+                relocation,
+                "address",
+                getattr(symbol, "address", 0),
+            )
+        )
+        namespace = str(getattr(symbol, "namespace", "") or "")
+        items.append(
+            {
+                "name": read_xrefs._import_symbol_name(symbol),
+                "address": hex(address),
+                "library": (
+                    namespace
+                    if namespace not in _BN_SENTINEL_NAMESPACES
+                    else None
+                ),
+                "namespace": namespace,
+                "raw_name": raw_name,
+                "kind": entry_kind,
+                "provenance": "relocation",
+            }
+        )
+        emitted_names.add(raw_name)
+        relocation_recovered += 1
     # #450: filter the survey to matching imports so a sink/source sweep
     # (`--query 'system|execve|popen' --regex`) doesn't need full paging + external
     # jq. Matches name / raw_name / library / namespace, mirroring strings/sections.
@@ -509,6 +561,8 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
             result["self_defined_excluded"] = self_defined_excluded
         if got_collapsed:
             result["got_collapsed"] = got_collapsed
+        if relocation_recovered:
+            result["relocation_recovered"] = relocation_recovered
         return result
     if summary:
         # Summary aggregates the whole import set; paging would distort the
@@ -518,6 +572,8 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
             result["self_defined_excluded"] = self_defined_excluded
         if got_collapsed:
             result["got_collapsed"] = got_collapsed
+        if relocation_recovered:
+            result["relocation_recovered"] = relocation_recovered
         return result
     # Order by kind USEFULNESS first (function -> data -> address), not the old
     # alphabetical kind sort which put "address"-kind internals ahead of
@@ -537,6 +593,8 @@ def _imports(ctx, selector: str | None, *, summary: bool = False,
         result["self_defined_excluded"] = self_defined_excluded
     if got_collapsed:
         result["got_collapsed"] = got_collapsed
+    if relocation_recovered:
+        result["relocation_recovered"] = relocation_recovered
     return result
 
 

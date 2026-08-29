@@ -400,6 +400,106 @@ def test_callsites_within_file_scope_preserves_file_order_and_dedupes(monkeypatc
     assert [row["call_index"] for row in rows] == [0, 0]
 
 
+def test_callsites_empty_scope_discovers_all_callers_and_dedupes(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    callee = _FakeFunction(0x403120, "checksum_update")
+    alpha = _FakeFunction(0x401000, "alpha")
+    alpha.basic_blocks = [_FakeBasicBlock(0x401010, 0x401016)]
+    alpha.low_level_il = [[_FakeLLILInstruction(0x401010, _FakeConstPtr(0x403120))]]
+    beta = _FakeFunction(0x402000, "beta")
+    beta.basic_blocks = [_FakeBasicBlock(0x402020, 0x402026)]
+    beta.low_level_il = [[_FakeLLILInstruction(0x402020, _FakeConstPtr(0x403120))]]
+    bv = _FakeBV(
+        functions=[callee, beta, alpha],
+        instruction_lengths={0x401010: 5, 0x402020: 5},
+        disassembly={
+            0x401010: "call checksum_update",
+            0x402020: "call checksum_update",
+        },
+        code_refs={
+            0x403120: [
+                _FakeCodeRef(0x402020, beta),
+                _FakeCodeRef(0x401010, alpha),
+                _FakeCodeRef(0x401011, alpha),
+            ]
+        },
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    rows = _callsites_items(
+        instance,
+        "active",
+        "checksum_update",
+        within_identifiers=[],
+        context=0,
+    )
+
+    assert [row["containing_function"]["name"] for row in rows] == ["alpha", "beta"]
+    assert [row["within_query"] for row in rows] == ["alpha", "beta"]
+
+
+
+def test_callsites_stops_after_page_lookahead_on_high_fan_in(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    callee = _FakeFunction(0x5000, "sink")
+    callers = [
+        (f"caller_{index}", _FakeFunction(0x1000 + index * 0x10, f"caller_{index}"))
+        for index in range(10)
+    ]
+    bv = _FakeBV(functions=[callee, *(function for _, function in callers)])
+    visited = []
+
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda *args, **kwargs: callee)
+    monkeypatch.setattr(instance.ctx, "_same_name_stub_functions", lambda *args: [])
+    monkeypatch.setattr(
+        bridge.read_listing,
+        "_all_caller_functions",
+        lambda *args: callers,
+    )
+
+    def one_callsite(ctx, view, target, function, **kwargs):
+        visited.append(function.name)
+        return [{"call_addr": hex(function.start)}]
+
+    monkeypatch.setattr(
+        bridge.read_listing, "_callsites_within_function", one_callsite
+    )
+
+    result = instance._callsites(
+        "active", "sink", within_identifiers=[], context=0, limit=2
+    )
+
+    assert visited == ["caller_0", "caller_1", "caller_2"]
+    assert len(result["items"]) == 2
+    assert result["has_more"] is True
+    assert result["total"] is None
+    assert result["total_lower_bound"] == 3
+    assert result["scan_truncated"] is True
+    assert result["callers_scanned"] == 3
+    assert result["caller_total"] == 10
+
+
+def test_callsites_returns_empty_for_unreferenced_import_symbol(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fake_bn = sys.modules["binaryninja"]
+    symbol = fake_bn.Symbol(
+        fake_bn.SymbolType.ImportAddressSymbol, 0x3000, "receive_record"
+    )
+    bv = _FakeBV(symbols=[symbol], code_refs={})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._callsites(
+        "active", "receive_record", within_identifiers=[], context=0, limit=10
+    )
+
+    assert result["items"] == []
+    assert result["total"] == 0
+    assert result["callee_symbol_only"] is True
+
 def test_callsites_ignores_indirect_calls_and_returns_null_context_when_unmapped(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -2694,7 +2794,21 @@ def test_annotation_summary_counts(monkeypatch):
                  symbols=[_AutoSym(False), _AutoSym(False), _AutoSym(True)],
                  comments={0x1000: "an address comment", 0x1004: "another"})
     summary = bridge.read_listing._annotation_summary(instance.ctx, bv)
-    assert summary == {"comments": 2, "function_comments": 1, "user_symbols": 2}
+    assert summary["comments"] == 2
+    assert summary["function_comments"] == 1
+    assert summary["user_symbols"] == 2
+    assert [item["address"] for item in summary["comment_locations"]] == [
+        "0x1000",
+        "0x1004",
+    ]
+    assert summary["function_comment_locations"] == [
+        {
+            "name": "documented",
+            "address": "0x1000",
+            "comment": "prior-run note",
+        }
+    ]
+    assert summary["locations_truncated"] is False
 
 
 def test_orient_surfaces_existing_annotations(monkeypatch):

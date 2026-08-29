@@ -127,7 +127,6 @@ def test_lines_range_rejects_zero_index_with_helpful_error(monkeypatch, capsys):
         ["decompile", "sub_401000", "--format", "json", "--lines", "1:5"],
         ["decompile", "sub_401000", "--format", "ndjson", "--lines", "1:5"],
         ["il", "sub_401000", "--format", "json", "--lines", "1:5"],
-        ["disasm", "sub_401000", "--format", "json", "--lines", "1:5"],
     ],
 )
 def test_lines_flag_rejected_outside_text_mode(monkeypatch, capsys, argv):
@@ -139,6 +138,41 @@ def test_lines_flag_rejected_outside_text_mode(monkeypatch, capsys, argv):
     err = capsys.readouterr().err
     assert "--lines only applies to --format text" in err
     assert "Traceback" not in err
+
+
+def test_disasm_json_lines_are_sliced_by_bridge(fake_transport, capsys):
+    calls = fake_transport(
+        {
+            "disasm": {
+                "ok": True,
+                "result": {
+                    "text": "line two",
+                    "total_lines": 4,
+                    "returned_lines": 1,
+                    "line_range": {"start": 2, "end": 2},
+                },
+            }
+        }
+    )
+
+    rc = bn.cli.main(
+        [
+            "disasm",
+            "sub_401000",
+            "--format",
+            "json",
+            "--lines",
+            "2:2",
+            "--target",
+            "active",
+        ]
+    )
+
+    assert rc == 0
+    assert calls[-1]["params"]["line_start"] == 2
+    assert calls[-1]["params"]["line_end"] == 2
+    assert calls[-1]["params"]["strict_range"] is True
+    assert json.loads(capsys.readouterr().out)["text"] == "line two"
 
 
 def test_json_format_error_emits_json_to_stdout(monkeypatch, capsys):
@@ -443,3 +477,128 @@ def test_render_orient_shows_existing_annotations():
     assert "existing annotations: comments=8" in out
     assert "user-symbols=12" in out and "cache-restored=True" in out
     assert "predate this run" in out
+
+
+def test_render_session_status_single_job_names_the_poll_command():
+    # Text mode is the DEFAULT for `session status`, so the human/agent driving a
+    # detached load must be able to re-poll without going and re-reading docs.
+    from bn.formatters import _render_session_status_text
+    value = {
+        "kind": "load_job",
+        "job_id": "abc123",
+        "state": "running",
+        "terminal": False,
+        "succeeded": None,
+        "job": {"job_id": "abc123", "state": "running", "path": "/tmp/s.bndb"},
+        "items": [{"job_id": "abc123", "state": "running", "path": "/tmp/s.bndb"}],
+        "count": 1,
+        "status_command": "bn -i worker session status abc123",
+    }
+    out = _render_session_status_text(value)
+    assert "abc123  running  /tmp/s.bndb" in out
+    assert "poll: bn -i worker session status abc123" in out
+    # Concise: the poll hint plus the row, nothing else.
+    assert len(out.splitlines()) == 2
+
+
+def test_render_session_status_terminal_job_drops_the_poll_command():
+    # Re-polling a finished job is pure waste; the note must disappear once the
+    # job is terminal so text mode never contradicts `terminal: true`.
+    from bn.formatters import _render_session_status_text
+    value = {
+        "kind": "load_job",
+        "job_id": "abc123",
+        "state": "complete",
+        "terminal": True,
+        "succeeded": True,
+        "job": {
+            "job_id": "abc123",
+            "state": "complete",
+            "path": "/tmp/s.bndb",
+            "result": {"targets": [{"selector": "s.bndb"}]},
+        },
+        "items": [{
+            "job_id": "abc123",
+            "state": "complete",
+            "path": "/tmp/s.bndb",
+            "result": {"targets": [{"selector": "s.bndb"}]},
+        }],
+        "count": 1,
+        "status_command": "bn -i worker session status abc123",
+    }
+    out = _render_session_status_text(value)
+    assert "poll:" not in out
+    assert "target: s.bndb" in out
+
+
+def test_resolution_note_does_not_claim_containment_for_an_exact_start():
+    # Bare-decimal input is disclosed with offset +0x0 when it names the exact
+    # function start. The old text said "<addr> is inside <fn> @ <addr> (+0x0);
+    # showing the containing function" -- which contradicts the JSON (offset 0 ==
+    # exact start) and reads as if the read answered for a different function.
+    from bn.formatters import _resolution_note
+    value = {
+        "function": {"name": "parse_packet", "address": "0x401000"},
+        "resolved_from": {
+            "requested_address": "0x401000",
+            "offset": "+0x0",
+            "input_format": "decimal",
+        },
+    }
+    note = _resolution_note(value)
+    assert "is inside" not in note
+    assert "showing the containing function" not in note
+    # It still discloses that a digit-only token was read as an address, which is
+    # the whole point of the +0x0 disclosure.
+    assert "decimal" in note
+    assert "0x401000" in note
+
+
+def test_resolution_note_discloses_decimal_input_on_an_interior_address():
+    # JSON says input_format=decimal; text must say so too, or an agent working
+    # in the default text mode never sees the documented disclosure.
+    from bn.formatters import _resolution_note
+    value = {
+        "function": {"name": "parse_packet", "address": "0x401000"},
+        "resolved_from": {
+            "requested_address": "0x401010",
+            "offset": "+0x10",
+            "input_format": "decimal",
+        },
+    }
+    note = _resolution_note(value)
+    assert "0x401010" in note and "is inside parse_packet @ 0x401000 (+0x10)" in note
+    assert "decimal" in note
+
+
+def test_resolution_note_hex_interior_address_is_unchanged():
+    from bn.formatters import _resolution_note
+    value = {
+        "function": {"name": "parse_packet", "address": "0x401000"},
+        "resolved_from": {"requested_address": "0x401010", "offset": "+0x10"},
+    }
+    note = _resolution_note(value)
+    assert "0x401010 is inside parse_packet @ 0x401000 (+0x10)" in note
+    assert "showing the containing function" in note
+    assert "decimal" not in note
+
+
+def test_disasm_linear_steer_note_suppressed_for_an_exact_decimal_start():
+    # The steer exists because `--count` slices from the PROLOGUE, not the
+    # requested interior address. At offset +0x0 they are the same address, so
+    # the advice is false and sends the agent to `--linear` for no reason.
+    from bn.formatters import _disasm_linear_steer_note
+    value = {
+        "function": {"name": "parse_packet", "address": "0x401000"},
+        "resolved_from": {
+            "requested_address": "0x401000",
+            "offset": "+0x0",
+            "input_format": "decimal",
+        },
+    }
+    assert _disasm_linear_steer_note(value, sliced=True) == ""
+    interior = {
+        "function": {"name": "parse_packet", "address": "0x401000"},
+        "resolved_from": {"requested_address": "0x401010", "offset": "+0x10"},
+    }
+    assert "--linear" in _disasm_linear_steer_note(interior, sliced=True)

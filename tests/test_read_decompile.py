@@ -60,6 +60,54 @@ def test_list_locals_returns_stable_ids(monkeypatch):
     assert result["locals"][1]["local_id"].startswith("0x401000:local:")
 
 
+def test_function_disasm_is_address_ordered_and_0x_prefixed(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    function = _FakeFunction(0x1000, "target")
+    function.basic_blocks = [
+        _FakeBasicBlock(0x2000, 0x2002),
+        _FakeBasicBlock(0x1000, 0x1002),
+        _FakeBasicBlock(0x3000, 0x3001),
+    ]
+    bv = _FakeBV(
+        memory={
+            0x1000: b"\x90\x90",
+            0x2000: b"\x90\x90",
+            0x3000: b"\xff",
+        },
+        disassembly={0x1000: "first", 0x2000: "second", 0x3000: ""},
+        instruction_lengths={0x1000: 2, 0x2000: 2, 0x3000: 1},
+    )
+
+    text = bridge.il_format._disasm_text(bv, function)
+    addresses = [line.split()[0] for line in text.splitlines()]
+
+    assert addresses == ["0x1000", "0x2000", "0x3000"]
+    assert ".byte 0xff" in text
+
+
+def test_function_disasm_rejects_out_of_range_line_window(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    function = _FakeFunction(0x1000, "target")
+    function.basic_blocks = [_FakeBasicBlock(0x1000, 0x1002)]
+    bv = _FakeBV(
+        functions=[function],
+        memory={0x1000: b"\x90\x90"},
+        disassembly={0x1000: "nop"},
+        instruction_lengths={0x1000: 2},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(Exception, match="1-indexed line numbers, not addresses"):
+        instance._disasm(
+            "active",
+            "target",
+            line_start=0x1000,
+            line_end=0x1001,
+            strict_range=True,
+        )
+
+
 def test_list_locals_skips_stack_aliases_for_parameters(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -183,7 +231,7 @@ def test_disasm_linear_walks_arbitrary_non_function_address(monkeypatch):
     assert res["instruction_count"] == 3
     assert [e["address"] for e in res["instructions"]] == ["0x1000", "0x1002", "0x1004"]
     assert all(e["text"] == "nop" for e in res["instructions"])
-    assert "00001000" in res["text"] and "nop" in res["text"]
+    assert "0x1000" in res["text"] and "nop" in res["text"]
     assert "not function-bounded" in res["note"]
 
 
@@ -543,9 +591,120 @@ def test_decompile_pseudo_c_with_address_gutter(monkeypatch):
     result = instance._decompile("active", "player_update", addresses=True)
 
     assert result["text"] == (
-        "00401000        int32_t player_update(int32_t arg1)\n"
+        "0x401000        int32_t player_update(int32_t arg1)\n"
         "\n"
-        "00401004            return arg1 + 1;"
+        "0x401004            return arg1 + 1;"
+    )
+
+
+def test_decompile_redacts_annotation_bodies_unless_explicitly_included(
+    monkeypatch
+):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    function = _FakeFunction(0x401000, "parse_record")
+    function.basic_blocks = [_FakeBasicBlock(0x401000, 0x401002)]
+    function.comment = "inherited function note"
+    bv = _FakeBV(
+        functions=[function],
+        comments={0x401000: "inherited address note"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(
+        bridge.il_format,
+        "_decompile_text",
+        lambda *args, **kwargs: (
+            "void parse_record() {\n"
+            "    // inherited function note\n"
+            "    // inherited address note\n"
+            "}"
+        ),
+    )
+
+    redacted = instance._decompile("active", "parse_record")
+    included = instance._decompile(
+        "active", "parse_record", include_annotations=True
+    )
+
+    assert "inherited function note" not in redacted["text"]
+    assert "inherited address note" not in redacted["text"]
+    assert redacted["comments"] == {}
+    assert redacted["annotation_summary"] == {
+        "comment_count": 2,
+        "redacted": True,
+    }
+    assert "inherited function note" in included["text"]
+    assert "inherited address note" in included["text"]
+    assert included["comments"] == {"0x401000": "inherited address note"}
+
+
+@pytest.mark.parametrize("body,code", [
+    ("1", "value = 1;"),
+    ("buf", "char* buf = input;"),
+    ("end", 'char* label = "weekend";'),
+])
+def test_decompile_redacts_only_rendered_comment_lines(monkeypatch, body, code):
+    # A short comment body like "1", "buf", or "end" is a substring of
+    # unrelated code (`value = 1;`, `char* buf`, `"weekend"`); redaction must
+    # rewrite only the rendered comment LINE, never bare-substring the body
+    # out of surrounding code.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    function = _FakeFunction(0x401000, "parse_record")
+    function.basic_blocks = [_FakeBasicBlock(0x401000, 0x401002)]
+    bv = _FakeBV(functions=[function], comments={0x401000: body})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    text = f"void parse_record() {{\n    // {body}\n    {code}\n}}"
+    monkeypatch.setattr(
+        bridge.il_format, "_decompile_text", lambda *args, **kwargs: text
+    )
+
+    result = instance._decompile("active", "parse_record")
+
+    assert f"// {body}" not in result["text"]
+    assert "// <annotation redacted>" in result["text"]
+    assert code in result["text"]
+
+
+def test_decompile_redacts_every_line_of_multiline_annotation(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    function = _FakeFunction(0x401000, "parse_record")
+    function.basic_blocks = [_FakeBasicBlock(0x401000, 0x401002)]
+    function.comment = "first line\nsecond line"
+    bv = _FakeBV(functions=[function])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    text = (
+        "void parse_record() {\n"
+        "    // first line\n"
+        "    // second line\n"
+        "    do_thing();\n"
+        "}"
+    )
+    monkeypatch.setattr(
+        bridge.il_format, "_decompile_text", lambda *args, **kwargs: text
+    )
+
+    result = instance._decompile("active", "parse_record")
+
+    assert "first line" not in result["text"]
+    assert "second line" not in result["text"]
+    assert result["text"].count("// <annotation redacted>") == 2
+    assert "do_thing();" in result["text"]
+
+
+def test_redact_rendered_annotations_preserves_address_gutter():
+    # The `--addresses` gutter form: a 0x-prefixed address, whitespace, then
+    # the rendered line. Redaction must preserve the gutter and the `//`
+    # prefix, rewriting only the comment body.
+    text = (
+        "0x401000        // secret note\n"
+        "0x401004            value = 1;"
+    )
+    redacted = read_decompile._redact_rendered_annotations(text, ["secret note"])
+    assert redacted == (
+        "0x401000        // <annotation redacted>\n"
+        "0x401004            value = 1;"
     )
 
 
@@ -608,6 +767,7 @@ def test_decompile_warns_on_placeholder_text_when_flag_clear(monkeypatch):
             [(0x401000, "int32_t big_fn()")],
             [(0x401000, "{")],
             [(0x401000, "    // This function is taking too long to analyze")],
+            [(0x401000, "    // Loading...")],
             [(0x401000, "}")],
         ],
     )
@@ -616,6 +776,14 @@ def test_decompile_warns_on_placeholder_text_when_flag_clear(monkeypatch):
 
     assert result["analysis_skipped"] is False
     assert any("incomplete stub" in w for w in result["warnings"])
+
+
+def test_analysis_stub_warning_ignores_legitimate_phrase_in_program_text(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    fn = _FakeFunction(0x401000, "real_fn")
+    text = 'int real_fn() { puts("This function is taking too long to analyze"); }'
+
+    assert bridge.il_format._analysis_stub_warning(fn, text) is None
 
 
 def test_decompile_force_analysis_reanalyzes_and_clears_warning(monkeypatch):
@@ -757,8 +925,7 @@ def test_function_list_defers_display_projection_to_the_returned_page(monkeypatc
 
 def test_function_list_sort_by_size_still_ranks_the_full_set(monkeypatch):
     # `--sort size` needs size for the WHOLE set to rank it, so the deferral must
-    # not break size ordering: the biggest function must lead regardless of which
-    # page it lands on. (Deferral is keyed on the sort mode for exactly this.)
+    # not break ascending size ordering regardless of which page a row lands on.
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     small = _FakeFunction(0x401000, "small_fn", total_bytes=16)
@@ -769,10 +936,10 @@ def test_function_list_sort_by_size_still_ranks_the_full_set(monkeypatch):
 
     result = instance._list_functions("active", sort="size", limit=1)
 
-    # natural size sort is largest-first, and it survives paging to one row.
+    # Natural ordering is ascending, like address/name and Python's sorted().
     assert result["returned"] == 1
-    assert result["items"][0]["address"] == "0x402000"
-    assert result["items"][0]["size"] == 65536
+    assert result["items"][0]["address"] == "0x401000"
+    assert result["items"][0]["size"] == 16
 
 
 def test_list_functions_is_sorted_by_address(monkeypatch):
@@ -848,7 +1015,9 @@ def test_function_list_basic_block_count_guards_bad_function(monkeypatch):
                 raise RuntimeError("analysis artifact: basic_blocks unavailable")
             return super().__getattribute__(attr)
 
-    good = _FakeFunction(0x401000, "ok_fn"); good.basic_blocks = [object()] * 3
+    good = _FakeFunction(0x401000, "ok_fn")
+    good.basic_blocks = [object()] * 3
+    good.total_bytes = 32
     bad = _ExplodingFunction(0x402000, "bad_fn")
     bv = _FakeBV(functions=[good, bad])
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
@@ -857,6 +1026,10 @@ def test_function_list_basic_block_count_guards_bad_function(monkeypatch):
     by = {it["address"]: it for it in result["items"]}
     assert by["0x401000"]["basic_block_count"] == 3
     assert by["0x402000"]["basic_block_count"] is None   # guarded, not a crash
+    assert by["0x401000"]["size"] == 32
+    assert by["0x401000"]["size_known"] is True
+    assert by["0x402000"]["size"] == 0
+    assert by["0x402000"]["size_known"] is False
     assert result["total"] == 2                          # whole request succeeded
 
 
@@ -882,9 +1055,8 @@ def test_function_list_envelope_kind_and_no_functions_alias(monkeypatch):
 
 
 def test_function_list_rows_carry_size_and_sort_by_size(monkeypatch):
-    # The dogfood's most-repeated friction: no size field forces per-function
-    # info loops / write-locked py exec to find large functions. Expose `size`
-    # on every row and a `--sort size` that ranks largest-first.
+    # Expose size on every row and keep the default sort direction consistent
+    # with address/name; --reverse/--desc requests largest-first.
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     small = _FakeFunction(0x1000, "small_fn"); small.total_bytes = 16
@@ -899,7 +1071,7 @@ def test_function_list_rows_carry_size_and_sort_by_size(monkeypatch):
     assert by_name["big_fn"]["size"] == 4096
 
     ranked = instance._list_functions("active", sort="size")
-    assert [r["name"] for r in ranked["items"]] == ["big_fn", "mid_fn", "small_fn"]
+    assert [r["name"] for r in ranked["items"]] == ["small_fn", "mid_fn", "big_fn"]
 
 
 def test_function_search_rows_carry_size(monkeypatch):
@@ -925,9 +1097,9 @@ def test_list_functions_binder_forwards_sort(monkeypatch):
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     res = bridge._bind_list_functions(instance, {"sort": "size"}, "active")
-    assert [r["name"] for r in res["items"]] == ["big_fn", "small_fn"]
+    assert [r["name"] for r in res["items"]] == ["small_fn", "big_fn"]
     res2 = bridge._bind_search_functions(instance, {"query": "_fn", "sort": "size"}, "active")
-    assert [r["name"] for r in res2["items"]] == ["big_fn", "small_fn"]
+    assert [r["name"] for r in res2["items"]] == ["small_fn", "big_fn"]
 
 
 def test_function_binders_tolerate_none_limit(monkeypatch):
@@ -2338,10 +2510,19 @@ def test_containment_meta_decimal_matches_hex(monkeypatch):
     hex_meta = instance.ctx._containment_meta("0x401010", fn)
     dec_meta = instance.ctx._containment_meta("4198416", fn)
     assert hex_meta == {"requested_address": "0x401010", "offset": "+0x10"}
-    assert dec_meta == hex_meta  # decimal discloses identically to hex
+    assert dec_meta == {
+        "requested_address": "0x401010",
+        "offset": "+0x10",
+        "input_format": "decimal",
+    }
 
-    # A decimal EXACT start still has no disclosure (like the hex exact start).
-    assert instance.ctx._containment_meta("4198400", fn) is None
+    # An exact bare-decimal address is disclosed so it cannot be mistaken for a
+    # digit-only symbol name; exact 0x input remains unremarkable.
+    assert instance.ctx._containment_meta("4198400", fn) == {
+        "requested_address": "0x401000",
+        "offset": "+0x0",
+        "input_format": "decimal",
+    }
     assert instance.ctx._containment_meta("0x401000", fn) is None
     # A plain name is not an address -> no disclosure.
     assert instance.ctx._containment_meta("parse_packet", fn) is None
@@ -2371,7 +2552,11 @@ def test_read_verbs_decimal_mid_address_discloses_like_hex(monkeypatch, call):
     assert result["function"]["name"] == "parse_packet"
     assert result["function"]["address"] == "0x401000"
     # requested_address is normalized to hex even though the request was decimal.
-    assert result["resolved_from"] == {"requested_address": "0x401010", "offset": "+0x10"}
+    assert result["resolved_from"] == {
+        "requested_address": "0x401010",
+        "offset": "+0x10",
+        "input_format": "decimal",
+    }
 
 
 # --- #626: extend the mid-function (contained) contract to the evidence /
@@ -2774,3 +2959,138 @@ def test_cfg_rejects_unknown_view(monkeypatch):
     with pytest.raises(bridge.OperationFailure) as exc:
         instance._cfg(None, "process_packet", view="llil")
     assert "view" in str(exc.value)
+
+
+# --- Cross-surface decimal-disclosure parity ------------------------------
+#
+# The skill promises that a bare-decimal address is accepted everywhere a
+# function identifier is accepted, and disclosed with ONE envelope shape. Agents
+# reported observing different keys on different surfaces, so this enumerates
+# EVERY containment-enabled read and drives the same four spellings through each
+# one. It is behavioral: each entry runs the real handler and reads the real
+# payload, so a new read that forgets `_annotate_containment` (or annotates with
+# its own key set) fails here rather than being caught by a source grep.
+
+def _containment_surface_calls():
+    """(id, callable(instance, identifier)) for every containment-enabled read."""
+    return [
+        ("decompile", lambda inst, ident: inst._decompile("active", ident)),
+        ("function_info", lambda inst, ident: inst._function_info("active", ident)),
+        ("proto_get", lambda inst, ident: inst._get_prototype("active", ident)),
+        ("local_list", lambda inst, ident: inst._list_locals_for_function("active", ident)),
+        ("il", lambda inst, ident: inst._il("active", ident, "mlil", False)),
+        ("cfg", lambda inst, ident: inst._cfg("active", ident)),
+        ("disasm", lambda inst, ident: inst._disasm("active", ident)),
+        ("structured_il", lambda inst, ident: inst._structured_il("active", ident)),
+        ("resolved_calls", lambda inst, ident: inst._resolved_calls("active", ident)),
+        ("defuse", lambda inst, ident: inst._defuse("active", ident, "arg1#0")),
+        # `at` names the instruction to inspect and is always an address; the
+        # identifier under test is the FUNCTION selector, which is what carries
+        # the containment disclosure.
+        ("possible_values", lambda inst, ident: inst._possible_values("active", ident, "0x401000")),
+        ("evidence_function", lambda inst, ident: inst._function_evidence("active", ident, context=0)),
+    ]
+
+
+def _containment_instance(monkeypatch):
+    """A bridge bound to parse_packet @ 0x401000..0x401040 with just enough IL
+    stubbing that every surface reaches its result instead of refusing early."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    # A block that satisfies BOTH the containment span (`end`) and `cfg`'s
+    # disassembly-line reader, so one fixture drives every surface.
+    block = _FakeCFGBlock(
+        0x401000,
+        lines=[_FakeCFGLine(0x401000, "push rbp"), _FakeCFGLine(0x401010, "ret")],
+    )
+    block.end = 0x401040
+    fn = _FakeFunction(0x401000, "parse_packet")
+    fn.basic_blocks = [block]
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    # An MLIL instruction at each candidate address so `possible_values` resolves
+    # a real value-set rather than short-circuiting on "no instruction here".
+    instructions = [
+        types.SimpleNamespace(
+            address=address,
+            possible_values=_pvs("ConstantValue", value=7),
+            src=None,
+        )
+        for address in (0x401000, 0x401010)
+    ]
+    il = types.SimpleNamespace(
+        instructions=instructions,
+        get_ssa_var_definition=lambda v: None,
+        get_ssa_var_uses=lambda v: [],
+    )
+    monkeypatch.setattr(bridge.il_format, "_il_function_for", lambda fn, view, ssa: il)
+    ssa_var = types.SimpleNamespace(
+        var=types.SimpleNamespace(name="arg1", type="int"), version=0
+    )
+    monkeypatch.setattr(
+        bridge.il_format, "_resolve_ssa_variable", lambda func, il_, sel: (ssa_var, [])
+    )
+    monkeypatch.setattr(bridge.il_format, "_ssa_var_entry", lambda v: {"ssa": "arg1#0"})
+    return instance
+
+
+assert 4198416 == 0x401010 and 4198400 == 0x401000
+
+
+@pytest.mark.parametrize(
+    "surface,call", _containment_surface_calls(), ids=[c[0] for c in _containment_surface_calls()]
+)
+def test_every_containment_read_discloses_decimal_interior_identically(monkeypatch, surface, call):
+    instance = _containment_instance(monkeypatch)
+
+    hex_result = call(instance, "0x401010")
+    dec_result = call(instance, "4198416")
+
+    assert hex_result["function"]["address"] == "0x401000", surface
+    assert dec_result["function"]["address"] == "0x401000", surface
+    # ONE documented shape, requested_address normalized to hex on both, and the
+    # decimal spelling is the only difference between them.
+    assert hex_result["resolved_from"] == {
+        "requested_address": "0x401010",
+        "offset": "+0x10",
+    }, surface
+    assert dec_result["resolved_from"] == {
+        "requested_address": "0x401010",
+        "offset": "+0x10",
+        "input_format": "decimal",
+    }, surface
+
+
+@pytest.mark.parametrize(
+    "surface,call", _containment_surface_calls(), ids=[c[0] for c in _containment_surface_calls()]
+)
+def test_every_containment_read_discloses_decimal_exact_start_identically(monkeypatch, surface, call):
+    # A digit-only token that lands exactly on the start is still disclosed, so
+    # it can never be silently mistaken for a symbol named "4198400" -- with a
+    # zero offset, which is what tells a reader it was NOT a containment hit.
+    instance = _containment_instance(monkeypatch)
+
+    result = call(instance, "4198400")
+
+    assert result["function"]["address"] == "0x401000", surface
+    assert result["resolved_from"] == {
+        "requested_address": "0x401000",
+        "offset": "+0x0",
+        "input_format": "decimal",
+    }, surface
+
+
+@pytest.mark.parametrize(
+    "surface,call", _containment_surface_calls(), ids=[c[0] for c in _containment_surface_calls()]
+)
+@pytest.mark.parametrize("identifier", ["0x401000", "parse_packet"])
+def test_every_containment_read_leaves_exact_hex_and_names_unannotated(
+    monkeypatch, surface, call, identifier
+):
+    instance = _containment_instance(monkeypatch)
+
+    result = call(instance, identifier)
+
+    assert result["function"]["address"] == "0x401000", surface
+    assert "resolved_from" not in result, surface

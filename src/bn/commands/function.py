@@ -46,9 +46,9 @@ from ..transport import BridgeError
              arg("--count", action="store_true", default=False,
                  help="Show total function count instead of listing"),
              arg("--sort", choices=["address", "size", "name"], default="address",
-                 help="Order results: address (default), size (largest first), or name"),
+                 help="Order results ascending by address (default), size, or name"),
              arg("--reverse", "--desc", action="store_true", default=False, dest="reverse",
-                 help="Reverse the sort's natural order (e.g. --sort size --reverse = smallest first)"),
+                 help="Reverse the sort (e.g. --sort size --reverse = largest first)"),
              arg("--demangle", action="store_true", default=False,
                  help="Show demangled C++ names in text (JSON always carries display_name)"),
              arg("--min-size", type=_positive_int, default=None, dest="min_size", metavar="N",
@@ -129,9 +129,9 @@ def _function_list(args: argparse.Namespace) -> int:
              arg("--count", action="store_true", default=False,
                  help="Show match count instead of listing"),
              arg("--sort", choices=["address", "size", "name"], default="address",
-                 help="Order results: address (default), size (largest first), or name"),
+                 help="Order results ascending by address (default), size, or name"),
              arg("--reverse", "--desc", action="store_true", default=False, dest="reverse",
-                 help="Reverse the sort's natural order (e.g. --sort size --reverse = smallest first)"),
+                 help="Reverse the sort (e.g. --sort size --reverse = largest first)"),
              arg("--demangle", action="store_true", default=False,
                  help="Show demangled C++ names in text (JSON always carries display_name)"),
              arg("--min-size", type=_positive_int, default=None, dest="min_size", metavar="N",
@@ -271,6 +271,8 @@ def _require_text_format(args: argparse.Namespace, flag: str) -> None:
              arg("--force-analysis", action="store_true", default=False,
                  help="If Binary Ninja skipped this function (e.g. too large), override the skip "
                       "and reanalyze it before decompiling (may be slow; takes the write lock)"),
+             arg("--include-annotations", action="store_true", default=False,
+                 help="Include inherited comment bodies in text/JSON (default: redact)"),
          ])
 def _decompile(args: argparse.Namespace) -> int:
     lines_range = getattr(args, "lines", None)
@@ -291,6 +293,7 @@ def _decompile(args: argparse.Namespace) -> int:
             "identifier": args.identifier,
             "addresses": args.addresses,
             "force_analysis": args.force_analysis,
+            "include_annotations": bool(args.include_annotations),
         },
         require_target=True,
         text_renderer=_render_decompile_text,
@@ -353,6 +356,19 @@ def _function_structured_il(args: argparse.Namespace) -> int:
         + _slice_text_lines(_render_structured_il_text(value), lines_range),
         stem="structured-il",
     )
+
+
+def _render_disasm_text(value: Any) -> str:
+    text = _text_field("text")(value)
+    if not isinstance(value, dict):
+        return text
+    selected = value.get("line_range")
+    total = value.get("total_lines")
+    if not isinstance(selected, dict) or not isinstance(total, int):
+        return text
+    start = selected.get("start")
+    end = selected.get("end")
+    return f"// lines {start}-{end} of {total}\n{text}"
 
 
 @command("disasm", help="Disassemble a function (slice with --lines or --count)", target=True,
@@ -420,22 +436,25 @@ def _disasm(args: argparse.Namespace) -> int:
     count = getattr(args, "count", None)
     lines_range = getattr(args, "lines", None)
     if count is not None:
-        # disasm is one instruction per line, so "first N instructions" is the
-        # 1-indexed window 1..N -- reuse the shared slicer (header + spill).
         lines_range = (1, count)
-    slice_flag = "--count" if count is not None else "--lines"
+    params = {"identifier": args.identifier}
     if lines_range is not None:
-        _require_text_format(args, slice_flag)
-    base = _text_field("text")
+        params.update(
+            {
+                "line_start": lines_range[0],
+                "line_end": lines_range[1],
+                "strict_range": count is None,
+            }
+        )
     sliced = lines_range is not None
     return _call(
         args,
         "disasm",
-        {"identifier": args.identifier},
+        params,
         require_target=True,
         text_renderer=lambda value: _resolution_note(value)
         + _disasm_linear_steer_note(value, sliced=sliced)
-        + _slice_text_lines(base(value), lines_range, flag=slice_flag),
+        + _render_disasm_text(value),
         stem="disasm",
     )
 
@@ -478,11 +497,14 @@ def _function_cfg(args: argparse.Namespace) -> int:
              arg("--any", nargs="+", dest="any_symbols", metavar="SYMBOL",
                  help="Batch-probe several symbols (a sink sweep); absent symbols are "
                       "reported, not errors"),
+             arg("--fn-pointer-scan", action="store_true",
+                 help="Also scan stored function pointers for references"),
          ])
 def _xrefs(args: argparse.Namespace) -> int:
     field_spec = getattr(args, "field_spec", None)
     identifier = getattr(args, "identifier", None)
     any_symbols = getattr(args, "any_symbols", None)
+    fn_pointer_scan = getattr(args, "fn_pointer_scan", False)
     if any_symbols:
         # #410: accept comma-separated lists as well as space-separated, so
         # `--any read,recv,memcpy` (or `read, recv, memcpy`) probes three symbols
@@ -492,6 +514,10 @@ def _xrefs(args: argparse.Namespace) -> int:
         any_symbols = [t for chunk in any_symbols
                        for s in (chunk.split(",") if "," in chunk else [chunk])
                        if (t := s.strip())]
+    if fn_pointer_scan and (any_symbols or field_spec):
+        raise BridgeError(
+            "xrefs --fn-pointer-scan requires an identifier, not --any or --field"
+        )
     if any_symbols:
         if identifier or field_spec:
             raise BridgeError("xrefs --any takes only the symbol list, not an identifier or --field")
@@ -536,6 +562,8 @@ def _xrefs(args: argparse.Namespace) -> int:
     # caller-group display cap, so it must fetch the full set -- don't forward
     # offset/limit to the op or the renderer would group only a slice.
     params: dict[str, Any] = {"identifier": identifier}
+    if fn_pointer_scan:
+        params["fn_pointer_scan"] = True
     limit = _effective_limit(args)
     if args.format != "text":
         if args.offset:
@@ -601,7 +629,7 @@ def _load_within_identifiers(path: Path) -> list[str]:
     return identifiers
 
 
-@command("callsites", help="Find direct native callsites and exact caller_static addresses",
+@command("callsites", help="Find direct native callsites and exact caller_static addresses (all callers by default)",
          target=True, paged=True,
          prefer_when="exact caller->callsite address mapping; "
                      "use xrefs for general or data cross-references",
@@ -615,9 +643,9 @@ def _load_within_identifiers(path: Path) -> list[str]:
          ],
          mutex_groups=[
              mutex(False,
-                   arg("--within", help="Containing function to search for callsites"),
+                   arg("--within", help="Restrict callsite search to one containing function"),
                    arg("--within-file", type=Path,
-                       help="Text file with one containing-function identifier per line (hex addresses accepted)")),
+                       help="Restrict callsite search to functions listed in a UTF-8 text file")),
          ])
 def _callsites(args: argparse.Namespace) -> int:
     if args.within is not None:
@@ -629,12 +657,7 @@ def _callsites(args: argparse.Namespace) -> int:
         if not within_identifiers:
             raise BridgeError(f"Scope file did not contain any function identifiers: {args.within_file}")
     else:
-        raise BridgeError(
-            "bn callsites needs a scope. Options:\n"
-            f"  single caller:  bn callsites {args.callee} --within <function>\n"
-            f"  many callers:   bn callsites {args.callee} --within-file <path>\n"
-            f"  list callers:   bn xrefs {args.callee}"
-        )
+        within_identifiers = []
 
     # #454: page high-fan-in callsite surveys bridge-side, like xrefs/function list.
     params: dict[str, Any] = {

@@ -194,8 +194,9 @@ def test_decompile_text_notes_decimal_mid_function_resolution_end_to_end(monkeyp
     # interior address resolved to its container but DROPPED resolved_from. This
     # drives the CLI end-to-end through the REAL bridge dispatch (not a stubbed
     # transport), so the decimal request genuinely exercises _containment_meta:
-    # text mode must show the resolution note for `decompile 4198416` exactly as
-    # it does for the equivalent hex `decompile 0x401010`.
+    # text mode must show the resolution note for `decompile 4198416` -- and,
+    # since the payload also records `input_format: decimal`, name that spelling
+    # instead of leaving text and JSON disagreeing about what was requested.
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     fn = _FakeFunction(0x401000, "parse_packet")
@@ -216,8 +217,9 @@ def test_decompile_text_notes_decimal_mid_function_resolution_end_to_end(monkeyp
     assert rc == 0
     out, _ = capsys.readouterr()
     # requested_address is normalized to hex in the disclosure even though the
-    # user typed the decimal spelling.
-    assert "0x401010 is inside parse_packet @ 0x401000 (+0x10)" in out
+    # user typed the decimal spelling, and the decimal spelling itself is named.
+    assert "is inside parse_packet @ 0x401000 (+0x10)" in out
+    assert "0x401010 (decimal input)" in out
 
 
 def test_decompile_text_has_no_note_for_exact_start(fake_transport, capsys):
@@ -505,18 +507,28 @@ def test_callsites_both_scope_flags_still_rejected():
         )
 
 
-def test_callsites_missing_scope_raises_actionable_error(fake_transport, capsys):
-    fake_transport()
+def test_callsites_missing_scope_routes_all_callers(fake_transport):
+    calls = fake_transport(
+        {
+            "callsites": {
+                "ok": True,
+                "result": {
+                    "kind": "callsites",
+                    "items": [],
+                    "total": 0,
+                    "offset": 0,
+                    "limit": None,
+                    "returned": 0,
+                    "has_more": False,
+                },
+            }
+        }
+    )
 
     rc = bn.cli.main(["callsites", "crt_rand", "--target", "active"])
 
-    # BridgeError surfaces as a nonzero exit with a human-facing message.
-    assert rc != 0
-    combined = capsys.readouterr()
-    text = combined.err + combined.out
-    assert "--within" in text
-    assert "--within-file" in text
-    assert "bn xrefs crt_rand" in text
+    assert rc == 0
+    assert calls[-1]["params"]["within_identifiers"] == []
 
 
 def test_function_info_uses_active_target_and_text_renderer(fake_transport, capsys):
@@ -1033,6 +1045,18 @@ def test_render_callsites_text_footer_when_paged():
     # No footer when everything fits.
     env_full = {**env, "total": 1, "has_more": False}
     assert "showing" not in formatters._render_callsites_text(env_full)
+    bounded = {
+        **env,
+        "total": None,
+        "total_lower_bound": 2,
+        "scan_truncated": True,
+        "callers_scanned": 2,
+        "caller_total": 47,
+    }
+    bounded_text = formatters._render_callsites_text(bounded)
+    assert "at least 2 callsites" in bounded_text
+    assert "scanned 2 of 47 callers" in bounded_text
+    assert "exact total not computed" in bounded_text
 
 
 def test_callsites_routes_within_scope_and_renders_text(fake_transport, capsys):
@@ -1135,11 +1159,13 @@ def test_target_summary_text_shows_function_counts():
         "named_function_count": 87,
         "unnamed_function_count": 313,
         "imported_function_count": 12,
+        "import_symbol_count": 19,
     })
     assert "412 functions" in out
     assert "87 named" in out
     assert "313 auto-named" in out
     assert "12 imported" in out
+    assert "19 symbols, 12 callable function targets" in out
 
 
 def test_function_search_auto_retries_regex_then_discloses_when_still_empty(monkeypatch, capsys):
@@ -1305,6 +1331,118 @@ def test_session_start_all_loads_fail_stops_bridge_and_exits_nonzero(monkeypatch
     assert parsed["stopped"] is True
 
 
+def test_session_start_rejects_load_success_without_open_target(
+    monkeypatch, capsys
+):
+    from bn.transport import BridgeInstance
+    from pathlib import Path
+
+    fake_inst = BridgeInstance(
+        pid=999,
+        socket_path=Path("/tmp/test-empty.sock"),
+        registry_path=Path("/tmp/test-empty.json"),
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at="2026-01-01T00:00:00Z",
+        meta={},
+        instance_id="empty9",
+    )
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: fake_inst)
+    ops = []
+
+    def fake_send_request(op, **kwargs):
+        ops.append(op)
+        if op == "load_binary":
+            return {
+                "ok": True,
+                "result": {"loaded": True, "targets": []},
+            }
+        if op == "shutdown":
+            return {"ok": True, "result": {"shutting_down": True}}
+        raise AssertionError(op)
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(
+        ["session", "start", "/tmp/sample.bin", "--format", "json"]
+    )
+
+    assert rc == 1
+    assert ops == ["load_binary", "shutdown"]
+    result = json.loads(capsys.readouterr().out)
+    assert result["stopped"] is True
+    assert "without an open target" in result["loaded"][0]["error"]
+
+
+def test_session_start_detach_queues_load_and_returns_poll_command(
+    monkeypatch, capsys
+):
+    from pathlib import Path
+    from bn.transport import BridgeInstance
+
+    instance = BridgeInstance(
+        pid=999,
+        socket_path=Path("/tmp/detached.sock"),
+        registry_path=Path("/tmp/detached.json"),
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at="2026-01-01T00:00:00Z",
+        meta={},
+        instance_id="detached9",
+    )
+    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: instance)
+    seen = []
+
+    def fake_send_request(op, **kwargs):
+        seen.append(op)
+        assert op == "load_binary_async"
+        return {
+            "ok": True,
+            "result": {
+                "job_id": "job123",
+                "state": "queued",
+                "path": kwargs["params"]["path"],
+                "status_command": "bn -i detached9 session status job123",
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(
+        [
+            "session",
+            "start",
+            "/tmp/sample.bndb",
+            "--instance-id",
+            "detached9",
+            "--detach",
+            "--format",
+            "json",
+        ]
+    )
+
+    assert rc == 0
+    assert seen == ["load_binary_async"]
+    result = json.loads(capsys.readouterr().out)
+    assert result["detached"] is True
+    assert result["loaded"][0]["job_id"] == "job123"
+    assert result.get("stopped") is None
+
+
+def test_session_start_rejects_invalid_timeout_before_spawn(monkeypatch, capsys):
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "not-a-timeout")
+    monkeypatch.setattr(
+        bn.cli,
+        "spawn_instance",
+        lambda *args, **kwargs: pytest.fail("spawned before environment validation"),
+    )
+
+    rc = bn.cli.main(["session", "start", "--instance-id", "worker"])
+
+    assert rc == 2
+    assert "BN_REQUEST_TIMEOUT" in capsys.readouterr().err
+
+
 def test_il_lines_slices_output_with_header(fake_transport, capsys):
     fake_transport({"il": {"ok": True, "result": {"text": "line1\nline2\nline3\nline4\nline5"}}})
 
@@ -1319,7 +1457,7 @@ def test_il_lines_slices_output_with_header(fake_transport, capsys):
 
 
 def test_disasm_lines_slices_output_with_header(fake_transport, capsys):
-    fake_transport({"disasm": {"ok": True, "result": {"text": "aaa\nbbb\nccc\nddd"}}})
+    fake_transport({"disasm": {"ok": True, "result": {"text": "aaa\nbbb", "total_lines": 4, "line_range": {"start": 1, "end": 2}}}})
 
     rc = bn.cli.main(["disasm", "0x1000", "--target", "active", "--lines", "1:2"])
 
@@ -1542,6 +1680,26 @@ def test_xrefs_json_limit_pages_instead_of_erroring(monkeypatch, capsys):
     assert rc == 0
     assert captured["op"] == "xrefs"
     assert captured["params"].get("limit") == 3
+
+
+def test_xrefs_function_pointer_scan_routes_to_bridge(monkeypatch, capsys):
+    captured = _capture_xrefs_call(monkeypatch)
+
+    rc = bn.cli.main(
+        [
+            "xrefs",
+            "sub_401000",
+            "--target",
+            "active",
+            "--format",
+            "json",
+            "--fn-pointer-scan",
+        ]
+    )
+
+    assert rc == 0
+    assert captured["op"] == "xrefs"
+    assert captured["params"]["fn_pointer_scan"] is True
 
 
 def test_evidence_xrefs_json_limit_pages_instead_of_erroring(monkeypatch, capsys):
@@ -1846,7 +2004,7 @@ def test_structured_il_lines_slices_output_with_header(monkeypatch, capsys):
 
 def test_disasm_count_shows_first_n_instructions(fake_transport, capsys):
     # disasm text is one instruction per line, so `--count 2` is the first two.
-    fake_transport({"disasm": {"ok": True, "result": {"text": "aaa\nbbb\nccc\nddd"}}})
+    fake_transport({"disasm": {"ok": True, "result": {"text": "aaa\nbbb", "total_lines": 4, "line_range": {"start": 1, "end": 2}}}})
     rc = bn.cli.main(["disasm", "0x1000", "--target", "active", "--count", "2"])
     assert rc == 0
     out = capsys.readouterr().out
@@ -1856,7 +2014,7 @@ def test_disasm_count_shows_first_n_instructions(fake_transport, capsys):
 
 
 def test_disasm_count_caps_at_total(fake_transport, capsys):
-    fake_transport({"disasm": {"ok": True, "result": {"text": "aaa\nbbb"}}})
+    fake_transport({"disasm": {"ok": True, "result": {"text": "aaa\nbbb", "total_lines": 2, "line_range": {"start": 1, "end": 2}}}})
     rc = bn.cli.main(["disasm", "0x1000", "--target", "active", "--count", "9"])
     assert rc == 0
     out = capsys.readouterr().out
@@ -1951,7 +2109,7 @@ def test_disasm_linear_rejects_non_positive(capsys):
 def test_disasm_limit_is_alias_for_count(fake_transport, capsys):
     # #312: disasm accepts --limit as an alias for --count (first N instructions),
     # matching xrefs/strings/function list.
-    fake_transport({"disasm": {"ok": True, "result": {"text": "aaa\nbbb\nccc\nddd"}}})
+    fake_transport({"disasm": {"ok": True, "result": {"text": "aaa\nbbb", "total_lines": 4, "line_range": {"start": 1, "end": 2}}}})
     rc = bn.cli.main(["disasm", "0x1000", "--target", "active", "--limit", "2"])
     assert rc == 0
     out = capsys.readouterr().out
@@ -1974,7 +2132,7 @@ def test_disasm_limit_and_lines_are_mutually_exclusive(capsys):
 
 
 def _literal_zero_regex_match(op, *, params=None, target=None, timeout=30.0,
-                              instance_id=None, spawn_missing_named=False):
+                              instance_id=None, spawn_missing_named=False, resolved=False, **kwargs):
     """A fake search backend: a literal (regex=False) search of an alternation
     matches nothing; the same query as a regex matches three functions."""
     if op == "list_targets":
@@ -2029,16 +2187,20 @@ def test_function_search_no_retry_when_literal_matches(monkeypatch, capsys):
     assert "retried" not in err.lower()
 
 
-def test_function_search_no_retry_for_invalid_regex(monkeypatch, capsys):
-    """An unbalanced metachar query can't compile as a regex; don't retry (the
-    plain 'add --regex' hint still fires)."""
+def test_function_search_word_mode_does_not_retry_as_regex(monkeypatch, capsys):
+    """#694 item 7: --word is an explicit match mode (an escaped, boundary-
+    anchored literal match -- see read_listing._search_functions), not a
+    request for pattern matching. A zero-hit `--word 'foo.bar'` must not
+    silently retry as the raw regex `foo.bar` (which could then match
+    `fooXbar`). The same metachar query WITHOUT --word still auto-retries."""
     seen = []
 
-    def fake(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+    def fake(op, *, params=None, target=None, timeout=30.0, instance_id=None,
+             spawn_missing_named=False, resolved=False, **kwargs):
         if op == "list_targets":
             return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "a.bndb"}]}
         if op == "search_functions":
-            seen.append(bool(params.get("regex")))
+            seen.append(dict(params))
             return {"ok": True, "result": {"kind": "functions", "items": [], "total": 0,
                                            "offset": 0, "limit": 100, "returned": 0,
                                            "has_more": False}}
@@ -2046,28 +2208,163 @@ def test_function_search_no_retry_for_invalid_regex(monkeypatch, capsys):
 
     monkeypatch.setattr(bn.cli, "send_request", fake)
     monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
-    rc = bn.cli.main(["function", "search", "func[("])
+
+    rc = bn.cli.main(["function", "search", "foo.bar", "--word", "--format", "json"])
+
     assert rc == 0
-    assert seen == [False]  # invalid regex -> no retry attempted
-    _, err = capsys.readouterr()
-    assert "--regex" in err  # the plain hint still fires as the fallback
+    # Only one request was ever sent (no regex-fallback retry).
+    assert len(seen) == 1
+    assert seen[0]["word"] is True
+    assert seen[0]["regex"] is False
+    out, err = capsys.readouterr()
+    data = json.loads(out)
+    # `regex_fallback: False` (the "no retry was attempted" marker, distinct
+    # from a retry that happened) and no second request in `seen`.
+    assert data.get("regex_fallback") is False
+    assert "no regex fallback was attempted" in err
+    assert "retried as" not in err
+
+    # The same query WITHOUT --word still auto-retries as regex (contrast).
+    monkeypatch.setattr(bn.cli, "send_request", _literal_zero_regex_match)
+    rc = bn.cli.main(["function", "search", "Parse|Process|Decode", "--format", "json"])
+    assert rc == 0
+    _, err2 = capsys.readouterr()
+    assert "regex" in err2.lower()
+
+
+def test_function_search_rejects_invalid_regex_like_literal(monkeypatch, capsys):
+    seen = []
+
+    def fake(op, *, params=None, target=None, timeout=30.0, instance_id=None,
+             spawn_missing_named=False):
+        if op == "list_targets":
+            return {
+                "ok": True,
+                "result": [{"target_id": "1:1:1", "selector": "a.bndb"}],
+            }
+        if op == "search_functions":
+            seen.append(bool(params.get("regex")))
+            return {
+                "ok": True,
+                "result": {
+                    "kind": "functions",
+                    "items": [],
+                    "total": 0,
+                    "offset": 0,
+                    "limit": 100,
+                    "returned": 0,
+                    "has_more": False,
+                },
+            }
+        raise AssertionError(op)
+
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    rc = bn.cli.main(["function", "search", "func[("])
+
+    assert rc == 2
+    assert seen == [False]
+    assert "invalid regex-like" in capsys.readouterr().err
 
 
 # --- #291.3 review (M1): JSON consumers get an in-band regex-fallback marker ---
 
 
-def test_function_search_json_marks_regex_fallback(monkeypatch, capsys):
+@pytest.mark.parametrize("query", ["Parse|Process|Decode", "Parse.Process"])
+def test_function_search_json_marks_regex_fallback(monkeypatch, capsys, query):
     """An agent reading --format json on stdout (and not stderr) must be able to
     tell the result set came from a regex fallback, not a literal match -- so the
     retry adds an in-band `regex_fallback` marker (#291.3 review M1)."""
     monkeypatch.setattr(bn.cli, "send_request", _literal_zero_regex_match)
     monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
-    rc = bn.cli.main(["function", "search", "Parse|Process|Decode", "--format", "json"])
+    rc = bn.cli.main(["function", "search", query, "--format", "json"])
     assert rc == 0
     out, _ = capsys.readouterr()
     data = json.loads(out)
     assert data.get("regex_fallback") is True
     assert data.get("total") == 3
+
+
+def test_function_search_dot_retries_after_nonzero_literal_subset(
+    monkeypatch, capsys
+):
+    seen = []
+
+    def fake(op, *, params=None, target=None, timeout=30.0, instance_id=None,
+             spawn_missing_named=False, resolved=False, **kwargs):
+        if op == "list_targets":
+            return {
+                "ok": True,
+                "result": [{"target_id": "1:1:1", "selector": "a.bndb"}],
+            }
+        if op == "search_functions":
+            is_regex = bool(params.get("regex"))
+            seen.append(is_regex)
+            names = ["first", "second"] if is_regex else ["literal.dot"]
+            items = [
+                {"name": name, "address": hex(index + 0x1000)}
+                for index, name in enumerate(names)
+            ]
+            return {
+                "ok": True,
+                "result": {
+                    "kind": "functions",
+                    "items": items,
+                    "total": len(items),
+                    "offset": 0,
+                    "limit": 100,
+                    "returned": len(items),
+                    "has_more": False,
+                },
+            }
+        raise AssertionError(op)
+
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    rc = bn.cli.main(["function", "search", ".", "--format", "json"])
+
+    assert rc == 0
+    assert seen == [False, True]
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["regex_fallback"] is True
+    assert payload["total"] == 2
+
+
+def test_function_search_plain_zero_marks_no_fallback(monkeypatch, capsys):
+    def fake(op, *, params=None, target=None, timeout=30.0, instance_id=None,
+             spawn_missing_named=False):
+        if op == "list_targets":
+            return {
+                "ok": True,
+                "result": [{"target_id": "1:1:1", "selector": "a.bndb"}],
+            }
+        if op == "search_functions":
+            return {
+                "ok": True,
+                "result": {
+                    "kind": "functions",
+                    "items": [],
+                    "total": 0,
+                    "offset": 0,
+                    "limit": 100,
+                    "returned": 0,
+                    "has_more": False,
+                },
+            }
+        raise AssertionError(op)
+
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    rc = bn.cli.main(
+        ["function", "search", "NoSuchLiteral", "--format", "json"]
+    )
+
+    assert rc == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["regex_fallback"] is False
 
 
 def test_function_search_json_no_marker_when_literal_matches(monkeypatch, capsys):
@@ -2094,13 +2391,20 @@ def test_function_search_json_no_marker_when_literal_matches(monkeypatch, capsys
 # --- #291.2 review (m2): --count error names --count, not --lines ---
 
 
-def test_disasm_count_on_empty_disasm_names_count_flag(fake_transport, capsys):
-    fake_transport({"disasm": {"ok": True, "result": {"text": ""}}})
+def test_disasm_count_on_empty_disasm_reports_one_indexed_range(monkeypatch, capsys):
+    from bn.transport import BridgeError
+
+    def fail(*args, **kwargs):
+        raise BridgeError(
+            "disasm line range 1:5 is outside the 1:0 listing; "
+            "these are 1-indexed line numbers, not addresses"
+        )
+
+    monkeypatch.setattr(bn.cli, "send_request", fail)
     rc = bn.cli.main(["disasm", "0x1000", "--target", "active", "--count", "5"])
     assert rc == 2
     _, err = capsys.readouterr()
-    assert "--count" in err
-    assert "--lines" not in err
+    assert "1-indexed line numbers, not addresses" in err
 
 
 def test_render_message_lens_text_counts_table_window_items_303():
@@ -2164,7 +2468,7 @@ def test_function_info_blocks_lists_ranges_653(fake_transport, capsys):
         "function": {"name": "dispatch", "address": "0x401000"},
         "prototype": "void dispatch(uint32_t cmd)",
         "size": 0x5c00, "xref_count": 3,
-        "basic_blocks": [
+        "blocks": [
             {"index": 0, "start": "0x401000", "end": "0x401020", "length": 0x20,
              "outgoing": ["0x401020", "0x401100"], "incoming": []},
             {"index": 1, "start": "0x401020", "end": "0x401040", "length": 0x20,
@@ -2259,3 +2563,110 @@ def test_function_cfg_rejects_unknown_view(fake_transport, capsys):
         bn.cli.main(["function", "cfg", "main", "--view", "llil"])
     err = capsys.readouterr().err
     assert "llil" in err and "invalid choice" in err
+
+
+# --- decimal disclosure: text and JSON must say the same thing ------------
+
+def _real_bridge_cli(monkeypatch):
+    """Route `bn.cli.send_request` through the REAL bridge dispatch over a
+    parse_packet @ 0x401000..0x401040 view, so a decimal request genuinely
+    exercises `_containment_meta` instead of a canned transport payload."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "parse_packet")
+    fn.basic_blocks = [_FakeBasicBlock(0x401000, 0x401040)]
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, spawn_missing_named=False, **kwargs):
+        return {"ok": True, "result": instance._dispatch_on_main(op, params or {}, target)}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+
+DECIMAL_SURFACE_ARGV = [
+    pytest.param(["decompile", "{ident}"], id="decompile"),
+    pytest.param(["function", "info", "{ident}"], id="function_info"),
+    pytest.param(["proto", "get", "{ident}"], id="proto_get"),
+    pytest.param(["local", "list", "{ident}"], id="local_list"),
+    pytest.param(["il", "{ident}"], id="il"),
+    pytest.param(["disasm", "{ident}"], id="disasm"),
+]
+
+
+@pytest.mark.parametrize("argv", DECIMAL_SURFACE_ARGV)
+def test_decimal_interior_json_and_text_agree(monkeypatch, capsys, argv):
+    # JSON carries the documented three-key envelope...
+    _real_bridge_cli(monkeypatch)
+    base = [part.format(ident="4198416") for part in argv]
+    assert bn.cli.main([*base, "--target", "active", "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["resolved_from"] == {
+        "requested_address": "0x401010",
+        "offset": "+0x10",
+        "input_format": "decimal",
+    }
+
+    # ...and text mode discloses BOTH facts it encodes: the containment hit and
+    # that a digit-only token was read as an address. Text used to drop the
+    # decimal half entirely, so an agent in the default mode never saw the
+    # disclosure the skill promises.
+    assert bn.cli.main([*base, "--target", "active"]) == 0
+    out = capsys.readouterr().out
+    assert "0x401010" in out and "is inside parse_packet @ 0x401000 (+0x10)" in out
+    assert "decimal" in out
+
+
+@pytest.mark.parametrize("argv", DECIMAL_SURFACE_ARGV)
+def test_decimal_exact_start_json_and_text_agree(monkeypatch, capsys, argv):
+    _real_bridge_cli(monkeypatch)
+    base = [part.format(ident="4198400") for part in argv]
+    assert bn.cli.main([*base, "--target", "active", "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["resolved_from"] == {
+        "requested_address": "0x401000",
+        "offset": "+0x0",
+        "input_format": "decimal",
+    }
+
+    assert bn.cli.main([*base, "--target", "active"]) == 0
+    out = capsys.readouterr().out
+    # offset +0x0 means the request named the exact start; text must not claim a
+    # containment redirect it did not perform.
+    assert "is inside" not in out
+    assert "showing the containing function" not in out
+    assert "decimal input resolved to 0x401000" in out
+
+
+@pytest.mark.parametrize("identifier", ["0x401000", "parse_packet"])
+@pytest.mark.parametrize("argv", DECIMAL_SURFACE_ARGV)
+def test_exact_hex_and_name_stay_unannotated_end_to_end(monkeypatch, capsys, argv, identifier):
+    _real_bridge_cli(monkeypatch)
+    base = [part.format(ident=identifier) for part in argv]
+    assert bn.cli.main([*base, "--target", "active", "--format", "json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert "resolved_from" not in payload
+
+    assert bn.cli.main([*base, "--target", "active"]) == 0
+    out = capsys.readouterr().out
+    assert "is inside" not in out and "decimal" not in out
+
+
+def test_disasm_count_at_a_decimal_exact_start_does_not_steer_to_linear(monkeypatch, capsys):
+    # `--count` slices from the function start; at offset +0x0 that IS the
+    # requested address, so the `--linear` steer would be false advice.
+    _real_bridge_cli(monkeypatch)
+    assert bn.cli.main(
+        ["disasm", "4198400", "--target", "active", "--count", "1"]
+    ) == 0
+    out = capsys.readouterr().out
+    assert "--linear" not in out
+    # The decimal spelling is still disclosed.
+    assert "decimal input resolved to 0x401000" in out
+
+    assert bn.cli.main(
+        ["disasm", "4198416", "--target", "active", "--count", "1"]
+    ) == 0
+    interior = capsys.readouterr().out
+    assert "--linear" in interior

@@ -19,7 +19,7 @@ except ModuleNotFoundError:  # importable without the Binary Ninja runtime (test
     bn = None  # type: ignore[assignment]
 
 from . import vars as vars_mod
-from ._shared import OperationFailure
+from ._shared import OperationFailure, is_imported_function
 
 
 def _function_size(func) -> int | None:
@@ -44,11 +44,18 @@ def _function_metadata(func) -> dict[str, Any]:
     return_type = getattr(func, "return_type", None)
     if return_type is None and func_type is not None:
         return_type = getattr(func_type, "return_value", None)
+    size = _function_size(func)
     return {
         "prototype": str(func_type),
         "return_type": str(return_type) if return_type is not None else None,
-        "calling_convention": str(calling_convention) if calling_convention is not None else None,
-        "size": _function_size(func),
+        "calling_convention": (
+            str(calling_convention)
+            if calling_convention is not None
+            else None
+        ),
+        "size": size,
+        "size_known": size is not None,
+        "imported": is_imported_function(func),
     }
 
 
@@ -592,7 +599,7 @@ def _format_hlil_tree(ins, indent=0, *, _else_prefix=False, addresses: bool = Tr
     if addresses:
         def _prefix(i):
             a = getattr(i, "address", None)
-            return f"{int(a):08x}        " if a is not None else "                "
+            return f"{hex(int(a))}        " if a is not None else "                "
 
         NO_PREFIX = "                "
     else:
@@ -694,7 +701,7 @@ def _function_text(bv, func, *, view: str = "hlil", ssa: bool = False, addresses
         for ins in il.instructions:
             if addresses:
                 address = getattr(ins, "address", func.start)
-                lines.append(f"{int(address):08x}        {ins}")
+                lines.append(f"{hex(int(address))}        {ins}")
             else:
                 lines.append(f"    {ins}")
         if lines:
@@ -789,18 +796,24 @@ def _structured_disasm_entries(bv, func) -> list[dict[str, Any]]:
 
 def _disasm_text(bv, func) -> str:
     arch = getattr(func, "arch", None)
-    lines = []
+    entries = []
     for block in list(func.basic_blocks):
-        addr = block.start
-        while addr < block.end:
-            length = max(1, _instruction_length(bv, int(addr), arch=arch))
+        addr = int(block.start)
+        end = int(block.end)
+        while addr < end:
+            length = max(1, _instruction_length(bv, addr, arch=arch))
             entry = _disasm_entry(bv, addr, arch=arch)
-            disasm = entry["text"]
             raw = bv.read(addr, length)
-            hex_bytes = raw.hex(" ") if raw else ""
-            lines.append(f"{addr:08x}  {hex_bytes:<16} {disasm}")
+            text = entry["text"]
+            if not text:
+                text = ".byte " + ", ".join(f"0x{byte:02x}" for byte in raw)
+            entries.append((addr, raw, text))
             addr += length
-    return "\n".join(lines)
+    entries.sort(key=lambda item: item[0])
+    return "\n".join(
+        f"{hex(addr)}  {(raw.hex(' ') if raw else ''):<16} {text}"
+        for addr, raw, text in entries
+    )
 
 
 def _function_signature(func) -> str:
@@ -857,7 +870,7 @@ def _pseudo_c_text(func, *, addresses: bool = False) -> str:
                 seen_content = True
             if addresses:
                 addr = getattr(line.contents, "address", None)
-                prefix = f"{int(addr):08x}        " if addr is not None else " " * 16
+                prefix = f"{hex(int(addr))}        " if addr is not None else " " * 16
                 out.append(f"{prefix}{text}")
             else:
                 out.append(text)
@@ -892,7 +905,7 @@ def _decompile_text(bv, func, *, addresses: bool = False) -> str:
     sig = _function_signature(func)
     body = _function_text(bv, func, view="hlil", addresses=addresses)
     if addresses:
-        return f"{marker}{int(func.start):08x}        {sig}\n{body}"
+        return f"{marker}{hex(int(func.start))}        {sig}\n{body}"
     return f"{marker}{sig}\n{{\n{body}\n}}"
 
 
@@ -904,7 +917,12 @@ def _analysis_stub_warning(func, text: str, *, forced: bool = False) -> str | No
     a distinctive-phrase text match is kept as a fallback.
     """
     skipped = bool(getattr(func, "analysis_skipped", False))
-    placeholder = "taking too long to analyze" in text
+    lowered = text.lower()
+    placeholder = (
+        len(text) <= 512
+        and "this function is taking too long to analyze" in lowered
+        and ("loading..." in lowered or "loading…" in lowered)
+    )
     if not (skipped or placeholder):
         return None
     reason = None

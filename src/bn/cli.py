@@ -30,6 +30,9 @@ from .paths import (  # noqa: F401
     claude_skills_dir,
     codex_home,
     codex_skills_dir,
+    omp_agent_dir,
+    omp_config_root,
+    omp_skills_dir,
     plugin_install_dir,
     plugin_source_dir,
     remove_instance_markers,
@@ -38,7 +41,11 @@ from .paths import (  # noqa: F401
 )
 from .transport import (  # noqa: F401
     BridgeError,
+    BridgeProcessSignal,
+    DEFAULT_REQUEST_TIMEOUT,
+    _resolve_timeout,
     _send_request_to_instance,
+    find_lifecycle_instance,
     gc_instances,
     instance_selector,
     list_instances,
@@ -688,17 +695,23 @@ def _emit_result(
     _render_result(result, fmt=fmt, out_path=args.out, stem=stem)
 
 
-# Regex metacharacters that make a literal substring query silently match
-# nothing without --regex. Deliberately EXCLUDES '.' -- it is too common in
-# legitimate literal names/strings (std::x, a.b.c) to flag (#122).
-_REGEX_METACHARS = "|()[]{}*+?^$\\"
+# Regex metacharacters that make a literal substring query likely to be a
+# pattern. Dot is included: the fleet demonstrated regex-shaped dotted queries
+# returning a misleading zero with no fallback.
+_REGEX_METACHARS = ".|()[]{}*+?^$\\"
 
 
 def _maybe_regex_hint(args: argparse.Namespace, result: Any, query: str | None) -> None:
     """When a NON-regex search whose query contains regex metacharacters matched
     nothing, nudge toward --regex on stderr -- the query was taken literally, so
     a pattern like `init|fini` silently returns zero results with no clue (#122).
-    Suppressed when --regex/--exact is set or the query is plain text."""
+    Suppressed when --regex/--exact is set or the query is plain text.
+
+    Deliberately NOT suppressed for --word (#694 item 7): the bridge's word-mode
+    match is `\\b` + `re.escape(query)` + `\\b` (see
+    `read_listing._search_functions`), i.e. still a literal token match, just
+    boundary-anchored -- so "was matched literally" remains true and the nudge
+    to add --regex is still good advice under --word."""
     if not query or getattr(args, "regex", False) or getattr(args, "exact", False):
         return
     # Every collection read is now a {kind, items, total, ...} envelope (#275),
@@ -714,24 +727,54 @@ def _maybe_regex_hint(args: argparse.Namespace, result: Any, query: str | None) 
 
 
 def _should_retry_as_regex(args: argparse.Namespace, result: Any, query: str) -> bool:
-    """True when a literal search of *query* found nothing and the query looks like
-    a regex that compiles -- the caller should re-run it as a pattern (#291.3).
+    """True when a literal search of *query* found nothing (or *query* is the
+    literal string `"."`) and *query* looks like a regex that compiles -- the
+    caller should re-run it as a pattern (#291.3).
 
     A first-pass alternation like `Parse|Process|Decode` is taken literally and
     returns a confident (misleading) `none`; auto-retrying it as a regex removes
-    the trap. Guarded so we never change a search that DID match, and never turn a
-    clean 0-result into a regex-compile error: only an explicit-literal query with
-    unescaped metacharacters that both matched nothing and compiles is retried."""
-    if getattr(args, "regex", False) or getattr(args, "exact", False):
+    the trap. Branches, in order:
+
+    - An explicit `--regex`, `--exact`, or `--word` on *args* short-circuits to
+      `False`: the caller already chose literal-vs-pattern matching (--word is
+      an escaped, boundary-anchored literal match, not a pattern -- see
+      `read_listing._search_functions`), so there is nothing to retry (#694
+      item 7: a zero-hit `--word 'foo.bar'` must not silently become the raw
+      regex `foo.bar` and match `fooXbar`).
+    - *result* must be the `{..., "total": ...}` envelope dict; anything else
+      (e.g. a raw list) is `False`.
+    - *query* must contain at least one character from `_REGEX_METACHARS`
+      (`.|()[]{}*+?^$\\`); this is a raw membership test against the query
+      string, not an escape-aware scan, so an escaped metacharacter like `\\.`
+      still counts.
+    - Special-cased `"."`: for every other query, a non-zero `total` means the
+      literal search DID match and short-circuits to `False` (never turn a hit
+      into a regex-compile error). The literal query `"."` is exempt from that
+      guard -- it proceeds to the regex-compile check even when the literal
+      search already matched, because a literal `.` search is itself
+      misleading (it "matches" every name containing a dot) and the caller
+      wants the true any-name-regex behavior instead.
+    - The surviving query must compile as a regex. A regex-shaped query that
+      does NOT compile raises `BridgeError` (guiding the caller to `--exact`)
+      instead of returning `False`, so a clean 0-result never silently retries
+      into a swallowed exception.
+
+    Only a query that clears every guard above and compiles returns `True`."""
+    if getattr(args, "regex", False) or getattr(args, "exact", False) or getattr(args, "word", False):
         return False
-    if not isinstance(result, dict) or result.get("total") != 0:
+    if not isinstance(result, dict):
         return False
     if not any(ch in query for ch in _REGEX_METACHARS):
         return False
+    if result.get("total") != 0 and query != ".":
+        return False
     try:
         re.compile(query)
-    except re.error:
-        return False
+    except re.error as exc:
+        raise BridgeError(
+            f"invalid regex-like search query {query!r}: {exc}; "
+            "pass --exact to search for it literally"
+        ) from exc
     return True
 
 
@@ -1041,6 +1084,19 @@ def _call(
         require_target=require_target,
         allow_implicit_target=allow_implicit_target,
     )
+    # One end-to-end deadline for this call, resolved exactly once (#694 item
+    # 8). Without it, the literal request below and the regex-fallback retry
+    # further down each re-resolve BN_REQUEST_TIMEOUT from scratch, so a single
+    # command could run for up to double its declared budget. `budget` mirrors
+    # what the literal `send_request` call below resolves for itself (it is not
+    # passed `timeout=`/`resolved=True` -- its own resolution IS where this
+    # deadline's clock starts); only the retry, which runs strictly after,
+    # needs to be handed the shrinking remainder.
+    budget = _resolve_timeout(
+        None,
+        default=op_default_timeout if op_default_timeout is not None else DEFAULT_REQUEST_TIMEOUT,
+    )
+    deadline = time.monotonic() + budget if budget is not None else None
     response = send_request(
         op,
         params=request_params,
@@ -1063,13 +1119,23 @@ def _call(
     if regex_fallback_query is not None and _should_retry_as_regex(args, result, regex_fallback_query):
         retry_params = dict(request_params)
         retry_params["regex"] = True
+        retry_timeout = None
+        if deadline is not None:
+            retry_timeout = deadline - time.monotonic()
+            if retry_timeout <= 0:
+                raise BridgeError(
+                    f"Timed out before the regex-fallback retry for {op!r}; the "
+                    f"{budget:g}s end-to-end request budget was already spent on "
+                    "the literal search (raise BN_REQUEST_TIMEOUT to allow both)"
+                )
         response = send_request(
             op,
             params=retry_params,
             target=target,
             instance_id=getattr(args, "instance", None),
             spawn_missing_named=spawn_missing_named,
-            **timeout_kwargs,
+            timeout=retry_timeout,
+            resolved=True,
         )
         result = response["result"]
         # An in-band marker so a --format json consumer (which reads stdout, not
@@ -1083,6 +1149,17 @@ def _call(
             file=sys.stderr,
         )
         regex_hint_query = None  # the retry supersedes the add-`--regex` nudge
+    elif (
+        regex_fallback_query is not None
+        and isinstance(result, dict)
+        and result.get("total") == 0
+    ):
+        result["regex_fallback"] = False
+        print(
+            f'note: "{regex_fallback_query}" matched no function literally; '
+            "no regex fallback was attempted.",
+            file=sys.stderr,
+        )
     # Exit code is computed on the ORIGINAL result (it reads the full results
     # list); a result_transform (e.g. #408 --summary) only changes what is
     # rendered, never the verification-aware exit code.
@@ -1553,38 +1630,89 @@ def _known_option_strings(parser: argparse.ArgumentParser) -> set[str]:
 #            with characters argparse would treat as options
 _PROTECTED_DATA_OPTIONS = frozenset({"--query", "--code"})
 
+# Help is always safe to preserve as a literal data value rather than reject:
+# `bn strings --query -h` must search for the literal "-h" (documented in
+# reading.md), not exit 2 pointing at a flag collision that doesn't exist for
+# these three (every subparser carries them; they never take a value of their
+# own, so there's no "expected one argument" ambiguity to protect against).
+_HELP_OPTION_STRINGS = frozenset({"-h", "--help", "--help-full"})
+
 
 def _protect_flag_like_option_values(
     parser: argparse.ArgumentParser,
     argv: list[str],
 ) -> list[str]:
-    """Let explicit data options accept values that look like flags.
+    """Let a protected data option's value look like a flag -- but only when it
+    ISN'T actually one of the selected subcommand's own flags (#694 item 14).
 
     Argparse treats ``bn strings --query -h`` as a help flag instead of a query
-    value. When the user has explicitly supplied an option that takes arbitrary
-    data, preserve the next token as that option's value by rewriting to the
-    ``--opt=value`` spelling before parsing.
+    value. `--query`/`--code` are documented as accepting arbitrary data, so
+    the token right after one of them is classified against the ACTUAL
+    subcommand's known options (`_selected_parser_for_argv` +
+    `_known_option_strings` -- previously unused, restored here) before
+    parsing:
+
+    - not a known option of that subcommand (`-foo`, `--nope`, a bare `-`) or
+      one of the three universal help spellings (`-h`/`--help`/`--help-full`)
+      -> preserve it as the option's value by rewriting to ``--opt=value``.
+    - a known option of that subcommand (`--regex`, `--format`, `--limit`, ...)
+      -> reject with a usage error instead of silently treating the flag text
+      as the search query (a `--query --regex` typo returning a confident,
+      wrong "no matches for '--regex'" is worse than a loud rejection). Use
+      the explicit ``--opt=value`` spelling to search for that literal text.
     """
     protected_options = _PROTECTED_DATA_OPTIONS
+    selected = _selected_parser_for_argv(parser, argv)
+    known_options = _known_option_strings(selected)
     out: list[str] = []
     index = 0
     while index < len(argv):
         item = argv[index]
         if item in protected_options and index + 1 < len(argv):
             value = argv[index + 1]
-            # Rewrite ANY following flag-like token to the --opt=value spelling,
-            # including ones that collide with KNOWN options (--format, --target,
-            # --limit). These data options are documented as free-form, so
-            # `bn strings --query --format` must search the literal "--format",
-            # not have argparse consume it as the format flag (#102). A user who
-            # genuinely wants --query followed by a real flag uses = themselves.
             if value.startswith("-"):
+                # `--opt=value` spelling for the following token (e.g.
+                # `--query --format=json`) is classified on `--format`, not the
+                # whole `--format=json` string.
+                flag = value.split("=", 1)[0]
+                if flag in known_options and flag not in _HELP_OPTION_STRINGS:
+                    selected.error(
+                        f"argument {item}: expected a value but found the known "
+                        f"flag {flag!r}; put flags before {item}, or use "
+                        f"{item}={value} to search for that literal text"
+                    )
                 out.append(f"{item}={value}")
                 index += 2
                 continue
         out.append(item)
         index += 1
     return out
+
+
+def _explicit_instance_options(argv: list[str]) -> tuple[bool, bool]:
+    instance = False
+    instance_id = False
+    index = 0
+    while index < len(argv):
+        item = argv[index]
+        if item == "--":
+            break
+        if item in {"-i", "--instance"}:
+            instance = True
+            index += 2
+            continue
+        if item.startswith("--instance=") or (
+            item.startswith("-i") and not item.startswith("--") and len(item) > 2
+        ):
+            instance = True
+        if item == "--instance-id":
+            instance_id = True
+            index += 2
+            continue
+        if item.startswith("--instance-id="):
+            instance_id = True
+        index += 1
+    return instance, instance_id
 
 
 def _apply_sticky_defaults(args: argparse.Namespace) -> None:
@@ -1616,6 +1744,10 @@ def main(argv: list[str] | None = None) -> int:
     # before args.format exists) can still emit a JSON error envelope.
     _MACHINE_ERROR_FORMAT = _requested_output_format(parse_argv)
     args = parser.parse_args(_protect_flag_like_option_values(parser, parse_argv))
+    (
+        args._explicit_instance,
+        args._explicit_instance_id,
+    ) = _explicit_instance_options(parse_argv)
     handler: Callable[[argparse.Namespace], int] | None = getattr(args, "handler", None)
     if handler is None:
         selected_parser = getattr(args, "_parser", parser)

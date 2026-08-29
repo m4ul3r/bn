@@ -97,6 +97,39 @@ def test_try_idle_shutdown_held_off_while_inflight(monkeypatch):
     assert inst._shutting_down is False
 
 
+@pytest.mark.parametrize("state", ["queued", "running"])
+def test_try_idle_shutdown_held_off_while_load_job_nonterminal(monkeypatch, state):
+    """A detached load job runs on its own worker thread outside any request's
+    dispatch, so _inflight alone can't see it -- the reaper must also consult
+    _load_jobs before latching shutdown."""
+    _, inst = _instance(monkeypatch)
+    inst._last_activity = 100.0
+    inst._load_jobs["job-1"] = {"state": state}
+    assert inst._try_idle_shutdown(now=100.0 + 10_000.0, timeout=30.0) is False
+    assert inst._shutting_down is False
+
+
+@pytest.mark.parametrize("state", ["complete", "failed"])
+def test_try_idle_shutdown_ignores_terminal_load_job(monkeypatch, state):
+    """complete/failed jobs are done -- they must never pin shutdown on their own."""
+    _, inst = _instance(monkeypatch)
+    inst._last_activity = 100.0
+    inst._load_jobs["job-1"] = {"state": state}
+    assert inst._try_idle_shutdown(now=131.0, timeout=30.0) is True
+    assert inst._shutting_down is True
+
+
+def test_idle_shutdown_waits_for_detached_load_then_full_idle_window(monkeypatch):
+    _, inst = _instance(monkeypatch)
+    inst._last_activity = 100.0
+    inst._load_jobs["job"] = {"state": "running"}
+    assert inst._try_idle_shutdown(now=1000.0, timeout=30.0) is False
+    assert inst._last_activity == 1000.0
+    inst._load_jobs["job"]["state"] = "complete"
+    assert inst._try_idle_shutdown(now=1029.0, timeout=30.0) is False
+    assert inst._try_idle_shutdown(now=1031.0, timeout=30.0) is True
+
+
 def test_request_registered_first_blocks_shutdown(monkeypatch):
     """F1 half A: a request that registers before the reaper wins -- shutdown is
     refused because _inflight > 0."""
