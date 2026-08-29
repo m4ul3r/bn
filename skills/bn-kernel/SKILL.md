@@ -147,7 +147,7 @@ Prefer these curated helpers for list-shaped and common reads:
 - `await s.decompile(identifier)` returns the non-empty text string with inherited annotation bodies redacted. Use `include_annotations=True` only after an explicit contamination decision. Skipped placeholders raise and direct you to `force_analysis=True`.
 - `await s.disasm(identifier, count=N)` / `lines=(START, END)` returns an address-ordered, bridge-sliced string with canonical `0x` addresses. `lines` is a 1-indexed inclusive text-line range, never an address range; out-of-range windows raise.
 - `await s.il(identifier)` returns the non-empty text string, `await s.xrefs(identifier, timeout=..., ...)` a validated row collection.
-- `await s.callsites(callee, timeout=..., ...)` defaults to 100 rows. A bounded high-fan-in payload may have `total=None`; read `total_lower_bound`, `callers_scanned`, `caller_total`, and `scan_truncated` instead of treating null as zero.
+- `await s.callsites(callee, timeout=..., ...)` defaults to 100 rows. A bounded high-fan-in payload may have `total=None`; read `total_lower_bound`, `callers_scanned`, `caller_total`, and `scan_truncated` instead of treating null as zero. `total` is monotone across a collection's pages: a `None` page can be followed by a page with the exact integer once the caller scan completes, so a long `callsites` collection can legitimately end with a determined total after starting with null ones -- but an already-determined total never reverts to null or changes to a different int.
 - `await s.strings(timeout=..., ...)` defaults to 100 rows to avoid latency cliffs; pass `limit=None` explicitly for a full collection. `imports` and `sections` retain explicit `limit=` control.
 - `await s.assert_unannotated()` reports offending comment locations; `allow_contaminated=True` is the explicit bypass and returns the full orientation digest. It fails **closed**: the digest must be a mapping whose `existing_annotations` is a mapping carrying non-negative integer `comments`, `function_comments` and `user_symbols`. An unreadable digest raises instead of collapsing to "zero comments", and `allow_contaminated=True` waives the contamination *policy*, never that payload contract.
 
@@ -157,9 +157,11 @@ payloads raise instead of returning an empty/list/dict/`None` shape that can be
 misread as “no findings.”
 
 Paged reads also require each page to publish an integer `offset` equal to the one
-requested, and reject any cross-page `total` transition (`null`→int, int→`null`, or
-a changed int). Progress is otherwise tracked by the caller's own arithmetic, so a
-bridge that ignores pagination would silently return duplicate rows.
+requested, and hold `total` to a **monotone** contract: `null` means "not
+determined yet" (a capped scan, e.g. high-fan-in `callsites`) and an integer means
+"determined", so `null`→int is a legal refinement, while int→`null` and a changed
+int are rejected as bridge drift. Progress is otherwise tracked by the caller's own
+arithmetic, so a bridge that ignores pagination would silently return duplicate rows.
 
 **`limit=0` asks for the schema, not the rows.** Passing `limit=0` to a curated
 collection helper (or to `Session.all()` / `bn.Client.collect()`) performs exactly
@@ -170,6 +172,16 @@ returned to you and never lands in `s.last.value`. The envelope you get back
 reports `returned=0` and `limit=0`, keeps the bridge-owned `kind`, `total` and
 `row_fields`, and reports `has_more=true` whenever the probe found a row — from a
 zero-row position, that row alone proves more exists at this offset.
+
+`Result` projects the common probe verdicts directly:
+
+```python
+s.last.returned   # 0
+s.last.has_more   # True when the probe found a row
+```
+
+`s.last.payload` remains the complete envelope and is authoritative for fields
+without a `Result` convenience property.
 
 `row_fields` may legitimately be **absent** from a `limit=0` envelope: the bridge
 derives it from a declared schema or from an actual row, so an *empty* collection
@@ -304,6 +316,15 @@ target, then stop the instance.
 ## Load cost and memory
 
 Full loads can take many minutes and each bridge can consume hundreds of MB. Detached start registers the bridge first and exposes queued/running/complete/failed load state through `session status`; it is the recovery path when a synchronous cold load would exceed 120 seconds. Bound fan-out concurrency, watch RSS with `bn session list`, use `--quick` for raw/container triage (it cannot skip analysis already stored inside a BNDB), and stop instances promptly.
+
+For high-fanout cold starts, the orchestration tool's command timeout must exceed
+`BN_SPAWN_TIMEOUT`; otherwise the harness can kill `bn session start` while its
+new-session child continues registering. On a heavily loaded host, set a larger
+spawn budget (for example `BN_SPAWN_TIMEOUT=180`) and give the surrounding tool a
+strictly larger timeout. This changes the registration budget, not the detached
+load-job budget; continue polling the exact job separately. In a 16-way dogfood
+run, every start and load succeeded with that budget, but two start commands took
+more than 30 seconds (maximum 34.3 seconds).
 
 ## OMP harness escalation
 

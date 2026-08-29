@@ -9,7 +9,6 @@ the ``bn.cli`` module at call time -- ``cli.send_request(...)`` rather than a
 from __future__ import annotations
 
 import argparse
-import contextlib
 import os
 import shutil
 import signal
@@ -429,25 +428,29 @@ def _session_start(args: argparse.Namespace) -> int:
     if loaded:
         result["loaded"] = loaded
 
-    # If the caller asked to preload binaries but none loaded, the freshly
-    # spawned bridge is an empty zombie they'd have to hunt down and stop. Shut
+    # If the caller asked to preload binaries but none loaded, the freshly spawned
+    # bridge is an empty zombie the caller would have to hunt down and stop. Shut
+    # it down here and report the outcome under `stopped` / `cleanup_errors`.
     if binaries and not successes:
         cleanup_errors: list[str] = []
-        try:
-            cli.send_request("shutdown", instance_id=instance.instance_id)
-        except BridgeError as exc:
-            cleanup_errors.append(f"shutdown request failed: {exc}")
+        # One verified process pin for the whole TERM -> wait -> KILL escalation
+        # (#694): the pid is pinned and its identity proven once, and both signals
+        # go through that same pin, so cleanup can never terminate an unrelated
+        # process that recycled this pid.
+        with cli.BridgeProcessSignal(instance) as signaller:
             try:
-                os.kill(instance.pid, signal.SIGTERM)
-            except OSError as signal_exc:
-                cleanup_errors.append(f"SIGTERM failed: {signal_exc}")
-        stopped = cli.wait_for_teardown(instance, timeout=5.0)
-        if not stopped:
-            try:
-                os.kill(instance.pid, signal.SIGKILL)
-            except OSError as exc:
-                cleanup_errors.append(f"SIGKILL failed: {exc}")
-            stopped = cli.wait_for_teardown(instance, timeout=2.0)
+                cli.send_request("shutdown", instance_id=instance.instance_id)
+            except BridgeError as exc:
+                cleanup_errors.append(f"shutdown request failed: {exc}")
+                reason = signaller.send(signal.SIGTERM)
+                if reason is not None:
+                    cleanup_errors.append(f"SIGTERM not sent: {reason}")
+            stopped = cli.wait_for_teardown(instance, timeout=5.0)
+            if not stopped:
+                reason = signaller.send(signal.SIGKILL)
+                if reason is not None:
+                    cleanup_errors.append(f"SIGKILL not sent: {reason}")
+                stopped = cli.wait_for_teardown(instance, timeout=2.0)
         result["stopped"] = stopped
         if cleanup_errors:
             result["cleanup_errors"] = cleanup_errors
@@ -535,79 +538,89 @@ def _session_stop(args: argparse.Namespace) -> int:
         )
     # Resolve the instance up front so we can confirm teardown by pid + files
     # after the shutdown, and SIGTERM it if the socket request fails.
-    inst = next(
-        (
-            i for i in cli.list_instances()
-            if i.instance_id == target_id or cli.instance_selector(i) == target_id
-        ),
-        None,
-    )
+    # Lifecycle lookup, not normal discovery: a bridge whose socket file is gone
+    # is hidden from `session list` because nothing can be dispatched to it, but
+    # that unreachable process is exactly the one this command must be able to
+    # stop (#694).
+    inst = cli.find_lifecycle_instance(target_id)
+    # One verified pin for the whole escalation, opened BEFORE the graceful
+    # shutdown so the process this command may later signal is pinned throughout
+    # (#694): the pid cannot be recycled while pinned, and both SIGTERM and
+    # SIGKILL address that same proven process.
+    signaller = cli.BridgeProcessSignal(inst) if inst is not None else None
     try:
-        cli.send_request("shutdown", instance_id=target_id)
-        method = "shutdown"
-    except BridgeError:
-        # Fallback: SIGTERM the process directly.
-        if inst is None:
-            raise BridgeError(f"No bridge instance found with id: {target_id}")
         try:
-            os.kill(inst.pid, signal.SIGTERM)
-        except OSError as exc:
-            print(
-                f"error: failed to stop bridge instance {target_id} "
-                f"(pid {inst.pid}): {exc}",
-                file=sys.stderr,
-            )
-            return 1
-        method = "sigterm"
-
-    result: dict[str, Any] = {"instance_id": target_id, "stopped": True}
-    if method == "sigterm":
-        result["method"] = method
-
-    # Block until the socket/registry are gone and the process has exited, so a
-    # follow-on `bn session start --instance-id <same>` can't race the dying
-    # instance and fail as a duplicate (#92 Problem B). Escalate to SIGKILL if
-    # graceful teardown stalls, and report failure if it never converges.
-    if inst is not None:
-        if not cli.wait_for_teardown(inst, timeout=5.0):
-            with contextlib.suppress(OSError):
-                os.kill(inst.pid, signal.SIGKILL)
-            if not cli.wait_for_teardown(inst, timeout=2.0):
-                result["stopped"] = False
-                result["error"] = (
-                    f"bridge instance {target_id} (pid {inst.pid}) did not fully "
-                    "tear down; registry/socket may be stale."
-                )
-                cli._emit_result(args, result, text_renderer=_render_session_stop_text, stem="session-stop")
+            cli.send_request("shutdown", instance_id=target_id)
+            method = "shutdown"
+        except BridgeError:
+            # Fallback: signal the pinned process directly.
+            if inst is None or signaller is None:
+                raise BridgeError(f"No bridge instance found with id: {target_id}")
+            reason = signaller.send(signal.SIGTERM)
+            if reason is not None:
+                print(f"error: {reason}", file=sys.stderr)
                 return 1
-            result["method"] = "sigkill"
+            method = "sigterm"
 
-    # #436: clean up the instance's project-local `.bn-<id>` marker so it doesn't
-    # accumulate as stray VCS noise. Remove by the canonical instance id (the
-    # marker was dropped under it), falling back to the requested selector.
-    marker_id = inst.instance_id if inst is not None else target_id
-    removed = cli.remove_instance_markers(marker_id)
-    if not removed and marker_id != target_id:
-        removed = cli.remove_instance_markers(target_id)
-    if inst is not None and isinstance(inst.meta, dict):
-        for raw_path in inst.meta.get("marker_paths", []) or []:
-            marker_path = Path(str(raw_path))
-            if marker_path.name != f".bn-{inst.instance_id}":
-                continue
-            try:
-                marker_path.unlink()
-            except FileNotFoundError:
-                # A clean bridge stop removes its own tracked markers before the
-                # CLI can unlink them. Still report the recorded path as cleared.
+        result: dict[str, Any] = {"instance_id": target_id, "stopped": True}
+        if method == "sigterm":
+            result["method"] = method
+
+        # Block until the socket/registry are gone and the process has exited, so a
+        # follow-on `bn session start --instance-id <same>` can't race the dying
+        # instance and fail as a duplicate (#92 Problem B). Escalate to SIGKILL if
+        # graceful teardown stalls, and report failure if it never converges.
+        if inst is not None and signaller is not None:
+            if not cli.wait_for_teardown(inst, timeout=5.0):
+                # Escalate through the SAME verified pin: SIGKILL against an
+                # unproven or recycled pid is the most destructive form of the bug
+                # (#694), so an unproven pin sends nothing and reports instead.
+                reason = signaller.send(signal.SIGKILL)
+                converged = (
+                    cli.wait_for_teardown(inst, timeout=2.0)
+                    if reason is None
+                    else False
+                )
+                if not converged:
+                    result["stopped"] = False
+                    detail = f" {reason}." if reason is not None else ""
+                    result["error"] = (
+                        f"bridge instance {target_id} (pid {inst.pid}) did not fully "
+                        f"tear down; registry/socket may be stale.{detail}"
+                    )
+                    cli._emit_result(args, result, text_renderer=_render_session_stop_text, stem="session-stop")
+                    return 1
+                result["method"] = "sigkill"
+
+        # #436: clean up the instance's project-local `.bn-<id>` marker so it doesn't
+        # accumulate as stray VCS noise. Remove by the canonical instance id (the
+        # marker was dropped under it), falling back to the requested selector.
+        marker_id = inst.instance_id if inst is not None else target_id
+        removed = cli.remove_instance_markers(marker_id)
+        if not removed and marker_id != target_id:
+            removed = cli.remove_instance_markers(target_id)
+        if inst is not None and isinstance(inst.meta, dict):
+            for raw_path in inst.meta.get("marker_paths", []) or []:
+                marker_path = Path(str(raw_path))
+                if marker_path.name != f".bn-{inst.instance_id}":
+                    continue
+                try:
+                    marker_path.unlink()
+                except FileNotFoundError:
+                    # A clean bridge stop removes its own tracked markers before the
+                    # CLI can unlink them. Still report the recorded path as cleared.
+                    removed.append(marker_path)
+                    continue
+                except OSError:
+                    continue
                 removed.append(marker_path)
-                continue
-            except OSError:
-                continue
-            removed.append(marker_path)
-    result["marker_removed"] = [str(path) for path in dict.fromkeys(removed)]
+        result["marker_removed"] = [str(path) for path in dict.fromkeys(removed)]
 
-    cli._emit_result(args, result, text_renderer=_render_session_stop_text, stem="session-stop")
-    return 0
+        cli._emit_result(args, result, text_renderer=_render_session_stop_text, stem="session-stop")
+        return 0
+    finally:
+        if signaller is not None:
+            signaller.close()
 
 
 @command("session", "restart", help="Stop a bridge session and respawn it (same id), reloading its targets",
@@ -618,13 +631,9 @@ def _session_restart(args: argparse.Namespace) -> int:
     same binaries -- so the new bridge serves current code without the caller
     hunting for the right paths."""
     target_id = args.instance
-    inst = next(
-        (
-            i for i in cli.list_instances()
-            if i.instance_id == target_id or cli.instance_selector(i) == target_id
-        ),
-        None,
-    )
+    # Lifecycle lookup (#694): a socket-less bridge is hidden from normal
+    # discovery, but restarting it is a legitimate way to recover it.
+    inst = cli.find_lifecycle_instance(target_id)
     if inst is None:
         raise BridgeError(
             f"No bridge instance found with id: {target_id}. See `bn session list`."
@@ -642,21 +651,36 @@ def _session_restart(args: argparse.Namespace) -> int:
     except Exception:
         pass
 
+    # Capture the project markers this instance owns, also BEFORE the teardown
+    # removes them (#694). The stopped bridge unlinks its own `.bn-<id>` files and
+    # the refresh-only load below can only touch a marker in THIS cwd, so a
+    # restart run from anywhere else silently dropped the marker that resolves a
+    # bare `bn` in the original project root. The registry is the record of where
+    # they were; they are restored explicitly once the new bridge is up.
+    inherited_markers: list[str] = []
+    if resolved_id and isinstance(inst.meta, dict):
+        expected_marker = f".bn-{resolved_id}"
+        for raw_path in inst.meta.get("marker_paths", []) or []:
+            marker_path = Path(str(raw_path))
+            if marker_path.name == expected_marker:
+                inherited_markers.append(str(marker_path))
+
     # Stop the old process: graceful shutdown, then SIGTERM/SIGKILL escalation,
     # blocking until the socket/registry are gone so the respawn can reuse the id.
-    try:
-        cli.send_request("shutdown", instance_id=resolved_id)
-    except BridgeError:
-        with contextlib.suppress(OSError):
-            os.kill(inst.pid, signal.SIGTERM)
-    if not cli.wait_for_teardown(inst, timeout=5.0):
-        with contextlib.suppress(OSError):
-            os.kill(inst.pid, signal.SIGKILL)
-        if not cli.wait_for_teardown(inst, timeout=2.0):
-            raise BridgeError(
-                f"bridge instance {target_id} (pid {inst.pid}) did not tear down; "
-                "cannot restart cleanly. Stop it manually and re-spawn."
-            )
+    # Both signals are gated on durable process identity: a restart must never
+    # terminate an unrelated process that recycled the recorded pid (#694).
+    with cli.BridgeProcessSignal(inst) as signaller:
+        try:
+            cli.send_request("shutdown", instance_id=resolved_id)
+        except BridgeError:
+            _require_signal_delivered(signaller.send(signal.SIGTERM), target_id)
+        if not cli.wait_for_teardown(inst, timeout=5.0):
+            _require_signal_delivered(signaller.send(signal.SIGKILL), target_id)
+            if not cli.wait_for_teardown(inst, timeout=2.0):
+                raise BridgeError(
+                    f"bridge instance {target_id} (pid {inst.pid}) did not tear down; "
+                    "cannot restart cleanly. Stop it manually and re-spawn."
+                )
 
     instance = cli.spawn_instance(resolved_id)
     # Refresh the project marker like `session start` does (#377), but REFRESH-ONLY
@@ -680,6 +704,10 @@ def _session_restart(args: argparse.Namespace) -> int:
         except BridgeError as exc:
             reloaded.append({"path": t["path"], "error": str(exc)})
 
+    markers = _restore_inherited_markers(
+        instance.instance_id, inherited_markers, no_marker=no_marker
+    )
+
     failures = [x for x in reloaded if isinstance(x, dict) and x.get("error")]
     result: dict[str, Any] = {
         "instance_id": instance.instance_id,
@@ -689,8 +717,74 @@ def _session_restart(args: argparse.Namespace) -> int:
         # Rendered by the session-start text renderer under "loaded".
         "loaded": reloaded,
     }
+    if markers is not None:
+        result["markers"] = markers
     cli._emit_result(args, result, text_renderer=_render_session_start_text, stem="session-restart")
     return 1 if failures else 0
+
+
+def _require_signal_delivered(reason: str | None, target_id: str) -> None:
+    """Raise when a teardown signal was not delivered to the verified process.
+
+    The registry pid is not an identity on its own: a crashed bridge's pid can be
+    recycled, and SIGTERM/SIGKILL would then kill an unrelated process. The
+    signaller pins and verifies the process, so *reason* being set means nothing
+    was sent -- abort the restart loudly rather than respawn over a live bridge
+    (#694).
+    """
+    if reason is not None:
+        raise BridgeError(
+            f"{reason}. Bridge instance {target_id} was left as it is; stop it "
+            "manually, then run `bn session start`."
+        )
+
+
+def _restore_inherited_markers(
+    instance_id: str | None,
+    paths: list[str],
+    *,
+    no_marker: bool,
+) -> dict[str, Any] | None:
+    """Ask the respawned bridge to re-publish the markers of the old process.
+
+    Returns the bridge's report, an error report, or None when there is nothing
+    to restore. Marker restoration is best-effort: a restart whose targets came
+    back is still a successful restart, so a failure here is reported (stderr +
+    the JSON payload) rather than failing the command (#694).
+    """
+    if not paths:
+        return None
+    if no_marker:
+        return {"restored": [], "requested": paths, "skipped_reason": "markers disabled"}
+    try:
+        response = cli.send_request(
+            "restore_markers",
+            params={"paths": paths},
+            instance_id=instance_id,
+        )
+    except BridgeError as exc:
+        print(
+            f"warning: could not restore project marker(s) {', '.join(paths)} "
+            f"after the restart: {exc}",
+            file=sys.stderr,
+        )
+        return {"restored": [], "requested": paths, "error": str(exc)}
+    result = response.get("result") if isinstance(response, dict) else None
+    if not isinstance(result, dict):
+        print(
+            "warning: the restarted bridge returned a malformed restore_markers "
+            f"reply; project marker(s) {', '.join(paths)} may be missing",
+            file=sys.stderr,
+        )
+        return {"restored": [], "requested": paths, "error": "malformed reply"}
+    for entry in result.get("skipped") or []:
+        if isinstance(entry, dict):
+            print(
+                f"warning: project marker {entry.get('path')} was not restored "
+                f"({entry.get('reason')})",
+                file=sys.stderr,
+            )
+    return result
 
 
 def _rss_mb(pid: int) -> float | None:
@@ -744,6 +838,13 @@ def _running_instances_result(selector_filter: str | None = None) -> dict[str, A
 
 @command("session", "list", help="List running bridge sessions")
 def _session_list(args: argparse.Namespace) -> int:
+    # An explicit `-i ''` is an empty SELECTOR, not "no selector": the filter in
+    # _running_instances_result is truthiness-based, so an empty string silently
+    # disabled it and listed every session -- the opposite of what an explicit
+    # selector asks for, and the same trap `bn session stop ""` already refuses
+    # (#694). Rejected here through the shared guard so the message matches every
+    # other command's.
+    cli._require_nonempty_instance(args)
     selector_filter = (
         getattr(args, "instance", None)
         if getattr(args, "_explicit_instance", False)
@@ -756,6 +857,9 @@ def _session_list(args: argparse.Namespace) -> int:
 
 @command("instance", "list", help="List running bridge instances (alias for `session list`)")
 def _instance_list(args: argparse.Namespace) -> int:
+    # `instance list` ignores the selector entirely, but an explicit empty one is
+    # still a caller mistake and is refused everywhere else in the CLI (#694).
+    cli._require_nonempty_instance(args)
     result: Any = _running_instances_result()
     cli._emit_result(args, result, text_renderer=_render_session_list_text, stem="instance-list")
     return 0

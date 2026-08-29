@@ -308,6 +308,13 @@ def _callsites(
             scan_truncated = True
             break
 
+    # Producer side of the monotone `total` contract (#694 item 3): `total`
+    # stays `null` here while the caller scan is capped, becomes the exact
+    # count once a later page's scan completes without truncation, and never
+    # regresses from an int back to `null` or to a different int. The client
+    # page validators (`src/bn/client.py` and
+    # `skills/bn-kernel/src/bn_kernel/__init__.py`) enforce that monotonicity
+    # across pages of one collection.
     if scan_truncated:
         assert limit is not None
         page = rows[offset:offset + limit]

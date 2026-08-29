@@ -22,6 +22,7 @@ from .paths import (
     bridge_registry_path, bridge_socket_path, ensure_private_dir, find_instance_markers,
     instances_dir,
 )
+from .proc_identity import PinUnavailable, identity_verdict, pin_process
 
 
 class BridgeError(RuntimeError):
@@ -91,6 +92,10 @@ class BridgeInstance:
     meta: dict[str, Any]
     instance_id: str | None = None
     instance_token: str | None = None
+    # True when the registry resolved but its socket file is gone: the bridge
+    # process may still be alive, yet nothing can be dispatched to it. Normal
+    # discovery hides these; only the lifecycle (admin) lookup returns them (#694).
+    unreachable: bool = False
 
 
 def instance_selector(instance: BridgeInstance) -> str:
@@ -170,6 +175,117 @@ def _process_state(pid: int) -> str | None:
     return fields[0] if fields else None
 
 
+def bridge_process_alive(instance: BridgeInstance) -> bool:
+    """Whether the bridge process *instance* registered is still running.
+
+    A recycled pid is NOT the bridge: the check runs against a pinned process
+    where possible, so the answer cannot be about a pid that was reused between
+    the liveness probe and the identity read (#694).
+    """
+    try:
+        pin = pin_process(instance.pid)
+    except PinUnavailable:
+        # No pin: either the pid is already gone, or this platform has no pidfd.
+        # Nothing is signalled from here, so a best-effort probe is acceptable --
+        # it only affects how long teardown polls.
+        if not _process_alive(instance.pid):
+            return False
+        return identity_verdict(instance.meta, instance.pid) != "mismatch"
+    with pin:
+        return pin.verdict(instance.meta) != "mismatch"
+
+
+class BridgeProcessSignal:
+    """A verified pin on a bridge process, held across a whole teardown.
+
+    `bn session start` cleanup, `session stop` and `session restart` all fall back
+    to SIGTERM, wait, then SIGKILL when the shutdown request fails. A pid read
+    from a registry file is only safe to signal while it is provably still the
+    bridge, so the pid is PINNED once (``os.pidfd_open``), its identity verified
+    through that pin, and EVERY signal of the escalation sent through the same
+    pin: the process cannot exit and have its pid recycled between the check and
+    either kill, and both signals provably address one identical process (#694).
+
+    Never raises. ``refusal`` is None only when the pin is verified; ``send()``
+    returns None when the signal was delivered and a complete, user-facing
+    sentence otherwise.
+    """
+
+    __slots__ = ("_instance", "_pin", "refusal")
+
+    def __init__(self, instance: BridgeInstance) -> None:
+        self._instance = instance
+        self._pin = None
+        selector = instance_selector(instance)
+        try:
+            pin = pin_process(instance.pid)
+        except PinUnavailable as exc:
+            self.refusal: str | None = (
+                f"refusing to signal pid {instance.pid} for bridge instance "
+                f"{selector!r}: {exc}"
+            )
+            return
+        verdict = pin.verdict(instance.meta)
+        if verdict == "proven":
+            self._pin = pin
+            self.refusal = None
+            return
+        pin.close()
+        if verdict == "mismatch":
+            self.refusal = (
+                f"refusing to signal pid {instance.pid} for bridge instance "
+                f"{selector!r}: the identity recorded at startup (boot id plus "
+                "process start time) does not match the pinned process, so the "
+                "bridge exited and its pid was reused"
+            )
+        else:
+            self.refusal = (
+                f"refusing to signal pid {instance.pid} for bridge instance "
+                f"{selector!r}: it recorded no verifiable process identity (an "
+                "older bridge wrote the registry, or this platform exposes no "
+                "boot id / process start time), so it cannot be confirmed to "
+                f"still be the bridge; confirm with `ps -p {instance.pid}` and "
+                "stop it manually"
+            )
+
+    def __enter__(self) -> BridgeProcessSignal:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._pin is not None:
+            self._pin.close()
+            self._pin = None
+
+    def send(self, sig: int) -> str | None:
+        """Deliver *sig* through the verified pin, or return why it was not sent.
+
+        Identity is verified once, at pin time: the pin itself guarantees every
+        later signal reaches that same process, so a second signal never re-reads
+        ``/proc`` (where a post-SIGTERM reap would look like "no identity").
+        """
+        if self.refusal is not None:
+            return self.refusal
+        if self._pin is None:
+            return (
+                f"refusing to signal pid {self._instance.pid}: the verified "
+                "process pin was already released"
+            )
+        selector = instance_selector(self._instance)
+        try:
+            self._pin.send(sig)
+        except ProcessLookupError:
+            return f"pid {self._instance.pid} exited before the signal was delivered"
+        except OSError as exc:
+            return (
+                f"failed to signal pid {self._instance.pid} for bridge instance "
+                f"{selector!r}: {exc}"
+            )
+        return None
+
+
 def _empty_response_error(instance: BridgeInstance, op: str | None) -> BridgeError:
     """Explain a connection that accepted the request but replied with nothing.
 
@@ -231,6 +347,7 @@ def _load_instance(
     path: Path,
     *,
     socket_timeout: float = 0.2,
+    include_unreachable: bool = False,
 ) -> BridgeInstance | None:
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
@@ -250,16 +367,34 @@ def _load_instance(
 
     process_state = _process_state(pid)
     owner_alive = _process_alive(pid) and process_state not in {"Z", "X", "x"}
+    # Liveness alone cannot tell a running bridge from an unrelated process that
+    # recycled its pid, so discovery consults the durable identity too (#694).
+    verdict = identity_verdict(payload, pid)
+    unreachable = False
     if not socket_path.exists():
-        if not owner_alive:
+        # start() binds the socket BEFORE writing the registry, so "registry with
+        # no socket" is never a legitimate startup window: it is a bridge that
+        # died hard, or a phantom kept listed only by whatever owns its pid now.
+        # A dead or unproven owner is purged outright; a PROVEN live owner is an
+        # unreachable bridge -- no request can reach it, so normal discovery and
+        # `bn session list` must not advertise it, but its record is the only
+        # handle `bn session stop` has on a process that is still holding memory,
+        # so lifecycle lookups (include_unreachable=True) still resolve it. Once
+        # that process is gone the next discovery purges the record (#694).
+        if not owner_alive or verdict != "proven":
             _purge_stale_registry(path, socket_path)
             return None
+        if not include_unreachable:
+            return None
+        unreachable = True
     elif not _socket_is_live(socket_path, timeout=socket_timeout):
         # A stopped or overloaded live bridge may not accept before the probe
         # timeout (its accept backlog can be full). Never convert temporary
         # unresponsiveness into destructive discovery cleanup: request dispatch
-        # will report bridge_stopped or the real socket failure.
-        if not owner_alive:
+        # will report bridge_stopped or the real socket failure. A recorded
+        # identity that MISMATCHES is not unresponsiveness -- it is proof the
+        # bridge exited and its pid was reused -- so that entry is swept.
+        if not owner_alive or verdict == "mismatch":
             _purge_stale_registry(path, socket_path)
             return None
 
@@ -273,10 +408,23 @@ def _load_instance(
         meta=payload,
         instance_id=instance_id,
         instance_token=payload.get("instance_token"),
+        unreachable=unreachable,
     )
 
 
-def list_instances(*, timeout: float | None = None) -> list[BridgeInstance]:
+def list_instances(
+    *,
+    timeout: float | None = None,
+    include_unreachable: bool = False,
+) -> list[BridgeInstance]:
+    """Every resolvable bridge instance.
+
+    ``include_unreachable`` adds registries whose socket file is gone but whose
+    process is provably alive. Request routing must NEVER set it (nothing can be
+    dispatched to such a bridge); the two callers that must are the lifecycle
+    lookup behind `bn session stop`/`restart` and spawn collision detection,
+    which has to see a hidden record before reusing its instance id (#694).
+    """
     instances: list[BridgeInstance] = []
     deadline = time.monotonic() + timeout if timeout is not None else None
 
@@ -290,7 +438,11 @@ def list_instances(*, timeout: float | None = None) -> list[BridgeInstance]:
                     "Timed out selecting a bridge instance while scanning registries"
                 )
             socket_timeout = min(0.2, remaining)
-        return _load_instance(path, socket_timeout=socket_timeout)
+        return _load_instance(
+            path,
+            socket_timeout=socket_timeout,
+            include_unreachable=include_unreachable,
+        )
 
     # Legacy fixed registry (GUI mode or old headless)
     fixed_registry = bridge_registry_path()
@@ -308,6 +460,23 @@ def list_instances(*, timeout: float | None = None) -> list[BridgeInstance]:
                 instances.append(instance)
 
     return instances
+
+
+def find_lifecycle_instance(
+    selector: str,
+    *,
+    timeout: float | None = None,
+) -> BridgeInstance | None:
+    """Resolve *selector* for a lifecycle command, unreachable bridges included.
+
+    `bn session stop` / `session restart` must be able to name a bridge whose
+    socket is gone -- that unreachable process is exactly the one a user needs to
+    kill -- while normal discovery keeps hiding it (#694).
+    """
+    for inst in list_instances(timeout=timeout, include_unreachable=True):
+        if inst.instance_id == selector or instance_selector(inst) == selector:
+            return inst
+    return None
 
 
 def gc_instances() -> dict[str, Any]:
@@ -441,6 +610,44 @@ def _remaining_deadline(deadline: float | None, context: str) -> float | None:
     return remaining
 
 
+def _resolve_spawn_timeout() -> float:
+    """Resolve BN_SPAWN_TIMEOUT into a positive number of seconds.
+
+    Starting a bridge is its OWN budget, deliberately separate from the request
+    budget. Handing instance selection the resolved request timeout let a child
+    that never registers hold an ordinary request for 600s -- or a load/refresh
+    for 3600s -- and made BN_SPAWN_TIMEOUT=1 do nothing at all (#694).
+    """
+    raw_timeout = os.environ.get("BN_SPAWN_TIMEOUT")
+    if raw_timeout is None:
+        return DEFAULT_SPAWN_TIMEOUT
+    try:
+        timeout = float(raw_timeout)
+    except ValueError:
+        raise BridgeError(
+            f"BN_SPAWN_TIMEOUT={raw_timeout!r} is not a valid positive "
+            "number of seconds"
+        ) from None
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise BridgeError(
+            f"BN_SPAWN_TIMEOUT={raw_timeout!r} is not a valid positive "
+            "number of seconds"
+        )
+    return timeout
+
+
+def _spawn_timeout_within(deadline: float | None, context: str) -> float:
+    """The spawn budget, capped by whatever is left of the request deadline.
+
+    Both bounds are real: a spawn must not outlive the caller's end-to-end
+    request budget, and it must not consume that whole budget waiting for a
+    registration that is not coming.
+    """
+    budget = _resolve_spawn_timeout()
+    remaining = _remaining_deadline(deadline, context)
+    return budget if remaining is None else min(budget, remaining)
+
+
 def _auto_spawn_locked(timeout: float | None = SPAWN_LOCK_TIMEOUT) -> BridgeInstance:
     """Serialize auto-spawn and keep lock, discovery, and registration bounded."""
     deadline = time.monotonic() + timeout if timeout is not None else None
@@ -486,13 +693,12 @@ def choose_instance(
             if inst.instance_id == instance_id or instance_selector(inst) == instance_id:
                 return inst
         if spawn_missing_named:
-            remaining = _remaining_deadline(
-                deadline, "starting the requested bridge instance"
-            )
+            # A spawn is bounded by BN_SPAWN_TIMEOUT capped by the request
+            # deadline -- never by the request budget alone (#694).
             return spawn_instance(
                 instance_id,
-                timeout=(
-                    remaining if remaining is not None else DEFAULT_SPAWN_TIMEOUT
+                timeout=_spawn_timeout_within(
+                    deadline, "starting the requested bridge instance"
                 ),
             )
         raise BridgeError(
@@ -508,7 +714,7 @@ def choose_instance(
         raise _multiple_instances_error(instances)
     if auto_start:
         return _auto_spawn_locked(
-            timeout=_remaining_deadline(deadline, "auto-starting a bridge")
+            timeout=_spawn_timeout_within(deadline, "auto-starting a bridge")
         )
     raise BridgeError("No running Binary Ninja bridge instances found")
 
@@ -766,22 +972,7 @@ def spawn_instance(
 ) -> BridgeInstance:
     """Spawn a bridge within one lock-and-registration deadline."""
     if timeout is None:
-        raw_timeout = os.environ.get("BN_SPAWN_TIMEOUT")
-        if raw_timeout is None:
-            timeout = DEFAULT_SPAWN_TIMEOUT
-        else:
-            try:
-                timeout = float(raw_timeout)
-            except ValueError:
-                raise BridgeError(
-                    f"BN_SPAWN_TIMEOUT={raw_timeout!r} is not a valid positive "
-                    "number of seconds"
-                ) from None
-            if not math.isfinite(timeout) or timeout <= 0:
-                raise BridgeError(
-                    f"BN_SPAWN_TIMEOUT={raw_timeout!r} is not a valid positive "
-                    "number of seconds"
-                )
+        timeout = _resolve_spawn_timeout()
     if instance_id is not None and instance_id != "default":
         validate_instance_id(instance_id)
     deadline = time.monotonic() + timeout
@@ -802,8 +993,14 @@ def _spawn_instance_unlocked(
 ) -> BridgeInstance:
     """Spawn-and-register core. MUST run under _spawn_lock()."""
     deadline = time.monotonic() + timeout
+    # Collision detection MUST see unreachable records too (#694): a socket-less
+    # registry is hidden from normal discovery, but its process can still be
+    # alive -- spawning a second bridge under that same id would bind its socket
+    # path, overwrite its registry, and orphan the live process with no record
+    # left to stop it.
     existing = list_instances(
-        timeout=_remaining_deadline(deadline, "checking existing bridge instances")
+        timeout=_remaining_deadline(deadline, "checking existing bridge instances"),
+        include_unreachable=True,
     )
     if instance_id is None:
         existing_selectors = {instance_selector(inst) for inst in existing}
@@ -836,8 +1033,13 @@ def _spawn_instance_unlocked(
     while time.monotonic() < deadline:
         if reg_path.exists():
             remaining = _remaining_deadline(deadline, "waiting for bridge registration")
+            # include_unreachable so a registry that exists under this id is SEEN
+            # (and reported as an ownership collision below) rather than silently
+            # skipped until the spawn deadline expires (#694).
             inst = _load_instance(
-                reg_path, socket_timeout=min(0.2, remaining or 0.2)
+                reg_path,
+                socket_timeout=min(0.2, remaining or 0.2),
+                include_unreachable=True,
             )
             if inst is not None:
                 # Verify the registered process is the child WE spawned. A
@@ -887,15 +1089,20 @@ def wait_for_teardown(
     `bn session stop` used to return as soon as the shutdown ACK (or a SIGTERM)
     was delivered, before the socket/registry were unlinked and the process
     exited -- so `stop X && start X` could race the dying instance and fail as a
-    duplicate (#92 Problem B). Convergence here means the process is gone AND the
-    registry no longer resolves (`_load_instance` returns None, which also sweeps
-    a stale registry+socket left by a hard kill). Returns True on convergence.
+    duplicate (#92 Problem B). Convergence here means the bridge process is gone
+    AND the registry no longer resolves (`_load_instance` returns None, which
+    also sweeps a stale registry+socket left by a hard kill). A pid that outlives
+    the bridge because an unrelated process reused it counts as gone: identity,
+    not the bare number, decides (#694). Returns True on convergence.
     """
     deadline = time.monotonic() + timeout
     while True:
         gone = (
-            not _process_alive(instance.pid)
-            and _load_instance(instance.registry_path) is None
+            not bridge_process_alive(instance)
+            # include_unreachable: convergence means the registry FILE is gone,
+            # not merely hidden from normal discovery (#694).
+            and _load_instance(instance.registry_path, include_unreachable=True)
+            is None
         )
         if gone:
             return True

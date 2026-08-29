@@ -61,6 +61,7 @@ from .paths import (
     PLUGIN_NAME, bridge_registry_path, bridge_socket_path, cache_home, ensure_private_dir,
     instances_dir, marker_name, project_root,
 )
+from .proc_identity import identity_payload
 from .seam import BridgeContext
 from .version import VERSION, build_id_for_file, build_id_for_package
 
@@ -927,6 +928,19 @@ class BinaryNinjaBridge:
         self._marker_paths: set[str] = set()
         self._load_jobs_lock = threading.Lock()
         self._load_jobs: dict[str, dict[str, Any]] = {}
+        # Detached load workers, so stop() can join what it is able to (#694).
+        self._load_job_threads: dict[str, threading.Thread] = {}
+        # Teardown latch (#694). stop() unlinks the socket, the project markers
+        # and the registry, but a detached load worker started by
+        # load_binary_async keeps running on its own thread and used to
+        # re-publish the marker + registry AFTER teardown removed them, leaving
+        # files that advertise a bridge which no longer exists. Every filesystem
+        # publication takes this lock and honours the latch, and stop() holds it
+        # across its unlinks, so a publication either lands before teardown (and
+        # is removed by it) or is skipped. NEVER acquired while holding
+        # _load_jobs_lock -- stop() latches, then refuses queued jobs.
+        self._teardown_lock = threading.Lock()
+        self._stopped: bool = False
         self.targets = TargetManager()
         self.ctx = BridgeContext(self.targets)
         self.socket_path = bridge_socket_path(instance_id)
@@ -1008,30 +1022,71 @@ class BinaryNinjaBridge:
         self._write_registry()
         bn.log_info(f"BN Agent Bridge listening on {self.socket_path}")
 
-    def stop(self):  # pragma: no cover - requires GUI runtime
+    def stop(self, *, load_join_timeout: float = 2.0):
+        # Latch teardown and refuse every not-yet-started load job under ONE hold
+        # of _teardown_lock (#694). Holding it across both halves is what closes
+        # the interleaving: a worker checks the latch and performs its
+        # queued->running transition under the same lock, so it can only observe
+        # "not stopped" while this hold has not happened yet -- it can never slip
+        # between the latch and the refusal and start a load into a dying process.
+        # Lock order everywhere is teardown -> load-jobs.
+        with self._teardown_lock:
+            self._stopped = True
+            self._refuse_queued_load_jobs_locked()
         if self._server is not None:
             with contextlib.suppress(Exception):
                 self._server.shutdown()
             with contextlib.suppress(Exception):
                 self._server.server_close()
-        if self.socket_path.exists():
-            with contextlib.suppress(OSError):
-                self.socket_path.unlink()
-        for marker_path in tuple(self._marker_paths):
-            with contextlib.suppress(OSError):
-                Path(marker_path).unlink()
-        self._marker_paths.clear()
-        if self.registry_path.exists():
-            with contextlib.suppress(OSError):
-                self.registry_path.unlink()
-        # On a clean shutdown there's no crash to diagnose, so drop the log
-        # file too rather than leave it as clutter in the instances dir. A
-        # crash skips stop() entirely (SIGKILL/segfault), so crash logs are
-        # preserved for `bn`'s empty-response diagnostic to point at.
-        log_path = self.registry_path.with_suffix(".log")
-        if log_path.exists():
-            with contextlib.suppress(OSError):
-                log_path.unlink()
+        # Join what can be joined. A load already inside
+        # update_analysis_and_wait() is not interruptible, so the latch -- not
+        # this join -- is what makes teardown final; the join just gives a
+        # nearly-done worker the chance to finish before the files disappear.
+        for thread in self._load_worker_threads():
+            with contextlib.suppress(RuntimeError):
+                thread.join(timeout=load_join_timeout)
+        with self._teardown_lock:
+            if self.socket_path.exists():
+                with contextlib.suppress(OSError):
+                    self.socket_path.unlink()
+            for marker_path in tuple(self._marker_paths):
+                with contextlib.suppress(OSError):
+                    Path(marker_path).unlink()
+            self._marker_paths.clear()
+            if self.registry_path.exists():
+                with contextlib.suppress(OSError):
+                    self.registry_path.unlink()
+            # On a clean shutdown there's no crash to diagnose, so drop the log
+            # file too rather than leave it as clutter in the instances dir. A
+            # crash skips stop() entirely (SIGKILL/segfault), so crash logs are
+            # preserved for `bn`'s empty-response diagnostic to point at.
+            log_path = self.registry_path.with_suffix(".log")
+            if log_path.exists():
+                with contextlib.suppress(OSError):
+                    log_path.unlink()
+
+    def _load_worker_threads(self) -> list[threading.Thread]:
+        with self._load_jobs_lock:
+            return [
+                thread
+                for thread in self._load_job_threads.values()
+                if thread.is_alive()
+            ]
+
+    def _refuse_queued_load_jobs_locked(self) -> None:
+        """Fail every not-yet-started load job. Caller MUST hold _teardown_lock.
+
+        A queued worker that started after stop() would open a view into a dying
+        process and publish nothing usable, so its job gets a terminal, pollable
+        verdict instead of sitting at ``queued`` forever (#694).
+        """
+        finished_at = datetime.now(timezone.utc).isoformat()
+        with self._load_jobs_lock:
+            for job in self._load_jobs.values():
+                if job.get("state") == "queued":
+                    job["state"] = "failed"
+                    job["error"] = "bridge stopped before the load started"
+                    job["finished_at"] = finished_at
 
     def _write_project_marker(self, workdir: str | None, no_marker: bool,
                               refresh_only: bool = False) -> str | None:
@@ -1055,18 +1110,86 @@ class BinaryNinjaBridge:
         marker = root / marker_name(self.instance_id)
         if refresh_only and not marker.exists():
             return None
-        try:
-            marker.write_text(json.dumps({
-                "instance_id": self.instance_id,
-                "socket_path": str(self.socket_path),
-                "pid": os.getpid(),
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }), encoding="utf-8")
-            self._marker_paths.add(str(marker))
-        except OSError as exc:
-            return f"could not write project marker in {root} ({exc}); resolve with -i"
+        note = self._publish_marker(marker)
+        if note is not None:
+            return f"could not write project marker in {root} ({note}); resolve with -i"
         self._git_exclude_marker(root)
         return None
+
+    def _publish_marker(self, marker: Path) -> str | None:
+        """Write this instance's marker body to *marker*. None on success.
+
+        Under the teardown latch (#694): a detached load worker that finishes
+        after stop() must not recreate a marker teardown just removed. Returns a
+        short reason on refusal/failure so the caller can render it in context.
+        """
+        body = json.dumps({
+            "instance_id": self.instance_id,
+            "socket_path": str(self.socket_path),
+            "pid": os.getpid(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        })
+        with self._teardown_lock:
+            if self._stopped:
+                return "bridge is shutting down"
+            try:
+                marker.write_text(body, encoding="utf-8")
+            except OSError as exc:
+                return str(exc)
+            self._marker_paths.add(str(marker))
+        return None
+
+    def _restore_markers(self, paths: Any) -> dict[str, Any]:
+        """Re-publish project markers this instance inherits from a prior process.
+
+        `bn session restart` respawns under the SAME instance id, but the stopped
+        bridge unlinked its own `.bn-<id>` markers on the way out and a
+        refresh-only load only ever touches a marker in the CLI's cwd -- so a
+        restart from any other directory silently dropped the marker that
+        resolves a bare `bn` in the original project root (#694). The CLI passes
+        the paths it recorded before the teardown; the bridge stays the only
+        marker writer, so a restored marker is owned -- and cleaned up on the next
+        stop -- exactly like the original.
+
+        Only a path whose basename is THIS instance's marker name and whose
+        parent directory already exists is restored; anything else is reported
+        under `skipped` rather than creating a stray file somewhere new.
+        """
+        if not self.instance_id:
+            raise RuntimeError(
+                "restore_markers: this bridge has no instance id; project markers "
+                "are per-instance and the fixed GUI bridge has none"
+            )
+        if not isinstance(paths, list) or not all(
+            isinstance(item, str) for item in paths
+        ):
+            raise RuntimeError("restore_markers: paths must be a list of strings")
+        expected = marker_name(self.instance_id)
+        restored: list[str] = []
+        skipped: list[dict[str, str]] = []
+        for raw in dict.fromkeys(paths):
+            marker = Path(raw)
+            if marker.name != expected:
+                skipped.append({"path": raw, "reason": f"not a {expected} marker"})
+                continue
+            if not marker.parent.is_dir():
+                skipped.append({"path": raw, "reason": "parent directory does not exist"})
+                continue
+            note = self._publish_marker(marker)
+            if note is not None:
+                skipped.append({"path": raw, "reason": note})
+                continue
+            restored.append(str(marker))
+            self._git_exclude_marker(marker.parent)
+        if restored:
+            # Record the inherited markers in the registry so `bn session stop`
+            # can find and clear them from any cwd.
+            self._write_registry()
+        return {
+            "instance_id": self.instance_id,
+            "restored": restored,
+            "skipped": skipped,
+        }
 
     def _git_exclude_marker(self, root: Path) -> None:
         """Add `.bn-*` to `.git/info/exclude` (not .gitignore -- no tracked-tree
@@ -1096,6 +1219,14 @@ class BinaryNinjaBridge:
             "plugin_build_id": PLUGIN_BUILD_ID,
             "started_at": datetime.now(timezone.utc).isoformat(),
         }
+        # Durable process identity (#694): a pid alone cannot distinguish this
+        # bridge from an unrelated process that recycles its number after a crash,
+        # and (pid, start ticks) is unique only within one boot while registries
+        # live in a persistent cache dir. `identity_payload()` records boot id +
+        # start ticks together (or nothing at all, which stays unprovable), and
+        # the CLI verifies both before it signals this pid or trusts a
+        # socket-less registry.
+        payload.update(identity_payload())
         if self.instance_id is not None:
             payload["instance_id"] = self.instance_id
         payload["instance_token"] = self.instance_token
@@ -1115,21 +1246,32 @@ class BinaryNinjaBridge:
         except Exception:
             binaries = []
         payload["binaries"] = binaries
-        payload["marker_paths"] = sorted(self._marker_paths)
         # Write atomically (temp file + rename) so a concurrent reader never
-        # sees a half-written registry and concludes no instance exists.
-        ensure_private_dir(self.registry_path.parent)
-        # tempfile.mkstemp opens at mode 0o600 (umask only clears bits, never
-        # adds), so the registry lands owner-only regardless of umask; os.replace
-        # preserves that mode (#612).
-        fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=self.registry_path.parent)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                fh.write(json.dumps(payload, indent=2))
-            os.replace(tmp, self.registry_path)
-        except Exception:
-            Path(tmp).unlink(missing_ok=True)
-            raise
+        # sees a half-written registry and concludes no instance exists. Under the
+        # teardown latch (#694): a detached load worker that finishes after stop()
+        # must not recreate a registry that advertises a bridge which is gone.
+        with self._teardown_lock:
+            if self._stopped:
+                return
+            # Snapshot the marker inventory HERE, under the same lock that guards
+            # marker publication and ownership (#694): reading it before the lock
+            # let a slow concurrent registry write capture the pre-restore set and
+            # then land after `_restore_markers()` had published its own, dropping
+            # the restored paths from the registry -- so the next `session stop`
+            # could not find and clear them.
+            payload["marker_paths"] = sorted(self._marker_paths)
+            ensure_private_dir(self.registry_path.parent)
+            # tempfile.mkstemp opens at mode 0o600 (umask only clears bits, never
+            # adds), so the registry lands owner-only regardless of umask;
+            # os.replace preserves that mode (#612).
+            fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=self.registry_path.parent)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    fh.write(json.dumps(payload, indent=2))
+                os.replace(tmp, self.registry_path)
+            except Exception:
+                Path(tmp).unlink(missing_ok=True)
+                raise
 
     def dispatch(self, payload: dict[str, Any]) -> dict[str, Any]:  # pragma: no cover - GUI runtime
         op = payload.get("op")
@@ -1380,9 +1522,29 @@ class BinaryNinjaBridge:
             self._load_jobs[job_id] = job
 
         def worker() -> None:
-            with self._load_jobs_lock:
-                job["state"] = "running"
-                job["started_at"] = datetime.now(timezone.utc).isoformat()
+            now = datetime.now(timezone.utc).isoformat()
+            # Latch check AND the queued->running transition under ONE hold of
+            # _teardown_lock, in the same teardown -> load-jobs order stop() uses
+            # (#694). Reading the latch and then reaching for the jobs lock
+            # separately let stop() latch in between, after which this worker could
+            # still take the jobs lock first and start a load into a process whose
+            # teardown had already begun.
+            with self._teardown_lock:
+                with self._load_jobs_lock:
+                    if self._stopped or job["state"] != "queued":
+                        # Either stop() already refused this job, or teardown
+                        # latched before the worker got scheduled. Never start a
+                        # load into a process that is exiting -- publish a terminal
+                        # verdict so a poller sees an answer instead of a job stuck
+                        # at `queued`.
+                        job["state"] = "failed"
+                        job["error"] = job.get("error") or (
+                            "bridge stopped before the load started"
+                        )
+                        job["finished_at"] = job.get("finished_at") or now
+                        return
+                    job["state"] = "running"
+                    job["started_at"] = now
             try:
                 result = self._load_binary(
                     str(resolved),
@@ -1402,11 +1564,19 @@ class BinaryNinjaBridge:
                     job["result"] = result
                     job["finished_at"] = datetime.now(timezone.utc).isoformat()
 
-        threading.Thread(
+        thread = threading.Thread(
             target=worker,
             name=f"bn-load-{job_id[:8]}",
             daemon=True,
-        ).start()
+        )
+        with self._load_jobs_lock:
+            # Keep only live workers: stop() joins whatever is still running, and
+            # finished threads are not worth retaining (#694).
+            for key, previous in list(self._load_job_threads.items()):
+                if not previous.is_alive():
+                    del self._load_job_threads[key]
+            self._load_job_threads[job_id] = thread
+        thread.start()
         return {
             "job_id": job_id,
             "state": "queued",
@@ -3236,6 +3406,14 @@ def _bind_refresh(bridge, params, target):  # only the write gate so reads stay 
 def _bind_shutdown(bridge, params, target):
     bridge._shutdown_event.set()
     return {"shutting_down": True}
+
+
+# lock="read": restoring a marker touches only project-local marker files and the
+# registry payload, which enumerates open targets -- a read of BN state, never a
+# mutation of it (#694).
+@op("restore_markers", lock="read")
+def _bind_restore_markers(bridge, params, target):
+    return bridge._restore_markers(params.get("paths"))
 
 
 @op("cancel_request", lock="none")

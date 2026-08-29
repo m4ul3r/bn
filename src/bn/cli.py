@@ -41,7 +41,11 @@ from .paths import (  # noqa: F401
 )
 from .transport import (  # noqa: F401
     BridgeError,
+    BridgeProcessSignal,
+    DEFAULT_REQUEST_TIMEOUT,
+    _resolve_timeout,
     _send_request_to_instance,
+    find_lifecycle_instance,
     gc_instances,
     instance_selector,
     list_instances,
@@ -701,7 +705,13 @@ def _maybe_regex_hint(args: argparse.Namespace, result: Any, query: str | None) 
     """When a NON-regex search whose query contains regex metacharacters matched
     nothing, nudge toward --regex on stderr -- the query was taken literally, so
     a pattern like `init|fini` silently returns zero results with no clue (#122).
-    Suppressed when --regex/--exact is set or the query is plain text."""
+    Suppressed when --regex/--exact is set or the query is plain text.
+
+    Deliberately NOT suppressed for --word (#694 item 7): the bridge's word-mode
+    match is `\\b` + `re.escape(query)` + `\\b` (see
+    `read_listing._search_functions`), i.e. still a literal token match, just
+    boundary-anchored -- so "was matched literally" remains true and the nudge
+    to add --regex is still good advice under --word."""
     if not query or getattr(args, "regex", False) or getattr(args, "exact", False):
         return
     # Every collection read is now a {kind, items, total, ...} envelope (#275),
@@ -725,9 +735,12 @@ def _should_retry_as_regex(args: argparse.Namespace, result: Any, query: str) ->
     returns a confident (misleading) `none`; auto-retrying it as a regex removes
     the trap. Branches, in order:
 
-    - An explicit `--regex` or `--exact` on *args* short-circuits to `False`:
-      the caller already chose literal-vs-pattern matching, so there is nothing
-      to retry.
+    - An explicit `--regex`, `--exact`, or `--word` on *args* short-circuits to
+      `False`: the caller already chose literal-vs-pattern matching (--word is
+      an escaped, boundary-anchored literal match, not a pattern -- see
+      `read_listing._search_functions`), so there is nothing to retry (#694
+      item 7: a zero-hit `--word 'foo.bar'` must not silently become the raw
+      regex `foo.bar` and match `fooXbar`).
     - *result* must be the `{..., "total": ...}` envelope dict; anything else
       (e.g. a raw list) is `False`.
     - *query* must contain at least one character from `_REGEX_METACHARS`
@@ -747,7 +760,7 @@ def _should_retry_as_regex(args: argparse.Namespace, result: Any, query: str) ->
       into a swallowed exception.
 
     Only a query that clears every guard above and compiles returns `True`."""
-    if getattr(args, "regex", False) or getattr(args, "exact", False):
+    if getattr(args, "regex", False) or getattr(args, "exact", False) or getattr(args, "word", False):
         return False
     if not isinstance(result, dict):
         return False
@@ -1071,6 +1084,19 @@ def _call(
         require_target=require_target,
         allow_implicit_target=allow_implicit_target,
     )
+    # One end-to-end deadline for this call, resolved exactly once (#694 item
+    # 8). Without it, the literal request below and the regex-fallback retry
+    # further down each re-resolve BN_REQUEST_TIMEOUT from scratch, so a single
+    # command could run for up to double its declared budget. `budget` mirrors
+    # what the literal `send_request` call below resolves for itself (it is not
+    # passed `timeout=`/`resolved=True` -- its own resolution IS where this
+    # deadline's clock starts); only the retry, which runs strictly after,
+    # needs to be handed the shrinking remainder.
+    budget = _resolve_timeout(
+        None,
+        default=op_default_timeout if op_default_timeout is not None else DEFAULT_REQUEST_TIMEOUT,
+    )
+    deadline = time.monotonic() + budget if budget is not None else None
     response = send_request(
         op,
         params=request_params,
@@ -1093,13 +1119,23 @@ def _call(
     if regex_fallback_query is not None and _should_retry_as_regex(args, result, regex_fallback_query):
         retry_params = dict(request_params)
         retry_params["regex"] = True
+        retry_timeout = None
+        if deadline is not None:
+            retry_timeout = deadline - time.monotonic()
+            if retry_timeout <= 0:
+                raise BridgeError(
+                    f"Timed out before the regex-fallback retry for {op!r}; the "
+                    f"{budget:g}s end-to-end request budget was already spent on "
+                    "the literal search (raise BN_REQUEST_TIMEOUT to allow both)"
+                )
         response = send_request(
             op,
             params=retry_params,
             target=target,
             instance_id=getattr(args, "instance", None),
             spawn_missing_named=spawn_missing_named,
-            **timeout_kwargs,
+            timeout=retry_timeout,
+            resolved=True,
         )
         result = response["result"]
         # An in-band marker so a --format json consumer (which reads stdout, not
@@ -1594,32 +1630,57 @@ def _known_option_strings(parser: argparse.ArgumentParser) -> set[str]:
 #            with characters argparse would treat as options
 _PROTECTED_DATA_OPTIONS = frozenset({"--query", "--code"})
 
+# Help is always safe to preserve as a literal data value rather than reject:
+# `bn strings --query -h` must search for the literal "-h" (documented in
+# reading.md), not exit 2 pointing at a flag collision that doesn't exist for
+# these three (every subparser carries them; they never take a value of their
+# own, so there's no "expected one argument" ambiguity to protect against).
+_HELP_OPTION_STRINGS = frozenset({"-h", "--help", "--help-full"})
+
 
 def _protect_flag_like_option_values(
     parser: argparse.ArgumentParser,
     argv: list[str],
 ) -> list[str]:
-    """Let explicit data options accept values that look like flags.
+    """Let a protected data option's value look like a flag -- but only when it
+    ISN'T actually one of the selected subcommand's own flags (#694 item 14).
 
     Argparse treats ``bn strings --query -h`` as a help flag instead of a query
-    value. When the user has explicitly supplied an option that takes arbitrary
-    data, preserve the next token as that option's value by rewriting to the
-    ``--opt=value`` spelling before parsing.
+    value. `--query`/`--code` are documented as accepting arbitrary data, so
+    the token right after one of them is classified against the ACTUAL
+    subcommand's known options (`_selected_parser_for_argv` +
+    `_known_option_strings` -- previously unused, restored here) before
+    parsing:
+
+    - not a known option of that subcommand (`-foo`, `--nope`, a bare `-`) or
+      one of the three universal help spellings (`-h`/`--help`/`--help-full`)
+      -> preserve it as the option's value by rewriting to ``--opt=value``.
+    - a known option of that subcommand (`--regex`, `--format`, `--limit`, ...)
+      -> reject with a usage error instead of silently treating the flag text
+      as the search query (a `--query --regex` typo returning a confident,
+      wrong "no matches for '--regex'" is worse than a loud rejection). Use
+      the explicit ``--opt=value`` spelling to search for that literal text.
     """
     protected_options = _PROTECTED_DATA_OPTIONS
+    selected = _selected_parser_for_argv(parser, argv)
+    known_options = _known_option_strings(selected)
     out: list[str] = []
     index = 0
     while index < len(argv):
         item = argv[index]
         if item in protected_options and index + 1 < len(argv):
             value = argv[index + 1]
-            # Rewrite ANY following flag-like token to the --opt=value spelling,
-            # including ones that collide with KNOWN options (--format, --target,
-            # --limit). These data options are documented as free-form, so
-            # `bn strings --query --format` must search the literal "--format",
-            # not have argparse consume it as the format flag (#102). A user who
-            # genuinely wants --query followed by a real flag uses = themselves.
             if value.startswith("-"):
+                # `--opt=value` spelling for the following token (e.g.
+                # `--query --format=json`) is classified on `--format`, not the
+                # whole `--format=json` string.
+                flag = value.split("=", 1)[0]
+                if flag in known_options and flag not in _HELP_OPTION_STRINGS:
+                    selected.error(
+                        f"argument {item}: expected a value but found the known "
+                        f"flag {flag!r}; put flags before {item}, or use "
+                        f"{item}={value} to search for that literal text"
+                    )
                 out.append(f"{item}={value}")
                 index += 2
                 continue

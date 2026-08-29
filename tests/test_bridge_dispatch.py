@@ -3856,3 +3856,124 @@ def test_declared_row_fields_match_the_rows_the_bridge_builds(monkeypatch):
         assert not undeclared, f"{kind}: row keys not declared: {sorted(undeclared)}"
         checked += 1
     assert checked >= 4, "drift guard did not exercise enough populated collections"
+
+
+def test_declared_row_fields_cover_conditional_producer_keys(monkeypatch):
+    # #694 item 9: several row keys are only set on SOME rows of a kind (a
+    # relocation-recovered import's `provenance`, a segment-backed section's
+    # permission fields, a fn-pointer-scan hit's `function_pointer`/
+    # `thumb_pointer`, a callsite's `call_index`/`within_query`/
+    # `callee_variadic`). `test_declared_row_fields_match_the_rows_the_bridge_builds`
+    # only exercises the UNCONDITIONAL keys (its shared fixture never triggers
+    # any of these paths), so it cannot catch a declaration that omits one of
+    # them. Drive each conditional path directly and hold it to the same
+    # undeclared-key bar.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    declared = sys.modules["bn_test_bridge._shared"]._DECLARED_ROW_FIELDS
+    fake_bn = sys.modules["binaryninja"]
+
+    # imports: a relocation-only external symbol recovered with no PLT/GOT
+    # symbol entry at all -- the only path that sets `provenance`.
+    jump_slot = fake_bn.RelocationType.ELFJumpSlotRelocationType
+    reloc_symbol = fake_bn.Symbol(fake_bn.SymbolType.ExternalSymbol, 0, "dispatch_record")
+    relocation = _FakeReloc(jump_slot, reloc_symbol)
+    relocation.address = 0x3000
+    imports_bv = _FakeBV()
+    imports_bv.relocations = [relocation]
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: imports_bv)
+    imports_result = instance._imports(None)
+    imports_observed = {key for row in imports_result["items"] for key in row}
+    assert "provenance" in imports_observed
+    assert not imports_observed - set(declared["imports"]), (
+        f"imports: row keys not declared: {sorted(imports_observed - set(declared['imports']))}"
+    )
+
+    # sections: a segment-backed section carries the permission projection.
+    sections_bv = _FakeBV(
+        sections={".text": _FakeSection(".text", 0x401000, 0x402000, 1)},
+        segments={0x401000: _FakeSegment(readable=True, writable=True, executable=True)},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: sections_bv)
+    sections_result = instance._sections(None)
+    sections_observed = {key for row in sections_result["items"] for key in row}
+    assert {"readable", "writable", "executable", "writable_executable", "permission_source"} <= sections_observed
+    assert not sections_observed - set(declared["sections"]), (
+        f"sections: row keys not declared: {sorted(sections_observed - set(declared['sections']))}"
+    )
+
+    # xrefs: a fn-pointer-scan hit stored as a thumb-tagged (addr|1) pointer.
+    func_addr = 0x401000
+    target = _FakeFunction(func_addr, "callback_only")
+    target.basic_blocks = [_FakeBasicBlock(func_addr, func_addr + 0x10)]
+    blob = bytearray(0x100)
+    blob[0x40:0x44] = (func_addr | 1).to_bytes(4, "little")
+    xrefs_bv = _FakeBV(
+        functions=[target],
+        arch=_FakeArch(name="armv7", address_size=4),
+        code_refs={func_addr: []},
+        data_refs={func_addr: []},
+        sections={".data.rel.ro": _FakeSection(".data.rel.ro", 0x420000, 0x420100)},
+        segments={0x420040: _FakeSegment(readable=True)},
+        memory={0x420000: bytes(blob)},
+    )
+    xrefs_result = instance._xrefs_to_address(xrefs_bv, func_addr, fn_pointer_scan=True)
+    xrefs_observed = {key for row in xrefs_result["data_refs"] for key in row}
+    assert {"function_pointer", "thumb_pointer"} <= xrefs_observed
+    assert not xrefs_observed - set(declared["xrefs"]), (
+        f"xrefs: row keys not declared: {sorted(xrefs_observed - set(declared['xrefs']))}"
+    )
+
+    # callsites: a variadic callee (`callee_variadic`) called from >=1 in-scope
+    # caller, which also always carries `call_index`/`within_query`.
+    callee = _FakeFunction(0x461746, "printf")
+    caller = _FakeFunction(0x412470, "format_and_send")
+    caller.basic_blocks = [_FakeBasicBlock(0x41249C, 0x4124D8)]
+    caller.low_level_il = [[_FakeLLILInstruction(0x4124A0, _FakeConstPtr(0x461746))]]
+    callsites_bv = _FakeBV(
+        functions=[callee, caller],
+        instruction_lengths={0x4124A0: 5},
+        disassembly={0x4124A0: "call printf"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: callsites_bv)
+    callsites_result = instance._callsites(None, "printf", within_identifiers=["format_and_send"])
+    callsites_observed = {key for row in callsites_result["items"] for key in row}
+    assert {"call_index", "within_query", "callee_variadic"} <= callsites_observed
+    assert not callsites_observed - set(declared["callsites"]), (
+        f"callsites: row keys not declared: {sorted(callsites_observed - set(declared['callsites']))}"
+    )
+
+
+_PREVIOUSLY_MISSING_ROW_FIELDS: dict[str, tuple[str, ...]] = {
+    "callsites": ("call_index", "within_query"),
+    "imports": ("provenance",),
+    "sections": ("readable", "writable", "executable", "writable_executable", "permission_source"),
+    "xrefs": ("function_pointer", "thumb_pointer"),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(_PREVIOUSLY_MISSING_ROW_FIELDS))
+def test_empty_page_row_fields_include_previously_missing_optional_keys(monkeypatch, kind):
+    # #694 item 9: a zero-hit page is exactly when there is no row to infer the
+    # schema from, so `row_fields` falls back to `_DECLARED_ROW_FIELDS` alone
+    # (`_annotate_row_fields`). It must still advertise every optional key a
+    # POPULATED page of this kind could carry -- omitting them here is the bug.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    op = "list_functions" if kind == "functions" else kind
+    op_params = {"callee": "memcpy"} if kind == "callsites" else (
+        {"identifier": "0x401000"} if kind == "xrefs" else {}
+    )
+
+    def empty_view(selector):
+        if kind == "callsites":
+            return _FakeBV(functions=[_FakeFunction(0x402000, "memcpy")])
+        return _FakeBV()
+
+    monkeypatch.setattr(instance.ctx, "_resolve_view", empty_view)
+
+    result = instance._dispatch_on_main(op, dict(op_params), "active")
+
+    assert result["items"] == []
+    missing = [key for key in _PREVIOUSLY_MISSING_ROW_FIELDS[kind] if key not in result["row_fields"]]
+    assert not missing, f"{kind}: empty-page row_fields missing {missing}"

@@ -168,7 +168,12 @@ def test_bootstrap_without_path_context_fails_actionably():
         )
 
 
-def test_bootstrap_removes_foreign_bn_kernel_source_path(tmp_path):
+def test_bootstrap_keeps_foreign_bn_kernel_source_path_but_precedes_it(tmp_path):
+    """A foreign/stale `bn_kernel` package elsewhere on `sys.path` (typically
+    shared site-packages, which also carries unrelated dependencies) must be
+    neutralized by import precedence and module eviction, never by deleting the
+    `sys.path` entry that contains it -- that used to make every unrelated
+    import from that root fail (#694 item 4)."""
     bootstrap = (
         Path(__file__).resolve().parents[1] / "skills" / "bn-kernel" / "bootstrap.py"
     )
@@ -185,10 +190,15 @@ def test_bootstrap_removes_foreign_bn_kernel_source_path(tmp_path):
             namespace,
             namespace,
         )
-        assert str(foreign_src) not in sys.path
+        assert str(foreign_src) in sys.path
         assert sys.path[0] == str(bootstrap.parent / "src")
+        assert namespace["bn_kernel"].__name__ == "bn_kernel"
+        assert not hasattr(namespace["bn_kernel"], "FOREIGN")
+        assert hasattr(namespace["bn_kernel"].Session, "disasm")
     finally:
         sys.path[:] = original_path
+
+
 def test_run_reads_complete_json_artifact_and_unwraps_items(monkeypatch, tmp_path):
     payload = {
         "kind": "functions",
@@ -284,14 +294,45 @@ def test_run_unwraps_first_text_key_and_can_return_payload(monkeypatch, tmp_path
 
 def test_result_is_immutable_and_uses_tuples():
     result = bn_kernel.Result(
-        value=[], payload={"total": 4}, notes=("note",), argv=("strings",), backend="cli"
+        value=[],
+        payload={"total": 4, "returned": 0, "has_more": True},
+        notes=("note",),
+        argv=("strings",),
+        backend="cli",
     )
 
     assert result.total == 4
+    assert result.returned == 0
+    assert result.has_more is True
     assert result.notes == ("note",)
     assert result.argv == ("strings",)
     with pytest.raises(FrozenInstanceError):
         result.backend = "native"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    ("payload", "returned", "has_more"),
+    [
+        ("text", None, None),
+        ({}, None, None),
+        ({"returned": -1, "has_more": 1}, None, None),
+        ({"returned": True, "has_more": "yes"}, None, None),
+        ({"returned": 3, "has_more": False}, 3, False),
+    ],
+)
+def test_result_collection_metadata_properties_are_typed(
+    payload, returned, has_more
+):
+    result = bn_kernel.Result(
+        value=[],
+        payload=payload,
+        notes=(),
+        argv=("strings",),
+        backend="cli",
+    )
+
+    assert result.returned == returned
+    assert result.has_more is has_more
 
 
 
@@ -531,6 +572,8 @@ def test_all_zero_limit_probes_one_row_and_discards_it(monkeypatch, tmp_path):
     # The bridge said has_more=False, but the probe found a row: from the
     # caller's zero-row position there IS more to fetch.
     assert session.last.payload["has_more"] is True
+    assert session.last.returned == 0
+    assert session.last.has_more is True
     assert session.last.payload["row_fields"] == [
         "name", "start", "end", "length", "semantics",
     ]
@@ -1781,6 +1824,45 @@ def test_assert_unannotated_locates_and_can_explicitly_allow_contamination():
     )
 
 
+@pytest.mark.parametrize(
+    "malformed_locations",
+    [42, {"address": "0x1234"}],
+    ids=["int", "mapping"],
+)
+def test_assert_unannotated_survives_malformed_comment_locations(
+    malformed_locations,
+):
+    """`comment_locations`/`function_comment_locations` are OPTIONAL rendering
+    detail, not part of the contamination verdict. A shape this gate cannot
+    read as a list (an int, a mapping) used to spread into a list literal and
+    crash with a bare TypeError, converting a real contamination finding into
+    an unhandled exception instead of the refusal it must still raise (#694
+    item 12)."""
+    session = bn_kernel.Session(instance="worker", backend="native")
+    digest = {
+        "existing_annotations": {
+            "comments": 1,
+            "comment_locations": malformed_locations,
+            "function_comments": 0,
+            "function_comment_locations": [],
+            "user_symbols": 0,
+        }
+    }
+
+    class OrientClient:
+        def request(self, op, params=None):
+            return digest
+
+    session._client = OrientClient()
+
+    with pytest.raises(bn_kernel.BridgeError, match="inherited comments") as caught:
+        _run(session.assert_unannotated())
+
+    assert "comments=1" in str(caught.value)
+    assert "malformed" in str(caught.value)
+
+
+
 def test_assert_unannotated_returns_digest_and_preserves_last():
     session = bn_kernel.Session(instance="worker", backend="native")
     digest = {
@@ -2976,16 +3058,17 @@ def test_all_rejects_a_non_integer_echoed_offset(monkeypatch, tmp_path, echoed):
 
 TOTAL_TRANSITIONS = [
     (
-        "none to int",
-        '{"items": [{"value": "a"}], "offset": 0, "returned": 1, "has_more": True}',
-        '{"items": [{"value": "b"}], "offset": 1, "returned": 1, "has_more": True,'
-        ' "total": 5}',
-    ),
-    (
         "int to none",
         '{"items": [{"value": "a"}], "offset": 0, "returned": 1, "has_more": True,'
         ' "total": 5}',
         '{"items": [{"value": "b"}], "offset": 1, "returned": 1, "has_more": True}',
+    ),
+    (
+        "int to different int",
+        '{"items": [{"value": "a"}], "offset": 0, "returned": 1, "has_more": True,'
+        ' "total": 5}',
+        '{"items": [{"value": "b"}], "offset": 1, "returned": 1, "has_more": True,'
+        ' "total": 9}',
     ),
 ]
 
@@ -2998,9 +3081,9 @@ TOTAL_TRANSITIONS = [
 def test_all_rejects_any_cross_page_total_transition(
     monkeypatch, tmp_path, label, first, second
 ):
-    """Reading the previous total off the first-page aggregate made a
-    None<->int transition invisible: `aggregate.get("total")` is None both when the
-    bridge published no total and when it published one that later changed."""
+    """`total` is monotone (#694 item 3): once a page has DETERMINED a total, a
+    later page dropping it back to null or reporting a different int is drift,
+    not a legitimate refinement, and must still be rejected."""
     script = _page_script(
         f"page = {first} if offset == 0 else {second}"
     )
@@ -3010,6 +3093,69 @@ def test_all_rejects_any_cross_page_total_transition(
     with pytest.raises(bn_kernel.BnError, match="total changed across pages"):
         _run(session.all("strings", page=1, limit=2))
 
+    assert session.last is None
+
+
+def test_all_accepts_a_capped_callsites_scan_completing_on_the_final_page(
+    monkeypatch, tmp_path
+):
+    """A high-fan-in `callsites` collection routinely reports `total: null` on a
+    capped page and the exact count once a later page's caller scan completes.
+    That `None -> int` refinement is the NORMAL end of a large collection and
+    must not be rejected as a transition (#694 item 3); the published aggregate
+    total must be the determined int, not the earlier null."""
+    script = _page_script(
+        'page = ({"items": [{"value": "a"}], "offset": 0, "returned": 1,\n'
+        '         "has_more": True, "total": None, "total_lower_bound": 2,\n'
+        '         "scan_truncated": True}\n'
+        '        if offset == 0 else\n'
+        '        {"items": [{"value": "b"}], "offset": 1, "returned": 1,\n'
+        '         "has_more": False, "total": 2, "scan_truncated": False})'
+    )
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+    session = bn_kernel.Session(backend="cli")
+
+    rows = _run(session.all("evidence", "calls", page=1))
+
+    assert [row["value"] for row in rows] == ["a", "b"]
+    assert session.last is not None
+    assert session.last.payload["total"] == 2
+
+
+def test_help_terminates_and_reaps_child_on_cancellation(monkeypatch, tmp_path):
+    """`help()` used to handle `asyncio.TimeoutError` but not `CancelledError`,
+    unlike `_run_resolved`, so cancelling an awaited `help()` leaked the running
+    `bn --help` child instead of terminating and reaping it (#694 item 11)."""
+    marker = tmp_path / "started"
+    script = f"""
+import sys, time
+open({str(marker)!r}, "w").write("up")
+time.sleep(30)
+"""
+    monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
+
+    terminate_calls: list[Any] = []
+    real_terminate = bn_kernel._terminate
+
+    def spy_terminate(process: Any) -> None:
+        terminate_calls.append(process)
+        real_terminate(process)
+
+    monkeypatch.setattr(bn_kernel, "_terminate", spy_terminate)
+
+    async def scenario() -> bn_kernel.Session:
+        session = bn_kernel.Session(backend="cli")
+        task = asyncio.ensure_future(session.help("target"))
+        while not marker.exists():
+            await asyncio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return session
+
+    session = _run(scenario())
+
+    assert len(terminate_calls) == 1
     assert session.last is None
 
 

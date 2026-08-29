@@ -1120,3 +1120,124 @@ def test_session_start_text_prints_the_target_selector_653(monkeypatch, capsys):
     assert "target: prog" in out
     assert "-t prog" in out
     assert "4242:1:99" in out
+
+
+# --- #694 item 8: one outer deadline across the literal + regex-fallback retry ---
+
+
+def test_regex_fallback_retry_uses_remaining_timeout_and_resolved_flag(monkeypatch, capsys):
+    """The literal request and the regex-fallback retry share ONE end-to-end
+    deadline. The retry must receive the shrinking remainder (a timeout
+    strictly smaller than the full budget) and resolved=True, not a fresh
+    full-budget timeout -- two fresh full-budget requests would let a single
+    command run for up to double its declared timeout."""
+    calls = []
+
+    def fake(op, *, params=None, target=None, instance_id=None,
+             spawn_missing_named=False, **kwargs):
+        calls.append(dict(kwargs))
+        if op == "search_functions":
+            if params.get("regex"):
+                return {"ok": True, "result": {"kind": "functions",
+                                               "items": [{"name": "Parse", "address": "0x1000"}],
+                                               "total": 1, "offset": 0, "limit": 100,
+                                               "returned": 1, "has_more": False}}
+            return {"ok": True, "result": {"kind": "functions", "items": [], "total": 0,
+                                           "offset": 0, "limit": 100, "returned": 0,
+                                           "has_more": False}}
+        raise AssertionError(op)
+
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+
+    rc = bn.cli.main(["function", "search", "Parse|Process", "--target", "active"])
+
+    assert rc == 0
+    assert len(calls) == 2
+    literal_kwargs, retry_kwargs = calls
+    # The literal request resolves the budget itself -- it is not handed an
+    # explicit timeout/resolved kwarg by _call.
+    assert "timeout" not in literal_kwargs
+    assert "resolved" not in literal_kwargs
+    assert retry_kwargs["resolved"] is True
+    assert retry_kwargs["timeout"] is not None
+    assert 0 < retry_kwargs["timeout"] < bn.cli.DEFAULT_REQUEST_TIMEOUT
+
+
+def test_regex_fallback_retry_raises_when_outer_deadline_already_expired(monkeypatch, capsys):
+    """An outer deadline that has already elapsed by the time the literal
+    search comes back empty must refuse the retry with a clear BridgeError
+    instead of silently sending a second full-budget request."""
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "5")
+    # First read is when the deadline is set; the second (100s later) is when
+    # the retry checks the remainder -- well past the 5s budget.
+    clock = iter([1000.0, 1100.0])
+    monkeypatch.setattr(bn.cli.time, "monotonic", lambda: next(clock))
+    calls = []
+
+    def fake(op, *, params=None, target=None, instance_id=None,
+             spawn_missing_named=False, **kwargs):
+        calls.append(op)
+        if op == "search_functions":
+            return {"ok": True, "result": {"kind": "functions", "items": [], "total": 0,
+                                           "offset": 0, "limit": 100, "returned": 0,
+                                           "has_more": False}}
+        raise AssertionError(op)
+
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+
+    rc = bn.cli.main(["function", "search", "Parse|Process", "--target", "active"])
+
+    assert rc == 2
+    assert calls == ["search_functions"]  # no second (retry) request sent
+    err = capsys.readouterr().err
+    assert "BN_REQUEST_TIMEOUT" in err
+
+
+def test_regex_fallback_retry_with_timeout_disabled_has_no_deadline(monkeypatch, capsys):
+    """BN_REQUEST_TIMEOUT=off disables the end-to-end deadline entirely -- the
+    retry still runs, but with timeout=None (still resolved=True)."""
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "off")
+    calls = []
+
+    def fake(op, *, params=None, target=None, instance_id=None,
+             spawn_missing_named=False, **kwargs):
+        calls.append(dict(kwargs))
+        if op == "search_functions":
+            if params.get("regex"):
+                return {"ok": True, "result": {"kind": "functions",
+                                               "items": [{"name": "Parse", "address": "0x1000"}],
+                                               "total": 1, "offset": 0, "limit": 100,
+                                               "returned": 1, "has_more": False}}
+            return {"ok": True, "result": {"kind": "functions", "items": [], "total": 0,
+                                           "offset": 0, "limit": 100, "returned": 0,
+                                           "has_more": False}}
+        raise AssertionError(op)
+
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+
+    rc = bn.cli.main(["function", "search", "Parse|Process", "--target", "active"])
+
+    assert rc == 0
+    assert len(calls) == 2
+    assert calls[1]["timeout"] is None
+    assert calls[1]["resolved"] is True
+
+
+def test_call_rejects_malformed_request_timeout_before_sending_anything(monkeypatch, capsys):
+    """A malformed BN_REQUEST_TIMEOUT must raise before the literal request is
+    even sent -- the deadline is resolved once, up front."""
+    monkeypatch.setenv("BN_REQUEST_TIMEOUT", "not-a-number")
+    calls = []
+
+    def fake(op, **kwargs):
+        calls.append(op)
+        raise AssertionError("send_request must not be called with a malformed timeout")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+
+    rc = bn.cli.main(["function", "search", "Parse", "--target", "active"])
+
+    assert rc == 2
+    assert calls == []
+    err = capsys.readouterr().err
+    assert "not a valid timeout" in err

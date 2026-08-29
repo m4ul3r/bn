@@ -24,12 +24,14 @@ def _spill_artifact_namespace(path: str) -> types.SimpleNamespace:
     )
 
 
-def _zero_function_search(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+def _zero_function_search(op, *, params=None, target=None, timeout=30.0, instance_id=None,
+                          spawn_missing_named=False, resolved=False, **kwargs):
     return {"ok": True, "result": {"functions": [], "total": 0, "offset": 0,
                                    "limit": None, "returned": 0, "has_more": False}}
 
 
-def _zero_function_search_count(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+def _zero_function_search_count(op, *, params=None, target=None, timeout=30.0, instance_id=None,
+                                spawn_missing_named=False, resolved=False, **kwargs):
     return {"ok": True, "result": {"count": 0, "total": 0}}
 
 

@@ -44,24 +44,47 @@ def _json_response(*, ok: bool, result: Any = None, error: str | None = None) ->
 # renamed or added key can never leave a populated read advertising a stale
 # schema; `test_declared_row_fields_match_the_rows_the_bridge_builds` holds the
 # declarations to the same standard for the empty case.
+#
+# A key that a producer sets only CONDITIONALLY (not on every row of a kind --
+# e.g. a relocation-recovered import's `provenance`, a segment-backed section's
+# permission fields, a fn-pointer-scan hit's `function_pointer`/`thumb_pointer`,
+# a variadic callee's `callee_variadic`) MUST still be declared here, not just
+# left for a populated read to surface (#694 item 9). A zero-hit page is
+# EXACTLY the case where there is no row to infer the schema from, so leaving
+# an optional key out here means the one time in-band schema discovery is the
+# only source of truth, it lies.
 _DECLARED_ROW_FIELDS: dict[str, tuple[str, ...]] = {
     "functions": (
         "address", "name", "raw_name", "display_name", "size", "size_known",
         "imported", "auto_named", "basic_block_count",
     ),
-    "strings": ("address", "value", "chars", "length", "type"),
-    "imports": ("address", "name", "raw_name", "kind", "library", "namespace"),
+    "strings": (
+        "address", "value", "chars", "length", "type",
+        "format_directives", "directive_count", "code_refs",
+    ),
+    "imports": (
+        "address", "name", "raw_name", "kind", "library", "namespace",
+        "provenance",
+    ),
     "exports": (
         "address", "name", "raw_name", "display_name", "kind", "binding",
         "ordinal",
     ),
-    "sections": ("name", "start", "end", "length", "semantics"),
-    "xrefs": ("address", "kind", "function", "caller_function", "context"),
+    "sections": (
+        "name", "start", "end", "length", "semantics",
+        "readable", "writable", "executable", "writable_executable",
+        "permission_source",
+    ),
+    "xrefs": (
+        "address", "kind", "function", "caller_function", "context",
+        "function_pointer", "thumb_pointer",
+    ),
     "callsites": (
         "callee", "containing_function", "call_addr", "call_kind",
         "caller_static", "instruction_length", "call_instruction",
         "previous_instructions", "next_instructions", "hlil_statement",
         "hlil_statement_reason", "pre_branch_condition", "callee_variadic",
+        "call_index", "within_query",
     ),
 }
 

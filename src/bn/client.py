@@ -76,10 +76,20 @@ def _validate_page(
         or (bool(items) and total < requested_offset + len(items))
     ):
         raise BridgeError(f"malformed {op} page: invalid total {total!r}")
-    # Checked outside the `total is not None` guard on purpose: None->int and
-    # int->None are transitions too, and `_UNSEEN` is what distinguishes "no page
-    # has reported a total yet" from "a page reported None".
-    if previous_total is not _UNSEEN and previous_total != total:
+    # `total` is MONOTONE across the pages of one collection: `None` means "not
+    # determined yet" (e.g. a callsites page whose caller scan was capped), and
+    # an int means "determined". `None -> int` is a legal refinement -- a
+    # paging client (page_size=500 by default) routinely sees the capped page
+    # first and the exact-count page last on a large callsites collection, so
+    # rejecting that transition made `callsites(limit=None)` unable to finish
+    # (#694 item 3). `int -> None` and `int -> a different int` are drift and
+    # stay rejected. `_UNSEEN` is what distinguishes "no page has reported a
+    # total yet" from "a page reported None".
+    if (
+        previous_total is not _UNSEEN
+        and previous_total is not None
+        and previous_total != total
+    ):
         raise BridgeError(
             f"malformed {op} page: total changed across pages "
             f"({previous_total!r} -> {total!r})"

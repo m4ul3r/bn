@@ -692,17 +692,6 @@ def test_collect_rejects_a_non_integer_echoed_offset(monkeypatch, echoed):
     "label,first,second",
     [
         (
-            "none to int",
-            {"items": [{"id": 1}], "offset": 0, "returned": 1, "has_more": True},
-            {
-                "items": [{"id": 2}],
-                "offset": 1,
-                "returned": 1,
-                "has_more": True,
-                "total": 5,
-            },
-        ),
-        (
             "int to none",
             {
                 "items": [{"id": 1}],
@@ -713,14 +702,31 @@ def test_collect_rejects_a_non_integer_echoed_offset(monkeypatch, echoed):
             },
             {"items": [{"id": 2}], "offset": 1, "returned": 1, "has_more": True},
         ),
+        (
+            "int to different int",
+            {
+                "items": [{"id": 1}],
+                "offset": 0,
+                "returned": 1,
+                "has_more": True,
+                "total": 5,
+            },
+            {
+                "items": [{"id": 2}],
+                "offset": 1,
+                "returned": 1,
+                "has_more": True,
+                "total": 9,
+            },
+        ),
     ],
 )
 def test_collect_rejects_any_cross_page_total_transition(
     monkeypatch, label, first, second
 ):
-    """`aggregate.get("total")` is None both when the bridge published no total and
-    when it published one that later vanished, so the old check could not see a
-    None<->int transition at all."""
+    """`total` is monotone (#694 item 3): once a page has DETERMINED a total, a
+    later page dropping it back to null or reporting a different int is drift,
+    not a legitimate refinement, and must still be rejected."""
     pages = iter([{"result": first}, {"result": second}])
     monkeypatch.setattr(
         client_module, "send_request", lambda op, **kwargs: next(pages)
@@ -728,3 +734,46 @@ def test_collect_rejects_any_cross_page_total_transition(
 
     with pytest.raises(BridgeError, match="total changed across pages"):
         Client().collect("list_functions", page_size=1, limit=2)
+
+
+def test_collect_accepts_a_capped_callsites_scan_completing_on_the_final_page(
+    monkeypatch,
+):
+    """A high-fan-in `callsites` collection routinely reports `total: null` on a
+    capped page and the exact count once a later page's caller scan completes.
+    That `None -> int` refinement is the NORMAL end of a large collection and
+    must not be rejected as a transition (#694 item 3); the aggregate's
+    published total must be the determined int, not the earlier null."""
+    pages = iter(
+        [
+            {
+                "result": {
+                    "items": [{"id": 1}],
+                    "offset": 0,
+                    "returned": 1,
+                    "has_more": True,
+                    "total": None,
+                    "total_lower_bound": 2,
+                    "scan_truncated": True,
+                }
+            },
+            {
+                "result": {
+                    "items": [{"id": 2}],
+                    "offset": 1,
+                    "returned": 1,
+                    "has_more": False,
+                    "total": 2,
+                    "scan_truncated": False,
+                }
+            },
+        ]
+    )
+    monkeypatch.setattr(
+        client_module, "send_request", lambda op, **kwargs: next(pages)
+    )
+
+    aggregate = Client().collect("callsites", page_size=1)
+
+    assert [item["id"] for item in aggregate["items"]] == [1, 2]
+    assert aggregate["total"] == 2

@@ -26,20 +26,27 @@ else:
 _source_path = _skill_dir / "src" / "bn_kernel" / "__init__.py"
 _source_hash = hashlib.sha256(_source_path.read_bytes()).hexdigest()
 _source_dir = str(_skill_dir / "src")
-_source_resolved = _source_path.resolve()
 
-_clean_path = []
+# A foreign/stale `bn_kernel` package elsewhere on `sys.path` (typically shared
+# site-packages, which also carries unrelated dependencies like `bn` and
+# `pytest`) is neutralized by import precedence -- our source directory goes
+# first -- and by the `sys.modules` eviction below, NEVER by deleting the
+# `sys.path` entry that contains it. Deleting that root made every unrelated
+# import from it fail (#694 item 4). The only entries dropped here are ones
+# that already resolve to `_source_dir` itself, so repeated bootstraps do not
+# accumulate duplicates.
+_source_dir_resolved = str(Path(_source_dir).resolve())
+_deduped_path = []
 for _entry in sys.path:
     try:
-        _candidate = (Path(_entry) / "bn_kernel" / "__init__.py").resolve()
+        _entry_resolved = str(Path(_entry).resolve())
     except (OSError, RuntimeError):
-        _clean_path.append(_entry)
+        _deduped_path.append(_entry)
         continue
-    if _candidate.exists() and _candidate != _source_resolved:
+    if _entry_resolved == _source_dir_resolved:
         continue
-    if str(Path(_entry).resolve()) != str(Path(_source_dir).resolve()):
-        _clean_path.append(_entry)
-sys.path[:] = [_source_dir, *_clean_path]
+    _deduped_path.append(_entry)
+sys.path[:] = [_source_dir, *_deduped_path]
 
 
 def _module_matches_source(module) -> bool:

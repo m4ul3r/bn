@@ -3,8 +3,11 @@ from __future__ import annotations
 import errno
 import json
 import os
+import signal
 import socket
 import socketserver
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -1888,3 +1891,671 @@ def test_send_request_to_instance_does_not_re_resolve_a_preresolved_budget(
     )
 
     assert fake_socket.timeouts == pytest.approx([0.25], rel=1e-5)
+
+
+# --------------------------------------------------------------------------
+# #694: the spawn budget is separate from the request budget
+# --------------------------------------------------------------------------
+
+
+def test_auto_spawn_uses_the_spawn_budget_not_the_request_budget(monkeypatch):
+    # choose_instance() used to hand the resolved REQUEST timeout to the spawn
+    # path, so a child that never registers held an ordinary request for 600s
+    # (3600s for load/refresh) and BN_SPAWN_TIMEOUT was ignored entirely.
+    import bn.transport as transport
+
+    monkeypatch.setenv("BN_SPAWN_TIMEOUT", "1.5")
+    monkeypatch.setattr(transport, "list_instances", lambda **kwargs: [])
+    seen: list[float | None] = []
+
+    def fake_auto_spawn(timeout=None):
+        seen.append(timeout)
+        return "instance"
+
+    monkeypatch.setattr(transport, "_auto_spawn_locked", fake_auto_spawn)
+
+    assert choose_instance(timeout=600.0) == "instance"
+    assert seen == [pytest.approx(1.5, rel=1e-3)]
+
+
+def test_spawn_budget_is_capped_by_the_remaining_request_deadline(monkeypatch):
+    # Both bounds are real: the spawn must not outlive the caller's end-to-end
+    # request budget either.
+    import bn.transport as transport
+
+    monkeypatch.setenv("BN_SPAWN_TIMEOUT", "60")
+    monkeypatch.setattr(transport, "list_instances", lambda **kwargs: [])
+    seen: list[float | None] = []
+    monkeypatch.setattr(
+        transport,
+        "_auto_spawn_locked",
+        lambda timeout=None: seen.append(timeout) or "instance",
+    )
+
+    choose_instance(timeout=2.0)
+
+    assert seen and 0 < seen[0] <= 2.0
+
+
+def test_named_spawn_uses_the_spawn_budget(monkeypatch):
+    import bn.transport as transport
+
+    monkeypatch.setenv("BN_SPAWN_TIMEOUT", "2")
+    monkeypatch.setattr(transport, "list_instances", lambda **kwargs: [])
+    seen: list[float | None] = []
+    monkeypatch.setattr(
+        transport,
+        "spawn_instance",
+        lambda instance_id=None, timeout=None: seen.append(timeout) or "named",
+    )
+
+    assert choose_instance("wanted", spawn_missing_named=True, timeout=3600.0) == "named"
+    assert seen == [pytest.approx(2.0, rel=1e-3)]
+
+
+def test_malformed_spawn_timeout_is_rejected_before_spawning(monkeypatch):
+    import bn.transport as transport
+
+    monkeypatch.setenv("BN_SPAWN_TIMEOUT", "soon")
+    monkeypatch.setattr(transport, "list_instances", lambda **kwargs: [])
+    monkeypatch.setattr(
+        transport,
+        "_auto_spawn_locked",
+        lambda timeout=None: pytest.fail("must not spawn on a malformed budget"),
+    )
+
+    with pytest.raises(BridgeError, match="BN_SPAWN_TIMEOUT"):
+        choose_instance(timeout=600.0)
+
+
+def test_spawn_instance_still_resolves_its_own_env_budget(monkeypatch):
+    import bn.transport as transport
+
+    monkeypatch.setenv("BN_SPAWN_TIMEOUT", "3.25")
+    seen: list[float] = []
+
+    class _NullLock:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(transport, "_spawn_lock", lambda timeout=None: _NullLock())
+    monkeypatch.setattr(
+        transport,
+        "_spawn_instance_unlocked",
+        lambda instance_id=None, timeout=None, poll_interval=0.2: seen.append(timeout)
+        or "spawned",
+    )
+
+    assert spawn_instance("named1") == "spawned"
+    assert seen and 0 < seen[0] <= 3.25
+
+
+# --------------------------------------------------------------------------
+# #694: durable identity + ATOMIC signalling
+#
+# A registry pid is not an identity, and a /proc check followed by os.kill is not
+# atomic: the verified process can exit and its pid be recycled in between. The
+# bridge records (boot id, pid, start ticks) -- boot id because start ticks are
+# unique only within one boot while registries live in a persistent cache -- and
+# the CLI pins the pid with a pidfd, verifies identity THROUGH the pin, and sends
+# every signal of a teardown through that same pin.
+# --------------------------------------------------------------------------
+
+
+def _pidfd_available() -> bool:
+    from bn.proc_identity import PIDFD_AVAILABLE
+
+    return PIDFD_AVAILABLE
+
+
+def _identity(*, ticks_delta=0, boot=None, omit_boot=False, omit_ticks=False):
+    """A recorded identity for THIS process, optionally tampered with."""
+    from bn.proc_identity import boot_id, process_start_ticks
+
+    payload = {}
+    if not omit_ticks:
+        payload["pid_start_ticks"] = process_start_ticks(os.getpid()) + ticks_delta
+    if not omit_boot:
+        payload["boot_id"] = boot if boot is not None else boot_id()
+    return payload
+
+
+def _registry_payload(socket_path, *, pid, identity=None, instance_id=None):
+    payload = {
+        "pid": pid,
+        "socket_path": str(socket_path),
+        "plugin_name": "bn_agent_bridge",
+        "plugin_version": "0.1.0",
+        "instance_token": "identity-token",
+    }
+    payload.update(identity or {})
+    if instance_id is not None:
+        payload["instance_id"] = instance_id
+    return payload
+
+
+def _sleeper(*, ignore_sigterm=False):
+    """A real child process to pin and signal."""
+    program = "import time; time.sleep(30)"
+    if ignore_sigterm:
+        program = (
+            "import signal, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "time.sleep(30)\n"
+        )
+    return subprocess.Popen(
+        [sys.executable, "-c", program],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def test_identity_payload_records_boot_id_and_start_ticks():
+    from bn.proc_identity import boot_id, identity_payload, process_start_ticks
+
+    assert identity_payload() == {
+        "pid_start_ticks": process_start_ticks(os.getpid()),
+        "boot_id": boot_id(),
+    }
+
+
+def test_identity_verdict_requires_both_boot_id_and_start_ticks():
+    from bn.proc_identity import identity_verdict
+
+    live = os.getpid()
+
+    assert identity_verdict(_identity(), live) == "proven"
+    assert identity_verdict(_identity(ticks_delta=1), live) == "mismatch"
+    # A registry that predates this boot is positively stale: start ticks count
+    # from boot, so an old (pid, ticks) pair can collide with a fresh process --
+    # and registries live in a persistent cache dir across reboots.
+    assert (
+        identity_verdict(_identity(boot="00000000-0000-4000-8000-000000000000"), live)
+        == "mismatch"
+    )
+    # Half an identity proves nothing, so older registries stay unproven.
+    assert identity_verdict(_identity(omit_boot=True), live) == "unrecorded"
+    assert identity_verdict(_identity(omit_ticks=True), live) == "unrecorded"
+    assert identity_verdict({}, live) == "unrecorded"
+    for bad_ticks in (True, "12345", -1, None):
+        assert (
+            identity_verdict({"pid_start_ticks": bad_ticks, "boot_id": "b"}, live)
+            == "unrecorded"
+        )
+    for bad_boot in (True, 7, "", "   ", None):
+        assert (
+            identity_verdict({"pid_start_ticks": 1, "boot_id": bad_boot}, live)
+            == "unrecorded"
+        )
+
+
+class _FakePin:
+    """Stand-in for a pidfd pin, so the signalling policy is testable anywhere.
+
+    The pidfd wrappers are a property of the interpreter build (the
+    python-build-standalone runtime uv installs has none), and the safety policy
+    -- verify once, send every escalation signal through THAT pin, send nothing
+    when unproven -- must be exercised regardless. One native integration test
+    below covers the real syscall path where it exists.
+    """
+
+    def __init__(self, pid, verdict="proven", error=None):
+        self.pid = pid
+        self.fd = 4242
+        self._verdict = verdict
+        self._error = error
+        self.sent: list[int] = []
+        self.closed = False
+
+    def verdict(self, payload):
+        assert not self.closed, "verdict() after close(): the pin must stay open"
+        return self._verdict
+
+    def send(self, sig):
+        assert not self.closed, "send() after close(): the pin must stay open"
+        if self._error is not None:
+            raise self._error
+        self.sent.append(sig)
+
+    def close(self):
+        self.closed = True
+
+
+def _fake_pin(monkeypatch, **kwargs):
+    """Install a fake pin factory; returns (pins_created, call_pids)."""
+    import bn.transport as transport
+
+    pins: list[_FakePin] = []
+    pids: list[int] = []
+
+    def factory(pid):
+        pids.append(pid)
+        pin = _FakePin(pid, **kwargs)
+        pins.append(pin)
+        return pin
+
+    monkeypatch.setattr(transport, "pin_process", factory)
+    return pins, pids
+
+
+def _instance(tmp_path, *, pid=4321, meta=None):
+    from bn.transport import BridgeInstance
+
+    return BridgeInstance(
+        pid=pid,
+        socket_path=tmp_path / "child.sock",
+        registry_path=tmp_path / "child.json",
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at=None,
+        meta=_identity() if meta is None else meta,
+        instance_id="child1",
+        instance_token="t",
+    )
+
+
+def test_bridge_signal_sends_term_then_kill_through_one_verified_pin(
+    tmp_path, monkeypatch
+):
+    # The escalation must hold ONE pin: reopening between SIGTERM and SIGKILL is a
+    # second check-then-act window, and after SIGTERM the process can be a zombie
+    # whose identity re-read would look unprovable.
+    pins, pids = _fake_pin(monkeypatch)
+
+    with transport_module().BridgeProcessSignal(_instance(tmp_path)) as signaller:
+        assert signaller.refusal is None
+        assert signaller.send(signal.SIGTERM) is None
+        assert signaller.send(signal.SIGKILL) is None
+
+    assert pids == [4321]                     # pinned exactly once
+    assert len(pins) == 1
+    assert pins[0].sent == [signal.SIGTERM, signal.SIGKILL]
+    assert pins[0].closed is True             # released with the context manager
+
+
+@pytest.mark.parametrize(
+    "verdict, expected",
+    [
+        ("mismatch", "does not match the pinned process"),
+        ("unrecorded", "no verifiable process identity"),
+    ],
+)
+def test_bridge_signal_refuses_and_sends_nothing_when_unproven(
+    tmp_path, monkeypatch, verdict, expected
+):
+    pins, _ = _fake_pin(monkeypatch, verdict=verdict)
+
+    with transport_module().BridgeProcessSignal(_instance(tmp_path)) as signaller:
+        assert signaller.refusal is not None and expected in signaller.refusal
+        assert expected in (signaller.send(signal.SIGTERM) or "")
+        assert expected in (signaller.send(signal.SIGKILL) or "")
+
+    assert pins[0].sent == []                 # nothing was signalled at all
+    assert pins[0].closed is True             # and the fd was not leaked
+
+
+def test_bridge_signal_refuses_when_the_pid_cannot_be_pinned(tmp_path, monkeypatch):
+    # Covers both "pid is gone" and "no pidfd on this interpreter": with no atomic
+    # pin, falling back to os.kill would reintroduce the reuse race, so nothing is
+    # signalled.
+    import bn.transport as transport
+    from bn.proc_identity import PinUnavailable
+
+    def refuse(pid):
+        raise PinUnavailable(f"pid {pid} is not running, so there is nothing to signal")
+
+    monkeypatch.setattr(transport, "pin_process", refuse)
+
+    with transport.BridgeProcessSignal(_instance(tmp_path)) as signaller:
+        assert signaller.refusal is not None
+        assert "refusing to signal pid 4321" in signaller.refusal
+        assert "not running" in signaller.refusal
+        assert signaller.send(signal.SIGKILL) == signaller.refusal
+
+
+def test_bridge_signal_refuses_without_an_atomic_primitive(tmp_path, monkeypatch):
+    import bn.proc_identity as proc_identity
+    import bn.transport as transport
+
+    monkeypatch.setattr(proc_identity, "PIDFD_AVAILABLE", False)
+
+    with transport.BridgeProcessSignal(_instance(tmp_path)) as signaller:
+        assert signaller.refusal is not None
+        assert "provides no pidfd" in signaller.refusal
+        assert signaller.send(signal.SIGTERM) is not None
+
+
+def test_bridge_signal_reports_a_process_that_exited_before_delivery(
+    tmp_path, monkeypatch
+):
+    _fake_pin(monkeypatch, error=ProcessLookupError())
+
+    with transport_module().BridgeProcessSignal(_instance(tmp_path)) as signaller:
+        assert signaller.refusal is None
+        reason = signaller.send(signal.SIGTERM)
+
+    assert reason is not None and "exited before the signal was delivered" in reason
+
+
+def test_bridge_signal_reports_a_permission_failure(tmp_path, monkeypatch):
+    _fake_pin(monkeypatch, error=PermissionError(1, "Operation not permitted"))
+
+    with transport_module().BridgeProcessSignal(_instance(tmp_path)) as signaller:
+        reason = signaller.send(signal.SIGKILL)
+
+    assert reason is not None and "failed to signal pid 4321" in reason
+
+
+def test_bridge_signal_refuses_after_its_pin_is_released(tmp_path, monkeypatch):
+    pins, _ = _fake_pin(monkeypatch)
+    signaller = transport_module().BridgeProcessSignal(_instance(tmp_path))
+    signaller.close()
+
+    reason = signaller.send(signal.SIGTERM)
+
+    assert reason is not None and "already released" in reason
+    assert pins[0].sent == []
+
+
+def transport_module():
+    import bn.transport as transport
+
+    return transport
+
+
+@pytest.mark.skipif(
+    not _pidfd_available(),
+    reason="this interpreter exposes no pidfd wrappers (os.pidfd_open)",
+)
+def test_bridge_signal_native_pidfd_delivers_and_reuses_the_same_fd(tmp_path):
+    # The one integration test over the real syscalls: everything above proves the
+    # policy, this proves the primitive is wired correctly where it exists.
+    from bn.proc_identity import boot_id, process_start_ticks
+    from bn.transport import BridgeProcessSignal
+
+    proc = _sleeper(ignore_sigterm=True)
+    try:
+        instance = _instance(
+            tmp_path,
+            pid=proc.pid,
+            meta={
+                "pid_start_ticks": process_start_ticks(proc.pid),
+                "boot_id": boot_id(),
+            },
+        )
+        with BridgeProcessSignal(instance) as signaller:
+            assert signaller.refusal is None
+            pinned_fd = signaller._pin._fd
+            assert signaller.send(signal.SIGTERM) is None
+            time.sleep(0.2)
+            assert proc.poll() is None            # SIGTERM ignored on purpose
+            assert signaller.send(signal.SIGKILL) is None
+            assert signaller._pin._fd == pinned_fd
+        assert proc.wait(timeout=5) == -signal.SIGKILL
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+def test_wait_for_teardown_treats_a_reused_pid_as_gone(tmp_path, monkeypatch):
+    # `session stop` escalates when teardown does not converge. With bare
+    # liveness a recycled pid never converges, so the escalation fired against a
+    # stranger; identity makes the recycled pid read as gone.
+    import bn.transport as transport
+    from bn.transport import BridgeInstance
+
+    instance = BridgeInstance(
+        pid=os.getpid(),
+        socket_path=tmp_path / "t.sock",
+        registry_path=tmp_path / "t.json",
+        plugin_name="bn_agent_bridge",
+        plugin_version="0.1.0",
+        started_at=None,
+        meta=_identity(ticks_delta=11),
+        instance_id="tear1",
+        instance_token="t",
+    )
+    monkeypatch.setattr(transport, "_load_instance", lambda *a, **k: None)
+
+    assert wait_for_teardown(instance, timeout=0.05) is True
+
+
+# --------------------------------------------------------------------------
+# #694 finding 10: a socket-less registry never reaches normal discovery
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [
+        _identity,
+        lambda: _identity(ticks_delta=5),
+        lambda: _identity(omit_boot=True),
+        dict,
+    ],
+    ids=["proven", "reused-pid", "no-boot-id", "no-identity"],
+)
+def test_socketless_registry_is_never_listed(tmp_path, monkeypatch, identity):
+    # start() binds the socket BEFORE writing the registry, so "registry, no
+    # socket" is never a startup window -- such a bridge is irrecoverably
+    # unreachable and must not be advertised, whatever its identity says.
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    registry_path = bridge_registry_path()
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_path.write_text(
+        json.dumps(
+            _registry_payload(
+                tmp_path / "gone.sock", pid=os.getpid(), identity=identity()
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    assert list_instances() == []
+
+
+@pytest.mark.parametrize(
+    "identity",
+    [lambda: _identity(ticks_delta=5), lambda: _identity(omit_boot=True), dict],
+    ids=["reused-pid", "no-boot-id", "no-identity"],
+)
+def test_socketless_registry_without_proof_self_heals(tmp_path, monkeypatch, identity):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    registry_path = bridge_registry_path()
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_path.write_text(
+        json.dumps(
+            _registry_payload(
+                tmp_path / "gone.sock", pid=os.getpid(), identity=identity()
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    assert list_instances() == []
+    assert not registry_path.exists()
+
+
+def test_unresponsive_socket_with_identity_mismatch_is_swept(tmp_path, monkeypatch):
+    # A crash leaves the socket FILE behind (only a clean stop unlinks it). A
+    # failing probe alone stays non-destructive -- a busy bridge may not accept in
+    # time -- but a recorded identity that no longer matches is proof the bridge
+    # exited and its pid was reused, so the entry goes.
+    import bn.transport as transport
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    registry_path = bridge_registry_path()
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    socket_path = tmp_path / "stale.sock"
+    socket_path.touch()
+    registry_path.write_text(
+        json.dumps(
+            _registry_payload(
+                socket_path, pid=os.getpid(), identity=_identity(ticks_delta=7)
+            )
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(transport, "_socket_is_live", lambda *a, **k: False)
+
+    assert list_instances() == []
+    assert not registry_path.exists()
+    assert not socket_path.exists()
+
+
+def test_unresponsive_socket_of_a_proven_bridge_is_preserved(tmp_path, monkeypatch):
+    # The other half of that rule: a live, proven bridge whose accept backlog is
+    # full must never be swept by discovery.
+    import bn.transport as transport
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    registry_path = bridge_registry_path()
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    socket_path = tmp_path / "busy.sock"
+    socket_path.touch()
+    registry_path.write_text(
+        json.dumps(
+            _registry_payload(socket_path, pid=os.getpid(), identity=_identity())
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(transport, "_socket_is_live", lambda *a, **k: False)
+
+    instances = list_instances()
+
+    assert [inst.pid for inst in instances] == [os.getpid()]
+    assert instances[0].unreachable is False
+    assert registry_path.exists() and socket_path.exists()
+
+
+def test_socketless_registry_with_proven_owner_is_lifecycle_only(tmp_path, monkeypatch):
+    # Hidden from every routing path, but `bn session stop` must still be able to
+    # name the live process that is holding memory -- so the record survives for
+    # the lifecycle lookup and is marked unreachable.
+    import bn.transport as transport
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    registry_path = instances_dir() / "hidden1.json"
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_path.write_text(
+        json.dumps(
+            _registry_payload(
+                tmp_path / "gone.sock",
+                pid=os.getpid(),
+                identity=_identity(),
+                instance_id="hidden1",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    assert list_instances() == []
+    assert registry_path.exists()               # not purged while its owner lives
+
+    admin = list_instances(include_unreachable=True)
+    assert [inst.instance_id for inst in admin] == ["hidden1"]
+    assert admin[0].unreachable is True
+
+    found = transport.find_lifecycle_instance("hidden1")
+    assert found is not None and found.unreachable is True
+    assert transport.find_lifecycle_instance("nope") is None
+
+
+def test_socketless_registry_is_purged_once_its_owner_exits(tmp_path, monkeypatch):
+    from bn.proc_identity import boot_id, process_start_ticks
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    proc = _sleeper()
+    registry_path = instances_dir() / "gone1.json"
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_path.write_text(
+        json.dumps(
+            _registry_payload(
+                tmp_path / "gone.sock",
+                pid=proc.pid,
+                identity={
+                    "pid_start_ticks": process_start_ticks(proc.pid),
+                    "boot_id": boot_id(),
+                },
+                instance_id="gone1",
+            )
+        ),
+        encoding="utf-8",
+    )
+    assert list_instances(include_unreachable=True)[0].instance_id == "gone1"
+
+    proc.kill()
+    proc.wait(timeout=5)
+
+    assert list_instances(include_unreachable=True) == []
+    assert not registry_path.exists()
+
+
+def test_spawn_refuses_to_reuse_a_hidden_unreachable_instance_id(tmp_path, monkeypatch):
+    # The dangerous interaction of hiding unreachable records: a spawn that cannot
+    # see one would bind its socket path, overwrite its registry, and orphan the
+    # live process with no record left to stop it.
+    import bn.transport as transport
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    registry_path = instances_dir() / "busy1.json"
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_path.write_text(
+        json.dumps(
+            _registry_payload(
+                tmp_path / "gone.sock",
+                pid=os.getpid(),
+                identity=_identity(),
+                instance_id="busy1",
+            )
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        transport.subprocess,
+        "Popen",
+        lambda *a, **k: pytest.fail("a duplicate id must be refused before spawning"),
+    )
+
+    with pytest.raises(BridgeError, match="already exists with id: busy1"):
+        transport._spawn_instance_unlocked("busy1", timeout=5.0)
+
+    assert registry_path.exists()
+
+
+def test_auto_spawn_never_picks_a_hidden_instance_id(tmp_path, monkeypatch):
+    import bn.transport as transport
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    registry_path = instances_dir() / "aaaa1111.json"
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_path.write_text(
+        json.dumps(
+            _registry_payload(
+                tmp_path / "gone.sock",
+                pid=os.getpid(),
+                identity=_identity(),
+                instance_id="aaaa1111",
+            )
+        ),
+        encoding="utf-8",
+    )
+    # Force the random id generator to collide first, then yield a free one.
+    candidates = iter(["aaaa1111", "bbbb2222"])
+    monkeypatch.setattr(transport.secrets, "token_hex", lambda n: next(candidates))
+    spawned: list[str] = []
+
+    def fake_popen(cmd, **kwargs):
+        spawned.append(cmd[-1])
+        raise AssertionError("stop here: the chosen id is what matters")
+
+    monkeypatch.setattr(transport.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(AssertionError, match="stop here"):
+        transport._spawn_instance_unlocked(None, timeout=5.0)
+
+    assert spawned == ["bbbb2222"]

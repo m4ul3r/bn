@@ -2132,7 +2132,7 @@ def test_disasm_limit_and_lines_are_mutually_exclusive(capsys):
 
 
 def _literal_zero_regex_match(op, *, params=None, target=None, timeout=30.0,
-                              instance_id=None, spawn_missing_named=False):
+                              instance_id=None, spawn_missing_named=False, resolved=False, **kwargs):
     """A fake search backend: a literal (regex=False) search of an alternation
     matches nothing; the same query as a regex matches three functions."""
     if op == "list_targets":
@@ -2185,6 +2185,51 @@ def test_function_search_no_retry_when_literal_matches(monkeypatch, capsys):
     assert seen == [False]  # literal only; no regex retry
     _, err = capsys.readouterr()
     assert "retried" not in err.lower()
+
+
+def test_function_search_word_mode_does_not_retry_as_regex(monkeypatch, capsys):
+    """#694 item 7: --word is an explicit match mode (an escaped, boundary-
+    anchored literal match -- see read_listing._search_functions), not a
+    request for pattern matching. A zero-hit `--word 'foo.bar'` must not
+    silently retry as the raw regex `foo.bar` (which could then match
+    `fooXbar`). The same metachar query WITHOUT --word still auto-retries."""
+    seen = []
+
+    def fake(op, *, params=None, target=None, timeout=30.0, instance_id=None,
+             spawn_missing_named=False, resolved=False, **kwargs):
+        if op == "list_targets":
+            return {"ok": True, "result": [{"target_id": "1:1:1", "selector": "a.bndb"}]}
+        if op == "search_functions":
+            seen.append(dict(params))
+            return {"ok": True, "result": {"kind": "functions", "items": [], "total": 0,
+                                           "offset": 0, "limit": 100, "returned": 0,
+                                           "has_more": False}}
+        raise AssertionError(op)
+
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {})
+
+    rc = bn.cli.main(["function", "search", "foo.bar", "--word", "--format", "json"])
+
+    assert rc == 0
+    # Only one request was ever sent (no regex-fallback retry).
+    assert len(seen) == 1
+    assert seen[0]["word"] is True
+    assert seen[0]["regex"] is False
+    out, err = capsys.readouterr()
+    data = json.loads(out)
+    # `regex_fallback: False` (the "no retry was attempted" marker, distinct
+    # from a retry that happened) and no second request in `seen`.
+    assert data.get("regex_fallback") is False
+    assert "no regex fallback was attempted" in err
+    assert "retried as" not in err
+
+    # The same query WITHOUT --word still auto-retries as regex (contrast).
+    monkeypatch.setattr(bn.cli, "send_request", _literal_zero_regex_match)
+    rc = bn.cli.main(["function", "search", "Parse|Process|Decode", "--format", "json"])
+    assert rc == 0
+    _, err2 = capsys.readouterr()
+    assert "regex" in err2.lower()
 
 
 def test_function_search_rejects_invalid_regex_like_literal(monkeypatch, capsys):
@@ -2247,7 +2292,7 @@ def test_function_search_dot_retries_after_nonzero_literal_subset(
     seen = []
 
     def fake(op, *, params=None, target=None, timeout=30.0, instance_id=None,
-             spawn_missing_named=False):
+             spawn_missing_named=False, resolved=False, **kwargs):
         if op == "list_targets":
             return {
                 "ok": True,

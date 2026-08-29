@@ -149,5 +149,7 @@ bn callsites crt_rand --within-file /tmp/rng-functions.txt --format json
 
 `hlil_statement` is intentionally local-or-null — when Binary Ninja only exposes a coarse enclosing region, expect `null` instead of a noisy whole-function blob. `pre_branch_condition` is the nearest enclosing pre-call HLIL condition when it can be recovered confidently; `null` is normal.
 
+**High-fan-in `total` is monotone, not missing.** A callsites read stops scanning callers once it has enough rows for the requested page, so a high-fan-in callee's page reports `total: null` plus `total_lower_bound`, `scan_truncated: true`, `callers_scanned` and `caller_total` — "at least N, exact count not computed to keep the scan bounded", never zero. A page whose scan *did* cover every caller reports the exact integer `total`. Across the pages of one collection that refines in one direction only: `null` → integer is normal (and is how a large `callsites` collection ends), while an already-determined integer never reverts to `null` and never changes — the client page validators (`bn.Client.collect`, the bn-kernel `Session` collectors) reject those as bridge drift (#694).
+
 If you call `bn callsites <callee>` without `--within` / `--within-file`, the CLI prints a 3-option help block (`single caller`, `many callers`, `list callers`) instead of erroring.
 

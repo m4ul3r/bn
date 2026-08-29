@@ -563,10 +563,20 @@ def _validate_page(
             returncode=0,
             argv=(op,),
         )
-    # Checked outside the `total is not None` guard on purpose: None->int and
-    # int->None are transitions too, and `_UNSEEN` is what distinguishes "no page
-    # has reported a total yet" from "a page reported None".
-    if previous_total is not _UNSEEN and previous_total != total:
+    # `total` is MONOTONE across the pages of one collection: `None` means "not
+    # determined yet" (e.g. a callsites page whose caller scan was capped), and
+    # an int means "determined". `None -> int` is a legal refinement -- a
+    # paging client (page_size=500 by default) routinely sees the capped page
+    # first and the exact-count page last on a large callsites collection, so
+    # rejecting that transition made `callsites(limit=None)` unable to finish
+    # (#694 item 3). `int -> None` and `int -> a different int` are drift and
+    # stay rejected. `_UNSEEN` is what distinguishes "no page has reported a
+    # total yet" from "a page reported None".
+    if (
+        previous_total is not _UNSEEN
+        and previous_total is not None
+        and previous_total != total
+    ):
         raise BnError(
             f"malformed {op} page: total changed across pages "
             f"({previous_total!r} -> {total!r})",
@@ -752,6 +762,26 @@ class Result:
             total = self.payload.get("total")
             if isinstance(total, int):
                 return total
+        return None
+
+    @property
+    def returned(self) -> int | None:
+        if isinstance(self.payload, Mapping):
+            returned = self.payload.get("returned")
+            if (
+                isinstance(returned, int)
+                and not isinstance(returned, bool)
+                and returned >= 0
+            ):
+                return returned
+        return None
+
+    @property
+    def has_more(self) -> bool | None:
+        if isinstance(self.payload, Mapping):
+            has_more = self.payload.get("has_more")
+            if isinstance(has_more, bool):
+                return has_more
         return None
 
     @property
@@ -1061,6 +1091,13 @@ class Session:
                 returncode=124,
                 argv=argv,
             ) from None
+        except asyncio.CancelledError:
+            # Mirror _run_resolved (#694 item 11): an awaited help() that gets
+            # cancelled must still terminate and reap its child instead of
+            # leaking a running `bn --help` process.
+            _terminate(process)
+            await process.communicate()
+            raise
 
         stdout_text = stdout_bytes.decode(errors="replace")
         stderr_text = stderr_bytes.decode(errors="replace").strip()
@@ -1489,10 +1526,24 @@ class Session:
         annotations = digest["existing_annotations"]
         if counts["comments"] + counts["function_comments"] and not allow_contaminated:
             argv = self.last.argv if self.last is not None else ("orient_digest",)
-            locations = [
-                *annotations.get("comment_locations", []),
-                *annotations.get("function_comment_locations", []),
-            ]
+            # Only take a field's entries when it IS a list (#694 item 12):
+            # malformed OPTIONAL location metadata (e.g. an int or a mapping
+            # instead of a list) must never crash the contamination refusal
+            # below with a bare TypeError, and must never suppress it either.
+            raw_comment_locations = annotations.get("comment_locations", [])
+            raw_function_comment_locations = annotations.get(
+                "function_comment_locations", []
+            )
+            locations: list[Any] = []
+            malformed_locations = False
+            for raw_locations in (
+                raw_comment_locations,
+                raw_function_comment_locations,
+            ):
+                if isinstance(raw_locations, list):
+                    locations.extend(raw_locations)
+                else:
+                    malformed_locations = True
             rendered_locations = ", ".join(
                 " ".join(
                     part
@@ -1510,6 +1561,10 @@ class Session:
                 if rendered_locations
                 else ""
             )
+            if malformed_locations:
+                location_note += (
+                    " (location metadata was malformed and omitted)"
+                )
             raise BridgeError(
                 "inherited comments detected: "
                 f"comments={counts['comments']}, "
