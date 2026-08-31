@@ -174,18 +174,32 @@ _LIST_SLICE_STEMS = frozenset({
 })
 
 
-def _rerun_hint(stem: str | None) -> str:
+def _rerun_hint(stem: str | None, fmt: str = "text") -> str:
     s = (stem or "").lower()
+    # The pointer key the consumer actually sees: the text envelope renders
+    # `path:` (render_artifact_envelope maps artifact_path -> path), json/ndjson
+    # carry `artifact_path`. Naming the wrong key sends a model hunting for a
+    # field that is not there.
+    pointer = "path" if fmt == "text" else "artifact_path"
     if s in _LIST_SLICE_STEMS or s.endswith("-list"):
         return "bound the next read with --limit N (and --offset K to page), or read the spilled file"
     if s in ("disasm", "il", "structured-il"):
-        return ("bound the next read with --lines START:END (function/CFG order) or "
-                "--linear N at an address, or read the spilled file")
+        if fmt != "text":
+            # --lines is text-only; suggesting it to a json/ndjson consumer is a
+            # dead end (#120).
+            return f"read the spilled file at `{pointer}`, or re-run with --out FILE"
+        return ("rerun with --lines START:END (function/CFG order) or "
+                f"--linear N at an address, or read the spilled file at `{pointer}`")
     if s == "function-evidence":
         return "bound the next read with --limit N / --address-window A:B, or read the spilled file"
-    if s in ("decompile", "function-bundle"):
-        return "narrow the scope or read the spilled file at artifact_path (no in-line slicing knob)"
-    return "read the spilled file at artifact_path, or re-run with a slicing flag (--limit/--offset/--lines) or --out"
+    if s == "decompile":
+        if fmt == "text":
+            return f"rerun with --lines START:END to fetch a slice, or read the spilled file at `{pointer}`"
+        return f"read the spilled file at `{pointer}`, or re-run with --out FILE"
+    if s == "function-bundle":
+        return f"narrow the scope or read the spilled file at `{pointer}`"
+    return (f"read the spilled file at `{pointer}`, or re-run with a slicing flag "
+            "(--limit/--offset/--lines) or --out")
 
 
 def _artifact_payload(
@@ -370,7 +384,7 @@ def write_output_result(
     # #409: name the command-specific slicing knob + the threshold that tripped, so
     # the agent bounds the next read instead of re-running blind. BN_SPILL_TOKENS
     # raises/lowers the threshold.
-    artifact["rerun"] = _rerun_hint(stem)
+    artifact["rerun"] = _rerun_hint(stem, fmt)
     artifact["spill_token_limit"] = spill_token_limit
     return OutputWriteResult(
         rendered=render_envelope(artifact, fmt),

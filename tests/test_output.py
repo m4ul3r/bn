@@ -314,6 +314,21 @@ def test_rerun_hint_names_slicing_knob_409():
     assert "--address-window" in _rerun_hint("function-evidence")
     # unknown stem still points at the spilled file + generic knobs
     assert "spilled file" in _rerun_hint("something-new")
+    # decompile DOES have a text slicing knob (--lines START:END); the hint must
+    # never claim otherwise, and must name the pointer key the consumer's
+    # envelope actually renders (`path` in text, `artifact_path` in json).
+    text_hint = _rerun_hint("decompile", "text")
+    assert "--lines" in text_hint
+    assert "no in-line slicing knob" not in text_hint
+    assert "`path`" in text_hint
+    # --lines is text-only: a json spill must not send the consumer down a flag
+    # that errors (#120); it points at the artifact + --out instead.
+    json_hint = _rerun_hint("decompile", "json")
+    assert "--lines" not in json_hint
+    assert "--out" in json_hint
+    assert "`artifact_path`" in json_hint
+    # disasm/il inherit the same format-awareness
+    assert "--lines" not in _rerun_hint("il", "json")
 
 
 def test_spill_envelope_carries_rerun_hint_and_limit_409(tmp_path, monkeypatch):
