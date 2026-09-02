@@ -208,7 +208,13 @@ def _doctor(args: argparse.Namespace) -> int:
         "instances": instances,
     }
     cli._emit_result(args, result, text_renderer=_render_doctor_text, stem="doctor")
-    return 0
+    # #620(c): a doctor report that never fails exit code hides unhealthy
+    # instances from scripted/CI callers who only check the exit status.
+    unhealthy = any(
+        (not inst["reachable"]) or inst.get("stale_plugin_code") or inst.get("stale_engine")
+        for inst in instances
+    )
+    return 1 if unhealthy else 0
 
 
 @command("plugin", "install", help="Install the GUI plugin", fmt="json",
@@ -308,7 +314,10 @@ def _skill_install(args: argparse.Namespace) -> int:
         _install_tree(source, dest, mode=args.mode, force=args.force)
 
     result = {
-        "installed": True,
+        # #620(b): report installed=false when every destination was skipped,
+        # rather than always claiming success. skipped_destinations already
+        # explains why.
+        "installed": bool(pending_installs),
         "mode": args.mode,
         "installed_destinations": [str(dest) for _, dest in pending_installs],
         "skipped_destinations": skipped_destinations,
@@ -518,12 +527,19 @@ def _session_stop(args: argparse.Namespace) -> int:
     # down the PINNED bridge.
     positional = getattr(args, "instance_id", None)
     alias = getattr(args, "instance_id_flag", None)
+    # #588: the final fallback must NOT pick up a sticky-pinned -i -- only a
+    # genuinely explicit -i/--instance on this invocation may supply the
+    # target for a bare `session stop`. Otherwise target_id stays unset and
+    # the "requires an instance id" branch below fires instead of silently
+    # stopping whatever instance the project happens to be pinned to.
     target_id = (
         positional
         if positional is not None
         else alias
         if alias is not None
         else getattr(args, "instance", None)
+        if getattr(args, "_explicit_instance", False)
+        else None
     )
     if target_id is not None and not str(target_id).strip():
         raise BridgeError(
@@ -622,8 +638,14 @@ def _session_restart(args: argparse.Namespace) -> int:
             path = t.get("filename")
             if path:
                 reload_targets.append({"path": path, "quick": t.get("analysis_state") == "quick"})
-    except Exception:
-        pass
+    except Exception as exc:
+        # #620(a): don't silently drop the target-enumeration failure -- the
+        # restart still proceeds (with no targets to reload), but the caller
+        # needs to know why nothing came back.
+        print(
+            f"warning: could not enumerate targets to reload after restart: {exc}",
+            file=sys.stderr,
+        )
 
     # Preserve private project associations across the same-id restart. Reloads
     # below deliberately carry no caller cwd, so restarting elsewhere cannot
