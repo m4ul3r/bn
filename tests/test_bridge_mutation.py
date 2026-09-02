@@ -2628,6 +2628,79 @@ def test_mutation_not_dirty_on_pure_noop(monkeypatch):
     assert marked == []
 
 
+# ===========================================================================
+# #656 -- go_rename marks the view dirty when applied renames survive a
+# failed rollback, not just on a clean commit.
+# ===========================================================================
+
+
+class _GoRenameFn:
+    def __init__(self, name):
+        self.name = name
+
+
+class _GoRenameRollbackFailsBV:
+    """A single function whose rename applies cleanly but whose rollback
+    lookup (the SECOND get_function_at call for that address) reports the
+    function missing, so _rollback_go_renames returns False."""
+
+    def __init__(self, fn):
+        self._fn = fn
+        self._calls = 0
+
+    def get_function_at(self, addr):
+        self._calls += 1
+        if self._calls > 1:
+            return None
+        return self._fn
+
+
+def test_go_rename_marks_dirty_when_preview_rollback_fails(monkeypatch):
+    """A preview go_rename applies a rename, then its rollback FAILS -- the
+    view is left with a live, uncommitted rename. That must mark the view
+    dirty so `bn close` warns, even though committed/verified_count gate is
+    False on a preview (#656)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _GoRenameFn("sub_401000")
+    bv = _GoRenameRollbackFailsBV(fn)
+    marked: list[object] = []
+    monkeypatch.setattr(instance.targets, "mark_dirty", lambda b: marked.append(b))
+
+    candidate = {"address": 0x401000, "before_name": "sub_401000", "new_name": "main.foo"}
+    result = instance._apply_go_renames_chunked(
+        bv, [candidate], preview=True, skipped_user_named=0, defined_count=1
+    )
+
+    assert result["rolled_back"] is False
+    assert fn.name == "main.foo"  # the rename really is still live
+    assert marked == [bv]
+
+
+def test_go_rename_not_dirty_when_preview_rollback_succeeds(monkeypatch):
+    """The negative control: a clean preview rollback must NOT mark dirty."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _GoRenameFn("sub_401000")
+
+    class _CleanRollbackBV:
+        def get_function_at(self, addr):
+            return fn
+
+    bv = _CleanRollbackBV()
+    marked: list[object] = []
+    monkeypatch.setattr(instance.targets, "mark_dirty", lambda b: marked.append(b))
+
+    candidate = {"address": 0x401000, "before_name": "sub_401000", "new_name": "main.foo"}
+    result = instance._apply_go_renames_chunked(
+        bv, [candidate], preview=True, skipped_user_named=0, defined_count=1
+    )
+
+    assert result["rolled_back"] is True
+    assert fn.name == "sub_401000"  # reverted
+    assert marked == []
+
+
 def test_mutation_dirty_on_prototype_user_type_residue(monkeypatch):
     """An unclearable has_user_type override left behind must mark the view dirty
     so `bn close` warns, even though the prototype VALUE round-tripped (#630)."""

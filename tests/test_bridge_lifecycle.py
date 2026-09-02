@@ -50,6 +50,7 @@ def test_registry_records_boot_id_and_process_start_time(instance):
 
 def test_registry_write_after_stop_is_refused(instance):
     instance._write_registry()
+    instance._server = object()  # simulate a bound socket, per #585's gate
     assert instance.registry_path.exists()
 
     instance.stop()
@@ -313,6 +314,7 @@ def test_stop_joins_a_running_load_worker_and_suppresses_its_publication(
     monkeypatch.setattr(instance, "_load_binary", slow_load)
     instance._record_project_root(str(project))
     instance._write_registry()
+    instance._server = object()  # simulate a bound socket, per #585's gate
     job = instance._load_binary_async(str(binary))
     assert job["job_id"] in instance._load_job_threads
 
@@ -409,3 +411,202 @@ def test_associate_project_roots_op_is_read_locked_and_routes(monkeypatch, tmp_p
     assert spec.binder(inst, {"roots": [str(project)]}, None)["associated"] == [
         str(project)
     ]
+
+
+# --------------------------------------------------------------------------
+# stop()/start_bridge()/restart_bridge() ownership hygiene (#585)
+# --------------------------------------------------------------------------
+
+
+def test_stop_on_unbound_server_does_not_unlink_another_instances_files(
+    monkeypatch, tmp_path
+):
+    # An instance whose _server is None (start() never ran, e.g. a refused
+    # bind) must not unlink ANOTHER live instance's socket/registry just
+    # because they happen to share the same on-disk paths (#585).
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+    live = module.BinaryNinjaBridge(instance_id="live1")
+    live._write_registry()
+    live.socket_path.parent.mkdir(parents=True, exist_ok=True)
+    live.socket_path.touch()
+    assert live.registry_path.exists()
+    assert live.socket_path.exists()
+
+    unbound = module.BinaryNinjaBridge(instance_id="live1")  # same paths, never start()ed
+    assert unbound._server is None
+
+    unbound.stop()
+
+    assert live.registry_path.exists()
+    assert live.socket_path.exists()
+
+
+def test_stop_on_bound_server_does_unlink_its_own_files(monkeypatch, tmp_path):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+    inst = module.BinaryNinjaBridge(instance_id="bound1")
+    inst._write_registry()
+    inst.socket_path.parent.mkdir(parents=True, exist_ok=True)
+    inst.socket_path.touch()
+    inst._server = object()  # simulate a bound socket without a real listener
+
+    inst.stop()
+
+    assert not inst.registry_path.exists()
+    assert not inst.socket_path.exists()
+
+
+def test_start_bridge_clears_global_when_start_raises(monkeypatch):
+    module = _load_bridge(monkeypatch)
+    monkeypatch.setattr(module, "ui", object())
+    monkeypatch.setattr(module, "_bridge", None)
+
+    class _BoomBridge:
+        def start(self):
+            raise RuntimeError("bind failed")
+
+    monkeypatch.setattr(module, "BinaryNinjaBridge", _BoomBridge)
+
+    with pytest.raises(RuntimeError, match="bind failed"):
+        module.start_bridge()
+
+    assert module._bridge is None
+
+
+def test_start_bridge_sets_global_only_after_successful_start(monkeypatch):
+    module = _load_bridge(monkeypatch)
+    monkeypatch.setattr(module, "ui", object())
+    monkeypatch.setattr(module, "_bridge", None)
+
+    class _FakeBridge:
+        def __init__(self):
+            self.started = False
+
+        def start(self):
+            self.started = True
+
+    monkeypatch.setattr(module, "BinaryNinjaBridge", _FakeBridge)
+
+    module.start_bridge()
+
+    assert module._bridge is not None
+    assert module._bridge.started is True
+
+
+def test_restart_bridge_stops_the_old_instance_before_starting_a_new_one(monkeypatch):
+    # The GUI "Restart Bridge" command was bound to start_bridge(), which
+    # early-returns whenever `_bridge` is already set -- so restart was a
+    # no-op (#585). restart_bridge() must stop-then-start.
+    module = _load_bridge(monkeypatch)
+    monkeypatch.setattr(module, "ui", object())
+
+    events: list[tuple[str, int]] = []
+
+    class _FakeBridge:
+        def start(self):
+            events.append(("start", id(self)))
+
+        def stop(self):
+            events.append(("stop", id(self)))
+
+    monkeypatch.setattr(module, "BinaryNinjaBridge", _FakeBridge)
+    old = _FakeBridge()
+    monkeypatch.setattr(module, "_bridge", old)
+
+    module.restart_bridge()
+
+    assert events[0] == ("stop", id(old))
+    assert events[1][0] == "start"
+    assert events[1][1] != id(old)
+    assert module._bridge is not None
+    assert module._bridge is not old
+
+
+def test_restart_bridge_leaves_global_none_when_the_new_start_fails(monkeypatch):
+    module = _load_bridge(monkeypatch)
+    monkeypatch.setattr(module, "ui", object())
+
+    class _StopOnlyBridge:
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(module, "_bridge", _StopOnlyBridge())
+
+    class _BoomBridge:
+        def start(self):
+            raise RuntimeError("bind failed")
+
+    monkeypatch.setattr(module, "BinaryNinjaBridge", _BoomBridge)
+
+    module.restart_bridge()  # must not raise -- logs and returns
+
+    assert module._bridge is None
+
+
+# --------------------------------------------------------------------------
+# SO_PEERCRED unsigned uid/gid unpack (#660)
+# --------------------------------------------------------------------------
+
+
+def test_check_peer_credentials_accepts_uid_above_signed_int32_range(monkeypatch):
+    # A NIS/container-mapped uid > 2**31 must not render negative and be
+    # rejected as a spurious mismatch (#660).
+    import struct
+
+    module = _load_bridge(monkeypatch)
+    monkeypatch.setattr(module.os, "getuid", lambda: 3_000_000_000)
+
+    class _FakeConn:
+        def __init__(self, uid):
+            self._packed = struct.pack("iII", 4242, uid, 0)
+
+        def getsockopt(self, level, optname, buflen):
+            return self._packed[:buflen]
+
+    err = module._check_peer_credentials(_FakeConn(3_000_000_000))
+    assert err is None
+
+
+# --------------------------------------------------------------------------
+# TargetManager.forget() -- dirty-id cleanup on close (#659)
+# --------------------------------------------------------------------------
+
+
+def test_target_manager_forget_discards_dirty_id(monkeypatch):
+    from _bridge_fakes import _FakeFileBV, _register_views
+
+    module = _load_bridge(monkeypatch)
+    manager = module.TargetManager()
+    bv = _FakeFileBV("/corpus/target.bndb")
+    _register_views(module, bv)
+    manager.refresh()  # assigns bv its stable view_id
+
+    manager.mark_dirty(bv)
+    assert manager.is_dirty(bv) is True
+
+    manager.forget(bv)
+
+    assert manager.is_dirty(bv) is False
+    module._headless_views.clear()
+
+
+def test_close_binary_forgets_dirty_view_on_close(monkeypatch):
+    # The real close path (_close_binary) must discard the closed view's
+    # dirty entry, not just the standalone TargetManager.forget() helper
+    # (#659).
+    from _bridge_fakes import _FakeFileBV, _register_views
+
+    module = _load_bridge(monkeypatch)
+    instance = module.BinaryNinjaBridge()
+    bv = _FakeFileBV("/corpus/target.bndb")
+    bv.file.close = lambda: None
+    _register_views(module, bv)
+    instance.targets.refresh()
+    instance.targets.mark_dirty(bv)
+    assert instance.targets.is_dirty(bv) is True
+
+    instance._close_binary(path="/corpus/target.bndb")
+
+    assert instance.targets.is_dirty(bv) is False
+    module._headless_views.clear()
