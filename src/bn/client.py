@@ -6,11 +6,6 @@ from typing import Any
 
 from .transport import BridgeError, _resolve_timeout, send_request
 
-_MALFORMED_REPLY = (
-    "malformed bridge reply (no result); the bridge may be stale -- restart it and retry"
-)
-
-
 # Distinguishes "no page has reported a total yet" from "a page reported None",
 # which `.get("total")` on an aggregate cannot.
 _UNSEEN: Any = object()
@@ -176,8 +171,6 @@ class Client:
             timeout=timeout,
             **extra,
         )
-        if not isinstance(response, dict) or "result" not in response:
-            raise BridgeError(_MALFORMED_REPLY)
         return response["result"]
 
     def request(

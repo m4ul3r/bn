@@ -1104,11 +1104,6 @@ def _call(
         spawn_missing_named=spawn_missing_named,
         **timeout_kwargs,
     )
-    if not isinstance(response, dict) or "result" not in response:
-        raise BridgeError(
-            "malformed bridge reply (no result); the bridge may be stale -- "
-            "restart it and retry"
-        )
     result = response["result"]
     # Auto-regex fallback (#291.3): a metacharacter query that matched nothing
     # literally is almost always meant as a pattern. Retry it once as a regex and

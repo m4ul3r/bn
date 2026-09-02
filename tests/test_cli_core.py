@@ -762,6 +762,44 @@ def test_fanout_all_instances_aggregates_and_isolates_errors(monkeypatch, capsys
     assert set(seen) == {"a", "b"}
 
 
+def test_fanout_all_instances_isolates_missing_result(monkeypatch, capsys):
+    # #617 fan-out isolation: one instance's ok:true-without-result reply
+    # (raised as BridgeError by the validated transport boundary) must
+    # produce an ok:false row for that instance alone; the sibling
+    # instance's normal reply must still succeed, and the aggregate must
+    # exit 0.
+    import json as _json
+    import types as _types
+    import bn.cli as cli
+    from bn.transport import BridgeError
+
+    insts = [_types.SimpleNamespace(instance_id="a"), _types.SimpleNamespace(instance_id="b")]
+    monkeypatch.setattr(cli, "list_instances", lambda: insts)
+    monkeypatch.setattr(cli, "instance_selector", lambda i: i.instance_id)
+    monkeypatch.setattr(cli, "_resolve_target", lambda args, **k: "active")
+    seen = []
+
+    def fake_send(op, *, params=None, target=None, instance_id=None, **k):
+        seen.append(instance_id)
+        if instance_id == "b":
+            raise BridgeError(
+                f"Binary Ninja bridge replied ok without a result field for op '{op}' "
+                "(instance b, pid 999); the bridge may be stale -- restart it"
+            )
+        return {"result": {"kind": "functions", "items": [{"name": "f", "address": "0x1"}],
+                           "total": 1, "count": 1}}
+    monkeypatch.setattr(cli, "send_request", fake_send)
+
+    rc = cli.main(["function", "list", "--all-instances", "--format", "json"])
+    assert rc == 0
+    out = _json.loads(capsys.readouterr().out)
+    assert out["kind"] == "fanout" and out["count"] == 2
+    by = {r["instance"]: r for r in out["instances"]}
+    assert by["a"]["ok"] is True and by["a"]["result"]["total"] == 1
+    assert by["b"]["ok"] is False and "without a result field" in by["b"]["error"]
+    assert set(seen) == {"a", "b"}
+
+
 def test_fanout_all_instances_text_renders_per_instance(monkeypatch, capsys):
     # #169 L1: text mode renders each instance with the command's own renderer
     # and an error line for failed instances.
