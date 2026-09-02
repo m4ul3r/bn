@@ -2705,6 +2705,22 @@ def test_argument_confidence_arity_mismatch_more_args_than_declared_648(monkeypa
     assert call["arity_unknown"] is False
 
 
+def test_argument_confidence_arity_mismatch_fewer_args_than_declared_648(monkeypatch):
+    """#648/#704: the mirror case of the more-args test -- a callee WITH a
+    recovered prototype (3 declared params) where HLIL rendered only 2
+    arguments. The rendered list demonstrably does not match the declared
+    signature (under-recovery), so this must demote and flag
+    `arity_mismatch` just as the extra-argument direction does."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _arity_bv(monkeypatch, instance, callee_params=3, arg_texts=["1", "2"])
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    assert call["argument_confidence"] == "inferred"
+    assert call["arity_mismatch"] is True
+    assert call["arity_unknown"] is False
+
+
 def test_argument_confidence_negative_control_matching_arity_stays_authoritative_648(monkeypatch):
     """#648 negative control (like a `memcpy`-shaped prototype): 3 declared params
     and exactly 3 rendered arguments -- nothing invented, stays `authoritative`
@@ -2741,6 +2757,36 @@ def test_argument_confidence_indirect_call_never_authoritative_648(monkeypatch):
     assert call["argument_source"] == "hlil"
     assert call["indirect_call"] is True
     assert call["argument_confidence"] == "heuristic"
+
+
+def test_argument_confidence_direct_call_to_unresolved_target_not_marked_indirect_704(monkeypatch):
+    """#704: a DIRECT call whose destination is a resolved constant that
+    matches no function (e.g. a mid-function branch target, or an address
+    with no covering function) must NOT be marked `indirect_call` -- that
+    would contradict the sibling `direct: true` in the same record. It is
+    still `callee_unresolved` (the callee's arity is unknowable either way),
+    so `argument_confidence` is demoted off `authoritative` regardless."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    caller = _FakeFunction(0x401800, "dispatch")
+    call_expr = _FakeHLILInstruction("fn_405000(a, b)", class_name="HighLevelILCall",
+                                     address=0x401800, expr_index=5, instr_index=5)
+    call_expr.params = ["a", "b"]
+    # 0x405000 resolves to a real constant (a DIRECT call) but no function in
+    # this view starts there or contains it -- exactly the case the dead
+    # `fn_entry.get("start")` lookup used to (fail to) handle.
+    call_insn = _FakeLLILInstruction(0x401800, _FakeConstPtr(0x405000), hlils=[call_expr])
+    caller.basic_blocks = [_FakeBasicBlock(0x401800, 0x401804)]
+    caller.low_level_il = [[call_insn]]
+    bv = _FakeBV(functions=[caller], instruction_lengths={0x401800: 4},
+                 disassembly={0x401800: "bl 0x405000"})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    call = instance._function_evidence("active", "dispatch", context=0)["calls"][0]
+    assert call["direct"] is True
+    assert call.get("indirect_call") is not True
+    assert call["callee_unresolved"] is True
+    assert call["argument_confidence"] != "authoritative"
 
 
 # --- #661: mlil: line / MLIL candidates come from the TRUE per-instruction MLIL --
@@ -2791,6 +2837,37 @@ def test_function_evidence_mlil_falls_back_to_mapped_form_when_true_mlil_absent_
     callee = _FakeFunction(0x461746, "send_message")
     caller = _FakeFunction(0x412470, "build_response")
     call_insn = _FakeLLILInstruction(0x4124A0, _FakeConstPtr(0x461746))
+    call_insn.mapped_medium_level_il = "call(0x461746, arg1)"
+    caller.basic_blocks = [_FakeBasicBlock(0x4124A0, 0x4124A4)]
+    caller.low_level_il = [[call_insn]]
+    bv = _FakeBV(functions=[callee, caller], instruction_lengths={0x4124A0: 4},
+                 disassembly={0x4124A0: "bl send_message"})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    call = instance._function_evidence("active", "build_response", context=0)["calls"][0]
+    assert call["mlil"] == "call(0x461746, arg1)"
+
+
+def test_function_evidence_mlil_falls_back_when_true_mlil_accessor_raises_661(monkeypatch):
+    """#704 (hardening #661's fallback chain): BN's real `.mlil` property can
+    itself raise (e.g. an internal `assert result is not None, "MLIL not
+    present"`) rather than raise `AttributeError` -- `getattr(insn, "mlil",
+    None)` only suppresses the latter, so a raising accessor used to
+    propagate out of the whole `evidence function` op instead of falling
+    back to the mapped form. This is pre-existing fragility symmetric with
+    the mapped accessor (not a regression from preferring `.mlil`); wrapping
+    it lets the documented fallback chain actually run."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    class _RaisingMLILInstruction(_FakeLLILInstruction):
+        @property
+        def mlil(self):
+            raise AssertionError("MLIL not present")
+
+    callee = _FakeFunction(0x461746, "send_message")
+    caller = _FakeFunction(0x412470, "build_response")
+    call_insn = _RaisingMLILInstruction(0x4124A0, _FakeConstPtr(0x461746))
     call_insn.mapped_medium_level_il = "call(0x461746, arg1)"
     caller.basic_blocks = [_FakeBasicBlock(0x4124A0, 0x4124A4)]
     caller.low_level_il = [[call_insn]]
@@ -2896,6 +2973,38 @@ def test_function_evidence_does_not_flag_local_tailcall_as_thunk_673(monkeypatch
         disassembly={0x500000: "b init_helper"},
     )
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_evidence("active", "init_array_0", context=0)
+    assert result["thunk"]["is_candidate"] is False
+
+
+def test_function_evidence_pseudo_c_fallback_does_not_flag_local_tailcall_673(monkeypatch):
+    """#673/#704: the pseudo-C `/* tailcall */` fallback must not re-flag a
+    function whose LLIL loop already positively identified a LOCAL,
+    non-imported branch target. Before the fix, the loop's per-instruction
+    `continue` (no `return`) let control fall through unconditionally to the
+    unguarded fallback below, which set `is_candidate: True` with
+    `target: None` for exactly this local-tailcall case whenever BN's
+    pseudo-C happened to contain the `/* tailcall */` marker -- which the
+    decompile-path caller (`read_decompile._thunk_veneer_warning`) already
+    guarantees before ever calling in."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    helper = _FakeFunction(0x461746, "init_helper")  # no .symbol -> not imported
+    ctor = _FakeFunction(0x500000, "init_array_0")
+    ctor.basic_blocks = [_FakeBasicBlock(0x500000, 0x500004)]
+    ctor.low_level_il = [[_FakeLLILInstruction(0x500000, _FakeConstPtr(0x461746), operation="LLIL_TAILCALL")]]
+    bv = _FakeBV(
+        functions=[helper, ctor],
+        disassembly={0x500000: "b init_helper"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    # Force the pseudo-C decompile path to render a tailcall marker, exactly
+    # as BN does for a real small-function tailcall -- the condition the
+    # unguarded fallback used to re-flag regardless of what the LLIL loop
+    # above already determined.
+    monkeypatch.setattr(bridge.il_format, "_decompile_text",
+                         lambda bv, f: "return init_helper() /* tailcall */")
 
     result = instance._function_evidence("active", "init_array_0", context=0)
     assert result["thunk"]["is_candidate"] is False

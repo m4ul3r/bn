@@ -767,15 +767,15 @@ def _evidence_xrefs(args: argparse.Namespace) -> int:
                       "use 4 for a uint32[] table at --stride 4)"),
              arg("--record-size", dest="record_size", default=None,
                  help="Record-aware mode: byte size of each MIXED record (scalar + pointer "
-                      "fields), e.g. a dispatch descriptor. Requires --ptr-fields"),
+                      "fields), e.g. a dispatch descriptor. Requires --ptr-fields and/or --field"),
              arg("--ptr-fields", dest="ptr_fields", default=None,
                  help="Comma-separated byte offsets of the pointer field(s) within each record "
                       "(record-aware mode), e.g. --record-size 0x18 --ptr-fields 0x8,0x10"),
              arg("--field", dest="field_specs", action="append", default=None, metavar="NAME:TYPE@OFF",
                  help="Declare a typed scalar/string record field (repeatable): TYPE is "
                       "u8/i8/u16/i16/u32/i32/u64/i64 or char[N], OFF is hex/decimal, e.g. "
-                      "--field command:u32@0 --field name:char[16]@8. Makes --ptr-fields "
-                      "optional (scalar-only records)."),
+                      "--field command:u32@0 --field name:char[16]@8. Requires --record-size; "
+                      "makes --ptr-fields optional (scalar-only records)."),
          ])
 def _evidence_table(args: argparse.Namespace) -> int:
     ptr_fields = None

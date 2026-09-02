@@ -61,11 +61,29 @@ def _true_mlil(insn):
     ``0x401156(rdi, 3)``). Prefer the direct accessor; fall back to the mapped
     form only when it is unavailable (older BN builds / degenerate cases), and
     to None when neither exists -- callers must never fabricate an `mlil` line.
+
+    Both accessors are wrapped rather than accessed via a bare ``getattr``
+    default: BN's real ``.mlil``/``.mapped_medium_level_il`` properties can
+    themselves raise (e.g. an internal ``assert result is not None, "MLIL not
+    present"`` when the underlying analysis has no MLIL for this instruction)
+    rather than raise ``AttributeError``, which ``getattr``'s default only
+    suppresses. This is pre-existing fragility symmetric across BOTH
+    accessors (not a regression introduced by preferring ``.mlil``); wrapping
+    each independently matches the pattern already used elsewhere in this
+    module for raising `.mlil`-family accesses (`:1101-1104`, `:1136-1139`,
+    `:1188-1191`) and lets a failure on the primary accessor still try the
+    fallback instead of propagating out of the whole `evidence function` op.
     """
-    mlil = getattr(insn, "mlil", None)
+    try:
+        mlil = insn.mlil
+    except Exception:
+        mlil = None
     if mlil is not None:
         return mlil
-    return getattr(insn, "mapped_medium_level_il", None)
+    try:
+        return insn.mapped_medium_level_il
+    except Exception:
+        return None
 
 
 def _il_argument_texts(ctx, node) -> list[str]:
@@ -218,7 +236,22 @@ def _callee_name_for_call(ctx, bv, dest_value, target) -> str | None:
 
 
 def _callee_function_for_call(ctx, bv, dest_value, target):
-    """The callee's BN function object for a DIRECT call, else None."""
+    """The callee's BN function object for a DIRECT call, else None.
+
+    Resolved two ways: an exact BN function start via ``bv.get_function_at``,
+    or -- when that misses but the seam already resolved the destination to a
+    function entry whose start EXACTLY matches it (``exact_start`` is True) --
+    that function, re-looked-up from the entry's ``address`` field. A
+    mid-function/containing-function match (``exact_start`` False, the seam's
+    ``_functions_containing`` fallback) is deliberately NOT resolved here:
+    treating a mid-function branch target as if it were a call to that
+    function's ENTRY would check this call's arguments against the wrong
+    (enclosing) function's declared arity -- a fresh silent-wrong-answer of
+    exactly the #648 class this evidence exists to avoid. (#704: the previous
+    secondary lookup tested ``fn_entry.get("start")``, a key
+    ``_function_entry_for_address`` never emits -- dead code -- and it did not
+    gate on ``exact_start`` at all.)
+    """
     if dest_value is not None:
         getter = getattr(bv, "get_function_at", None)
         fn = getter(int(dest_value)) if callable(getter) else None
@@ -226,11 +259,14 @@ def _callee_function_for_call(ctx, bv, dest_value, target):
             return fn
     if isinstance(target, dict):
         fn_entry = target.get("function")
-        if isinstance(fn_entry, dict) and fn_entry.get("start") is not None:
+        if isinstance(fn_entry, dict) and fn_entry.get("exact_start") is True:
             getter = getattr(bv, "get_function_at", None)
-            start = _safe_int(fn_entry.get("start"))
-            if callable(getter) and start:
-                return getter(start)
+            try:
+                addr = _parse_address(fn_entry.get("address"))
+            except (TypeError, ValueError):
+                addr = None
+            if callable(getter) and addr is not None:
+                return getter(addr)
     return None
 
 
@@ -258,19 +294,32 @@ def _argument_arity_evidence(ctx, bv, dest_value, target,
     ``authoritative`` stamp is EARNED), while an unprototyped vendor import reports
     zero -- verified against a live BN view.
 
-    Two residual lies remain even with a resolved callee: HLIL can render MORE
-    arguments than a recovered prototype declares (an invented ABI-register arg
-    tacked onto a real signature -- ``arity_mismatch``), and an INDIRECT call
-    (``callee_fn is None``) has no declared arity to check at all
-    (``indirect_call``).
+    ``indirect_call`` (#704) means exactly what its name says -- the call's
+    destination could not be resolved to a constant at all (``dest_value is
+    None``), mirroring the sibling ``direct`` field on the call record
+    (``direct: dest_value is not None``); the two are logical opposites and set
+    ONLY when true, like ``abi_register_saturated``. It is a DIFFERENT condition
+    from ``callee_unresolved`` -- no BN function object could be found for the
+    destination, by whatever means (genuinely indirect, OR a direct call whose
+    resolved constant is mid-function / an undefined address). A direct call to
+    an unmatched address is ``indirect_call`` absent, ``callee_unresolved: True``:
+    the call SHAPE is direct, but the callee's arity is still unknowable. HLIL
+    can also render MORE OR FEWER arguments than a resolved callee's recovered
+    prototype declares (an invented/dropped ABI-register arg -- ``arity_mismatch``,
+    only checked against a non-empty rendered list; an empty list usually means no
+    IL layer supplied one at all, not a real mismatch).
 
     Returns ``{"arity_unknown": bool, ...}``; ``arity_unknown`` is False whenever the
-    callee cannot be resolved -- ``indirect_call`` carries that case instead.
+    callee cannot be resolved -- ``callee_unresolved`` carries that case instead.
     """
     evidence: dict[str, Any] = {"arity_unknown": False}
+    if dest_value is None:
+        evidence["indirect_call"] = True
+        evidence["callee_unresolved"] = True
+        return evidence
     callee_fn = _callee_function_for_call(ctx, bv, dest_value, target)
     if callee_fn is None:
-        evidence["indirect_call"] = True
+        evidence["callee_unresolved"] = True
         return evidence
     if bool(getattr(callee_fn, "has_user_type", False)):
         return evidence          # a user prototype pins the arity
@@ -285,11 +334,15 @@ def _argument_arity_evidence(ctx, bv, dest_value, target,
     is_variadic = il_format._function_is_variadic(callee_fn)
     if declared_count > 0:
         # A recovered/bundled prototype: the arity itself is known, but HLIL can
-        # still have rendered MORE arguments than declared (an invented
-        # ABI-register arg riding along with the real ones) -- flag that without
-        # claiming the whole arity is unknown.
-        if not is_variadic and len(arguments) > declared_count:
+        # still have rendered MORE OR FEWER arguments than declared (an invented
+        # ABI-register arg riding along, or an under-recovered call) -- flag that
+        # without claiming the whole arity is unknown. Guarded on a non-empty
+        # rendered list: an empty list usually means no IL layer supplied
+        # arguments at all (e.g. a non-SSA LLIL call with neither `params` nor
+        # `parameters`), not a genuine mismatch (#704 round-2 correction).
+        if not is_variadic and arguments and len(arguments) != declared_count:
             evidence["arity_mismatch"] = True
+            evidence["declared_arity"] = declared_count
         return evidence
     if is_variadic:
         return evidence          # a declared variadic with no fixed parameters
@@ -401,14 +454,18 @@ def _variadic_diagnostic(ctx, bv, dest_value, target, arg_source,
 
 
 def _mlil_call_text(mlil) -> str | None:
-    """Render a mapped-MLIL call WITHOUT its clobber-LHS.
+    """Render an MLIL call, stripping a clobber-LHS assignment if present.
 
-    BN renders a mapped-MLIL call as "<written regs> = call(dest, args...)". For
-    a varargs / full-clobber callee the LHS is the entire caller-saved register
-    set (~44 regs on aarch64: arg1, arg2, x2..x18, lr, v0..v31), which buries the
-    one thing the field is for -- the call and its inputs. Drop the assignment
-    LHS so the line mirrors the concise `arguments:` block; the full instruction
-    (with outputs) is still available in the sibling `llil` field. (E17)
+    Post-#661, `mlil` is usually the TRUE per-instruction form (`_true_mlil`
+    prefers `insn.mlil`), which renders as `dest(args...)` with no LHS to
+    strip. The stripping below still matters on the fallback path: when
+    `insn.mlil` is unavailable and `_true_mlil` falls back to the COALESCED
+    mapped form, BN renders it as "<written regs> = call(dest, args...)" --
+    for a varargs/full-clobber callee the LHS is the entire caller-saved
+    register set (~44 regs on aarch64), which buried the one thing the field
+    is for. Drop the assignment LHS so the line mirrors the concise
+    `arguments:` block; the full instruction (with outputs) is still
+    available in the sibling `llil` field. (E17)
     """
     if mlil is None:
         return None
@@ -464,10 +521,14 @@ def _function_call_evidence(ctx, bv, func, *, context: int) -> list[dict[str, An
         # #648: `authoritative` meant "HLIL produced a list", not "the list is right".
         # On an unknown-arity callee HLIL invents ABI-register args (a neighbouring
         # call's staging, the stack canary), so demote and flag it -- confirmed wrong
-        # against upstream source on a dogfood target. An indirect call has no
-        # declared arity at all: it is NEVER `authoritative`, regardless of source.
+        # against upstream source on a dogfood target. A call whose callee could
+        # not be resolved at all (genuinely indirect, or a resolved destination
+        # that matched no function) has no declared arity to check: it is NEVER
+        # `authoritative`, regardless of source (#704: keyed on `callee_unresolved`,
+        # not `indirect_call` -- the latter is purely a call-shape mirror of
+        # `direct` and does not by itself mean the arity is unknown).
         arity = _argument_arity_evidence(ctx, bv, dest_value, target, arguments)
-        if arity.get("indirect_call"):
+        if arity.get("callee_unresolved"):
             argument_confidence = "heuristic"
         elif (arity["arity_unknown"] or arity.get("arity_mismatch")) and argument_confidence == "authoritative":
             argument_confidence = "inferred"
@@ -524,6 +585,20 @@ def _function_thunk_summary(ctx, bv, func) -> dict[str, Any]:
     }
     if not llil or len(llil) > 3:
         return result
+    # #673/#704: track whether the loop's `continue` below fired because the
+    # branch target resolved to a LOCAL, non-imported function -- as opposed to
+    # an earlier disqualifier (op not in the branch set, unresolved dest_value,
+    # unresolved target). Only the local-target case must suppress the pseudo-C
+    # fallback below: a small function whose branch target IS a local defined
+    # function is never a thunk FOR that function (see the comment inline), and
+    # the fallback has no target/import check of its own, so leaving it
+    # unguarded re-flagged exactly that case via a different code path --
+    # unconditionally, since the only caller that reaches this fallback
+    # (`read_decompile._thunk_veneer_warning`) already requires
+    # `"/* tailcall */" in text` to be true. A genuinely unresolved/unlifted
+    # tailcall (no local target was ever positively identified) must still
+    # reach the fallback below, unaffected.
+    saw_local_tailcall_target = False
     for insn in llil:
         op_name = il_format._il_op_name(insn)
         if op_name not in {"LLIL_JUMP", "LLIL_TAILCALL", "LLIL_CALL", "LLIL_CALL_STACK_ADJUST"}:
@@ -542,6 +617,7 @@ def _function_thunk_summary(ctx, bv, func) -> dict[str, Any]:
             getter = getattr(bv, "get_function_at", None)
             callee_fn = getter(int(dest_value)) if callable(getter) else None
         if callee_fn is not None and not is_imported_function(callee_fn):
+            saw_local_tailcall_target = True
             continue
         result.update(
             {
@@ -552,6 +628,8 @@ def _function_thunk_summary(ctx, bv, func) -> dict[str, Any]:
         )
         return result
 
+    if saw_local_tailcall_target:
+        return result
     try:
         text = il_format._decompile_text(bv, func)
     except Exception:

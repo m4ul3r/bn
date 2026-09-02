@@ -1571,6 +1571,28 @@ def _render_function_evidence_text(value: Any) -> str:
                 if call.get("abi_register_saturated"):
                     note += "; the count saturates the ABI argument registers"
                 lines.append(note + ". Confirm with `bn proto get <callee>` / `proto set`.")
+            if call.get("arity_mismatch"):
+                # #648/#704: a resolved, non-variadic callee's recovered prototype
+                # declares a DIFFERENT argument count than HLIL rendered (extra OR
+                # missing) -- the canonical list is not the declared signature.
+                declared = call.get("declared_arity")
+                if isinstance(declared, int):
+                    note = (f"  arity: MISMATCH — HLIL rendered {len(args)} argument(s) but "
+                            f"the callee's recovered prototype declares {declared}")
+                else:
+                    note = ("  arity: MISMATCH — HLIL rendered a different argument count "
+                            "than the callee's recovered prototype declares")
+                lines.append(note + "; the canonical list is not the declared signature. "
+                             "Confirm with `bn proto get <callee>` / `proto set`.")
+        if call.get("callee_unresolved") and not call.get("arity_unknown"):
+            # #648/#704: the call's destination could not be matched to any callee
+            # function at all (genuinely indirect, or a resolved-but-unmatched
+            # direct destination) -- no signature exists to check arguments
+            # against, so `argument_confidence` was demoted regardless of source.
+            lines.append(
+                "  arity: UNKNOWN — call target could not be resolved to a callee "
+                "function, so no signature exists to check arguments against."
+            )
         variadic = call.get("variadic")
         if isinstance(variadic, dict) and variadic.get("is_variadic"):
             # #558: surface variadic under-recovery / recovered format string.
