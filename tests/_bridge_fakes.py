@@ -850,15 +850,14 @@ class _FakeBV:
         return self._segments.get(address)
 
     def read(self, address: int, length: int):
-        if self._memory:
-            # Binary Ninja's bv.read returns only the contiguous mapped bytes
-            # starting at *address*, or b"" if the address is unmapped.
-            for base, blob in self._memory.items():
-                if base <= address < base + len(blob):
-                    start = address - base
-                    return blob[start:start + length]
-            return b""
-        return b"\x90" * length
+        # Binary Ninja's bv.read returns only the contiguous mapped bytes
+        # starting at *address*, or b"" if the address is unmapped (including
+        # when nothing has been seeded into self._memory at all).
+        for base, blob in self._memory.items():
+            if base <= address < base + len(blob):
+                start = address - base
+                return blob[start:start + length]
+        return b""
 
     @property
     def tag_types(self):
