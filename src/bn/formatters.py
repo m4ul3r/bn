@@ -633,6 +633,18 @@ def _render_session_start_text(value: Any) -> str:
                     lines.append(f"  note: {note}")
             else:
                 lines.append(f"- {_render_fallback_text(item)}")
+    project_roots = list(value.get("project_roots") or [])
+    if project_roots:
+        lines.append("")
+        lines.append(f"projects: {', '.join(str(root) for root in project_roots)}")
+    association_error = value.get("project_association_error")
+    if association_error:
+        lines.append("")
+        lines.append(f"project association error: {association_error}")
+        lines.append(
+            f"hint: bare `bn` commands from this checkout won't route to this "
+            f"session; pass -i {value.get('instance_id', '<id>')}"
+        )
     if value.get("stopped"):
         lines.append("")
         lines.append("session stopped: no binaries loaded successfully")
@@ -679,9 +691,6 @@ def _render_session_stop_text(value: Any) -> str:
     method = value.get("method")
     if method:
         line += f" ({method})"
-    removed = value.get("marker_removed")
-    if removed:
-        line += f"\nremoved marker(s): {', '.join(str(p) for p in removed)}"
     return line
 
 
@@ -711,6 +720,11 @@ def _render_session_list_text(value: Any) -> str:
         binaries = item.get("binaries")
         if binaries:
             lines.append(f"  open: {', '.join(str(b) for b in binaries)}")
+        project_roots = item.get("project_roots")
+        if project_roots:
+            lines.append(
+                f"  projects: {', '.join(str(root) for root in project_roots)}"
+            )
     total_rss = value.get("total_rss_mb")
     if total_rss is not None and instances:
         lines.append("")

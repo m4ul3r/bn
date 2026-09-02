@@ -854,17 +854,23 @@ def test_load_binary_idempotent_returns_existing_view(monkeypatch, tmp_path):
     bridge, instance, loaded_paths = _setup_load_test(monkeypatch)
     raw = tmp_path / "app.bin"
     raw.write_bytes(b"")
+    project = tmp_path / "project"
+    project.mkdir()
 
     instance._load_binary(str(raw), prefer_bndb=False)
     assert loaded_paths == [str(raw)]
     assert len(bridge._headless_views) == 1
 
     # second load of the SAME path: no duplicate view, no second binaryninja.load
-    result = instance._load_binary(str(raw), prefer_bndb=False)
+    result = instance._load_binary(
+        str(raw), prefer_bndb=False, workdir=str(project)
+    )
     assert loaded_paths == [str(raw)]               # load NOT called again
     assert len(bridge._headless_views) == 1         # no duplicate view
     assert result.get("already_open") is True
     assert any("already open" in n.lower() for n in result["notes"])
+    registry = json.loads(instance.registry_path.read_text(encoding="utf-8"))
+    assert registry["project_roots"] == [str(project)]
     bridge._headless_views.clear()
 
 
@@ -3209,68 +3215,50 @@ def test_write_registry_binaries_best_effort_on_refresh_error(monkeypatch, tmp_p
     assert payload["binaries"] == []   # degrades to empty, registry still written
 
 
-def test_write_project_marker_gated_and_git_excludes(monkeypatch, tmp_path):
-    # #80: the bridge drops a `.bn-<id>` marker in the CLI's project root, adds
-    # `.bn-*` to .git/info/exclude, and is gated (GUI bridge / --no-marker write none).
+def test_project_association_is_private_canonical_and_deduplicated(
+    monkeypatch, tmp_path
+):
     bridge = _load_bridge(monkeypatch)
     inst = bridge.BinaryNinjaBridge(instance_id="zz99")
+    inst.registry_path = tmp_path / "cache" / "zz99.json"
+    inst.socket_path = tmp_path / "cache" / "zz99.sock"
 
-    git = tmp_path / ".git" / "info"
-    git.mkdir(parents=True)  # make tmp_path look like a git work tree root
-    assert inst._write_project_marker(str(tmp_path), no_marker=False) is None
-    marker = tmp_path / ".bn-zz99"
-    assert marker.exists()
-    body = json.loads(marker.read_text())
-    assert body["instance_id"] == "zz99" and "socket_path" in body
-    assert ".bn-*" in (tmp_path / ".git" / "info" / "exclude").read_text()
+    project = tmp_path / "project"
+    subdir = project / "src" / "deep"
+    (project / ".git").mkdir(parents=True)
+    subdir.mkdir(parents=True)
 
-    # opt-out writes nothing
-    other = tmp_path / "other"
-    other.mkdir()
-    assert inst._write_project_marker(str(other), no_marker=True) is None
-    assert not (other / ".bn-zz99").exists()
+    result = inst._associate_project_roots([str(subdir), str(project)])
 
-    # GUI bridge (instance_id None) writes nothing (keeps its legacy fixed registry)
-    gui = bridge.BinaryNinjaBridge()
-    assert gui._write_project_marker(str(other), no_marker=False) is None
-    assert not list(other.glob(".bn-*"))
+    assert result["associated"] == [str(project)]
+    payload = json.loads(inst.registry_path.read_text(encoding="utf-8"))
+    assert payload["project_roots"] == [str(project)]
+    assert not list(project.glob(".bn-*"))
+    assert not (project / ".git" / "info" / "exclude").exists()
 
 
-def test_write_project_marker_refresh_only_does_not_create(monkeypatch, tmp_path):
-    # #391: `session restart` refreshes a marker but must NOT create a new one in
-    # a restart cwd that differs from the original session-start cwd. refresh_only
-    # writes ONLY when a marker already exists there.
+def test_project_association_skips_missing_directory(monkeypatch, tmp_path):
     bridge = _load_bridge(monkeypatch)
-    inst = bridge.BinaryNinjaBridge(instance_id="rs42")
-    git = tmp_path / ".git" / "info"
-    git.mkdir(parents=True)
+    inst = bridge.BinaryNinjaBridge(instance_id="gone1")
+    inst.registry_path = tmp_path / "cache" / "gone1.json"
+    inst.socket_path = tmp_path / "cache" / "gone1.sock"
+    missing = tmp_path / "missing"
 
-    # no existing marker -> refresh_only writes nothing
-    assert inst._write_project_marker(str(tmp_path), no_marker=False, refresh_only=True) is None
-    assert not (tmp_path / ".bn-rs42").exists()
+    result = inst._associate_project_roots([str(missing)])
 
-    # create one (a prior session start), then refresh_only updates it in place
-    marker = tmp_path / ".bn-rs42"
-    marker.write_text(json.dumps({"instance_id": "rs42", "socket_path": "/old", "pid": 1, "created_at": "old"}))
-    assert inst._write_project_marker(str(tmp_path), no_marker=False, refresh_only=True) is None
-    body = json.loads(marker.read_text())
-    assert body["instance_id"] == "rs42"
-    assert body["created_at"] != "old"  # refreshed
+    assert result["associated"] == []
+    assert result["skipped"] == [
+        {"path": str(missing), "reason": "project directory does not exist"}
+    ]
+    assert not inst.registry_path.exists()
 
 
-def test_write_project_marker_readonly_dir_is_a_note_not_error(monkeypatch, tmp_path):
+def test_project_association_rejects_malformed_roots(monkeypatch):
     bridge = _load_bridge(monkeypatch)
-    inst = bridge.BinaryNinjaBridge(instance_id="ro11")
-    ro = tmp_path / "ro"
-    ro.mkdir()
-    ro.chmod(0o500)
-    try:
-        note = inst._write_project_marker(str(ro), no_marker=False)
-        # best-effort: a one-line note, never a raised error (a missing/locked dir
-        # must not fail the load)
-        assert note is None or "marker" in note
-    finally:
-        ro.chmod(0o700)
+    inst = bridge.BinaryNinjaBridge(instance_id="bad1")
+
+    with pytest.raises(RuntimeError, match="list of strings"):
+        inst._associate_project_roots("not-a-list")
 
 
 def test_lens_read_ops_are_read_locked_and_py_exec_stays_write_locked(monkeypatch):

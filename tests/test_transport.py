@@ -28,15 +28,15 @@ from bn.transport import (
 
 
 def test_choose_instance_multiple_with_no_selector_errors_before_target(monkeypatch):
-    # #368 facet 2: with several live instances and NO selector (no -i/env/sticky/
-    # marker), instance resolution must surface the workspace-level ambiguity --
-    # not narrow to one instance -- BEFORE any target resolution runs.
+    # #368 facet 2: with several live instances and NO selector or project
+    # association, resolution must surface workspace ambiguity before target
+    # resolution runs.
     import types
     import bn.transport as t
     insts = [types.SimpleNamespace(instance_id="aa11", pid=11, socket_path="/s/aa11", started_at=None),
              types.SimpleNamespace(instance_id="bb22", pid=22, socket_path="/s/bb22", started_at=None)]
     monkeypatch.setattr(t, "list_instances", lambda **kwargs: insts)
-    monkeypatch.setattr(t, "_resolve_from_markers", lambda instances: None)  # no marker
+    monkeypatch.setattr(t, "_resolve_from_project_roots", lambda instances: None)
     with pytest.raises(BridgeError) as exc:
         choose_instance(auto_start=False)
     assert "Multiple" in str(exc.value) and "instance" in str(exc.value).lower()
@@ -1769,56 +1769,72 @@ def test_send_request_load_refresh_use_larger_default(tmp_path, monkeypatch):
     assert fake_socket.timeouts == pytest.approx([REFRESH_REQUEST_TIMEOUT], rel=1e-5)
 
 
-# -- #80: project-local instance markers ----------------------------------
+# -- private project associations -----------------------------------------
 import bn.transport as _t
-import bn.paths as _p
 from pathlib import Path as _Path
 
 
-def _mk_inst(iid):
-    return _t.BridgeInstance(pid=1, socket_path=_Path("/x.sock"), registry_path=_Path("/x.json"),
-                             plugin_name="p", plugin_version="v", started_at=None, meta={},
-                             instance_id=iid)
+def _mk_inst(iid, *, roots=None, meta=None):
+    payload = dict(meta or {})
+    if roots is not None:
+        payload["project_roots"] = roots
+    return _t.BridgeInstance(
+        pid=1,
+        socket_path=_Path("/x.sock"),
+        registry_path=_Path("/x.json"),
+        plugin_name="p",
+        plugin_version="v",
+        started_at=None,
+        meta=payload,
+        instance_id=iid,
+    )
 
 
-def test_resolve_from_markers_picks_live_instance(monkeypatch, tmp_path):
-    live = _mk_inst("abcd")
-    marker = tmp_path / ".bn-abcd"
-    marker.write_text("{}")
-    monkeypatch.setattr(_t, "find_instance_markers", lambda: iter([("abcd", marker)]))
-    assert _t._resolve_from_markers([_mk_inst("ef01"), live]) is live
+def test_resolve_from_project_roots_picks_unique_live_instance(monkeypatch, tmp_path):
+    root = tmp_path / "project"
+    (root / ".git").mkdir(parents=True)
+    monkeypatch.chdir(root)
+    live = _mk_inst("abcd", roots=[str(root)])
+
+    assert _t._resolve_from_project_roots([_mk_inst("ef01"), live]) is live
 
 
-def test_resolve_from_markers_heals_marker_not_in_live_list(monkeypatch, tmp_path):
-    # A marker whose id isn't in the resolved LIVE list (stopped/crashed/purged) is
-    # unlinked -- the live list is authoritative (list_instances ran its purge).
-    dead = tmp_path / ".bn-dead1"
-    dead.write_text("{}")
-    monkeypatch.setattr(_t, "find_instance_markers", lambda: iter([("dead1", dead)]))
-    assert _t._resolve_from_markers([_mk_inst("live9")]) is None
-    assert not dead.exists()
+def test_resolve_from_project_roots_ignores_missing_or_malformed_metadata(
+    monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+
+    assert _t._resolve_from_project_roots([
+        _mk_inst("none1"),
+        _mk_inst("bad1", meta={"project_roots": "not-a-list"}),
+        _mk_inst("bad2", roots=[str(tmp_path), 7]),
+    ]) is None
 
 
-def test_resolve_from_markers_ignores_foreign_marker_id(monkeypatch, tmp_path):
-    # A `.bn-*` file whose id isn't a well-formed bn instance id is NOT ours -- it
-    # must never be unlinked (and never resolve).
-    foreign = tmp_path / ".bn-not a valid id!"
-    foreign.write_text("{}")
-    monkeypatch.setattr(_t, "find_instance_markers",
-                        lambda: iter([("not a valid id!", foreign)]))
-    assert _t._resolve_from_markers([_mk_inst("live9")]) is None
-    assert foreign.exists()
+def test_resolve_from_project_roots_fails_closed_on_multiple_matches(
+    monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    first = _mk_inst("aaaa", roots=[str(tmp_path)])
+    second = _mk_inst("bbbb", roots=[str(tmp_path)])
+
+    with pytest.raises(_t.BridgeError, match="Multiple.*associated"):
+        _t._resolve_from_project_roots([first, second])
 
 
-def test_find_instance_markers_walks_up_from_cwd(monkeypatch, tmp_path):
-    root = tmp_path / "proj"
-    sub = root / "a" / "b"
-    sub.mkdir(parents=True)
-    (root / ".bn-rootinst").write_text("{}")
-    (sub / ".bn-nearinst").write_text("{}")
-    monkeypatch.chdir(sub)
-    found = dict(_p.find_instance_markers())
-    assert found.get("rootinst") and found.get("nearinst")  # both, walking up
+def test_resolve_from_project_roots_keeps_nested_repositories_isolated(
+    monkeypatch, tmp_path
+):
+    outer = tmp_path / "outer"
+    inner = outer / "vendor" / "inner"
+    (outer / ".git").mkdir(parents=True)
+    (inner / ".git").mkdir(parents=True)
+    monkeypatch.chdir(inner)
+
+    assert _t._resolve_from_project_roots([
+        _mk_inst("outer1", roots=[str(outer)]),
+        _mk_inst("inner1", roots=[str(inner)]),
+    ]).instance_id == "inner1"
 
 
 def test_send_request_still_lets_the_env_override_win_for_a_single_request(

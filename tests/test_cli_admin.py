@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import types
 
 import bn.cli
@@ -449,8 +450,8 @@ def test_session_restart_respawns_and_reloads_targets(monkeypatch, capsys):
     old = type("FakeInstance", (), {
         "instance_id": "keep-me", "pid": 500,
         "socket_path": __import__("pathlib").Path("/tmp/old.sock"),
-        # #694: restart reads the registry payload to recover the project markers
-        # the stopped process owned; this instance owned none.
+        # Restart reads the registry payload to recover private project
+        # associations; this instance owned none.
         "meta": {},
     })()
     new = BridgeInstance(
@@ -638,7 +639,7 @@ def test_session_list_shows_instances(monkeypatch, capsys):
             plugin_name="bn_agent_bridge",
             plugin_version="0.1.0",
             started_at="2026-01-01T00:00:00Z",
-            meta={},
+            meta={"project_roots": ["/workspace/project-a"]},
             instance_id="aaaa1111",
         ),
         BridgeInstance(
@@ -665,6 +666,7 @@ def test_session_list_shows_instances(monkeypatch, capsys):
     assert len(parsed["items"]) == 2
     assert parsed["items"][0]["selector"] == "aaaa1111"
     assert parsed["items"][0]["instance_id"] == "aaaa1111"
+    assert parsed["items"][0]["project_roots"] == ["/workspace/project-a"]
     assert parsed["items"][1]["instance_id"] == "bbbb2222"
     assert "rss_mb" in parsed["items"][0]
     assert "total_rss_mb" in parsed
@@ -767,72 +769,6 @@ def test_session_status_unknown_job_fails_loudly(monkeypatch, capsys):
     assert "Unknown load job: nope" in capsys.readouterr().err
 
 
-def test_remove_instance_markers_matches_only_the_id(tmp_path):
-    # #436: session stop must clean up the instance's own `.bn-<id>` marker and
-    # leave unrelated markers (other sessions) in place.
-    from bn import paths
-    (tmp_path / ".bn-WorkerA").write_text("")
-    (tmp_path / ".bn-Other").write_text("")
-    removed = paths.remove_instance_markers("WorkerA", start=tmp_path)
-    assert [p.name for p in removed] == [".bn-WorkerA"]
-    assert not (tmp_path / ".bn-WorkerA").exists()
-    assert (tmp_path / ".bn-Other").exists()
-    # Idempotent: a second stop with no marker returns nothing.
-    assert paths.remove_instance_markers("WorkerA", start=tmp_path) == []
-
-
-def test_session_stop_removes_marker(monkeypatch, capsys, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".bn-abc123").write_text("")
-    monkeypatch.setattr(bn.cli, "list_instances", lambda: [])
-    monkeypatch.setattr(bn.cli, "send_request",
-                        lambda op, **k: {"ok": True, "result": {}})
-    rc = bn.cli.main(["session", "stop", "abc123", "--format", "json"])
-    assert rc == 0
-    parsed = json.loads(capsys.readouterr().out)
-    assert any(".bn-abc123" in p for p in parsed["marker_removed"])
-    assert not (tmp_path / ".bn-abc123").exists()
-
-
-def test_session_stop_removes_recorded_marker_outside_cwd(
-    monkeypatch, capsys, tmp_path
-):
-    from bn.transport import BridgeInstance
-
-    origin = tmp_path / "origin"
-    caller = tmp_path / "caller"
-    origin.mkdir()
-    caller.mkdir()
-    marker = origin / ".bn-abc123"
-    marker.write_text("")
-    instance = BridgeInstance(
-        pid=111,
-        socket_path=tmp_path / "bridge.sock",
-        registry_path=tmp_path / "bridge.json",
-        plugin_name="bn_agent_bridge",
-        plugin_version="0.1.0",
-        started_at="2026-01-01T00:00:00Z",
-        meta={"marker_paths": [str(marker)]},
-        instance_id="abc123",
-    )
-    monkeypatch.chdir(caller)
-    monkeypatch.setattr(bn.cli, "list_instances", lambda **kw: [instance])
-    monkeypatch.setattr(bn.cli, "find_lifecycle_instance", lambda target: instance)
-    def fake_shutdown(op, **kwargs):
-        marker.unlink(missing_ok=True)  # bridge clean-shutdown path removed it
-        return {"ok": True, "result": {}}
-
-    monkeypatch.setattr(bn.cli, "send_request", fake_shutdown)
-    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda *args, **kwargs: True)
-
-    rc = bn.cli.main(
-        ["session", "stop", "abc123", "--format", "json"]
-    )
-
-    assert rc == 0
-    assert not marker.exists()
-    result = json.loads(capsys.readouterr().out)
-    assert str(marker) in result["marker_removed"]
 
 
 @pytest.mark.parametrize("flag", ["--instance", "--instance-id"])
@@ -910,6 +846,18 @@ def test_session_start_spawns_instance(monkeypatch, capsys):
         instance_id="test1234",
     )
     monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: fake_inst)
+    monkeypatch.setattr(
+        bn.cli,
+        "send_request",
+        lambda op, **kwargs: {
+            "ok": True,
+            "result": {
+                "instance_id": "test1234",
+                "associated": [os.getcwd()],
+                "skipped": [],
+            },
+        },
+    )
 
     rc = bn.cli.main(["session", "start", "--format", "json"])
 
@@ -935,47 +883,105 @@ def _fake_instance(instance_id):
     )
 
 
-def test_session_start_passes_workdir_and_no_marker_to_load(monkeypatch, capsys, tmp_path):
-    """session start must pass `workdir` + `no_marker` to load_binary (like load)
-    so the bridge drops the `.bn-<id>` project marker -- the recommended
-    `session start --instance-id X` workflow otherwise silently fails to register
-    it, defeating #80 cwd-resolution (#377)."""
-    import os
-    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: _fake_instance("m1"))
-    monkeypatch.delenv("BN_NO_MARKERS", raising=False)
+def test_session_start_associates_project_and_forwards_workdir(
+    monkeypatch, capsys, tmp_path
+):
+    monkeypatch.setattr(
+        bn.cli, "spawn_instance", lambda instance_id=None: _fake_instance("m1")
+    )
     monkeypatch.chdir(tmp_path)
     calls = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, spawn_missing_named=False):
         calls.append((op, params))
-        return {"ok": True, "result": {"path": params.get("path"), "loaded": True, "targets": [{"selector": "x.bndb"}]}}
+        if op == "associate_project_roots":
+            return {
+                "ok": True,
+                "result": {
+                    "instance_id": "m1",
+                    "associated": [str(tmp_path)],
+                    "skipped": [],
+                },
+            }
+        return {
+            "ok": True,
+            "result": {
+                "path": params.get("path"),
+                "loaded": True,
+                "targets": [{"selector": "x.bndb"}],
+            },
+        }
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
-    rc = bn.cli.main(["session", "start", str(tmp_path / "x.bndb"), "--format", "json"])
+    rc = bn.cli.main([
+        "session", "start", str(tmp_path / "x.bndb"), "--format", "json"
+    ])
+
     assert rc == 0
-    load = next(p for op, p in calls if op == "load_binary")
-    assert load["workdir"] == os.getcwd()
-    assert load["no_marker"] is False
+    assert calls[0] == ("associate_project_roots", {"roots": [str(tmp_path)]})
+    load = next(params for op, params in calls if op == "load_binary")
+    assert load["workdir"] == str(tmp_path)
+    assert "no_marker" not in load
+    assert json.loads(capsys.readouterr().out)["project_roots"] == [str(tmp_path)]
 
 
-def test_session_start_no_marker_flag_suppresses_marker(monkeypatch, capsys, tmp_path):
-    """`session start --no-marker` suppresses the marker, parity with load (#377)."""
-    monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: _fake_instance("m2"))
-    monkeypatch.delenv("BN_NO_MARKERS", raising=False)
+def test_session_start_text_mode_shows_associated_projects(
+    monkeypatch, capsys, tmp_path
+):
+    monkeypatch.setattr(
+        bn.cli, "spawn_instance", lambda instance_id=None: _fake_instance("m1")
+    )
     monkeypatch.chdir(tmp_path)
-    calls = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
-        calls.append((op, params))
-        return {"ok": True, "result": {"path": params.get("path"), "loaded": True, "targets": [{"selector": "x.bndb"}]}}
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, spawn_missing_named=False):
+        if op == "associate_project_roots":
+            return {
+                "ok": True,
+                "result": {
+                    "instance_id": "m1",
+                    "associated": [str(tmp_path)],
+                    "skipped": [],
+                },
+            }
+        return {
+            "ok": True,
+            "result": {
+                "path": params.get("path"),
+                "loaded": True,
+                "targets": [{"selector": "x.bndb"}],
+            },
+        }
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
-    rc = bn.cli.main(["session", "start", str(tmp_path / "x.bndb"), "--no-marker", "--format", "json"])
+    rc = bn.cli.main(["session", "start", str(tmp_path / "x.bndb")])
+
     assert rc == 0
-    load = next(p for op, p in calls if op == "load_binary")
-    assert load["no_marker"] is True
+    assert f"projects: {tmp_path}" in capsys.readouterr().out
+
+
+def test_session_start_text_mode_shows_association_error(monkeypatch, capsys):
+    monkeypatch.setattr(
+        bn.cli, "spawn_instance", lambda instance_id=None: _fake_instance("m2")
+    )
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, spawn_missing_named=False):
+        if op == "associate_project_roots":
+            raise bn.cli.BridgeError("bridge is shutting down")
+        raise AssertionError(f"unexpected op {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["session", "start"])
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "project association error: bridge is shutting down" in out
+    assert "pass -i m2" in out
 
 
 def test_session_start_partial_failure_keeps_bridge_but_exits_nonzero(monkeypatch, capsys):
@@ -997,6 +1003,11 @@ def test_session_start_partial_failure_keeps_bridge_but_exits_nonzero(monkeypatc
 
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         ops.append(op)
+        if op == "associate_project_roots":
+            return {
+                "ok": True,
+                "result": {"instance_id": "half", "associated": [], "skipped": []},
+            }
         if op == "load_binary":
             if "good" in params["path"]:
                 return {"ok": True, "result": {"path": params["path"], "loaded": True, "targets": [{"selector": "good.so"}]}}
@@ -1412,9 +1423,27 @@ def test_session_start_no_bndb_propagates_to_each_load(monkeypatch, tmp_path):
 
     captured = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, spawn_missing_named=False):
+        if op == "associate_project_roots":
+            return {
+                "ok": True,
+                "result": {
+                    "instance_id": "test1234",
+                    "associated": [str(tmp_path)],
+                    "skipped": [],
+                },
+            }
         captured.append(dict(params or {}))
-        return {"ok": True, "result": {"loaded": True, "path": params["path"], "notes": [], "targets": [{"selector": __import__("pathlib").Path(params["path"]).name}]}}
+        return {
+            "ok": True,
+            "result": {
+                "loaded": True,
+                "path": params["path"],
+                "notes": [],
+                "targets": [{"selector": pathlib.Path(params["path"]).name}],
+            },
+        }
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
     rc = bn.cli.main(["session", "start", "--no-bndb", str(a), str(b)])
@@ -2083,18 +2112,19 @@ def test_session_start_cleanup_reports_a_refused_signal(monkeypatch, capsys, tmp
 
 
 # --------------------------------------------------------------------------
-# #694: a restart restores the project markers of the process it replaced
+# #694: restart preserves private project associations
 # --------------------------------------------------------------------------
 
 
-def _restart_bridge_stubs(monkeypatch, marker_paths, *, restore_result=None, restore_error=None):
-    """Wire a restart whose old instance owned *marker_paths*. Returns the calls."""
+def _restart_bridge_stubs(
+    monkeypatch, project_roots, *, restore_result=None, restore_error=None
+):
     import pathlib
 
     from bn.transport import BridgeError, BridgeInstance
 
     old = _fake_bridge_instance("keep1", pid=4242)  # noqa: F405
-    old.meta["marker_paths"] = [str(path) for path in marker_paths]
+    old.meta["project_roots"] = [str(path) for path in project_roots]
     new = BridgeInstance(
         pid=5151,
         socket_path=pathlib.Path("/tmp/keep1.sock"),
@@ -2107,13 +2137,22 @@ def _restart_bridge_stubs(monkeypatch, marker_paths, *, restore_result=None, res
     )
     calls: list[tuple[str, dict]] = []
 
-    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, **kwargs):
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, **kwargs):
         calls.append((op, dict(params or {})))
         if op == "shutdown":
             return {"ok": True, "result": {"shutting_down": True}}
         if op == "load_binary":
-            return {"ok": True, "result": {"loaded": True, "path": params["path"], "notes": [], "targets": []}}
-        if op == "restore_markers":
+            return {
+                "ok": True,
+                "result": {
+                    "loaded": True,
+                    "path": params["path"],
+                    "notes": [],
+                    "targets": [],
+                },
+            }
+        if op == "associate_project_roots":
             if restore_error is not None:
                 raise BridgeError(restore_error)
             return {
@@ -2122,7 +2161,7 @@ def _restart_bridge_stubs(monkeypatch, marker_paths, *, restore_result=None, res
                 if restore_result is not None
                 else {
                     "instance_id": "keep1",
-                    "restored": [p["path"] if isinstance(p, dict) else p for p in params["paths"]],
+                    "associated": list(params["roots"]),
                     "skipped": [],
                 },
             }
@@ -2144,82 +2183,83 @@ def _restart_bridge_stubs(monkeypatch, marker_paths, *, restore_result=None, res
     return calls
 
 
-def test_session_restart_restores_the_original_project_marker(monkeypatch, capsys, tmp_path):
-    # The stopped bridge unlinks its own `.bn-<id>` markers and the reload only
-    # refreshes a marker in the CLI's cwd, so a restart from anywhere else used to
-    # drop the marker that resolves a bare `bn` in the original project root.
-    marker = tmp_path / "project" / ".bn-keep1"
-    marker.parent.mkdir()
-    monkeypatch.delenv("BN_NO_MARKERS", raising=False)
-    calls = _restart_bridge_stubs(monkeypatch, [marker])
+def test_session_restart_restores_original_project_roots(
+    monkeypatch, capsys, tmp_path
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    calls = _restart_bridge_stubs(monkeypatch, [project])
 
     rc = bn.cli.main(["session", "restart", "keep1", "--format", "json"])
 
     assert rc == 0
-    restore = [params for op, params in calls if op == "restore_markers"]
-    assert restore == [{"paths": [str(marker)]}]
+    restore = [params for op, params in calls if op == "associate_project_roots"]
+    assert restore == [{"roots": [str(project)]}]
+    load = next(params for op, params in calls if op == "load_binary")
+    assert "workdir" not in load
     parsed = json.loads(capsys.readouterr().out)
-    assert parsed["markers"]["restored"] == [str(marker)]
-    # The marker request is sent AFTER the respawn, so it lands on the new bridge.
-    assert [op for op, _ in calls].index("restore_markers") > [
+    assert parsed["project_roots"] == [str(project)]
+    assert "project_association_error" not in parsed
+    assert [op for op, _ in calls].index("associate_project_roots") > [
         op for op, _ in calls
     ].index("load_binary")
 
 
-def test_session_restart_ignores_foreign_marker_paths_from_the_registry(monkeypatch, tmp_path):
-    # Only this instance's own marker name is handed back; a stray path for a
-    # different instance is never re-created under our id.
-    mine = tmp_path / ".bn-keep1"
-    foreign = tmp_path / ".bn-other9"
-    monkeypatch.delenv("BN_NO_MARKERS", raising=False)
-    calls = _restart_bridge_stubs(monkeypatch, [foreign, mine])
-
-    assert bn.cli.main(["session", "restart", "keep1", "--format", "json"]) == 0
-
-    restore = [params for op, params in calls if op == "restore_markers"]
-    assert restore == [{"paths": [str(mine)]}]
-
-
-def test_session_restart_skips_marker_restore_when_markers_are_disabled(monkeypatch, tmp_path):
-    monkeypatch.setenv("BN_NO_MARKERS", "1")
-    calls = _restart_bridge_stubs(monkeypatch, [tmp_path / ".bn-keep1"])
-
-    assert bn.cli.main(["session", "restart", "keep1", "--format", "json"]) == 0
-
-    assert [op for op, _ in calls if op == "restore_markers"] == []
-
-
-def test_session_restart_reports_a_failed_marker_restore_without_failing(monkeypatch, capsys, tmp_path):
-    # A restart whose targets came back is a successful restart; a marker that
-    # could not be restored is a warning plus a structured field, not exit 1.
-    monkeypatch.delenv("BN_NO_MARKERS", raising=False)
+def test_session_restart_reports_failed_association_restore_and_fails(
+    monkeypatch, capsys, tmp_path
+):
+    project = tmp_path / "project"
+    project.mkdir()
     _restart_bridge_stubs(
-        monkeypatch, [tmp_path / ".bn-keep1"], restore_error="op restore_markers unknown"
+        monkeypatch, [project], restore_error="associate operation unavailable"
     )
 
     rc = bn.cli.main(["session", "restart", "keep1", "--format", "json"])
 
     captured = capsys.readouterr()
-    assert rc == 0
-    assert "could not restore project marker" in captured.err
-    assert json.loads(captured.out)["markers"]["error"] == "op restore_markers unknown"
+    assert rc == 1
+    assert "project association failed" in captured.err
+    parsed = json.loads(captured.out)
+    assert parsed["project_association_error"] == "associate operation unavailable"
+    assert "project_roots" not in parsed
 
 
-def test_session_restart_warns_about_each_skipped_marker(monkeypatch, capsys, tmp_path):
-    monkeypatch.delenv("BN_NO_MARKERS", raising=False)
-    marker = tmp_path / ".bn-keep1"
+def test_session_restart_reports_failed_association_restore_in_text_mode(
+    monkeypatch, capsys, tmp_path
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    _restart_bridge_stubs(
+        monkeypatch, [project], restore_error="associate operation unavailable"
+    )
+
+    rc = bn.cli.main(["session", "restart", "keep1"])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "project association error: associate operation unavailable" in captured.out
+    assert "pass -i keep1" in captured.out
+
+
+def test_session_restart_warns_about_each_skipped_association(
+    monkeypatch, capsys, tmp_path
+):
+    project = tmp_path / "project"
+    project.mkdir()
     _restart_bridge_stubs(
         monkeypatch,
-        [marker],
+        [project],
         restore_result={
             "instance_id": "keep1",
-            "restored": [],
-            "skipped": [{"path": str(marker), "reason": "parent directory does not exist"}],
+            "associated": [],
+            "skipped": [
+                {"path": str(project), "reason": "project directory does not exist"}
+            ],
         },
     )
 
     assert bn.cli.main(["session", "restart", "keep1", "--format", "json"]) == 0
-    assert "parent directory does not exist" in capsys.readouterr().err
+    assert "project directory does not exist" in capsys.readouterr().err
 
 
 # --------------------------------------------------------------------------

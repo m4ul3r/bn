@@ -1,17 +1,8 @@
-"""Bridge teardown lifecycle: the files a stopping bridge owns (#694).
+"""Bridge teardown lifecycle for private cache registries (#694).
 
-`stop()` unlinks the socket, the project markers and the registry. Two things
-outlive it and used to undo that work:
-
-* a detached load worker (``load_binary_async``) runs on its own thread, so a
-  load that finished after teardown re-published the marker + registry and left
-  files advertising a bridge that no longer exists;
-* `bn session restart` respawns under the same instance id, but the marker the
-  stopped process owned was already gone and the refresh-only reload could only
-  touch a marker in the CLI's cwd -- so a restart from anywhere else dropped it.
-
-These tests pin the teardown latch, the load-job quiescence, the durable process
-identity the registry now records, and the explicit marker restoration.
+Detached load workers can outlive ``stop()``. These tests pin the teardown
+latch, load-job quiescence, durable process identity, and project-association
+restoration so a late worker cannot re-publish a dead bridge registry.
 """
 from __future__ import annotations
 
@@ -70,34 +61,19 @@ def test_registry_write_after_stop_is_refused(instance):
     assert not instance.registry_path.exists()
 
 
-def test_marker_publication_after_stop_is_refused(instance, tmp_path):
-    marker = tmp_path / "project" / ".bn-life1"
-    marker.parent.mkdir()
-
-    assert instance._publish_marker(marker) is None
-    assert marker.exists()
-
-    instance.stop()
-    assert not marker.exists()          # teardown removed the tracked marker
-    assert instance._marker_paths == set()
-
-    note = instance._publish_marker(marker)
-
-    assert note == "bridge is shutting down"
-    assert not marker.exists()
-
-
-def test_project_marker_write_after_stop_reports_the_refusal(instance, tmp_path):
-    # The `bn load` path surfaces marker problems as a note, so the refusal has to
-    # travel that channel rather than silently succeeding or raising.
-    project = tmp_path / "work"
+def test_project_association_after_stop_is_refused(instance, tmp_path):
+    project = tmp_path / "project"
     project.mkdir()
     instance.stop()
 
-    note = instance._write_project_marker(str(project), False)
+    assert instance._record_project_root(str(project)) is None
+    result = instance._associate_project_roots([str(project)])
 
-    assert note is not None and "shutting down" in note
-    assert not (project / ".bn-life1").exists()
+    assert result["associated"] == []
+    assert result["skipped"] == [
+        {"path": str(project), "reason": "bridge is shutting down"}
+    ]
+    assert not instance.registry_path.exists()
 
 
 # --------------------------------------------------------------------------
@@ -293,68 +269,51 @@ def test_stop_refuses_a_queued_job_a_worker_has_not_reached(instance, monkeypatc
     assert instance._load_jobs[job["job_id"]]["state"] == "failed"
 
 
-def test_registry_write_snapshots_marker_paths_under_the_teardown_lock(
+def test_registry_write_snapshots_project_roots_under_the_teardown_lock(
     instance, monkeypatch, tmp_path
 ):
-    # A registry write that begins BEFORE a marker is restored must not publish a
-    # stale marker inventory afterwards: snapshotting `_marker_paths` outside the
-    # lock let a slow concurrent write (e.g. a detached load finishing) land after
-    # `_restore_markers()` and drop the restored path, so the next `session stop`
-    # could not find and clear it (#694).
+    # An older concurrent write must not overwrite a root restored by restart.
     project = tmp_path / "project"
     project.mkdir()
-    marker = project / ".bn-life1"
     gate = _GatedLock(instance._teardown_lock, "regwriter")
     monkeypatch.setattr(instance, "_teardown_lock", gate)
 
     writer = threading.Thread(target=instance._write_registry, name="regwriter")
     writer.start()
-    assert gate.arrived.wait(5.0)               # the write is parked at the lock
+    assert gate.arrived.wait(5.0)
 
-    # The restore runs to completion first, publishing the marker and its own
-    # registry (it takes the same lock, which is NOT gated for this thread).
-    assert instance._restore_markers([str(marker)])["restored"] == [str(marker)]
-    assert marker.exists()
+    result = instance._associate_project_roots([str(project)])
+    assert result["associated"] == [str(project)]
 
-    gate.release.set()                          # the older write now lands
+    gate.release.set()
     writer.join(timeout=5.0)
     assert not writer.is_alive()
 
     payload = json.loads(instance.registry_path.read_text(encoding="utf-8"))
-    assert payload["marker_paths"] == [str(marker)]
+    assert payload["project_roots"] == [str(project)]
 
 
 def test_stop_joins_a_running_load_worker_and_suppresses_its_publication(
     instance, monkeypatch, tmp_path
 ):
-    # The review's exact defect: a detached load finishing AFTER teardown
-    # re-published the marker + registry that stop() had just removed, leaving
-    # files that advertise a bridge which no longer exists. The worker also has to
-    # be joinable -- and the join bounded, because a load wedged inside
-    # update_analysis_and_wait() must never hang teardown; the latch, not the
-    # join, is what makes teardown final.
     binary = tmp_path / "app.bin"
     binary.write_bytes(b"\x7fELF")
     project = tmp_path / "project"
     project.mkdir()
-    marker = project / ".bn-life1"
     release = threading.Event()
     finished = threading.Event()
 
     def slow_load(*args, **kwargs):
         release.wait(5.0)
-        # Mirror the tail of the real _load_binary: publish the marker, then the
-        # registry, both of which teardown has already unlinked.
-        instance._write_project_marker(str(project), False)
+        instance._record_project_root(str(project))
         instance._write_registry()
         finished.set()
         return {"loaded": True, "path": str(binary)}
 
     monkeypatch.setattr(instance, "_load_binary", slow_load)
+    instance._record_project_root(str(project))
     instance._write_registry()
-    assert instance._publish_marker(marker) is None
     job = instance._load_binary_async(str(binary))
-    # The worker is tracked, so stop() has something to join.
     assert job["job_id"] in instance._load_job_threads
 
     started = time.monotonic()
@@ -364,9 +323,8 @@ def test_stop_joins_a_running_load_worker_and_suppresses_its_publication(
     elapsed = time.monotonic() - started
 
     assert not stopper.is_alive()
-    assert elapsed < 4.0                      # bounded: never waits out the load
+    assert elapsed < 4.0
     assert not instance.registry_path.exists()
-    assert not marker.exists()
 
     release.set()
     assert finished.wait(5.0)
@@ -376,112 +334,78 @@ def test_stop_joins_a_running_load_worker_and_suppresses_its_publication(
             break
         time.sleep(0.01)
 
-    # The load ran to completion -- and published nothing.
     assert instance._load_jobs[job["job_id"]]["state"] == "complete"
     assert not instance.registry_path.exists()
-    assert not marker.exists()
 
 
 # --------------------------------------------------------------------------
-# restore_markers: `session restart` hands back what the old process owned
+# associate_project_roots: session start and restart registry ownership
 # --------------------------------------------------------------------------
 
 
-def test_restore_markers_republishes_and_records_ownership(instance, tmp_path):
+def test_associate_project_roots_records_private_ownership(instance, tmp_path):
     project = tmp_path / "project"
     project.mkdir()
-    marker = project / ".bn-life1"
 
-    result = instance._restore_markers([str(marker)])
+    result = instance._associate_project_roots([str(project)])
 
     assert result == {
         "instance_id": "life1",
-        "restored": [str(marker)],
+        "associated": [str(project)],
         "skipped": [],
     }
-    body = json.loads(marker.read_text(encoding="utf-8"))
-    assert body["instance_id"] == "life1"
-    assert body["socket_path"] == str(instance.socket_path)
-    # Ownership is recorded, so the next `bn session stop` can clear it from any cwd.
-    assert str(marker) in instance._marker_paths
     payload = json.loads(instance.registry_path.read_text(encoding="utf-8"))
-    assert payload["marker_paths"] == [str(marker)]
+    assert payload["project_roots"] == [str(project)]
+    assert not list(project.glob(".bn-*"))
 
 
-def test_restore_markers_skips_a_foreign_marker_name(instance, tmp_path):
-    foreign = tmp_path / ".bn-other9"
+def test_associate_project_roots_skips_a_vanished_root(instance, tmp_path):
+    missing = tmp_path / "deleted-project"
 
-    result = instance._restore_markers([str(foreign)])
+    result = instance._associate_project_roots([str(missing)])
 
-    assert result["restored"] == []
+    assert result["associated"] == []
     assert result["skipped"] == [
-        {"path": str(foreign), "reason": "not a .bn-life1 marker"}
-    ]
-    assert not foreign.exists()
-    assert instance._marker_paths == set()
-
-
-def test_restore_markers_skips_a_vanished_project_root(instance, tmp_path):
-    marker = tmp_path / "deleted-project" / ".bn-life1"
-
-    result = instance._restore_markers([str(marker)])
-
-    assert result["restored"] == []
-    assert result["skipped"] == [
-        {"path": str(marker), "reason": "parent directory does not exist"}
+        {"path": str(missing), "reason": "project directory does not exist"}
     ]
 
 
-def test_restore_markers_is_refused_after_teardown(instance, tmp_path):
-    marker = tmp_path / ".bn-life1"
-    instance.stop()
-
-    result = instance._restore_markers([str(marker)])
-
-    assert result["restored"] == []
-    assert result["skipped"] == [
-        {"path": str(marker), "reason": "bridge is shutting down"}
-    ]
-    assert not marker.exists()
-
-
-@pytest.mark.parametrize("paths", ["/tmp/.bn-life1", {"path": "x"}, [1], None, [None]])
-def test_restore_markers_rejects_a_malformed_paths_param(instance, paths):
-    # A raw socket client can send any JSON shape; a marker writer must not
-    # iterate a string into per-character paths or spread a non-list.
+@pytest.mark.parametrize("roots", ["/tmp/project", {"path": "x"}, [1], None, [None]])
+def test_associate_project_roots_rejects_malformed_roots(instance, roots):
     with pytest.raises(RuntimeError, match="list of strings"):
-        instance._restore_markers(paths)
+        instance._associate_project_roots(roots)
 
 
-def test_restore_markers_refuses_the_gui_bridge(monkeypatch, tmp_path):
-    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+def test_associate_project_roots_deduplicates_repeated_roots(instance, tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+
+    result = instance._associate_project_roots([str(project), str(project)])
+
+    assert result["associated"] == [str(project)]
+
+
+def test_associate_project_roots_supports_gui_registry(monkeypatch, tmp_path):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "cache"))
     module = _load_bridge(monkeypatch)
-    gui = module.BinaryNinjaBridge()          # no instance id: the fixed GUI bridge
+    gui = module.BinaryNinjaBridge()
+    project = tmp_path / "project"
+    project.mkdir()
 
-    with pytest.raises(RuntimeError, match="no instance id"):
-        gui._restore_markers([str(tmp_path / ".bn-x")])
-
-
-def test_restore_markers_deduplicates_repeated_paths(instance, tmp_path):
-    marker = tmp_path / ".bn-life1"
-
-    result = instance._restore_markers([str(marker), str(marker)])
-
-    assert result["restored"] == [str(marker)]
+    assert gui._associate_project_roots([str(project)])["associated"] == [str(project)]
 
 
-def test_restore_markers_op_binder_is_read_locked_and_routes_through(monkeypatch, tmp_path):
-    # The CLI reaches marker restoration as an op, so the binder wiring is part of
-    # the contract: read-locked (it enumerates open targets for the registry
-    # payload but mutates no BN state) and forwarding `paths` verbatim.
-    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+def test_associate_project_roots_op_is_read_locked_and_routes(monkeypatch, tmp_path):
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path / "cache"))
     module = _load_bridge(monkeypatch)
     inst = module.BinaryNinjaBridge(instance_id="life1")
-    marker = tmp_path / ".bn-life1"
+    project = tmp_path / "project"
+    project.mkdir()
 
-    spec = module.REGISTRY.spec("restore_markers")
+    spec = module.REGISTRY.spec("associate_project_roots")
 
     assert spec is not None and spec.lock == "read"
-    assert "restore_markers" in module.READ_LOCKED_OPS
-    assert spec.binder(inst, {"paths": [str(marker)]}, None)["restored"] == [str(marker)]
-    assert marker.exists()
+    assert "associate_project_roots" in module.READ_LOCKED_OPS
+    assert spec.binder(inst, {"roots": [str(project)]}, None)["associated"] == [
+        str(project)
+    ]

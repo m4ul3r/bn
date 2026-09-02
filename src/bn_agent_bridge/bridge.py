@@ -59,7 +59,7 @@ from ._shared import (
 from .op_registry import REGISTRY, op
 from .paths import (
     PLUGIN_NAME, bridge_registry_path, bridge_socket_path, cache_home, ensure_private_dir,
-    instances_dir, marker_name, project_root,
+    instances_dir, project_root,
 )
 from .proc_identity import identity_payload
 from .seam import BridgeContext
@@ -925,19 +925,15 @@ class BinaryNinjaBridge:
     def __init__(self, instance_id: str | None = None):
         self.instance_id = instance_id
         self.instance_token = str(uuid.uuid4())
-        self._marker_paths: set[str] = set()
+        self._project_roots: set[str] = set()
         self._load_jobs_lock = threading.Lock()
         self._load_jobs: dict[str, dict[str, Any]] = {}
         # Detached load workers, so stop() can join what it is able to (#694).
         self._load_job_threads: dict[str, threading.Thread] = {}
-        # Teardown latch (#694). stop() unlinks the socket, the project markers
-        # and the registry, but a detached load worker started by
-        # load_binary_async keeps running on its own thread and used to
-        # re-publish the marker + registry AFTER teardown removed them, leaving
-        # files that advertise a bridge which no longer exists. Every filesystem
-        # publication takes this lock and honours the latch, and stop() holds it
-        # across its unlinks, so a publication either lands before teardown (and
-        # is removed by it) or is skipped. NEVER acquired while holding
+        # Teardown latch (#694). A detached load worker started by
+        # load_binary_async can outlive stop(); every registry publication takes
+        # this lock and honours the latch, so it either lands before teardown and
+        # is removed by it, or is skipped. NEVER acquired while holding
         # _load_jobs_lock -- stop() latches, then refuses queued jobs.
         self._teardown_lock = threading.Lock()
         self._stopped: bool = False
@@ -1049,10 +1045,6 @@ class BinaryNinjaBridge:
             if self.socket_path.exists():
                 with contextlib.suppress(OSError):
                     self.socket_path.unlink()
-            for marker_path in tuple(self._marker_paths):
-                with contextlib.suppress(OSError):
-                    Path(marker_path).unlink()
-            self._marker_paths.clear()
             if self.registry_path.exists():
                 with contextlib.suppress(OSError):
                     self.registry_path.unlink()
@@ -1088,127 +1080,54 @@ class BinaryNinjaBridge:
                     job["error"] = "bridge stopped before the load started"
                     job["finished_at"] = finished_at
 
-    def _write_project_marker(self, workdir: str | None, no_marker: bool,
-                              refresh_only: bool = False) -> str | None:
-        """Drop a `.bn-<instance_id>` pointer in the CLI's project root so a bare
-        `bn` command there resolves THIS instance among many (#80). Best-effort:
-        a read-only/unwritable dir is a non-fatal one-line note, never an error.
-        Skipped for the GUI bridge (instance_id None keeps its legacy fixed
-        registry) and when the caller opts out (--no-marker / BN_NO_MARKERS).
-        Registry stays the source of truth; the marker is a validated pointer.
-
-        ``refresh_only`` (used by `session restart`, #391) writes ONLY when a
-        marker already exists in this root -- so a restart from a cwd that differs
-        from the original `session start` cwd refreshes the real marker's stale
-        body without dropping a stray new marker in an unintended directory."""
-        if no_marker or not self.instance_id or not workdir:
+    def _record_project_root(self, workdir: str | None) -> str | None:
+        """Associate this live instance with the caller's canonical project root."""
+        if not workdir:
             return None
         try:
             root = project_root(Path(workdir).expanduser())
-        except Exception:
+        except (OSError, RuntimeError):
             return None
-        marker = root / marker_name(self.instance_id)
-        if refresh_only and not marker.exists():
+        if not root.is_dir():
             return None
-        note = self._publish_marker(marker)
-        if note is not None:
-            return f"could not write project marker in {root} ({note}); resolve with -i"
-        self._git_exclude_marker(root)
-        return None
-
-    def _publish_marker(self, marker: Path) -> str | None:
-        """Write this instance's marker body to *marker*. None on success.
-
-        Under the teardown latch (#694): a detached load worker that finishes
-        after stop() must not recreate a marker teardown just removed. Returns a
-        short reason on refusal/failure so the caller can render it in context.
-        """
-        body = json.dumps({
-            "instance_id": self.instance_id,
-            "socket_path": str(self.socket_path),
-            "pid": os.getpid(),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-        })
+        canonical = str(root)
         with self._teardown_lock:
             if self._stopped:
-                return "bridge is shutting down"
-            try:
-                marker.write_text(body, encoding="utf-8")
-            except OSError as exc:
-                return str(exc)
-            self._marker_paths.add(str(marker))
-        return None
+                return None
+            self._project_roots.add(canonical)
+        return canonical
 
-    def _restore_markers(self, paths: Any) -> dict[str, Any]:
-        """Re-publish project markers this instance inherits from a prior process.
+    def _associate_project_roots(self, roots: Any) -> dict[str, Any]:
+        """Add private registry associations for ``session start`` and restart."""
+        if not isinstance(roots, list) or not all(isinstance(item, str) for item in roots):
+            raise RuntimeError("associate_project_roots: roots must be a list of strings")
 
-        `bn session restart` respawns under the SAME instance id, but the stopped
-        bridge unlinked its own `.bn-<id>` markers on the way out and a
-        refresh-only load only ever touches a marker in the CLI's cwd -- so a
-        restart from any other directory silently dropped the marker that
-        resolves a bare `bn` in the original project root (#694). The CLI passes
-        the paths it recorded before the teardown; the bridge stays the only
-        marker writer, so a restored marker is owned -- and cleaned up on the next
-        stop -- exactly like the original.
-
-        Only a path whose basename is THIS instance's marker name and whose
-        parent directory already exists is restored; anything else is reported
-        under `skipped` rather than creating a stray file somewhere new.
-        """
-        if not self.instance_id:
-            raise RuntimeError(
-                "restore_markers: this bridge has no instance id; project markers "
-                "are per-instance and the fixed GUI bridge has none"
-            )
-        if not isinstance(paths, list) or not all(
-            isinstance(item, str) for item in paths
-        ):
-            raise RuntimeError("restore_markers: paths must be a list of strings")
-        expected = marker_name(self.instance_id)
-        restored: list[str] = []
+        associated: list[str] = []
         skipped: list[dict[str, str]] = []
-        for raw in dict.fromkeys(paths):
-            marker = Path(raw)
-            if marker.name != expected:
-                skipped.append({"path": raw, "reason": f"not a {expected} marker"})
+        for raw in dict.fromkeys(roots):
+            try:
+                candidate = Path(raw).expanduser()
+                if not candidate.is_dir():
+                    skipped.append({"path": raw, "reason": "project directory does not exist"})
+                    continue
+                canonical = str(project_root(candidate))
+            except (OSError, RuntimeError) as exc:
+                skipped.append({"path": raw, "reason": str(exc)})
                 continue
-            if not marker.parent.is_dir():
-                skipped.append({"path": raw, "reason": "parent directory does not exist"})
-                continue
-            note = self._publish_marker(marker)
-            if note is not None:
-                skipped.append({"path": raw, "reason": note})
-                continue
-            restored.append(str(marker))
-            self._git_exclude_marker(marker.parent)
-        if restored:
-            # Record the inherited markers in the registry so `bn session stop`
-            # can find and clear them from any cwd.
+            with self._teardown_lock:
+                if self._stopped:
+                    skipped.append({"path": raw, "reason": "bridge is shutting down"})
+                    continue
+                self._project_roots.add(canonical)
+            associated.append(canonical)
+
+        if associated:
             self._write_registry()
         return {
             "instance_id": self.instance_id,
-            "restored": restored,
+            "associated": list(dict.fromkeys(associated)),
             "skipped": skipped,
         }
-
-    def _git_exclude_marker(self, root: Path) -> None:
-        """Add `.bn-*` to `.git/info/exclude` (not .gitignore -- no tracked-tree
-        dirt) so markers don't show up as untracked in `git status` (#80)."""
-        git_dir = root / ".git"
-        if not git_dir.is_dir():
-            return
-        exclude = git_dir / "info" / "exclude"
-        try:
-            existing = exclude.read_text(encoding="utf-8") if exclude.exists() else ""
-            if any(line.strip() == ".bn-*" for line in existing.splitlines()):
-                return
-            # This is the project's .git/info dir, NOT our cache tree: leave its
-            # mode to git/the user, don't force 0o700 via ensure_private_dir.
-            exclude.parent.mkdir(parents=True, exist_ok=True)
-            sep = "" if (not existing or existing.endswith("\n")) else "\n"
-            exclude.write_text(f"{existing}{sep}.bn-*\n", encoding="utf-8")
-        except OSError:
-            pass  # best-effort; a missing exclude just means markers show in git status
 
     def _write_registry(self):
         payload = {
@@ -1253,13 +1172,10 @@ class BinaryNinjaBridge:
         with self._teardown_lock:
             if self._stopped:
                 return
-            # Snapshot the marker inventory HERE, under the same lock that guards
-            # marker publication and ownership (#694): reading it before the lock
-            # let a slow concurrent registry write capture the pre-restore set and
-            # then land after `_restore_markers()` had published its own, dropping
-            # the restored paths from the registry -- so the next `session stop`
-            # could not find and clear them.
-            payload["marker_paths"] = sorted(self._marker_paths)
+            # Snapshot project associations under the same latch that guards
+            # publication so an older concurrent registry write cannot overwrite
+            # a root restored during session restart.
+            payload["project_roots"] = sorted(self._project_roots)
             ensure_private_dir(self.registry_path.parent)
             # tempfile.mkstemp opens at mode 0o600 (umask only clears bits, never
             # adds), so the registry lands owner-only regardless of umask;
@@ -1470,7 +1386,14 @@ class BinaryNinjaBridge:
                 continue
         return None
 
-    def _load_existing_result(self, load_path: Path, resolved: Path, notes: list[str], existing):
+    def _load_existing_result(
+        self,
+        load_path: Path,
+        resolved: Path,
+        notes: list[str],
+        existing,
+        workdir: str | None,
+    ):
         with self._target_lock.write():
             targets = self.targets.refresh()
         analyzed = existing not in _quick_loaded_views and existing not in _unanalyzed_views
@@ -1483,6 +1406,8 @@ class BinaryNinjaBridge:
             f"{load_path} is already open; returned the existing target "
             "instead of opening a duplicate (use `bn close` first to reload)"
         )
+        self._record_project_root(workdir)
+        self._write_registry()
         return {
             "loaded": True,
             "path": str(load_path),
@@ -1501,7 +1426,6 @@ class BinaryNinjaBridge:
         prefer_bndb: bool = True,
         quick: bool = False,
         workdir: str | None = None,
-        no_marker: bool = False,
     ) -> dict[str, Any]:
         resolved = Path(path).expanduser().resolve()
         if not resolved.exists():
@@ -1551,7 +1475,6 @@ class BinaryNinjaBridge:
                     prefer_bndb=prefer_bndb,
                     quick=quick,
                     workdir=workdir,
-                    no_marker=no_marker,
                 )
             except BaseException as exc:
                 with self._load_jobs_lock:
@@ -1635,8 +1558,7 @@ class BinaryNinjaBridge:
 
 
     def _load_binary(self, path: str, *, prefer_bndb: bool = True, quick: bool = False,
-                     workdir: str | None = None, no_marker: bool = False,
-                     marker_refresh_only: bool = False):
+                     workdir: str | None = None):
         import binaryninja
 
         resolved = Path(path).expanduser().resolve()
@@ -1672,7 +1594,9 @@ class BinaryNinjaBridge:
         while True:
             existing = self._find_open_view_for_path(load_path)
             if existing is not None:
-                return self._load_existing_result(load_path, resolved, notes, existing)
+                return self._load_existing_result(
+                    load_path, resolved, notes, existing, workdir
+                )
             with _load_in_progress_lock:
                 waiter = _load_in_progress.get(load_key)
                 if waiter is None:
@@ -1791,14 +1715,8 @@ class BinaryNinjaBridge:
                     published = True  # latched: view now owned by _headless_views
                 targets = self.targets.refresh()
 
-            marker_note = self._write_project_marker(
-                workdir,
-                no_marker,
-                refresh_only=marker_refresh_only,
-            )
-            if marker_note:
-                notes.append(marker_note)
-            # Persist both the open-binary and marker-path inventories.
+            self._record_project_root(workdir)
+            # Persist both the open-binary and project-root inventories.
             self._write_registry()
             return {
                 "loaded": True,
@@ -3408,12 +3326,11 @@ def _bind_shutdown(bridge, params, target):
     return {"shutting_down": True}
 
 
-# lock="read": restoring a marker touches only project-local marker files and the
-# registry payload, which enumerates open targets -- a read of BN state, never a
-# mutation of it (#694).
-@op("restore_markers", lock="read")
-def _bind_restore_markers(bridge, params, target):
-    return bridge._restore_markers(params.get("paths"))
+# lock="read": project association updates only the private registry payload,
+# which enumerates open targets -- a read of BN state, never a mutation of it.
+@op("associate_project_roots", lock="read")
+def _bind_associate_project_roots(bridge, params, target):
+    return bridge._associate_project_roots(params.get("roots"))
 
 
 @op("cancel_request", lock="none")
@@ -3428,9 +3345,6 @@ def _bind_load_binary(bridge, params, target):
         prefer_bndb=_validate_bool(params.get("prefer_bndb"), label="prefer_bndb", default=True),
         quick=_validate_bool(params.get("quick"), label="quick", default=False),
         workdir=params.get("workdir"),
-        no_marker=_validate_bool(params.get("no_marker"), label="no_marker", default=False),
-        marker_refresh_only=_validate_bool(params.get("marker_refresh_only"),
-                                           label="marker_refresh_only", default=False),
     )
 
 
@@ -3445,11 +3359,6 @@ def _bind_load_binary_async(bridge, params, target):
         ),
         quick=_validate_bool(params.get("quick"), label="quick", default=False),
         workdir=params.get("workdir"),
-        no_marker=_validate_bool(
-            params.get("no_marker"),
-            label="no_marker",
-            default=False,
-        ),
     )
 
 
