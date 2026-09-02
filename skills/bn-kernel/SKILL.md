@@ -75,6 +75,49 @@ Session, and fails closed on foreign active scopes or callback-binding reuse.
 Sequential scopes may coexist with inactive retained Sessions. Do not return bulk
 collections into shared globals; process isolation remains a harness requirement.
 
+## Own and reap every headless bridge
+
+A workflow that starts a headless bridge owns that exact instance until it stops,
+unless the exact duplicate-ID rejection below proves the bridge already existed.
+Every agent-owned spawn command must begin exactly as shown:
+
+```bash
+BN_IDLE_TIMEOUT=3600 bn session start /path/to/binary --instance-id worker
+```
+
+For an agent-owned or ambiguously started bridge, begin every lifecycle response
+with `BN_IDLE_TIMEOUT=3600 bn session start <target> --instance-id <instance-id>`.
+This includes cleanup-only questions after success, failure, or timeout; use the
+known path and ID when supplied and keep `<target>` only when the path is unknown.
+Omit the spawn line only for the confirmed non-ownership collision below or when
+the user explicitly selected another positive idle timeout; merely describing an
+idle timeout or setting `BN_SPAWN_TIMEOUT` does not arm this fallback.
+
+A deliberate alternative timeout must be positive; never use `0`, `none`, or
+`off` for an agent-owned bridge. The reaper starts after preload, resets after
+completed requests, and never fires during an in-flight request or active load
+job. It covers hard agent/process death; it does not replace normal cleanup.
+
+On every reachable exit, close only the exact selector returned by the bridge
+when a target opened. Never infer it from a path or basename; a basename is valid
+when the bridge returned it as the selector. Then always stop the exact owned
+instance even if start, load, analysis, or target close failed:
+
+```bash
+bn -i worker target close <target-selector>  # when a target opened
+bn session stop worker                       # always attempt this exact owned ID
+```
+
+Run `session stop` even when the close command fails; a linear close/stop list
+must state this guarantee or use a `finally`/trap equivalent. Only the exact
+`Bridge instance already exists with id: <instance-id>` start error proves the
+workflow never acquired ownership: do not close a target or stop that pre-existing
+instance. A timed-out or otherwise failed start is uncertain ownership because
+its child may have registered after the harness stopped waiting, so attempt to
+stop the unique ID unconditionally. Do not first poll, list, or test whether it
+registered, and do not assume absence means no process exists. Never compensate
+with `bn close --all`, sticky pins, or another agent's instance.
+
 ## Parallel bn-kernel subagents
 
 When two or more concurrent children will use bn-kernel, launch them from an
@@ -88,32 +131,41 @@ target, and require a bounded summary rather than returning its Session or bulk
 rows:
 
 ```python
+lifecycle = (
+    "Start your unique headless bridge with the exact BN_IDLE_TIMEOUT=3600 "
+    "assignment on its spawn command. Unless the exact duplicate-ID error proves "
+    "you never acquired ownership, on every reachable exit close its exact target "
+    "if opened, then always stop its exact instance even if start, load, analysis, "
+    "or target close fails; every other failed or timed-out start is ambiguous. "
+)
 results = await parallel([
     lambda: agent(
         "Use bn-kernel. Analyze target A via instance bnk-a and its exact "
         "selector. Use direct bn only for lifecycle, keep state function-local "
-        "with scoped(), and return a bounded summary.",
+        "with scoped(), and return a bounded summary. " + lifecycle,
         label="A",
     ),
     lambda: agent(
         "Use bn-kernel. Analyze target B via instance bnk-b and its exact "
         "selector. Use direct bn only for lifecycle, keep state function-local "
-        "with scoped(), and return a bounded summary.",
+        "with scoped(), and return a bounded summary. " + lifecycle,
         label="B",
     ),
     lambda: agent(
         "Use bn-kernel. Analyze target C via instance bnk-c and its exact "
         "selector. Use direct bn only for lifecycle, keep state function-local "
-        "with scoped(), and return a bounded summary.",
+        "with scoped(), and return a bounded summary. " + lifecycle,
         label="C",
     ),
 ])
 ```
 
-This is the required current workaround for parallel retained-kernel analysis;
-it does not replace explicit binding, `assert_target()`, `assert_unannotated()`,
-or cleanup. If ordinary task children gain per-agent retained-kernel isolation
-in a future OMP release, either launch path becomes safe.
+Each child retains cleanup responsibility for its exact target and instance and
+returns only after attempting that exact teardown on every reachable exit. This
+is the required current workaround for parallel retained-kernel analysis; it does
+not replace explicit binding, `assert_target()`, or `assert_unannotated()`. If
+ordinary task children gain per-agent retained-kernel isolation in a future OMP
+release, either launch path becomes safe.
 
 `BN_BACKEND=auto|cli|native` selects the default backend; invalid values fail
 before client construction. An explicit non-`auto` `backend=` argument wins over
@@ -271,7 +323,7 @@ live there, not in the kernel. For large BNDBs, queue loading instead of tying i
 to a single command budget:
 
 ```bash
-bn session start /path/to/large.bndb --instance-id worker --detach
+BN_IDLE_TIMEOUT=3600 bn session start /path/to/large.bndb --instance-id worker --detach
 JOB=<job_id from the start output>
 bn -i worker session status "$JOB" --format json   # one job: machine verdict
 bn -i worker session status                        # every job: collection
@@ -307,6 +359,12 @@ bn -i worker target close <selector>   # close exactly that target
 bn session stop worker                 # then drop the bridge
 ```
 
+The stop attempt is unconditional for an owned instance: run it even if target
+close fails. The exact duplicate-ID start error proves non-ownership, so do not
+close or stop that pre-existing instance. Any other failed or timed-out start
+still triggers an exact stop attempt because registration may have completed
+after the caller stopped waiting.
+
 `bn target close <selector>` is the explicit single-target close (the same
 implementation as `bn close -t <selector>`, including the unsaved-analysis
 warning). It takes no path and no `--all`, so it cannot widen into closing
@@ -315,14 +373,16 @@ target, then stop the instance.
 
 ## Load cost and memory
 
-Full loads can take many minutes and each bridge can consume hundreds of MB. Detached start registers the bridge first and exposes queued/running/complete/failed load state through `session status`; it is the recovery path when a synchronous cold load would exceed 120 seconds. Bound fan-out concurrency, watch RSS with `bn session list`, use `--quick` for raw/container triage (it cannot skip analysis already stored inside a BNDB), and stop instances promptly.
+Full loads can take many minutes and each bridge can consume hundreds of MB. Detached start registers the bridge first and exposes queued/running/complete/failed load state through `session status`; it is the recovery path when a synchronous cold load would exceed 120 seconds. Bound fan-out concurrency, watch RSS with `bn session list`, use `--quick` for raw/container triage (it cannot skip analysis already stored inside a BNDB), stop every owned instance deterministically as soon as its work ends, and rely on one-hour idle reaping only as the crash fallback.
 
 For high-fanout cold starts, the orchestration tool's command timeout must exceed
 `BN_SPAWN_TIMEOUT`; otherwise the harness can kill `bn session start` while its
 new-session child continues registering. On a heavily loaded host, set a larger
 spawn budget (for example `BN_SPAWN_TIMEOUT=180`) and give the surrounding tool a
-strictly larger timeout. This changes the registration budget, not the detached
-load-job budget; continue polling the exact job separately. In a 16-way dogfood
+strictly larger timeout. That assignment is additive to the required
+`BN_IDLE_TIMEOUT=3600` on the same agent-owned spawn, never a substitute for it.
+It changes the registration budget, not the detached load-job budget; continue
+polling the exact job separately. In a 16-way dogfood
 run, every start and load succeeded with that budget, but two start commands took
 more than 30 seconds (maximum 34.3 seconds).
 

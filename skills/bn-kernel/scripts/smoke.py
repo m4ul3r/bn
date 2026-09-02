@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import os
 import shutil
 import subprocess
 import sys
@@ -62,10 +64,31 @@ async def _exercise(instance: str, backend: str) -> None:
     _check("generic CLI", isinstance(generic, dict))
 
 
+def _loaded_selector(stdout: str) -> str:
+    payload = json.loads(stdout)
+    loaded = payload.get("loaded") if isinstance(payload, dict) else None
+    selectors = [
+        target.get("selector")
+        for item in loaded or []
+        if isinstance(item, dict)
+        for target in item.get("targets") or []
+        if isinstance(target, dict) and isinstance(target.get("selector"), str)
+    ]
+    if len(selectors) != 1:
+        raise RuntimeError(
+            f"session start returned {len(selectors)} target selectors; expected 1"
+        )
+    return selectors[0]
+
+
+def _start_proves_nonownership(stderr: str, instance: str) -> bool:
+    return f"Bridge instance already exists with id: {instance}" in stderr
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", nargs="?", default="/bin/ls")
-    parser.add_argument("--instance", default="bn-kernel-smoke")
+    parser.add_argument("--instance", default=f"bn-kernel-smoke-{os.getpid()}")
     parser.add_argument(
         "--backend", choices=("auto", "cli", "native"), default="auto"
     )
@@ -80,44 +103,84 @@ def main() -> int:
         print("FAIL bn executable unavailable")
         return 1
 
-    started = subprocess.run(
-        [
-            executable,
-            "session",
-            "start",
-            args.binary,
-            "--instance-id",
-            args.instance,
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
-    if started.returncode:
-        print(f"FAIL session start returncode={started.returncode}")
-        return 1
-
+    start_env = os.environ.copy()
+    start_env["BN_IDLE_TIMEOUT"] = "3600"
     succeeded = False
+    target_selector: str | None = None
+    owns_instance = True
     try:
-        asyncio.run(_exercise(args.instance, args.backend))
-        succeeded = True
-    except Exception as exc:
-        print(f"FAIL smoke error={type(exc).__name__}")
-    finally:
-        if not args.keep:
-            stopped = subprocess.run(
-                [executable, "session", "stop", args.instance],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=False,
+        started = subprocess.run(
+            [
+                executable,
+                "session",
+                "start",
+                args.binary,
+                "--instance-id",
+                args.instance,
+                "--format",
+                "json",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            check=False,
+            env=start_env,
+        )
+        if started.returncode:
+            owns_instance = not _start_proves_nonownership(
+                started.stderr, args.instance
             )
-            if stopped.returncode:
-                print(f"FAIL session stop returncode={stopped.returncode}")
-                succeeded = False
-            else:
-                print("PASS session stop")
+            print(f"FAIL session start returncode={started.returncode}")
+        else:
+            try:
+                target_selector = _loaded_selector(started.stdout)
+                asyncio.run(_exercise(args.instance, args.backend))
+                succeeded = True
+            except Exception as exc:
+                print(f"FAIL smoke error={type(exc).__name__}")
+    finally:
+        if not args.keep and owns_instance:
+            try:
+                if target_selector is not None:
+                    try:
+                        closed = subprocess.run(
+                            [
+                                executable,
+                                "-i",
+                                args.instance,
+                                "target",
+                                "close",
+                                target_selector,
+                            ],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            check=False,
+                        )
+                    except Exception as exc:
+                        print(f"FAIL target close error={type(exc).__name__}")
+                        succeeded = False
+                    else:
+                        if closed.returncode:
+                            print(
+                                f"FAIL target close returncode={closed.returncode}"
+                            )
+                            succeeded = False
+                        else:
+                            print("PASS target close")
+            finally:
+                stopped = subprocess.run(
+                    [executable, "session", "stop", args.instance],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=False,
+                )
+                if stopped.returncode:
+                    print(f"FAIL session stop returncode={stopped.returncode}")
+                    succeeded = False
+                else:
+                    print("PASS session stop")
     return 0 if succeeded else 1
 
 
