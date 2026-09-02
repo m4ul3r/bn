@@ -633,6 +633,18 @@ def _render_session_start_text(value: Any) -> str:
                     lines.append(f"  note: {note}")
             else:
                 lines.append(f"- {_render_fallback_text(item)}")
+    project_roots = list(value.get("project_roots") or [])
+    if project_roots:
+        lines.append("")
+        lines.append(f"projects: {', '.join(str(root) for root in project_roots)}")
+    association_error = value.get("project_association_error")
+    if association_error:
+        lines.append("")
+        lines.append(f"project association error: {association_error}")
+        lines.append(
+            f"hint: bare `bn` commands from this checkout won't route to this "
+            f"session; pass -i {value.get('instance_id', '<id>')}"
+        )
     if value.get("stopped"):
         lines.append("")
         lines.append("session stopped: no binaries loaded successfully")

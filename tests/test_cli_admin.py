@@ -927,6 +927,63 @@ def test_session_start_associates_project_and_forwards_workdir(
     assert json.loads(capsys.readouterr().out)["project_roots"] == [str(tmp_path)]
 
 
+def test_session_start_text_mode_shows_associated_projects(
+    monkeypatch, capsys, tmp_path
+):
+    monkeypatch.setattr(
+        bn.cli, "spawn_instance", lambda instance_id=None: _fake_instance("m1")
+    )
+    monkeypatch.chdir(tmp_path)
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, spawn_missing_named=False):
+        if op == "associate_project_roots":
+            return {
+                "ok": True,
+                "result": {
+                    "instance_id": "m1",
+                    "associated": [str(tmp_path)],
+                    "skipped": [],
+                },
+            }
+        return {
+            "ok": True,
+            "result": {
+                "path": params.get("path"),
+                "loaded": True,
+                "targets": [{"selector": "x.bndb"}],
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["session", "start", str(tmp_path / "x.bndb")])
+
+    assert rc == 0
+    assert f"projects: {tmp_path}" in capsys.readouterr().out
+
+
+def test_session_start_text_mode_shows_association_error(monkeypatch, capsys):
+    monkeypatch.setattr(
+        bn.cli, "spawn_instance", lambda instance_id=None: _fake_instance("m2")
+    )
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                          instance_id=None, spawn_missing_named=False):
+        if op == "associate_project_roots":
+            raise bn.cli.BridgeError("bridge is shutting down")
+        raise AssertionError(f"unexpected op {op}")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["session", "start"])
+
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "project association error: bridge is shutting down" in out
+    assert "pass -i m2" in out
+
+
 def test_session_start_partial_failure_keeps_bridge_but_exits_nonzero(monkeypatch, capsys):
     from bn.transport import BridgeInstance
 
@@ -2141,13 +2198,14 @@ def test_session_restart_restores_original_project_roots(
     load = next(params for op, params in calls if op == "load_binary")
     assert "workdir" not in load
     parsed = json.loads(capsys.readouterr().out)
-    assert parsed["project_roots"]["associated"] == [str(project)]
+    assert parsed["project_roots"] == [str(project)]
+    assert "project_association_error" not in parsed
     assert [op for op, _ in calls].index("associate_project_roots") > [
         op for op, _ in calls
     ].index("load_binary")
 
 
-def test_session_restart_reports_failed_association_restore_without_failing(
+def test_session_restart_reports_failed_association_restore_and_fails(
     monkeypatch, capsys, tmp_path
 ):
     project = tmp_path / "project"
@@ -2159,11 +2217,28 @@ def test_session_restart_reports_failed_association_restore_without_failing(
     rc = bn.cli.main(["session", "restart", "keep1", "--format", "json"])
 
     captured = capsys.readouterr()
-    assert rc == 0
-    assert "could not restore project association" in captured.err
-    assert json.loads(captured.out)["project_roots"]["error"] == (
-        "associate operation unavailable"
+    assert rc == 1
+    assert "project association failed" in captured.err
+    parsed = json.loads(captured.out)
+    assert parsed["project_association_error"] == "associate operation unavailable"
+    assert "project_roots" not in parsed
+
+
+def test_session_restart_reports_failed_association_restore_in_text_mode(
+    monkeypatch, capsys, tmp_path
+):
+    project = tmp_path / "project"
+    project.mkdir()
+    _restart_bridge_stubs(
+        monkeypatch, [project], restore_error="associate operation unavailable"
     )
+
+    rc = bn.cli.main(["session", "restart", "keep1"])
+
+    captured = capsys.readouterr()
+    assert rc == 1
+    assert "project association error: associate operation unavailable" in captured.out
+    assert "pass -i keep1" in captured.out
 
 
 def test_session_restart_warns_about_each_skipped_association(

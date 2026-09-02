@@ -355,21 +355,9 @@ def _session_start(args: argparse.Namespace) -> int:
     instance_id = getattr(args, "instance_id", None)
     _resolve_timeout(None)
     instance = cli.spawn_instance(instance_id)
-    association_error: str | None = None
-    association: dict[str, Any] | None = None
-    try:
-        response = cli.send_request(
-            "associate_project_roots",
-            params={"roots": [os.getcwd()]},
-            instance_id=instance.instance_id,
-        )
-        candidate = response.get("result") if isinstance(response, dict) else None
-        if isinstance(candidate, dict):
-            association = candidate
-        else:
-            association_error = "bridge returned a malformed project association reply"
-    except BridgeError as exc:
-        association_error = str(exc)
+    project_roots, association_error = _restore_project_roots(
+        instance.instance_id, [os.getcwd()]
+    )
 
     prefer_bndb = not args.no_bndb
     quick = bool(getattr(args, "quick", False))
@@ -433,8 +421,8 @@ def _session_start(args: argparse.Namespace) -> int:
     }
     if loaded:
         result["loaded"] = loaded
-    if association is not None:
-        result["project_roots"] = association.get("associated", [])
+    if project_roots:
+        result["project_roots"] = project_roots
     if association_error is not None:
         result["project_association_error"] = association_error
 
@@ -677,7 +665,9 @@ def _session_restart(args: argparse.Namespace) -> int:
         except BridgeError as exc:
             reloaded.append({"path": t["path"], "error": str(exc)})
 
-    associations = _restore_project_roots(instance.instance_id, inherited_roots)
+    project_roots, association_error = _restore_project_roots(
+        instance.instance_id, inherited_roots
+    )
 
     failures = [x for x in reloaded if isinstance(x, dict) and x.get("error")]
     result: dict[str, Any] = {
@@ -688,10 +678,12 @@ def _session_restart(args: argparse.Namespace) -> int:
         # Rendered by the session-start text renderer under "loaded".
         "loaded": reloaded,
     }
-    if associations is not None:
-        result["project_roots"] = associations
+    if project_roots:
+        result["project_roots"] = project_roots
+    if association_error is not None:
+        result["project_association_error"] = association_error
     cli._emit_result(args, result, text_renderer=_render_session_start_text, stem="session-restart")
-    return 1 if failures else 0
+    return 1 if failures or association_error else 0
 
 
 def _require_signal_delivered(reason: str | None, target_id: str) -> None:
@@ -713,10 +705,20 @@ def _require_signal_delivered(reason: str | None, target_id: str) -> None:
 def _restore_project_roots(
     instance_id: str | None,
     roots: list[str],
-) -> dict[str, Any] | None:
-    """Restore private registry associations inherited from the old process."""
+) -> tuple[list[str], str | None]:
+    """Associate project roots on a bridge instance.
+
+    Shared by `session start` (associating the caller's cwd on a fresh
+    bridge) and `session restart` (restoring roots inherited from the old
+    process). Returns ``(associated_roots, error)``: `associated_roots` is
+    always a list (possibly empty), and `error` is set only when the
+    association request itself failed or the bridge replied with something
+    malformed. Skipped roots and request errors are warned to stderr so the
+    reason stays visible even when stdout is redirected or the caller only
+    checks the exit code.
+    """
     if not roots:
-        return None
+        return [], None
     try:
         response = cli.send_request(
             "associate_project_roots",
@@ -724,27 +726,23 @@ def _restore_project_roots(
             instance_id=instance_id,
         )
     except BridgeError as exc:
-        print(
-            f"warning: could not restore project association(s) after restart: {exc}",
-            file=sys.stderr,
-        )
-        return {"associated": [], "requested": roots, "error": str(exc)}
+        error = str(exc)
+        print(f"warning: project association failed: {error}", file=sys.stderr)
+        return [], error
     result = response.get("result") if isinstance(response, dict) else None
     if not isinstance(result, dict):
-        print(
-            "warning: the restarted bridge returned a malformed project "
-            "association reply",
-            file=sys.stderr,
-        )
-        return {"associated": [], "requested": roots, "error": "malformed reply"}
+        error = "bridge returned a malformed project association reply"
+        print(f"warning: {error}", file=sys.stderr)
+        return [], error
     for entry in result.get("skipped") or []:
         if isinstance(entry, dict):
             print(
-                f"warning: project association {entry.get('path')} was not restored "
+                f"warning: project association {entry.get('path')} was skipped "
                 f"({entry.get('reason')})",
                 file=sys.stderr,
             )
-    return result
+    associated = result.get("associated")
+    return (associated if isinstance(associated, list) else []), None
 
 
 def _rss_mb(pid: int) -> float | None:
