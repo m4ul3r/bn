@@ -1260,6 +1260,71 @@ class TestArgumentArityConfidence:
         finally:
             _session_stop(inst)
 
+    _VENDOR_SRC = (
+        "int vendor_get_status(int code, int flags, int retries,\n"
+        "                       int timeout, int mode, int reserved) {\n"
+        "  return code + flags + retries + timeout + mode + reserved;\n"
+        "}\n"
+    )
+    _CALLER_SRC = (
+        "extern int vendor_get_status(int code, int flags, int retries,\n"
+        "                              int timeout, int mode, int reserved);\n"
+        "__attribute__((noinline, used)) int probe_device(void) {\n"
+        "  return vendor_get_status(1, 2, 3, 4, 5, 6);\n"
+        "}\n"
+        "int main(void) { return probe_device(); }\n"
+    )
+
+    def test_demotion_fires(self, tmp_path):
+        """#648 positive control: the demotion must actually FIRE, not just
+        decline to fire on a known prototype. A call to a DYNAMICALLY-linked
+        "vendor" import BN's bundled type library has no signature for (unlike
+        memcpy/printf, which are covered) analyzes with zero declared
+        parameters, so its `argument_confidence` must demote off
+        `authoritative` and flag `arity_unknown`. Needs real BN + a C compiler
+        that can build a small shared library."""
+        import shutil
+        cc = shutil.which("cc") or shutil.which("gcc")
+        if cc is None:
+            pytest.skip("a C compiler is required to build the vendor-import fixture")
+
+        vendor_src = tmp_path / "vendor.c"
+        vendor_src.write_text(self._VENDOR_SRC)
+        libvendor = tmp_path / "libvendor.so"
+        build_lib = subprocess.run(
+            [cc, "-O0", "-fPIC", "-shared", "-o", str(libvendor), str(vendor_src)],
+            capture_output=True, text=True)
+        if build_lib.returncode != 0:
+            pytest.skip(f"vendor shared-library build failed: {build_lib.stderr}")
+
+        caller_src = tmp_path / "caller.c"
+        caller_src.write_text(self._CALLER_SRC)
+        binp = tmp_path / "vendor_caller_x86_64"
+        build_bin = subprocess.run(
+            [cc, "-O0", "-fno-stack-protector", "-no-pie",
+             str(caller_src), "-o", str(binp),
+             "-L", str(tmp_path), "-lvendor",
+             "-Wl,-rpath," + str(tmp_path)],
+            capture_output=True, text=True)
+        if build_bin.returncode != 0:
+            pytest.skip(f"vendor-import caller build failed: {build_bin.stderr}")
+
+        info = _session_start(str(binp))
+        inst = info["instance_id"]
+        try:
+            ev = json.loads(_bn("--instance", inst, "evidence", "function", "probe_device",
+                                "--format", "json").stdout)
+            vendor_calls = [
+                c for c in ev["calls"]
+                if "vendor_get_status" in str(((c.get("target") or {}).get("function") or {}).get("name", ""))
+            ]
+            assert vendor_calls, "expected a call to the unprototyped vendor import"
+            for c in vendor_calls:
+                assert c["arity_unknown"] is True, c
+                assert c["argument_confidence"] != "authoritative", c
+        finally:
+            _session_stop(inst)
+
 
 class TestDataRetypeRoundtrip:
     """Regression for #649: typing a recovered data variable had NO verified

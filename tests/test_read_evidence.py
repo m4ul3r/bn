@@ -660,6 +660,10 @@ def test_function_evidence_reports_calls_arguments_and_thunk_candidate(monkeypat
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     callee = _FakeFunction(0x461746, "send_message")
+    # #673: the thunk/veneer guard now only flags EXTERNAL branch targets --
+    # mark this callee as an import so `j_send_message` below still reads as a
+    # legitimate veneer, not a local tail-call.
+    callee.symbol = _FakeSymbol("ImportedFunctionSymbol")
     caller = _FakeFunction(0x412470, "build_response")
     call_expr = _FakeHLILInstruction(
         "send_message(6, &response)",
@@ -2683,6 +2687,218 @@ def test_argument_confidence_user_prototype_is_authoritative_648(monkeypatch):
     call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
     assert call["arity_unknown"] is False
     assert call["argument_confidence"] == "authoritative"
+
+
+def test_argument_confidence_arity_mismatch_more_args_than_declared_648(monkeypatch):
+    """#648: a callee WITH a recovered prototype (2 declared params) where HLIL
+    rendered 3 arguments -- an invented ABI-register arg riding along with the
+    real ones. The arity itself is known (not `arity_unknown`), but the extra
+    argument means the canonical list is not what the prototype declares, so it
+    must demote and flag `arity_mismatch`."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _arity_bv(monkeypatch, instance, callee_params=2, arg_texts=["1", "2", "0x100"])
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    assert call["argument_confidence"] == "inferred"
+    assert call["arity_mismatch"] is True
+    assert call["arity_unknown"] is False
+
+
+def test_argument_confidence_negative_control_matching_arity_stays_authoritative_648(monkeypatch):
+    """#648 negative control (like a `memcpy`-shaped prototype): 3 declared params
+    and exactly 3 rendered arguments -- nothing invented, stays `authoritative`
+    and carries neither `arity_mismatch` nor `arity_unknown`."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _arity_bv(monkeypatch, instance, callee_params=3, arg_texts=["&dst", "&src", "0x40"])
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    assert call["argument_confidence"] == "authoritative"
+    assert "arity_mismatch" not in call
+    assert call["arity_unknown"] is False
+
+
+def test_argument_confidence_indirect_call_never_authoritative_648(monkeypatch):
+    """#648: an indirect call has no resolvable callee, so its arity is
+    unknowable even when HLIL produced a clean-looking argument list. The
+    canonical field must never report `authoritative` for it."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    caller = _FakeFunction(0x401800, "dispatch")
+    call_expr = _FakeHLILInstruction("(*fp)(a, b)", class_name="HighLevelILCall",
+                                     address=0x401800, expr_index=5, instr_index=5)
+    call_expr.params = ["a", "b"]
+    call_insn = _FakeLLILInstruction(0x401800, _FakeReg("r3"), hlils=[call_expr])
+    caller.basic_blocks = [_FakeBasicBlock(0x401800, 0x401804)]
+    caller.low_level_il = [[call_insn]]
+    bv = _FakeBV(functions=[caller], instruction_lengths={0x401800: 4},
+                 disassembly={0x401800: "blx r3"})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    call = instance._function_evidence("active", "dispatch", context=0)["calls"][0]
+    assert call["direct"] is False
+    assert call["argument_source"] == "hlil"
+    assert call["indirect_call"] is True
+    assert call["argument_confidence"] == "heuristic"
+
+
+# --- #661: mlil: line / MLIL candidates come from the TRUE per-instruction MLIL --
+
+
+def test_function_evidence_mlil_uses_true_per_instruction_form_661(monkeypatch):
+    """#661: `mlil:` and the MLIL argument_candidates must come from the LLIL
+    instruction's TRUE per-instruction MLIL (`insn.mlil`), which renders the
+    callee's real operands (`0x401156(rdi, 3)`), not the mapped/coalesced form
+    (`call(0x401156, arg1, arg2, ...)`) which names the CALLER's ABI registers."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    callee = _FakeFunction(0x401156, "rotl8")
+    caller = _FakeFunction(0x40118B, "encrypt")
+    call_expr = _FakeHLILInstruction("rotl8(edi, 3)", class_name="HighLevelILCall",
+                                     address=0x4011F2, expr_index=7, instr_index=7)
+    call_expr.params = ["edi", "3"]
+    call_insn = _FakeLLILInstruction(0x4011F2, _FakeConstPtr(0x401156), hlils=[call_expr])
+
+    class _TrueMLIL:
+        def __init__(self):
+            self.params = ["rdi", "3"]
+
+        def __str__(self):
+            return "0x401156(rdi, 3)"
+
+    call_insn.mlil = _TrueMLIL()
+    # A stale mapped-MLIL form the fix must NOT prefer -- if the accessor
+    # regresses to this it names the CALLER's registers instead of the callee's.
+    call_insn.mapped_medium_level_il = "arg1, arg2 = call(0x401156, arg1, arg2)"
+    caller.basic_blocks = [_FakeBasicBlock(0x4011F2, 0x4011F6)]
+    caller.low_level_il = [[call_insn]]
+    bv = _FakeBV(functions=[callee, caller], instruction_lengths={0x4011F2: 4},
+                 disassembly={0x4011F2: "call rotl8"})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    call = instance._function_evidence("active", "encrypt", context=0)["calls"][0]
+    assert call["mlil"] == "0x401156(rdi, 3)"
+    assert "arg1, arg2" not in call["mlil"]
+    assert any(c["source"] == "mlil" and c["text"] == "3" for c in call["argument_candidates"])
+
+
+def test_function_evidence_mlil_falls_back_to_mapped_form_when_true_mlil_absent_661(monkeypatch):
+    """#661 fallback: when `insn.mlil` is unavailable, the mapped form is still
+    used (better than nothing) rather than emitting no `mlil` line at all."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    callee = _FakeFunction(0x461746, "send_message")
+    caller = _FakeFunction(0x412470, "build_response")
+    call_insn = _FakeLLILInstruction(0x4124A0, _FakeConstPtr(0x461746))
+    call_insn.mapped_medium_level_il = "call(0x461746, arg1)"
+    caller.basic_blocks = [_FakeBasicBlock(0x4124A0, 0x4124A4)]
+    caller.low_level_il = [[call_insn]]
+    bv = _FakeBV(functions=[callee, caller], instruction_lengths={0x4124A0: 4},
+                 disassembly={0x4124A0: "bl send_message"})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    call = instance._function_evidence("active", "build_response", context=0)["calls"][0]
+    assert call["mlil"] == "call(0x461746, arg1)"
+
+
+def test_function_evidence_mlil_absent_when_no_mlil_form_available_661(monkeypatch):
+    """#661: when neither `insn.mlil` nor `insn.mapped_medium_level_il` exists,
+    emit NO `mlil` line rather than fabricate one."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    callee = _FakeFunction(0x461746, "send_message")
+    caller = _FakeFunction(0x412470, "build_response")
+    call_insn = _FakeLLILInstruction(0x4124A0, _FakeConstPtr(0x461746))
+    caller.basic_blocks = [_FakeBasicBlock(0x4124A0, 0x4124A4)]
+    caller.low_level_il = [[call_insn]]
+    bv = _FakeBV(functions=[callee, caller], instruction_lengths={0x4124A0: 4},
+                 disassembly={0x4124A0: "bl send_message"})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    call = instance._function_evidence("active", "build_response", context=0)["calls"][0]
+    assert call["mlil"] is None
+
+
+# --- #667: --field/--ptr-fields without --record-size must error, not silently
+# drop the record-aware fields and run a plain scalar pointer scan -----------
+
+
+def test_pointer_table_field_without_record_size_errors_667(monkeypatch):
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    target = _FakeFunction(0x401000, "handler")
+    bv = _FakeBV(functions=[target], memory={0x3000: (0x401000).to_bytes(8, "little")})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._pointer_table("active", "0x3000", entries=1, ptr_fields=["0x8"])
+    assert exc.value.status == "invalid_request"
+
+    with pytest.raises(bridge.OperationFailure) as exc2:
+        instance._pointer_table("active", "0x3000", entries=1, fields=["flag:u32@0"])
+    assert exc2.value.status == "invalid_request"
+
+
+def test_pointer_table_field_with_record_size_still_works_667(monkeypatch):
+    """Negative control: --record-size alongside --ptr-fields/--field is
+    unaffected by the new guard and still scans as a record table."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    target = _FakeFunction(0x401000, "handler")
+    table = (0x401000).to_bytes(4, "little") + (5).to_bytes(4, "little")
+    bv = _FakeBV(functions=[target], arch=_FakeArch(name="x86", address_size=4),
+                 memory={0x3000: table})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._pointer_table("active", "0x3000", entries=1,
+                                      record_size="0x8", ptr_fields=["0x0"])
+    assert result["kind"] == "record_table"
+
+
+# --- #673: thunk/veneer candidates must be EXTERNAL targets only ------------
+
+
+def test_function_evidence_flags_tailcall_to_import_as_thunk_673(monkeypatch):
+    """#673 positive control: a small function whose tail branch resolves to an
+    IMPORTED function (not a PLT-named section, e.g. a GOT-indirected veneer) is
+    still a legitimate thunk/veneer candidate."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    callee = _FakeFunction(0x461746, "log_write")
+    callee.symbol = _FakeSymbol("ImportedFunctionSymbol")
+    veneer = _FakeFunction(0x500000, "j_log_write")
+    veneer.basic_blocks = [_FakeBasicBlock(0x500000, 0x500004)]
+    veneer.low_level_il = [[_FakeLLILInstruction(0x500000, _FakeConstPtr(0x461746), operation="LLIL_JUMP")]]
+    bv = _FakeBV(
+        functions=[callee, veneer],
+        disassembly={0x500000: "b log_write"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_evidence("active", "j_log_write", context=0)
+    assert result["thunk"]["is_candidate"] is True
+
+
+def test_function_evidence_does_not_flag_local_tailcall_as_thunk_673(monkeypatch):
+    """#673: a small function tail-calling a LOCAL defined function (e.g. an
+    .init_array constructor tail-calling a local helper) is not a thunk/veneer FOR
+    that helper -- it has its own real body and must not be masked behind a
+    'go to X' pointer."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    helper = _FakeFunction(0x461746, "init_helper")  # no .symbol -> not imported
+    ctor = _FakeFunction(0x500000, "init_array_0")
+    ctor.basic_blocks = [_FakeBasicBlock(0x500000, 0x500004)]
+    ctor.low_level_il = [[_FakeLLILInstruction(0x500000, _FakeConstPtr(0x461746), operation="LLIL_TAILCALL")]]
+    bv = _FakeBV(
+        functions=[helper, ctor],
+        disassembly={0x500000: "b init_helper"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_evidence("active", "init_array_0", context=0)
+    assert result["thunk"]["is_candidate"] is False
 
 
 # --- #558: variadic (scanf-family) under-recovery warning + recovery -------

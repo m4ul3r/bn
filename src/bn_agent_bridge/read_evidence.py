@@ -38,7 +38,7 @@ except ModuleNotFoundError:  # importable without the Binary Ninja runtime (test
 
 from . import il_format
 from . import read_xrefs
-from ._shared import OperationFailure, _parse_address, _validate_count
+from ._shared import OperationFailure, _parse_address, _validate_count, is_imported_function
 
 
 def _call_destination_value(ctx, insn) -> int | None:
@@ -49,6 +49,23 @@ def _target_entry_for_call(ctx, bv, value: int | None) -> dict[str, Any] | None:
     if value is None:
         return None
     return ctx._normalize_code_pointer(bv, value)
+
+
+def _true_mlil(insn):
+    """The LLIL call instruction's TRUE per-instruction MLIL (#661).
+
+    ``insn.mapped_medium_level_il`` is a COALESCED form that renders the whole
+    caller-register call site as ``call(dest, arg1, arg2, ...)`` -- naming the
+    CALLER's ABI registers, not the callee's actual operands. ``insn.mlil`` is
+    the direct per-instruction MLIL and renders the real call expression (e.g.
+    ``0x401156(rdi, 3)``). Prefer the direct accessor; fall back to the mapped
+    form only when it is unavailable (older BN builds / degenerate cases), and
+    to None when neither exists -- callers must never fabricate an `mlil` line.
+    """
+    mlil = getattr(insn, "mlil", None)
+    if mlil is not None:
+        return mlil
+    return getattr(insn, "mapped_medium_level_il", None)
 
 
 def _il_argument_texts(ctx, node) -> list[str]:
@@ -128,7 +145,7 @@ def _call_arguments(ctx, bv, insn, call_addr: int) -> tuple[str, list[dict[str, 
     elif len(roots) == 1:
         chosen = roots[0]
 
-    mlil = getattr(insn, "mapped_medium_level_il", None)
+    mlil = _true_mlil(insn)
     if chosen is not None:
         source, texts = "hlil", _il_argument_texts(ctx, chosen)
     elif mlil is not None:
@@ -241,12 +258,19 @@ def _argument_arity_evidence(ctx, bv, dest_value, target,
     ``authoritative`` stamp is EARNED), while an unprototyped vendor import reports
     zero -- verified against a live BN view.
 
+    Two residual lies remain even with a resolved callee: HLIL can render MORE
+    arguments than a recovered prototype declares (an invented ABI-register arg
+    tacked onto a real signature -- ``arity_mismatch``), and an INDIRECT call
+    (``callee_fn is None``) has no declared arity to check at all
+    (``indirect_call``).
+
     Returns ``{"arity_unknown": bool, ...}``; ``arity_unknown`` is False whenever the
-    callee cannot be resolved, so an indirect call keeps its previous reporting.
+    callee cannot be resolved -- ``indirect_call`` carries that case instead.
     """
     evidence: dict[str, Any] = {"arity_unknown": False}
     callee_fn = _callee_function_for_call(ctx, bv, dest_value, target)
     if callee_fn is None:
+        evidence["indirect_call"] = True
         return evidence
     if bool(getattr(callee_fn, "has_user_type", False)):
         return evidence          # a user prototype pins the arity
@@ -258,8 +282,17 @@ def _argument_arity_evidence(ctx, bv, dest_value, target,
         declared_count = len(declared) if declared is not None else 0
     except TypeError:
         declared_count = 0
-    if declared_count > 0 or il_format._function_is_variadic(callee_fn):
-        return evidence          # a recovered/bundled prototype (or a declared variadic)
+    is_variadic = il_format._function_is_variadic(callee_fn)
+    if declared_count > 0:
+        # A recovered/bundled prototype: the arity itself is known, but HLIL can
+        # still have rendered MORE arguments than declared (an invented
+        # ABI-register arg riding along with the real ones) -- flag that without
+        # claiming the whole arity is unknown.
+        if not is_variadic and len(arguments) > declared_count:
+            evidence["arity_mismatch"] = True
+        return evidence
+    if is_variadic:
+        return evidence          # a declared variadic with no fixed parameters
     # Zero declared parameters yet HLIL rendered arguments: the list is BN's
     # register guess, not the callee's signature. A genuinely void callee rendering
     # zero arguments agrees with its prototype and is left alone.
@@ -420,7 +453,7 @@ def _function_call_evidence(ctx, bv, func, *, context: int) -> list[dict[str, An
                 "text": disasm_entries[disasm_index]["text"],
             }
 
-        mlil = getattr(insn, "mapped_medium_level_il", None)
+        mlil = _true_mlil(insn)
         dest_value = _call_destination_value(ctx, insn)
         target = _target_entry_for_call(ctx, bv, dest_value)
         arg_source, arguments, argument_candidates = _call_arguments(ctx, bv, insn, call_addr)
@@ -431,9 +464,12 @@ def _function_call_evidence(ctx, bv, func, *, context: int) -> list[dict[str, An
         # #648: `authoritative` meant "HLIL produced a list", not "the list is right".
         # On an unknown-arity callee HLIL invents ABI-register args (a neighbouring
         # call's staging, the stack canary), so demote and flag it -- confirmed wrong
-        # against upstream source on a dogfood target.
+        # against upstream source on a dogfood target. An indirect call has no
+        # declared arity at all: it is NEVER `authoritative`, regardless of source.
         arity = _argument_arity_evidence(ctx, bv, dest_value, target, arguments)
-        if arity["arity_unknown"] and argument_confidence == "authoritative":
+        if arity.get("indirect_call"):
+            argument_confidence = "heuristic"
+        elif (arity["arity_unknown"] or arity.get("arity_mismatch")) and argument_confidence == "authoritative":
             argument_confidence = "inferred"
         # #557: expose WHY the HLIL statement is null (reason code) rather than a bare null.
         hlil_statement, hlil_reason = il_format._hlil_statement_localization(insn)
@@ -492,8 +528,20 @@ def _function_thunk_summary(ctx, bv, func) -> dict[str, Any]:
         op_name = il_format._il_op_name(insn)
         if op_name not in {"LLIL_JUMP", "LLIL_TAILCALL", "LLIL_CALL", "LLIL_CALL_STACK_ADJUST"}:
             continue
-        target = _target_entry_for_call(ctx, bv, _call_destination_value(ctx, insn))
+        dest_value = _call_destination_value(ctx, insn)
+        target = _target_entry_for_call(ctx, bv, dest_value)
         if target is None:
+            continue
+        # #673: only an EXTERNAL branch target (import/PLT/GOT/external symbol) is a
+        # thunk/veneer candidate. A tail call/jump to a LOCAL defined function --
+        # e.g. an `.init_array` constructor tail-calling a local helper -- is not a
+        # stub FOR that function; flagging it hid the real implementation behind a
+        # "go to X" pointer instead of showing the constructor's own body.
+        callee_fn = None
+        if dest_value is not None:
+            getter = getattr(bv, "get_function_at", None)
+            callee_fn = getter(int(dest_value)) if callable(getter) else None
+        if callee_fn is not None and not is_imported_function(callee_fn):
             continue
         result.update(
             {
@@ -1383,6 +1431,11 @@ def _pointer_table(ctx, selector: str | None, address, *, entries: int = 16, str
     # #455/#467: record-aware mode -- a mixed dispatch descriptor (scalar/string +
     # pointer fields), not a pure pointer table. Declared here (before the GOT-alias /
     # stride handling) since it scans records, not a strided pointer run.
+    if (ptr_fields or fields) and record_size in (None, ""):
+        raise OperationFailure(
+            "invalid_request",
+            "--field/--ptr-fields require --record-size to define the record stride",
+        )
     if record_size not in (None, ""):
         rec_size = _parse_address(record_size)
         if rec_size <= 0:
