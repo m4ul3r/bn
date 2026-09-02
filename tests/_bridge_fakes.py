@@ -853,6 +853,11 @@ class _FakeBV:
         # Binary Ninja's bv.read returns only the contiguous mapped bytes
         # starting at *address*, or b"" if the address is unmapped (including
         # when nothing has been seeded into self._memory at all).
+        if length <= 0:
+            # Real bv.read hands length to a size_t-backed C API and can never
+            # receive a negative value; b"" here is a defensive convention for
+            # this double, not an observed real-BN return value.
+            return b""
         for base, blob in self._memory.items():
             if base <= address < base + len(blob):
                 start = address - base

@@ -2407,7 +2407,7 @@ def test_search_functions_count_only_returns_total(monkeypatch):
 def _mid_function_bv():
     fn = _FakeFunction(0x401000, "parse_packet")
     fn.basic_blocks = [_FakeBasicBlock(0x401000, 0x401040)]  # spans 0x401000..0x401040
-    return _FakeBV(functions=[fn]), fn
+    return _FakeBV(functions=[fn], memory={0x401000: b"\x90" * 0x40}), fn
 
 
 def test_find_function_resolves_contained_address_only_when_opted_in(monkeypatch):
@@ -3006,7 +3006,7 @@ def _containment_instance(monkeypatch):
     block.end = 0x401040
     fn = _FakeFunction(0x401000, "parse_packet")
     fn.basic_blocks = [block]
-    bv = _FakeBV(functions=[fn])
+    bv = _FakeBV(functions=[fn], memory={0x401000: b"\x90" * 0x40})
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     # An MLIL instruction at each candidate address so `possible_values` resolves
