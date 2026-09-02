@@ -3290,6 +3290,24 @@ class TaintEngine:
                 if _gate not in self._enabled_sink_classes:
                     sink = None
             if sink is not None:
+                # #615: an `unbounded_input` sink (e.g. `gets()`) is unconditionally
+                # unsafe -- it must be reported even when no tracked taint reaches
+                # any argument, since its `tainted_args` is intentionally empty (the
+                # danger is the call itself, not a tainted operand). Fires once per
+                # callsite, deduped like every other sink below.
+                if sink.get("class") == "unbounded_input":
+                    usig = (addr, "unconditional")
+                    if usig not in recorded_sinks:
+                        recorded_sinks.add(usig)
+                        dest = self._buffer_target(ssaf, params[0]) if params else None
+                        if dest is not None:
+                            node = (dest[0], None)
+                            node_lbl = dest[1]
+                        else:
+                            node = (("name", f"{mkey or name or 'unbounded_input'}_arg0@{hex(addr)}"), None)
+                            node_lbl = var_label_of(node)
+                        taint_node(node, node_lbl, ins, f"{mkey or name}(): unbounded read, always unsafe", [])
+                        findings.append(self._make_finding(ins, mkey or name, 0, sink, [node], why))
                 # #443: a bounded-write sink (wrapped recv/read) is armed by its
                 # `len_arg` -- an attacker-controlled write length -- in addition to
                 # any explicit `tainted_args`.

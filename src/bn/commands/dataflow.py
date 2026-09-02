@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -25,22 +26,32 @@ def _models_arg() -> tuple[tuple[str, ...], dict[str, Any]]:
                help="JSON file of extra taint models (same schema as the builtin DB: "
                     'a {name: model} map) for project-internal copy/format/exec wrappers, '
                     "merged over the builtins so taint follows flows through your own "
-                    "wrappers (#317). Persist them globally instead via BN_TAINT_MODELS.")
+                    "wrappers (#317). BN_TAINT_MODELS is honored as a fallback for the "
+                    "same file, per invocation (#669); this flag wins when both are set.")
 
 
 def _add_user_models(args: argparse.Namespace, params: dict[str, Any]) -> None:
-    """Read `--models <file>` into ``params['user_models']`` (loud on a bad file,
-    mirroring --resolve-map and the #97 no-silent-model-failure rule)."""
-    path = getattr(args, "models", None)
+    """Read `--models <file>`, else `$BN_TAINT_MODELS`, into ``params['user_models']``
+    (loud on a bad file, mirroring --resolve-map and the #97 no-silent-model-failure
+    rule).
+
+    #669: the env var is resolved HERE, per invocation, and forwarded as a request
+    param -- the bridge only ever captured it at spawn time, so setting it for one
+    client call against a running bridge was silently ignored."""
+    flag = getattr(args, "models", None)
+    path = flag or os.environ.get("BN_TAINT_MODELS")
     if not path:
         return
+    source = "--models" if flag else "$BN_TAINT_MODELS"
     try:
         params["user_models"] = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        raise BridgeError(f"could not read --models {path}: {exc}")
+        raise BridgeError(f"could not read {source} {path}: {exc}")
     # #415: pass the file path through so the run's model_sources disclosure can
-    # name WHICH --models file landed, not just a count.
+    # name WHICH file landed, not just a count. #669: also pass WHICH knob
+    # supplied it, so the disclosure cannot label an env-sourced file `--models`.
     params["user_models_path"] = str(path)
+    params["user_models_via"] = source
 
 
 @command("dataflow", "defuse", help="Show the SSA definition site and use sites of a variable",

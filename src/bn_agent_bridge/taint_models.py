@@ -195,7 +195,8 @@ def load_models(extra: dict[str, Any] | None = None) -> dict[str, Any]:
 
 
 def model_overlay_sources(extra: dict[str, Any] | None = None, *,
-                          user_models_path: str | None = None) -> list[dict[str, Any]]:
+                          user_models_path: str | None = None,
+                          user_models_via: str | None = None) -> list[dict[str, Any]]:
     """#415: the active taint-model overlay sources (most-specific last), so a
     `taint` run discloses WHICH models are in effect.
 
@@ -204,8 +205,9 @@ def model_overlay_sources(extra: dict[str, Any] | None = None, *,
     (or passing ``--models``) takes effect on the next taint command with no
     bridge restart -- this disclosure makes that visible (and lets a status check
     confirm an overlay landed). ``user_models_path`` (when known) names the
-    ``--models`` file so the disclosure points at WHICH file landed, not just a
-    count."""
+    file so the disclosure points at WHICH file landed, not just a count, and
+    ``user_models_via`` (when known) names WHICH knob supplied it -- ``--models``
+    or ``$BN_TAINT_MODELS`` -- since #669 lets the client forward either."""
     sources: list[dict[str, Any]] = [{"kind": "builtin", "path": str(_BUILTIN_MODELS)}]
     if taint_models_path is not None:
         try:
@@ -229,7 +231,8 @@ def model_overlay_sources(extra: dict[str, Any] | None = None, *,
         # file with two inner models otherwise reported count 1).
         inner = extra.get("models") if isinstance(extra, dict) and "models" in extra else extra
         count = sum(1 for k in inner if not str(k).startswith("_comment")) if isinstance(inner, dict) else 0
-        user: dict[str, Any] = {"kind": "user", "via": "--models", "count": count}
+        user: dict[str, Any] = {"kind": "user", "via": user_models_via or "--models",
+                                "count": count}
         if user_models_path:
             user["path"] = str(user_models_path)
         sources.append(user)

@@ -282,6 +282,22 @@ def test_model_overlay_sources_unwraps_models_envelope_and_path():
     assert user[0]["path"] == "proj/models.json"
 
 
+def test_model_overlay_sources_names_the_knob_that_supplied_the_file():
+    # #669: the client now forwards a BN_TAINT_MODELS-sourced file through the
+    # same request param as --models, so the disclosure must name WHICH knob
+    # supplied it instead of always claiming `--models`.
+    by_env = te.model_overlay_sources({"app_copy": {}}, user_models_path="/tmp/env.json",
+                                      user_models_via="$BN_TAINT_MODELS")
+    user = [s for s in by_env if s["kind"] == "user"]
+    assert user[0]["via"] == "$BN_TAINT_MODELS"
+    assert user[0]["path"] == "/tmp/env.json"
+
+    # unspecified (an older client, or a direct socket caller) keeps the
+    # historical label rather than inventing a source
+    legacy = te.model_overlay_sources({"app_copy": {}})
+    assert [s for s in legacy if s["kind"] == "user"][0]["via"] == "--models"
+
+
 def test_model_overlay_sources_labels_override_by_env_presence(monkeypatch, tmp_path):
     # #415 review: an active override file is labeled env_override ONLY when
     # BN_TAINT_MODELS is set; the default-cache file (env unset) is override_default,
@@ -6588,3 +6604,38 @@ def test_reclassify_constant_format_sink_477(models):
     other = {"class": "overflow_len", "detail": "y"}
     assert engine._reclassify_constant_format_sink(other, "%d") == other
     assert engine._reclassify_constant_format_sink(None, "%d") is None
+
+
+def _gets_no_taint_func():
+    # dump(fd): gets(&buf) -- `buf` receives no other taint (fd is unused by the
+    # call), so the ONLY way this sink can fire is #615's unconditional
+    # `unbounded_input` emission, not the ordinary tainted-arg path.
+    buf = FVar("buf", typ="char[0x40]")
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "gets(&buf)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401070", constant=0x401070),
+               params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)]),
+    ]
+    bv = FBV({0x401070: "gets"})
+    return FFunc("dump", 0x10, FSSAFunc(instrs), params=[FVar("fd")]), bv
+
+
+def test_unbounded_input_sink_fires_unconditionally(models):
+    # #615: gets()'s model declares an empty `tainted_args` (the danger is the
+    # call itself, not a tainted operand) -- the sink must still fire exactly
+    # once per callsite, with no incoming taint required.
+    func, bv = _gets_no_taint_func()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])   # taints fd, unrelated to buf
+    gets_sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "gets"]
+    assert len(gets_sinks) == 1, result["reached_sinks"]
+    assert gets_sinks[0]["sink"]["class"] == "unbounded_input"
+    assert gets_sinks[0]["sink"]["tainted_arg_index"] == 0
+
+    # negative control: no call to gets() at all -> no unbounded_input finding.
+    a = FVar("a"); a0 = FSSA(a, 0)
+    clean_instrs = [FInstr(0, 0x10, "MLIL_NOP", "nop", reads=[a0])]
+    clean_func = FFunc("clean", 0x10, FSSAFunc(clean_instrs), params=[a])
+    clean_engine = te.TaintEngine(FBV({}), models)
+    clean_result = clean_engine.forward(clean_func, [te.parse_locator("param:0")])
+    assert clean_result["reached_sinks"] == []

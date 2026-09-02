@@ -499,6 +499,64 @@ def test_taint_models_bad_file_is_loud(monkeypatch, capsys, tmp_path):
     assert rc2 != 0
 
 
+def test_taint_forward_reads_user_models_from_env_when_no_flag(monkeypatch, capsys, tmp_path):
+    # #669: BN_TAINT_MODELS must reach a per-invocation CLI call even without
+    # --models, so a client-set env var on an already-running bridge works.
+    mfile = tmp_path / "env_models.json"
+    mfile.write_text(json.dumps({"app_copy": {"sink": {"class": "overflow_len", "tainted_args": [1]},
+                                              "propagates": [{"from": "*arg:1", "to": "*arg:0"}]}}))
+    monkeypatch.setenv("BN_TAINT_MODELS", str(mfile))
+    fake, calls = _fake({"taint": {"direction": "forward", "function": {"name": "p", "address": "0x1"},
+                                   "sources": [], "reached_sinks": [], "leaves": [],
+                                   "assumptions": [], "soundness": "x"}})
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    rc = bn.cli.main(["taint", "forward", "-f", "h", "--source", "param:0", "--target", "active"])
+    assert rc == 0
+    call = [c for c in calls if c["op"] == "taint"][0]
+    assert call["params"]["user_models"]["app_copy"]["sink"]["class"] == "overflow_len"
+    assert call["params"]["user_models_path"] == str(mfile)
+    # the disclosure must name the env var, not claim `--models` supplied it
+    assert call["params"]["user_models_via"] == "$BN_TAINT_MODELS"
+
+
+def test_taint_forward_models_flag_wins_over_env(monkeypatch, capsys, tmp_path):
+    # --models is the more specific, explicit choice -- it must win over an
+    # ambient BN_TAINT_MODELS env var, not the other way around.
+    flag_file = tmp_path / "flag_models.json"
+    flag_file.write_text(json.dumps({"flag_copy": {"sink": {"class": "overflow_len", "tainted_args": [1]}}}))
+    env_file = tmp_path / "env_models.json"
+    env_file.write_text(json.dumps({"env_copy": {"sink": {"class": "overflow_len", "tainted_args": [1]}}}))
+    monkeypatch.setenv("BN_TAINT_MODELS", str(env_file))
+    fake, calls = _fake({"taint": {"direction": "forward", "function": {"name": "p", "address": "0x1"},
+                                   "sources": [], "reached_sinks": [], "leaves": [],
+                                   "assumptions": [], "soundness": "x"}})
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    rc = bn.cli.main(["taint", "forward", "-f", "h", "--source", "param:0",
+                      "--models", str(flag_file), "--target", "active"])
+    assert rc == 0
+    call = [c for c in calls if c["op"] == "taint"][0]
+    assert "flag_copy" in call["params"]["user_models"]
+    assert "env_copy" not in call["params"]["user_models"]
+    assert call["params"]["user_models_path"] == str(flag_file)
+    assert call["params"]["user_models_via"] == "--models"
+
+
+def test_taint_forward_malformed_env_models_is_loud(monkeypatch, capsys, tmp_path):
+    # #669: a malformed BN_TAINT_MODELS-referenced file must raise the same
+    # loud BridgeError as a malformed --models file, not silently exit 0.
+    bad = tmp_path / "bad_env.json"
+    bad.write_text("{not valid json")
+    monkeypatch.setenv("BN_TAINT_MODELS", str(bad))
+    fake, _ = _fake({"taint": {}})
+    monkeypatch.setattr(bn.cli, "send_request", fake)
+    rc = bn.cli.main(["taint", "forward", "-f", "h", "--source", "param:0", "--target", "active"])
+    assert rc != 0   # BridgeError -> non-zero
+    # a nonexistent env-referenced file is likewise loud
+    monkeypatch.setenv("BN_TAINT_MODELS", str(tmp_path / "nope_env.json"))
+    rc2 = bn.cli.main(["taint", "forward", "-f", "h", "--source", "param:0", "--target", "active"])
+    assert rc2 != 0
+
+
 def test_render_backward_origin_via_spill():
     value = {"direction": "backward", "function": {"name": "use_len", "address": "0x800"},
              "sinks": [{"kind": "arg", "callee": "memcpy", "index": 2}],
