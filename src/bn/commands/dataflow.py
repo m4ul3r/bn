@@ -37,20 +37,32 @@ def _add_user_models(args: argparse.Namespace, params: dict[str, Any]) -> None:
 
     #669: the env var is resolved HERE, per invocation, and forwarded as a request
     param -- the bridge only ever captured it at spawn time, so setting it for one
-    client call against a running bridge was silently ignored."""
+    client call against a running bridge was silently ignored.
+
+    #615 review (New finding 2 / F9 correction): the path is expanduser()'d, same
+    as the bridge's own `taint_models_path()` (paths.py) -- an unexpanded ``~`` in
+    a BN_TAINT_MODELS set from a shell profile/config file used to work at spawn
+    time and must keep working per-invocation. And a MISSING $BN_TAINT_MODELS
+    file silently degrades to "no override" here, matching the bridge's own
+    spawn-time handling of the identical variable (`taint_models_path()`,
+    `if override_path.exists()`) -- only an EXPLICIT --models typo is a loud
+    error; a malformed file is loud regardless of which knob supplied it (#669)."""
     flag = getattr(args, "models", None)
     path = flag or os.environ.get("BN_TAINT_MODELS")
     if not path:
         return
     source = "--models" if flag else "$BN_TAINT_MODELS"
+    resolved = Path(path).expanduser()
+    if not flag and not resolved.exists():
+        return
     try:
-        params["user_models"] = json.loads(Path(path).read_text(encoding="utf-8"))
+        params["user_models"] = json.loads(resolved.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise BridgeError(f"could not read {source} {path}: {exc}")
     # #415: pass the file path through so the run's model_sources disclosure can
     # name WHICH file landed, not just a count. #669: also pass WHICH knob
     # supplied it, so the disclosure cannot label an env-sourced file `--models`.
-    params["user_models_path"] = str(path)
+    params["user_models_path"] = str(resolved)
     params["user_models_via"] = source
 
 
@@ -248,6 +260,7 @@ def _taint_backward(args: argparse.Namespace) -> int:
                  help="With a target: show only models present in the binary (errors without a target)"),
              arg("--callsites", action="store_true", default=False,
                  help="With --present: expand each present sink's callsite addresses"),
+             _models_arg(),
          ])
 def _taint_models(args: argparse.Namespace) -> int:
     params: dict[str, Any] = {}
@@ -259,6 +272,11 @@ def _taint_models(args: argparse.Namespace) -> int:
         params["present"] = True
     if args.callsites:
         params["callsites"] = True
+    # #615 review F7: `bn taint models` is the documented "confirm an overlay
+    # landed" check -- it must honor --models/$BN_TAINT_MODELS identically to
+    # `taint forward`/`taint backward`, not silently reflect only the bridge's
+    # spawn-time env.
+    _add_user_models(args, params)
     # #473: --present/--callsites are defined against a loaded binary, so require a
     # target for them -- which lets `_resolve_target` auto-select the single open
     # target like every other read command (no spurious "need a target" when one is
