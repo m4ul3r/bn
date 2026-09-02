@@ -466,3 +466,177 @@ def test_interprocedural_mode_out_param_fill_reason_unchanged(monkeypatch):
 
     assert trace[0]["reason"] == "interprocedural_out_param_not_followed"
     assert trace[0]["out_param_callee"] == "parse_input"
+
+
+def test_backward_slice_assumptions_nonempty_when_ip_depth_exhausted(monkeypatch):
+    # #671 (round-2): `assumptions` must name the `--ip-depth` cap, not just
+    # `--max-depth`, when a crossable call boundary is stopped by the budget.
+    from _bridge_fakes import (
+        _FakeBV, _FakeConstPtr, _FakeFunction, _FakeMLILFunction, _FakeMLILInsn,
+        _FakeSSAVariable,
+    )
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    # Callee: returns callee_ret_var, which is a copy of a parameter -- the
+    # crossing would otherwise fire (matches test_backward_slice_interprocedural_
+    # follows_callee's shape).
+    callee_ret_var = _FakeSSAVariable("result#1")
+    callee_def_var = _FakeSSAVariable("tmp#2")
+    callee_ret_insn = _FakeMLILInsn(0x20010, operation="MLIL_RET", vars_read=[callee_ret_var])
+    callee_def_insn = _FakeMLILInsn(0x20008, operation="MLIL_SET_VAR_SSA", vars_read=[callee_def_var])
+    callee = _FakeFunction(0x20000, "callee_fn")
+    callee.medium_level_il = _FakeMLILFunction(
+        instructions=[callee_ret_insn, callee_def_insn],
+        definitions={callee_ret_var: callee_def_insn})
+
+    ret_var = _FakeSSAVariable("r0#3")
+    inner_call_insn = _FakeMLILInsn(0x1000c, operation="MLIL_CALL_SSA", dest=_FakeConstPtr(0x20000))
+    target_call_insn = _FakeMLILInsn(
+        0x10010, operation="MLIL_CALL_SSA",
+        params=[_FakeMLILInsn(0x10010, operation="MLIL_VAR_SSA", vars_read=[ret_var])],
+        vars_read=[ret_var])
+    caller = _FakeFunction(0x10000, "caller_fn")
+    caller.medium_level_il = _FakeMLILFunction(
+        instructions=[inner_call_insn, target_call_insn],
+        definitions={ret_var: inner_call_insn})
+    bv = _FakeBV(functions=[caller, callee])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    # --ip-depth 0: the budget is spent before the very first crossing attempt.
+    result = instance._backward_slice(
+        "active", "caller_fn", "0x10010", arg_index=0,
+        interprocedural=True, ip_depth=0)
+
+    assert result["truncated"] is False
+    entry = result["trace"][0]
+    assert entry["reason"] == "call_or_jump_boundary"
+    assert entry["ip_depth_exhausted"] is True
+    assert "call_depth_exhausted" not in entry
+    assert len(result["assumptions"]) == 1
+    assert "--ip-depth cap" in result["assumptions"][0]
+    assert result["frontiers"] == [
+        {"reason": "call_or_jump_boundary", "count": 1,
+         "examples": [{"ssa_label": "r0#3", "address": "0x1000c", "depth": 0,
+                       "callee": "callee_fn"}]},
+    ]
+
+
+def test_build_backward_trace_call_depth_guard_marks_boundary_not_dangling_cross_function(monkeypatch):
+    # #671 (round-2): the hard `_call_depth > 10` recursion backstop must not
+    # leave a dangling non-terminal `cross_function` step with empty
+    # `frontiers`/`assumptions` (R2 finding A2) -- the crossing guard now
+    # requires `_call_depth < 10` as a PRE-condition, so the boundary itself
+    # is marked `call_depth_exhausted` instead.
+    from _bridge_fakes import (
+        _FakeBV, _FakeConstPtr, _FakeFunction, _FakeMLILFunction, _FakeMLILInsn,
+        _FakeSSAVariable,
+    )
+    bridge = _load_bridge(monkeypatch)
+    rts = bridge.read_taint_slice
+    instance = bridge.BinaryNinjaBridge()
+
+    callee_ret_var = _FakeSSAVariable("result#1")
+    callee_def_var = _FakeSSAVariable("tmp#2")
+    callee_ret_insn = _FakeMLILInsn(0x20010, operation="MLIL_RET", vars_read=[callee_ret_var])
+    callee_def_insn = _FakeMLILInsn(0x20008, operation="MLIL_SET_VAR_SSA", vars_read=[callee_def_var])
+    callee = _FakeFunction(0x20000, "callee_fn")
+    callee.medium_level_il = _FakeMLILFunction(
+        instructions=[callee_ret_insn, callee_def_insn],
+        definitions={callee_ret_var: callee_def_insn})
+
+    ret_var = _FakeSSAVariable("r0#3")
+    inner_call_insn = _FakeMLILInsn(0x1000c, operation="MLIL_CALL_SSA", dest=_FakeConstPtr(0x20000))
+    caller = _FakeFunction(0x10000, "caller_fn")
+    caller.medium_level_il = _FakeMLILFunction(
+        instructions=[inner_call_insn], definitions={ret_var: inner_call_insn})
+    bv = _FakeBV(functions=[caller, callee])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    # ip_depth=5 (budget not spent) but _call_depth=10 (hard backstop already
+    # reached) -- reproduces R2's finding A2 repro exactly.
+    trace = rts._build_backward_trace(
+        instance.ctx, bv, caller.medium_level_il.ssa_form, [ret_var], max_depth=10,
+        interprocedural=True, ip_depth=5, _call_depth=10, seed_addr=None)
+
+    assert len(trace) == 1
+    entry = trace[0]
+    assert entry["reason"] == "call_or_jump_boundary"
+    assert entry["terminates"] is True
+    assert entry.get("call_depth_exhausted") is True
+    assert "ip_depth_exhausted" not in entry
+    assert "cross_function" not in entry
+    assert rts._summarize_frontiers(trace) == [
+        {"reason": "call_or_jump_boundary", "count": 1,
+         "examples": [{"ssa_label": "r0#3", "address": "0x1000c", "depth": 0,
+                       "callee": "callee_fn"}]},
+    ]
+    assert rts._trace_assumptions(trace, truncated=False, max_depth=10) == [
+        "interprocedural crossing stopped at the internal recursion-depth "
+        "safety limit (not adjustable via --ip-depth); the slice may be "
+        "incomplete beyond that boundary"
+    ]
+
+
+def test_output_pointer_hint_names_callee_not_param_name(monkeypatch):
+    # #662 (round-2, finding C): the output-pointer hint must name the resolved
+    # callee, not the callee's PARAMETER name -- the same confusion the header
+    # fix closes, in the one remaining internal consumer of `arg_label["name"]`.
+    import types as _types
+    from _bridge_fakes import (
+        _FakeBV, _FakeConstPtr, _FakeFunction, _FakeMLILFunction, _FakeMLILInsn,
+        _FakeSSAVariable,
+    )
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    local = _FakeSSAVariable("rec#1")
+    addr_of_local = _FakeMLILInsn(0x2010, operation="MLIL_ADDRESS_OF", src=local)
+    call_insn = _FakeMLILInsn(
+        0x2010, operation="MLIL_CALL_SSA",
+        params=[addr_of_local], dest=_FakeConstPtr(0x3000))
+    fill_record = _FakeFunction(0x3000, "fill_record")
+    fill_record.parameter_vars = [_types.SimpleNamespace(name="out")]
+    caller = _FakeFunction(0x2000, "caller")
+    caller.medium_level_il = _FakeMLILFunction(instructions=[call_insn], definitions={})
+    bv = _FakeBV(functions=[caller, fill_record])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._backward_slice("active", "caller", "0x2010", arg_index=0)
+
+    assert result["arg_label"]["callee"] == "fill_record"
+    assert result["arg_label"]["name"] == "out"
+    assert len(result["hints"]) == 1
+    assert "fill_record writes into the pointee" in result["hints"][0]
+    assert "out writes into the pointee" not in result["hints"][0]
+
+
+def test_backward_slice_assumptions_nonempty_for_unfollowed_out_param(monkeypatch):
+    # #671/#672: `_backward_slice`'s `assumptions` must name an unfollowed
+    # out-param fill, not just the depth cap -- end-to-end through
+    # `_trace_assumptions`'s out-param branch (read_taint_slice.py:965-972),
+    # which the direct `_build_backward_trace` tests never reach.
+    from _bridge_fakes import (
+        _FakeBV, _FakeFunction, _FakeMLILFunction, _FakeMLILInsn, _FakeSSAVariable,
+    )
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    var_r0 = _FakeSSAVariable("r0#1")
+    call_insn = _FakeMLILInsn(
+        0x10010, operation="MLIL_CALL_SSA",
+        params=[_FakeMLILInsn(0x10010, operation="MLIL_VAR_SSA", vars_read=[var_r0])],
+        vars_read=[var_r0])
+    fn = _FakeFunction(0x10000, "test_func")
+    fn.medium_level_il = _FakeMLILFunction(instructions=[call_insn], definitions={})
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(
+        bridge.read_taint_slice, "_build_out_param_map",
+        lambda ctx, bv, ssa_func: {var_r0: [(0x5, "parse_input")]})
+
+    result = instance._backward_slice("active", "test_func", "0x10010", arg_index=0)
+
+    assert result["trace"][0]["reason"] == "out_param_not_followed"
+    assert len(result["assumptions"]) == 1
+    assert "parse_input" in result["assumptions"][0]

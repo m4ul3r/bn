@@ -811,7 +811,7 @@ def _build_backward_trace(
 
         def_op = entry["operation"]
         if "CALL" in def_op or "JUMP" in def_op:
-            if interprocedural and ip_depth > 0:
+            if interprocedural and ip_depth > 0 and _call_depth < 10:
                 callee = _resolve_callee(ctx, bv, def_insn)
                 if callee is not None:
                     callee_mlil = getattr(callee, "medium_level_il", None)
@@ -846,6 +846,10 @@ def _build_backward_trace(
                                 continue
             entry["terminates"] = True
             entry["reason"] = "call_or_jump_boundary"
+            if interprocedural and ip_depth <= 0:
+                entry["ip_depth_exhausted"] = True
+            elif interprocedural and _call_depth >= 10:
+                entry["call_depth_exhausted"] = True
             # Resolve the call target to its symbol so a library-call origin reads
             # as e.g. `call strlen` rather than a bare PLT address (#193).
             callee_nm = _callee_display_name(ctx, bv, def_insn)
@@ -971,6 +975,17 @@ def _trace_assumptions(trace: list[dict[str, Any]], *, truncated: bool, max_dept
                 f"trace did not follow; the true origin may be inside it"
             )
             break
+    if any(isinstance(step, dict) and step.get("ip_depth_exhausted") for step in trace):
+        assumptions.append(
+            "interprocedural crossing stopped at the --ip-depth cap; the "
+            "slice may be incomplete beyond that boundary -- raise --ip-depth to continue"
+        )
+    if any(isinstance(step, dict) and step.get("call_depth_exhausted") for step in trace):
+        assumptions.append(
+            "interprocedural crossing stopped at the internal recursion-depth "
+            "safety limit (not adjustable via --ip-depth); the slice may be "
+            "incomplete beyond that boundary"
+        )
     return assumptions
 
 
@@ -1315,7 +1330,7 @@ def _backward_slice(
     # not the data the callee writes through it. Surface that instead of the
     # misleading "constant or immediate -- no SSA trace" (#166).
     if param_expr is not None and not initial_vars and _is_address_of(param_expr):
-        callee_nm = arg_label.get("name") or "the callee"
+        callee_nm = arg_label.get("callee") or "the callee"
         hints.append(
             f"arg {arg_index} is a pointer (address-of); this traces where the "
             f"pointer came from, not the data written through it. To follow data "

@@ -654,6 +654,23 @@ def test_render_trace_text_renders_caveats_from_assumptions():
     assert "depth cap reached (1)" in out
 
 
+def test_render_trace_text_empty_trace_still_renders_caveats():
+    # Defensive hardening (round-2 finding F): an empty `trace` short-circuited
+    # before the caveats block, which would silently drop any `assumptions` if
+    # a future producer ever populated `assumptions` on a zero-step result.
+    from bn.formatters import _render_trace_text
+    value = {
+        "function": "f", "function_address": "0x1000", "target_address": "0x1010",
+        "arg_index": 0, "arg_label": {}, "trace": [],
+        "assumptions": ["interprocedural crossing stopped at the --ip-depth cap; "
+                        "the slice may be incomplete beyond that boundary -- "
+                        "raise --ip-depth to continue"],
+    }
+    out = _render_trace_text(value)
+    assert "caveats (1):" in out
+    assert "--ip-depth cap" in out
+
+
 def test_render_trace_text_omits_caveats_when_assumptions_empty():
     from bn.formatters import _render_trace_text
     value = {

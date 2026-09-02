@@ -3604,6 +3604,16 @@ def _render_trace_text(value: Any) -> str:
     if not trace:
         body = "\n".join(f"  hint: {h}" for h in hints) if hints \
             else "  constant or immediate — no SSA trace"
+        # Defensive: every `assumptions` entry is carried on a step already
+        # appended to `trace` (the depth cap, the out-param reasons, and the
+        # --ip-depth/recursion-depth markers all require a non-empty trace),
+        # so `assumptions` cannot actually be non-empty here today. Kept as
+        # pure renderer robustness against a future producer relaxing that
+        # invariant, not because this path is currently reachable.
+        assumptions = [a for a in (value.get("assumptions") or []) if a]
+        if assumptions:
+            body += f"\n\ncaveats ({len(assumptions)}):\n" + \
+                "\n".join(f"  - {a}" for a in assumptions)
         return f"{header}\n{info}\n\n{body}"
 
     lines = [header, info, ""]
