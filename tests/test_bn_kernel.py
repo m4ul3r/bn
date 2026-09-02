@@ -194,6 +194,46 @@ def test_smoke_start_failure_still_attempts_exact_instance_stop(monkeypatch):
     assert calls[-1] == ["/usr/bin/bn", "session", "stop", "failed-worker"]
 
 
+def test_smoke_start_collision_preserves_pre_existing_instance(monkeypatch):
+    from types import SimpleNamespace
+
+    smoke = _load_bn_kernel_smoke()
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return SimpleNamespace(
+            returncode=2,
+            stdout="",
+            stderr=(
+                "error: Bridge instance already exists with id: "
+                "occupied-worker\n"
+            ),
+        )
+
+    monkeypatch.setattr(smoke.shutil, "which", lambda name: "/usr/bin/bn")
+    monkeypatch.setattr(smoke.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["smoke.py", "/tmp/sample.bin", "--instance", "occupied-worker"],
+    )
+
+    assert smoke.main() == 1
+    assert calls == [
+        [
+            "/usr/bin/bn",
+            "session",
+            "start",
+            "/tmp/sample.bin",
+            "--instance-id",
+            "occupied-worker",
+            "--format",
+            "json",
+        ]
+    ]
+
+
 def test_smoke_target_close_failure_does_not_suppress_instance_stop(monkeypatch):
     from types import SimpleNamespace
 

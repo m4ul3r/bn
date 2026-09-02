@@ -81,6 +81,10 @@ def _loaded_selector(stdout: str) -> str:
     return selectors[0]
 
 
+def _start_proves_nonownership(stderr: str, instance: str) -> bool:
+    return f"Bridge instance already exists with id: {instance}" in stderr
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("binary", nargs="?", default="/bin/ls")
@@ -103,6 +107,7 @@ def main() -> int:
     start_env["BN_IDLE_TIMEOUT"] = "3600"
     succeeded = False
     target_selector: str | None = None
+    owns_instance = True
     try:
         started = subprocess.run(
             [
@@ -122,6 +127,9 @@ def main() -> int:
             env=start_env,
         )
         if started.returncode:
+            owns_instance = not _start_proves_nonownership(
+                started.stderr, args.instance
+            )
             print(f"FAIL session start returncode={started.returncode}")
         else:
             try:
@@ -131,7 +139,7 @@ def main() -> int:
             except Exception as exc:
                 print(f"FAIL smoke error={type(exc).__name__}")
     finally:
-        if not args.keep:
+        if not args.keep and owns_instance:
             try:
                 if target_selector is not None:
                     try:

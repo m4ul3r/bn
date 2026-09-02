@@ -12,7 +12,7 @@
 
 - Scope behavior changes to `skills/bn-kernel`; do not change the global `bn` headless default.
 - Every agent-owned bridge starts with `BN_IDLE_TIMEOUT=3600`; another deliberate value must be positive, never `0`, `none`, or `off`.
-- Normal cleanup closes the exact loaded target when known and always stops the exact instance even if target close fails.
+- Normal cleanup closes the exact loaded target when known and always stops the exact owned instance even if target close fails. Any start failure or timeout is ambiguous and requires exact stop except the stable exact duplicate-ID rejection, which proves non-ownership and must leave the pre-existing bridge untouched.
 - Every workflow uses a unique instance ID plus explicit `-i/--instance` and target selector; never use sticky pins or broad cleanup.
 - Hard agent/process death relies on the existing headless-only idle reaper; do not add another process manager.
 - Do not terminate pre-existing bridge instances while implementing or testing this change.
@@ -22,8 +22,8 @@
 ## File Structure
 
 - Modify `skills/bn-kernel/SKILL.md`: authoritative lifecycle recipe, fan-out prompt contract, timeout/start-failure guidance, and memory warning.
-- Modify `skills/bn-kernel/scripts/smoke.py`: make the shipped smoke workflow arm the fallback, recover its exact selector, close it, and stop its exact instance on every reachable exit.
-- Modify `tests/test_bn_kernel.py`: behavioral tests for smoke start environment and exact teardown ordering.
+- Modify `skills/bn-kernel/scripts/smoke.py`: make the shipped smoke workflow arm the fallback, recover its exact selector, close it, and stop its exact owned or ambiguously started instance on every reachable exit while preserving an exact-ID collision it did not create.
+- Modify `tests/test_bn_kernel.py`: behavioral tests for smoke start environment, exact teardown ordering, ambiguous start cleanup, and duplicate-ID non-ownership.
 - Use `local://bn-kernel-cleanup-*.md` only for transient RED/GREEN pressure-test prompts and responses; do not add generated response artifacts to git.
 
 ---
@@ -122,7 +122,7 @@ RED is valid only if the control demonstrably omits or weakens at least one appr
 - Consumes: existing `bn session start`, JSON `loaded[].targets[].selector`, `bn -i ID target close SELECTOR`, and `bn session stop ID` contracts.
 - Produces: smoke start environment with `BN_IDLE_TIMEOUT=3600` and teardown order `target close` then `session stop`.
 
-- [ ] **Step 1: Add a test loader and four failing smoke lifecycle tests**
+- [ ] **Step 1: Add a test loader and failing smoke lifecycle tests**
 
 Add local imports and a loader near the existing test helpers in `tests/test_bn_kernel.py`:
 
@@ -237,6 +237,48 @@ def test_smoke_start_failure_still_attempts_exact_instance_stop(monkeypatch):
     assert smoke.main() == 1
     assert calls[-1] == ["/usr/bin/bn", "session", "stop", "failed-worker"]
 
+```
+
+Add the exact collision case separately from the ambiguous failure case:
+
+```python
+def test_smoke_start_collision_preserves_pre_existing_instance(monkeypatch):
+    from types import SimpleNamespace
+
+    smoke = _load_bn_kernel_smoke()
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return SimpleNamespace(
+            returncode=2,
+            stdout="",
+            stderr=(
+                "error: Bridge instance already exists with id: "
+                "occupied-worker\n"
+            ),
+        )
+
+    monkeypatch.setattr(smoke.shutil, "which", lambda name: "/usr/bin/bn")
+    monkeypatch.setattr(smoke.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["smoke.py", "/tmp/sample.bin", "--instance", "occupied-worker"],
+    )
+
+    assert smoke.main() == 1
+    assert calls == [[
+        "/usr/bin/bn",
+        "session",
+        "start",
+        "/tmp/sample.bin",
+        "--instance-id",
+        "occupied-worker",
+        "--format",
+        "json",
+    ]]
+
 
 def test_smoke_target_close_failure_does_not_suppress_instance_stop(monkeypatch):
     from types import SimpleNamespace
@@ -282,10 +324,13 @@ def test_smoke_target_close_failure_does_not_suppress_instance_stop(monkeypatch)
 Run:
 
 ```bash
-uv run pytest tests/test_bn_kernel.py -k 'smoke_default_instance or smoke_arms_idle or smoke_start_failure or smoke_target_close_failure' -v
+uv run pytest tests/test_bn_kernel.py -k 'smoke_' -v
 ```
 
-Expected: all four FAIL against the old smoke workflow. The default instance is fixed rather than process-unique; the normal start lacks the fallback environment and target close; start failure returns before stop; and close failure has no exact close step.
+Expected RED for the final collision test: the old cleanup performs a second
+`bn session stop occupied-worker` call. The other smoke tests continue to prove
+the unique default, armed fallback, normal close/stop order, ambiguous-start
+stop, and close-failure stop guarantee.
 
 - [ ] **Step 3: Implement the minimal owned-lifecycle flow**
 
@@ -309,6 +354,13 @@ def _loaded_selector(stdout: str) -> str:
     return selectors[0]
 ```
 
+Detect only the stable exact duplicate-ID text:
+
+```python
+def _start_proves_nonownership(stderr: str, instance: str) -> bool:
+    return f"Bridge instance already exists with id: {instance}" in stderr
+```
+
 Replace the current start/early-return/finally block with this flow:
 
 ```python
@@ -316,6 +368,7 @@ Replace the current start/early-return/finally block with this flow:
     start_env["BN_IDLE_TIMEOUT"] = "3600"
     succeeded = False
     target_selector: str | None = None
+    owns_instance = True
     try:
         started = subprocess.run(
             [
@@ -335,6 +388,9 @@ Replace the current start/early-return/finally block with this flow:
             env=start_env,
         )
         if started.returncode:
+            owns_instance = not _start_proves_nonownership(
+                started.stderr, args.instance
+            )
             print(f"FAIL session start returncode={started.returncode}")
         else:
             try:
@@ -344,7 +400,7 @@ Replace the current start/early-return/finally block with this flow:
             except Exception as exc:
                 print(f"FAIL smoke error={type(exc).__name__}")
     finally:
-        if not args.keep:
+        if not args.keep and owns_instance:
             if target_selector is not None:
                 closed = subprocess.run(
                     [
@@ -387,10 +443,11 @@ Do not make `--keep` disable the idle fallback; it skips deterministic cleanup o
 Run:
 
 ```bash
-uv run pytest tests/test_bn_kernel.py -k 'smoke_default_instance or smoke_arms_idle or smoke_start_failure or smoke_target_close_failure' -v
+uv run pytest tests/test_bn_kernel.py -k 'smoke_' -v
 ```
 
-Expected: 4 passed.
+Expected: all six smoke tests pass. The exact duplicate-ID case makes only the
+start call; every ambiguous failure still attempts exact stop.
 
 - [ ] **Step 5: Commit the smoke lifecycle change**
 
@@ -419,8 +476,9 @@ Immediately before `## Parallel bn-kernel subagents`, add:
 ````markdown
 ## Own and reap every headless bridge
 
-A workflow that starts a headless bridge owns that exact instance until it stops.
-Give it a unique ID and arm the crash fallback on the spawn command:
+A workflow that starts a headless bridge owns that exact instance until it stops,
+unless the exact duplicate-ID start rejection proves the bridge already existed.
+Give an owned bridge a unique ID and arm the crash fallback on the spawn command:
 
 ```bash
 BN_IDLE_TIMEOUT=3600 bn session start /path/to/binary --instance-id worker
@@ -432,17 +490,19 @@ completed requests, and never fires during an in-flight request or active load
 job. It covers hard agent/process death; it does not replace normal cleanup.
 
 On every reachable exit, close the exact target when one opened, then always stop
-the exact instance even if start, load, analysis, or target close failed:
+the exact owned instance even if start, load, analysis, or target close failed:
 
 ```bash
 bn -i worker target close <target-selector>  # when a target opened
-bn session stop worker                       # always attempt this exact ID
+bn session stop worker                       # always attempt this exact owned ID
 ```
 
-Run `session stop` even when the close command fails. A timed-out start is
-uncertain ownership: its child may have registered after the harness stopped
-waiting, so attempt to stop the unique ID rather than assuming no process exists.
-Never compensate with `bn close --all`, sticky pins, or another agent's instance.
+Run `session stop` even when the close command fails. Only the exact
+`Bridge instance already exists with id: <instance-id>` error proves the workflow
+never acquired ownership, so do not close or stop that pre-existing bridge. Any
+other failed or timed-out start is ambiguous because its child may have registered;
+attempt to stop the unique ID rather than assuming no process exists. Never
+compensate with `bn close --all`, sticky pins, or another agent's instance.
 ````
 
 Keep this as a recipe, not a prohibition-only section: future agents need the exact start and teardown shape.
@@ -453,9 +513,10 @@ Replace the parallel example's repeated prompt suffix with a shared positive cla
 
 ```python
 lifecycle = (
-    "Start your unique headless bridge with BN_IDLE_TIMEOUT=3600. On every "
-    "reachable exit, close its exact target if opened, then always stop its "
-    "exact instance even if start, load, analysis, or target close fails. "
+    "Start your unique headless bridge with BN_IDLE_TIMEOUT=3600. Unless the exact "
+    "duplicate-ID error proves non-ownership, on every reachable exit close its "
+    "exact target if opened, then always stop its exact instance; every other "
+    "failed or timed-out start is ambiguous. "
 )
 results = await parallel([
     lambda: agent(
@@ -489,7 +550,7 @@ Change the detached start command to:
 BN_IDLE_TIMEOUT=3600 bn session start /path/to/large.bndb --instance-id worker --detach
 ```
 
-After the exact close/stop example, state that `session stop` must run even if target close fails and that a failed/timed-out start still triggers an exact stop attempt. In `## Load cost and memory`, replace “stop instances promptly” with the two-layer contract: deterministic stop immediately, one-hour idle reaping only as fallback.
+After the exact close/stop example, state that `session stop` must run even if target close fails, that the exact duplicate-ID rejection proves non-ownership and suppresses teardown, and that any other failed/timed-out start remains ambiguous and triggers exact stop. In `## Load cost and memory`, replace “stop instances promptly” with the two-layer contract: deterministic stop immediately, one-hour idle reaping only as fallback.
 
 - [ ] **Step 4: Run five GREEN wording micro-tests**
 
@@ -511,8 +572,8 @@ Write the candidate skill to `local://bn-kernel-cleanup-candidate.md`. Launch fr
 
 - `BN_IDLE_TIMEOUT=3600` on spawn;
 - exact target close when the selector exists;
-- exact instance stop on normal, partial, close-failure, and uncertain-start paths;
-- no broad or sticky cleanup.
+- exact instance stop on normal, partial, close-failure, and ambiguous-start paths;
+- no stop after the exact duplicate-ID non-ownership rejection, and no broad or sticky cleanup.
 
 Record bounded results in `local://bn-kernel-cleanup-green-results.md`. Add a rationalization table or red-flags subsection only if GREEN agents discover a new loophole; otherwise keep the positive recipe minimal.
 

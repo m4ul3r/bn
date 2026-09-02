@@ -77,17 +77,21 @@ collections into shared globals; process isolation remains a harness requirement
 
 ## Own and reap every headless bridge
 
-A workflow that starts a headless bridge owns that exact instance until it stops.
+A workflow that starts a headless bridge owns that exact instance until it stops,
+unless the exact duplicate-ID rejection below proves the bridge already existed.
 Every agent-owned spawn command must begin exactly as shown:
 
 ```bash
 BN_IDLE_TIMEOUT=3600 bn session start /path/to/binary --instance-id worker
 ```
 
-Every lifecycle response must include the exact `BN_IDLE_TIMEOUT=3600` default
-on its spawn line, even when the immediate question begins after start. Omit it
-only when the user explicitly selected another positive idle timeout; merely
-describing an idle timeout or setting `BN_SPAWN_TIMEOUT` does not arm this fallback.
+For an agent-owned or ambiguously started bridge, begin every lifecycle response
+with `BN_IDLE_TIMEOUT=3600 bn session start <target> --instance-id <instance-id>`.
+This includes cleanup-only questions after success, failure, or timeout; use the
+known path and ID when supplied and keep `<target>` only when the path is unknown.
+Omit the spawn line only for the confirmed non-ownership collision below or when
+the user explicitly selected another positive idle timeout; merely describing an
+idle timeout or setting `BN_SPAWN_TIMEOUT` does not arm this fallback.
 
 A deliberate alternative timeout must be positive; never use `0`, `none`, or
 `off` for an agent-owned bridge. The reaper starts after preload, resets after
@@ -96,21 +100,23 @@ job. It covers hard agent/process death; it does not replace normal cleanup.
 
 On every reachable exit, close only the exact selector returned by the bridge
 when a target opened. Never infer it from a path or basename; a basename is valid
-when the bridge returned it as the selector. Then always stop the exact instance
-even if start, load, analysis, or target close failed:
+when the bridge returned it as the selector. Then always stop the exact owned
+instance even if start, load, analysis, or target close failed:
 
 ```bash
 bn -i worker target close <target-selector>  # when a target opened
-bn session stop worker                       # always attempt this exact ID
+bn session stop worker                       # always attempt this exact owned ID
 ```
 
 Run `session stop` even when the close command fails; a linear close/stop list
-must state this guarantee or use a `finally`/trap equivalent. A timed-out start
-is uncertain ownership: its child may have registered after the harness stopped
-waiting, so attempt to stop the unique ID unconditionally. Do not first poll,
-list, or test whether it registered, and do not assume absence means no process
-exists. Never compensate with `bn close --all`, sticky pins, or another agent's
-instance.
+must state this guarantee or use a `finally`/trap equivalent. Only the exact
+`Bridge instance already exists with id: <instance-id>` start error proves the
+workflow never acquired ownership: do not close a target or stop that pre-existing
+instance. A timed-out or otherwise failed start is uncertain ownership because
+its child may have registered after the harness stopped waiting, so attempt to
+stop the unique ID unconditionally. Do not first poll, list, or test whether it
+registered, and do not assume absence means no process exists. Never compensate
+with `bn close --all`, sticky pins, or another agent's instance.
 
 ## Parallel bn-kernel subagents
 
@@ -127,9 +133,10 @@ rows:
 ```python
 lifecycle = (
     "Start your unique headless bridge with the exact BN_IDLE_TIMEOUT=3600 "
-    "assignment on its spawn command. On every reachable exit, close its exact "
-    "target if opened, then always stop its exact instance even if start, load, "
-    "analysis, or target close fails. "
+    "assignment on its spawn command. Unless the exact duplicate-ID error proves "
+    "you never acquired ownership, on every reachable exit close its exact target "
+    "if opened, then always stop its exact instance even if start, load, analysis, "
+    "or target close fails; every other failed or timed-out start is ambiguous. "
 )
 results = await parallel([
     lambda: agent(
@@ -352,9 +359,11 @@ bn -i worker target close <selector>   # close exactly that target
 bn session stop worker                 # then drop the bridge
 ```
 
-The stop attempt is unconditional: run it even if target close fails. A failed
-or timed-out start also triggers an exact stop attempt because registration may
-have completed after the caller stopped waiting.
+The stop attempt is unconditional for an owned instance: run it even if target
+close fails. The exact duplicate-ID start error proves non-ownership, so do not
+close or stop that pre-existing instance. Any other failed or timed-out start
+still triggers an exact stop attempt because registration may have completed
+after the caller stopped waiting.
 
 `bn target close <selector>` is the explicit single-target close (the same
 implementation as `bn close -t <selector>`, including the unsaved-analysis
