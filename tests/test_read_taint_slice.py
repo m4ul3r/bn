@@ -371,6 +371,8 @@ def test_backward_slice_result_includes_frontiers(monkeypatch):
         {"reason": "undefined_or_global", "count": 1,
          "examples": [{"ssa_label": "r1#2", "depth": 1}]},
     ]
+    # #671: a complete slice claims completeness with an empty assumptions list.
+    assert result["assumptions"] == []
 
 
 def test_render_trace_frontiers_text(monkeypatch):
@@ -388,3 +390,79 @@ def test_render_trace_frontiers_text(monkeypatch):
     # Empty / missing frontiers render nothing.
     assert _render_trace_frontiers([]) == []
     assert _render_trace_frontiers(None) == []
+
+
+def test_backward_slice_assumptions_nonempty_when_truncated(monkeypatch):
+    # #671: `assumptions` names the depth cap when the walk hits max_depth.
+    from _bridge_fakes import (
+        _FakeBV, _FakeFunction, _FakeMLILFunction, _FakeMLILInsn, _FakeSSAVariable,
+    )
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    var_r0 = _FakeSSAVariable("r0#1")
+    var_r1 = _FakeSSAVariable("r1#2")
+    call_insn = _FakeMLILInsn(
+        0x10010, operation="MLIL_CALL_SSA",
+        params=[_FakeMLILInsn(0x10010, operation="MLIL_VAR_SSA", vars_read=[var_r0])],
+        vars_read=[var_r0])
+    def_insn = _FakeMLILInsn(0x10008, operation="MLIL_SET_VAR_SSA", vars_read=[var_r1])
+    fn = _FakeFunction(0x10000, "test_func")
+    fn.medium_level_il = _FakeMLILFunction(
+        instructions=[call_insn], definitions={var_r0: def_insn})
+    bv = _FakeBV(functions=[fn])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._backward_slice(
+        "active", "test_func", "0x10010", arg_index=0, max_depth=1)
+
+    assert result["truncated"] is True
+    assert len(result["assumptions"]) == 1
+    assert "depth cap reached (1)" in result["assumptions"][0]
+
+
+def test_intra_mode_out_param_fill_not_mislabeled_undefined(monkeypatch):
+    # #672: a value that bottoms out at a local whose address was passed into
+    # a call must be labeled `out_param_not_followed` (naming the callee) in
+    # INTRA mode too, not the misleading `undefined_or_global`.
+    from _bridge_fakes import _FakeSSAVariable, _FakeSSAFunction
+    rts = _load_bridge(monkeypatch).read_taint_slice
+
+    local_var = object()  # sentinel local; no `identifier`, hashable by identity
+    ssa_var = _FakeSSAVariable("local#1")
+    ssa_var.var = local_var
+
+    ssa_func = _FakeSSAFunction([], {})
+    monkeypatch.setattr(
+        rts, "_build_out_param_map",
+        lambda ctx, bv, ssa_func: {local_var: [(0x10, "parse_input")]})
+
+    trace = rts._build_backward_trace(
+        ctx=None, bv=None, ssa_func=ssa_func, initial_vars=[ssa_var], max_depth=50,
+        interprocedural=False, seed_addr=0x20)
+
+    assert len(trace) == 1
+    entry = trace[0]
+    assert entry["reason"] == "out_param_not_followed"
+    assert entry["out_param_callee"] == "parse_input"
+
+
+def test_interprocedural_mode_out_param_fill_reason_unchanged(monkeypatch):
+    # Interprocedural mode keeps its existing, distinctly-named reason.
+    from _bridge_fakes import _FakeSSAVariable, _FakeSSAFunction
+    rts = _load_bridge(monkeypatch).read_taint_slice
+
+    local_var = object()  # sentinel local; hashable by identity
+    ssa_var = _FakeSSAVariable("local#1")
+    ssa_var.var = local_var
+    ssa_func = _FakeSSAFunction([], {})
+    monkeypatch.setattr(
+        rts, "_build_out_param_map",
+        lambda ctx, bv, ssa_func: {local_var: [(0x10, "parse_input")]})
+
+    trace = rts._build_backward_trace(
+        ctx=None, bv=None, ssa_func=ssa_func, initial_vars=[ssa_var], max_depth=50,
+        interprocedural=True, seed_addr=0x20)
+
+    assert trace[0]["reason"] == "interprocedural_out_param_not_followed"
+    assert trace[0]["out_param_callee"] == "parse_input"

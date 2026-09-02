@@ -1830,7 +1830,9 @@ def test_trace_render_step_grammar_singular_and_plural():
 
 
 def test_trace_render_shows_arg_register_and_field_load_meta():
-    # header labels the traced arg with its register + C name; a field_load step
+    # header labels the traced arg with its register and, when it resolves, the
+    # callee -- never the callee's PARAMETER name (#662: the value sliced is the
+    # caller's operand at the callsite, not a named parameter). A field_load step
     # renders base/offset/width (#162, #166).
     from bn import formatters
     value = {
@@ -1844,7 +1846,9 @@ def test_trace_render_shows_arg_register_and_field_load_meta():
         "hints": [],
     }
     text = formatters._render_trace_text(value)
-    assert 'arg[1] (x1, "buf")' in text
+    assert "arg[1] (x1)" in text
+    # #662: a stale `name` in arg_label must not leak back into the header.
+    assert '"buf"' not in text
     assert "field load" in text
     assert "base=obj#1" in text and "offset=0x8" in text and "width=4" in text
 

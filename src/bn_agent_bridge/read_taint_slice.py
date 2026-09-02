@@ -691,9 +691,12 @@ def _recover_trace_arg_via_reg(ctx, bv, func, call_insn, target_addr, arg_index:
 
 
 def _arg_label(ctx, bv, call_insn, arg_index: int, caller_func) -> dict[str, Any]:
-    """{index, [register], [name]} for the traced call argument: its
-    calling-convention register plus the callee's C parameter name when the
-    callee resolves (#166)."""
+    """{index, [register], [callee], [name]} for the traced call argument:
+    its calling-convention register, the resolved callee's name (#662), and
+    the callee's C parameter name when it resolves (#166). ``name`` is kept
+    for JSON back-compat only -- the traced value is the caller's operand at
+    the callsite, not necessarily anything the callee's parameter is named,
+    so renderers must key headers off ``callee``, not ``name``."""
     label: dict[str, Any] = {"index": arg_index}
     reg = _arg_register(caller_func, arg_index)
     if reg:
@@ -701,6 +704,9 @@ def _arg_label(ctx, bv, call_insn, arg_index: int, caller_func) -> dict[str, Any
     try:
         rt = _taint.resolve_call_target(bv, call_insn, follow_thunks=True)
         callee = getattr(rt, "function", None)
+        callee_nm = str(getattr(callee, "name", "") or "")
+        if callee_nm:
+            label["callee"] = callee_nm
         pvars = list(getattr(callee, "parameter_vars", []) or []) if callee else []
         if 0 <= arg_index < len(pvars):
             nm = getattr(pvars[arg_index], "name", None)
@@ -729,9 +735,10 @@ def _build_backward_trace(
     if _call_depth > 10:
         return []  # Safety: prevent runaway recursion
     trace: list[dict[str, Any]] = []
-    # #416: locals whose address is passed into a call, computed once per
-    # function (not per terminus). Only needed in interprocedural mode.
-    out_param_map = _build_out_param_map(ctx, bv, ssa_func) if interprocedural else {}
+    # #416/#672: locals whose address is passed into a call, computed once
+    # per function (not per terminus). Used in both intra and interprocedural
+    # modes so an out-param fill is never mistaken for "undefined".
+    out_param_map = _build_out_param_map(ctx, bv, ssa_func)
     # Each worklist item carries its def-use distance from the seed so the
     # reported "depth" is the real graph depth (operands of one definition
     # share a depth) rather than a sequential append index. base_depth
@@ -782,17 +789,19 @@ def _build_backward_trace(
                 entry["reason"] = "function_parameter"
             else:
                 entry["reason"] = "undefined_or_global"
-                # #416: a value that bottoms out at a LOCAL whose address was
-                # passed into a call (the common stack-struct out-param form,
-                # `parse(input, &rec); use(rec.len)`) was likely written by that
-                # callee through an out-pointer. Interprocedural tracing follows
-                # only return values, so name the callee instead of leaving an
-                # "undefined" terminus that reads like proof of origin.
-                if interprocedural:
-                    out_callee = _lookup_out_param_callee(out_param_map, ssa_var, ref_addr)
-                    if out_callee:
-                        entry["reason"] = "interprocedural_out_param_not_followed"
-                        entry["out_param_callee"] = out_callee
+                # #416/#672: a value that bottoms out at a LOCAL whose address
+                # was passed into a call (the common stack-struct out-param
+                # form, `parse(input, &rec); use(rec.len)`) was likely written
+                # by that callee through an out-pointer. Interprocedural
+                # tracing follows only return values, and INTRA tracing never
+                # crosses the call at all, so in both modes name the callee
+                # instead of leaving an "undefined" terminus that reads like
+                # proof of origin.
+                out_callee = _lookup_out_param_callee(out_param_map, ssa_var, ref_addr)
+                if out_callee:
+                    entry["reason"] = ("interprocedural_out_param_not_followed" if interprocedural
+                                        else "out_param_not_followed")
+                    entry["out_param_callee"] = out_callee
             trace.append(entry)
             continue
 
@@ -858,29 +867,30 @@ def _build_backward_trace(
                 entry["offset"] = hex(offset) if isinstance(offset, int) else offset
             if width is not None:
                 entry["width"] = width
-            # #416: in interprocedural mode, if this load reads from the address
-            # of a local that was passed by-address into a call, the value was
-            # likely written by that callee through an OUT-POINTER -- which
-            # interprocedural tracing follows only for return values. Emit an
-            # honest boundary reason naming the callee instead of letting the
-            # slice stop silently at a `field_load`/`memory_load`.
-            if interprocedural:
-                load_local = _address_of_target(getattr(load_expr, "src", None))
-                out_callee = _lookup_out_param_callee(
-                    out_param_map, load_local, int(getattr(def_insn, "address", 0)))
-                if out_callee:
-                    entry["reason"] = "interprocedural_out_param_not_followed"
-                    entry["out_param_callee"] = out_callee
-                    # The value's true origin is the callee's write through the
-                    # out-pointer; mark the load as a boundary. Index/base
-                    # provenance (`*(&local + idx)`) is still walked below, so a
-                    # tainted index is not dropped.
-                    entry["terminates"] = True
-                    trace.append(entry)
-                    for rv in _ssa_vars_from(getattr(def_insn, "vars_read", []) or []):
-                        if rv not in visited:
-                            worklist.append((rv, node_depth + 1, int(getattr(def_insn, "address", 0))))
-                    continue
+            # #416/#672: if this load reads from the address of a local that
+            # was passed by-address into a call, the value was likely written
+            # by that callee through an OUT-POINTER -- which interprocedural
+            # tracing follows only for return values, and intra tracing never
+            # crosses the call at all. Emit an honest boundary reason naming
+            # the callee instead of letting the slice stop silently at a
+            # `field_load`/`memory_load`.
+            load_local = _address_of_target(getattr(load_expr, "src", None))
+            out_callee = _lookup_out_param_callee(
+                out_param_map, load_local, int(getattr(def_insn, "address", 0)))
+            if out_callee:
+                entry["reason"] = ("interprocedural_out_param_not_followed" if interprocedural
+                                    else "out_param_not_followed")
+                entry["out_param_callee"] = out_callee
+                # The value's true origin is the callee's write through the
+                # out-pointer; mark the load as a boundary. Index/base
+                # provenance (`*(&local + idx)`) is still walked below, so a
+                # tainted index is not dropped.
+                entry["terminates"] = True
+                trace.append(entry)
+                for rv in _ssa_vars_from(getattr(def_insn, "vars_read", []) or []):
+                    if rv not in visited:
+                        worklist.append((rv, node_depth + 1, int(getattr(def_insn, "address", 0))))
+                continue
             # Preserve prior per-form walk behavior: a top-level load def
             # terminated; a `x = [addr]` SET_VAR continued through its base
             # pointer (so provenance reaches where the struct came from).
@@ -936,6 +946,32 @@ def _summarize_frontiers(trace: list[dict[str, Any]]) -> list[dict[str, Any]]:
             grp["examples"].append(
                 {k: step[k] for k in _FRONTIER_EXAMPLE_KEYS if step.get(k) is not None})
     return sorted(groups.values(), key=lambda g: (-g["count"], g["reason"]))
+
+
+def _trace_assumptions(trace: list[dict[str, Any]], *, truncated: bool, max_depth: int) -> list[str]:
+    """#671: honest caveats for a backward ``trace`` result, mirroring the
+    ``assumptions`` key already emitted by ``taint forward``/``taint
+    backward`` (see ``_render_taint_text``'s ``caveats`` block). Non-empty
+    ONLY when the slice is provably incomplete -- an empty list is a
+    positive claim of completeness, so every entry here must come from a
+    stopping condition already recorded on the trace/return dict, never a
+    guess."""
+    assumptions: list[str] = []
+    if truncated:
+        assumptions.append(
+            f"depth cap reached ({max_depth}); slice is incomplete -- "
+            f"raise --max-depth to continue"
+        )
+    out_param_reasons = {"interprocedural_out_param_not_followed", "out_param_not_followed"}
+    for step in trace:
+        if isinstance(step, dict) and step.get("reason") in out_param_reasons:
+            callee = step.get("out_param_callee") or "a callee"
+            assumptions.append(
+                f"value crosses an out-parameter fill by {callee} that this "
+                f"trace did not follow; the true origin may be inside it"
+            )
+            break
+    return assumptions
 
 
 def _is_parameter_ssa_var(ctx, ssa_func, ssa_var) -> bool:
@@ -1310,6 +1346,7 @@ def _backward_slice(
         seed_addr=target_addr,
     )
 
+    truncated = len(trace) >= max_depth
     return {
         "function": func.name,
         "function_address": hex(func.start),
@@ -1319,12 +1356,16 @@ def _backward_slice(
         "view": view,
         "interprocedural": interprocedural,
         "ip_depth": ip_depth if interprocedural else 0,
-        "truncated": len(trace) >= max_depth,
+        "truncated": truncated,
         "step_count": len(trace),
         "trace": trace,
         # Top-level roll-up of where the slice stopped, so an agent needn't scan
         # the whole `trace` array to compare stopping conditions across callsites
         # (#552). Factual summary, not a verdict.
         "frontiers": _summarize_frontiers(trace),
+        # #671: non-empty ONLY when the slice is provably incomplete (depth cap
+        # or an unfollowed out-param fill) -- mirrors `taint forward`/`backward`'s
+        # `assumptions` key so `caveats (N)` renders in text mode too.
+        "assumptions": _trace_assumptions(trace, truncated=truncated, max_depth=max_depth),
         "hints": hints,
     }
