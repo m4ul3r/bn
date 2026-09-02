@@ -602,7 +602,6 @@ def _session_stop(args: argparse.Namespace) -> int:
                     return 1
                 result["method"] = "sigkill"
 
-
         cli._emit_result(args, result, text_renderer=_render_session_stop_text, stem="session-stop")
         return 0
     finally:

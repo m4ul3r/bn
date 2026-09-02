@@ -173,8 +173,6 @@ def session_state_path(start: Path | None = None) -> Path:
     return sessions_dir() / f"{digest}.json"
 
 
-
-
 def bridge_registry_path(instance_id: str | None = None) -> Path:
     if instance_id is None:
         return cache_home() / f"{PLUGIN_NAME}.json"
