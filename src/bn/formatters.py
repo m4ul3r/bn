@@ -3806,6 +3806,11 @@ def _render_one_class(rec: Any) -> str:
     if vt and vt.get("slots"):
         for s in vt["slots"]:
             lines.append(f"  vtable [{s.get('index')}] {s.get('address', '?')}  {_vtable_slot_label(s)}")
+        if vt.get("truncated"):
+            lines.append(
+                f"  vtable: showing first {vt.get('max_slots')} slots; scan capped -- "
+                "more may exist (raise the cap or inspect the table directly)"
+            )
     elif vt_addr:
         # A vtable symbol exists but no slots resolved. Either the vtable is
         # defined in another module (the local symbol is an import/GOT slot) or
@@ -3824,6 +3829,11 @@ def _render_one_class(rec: Any) -> str:
         lines.append(f"  secondary vtable @ {sec.get('address', '?')}{ott_s}:")
         for s in sec.get("slots") or []:
             lines.append(f"    [{s.get('index')}] {s.get('address', '?')}  {_vtable_slot_label(s)}")
+        if sec.get("truncated"):
+            lines.append(
+                f"    vtable: showing first {sec.get('max_slots')} slots; scan capped -- "
+                "more may exist (raise the cap or inspect the table directly)"
+            )
     # Non-virtual member functions (kind=method). Virtual ones already appear as
     # vtable slots above; listing the symbol-side methods makes `class show`
     # useful for classes whose vtable is empty or absent (e.g. Controller).

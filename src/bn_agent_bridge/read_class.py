@@ -11,7 +11,7 @@ import re
 from typing import Any
 
 from . import il_format
-from ._shared import OperationFailure
+from ._shared import OperationFailure, _validate_count
 
 
 def _strip_signature(name: str) -> str:
@@ -501,6 +501,8 @@ def _class_list(
         if total == 0:
             result["inputs"] = _class_lens_inputs(ctx, bv)   # #653.6
         return result
+    offset = _validate_count(offset, label="offset", minimum=0)
+    limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     page = candidates[offset:] if offset else candidates
     if limit is not None:
         page = page[:limit]
@@ -587,7 +589,17 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
     # external slots as valid entries and terminate only at a genuine boundary --
     # an unmapped word (the next sub-vtable's offset-to-top, e.g. -8) or a mapped
     # DATA pointer (the next object's typeinfo). Trailing null slots are trimmed.
-    for i, row in enumerate(table.get("items") or table.get("entries") or []):
+    raw_entries = table.get("items") or table.get("entries") or []
+    scanned = 0
+    truncated = False
+    # #584: track whether the raw scan hit `max_slots` without ever finding a
+    # genuine terminator (unreadable slot / mapped data pointer). `for...else`
+    # runs the `else` branch only when the loop completed without `break` --
+    # i.e. every raw entry was consumed as a valid slot, so the real vtable
+    # may continue past `max_slots` and the result is a lower bound, not the
+    # true length.
+    for i, row in enumerate(raw_entries):
+        scanned = i + 1
         if not row.get("readable"):
             break
         target = row.get("target") if isinstance(row.get("target"), dict) else {}
@@ -632,11 +644,19 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
             # A mapped data pointer / unmapped garbage: the next object
             # (typeinfo / secondary-vtable header) -- the vtable ends here.
             break
+    else:
+        truncated = scanned >= max_slots > 0
     # A vtable ends at a real or pure-virtual method, so a trailing run of null
     # slots is the next object's zeroed offset-to-top / padding, not a slot.
     while slots and slots[-1].get("null"):
         slots.pop()
-    return {"address": hex(int(vtable_addr)), "slots": slots}
+    return {
+        "address": hex(int(vtable_addr)),
+        "slots": slots,
+        "truncated": truncated,
+        "max_slots": max_slots,
+        "scanned": scanned,
+    }
 
 
 def _slot_external_name(bv, value: Any) -> str | None:

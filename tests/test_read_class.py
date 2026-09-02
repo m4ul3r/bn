@@ -1177,3 +1177,120 @@ def test_is_alias_symbol_uses_enum_name_not_str_529():
         assert m["net::Session"]["vtable"] is local_v
     finally:
         read_class._rtti_kind_and_class = orig
+
+
+def test_class_list_rejects_negative_offset():
+    bv = _make_registry_bv()
+
+    class _Ctx:
+        def _resolve_view(self, sel):
+            return bv
+
+    import pytest
+    with pytest.raises(read_class.OperationFailure) as exc:
+        read_class._class_list(_Ctx(), None, include_all=True, offset=-1)
+    assert exc.value.status == "invalid_request"
+
+
+def test_class_list_rejects_negative_limit():
+    bv = _make_registry_bv()
+
+    class _Ctx:
+        def _resolve_view(self, sel):
+            return bv
+
+    import pytest
+    with pytest.raises(read_class.OperationFailure) as exc:
+        read_class._class_list(_Ctx(), None, include_all=True, limit=-1)
+    assert exc.value.status == "invalid_request"
+
+
+def test_class_list_rejects_non_int_offset():
+    bv = _make_registry_bv()
+
+    class _Ctx:
+        def _resolve_view(self, sel):
+            return bv
+
+    import pytest
+    with pytest.raises(read_class.OperationFailure) as exc:
+        read_class._class_list(_Ctx(), None, include_all=True, offset="nope")
+    assert exc.value.status == "invalid_request"
+
+
+def test_vtable_layout_marks_truncated_when_scan_hits_cap():
+    # #584: a vtable with more than max_slots (64) resolvable CODE slots must
+    # not silently look like a complete 64-slot vtable -- the scan ran out of
+    # raw entries to read (all 64 were valid code slots, no terminator found).
+    slots = [(0x400000 + i * 8, f"m{i}") for i in range(64)]
+    ctx = _VtableCtx(slots)
+    layout = read_class._vtable_layout(ctx, object(), 0x9000)
+    assert len(layout["slots"]) == 64
+    assert layout["truncated"] is True
+    assert layout["max_slots"] == 64
+    assert layout["scanned"] == 64
+
+
+def test_vtable_layout_not_truncated_for_small_vtable():
+    # A vtable that ends naturally (a real terminator found) well under the
+    # cap must not be flagged as truncated.
+    slots = [(0x40e8b0, "onData"), (0x40e3d0, None), (0xDEAD, "__cxa_pure_virtual")]
+    ctx = _VtableCtx(slots)
+    layout = read_class._vtable_layout(ctx, object(), 0x9000)
+    assert layout["truncated"] is False
+    assert layout["max_slots"] == 64
+    assert layout["scanned"] == 3
+
+
+def test_render_class_show_text_notes_truncated_vtable():
+    from bn.formatters import _render_class_show_text
+    rec = {
+        "name": "net::Session",
+        "confidence": "rtti",
+        "methods": [],
+        "vtable": {
+            "address": "0x9000",
+            "slots": [{"index": 0, "address": "0x400000", "method": {"display_name": "m0"}}],
+            "truncated": True,
+            "max_slots": 64,
+        },
+    }
+    text = _render_class_show_text(rec)
+    assert "scan capped" in text
+    assert "64" in text
+
+
+def test_render_class_show_text_no_note_when_vtable_not_truncated():
+    from bn.formatters import _render_class_show_text
+    rec = {
+        "name": "net::Session",
+        "confidence": "rtti",
+        "methods": [],
+        "vtable": {
+            "address": "0x9000",
+            "slots": [{"index": 0, "address": "0x400000", "method": {"display_name": "m0"}}],
+            "truncated": False,
+            "max_slots": 64,
+        },
+    }
+    text = _render_class_show_text(rec)
+    assert "scan capped" not in text
+
+
+def test_render_class_show_text_notes_truncated_secondary_vtable():
+    from bn.formatters import _render_class_show_text
+    rec = {
+        "name": "net::Session",
+        "confidence": "rtti",
+        "methods": [],
+        "vtable": None,
+        "secondary_vtables": [{
+            "address": "0xa000",
+            "offset_to_top": -16,
+            "slots": [{"index": 0, "address": "0x400000", "method": {"display_name": "m0"}}],
+            "truncated": True,
+            "max_slots": 64,
+        }],
+    }
+    text = _render_class_show_text(rec)
+    assert "scan capped" in text
