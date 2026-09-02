@@ -451,6 +451,8 @@ def _class_list(
     limit: int | None = None,
     count_only: bool = False,
 ) -> dict[str, Any]:
+    offset = _validate_count(offset, label="offset", minimum=0)
+    limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     bv = ctx._resolve_view(selector)
     registry = _build_class_registry(ctx, bv, query=query)
     candidates = []
@@ -501,8 +503,6 @@ def _class_list(
         if total == 0:
             result["inputs"] = _class_lens_inputs(ctx, bv)   # #653.6
         return result
-    offset = _validate_count(offset, label="offset", minimum=0)
-    limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     page = candidates[offset:] if offset else candidates
     if limit is not None:
         page = page[:limit]
@@ -560,7 +560,11 @@ def _slot_is_code(target: dict[str, Any]) -> bool:
 def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[str, Any]:
     """Function slots of an Itanium vtable. Words [0] (offset-to-top) and [1]
     (typeinfo ptr) are header; slots start at +2*ptr_size. Reuses the
-    Thumb-aware pointer-table reader. Only CODE targets count as slots."""
+    Thumb-aware pointer-table reader. Only CODE targets count as slots.
+
+    The returned ``scanned`` count is raw table entries examined, including
+    any terminating row that stopped the scan -- it is neither ``len(slots)``
+    nor a virtual-method count."""
     ptr = ctx._pointer_size(bv)
     # Itanium invariant: word[1] (vtable_addr + ptr) points to the class's
     # typeinfo. If it doesn't resolve to a typeinfo symbol, this address is NOT
@@ -570,7 +574,13 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
     # (#205 review), so report no slots and let the caller note it.
     ti_ptr = ctx._read_pointer_value(bv, vtable_addr + ptr, size=ptr)
     if not ti_ptr or ctx._typeinfo_name_at(bv, ti_ptr) is None:
-        return {"address": hex(int(vtable_addr)), "slots": []}
+        return {
+            "address": hex(int(vtable_addr)),
+            "slots": [],
+            "truncated": False,
+            "max_slots": max_slots,
+            "scanned": 0,
+        }
     start = vtable_addr + 2 * ptr
     table = ctx._pointer_table_layout(bv, start, entries=max_slots, stride=ptr)
     slots: list[dict[str, Any]] = []
@@ -650,6 +660,15 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
     # slots is the next object's zeroed offset-to-top / padding, not a slot.
     while slots and slots[-1].get("null"):
         slots.pop()
+    # #706 round 2: the trim above can remove exactly the slots that made
+    # `truncated` True -- a trailing null run consumed to reach `max_slots` is
+    # the next object's header, not evidence the real vtable continues past
+    # the cap (that would report a COMPLETE vtable as possibly truncated).
+    # Only honor `truncated` when the cap cut into a RETAINED slot, i.e. the
+    # last slot still present is genuinely the last raw entry scanned -- so
+    # nothing was trimmed off the boundary the cap hit.
+    if truncated and not (slots and slots[-1]["index"] == scanned - 1):
+        truncated = False
     return {
         "address": hex(int(vtable_addr)),
         "slots": slots,

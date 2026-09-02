@@ -2381,6 +2381,7 @@ def _resolve_virtual_call(ctx, selector, at, providers=None):
     else:
         provider_views = [(bv, str(selector) if selector else "self")]
     candidates: list[dict[str, Any]] = []
+    truncated_cap: int | None = None
     for pv, pname in provider_views:
         try:
             maps = read_class._rtti_symbol_maps(pv)
@@ -2396,7 +2397,11 @@ def _resolve_virtual_call(ctx, selector, at, providers=None):
             except Exception:
                 continue
             slot = next((s for s in layout.get("slots", []) if s.get("index") == slot_index), None)
-            if slot is None or not slot.get("method"):
+            if slot is None:
+                if layout.get("truncated") and slot_index >= len(layout.get("slots") or []):
+                    truncated_cap = layout.get("max_slots")
+                continue
+            if not slot.get("method"):
                 continue
             m = slot["method"]
             # vtable_entry is the ADDRESS of the slot (where the function pointer is
@@ -2416,7 +2421,7 @@ def _resolve_virtual_call(ctx, selector, at, providers=None):
     # If the factory names a class whose candidate is present, surface it first so an
     # unambiguous provider is obvious even when several classes share the slot shape.
     candidates.sort(key=lambda c: (factory or "") not in (c.get("class") or ""))
-    return {
+    result = {
         "kind": "virtual_call",
         "callsite": hex(at_addr),
         "caller": str(getattr(caller, "name", "") or ""),
@@ -2427,3 +2432,9 @@ def _resolve_virtual_call(ctx, selector, at, providers=None):
         "ambiguous": len(candidates) > 1,
         "resolved": len(candidates) == 1,
     }
+    if not candidates and truncated_cap is not None:
+        result["unresolved_reason"] = (
+            f"slot {slot_index} is beyond the recovered vtable window (scan capped at "
+            f"{truncated_cap} slots) in at least one provider -- the target method may "
+            f"exist past the cap rather than being genuinely unresolvable")
+    return result

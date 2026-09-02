@@ -2486,6 +2486,54 @@ def test_virtual_call_aligned_slot_offset_resolves_531(monkeypatch):
     assert out["candidates"][0]["method"] == "doWork"
 
 
+def test_virtual_call_beyond_truncated_cap_reports_reason(monkeypatch):
+    # F2/#584: a slot index beyond the recovered (capped) vtable window must
+    # not look identical to a genuinely nonexistent slot -- it carries a
+    # reason naming the cap so the caller knows the method may simply be
+    # past the scan boundary.
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_mlil_call_at", lambda caller, a: object())
+    monkeypatch.setattr(re, "_vc_slot_and_factory", lambda caller, call, ptr: (8 * 70, None))
+    monkeypatch.setattr(bridge.read_class, "_rtti_symbol_maps",
+                        lambda pv: {"Provider": {"vtable": types.SimpleNamespace(address=0x9000)}})
+    monkeypatch.setattr(bridge.read_class, "_vtable_layout",
+                        lambda ctx, pv, addr: {
+                            "slots": [{"index": i, "method": {"name": f"m{i}"}} for i in range(64)],
+                            "truncated": True,
+                            "max_slots": 64,
+                        })
+
+    out = re._resolve_virtual_call(_vc_resolve_ctx(object()), None, "0x1000")
+    assert out["resolved"] is False
+    assert out["candidates"] == []
+    assert out["slot_index"] == 70
+    assert "70" in out["unresolved_reason"]
+    assert "64" in out["unresolved_reason"]
+
+
+def test_virtual_call_unresolved_without_truncation_omits_reason(monkeypatch):
+    # Pins that `unresolved_reason` is never spuriously attached when the
+    # provider's scan was not truncated -- a genuinely nonexistent slot stays
+    # a plain unresolved result.
+    bridge = _load_bridge(monkeypatch)
+    re = bridge.read_evidence
+    monkeypatch.setattr(re, "_mlil_call_at", lambda caller, a: object())
+    monkeypatch.setattr(re, "_vc_slot_and_factory", lambda caller, call, ptr: (8 * 5, None))
+    monkeypatch.setattr(bridge.read_class, "_rtti_symbol_maps",
+                        lambda pv: {"Provider": {"vtable": types.SimpleNamespace(address=0x9000)}})
+    monkeypatch.setattr(bridge.read_class, "_vtable_layout",
+                        lambda ctx, pv, addr: {
+                            "slots": [{"index": i, "method": {"name": f"m{i}"}} for i in range(3)],
+                            "truncated": False,
+                            "max_slots": 64,
+                        })
+
+    out = re._resolve_virtual_call(_vc_resolve_ctx(object()), None, "0x1000")
+    assert out["candidates"] == []
+    assert "unresolved_reason" not in out
+
+
 # --- #557: machine-readable reason codes for a null hlil_statement ---------
 
 

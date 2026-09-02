@@ -3806,11 +3806,6 @@ def _render_one_class(rec: Any) -> str:
     if vt and vt.get("slots"):
         for s in vt["slots"]:
             lines.append(f"  vtable [{s.get('index')}] {s.get('address', '?')}  {_vtable_slot_label(s)}")
-        if vt.get("truncated"):
-            lines.append(
-                f"  vtable: showing first {vt.get('max_slots')} slots; scan capped -- "
-                "more may exist (raise the cap or inspect the table directly)"
-            )
     elif vt_addr:
         # A vtable symbol exists but no slots resolved. Either the vtable is
         # defined in another module (the local symbol is an import/GOT slot) or
@@ -3819,6 +3814,11 @@ def _render_one_class(rec: Any) -> str:
         # decodable local body; say so rather than render fake or empty virtuals.
         lines.append("  vtable: symbol present but no slots resolved here "
                      "(defined in another module, or applied at load time via relocations)")
+    if vt and vt.get("truncated"):
+        lines.append(
+            f"  vtable: showing {len(vt.get('slots') or [])} slots; scan capped at {vt.get('max_slots')} -- "
+            "more may exist (raise the cap or inspect the table directly)"
+        )
     # #412: secondary (multiple-inheritance) vtables -- shown compactly so a simple
     # single-inheritance class isn't cluttered (there are none to show there).
     for sec in rec.get("secondary_vtables") or []:
@@ -3831,7 +3831,7 @@ def _render_one_class(rec: Any) -> str:
             lines.append(f"    [{s.get('index')}] {s.get('address', '?')}  {_vtable_slot_label(s)}")
         if sec.get("truncated"):
             lines.append(
-                f"    vtable: showing first {sec.get('max_slots')} slots; scan capped -- "
+                f"    vtable: showing {len(sec.get('slots') or [])} slots; scan capped at {sec.get('max_slots')} -- "
                 "more may exist (raise the cap or inspect the table directly)"
             )
     # Non-virtual member functions (kind=method). Virtual ones already appear as
