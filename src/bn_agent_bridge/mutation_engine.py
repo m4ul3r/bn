@@ -3045,7 +3045,19 @@ def _register_local_restore(ctx, bv, restores, *, fn, var, name, type_obj, is_pa
 def _op_local_rename(ctx, bv, op: dict[str, Any], restores: list | None = None):
     fn = ctx._find_function(bv, op["function"])
     var, is_parameter = vars_mod._find_variable_selector(fn, str(op["variable"]))
-    new_name = str(op["new_name"])
+    # Reject a degenerate empty/whitespace/null name before touching the view
+    # (mirrors _op_rename_symbol's guard, see #363/#605): `str(None)` would
+    # otherwise become the literal "None" and slip through, and "" / "   "
+    # would create an unnamed/blank-named local. Inspect the RAW value first;
+    # done pre-mutation so no view state changes on rejection.
+    raw_new_name = op["new_name"]
+    if raw_new_name is None or not str(raw_new_name).strip():
+        raise OperationFailure(
+            "invalid_request",
+            "new name must be non-empty",
+            requested=_operation_requested(ctx, op),
+        )
+    new_name = str(raw_new_name)
     # Variable.name is a live property backed by the core: snapshot it
     # before mutating, or before_name reads back the new name and
     # verification misclassifies a real change as a noop.
@@ -3361,13 +3373,35 @@ def _op_struct_field_rename(ctx, bv, op: dict[str, Any]):
     index, member = _resolve_struct_field(ctx, builder, resolved_name, op["old_name"])
     old_name = str(getattr(member, "name", ""))
     member_offset = int(getattr(member, "offset", -1))
-    builder.replace(index, member.type, str(op["new_name"]), True)
+    # Reject a degenerate empty/whitespace/null name before mutating (mirrors
+    # _op_rename_symbol/_op_local_rename, see #363/#605): str(None) would
+    # otherwise become the literal "None" and slip through.
+    raw_new_name = op["new_name"]
+    if raw_new_name is None or not str(raw_new_name).strip():
+        raise OperationFailure(
+            "invalid_request",
+            "new name must be non-empty",
+            requested=_operation_requested(ctx, op),
+        )
+    new_name = str(raw_new_name)
+    # A rename to a name already held by another member "verifies" cleanly but
+    # leaves the struct with a duplicate field name; a later struct_field_delete
+    # resolving that name would then pick an arbitrary member (#666).
+    for other_index, other_member in enumerate(getattr(builder, "members", []) or []):
+        if other_index != index and str(getattr(other_member, "name", "")) == new_name:
+            raise OperationFailure(
+                "invalid_request",
+                f"struct {resolved_name} already has a member named {new_name!r}; "
+                "field names must be unique",
+                requested=_operation_requested(ctx, op),
+            )
+    builder.replace(index, member.type, new_name, True)
     _commit_struct_builder(ctx, bv, resolved_name, builder)
     return {
         "op": "struct_field_rename",
         "struct_name": resolved_name,
         "old_name": old_name,
-        "new_name": str(op["new_name"]),
+        "new_name": new_name,
         "member_offset": member_offset,
         "requested": _operation_requested(ctx, op),
     }

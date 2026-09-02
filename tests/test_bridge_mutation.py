@@ -1720,6 +1720,64 @@ def test_struct_field_unknown_locator_is_invalid_request(monkeypatch):
     assert excinfo.value.status == "invalid_request"
 
 
+@pytest.mark.parametrize("bad_name", ["", "   ", "\t", None])
+def test_op_local_rename_rejects_empty_new_name(monkeypatch, bad_name):
+    """Mirrors test_op_rename_symbol_rejects_empty_new_name (#605): an empty,
+    whitespace-only, or null new_name must be rejected before the variable is
+    touched -- str(None) must not slip through as the literal "None"."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    var = _FakeVariable(name="v1", storage=8, var_type="int32_t", identifier=1)
+    fn = _FakeFunction(0x401000, "f")
+    fn.stack_layout = [var]
+    bv = types.SimpleNamespace(get_function_at=lambda addr: fn)
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda _bv, ident: fn)
+
+    op = {"op": "local_rename", "function": "f", "variable": "v1", "new_name": bad_name}
+    with pytest.raises(bridge.mutation_engine.OperationFailure) as excinfo:
+        bridge.mutation_engine._op_local_rename(instance.ctx, bv, op)
+    assert excinfo.value.status == "invalid_request"
+    assert "non-empty" in excinfo.value.message
+    assert var.name == "v1"  # rejected before any mutation landed
+
+
+@pytest.mark.parametrize("bad_name", ["", "   "])
+def test_op_struct_field_rename_rejects_empty_new_name(monkeypatch, bad_name):
+    """Mirrors test_op_rename_symbol_rejects_empty_new_name (#605) for struct
+    field rename."""
+    bridge, instance, builder = _struct_instance(monkeypatch, [_FakeStructMember(0, "a")])
+    with pytest.raises(bridge.OperationFailure) as excinfo:
+        instance._op_struct_field_rename(None, {"struct_name": "S", "old_name": "a", "new_name": bad_name})
+    assert excinfo.value.status == "invalid_request"
+    assert "non-empty" in excinfo.value.message
+    assert builder.members[0].name == "a"  # rejected before any mutation landed
+
+
+def test_op_struct_field_rename_rejects_duplicate_name(monkeypatch):
+    """Renaming a field to a name already held by ANOTHER member must be
+    rejected (#666): otherwise the rename "verifies" cleanly and a later
+    struct_field_delete resolving that name picks an arbitrary member."""
+    bridge, instance, builder = _struct_instance(
+        monkeypatch, [_FakeStructMember(0, "a"), _FakeStructMember(8, "b")])
+    with pytest.raises(bridge.OperationFailure) as excinfo:
+        instance._op_struct_field_rename(None, {"struct_name": "S", "old_name": "a", "new_name": "b"})
+    assert excinfo.value.status == "invalid_request"
+    assert "already has a member named" in excinfo.value.message
+    # neither member was touched
+    assert [(m.offset, m.name) for m in builder.members] == [(0, "a"), (8, "b")]
+
+
+def test_op_struct_field_rename_unique_name_still_succeeds(monkeypatch):
+    """Regression guard: a unique, non-empty rename still succeeds and
+    verifies (not over-corrected by the #605/#666 guards)."""
+    bridge, instance, builder = _struct_instance(
+        monkeypatch, [_FakeStructMember(0, "a"), _FakeStructMember(8, "b")])
+    res = instance._op_struct_field_rename(None, {"struct_name": "S", "old_name": "a", "new_name": "aa"})
+    assert res["old_name"] == "a"
+    assert res["new_name"] == "aa"
+    assert builder.members[0].name == "aa"
+
+
 def test_struct_field_offset_delete_targets_right_field_on_duplicate_names(monkeypatch):
     # Two members share the name 'dup' at offsets 0x0 and 0x8. Deleting by
     # offset 0x8 must remove the SECOND one. A name round-trip would resolve via
