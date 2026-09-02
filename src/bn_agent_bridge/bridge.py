@@ -456,9 +456,13 @@ class TargetManager:
 
         A committed-but-unsaved mutation marks a view dirty (`mark_dirty`); if
         the view is closed WITHOUT saving, `clear_dirty` (save-only) never
-        fires, so the stable view_id stayed in `_dirty_view_ids` forever. A
-        later view that recycles that same stable id then falsely inherits a
-        dirty flag from a view it never touched (#659).
+        fires, so the stable view_id would stay in `_dirty_view_ids` forever.
+        Unlike `_ids_by_object`/`_records`, `_dirty_view_ids` is never pruned by
+        `refresh()`, so without this discard it is the one unbounded structure
+        in `TargetManager` across many load -> mutate -> close-without-save
+        cycles (#659). This is wired only into the `bn close` path
+        (`_close_binary`); a GUI tab closed without going through that path
+        still bypasses this discard and leaks its view_id.
         """
         with self._lock:
             vid = self._stable_view_id(bv)
@@ -1063,14 +1067,14 @@ class BinaryNinjaBridge:
                 if self.registry_path.exists():
                     with contextlib.suppress(OSError):
                         self.registry_path.unlink()
-            # On a clean shutdown there's no crash to diagnose, so drop the log
-            # file too rather than leave it as clutter in the instances dir. A
-            # crash skips stop() entirely (SIGKILL/segfault), so crash logs are
-            # preserved for `bn`'s empty-response diagnostic to point at.
-            log_path = self.registry_path.with_suffix(".log")
-            if log_path.exists():
-                with contextlib.suppress(OSError):
-                    log_path.unlink()
+                # On a clean shutdown there's no crash to diagnose, so drop the log
+                # file too rather than leave it as clutter in the instances dir. A
+                # crash skips stop() entirely (SIGKILL/segfault), so crash logs are
+                # preserved for `bn`'s empty-response diagnostic to point at.
+                log_path = self.registry_path.with_suffix(".log")
+                if log_path.exists():
+                    with contextlib.suppress(OSError):
+                        log_path.unlink()
 
     def _load_worker_threads(self) -> list[threading.Thread]:
         with self._load_jobs_lock:
@@ -2775,6 +2779,8 @@ class BinaryNinjaBridge:
 
     def _go_rename_cancelled(self, bv, applied: list[dict[str, Any]]) -> None:
         rolled_back = self._rollback_go_renames(bv, applied)
+        if applied and not rolled_back:
+            self.targets.mark_dirty(bv)
         suffix = "" if rolled_back else " (rollback failed; the view may be partially renamed)"
         raise RuntimeError(f"request cancelled during go rename{suffix}")
 
@@ -4233,10 +4239,6 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
     return bv
 
 
-def _start_bridge_command(_):  # pragma: no cover - GUI runtime
-    start_bridge()
-
-
 def start_bridge():  # pragma: no cover - GUI runtime
     global _bridge
     if ui is None:
@@ -4273,8 +4275,9 @@ def start_headless(
 
     ensure_private_dir(instances_dir())
 
-    _bridge = BinaryNinjaBridge(instance_id=instance_id)
-    _bridge.start()
+    bridge = BinaryNinjaBridge(instance_id=instance_id)
+    bridge.start()
+    _bridge = bridge
     bn.log_info(f"BN Agent Bridge running in headless mode (instance {instance_id})")
 
     # Open any preloaded binaries *after* the socket is live and the registry

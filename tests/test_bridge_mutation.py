@@ -2701,6 +2701,59 @@ def test_go_rename_not_dirty_when_preview_rollback_succeeds(monkeypatch):
     assert marked == []
 
 
+class _GoRenameCancelledRollbackFailsBV:
+    """The function is already gone by the time the cancellation path's own
+    rollback looks it up, so _rollback_go_renames reports failure on its
+    very first (and only, for this call) get_function_at lookup -- unlike
+    _GoRenameRollbackFailsBV, which only fails from the SECOND call onward
+    and so rolls back cleanly when invoked directly (not preceded by an
+    apply-loop lookup)."""
+
+    def get_function_at(self, addr):
+        return None
+
+
+def test_go_rename_cancelled_marks_dirty_when_rollback_fails(monkeypatch):
+    """A cancelled go_rename whose rollback FAILS must mark the view dirty
+    before raising -- otherwise `bn close` sees unsaved=false over live,
+    un-rolled-back renames (#656, the cancellation path)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _GoRenameCancelledRollbackFailsBV()
+    marked: list[object] = []
+    monkeypatch.setattr(instance.targets, "mark_dirty", lambda b: marked.append(b))
+
+    applied = [{"address": 0x401000, "before_name": "sub_401000", "new_name": "main.foo"}]
+
+    with pytest.raises(RuntimeError, match="rollback failed"):
+        instance._go_rename_cancelled(bv, applied)
+
+    assert marked == [bv]
+
+
+def test_go_rename_cancelled_not_dirty_when_rollback_succeeds(monkeypatch):
+    """Negative control: a cancelled go_rename whose rollback SUCCEEDS must
+    not mark dirty."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _GoRenameFn("sub_401000")
+
+    class _CleanRollbackBV:
+        def get_function_at(self, addr):
+            return fn
+
+    bv = _CleanRollbackBV()
+    marked: list[object] = []
+    monkeypatch.setattr(instance.targets, "mark_dirty", lambda b: marked.append(b))
+
+    applied = [{"address": 0x401000, "before_name": "sub_401000", "new_name": "main.foo"}]
+
+    with pytest.raises(RuntimeError) as exc_info:
+        instance._go_rename_cancelled(bv, applied)
+    assert "rollback failed" not in str(exc_info.value)
+    assert marked == []
+
+
 def test_mutation_dirty_on_prototype_user_type_residue(monkeypatch):
     """An unclearable has_user_type override left behind must mark the view dirty
     so `bn close` warns, even though the prototype VALUE round-tripped (#630)."""

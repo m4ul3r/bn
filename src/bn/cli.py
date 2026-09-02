@@ -965,6 +965,11 @@ def _mutate(
     ``preview`` param so handlers don't each repeat ``"preview": bool(args.preview)``.
     Extra keyword args (e.g. ``bridge_writes_output``) pass through to ``_call``.
     """
+    # F3 exit-code scoping: an escaped `BridgeError` maps its `status` to exit
+    # 3 only for genuine mutation calls (this flag), never for a read op that
+    # happens to share a FAILED_MUTATION_STATUSES status string (e.g.
+    # "unsupported"/"invalid_request" on a read-only bridge op).
+    setattr(args, "_mutation_call", True)
     if preview is not None:
         params = {**params, "preview": preview}
     # #408: --summary collapses the result to a compact, schema-stable status
@@ -1761,13 +1766,26 @@ def main(argv: list[str] | None = None) -> int:
         msg = str(exc)
         if getattr(args, "_sticky_instance", False) and _looks_like_dead_bridge(msg):
             msg += "\n\nThis came from sticky state. Clear it with `bn instance clear`."
+        status = getattr(exc, "status", None)
+        requested = getattr(exc, "requested", None)
+        observed = getattr(exc, "observed", None)
         # Under a machine-readable format, also emit the error as JSON on stdout
         # so `bn ... --format json | jq` gets a parseable object instead of an
         # empty stream; the human-readable line still goes to stderr. Routed
         # through render_error so the envelope matches successful JSON output.
         if getattr(args, "format", None) in ("json", "ndjson"):
-            sys.stdout.write(render_error(msg, args.format))
+            sys.stdout.write(render_error(
+                msg, args.format,
+                status=status, requested=requested, observed=observed,
+            ))
         print(msg, file=sys.stderr)
+        # #625: an escaped OperationFailure's status maps to exit 3 only for a
+        # genuine mutation call (`_mutate`-marked). dispatch() attaches `status`
+        # to every OperationFailure, including read/resolver ops that raise
+        # "unsupported"/"invalid_request" -- those keep exit 2 so a read-op
+        # failure's exit code does not silently widen alongside mutations.
+        if getattr(args, "_mutation_call", False) and status in FAILED_MUTATION_STATUSES:
+            return 3
         return 2
 
 

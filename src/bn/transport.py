@@ -26,7 +26,18 @@ from .proc_identity import PinUnavailable, identity_verdict, pin_process
 
 
 class BridgeError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: str | None = None,
+        requested: dict[str, Any] | None = None,
+        observed: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.requested = requested
+        self.observed = observed
 
 
 TRANSIENT_SOCKET_ERRNOS = {
@@ -926,7 +937,12 @@ def _send_request_to_instance(
         return response
 
     error = response.get("error") or "Unknown Binary Ninja bridge error"
-    raise BridgeError(str(error))
+    raise BridgeError(
+        str(error),
+        status=response.get("status"),
+        requested=response.get("requested"),
+        observed=response.get("observed"),
+    )
 
 
 def _find_bn_agent() -> list[str]:

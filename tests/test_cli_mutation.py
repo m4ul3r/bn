@@ -942,6 +942,61 @@ def test_symbol_rename_noop_still_succeeds(monkeypatch):
     assert rc == 0
 
 
+def test_operation_failure_status_maps_to_exit_3_for_mutation(monkeypatch, capsys):
+    """#625: an OperationFailure that escapes a genuine mutation call (routed
+    through `_mutate`) with a status in FAILED_MUTATION_STATUSES maps to exit
+    3, and its structured fields are surfaced in the --format json envelope."""
+    from bn.transport import BridgeError
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, **kwargs):
+        raise BridgeError(
+            "Cannot apply mutations: this target was loaded with --quick",
+            status="invalid_request",
+            requested={"op": "mutation", "operations": 1},
+        )
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["symbol", "rename", "--target", "active", "sub_401000", "x"])
+    assert rc == 3
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["symbol", "rename", "--target", "active", "sub_401000", "x", "--format", "json"])
+    assert rc == 3
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "invalid_request"
+    assert payload["requested"] == {"op": "mutation", "operations": 1}
+
+
+def test_operation_failure_status_on_read_op_still_exits_2(monkeypatch):
+    """#625 scoping: dispatch() attaches `status` to every escaped
+    OperationFailure, including read/resolver ops -- not only mutations. A
+    read op (`bn function list`, never routed through `_mutate`) whose
+    status happens to be in FAILED_MUTATION_STATUSES (e.g. "unsupported")
+    must NOT have its exit code widened from 2 to 3; only a genuine mutation
+    call may reach exit 3."""
+    from bn.transport import BridgeError
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, **kwargs):
+        raise BridgeError("no matching op", status="unsupported")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["function", "list"])
+    assert rc == 2
+
+
+def test_non_mutation_status_still_exits_2(monkeypatch):
+    """A mutation call whose escaped status is not in FAILED_MUTATION_STATUSES
+    (a future/unexpected bridge status string) keeps exit 2."""
+    from bn.transport import BridgeError
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, **kwargs):
+        raise BridgeError("weird bridge-side status", status="some_future_status")
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    rc = bn.cli.main(["symbol", "rename", "--target", "active", "sub_401000", "x"])
+    assert rc == 2
+
+
 def test_comment_get_empty_comment_shows_placeholder(monkeypatch, capsys):
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         assert op == "get_comment"

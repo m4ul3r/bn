@@ -299,15 +299,31 @@ def render_envelope(payload: dict[str, Any], fmt: str) -> str:
     return render_artifact_envelope(payload)
 
 
-def render_error(message: str, fmt: str) -> str:
+def render_error(
+    message: str,
+    fmt: str,
+    *,
+    status: str | None = None,
+    requested: dict[str, Any] | None = None,
+    observed: dict[str, Any] | None = None,
+) -> str:
     """Render an error as a machine-readable envelope under json/ndjson.
 
     Routes through :func:`render_value` so error envelopes match successful
     JSON output (compact, ``sort_keys=True`` since #215) instead of a divergent
     hand-rolled ``json.dumps``. Lets ``bn ... --format json | jq`` parse an error
-    object rather than an empty stream.
+    object rather than an empty stream. *status*/*requested*/*observed* mirror
+    the structured fields an escaped bridge ``OperationFailure`` carries; they
+    are omitted from the envelope when ``None`` (unstructured/transport errors).
     """
-    return render_value({"ok": False, "error": message}, fmt)
+    payload: dict[str, Any] = {"ok": False, "error": message}
+    if status is not None:
+        payload["status"] = status
+    if requested is not None:
+        payload["requested"] = requested
+    if observed is not None:
+        payload["observed"] = observed
+    return render_value(payload, fmt)
 
 
 def write_output_result(

@@ -422,7 +422,7 @@ def test_stop_on_unbound_server_does_not_unlink_another_instances_files(
     monkeypatch, tmp_path
 ):
     # An instance whose _server is None (start() never ran, e.g. a refused
-    # bind) must not unlink ANOTHER live instance's socket/registry just
+    # bind) must not unlink ANOTHER live instance's socket/registry/log just
     # because they happen to share the same on-disk paths (#585).
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     module = _load_bridge(monkeypatch)
@@ -430,6 +430,7 @@ def test_stop_on_unbound_server_does_not_unlink_another_instances_files(
     live._write_registry()
     live.socket_path.parent.mkdir(parents=True, exist_ok=True)
     live.socket_path.touch()
+    live.registry_path.with_suffix(".log").touch()
     assert live.registry_path.exists()
     assert live.socket_path.exists()
 
@@ -440,6 +441,28 @@ def test_stop_on_unbound_server_does_not_unlink_another_instances_files(
 
     assert live.registry_path.exists()
     assert live.socket_path.exists()
+    assert live.registry_path.with_suffix(".log").exists()
+
+
+def test_start_headless_clears_global_when_start_raises(monkeypatch, tmp_path):
+    # start_headless must not leave an unbound instance assigned to the
+    # module global when start() raises -- same #585 pattern the GUI
+    # start_bridge() path was fixed for in this PR. An assigned-but-unbound
+    # _bridge reaches atexit -> _stop_bridge() -> stop(), which (pre-fix)
+    # unlinks another live instance's discovery files.
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    module = _load_bridge(monkeypatch)
+    monkeypatch.setattr(module, "_bridge", None)
+
+    def fake_start(self):
+        raise RuntimeError("bind failed")
+
+    monkeypatch.setattr(module.BinaryNinjaBridge, "start", fake_start)
+
+    with pytest.raises(RuntimeError, match="bind failed"):
+        module.start_headless(instance_id="testinst")
+
+    assert module._bridge is None
 
 
 def test_stop_on_bound_server_does_unlink_its_own_files(monkeypatch, tmp_path):
