@@ -454,7 +454,6 @@ def test_render_tag_row_address_scope_prefers_address():
 def test_tag_list_defaults_to_page_limit_100(fake_transport):
     # #599: `tag list` must honor the advertised default page limit of 100
     # instead of forwarding argparse's unbounded `None`.
-
     calls = fake_transport({"list_tags": {"ok": True, "result": []}})
     rc = bn.cli.main(["tag", "list", "--target", "active"])
     assert rc == 0
@@ -462,7 +461,6 @@ def test_tag_list_defaults_to_page_limit_100(fake_transport):
 
 
 def test_tag_list_uncaps_limit_with_out(fake_transport, tmp_path):
-
     calls = fake_transport({"list_tags": {"ok": True, "result": []}})
     out_path = tmp_path / "tags.json"
     rc = bn.cli.main(["tag", "list", "--target", "active", "--out", str(out_path)])

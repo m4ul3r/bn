@@ -463,6 +463,39 @@ def test_render_callsites_footer_on_partial_last_page():
     assert "offset 2" in out
 
 
+def test_render_callsites_last_page_footer_omits_page_forward_hint():
+    # finding 3 (round 2): a true last page (has_more False) must not repeat
+    # the page-forward hint that only makes sense mid-page.
+    from bn.formatters import _render_callsites_text
+    value = {
+        "items": [_callsite_row("0x500010")],
+        "total": 3, "offset": 2, "has_more": False,
+    }
+    out = _render_callsites_text(value)
+    assert "--offset/--limit" not in out
+
+
+def test_render_callsites_mid_page_footer_keeps_page_forward_hint():
+    from bn.formatters import _render_callsites_text
+    value = {
+        "items": [_callsite_row("0x500010")],
+        "total": 47, "offset": 0, "has_more": True,
+    }
+    out = _render_callsites_text(value)
+    assert "--offset/--limit" in out
+
+
+def test_render_callsites_over_shot_page_still_footers():
+    # finding 3 (round 2): an --offset past the end must report the true
+    # total, not "no callsites found" (which reads as "never called"), and
+    # must not begin with leading blank lines.
+    from bn.formatters import _render_callsites_text
+    value = {"items": [], "total": 47, "offset": 60, "has_more": False}
+    out = _render_callsites_text(value)
+    assert "showing 0 of 47 callsites (offset 60)" in out
+    assert not out.startswith("\n")
+
+
 def test_render_callsites_no_footer_on_complete_single_page():
     from bn.formatters import _render_callsites_text
     value = {
@@ -486,45 +519,84 @@ def test_render_capabilities_malformed_element_renders_placeholder():
     assert "None" in out
 
 
+def test_render_capabilities_malformed_string_element_renders_repr():
+    # finding 5: a string element must not read as a real row -- repr()
+    # visibly distinguishes it (quoted) from a real "  cmd  --  help" row.
+    from bn.formatters import _render_capabilities_text
+    value = {"items": [
+        {"group": "read", "command": "bn read", "help": "read bytes"},
+        "disabled",
+    ]}
+    out = _render_capabilities_text(value)
+    assert "  'disabled'" in out
+    assert "\n  disabled\n" not in out + "\n"
+
+
 def test_render_callgraph_malformed_element_renders_placeholder():
     from bn.formatters import _render_callgraph_text
     value = {
         "function": {"name": "main", "address": "0x401000"},
         "callees": [{"kind": "direct", "call_addr": "0x401010",
-                     "target": {"name": "helper", "address": "0x401200"}}, None],
-        "callers": [None, {"caller": {"name": "start", "address": "0x400ff0"},
+                     "target": {"name": "helper", "address": "0x401200"}}, "bad"],
+        "callers": ["bad", {"caller": {"name": "start", "address": "0x400ff0"},
                             "call_addr": "0x401000"}],
     }
     out = _render_callgraph_text(value)
     assert "helper" in out
     assert "start" in out
-    assert "None" in out
+    assert "'bad'" in out
+
+
+def test_render_callgraph_malformed_function_field_does_not_raise():
+    # #619: a string `function` field must degrade, not crash the header.
+    from bn.formatters import _render_callgraph_text
+    value = {"function": "main", "callees": []}
+    out = _render_callgraph_text(value)
+    assert "<unknown> @ <unknown>" in out
 
 
 def test_render_taint_models_malformed_element_renders_placeholder():
     from bn.formatters import _render_taint_models_text
     value = {
-        "sources": [{"symbol": "gets", "to": "*arg:0"}, None],
-        "sinks_by_class": {"unbounded_input": [None, {
+        "sources": [{"symbol": "gets", "to": "*arg:0"}, "bad"],
+        "sinks_by_class": {"unbounded_input": ["bad", {
             "symbol": "gets", "tainted_args": [0], "present": True,
         }]},
-        "propagators": [None, {"symbol": "strcpy", "from_to": "arg1 -> arg0"}],
+        "propagators": ["bad", {"symbol": "strcpy", "from_to": "arg1 -> arg0"}],
         "overlays": [None, {"path": "extra_models.json"}],
     }
     out = _render_taint_models_text(value)
     assert "gets" in out
     assert "strcpy" in out
     assert "extra_models.json" in out
-    assert "None" in out
+    assert "'bad'" in out
 
 
-def test_render_field_xrefs_offset_none_does_not_raise():
-    # #619: `int(field.get('offset', 0))` used to raise on a None/non-int offset.
+def test_render_taint_models_sink_entry_missing_symbol_does_not_raise():
+    # #619: a sink entry dict missing "symbol" must degrade, not KeyError.
+    from bn.formatters import _render_taint_models_text
+    value = {"sinks_by_class": {"unbounded_input": [{"tainted_args": [0], "present": True}]}}
+    out = _render_taint_models_text(value)
+    assert "<unknown>" in out
+
+
+def test_render_field_xrefs_offset_none_renders_unknown_not_zero():
+    # #619: a None/uncoercible offset must render as an explicit placeholder,
+    # never the fabricated "+0x0" (indistinguishable from a real offset-0 field).
     from bn.formatters import _render_field_xrefs_text
     value = {"field": {"type_name": "Widget", "field_name": "flags", "offset": None,
                         "field_type": "uint32_t"}, "items": []}
     out = _render_field_xrefs_text(value)
-    assert "Widget.flags" in out
+    assert "Widget.flags @ +<unknown: None>" in out
+    assert "+0x0" not in out
+
+
+def test_render_field_xrefs_offset_hex_string_renders_unknown_not_zero():
+    from bn.formatters import _render_field_xrefs_text
+    value = {"field": {"type_name": "Widget", "field_name": "flags", "offset": "0x40",
+                        "field_type": "uint32_t"}, "items": []}
+    out = _render_field_xrefs_text(value)
+    assert "+<unknown: '0x40'>" in out
 
 
 def test_render_evidence_shows_argument_confidence_and_variadic():

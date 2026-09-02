@@ -514,12 +514,12 @@ def test_bind_list_comments_forwards_scope_643(monkeypatch):
 
 
 def test_bind_list_comments_tolerates_none_limit(monkeypatch):
-    """The CLI sends `limit: None` (the --limit default) for a bare `comment
-    list`, so the key is present with value None. The binder must read that as
-    "no limit" -- guarding on `params.get("limit") is not None`, like every
-    sibling list binder -- not on key presence, which does int(None) and crashes
-    the command with a raw `int() argument must be ... not 'NoneType'` TypeError
-    (regression from the #131 paging-envelope adoption)."""
+    """A raw-socket / `--out` caller sends `limit: None` (unbounded); the CLI
+    itself now sends 100 for a bare `comment list` (#599). The binder must
+    still read a present `limit: None` as "no limit" -- guarding on
+    `params.get("limit") is not None`, like every sibling list binder -- not
+    on key presence, which does int(None) and crashes the command with a raw
+    `int() argument must be ... not 'NoneType'` TypeError."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _FakeBV()
@@ -527,7 +527,7 @@ def test_bind_list_comments_tolerates_none_limit(monkeypatch):
     bv.get_functions_containing = lambda addr: []
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
-    # Exactly what the CLI forwards for `bn comment list` with no --limit/--offset.
+    # What a raw-socket / --out caller forwards -- unbounded, no --limit/--offset.
     res = bridge._bind_list_comments(instance, {"query": None, "offset": 0, "limit": None}, "active")
     assert res["total"] == 2
     assert res["returned"] == 2
