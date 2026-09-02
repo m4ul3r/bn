@@ -355,7 +355,7 @@ def _session_start(args: argparse.Namespace) -> int:
     instance_id = getattr(args, "instance_id", None)
     _resolve_timeout(None)
     instance = cli.spawn_instance(instance_id)
-    project_roots, association_error = _restore_project_roots(
+    project_roots, association_error = _associate_project_roots(
         instance.instance_id, [os.getcwd()]
     )
 
@@ -665,7 +665,7 @@ def _session_restart(args: argparse.Namespace) -> int:
         except BridgeError as exc:
             reloaded.append({"path": t["path"], "error": str(exc)})
 
-    project_roots, association_error = _restore_project_roots(
+    project_roots, association_error = _associate_project_roots(
         instance.instance_id, inherited_roots
     )
 
@@ -702,7 +702,7 @@ def _require_signal_delivered(reason: str | None, target_id: str) -> None:
         )
 
 
-def _restore_project_roots(
+def _associate_project_roots(
     instance_id: str | None,
     roots: list[str],
 ) -> tuple[list[str], str | None]:
