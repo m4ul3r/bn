@@ -1321,6 +1321,7 @@ def test_session_start_all_loads_fail_stops_bridge_and_exits_nonzero(monkeypatch
         raise AssertionError(f"unexpected op: {op}")
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kwargs: True)
 
     rc = bn.cli.main(["session", "start", "/tmp/nonexistent.so", "--format", "json"])
 
@@ -1362,6 +1363,7 @@ def test_session_start_rejects_load_success_without_open_target(
         raise AssertionError(op)
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, **kwargs: True)
 
     rc = bn.cli.main(
         ["session", "start", "/tmp/sample.bin", "--format", "json"]
