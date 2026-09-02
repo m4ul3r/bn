@@ -110,3 +110,14 @@ def test_proto_get_splices_name_that_is_substring_of_return_type(monkeypatch, ca
     assert capsys.readouterr().out == "uint64_t t(int32_t a)\n"
 
 
+@pytest.mark.parametrize("bad_name", ["", "   "])
+def test_struct_field_rename_rejects_empty_new_name(fake_transport, capsys, bad_name):
+    """An empty/whitespace-only new name is rejected client-side (exit 2) before
+    any struct_field_rename op is sent -- mirrors _symbol_rename's guard (#605)."""
+    calls = fake_transport({"struct_field_rename": {"ok": True, "result": {"preview": True}}})
+
+    rc = bn.cli.main(["struct", "field", "rename", "--target", "123:1:7", "S", "old", bad_name])
+
+    assert rc == 2
+    assert "new name must be non-empty" in capsys.readouterr().err
+    assert [call["op"] for call in calls] == []

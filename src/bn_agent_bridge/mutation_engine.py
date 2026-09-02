@@ -45,6 +45,7 @@ from ._shared import (
     _BUILTIN_TAG_TYPE_NAMES,
     _normalize_prototype,
     _parse_address,
+    _require_nonempty_name,
     _serialize_error,
     _validate_bool,
 )
@@ -2418,14 +2419,7 @@ def _op_rename_symbol(ctx, bv, op: dict[str, Any]):
     # otherwise `str()` to the literal "None" and slip the emptiness check. Done
     # here (not just CLI-side) so batch/raw callers are covered too; pre-resolution
     # so no view state is modified on rejection.
-    raw_new_name = op["new_name"]
-    if raw_new_name is None or not str(raw_new_name).strip():
-        raise OperationFailure(
-            "invalid_request",
-            "new name must be non-empty",
-            requested=_operation_requested(ctx, op),
-        )
-    new_name = str(raw_new_name)
+    new_name = _require_nonempty_name(op["new_name"], requested=_operation_requested(ctx, op))
     target = ctx._resolve_rename_target(bv, identifier, kind)
     requested = _operation_requested(ctx, op)
     if target["kind"] == "function":
@@ -3050,14 +3044,7 @@ def _op_local_rename(ctx, bv, op: dict[str, Any], restores: list | None = None):
     # otherwise become the literal "None" and slip through, and "" / "   "
     # would create an unnamed/blank-named local. Inspect the RAW value first;
     # done pre-mutation so no view state changes on rejection.
-    raw_new_name = op["new_name"]
-    if raw_new_name is None or not str(raw_new_name).strip():
-        raise OperationFailure(
-            "invalid_request",
-            "new name must be non-empty",
-            requested=_operation_requested(ctx, op),
-        )
-    new_name = str(raw_new_name)
+    new_name = _require_nonempty_name(op["new_name"], requested=_operation_requested(ctx, op))
     # Variable.name is a live property backed by the core: snapshot it
     # before mutating, or before_name reads back the new name and
     # verification misclassifies a real change as a noop.
@@ -3349,9 +3336,16 @@ def _resolve_struct_field(ctx, builder, resolved_name: str, locator: Any):
     same in all three). Raises invalid_request when nothing matches."""
     text = str(locator)
     members = list(getattr(builder, "members", []) or [])
-    for index, member in enumerate(members):
-        if str(getattr(member, "name", "")) == text:
-            return index, member
+    by_name = [(i, m) for i, m in enumerate(members) if str(getattr(m, "name", "")) == text]
+    if len(by_name) > 1:
+        offsets = ", ".join(hex(int(getattr(m, "offset", -1))) for _, m in by_name)
+        raise OperationFailure(
+            "invalid_request",
+            f"struct {resolved_name} has {len(by_name)} members named {text!r} "
+            f"(at {offsets}); target one by offset instead of by name",
+        )
+    if by_name:
+        return by_name[0]
     try:
         offset = _parse_address(text)
     except ValueError:
@@ -3376,14 +3370,7 @@ def _op_struct_field_rename(ctx, bv, op: dict[str, Any]):
     # Reject a degenerate empty/whitespace/null name before mutating (mirrors
     # _op_rename_symbol/_op_local_rename, see #363/#605): str(None) would
     # otherwise become the literal "None" and slip through.
-    raw_new_name = op["new_name"]
-    if raw_new_name is None or not str(raw_new_name).strip():
-        raise OperationFailure(
-            "invalid_request",
-            "new name must be non-empty",
-            requested=_operation_requested(ctx, op),
-        )
-    new_name = str(raw_new_name)
+    new_name = _require_nonempty_name(op["new_name"], requested=_operation_requested(ctx, op))
     # A rename to a name already held by another member "verifies" cleanly but
     # leaves the struct with a duplicate field name; a later struct_field_delete
     # resolving that name would then pick an arbitrary member (#666).

@@ -1741,7 +1741,7 @@ def test_op_local_rename_rejects_empty_new_name(monkeypatch, bad_name):
     assert var.name == "v1"  # rejected before any mutation landed
 
 
-@pytest.mark.parametrize("bad_name", ["", "   "])
+@pytest.mark.parametrize("bad_name", ["", "   ", "\t", None])
 def test_op_struct_field_rename_rejects_empty_new_name(monkeypatch, bad_name):
     """Mirrors test_op_rename_symbol_rejects_empty_new_name (#605) for struct
     field rename."""
@@ -1787,6 +1787,36 @@ def test_struct_field_offset_delete_targets_right_field_on_duplicate_names(monke
     res = instance._op_struct_field_delete(None, {"struct_name": "S", "field_name": "0x8"})
     assert res["field_name"] == "dup"
     assert [(m.offset, m.name) for m in builder.members] == [(0, "dup")]  # 0x8 gone, 0x0 kept
+
+
+def test_struct_field_delete_by_ambiguous_name_is_invalid_request(monkeypatch):
+    # #666: a name locator that matches more than one member must be rejected
+    # as ambiguous rather than silently deleting whichever member the
+    # first-match scan happens to hit -- the exact "coin flip that still
+    # verifies" scenario the issue describes.
+    bridge, instance, builder = _struct_instance(
+        monkeypatch, [_FakeStructMember(0, "dup"), _FakeStructMember(8, "dup")])
+    with pytest.raises(bridge.OperationFailure) as excinfo:
+        instance._op_struct_field_delete(None, {"struct_name": "S", "field_name": "dup"})
+    assert excinfo.value.status == "invalid_request"
+    assert "0x0" in excinfo.value.message
+    assert "0x8" in excinfo.value.message
+    # nothing was deleted
+    assert [(m.offset, m.name) for m in builder.members] == [(0, "dup"), (8, "dup")]
+
+
+def test_struct_field_rename_by_ambiguous_name_is_invalid_request(monkeypatch):
+    # Same ambiguity, via the rename op's old_name locator.
+    bridge, instance, builder = _struct_instance(
+        monkeypatch, [_FakeStructMember(0, "dup"), _FakeStructMember(8, "dup")])
+    with pytest.raises(bridge.OperationFailure) as excinfo:
+        instance._op_struct_field_rename(None, {"struct_name": "S", "old_name": "dup", "new_name": "renamed"})
+    assert excinfo.value.status == "invalid_request"
+    assert "0x0" in excinfo.value.message
+    assert "0x8" in excinfo.value.message
+    # neither member was renamed
+    assert [(m.offset, m.name) for m in builder.members] == [(0, "dup"), (8, "dup")]
+
 
 
 def test_struct_field_delete_trailing_shrinks_struct_width(monkeypatch):

@@ -161,6 +161,12 @@ def _struct_field_set(args: argparse.Namespace) -> int:
              arg("new_name"),
          ])
 def _struct_field_rename(args: argparse.Namespace) -> int:
+    # An empty/whitespace-only name is not a usable identifier; reject it before
+    # any op is sent rather than letting the bridge "verify" a degenerate
+    # unnamed field (#605). The bridge enforces the same contract for batch /
+    # raw-socket callers.
+    if not args.new_name.strip():
+        raise BridgeError("new name must be non-empty")
     return _mutate(
         args,
         "struct_field_rename",
