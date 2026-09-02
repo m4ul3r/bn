@@ -208,12 +208,17 @@ def _doctor(args: argparse.Namespace) -> int:
         "instances": instances,
     }
     cli._emit_result(args, result, text_renderer=_render_doctor_text, stem="doctor")
-    # #620(c): a doctor report that never fails exit code hides unhealthy
+    # #620(c): a doctor report that never fails exit code hides unreachable
     # instances from scripted/CI callers who only check the exit status.
-    unhealthy = any(
-        (not inst["reachable"]) or inst.get("stale_plugin_code") or inst.get("stale_engine")
-        for inst in instances
-    )
+    # Deliberately reachable-only (not staleness): stale_plugin_version /
+    # stale_plugin_code / stale_engine stay informational (see
+    # _render_doctor_text) and never gate the exit code -- a reachable bridge
+    # that happens to be running slightly stale code is not a CI failure, and
+    # gating on it would false-positive the common case of a live session that
+    # simply hasn't been restarted since the last `git pull` (#161). Zero
+    # instances registered is not a probe failure either: any([]) is False, so
+    # doctor still exits 0 when nothing is running (#620 C.3).
+    unhealthy = any(not inst["reachable"] for inst in instances)
     return 1 if unhealthy else 0
 
 
@@ -528,17 +533,18 @@ def _session_stop(args: argparse.Namespace) -> int:
     positional = getattr(args, "instance_id", None)
     alias = getattr(args, "instance_id_flag", None)
     # #588: the final fallback must NOT pick up a sticky-pinned -i -- only a
-    # genuinely explicit -i/--instance on this invocation may supply the
-    # target for a bare `session stop`. Otherwise target_id stays unset and
-    # the "requires an instance id" branch below fires instead of silently
-    # stopping whatever instance the project happens to be pinned to.
+    # non-sticky args.instance (an explicit -i/--instance OR the BN_INSTANCE
+    # env default; see _instance_option/_apply_sticky_defaults in cli.py) may
+    # supply the target for a bare `session stop`. Otherwise target_id stays
+    # unset and the "requires an instance id" branch below fires instead of
+    # silently stopping whatever instance the project happens to be pinned to.
     target_id = (
         positional
         if positional is not None
         else alias
         if alias is not None
         else getattr(args, "instance", None)
-        if getattr(args, "_explicit_instance", False)
+        if not getattr(args, "_sticky_instance", False)
         else None
     )
     if target_id is not None and not str(target_id).strip():
@@ -632,18 +638,31 @@ def _session_restart(args: argparse.Namespace) -> int:
 
     # Capture loaded targets (+ their analysis state) BEFORE tearing down.
     reload_targets: list[dict[str, Any]] = []
+    reload_capture_failed = False
+    reload_capture_error: str | None = None
     try:
         resp = cli._send_request_to_instance(inst, "list_targets", params={}, target=None)
+        captured: list[dict[str, Any]] = []
         for t in (resp.get("result") or []):
             path = t.get("filename")
             if path:
-                reload_targets.append({"path": path, "quick": t.get("analysis_state") == "quick"})
+                captured.append({"path": path, "quick": t.get("analysis_state") == "quick"})
+        # Commit only after the whole capture succeeds -- a mid-iteration
+        # exception (a malformed row) must never leave a partially populated
+        # reload_targets that gets reloaded and reported as a complete `loaded`.
+        reload_targets = captured
     except Exception as exc:
         # #620(a): don't silently drop the target-enumeration failure -- the
         # restart still proceeds (with no targets to reload), but the caller
-        # needs to know why nothing came back.
+        # needs to know why nothing came back. Recorded in the structured
+        # result (not just stderr) so `loaded == []` at rc 0 means only "list
+        # succeeded with zero rows", matching _associate_project_roots's
+        # project_association_error pattern below.
+        reload_capture_failed = True
+        reload_capture_error = f"{type(exc).__name__}: {exc}"
         print(
-            f"warning: could not enumerate targets to reload after restart: {exc}",
+            f"warning: could not list open targets before restarting {target_id}: "
+            f"{reload_capture_error}",
             file=sys.stderr,
         )
 
@@ -704,8 +723,11 @@ def _session_restart(args: argparse.Namespace) -> int:
         result["project_roots"] = project_roots
     if association_error is not None:
         result["project_association_error"] = association_error
+    if reload_capture_failed:
+        result["reload_capture_failed"] = True
+        result["reload_capture_error"] = reload_capture_error
     cli._emit_result(args, result, text_renderer=_render_session_start_text, stem="session-restart")
-    return 1 if failures or association_error else 0
+    return 1 if failures or association_error or reload_capture_failed else 0
 
 
 def _require_signal_delivered(reason: str | None, target_id: str) -> None:

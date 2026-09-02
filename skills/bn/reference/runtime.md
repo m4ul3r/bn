@@ -35,7 +35,7 @@ Target selection, sticky pins, instance/target resolution order, sessions/headle
    ```
 
    Resolution order:
-   - **Instance:** CLI `-i/--instance` > env `BN_INSTANCE` > sticky > sole live instance > unique live instance associated with the current project > auto-spawn. Associations are private registry metadata under `~/.cache/bn/instances/`; if two sessions are associated with one project, bare commands fail closed and require `-i`.
+   - **Instance:** CLI `-i/--instance` > env `BN_INSTANCE` > sticky > sole live instance > unique live instance associated with the current project > auto-spawn — except `session stop`, which never falls back to a sticky pin (a bare `bn session stop` under a pinned project errors rather than silently stopping the pinned instance; pass `-i`/`--instance-id` or rely on `BN_INSTANCE`). Associations are private registry metadata under `~/.cache/bn/instances/`; if two sessions are associated with one project, bare commands fail closed and require `-i`.
    - **Target:** CLI `-t/--target` > sticky > single-open auto-pick. **`BN_TARGET` does not exist** — target selection is the CLI flag or `bn target use`, nothing else.
 
    Env `BN_INSTANCE` is optional **single-agent** convenience (same effect as always passing `-i`). **Do not** rely on it for multi-agent fan-out — a shared process env is still clobberable across concurrent agents; pass `-i` on every command instead.
@@ -71,6 +71,8 @@ bn exports [list]                         # public exported symbols
 bn help [family]                          # concise index; advertises capabilities
 bn instance gc                            # reap dead instance cache residue
 ```
+
+`bn session stop <id>` deliberately refuses the sticky-pin fallback other commands use: a bare `bn session stop` with no positional id, no `-i/--instance`, and no `BN_INSTANCE` errors instead of stopping whatever instance the project happens to be pinned to. Pass the id explicitly (positional, `-i/--instance`, or `BN_INSTANCE`) to stop a specific bridge.
 
 When multiple bridge instances exist, flagless `bn load <path>` refuses ambient project/env/sticky routing. Pass `-i/--instance` to load into an existing bridge or `--instance-id` to create a named one. This destructive lifecycle boundary never guesses among concurrent agents.
 
@@ -281,7 +283,7 @@ Run `bn doctor` only when something is wrong — commands fail unexpectedly, tar
 bn doctor
 ```
 
-It checks CLI version, plugin staleness (`stale_plugin_version`, `stale_plugin_code`), and instance connectivity. Don't run it as part of normal workflow.
+It checks CLI version, plugin staleness (`stale_plugin_version`, `stale_plugin_code`), and instance connectivity. Don't run it as part of normal workflow. Exit code is reachability-only: nonzero if any probed instance is unreachable, zero otherwise (staleness fields are informational and never affect the exit code; zero registered instances is not a failure).
 
 ## 10. Known quirks
 
