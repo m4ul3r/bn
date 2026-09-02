@@ -440,6 +440,93 @@ def test_render_callsites_shows_null_hlil_reason_and_variadic_hint():
     assert "bn evidence function parse_line" in out
 
 
+def _callsite_row(call_addr: str) -> dict:
+    return {
+        "callee": {"name": "rotl8", "address": "0x401156"},
+        "containing_function": {"name": "encrypt", "address": "0x40118b"},
+        "call_addr": call_addr, "caller_static": call_addr,
+        "call_instruction": {"address": call_addr, "text": "call rotl8"},
+        "previous_instructions": [], "next_instructions": [],
+    }
+
+
+def test_render_callsites_footer_on_partial_last_page():
+    # #611: a partial LAST page (offset > 0, has_more False, fewer rows than the
+    # total) must still say so -- it used to read as the complete result.
+    from bn.formatters import _render_callsites_text
+    value = {
+        "items": [_callsite_row("0x500010")],
+        "total": 3, "offset": 2, "has_more": False,
+    }
+    out = _render_callsites_text(value)
+    assert "showing 1 of 3 callsites" in out
+    assert "offset 2" in out
+
+
+def test_render_callsites_no_footer_on_complete_single_page():
+    from bn.formatters import _render_callsites_text
+    value = {
+        "items": [_callsite_row("0x500010"), _callsite_row("0x500020")],
+        "total": 2, "offset": 0, "has_more": False,
+    }
+    out = _render_callsites_text(value)
+    assert "showing" not in out
+
+
+def test_render_capabilities_malformed_element_renders_placeholder():
+    # #619: a malformed (non-dict) list element must degrade to a placeholder
+    # line, not raise inside the renderer.
+    from bn.formatters import _render_capabilities_text
+    value = {"items": [
+        {"group": "read", "command": "bn read", "help": "read bytes"},
+        None,
+    ]}
+    out = _render_capabilities_text(value)
+    assert "bn read" in out
+    assert "None" in out
+
+
+def test_render_callgraph_malformed_element_renders_placeholder():
+    from bn.formatters import _render_callgraph_text
+    value = {
+        "function": {"name": "main", "address": "0x401000"},
+        "callees": [{"kind": "direct", "call_addr": "0x401010",
+                     "target": {"name": "helper", "address": "0x401200"}}, None],
+        "callers": [None, {"caller": {"name": "start", "address": "0x400ff0"},
+                            "call_addr": "0x401000"}],
+    }
+    out = _render_callgraph_text(value)
+    assert "helper" in out
+    assert "start" in out
+    assert "None" in out
+
+
+def test_render_taint_models_malformed_element_renders_placeholder():
+    from bn.formatters import _render_taint_models_text
+    value = {
+        "sources": [{"symbol": "gets", "to": "*arg:0"}, None],
+        "sinks_by_class": {"unbounded_input": [None, {
+            "symbol": "gets", "tainted_args": [0], "present": True,
+        }]},
+        "propagators": [None, {"symbol": "strcpy", "from_to": "arg1 -> arg0"}],
+        "overlays": [None, {"path": "extra_models.json"}],
+    }
+    out = _render_taint_models_text(value)
+    assert "gets" in out
+    assert "strcpy" in out
+    assert "extra_models.json" in out
+    assert "None" in out
+
+
+def test_render_field_xrefs_offset_none_does_not_raise():
+    # #619: `int(field.get('offset', 0))` used to raise on a None/non-int offset.
+    from bn.formatters import _render_field_xrefs_text
+    value = {"field": {"type_name": "Widget", "field_name": "flags", "offset": None,
+                        "field_type": "uint32_t"}, "items": []}
+    out = _render_field_xrefs_text(value)
+    assert "Widget.flags" in out
+
+
 def test_render_evidence_shows_argument_confidence_and_variadic():
     # #549 + #558: evidence text tags argument confidence and the variadic warning.
     from bn.formatters import _render_function_evidence_text
