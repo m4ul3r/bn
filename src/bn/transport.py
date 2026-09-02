@@ -915,14 +915,21 @@ def _send_request_to_instance(
         raise _empty_response_error(instance, op)
     try:
         response = json.loads(b"".join(chunks).decode("utf-8"))
-    except json.JSONDecodeError as exc:
-        raise BridgeError("Binary Ninja bridge returned invalid JSON") from exc
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise BridgeError(
+            "Binary Ninja bridge returned a non-UTF-8 or invalid JSON response"
+        ) from exc
 
     if not isinstance(response, dict):
         raise BridgeError("Binary Ninja bridge returned a malformed response")
 
     _verify_response_identity(response, expected_identity)
     if response.get("ok"):
+        if "result" not in response:
+            raise BridgeError(
+                "Binary Ninja bridge replied ok without a result field; "
+                "the bridge may be stale -- restart it"
+            )
         return response
 
     error = response.get("error") or "Unknown Binary Ninja bridge error"
