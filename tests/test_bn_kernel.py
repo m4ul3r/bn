@@ -31,6 +31,22 @@ from bn.transport import BridgeError as NativeBridgeError  # noqa: E402
 def _run(coro):
     return asyncio.run(coro)
 
+def _load_bn_kernel_smoke():
+    import importlib.util
+
+    path = (
+        Path(__file__).resolve().parents[1]
+        / "skills"
+        / "bn-kernel"
+        / "scripts"
+        / "smoke.py"
+    )
+    spec = importlib.util.spec_from_file_location("bn_kernel_smoke_test", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
 
 def _fake_bn(tmp_path: Path, script: str) -> Path:
     executable = tmp_path / "fake-bn"
@@ -88,6 +104,201 @@ def _clear_bn_bin(monkeypatch):
     bn_kernel._ACTIVE_SCOPED_CALLBACKS.clear()
     bn_kernel._ACTIVE_SCOPED_BINDINGS.clear()
     bn_kernel._WARNED_BINDING_PAIRS.clear()
+
+def test_smoke_default_instance_is_unique_to_the_process(monkeypatch):
+    smoke = _load_bn_kernel_smoke()
+    monkeypatch.setattr(sys, "argv", ["smoke.py"])
+
+    args = smoke._parser().parse_args()
+
+    assert args.instance == f"bn-kernel-smoke-{os.getpid()}"
+
+
+def test_smoke_arms_idle_fallback_and_closes_target_before_stop(monkeypatch):
+    from types import SimpleNamespace
+
+    smoke = _load_bn_kernel_smoke()
+    calls = []
+    responses = iter(
+        [
+            SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "instance_id": "owned-worker",
+                        "loaded": [{"targets": [{"selector": "sample.bndb"}]}],
+                    }
+                ),
+                stderr="",
+            ),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+        ]
+    )
+
+    def fake_run(argv, **kwargs):
+        calls.append((list(argv), kwargs))
+        return next(responses)
+
+    async def fake_exercise(instance, backend):
+        assert instance == "owned-worker"
+
+    monkeypatch.setattr(smoke.shutil, "which", lambda name: "/usr/bin/bn")
+    monkeypatch.setattr(smoke.subprocess, "run", fake_run)
+    monkeypatch.setattr(smoke, "_exercise", fake_exercise)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["smoke.py", "/tmp/sample.bin", "--instance", "owned-worker"],
+    )
+    monkeypatch.setenv("BN_IDLE_TIMEOUT", "off")
+
+    assert smoke.main() == 0
+    assert calls[0][1]["env"]["BN_IDLE_TIMEOUT"] == "3600"
+    assert calls[1][0] == [
+        "/usr/bin/bn",
+        "-i",
+        "owned-worker",
+        "target",
+        "close",
+        "sample.bndb",
+    ]
+    assert calls[2][0] == ["/usr/bin/bn", "session", "stop", "owned-worker"]
+
+
+def test_smoke_start_failure_still_attempts_exact_instance_stop(monkeypatch):
+    from types import SimpleNamespace
+
+    smoke = _load_bn_kernel_smoke()
+    calls = []
+    responses = iter(
+        [
+            SimpleNamespace(returncode=2, stdout="", stderr="start failed"),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+        ]
+    )
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return next(responses)
+
+    monkeypatch.setattr(smoke.shutil, "which", lambda name: "/usr/bin/bn")
+    monkeypatch.setattr(smoke.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["smoke.py", "/tmp/sample.bin", "--instance", "failed-worker"],
+    )
+
+    assert smoke.main() == 1
+    assert calls[-1] == ["/usr/bin/bn", "session", "stop", "failed-worker"]
+
+
+def test_smoke_target_close_failure_does_not_suppress_instance_stop(monkeypatch):
+    from types import SimpleNamespace
+
+    smoke = _load_bn_kernel_smoke()
+    calls = []
+    responses = iter(
+        [
+            SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    {"loaded": [{"targets": [{"selector": "sample.bndb"}]}]}
+                ),
+                stderr="",
+            ),
+            SimpleNamespace(returncode=2, stdout="", stderr="close failed"),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+        ]
+    )
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return next(responses)
+
+    async def fake_exercise(instance, backend):
+        return None
+
+    monkeypatch.setattr(smoke.shutil, "which", lambda name: "/usr/bin/bn")
+    monkeypatch.setattr(smoke.subprocess, "run", fake_run)
+    monkeypatch.setattr(smoke, "_exercise", fake_exercise)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["smoke.py", "/tmp/sample.bin", "--instance", "close-worker"],
+    )
+
+    assert smoke.main() == 1
+    assert calls[-2] == [
+        "/usr/bin/bn",
+        "-i",
+        "close-worker",
+        "target",
+        "close",
+        "sample.bndb",
+    ]
+    assert calls[-1] == ["/usr/bin/bn", "session", "stop", "close-worker"]
+
+def test_smoke_target_close_failure_exception_still_attempts_instance_stop(
+    monkeypatch,
+):
+    from types import SimpleNamespace
+
+    smoke = _load_bn_kernel_smoke()
+    calls = []
+    responses = iter(
+        [
+            SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps(
+                    {"loaded": [{"targets": [{"selector": "sample.bndb"}]}]}
+                ),
+                stderr="",
+            ),
+            SimpleNamespace(returncode=0, stdout="", stderr=""),
+        ]
+    )
+
+    def fake_run(argv, **kwargs):
+        command = list(argv)
+        calls.append(command)
+        if command[1:4] == ["-i", "close-exception-worker", "target"]:
+            raise OSError("target close failed")
+        return next(responses)
+
+    async def fake_exercise(instance, backend):
+        return None
+
+    monkeypatch.setattr(smoke.shutil, "which", lambda name: "/usr/bin/bn")
+    monkeypatch.setattr(smoke.subprocess, "run", fake_run)
+    monkeypatch.setattr(smoke, "_exercise", fake_exercise)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "smoke.py",
+            "/tmp/sample.bin",
+            "--instance",
+            "close-exception-worker",
+        ],
+    )
+
+    assert smoke.main() == 1
+    assert calls[-2] == [
+        "/usr/bin/bn",
+        "-i",
+        "close-exception-worker",
+        "target",
+        "close",
+        "sample.bndb",
+    ]
+    assert calls[-1] == [
+        "/usr/bin/bn",
+        "session",
+        "stop",
+        "close-exception-worker",
+    ]
 
 
 def test_bootstrap_restores_module_after_sys_modules_loss():
