@@ -1309,11 +1309,21 @@ def test_session_start_all_loads_fail_stops_bridge_and_exits_nonzero(monkeypatch
         instance_id="ghost9",
     )
     monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: fake_inst)
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda *args, **kwargs: True)
 
     ops = []
 
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         ops.append(op)
+        if op == "associate_project_roots":
+            return {
+                "ok": True,
+                "result": {
+                    "instance_id": "ghost9",
+                    "associated": [],
+                    "skipped": [],
+                },
+            }
         if op == "load_binary":
             raise BridgeError(f"File not found: {params['path']}")
         if op == "shutdown":
@@ -1348,10 +1358,20 @@ def test_session_start_rejects_load_success_without_open_target(
         instance_id="empty9",
     )
     monkeypatch.setattr(bn.cli, "spawn_instance", lambda instance_id=None: fake_inst)
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda *args, **kwargs: True)
     ops = []
 
     def fake_send_request(op, **kwargs):
         ops.append(op)
+        if op == "associate_project_roots":
+            return {
+                "ok": True,
+                "result": {
+                    "instance_id": "empty9",
+                    "associated": [],
+                    "skipped": [],
+                },
+            }
         if op == "load_binary":
             return {
                 "ok": True,
@@ -1368,7 +1388,7 @@ def test_session_start_rejects_load_success_without_open_target(
     )
 
     assert rc == 1
-    assert ops == ["load_binary", "shutdown"]
+    assert ops == ["associate_project_roots", "load_binary", "shutdown"]
     result = json.loads(capsys.readouterr().out)
     assert result["stopped"] is True
     assert "without an open target" in result["loaded"][0]["error"]
@@ -1395,6 +1415,15 @@ def test_session_start_detach_queues_load_and_returns_poll_command(
 
     def fake_send_request(op, **kwargs):
         seen.append(op)
+        if op == "associate_project_roots":
+            return {
+                "ok": True,
+                "result": {
+                    "instance_id": "detached9",
+                    "associated": [],
+                    "skipped": [],
+                },
+            }
         assert op == "load_binary_async"
         return {
             "ok": True,
@@ -1422,7 +1451,7 @@ def test_session_start_detach_queues_load_and_returns_poll_command(
     )
 
     assert rc == 0
-    assert seen == ["load_binary_async"]
+    assert seen == ["associate_project_roots", "load_binary_async"]
     result = json.loads(capsys.readouterr().out)
     assert result["detached"] is True
     assert result["loaded"][0]["job_id"] == "job123"

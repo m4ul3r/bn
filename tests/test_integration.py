@@ -34,16 +34,12 @@ pytestmark = [
 # Use the bn console-scripts entry point instead of -m bn.cli
 # to avoid Python module shadowing issues with the 'bn' package name.
 _BN_CLI = [str(Path(sys.executable).parent / "bn")]
-# Don't litter the bn repo with `.bn-<id>` project markers (#80) during integration
-# runs (`bn load` from the repo cwd would otherwise drop one here + touch
-# .git/info/exclude). The marker path has its own unit coverage.
-#
 # Built at call time, not import time (#589): conftest's autouse `_hermetic_env`
 # fixture pins BN_CACHE_DIR/NO_COLOR per test, and a module-import-time snapshot
 # of os.environ would predate every fixture -- so the subprocesses these helpers
 # spawn would read the developer's real ~/.cache/bn instead of the isolated one.
 def _env() -> dict[str, str]:
-    return {**os.environ, "BN_NO_MARKERS": "1"}
+    return dict(os.environ)
 
 
 def _bn(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:

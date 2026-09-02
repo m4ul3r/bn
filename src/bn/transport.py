@@ -19,8 +19,8 @@ from pathlib import Path
 from typing import Any
 
 from .paths import (
-    bridge_registry_path, bridge_socket_path, ensure_private_dir, find_instance_markers,
-    instances_dir,
+    bridge_registry_path, bridge_socket_path, ensure_private_dir, instances_dir,
+    project_root,
 )
 from .proc_identity import PinUnavailable, identity_verdict, pin_process
 
@@ -535,30 +535,36 @@ def gc_instances() -> dict[str, Any]:
     return summary
 
 
-def _resolve_from_markers(instances: list[BridgeInstance]) -> BridgeInstance | None:
-    """#80: when multiple bridges are running and none was explicitly selected, a
-    `.bn-<id>` marker found walking up from cwd selects that instance -- so a bare
-    `bn` in a project dir resolves the bridge that loaded its binary, instead of
-    erroring with "multiple instances".
+def _resolve_from_project_roots(
+    instances: list[BridgeInstance],
+) -> BridgeInstance | None:
+    """Resolve a unique live bridge associated with the caller's project.
 
-    *instances* is the already-resolved LIVE list (``list_instances()`` has run its
-    stale-registry purge). A marker matching a live instance wins; any other marker
-    is for an instance that is no longer live (stopped/crashed/purged) and is
-    unlinked (heal) -- the next ``bn load`` from that dir rewrites it. Markers are a
-    pointer; the live registry is authoritative. Only our own well-formed ``.bn-*``
-    files are touched (an id that isn't a valid instance id is left alone)."""
-    by_id = {inst.instance_id: inst for inst in instances}
-    by_sel = {instance_selector(inst): inst for inst in instances}
-    for marker_id, path in find_instance_markers():
-        if not _INSTANCE_ID_RE.match(marker_id):
-            continue  # not a well-formed bn instance id -> not ours, never touch it
-        inst = by_id.get(marker_id) or by_sel.get(marker_id)
-        if inst is not None:
-            return inst
-        try:
-            path.unlink()  # not live -> heal (recoverable: next `bn load` rewrites it)
-        except OSError:
-            pass
+    Associations live in each already-validated instance registry. The registry
+    remains authoritative: absent or malformed metadata contributes no match,
+    and multiple matches fail closed instead of choosing by ordering or age.
+    """
+    try:
+        current_root = str(project_root())
+    except OSError:
+        return None
+
+    matches: list[BridgeInstance] = []
+    for instance in instances:
+        roots = instance.meta.get("project_roots") if isinstance(instance.meta, dict) else None
+        if not isinstance(roots, list) or not all(isinstance(root, str) for root in roots):
+            continue
+        if current_root in roots:
+            matches.append(instance)
+
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise BridgeError(
+            f"Multiple Binary Ninja bridge instances are associated with "
+            f"{current_root}; pass -i/--instance <id> or set BN_INSTANCE.\n"
+            f"Instances:\n{_format_instance_choices(matches)}"
+        )
     return None
 
 
@@ -663,9 +669,9 @@ def _auto_spawn_locked(timeout: float | None = SPAWN_LOCK_TIMEOUT) -> BridgeInst
         if len(instances) == 1:
             return instances[0]
         if instances:
-            marked = _resolve_from_markers(instances)
-            if marked is not None:
-                return marked
+            associated = _resolve_from_project_roots(instances)
+            if associated is not None:
+                return associated
             raise _multiple_instances_error(instances)
         remaining = _remaining_deadline(deadline, "auto-starting a bridge")
         return _spawn_instance_unlocked(
@@ -708,9 +714,9 @@ def choose_instance(
     if len(instances) == 1:
         return instances[0]
     if instances:
-        marked = _resolve_from_markers(instances)
-        if marked is not None:
-            return marked
+        associated = _resolve_from_project_roots(instances)
+        if associated is not None:
+            return associated
         raise _multiple_instances_error(instances)
     if auto_start:
         return _auto_spawn_locked(

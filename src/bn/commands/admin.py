@@ -338,12 +338,8 @@ def _default_skill_install_roots() -> list[Path]:
              arg("--detach", action="store_true", default=False,
                  help="Queue BNDB loading in the bridge and return immediately; "
                       "poll with `bn -i ID session status`"),
-             arg("--no-marker", action="store_true", default=False, dest="no_marker",
-                 help="Don't drop a project-local `.bn-<id>` marker (#80); markers let a bare "
-                      "`bn` in this project resolve this instance among many (env: BN_NO_MARKERS)"),
          ])
 def _session_start(args: argparse.Namespace) -> int:
-    import os
     if getattr(args, "_explicit_instance", False):
         selected = getattr(args, "instance", None)
         suffix = f" {selected}" if selected else " NAME"
@@ -359,14 +355,25 @@ def _session_start(args: argparse.Namespace) -> int:
     instance_id = getattr(args, "instance_id", None)
     _resolve_timeout(None)
     instance = cli.spawn_instance(instance_id)
+    association_error: str | None = None
+    association: dict[str, Any] | None = None
+    try:
+        response = cli.send_request(
+            "associate_project_roots",
+            params={"roots": [os.getcwd()]},
+            instance_id=instance.instance_id,
+        )
+        candidate = response.get("result") if isinstance(response, dict) else None
+        if isinstance(candidate, dict):
+            association = candidate
+        else:
+            association_error = "bridge returned a malformed project association reply"
+    except BridgeError as exc:
+        association_error = str(exc)
 
     prefer_bndb = not args.no_bndb
     quick = bool(getattr(args, "quick", False))
-    # Mirror `bn load`: pass our cwd + the marker preference so the bridge drops a
-    # `.bn-<id>` project marker (#80) -- the documented `session start
-    # --instance-id X` workflow must register the marker just like `load` (#377).
-    _env = (os.environ.get("BN_NO_MARKERS") or "").strip().lower()
-    no_marker = bool(getattr(args, "no_marker", False)) or (_env not in ("", "0", "false", "no", "off"))
+    # Each successful load also records this root, including detached completion.
     workdir = os.getcwd()
     loaded = []
     for binary in binaries:
@@ -379,7 +386,6 @@ def _session_start(args: argparse.Namespace) -> int:
                     "prefer_bndb": prefer_bndb,
                     "quick": quick,
                     "workdir": workdir,
-                    "no_marker": no_marker,
                 },
                 instance_id=instance.instance_id,
             )
@@ -427,6 +433,10 @@ def _session_start(args: argparse.Namespace) -> int:
     }
     if loaded:
         result["loaded"] = loaded
+    if association is not None:
+        result["project_roots"] = association.get("associated", [])
+    if association_error is not None:
+        result["project_association_error"] = association_error
 
     # If the caller asked to preload binaries but none loaded, the freshly spawned
     # bridge is an empty zombie the caller would have to hunt down and stop. Shut
@@ -461,7 +471,7 @@ def _session_start(args: argparse.Namespace) -> int:
             )
 
     cli._emit_result(args, result, text_renderer=_render_session_start_text, stem="session-start")
-    return 1 if failures else 0
+    return 1 if failures or association_error else 0
 
 
 @command(
@@ -592,29 +602,6 @@ def _session_stop(args: argparse.Namespace) -> int:
                     return 1
                 result["method"] = "sigkill"
 
-        # #436: clean up the instance's project-local `.bn-<id>` marker so it doesn't
-        # accumulate as stray VCS noise. Remove by the canonical instance id (the
-        # marker was dropped under it), falling back to the requested selector.
-        marker_id = inst.instance_id if inst is not None else target_id
-        removed = cli.remove_instance_markers(marker_id)
-        if not removed and marker_id != target_id:
-            removed = cli.remove_instance_markers(target_id)
-        if inst is not None and isinstance(inst.meta, dict):
-            for raw_path in inst.meta.get("marker_paths", []) or []:
-                marker_path = Path(str(raw_path))
-                if marker_path.name != f".bn-{inst.instance_id}":
-                    continue
-                try:
-                    marker_path.unlink()
-                except FileNotFoundError:
-                    # A clean bridge stop removes its own tracked markers before the
-                    # CLI can unlink them. Still report the recorded path as cleared.
-                    removed.append(marker_path)
-                    continue
-                except OSError:
-                    continue
-                removed.append(marker_path)
-        result["marker_removed"] = [str(path) for path in dict.fromkeys(removed)]
 
         cli._emit_result(args, result, text_renderer=_render_session_stop_text, stem="session-stop")
         return 0
@@ -651,19 +638,14 @@ def _session_restart(args: argparse.Namespace) -> int:
     except Exception:
         pass
 
-    # Capture the project markers this instance owns, also BEFORE the teardown
-    # removes them (#694). The stopped bridge unlinks its own `.bn-<id>` files and
-    # the refresh-only load below can only touch a marker in THIS cwd, so a
-    # restart run from anywhere else silently dropped the marker that resolves a
-    # bare `bn` in the original project root. The registry is the record of where
-    # they were; they are restored explicitly once the new bridge is up.
-    inherited_markers: list[str] = []
-    if resolved_id and isinstance(inst.meta, dict):
-        expected_marker = f".bn-{resolved_id}"
-        for raw_path in inst.meta.get("marker_paths", []) or []:
-            marker_path = Path(str(raw_path))
-            if marker_path.name == expected_marker:
-                inherited_markers.append(str(marker_path))
+    # Preserve private project associations across the same-id restart. Reloads
+    # below deliberately carry no caller cwd, so restarting elsewhere cannot
+    # associate an unrelated project.
+    inherited_roots: list[str] = []
+    if isinstance(inst.meta, dict):
+        roots = inst.meta.get("project_roots")
+        if isinstance(roots, list):
+            inherited_roots = [root for root in roots if isinstance(root, str)]
 
     # Stop the old process: graceful shutdown, then SIGTERM/SIGKILL escalation,
     # blocking until the socket/registry are gone so the respawn can reuse the id.
@@ -683,30 +665,20 @@ def _session_restart(args: argparse.Namespace) -> int:
                 )
 
     instance = cli.spawn_instance(resolved_id)
-    # Refresh the project marker like `session start` does (#377), but REFRESH-ONLY
-    # (#391): a restart may run from a different cwd than the original start, so we
-    # update an existing `.bn-<id>` marker's stale body without dropping a stray new
-    # one. BN_NO_MARKERS still opts out entirely.
-    _env = (os.environ.get("BN_NO_MARKERS") or "").strip().lower()
-    no_marker = _env not in ("", "0", "false", "no", "off")
-    workdir = os.getcwd()
+    # Reload targets without associating the restart command's cwd.
     reloaded: list[Any] = []
     for t in reload_targets:
         try:
             r = cli.send_request(
                 "load_binary",
-                params={"path": t["path"], "prefer_bndb": True, "quick": t["quick"],
-                        "workdir": workdir, "no_marker": no_marker,
-                        "marker_refresh_only": True},
+                params={"path": t["path"], "prefer_bndb": True, "quick": t["quick"]},
                 instance_id=instance.instance_id,
             )
             reloaded.append(r["result"])
         except BridgeError as exc:
             reloaded.append({"path": t["path"], "error": str(exc)})
 
-    markers = _restore_inherited_markers(
-        instance.instance_id, inherited_markers, no_marker=no_marker
-    )
+    associations = _restore_project_roots(instance.instance_id, inherited_roots)
 
     failures = [x for x in reloaded if isinstance(x, dict) and x.get("error")]
     result: dict[str, Any] = {
@@ -717,8 +689,8 @@ def _session_restart(args: argparse.Namespace) -> int:
         # Rendered by the session-start text renderer under "loaded".
         "loaded": reloaded,
     }
-    if markers is not None:
-        result["markers"] = markers
+    if associations is not None:
+        result["project_roots"] = associations
     cli._emit_result(args, result, text_renderer=_render_session_start_text, stem="session-restart")
     return 1 if failures else 0
 
@@ -739,48 +711,37 @@ def _require_signal_delivered(reason: str | None, target_id: str) -> None:
         )
 
 
-def _restore_inherited_markers(
+def _restore_project_roots(
     instance_id: str | None,
-    paths: list[str],
-    *,
-    no_marker: bool,
+    roots: list[str],
 ) -> dict[str, Any] | None:
-    """Ask the respawned bridge to re-publish the markers of the old process.
-
-    Returns the bridge's report, an error report, or None when there is nothing
-    to restore. Marker restoration is best-effort: a restart whose targets came
-    back is still a successful restart, so a failure here is reported (stderr +
-    the JSON payload) rather than failing the command (#694).
-    """
-    if not paths:
+    """Restore private registry associations inherited from the old process."""
+    if not roots:
         return None
-    if no_marker:
-        return {"restored": [], "requested": paths, "skipped_reason": "markers disabled"}
     try:
         response = cli.send_request(
-            "restore_markers",
-            params={"paths": paths},
+            "associate_project_roots",
+            params={"roots": roots},
             instance_id=instance_id,
         )
     except BridgeError as exc:
         print(
-            f"warning: could not restore project marker(s) {', '.join(paths)} "
-            f"after the restart: {exc}",
+            f"warning: could not restore project association(s) after restart: {exc}",
             file=sys.stderr,
         )
-        return {"restored": [], "requested": paths, "error": str(exc)}
+        return {"associated": [], "requested": roots, "error": str(exc)}
     result = response.get("result") if isinstance(response, dict) else None
     if not isinstance(result, dict):
         print(
-            "warning: the restarted bridge returned a malformed restore_markers "
-            f"reply; project marker(s) {', '.join(paths)} may be missing",
+            "warning: the restarted bridge returned a malformed project "
+            "association reply",
             file=sys.stderr,
         )
-        return {"restored": [], "requested": paths, "error": "malformed reply"}
+        return {"associated": [], "requested": roots, "error": "malformed reply"}
     for entry in result.get("skipped") or []:
         if isinstance(entry, dict):
             print(
-                f"warning: project marker {entry.get('path')} was not restored "
+                f"warning: project association {entry.get('path')} was not restored "
                 f"({entry.get('reason')})",
                 file=sys.stderr,
             )
@@ -826,6 +787,15 @@ def _running_instances_result(selector_filter: str | None = None) -> dict[str, A
         binaries = inst.meta.get("binaries") if isinstance(inst.meta, dict) else None
         if binaries:
             entry["binaries"] = list(binaries)
+        project_roots = (
+            inst.meta.get("project_roots") if isinstance(inst.meta, dict) else None
+        )
+        if (
+            isinstance(project_roots, list)
+            and project_roots
+            and all(isinstance(root, str) for root in project_roots)
+        ):
+            entry["project_roots"] = list(project_roots)
         if sticky_id and (inst.instance_id == sticky_id or selector == sticky_id):
             entry["sticky"] = True
         entries.append(entry)

@@ -71,9 +71,9 @@ bn session list
 bn session stop <instance>
 ```
 
-`bn session start` spawns a `bn-agent` process, registers it under `~/.cache/bn/instances/<id>.{json,sock}`, and prints the instance ID. Use `bn session list` to see what's running and `bn session stop <id>` to shut one down. You can also start a bridge directly with `python -m bn_agent_bridge /path/to/binary.bndb` if you want to manage the process yourself.
+`bn session start` spawns a `bn-agent` process, registers it under `~/.cache/bn/instances/<id>.{json,sock}`, and associates the canonical project root in that private registry. No routing files are written to the checkout. Use `bn session list` to see what's running and `bn session stop <id>` to shut one down. You can also start a bridge directly with `python -m bn_agent_bridge /path/to/binary.bndb` if you want to manage the process yourself.
 
-You can run several sessions in parallel. With more than one instance up, either pass **`-i/--instance <id>`** per call (prefer the short form) or pin one for a single shell with:
+You can run several sessions in parallel. When exactly one live session is associated with the current project, bare commands select it. With multiple sessions for one project, selection fails closed: pass **`-i/--instance <id>`** per call (prefer the short form) or pin one for a single shell with:
 
 ```bash
 bn -i <id> decompile main          # explicit per call (required for parallel agents)

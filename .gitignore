@@ -11,10 +11,6 @@ wheels/
 .pytest_cache/
 *.sock
 
-# Project-local dedicated-instance markers (#80/#436): a `.bn-<id>` file dropped
-# in the repo root so a bare `bn` resolves the right bridge. Instance IDs can
-# encode target/campaign hints; never let a broad `git add` sweep one into VCS.
-.bn-*
 
 # Test fixtures: ignore built binaries + databases, keep src/*.c + Makefile (#167)
 tests/fixtures/*_x86_64

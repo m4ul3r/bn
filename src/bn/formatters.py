@@ -679,9 +679,6 @@ def _render_session_stop_text(value: Any) -> str:
     method = value.get("method")
     if method:
         line += f" ({method})"
-    removed = value.get("marker_removed")
-    if removed:
-        line += f"\nremoved marker(s): {', '.join(str(p) for p in removed)}"
     return line
 
 
@@ -711,6 +708,11 @@ def _render_session_list_text(value: Any) -> str:
         binaries = item.get("binaries")
         if binaries:
             lines.append(f"  open: {', '.join(str(b) for b in binaries)}")
+        project_roots = item.get("project_roots")
+        if project_roots:
+            lines.append(
+                f"  projects: {', '.join(str(root) for root in project_roots)}"
+            )
     total_rss = value.get("total_rss_mb")
     if total_rss is not None and instances:
         lines.append("")

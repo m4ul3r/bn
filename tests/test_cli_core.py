@@ -1106,6 +1106,15 @@ def test_session_start_text_prints_the_target_selector_653(monkeypatch, capsys):
 
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None,
                           spawn_missing_named=False):
+        if op == "associate_project_roots":
+            return {
+                "ok": True,
+                "result": {
+                    "instance_id": "a1b2c3",
+                    "associated": [],
+                    "skipped": [],
+                },
+            }
         assert op == "load_binary"
         return {"ok": True, "result": {
             "path": "/bin/prog", "loaded": True, "analyzed": True, "notes": [],
