@@ -186,6 +186,8 @@ bn decompile sample_track_floor_height_at_position --out /tmp/floor.json
 
 If `--out` is set, the command writes the rendered result to that path and prints a compact text envelope with the artifact path, byte size, token count, tokenizer, hash, and summary. Agents can use that envelope to decide whether to read the full artifact, keep a summary, or defer loading it into context.
 
+A relative `--out` path is resolved against the cwd of the shell that invoked `bn`, never against the long-lived bridge process's cwd, and the envelope's `artifact_path` is always absolute so it stays usable from any directory. Absolute paths are passed through untouched — including process-local destinations like `--out /dev/stdout` or `--out /proc/self/fd/<n>`, which are always written by the `bn` process itself.
+
 Example artifact envelope:
 
 ```text
