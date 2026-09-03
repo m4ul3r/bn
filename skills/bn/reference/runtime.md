@@ -35,7 +35,7 @@ Target selection, sticky pins, instance/target resolution order, sessions/headle
    ```
 
    Resolution order:
-   - **Instance:** CLI `-i/--instance` > env `BN_INSTANCE` > sticky > sole live instance > unique live instance associated with the current project > auto-spawn. Associations are private registry metadata under `~/.cache/bn/instances/`; if two sessions are associated with one project, bare commands fail closed and require `-i`.
+   - **Instance:** CLI `-i/--instance` > env `BN_INSTANCE` > sticky > sole live instance > unique live instance associated with the current project > auto-spawn — except `session stop`, which never falls back to a sticky pin (a bare `bn session stop` under a pinned project errors rather than silently stopping the pinned instance; pass `-i`/`--instance-id` or rely on `BN_INSTANCE`). Associations are private registry metadata under `~/.cache/bn/instances/`; if two sessions are associated with one project, bare commands fail closed and require `-i`.
    - **Target:** CLI `-t/--target` > sticky > single-open auto-pick. **`BN_TARGET` does not exist** — target selection is the CLI flag or `bn target use`, nothing else.
 
    Env `BN_INSTANCE` is optional **single-agent** convenience (same effect as always passing `-i`). **Do not** rely on it for multi-agent fan-out — a shared process env is still clobberable across concurrent agents; pass `-i` on every command instead.
@@ -71,6 +71,8 @@ bn exports [list]                         # public exported symbols
 bn help [family]                          # concise index; advertises capabilities
 bn instance gc                            # reap dead instance cache residue
 ```
+
+`bn session stop <id>` deliberately refuses the sticky-pin fallback other commands use: a bare `bn session stop` with no positional id, no `-i/--instance`, and no `BN_INSTANCE` errors instead of stopping whatever instance the project happens to be pinned to. Pass the id explicitly (positional, `-i/--instance`, or `BN_INSTANCE`) to stop a specific bridge.
 
 When multiple bridge instances exist, flagless `bn load <path>` refuses ambient project/env/sticky routing. Pass `-i/--instance` to load into an existing bridge or `--instance-id` to create a named one. This destructive lifecycle boundary never guesses among concurrent agents.
 
@@ -185,7 +187,7 @@ Identity is `(boot id, pid, process start time)`. Start times count from boot, s
 
 When the pid cannot be proven, or the interpreter provides no pidfd (availability is a property of the CPython build, not just the kernel — the interpreters `uv` installs have no `os.pidfd_open`), the command **refuses to signal at all**, names the pid, and tells you to confirm with `ps -p <pid>` and stop it by hand. That is deliberate: there is no safe non-atomic fallback. The `SIGKILL` escalation is gated identically, and teardown convergence treats a recycled pid as gone rather than escalating against it.
 
-**Unreachable bridges are hidden, not advertised.** The bridge binds its socket *before* writing its registry, so "registry, no socket" is never a live bridge starting up. Such an entry is dropped from normal discovery — `bn session list`, instance resolution and every request path — because nothing can be dispatched to it; if its owner is dead or unproven the record is purged outright, and it is purged as soon as a proven owner exits. While that owner is alive the record survives for **lifecycle lookups only**: `session stop` / `session restart` resolve it (marked `unreachable`) so the live process still holding memory can be stopped, and spawn collision detection consults it too, so a new bridge can never reuse that instance id, bind over its socket path and orphan the process.
+**Unreachable bridges are hidden, not advertised.** The bridge binds its socket *before* writing its registry, so "registry, no socket" is never a live bridge starting up. Such an entry is dropped from normal discovery — `bn session list`, instance resolution and every request path — because nothing can be dispatched to it; if its owner is dead or unproven the record is purged outright, and it is purged as soon as a proven owner exits. While that owner is alive the record survives for **lifecycle lookups only**: `session stop` / `session restart` resolve it (marked `unreachable`) so the live process still holding memory can be stopped, and spawn collision detection consults it too, so a new bridge can never reuse that instance id, bind over its socket path and orphan the process. Recovering an unreachable/socket-less bridge this way exits **1** rather than 0 whenever the teardown and respawn succeed: `session restart` cannot list its open targets before teardown (there is no socket to ask), so `reload_capture_failed` is always set even when the respawn under the same id fully succeeds. A scripted recovery loop that keys on the exit code alone will read that success as a failure — check `restarted` / `reload_capture_failed` in the JSON result instead, since `restarted: true` with `reload_capture_failed: true` is a fully successful recovery of a target-less bridge, not an error. That JSON check only applies when teardown could signal the process at all: where the pid cannot be pinned (no pidfd, as with this project's own `uv`-installed interpreters — see above), the restart refuses to signal and exits **2** instead, with no result payload to check.
 
 An explicit-but-empty selector is always an error, never "everything": `bn session list -i ''` (e.g. an unset shell variable) is rejected instead of silently listing every session, the same doctrine `bn session stop ""` and `bn close -t ""` already follow.
 
@@ -281,7 +283,7 @@ Run `bn doctor` only when something is wrong — commands fail unexpectedly, tar
 bn doctor
 ```
 
-It checks CLI version, plugin staleness (`stale_plugin_version`, `stale_plugin_code`), and instance connectivity. Don't run it as part of normal workflow.
+It checks CLI version, plugin staleness (`stale_plugin_version`, `stale_plugin_code`), and instance connectivity. Don't run it as part of normal workflow. Exit code is reachability-only: nonzero if any probed instance is unreachable, zero otherwise (staleness fields are informational and never affect the exit code; zero registered instances is not a failure).
 
 ## 10. Known quirks
 

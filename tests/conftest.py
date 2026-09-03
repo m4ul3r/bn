@@ -229,6 +229,15 @@ def _hermetic_env(request, monkeypatch, tmp_path_factory):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("NO_COLOR", "1")
 
+    # An ambient BN_INSTANCE in the developer's/CI's shell is "same effect as
+    # always passing -i" (runtime.md) and silently changes instance
+    # resolution for any test that doesn't itself pin one -- most visibly
+    # `session stop`'s no-sticky-fallback guard (#588), which an ambient
+    # BN_INSTANCE bypasses exactly like an explicit -i would. Scrub it so
+    # suite results don't depend on the caller's environment; a test that
+    # wants BN_INSTANCE sets it itself via monkeypatch.setenv.
+    monkeypatch.delenv("BN_INSTANCE", raising=False)
+
     if request.node.get_closest_marker("no_cache_isolation") is None:
         cache_root = tmp_path_factory.mktemp("bn-cache")
         monkeypatch.setenv("BN_CACHE_DIR", str(cache_root))

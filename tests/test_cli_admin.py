@@ -198,6 +198,31 @@ def test_skill_install_json_output_remains_available(tmp_path, monkeypatch, caps
     assert '"installed_destinations"' in output
 
 
+def test_skill_install_all_skipped_reports_installed_false(tmp_path, monkeypatch, capsys):
+    # #620(b): when every destination already exists and is skipped, nothing
+    # was actually installed -- the result must say so instead of always
+    # claiming success.
+    source_root = tmp_path / "bundled-skills"
+    skill = source_root / "sample"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text("---\nname: sample\n---\n")
+    monkeypatch.setattr(bn.cli, "skills_source_dir", lambda: source_root)
+
+    claude_root = tmp_path / "claude" / "skills"
+    codex_home = tmp_path / "codex"
+    (claude_root / "sample").mkdir(parents=True)
+    monkeypatch.setattr(bn.cli, "claude_skills_dir", lambda: claude_root)
+    monkeypatch.setattr(bn.cli, "codex_home", lambda: codex_home)
+
+    rc = bn.cli.main(["skill", "install", "--mode", "copy", "--format", "json"])
+
+    assert rc == 0
+    output = capsys.readouterr().out
+    assert '"installed":false' in output
+    assert '"installed_destinations":[]' in output
+    assert str(claude_root / "sample") in output  # skipped_destinations explains why
+
+
 def test_skill_install_custom_dest_still_fails_when_destination_exists(tmp_path):
     destination = tmp_path / "skill-copy"
     (destination / "bn").mkdir(parents=True)
@@ -399,6 +424,8 @@ def test_doctor_reports_stale_loaded_plugin(monkeypatch, tmp_path, capsys):
 
     rc = bn.cli.main(["doctor", "--format", "json"])
 
+    # #620(c): staleness is informational and does not affect exit code -- the
+    # instance is reachable, so doctor still exits 0.
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     assert payload["cli_version"] == bn.cli.VERSION
@@ -437,6 +464,8 @@ def test_doctor_flags_stale_engine(monkeypatch, tmp_path, capsys):
     )
 
     rc = bn.cli.main(["doctor", "--format", "json"])
+    # #620(c): staleness is informational and does not affect exit code -- the
+    # instance is reachable, so doctor still exits 0.
     assert rc == 0
     payload = json.loads(capsys.readouterr().out)
     inst = payload["instances"][0]
@@ -494,6 +523,105 @@ def test_session_restart_respawns_and_reloads_targets(monkeypatch, capsys):
     assert any(c[0] == "load_binary" and (c[2] or {}).get("path") == "/fw/svc_a" for c in calls)
 
 
+def test_session_restart_records_capture_failure_but_still_restarts(monkeypatch, capsys):
+    # #620(a): a `list_targets` failure while capturing the pre-restart state
+    # must not be silently swallowed. Round 2: raising BridgeError here would
+    # break the documented unreachable-bridge recovery path (#694), whose
+    # list_targets can never succeed -- so the restart still proceeds, but the
+    # failure is now reported honestly: a stderr warning AND structured
+    # reload_capture_failed/reload_capture_error result fields AND a nonzero
+    # exit code, matching the project_association_error pattern.
+    from bn.transport import BridgeInstance
+    old = type("FakeInstance", (), {
+        "instance_id": "keep-me", "pid": 500,
+        "socket_path": __import__("pathlib").Path("/tmp/old.sock"),
+        "meta": {},
+    })()
+    new = BridgeInstance(
+        pid=999, socket_path=__import__("pathlib").Path("/tmp/new.sock"),
+        registry_path=__import__("pathlib").Path("/tmp/new.json"),
+        plugin_name="bn_agent_bridge", plugin_version="0.1.0",
+        started_at="2026-01-01T00:00:00Z", meta={}, instance_id="keep-me",
+    )
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": {}}
+
+    monkeypatch.setattr(bn.cli, "list_instances", lambda **kw: [old])
+    monkeypatch.setattr(bn.cli, "find_lifecycle_instance", lambda target: old)
+    monkeypatch.setattr(bn.cli, "instance_selector", lambda i: getattr(i, "instance_id", ""))
+
+    def failing_send_to_instance(instance, op, params=None, target=None):
+        raise OSError("connection refused")
+
+    monkeypatch.setattr(bn.cli, "_send_request_to_instance", failing_send_to_instance)
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
+    spawned = {}
+    def fake_spawn(instance_id=None):
+        spawned["id"] = instance_id
+        return new
+    monkeypatch.setattr(bn.cli, "spawn_instance", fake_spawn)
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["session", "restart", "keep-me", "--format", "json"])
+
+    assert rc == 1
+    assert spawned["id"] == "keep-me"   # restart still happened (recovery path preserved)
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["restarted"] is True
+    assert payload["loaded"] == []      # nothing captured to reload
+    assert payload["reload_capture_failed"] is True
+    assert payload["reload_capture_error"] == "OSError: connection refused"
+    assert "could not list open targets before restarting keep-me" in captured.err
+
+
+def test_session_restart_with_zero_open_targets_still_restarts(monkeypatch, capsys):
+    # The only legitimate way to reach `loaded == []` at rc 0: list_targets
+    # succeeded and simply returned no rows.
+    from bn.transport import BridgeInstance
+    old = type("FakeInstance", (), {
+        "instance_id": "keep-me", "pid": 500,
+        "socket_path": __import__("pathlib").Path("/tmp/old.sock"),
+        "meta": {},
+    })()
+    new = BridgeInstance(
+        pid=999, socket_path=__import__("pathlib").Path("/tmp/new.sock"),
+        registry_path=__import__("pathlib").Path("/tmp/new.json"),
+        plugin_name="bn_agent_bridge", plugin_version="0.1.0",
+        started_at="2026-01-01T00:00:00Z", meta={}, instance_id="keep-me",
+    )
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": {}}
+
+    monkeypatch.setattr(bn.cli, "list_instances", lambda **kw: [old])
+    monkeypatch.setattr(bn.cli, "find_lifecycle_instance", lambda target: old)
+    monkeypatch.setattr(bn.cli, "instance_selector", lambda i: getattr(i, "instance_id", ""))
+    monkeypatch.setattr(
+        bn.cli, "_send_request_to_instance",
+        lambda instance, op, params=None, target=None: {"ok": True, "result": []},
+    )
+    monkeypatch.setattr(bn.cli, "wait_for_teardown", lambda inst, timeout=5.0: True)
+    spawned = {}
+    def fake_spawn(instance_id=None):
+        spawned["id"] = instance_id
+        return new
+    monkeypatch.setattr(bn.cli, "spawn_instance", fake_spawn)
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["session", "restart", "keep-me", "--format", "json"])
+
+    assert rc == 0
+    assert spawned["id"] == "keep-me"
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert payload["restarted"] is True
+    assert payload["loaded"] == []
+    assert "reload_capture_failed" not in payload
+    assert captured.err == ""
+
+
 def test_doctor_text_marks_healthy_instance_ok(monkeypatch, tmp_path, capsys):
     install_dir = tmp_path / "install"
     source_dir = tmp_path / "source"
@@ -516,6 +644,11 @@ def test_doctor_text_marks_healthy_instance_ok(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(bn.cli, "list_instances", lambda: [fake_instance])
     monkeypatch.setattr(bn.cli, "plugin_install_dir", lambda: install_dir)
     monkeypatch.setattr(bn.cli, "plugin_source_dir", lambda: source_dir)
+    # Genuinely healthy: the loaded plugin_build_id matches what's on disk. The
+    # doctor exit code is reachable-only (staleness is informational), but a
+    # stale build id would still be a lie in a fixture meant to model a clean
+    # install, so keep it matching regardless.
+    matching_build_id = bn.cli.build_id_for_file(install_dir / "bridge.py")
     monkeypatch.setattr(
         bn.cli,
         "_send_request_to_instance",
@@ -524,7 +657,7 @@ def test_doctor_text_marks_healthy_instance_ok(monkeypatch, tmp_path, capsys):
             "result": {
                 "plugin_name": "bn_agent_bridge",
                 "plugin_version": bn.cli.VERSION,
-                "plugin_build_id": "newbuild123456",
+                "plugin_build_id": matching_build_id,
                 "pid": 123,
                 "socket_path": str(tmp_path / "bridge.sock"),
                 "targets": [],
@@ -572,7 +705,9 @@ def test_doctor_json_carries_reachable_and_status(monkeypatch, tmp_path, capsys)
     monkeypatch.setattr(bn.cli, "_send_request_to_instance", fake_send)
 
     rc = bn.cli.main(["doctor", "--format", "json"])
-    assert rc == 0
+    # #620(c): an unreachable instance makes the overall doctor exit nonzero,
+    # so a scripted health check can trust the exit code alone.
+    assert rc == 1
     data = json.loads(capsys.readouterr().out)
     by_pid = {i["pid"]: i for i in data["instances"]}
     assert by_pid[1]["reachable"] is True and by_pid[1]["status"] == "ok"
@@ -1767,6 +1902,58 @@ def test_session_stop_rejects_explicit_empty_positional(fake_transport, monkeypa
     assert calls == []
     err = capsys.readouterr().err
     assert "instance id is empty" in err
+
+
+def test_session_stop_bare_does_not_stop_sticky_pinned_instance(fake_transport, monkeypatch, capsys):
+    # #588: a bare `session stop` (no positional, no -i/--instance at all) must
+    # NOT fall through to a sticky-pinned instance and stop it -- only a
+    # genuinely explicit -i on THIS invocation may supply the target.
+    calls = fake_transport({})
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {"instance_id": "pinned-inst"})
+
+    rc = bn.cli.main(["session", "stop"])
+
+    assert rc == 2
+    assert calls == []
+    err = capsys.readouterr().err
+    assert "instance id" in err.lower()
+
+
+def test_session_stop_explicit_instance_flag_still_resolves_sticky_slot(monkeypatch, capsys):
+    # #588: an EXPLICIT -i/--instance on the `session stop` invocation itself
+    # (as opposed to a silently-injected sticky pin) must still work, and must
+    # target the FLAG's id, not whatever happens to be pinned.
+    calls = []
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                           instance_id=None, spawn_missing_named=False, **kwargs):
+        calls.append({"op": op, "instance_id": instance_id})
+        return {"ok": True, "result": {}}
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {"instance_id": "pinned-inst"})
+
+    rc = bn.cli.main(["session", "stop", "-i", "other-inst", "--format", "json"])
+
+    assert rc == 0
+    assert calls == [{"op": "shutdown", "instance_id": "other-inst"}]
+
+
+def test_session_stop_bn_instance_env_overrides_sticky_pin(monkeypatch, capsys):
+    # #588 finding 2: BN_INSTANCE is documented as "same effect as always
+    # passing -i" (runtime.md:41) and must still resolve a bare `session
+    # stop` even though a DIFFERENT instance is sticky-pinned.
+    calls = []
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0,
+                           instance_id=None, spawn_missing_named=False, **kwargs):
+        calls.append({"op": op, "instance_id": instance_id})
+        return {"ok": True, "result": {}}
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli.session_state, "read", lambda: {"instance_id": "pinned-inst"})
+    monkeypatch.setenv("BN_INSTANCE", "env-inst")
+
+    rc = bn.cli.main(["session", "stop", "--format", "json"])
+
+    assert rc == 0
+    assert calls == [{"op": "shutdown", "instance_id": "env-inst"}]
 
 
 def test_close_empty_instance_gets_the_actionable_message(fake_transport, monkeypatch, capsys):
