@@ -6878,6 +6878,74 @@ def test_descend_downstream_finding_not_attributed_when_handoff_is_unconditional
     assert result["stats"]["functions_visited"] == 2
 
 
+def test_descend_downstream_finding_composes_across_two_levels(models):
+    # Round-3 blocker fix, TWO-level version of the test above: the
+    # unconditional injection and the eventual sink are separated by two call
+    # boundaries, not one -- handler(fd) calls relay(x), which itself calls
+    # copy_it(src, dst). relay() does gets(&buf) (unconditional, independent
+    # of x) and then calls copy_it(&buf, &out); copy_it's body is
+    # `rax = src[0]; memcpy(dst, src, rax)`. fd (handler's declared --source)
+    # is passed down to relay but never read anywhere. Each `_descend` merge
+    # re-checks the finding against ITS OWN frame's handoff node
+    # (`taint_engine.py` "Round-3 blocker" comment at the `findings.extend`
+    # call site), so this must compose through both merges (relay->copy_it,
+    # then handler->relay), not just the first one.
+    src = FVar("src"); dst = FVar("dst"); rax = FVar("rax")
+    src1 = FSSA(src, 1); rax1 = FSSA(rax, 1)
+    copy_ssa = FSSAFunc([
+        FInstr(0, 0x2004, "MLIL_SET_VAR_SSA", "rax#1 = src#1[0]", reads=[src1], writes=[rax1]),
+        FInstr(1, 0x2010, "MLIL_CALL_SSA", "0x1080(dst#1, src#1, rax#1)",
+               reads=[rax1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x1080", constant=0x1080),
+               params=[FExpr("MLIL_VAR_SSA", "dst#1", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "src#1", reads=[src1]),
+                       FExpr("MLIL_VAR_SSA", "rax#1", reads=[rax1])]),
+    ])
+    copy_it = FFunc("copy_it", 0x2000, copy_ssa, params=[src, dst])
+
+    # relay(x): gets(&buf); copy_it(&buf, &out) -- x is never touched.
+    buf = FVar("buf", typ="char[0x40]"); out = FVar("out", typ="char[0x10]")
+    x = FVar("x")
+    relay_ssa = FSSAFunc([
+        FInstr(0, 0x4008, "MLIL_CALL_SSA", "gets(&buf)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x1050", constant=0x1050),
+               params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)]),
+        FInstr(1, 0x4018, "MLIL_CALL_SSA", "0x2000(&buf, &out)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       FExpr("MLIL_ADDRESS_OF", "&out", src=out)]),
+    ])
+    relay = FFunc("relay", 0x4000, relay_ssa, params=[x])
+
+    # handler(fd): relay(fd) -- fd is passed down but relay never reads it.
+    fd = FVar("fd"); fd0 = FSSA(fd, 0)
+    handler_ssa = FSSAFunc([
+        FInstr(0, 0x3008, "MLIL_CALL_SSA", "relay(fd)", reads=[fd0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x4000", constant=0x4000),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[fd0])]),
+    ])
+    handler = FFunc("handler", 0x3000, handler_ssa, params=[fd])
+
+    bv = FBV({0x1050: "gets", 0x1080: "memcpy"}, funcs={0x2000: copy_it, 0x4000: relay})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(handler, [te.parse_locator("param:0")])   # taints fd, reaches nothing
+
+    gets_sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "gets"]
+    memcpy_sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(gets_sinks) == 1, result["reached_sinks"]
+    assert len(memcpy_sinks) == 1, result["reached_sinks"]
+    assert gets_sinks[0]["signature"]["source"] == "?"
+    # the blocker (two-level form): the memcpy finding is real (its len arg is
+    # genuinely tainted, two call boundaries down, by the buffer gets() filled
+    # in relay()) but never traces back to the declared --source, so it must
+    # still render the "?" sentinel, not param:0, even after two merges.
+    assert memcpy_sinks[0]["sink"]["class"] == "overflow_len"
+    assert memcpy_sinks[0]["sink"]["tainted_arg_index"] is not None
+    assert memcpy_sinks[0]["signature"]["source"] == "?"
+    assert "param:0" not in memcpy_sinks[0]["signature"]["rendered"]
+    assert result["stats"]["functions_visited"] == 3
+
+
 def _unconditional_declared_unresolvable_buf_func():
     # app_peek's model declares buf_arg=0, but the call's actual arg0 is a
     # bare constant (not a pointer/address-of expression) -- `_buffer_target`
@@ -6933,3 +7001,32 @@ def test_model_overlay_sources_folds_duplicate_env_and_user_entry(monkeypatch, t
     kinds2 = [s["kind"] for s in sources2]
     assert kinds2.count("env_override") == 1
     assert kinds2.count("user") == 1
+
+
+def test_model_overlay_sources_folded_entry_keeps_model_count(monkeypatch, tmp_path):
+    # Round-3 follow-up (#707): folding the duplicate `user` entry into the
+    # `env_override` entry (F8, tested above) must not silently drop the
+    # model count the unfolded `user` entry would have carried -- a status
+    # check reading the folded entry must still learn how many models the
+    # overlay contributed, not just which file it came from.
+    shared = tmp_path / "shared.json"
+    shared.write_text(json.dumps({
+        "app_copy": {"sink": {"class": "overflow_len", "tainted_args": [1]}},
+        "app_fmt": {"sink": {"class": "format_string", "tainted_args": [0]}},
+    }))
+    monkeypatch.setenv("BN_TAINT_MODELS", str(shared))
+    monkeypatch.setattr(te._taint_models_mod, "taint_models_path", lambda: shared)
+    sources = te.model_overlay_sources({"app_copy": {}, "app_fmt": {}}, user_models_path=str(shared),
+                                       user_models_via="$BN_TAINT_MODELS")
+    folded = [s for s in sources if s["kind"] == "env_override"]
+    assert len(folded) == 1, sources
+    assert folded[0]["count"] == 2, folded[0]
+
+    # the override_default fold path (no BN_TAINT_MODELS set, but the client's
+    # --models happens to match the default override file) must carry it too.
+    monkeypatch.delenv("BN_TAINT_MODELS", raising=False)
+    sources2 = te.model_overlay_sources({"app_copy": {}}, user_models_path=str(shared),
+                                        user_models_via="--models")
+    folded2 = [s for s in sources2 if s["kind"] == "override_default"]
+    assert len(folded2) == 1, sources2
+    assert folded2[0]["count"] == 1, folded2[0]

@@ -248,6 +248,16 @@ def model_overlay_sources(extra: dict[str, Any] | None = None, *,
             if user_models_path:
                 user["path"] = str(user_models_path)
             sources.append(user)
+        else:
+            # Round-3 follow-up (#707): folding into the override entry must
+            # not lose the model count the unfolded `user` entry would have
+            # carried -- attach it to the just-appended override entry
+            # (`env_override` or `override_default`, whichever matched)
+            # instead of silently dropping it.
+            for entry in reversed(sources):
+                if entry.get("kind") in ("env_override", "override_default"):
+                    entry["count"] = count
+                    break
     return sources
 
 
