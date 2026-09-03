@@ -60,7 +60,14 @@ def test_documented_pytest_invocations_resolve(line: str):
 
 
 def test_exit_code_3_lists_every_failed_mutation_status():
-    """Adding a failure status must not silently leave the docs understating exit 3."""
-    text = CLAUDE_MD.read_text(encoding="utf-8")
-    missing = sorted(s for s in FAILED_MUTATION_STATUSES if f"`{s}`" not in text)
-    assert not missing, f"statuses missing from CLAUDE.md exit-code docs: {missing}"
+    """Adding a failure status must not silently leave the docs understating exit 3.
+
+    Scoped to the exit-code bullet itself: a status named somewhere else in the
+    file (the Mutation Verification prose) does not tell an agent reading the
+    exit-code contract that the status maps to 3, which was exactly #614's gap.
+    """
+    lines = CLAUDE_MD.read_text(encoding="utf-8").splitlines()
+    bullets = [line for line in lines if line.startswith("- Exit codes:")]
+    assert len(bullets) == 1, f"expected one exit-code bullet, found {len(bullets)}"
+    missing = sorted(s for s in FAILED_MUTATION_STATUSES if f"`{s}`" not in bullets[0])
+    assert not missing, f"statuses missing from the exit-code bullet: {missing}"
