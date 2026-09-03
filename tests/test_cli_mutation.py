@@ -105,13 +105,27 @@ def test_mutation_summary_flags_empty_results_as_unmeasured_not_zero():
     # discards whatever the op actually did (the #683 `go_rename` regression).
     # The generic summary must flag this as unmeasured instead of asserting a
     # zero-change measurement it never actually took.
+    #
+    # #684 review round 2: `dirty_after: None` was FALSY under every
+    # truthiness check a control loop actually writes (`if not dirty_after:`),
+    # so it read IDENTICALLY to a confirmed clean no-op and the fix was a
+    # no-op on the JSON path. Fail safe instead: unmeasured reports
+    # `dirty_after: True` (a spurious save is cheap) and nulls the derived
+    # counts (None, not a confident 0) while surfacing an explanation on
+    # `first_error` -- the one key an agent contract already tells callers to
+    # check.
     from bn.formatters import _mutation_summary, _render_mutation_summary_text
     out = _mutation_summary({"success": True, "committed": True, "results": []})
     assert out["measured"] is False
-    assert out["dirty_after"] is None          # unknown, NOT a confirmed False
-    assert out["changed_count"] == 0 and out["op_count"] == 0
+    assert out["dirty_after"] is True          # fail-safe, NOT a confirmed clean state
+    assert out["op_count"] == 0                # literally true: zero results[] rows
+    assert out["changed_count"] is None        # unknown, NOT a confirmed 0
+    assert out["verified_count"] is None
+    assert out["noop_count"] is None
+    assert out["failed_count"] is None
+    assert out["first_error"] and "unmeasured" in out["first_error"].lower()
     text = _render_mutation_summary_text(out)
-    assert "dirty_after=None" in text
+    assert "dirty_after=True" in text
     assert "unmeasured" in text.lower()
 
     # A genuine zero-change result (a real `noop` STATUS ROW inside a non-empty
@@ -123,6 +137,8 @@ def test_mutation_summary_flags_empty_results_as_unmeasured_not_zero():
                                       "results": [{"status": "noop"}]})
     assert genuine_noop["measured"] is True
     assert genuine_noop["dirty_after"] is False
+    assert genuine_noop["noop_count"] == 1 and genuine_noop["changed_count"] == 0
+    assert genuine_noop["first_error"] is None
     noop_text = _render_mutation_summary_text(genuine_noop)
     assert "unmeasured" not in noop_text.lower()
 
@@ -130,11 +146,43 @@ def test_mutation_summary_flags_empty_results_as_unmeasured_not_zero():
 def test_mutation_summary_unmeasured_flag_covers_failure_envelopes_too():
     # The same empty-results ambiguity applies on the failure side: a bespoke op
     # that claims failure without ever populating `results[]` must not have its
-    # dirty_after silently resolve to a confident False either.
+    # dirty_after silently resolve to a confident False either -- it must fail
+    # safe to True like the success-side case above, and `first_error` must
+    # carry the unmeasured explanation ALONGSIDE the existing failure message,
+    # not overwrite it.
     from bn.formatters import _mutation_summary
     out = _mutation_summary({"success": False, "committed": False, "results": []})
     assert out["measured"] is False
-    assert out["dirty_after"] is None
+    assert out["dirty_after"] is True
+    assert out["changed_count"] is None
+    assert "mutation failed" in out["first_error"]
+    assert "unmeasured" in out["first_error"].lower()
+
+
+def test_unmeasured_envelope_is_truthy_dirty_after_unlike_confirmed_noop():
+    # #684 review: a JSON consumer doing `if not summary["dirty_after"]: close()`
+    # -- the naive pattern a control loop actually writes -- must now SAVE
+    # (i.e. NOT take the close-without-saving branch) on an unmeasured
+    # envelope, while a genuine measured all-noop must still take it. Before
+    # this fix `dirty_after: None` and `dirty_after: False` were
+    # indistinguishable under that check; this pins the behavioural
+    # difference, not just the presence of the new `measured` key.
+    from bn.formatters import _mutation_summary
+
+    def closes_without_saving(summary: dict) -> bool:
+        return not summary["dirty_after"]
+
+    unmeasured = _mutation_summary({"success": True, "committed": True, "results": []})
+    assert unmeasured["measured"] is False
+    assert closes_without_saving(unmeasured) is False   # now falls through to save
+
+    clean_noop = _mutation_summary({"success": True, "committed": True,
+                                     "rolled_back": False,
+                                     "results": [{"status": "noop"}]})
+    assert clean_noop["measured"] is True
+    assert closes_without_saving(clean_noop) is True    # unchanged: still skips
+
+    assert closes_without_saving(unmeasured) != closes_without_saving(clean_noop)
 
 
 def test_go_rename_summary_emits_compact_status(fake_transport, capsys):

@@ -3390,15 +3390,33 @@ def _mutation_summary(value: Any) -> Any:
     # summary (no registered `summary_transform`) with an EMPTY `results[]`
     # is never reporting a real zero-change measurement. It means the op
     # reports through its OWN counters instead (the shape `_go_rename_summary`
-    # exists to handle) and forgot to register that escape hatch. Rendering
-    # that as `changed=0 ... dirty_after=False` reads as "confirmed no-op" to
-    # an agent, which then closes without saving and silently discards real
-    # work -- the exact failure #683 shipped for `go_rename`. Flag it as
-    # UNMEASURED instead of asserting a zero count and a clean `dirty_after`
-    # that was never actually observed. A genuine zero-change result (e.g. a
-    # rename that matched the current name already) still comes through as a
-    # `noop` STATUS ROW inside `results[]` -- it stays measured and distinct.
+    # exists to handle) and forgot to register that escape hatch. A genuine
+    # zero-change result (e.g. a rename that matched the current name already)
+    # still comes through as a `noop` STATUS ROW inside a non-empty `results[]`
+    # -- it stays measured and distinct from the unmeasured case below.
     unmeasured = not results
+    if unmeasured:
+        # Review of the first cut of this fix (#684): `dirty_after: None` is
+        # FALSY under every truthiness check a control loop actually writes --
+        # `jq 'if .dirty_after then'`, `if summary["dirty_after"]:`,
+        # `if (!s.dirty_after) close()`. An unmeasured envelope and a confirmed
+        # all-noop therefore produced the IDENTICAL "skip save" decision, which
+        # made the original fix a no-op on the JSON path. Fail safe instead:
+        # the derived counts are unknown (None, not a confident 0) and
+        # `dirty_after` defaults to True, so a naive falsy check SAVES. A
+        # spurious `bn save` is cheap; a discarded rename batch is the #683 bug
+        # this guard exists to catch. Also load `first_error` -- the one
+        # summary key an agent contract already tells callers to check -- with
+        # the same explanation, layered on top of whatever failure message was
+        # already found above.
+        unmeasured_explanation = (
+            "unmeasured: this op reported no results[] rows, so "
+            "changed/verified/noop/failed counts could not be derived (None, "
+            "not a confirmed 0) and dirty_after defaults to True as a "
+            "fail-safe -- do not assume nothing changed"
+        )
+        first_error = (f"{first_error} ({unmeasured_explanation})" if first_error
+                       else unmeasured_explanation)
     summary = {
         "kind": "mutation_summary",
         # Top-level `ok` mirrors the read-command envelope so a uniform `jq '.ok'`
@@ -3412,10 +3430,10 @@ def _mutation_summary(value: Any) -> Any:
         # populate it -- the counts/dirty_after below are UNKNOWN, not zero (#684).
         "measured": not unmeasured,
         "op_count": len(results),
-        "changed_count": verified,        # ops that actually changed + verified
-        "verified_count": verified,
-        "noop_count": noop,
-        "failed_count": len(failed),
+        "changed_count": (None if unmeasured else verified),  # ops that changed + verified
+        "verified_count": (None if unmeasured else verified),
+        "noop_count": (None if unmeasured else noop),
+        "failed_count": (None if unmeasured else len(failed)),
         # True/False when a revert was attempted; None when none was needed.
         "rolled_back": (bool(rolled_back) if rolled_back is not None else None),
         "first_error": first_error,
@@ -3432,9 +3450,10 @@ def _mutation_summary(value: Any) -> Any:
         # is meaningful exactly when `committed` is False -- gating on it is what
         # keeps an all-noop commit (which reverts nothing) from reading dirty.
         #
-        # UNMEASURED overrides all of the above to None: with no results[] rows
-        # to derive it from, we did not observe whether the view is dirty (#684).
-        "dirty_after": (None if unmeasured else (
+        # UNMEASURED overrides all of the above to True (not None): see the
+        # fail-safe rationale above (#684 review). An agent that never reads
+        # `measured` still gets the safe answer from `dirty_after` alone.
+        "dirty_after": (True if unmeasured else (
             (committed and verified > 0)
             or (rolled_back is False and not committed)
             or proto_residue
@@ -3551,14 +3570,20 @@ def _render_mutation_summary_text(value: Any) -> str:
     ]
     line = "  ".join(parts)
     if value.get("measured") is False:
-        # #684: an op reported no `results[]` rows to derive the counts above
-        # from -- they (and dirty_after) are UNKNOWN, not a confirmed
-        # zero-change. Say so explicitly instead of letting the all-zero line
-        # above read as "nothing happened."
+        # #684 review: `dirty_after` is no longer "UNKNOWN" here -- it is a
+        # fail-safe True (see _mutation_summary) precisely so a naive
+        # `if not dirty_after` consumer still saves. Only the derived counts
+        # are genuinely unknown (None above, not a confirmed zero-change).
+        # Advise INSPECTION, not a re-run: this mutation already committed (or
+        # attempted to), so running it again is a different execution that
+        # cannot recover what the first one did, and duplicates state for a
+        # non-idempotent op.
         line += ("\nwarning: unmeasured -- this op reported no results[] rows; "
-                 "the counts and dirty_after above are UNKNOWN, not a confirmed "
-                 "zero-change. Rerun with --verbose/--format json to inspect the "
-                 "raw result before assuming nothing changed.")
+                 "the changed/verified/noop/failed counts above are UNKNOWN. "
+                 "dirty_after is reported True as a fail-safe, not confirmed. "
+                 "Do not assume nothing changed: read the view back (e.g. "
+                 "`bn target info` or a targeted readback) and `bn save` "
+                 "before closing.")
     if value.get("first_error"):
         line += f"\nfirst_error: {value['first_error']}"
     return line

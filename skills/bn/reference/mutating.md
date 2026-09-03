@@ -64,6 +64,45 @@ codes are unchanged in every combination (0 ok / 2 bridge or request error / 3
 mutation status `verification_failed`, `unsupported`, `invalid_request`,
 `rollback_failed`, or `internal_error`).
 
+### Compact status keys
+
+The compact status — the default text line, and the object returned by
+`--format json --summary` — is a stable schema:
+
+| key | meaning |
+|---|---|
+| `ok` / `success` | mirrors the read-command envelope (`ok` is always present, unlike the full result) |
+| `committed` | true for any non-preview mutation that reached apply — including an all-noop |
+| `preview` | true when `--preview` was requested |
+| `measured` | **false** when the op reported no `results[]` rows to derive the fields below from; see "Unmeasured mutations" |
+| `op_count`, `changed_count`, `verified_count`, `noop_count`, `failed_count` | derived from `results[]`; `changed_count`/`verified_count`/`noop_count`/`failed_count` are `null` (not `0`) when `measured` is `false` — `op_count` stays `0`, which is literally true |
+| `rolled_back` | `true`/`false` when a revert was attempted, `null` when none was needed |
+| `first_error` | the first failure's explanation, or the unmeasured explanation below when `measured` is `false` — this is the one key every consumer should check regardless of `dirty_after` |
+| `dirty_after` | `true` iff the BNDB was left modified and needs `bn save` before closing |
+
+#### Unmeasured mutations
+
+A small number of bespoke ops (identified statically by `test_mutation_summary_wiring.py`) report success through their own counters instead of populating `results[]`. When that happens the compact summary cannot derive real counts, and says so:
+
+```
+mutation: committed  changed=None  verified=None  noop=None  failed=None  dirty_after=True
+warning: unmeasured -- this op reported no results[] rows; the changed/verified/noop/failed
+counts above are UNKNOWN. dirty_after is reported True as a fail-safe, not confirmed. Do not
+assume nothing changed: read the view back (e.g. `bn target info` or a targeted readback) and
+`bn save` before closing.
+first_error: unmeasured: this op reported no results[] rows, ...
+```
+
+`dirty_after` is deliberately reported `true` here rather than `null`: `null` is
+falsy under every truthiness check a control loop actually writes (`jq 'if
+.dirty_after then'`, `if summary["dirty_after"]:`, `if (!s.dirty_after)
+close()`), so it would read identically to a confirmed clean no-op and a naive
+consumer would discard real work. Check `measured` (or just read `dirty_after`,
+which fails safe on its own) before trusting a `0`-looking status line as a
+confirmed no-op. The exit code does **not** change for an unmeasured result —
+it is still `0` on success — so a script that only checks `$?` will not notice;
+read the summary object.
+
 **A mutation result never spills.** A read that spills is recoverable (re-read the
 artifact); an atomic write whose result is unparseable is not — the agent's model of
 the BNDB silently desyncs from the BNDB. However large the detail payload, stdout

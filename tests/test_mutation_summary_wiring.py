@@ -65,16 +65,32 @@ def _cli_summary_wiring(commands: list[dict[str, Any]]) -> dict[str, bool]:
 
 
 def _binder_populates_results(binder: Callable[..., Any]) -> bool:
-    """True iff *binder* delegates directly to `bridge._mutation(` -- the one
-    bridge helper that structurally guarantees a `results[]` row per requested
-    operation: `mutation_engine._mutation()` refuses an empty operation list
-    outright, and appends exactly one result row per requested op on every
-    return path (including the mid-batch failure path)."""
+    """True iff *binder*'s own source contains a call shaped `bridge._mutation(
+    ... )` -- the one bridge helper that structurally guarantees a `results[]`
+    row per requested operation: `mutation_engine._mutation()` refuses an
+    empty operation list outright, and appends exactly one result row per
+    requested op on every return path (including the mid-batch failure path).
+
+    Matched via AST (an `ast.Call` whose `func` is an `ast.Attribute` with
+    `attr == "_mutation"`), not a source substring: a substring match is
+    fooled by a binder that only MENTIONS `bridge._mutation(` in a comment
+    while actually reporting through its own bespoke counters -- exactly the
+    counter-reporting shape this whole file exists to catch.
+    """
     try:
-        source = inspect.getsource(binder)
+        source = textwrap.dedent(inspect.getsource(binder))
     except (OSError, TypeError):
         return False
-    return "bridge._mutation(" in source
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    return any(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "_mutation"
+        for node in ast.walk(tree)
+    )
 
 
 # Ops whose bridge implementation is bespoke -- it does NOT delegate to the
@@ -121,20 +137,41 @@ def _assert_op_is_summary_safe(
     )
 
 
-def test_every_write_locked_op_has_safe_summary_wiring(monkeypatch):
-    """#684 primary guard: every write-locked bridge op is either provably safe
-    for the shared compact mutation summary, or explicitly opts out via
-    `summary_transform`. A FUTURE op that reports through its own counters and
-    forgets the wiring must fail here -- not render a plausible all-zero status
-    at an agent that then discards real work."""
+def _sweep(cli_wiring: dict[str, bool], spec: Callable[[str], Any]) -> None:
+    """The #684 sweep body, factored out so both the production guard below
+    and the regression test that proves `go_rename` coverage run the SAME
+    code, not a bespoke re-implementation. *spec* is `REGISTRY.spec` (or a
+    stand-in with the same signature)."""
+    assert cli_wiring, "sanity: no _mutate() call site was found at all"
+    for op_name in sorted(cli_wiring):
+        _assert_op_is_summary_safe(
+            op_name, binder=spec(op_name).binder, cli_wiring=cli_wiring,
+        )
+
+
+def test_every_mutating_op_has_safe_summary_wiring(monkeypatch):
+    """#684 primary guard: every op the CLI routes through `_mutate()` -- the
+    only path that can reach the generic `_mutation_summary` (`cli.py`
+    `_mutate`'s `result_transform`/`spill_status`) -- is either provably safe
+    for it, or explicitly opts out via `summary_transform`.
+
+    The population swept is `cli_wiring.keys()`, derived straight from
+    `_mutate()` call sites via `_cli_summary_wiring` -- NOT
+    `REGISTRY.write_locked_ops()`. `write_locked_ops()` is the WRONG
+    population: it excludes any op that self-manages its own locking
+    (`lock="none"`), which is exactly the shape that caused #683's
+    `go_rename` regression. The OLD version of this sweep iterated
+    `write_locked_ops() ∩ cli_wiring` -- a strict subset of `cli_wiring` --
+    and so could never see `go_rename` at all; it had to be patched with a
+    hand-written exception test instead (the "same remembered exception #684
+    complains about"). `cli_wiring.keys()` is complete, minimal, needs no
+    registry knowledge, and covers `go_rename` automatically -- see
+    `test_go_rename_summary_transform_removal_is_caught_by_the_sweep` below.
+    A FUTURE `lock="none"` op that reports through its own counters and
+    forgets the wiring must fail HERE."""
     bridge = _load_bridge(monkeypatch)
     cli_wiring = _cli_summary_wiring(_real_commands())
-    write_ops = bridge.REGISTRY.write_locked_ops()
-    assert write_ops, "sanity: the write-locked op set must not be empty"
-    for op_name in sorted(write_ops):
-        _assert_op_is_summary_safe(
-            op_name, binder=bridge.REGISTRY.spec(op_name).binder, cli_wiring=cli_wiring,
-        )
+    _sweep(cli_wiring, bridge.REGISTRY.spec)
 
 
 def test_hypothetical_counter_reporting_op_without_wiring_is_flagged():
@@ -190,13 +227,37 @@ def test_hypothetical_counter_reporting_op_without_wiring_is_flagged():
     )
 
 
-def test_go_rename_is_not_write_locked_but_has_its_own_escape_hatch(monkeypatch):
+def test_go_rename_is_not_write_locked(monkeypatch):
     """`go_rename` self-manages locking (lock="none", #365 -- it releases the
     write lock between chunks), so it is intentionally absent from
-    `write_locked_ops()` and the primary registry sweep above never visits it.
-    It still needs -- and has -- the same #684 protection via its dedicated
-    `summary_transform`; this pins that it isn't accidentally dropped."""
+    `write_locked_ops()`. That fact is WHY the old `write_locked_ops()`-based
+    sweep could never see `go_rename` (#683) -- it is not itself something the
+    new `cli_wiring.keys()`-based sweep needs to know, since it does not
+    consult `write_locked_ops()` at all, but it stays worth pinning on its own
+    so `write_locked_ops()` is never mistaken for a safe sweep population
+    again. The wiring check itself now lives in
+    `test_go_rename_summary_transform_removal_is_caught_by_the_sweep` below,
+    which exercises the real sweep instead of re-deriving `cli_wiring` here."""
     bridge = _load_bridge(monkeypatch)
     assert "go_rename" not in bridge.REGISTRY.write_locked_ops()
-    cli_wiring = _cli_summary_wiring(_real_commands())
-    assert cli_wiring.get("go_rename") is True
+
+
+def test_go_rename_summary_transform_removal_is_caught_by_the_sweep(monkeypatch):
+    """Major-2 fix verification: prove the NEW sweep actually covers
+    `go_rename`, by running the SAME sweep code
+    (`test_every_mutating_op_has_safe_summary_wiring` calls `_sweep`) with
+    `go_rename`'s `summary_transform` wiring simulated as dropped -- the
+    actual #683 regression -- and showing it fails. Not a bespoke re-check:
+    `_sweep` is the identical function the production guard runs.
+
+    `go_rename`'s bridge binder is bespoke (does not delegate to
+    `bridge._mutation()`) and `go_rename` is not in `AUDITED_BESPOKE_SAFE_OPS`,
+    so it depends entirely on the CLI-side `summary_transform` this test
+    strips."""
+    bridge = _load_bridge(monkeypatch)
+    cli_wiring = dict(_cli_summary_wiring(_real_commands()))
+    assert "go_rename" in cli_wiring          # now inside the swept population at all
+    assert cli_wiring["go_rename"] is True    # currently wired safely
+    cli_wiring["go_rename"] = False           # simulate the #683 regression
+    with pytest.raises(AssertionError, match="go_rename"):
+        _sweep(cli_wiring, bridge.REGISTRY.spec)
