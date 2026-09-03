@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import pytest
 
+import bn.cli
+
 from bn_agent_bridge import read_tags
 from bn.formatters import _render_tag_row
 from _bridge_fakes import _FakeBV
@@ -447,3 +449,28 @@ def test_render_tag_row_address_scope_prefers_address():
         "icon": "🐛", "type": "Bugs", "data": "check this",
     })
     assert row.startswith("0x1010  ")
+
+
+def test_tag_list_defaults_to_page_limit_100(fake_transport):
+    # #599: `tag list` must honor the advertised default page limit of 100
+    # instead of forwarding argparse's unbounded `None`.
+    calls = fake_transport({"list_tags": {"ok": True, "result": []}})
+    rc = bn.cli.main(["tag", "list", "--target", "active"])
+    assert rc == 0
+    assert calls[-1]["params"]["limit"] == 100
+
+
+def test_tag_list_uncaps_limit_with_out(fake_transport, tmp_path):
+    calls = fake_transport({"list_tags": {"ok": True, "result": []}})
+    out_path = tmp_path / "tags.json"
+    rc = bn.cli.main(["tag", "list", "--target", "active", "--out", str(out_path)])
+    assert rc == 0
+    assert calls[-1]["params"]["limit"] is None
+
+
+def test_tag_list_explicit_limit_wins(fake_transport):
+
+    calls = fake_transport({"list_tags": {"ok": True, "result": []}})
+    rc = bn.cli.main(["tag", "list", "--target", "active", "--limit", "17"])
+    assert rc == 0
+    assert calls[-1]["params"]["limit"] == 17

@@ -466,6 +466,224 @@ def test_render_callsites_shows_null_hlil_reason_and_variadic_hint():
     assert "bn evidence function parse_line" in out
 
 
+def _callsite_row(call_addr: str) -> dict:
+    return {
+        "callee": {"name": "rotl8", "address": "0x401156"},
+        "containing_function": {"name": "encrypt", "address": "0x40118b"},
+        "call_addr": call_addr, "caller_static": call_addr,
+        "call_instruction": {"address": call_addr, "text": "call rotl8"},
+        "previous_instructions": [], "next_instructions": [],
+    }
+
+
+def test_render_callsites_footer_on_partial_last_page():
+    # #611: a partial LAST page (offset > 0, has_more False, fewer rows than the
+    # total) must still say so -- it used to read as the complete result.
+    from bn.formatters import _render_callsites_text
+    value = {
+        "items": [_callsite_row("0x500010")],
+        "total": 3, "offset": 2, "has_more": False,
+    }
+    out = _render_callsites_text(value)
+    assert "showing 1 of 3 callsites" in out
+    assert "offset 2" in out
+
+
+def test_render_callsites_last_page_footer_omits_page_forward_hint():
+    # finding 3 (round 2): a true last page (has_more False) must not repeat
+    # the page-forward hint that only makes sense mid-page.
+    from bn.formatters import _render_callsites_text
+    value = {
+        "items": [_callsite_row("0x500010")],
+        "total": 3, "offset": 2, "has_more": False,
+    }
+    out = _render_callsites_text(value)
+    assert "--offset/--limit" not in out
+
+
+def test_render_callsites_mid_page_footer_keeps_page_forward_hint():
+    from bn.formatters import _render_callsites_text
+    value = {
+        "items": [_callsite_row("0x500010")],
+        "total": 47, "offset": 0, "has_more": True,
+    }
+    out = _render_callsites_text(value)
+    assert "--offset/--limit" in out
+
+
+def test_render_callsites_over_shot_page_still_footers():
+    # finding 3 (round 2): an --offset past the end must report the true
+    # total, not "no callsites found" (which reads as "never called"), and
+    # must not begin with leading blank lines.
+    from bn.formatters import _render_callsites_text
+    value = {"items": [], "total": 47, "offset": 60, "has_more": False}
+    out = _render_callsites_text(value)
+    assert "showing 0 of 47 callsites (offset 60)" in out
+    assert not out.startswith("\n")
+
+
+def test_render_callsites_no_footer_on_complete_single_page():
+    from bn.formatters import _render_callsites_text
+    value = {
+        "items": [_callsite_row("0x500010"), _callsite_row("0x500020")],
+        "total": 2, "offset": 0, "has_more": False,
+    }
+    out = _render_callsites_text(value)
+    assert "showing" not in out
+
+
+def test_render_callsites_empty_string_row_does_not_read_as_no_callsites():
+    # A row that renders to a literal empty string (fallback text for a raw ""
+    # item) must not be silently dropped into the "no callsites found" fallback
+    # -- that misrepresents a one-row page as a zero-result page.
+    from bn.formatters import _render_callsites_text
+    value = {"items": [""]}
+    out = _render_callsites_text(value)
+    assert out != "no callsites found"
+
+
+def test_render_callsites_string_offset_footer_renders_unknown_not_fabricated():
+    # #619: a string offset ("60") must not coerce to the same footer text as
+    # the int 60 -- _fmt_offset must disclose it as unknown instead of
+    # fabricating a specific page position the payload never stated as an int.
+    from bn.formatters import _render_callsites_text
+    value = {"items": [], "total": 47, "offset": "60", "has_more": False}
+    out = _render_callsites_text(value)
+    assert "(offset <unknown>)" in out
+    assert "(offset 60)" not in out
+
+
+def test_render_callsites_non_int_total_empty_page_does_not_assert_zero():
+    # #619 follow-up: an empty page whose `total` is not an int is not a
+    # confirmed zero-result page -- claiming "no callsites found" here is
+    # the same confidently-wrong shape the over-shot-page fix (F3) stopped
+    # fabricating for a bad offset. The total is unusable, so say so instead
+    # of asserting zero.
+    from bn.formatters import _render_callsites_text
+    value = {"items": [], "total": "47", "offset": 60}
+    out = _render_callsites_text(value)
+    assert out != "no callsites found"
+    assert "total count is not a number" in out
+    assert "(offset 60)" in out
+
+
+def test_render_capabilities_malformed_element_renders_placeholder():
+    # #619: a malformed (non-dict) list element must degrade to a placeholder
+    # line, not raise inside the renderer.
+    from bn.formatters import _render_capabilities_text
+    value = {"items": [
+        {"group": "read", "command": "bn read", "help": "read bytes"},
+        None,
+    ]}
+    out = _render_capabilities_text(value)
+    assert "bn read" in out
+    assert "None" in out
+
+
+def test_render_capabilities_malformed_string_element_renders_repr():
+    # finding 5: a string element must not read as a real row -- repr()
+    # visibly distinguishes it (quoted) from a real "  cmd  --  help" row.
+    from bn.formatters import _render_capabilities_text
+    value = {"items": [
+        {"group": "read", "command": "bn read", "help": "read bytes"},
+        "disabled",
+    ]}
+    out = _render_capabilities_text(value)
+    assert "  'disabled'" in out
+    assert "\n  disabled\n" not in out + "\n"
+
+
+def test_render_callgraph_malformed_element_renders_placeholder():
+    from bn.formatters import _render_callgraph_text
+    value = {
+        "function": {"name": "main", "address": "0x401000"},
+        "callees": [{"kind": "direct", "call_addr": "0x401010",
+                     "target": {"name": "helper", "address": "0x401200"}}, "bad"],
+        "callers": ["bad", {"caller": {"name": "start", "address": "0x400ff0"},
+                            "call_addr": "0x401000"}],
+    }
+    out = _render_callgraph_text(value)
+    assert "helper" in out
+    assert "start" in out
+    assert "'bad'" in out
+
+
+def test_render_callgraph_malformed_function_field_does_not_raise():
+    # #619: a string `function` field must degrade, not crash the header.
+    from bn.formatters import _render_callgraph_text
+    value = {"function": "main", "callees": []}
+    out = _render_callgraph_text(value)
+    assert "<unknown> @ <unknown>" in out
+
+
+def test_render_taint_models_malformed_element_renders_placeholder():
+    from bn.formatters import _render_taint_models_text
+    value = {
+        "sources": [{"symbol": "gets", "to": "*arg:0"}, "bad"],
+        "sinks_by_class": {"unbounded_input": ["bad", {
+            "symbol": "gets", "tainted_args": [0], "present": True,
+        }]},
+        "propagators": ["bad", {"symbol": "strcpy", "from_to": "arg1 -> arg0"}],
+        "overlays": [None, {"path": "extra_models.json"}],
+    }
+    out = _render_taint_models_text(value)
+    assert "gets" in out
+    assert "strcpy" in out
+    assert "extra_models.json" in out
+    assert "'bad'" in out
+
+
+def test_render_taint_models_sink_entry_missing_symbol_does_not_raise():
+    # #619: a sink entry dict missing "symbol" must degrade, not KeyError.
+    from bn.formatters import _render_taint_models_text
+    value = {"sinks_by_class": {"unbounded_input": [{"tainted_args": [0], "present": True}]}}
+    out = _render_taint_models_text(value)
+    assert "<unknown>" in out
+
+
+def test_render_field_xrefs_offset_none_renders_unknown_not_zero():
+    # #619: a None/uncoercible offset must render as an explicit placeholder,
+    # never the fabricated "+0x0" (indistinguishable from a real offset-0 field).
+    from bn.formatters import _render_field_xrefs_text
+    value = {"field": {"type_name": "Widget", "field_name": "flags", "offset": None,
+                        "field_type": "uint32_t"}, "items": []}
+    out = _render_field_xrefs_text(value)
+    assert "Widget.flags @ +<unknown: None>" in out
+    assert "+0x0" not in out
+
+
+def test_render_field_xrefs_offset_hex_string_renders_unknown_not_zero():
+    from bn.formatters import _render_field_xrefs_text
+    value = {"field": {"type_name": "Widget", "field_name": "flags", "offset": "0x40",
+                        "field_type": "uint32_t"}, "items": []}
+    out = _render_field_xrefs_text(value)
+    assert "+<unknown: '0x40'>" in out
+
+
+def test_render_field_xrefs_missing_offset_key_renders_unknown_not_zero():
+    # F2: the call site must not default a missing "offset" key to 0 -- that
+    # fabricates a real offset-0 member for a struct field the payload never
+    # gave an offset for.
+    from bn.formatters import _render_field_xrefs_text
+    value = {"field": {"type_name": "Widget", "field_name": "flags",
+                        "field_type": "uint32_t"}, "items": []}
+    out = _render_field_xrefs_text(value)
+    assert "Widget.flags @ +<unknown: None>" in out
+    assert "+0x0" not in out
+
+
+def test_render_field_xrefs_non_dict_field_renders_unknown_not_zero():
+    # F2: a malformed (non-dict) "field" degrades to placeholder names, and
+    # the offset must degrade alongside them instead of impersonating +0x0.
+    from bn.formatters import _render_field_xrefs_text
+    value = {"field": "not-a-dict", "items": []}
+    out = _render_field_xrefs_text(value)
+    assert "<unknown>.<unknown> @ +<unknown: None>" in out
+    assert "+0x0" not in out
+
+
+
+
 def test_render_evidence_shows_argument_confidence_and_variadic():
     # #549 + #558: evidence text tags argument confidence and the variadic warning.
     from bn.formatters import _render_function_evidence_text

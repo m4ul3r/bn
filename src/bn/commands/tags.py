@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 
-from ..cli import _call, _mutate, _pick, arg, command, mutation_output_args, preview_arg
+from ..cli import _call, _effective_limit, _mutate, _pick, arg, command, mutation_output_args, preview_arg
 from ..formatters import _render_tag_get_text, _render_tag_list_text, _render_tag_types_text
 from ..transport import BridgeError
 
@@ -76,7 +76,7 @@ def _tag_list(args: argparse.Namespace) -> int:
             "data_only": bool(args.data_only),
             "query": args.query,
             "offset": args.offset,
-            "limit": args.limit,
+            "limit": _effective_limit(args),
         },
         require_target=True,
         text_renderer=_render_tag_list_text,

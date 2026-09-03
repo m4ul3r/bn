@@ -3881,10 +3881,11 @@ def _bind_list_comments(bridge, params, target):
         target,
         query=params.get("query"),
         offset=int(params.get("offset", 0)),
-        # `limit: None` ("no limit") is the CLI default and is sent as a present
-        # key, so guard on the VALUE not key presence -- `"limit" in params`
-        # would do int(None) and crash a bare `comment list`. Matches the
-        # strings/imports/sections/types binders.
+        # limit=None means "no limit" for raw-socket / --out callers (allow_none);
+        # guard on the VALUE not key presence -- "limit" in params would do
+        # int(None) and crash. The CLI itself now sends 100 for a bare
+        # `comment list` (via _effective_limit, #599); this binder still
+        # tolerates None because raw clients and --out exports need it.
         limit=int(params["limit"]) if params.get("limit") is not None else None,
         scope=params.get("scope") or "all",
     )

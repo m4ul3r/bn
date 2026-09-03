@@ -1476,3 +1476,27 @@ def test_go_rename_op_count_does_not_double_count_apply_time_skips():
     assert summary["op_count"] == 12
     assert summary["noop_count"] == 5
     assert summary["changed_count"] == 7
+
+
+def test_comment_list_defaults_to_page_limit_100(fake_transport):
+    # #599: `comment list` must honor the advertised default page limit of 100
+    # instead of forwarding argparse's unbounded `None`.
+    calls = fake_transport({"list_comments": {"ok": True, "result": []}})
+    rc = bn.cli.main(["comment", "list", "--target", "active"])
+    assert rc == 0
+    assert calls[-1]["params"]["limit"] == 100
+
+
+def test_comment_list_uncaps_limit_with_out(fake_transport, tmp_path):
+    calls = fake_transport({"list_comments": {"ok": True, "result": []}})
+    out_path = tmp_path / "comments.json"
+    rc = bn.cli.main(["comment", "list", "--target", "active", "--out", str(out_path)])
+    assert rc == 0
+    assert calls[-1]["params"]["limit"] is None
+
+
+def test_comment_list_explicit_limit_wins(fake_transport):
+    calls = fake_transport({"list_comments": {"ok": True, "result": []}})
+    rc = bn.cli.main(["comment", "list", "--target", "active", "--limit", "17"])
+    assert rc == 0
+    assert calls[-1]["params"]["limit"] == 17

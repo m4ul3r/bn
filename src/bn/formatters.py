@@ -58,6 +58,44 @@ def _as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _fmt_field_offset(value: Any) -> str:
+    """Render a struct-field offset, disclosing an uncoercible one instead of
+    fabricating ``+0x0`` -- a zero is a real, common offset, so a degraded row
+    must not be able to impersonate one (#619)."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return f"+0x{value:x}"
+    return f"+<unknown: {value!r}>"
+
+
+def _int_or_default(value: Any, default: int = 0) -> int:
+    """Coerce a field expected to be an int, degrading a ``None``/non-numeric
+    value to ``default`` instead of raising inside ``int(...)`` or an ordering
+    comparison. Distinct from ``read_evidence._as_int``, which parses hex
+    strings and returns ``-1`` on failure -- same-named helpers with
+    different contracts are a trap, so this one names its defaulting
+    behavior explicitly (#619)."""
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _fmt_offset(value: Any) -> str:
+    """Render a paging offset for a footer, disclosing an uncoercible one
+    instead of fabricating a specific ``0`` the payload never stated. ``None``
+    (an omitted offset) legitimately means "first page", so it alone renders
+    as ``0`` (#619)."""
+    if value is None:
+        return "0"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return "<unknown>"
+
+
 def _render_string_literal(value: Any, *, truncated: bool = False) -> str:
     text = json.dumps(value, ensure_ascii=True)
     if truncated:
@@ -224,6 +262,11 @@ def _render_capabilities_text(value: Any) -> str:
     lines: list[str] = []
     current_group: str | None = None
     for item in items:
+        # A malformed list element (non-dict) must render as a placeholder line,
+        # not crash the whole catalog with an AttributeError (#619).
+        if not isinstance(item, dict):
+            lines.append(f"  {item!r}")
+            continue
         group = item.get("group", "")
         if group != current_group:
             if lines:
@@ -375,9 +418,9 @@ def _render_field_xrefs_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
 
-    field = value.get("field") or {}
+    field = _as_dict(value.get("field"))
     lines = [
-        f"{field.get('type_name', '<unknown>')}.{field.get('field_name', '<unknown>')} @ +0x{int(field.get('offset', 0)):x}",
+        f"{field.get('type_name', '<unknown>')}.{field.get('field_name', '<unknown>')} @ {_fmt_field_offset(field.get('offset'))}",
         f"type: {field.get('field_type', '<unknown>')}",
         "",
         "code refs:",
@@ -2101,6 +2144,7 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
     # paging metadata (#454: callsites now pages bridge-side like xrefs) so a
     # truncated high-fan-in survey states the true total + remainder in a footer.
     total = None
+    offset = None
     lower_bound = None
     callers_scanned = None
     caller_total = None
@@ -2108,6 +2152,7 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
     has_more = False
     if isinstance(value, dict) and "items" in value:
         total = value.get("total")
+        offset = value.get("offset")
         lower_bound = value.get("total_lower_bound")
         callers_scanned = value.get("callers_scanned")
         caller_total = value.get("caller_total")
@@ -2116,7 +2161,16 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
         value = value.get("items") or []
     if not isinstance(value, list):
         return _render_fallback_text(value)
-    if not value:
+    if not value and not isinstance(total, int):
+        if total is not None:
+            # #619 follow-up: a non-int `total` on an empty page is not a
+            # confirmed zero -- it is a malformed/unusable count. Saying "no
+            # callsites found" here would assert the same confident-zero the
+            # over-shot-page fix above was written to stop fabricating.
+            return (
+                f"no callsites on this page (offset {_fmt_offset(offset)}); "
+                "total count is not a number, so a zero result cannot be confirmed"
+            )
         return "no callsites found"
 
     blocks = []
@@ -2180,23 +2234,33 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
             if isinstance(item, dict):
                 lines.append(f"  {item.get('address', '<unknown>')}  {item.get('text', '')}".rstrip())
         blocks.append("\n".join(lines))
-    body = "\n\n".join(blocks)
-    if has_more and isinstance(total, int):
-        body += (
-            f"\n\n... showing {len(value)} of {total} callsites; "
-            "use --offset/--limit to page (or --format json for all)"
-        )
+    body = "\n\n".join(block for block in blocks if block)
+    # #611: a partial LAST page (offset > 0, has_more false, fewer rows than the
+    # total) must still say so -- otherwise it silently reads as the complete
+    # result instead of one page of a paged survey. An over-shot page (offset
+    # past the end) must footer too instead of hitting the empty-list early
+    # return and reading as "never called" while JSON reports the real total.
+    if isinstance(total, int) and (has_more or _int_or_default(offset) > 0 or len(value) != total):
+        footer = f"... showing {len(value)} of {total} callsites (offset {_fmt_offset(offset)})"
+        if has_more:
+            # Only a mid-survey page has somewhere to page forward to -- a true
+            # last page (has_more False) must not repeat the hint.
+            footer += "; use --offset/--limit to page (or --format json for all)"
+        body = f"{body}\n\n{footer}" if body else footer
     elif has_more and scan_truncated and isinstance(lower_bound, int):
         scan = (
             f"; scanned {callers_scanned} of {caller_total} callers"
             if isinstance(callers_scanned, int) and isinstance(caller_total, int)
             else ""
         )
-        body += (
-            f"\n\n... showing {len(value)} rows; at least {lower_bound} "
+        footer = (
+            f"... showing {len(value)} rows; at least {lower_bound} "
             f"callsites{scan}; exact total not computed to keep the scan bounded. "
             "Use --offset/--limit to page."
         )
+        body = f"{body}\n\n{footer}" if body else footer
+    if not blocks and not body:
+        body = "no callsites found"
     return body
 
 
@@ -2251,19 +2315,22 @@ def _render_defuse_text(value: Any) -> str:
 def _render_callgraph_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    fn = value.get("function") or {}
+    fn = _as_dict(value.get("function"))
     lines = [f"{fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}"]
     if "callees" in value:
         callees = list(value.get("callees") or [])
         lines.append(f"callees ({len(callees)}):")
         for c in callees:
+            if not isinstance(c, dict):
+                lines.append(f"  {c!r}")
+                continue
             if c.get("kind") == "direct":
-                tgt = c.get("target") or {}
+                tgt = _as_dict(c.get("target"))
                 lines.append(f"  {c.get('call_addr')}  direct -> {tgt.get('name', '<unknown>')} @ {tgt.get('address')}")
             else:
                 resolved = c.get("resolved") or []
                 if resolved:
-                    tgts = ", ".join(f"{r.get('name', '?')}@{r.get('address')}" for r in resolved)
+                    tgts = ", ".join(f"{_as_dict(r).get('name', '?')}@{_as_dict(r).get('address')}" for r in resolved)
                     suffix = f"resolved: {tgts}"
                 else:
                     suffix = f"UNRESOLVED ({c.get('resolution_detail', 'indirect')})"
@@ -2272,7 +2339,10 @@ def _render_callgraph_text(value: Any) -> str:
         callers = list(value.get("callers") or [])
         lines.append(f"callers ({len(callers)}):")
         for c in callers:
-            caller = c.get("caller") or {}
+            if not isinstance(c, dict):
+                lines.append(f"  {c!r}")
+                continue
+            caller = _as_dict(c.get("caller"))
             site = f"{c.get('call_addr')}  " if c.get("call_addr") else ""
             lines.append(f"  {site}{caller.get('name', '<unknown>')} @ {caller.get('address', '?')}")
     return "\n".join(lines)
@@ -2677,8 +2747,11 @@ def _render_taint_models_text(value: Any) -> str:
     if srcs:
         lines.append(f"sources ({len(srcs)}):")
         for s in srcs:
+            if not isinstance(s, dict):
+                lines.append(f"  {s!r}")
+                continue
             p = " [present]" if s.get("present") else (" [absent]" if "present" in s else "")
-            lines.append(f"  {s['symbol']}  ->  {s.get('to', '')}{p}")
+            lines.append(f"  {s.get('symbol', '<unknown>')}  ->  {s.get('to', '')}{p}")
     sbc = value.get("sinks_by_class") or {}
     if sbc:
         lines.append("")
@@ -2687,17 +2760,23 @@ def _render_taint_models_text(value: Any) -> str:
         for cls, lst in sbc.items():
             lines.append(f"  [{cls}]")
             for e in lst:
+                if not isinstance(e, dict):
+                    lines.append(f"    {e!r}")
+                    continue
                 lines.extend(_render_taint_sink_entry(e))
     props = value.get("propagators") or []
     if props:
         lines.append("")
         lines.append(f"propagators ({len(props)}):")
         for p in props:
-            lines.append(f"  {p['symbol']}  {p.get('from_to', '')}")
+            if not isinstance(p, dict):
+                lines.append(f"  {p!r}")
+                continue
+            lines.append(f"  {p.get('symbol', '<unknown>')}  {p.get('from_to', '')}")
     ov = value.get("overlays") or []
     if ov:
         lines.append("")
-        lines.append("overlays: " + ", ".join(o.get("path", o.get("kind", "?")) for o in ov))
+        lines.append("overlays: " + ", ".join(_as_dict(o).get("path", _as_dict(o).get("kind", "?")) for o in ov))
     return "\n".join(lines) if lines else "no models match the filter"
 
 
@@ -2715,7 +2794,7 @@ def _render_taint_sink_entry(e: dict[str, Any]) -> list[str]:
     else:
         cs = ""
     desc = f"  -- {e['model_description']}" if e.get("model_description") else ""
-    out = [f"    {e['symbol']} (arg {e.get('tainted_args')}){p}{cs}{desc}"]
+    out = [f"    {e.get('symbol', '<unknown>')} (arg {e.get('tainted_args')}){p}{cs}{desc}"]
     for c in (e.get("callsites") or []):
         fn = c.get("function") or "?"
         kind = c.get("kind")

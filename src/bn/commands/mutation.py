@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from ..cli import _call, _mutate, _pick, arg, command, mutation_output_args, preview_arg
+from ..cli import _call, _effective_limit, _mutate, _pick, arg, command, mutation_output_args, preview_arg
 from ..formatters import (
     _render_comment_list_text,
     _render_comment_text,
@@ -59,7 +59,7 @@ def _comment_list(args: argparse.Namespace) -> int:
     return _call(
         args,
         "list_comments",
-        {"query": args.query, "offset": args.offset, "limit": args.limit,
+        {"query": args.query, "offset": args.offset, "limit": _effective_limit(args),
          "scope": args.scope},
         require_target=True,
         text_renderer=_render_comment_list_text,
