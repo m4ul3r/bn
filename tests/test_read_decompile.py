@@ -85,6 +85,23 @@ def test_function_disasm_is_address_ordered_and_0x_prefixed(monkeypatch):
     assert ".byte 0xff" in text
 
 
+def test_function_disasm_reports_unreadable_instead_of_bare_byte_directive(monkeypatch):
+    # #616 follow-up: a block address with no decode text AND no bytes (a gap
+    # inside an otherwise-mapped block, or a stale/partial mapping) must not
+    # render `.byte ` with nothing after it -- syntactically broken and reads
+    # as "decoded to an empty instruction" rather than "could not read this".
+    bridge = _load_bridge(monkeypatch)
+    function = _FakeFunction(0x1000, "target")
+    function.basic_blocks = [_FakeBasicBlock(0x1000, 0x1001)]
+    bv = _FakeBV(memory={}, disassembly={0x1000: ""})
+
+    text = bridge.il_format._disasm_text(bv, function)
+
+    assert ".byte " not in text
+    assert "<unreadable" in text
+    assert text.startswith("0x1000")
+
+
 def test_function_disasm_rejects_out_of_range_line_window(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -2407,7 +2424,7 @@ def test_search_functions_count_only_returns_total(monkeypatch):
 def _mid_function_bv():
     fn = _FakeFunction(0x401000, "parse_packet")
     fn.basic_blocks = [_FakeBasicBlock(0x401000, 0x401040)]  # spans 0x401000..0x401040
-    return _FakeBV(functions=[fn]), fn
+    return _FakeBV(functions=[fn], memory={0x401000: b"\x90" * 0x40}), fn
 
 
 def test_find_function_resolves_contained_address_only_when_opted_in(monkeypatch):
@@ -3006,7 +3023,7 @@ def _containment_instance(monkeypatch):
     block.end = 0x401040
     fn = _FakeFunction(0x401000, "parse_packet")
     fn.basic_blocks = [block]
-    bv = _FakeBV(functions=[fn])
+    bv = _FakeBV(functions=[fn], memory={0x401000: b"\x90" * 0x40})
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     # An MLIL instruction at each candidate address so `possible_values` resolves

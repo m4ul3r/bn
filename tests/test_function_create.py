@@ -592,3 +592,23 @@ def test_verify_operation_dispatches_function_create(monkeypatch):
         ctx, bv,
         {"op": "function_create", "address": "0x1000", "status": "verified", "function": "sub_1000"})
     assert out["status"] == "verified"  # would be "unsupported" without the arm
+
+
+def test_function_create_rejects_unmapped_address_with_no_memory_seeded_at_all(monkeypatch):
+    """#616 regression: previously, a _FakeFunctionCreateBV with an entirely
+    empty memory map (no `memory=` kwarg) made bv.read() return fabricated
+    \\x90 filler for ANY address, so the create_comments.py mappedness guard
+    (`len(bytes(bv.read(addr, 1))) == 0`) never fired and this production
+    branch went untested. With a faithful empty-read default, the guard now
+    correctly rejects the address as unmapped."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeFunctionCreateBV(
+        segments={0x1000: _FakeSegment(readable=True, executable=True)},
+    )  # no memory= at all -- every address is unmapped
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(RuntimeError, match="0x1000.*not mapped"):
+        instance._function_create(None, "0x1000", False)
+
+    assert bv.added == []

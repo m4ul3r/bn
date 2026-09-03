@@ -26,12 +26,10 @@ class _FunctionCreateBV(_FakeBV):
     def __init__(self, addr):
         super().__init__()
         self._addr = int(addr)
+        self._memory = {self._addr: b"\x90\x90\x90\x90"}
         self._created = False
         self.add_function_called = False
         self.create_user_function_called = False
-
-    def read(self, addr, length):
-        return b"\x90" * length  # mapped, returns bytes
 
     def get_function_at(self, addr):
         if self._created and int(addr) == self._addr:

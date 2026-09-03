@@ -806,7 +806,15 @@ def _disasm_text(bv, func) -> str:
             raw = bv.read(addr, length)
             text = entry["text"]
             if not text:
-                text = ".byte " + ", ".join(f"0x{byte:02x}" for byte in raw)
+                if raw:
+                    text = ".byte " + ", ".join(f"0x{byte:02x}" for byte in raw)
+                else:
+                    # No decode AND no bytes: a genuinely unreadable address (a
+                    # gap inside an otherwise-mapped block, or a stale/partial
+                    # mapping). Say so instead of emitting a byte directive with
+                    # no byte -- syntactically broken and would misreport an
+                    # unreadable range as "decoded to an empty instruction".
+                    text = "<unreadable: no bytes available at this address>"
             entries.append((addr, raw, text))
             addr += length
     entries.sort(key=lambda item: item[0])
