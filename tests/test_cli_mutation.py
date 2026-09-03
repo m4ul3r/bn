@@ -507,6 +507,19 @@ def test_symbol_rename_rejects_whitespace_new_name(fake_transport, capsys):
     assert [call["op"] for call in calls] == []
 
 
+@pytest.mark.parametrize("bad_name", ["", "   "])
+def test_local_rename_rejects_empty_new_name(fake_transport, capsys, bad_name):
+    """An empty/whitespace-only new name is rejected client-side (exit 2) before
+    any local_rename op is sent -- mirrors _symbol_rename's guard (#605)."""
+    calls = fake_transport({"local_rename": {"ok": True, "result": {"preview": True}}})
+
+    rc = bn.cli.main(["local", "rename", "--target", "123:1:7", "sub_401000", "var_8", bad_name])
+
+    assert rc == 2
+    assert "new name must be non-empty" in capsys.readouterr().err
+    assert [call["op"] for call in calls] == []
+
+
 def test_symbol_rename_uses_implicit_target_when_single_target_is_open(fake_transport):
     calls = fake_transport(
         {

@@ -45,6 +45,7 @@ from ._shared import (
     _BUILTIN_TAG_TYPE_NAMES,
     _normalize_prototype,
     _parse_address,
+    _require_nonempty_name,
     _serialize_error,
     _validate_bool,
 )
@@ -901,26 +902,34 @@ def _member_byte_width(member) -> int:
         return 0
 
 
+def _overlapping_members(type_obj, offset: int, width: int) -> list:
+    """Every existing member whose byte range intersects the range a new field
+    of *width* bytes at *offset* would occupy. Width 0/unknown is treated as 1
+    byte so an exact start-offset collision is always caught. Shared by the
+    ``--no-overwrite`` clash check and the struct-field-set duplicate-name
+    guard, which needs to know EVERY member ``add_member_at_offset(overwrite=
+    True)`` would remove, not just the first (#56, #666)."""
+    members = getattr(type_obj, "members", None)
+    if members is None:
+        return []
+    new_start = int(offset)
+    new_end = new_start + max(int(width or 0), 1)
+    result = []
+    for member in list(members):
+        m_start = int(getattr(member, "offset", 0))
+        m_end = m_start + max(_member_byte_width(member), 1)
+        if new_start < m_end and m_start < new_end:
+            result.append(member)
+    return result
+
+
 def _first_overlapping_member(ctx, type_obj, offset: int, width: int):
     """The first existing member whose byte range intersects the range a new
     field of *width* bytes at *offset* would occupy, else None. Width 0/unknown
     is treated as 1 byte so an exact start-offset collision is always caught.
     Used to enforce struct field set --no-overwrite (#56)."""
-    members = getattr(type_obj, "members", None)
-    if members is None:
-        return None
-    new_start = int(offset)
-    new_end = new_start + max(int(width or 0), 1)
-    for member in list(members):
-        m_start = int(getattr(member, "offset", 0))
-        try:
-            m_width = int(getattr(getattr(member, "type", None), "width", 0) or 0)
-        except Exception:
-            m_width = 0
-        m_end = m_start + max(m_width, 1)
-        if new_start < m_end and m_start < new_end:
-            return member
-    return None
+    overlaps = _overlapping_members(type_obj, offset, width)
+    return overlaps[0] if overlaps else None
 
 
 
@@ -2418,14 +2427,7 @@ def _op_rename_symbol(ctx, bv, op: dict[str, Any]):
     # otherwise `str()` to the literal "None" and slip the emptiness check. Done
     # here (not just CLI-side) so batch/raw callers are covered too; pre-resolution
     # so no view state is modified on rejection.
-    raw_new_name = op["new_name"]
-    if raw_new_name is None or not str(raw_new_name).strip():
-        raise OperationFailure(
-            "invalid_request",
-            "new name must be non-empty",
-            requested=_operation_requested(ctx, op),
-        )
-    new_name = str(raw_new_name)
+    new_name = _require_nonempty_name(op["new_name"], requested=_operation_requested(ctx, op))
     target = ctx._resolve_rename_target(bv, identifier, kind)
     requested = _operation_requested(ctx, op)
     if target["kind"] == "function":
@@ -3045,7 +3047,12 @@ def _register_local_restore(ctx, bv, restores, *, fn, var, name, type_obj, is_pa
 def _op_local_rename(ctx, bv, op: dict[str, Any], restores: list | None = None):
     fn = ctx._find_function(bv, op["function"])
     var, is_parameter = vars_mod._find_variable_selector(fn, str(op["variable"]))
-    new_name = str(op["new_name"])
+    # Reject a degenerate empty/whitespace/null name before touching the view
+    # (mirrors _op_rename_symbol's guard, see #363/#605): `str(None)` would
+    # otherwise become the literal "None" and slip through, and "" / "   "
+    # would create an unnamed/blank-named local. Inspect the RAW value first;
+    # done pre-mutation so no view state changes on rejection.
+    new_name = _require_nonempty_name(op["new_name"], requested=_operation_requested(ctx, op))
     # Variable.name is a live property backed by the core: snapshot it
     # before mutating, or before_name reads back the new name and
     # verification misclassifies a real change as a noop.
@@ -3279,6 +3286,11 @@ def _op_struct_field_set(ctx, bv, op: dict[str, Any]):
                 "field_type": str(getattr(member, "type", "")),
                 "offset": hex(int(getattr(member, "offset", offset))),
             }
+    new_width = 0
+    try:
+        new_width = int(field_type.width)
+    except Exception:
+        new_width = 0
     # --no-overwrite must REFUSE when the new field would clobber existing
     # data, not add an overlapping member: BN's add_member_at_offset(...,
     # overwrite=False) silently appends an overlapping member (worse than the
@@ -3287,11 +3299,6 @@ def _op_struct_field_set(ctx, bv, op: dict[str, Any]):
     # wider member (e.g. 0x4 within an int64_t at 0x0) overlaps just as much
     # (#56).
     if not overwrite and before_type is not None:
-        new_width = 0
-        try:
-            new_width = int(field_type.width)
-        except Exception:
-            new_width = 0
         clash = _first_overlapping_member(ctx, before_type, offset, new_width)
         if clash is not None:
             raise OperationFailure(
@@ -3303,6 +3310,35 @@ def _op_struct_field_set(ctx, bv, op: dict[str, Any]):
                 f"{hex(int(getattr(clash, 'offset', offset)))}; --no-overwrite refuses "
                 f"to clobber it. Re-run without --no-overwrite to replace it, or choose "
                 f"a free range.",
+                requested=_operation_requested(ctx, op),
+            )
+    # A member the write does NOT remove must not collide by NAME either.
+    # add_member_at_offset(overwrite=True) removes every member whose byte
+    # range overlaps the new field's, so a retype at a DIFFERENT offset (e.g.
+    # narrowing a wide field and re-adding a member under the same name
+    # elsewhere in its old range) creates no duplicate and must not be
+    # refused -- the guard round 2 rejected did exactly that (#666). Only a
+    # member OUTSIDE the range this write removes, that already holds the
+    # requested name, is a real duplicate.
+    if before_type is not None:
+        requested_field_name = str(op["field_name"])
+        removed = (
+            {id(m) for m in _overlapping_members(before_type, offset, new_width)}
+            if overwrite else set()
+        )
+        for member in list(getattr(before_type, "members", None) or []):
+            if id(member) in removed:
+                continue
+            if str(getattr(member, "name", "")) != requested_field_name:
+                continue
+            raise OperationFailure(
+                "invalid_request",
+                f"struct {resolved_name} already has a member named "
+                f"{requested_field_name!r} at offset "
+                f"{hex(int(getattr(member, 'offset', 0)))}, outside the byte range "
+                f"this write replaces ({hex(offset)}..{hex(offset + max(new_width, 1))}); "
+                "field names must be unique. Choose a different name, or target "
+                "that member's offset instead.",
                 requested=_operation_requested(ctx, op),
             )
     builder.add_member_at_offset(str(op["field_name"]), field_type, offset, overwrite)
@@ -3337,9 +3373,16 @@ def _resolve_struct_field(ctx, builder, resolved_name: str, locator: Any):
     same in all three). Raises invalid_request when nothing matches."""
     text = str(locator)
     members = list(getattr(builder, "members", []) or [])
-    for index, member in enumerate(members):
-        if str(getattr(member, "name", "")) == text:
-            return index, member
+    by_name = [(i, m) for i, m in enumerate(members) if str(getattr(m, "name", "")) == text]
+    if len(by_name) > 1:
+        offsets = ", ".join(hex(int(getattr(m, "offset", -1))) for _, m in by_name)
+        raise OperationFailure(
+            "invalid_request",
+            f"struct {resolved_name} has {len(by_name)} members named {text!r} "
+            f"(at {offsets}); target one by offset instead of by name",
+        )
+    if by_name:
+        return by_name[0]
     try:
         offset = _parse_address(text)
     except ValueError:
@@ -3361,13 +3404,28 @@ def _op_struct_field_rename(ctx, bv, op: dict[str, Any]):
     index, member = _resolve_struct_field(ctx, builder, resolved_name, op["old_name"])
     old_name = str(getattr(member, "name", ""))
     member_offset = int(getattr(member, "offset", -1))
-    builder.replace(index, member.type, str(op["new_name"]), True)
+    # Reject a degenerate empty/whitespace/null name before mutating (mirrors
+    # _op_rename_symbol/_op_local_rename, see #363/#605): str(None) would
+    # otherwise become the literal "None" and slip through.
+    new_name = _require_nonempty_name(op["new_name"], requested=_operation_requested(ctx, op))
+    # A rename to a name already held by another member "verifies" cleanly but
+    # leaves the struct with a duplicate field name; a later struct_field_delete
+    # resolving that name would then pick an arbitrary member (#666).
+    for other_index, other_member in enumerate(getattr(builder, "members", []) or []):
+        if other_index != index and str(getattr(other_member, "name", "")) == new_name:
+            raise OperationFailure(
+                "invalid_request",
+                f"struct {resolved_name} already has a member named {new_name!r}; "
+                "field names must be unique",
+                requested=_operation_requested(ctx, op),
+            )
+    builder.replace(index, member.type, new_name, True)
     _commit_struct_builder(ctx, bv, resolved_name, builder)
     return {
         "op": "struct_field_rename",
         "struct_name": resolved_name,
         "old_name": old_name,
-        "new_name": str(op["new_name"]),
+        "new_name": new_name,
         "member_offset": member_offset,
         "requested": _operation_requested(ctx, op),
     }

@@ -340,6 +340,9 @@ Mutation results now distinguish:
 - `noop`
 - `unsupported`
 - `verification_failed`
+- `invalid_request`
+- `rollback_failed`
+- `internal_error`
 
 When verification fails, JSON output also includes `requested` and `observed` state for the failed op.
 

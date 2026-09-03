@@ -106,7 +106,7 @@ omitted entirely for other errors.
 ## Conventions
 
 - Command handlers are named `_<group>_<subcommand>()` (e.g., `_function_list`)
-- Exit codes: 0 = success, 1 = CLI-side handler error (e.g. partial `session start` failure), 2 = `BridgeError` (transport failures and bridge-side errors, including mutation apply failures), 3 = mutation status `verification_failed` or `unsupported`
+- Exit codes: 0 = success, 1 = CLI-side handler error (e.g. partial `session start` failure), 2 = `BridgeError` (transport failures and bridge-side errors, including mutation apply failures), 3 = mutation status `verification_failed`, `unsupported`, `invalid_request`, `rollback_failed`, or `internal_error`
 - `BridgeError` for user-facing errors, `OperationFailure` for bridge-side mutation failures with structured fields
 - Read commands default to `--format text`, mutations default to `--format json`
 - Type hints everywhere, `from __future__ import annotations` in all modules

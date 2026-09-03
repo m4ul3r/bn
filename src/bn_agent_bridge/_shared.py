@@ -337,6 +337,18 @@ def _validate_bool(value: Any, *, label: str, default: bool) -> bool:
     )
 
 
+def _require_nonempty_name(value: Any, *, label: str = "new name",
+                           requested: dict[str, Any] | None = None) -> str:
+    """Reject an empty/whitespace-only/null name before any view mutation.
+
+    A JSON ``null`` must not ``str()`` into the literal "None" and slip the
+    emptiness check, and an empty name leaves a degenerate unnamed
+    function/local/field that then "verifies" against itself (#363/#605)."""
+    if value is None or not str(value).strip():
+        raise OperationFailure("invalid_request", f"{label} must be non-empty", requested=requested)
+    return str(value)
+
+
 def _run_on_main_thread(func):
     if is_main_thread():
         return func()
