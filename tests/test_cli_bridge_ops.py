@@ -21,6 +21,14 @@ that: both are in fact extracted by this module's own rules --
 `_send_request_to_instance` and the dict-literal rule below, respectively
 -- and both appear in the extraction; today the CLI-side extraction happens
 to cover the bridge's full `REGISTRY.names()`.)
+
+Extraction is bucketed per call shape, and each shape must still yield its
+documented sentinel op -- that is what catches a stale entry in the shape
+table (a renamed `_mutate` leaves 59 of 77 literals, clearing any plausible
+count floor, yet silently unchecks every mutation op). The subset assertion
+runs BEFORE those anti-vacuity guards so a plain typo -- which blanks a
+sentinel when it lands on one -- always fails with the offending op name.
+
 Batch-manifest *inner* op names carried inside a `bn batch` JSON payload
 are out of scope: the dict-literal rule below only fires on a hand-built
 transport *request envelope* (an `"op"` key with sibling `"id"`/`"params"`
@@ -50,23 +58,31 @@ _OP_ARG_INDEX = {
     "_send_request_to_instance": 1,
 }
 
-# A floor, not a target: the extractor should find "a whole CLI's worth" of
-# op literals. If a refactor legitimately drops call sites below this, lower
-# it deliberately -- but a silent drop to near-zero means the extractor
-# broke (e.g. a rename of `_call`/`_mutate`), not that the CLI shrank.
+# The extractor's fifth shape: a hand-built request envelope dict literal.
+# Named like the call shapes above so per-shape attribution below can talk
+# about all five uniformly.
+_DICT_LITERAL_SHAPE = 'dict literal {"id", "op", "params"}'
+
+# Catch-all floor, checked last (the per-shape sentinels below diagnose a
+# stale shape-table entry far more precisely). It only earns its keep for
+# the case where every sentinel survives yet the tree stops holding "a
+# whole CLI's worth" of op literals -- e.g. a mass deletion of call sites.
+# If a refactor legitimately drops below this, lower it deliberately.
 _MIN_PLAUSIBLE_OP_COUNT = 40
 
-# One op name each shape -- and ONLY that shape -- produces in today's
-# tree. The count floor above cannot detect a stale table entry on its own:
-# dropping `_mutate` still leaves 59 of 77 literals, well clear of the
-# floor, so a renamed `_mutate` would leave every mutation op string
-# unchecked and still green. Losing a sentinel names the exact broken shape.
+# One op name each shape produces in today's tree, checked against that
+# shape's OWN extraction (not the union), so the guard does not depend on
+# the sentinel being unique across shapes. The count floor above cannot
+# detect a stale table entry on its own: dropping `_mutate` still leaves 59
+# of 77 literals, well clear of the floor, so a renamed `_mutate` would
+# leave every mutation op string unchecked and still green. Losing a
+# sentinel names the exact broken shape.
 _SHAPE_SENTINELS = {
     "_call": "decompile",  # commands/function.py
     "_mutate": "set_prototype",  # commands/mutation.py
     "send_request": "load_status",  # commands/admin.py
     "_send_request_to_instance": "doctor",  # commands/admin.py
-    'dict literal {"id", "op", "params"}': "cancel_request",  # transport.py
+    _DICT_LITERAL_SHAPE: "cancel_request",  # transport.py
 }
 
 
@@ -104,8 +120,8 @@ def _op_arg_strings(call: ast.Call, index: int) -> set[str]:
     return set()
 
 
-def extract_cli_wire_ops(root: Path) -> set[str]:
-    """Statically collect every wire op string constant the CLI can send.
+def extract_cli_wire_ops_by_shape(root: Path) -> dict[str, set[str]]:
+    """Statically collect the CLI's wire op string constants, per shape.
 
     Walks every `*.py` file under *root* with `ast` and collects string
     constants from:
@@ -118,15 +134,27 @@ def extract_cli_wire_ops(root: Path) -> set[str]:
       `transport.py`'s `cancel_request` payload -- never an arbitrary dict
       that merely happens to carry an `"op"` key (a batch-manifest entry, a
       decoded response row)
+
+    Returns one bucket per shape (every `_OP_ARG_INDEX` key plus
+    `_DICT_LITERAL_SHAPE`), always present, empty when that shape has no
+    literal call site left. Attribution is what makes the anti-vacuity
+    guard self-sufficient: a shape whose bucket went empty is a stale
+    extractor entry regardless of what the other shapes happen to emit.
     """
-    ops: set[str] = set()
+    by_shape: dict[str, set[str]] = {shape: set() for shape in _OP_ARG_INDEX}
+    by_shape[_DICT_LITERAL_SHAPE] = set()
     for path in sorted(root.rglob("*.py")):
+        # Bytes, not `Path.read_text()`: the latter decodes with the process
+        # locale, so a non-ASCII source file (several exist under `src/bn`)
+        # raised `UnicodeDecodeError` under `LC_ALL=C PYTHONUTF8=0`.
+        # `ast.parse` honours the file's own PEP 263 coding declaration.
         tree = ast.parse(path.read_bytes(), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
-                index = _OP_ARG_INDEX.get(_callee_name(node.func) or "")
+                shape = _callee_name(node.func) or ""
+                index = _OP_ARG_INDEX.get(shape)
                 if index is not None:
-                    ops |= _op_arg_strings(node, index)
+                    by_shape[shape] |= _op_arg_strings(node, index)
             elif isinstance(node, ast.Dict):
                 keys = {
                     key.value
@@ -137,25 +165,44 @@ def extract_cli_wire_ops(root: Path) -> set[str]:
                     continue
                 for key, value in zip(node.keys, node.values):
                     if isinstance(key, ast.Constant) and key.value == "op":
-                        ops |= _string_constants(value)
-    return ops
+                        by_shape[_DICT_LITERAL_SHAPE] |= _string_constants(value)
+    return by_shape
+
+
+def extract_cli_wire_ops(root: Path) -> set[str]:
+    """Every wire op string constant the CLI can send, shapes unioned."""
+    return set().union(*extract_cli_wire_ops_by_shape(root).values())
 
 
 def test_cli_wire_ops_are_registered_on_bridge(monkeypatch):
     bridge = _load_bridge(monkeypatch)
-    cli_ops = extract_cli_wire_ops(CLI_SRC_ROOT)
+    by_shape = extract_cli_wire_ops_by_shape(CLI_SRC_ROOT)
+    cli_ops = set().union(*by_shape.values())
 
-    # A broken extractor (e.g. a rename of `_call`/`send_request` this table
-    # was not updated for) must not silently pass by finding nothing.
-    assert len(cli_ops) >= _MIN_PLAUSIBLE_OP_COUNT, (
-        f"extractor only found {len(cli_ops)} CLI wire op string(s) under "
-        f"{CLI_SRC_ROOT} -- expected at least {_MIN_PLAUSIBLE_OP_COUNT}; this "
-        "looks like a broken extractor (a call-shape table entry went stale), "
-        "not a real shrink of the CLI"
+    # #623's actual invariant, asserted FIRST so its message always names the
+    # offending op. A typo'd op is also a *missing sentinel* when it lands on
+    # a sentinel name (`set_prototype` -> `set_prototipe`, the issue's own
+    # example); checking vacuity first would have reported "shape went stale"
+    # and never printed `set_prototipe`.
+    missing = cli_ops - bridge.REGISTRY.names()
+    assert not missing, f"CLI op strings missing from REGISTRY: {missing}"
+
+    # Every shape the extractor knows about must have a sentinel, or a newly
+    # added `_OP_ARG_INDEX` entry could sit unguarded.
+    assert set(_SHAPE_SENTINELS) == set(by_shape), (
+        "_SHAPE_SENTINELS and the extractor's shapes have drifted: "
+        f"unsentinelled {sorted(set(by_shape) - set(_SHAPE_SENTINELS))}, "
+        f"unknown {sorted(set(_SHAPE_SENTINELS) - set(by_shape))}"
     )
 
+    # Anti-vacuity, per shape: this is the guard that can actually name what
+    # broke, so it runs before the whole-tree count floor below (a `_call`
+    # rename trips both, and "shape `_call` extracts nothing" is the useful
+    # message, not "found 27, expected 40").
     stale = {
-        shape for shape, sentinel in _SHAPE_SENTINELS.items() if sentinel not in cli_ops
+        shape
+        for shape, sentinel in _SHAPE_SENTINELS.items()
+        if sentinel not in by_shape[shape]
     }
     assert not stale, (
         f"extractor found no literal for call shape(s) {sorted(stale)} -- "
@@ -163,8 +210,14 @@ def test_cli_wire_ops_are_registered_on_bridge(monkeypatch):
         "stale, so every op string sent through them is now unchecked"
     )
 
-    missing = cli_ops - bridge.REGISTRY.names()
-    assert not missing, f"CLI op strings missing from REGISTRY: {missing}"
+    # Catch-all floor: every shape still yields its sentinel, yet the tree as
+    # a whole no longer holds a plausible CLI's worth of op literals.
+    assert len(cli_ops) >= _MIN_PLAUSIBLE_OP_COUNT, (
+        f"extractor only found {len(cli_ops)} CLI wire op string(s) under "
+        f"{CLI_SRC_ROOT} -- expected at least {_MIN_PLAUSIBLE_OP_COUNT}; this "
+        "looks like a broken extractor (a call-shape table entry went stale), "
+        "not a real shrink of the CLI"
+    )
 
 
 def test_extractor_finds_op_from_call_positional_arg(tmp_path):
@@ -272,10 +325,10 @@ def test_extractor_ignores_dynamic_op_variables(tmp_path):
 def test_sentinel_catches_mutate_rename_the_count_floor_misses(tmp_path):
     """#709 review: dropping `_mutate` alone leaves 59/77 literals in the
     real tree -- well clear of `_MIN_PLAUSIBLE_OP_COUNT`. Reproduce that
-    shape here: a fixture tree with plenty of `_call`/`send_request`
-    literals (>= the floor) but zero `_mutate` call sites, standing in for
-    a `_mutate` rename that the extractor's table was never updated for.
-    The count floor alone would pass this; the sentinel must not.
+    shape here: a fixture tree with plenty of `_call` literals (>= the
+    floor) but zero `_mutate` call sites, standing in for a `_mutate`
+    rename that the extractor's table was never updated for. The count
+    floor alone would pass this; the per-shape sentinel must not.
     """
     src_dir = tmp_path / "bn"
     src_dir.mkdir()
@@ -290,18 +343,81 @@ def test_sentinel_catches_mutate_rename_the_count_floor_misses(tmp_path):
         "    # standing in for a renamed `_mutate` the table wasn't updated for\n"
     )
 
-    ops = extract_cli_wire_ops(src_dir)
+    by_shape = extract_cli_wire_ops_by_shape(src_dir)
+    ops = set().union(*by_shape.values())
 
     # The count floor alone is satisfied...
     assert len(ops) >= _MIN_PLAUSIBLE_OP_COUNT
-    # ...but the `_mutate` shape produced nothing, so its sentinel is absent,
-    # and the sentinel check catches it even though the floor did not (this
-    # fixture only exercises the `_call` shape, so the other four shapes'
-    # sentinels are also naturally absent -- the point is that `_mutate`
-    # specifically is now named, which a bare count floor cannot do).
-    assert _SHAPE_SENTINELS["_mutate"] not in ops
-    stale = {shape for shape, sentinel in _SHAPE_SENTINELS.items() if sentinel not in ops}
+    # ...but the `_mutate` bucket is empty, so its sentinel is absent and the
+    # guard names that exact shape -- which a bare count floor cannot do.
+    assert by_shape["_mutate"] == set()
+    stale = {
+        shape
+        for shape, sentinel in _SHAPE_SENTINELS.items()
+        if sentinel not in by_shape[shape]
+    }
     assert "_mutate" in stale
+
+
+def test_sentinel_check_is_attributed_not_unioned(tmp_path):
+    """A sentinel is checked against its OWN shape's bucket.
+
+    If the guard tested the union, another shape emitting the same op name
+    would mask a stale entry: here `send_request` emits `_call`'s sentinel
+    while `_call` itself has no call site left, so a union test would pass.
+    """
+    src_dir = tmp_path / "bn"
+    src_dir.mkdir()
+    (src_dir / "fake_masking.py").write_text(
+        "from __future__ import annotations\n"
+        "\n"
+        "\n"
+        "def _fake_masking(args):\n"
+        f'    return send_request("{_SHAPE_SENTINELS["_call"]}", params={{}})\n'
+    )
+
+    by_shape = extract_cli_wire_ops_by_shape(src_dir)
+    ops = set().union(*by_shape.values())
+
+    # A union-based guard would see `_call`'s sentinel and call the shape healthy.
+    assert _SHAPE_SENTINELS["_call"] in ops
+    # Attributed, it is correctly reported stale.
+    assert by_shape["_call"] == set()
+    stale = {
+        shape
+        for shape, sentinel in _SHAPE_SENTINELS.items()
+        if sentinel not in by_shape[shape]
+    }
+    assert "_call" in stale
+
+
+def test_typoed_sentinel_op_is_reported_as_missing_not_as_a_stale_shape(tmp_path):
+    """#709 review: the issue's own example typo (`set_prototype` ->
+    `set_prototipe`) lands ON a sentinel name, so it both breaks the subset
+    check and blanks that sentinel. The subset assertion runs first, so the
+    failure message names the typo (#623 acceptance criterion) instead of
+    blaming a stale `_OP_ARG_INDEX` entry -- and the `_mutate` bucket is
+    still non-empty, so the shape is (correctly) not reported stale at all.
+    """
+    src_dir = tmp_path / "bn"
+    src_dir.mkdir()
+    (src_dir / "fake_mutation.py").write_text(
+        "from __future__ import annotations\n"
+        "\n"
+        "\n"
+        "def _fake_proto_set(args):\n"
+        '    return _mutate(args, "set_prototipe", {})\n'
+    )
+
+    by_shape = extract_cli_wire_ops_by_shape(src_dir)
+    ops = set().union(*by_shape.values())
+    fake_registry_names = {_SHAPE_SENTINELS["_mutate"], "rename_symbol"}
+
+    # The subset check fires and names the typo.
+    assert ops - fake_registry_names == {"set_prototipe"}
+    # The `_mutate` shape still extracts fine -- a typo is not a stale table
+    # entry, and must not be misreported as one.
+    assert by_shape["_mutate"] == {"set_prototipe"}
 
 
 def test_extractor_ignores_op_key_on_non_envelope_dict(tmp_path):
