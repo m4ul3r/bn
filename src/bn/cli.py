@@ -1259,9 +1259,19 @@ def _fanout_call(
     def _instance_target_ids(iid: Any) -> list[Any]:
         tresp = send_request("list_targets", params={}, instance_id=iid, **timeout_kwargs)
         titems = tresp["result"]
-        tlist = titems.get("items") if isinstance(titems, dict) else titems
+        # Production list_targets always replies with a bare list (see
+        # _implicit_target's identical guard) -- a wrong-typed result (an int,
+        # a string, ...) must not reach `for t in titems` below as a raw
+        # TypeError: that would escape _plan_instance's `except BridgeError`
+        # and abort the whole fan-out instead of degrading to one row (#617
+        # follow-up).
+        if not isinstance(titems, list):
+            raise BridgeError(
+                "malformed bridge reply to list_targets (no target list); the "
+                "bridge may be stale -- restart it or pass an explicit --target"
+            )
         return [t.get("target_id") or t.get("selector")
-                for t in (tlist or []) if isinstance(t, dict)]
+                for t in titems if isinstance(t, dict)]
 
     # Phase 1 -- PLAN each instance: resolve its target set (a list_targets peek
     # for --all-targets, or the #368 multi-target auto-survey). That peek is itself

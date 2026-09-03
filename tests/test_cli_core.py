@@ -1031,6 +1031,37 @@ def test_fanout_preserves_instance_order_with_enumeration_error(monkeypatch, cap
     assert by["a"]["ok"] is True and by["c"]["ok"] is True
 
 
+def test_fanout_isolates_wrong_typed_list_targets_result(monkeypatch, capsys):
+    # #617 round-3 follow-up: a list_targets reply of {"ok": true, "result": 5}
+    # (a wrong-typed but present result) used to reach `for t in (tlist or [])`
+    # in _instance_target_ids and raise a raw TypeError, escaping
+    # _plan_instance's `except BridgeError` and aborting the whole fan-out
+    # (pool.map) instead of degrading to one row. The shape guard must turn
+    # it into a BridgeError so the other instance's row still succeeds.
+    import json as _json
+    import types as _types
+    import bn.cli as cli
+
+    insts = [_types.SimpleNamespace(instance_id="a"), _types.SimpleNamespace(instance_id="b")]
+    monkeypatch.setattr(cli, "list_instances", lambda: insts)
+    monkeypatch.setattr(cli, "instance_selector", lambda i: i.instance_id)
+
+    def fake_send(op, *, params=None, target=None, instance_id=None, **k):
+        if op == "list_targets":
+            if instance_id == "b":
+                return {"result": 5}   # wrong-typed but present result
+            return {"result": [{"target_id": instance_id + "-t"}]}
+        return {"result": {"kind": "sections", "items": [], "total": 0}}
+    monkeypatch.setattr(cli, "send_request", fake_send)
+
+    rc = cli.main(["sections", "--all-instances", "--all-targets", "--format", "json"])
+    assert rc == 0   # instance a still succeeds -> not an all-fail exit
+    out = _json.loads(capsys.readouterr().out)
+    by = {r["instance"]: r for r in out["instances"]}
+    assert by["a"]["ok"] is True
+    assert by["b"]["ok"] is False and "list targets" in by["b"]["error"]
+
+
 def test_fanout_all_instances_auto_surveys_despite_sticky_target_pin(monkeypatch, capsys):
     # #368 review (HIGH): a STICKY target pin must NOT count as an explicit -t.
     # _apply_sticky_defaults fills args.target from session state and marks it

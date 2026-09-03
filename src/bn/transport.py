@@ -927,7 +927,10 @@ def _send_request_to_instance(
         ) from exc
 
     if not isinstance(response, dict):
-        raise BridgeError("Binary Ninja bridge returned a malformed response")
+        raise BridgeError(
+            f"Binary Ninja bridge returned a malformed response for op '{op}' "
+            f"(instance {instance_selector(instance)}, pid {instance.pid})"
+        )
 
     _verify_response_identity(response, expected_identity)
     if response.get("ok"):

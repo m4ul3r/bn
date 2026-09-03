@@ -1094,6 +1094,22 @@ def test_send_request_malformed_non_dict_reply_raises_bridge_error(tmp_path, mon
         transport._send_request_to_instance(instance, "ping", timeout=5.0)
 
 
+def test_send_request_empty_dict_reply_raises_bridge_error(tmp_path, monkeypatch):
+    # #617 review follow-up 3: `{}` is dict-shaped so it passes the non-dict
+    # guard, but it carries no bridge_identity -- it must still surface as a
+    # BridgeError (an identity mismatch, in practice), not propagate to a
+    # caller as a raw KeyError/AttributeError. Closes the last untested shape
+    # from the deleted client-layer parametrisation (None, [], {}, {"other": 1}).
+    import bn.transport as transport
+
+    instance = _make_instance(tmp_path)
+    fake_socket = _fake_socket_returning(b"{}")
+    monkeypatch.setattr(transport.socket, "socket", lambda *a, **k: fake_socket())
+
+    with pytest.raises(BridgeError):
+        transport._send_request_to_instance(instance, "ping", timeout=5.0)
+
+
 def test_send_request_non_utf8_reply_raises_bridge_error(tmp_path, monkeypatch):
     # #601: a non-UTF-8 byte stream used to raise a bare UnicodeDecodeError,
     # an exception type no caller handles. It must surface as BridgeError.
