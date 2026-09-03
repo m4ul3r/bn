@@ -27,7 +27,6 @@ vibe_report.json
 .dogfood/
 docs
 # Root-level design/review/dogfood notes -- local only, never committed
-AGENTS.md
 CODEX_*.md
 DOGFOOD_*.md
 FORWARD_TAINT_DESIGN.md

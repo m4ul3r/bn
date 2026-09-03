@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository. It is the canonical agent-instruction file: root `AGENTS.md` is a tracked symlink to it, so the two can never drift (#607).
 
 ## What This Is
 
@@ -22,8 +22,8 @@ Requires Python >= 3.14 and uv.
 
 ```bash
 uv run pytest                              # All tests
-uv run pytest tests/test_cli.py            # CLI tests only
-uv run pytest tests/test_cli.py::test_foo  # Single test
+uv run pytest tests/test_cli_core.py       # one module
+uv run pytest tests/test_cli_mutation.py::test_mutation_summary_committed_noop_is_not_dirty  # single test
 uv run pytest -v                           # Verbose output
 ```
 
@@ -83,7 +83,7 @@ The CLI supports several headless bridges concurrently. Each instance gets its o
 
 ### Mutation Verification
 
-All mutations support `--preview` (apply → capture diffs → revert) and live verification (readback confirms requested state landed). Statuses: `verified`, `noop`, `unsupported`, `verification_failed`. Failed batches are fully reverted.
+All mutations support `--preview` (apply → capture diffs → revert) and live verification (readback confirms requested state landed). Success-ish statuses: `verified` (requested state observed) and `noop` (already in the requested state). Failure statuses are exactly `FAILED_MUTATION_STATUSES` in `src/bn/formatters.py` — `unsupported`, `verification_failed`, `invalid_request`, `rollback_failed`, `internal_error` — and any of them puts the run at exit 3. A failed batch is fully reverted, and its cleanly rolled-back siblings are stamped `reverted`, which is **not** a failure and does not affect the exit code (#118); a sibling whose restore itself failed is stamped `rollback_failed` and is.
 
 ### Tags & function docs
 
@@ -110,7 +110,7 @@ omitted entirely for other errors.
 - `BridgeError` for user-facing errors, `OperationFailure` for bridge-side mutation failures with structured fields
 - Read commands default to `--format text`, mutations default to `--format json`
 - Type hints everywhere, `from __future__ import annotations` in all modules
-- Test files mirror source: `test_cli.py`, `test_bridge.py`, `test_transport.py`, `test_output.py`
+- Test files mirror source, split by concern rather than one module per package: `test_cli_*.py` (core/admin/binary/function/mutation/types/misc/formatters), `test_bridge_*.py` (dispatch/lifecycle/mutation/idle_reaper), `test_read_*.py`, `test_transport.py`, `test_output.py`, plus domain modules (`test_taint_*.py`, `test_op_registry.py`, `test_paths.py`, …). `tests/test_cli.py` and `tests/test_bridge.py` do not exist.
 - Tests use `monkeypatch` fixtures and fake `binaryninja` module stubs
 
 ## Issues, PRs & Commits — Sanitize Test Data
