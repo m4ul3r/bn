@@ -463,11 +463,12 @@ class TargetManager:
         cycles (#659). This is wired only into the `bn close` path
         (`_close_binary`); a GUI tab closed without going through that path
         still bypasses this discard and leaks its view_id.
+
+        Same effect as `clear_dirty`; kept as a distinct name for its own
+        call sites (`_close_binary`) so the intent at each site — "closing"
+        vs. "saved" — stays clear in the code, not just the docstring.
         """
-        with self._lock:
-            vid = self._stable_view_id(bv)
-            if vid is not None:
-                self._dirty_view_ids.discard(vid)
+        self.clear_dirty(bv)
 
     def _view_name(self, bv) -> str:
         for attr in ("view_type", "name"):
