@@ -1006,6 +1006,187 @@ def test_send_request_partial_response_reports_real_error(tmp_path, monkeypatch)
         send_request("ping", timeout=5.0)
 
 
+def _fake_socket_returning(payload_bytes):
+    """A fake connected socket whose first recv() returns *payload_bytes*."""
+
+    class _FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, path):
+            pass
+
+        def sendall(self, payload):
+            pass
+
+        def shutdown(self, how):
+            pass
+
+        def recv(self, size):
+            if not hasattr(self, "_sent"):
+                self._sent = True
+                return payload_bytes
+            return b""
+
+    return _FakeSocket
+
+
+def test_send_request_ok_without_result_raises_bridge_error(tmp_path, monkeypatch):
+    # #617: an "ok": true reply with no "result" key used to reach _run_one's
+    # bare response["result"] index, raising KeyError instead of BridgeError
+    # and crashing a whole fan-out survey. The transport layer must reject it.
+    import bn.transport as transport
+
+    instance = _make_instance(tmp_path)
+
+    class _FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, path):
+            pass
+
+        def sendall(self, payload):
+            self.payload = payload
+
+        def shutdown(self, how):
+            pass
+
+        def recv(self, size):
+            if not hasattr(self, "_sent"):
+                self._sent = True
+                request = json.loads(self.payload.decode("utf-8"))
+                return json.dumps(
+                    {"ok": True, "bridge_identity": request["_bridge_identity"]}
+                ).encode("utf-8")
+            return b""
+
+    monkeypatch.setattr(transport.socket, "socket", lambda *a, **k: _FakeSocket())
+
+    with pytest.raises(BridgeError, match="without a result field"):
+        transport._send_request_to_instance(instance, "ping", timeout=5.0)
+
+
+def test_send_request_malformed_non_dict_reply_raises_bridge_error(tmp_path, monkeypatch):
+    # #617/F4: the only guard against a non-dict reply (e.g. a bridge that
+    # writes a bare JSON array) lives at the transport boundary now that the
+    # duplicate checks in cli.py's _call and Client._request were removed as
+    # dead code. This is the sole remaining coverage of that contract.
+    import bn.transport as transport
+
+    instance = _make_instance(tmp_path)
+    fake_socket = _fake_socket_returning(b"[]")
+    monkeypatch.setattr(transport.socket, "socket", lambda *a, **k: fake_socket())
+
+    with pytest.raises(BridgeError, match="malformed response"):
+        transport._send_request_to_instance(instance, "ping", timeout=5.0)
+
+
+def test_send_request_empty_dict_reply_raises_bridge_error(tmp_path, monkeypatch):
+    # #617 review follow-up 3: `{}` is dict-shaped so it passes the non-dict
+    # guard, but it carries no bridge_identity -- it must still surface as a
+    # BridgeError (an identity mismatch, in practice), not propagate to a
+    # caller as a raw KeyError/AttributeError. Closes the last untested shape
+    # from the deleted client-layer parametrisation (None, [], {}, {"other": 1}).
+    import bn.transport as transport
+
+    instance = _make_instance(tmp_path)
+    fake_socket = _fake_socket_returning(b"{}")
+    monkeypatch.setattr(transport.socket, "socket", lambda *a, **k: fake_socket())
+
+    with pytest.raises(BridgeError):
+        transport._send_request_to_instance(instance, "ping", timeout=5.0)
+
+
+def test_send_request_non_utf8_reply_raises_bridge_error(tmp_path, monkeypatch):
+    # #601: a non-UTF-8 byte stream used to raise a bare UnicodeDecodeError,
+    # an exception type no caller handles. It must surface as BridgeError.
+    import bn.transport as transport
+
+    instance = _make_instance(tmp_path)
+    fake_socket = _fake_socket_returning(b"\xff\xfe\x00not valid utf-8")
+    monkeypatch.setattr(transport.socket, "socket", lambda *a, **k: fake_socket())
+
+    with pytest.raises(BridgeError, match="non-UTF-8"):
+        transport._send_request_to_instance(instance, "ping", timeout=5.0)
+
+
+def test_send_request_invalid_json_valid_utf8_raises_invalid_json_message(tmp_path, monkeypatch):
+    # #601: invalid JSON that IS valid UTF-8 must raise the invalid-JSON
+    # message, not the non-UTF-8 message -- proves the split except clauses
+    # (transport.py) attribute the failure to the right cause.
+    import bn.transport as transport
+
+    instance = _make_instance(tmp_path)
+    fake_socket = _fake_socket_returning(b"{not valid json")
+    monkeypatch.setattr(transport.socket, "socket", lambda *a, **k: fake_socket())
+
+    with pytest.raises(BridgeError, match="invalid JSON") as excinfo:
+        transport._send_request_to_instance(instance, "ping", timeout=5.0)
+    assert "non-UTF-8" not in str(excinfo.value)
+    assert isinstance(excinfo.value.__cause__, json.JSONDecodeError)
+
+
+def test_send_request_multi_chunk_utf8_reply_reassembles(tmp_path, monkeypatch):
+    # #601: a well-formed reply split across multiple recv() calls must still
+    # decode and parse correctly -- the encoding/parse split (#601 fix) must
+    # not break chunk reassembly for the success path.
+    import bn.transport as transport
+
+    instance = _make_instance(tmp_path)
+
+    class _FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, path):
+            pass
+
+        def sendall(self, payload):
+            self.payload = payload
+
+        def shutdown(self, how):
+            pass
+
+        def recv(self, size):
+            if not hasattr(self, "_body"):
+                request = json.loads(self.payload.decode("utf-8"))
+                self._body = json.dumps(
+                    {"ok": True, "bridge_identity": request["_bridge_identity"],
+                     "result": {"pong": True}}
+                ).encode("utf-8")
+                self._sent = 0
+            if self._sent >= len(self._body):
+                return b""
+            half = len(self._body) // 2 or 1
+            chunk = self._body[self._sent:self._sent + half]
+            self._sent += len(chunk)
+            return chunk
+
+    monkeypatch.setattr(transport.socket, "socket", lambda *a, **k: _FakeSocket())
+
+    response = transport._send_request_to_instance(instance, "ping", timeout=5.0)
+    assert response["result"]["pong"] is True
+
+
 def test_send_request_reports_timeout_waiting_for_response(tmp_path, monkeypatch):
     from bn.transport import BridgeError, BridgeInstance
 

@@ -38,17 +38,6 @@ def test_request_forwards_binding_timeout_and_copies_params(monkeypatch):
     ]
 
 
-@pytest.mark.parametrize("reply", [None, [], {}, {"other": 1}])
-def test_request_rejects_malformed_reply(monkeypatch, reply):
-    monkeypatch.setattr(client_module, "send_request", lambda *args, **kwargs: reply)
-
-    with pytest.raises(
-        BridgeError,
-        match=r"malformed bridge reply \(no result\); the bridge may be stale -- restart it and retry",
-    ):
-        Client().request("target_info")
-
-
 def test_collect_aggregates_pages_and_preserves_first_page_metadata(monkeypatch):
     calls: list[dict[str, Any]] = []
     pages = iter(
