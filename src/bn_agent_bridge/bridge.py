@@ -16,7 +16,6 @@ import tempfile
 import threading
 import time
 import uuid
-import weakref
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -318,17 +317,37 @@ def _active_binary_view():
     return None
 
 
-def _collect_open_views() -> list[Any]:
+class _OpenViewEnumerationError(RuntimeError):
+    """Raised by ``_collect_open_views(strict=True)`` when a per-tab/context UI
+    query failed mid-walk, making the returned view count unreliable.
+
+    ``_collect_open_views()`` swallows per-tab exceptions so a single flaky
+    tab never breaks ``target list``. But a destructive decision gated on
+    "how many views are open" (the bare-close sole-target ``== 1`` gate,
+    ``close --all``/path close) must not silently treat a lossy undercount as
+    ground truth -- a transient enumeration failure could hide a second open
+    tab and let a bare close destroy the one tab it could see (#613 hardening,
+    carried from #691)."""
+
+
+def _collect_open_views(*, strict: bool = False) -> list[Any]:
     if ui is None:
         with _headless_views_lock:
             return list(_headless_views)
 
     def collect():
         found: list[Any] = []
+        incomplete = False
+
+        def note_incomplete():
+            nonlocal incomplete
+            incomplete = True
+
         try:
             contexts = list(ui.UIContext.allContexts())
         except Exception:
             contexts = []
+            note_incomplete()
         if not contexts:
             active_context = ui.UIContext.activeContext()
             if active_context is not None:
@@ -347,22 +366,23 @@ def _collect_open_views() -> list[Any]:
             try:
                 collect_from_frame(context.getViewFrameForTab(tab))
             except Exception:
-                pass
+                note_incomplete()
             try:
                 view = context.getViewForTab(tab)
                 collect_binary_view(view.getData() if view is not None else None)
             except Exception:
-                pass
+                note_incomplete()
 
         for context in contexts:
             try:
                 collect_from_frame(context.getCurrentViewFrame())
             except Exception:
-                pass
+                note_incomplete()
             try:
                 tabs = list(context.getTabs())
             except Exception:
                 tabs = []
+                note_incomplete()
             for tab in tabs:
                 collect_from_tab(context, tab)
 
@@ -373,9 +393,16 @@ def _collect_open_views() -> list[Any]:
             if marker not in seen:
                 seen.add(marker)
                 unique.append(bv)
-        return unique
+        return unique, incomplete
 
-    views = _run_on_main_thread(collect)
+    views, incomplete = _run_on_main_thread(collect)
+    if incomplete and strict:
+        raise _OpenViewEnumerationError(
+            "Unable to enumerate every open BinaryView tab: a UI query raised "
+            "mid-walk, so the open-view count cannot be trusted for a "
+            "destructive close. Retry, or close an explicit target selector "
+            "or path instead of a bare or --all close."
+        )
     # `bn load` against a GUI bridge appends to _headless_views, but the UI
     # enumeration above only walks UI tabs/contexts -- so a headless-loaded view
     # would be invisible to `target list` and unselectable despite a successful
@@ -399,7 +426,7 @@ def _path_components(path: str) -> tuple[str, ...]:
 @dataclass(slots=True)
 class TargetRecord:
     view_id: str
-    ref: weakref.ReferenceType
+    view: Any
     session_id: str
     filename: str
     basename: str
@@ -413,10 +440,19 @@ class TargetManager:
     def __init__(self):
         self._lock = threading.RLock()
         self._records: dict[str, TargetRecord] = {}
-        # id(bv) -> (weakref to that exact bv, stable view_id). The weakref is
-        # validated on lookup because CPython recycles addresses: a new view can
-        # otherwise inherit a dead view's stable view_id.
-        self._ids_by_object: dict[int, tuple[weakref.ref, str]] = {}
+        # bv -> stable view_id, keyed by the view OBJECT itself rather than
+        # id(bv) or a weakref to it (#586). BN only interns a BinaryView
+        # wrapper for the scripting console's *current* view (the sole
+        # _cache_insert call site); every other open tab's
+        # frame.getCurrentBinaryView() can return a brand-new Python wrapper
+        # object on every walk. Two such wrappers for the same core handle
+        # still compare equal and hash equal (BN's __eq__/__hash__ are
+        # handle-address based), so dict lookup finds the existing view_id
+        # regardless of which wrapper instance asks -- and the dict itself
+        # holds a strong reference to whichever wrapper became the key, so a
+        # transient collecting call's local list going out of scope can no
+        # longer make resolve() see a dead reference.
+        self._ids_by_object: dict[Any, str] = {}
         self._next_id = 1
         # Stable view_ids of views with a committed-but-unsaved mutation. BN's
         # bv.file.modified does NOT flip True after our verified rename/comment/
@@ -426,12 +462,7 @@ class TargetManager:
         self._dirty_view_ids: set[str] = set()
 
     def _stable_view_id(self, bv) -> str | None:
-        entry = self._ids_by_object.get(id(bv))
-        if entry is not None:
-            ref, vid = entry
-            if ref() is bv:
-                return vid
-        return None
+        return self._ids_by_object.get(bv)
 
     def mark_dirty(self, bv) -> None:
         """Record that *bv* has a committed mutation not yet written to a .bndb."""
@@ -559,44 +590,36 @@ class TargetManager:
             return active
 
         with self._lock:
-            live_views = [record.ref() for record in self._records.values()]
-        live_views = [view for view in live_views if view is not None]
+            live_views = [record.view for record in self._records.values()]
         if len(live_views) == 1:
             return live_views[0]
         return None
 
-    def refresh(self) -> list[dict[str, Any]]:
-        views = _collect_open_views()
+    def refresh(self, *, strict: bool = False) -> list[dict[str, Any]]:
+        views = _collect_open_views(strict=strict)
         focused = _active_binary_view()
 
         with self._lock:
-            # Prune entries whose referent is gone so the map cannot grow
-            # without bound across many load/close cycles.
+            # Prune entries for views that are no longer open -- by BN's own
+            # handle-based equality, not id() -- so a closed/stale handle
+            # cannot pin a stable view_id (or the wrapper object it is keyed
+            # on) forever across many load/close cycles (#586).
+            current = set(views)
             self._ids_by_object = {
-                key: (ref, vid)
-                for key, (ref, vid) in self._ids_by_object.items()
-                if ref() is not None
+                key: vid for key, vid in self._ids_by_object.items() if key in current
             }
             alive: dict[str, TargetRecord] = {}
             for bv in views:
-                key = id(bv)
-                view_id = None
-                entry = self._ids_by_object.get(key)
-                if entry is not None:
-                    ref, candidate = entry
-                    # Only reuse the id if the stored ref still points at this
-                    # exact object; id() values get recycled by CPython.
-                    if ref() is bv:
-                        view_id = candidate
+                view_id = self._ids_by_object.get(bv)
                 if view_id is None:
                     view_id = str(self._next_id)
                     self._next_id += 1
-                    self._ids_by_object[key] = (weakref.ref(bv), view_id)
+                    self._ids_by_object[bv] = view_id
 
                 try:
                     session_id = str(bv.file.session_id)
                 except Exception:
-                    session_id = str(key)
+                    session_id = str(id(bv))
                 try:
                     filename = str(getattr(bv.file, "filename", "")) if bv.file else ""
                 except Exception:
@@ -604,7 +627,7 @@ class TargetManager:
 
                 alive[view_id] = TargetRecord(
                     view_id=view_id,
-                    ref=weakref.ref(bv),
+                    view=bv,
                     session_id=session_id,
                     filename=filename,
                     basename=os.path.basename(filename) if filename else "",
@@ -614,15 +637,13 @@ class TargetManager:
             self._records = alive
             active = focused
             if active is None and len(self._records) == 1:
-                active = next(iter(self._records.values())).ref()
+                active = next(iter(self._records.values())).view
             selectors = self._compute_selectors(self._records)
 
             result = []
             for view_id in sorted(self._records, key=lambda item: int(item)):
                 record = self._records[view_id]
-                view = record.ref()
-                if view is None:
-                    continue
+                view = record.view
                 result.append(
                     {
                         "target_id": record.target_id(),
@@ -665,10 +686,7 @@ class TargetManager:
             for record in self._records.values():
                 if not self._matches_record(record, selector):
                     continue
-                view = record.ref()
-                if view is None:
-                    continue
-                matches.append((record, view))
+                matches.append((record, record.view))
 
         if not matches:
             raise RuntimeError(_format_unknown_target_error(selector, targets))
@@ -1897,36 +1915,51 @@ class BinaryNinjaBridge:
             self._write_registry()
             return {"closed": closed}
 
+        # #613: path/--all close over the FULL open-view set (GUI tabs plus
+        # any _headless_views), not _headless_views alone. GUI-opened tabs are
+        # visible to `target list` and closeable via `close -t`, but a pure-GUI
+        # session left `_headless_views` empty, so the old guard below fired
+        # before any path/all-close ever saw a GUI tab. Snapshot OUTSIDE
+        # _headless_views_lock: _collect_open_views() itself takes that lock to
+        # merge in tracked headless views, and it is non-reentrant (#80/#86);
+        # strict=True refuses instead of silently closing off a lossy tab
+        # count if a per-tab UI query raised mid-walk (#613 hardening,
+        # carried from #691).
+        views = list(_collect_open_views(strict=True))
+        if not views:
+            raise RuntimeError("No binaries are currently loaded")
+
+        if all_:
+            to_close = views
+        else:
+            resolved = str(Path(path).expanduser().resolve())
+            to_close = []
+            for bv in views:
+                filename = str(getattr(bv.file, "filename", ""))
+                if filename == resolved or str(Path(filename).resolve()) == resolved:
+                    to_close.append(bv)
+
+            if not to_close:
+                raise RuntimeError(f"No loaded binary matches path: {path}")
+
+        # Close on the main thread OUTSIDE any lock (#658): a blocking
+        # cross-thread round trip -- like the _headless_views_lock-held one
+        # this replaces -- must never run while that lock is held, or a
+        # same-thread re-acquire (via _collect_open_views()/_write_registry())
+        # deadlocks (#80/#86).
+        closed = []
+        for bv in to_close:
+            closed.append(_snapshot(bv))
+            _run_on_main_thread(lambda v=bv: v.file.close())
+            self.targets.forget(bv)
+
+        # Prune closed views out of _headless_views as a side effect (#613):
+        # the snapshot above can hold headless-tracked views, GUI-only views,
+        # or a mix of both -- never assume all-close means only headless
+        # views existed. The lock here only mutates a list, no blocking call.
+        closed_ids = {id(bv) for bv in to_close}
         with _headless_views_lock:
-            if not _headless_views:
-                raise RuntimeError("No binaries are currently loaded")
-
-            # all=true closes everything (a bare request never reaches here:
-            # it resolved to a single target above or raised, #664)
-            if all_:
-                closed = []
-                for bv in _headless_views:
-                    closed.append(_snapshot(bv))
-                    _run_on_main_thread(lambda v=bv: v.file.close())
-                    self.targets.forget(bv)
-                _headless_views.clear()
-            else:
-                resolved = str(Path(path).expanduser().resolve())
-                to_remove = []
-                for i, bv in enumerate(_headless_views):
-                    filename = str(getattr(bv.file, "filename", ""))
-                    if filename == resolved or str(Path(filename).resolve()) == resolved:
-                        to_remove.append(i)
-
-                if not to_remove:
-                    raise RuntimeError(f"No loaded binary matches path: {path}")
-
-                closed = []
-                for i in reversed(to_remove):
-                    bv = _headless_views.pop(i)
-                    closed.append(_snapshot(bv))
-                    _run_on_main_thread(lambda v=bv: v.file.close())
-                    self.targets.forget(bv)
+            _headless_views[:] = [v for v in _headless_views if id(v) not in closed_ids]
 
         # Single post-lock registry refresh + return for both the --all and the
         # by-path close paths (must be OUTSIDE the lock; see the note above) (#80).
@@ -1941,8 +1974,15 @@ class BinaryNinjaBridge:
         more than one target open the request is ambiguous and a destructive
         close must not pick one. With exactly one open, the view is taken
         straight from the same ``refresh()`` snapshot the ==1 decision used
-        (a record lookup by ``view_id``, not a second resolver pass)."""
-        targets = self.targets.refresh()
+        (a record lookup by ``view_id``, not a second resolver pass).
+
+        ``strict=True`` (#613 hardening, carried from #691): ``refresh()`` /
+        ``_collect_open_views()`` swallow per-tab UI exceptions so a single
+        flaky tab never breaks `target list`, but that means the count this
+        ==1 gate decides on can be silently lossy -- a transient enumeration
+        failure could hide a second open tab and let a bare close destroy the
+        one tab it could see. Refuse loudly instead of trusting that count."""
+        targets = self.targets.refresh(strict=True)
         if not targets:
             raise RuntimeError("No BinaryView targets are open")
         if len(targets) > 1:
@@ -1961,7 +2001,7 @@ class BinaryNinjaBridge:
         manager = self.targets
         with manager._lock:
             record = manager._records.get(row["view_id"])
-            view = record.ref() if record is not None else None
+            view = record.view if record is not None else None
         if view is None:
             # The sole view died between the snapshot and the lookup (GUI tab
             # closed / GC). Say so -- an unknown-selector error listing that
