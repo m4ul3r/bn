@@ -662,13 +662,13 @@ def test_render_trace_text_empty_trace_still_renders_caveats():
     value = {
         "function": "f", "function_address": "0x1000", "target_address": "0x1010",
         "arg_index": 0, "arg_label": {}, "trace": [],
-        "assumptions": ["interprocedural crossing stopped at the --ip-depth cap; "
-                        "the slice may be incomplete beyond that boundary -- "
-                        "raise --ip-depth to continue"],
+        "assumptions": ["crossing was not attempted at one or more call boundaries "
+                        "because the --ip-depth budget was spent before reaching "
+                        "them; the slice may be incomplete beyond those boundaries"],
     }
     out = _render_trace_text(value)
     assert "caveats (1):" in out
-    assert "--ip-depth cap" in out
+    assert "--ip-depth budget was spent" in out
 
 
 def test_render_trace_text_omits_caveats_when_assumptions_empty():

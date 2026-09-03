@@ -1720,6 +1720,11 @@ def test_backward_slice_out_param_caveat_requires_call_before_read(monkeypatch):
 
     assert result["trace"][-1]["reason"] != "interprocedural_out_param_not_followed"
 
+    # #672 (round-3 follow-up): the ordering guard is load-bearing in intra
+    # mode too, since it now also gates `out_param_not_followed`.
+    intra_result = instance._backward_slice("active", "caller", "0x2030", arg_index=0)
+    assert intra_result["trace"][-1]["reason"] != "out_param_not_followed"
+
 
 def test_backward_slice_out_param_caveat_fires_in_intra_mode(monkeypatch):
     """#672: WITHOUT --interprocedural, the out-param caveat still fires -- the
@@ -1730,7 +1735,7 @@ def test_backward_slice_out_param_caveat_fires_in_intra_mode(monkeypatch):
     `test_backward_slice_assumptions_nonempty_for_unfollowed_out_param`
     (test_read_taint_slice.py), which only drives the `def_insn is None`
     branch; `_out_param_fixture` is the only fixture that exercises the
-    rewritten LOAD branch (read_taint_slice.py:877-895) end-to-end."""
+    rewritten LOAD branch (read_taint_slice.py:894-910) end-to-end."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     fn = _out_param_fixture()

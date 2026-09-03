@@ -716,6 +716,8 @@ def _arg_label(ctx, bv, call_insn, arg_index: int, caller_func) -> dict[str, Any
         pass
     return label
 
+_MAX_CALL_DEPTH = 10  # hard interprocedural recursion ceiling, independent of --ip-depth
+
 
 def _build_backward_trace(
     ctx,
@@ -732,8 +734,6 @@ def _build_backward_trace(
     seed_addr: int | None = None,
 ) -> list[dict[str, Any]]:
     """Recursively walk SSA use-def chains backward, optionally crossing call boundaries."""
-    if _call_depth > 10:
-        return []  # Safety: prevent runaway recursion
     trace: list[dict[str, Any]] = []
     # #416/#672: locals whose address is passed into a call, computed once
     # per function (not per terminus). Used in both intra and interprocedural
@@ -768,6 +768,19 @@ def _build_backward_trace(
             def_insn = ssa_func.get_ssa_var_definition(ssa_var)
         except AttributeError:
             if interprocedural:
+                # This callee's SSA form doesn't support the query (rare: the
+                # crossing guard already requires `hasattr(...,
+                # "get_ssa_var_definition")` before recursing here). Record a
+                # terminal step rather than vanishing, so an empty
+                # `assumptions` list still means "complete within the
+                # requested mode and budgets" (see `_trace_assumptions`).
+                trace.append({
+                    "ssa_var": str(ssa_var),
+                    "ssa_label": _ssa_label(ssa_var),
+                    "depth": depth,
+                    "terminates": True,
+                    "reason": "ssa_definition_unavailable",
+                })
                 continue
             raise OperationFailure(
                 "no_ssa_trace",
@@ -811,7 +824,7 @@ def _build_backward_trace(
 
         def_op = entry["operation"]
         if "CALL" in def_op or "JUMP" in def_op:
-            if interprocedural and ip_depth > 0 and _call_depth < 10:
+            if interprocedural and ip_depth > 0 and _call_depth < _MAX_CALL_DEPTH:
                 callee = _resolve_callee(ctx, bv, def_insn)
                 if callee is not None:
                     callee_mlil = getattr(callee, "medium_level_il", None)
@@ -848,7 +861,7 @@ def _build_backward_trace(
             entry["reason"] = "call_or_jump_boundary"
             if interprocedural and ip_depth <= 0:
                 entry["ip_depth_exhausted"] = True
-            elif interprocedural and _call_depth >= 10:
+            elif interprocedural and _call_depth >= _MAX_CALL_DEPTH:
                 entry["call_depth_exhausted"] = True
             # Resolve the call target to its symbol so a library-call origin reads
             # as e.g. `call strlen` rather than a bare PLT address (#193).
@@ -921,6 +934,9 @@ def _build_backward_trace(
 
 # Compact per-example fields carried into a frontier roll-up (#552). Kept to the
 # machine-consumable subset already present on a terminal step -- never recomputed.
+# Deliberately omits ip_depth_exhausted/call_depth_exhausted: those are
+# top-level cap markers surfaced only via `_trace_assumptions`, not per-step
+# fields, so a capped boundary and a genuinely terminal one look identical here.
 _FRONTIER_EXAMPLE_KEYS = (
     "ssa_label", "address", "depth", "callee", "out_param_callee",
     "base", "offset", "width", "function_context",
@@ -957,9 +973,11 @@ def _trace_assumptions(trace: list[dict[str, Any]], *, truncated: bool, max_dept
     ``assumptions`` key already emitted by ``taint forward``/``taint
     backward`` (see ``_render_taint_text``'s ``caveats`` block). Non-empty
     ONLY when the slice is provably incomplete -- an empty list is a
-    positive claim of completeness, so every entry here must come from a
-    stopping condition already recorded on the trace/return dict, never a
-    guess."""
+    positive claim of completeness WITHIN THE REQUESTED MODE AND BUDGETS,
+    not an unconditional one (intra-mode ``call_or_jump_boundary`` steps are
+    deliberately left unmarked: crossing was never attempted, so there is
+    nothing to flag as capped). Every entry here must come from a stopping
+    condition already recorded on the trace/return dict, never a guess."""
     assumptions: list[str] = []
     if truncated:
         assumptions.append(
@@ -977,14 +995,22 @@ def _trace_assumptions(trace: list[dict[str, Any]], *, truncated: bool, max_dept
             break
     if any(isinstance(step, dict) and step.get("ip_depth_exhausted") for step in trace):
         assumptions.append(
-            "interprocedural crossing stopped at the --ip-depth cap; the "
-            "slice may be incomplete beyond that boundary -- raise --ip-depth to continue"
+            "crossing was not attempted at one or more call boundaries because "
+            "the --ip-depth budget was spent before reaching them; the slice "
+            "may be incomplete beyond those boundaries"
         )
     if any(isinstance(step, dict) and step.get("call_depth_exhausted") for step in trace):
         assumptions.append(
             "interprocedural crossing stopped at the internal recursion-depth "
             "safety limit (not adjustable via --ip-depth); the slice may be "
             "incomplete beyond that boundary"
+        )
+    if any(isinstance(step, dict) and step.get("reason") == "ssa_definition_unavailable"
+           for step in trace):
+        assumptions.append(
+            "a value's SSA definition could not be queried on one or more "
+            "steps (the SSA form does not support the lookup there); the "
+            "slice stops at that value without full provenance"
         )
     return assumptions
 
@@ -1331,11 +1357,12 @@ def _backward_slice(
     # misleading "constant or immediate -- no SSA trace" (#166).
     if param_expr is not None and not initial_vars and _is_address_of(param_expr):
         callee_nm = arg_label.get("callee") or "the callee"
+        callee_ref = arg_label.get("callee") or "<callee>"
         hints.append(
             f"arg {arg_index} is a pointer (address-of); this traces where the "
             f"pointer came from, not the data written through it. To follow data "
             f"{callee_nm} writes into the pointee, run a forward taint from the "
-            f"call site (e.g. `taint forward --source call:<callee>`) or trace the "
+            f"call site (e.g. `taint forward --source call:{callee_ref}`) or trace the "
             f"buffer's later consumers."
         )
     elif param_expr is not None and not initial_vars:

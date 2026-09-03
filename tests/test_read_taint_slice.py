@@ -514,7 +514,7 @@ def test_backward_slice_assumptions_nonempty_when_ip_depth_exhausted(monkeypatch
     assert entry["ip_depth_exhausted"] is True
     assert "call_depth_exhausted" not in entry
     assert len(result["assumptions"]) == 1
-    assert "--ip-depth cap" in result["assumptions"][0]
+    assert "--ip-depth budget was spent" in result["assumptions"][0]
     assert result["frontiers"] == [
         {"reason": "call_or_jump_boundary", "count": 1,
          "examples": [{"ssa_label": "r0#3", "address": "0x1000c", "depth": 0,
@@ -523,11 +523,11 @@ def test_backward_slice_assumptions_nonempty_when_ip_depth_exhausted(monkeypatch
 
 
 def test_build_backward_trace_call_depth_guard_marks_boundary_not_dangling_cross_function(monkeypatch):
-    # #671 (round-2): the hard `_call_depth > 10` recursion backstop must not
-    # leave a dangling non-terminal `cross_function` step with empty
-    # `frontiers`/`assumptions` (R2 finding A2) -- the crossing guard now
-    # requires `_call_depth < 10` as a PRE-condition, so the boundary itself
-    # is marked `call_depth_exhausted` instead.
+    # #671 (round-2): the recursion-depth guard must not leave a dangling
+    # non-terminal `cross_function` step with empty `frontiers`/`assumptions`
+    # (R2 finding A2) -- the crossing guard requires `_call_depth <
+    # _MAX_CALL_DEPTH` as a PRE-condition, so the boundary itself is marked
+    # `call_depth_exhausted` instead.
     from _bridge_fakes import (
         _FakeBV, _FakeConstPtr, _FakeFunction, _FakeMLILFunction, _FakeMLILInsn,
         _FakeSSAVariable,
@@ -576,6 +576,34 @@ def test_build_backward_trace_call_depth_guard_marks_boundary_not_dangling_cross
         "safety limit (not adjustable via --ip-depth); the slice may be "
         "incomplete beyond that boundary"
     ]
+
+
+def test_build_backward_trace_records_step_for_unsupported_ssa_form(monkeypatch):
+    # Round-3 follow-up: an `AttributeError` from `get_ssa_var_definition` (a
+    # callee SSA form that doesn't support the query) must not vanish as a
+    # silent `continue` in interprocedural mode -- the last remaining silent
+    # stop. It is now recorded as a terminal step with a distinct reason and
+    # surfaced in `assumptions`, so an empty `assumptions` list still means
+    # "complete within the requested mode and budgets".
+    from _bridge_fakes import _FakeSSAVariable
+    rts = _load_bridge(monkeypatch).read_taint_slice
+
+    class _RaisingSSAFunc:
+        def get_ssa_var_definition(self, ssa_var):
+            raise AttributeError("get_ssa_var_definition unsupported for this SSA form")
+
+    ssa_var = _FakeSSAVariable("v#1")
+    trace = rts._build_backward_trace(
+        ctx=None, bv=None, ssa_func=_RaisingSSAFunc(), initial_vars=[ssa_var], max_depth=50,
+        interprocedural=True, seed_addr=0x20)
+
+    assert len(trace) == 1
+    entry = trace[0]
+    assert entry["terminates"] is True
+    assert entry["reason"] == "ssa_definition_unavailable"
+    assumptions = rts._trace_assumptions(trace, truncated=False, max_depth=50)
+    assert len(assumptions) == 1
+    assert "ssa_definition_unavailable" not in assumptions[0]  # human prose, not the raw code
 
 
 def test_output_pointer_hint_names_callee_not_param_name(monkeypatch):
