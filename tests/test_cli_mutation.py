@@ -96,6 +96,47 @@ def test_mutation_summary_surfaces_top_level_message_error():
     assert out["first_error"] == "revert failed: database is read-only"
 
 
+def test_mutation_summary_flags_empty_results_as_unmeasured_not_zero():
+    # #684: an op that reports through its OWN counters instead of `results[]`
+    # and forgets to register a `summary_transform` reaches the GENERIC summary
+    # with an empty `results[]` on an otherwise-successful envelope. Rendering
+    # that as `changed=0 verified=0 noop=0 failed=0 dirty_after=False` reads as
+    # a CONFIRMED no-op to an agent, which closes without saving and silently
+    # discards whatever the op actually did (the #683 `go_rename` regression).
+    # The generic summary must flag this as unmeasured instead of asserting a
+    # zero-change measurement it never actually took.
+    from bn.formatters import _mutation_summary, _render_mutation_summary_text
+    out = _mutation_summary({"success": True, "committed": True, "results": []})
+    assert out["measured"] is False
+    assert out["dirty_after"] is None          # unknown, NOT a confirmed False
+    assert out["changed_count"] == 0 and out["op_count"] == 0
+    text = _render_mutation_summary_text(out)
+    assert "dirty_after=None" in text
+    assert "unmeasured" in text.lower()
+
+    # A genuine zero-change result (a real `noop` STATUS ROW inside a non-empty
+    # `results[]`) must stay measured and distinct from the unmeasured case above
+    # -- the whole point is telling "verified nothing changed" apart from "we
+    # never actually counted."
+    genuine_noop = _mutation_summary({"success": True, "committed": True,
+                                      "rolled_back": False,
+                                      "results": [{"status": "noop"}]})
+    assert genuine_noop["measured"] is True
+    assert genuine_noop["dirty_after"] is False
+    noop_text = _render_mutation_summary_text(genuine_noop)
+    assert "unmeasured" not in noop_text.lower()
+
+
+def test_mutation_summary_unmeasured_flag_covers_failure_envelopes_too():
+    # The same empty-results ambiguity applies on the failure side: a bespoke op
+    # that claims failure without ever populating `results[]` must not have its
+    # dirty_after silently resolve to a confident False either.
+    from bn.formatters import _mutation_summary
+    out = _mutation_summary({"success": False, "committed": False, "results": []})
+    assert out["measured"] is False
+    assert out["dirty_after"] is None
+
+
 def test_go_rename_summary_emits_compact_status(fake_transport, capsys):
     # #408 review: go rename is a bulk mutation, so --summary is accepted and emits
     # the same compact status object as the single-op mutations.

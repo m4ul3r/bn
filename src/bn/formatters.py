@@ -3384,6 +3384,21 @@ def _mutation_summary(value: Any) -> Any:
         first_error = value.get("message") or first_error or (
             "prototype has_user_type override could not be cleared"
         )
+    # #684: every genuine `mutation_engine` op populates at least one
+    # `results[]` row per requested operation -- `_mutation()` refuses an
+    # empty operation list outright, so an op that reaches this GENERIC
+    # summary (no registered `summary_transform`) with an EMPTY `results[]`
+    # is never reporting a real zero-change measurement. It means the op
+    # reports through its OWN counters instead (the shape `_go_rename_summary`
+    # exists to handle) and forgot to register that escape hatch. Rendering
+    # that as `changed=0 ... dirty_after=False` reads as "confirmed no-op" to
+    # an agent, which then closes without saving and silently discards real
+    # work -- the exact failure #683 shipped for `go_rename`. Flag it as
+    # UNMEASURED instead of asserting a zero count and a clean `dirty_after`
+    # that was never actually observed. A genuine zero-change result (e.g. a
+    # rename that matched the current name already) still comes through as a
+    # `noop` STATUS ROW inside `results[]` -- it stays measured and distinct.
+    unmeasured = not results
     summary = {
         "kind": "mutation_summary",
         # Top-level `ok` mirrors the read-command envelope so a uniform `jq '.ok'`
@@ -3393,6 +3408,9 @@ def _mutation_summary(value: Any) -> Any:
         "success": success,
         "committed": committed,
         "preview": bool(value.get("preview", False)),
+        # False when `results[]` came back empty on an op that was expected to
+        # populate it -- the counts/dirty_after below are UNKNOWN, not zero (#684).
+        "measured": not unmeasured,
         "op_count": len(results),
         "changed_count": verified,        # ops that actually changed + verified
         "verified_count": verified,
@@ -3413,9 +3431,14 @@ def _mutation_summary(value: Any) -> Any:
         # absent. Since `committed` is `(not preview) and (not failed)`, the key
         # is meaningful exactly when `committed` is False -- gating on it is what
         # keeps an all-noop commit (which reverts nothing) from reading dirty.
-        "dirty_after": ((committed and verified > 0)
-                        or (rolled_back is False and not committed)
-                        or proto_residue),
+        #
+        # UNMEASURED overrides all of the above to None: with no results[] rows
+        # to derive it from, we did not observe whether the view is dirty (#684).
+        "dirty_after": (None if unmeasured else (
+            (committed and verified > 0)
+            or (rolled_back is False and not committed)
+            or proto_residue
+        )),
     }
     if proto_residue:
         summary["prototype_user_type_residue"] = True
@@ -3484,6 +3507,9 @@ def _go_rename_summary(value: Any) -> Any:
         "success": success,
         "committed": committed,
         "preview": preview,
+        # go_rename measures through its own counters by design (this whole
+        # function is that escape hatch) -- always measured, never #684-flagged.
+        "measured": True,
         # NOT disjoint sets: the wire `skipped_user_named` FOLDS apply-time
         # "changed underneath us" skips in (bridge: skipped_total =
         # skipped_user_named + skipped_during_apply) while those same rows stay
@@ -3524,6 +3550,15 @@ def _render_mutation_summary_text(value: Any) -> str:
         f"dirty_after={value.get('dirty_after')}",
     ]
     line = "  ".join(parts)
+    if value.get("measured") is False:
+        # #684: an op reported no `results[]` rows to derive the counts above
+        # from -- they (and dirty_after) are UNKNOWN, not a confirmed
+        # zero-change. Say so explicitly instead of letting the all-zero line
+        # above read as "nothing happened."
+        line += ("\nwarning: unmeasured -- this op reported no results[] rows; "
+                 "the counts and dirty_after above are UNKNOWN, not a confirmed "
+                 "zero-change. Rerun with --verbose/--format json to inspect the "
+                 "raw result before assuming nothing changed.")
     if value.get("first_error"):
         line += f"\nfirst_error: {value['first_error']}"
     return line
