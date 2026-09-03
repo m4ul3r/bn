@@ -3870,6 +3870,131 @@ def test_close_binary_all_dedups_multiple_wrappers_of_same_core_view(monkeypatch
     assert all(w.closed for w in wrappers)  # shared handle: closing any closes all
 
 
+def test_close_binary_all_dedups_wrappers_minted_by_the_real_gui_walk(monkeypatch, tmp_path):
+    # Companion to the test above, which monkeypatches _collect_open_views()
+    # outright and so proves only that the close loop dedups a list it is
+    # handed. This one drives the REAL walk: a fake UIContext whose three
+    # accessors (getCurrentViewFrame / getViewFrameForTab / getViewForTab) each
+    # mint a BRAND NEW wrapper for the same core handle, which is what BN does
+    # for any view the scripting console is not currently interning (#586).
+    # _collect_open_views()'s own dedup is `id(bv)` (bridge.py), so it cannot
+    # collapse them -- the close path must.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+
+    handle = types.SimpleNamespace(closed=False)
+    close_call_count = [0]
+
+    def mint():
+        """A fresh Python wrapper for the one shared core handle, every call."""
+        w = _ClosableBV("/proj/parse_header.elf", session_id="11", handle=handle)
+
+        def _close():
+            close_call_count[0] += 1
+            handle.closed = True
+
+        w.file.close = _close
+        return w
+
+    class _Frame:
+        def getCurrentBinaryView(self):
+            return mint()
+
+    class _TabView:
+        def getData(self):
+            return mint()
+
+    class _Context:
+        def getCurrentViewFrame(self):
+            return _Frame()
+
+        def getTabs(self):
+            return ["tab-0"]
+
+        def getViewFrameForTab(self, tab):
+            return _Frame()
+
+        def getViewForTab(self, tab):
+            return _TabView()
+
+    context = _Context()
+    monkeypatch.setattr(bridge, "ui", types.SimpleNamespace(
+        UIContext=types.SimpleNamespace(
+            allContexts=lambda: [context],
+            activeContext=lambda: context,
+        )
+    ))
+    bridge._headless_views.clear()
+
+    # The walk itself really does hand back one wrapper per accessor: this is
+    # the duplication the close path has to absorb, not a hypothetical.
+    raw = bridge._collect_open_views()
+    assert len(raw) == 3
+    assert len({id(v) for v in raw}) == 3   # three distinct Python objects
+    assert len(set(raw)) == 1               # one core view by handle equality
+
+    # `target list` already collapses them (records are keyed by stable id)...
+    assert len(instance.targets.refresh()) == 1
+    # ...and so must the destructive close: one round trip, one reported row.
+    result = _close_on_watchdog(instance, all_=True)
+    assert len(result["closed"]) == 1
+    assert close_call_count[0] == 1
+    assert handle.closed
+
+
+def test_close_binary_registry_failure_does_not_mask_the_close_failure(monkeypatch, tmp_path):
+    # The reconciliation above runs in `finally`, and a `finally` that raises
+    # REPLACES the in-flight exception. _write_registry() can raise on its own
+    # (mkstemp / os.replace / ensure_private_dir), so a disk problem would swap
+    # the caller's "your close failed" diagnosis for an unrelated I/O error and
+    # hide the fact that a destructive op only half-ran.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    good = _ClosableBV("/proj/alpha.so", session_id="11")
+    bad = _ClosableBV("/proj/beta.so", session_id="22")
+
+    def _boom():
+        raise RuntimeError("simulated main-thread close failure")
+
+    bad.file.close = _boom
+    _register_views(bridge, good, bad)
+    monkeypatch.setattr(
+        instance, "_write_registry",
+        lambda: (_ for _ in ()).throw(OSError("simulated registry write failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="simulated main-thread close failure"):
+        _close_on_watchdog(instance, all_=True)
+
+    # The prune still happened before the registry attempt.
+    assert good.closed and not bad.closed
+    assert bridge._headless_views == [bad]
+    bridge._headless_views.clear()
+
+
+def test_close_binary_surfaces_registry_failure_when_the_close_succeeded(monkeypatch, tmp_path):
+    # The converse of the test above: with no close failure in flight there is
+    # nothing to mask, so a registry write failure is the real result and must
+    # still reach the caller rather than being swallowed.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    only = _ClosableBV("/proj/alpha.so", session_id="11")
+    _register_views(bridge, only)
+    monkeypatch.setattr(
+        instance, "_write_registry",
+        lambda: (_ for _ in ()).throw(OSError("simulated registry write failure")),
+    )
+
+    with pytest.raises(OSError, match="simulated registry write failure"):
+        _close_on_watchdog(instance, all_=True)
+
+    assert only.closed
+    assert bridge._headless_views == []
+
+
 def test_close_binary_all_reconciles_headless_views_and_registry_on_mid_loop_failure(monkeypatch, tmp_path):
     # #613 review (minor): the _headless_views prune and _write_registry()
     # used to run strictly AFTER the close loop finished. If v.file.close()
@@ -3928,13 +4053,17 @@ def test_target_manager_forget_releases_record_without_waiting_for_refresh(monke
     assert bv not in manager._ids_by_object
 
 
-def test_close_binary_all_succeeds_when_allcontexts_fails_but_activecontext_recovers(monkeypatch, tmp_path):
-    # #613 review (minor): a raising ui.UIContext.allContexts() used to latch
-    # note_incomplete() even though the activeContext() fallback right below
-    # it fully recovers a complete context set in the normal single-window
-    # case -- so strict=True refused every bare/--all/path close on a session
-    # that enumerated perfectly. The flag must clear when the fallback
-    # actually recovers a context set.
+def test_close_binary_all_refuses_when_allcontexts_fails_even_if_activecontext_recovers(monkeypatch, tmp_path):
+    # #613 review round 2: the follow-up commit cleared `incomplete` whenever
+    # the activeContext() fallback produced a context, on the theory that the
+    # fallback "fully recovers" a single-window session. It does not: the
+    # fallback recovers *a* context -- the active main window -- and can never
+    # prove it is the ONLY one. BN holds one UIContext per main window, which
+    # is exactly why allContexts() exists. Once allContexts() raises, a second
+    # window's tabs are invisible, so `--all` would close one window's tabs and
+    # report "closed everything", and the bare-close ==1 gate would destroy the
+    # single tab it could see while several were open. A destructive close must
+    # refuse on a count it cannot trust.
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     _hermetic_registry(instance, tmp_path)
@@ -3974,10 +4103,45 @@ def test_close_binary_all_succeeds_when_allcontexts_fails_but_activecontext_reco
     monkeypatch.setattr(bridge, "ui", fake_ui)
     bridge._headless_views.clear()
 
-    result = _close_on_watchdog(instance, all_=True)
+    with pytest.raises(bridge._OpenViewEnumerationError):
+        _close_on_watchdog(instance, all_=True)
+    with pytest.raises(bridge._OpenViewEnumerationError):
+        _close_on_watchdog(instance, target=None)
+    with pytest.raises(bridge._OpenViewEnumerationError):
+        _close_on_watchdog(instance, path="/proj/alpha.so")
+    assert not view_a.closed
 
+    # The escape hatch the refusal names must actually work: `close -t` resolves
+    # by name through the NON-strict walk, so it is unaffected by the lossy
+    # count. A refusal that leaves no way to close anything would be worse than
+    # the over-closing it prevents.
+    result = _close_on_watchdog(instance, target="alpha.so")
     assert [c["path"] for c in result["closed"]] == ["/proj/alpha.so"]
     assert view_a.closed
+
+
+def test_collect_open_views_survives_activecontext_raising(monkeypatch):
+    # The activeContext() fallback used to run unguarded, so a UI query that
+    # raised there propagated a raw exception out of every read that walks the
+    # open views (`target list`, `-t` resolution, load dedup). Reads must
+    # degrade to the tracked headless views instead; only a STRICT (destructive)
+    # caller may refuse.
+    bridge = _load_bridge(monkeypatch)
+    tracked = _FakeFileBV("/proj/alpha.bndb", session_id="11")
+    _register_views(bridge, tracked)
+
+    def _boom():
+        raise RuntimeError("transient UI failure")
+
+    fake_ui = types.SimpleNamespace(
+        UIContext=types.SimpleNamespace(allContexts=lambda: [], activeContext=_boom)
+    )
+    monkeypatch.setattr(bridge, "ui", fake_ui)
+
+    assert bridge._collect_open_views() == [tracked]
+    with pytest.raises(bridge._OpenViewEnumerationError):
+        bridge._collect_open_views(strict=True)
+    bridge._headless_views.clear()
 
 
 def test_close_binary_bare_close_refuses_on_incomplete_view_enumeration(monkeypatch, tmp_path):
