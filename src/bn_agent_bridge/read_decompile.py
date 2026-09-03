@@ -127,13 +127,26 @@ def _thunk_veneer_warning(ctx, bv, func) -> str | None:
     if not summary.get("is_candidate"):
         return None
     target = summary.get("target") if isinstance(summary.get("target"), dict) else None
-    if target and (target.get("name") or target.get("address")):
-        name, addr = target.get("name"), target.get("address")
+    fn = target.get("function") if isinstance(target, dict) else None
+    if isinstance(fn, dict) and (fn.get("name") or fn.get("address")):
+        name, addr = fn.get("name"), fn.get("address")
         dest = f"{name} @ {addr}" if name and addr else (name or addr)
+        if fn.get("exact_start") is False:
+            return (f"thunk/veneer: the branch target lands inside {dest}, not at its "
+                    f"entry -- a mid-function destination is not a trampoline entry "
+                    f"point, so this is not confirmed as a PLT/GOT thunk.")
         return (f"thunk/veneer -> {dest}: this is a PLT/GOT trampoline (a jump to "
                 f"the real body), not a self-recursive function.")
-    return ("thunk/veneer: this is a PLT/GOT trampoline (a small jump stub), not a "
-            "real function body; the apparent self-call is the resolved target.")
+    # #704 round 3: no target was resolved here -- the candidate was flagged
+    # either because the function merely starts in a PLT/import section, or
+    # because BN's pseudo-C rendered a bare `/* tailcall */` with no branch
+    # destination this detector could follow. Asserting "PLT/GOT trampoline
+    # ... the apparent self-call is the resolved target" claimed a resolution
+    # the tool never made. State only the reason the candidate was flagged;
+    # make no claim about what the unresolved target actually is.
+    reason = summary.get("reason") or "no branch target could be resolved"
+    return (f"thunk/veneer: {reason}; the branch target was not resolved, so "
+            f"this may be a trampoline/veneer but that is not confirmed.")
 
 
 _COMMENT_LINE_RE = re.compile(

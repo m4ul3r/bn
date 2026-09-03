@@ -491,6 +491,74 @@ def test_render_evidence_shows_argument_confidence_and_variadic():
     assert "variadic: UNDER-RECOVERED" in out
 
 
+def test_render_evidence_function_shows_recorded_local_tailcall_target_704():
+    # #704 round 4: `_function_thunk_summary` records a resolved LOCAL branch
+    # target (`is_candidate: False`, `target` populated) so a genuine
+    # `j_`-style veneer lifted as LLIL_JUMP is not silently invisible in text
+    # output -- the target must be rendered as a plain fact, without
+    # asserting the thunk/veneer verdict the tool never established for a
+    # local destination.
+    from bn.formatters import _render_function_evidence_text
+    value = {
+        "function": {"name": "init_array_0", "address": "0x500000"},
+        "prototype": "void init_array_0()", "calling_convention": "__cdecl",
+        "thunk": {
+            "is_candidate": False, "reason": None,
+            "target": {"function": {"name": "init_helper", "address": "0x461746",
+                                     "exact_start": True}},
+        },
+        "total_calls": 0, "matched_calls": 0, "offset": 0, "limit": None,
+        "calls": [],
+    }
+    out = _render_function_evidence_text(value)
+    assert "thunk: no" in out
+    assert "candidate" not in out
+    assert "init_helper @ 0x461746" in out
+
+
+def test_render_evidence_function_notes_arity_mismatch_704():
+    # #648/#704: a call demoted via `arity_mismatch` must state the reason in
+    # text mode, not just print `arguments: (hlil inferred)` with no note.
+    from bn.formatters import _render_function_evidence_text
+    value = {
+        "function": {"name": "parse_line", "address": "0x500000"},
+        "prototype": "void parse_line()", "calling_convention": "__cdecl",
+        "thunk": {"is_candidate": False},
+        "total_calls": 1, "matched_calls": 1, "offset": 0, "limit": None,
+        "calls": [{
+            "address": "0x500010", "operation": "LLIL_CALL", "direct": True,
+            "argument_source": "hlil", "argument_confidence": "inferred",
+            "arguments": [{"text": "1"}, {"text": "2"}],
+            "argument_candidates": [],
+            "arity_unknown": False, "arity_mismatch": True, "declared_arity": 3,
+        }],
+    }
+    out = _render_function_evidence_text(value)
+    assert "arity: MISMATCH" in out
+    assert "2 argument(s)" in out and "declares 3" in out
+
+
+def test_render_evidence_function_notes_callee_unresolved_704():
+    # #648/#704: a call demoted via `callee_unresolved` (genuinely indirect,
+    # or a resolved-but-unmatched direct destination) must state the reason,
+    # even when it rendered NO arguments (so the note lives outside `if args:`).
+    from bn.formatters import _render_function_evidence_text
+    value = {
+        "function": {"name": "dispatch", "address": "0x401800"},
+        "prototype": "void dispatch()", "calling_convention": "__cdecl",
+        "thunk": {"is_candidate": False},
+        "total_calls": 1, "matched_calls": 1, "offset": 0, "limit": None,
+        "calls": [{
+            "address": "0x401800", "operation": "LLIL_CALL", "direct": False,
+            "argument_source": "hlil", "argument_confidence": "heuristic",
+            "arguments": [], "argument_candidates": [],
+            "arity_unknown": False, "indirect_call": True, "callee_unresolved": True,
+        }],
+    }
+    out = _render_function_evidence_text(value)
+    assert "arity: UNKNOWN — call target could not be resolved" in out
+
+
 def test_render_orient_shows_existing_annotations():
     # #561: the orient card surfaces inherited-annotation counts + provenance hint.
     from bn.formatters import _render_orient_text

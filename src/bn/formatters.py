@@ -1515,6 +1515,9 @@ def _render_function_evidence_text(value: Any) -> str:
         lines.append(f"thunk: candidate ({thunk.get('reason', 'no reason recorded')})")
         if thunk.get("target"):
             lines.append(f"  target: {_render_target_line(thunk['target'])}")
+    elif thunk.get("target"):
+        lines.append("thunk: no (tail branch to a local function, not a trampoline)")
+        lines.append(f"  tail branch -> {_render_target_line(thunk['target'])}")
     else:
         lines.append("thunk: no")
 
@@ -1579,6 +1582,32 @@ def _render_function_evidence_text(value: Any) -> str:
                 if call.get("abi_register_saturated"):
                     note += "; the count saturates the ABI argument registers"
                 lines.append(note + ". Confirm with `bn proto get <callee>` / `proto set`.")
+            if call.get("arity_mismatch"):
+                # #648/#704: a resolved, non-variadic callee's recovered prototype
+                # declares a DIFFERENT argument count than the canonical list rendered
+                # (extra OR missing). `_argument_arity_evidence` only sets this flag
+                # when `argument_source == "hlil"` (#704 round-3), but name the layer
+                # from `source` rather than hard-coding "HLIL" so this note can never
+                # attribute the list to a layer that did not actually produce it.
+                declared = call.get("declared_arity")
+                layer = source.upper() if source else "the rendered list"
+                if isinstance(declared, int):
+                    note = (f"  arity: MISMATCH — {layer} rendered {len(args)} argument(s) but "
+                            f"the callee's recovered prototype declares {declared}")
+                else:
+                    note = (f"  arity: MISMATCH — {layer} rendered a different argument count "
+                            "than the callee's recovered prototype declares")
+                lines.append(note + "; the canonical list is not the declared signature. "
+                             "Confirm with `bn proto get <callee>` / `proto set`.")
+        if call.get("callee_unresolved") and not call.get("arity_unknown"):
+            # #648/#704: the call's destination could not be matched to any callee
+            # function at all (genuinely indirect, or a resolved-but-unmatched
+            # direct destination) -- no signature exists to check arguments
+            # against, so `argument_confidence` was demoted regardless of source.
+            lines.append(
+                "  arity: UNKNOWN — call target could not be resolved to a callee "
+                "function, so no signature exists to check arguments against."
+            )
         variadic = call.get("variadic")
         if isinstance(variadic, dict) and variadic.get("is_variadic"):
             # #558: surface variadic under-recovery / recovered format string.
