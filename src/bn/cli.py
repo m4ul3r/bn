@@ -321,6 +321,42 @@ def _resolve_out_path(value: str) -> Path:
     return path if path.is_absolute() else Path.cwd() / path
 
 
+# Destinations that name a per-process view of the filesystem: they resolve
+# against whichever process calls open(), so only THIS process may write them.
+# `/dev/{stdout,stderr,stdin}` and `/dev/fd/<n>` are Linux symlinks into
+# `/proc/self/fd`; `/proc/self/...` and `/proc/thread-self/...` are the
+# per-process procfs roots.
+_PROCESS_LOCAL_OUT_PATHS: frozenset[str] = frozenset(
+    {"/dev/stdout", "/dev/stderr", "/dev/stdin"}
+)
+_PROCESS_LOCAL_OUT_PREFIXES: tuple[str, ...] = (
+    "/dev/fd/", "/proc/self/", "/proc/thread-self/",
+)
+
+
+def _out_path_is_process_local(out: Path | None) -> bool:
+    """True when ``--out`` names a destination only THIS process can write.
+
+    The bn-kernel CLI backend hands the child ``bn`` an already-open fd as
+    ``--out /proc/self/fd/<n>`` (``/dev/fd/<n>`` fallback) plus ``pass_fds``,
+    and ``--out /dev/stdout`` is the equivalent shell idiom. Such a path is
+    resolved by whichever process opens it, so a command that delegates the
+    write to the BRIDGE (``bridge_writes_output``) must not forward it: the
+    bridge opens its OWN fd <n> and the payload lands in an unrelated file
+    while the envelope still reports ok/bytes/sha256 and the caller reads
+    zero bytes -- the same silent-truncation failure #665's fix exists to
+    prevent, one process further out. Keep those writes CLI-side.
+    """
+    if out is None:
+        return False
+    text = str(out)
+    return (
+        text in _PROCESS_LOCAL_OUT_PATHS
+        or text.startswith(_PROCESS_LOCAL_OUT_PREFIXES)
+        or text.startswith(f"/proc/{os.getpid()}/")
+    )
+
+
 def _common_io_options(
     parser: argparse.ArgumentParser,
     *,

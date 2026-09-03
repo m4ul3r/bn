@@ -7,8 +7,9 @@ from pathlib import Path
 from typing import Any
 
 from ..cli import (_call, _effective_limit, _int_or_hex, _mutate, _mutation_exit_code,
-                   _non_negative_int, _pick, _positive_int, arg, command, mutex,
-                   mutation_output_args, preview_arg)
+                   _non_negative_int, _out_path_is_process_local, _pick,
+                   _positive_int, arg, command, mutex, mutation_output_args,
+                   preview_arg)
 from ..formatters import (
     _render_data_symbols_text,
     _render_data_vars_text,
@@ -368,14 +369,24 @@ def _go_rename(args: argparse.Namespace) -> int:
 @command("bundle", "function", help="Export a function bundle", fmt="json", target=True,
          args=[arg("identifier")])
 def _bundle_function(args: argparse.Namespace) -> int:
+    # #665: `--out` is already absolute here (`_resolve_out_path`), so the
+    # bridge writes it where the CALLER meant. The one destination the bridge
+    # must NOT be handed is a process-local fd path -- `--out /proc/self/fd/<n>`
+    # (the bn-kernel CLI backend's artifact contract) or `--out /dev/stdout`.
+    # Those resolve in whichever process opens them, so the bridge would write
+    # into its own fd <n> and the caller would read zero bytes behind an
+    # ok/bytes/sha256 envelope. Write those in THIS process instead: with
+    # `out_path=None` the bridge returns the bundle itself.
+    bridge_writes = bool(args.out) and not _out_path_is_process_local(args.out)
     return _call(
         args,
         "bundle_function",
-        {"identifier": args.identifier, "out_path": str(args.out) if args.out else None},
+        {"identifier": args.identifier,
+         "out_path": str(args.out) if bridge_writes else None},
         require_target=True,
         text_renderer=_render_function_bundle_text,
         stem="function-bundle",
-        bridge_writes_output=bool(args.out),
+        bridge_writes_output=bridge_writes,
     )
 
 
