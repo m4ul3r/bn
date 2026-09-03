@@ -6648,6 +6648,21 @@ def test_unbounded_input_sink_fires_unconditionally(models):
     assert clean_result["reached_sinks"] == []
 
 
+def test_unbounded_input_sink_zero_hop_path_has_single_step(models):
+    # Round-3 F1 residual: `_make_finding` reconstructs the path from the
+    # unconditional hit node's `why` entry (one step: the call itself, since
+    # that IS the injection site with no parents) and then unconditionally
+    # appended a SECOND entry for that same call -- a zero-hop finding must
+    # have exactly one path step, not two.
+    func, bv = _gets_no_taint_func()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    gets_sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "gets"]
+    assert len(gets_sinks) == 1, result["reached_sinks"]
+    assert len(gets_sinks[0]["path"]) == 1, gets_sinks[0]["path"]
+    assert gets_sinks[0]["metrics"]["steps"] == 1
+
+
 def _gets_then_earlier_strcpy_func():
     # #615 review F2: linear instruction order strcpy(&dst, &buf) FIRST,
     # gets(&buf) SECOND -- stands in for a loop back-edge where the
@@ -6804,6 +6819,96 @@ def test_unconditional_sink_downstream_finding_not_attributed_to_unrelated_sourc
     assert strcpy_sinks[0]["sink"]["tainted_arg_index"] == 1     # a REAL arg-taint finding, not the sentinel
     assert strcpy_sinks[0]["signature"]["source"] == "?"         # but NOT attributed to param:0
     assert "param:0" not in strcpy_sinks[0]["signature"]["rendered"]
+
+
+def test_descend_downstream_finding_not_attributed_when_handoff_is_unconditional(models):
+    # Round-3 BLOCKER: the intra-function fix above
+    # (test_unconditional_sink_downstream_finding_not_attributed_to_unrelated_source)
+    # does not survive a descent into an in-binary callee. handler(fd) calls
+    # gets(&buf) -- buf tainted unconditionally, independently of --source --
+    # then copy_it(&buf, &out), an in-binary helper whose body is
+    # `rax = src[0]; memcpy(dst, src, rax)`. `fd` (the declared --source) is
+    # never read by either call. The descended memcpy finding must render the
+    # same "?" no-source sentinel as the gets() finding, not be falsely
+    # attributed to param:0 just because it crossed a call boundary.
+    src = FVar("src"); dst = FVar("dst"); rax = FVar("rax")
+    src1 = FSSA(src, 1); rax1 = FSSA(rax, 1)
+    copy_ssa = FSSAFunc([
+        FInstr(0, 0x2004, "MLIL_SET_VAR_SSA", "rax#1 = src#1[0]", reads=[src1], writes=[rax1]),
+        FInstr(1, 0x2010, "MLIL_CALL_SSA", "0x1080(dst#1, src#1, rax#1)",
+               reads=[rax1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x1080", constant=0x1080),
+               params=[FExpr("MLIL_VAR_SSA", "dst#1", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "src#1", reads=[src1]),
+                       FExpr("MLIL_VAR_SSA", "rax#1", reads=[rax1])]),
+    ])
+    copy_it = FFunc("copy_it", 0x2000, copy_ssa, params=[src, dst])
+
+    # handler(fd): gets(&buf); copy_it(&buf, &out) -- fd is never touched.
+    buf = FVar("buf", typ="char[0x40]"); out = FVar("out", typ="char[0x10]")
+    fd = FVar("fd")
+    handler_ssa = FSSAFunc([
+        FInstr(0, 0x3008, "MLIL_CALL_SSA", "gets(&buf)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x1050", constant=0x1050),
+               params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)]),
+        FInstr(1, 0x3018, "MLIL_CALL_SSA", "0x2000(&buf, &out)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       FExpr("MLIL_ADDRESS_OF", "&out", src=out)]),
+    ])
+    handler = FFunc("handler", 0x3000, handler_ssa, params=[fd])
+
+    bv = FBV({0x1050: "gets", 0x1080: "memcpy"}, funcs={0x2000: copy_it})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(handler, [te.parse_locator("param:0")])   # taints fd, reaches nothing
+
+    gets_sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "gets"]
+    memcpy_sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(gets_sinks) == 1, result["reached_sinks"]
+    assert len(memcpy_sinks) == 1, result["reached_sinks"]
+    assert gets_sinks[0]["signature"]["source"] == "?"
+    # the blocker: a REAL arg-taint finding (memcpy's len arg is genuinely
+    # tainted, inside copy_it, by the buffer gets() filled) -- but that buffer
+    # taint never traced back to the declared --source, so the finding must
+    # still render the "?" sentinel, not param:0.
+    assert memcpy_sinks[0]["sink"]["class"] == "overflow_len"
+    assert memcpy_sinks[0]["sink"]["tainted_arg_index"] is not None
+    assert memcpy_sinks[0]["signature"]["source"] == "?"
+    assert "param:0" not in memcpy_sinks[0]["signature"]["rendered"]
+    assert result["stats"]["functions_visited"] == 2
+
+
+def _unconditional_declared_unresolvable_buf_func():
+    # app_peek's model declares buf_arg=0, but the call's actual arg0 is a
+    # bare constant (not a pointer/address-of expression) -- `_buffer_target`
+    # cannot resolve it to any real buffer, so the injection falls back to a
+    # synthetic placeholder node even though a buf_arg WAS declared.
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "app_peek(0x40)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401080", constant=0x401080),
+               params=[FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+    ]
+    bv = FBV({0x401080: "app_peek"})
+    return FFunc("peek", 0x10, FSSAFunc(instrs), params=[FVar("fd")]), bv
+
+
+def test_unconditional_sink_declared_buf_arg_unresolvable_does_not_overclaim(models):
+    # P3: a DECLARED buf_arg whose target can't be resolved must not be
+    # reported as "taints arg0" -- no real buffer taint was injected, only a
+    # synthetic `<name>_arg0@<addr>` node no downstream read can match. This is
+    # a distinct shape from BOTH the declared-and-resolved case (real buffer
+    # taint, "taints argN") and the fully-undeclared case ("no declared
+    # destination").
+    shaped = te.load_models(extra={"app_peek": {
+        "sink": {"class": "unbounded_input", "tainted_args": [], "buf_arg": 0}}})
+    func, bv = _unconditional_declared_unresolvable_buf_func()
+    engine = te.TaintEngine(bv, shaped)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    hit = [a for a in result["assumptions"] if "app_peek" in a and "unconditional" in a]
+    assert len(hit) == 1, result["assumptions"]
+    assert "taints arg0" not in hit[0]
+    assert "declares arg0 as its buffer but the target could not be resolved" in hit[0]
+    assert "independently of --source" in hit[0]
 
 
 def test_model_overlay_sources_folds_duplicate_env_and_user_entry(monkeypatch, tmp_path):
