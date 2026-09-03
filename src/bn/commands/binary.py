@@ -74,10 +74,10 @@ def _load(args: argparse.Namespace) -> int:
     )
 
 
-@command("close", help="Close a loaded binary", target=True,
+@command("close", help="Close an open target (bn-loaded or a GUI tab)", target=True,
          args=[
              arg("path", nargs="?", help="Path to close (omit to close the single open target)"),
-             arg("--all", action="store_true", help="Close all loaded binaries"),
+             arg("--all", action="store_true", help="Close all open targets, including GUI tabs bn did not load"),
          ])
 def _close(args: argparse.Namespace) -> int:
     # Only honor an explicit -t/--target. A sticky pin must not silently pick
@@ -104,17 +104,20 @@ def _close(args: argparse.Namespace) -> int:
     if explicit_path is not None and args.all:
         raise BridgeError(
             "Pass a path or --all, not both: a named path closes only that "
-            "target; --all closes every loaded target."
+            "target; --all closes every open target, including GUI tabs bn "
+            "did not load."
         )
     if explicit_target is not None and explicit_path is not None:
         raise BridgeError(
             "Pass --target or a path, not both: --target closes that target; "
-            "a path closes the loaded binary at that path."
+            "a path closes the open target at that path, whether bn loaded it "
+            "or a GUI tab did."
         )
     if explicit_target is not None and args.all:
         raise BridgeError(
             "Pass --target or --all, not both: --target closes only that "
-            "target; --all closes every loaded target."
+            "target; --all closes every open target, including GUI tabs bn "
+            "did not load."
         )
     # `-t ""` is neither an explicit selector nor a bare close. It used to fall
     # into the implicit-resolution branch (`not target`) and tear down the
@@ -162,8 +165,8 @@ def _close(args: argparse.Namespace) -> int:
                 raise BridgeError(
                     f"{exc}\nnote: `-t active` follows the GUI selection, "
                     "which is not honored for close: pass a concrete "
-                    "selector, a path, or --all (closes every bn-loaded "
-                    "target)."
+                    "selector, a path, or --all (closes every open target, "
+                    "including GUI tabs bn did not load)."
                 ) from None
             raise
     return _call(
@@ -203,7 +206,8 @@ def _target_close(args: argparse.Namespace) -> int:
     if selector is None or not str(selector).strip():
         raise BridgeError(
             "selector is empty: pass a target selector from `bn target list` "
-            "(use `bn close --all` to close every loaded target)."
+            "(use `bn close --all` to close every open target, including GUI "
+            "tabs bn did not load)."
         )
     args.target = selector
     # `active` follows the GUI selection and is re-resolved bridge-side, so it is

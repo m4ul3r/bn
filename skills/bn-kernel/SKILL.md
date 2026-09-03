@@ -116,7 +116,8 @@ instance. A timed-out or otherwise failed start is uncertain ownership because
 its child may have registered after the harness stopped waiting, so attempt to
 stop the unique ID unconditionally. Do not first poll, list, or test whether it
 registered, and do not assume absence means no process exists. Never compensate
-with `bn close --all`, sticky pins, or another agent's instance.
+with `bn close --all` (it closes every open target in the instance, including
+GUI tabs bn never loaded), sticky pins, or another agent's instance.
 
 ## Parallel bn-kernel subagents
 
@@ -368,8 +369,8 @@ after the caller stopped waiting.
 `bn target close <selector>` is the explicit single-target close (the same
 implementation as `bn close -t <selector>`, including the unsaved-analysis
 warning). It takes no path and no `--all`, so it cannot widen into closing
-everything; `bn close --all` is the deliberate spelling for that. Close the
-target, then stop the instance.
+everything; `bn close --all` is the deliberate spelling for that -- including
+GUI tabs `bn` never loaded. Close the target, then stop the instance.
 
 ## Load cost and memory
 

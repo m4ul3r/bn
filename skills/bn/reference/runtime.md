@@ -80,6 +80,8 @@ When multiple bridge instances exist, flagless `bn load <path>` refuses ambient 
 
 A bare `bn close` closes the single open target; with several open it refuses with the open-target list (pass `-t <selector>`, a path, or `--all`). It never closes everything implicitly — only `--all` does (#664). Because close is destructive, it is stricter than `bn save`: on a multi-tab GUI bridge a bare close does **not** fall back to the focused tab (save does), the CLI pins the exact `target_id` it observed rather than sending `active` (so a concurrent close/load between the lookup and the close yields an unknown-selector error instead of closing a different binary), an empty `-t ""` or empty positional path `""` (e.g. an unset shell variable) is an error rather than a bare close, and `-t` cannot be combined with a path or `--all`. The bridge enforces the same rules for raw socket clients: a non-null empty `target`, an empty `path`, and any `target`+`path`/`all` pair are rejected.
 
+Blast radius: a bare, path, or `--all` close resolves against **every open target**, not only the ones `bn load` opened — on a GUI bridge that includes tabs you opened in the UI (#613). `bn close /proj/loader.bndb` matches a GUI tab's filename, and `bn close --all` tears those tabs down too. Because all three spellings decide what to destroy from a count of open tabs, they refuse outright when the UI walk cannot enumerate every tab (a UI query raised mid-walk, so the count may be silently short). `bn close -t <selector>` resolves by name rather than by count, so it keeps working and is the escape hatch the refusal names.
+
 `bn close` reports each closed view as `{path, unsaved, engine_modified}`. `unsaved` is the sole persistence/cleanliness signal: it means a committed bn mutation was not saved and is the only condition that triggers the discard warning. `engine_modified` is Binary Ninja's broader analysis/cache bit; it can be true after a strictly read-only session and must not be interpreted as user mutation.
 
 **`session status <job-id>` JSON contract.** Naming a job returns the single-job
@@ -125,7 +127,8 @@ It is the discoverable spelling of `bn close -t <selector>` and delegates to the
 same implementation, so unsaved warnings, selector resolution, and the refusal to
 forward the volatile `active` literal are identical. It accepts no path and no
 `--all`, so it can never widen into closing everything; an empty selector is an
-error. Use `bn close --all` when you really do mean every loaded target.
+error. Use `bn close --all` when you really do mean every open target,
+including GUI tabs bn did not load.
 
 ```bash
 bn save                                  # saves to <filename>.bndb

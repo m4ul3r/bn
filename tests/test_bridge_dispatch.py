@@ -10,7 +10,6 @@ import sys
 import threading
 import time
 import types
-import weakref
 from pathlib import Path
 
 import pytest
@@ -2553,21 +2552,24 @@ def test_bridge_handler_rejects_non_dict_json(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# TargetManager: _ids_by_object pruning and id() recycling
+# TargetManager: _ids_by_object pruning and stable ids across fresh wrappers
 # ---------------------------------------------------------------------------
 
 
-def test_target_manager_does_not_alias_recycled_object_ids(monkeypatch):
+def test_target_manager_does_not_alias_stale_entries_across_refresh(monkeypatch):
+    """A stale/unrelated `_ids_by_object` entry must never be aliased onto a
+    brand-new view that happens to land in the same dict slot -- each
+    newly-seen view still gets its own fresh id, and the unrelated entry is
+    pruned since it names no currently open view."""
     bridge = _load_bridge(monkeypatch)
     bv_a = _FakeFileBV("/proj/alpha.bndb", session_id="11")
     _register_views(bridge, bv_a)
     manager = bridge.TargetManager()
     manager.refresh()
 
-    # Simulate CPython id() recycling: a stale map entry whose key collides
-    # with a brand-new view but whose ref points at a different object.
     bv_b = _FakeFileBV("/proj/beta.bndb", session_id="22")
-    manager._ids_by_object[id(bv_b)] = (weakref.ref(bv_a), "999")
+    stale = _FakeFileBV("/proj/stale.bndb", session_id="99")
+    manager._ids_by_object[stale] = "999"
     _register_views(bridge, bv_a, bv_b)
 
     targets = manager.refresh()
@@ -2576,27 +2578,87 @@ def test_target_manager_does_not_alias_recycled_object_ids(monkeypatch):
     # The new view must get a fresh id, not inherit the stale "999".
     assert by_file["/proj/beta.bndb"] != "999"
     assert by_file["/proj/alpha.bndb"] != by_file["/proj/beta.bndb"]
+    assert stale not in manager._ids_by_object
     bridge._headless_views.clear()
 
 
-def test_target_manager_prunes_dead_id_entries_on_refresh(monkeypatch):
+def test_target_manager_prunes_stale_id_entries_on_refresh(monkeypatch):
+    """A view no longer present in the open-view set (closed, or never really
+    open) must not keep pinning its stable id -- or the strong reference
+    `_ids_by_object` now holds instead of a weakref -- forever (#586)."""
     bridge = _load_bridge(monkeypatch)
     bv_a = _FakeFileBV("/proj/alpha.bndb", session_id="11")
     _register_views(bridge, bv_a)
     manager = bridge.TargetManager()
 
-    class _Doomed:
-        pass
+    stale = _FakeFileBV("/proj/closed.bndb", session_id="77")
+    manager._ids_by_object[stale] = "777"
 
-    doomed = _Doomed()
-    manager._ids_by_object[id(doomed)] = (weakref.ref(doomed), "777")
-    del doomed
+    manager.refresh()  # only bv_a is open; `stale` was never in _headless_views
 
-    manager.refresh()
-
-    assert all(vid != "777" for _, vid in manager._ids_by_object.values())
+    assert all(vid != "777" for vid in manager._ids_by_object.values())
     assert len(manager._ids_by_object) == 1
     bridge._headless_views.clear()
+
+
+# ---------------------------------------------------------------------------
+# TargetManager: strong refs survive BN's non-interned GUI wrappers (#586)
+# ---------------------------------------------------------------------------
+
+
+class _NonInterningBV:
+    """Models BN's real BinaryView wrapper behavior: ``__eq__``/``__hash__``
+    are handle-address based, so two distinct Python objects standing in for
+    the same core view compare and hash equal -- but BN does NOT intern a
+    wrapper for every open tab, only the scripting console's *current* view
+    goes through ``_cache_insert``. A non-focused tab's
+    ``getCurrentBinaryView()`` can therefore hand back a BRAND NEW wrapper
+    instance on every walk for the very same underlying handle (#586)."""
+
+    def __init__(self, handle: object, filename: str, session_id: str = "0"):
+        self.handle = handle
+        self.file = types.SimpleNamespace(
+            session_id=session_id, filename=filename, modified=False)
+        self.view_type = types.SimpleNamespace(name="ELF")
+
+    def __eq__(self, other):
+        return isinstance(other, _NonInterningBV) and other.handle is self.handle
+
+    def __hash__(self):
+        return hash(self.handle)
+
+
+def test_target_manager_resolves_view_across_fresh_wrapper_instances(monkeypatch):
+    """#586: a TargetManager that stored only a weakref to the transient
+    wrapper `_collect_open_views()` handed back saw it die the instant the
+    collecting call returned -- `resolve()` then saw None for every GUI tab BN
+    was not currently interning, and `view_id` churned on every refresh().
+    Model BN's real non-interning behavior by returning a FRESH wrapper object
+    per `_collect_open_views()` call for the SAME underlying handle, drop
+    every local reference to it, and prove the selector still resolves and the
+    view_id stays stable across refreshes."""
+    bridge = _load_bridge(monkeypatch)
+    manager = bridge.TargetManager()
+    handle = object()  # stand-in for the shared core view handle
+
+    def fresh_collect(*, strict: bool = False):
+        return [_NonInterningBV(handle, "/proj/b.bin", session_id="22")]
+
+    monkeypatch.setattr(bridge, "_collect_open_views", fresh_collect)
+
+    first_targets = manager.refresh()
+    assert len(first_targets) == 1
+    view_id_1 = first_targets[0]["view_id"]
+    # No local reference to the wrapper fresh_collect() returned survives past
+    # this point -- exactly the window that killed a weakref-based record.
+
+    view = manager.resolve("b.bin")
+    assert view is not None
+    assert view.file.filename == "/proj/b.bin"
+
+    second_targets = manager.refresh()
+    assert len(second_targets) == 1
+    assert second_targets[0]["view_id"] == view_id_1  # stable across refresh()
 
 
 # ---------------------------------------------------------------------------
@@ -3694,6 +3756,447 @@ def test_close_binary_padded_active_is_unknown_selector(monkeypatch, tmp_path):
     assert not bv.closed
     assert bridge._headless_views == [bv]
     bridge._headless_views.clear()
+
+
+def test_close_binary_all_closes_gui_only_views(monkeypatch, tmp_path):
+    # #613: on a pure-GUI session (nothing loaded via `bn load`) _headless_views
+    # stays empty. `--all` must walk the same open-view set target resolution
+    # and `close -t` already use, not `_headless_views` alone, or it silently
+    # closes nothing.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    view_a = _ClosableBV("/proj/firmware.elf", session_id="11")
+    view_b = _ClosableBV("/proj/loader.bndb", session_id="22")
+    _gui_with_focused_tab(monkeypatch, bridge, view_a, view_b)
+
+    result = _close_on_watchdog(instance, all_=True)
+
+    assert len(result["closed"]) == 2
+    assert view_a.closed and view_b.closed
+    assert bridge._headless_views == []
+
+
+def test_close_binary_by_path_matches_gui_view(monkeypatch, tmp_path):
+    # #613: a path close must match a GUI-opened tab's filename, not only a
+    # headless-loaded one.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    view_a = _ClosableBV("/proj/firmware.elf", session_id="11")
+    view_b = _ClosableBV("/proj/loader.bndb", session_id="22")
+    _gui_with_focused_tab(monkeypatch, bridge, view_a, view_b)
+
+    result = _close_on_watchdog(instance, path="/proj/loader.bndb")
+
+    assert [c["path"] for c in result["closed"]] == ["/proj/loader.bndb"]
+    assert view_b.closed and not view_a.closed
+
+
+def test_close_binary_all_closes_mixed_gui_and_headless(monkeypatch, tmp_path):
+    # #613: one view tracked only in _headless_views, one visible only via the
+    # GUI open-view walk. --all must close both and leave _headless_views
+    # empty -- neither "GUI tabs win" nor "only headless gets closed".
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    headless_view = _ClosableBV("/proj/alpha.so", session_id="11")
+    gui_view = _ClosableBV("/proj/beta.so", session_id="22")
+    _gui_with_focused_tab(monkeypatch, bridge, gui_view)  # clears _headless_views
+    bridge._headless_views.append(headless_view)
+
+    result = _close_on_watchdog(instance, all_=True)
+
+    assert len(result["closed"]) == 2
+    assert headless_view.closed and gui_view.closed
+    assert bridge._headless_views == []
+
+
+def test_close_binary_by_path_prefers_match_across_sets(monkeypatch, tmp_path):
+    # #613: headless holds alpha.so, the GUI-only open set holds beta.so. A
+    # path close of beta.so must succeed and must not touch alpha, which stays
+    # open AND stays tracked in _headless_views.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    alpha = _ClosableBV("/proj/alpha.so", session_id="11")
+    beta = _ClosableBV("/proj/beta.so", session_id="22")
+    _gui_with_focused_tab(monkeypatch, bridge, beta)  # clears _headless_views
+    bridge._headless_views.append(alpha)
+
+    result = _close_on_watchdog(instance, path="/proj/beta.so")
+
+    assert [c["path"] for c in result["closed"]] == ["/proj/beta.so"]
+    assert beta.closed and not alpha.closed
+    assert bridge._headless_views == [alpha]
+
+
+def test_close_binary_all_dedups_multiple_wrappers_of_same_core_view(monkeypatch, tmp_path):
+    # #613 review (major): _collect_open_views() only dedups its own walk by
+    # id(bv) (bridge.py:389-395, untouched by this PR); BN interns no wrapper
+    # for a non-console view, so the UI walk's several accessors
+    # (getCurrentViewFrame / getViewFrameForTab / getViewForTab) hand back
+    # DISTINCT Python wrapper objects for the SAME core view. Before the fix,
+    # --all fed that raw list straight into the close loop and closed/
+    # reported the one core view once per wrapper (demonstrated executably
+    # on the patched bridge: 3 wrappers -> 3 v.file.close() round trips and 3
+    # identical `closed` rows). Model the duplication directly: three
+    # distinct _ClosableBV instances sharing one handle -- BN's real
+    # handle-address __eq__/__hash__ -- standing in for the same core view.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+
+    handle = types.SimpleNamespace(closed=False)
+    close_call_count = [0]
+    wrappers = []
+    for _ in range(3):
+        w = _ClosableBV("/proj/parse_header.elf", session_id="11", handle=handle)
+
+        def _close(handle=handle):
+            close_call_count[0] += 1
+            handle.closed = True
+
+        w.file.close = _close
+        wrappers.append(w)
+
+    monkeypatch.setattr(bridge, "_collect_open_views", lambda strict=False: list(wrappers))
+    bridge._headless_views.clear()
+
+    result = _close_on_watchdog(instance, all_=True)
+
+    assert len(result["closed"]) == 1
+    assert close_call_count[0] == 1
+    assert all(w.closed for w in wrappers)  # shared handle: closing any closes all
+
+
+def test_close_binary_all_dedups_wrappers_minted_by_the_real_gui_walk(monkeypatch, tmp_path):
+    # Companion to the test above, which monkeypatches _collect_open_views()
+    # outright and so proves only that the close loop dedups a list it is
+    # handed. This one drives the REAL walk: a fake UIContext whose three
+    # accessors (getCurrentViewFrame / getViewFrameForTab / getViewForTab) each
+    # mint a BRAND NEW wrapper for the same core handle, which is what BN does
+    # for any view the scripting console is not currently interning (#586).
+    # _collect_open_views()'s own dedup is `id(bv)` (bridge.py), so it cannot
+    # collapse them -- the close path must.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+
+    handle = types.SimpleNamespace(closed=False)
+    close_call_count = [0]
+
+    def mint():
+        """A fresh Python wrapper for the one shared core handle, every call."""
+        w = _ClosableBV("/proj/parse_header.elf", session_id="11", handle=handle)
+
+        def _close():
+            close_call_count[0] += 1
+            handle.closed = True
+
+        w.file.close = _close
+        return w
+
+    class _Frame:
+        def getCurrentBinaryView(self):
+            return mint()
+
+    class _TabView:
+        def getData(self):
+            return mint()
+
+    class _Context:
+        def getCurrentViewFrame(self):
+            return _Frame()
+
+        def getTabs(self):
+            return ["tab-0"]
+
+        def getViewFrameForTab(self, tab):
+            return _Frame()
+
+        def getViewForTab(self, tab):
+            return _TabView()
+
+    context = _Context()
+    monkeypatch.setattr(bridge, "ui", types.SimpleNamespace(
+        UIContext=types.SimpleNamespace(
+            allContexts=lambda: [context],
+            activeContext=lambda: context,
+        )
+    ))
+    bridge._headless_views.clear()
+
+    # The walk itself really does hand back one wrapper per accessor: this is
+    # the duplication the close path has to absorb, not a hypothetical.
+    raw = bridge._collect_open_views()
+    assert len(raw) == 3
+    assert len({id(v) for v in raw}) == 3   # three distinct Python objects
+    assert len(set(raw)) == 1               # one core view by handle equality
+
+    # `target list` already collapses them (records are keyed by stable id)...
+    assert len(instance.targets.refresh()) == 1
+    # ...and so must the destructive close: one round trip, one reported row.
+    result = _close_on_watchdog(instance, all_=True)
+    assert len(result["closed"]) == 1
+    assert close_call_count[0] == 1
+    assert handle.closed
+
+
+def test_close_binary_registry_failure_does_not_mask_the_close_failure(monkeypatch, tmp_path):
+    # The reconciliation above runs in `finally`, and a `finally` that raises
+    # REPLACES the in-flight exception. _write_registry() can raise on its own
+    # (mkstemp / os.replace / ensure_private_dir), so a disk problem would swap
+    # the caller's "your close failed" diagnosis for an unrelated I/O error and
+    # hide the fact that a destructive op only half-ran.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    good = _ClosableBV("/proj/alpha.so", session_id="11")
+    bad = _ClosableBV("/proj/beta.so", session_id="22")
+
+    def _boom():
+        raise RuntimeError("simulated main-thread close failure")
+
+    bad.file.close = _boom
+    _register_views(bridge, good, bad)
+    monkeypatch.setattr(
+        instance, "_write_registry",
+        lambda: (_ for _ in ()).throw(OSError("simulated registry write failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="simulated main-thread close failure"):
+        _close_on_watchdog(instance, all_=True)
+
+    # The prune still happened before the registry attempt.
+    assert good.closed and not bad.closed
+    assert bridge._headless_views == [bad]
+    bridge._headless_views.clear()
+
+
+def test_close_binary_surfaces_registry_failure_when_the_close_succeeded(monkeypatch, tmp_path):
+    # The converse of the test above: with no close failure in flight there is
+    # nothing to mask, so a registry write failure is the real result and must
+    # still reach the caller rather than being swallowed.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    only = _ClosableBV("/proj/alpha.so", session_id="11")
+    _register_views(bridge, only)
+    monkeypatch.setattr(
+        instance, "_write_registry",
+        lambda: (_ for _ in ()).throw(OSError("simulated registry write failure")),
+    )
+
+    with pytest.raises(OSError, match="simulated registry write failure"):
+        _close_on_watchdog(instance, all_=True)
+
+    assert only.closed
+    assert bridge._headless_views == []
+
+
+def test_close_binary_all_reconciles_headless_views_and_registry_on_mid_loop_failure(monkeypatch, tmp_path):
+    # #613 review (minor): the _headless_views prune and _write_registry()
+    # used to run strictly AFTER the close loop finished. If v.file.close()
+    # raised partway through --all, the views already closed before the
+    # failure stayed listed in _headless_views and the on-disk registry kept
+    # advertising them as open. The loop must be wrapped in try/finally so a
+    # mid-loop failure still reconciles whatever it actually closed -- and
+    # must NOT also drop the other view it never got to (still genuinely
+    # open).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    good = _ClosableBV("/proj/alpha.so", session_id="11")
+    bad = _ClosableBV("/proj/beta.so", session_id="22")
+
+    def _boom():
+        raise RuntimeError("simulated main-thread close failure")
+
+    bad.file.close = _boom
+    _register_views(bridge, good, bad)
+
+    with pytest.raises(RuntimeError, match="simulated main-thread close failure"):
+        _close_on_watchdog(instance, all_=True)
+
+    assert good.closed
+    assert not bad.closed
+    # `good` was actually closed before `bad` raised -- it must be pruned;
+    # `bad` never actually closed -- it must stay tracked as open.
+    assert bridge._headless_views == [bad]
+    registry = json.loads(instance.registry_path.read_text())
+    assert registry["binaries"] == ["/proj/beta.so"]
+
+
+def test_target_manager_forget_releases_record_without_waiting_for_refresh(monkeypatch):
+    # #613 review (minor): forget() used to only clear_dirty(), leaving a
+    # closed view's TargetRecord and _ids_by_object entry -- both STRONG refs
+    # since #586 -- pinned in memory (whole BinaryView, analysis state and
+    # all) until some later refresh() that nothing schedules for a view
+    # closed outside `bn close` (e.g. a GUI tab). forget() must drop both
+    # itself so the bridge's own close path never depends on a follow-up
+    # refresh().
+    bridge = _load_bridge(monkeypatch)
+    manager = bridge.TargetManager()
+    bv = _ClosableBV("/proj/parse_header.elf", session_id="11")
+
+    monkeypatch.setattr(bridge, "_collect_open_views", lambda strict=False: [bv])
+    targets = manager.refresh()
+    assert len(targets) == 1
+    vid = targets[0]["view_id"]
+    assert vid in manager._records
+    assert bv in manager._ids_by_object
+
+    manager.forget(bv)
+
+    assert vid not in manager._records
+    assert bv not in manager._ids_by_object
+
+
+def test_close_binary_all_refuses_when_allcontexts_fails_even_if_activecontext_recovers(monkeypatch, tmp_path):
+    # #613 review round 2: the follow-up commit cleared `incomplete` whenever
+    # the activeContext() fallback produced a context, on the theory that the
+    # fallback "fully recovers" a single-window session. It does not: the
+    # fallback recovers *a* context -- the active main window -- and can never
+    # prove it is the ONLY one. BN holds one UIContext per main window, which
+    # is exactly why allContexts() exists. Once allContexts() raises, a second
+    # window's tabs are invisible, so `--all` would close one window's tabs and
+    # report "closed everything", and the bare-close ==1 gate would destroy the
+    # single tab it could see while several were open. A destructive close must
+    # refuse on a count it cannot trust.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    view_a = _ClosableBV("/proj/alpha.so", session_id="11")
+
+    class _Frame:
+        def __init__(self, view):
+            self._view = view
+
+        def getCurrentBinaryView(self):
+            return self._view
+
+    class _Context:
+        def getCurrentViewFrame(self):
+            return _Frame(view_a)
+
+        def getTabs(self):
+            return ["tab-0"]
+
+        def getViewFrameForTab(self, tab):
+            return _Frame(view_a)
+
+        def getViewForTab(self, tab):
+            return None
+
+    context = _Context()
+
+    def _broken_all_contexts():
+        raise RuntimeError("transient allContexts() failure")
+
+    fake_ui = types.SimpleNamespace(
+        UIContext=types.SimpleNamespace(
+            allContexts=_broken_all_contexts,
+            activeContext=lambda: context,
+        )
+    )
+    monkeypatch.setattr(bridge, "ui", fake_ui)
+    bridge._headless_views.clear()
+
+    with pytest.raises(bridge._OpenViewEnumerationError):
+        _close_on_watchdog(instance, all_=True)
+    with pytest.raises(bridge._OpenViewEnumerationError):
+        _close_on_watchdog(instance, target=None)
+    with pytest.raises(bridge._OpenViewEnumerationError):
+        _close_on_watchdog(instance, path="/proj/alpha.so")
+    assert not view_a.closed
+
+    # The escape hatch the refusal names must actually work: `close -t` resolves
+    # by name through the NON-strict walk, so it is unaffected by the lossy
+    # count. A refusal that leaves no way to close anything would be worse than
+    # the over-closing it prevents.
+    result = _close_on_watchdog(instance, target="alpha.so")
+    assert [c["path"] for c in result["closed"]] == ["/proj/alpha.so"]
+    assert view_a.closed
+
+
+def test_collect_open_views_survives_activecontext_raising(monkeypatch):
+    # The activeContext() fallback used to run unguarded, so a UI query that
+    # raised there propagated a raw exception out of every read that walks the
+    # open views (`target list`, `-t` resolution, load dedup). Reads must
+    # degrade to the tracked headless views instead; only a STRICT (destructive)
+    # caller may refuse.
+    bridge = _load_bridge(monkeypatch)
+    tracked = _FakeFileBV("/proj/alpha.bndb", session_id="11")
+    _register_views(bridge, tracked)
+
+    def _boom():
+        raise RuntimeError("transient UI failure")
+
+    fake_ui = types.SimpleNamespace(
+        UIContext=types.SimpleNamespace(allContexts=lambda: [], activeContext=_boom)
+    )
+    monkeypatch.setattr(bridge, "ui", fake_ui)
+
+    assert bridge._collect_open_views() == [tracked]
+    with pytest.raises(bridge._OpenViewEnumerationError):
+        bridge._collect_open_views(strict=True)
+    bridge._headless_views.clear()
+
+
+def test_close_binary_bare_close_refuses_on_incomplete_view_enumeration(monkeypatch, tmp_path):
+    # #613 hardening (carried from #691): _collect_open_views() swallows
+    # per-tab UI exceptions so a single flaky tab never breaks `target list`.
+    # But the bare-close sole-target ==1 gate derives its count from that same
+    # walk -- if one context's tab enumeration throws, the apparent count can
+    # collapse to "1" even though more tabs are really open, and a bare close
+    # would destroy the one tab it could see. It must refuse instead.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    view_a = _ClosableBV("/proj/alpha.so", session_id="11")
+
+    class _Frame:
+        def __init__(self, view):
+            self._view = view
+
+        def getCurrentBinaryView(self):
+            return self._view
+
+    class _WorkingContext:
+        def getCurrentViewFrame(self):
+            return _Frame(view_a)
+
+        def getTabs(self):
+            return ["tab-0"]
+
+        def getViewFrameForTab(self, tab):
+            return _Frame(view_a)
+
+        def getViewForTab(self, tab):
+            return None
+
+    class _BrokenContext:
+        def getCurrentViewFrame(self):
+            return None
+
+        def getTabs(self):
+            raise RuntimeError("transient UI enumeration failure")
+
+    fake_ui = types.SimpleNamespace(
+        UIContext=types.SimpleNamespace(
+            allContexts=lambda: [_WorkingContext(), _BrokenContext()],
+            activeContext=lambda: None,
+        )
+    )
+    monkeypatch.setattr(bridge, "ui", fake_ui)
+    bridge._headless_views.clear()
+
+    with pytest.raises(bridge._OpenViewEnumerationError):
+        _close_on_watchdog(instance, target=None)
+
+    assert not view_a.closed
+
 
 
 def test_close_binary_rejects_non_string_target_and_path(monkeypatch, tmp_path):
