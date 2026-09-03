@@ -26,8 +26,10 @@ vibe_check.py
 vibe_report.json
 .dogfood/
 docs
-# Root-level design/review/dogfood notes -- local only, never committed
+# Root AGENTS.md is a tracked symlink to CLAUDE.md (#607); a nested one is scratch.
 AGENTS.md
+!/AGENTS.md
+# Root-level design/review/dogfood notes -- local only, never committed
 CODEX_*.md
 DOGFOOD_*.md
 FORWARD_TAINT_DESIGN.md

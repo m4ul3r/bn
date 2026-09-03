@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository. It is the canonical agent-instruction file: root `AGENTS.md` is a tracked symlink to it, so the two can never drift (#607).
 
 ## What This Is
 
@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 uv tool install -e .          # Install CLI on PATH
 bn plugin install              # Symlink bridge into BN plugins dir
-bn skill install               # Symlink skills into ~/.claude/skills/ and, when present, ~/.codex/skills/
+bn skill install               # Symlink skills into ~/.claude/skills/, plus each other agent skill root whose home exists (~/.codex/skills/, the omp agent's skills/)
 
 uv run bn --help               # Run CLI from repo without installing
 ```
@@ -22,8 +22,8 @@ Requires Python >= 3.14 and uv.
 
 ```bash
 uv run pytest                              # All tests
-uv run pytest tests/test_cli.py            # CLI tests only
-uv run pytest tests/test_cli.py::test_foo  # Single test
+uv run pytest tests/test_cli_core.py       # one module
+uv run pytest tests/test_cli_mutation.py::test_mutation_summary_committed_noop_is_not_dirty  # single test
 uv run pytest -v                           # Verbose output
 ```
 
@@ -49,7 +49,7 @@ The bridge runs either as a **GUI plugin** (auto-starts when BN loads) or as a *
 
 `cli.py` is the entry point and shared infrastructure only — argparse plumbing, the `@command` decorator + `_COMMANDS` registry, target/instance resolution, the `_call` request wrapper, and `main()`. It does **not** define command handlers or text rendering anymore.
 
-- `commands/` — handler modules grouped by concern: `binary.py` (load/close/save/refresh/target info), `function.py` (list/search/info/decompile/il/disasm/xrefs/callsites), `types.py`, `mutation.py`, `misc.py` (strings/imports/sections/bundle/py exec/batch), `admin.py` (doctor/plugin/skill install/session/instance/target pins). Importing the package via `commands/__init__.py` triggers `@command` decorators that populate `_COMMANDS`. Registering the same command path twice raises at import time.
+- `commands/` — handler modules grouped by concern: `binary.py` (load/close/save/refresh/target info), `function.py` (list/search/info/decompile/il/disasm/xrefs/callsites), `types.py`, `mutation.py`, `cpp_class.py` (`class list/show`), `dataflow.py` (`dataflow defuse/callgraph/values` and the `taint forward/backward/models` surface), `tags.py` (`tag list/get/add/remove`, `tag types`, `tag type create/remove`), `misc.py` (strings/imports/sections/bundle/py exec/batch), `admin.py` (doctor/plugin/skill install/session/instance/target pins). Importing the package via `commands/__init__.py` triggers `@command` decorators that populate `_COMMANDS`. Registering the same command path twice raises at import time.
 - `formatters.py` — all text-mode rendering (`_render_*`, `_format_operation_result`). Add new text output here, not in `cli.py`.
 - `transport.py` — socket I/O, bridge discovery, multi-instance registry, auto-spawn.
 - `output.py` — token-aware rendering and artifact spillover (>10k tokens → disk).
@@ -83,7 +83,7 @@ The CLI supports several headless bridges concurrently. Each instance gets its o
 
 ### Mutation Verification
 
-All mutations support `--preview` (apply → capture diffs → revert) and live verification (readback confirms requested state landed). Statuses: `verified`, `noop`, `unsupported`, `verification_failed`. Failed batches are fully reverted.
+All mutations support `--preview` (apply → capture diffs → revert) and live verification (readback confirms requested state landed). Success-ish statuses: `verified` (requested state observed) and `noop` (already in the requested state). Failure statuses are exactly `FAILED_MUTATION_STATUSES` in `src/bn/formatters.py` — `unsupported`, `verification_failed`, `invalid_request`, `rollback_failed`, `internal_error` — and any of them puts the run at exit 3. A failed batch is fully reverted, and its cleanly rolled-back siblings are stamped `reverted`, which is **not** a failure and does not affect the exit code (#118); a sibling whose restore itself failed is stamped `rollback_failed` and is.
 
 ### Tags & function docs
 
@@ -106,11 +106,11 @@ omitted entirely for other errors.
 ## Conventions
 
 - Command handlers are named `_<group>_<subcommand>()` (e.g., `_function_list`)
-- Exit codes: 0 = success, 1 = CLI-side handler error (e.g. partial `session start` failure), 2 = `BridgeError` (transport failures and bridge-side errors, including mutation apply failures), 3 = mutation status `verification_failed`, `unsupported`, `invalid_request`, `rollback_failed`, or `internal_error`
+- Exit codes: 0 = success, 1 = CLI-side handler error (e.g. partial `session start` failure), 2 = `BridgeError` (transport failures and bridge-side errors, including an up-front request rejection on a read/resolver op that happens to carry one of the statuses below), 3 = mutation status `verification_failed`, `unsupported`, `invalid_request`, `rollback_failed`, or `internal_error` — a status in `FAILED_MUTATION_STATUSES` is exit 3 only on a `_mutate`-marked call, never on a read op that shares the string
 - `BridgeError` for user-facing errors, `OperationFailure` for bridge-side mutation failures with structured fields
 - Read commands default to `--format text`, mutations default to `--format json`
 - Type hints everywhere, `from __future__ import annotations` in all modules
-- Test files mirror source: `test_cli.py`, `test_bridge.py`, `test_transport.py`, `test_output.py`
+- Test files mirror source, split by concern rather than one module per package: `test_cli_*.py` (core/admin/binary/function/mutation/types/misc/formatters), `test_bridge_*.py` (dispatch/lifecycle/mutation/idle_reaper), `test_read_*.py`, `test_transport.py`, `test_output.py`, plus domain modules (`test_taint_*.py`, `test_op_registry.py`, `test_paths.py`, …). `tests/test_cli.py` and `tests/test_bridge.py` do not exist.
 - Tests use `monkeypatch` fixtures and fake `binaryninja` module stubs
 
 ## Issues, PRs & Commits — Sanitize Test Data
