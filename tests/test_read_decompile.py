@@ -85,6 +85,23 @@ def test_function_disasm_is_address_ordered_and_0x_prefixed(monkeypatch):
     assert ".byte 0xff" in text
 
 
+def test_function_disasm_reports_unreadable_instead_of_bare_byte_directive(monkeypatch):
+    # #616 follow-up: a block address with no decode text AND no bytes (a gap
+    # inside an otherwise-mapped block, or a stale/partial mapping) must not
+    # render `.byte ` with nothing after it -- syntactically broken and reads
+    # as "decoded to an empty instruction" rather than "could not read this".
+    bridge = _load_bridge(monkeypatch)
+    function = _FakeFunction(0x1000, "target")
+    function.basic_blocks = [_FakeBasicBlock(0x1000, 0x1001)]
+    bv = _FakeBV(memory={}, disassembly={0x1000: ""})
+
+    text = bridge.il_format._disasm_text(bv, function)
+
+    assert ".byte " not in text
+    assert "<unreadable" in text
+    assert text.startswith("0x1000")
+
+
 def test_function_disasm_rejects_out_of_range_line_window(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
