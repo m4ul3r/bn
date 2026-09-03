@@ -3609,9 +3609,11 @@ _TRACE_REASON_LABELS: dict[str, str] = {
     "definition": "definition",
     "phi_source": "phi source",
     "cross_function": "crosses into callee",
-    # #416: the value was written by a callee through an out-pointer; backward
-    # interprocedural tracing follows return values, not out-parameters.
+    # #416/#672: the value was written by a callee through an out-pointer;
+    # backward tracing follows return values, not out-parameters, in either
+    # mode.
     "interprocedural_out_param_not_followed": "out-param fill not followed",
+    "out_param_not_followed": "out-param fill not followed",
 }
 
 
@@ -3625,12 +3627,17 @@ def _render_trace_text(value: Any) -> str:
     trace = list(value.get("trace") or [])
     hints = [h for h in (value.get("hints") or []) if h]
 
-    # arg[N] (reg, "name") -- the calling-convention register + C-arg name (#166)
+    # arg[N] of <callee> (reg) -- the callee resolved for this callsite plus
+    # the calling-convention register (#662): the value being sliced is the
+    # CALLER's operand at the callsite, not a named callee parameter, so the
+    # header no longer prints a parameter name (which suggested a seed that
+    # was never what was traced).
     arg_lbl = value.get("arg_label") or {}
-    extra = ", ".join(
-        x for x in (arg_lbl.get("register"),
-                    (f'"{arg_lbl["name"]}"' if arg_lbl.get("name") else None)) if x)
-    arg_desc = f"arg[{arg_index}]" + (f" ({extra})" if extra else "")
+    arg_desc = f"arg[{arg_index}]"
+    if arg_lbl.get("callee"):
+        arg_desc += f" of {arg_lbl['callee']}"
+    if arg_lbl.get("register"):
+        arg_desc += f" ({arg_lbl['register']})"
     header = f"backward trace of {arg_desc} in {fn_name} @ {target_addr}"
     step_word = "step" if len(trace) == 1 else "steps"
     info = f"  {fn_name} @ {fn_addr}  •  {len(trace)} {step_word}"
@@ -3640,6 +3647,16 @@ def _render_trace_text(value: Any) -> str:
     if not trace:
         body = "\n".join(f"  hint: {h}" for h in hints) if hints \
             else "  constant or immediate — no SSA trace"
+        # Defensive: every `assumptions` entry is carried on a step already
+        # appended to `trace` (the depth cap, the out-param reasons, and the
+        # --ip-depth/recursion-depth markers all require a non-empty trace),
+        # so `assumptions` cannot actually be non-empty here today. Kept as
+        # pure renderer robustness against a future producer relaxing that
+        # invariant, not because this path is currently reachable.
+        assumptions = [a for a in (value.get("assumptions") or []) if a]
+        if assumptions:
+            body += f"\n\ncaveats ({len(assumptions)}):\n" + \
+                "\n".join(f"  - {a}" for a in assumptions)
         return f"{header}\n{info}\n\n{body}"
 
     lines = [header, info, ""]
@@ -3674,7 +3691,8 @@ def _render_trace_text(value: Any) -> str:
             # reads as `call boundary (strlen)` not a bare PLT address (#193).
             if reason == "call_or_jump_boundary" and step.get("callee"):
                 line += f" ({step['callee']})"
-            if reason == "interprocedural_out_param_not_followed" and step.get("out_param_callee"):
+            if (reason in ("interprocedural_out_param_not_followed", "out_param_not_followed")
+                    and step.get("out_param_callee")):
                 line += f" (via {step['out_param_callee']})"
             if reason == "field_load":
                 meta = " ".join(
@@ -3691,6 +3709,12 @@ def _render_trace_text(value: Any) -> str:
                 lines.append(f"  {il_text}")
 
     lines.extend(_render_trace_frontiers(value.get("frontiers")))
+    assumptions = [a for a in (value.get("assumptions") or []) if a]
+    if assumptions:
+        lines.append("")
+        lines.append(f"caveats ({len(assumptions)}):")
+        for a in assumptions:
+            lines.append(f"  - {a}")
 
     for h in hints:
         lines.append(f"  hint: {h}")

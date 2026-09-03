@@ -978,7 +978,9 @@ def _evidence_init(args: argparse.Namespace) -> int:
                       "Out-pointer/output-parameter writes are NOT followed; a value "
                       "loaded from a local an earlier call filled by-address is "
                       "reported as `interprocedural_out_param_not_followed` (naming "
-                      "the callee), not traced into the callee (#416)"),
+                      "the callee), not traced into the callee (#416). The same "
+                      "out-pointer fill is reported as `out_param_not_followed` in "
+                      "intra mode (this flag off), for a call in the same function."),
              arg("--ip-depth", type=_depth_int, default=2,
                  help="Max call depth for interprocedural tracing (default: 2; 0 disables crossing)"),
          ])

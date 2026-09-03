@@ -729,3 +729,102 @@ def test_disasm_linear_steer_note_suppressed_for_an_exact_decimal_start():
         "resolved_from": {"requested_address": "0x401010", "offset": "+0x10"},
     }
     assert "--linear" in _disasm_linear_steer_note(interior, sliced=True)
+
+
+def test_render_trace_text_header_names_callee_not_parameter():
+    # #662: the header names the resolved CALLEE, not a callee parameter name
+    # -- the value being sliced is the caller's operand at the callsite, not
+    # necessarily anything the callee's parameter is called.
+    from bn.formatters import _render_trace_text
+    value = {
+        "function": "encrypt",
+        "function_address": "0x401180",
+        "target_address": "0x4011f2",
+        "arg_index": 1,
+        "arg_label": {"index": 1, "register": "rsi", "name": "count", "callee": "rotl8"},
+        "trace": [
+            {"ssa_var": "arg1#1", "ssa_label": "arg1#1", "depth": 0,
+             "terminates": True, "reason": "function_parameter"},
+        ],
+    }
+    out = _render_trace_text(value)
+    assert "backward trace of arg[1] of rotl8 (rsi) in encrypt @ 0x4011f2" in out
+    assert '"count"' not in out
+    assert "count" not in out.splitlines()[0]
+
+
+def test_render_trace_text_header_omits_missing_callee_or_register():
+    from bn.formatters import _render_trace_text
+    value = {
+        "function": "f", "function_address": "0x1000", "target_address": "0x1010",
+        "arg_index": 0, "arg_label": {"index": 0}, "trace": [],
+    }
+    out = _render_trace_text(value)
+    assert "backward trace of arg[0] in f @ 0x1010" in out
+
+
+def test_render_trace_text_renders_caveats_from_assumptions():
+    # #671: a non-empty `assumptions` list renders a `caveats (N):` block,
+    # mirroring `_render_taint_text`.
+    from bn.formatters import _render_trace_text
+    value = {
+        "function": "f", "function_address": "0x1000", "target_address": "0x1010",
+        "arg_index": 0, "arg_label": {}, "truncated": True,
+        "trace": [
+            {"ssa_var": "v#1", "ssa_label": "v#1", "depth": 0,
+             "terminates": True, "reason": "undefined_or_global"},
+        ],
+        "assumptions": ["depth cap reached (1); slice is incomplete -- raise --max-depth to continue"],
+    }
+    out = _render_trace_text(value)
+    assert "caveats (1):" in out
+    assert "depth cap reached (1)" in out
+
+
+def test_render_trace_text_empty_trace_still_renders_caveats():
+    # Defensive hardening (round-2 finding F): an empty `trace` short-circuited
+    # before the caveats block, which would silently drop any `assumptions` if
+    # a future producer ever populated `assumptions` on a zero-step result.
+    from bn.formatters import _render_trace_text
+    value = {
+        "function": "f", "function_address": "0x1000", "target_address": "0x1010",
+        "arg_index": 0, "arg_label": {}, "trace": [],
+        "assumptions": ["crossing was not attempted at one or more call boundaries "
+                        "because the --ip-depth budget was spent before reaching "
+                        "them; the slice may be incomplete beyond those boundaries"],
+    }
+    out = _render_trace_text(value)
+    assert "caveats (1):" in out
+    assert "--ip-depth budget was spent" in out
+
+
+def test_render_trace_text_omits_caveats_when_assumptions_empty():
+    from bn.formatters import _render_trace_text
+    value = {
+        "function": "f", "function_address": "0x1000", "target_address": "0x1010",
+        "arg_index": 0, "arg_label": {},
+        "trace": [
+            {"ssa_var": "v#1", "ssa_label": "v#1", "depth": 0,
+             "terminates": True, "reason": "function_parameter"},
+        ],
+        "assumptions": [],
+    }
+    out = _render_trace_text(value)
+    assert "caveats" not in out
+
+
+def test_render_trace_text_intra_out_param_reason_shows_callee():
+    # #672: the intra-mode reason renders the same "(via <callee>)" suffix as
+    # the interprocedural one.
+    from bn.formatters import _render_trace_text
+    value = {
+        "function": "f", "function_address": "0x1000", "target_address": "0x1010",
+        "arg_index": 0, "arg_label": {},
+        "trace": [
+            {"ssa_var": "local#1", "ssa_label": "local#1", "depth": 0,
+             "terminates": True, "reason": "out_param_not_followed",
+             "out_param_callee": "parse_input"},
+        ],
+    }
+    out = _render_trace_text(value)
+    assert "out-param fill not followed (via parse_input)" in out
