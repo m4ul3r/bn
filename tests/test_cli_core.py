@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import types
 
 import bn.cli
@@ -698,6 +699,144 @@ def test_resolve_output_format_explicit_format_wins_with_warning(capsys):
 def test_resolve_output_format_matching_explicit_json_is_silent(capsys):
     assert _rof(_fmt_ns(out=_Path("x.json"), format="json", _format_explicit=True)) == "json"
     assert capsys.readouterr().err == ""
+
+
+# --- #665: --out resolves against the CLI's own cwd, not the bridge's ---
+
+
+def test_resolve_out_path_relative_anchors_at_cli_cwd(monkeypatch, tmp_path):
+    work = tmp_path / "shell-cwd"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    parser = bn.cli.build_parser()
+    ns = parser.parse_args(["function", "list", "--out", "fns.json"])
+    assert ns.out == (work / "fns.json").resolve()
+    assert ns.out.is_absolute()
+
+
+def test_resolve_out_path_absolute_is_unchanged(tmp_path):
+    # Byte-identical passthrough, including a `..` component: `.resolve()`
+    # collapses that lexically, and collapsing is half of what destroys an
+    # fd-backed target (the other half is following the symlink). Without a
+    # `..` here this assertion holds on the pre-fix body too and guards
+    # nothing (#708 review, minor).
+    abs_out = tmp_path / "nested" / ".." / "fns.json"
+    parser = bn.cli.build_parser()
+    ns = parser.parse_args(["function", "list", "--out", str(abs_out)])
+    assert ns.out == abs_out
+    assert str(ns.out) == str(abs_out)
+    assert ns.out != abs_out.resolve()
+
+
+def test_resolve_out_path_does_not_follow_symlinked_components(tmp_path):
+    # An absolute --out must come back byte-identical even when a path
+    # component is a symlink: .resolve() would silently swap it for the
+    # real target, which is exactly how it destroys /proc/self/fd/<n> and
+    # /dev/stdout targets (#708 review).
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    abs_out = link / "fns.json"
+    parser = bn.cli.build_parser()
+    ns = parser.parse_args(["function", "list", "--out", str(abs_out)])
+    assert ns.out == abs_out
+    assert ns.out != abs_out.resolve()
+
+
+def test_resolve_out_path_proc_self_fd_is_unchanged():
+    # The bn-kernel CLI backend's own contract (skills/bn-kernel/SKILL.md):
+    # --out /proc/self/fd/<n> must reach output.py as that exact fd path,
+    # not the deleted-inode target .resolve() would follow it to.
+
+    r, w = os.pipe()
+    try:
+        fd_path = f"/proc/self/fd/{w}"
+        parser = bn.cli.build_parser()
+        ns = parser.parse_args(["function", "list", "--out", fd_path])
+        assert str(ns.out) == fd_path
+    finally:
+        os.close(r)
+        os.close(w)
+
+
+def test_resolve_out_path_expands_user(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    parser = bn.cli.build_parser()
+    ns = parser.parse_args(["function", "list", "--out", "~/fns.json"])
+    assert ns.out == (tmp_path / "fns.json")
+
+
+def test_resolve_out_path_unresolvable_user_raises_clean_parser_error(capsys):
+    # Path.expanduser() raises RuntimeError for an unresolvable ~user, which
+    # argparse's type= machinery does NOT catch (only ArgumentTypeError,
+    # ValueError, TypeError are). Left unwrapped this escapes as a raw
+    # traceback (exit 1, empty stdout) instead of the JSON error envelope.
+    with pytest.raises(SystemExit) as exc_info:
+        bn.cli.main([
+            "function", "list", "--out", "~nosuchuser4242/x.json", "--format", "json",
+        ])
+    assert exc_info.value.code == 2
+    out, err = capsys.readouterr()
+    payload = json.loads(out)
+    assert payload["ok"] is False
+    assert "--out" in payload["error"]
+
+
+@pytest.mark.parametrize("value", [
+    "/proc/self/fd/3",
+    "/proc/self/cwd/fns.json",
+    "/proc/thread-self/fd/3",
+    "/dev/fd/3",
+    "/dev/stdout",
+    "/dev/stderr",
+    "/dev/stdin",
+])
+def test_out_path_is_process_local_recognises_per_process_destinations(value):
+    # These resolve against whichever process calls open(), so a command that
+    # delegates the write to the bridge must keep them CLI-side (#665/#708).
+    assert bn.cli._out_path_is_process_local(_Path(value)) is True
+
+
+def test_out_path_is_process_local_recognises_our_own_pid_procfs():
+    assert bn.cli._out_path_is_process_local(_Path(f"/proc/{os.getpid()}/fd/3")) is True
+
+
+@pytest.mark.parametrize("value", [
+    "/tmp/fns.json",
+    "/dev/null",
+    "/dev/shm/fns.json",
+    "/proc/selfish/fns.json",
+    "/home/u/proc/self/fd/3",
+])
+def test_out_path_is_process_local_leaves_ordinary_destinations_bridge_writable(value):
+    assert bn.cli._out_path_is_process_local(_Path(value)) is False
+
+
+def test_out_path_is_process_local_of_none_is_false():
+    assert bn.cli._out_path_is_process_local(None) is False
+
+
+
+def test_relative_out_writes_and_echoes_absolute_path(fake_transport, monkeypatch, tmp_path, capsys):
+    # The dogfood scenario from #665: a relative --out must land next to the
+    # invoking shell's cwd (here, a directory the bridge never even visited)
+    # and the printed envelope's artifact_path must be usable from any cwd.
+    work = tmp_path / "shell-cwd"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    fake_transport({"list_functions": {"ok": True, "result": {
+        "kind": "functions",
+        "items": [{"address": "0x1000", "name": "f", "size": 10}],
+        "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False,
+    }}})
+    rc = bn.cli.main(["function", "list", "--target", "active", "--out", "fns.json"])
+    assert rc == 0
+    expected = (work / "fns.json").resolve()
+    assert expected.exists()
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["artifact_path"] == str(expected)
+    assert envelope["artifact_path"].startswith("/")
 
 
 def test_out_json_extension_writes_valid_json_end_to_end(fake_transport, tmp_path, capsys):

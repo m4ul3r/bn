@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import types
+from pathlib import Path
 
 import bn.cli
 import pytest
@@ -190,6 +192,92 @@ def test_bundle_function_out_path_is_bridge_owned(fake_transport, tmp_path, caps
     payload = json.loads(output)
     assert payload["artifact_path"] == str(out_path)
     assert payload["spilled"] is False
+
+
+def test_bundle_function_relative_out_resolves_to_cli_cwd(fake_transport, monkeypatch, tmp_path, capsys):
+    # #665: bundle is bridge-owned (the bridge process, not this CLI process,
+    # writes the file), so a relative --out must be resolved to an absolute
+    # path BEFORE it is threaded into the request params -- otherwise a
+    # long-lived bridge spawned from a different directory writes the
+    # artifact next to itself instead of next to the invoking shell.
+    work = tmp_path / "shell-cwd"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    expected = (work / "bundle.json").resolve()
+
+    calls = fake_transport({
+        "list_targets": {
+            "ok": True,
+            "result": [{"target_id": "123:1:7", "selector": "alpha.bndb"}],
+        },
+        "bundle_function": {
+            "ok": True,
+            "result": {
+                "ok": True,
+                "artifact_path": str(expected),
+                "format": "json",
+                "bytes": 123,
+                "sha256": "deadbeef",
+                "summary": {"kind": "object", "count": 3},
+            },
+        },
+    })
+
+    rc = bn.cli.main(["bundle", "function", "--out", "bundle.json", "sub_401000"])
+
+    assert rc == 0
+    assert calls[-1]["op"] == "bundle_function"
+    # The bug: this used to be the literal relative string "bundle.json".
+    assert calls[-1]["params"]["out_path"] == str(expected)
+    assert Path(calls[-1]["params"]["out_path"]).is_absolute()
+
+
+def test_bundle_function_process_local_out_is_written_cli_side(fake_transport, capsys):
+    # #665/#708: `bundle function` normally lets the BRIDGE write --out. A
+    # process-local fd path must be the exception: `--out /proc/self/fd/<n>`
+    # (the bn-kernel CLI backend's artifact contract) and `--out /dev/stdout`
+    # resolve in whichever process opens them, so forwarding the literal path
+    # makes the bridge write into ITS OWN fd <n> -- the caller then reads zero
+    # bytes behind an ok/bytes/sha256 envelope. Keep the write in this process:
+    # out_path must be None on the wire and the bundle body must reach the fd.
+    bundle = {
+        "target": {"selector": "alpha.bndb"},
+        "function": {"name": "sub_401000", "address": "0x401000"},
+        "decompile": "int64_t sub_401000()\n{\n    return 0;\n}\n",
+        "warnings": [],
+    }
+    calls = fake_transport({
+        "list_targets": {
+            "ok": True,
+            "result": [{"target_id": "123:1:7", "selector": "alpha.bndb"}],
+        },
+        # out_path=None makes the bridge return the bundle itself, not an artifact.
+        "bundle_function": {"ok": True, "result": bundle},
+    })
+
+    read_fd, write_fd = os.pipe()
+    fd_path = f"/proc/self/fd/{write_fd}"
+    try:
+        rc = bn.cli.main(["bundle", "function", "--out", fd_path, "sub_401000"])
+        assert rc == 0
+        assert calls[-1]["op"] == "bundle_function"
+        # The bug: this used to be the literal "/proc/self/fd/<n>" string, which
+        # the BRIDGE would resolve against its own fd table.
+        assert calls[-1]["params"]["out_path"] is None
+        os.close(write_fd)
+        write_fd = -1
+        body = os.read(read_fd, 1 << 20)
+    finally:
+        if write_fd != -1:
+            os.close(write_fd)
+        os.close(read_fd)
+
+    # Full body recovered through the caller's own fd, not zero bytes.
+    assert json.loads(body.decode()) == bundle
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["artifact_path"] == fd_path
+    assert envelope["ok"] is True
+    assert envelope["bytes"] == len(body)
 
 
 def test_strings_json_carries_paging_envelope(fake_transport, capsys):

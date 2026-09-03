@@ -280,6 +280,83 @@ class BnArgumentParser(argparse.ArgumentParser):
         return parsed
 
 
+def _resolve_out_path(value: str) -> Path:
+    """argparse ``type=`` for ``--out``: anchor a relative path at the CLI
+    process's own cwd, before it can reach a bridge request (#665).
+
+    The bridge is a long-lived process that may have been spawned from (or
+    reattached to across sessions in) a different directory than the shell
+    invoking this CLI call. Commands like ``bundle`` thread ``--out`` into
+    the request params and let the BRIDGE write the file server-side; a
+    relative path shipped as-is silently resolves against the bridge's cwd,
+    not the caller's, so the artifact lands somewhere the caller never
+    intended (and the echoed relative ``artifact_path`` is unusable from any
+    other cwd). Resolving here -- once, centrally, before any command or
+    transport code sees the value -- fixes both the CLI-side writers in
+    output.py (which happened to write correctly already, since they run in
+    this same process, but echoed a relative path back) and the bridge-owned
+    writers that do not.
+
+    Only RELATIVE paths are anchored. An absolute path is returned exactly
+    as given: callers deliberately pass absolute paths like
+    ``/proc/self/fd/<n>`` or ``/dev/stdout`` to hand this process a specific
+    open file descriptor (this is the bn-kernel CLI backend's own contract,
+    see skills/bn-kernel/SKILL.md), and ``Path.resolve()`` follows those
+    symlinks to a different (often deleted) path -- silently discarding the
+    fd. ``..`` normalization for relative paths is left to the kernel/OS,
+    which resolves it symlink-correctly; ``Path.cwd() / path`` here does not
+    lexically collapse it.
+    """
+    try:
+        path = Path(value).expanduser()
+    except RuntimeError as exc:
+        # Path.expanduser() raises RuntimeError (not ArgumentTypeError/
+        # ValueError/TypeError) for an unresolvable `~user` or a missing
+        # home directory. argparse's type= machinery only converts
+        # ArgumentTypeError/TypeError/ValueError into a clean parser error;
+        # anything else escapes as a raw traceback (exit 1, empty stdout),
+        # bypassing BnArgumentParser.error()'s JSON-error-envelope contract
+        # and the documented 0/2/3 exit codes.
+        raise argparse.ArgumentTypeError(f"--out {value}: {exc}") from None
+    return path if path.is_absolute() else Path.cwd() / path
+
+
+# Destinations that name a per-process view of the filesystem: they resolve
+# against whichever process calls open(), so only THIS process may write them.
+# `/dev/{stdout,stderr,stdin}` and `/dev/fd/<n>` are Linux symlinks into
+# `/proc/self/fd`; `/proc/self/...` and `/proc/thread-self/...` are the
+# per-process procfs roots.
+_PROCESS_LOCAL_OUT_PATHS: frozenset[str] = frozenset(
+    {"/dev/stdout", "/dev/stderr", "/dev/stdin"}
+)
+_PROCESS_LOCAL_OUT_PREFIXES: tuple[str, ...] = (
+    "/dev/fd/", "/proc/self/", "/proc/thread-self/",
+)
+
+
+def _out_path_is_process_local(out: Path | None) -> bool:
+    """True when ``--out`` names a destination only THIS process can write.
+
+    The bn-kernel CLI backend hands the child ``bn`` an already-open fd as
+    ``--out /proc/self/fd/<n>`` (``/dev/fd/<n>`` fallback) plus ``pass_fds``,
+    and ``--out /dev/stdout`` is the equivalent shell idiom. Such a path is
+    resolved by whichever process opens it, so a command that delegates the
+    write to the BRIDGE (``bridge_writes_output``) must not forward it: the
+    bridge opens its OWN fd <n> and the payload lands in an unrelated file
+    while the envelope still reports ok/bytes/sha256 and the caller reads
+    zero bytes -- the same silent-truncation failure #665's fix exists to
+    prevent, one process further out. Keep those writes CLI-side.
+    """
+    if out is None:
+        return False
+    text = str(out)
+    return (
+        text in _PROCESS_LOCAL_OUT_PATHS
+        or text.startswith(_PROCESS_LOCAL_OUT_PREFIXES)
+        or text.startswith(f"/proc/{os.getpid()}/")
+    )
+
+
 def _common_io_options(
     parser: argparse.ArgumentParser,
     *,
@@ -293,9 +370,10 @@ def _common_io_options(
         help="Output format",
     )
     parser.add_argument(
-        "--out", type=Path,
+        "--out", type=_resolve_out_path,
         help="Write output to a file instead of stdout (a .json/.ndjson path "
-             "infers --format unless one is given)",
+             "infers --format unless one is given). Relative paths are resolved "
+             "against the invoking shell's cwd, not the bridge's.",
     )
 
 
