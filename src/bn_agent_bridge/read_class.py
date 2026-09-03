@@ -11,7 +11,7 @@ import re
 from typing import Any
 
 from . import il_format
-from ._shared import OperationFailure
+from ._shared import OperationFailure, _validate_count
 
 
 def _strip_signature(name: str) -> str:
@@ -451,6 +451,8 @@ def _class_list(
     limit: int | None = None,
     count_only: bool = False,
 ) -> dict[str, Any]:
+    offset = _validate_count(offset, label="offset", minimum=0)
+    limit = _validate_count(limit, label="limit", minimum=1, allow_none=True)
     bv = ctx._resolve_view(selector)
     registry = _build_class_registry(ctx, bv, query=query)
     candidates = []
@@ -555,10 +557,33 @@ def _slot_is_code(target: dict[str, Any]) -> bool:
     return (target.get("context") or {}).get("kind") == "code"
 
 
+def _lookahead_row_confirms_continuation(row: dict[str, Any] | None) -> bool:
+    """#706 follow-up: row `max_slots` -- read but never scanned as a slot --
+    resolves the one ambiguity the raw cap can't: a trailing run of null rows
+    inside the window reads identically whether the vtable ended there (the
+    next object's zeroed padding) or is an unresolved-relocation run inside a
+    table that keeps going past the cap (#441). A readable code/null/extern
+    row one past the cap is the same kind of entry the window itself accepts
+    as a slot, so the table demonstrably continues. Missing (the reader
+    couldn't produce it), unreadable, or a mapped-data pointer is never
+    treated as evidence of continuation -- absence of proof is not proof the
+    table goes on."""
+    if row is None or not row.get("readable"):
+        return False
+    target = row.get("target") if isinstance(row.get("target"), dict) else {}
+    status = target.get("status")
+    kind = (target.get("context") or {}).get("kind")
+    return _slot_is_code(target) or status == "null" or kind == "extern"
+
+
 def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[str, Any]:
     """Function slots of an Itanium vtable. Words [0] (offset-to-top) and [1]
     (typeinfo ptr) are header; slots start at +2*ptr_size. Reuses the
-    Thumb-aware pointer-table reader. Only CODE targets count as slots."""
+    Thumb-aware pointer-table reader. Only CODE targets count as slots.
+
+    The returned ``scanned`` count is raw table entries examined, including
+    any terminating row that stopped the scan -- it is neither ``len(slots)``
+    nor a virtual-method count."""
     ptr = ctx._pointer_size(bv)
     # Itanium invariant: word[1] (vtable_addr + ptr) points to the class's
     # typeinfo. If it doesn't resolve to a typeinfo symbol, this address is NOT
@@ -568,9 +593,19 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
     # (#205 review), so report no slots and let the caller note it.
     ti_ptr = ctx._read_pointer_value(bv, vtable_addr + ptr, size=ptr)
     if not ti_ptr or ctx._typeinfo_name_at(bv, ti_ptr) is None:
-        return {"address": hex(int(vtable_addr)), "slots": []}
+        return {
+            "address": hex(int(vtable_addr)),
+            "slots": [],
+            "truncated": False,
+            "max_slots": max_slots,
+            "scanned": 0,
+        }
     start = vtable_addr + 2 * ptr
-    table = ctx._pointer_table_layout(bv, start, entries=max_slots, stride=ptr)
+    # #706 follow-up: read one entry PAST the cap. Row `max_slots` is a
+    # lookahead ONLY -- never a slot in its own right (the window below
+    # excludes it from both scanning and `slots`) -- consulted after the loop
+    # to resolve the trailing-null ambiguity (see the `else` branch).
+    table = ctx._pointer_table_layout(bv, start, entries=max_slots + 1, stride=ptr)
     slots: list[dict[str, Any]] = []
     # #303: the pointer-table reader (`_pointer_table_for_view`) returns the
     # canonical #275 envelope, whose rows live under `items`. This loop read the
@@ -587,7 +622,18 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
     # external slots as valid entries and terminate only at a genuine boundary --
     # an unmapped word (the next sub-vtable's offset-to-top, e.g. -8) or a mapped
     # DATA pointer (the next object's typeinfo). Trailing null slots are trimmed.
-    for i, row in enumerate(table.get("items") or table.get("entries") or []):
+    raw_entries = table.get("items") or table.get("entries") or []
+    window = raw_entries[:max_slots]
+    scanned = 0
+    truncated = False
+    # #584: track whether the window scan hit `max_slots` without ever finding
+    # a genuine terminator (unreadable slot / mapped data pointer). `for...else`
+    # runs the `else` branch only when the loop completed without `break` --
+    # i.e. every entry in the window was consumed as a valid slot, so the raw
+    # scan alone can't tell whether the real vtable ends there or continues
+    # past `max_slots` (the lookahead below resolves it).
+    for i, row in enumerate(window):
+        scanned = i + 1
         if not row.get("readable"):
             break
         target = row.get("target") if isinstance(row.get("target"), dict) else {}
@@ -632,11 +678,36 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
             # A mapped data pointer / unmapped garbage: the next object
             # (typeinfo / secondary-vtable header) -- the vtable ends here.
             break
+    else:
+        # #706 follow-up: the window's `for...else` completion is ambiguous by
+        # itself -- a trailing null run consumed to reach `max_slots` reads
+        # identically whether it's the next object's padding (table ended) or
+        # an unresolved-reloc run inside a table that keeps going (#441). The
+        # one-entry lookahead at row `max_slots` (never scanned as a slot)
+        # resolves it directly instead of inferring from what the trim below
+        # removes: it proves the table continues (or doesn't) independent of
+        # `slots`'s final shape.
+        if scanned >= max_slots > 0:
+            lookahead = raw_entries[max_slots] if len(raw_entries) > max_slots else None
+            truncated = _lookahead_row_confirms_continuation(lookahead)
     # A vtable ends at a real or pure-virtual method, so a trailing run of null
-    # slots is the next object's zeroed offset-to-top / padding, not a slot.
-    while slots and slots[-1].get("null"):
-        slots.pop()
-    return {"address": hex(int(vtable_addr)), "slots": slots}
+    # slots is the next object's zeroed offset-to-top / padding, not a slot --
+    # but ONLY once the table is known to have ended (`truncated` False): when
+    # the lookahead confirmed the table continues, those same trailing nulls
+    # are interior placeholder slots the scan hasn't resolved yet, not
+    # padding, and trimming them would silently drop real (if unresolved)
+    # entries from a table that is honestly (and now unambiguously) reported
+    # as truncated.
+    if not truncated:
+        while slots and slots[-1].get("null"):
+            slots.pop()
+    return {
+        "address": hex(int(vtable_addr)),
+        "slots": slots,
+        "truncated": truncated,
+        "max_slots": max_slots,
+        "scanned": scanned,
+    }
 
 
 def _slot_external_name(bv, value: Any) -> str | None:

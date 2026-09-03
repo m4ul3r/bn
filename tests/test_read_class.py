@@ -175,7 +175,13 @@ class _SlotCtx:
 
     def _pointer_table_layout(self, bv, start, *, entries, stride):
         # #303: the real reader returns the #275 envelope keyed on `items`.
-        return {"kind": "pointer_table", "items": self._rows}
+        # #706 follow-up: honor `entries` like the real reader does -- it
+        # always returns exactly `entries` rows (`_pointer_table_for_view`
+        # loops `range(entries)`). Ignoring it here would let a regression
+        # that drops the one-entry lookahead (`entries=max_slots + 1`) pass
+        # anyway, since this fake would still hand back every row a test
+        # crafted regardless of what the source actually requested.
+        return {"kind": "pointer_table", "items": self._rows[:entries]}
 
 
 class _RecoverCtx:
@@ -644,7 +650,9 @@ class _VtableCtx:
                           "function": {"name": "__cxa_pure_virtual", "address": hex(val)}}
             rows.append({"index": i, "entry_address": hex(start + i * stride),
                          "value": hex(val), "readable": True, "plausible": True, "target": target})
-        return {"entries": rows}
+        # #706 follow-up: honor `entries`, matching the real reader's
+        # `range(entries)` -- see the matching note on `_SlotCtx`.
+        return {"entries": rows[:entries]}
 
 
 def test_vtable_layout_skips_header_and_marks_slots():
@@ -1177,3 +1185,329 @@ def test_is_alias_symbol_uses_enum_name_not_str_529():
         assert m["net::Session"]["vtable"] is local_v
     finally:
         read_class._rtti_kind_and_class = orig
+
+
+def test_class_list_rejects_negative_offset():
+    bv = _make_registry_bv()
+
+    class _Ctx:
+        def _resolve_view(self, sel):
+            return bv
+
+    import pytest
+    with pytest.raises(read_class.OperationFailure) as exc:
+        read_class._class_list(_Ctx(), None, include_all=True, offset=-1)
+    assert exc.value.status == "invalid_request"
+    assert exc.value.message == "offset must be >= 0, got -1"
+
+
+def test_class_list_rejects_negative_limit():
+    bv = _make_registry_bv()
+
+    class _Ctx:
+        def _resolve_view(self, sel):
+            return bv
+
+    import pytest
+    with pytest.raises(read_class.OperationFailure) as exc:
+        read_class._class_list(_Ctx(), None, include_all=True, limit=-1)
+    assert exc.value.status == "invalid_request"
+    assert exc.value.message == "limit must be >= 1, got -1"
+
+
+def test_class_list_rejects_zero_limit():
+    # #610: zero is a degenerate-but-not-negative boundary distinct from -1.
+    bv = _make_registry_bv()
+
+    class _Ctx:
+        def _resolve_view(self, sel):
+            return bv
+
+    import pytest
+    with pytest.raises(read_class.OperationFailure) as exc:
+        read_class._class_list(_Ctx(), None, include_all=True, limit=0)
+    assert exc.value.status == "invalid_request"
+    assert exc.value.message == "limit must be >= 1, got 0"
+
+
+def test_class_list_rejects_non_int_offset():
+    bv = _make_registry_bv()
+
+    class _Ctx:
+        def _resolve_view(self, sel):
+            return bv
+
+    import pytest
+    with pytest.raises(read_class.OperationFailure) as exc:
+        read_class._class_list(_Ctx(), None, include_all=True, offset="nope")
+    assert exc.value.status == "invalid_request"
+    assert exc.value.message == "offset must be an integer, got 'nope'"
+
+
+def test_class_list_rejects_negative_offset_with_count_only():
+    # #610 proposed-fix item 5: invalid offset/limit must fail even when
+    # counting, not just when paging. Before F3, count_only short-circuited
+    # before validation ran and silently returned an ok count result.
+    bv = _make_registry_bv()
+
+    class _Ctx:
+        def _resolve_view(self, sel):
+            return bv
+
+    import pytest
+    with pytest.raises(read_class.OperationFailure) as exc:
+        read_class._class_list(_Ctx(), None, include_all=True, offset=-1, count_only=True)
+    assert exc.value.status == "invalid_request"
+
+
+def test_vtable_layout_marks_truncated_when_scan_hits_cap():
+    # #584/#706 follow-up: a vtable with more than max_slots (64) resolvable
+    # CODE slots must not silently look like a complete 64-slot vtable -- the
+    # window scan ran out of raw entries to read (all 64 were valid code
+    # slots, no terminator found) AND the one-entry lookahead at row 64
+    # (fetched via `entries=max_slots + 1`, honored by `_VtableCtx` post-#706)
+    # is itself a readable code slot, confirming the table keeps going.
+    slots = [(0x400000 + i * 8, f"m{i}") for i in range(65)]
+    ctx = _VtableCtx(slots)
+    layout = read_class._vtable_layout(ctx, object(), 0x9000)
+    assert len(layout["slots"]) == 64          # window entries only -- the
+    assert all(s["index"] < 64 for s in layout["slots"])   # lookahead is never a slot
+    assert layout["truncated"] is True
+    assert layout["max_slots"] == 64
+    assert layout["scanned"] == 64
+
+
+def test_vtable_layout_not_truncated_for_small_vtable():
+    # The fake pointer-table reader returns only the 3 rows it was given
+    # (well under max_slots=64) and the loop exhausts them without a
+    # `break`, so `for...else` computes `scanned (3) >= max_slots (64)` ->
+    # False. Not flagged as truncated.
+    slots = [(0x40e8b0, "onData"), (0x40e3d0, None), (0xDEAD, "__cxa_pure_virtual")]
+    ctx = _VtableCtx(slots)
+    layout = read_class._vtable_layout(ctx, object(), 0x9000)
+    assert layout["truncated"] is False
+    assert layout["max_slots"] == 64
+    assert layout["scanned"] == 3
+
+
+def test_vtable_layout_not_truncated_when_terminator_found_at_cap():
+    # A genuine terminator (mapped data pointer -- the next object) found
+    # exactly at the cap boundary must break the loop rather than fall into
+    # the `for...else` truncated path. 63 code slots + 1 terminating data
+    # slot = 64 raw rows scanned, but the loop `break`s on the last row, so
+    # this kills the mutant that drops the `for...else` distinction (an
+    # unconditional `truncated = scanned >= max_slots > 0` after the loop).
+    rows = [
+        {"index": i, "value": hex(0x400000 + i * 8), "readable": True,
+         "target": {"status": "function", "function": {"name": f"m{i}"}}}
+        for i in range(63)
+    ]
+    rows.append({"index": 63, "value": "0x9999", "readable": True,
+                  "target": {"status": "mapped", "function": None,
+                             "context": {"kind": "data", "segment": {"executable": False}}}})
+    layout = read_class._vtable_layout(_SlotCtx(rows), object(), 0x9000)
+    assert layout["truncated"] is False
+    assert len(layout["slots"]) == 63
+    assert layout["scanned"] == 64
+
+
+def test_vtable_layout_not_truncated_when_trailing_null_completes_object():
+    # #706 round 2 + follow-up: a COMPLETE 63-slot vtable immediately followed
+    # by the next object's zeroed offset-to-top consumes all 64 window entries
+    # without ever `break`ing (a null slot doesn't stop the scan), so the raw
+    # `for...else` completes and the one-entry lookahead at row 64 is
+    # consulted. That lookahead is the next object's typeinfo pointer -- a
+    # mapped DATA pointer, not code/null/extern -- so it does NOT confirm
+    # continuation and `truncated` resolves to False; the trailing null is
+    # then trimmed as the next object's padding.
+    rows = [
+        {"index": i, "value": hex(0x400000 + i * 8), "readable": True,
+         "target": {"status": "function", "function": {"name": f"m{i}"}}}
+        for i in range(63)
+    ]
+    rows.append({"index": 63, "value": "0x0", "readable": True,
+                  "target": {"status": "null", "context": {"kind": "null"}}})
+    rows.append({"index": 64, "value": "0xa100", "readable": True,   # next object's typeinfo
+                  "target": {"status": "mapped", "function": None,
+                             "context": {"kind": "data", "segment": {"executable": False}}}})
+    layout = read_class._vtable_layout(_SlotCtx(rows), object(), 0x9000)
+    assert layout["truncated"] is False
+    assert len(layout["slots"]) == 63
+    assert layout["scanned"] == 64
+
+
+def test_vtable_layout_truncated_when_lookahead_confirms_continuation_past_null_tail():
+    # #706 follow-up (round-3 case X, the residual under-report the follow-up
+    # retires): a genuinely capped vtable whose IN-WINDOW tail happens to be a
+    # null run (unresolved relocations / pure-virtual placeholders -- exactly
+    # what read_class.py's #441 comment says interior nulls are) must not be
+    # silently mistaken for a complete vtable just because the trim would
+    # otherwise remove those trailing slots. 61 code + 3 null fills the
+    # window (all 64 raw entries) without a `break`, so the raw `for...else`
+    # fires; the one-entry lookahead at row 64 is itself a readable CODE slot
+    # -- proof the real vtable keeps going past the cap -- so `truncated`
+    # must be True, and the 3 null slots must NOT be trimmed (they are
+    # interior placeholders in a table that is honestly reported as capped,
+    # not the next object's padding).
+    rows = [
+        {"index": i, "value": hex(0x400000 + i * 8), "readable": True,
+         "target": {"status": "function", "function": {"name": f"m{i}"}}}
+        for i in range(61)
+    ]
+    rows += [
+        {"index": i, "value": "0x0", "readable": True,
+         "target": {"status": "null", "context": {"kind": "null"}}}
+        for i in range(61, 64)
+    ]
+    rows.append({"index": 64, "value": hex(0x500000), "readable": True,   # lookahead: still code
+                  "target": {"status": "function", "function": {"name": "m64"}}})
+    layout = read_class._vtable_layout(_SlotCtx(rows), object(), 0x9000)
+    assert layout["truncated"] is True
+    assert layout["scanned"] == 64
+    assert len(layout["slots"]) == 64                     # trailing nulls kept, not trimmed
+    assert [s["index"] for s in layout["slots"][61:]] == [61, 62, 63]
+    assert all(s.get("null") for s in layout["slots"][61:])
+
+
+def test_vtable_layout_early_return_carries_truncation_keys():
+    # #205 review finding 4: the "word[1] isn't typeinfo" early return must
+    # carry the same key set as the main return path -- a set comparison so
+    # a future key added to the main path can't silently drift out of sync
+    # here (an exact-dict-literal assertion would stay green through that).
+    ctx = _SlotCtx(rows=[], ti_ok=False)
+    early = read_class._vtable_layout(ctx, object(), 0x9000)
+    main = read_class._vtable_layout(_SlotCtx([]), object(), 0x9000)
+    assert set(early.keys()) == set(main.keys())
+    assert early == {
+        "address": "0x9000",
+        "slots": [],
+        "truncated": False,
+        "max_slots": 64,
+        "scanned": 0,
+    }
+
+
+def test_render_class_show_text_notes_truncated_vtable():
+    from bn.formatters import _render_class_show_text
+    rec = {
+        "name": "net::Session",
+        "confidence": "rtti",
+        "methods": [],
+        "vtable": {
+            "address": "0x9000",
+            "slots": [{"index": 0, "address": "0x400000", "method": {"display_name": "m0"}}],
+            "truncated": True,
+            "max_slots": 64,
+        },
+    }
+    text = _render_class_show_text(rec)
+    assert "scan capped" in text
+    assert "64" in text
+
+
+def test_render_class_show_text_no_note_when_vtable_not_truncated():
+    from bn.formatters import _render_class_show_text
+    rec = {
+        "name": "net::Session",
+        "confidence": "rtti",
+        "methods": [],
+        "vtable": {
+            "address": "0x9000",
+            "slots": [{"index": 0, "address": "0x400000", "method": {"display_name": "m0"}}],
+            "truncated": False,
+            "max_slots": 64,
+        },
+    }
+    text = _render_class_show_text(rec)
+    assert "scan capped" not in text
+
+
+def test_render_class_show_text_notes_truncated_secondary_vtable():
+    from bn.formatters import _render_class_show_text
+    rec = {
+        "name": "net::Session",
+        "confidence": "rtti",
+        "methods": [],
+        "vtable": None,
+        "secondary_vtables": [{
+            "address": "0xa000",
+            "offset_to_top": -16,
+            "slots": [{"index": 0, "address": "0x400000", "method": {"display_name": "m0"}}],
+            "truncated": True,
+            "max_slots": 64,
+        }],
+    }
+    text = _render_class_show_text(rec)
+    assert "scan capped" in text
+
+
+def test_render_class_show_text_note_reflects_trimmed_slot_count():
+    # F1: the cap note must report the number of lines actually rendered
+    # (post trailing-null trim), not the configured `max_slots` cap.
+    from bn.formatters import _render_class_show_text
+    rec = {
+        "name": "net::Session",
+        "confidence": "rtti",
+        "methods": [],
+        "vtable": {
+            "address": "0x9000",
+            "slots": [{"index": 0, "address": "0x400000", "method": {"display_name": "m0"}}],
+            "truncated": True,
+            "max_slots": 64,
+        },
+    }
+    text = _render_class_show_text(rec)
+    assert "showing 1 slots" in text
+    assert "capped at 64" in text
+    assert "showing first 64" not in text
+
+
+def test_render_class_show_text_discloses_truncation_when_slots_fully_trimmed():
+    # F1: a fully-trimmed truncated window (all raw entries were trailing
+    # null and got popped) must still disclose the cap -- not fall silently
+    # into the "no slots resolved" branch with the note dropped.
+    #
+    # #706 follow-up: this payload -- `truncated: True` with `slots: []` --
+    # is a RENDERER-level contract only. Post-follow-up, `_vtable_layout`
+    # itself can no longer emit it: `truncated` is now only ever set True
+    # inside the `for...else` branch, which appends every window row it
+    # consumes to `slots` (so `len(slots) == scanned >= max_slots > 0`), and
+    # the trailing-null trim is skipped whenever `truncated` is True. The
+    # renderer is still a pure function over the JSON envelope (also fed by
+    # `secondary_vtables`), so the defensively-correct hoisted branch stays;
+    # it is simply unreachable from the bridge's own vtable scan now.
+    from bn.formatters import _render_class_show_text
+    rec = {
+        "name": "net::Session",
+        "confidence": "rtti",
+        "methods": [],
+        "vtable": {
+            "address": "0x9000",
+            "slots": [],
+            "truncated": True,
+            "max_slots": 64,
+        },
+    }
+    text = _render_class_show_text(rec)
+    assert "scan capped" in text
+    assert "showing 0 slots" in text
+
+
+def test_render_class_show_text_secondary_note_reflects_trimmed_slot_count():
+    from bn.formatters import _render_class_show_text
+    rec = {
+        "name": "net::Session",
+        "confidence": "rtti",
+        "methods": [],
+        "vtable": None,
+        "secondary_vtables": [{
+            "address": "0xa000",
+            "offset_to_top": -16,
+            "slots": [{"index": 0, "address": "0x400000", "method": {"display_name": "m0"}}],
+            "truncated": True,
+            "max_slots": 64,
+        }],
+    }
+    text = _render_class_show_text(rec)
+    assert "showing 1 slots" in text
+    assert "capped at 64" in text

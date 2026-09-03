@@ -1754,6 +1754,12 @@ def _render_virtual_call_text(value: Any) -> str:
     if value.get("ambiguous"):
         lines.append(f"  AMBIGUOUS: {len(cands)} provider classes implement slot "
                      f"{value.get('slot_offset', '?')}")
+    # #706 follow-up (round-2 finding 9): a reason can be attached ALONGSIDE a
+    # resolved/ambiguous candidate set (an unscanned provider's capped vtable
+    # scan might supply another candidate) -- surface it here instead of only
+    # inside the `not cands` branch above, which would silently drop it.
+    for warning in list(value.get("warnings") or []):
+        lines.append(f"  warning: {warning}")
     for c in cands:
         method = c.get("method") or "<unnamed>"
         entry = c.get("vtable_entry") or "?"
@@ -3822,6 +3828,11 @@ def _render_one_class(rec: Any) -> str:
         # decodable local body; say so rather than render fake or empty virtuals.
         lines.append("  vtable: symbol present but no slots resolved here "
                      "(defined in another module, or applied at load time via relocations)")
+    if vt and vt.get("truncated"):
+        lines.append(
+            f"  vtable: showing {len(vt.get('slots') or [])} slots; scan capped at {vt.get('max_slots')} -- "
+            "more may exist (raise the cap or inspect the table directly)"
+        )
     # #412: secondary (multiple-inheritance) vtables -- shown compactly so a simple
     # single-inheritance class isn't cluttered (there are none to show there).
     for sec in rec.get("secondary_vtables") or []:
@@ -3832,6 +3843,11 @@ def _render_one_class(rec: Any) -> str:
         lines.append(f"  secondary vtable @ {sec.get('address', '?')}{ott_s}:")
         for s in sec.get("slots") or []:
             lines.append(f"    [{s.get('index')}] {s.get('address', '?')}  {_vtable_slot_label(s)}")
+        if sec.get("truncated"):
+            lines.append(
+                f"    vtable: showing {len(sec.get('slots') or [])} slots; scan capped at {sec.get('max_slots')} -- "
+                "more may exist (raise the cap or inspect the table directly)"
+            )
     # Non-virtual member functions (kind=method). Virtual ones already appear as
     # vtable slots above; listing the symbol-side methods makes `class show`
     # useful for classes whose vtable is empty or absent (e.g. Controller).

@@ -420,6 +420,32 @@ def test_render_virtual_call_text_handles_int_and_missing_method_address_533():
     assert "B" in out and "n" in out  # missing method_address still renders the line
 
 
+def test_render_virtual_call_text_surfaces_warnings_alongside_candidates():
+    # #706 follow-up (round-2 finding 9): a `resolved: true` result can still
+    # carry a `warnings` entry (a DIFFERENT provider's vtable scan was
+    # capped before it reached this slot) -- must render alongside the
+    # resolved candidate, not only in the empty-candidates branch.
+    from bn.formatters import _render_virtual_call_text
+    value = {
+        "callsite": "0x1000", "caller": "consumer", "slot_offset": "0x10",
+        "slot_index": 2, "factory": None,
+        "candidates": [{
+            "provider": "self", "class": "Provider", "vtable": "0x9000",
+            "vtable_entry": "0x9010", "method": "doWork", "method_address": "0x4100",
+        }],
+        "ambiguous": False, "resolved": True,
+        "warnings": ["resolution may be incomplete: slot 2 is beyond the recovered "
+                     "vtable window (scan capped at 2 slots) in at least one OTHER "
+                     "provider that was not fully scanned for this slot -- it could "
+                     "supply an additional candidate not reflected in "
+                     "`resolved`/`ambiguous`"],
+    }
+    out = _render_virtual_call_text(value)
+    assert "doWork" in out
+    assert "warning:" in out
+    assert "resolution may be incomplete" in out
+
+
 def test_render_callsites_shows_null_hlil_reason_and_variadic_hint():
     # #557 + #558: text output surfaces the null-hlil reason code and the
     # variadic-callee steer.
