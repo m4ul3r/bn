@@ -112,7 +112,9 @@ def _bullet(prefix: str) -> str:
         if not line.startswith((" ", "\t")) or not line.strip():
             break
         bullet.append(line)
-    return " ".join(bullet)
+    # Collapse the fold seams too: a bullet wrapped between a name and its
+    # parenthetical must read the same as the one-line form.
+    return " ".join(" ".join(bullet).split())
 
 
 def test_exit_code_3_lists_every_failed_mutation_status():
@@ -128,19 +130,34 @@ def test_exit_code_3_lists_every_failed_mutation_status():
 
 
 @pytest.mark.parametrize("group", ("cli", "bridge"))
-def test_test_layout_bullet_names_every_split_module(group: str):
-    """#614 replaced the monolith names with the split pattern *and* the concern
-    list; a new `test_cli_*.py` / `test_bridge_*.py` module left out of that list
-    is how the monolith names survived a rename in the first place.
+def test_test_layout_bullet_concerns_still_resolve(group: str):
+    """#614's defect was the bullet naming modules a split had renamed away, so
+    every concern it lists must still resolve to a real module.
+
+    Deliberately one-directional: the ticket asked for the *pattern* rather than
+    an exhaustive list, so a newly added `test_cli_*.py` is covered by the glob
+    and does not have to be enumerated here.
     """
     bullet = _bullet("- Test files mirror source")
-    concerns = sorted(
-        path.stem.removeprefix(f"test_{group}_")
-        for path in (REPO / "tests").glob(f"test_{group}_*.py")
-    )
-    assert concerns, f"no tests/test_{group}_*.py modules found"
-    missing = [c for c in concerns if c not in bullet]
-    assert not missing, f"test_{group}_* concerns missing from the bullet: {missing}"
+    listed = re.search(rf"`test_{group}_\*\.py` \(([^)]+)\)", bullet)
+    assert listed, f"the bullet no longer lists the test_{group}_* concerns"
+    # A concern token never contains a space, so dropping every space inside the
+    # parenthetical survives a hard wrap that broke one across two lines.
+    concerns = listed.group(1).replace(" ", "").split("/")
+    missing = [c for c in concerns if not (REPO / "tests" / f"test_{group}_{c}.py").is_file()]
+    assert not missing, f"test_{group}_* concerns naming no module: {missing}"
+
+
+def test_test_layout_bullet_retired_modules_stay_gone():
+    """The bullet closes by naming the two monolith modules that no longer exist
+    (#614). If one comes back, that sentence is the stale claim."""
+    bullet = _bullet("- Test files mirror source")
+    retired = re.search(r"((?:`tests/test_\w+\.py`(?:,| and )?)+) do not exist", bullet)
+    assert retired, "the bullet must keep naming the monolith modules the split retired"
+    names = re.findall(r"`(tests/test_\w+\.py)`", retired.group(1))
+    assert len(names) == 2, f"expected the two monolith names, got {names}"
+    resurrected = [n for n in names if (REPO / n).exists()]
+    assert not resurrected, f"the bullet says these do not exist, but they do: {resurrected}"
 
 
 def test_cli_layout_names_every_command_module():
