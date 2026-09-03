@@ -34,7 +34,7 @@ Per-op statuses:
 - `noop` — already in the requested state.
 - `unsupported` — operation not supported on this object.
 - `verification_failed` — readback disagrees; the whole mutation/batch is reverted, and JSON also returns the requested vs observed state.
-- `invalid_request` — the op itself is malformed or refused before being applied (bad/missing field, ambiguous target, conflicting options); the whole mutation/batch is reverted.
+- `invalid_request` — the op was refused **during apply** (bad field *value*, an ambiguous target, conflicting options); the whole mutation/batch is reverted and this status shows up in a per-op `results[]` row, exit 3. A manifest that instead fails the **up-front shape check** (an unknown op kind, or a missing required field) never reaches apply — nothing is touched, so there is nothing to revert — and surfaces as a bridge/request error with no `results[]` envelope at all, exit 2.
 - `rollback_failed` — an operation failed and the automatic revert of that failure also failed; the view may be left in a mixed state.
 - `internal_error` — an unexpected exception during apply; treated like a failure and reverted.
 

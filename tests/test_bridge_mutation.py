@@ -2044,7 +2044,6 @@ def test_struct_field_set_overwrite_minting_surviving_duplicate_refused(monkeypa
     assert builder.added == []                 # never reached add_member_at_offset
 
 
-
 def test_types_declare_rejects_bitfield(monkeypatch):
     # #322: BN's parser silently drops `:N` bit widths and lays each bitfield out
     # as a full-width integer at the byte offset of its bit position -> overlapping,
