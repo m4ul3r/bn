@@ -323,7 +323,7 @@ def _validate_bool(value: Any, *, label: str, default: bool) -> bool:
 
 
 def _require_nonempty_name(value: Any, *, label: str = "new name",
-                            requested: dict[str, Any] | None = None) -> str:
+                           requested: dict[str, Any] | None = None) -> str:
     """Reject an empty/whitespace-only/null name before any view mutation.
 
     A JSON ``null`` must not ``str()`` into the literal "None" and slip the

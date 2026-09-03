@@ -902,26 +902,34 @@ def _member_byte_width(member) -> int:
         return 0
 
 
+def _overlapping_members(type_obj, offset: int, width: int) -> list:
+    """Every existing member whose byte range intersects the range a new field
+    of *width* bytes at *offset* would occupy. Width 0/unknown is treated as 1
+    byte so an exact start-offset collision is always caught. Shared by the
+    ``--no-overwrite`` clash check and the struct-field-set duplicate-name
+    guard, which needs to know EVERY member ``add_member_at_offset(overwrite=
+    True)`` would remove, not just the first (#56, #666)."""
+    members = getattr(type_obj, "members", None)
+    if members is None:
+        return []
+    new_start = int(offset)
+    new_end = new_start + max(int(width or 0), 1)
+    result = []
+    for member in list(members):
+        m_start = int(getattr(member, "offset", 0))
+        m_end = m_start + max(_member_byte_width(member), 1)
+        if new_start < m_end and m_start < new_end:
+            result.append(member)
+    return result
+
+
 def _first_overlapping_member(ctx, type_obj, offset: int, width: int):
     """The first existing member whose byte range intersects the range a new
     field of *width* bytes at *offset* would occupy, else None. Width 0/unknown
     is treated as 1 byte so an exact start-offset collision is always caught.
     Used to enforce struct field set --no-overwrite (#56)."""
-    members = getattr(type_obj, "members", None)
-    if members is None:
-        return None
-    new_start = int(offset)
-    new_end = new_start + max(int(width or 0), 1)
-    for member in list(members):
-        m_start = int(getattr(member, "offset", 0))
-        try:
-            m_width = int(getattr(getattr(member, "type", None), "width", 0) or 0)
-        except Exception:
-            m_width = 0
-        m_end = m_start + max(m_width, 1)
-        if new_start < m_end and m_start < new_end:
-            return member
-    return None
+    overlaps = _overlapping_members(type_obj, offset, width)
+    return overlaps[0] if overlaps else None
 
 
 
@@ -3278,6 +3286,11 @@ def _op_struct_field_set(ctx, bv, op: dict[str, Any]):
                 "field_type": str(getattr(member, "type", "")),
                 "offset": hex(int(getattr(member, "offset", offset))),
             }
+    new_width = 0
+    try:
+        new_width = int(field_type.width)
+    except Exception:
+        new_width = 0
     # --no-overwrite must REFUSE when the new field would clobber existing
     # data, not add an overlapping member: BN's add_member_at_offset(...,
     # overwrite=False) silently appends an overlapping member (worse than the
@@ -3286,11 +3299,6 @@ def _op_struct_field_set(ctx, bv, op: dict[str, Any]):
     # wider member (e.g. 0x4 within an int64_t at 0x0) overlaps just as much
     # (#56).
     if not overwrite and before_type is not None:
-        new_width = 0
-        try:
-            new_width = int(field_type.width)
-        except Exception:
-            new_width = 0
         clash = _first_overlapping_member(ctx, before_type, offset, new_width)
         if clash is not None:
             raise OperationFailure(
@@ -3302,6 +3310,35 @@ def _op_struct_field_set(ctx, bv, op: dict[str, Any]):
                 f"{hex(int(getattr(clash, 'offset', offset)))}; --no-overwrite refuses "
                 f"to clobber it. Re-run without --no-overwrite to replace it, or choose "
                 f"a free range.",
+                requested=_operation_requested(ctx, op),
+            )
+    # A member the write does NOT remove must not collide by NAME either.
+    # add_member_at_offset(overwrite=True) removes every member whose byte
+    # range overlaps the new field's, so a retype at a DIFFERENT offset (e.g.
+    # narrowing a wide field and re-adding a member under the same name
+    # elsewhere in its old range) creates no duplicate and must not be
+    # refused -- the guard round 2 rejected did exactly that (#666). Only a
+    # member OUTSIDE the range this write removes, that already holds the
+    # requested name, is a real duplicate.
+    if before_type is not None:
+        requested_field_name = str(op["field_name"])
+        removed = (
+            {id(m) for m in _overlapping_members(before_type, offset, new_width)}
+            if overwrite else set()
+        )
+        for member in list(getattr(before_type, "members", None) or []):
+            if id(member) in removed:
+                continue
+            if str(getattr(member, "name", "")) != requested_field_name:
+                continue
+            raise OperationFailure(
+                "invalid_request",
+                f"struct {resolved_name} already has a member named "
+                f"{requested_field_name!r} at offset "
+                f"{hex(int(getattr(member, 'offset', 0)))}, outside the byte range "
+                f"this write replaces ({hex(offset)}..{hex(offset + max(new_width, 1))}); "
+                "field names must be unique. Choose a different name, or target "
+                "that member's offset instead.",
                 requested=_operation_requested(ctx, op),
             )
     builder.add_member_at_offset(str(op["field_name"]), field_type, offset, overwrite)

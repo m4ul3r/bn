@@ -1818,7 +1818,6 @@ def test_struct_field_rename_by_ambiguous_name_is_invalid_request(monkeypatch):
     assert [(m.offset, m.name) for m in builder.members] == [(0, "dup"), (8, "dup")]
 
 
-
 def test_struct_field_delete_trailing_shrinks_struct_width(monkeypatch):
     # #320: removing the field that reaches the struct end must shrink the width.
     # BN's builder.remove() leaves the width stale, so the delete would otherwise
@@ -1983,6 +1982,67 @@ def test_struct_field_set_overwrite_at_occupied_offset_replaces(monkeypatch):
         "field_type": "int32_t", "overwrite_existing": True})
     assert res["before_member"]["field_name"] == "x"
     assert builder.added and builder.added[0] == ("replfld", 0, True)
+
+
+def test_struct_field_set_overwrite_narrower_retype_reusing_removed_name_succeeds(monkeypatch):
+    """#666 round 3 follow-up: `add_member_at_offset(overwrite=True)` removes
+    EVERY member overlapping the new byte range, so retyping a wide field
+    narrower at a different offset but the SAME name creates no duplicate --
+    the guard must not false-reject it. `wide` occupies [0x0, 0x8); the new
+    4-byte field at 0x4 overlaps it (removes it), and the requested name
+    `wide` is exactly the member being removed."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    builder = _AddableStructBuilder()
+    wide = types.SimpleNamespace(offset=0, name="wide", type=types.SimpleNamespace(width=8))
+    occupied_type = types.SimpleNamespace(members=[wide])
+
+    class _BV:
+        def parse_type_string(self, s):
+            return types.SimpleNamespace(width=4), None   # a 4-byte field
+
+        def get_type_by_name(self, n):
+            return occupied_type
+
+    monkeypatch.setattr(bridge.mutation_engine, "_struct_builder", lambda ctx, bv, name: ("S", builder))
+    monkeypatch.setattr(bridge.mutation_engine, "_commit_struct_builder", lambda *a, **k: None)
+    res = instance._op_struct_field_set(_BV(), {
+        "struct_name": "S", "offset": "0x4", "field_name": "wide",
+        "field_type": "int32_t", "overwrite_existing": True})
+    assert res["before_member"] is None       # 0x4 itself wasn't a member start
+    assert builder.added and builder.added[0] == ("wide", 4, True)
+
+
+def test_struct_field_set_overwrite_minting_surviving_duplicate_refused(monkeypatch):
+    """#666 round 3 follow-up, the genuine case: `a` at 0x0 and `b` at 0x8 do
+    NOT overlap a 4-byte write at 0x0 (only `a` is removed), so naming the new
+    field `b` would leave TWO members named `b` -- must be refused, and never
+    reach add_member_at_offset."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    builder = _AddableStructBuilder()
+    a = types.SimpleNamespace(offset=0, name="a", type=types.SimpleNamespace(width=4))
+    b = types.SimpleNamespace(offset=8, name="b", type=types.SimpleNamespace(width=4))
+    occupied_type = types.SimpleNamespace(members=[a, b])
+
+    class _BV:
+        def parse_type_string(self, s):
+            return types.SimpleNamespace(width=4), None
+
+        def get_type_by_name(self, n):
+            return occupied_type
+
+    monkeypatch.setattr(bridge.mutation_engine, "_struct_builder", lambda ctx, bv, name: ("S", builder))
+    monkeypatch.setattr(bridge.mutation_engine, "_commit_struct_builder", lambda *a, **k: None)
+    with pytest.raises(bridge.OperationFailure) as exc:
+        instance._op_struct_field_set(_BV(), {
+            "struct_name": "S", "offset": "0x0", "field_name": "b",
+            "field_type": "int32_t", "overwrite_existing": True})
+    assert exc.value.status == "invalid_request"
+    assert "b" in str(exc.value)
+    assert "0x8" in str(exc.value)             # names the surviving member's offset
+    assert builder.added == []                 # never reached add_member_at_offset
+
 
 
 def test_types_declare_rejects_bitfield(monkeypatch):
@@ -2775,6 +2835,65 @@ def test_end_to_end_clean_preview_leaves_view_unchanged_and_not_dirty(monkeypatc
     assert var.name == "var_8"
     assert fn.is_var_user_defined(var) is False
     assert marked == []  # a clean preview does not dirty the view
+
+
+def test_end_to_end_batch_with_invalid_local_rename_leaves_view_untouched(monkeypatch):
+    """#605 acceptance criterion 5: a batch containing an invalid `local_rename`
+    after a valid one is atomic. Driven through the REAL _mutation path (real
+    _apply_operation dispatch to _op_local_rename, real restore replay, real
+    undo revert) -- not the stubbed-apply helper, which would bypass the very
+    validation this test defends. The first op actually renames a variable;
+    the second's blank new_name is rejected by _require_nonempty_name only
+    AFTER the first has applied, so the batch must roll the first back too."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    me = bridge.mutation_engine
+
+    var8 = _FakeVariable(name="var_8", storage=-8, var_type="int32_t", identifier=10)
+    var12 = _FakeVariable(name="var_c", storage=-12, var_type="int32_t", identifier=11)
+    fn = _FakeFunction(0x401000, "f")
+    fn.stack_layout = [var8, var12]
+    bv = _FakeMutationBV(functions=[fn])
+    fn.view = bv
+
+    marked: list = []
+    monkeypatch.setattr(instance.targets, "resolve", lambda selector: bv)
+    monkeypatch.setattr(instance.targets, "mark_dirty", lambda b: marked.append(b))
+    # Wire the seam/peers so REAL _op_local_rename + restores + drift run; only
+    # the snapshot/diff machinery (irrelevant to this assertion) is stubbed out.
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(instance.ctx, "_find_function", lambda _bv, ident: fn)
+    monkeypatch.setattr(me, "_guess_affected_functions", lambda ctx, b, ops: [fn])
+    monkeypatch.setattr(me, "_capture_function_snapshots", lambda ctx, b, fns: {})
+    monkeypatch.setattr(me, "_capture_type_snapshots", lambda ctx, b, ops: {})
+    monkeypatch.setattr(me, "_diff_snapshots", lambda ctx, before, after: [])
+    monkeypatch.setattr(me, "_diff_type_snapshots", lambda ctx, before, after: [])
+    by_selector = {"var_8": (var8, False), "var_c": (var12, False)}
+    monkeypatch.setattr(bridge.vars_mod, "_find_variable_selector",
+                        lambda _f, sel: by_selector[sel])
+    monkeypatch.setattr(bridge.vars_mod, "_local_id", lambda _f, _v, is_parameter: "lid")
+    by_storage = {int(var8.storage): var8, int(var12.storage): var12}
+    monkeypatch.setattr(me, "_find_var_for_restore",
+                        lambda ctx, _f, identifier, storage, is_parameter: by_storage[int(storage)])
+
+    result = instance._mutation(
+        "active", False,
+        [
+            {"op": "local_rename", "function": "f", "variable": "var_8", "new_name": "renamed_ok"},
+            {"op": "local_rename", "function": "f", "variable": "var_c", "new_name": ""},
+        ],
+    )
+
+    assert result["success"] is False
+    assert result["committed"] is False
+    assert result["rolled_back"] is True
+    assert result["results"][-1]["status"] == "invalid_request"
+    # The view is actually unchanged: the first op's rename was rolled back,
+    # not just reported as failed -- the batch is provably atomic.
+    assert var8.name == "var_8"
+    assert fn.is_var_user_defined(var8) is False
+    assert var12.name == "var_c"
+    assert marked == []
 
 
 def test_end_to_end_propagated_auto_sibling_drift_repaired_by_mutation(monkeypatch):

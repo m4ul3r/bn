@@ -520,7 +520,6 @@ def test_local_rename_rejects_empty_new_name(fake_transport, capsys, bad_name):
     assert [call["op"] for call in calls] == []
 
 
-
 def test_symbol_rename_uses_implicit_target_when_single_target_is_open(fake_transport):
     calls = fake_transport(
         {
