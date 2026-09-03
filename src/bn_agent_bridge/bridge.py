@@ -347,18 +347,30 @@ def _collect_open_views(*, strict: bool = False) -> list[Any]:
             contexts = list(ui.UIContext.allContexts())
         except Exception:
             contexts = []
+            # NOT repaired by the activeContext() fallback below. That fallback
+            # recovers *a* context -- the active main window -- never a proof
+            # that it is the ONLY one. BN can hold several UIContexts (one per
+            # main window), which is precisely why allContexts() exists, so
+            # once it raises the number of open tabs is unknowable: a second
+            # window's tabs would be silently absent from the snapshot. A
+            # destructive decision gated on that count must refuse
+            # (_OpenViewEnumerationError); the fallback still runs so
+            # non-strict reads (`target list`) keep working off whatever the
+            # active window can still report.
             note_incomplete()
         if not contexts:
-            active_context = ui.UIContext.activeContext()
+            try:
+                active_context = ui.UIContext.activeContext()
+            except Exception:
+                # Both enumeration routes failed. Mark the snapshot lossy and
+                # let the walk fall through to the _headless_views merge --
+                # this used to propagate a raw UI exception straight out of
+                # `target list`, which has no business failing because one UI
+                # query hiccuped.
+                active_context = None
+                note_incomplete()
             if active_context is not None:
                 contexts = [active_context]
-                # The fallback recovered a full context set, so the
-                # allContexts() failure above cost nothing -- do not refuse a
-                # destructive close over an enumeration hiccup that has
-                # already been repaired. The other note_incomplete() sites
-                # (per-tab/context queries below) have no such fallback and
-                # stay correctly fatal.
-                incomplete = False
 
         def collect_binary_view(view):
             if view is not None:
@@ -407,8 +419,10 @@ def _collect_open_views(*, strict: bool = False) -> list[Any]:
         raise _OpenViewEnumerationError(
             "Unable to enumerate every open BinaryView tab: a UI query raised "
             "mid-walk, so the open-view count cannot be trusted for a "
-            "destructive close. Retry, or close an explicit target selector "
-            "or path instead of a bare or --all close."
+            "destructive close. Retry, or close one explicit target selector "
+            "at a time (`close -t <selector>` resolves by name and never "
+            "depends on the open-view count). A path or --all close reads the "
+            "same lossy snapshot and refuses too."
         )
     # `bn load` against a GUI bridge appends to _headless_views, but the UI
     # enumeration above only walks UI tabs/contexts -- so a headless-loaded view
@@ -500,10 +514,18 @@ class TargetManager:
         (#586), so without this eager pop a view the bridge itself closes
         would otherwise stay pinned in memory -- whole BinaryView, analysis
         state and all -- until some later `refresh()` prunes it; nothing
-        schedules one on a timer or a BN notification. This is wired only
-        into the `bn close` path (`_close_binary`); a GUI tab closed without
-        going through that path still bypasses this and stays pinned until
-        the next `refresh()` (#659, #613 review).
+        schedules one on a timer or a BN notification.
+
+        Release timing, stated exactly: this is wired ONLY into the `bn close`
+        path (`_close_binary`). A tab the USER closes in the GUI never reaches
+        it, and the two structures then age out differently -- `_records` and
+        `_ids_by_object` (and with them the strong view ref) are reclaimed by
+        the next `refresh()`, which prunes to the current open-view set, but
+        `_dirty_view_ids` is NOT pruned by `refresh()` at all, so that view's
+        stable view_id leaks for the process lifetime. `_dirty_view_ids` holds
+        only short id strings, so the leak is bounded in size, not in count
+        (#659). `refresh()` still bounds every structure that pins a
+        BinaryView (#586, #613 review).
         """
         with self._lock:
             vid = self._stable_view_id(bv)
@@ -1848,17 +1870,20 @@ class BinaryNinjaBridge:
         if all_ and path is not None:
             raise RuntimeError(
                 "Pass either a path or all=true, not both: a named path closes "
-                "only that target; all=true closes every loaded target."
+                "only that target; all=true closes every open target, "
+                "including GUI tabs bn did not load."
             )
         if not bare_target and path is not None:
             raise RuntimeError(
                 "Pass either a target or a path, not both: a target selector "
-                "closes that target; a path closes the loaded binary at that path."
+                "closes that target; a path closes the open target at that "
+                "path, whether bn loaded it or a GUI tab did."
             )
         if not bare_target and all_:
             raise RuntimeError(
                 "Pass either a target or all=true, not both: a target selector "
-                "closes only that target; all=true closes every loaded target."
+                "closes only that target; all=true closes every open target, "
+                "including GUI tabs bn did not load."
             )
         # A raw {"path": ""} is neither a real path nor a bare request: it must
         # not slip past the bare-close refusal below (path is not None) into the
@@ -1954,7 +1979,7 @@ class BinaryNinjaBridge:
                 raise RuntimeError(f"No loaded binary matches path: {path}")
 
         # Dedup by BN's handle-based equality, not id(): _collect_open_views()
-        # only dedups its own walk on id(bv) (bridge.py:389-395), and BN
+        # only dedups its own walk on `id(bv)`, and BN
         # interns no wrapper for a non-console view, so the same core view can
         # arrive here under several distinct wrapper objects -- one per
         # accessor (getCurrentViewFrame / getViewFrameForTab / getViewForTab).
@@ -1970,12 +1995,16 @@ class BinaryNinjaBridge:
         # deadlocks (#80/#86).
         closed = []
         succeeded: list[Any] = []
+        close_failed = False
         try:
             for bv in to_close:
                 closed.append(_snapshot(bv))
                 _run_on_main_thread(lambda v=bv: v.file.close())
                 self.targets.forget(bv)
                 succeeded.append(bv)
+        except BaseException:
+            close_failed = True
+            raise
         finally:
             # Prune out of _headless_views only the views THIS call actually
             # closed (#613 review): if v.file.close() raises partway through
@@ -1988,9 +2017,15 @@ class BinaryNinjaBridge:
             # whose UI-walk twin won the dict.fromkeys() dedup above must
             # still be pruned. Runs in `finally` so a close raising partway
             # through the loop still reconciles every view closed before the
-            # failure -- both operations below are cheap (list filter, no
-            # blocking round trip) so running them unconditionally does not
-            # reintroduce the #658 lock-scope problem.
+            # failure.
+            #
+            # Lock scope (#658/#80/#86): the set build and the list filter are
+            # pure computation (BN's handle-address __eq__/__hash__), so the
+            # only thing done under _headless_views_lock is the rebind. The
+            # registry write below is NOT cheap -- _write_registry() ->
+            # refresh() -> _collect_open_views() is a blocking main-thread
+            # round trip that re-acquires this very non-reentrant lock -- so
+            # it stays strictly outside the `with`.
             closed_views = set(succeeded)
             with _headless_views_lock:
                 _headless_views[:] = [v for v in _headless_views if v not in closed_views]
@@ -1998,7 +2033,23 @@ class BinaryNinjaBridge:
             # Always refresh the registry (#80), even on a mid-loop failure,
             # so already-closed views stop being advertised as open on disk
             # instead of only doing so when the whole loop succeeds.
-            self._write_registry()
+            try:
+                self._write_registry()
+            except Exception as registry_exc:
+                # A `finally` that raises REPLACES the in-flight exception. The
+                # close failure is the caller's primary diagnosis and must not
+                # be swapped out for a secondary registry-write error (which
+                # can raise on its own: mkstemp/os.replace/ensure_private_dir).
+                # Log and let the original propagate. With no close failure in
+                # flight there is nothing to mask, so the registry error is the
+                # real result and still surfaces.
+                if not close_failed:
+                    raise
+                bn.log_error(
+                    "bn close: registry refresh failed after a partial close "
+                    f"({registry_exc}); the close error below is the primary "
+                    "failure"
+                )
         return {"closed": closed}
 
     def _resolve_sole_target_for_close(self) -> Any:
