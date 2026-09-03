@@ -2842,7 +2842,7 @@ class TaintEngine:
         n_params = len(list(getattr(callee_fn, "parameter_vars", []) or []))
         valid = frozenset(i for i in tainted_args if i < n_params)
         out: dict[str, Any] = {"findings": [], "reached_return": False, "leaves": [],
-                               "assumptions": [], "out_params": frozenset(), "handoff_node": None}
+                               "assumptions": [], "out_params": frozenset(), "handoff_node": []}
         if not valid:
             out["reached_return"] = True
             out["assumptions"].append(f"tainted args to {callee_fn.name} fall beyond its parameters; conservative")
@@ -2872,7 +2872,7 @@ class TaintEngine:
             note = f"[{via}-resolved] " + note
         prefix.append(_instr_dict(ins, reason=note, tainted=[node_label(first_hit, why)],
                                   callee=getattr(callee_fn, "name", None)))
-        out["handoff_node"] = first_hit
+        out["handoff_node"] = [n for i in sorted(valid) for n in tainted_args[i]]
         for f in sub["findings"]:
             rebuilt = {"sink": f["sink"], "path": prefix + f["path"]}
             # Round-3 blocker: a callee's OWN unconditional-flow tag (set by its
@@ -3108,7 +3108,7 @@ class TaintEngine:
             return False
 
         def _tag_unconditional_flow(finding: dict[str, Any], hit_nodes: list[tuple]) -> dict[str, Any]:
-            if hit_nodes and _rooted_at_unconditional(hit_nodes[0]):
+            if hit_nodes and any(_rooted_at_unconditional(n) for n in hit_nodes):
                 finding["_unconditional_flow"] = True
             return finding
 
@@ -3829,15 +3829,18 @@ class TaintEngine:
                             # Round-3 blocker: `_descend`'s rebuild strips per-finding
                             # taint-graph context, so a finding's provenance can only be
                             # re-checked HERE, against the CALLER's own why-chain, using
-                            # the node that actually crossed into the callee. If that
-                            # hand-off node is itself rooted at an unconditional
-                            # injection (e.g. a caller-side gets()), every finding
-                            # descended through it is equally unattributable to
-                            # --source, no matter how deep the descent went (the merge
-                            # at each intervening level re-applies this same check with
-                            # its own hand-off node, so multi-level descent composes).
+                            # the nodes that actually crossed into the callee -- one per
+                            # tainted argument at the call site, not just the lowest-
+                            # indexed one (a lower-indexed --source-derived arg must not
+                            # mask a higher-indexed unconditionally-injected one). If ANY
+                            # hand-off node is itself rooted at an unconditional injection
+                            # (e.g. a caller-side gets()), every finding descended through
+                            # it is equally unattributable to --source, no matter how deep
+                            # the descent went (the merge at each intervening level
+                            # re-applies this same check with its own hand-off nodes, so
+                            # multi-level descent composes).
                             for f in d["findings"]:
-                                findings.append(_tag_unconditional_flow(f, [d.get("handoff_node")]))
+                                findings.append(_tag_unconditional_flow(f, d.get("handoff_node") or []))
                             for lf in d["leaves"]:
                                 if lf not in leaves:
                                     leaves.append(lf)

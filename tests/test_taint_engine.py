@@ -6946,6 +6946,60 @@ def test_descend_downstream_finding_composes_across_two_levels(models):
     assert result["stats"]["functions_visited"] == 3
 
 
+def test_descend_tags_flow_when_unconditional_arg_outranks_source_arg(models):
+    # Round-4 P2: `_descend`'s hand-off witness was a SINGLE node --
+    # `tainted_args[sorted(valid)[0]][0]` -- i.e. only the LOWEST-indexed
+    # tainted argument at the call site, and the merge site only checked that
+    # one node. When a call hands the callee BOTH a --source-derived argument
+    # at a lower index AND the unconditionally-injected buffer at a HIGHER
+    # index, the check ran against the source-derived node and the tag was
+    # never set. handler(fd): gets(&buf) (unconditional); helper(fd, &buf)
+    # where helper(a, b) does `rax = b[0]; memcpy(a, b, rax)`. fd is arg 0
+    # (--source, arms nothing) and &buf is arg 1 (unconditionally tainted by
+    # gets, and the ONLY thing that arms the memcpy finding via b's length).
+    a = FVar("a"); b = FVar("b"); rax = FVar("rax")
+    b1 = FSSA(b, 1); rax1 = FSSA(rax, 1)
+    helper_ssa = FSSAFunc([
+        FInstr(0, 0x2004, "MLIL_SET_VAR_SSA", "rax#1 = b#1[0]", reads=[b1], writes=[rax1]),
+        FInstr(1, 0x2010, "MLIL_CALL_SSA", "0x1080(a#1, b#1, rax#1)",
+               reads=[rax1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x1080", constant=0x1080),
+               params=[FExpr("MLIL_VAR_SSA", "a#1", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "b#1", reads=[b1]),
+                       FExpr("MLIL_VAR_SSA", "rax#1", reads=[rax1])]),
+    ])
+    helper = FFunc("helper", 0x2000, helper_ssa, params=[a, b])
+
+    # handler(fd): gets(&buf); helper(fd, &buf) -- fd (arg 0) precedes the
+    # unconditionally-tainted &buf (arg 1) at the call site.
+    buf = FVar("buf", typ="char[0x40]")
+    fd = FVar("fd"); fd0 = FSSA(fd, 0)
+    handler_ssa = FSSAFunc([
+        FInstr(0, 0x3008, "MLIL_CALL_SSA", "gets(&buf)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x1050", constant=0x1050),
+               params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)]),
+        FInstr(1, 0x3018, "MLIL_CALL_SSA", "0x2000(fd, &buf)", reads=[fd0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[fd0]),
+                       FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)]),
+    ])
+    handler = FFunc("handler", 0x3000, handler_ssa, params=[fd])
+
+    bv = FBV({0x1050: "gets", 0x1080: "memcpy"}, funcs={0x2000: helper})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(handler, [te.parse_locator("param:0")])   # taints fd, reaches nothing
+
+    memcpy_sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(memcpy_sinks) == 1, result["reached_sinks"]
+    assert memcpy_sinks[0]["sink"]["tainted_arg_index"] == 2   # b's length, genuinely tainted
+    # the blocker: the lower-indexed source-derived arg (fd, arg 0) must not
+    # mask the higher-indexed unconditionally-injected arg (&buf, arg 1) --
+    # the finding must still render the "?" sentinel, not be attributed to
+    # param:0 just because fd sorted first among the call's tainted args.
+    assert memcpy_sinks[0]["signature"]["source"] == "?"
+    assert "param:0" not in memcpy_sinks[0]["signature"]["rendered"]
+
+
 def _unconditional_declared_unresolvable_buf_func():
     # app_peek's model declares buf_arg=0, but the call's actual arg0 is a
     # bare constant (not a pointer/address-of expression) -- `_buffer_target`
