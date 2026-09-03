@@ -3427,7 +3427,9 @@ def _mutation_summary(value: Any) -> Any:
         "committed": committed,
         "preview": bool(value.get("preview", False)),
         # False when `results[]` came back empty on an op that was expected to
-        # populate it -- the counts/dirty_after below are UNKNOWN, not zero (#684).
+        # populate it. The four derived counts below are then UNKNOWN (None, not
+        # a confident zero); `op_count` stays 0 (literally true -- zero rows) and
+        # `dirty_after` is a deliberate fail-safe True, NOT unknown (#684).
         "measured": not unmeasured,
         "op_count": len(results),
         "changed_count": (None if unmeasured else verified),  # ops that changed + verified

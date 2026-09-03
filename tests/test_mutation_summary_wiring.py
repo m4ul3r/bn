@@ -28,6 +28,14 @@ def _mutate_call_sites(handler: Callable[..., int]) -> list[tuple[str, bool]]:
     hand-listing which command drives which bridge op, statically scan each
     registered command handler's own source for its `_mutate()` call(s) and
     read the op name straight off the literal second argument.
+
+    A `_mutate()` call whose op name is NOT a string literal raises instead of
+    being skipped. Skipping would drop that op out of the swept population
+    silently -- the same "narrower than the real failure surface" hole that let
+    the first version of this sweep miss `go_rename`. Every call site in the
+    tree today passes the op positionally as a literal; a future one that does
+    not must make this guard fail loudly and get an extractor that understands
+    it, not vanish from the sweep.
     """
     try:
         source = textwrap.dedent(inspect.getsource(handler))
@@ -43,12 +51,17 @@ def _mutate_call_sites(handler: Callable[..., int]) -> list[tuple[str, bool]]:
                 else func.attr if isinstance(func, ast.Attribute) else None)
         if name != "_mutate":
             continue
-        if len(node.args) < 2 or not (
-            isinstance(node.args[1], ast.Constant) and isinstance(node.args[1].value, str)
-        ):
-            continue
+        op_arg: ast.expr | None = node.args[1] if len(node.args) >= 2 else next(
+            (kw.value for kw in node.keywords if kw.arg == "op"), None
+        )
+        assert isinstance(op_arg, ast.Constant) and isinstance(op_arg.value, str), (
+            f"{getattr(handler, '__qualname__', handler)!r} calls _mutate() with a "
+            "non-literal op name, so this sweep cannot tell WHICH bridge op it "
+            "routes and would silently drop it from the #684 population. Pass the "
+            "op as a string literal, or teach _mutate_call_sites to resolve it."
+        )
         has_transform = any(kw.arg == "summary_transform" for kw in node.keywords)
-        sites.append((node.args[1].value, has_transform))
+        sites.append((op_arg.value, has_transform))
     return sites
 
 
@@ -117,23 +130,32 @@ def _assert_op_is_summary_safe(
     `_mutation_summary` compact path iff its bridge binder is known to
     populate `results[]` (delegates to `bridge._mutation()`, or is an audited
     bespoke exception), OR every CLI command that invokes it via `_mutate()`
-    registers a `summary_transform`. An op the CLI never routes through
-    `_mutate()` at all (rendered by its own dedicated formatter, e.g.
-    close/save/py-exec) never reaches the compact mutation summary and is
-    outside this bug's failure surface, so it is not checked."""
+    registers a `summary_transform`.
+
+    *op_name* MUST be present in *cli_wiring* -- i.e. some command really does
+    route it through `_mutate()`. There is deliberately no "not routed, so skip"
+    branch: the swept population IS `cli_wiring.keys()`, so such a branch would
+    be unreachable dead code whose only possible effect is a SILENT pass, the
+    exact failure mode that let the previous `write_locked_ops()`-based sweep
+    drop `go_rename`. An op the CLI never routes through `_mutate()` (rendered
+    by its own dedicated formatter, e.g. close/save/py-exec) cannot reach the
+    compact mutation summary at all and is simply never in the population."""
     if _binder_populates_results(binder) or op_name in AUDITED_BESPOKE_SAFE_OPS:
         return
-    if op_name not in cli_wiring:
-        return
     assert cli_wiring[op_name], (
-        f"write-locked op {op_name!r} neither delegates to bridge._mutation() "
-        "(so its results[] population is unverified) nor has a summary_transform "
-        "registered on its CLI command -- the default _mutation_summary compact "
-        "path would render it as changed=0 verified=0 noop=0 failed=0 "
-        "dirty_after=False even if it actually did real work (#684, the class of "
-        "bug behind #683's go_rename regression). Register summary_transform=... "
-        "on its _mutate() call, or add it to AUDITED_BESPOKE_SAFE_OPS with proof "
-        "results[] is populated on every return path."
+        f"mutating op {op_name!r} (routed through cli._mutate) neither delegates "
+        "to bridge._mutation() (so its results[] population is unverified) nor "
+        "has a summary_transform registered on its CLI command. If it reports "
+        "through its own counters it will reach the generic _mutation_summary "
+        "with an EMPTY results[], which cannot measure anything: the compact "
+        "status renders changed=None verified=None noop=None failed=None with a "
+        "fail-safe dirty_after=True and an `unmeasured` warning, instead of the "
+        "real counts the op did produce (#684, the class of bug behind #683's "
+        "go_rename regression -- note go_rename is lock=\"none\", so being "
+        "outside REGISTRY.write_locked_ops() is no excuse). Register "
+        "summary_transform=... on its _mutate() call, or add it to "
+        "AUDITED_BESPOKE_SAFE_OPS with proof results[] is populated on every "
+        "return path."
     )
 
 

@@ -67,18 +67,22 @@ mutation status `verification_failed`, `unsupported`, `invalid_request`,
 ### Compact status keys
 
 The compact status — the default text line, and the object returned by
-`--format json --summary` — is a stable schema:
+`--format json --summary` — is a stable schema. Every key below is always
+present except `prototype_user_type_residue`, which is emitted only when it is
+true:
 
 | key | meaning |
 |---|---|
+| `kind` | always `"mutation_summary"` — how a consumer tells a compact status apart from a full mutation envelope |
 | `ok` / `success` | mirrors the read-command envelope (`ok` is always present, unlike the full result) |
 | `committed` | true for any non-preview mutation that reached apply — including an all-noop |
 | `preview` | true when `--preview` was requested |
 | `measured` | **false** when the op reported no `results[]` rows to derive the fields below from; see "Unmeasured mutations" |
 | `op_count`, `changed_count`, `verified_count`, `noop_count`, `failed_count` | derived from `results[]`; `changed_count`/`verified_count`/`noop_count`/`failed_count` are `null` (not `0`) when `measured` is `false` — `op_count` stays `0`, which is literally true |
 | `rolled_back` | `true`/`false` when a revert was attempted, `null` when none was needed |
-| `first_error` | the first failure's explanation, or the unmeasured explanation below when `measured` is `false` — this is the one key every consumer should check regardless of `dirty_after` |
+| `first_error` | the first failure's explanation, or the unmeasured explanation below when `measured` is `false` — this is the one key every consumer should check regardless of `dirty_after`. It is **not** a failure signal on its own: read `ok`/`success` for that |
 | `dirty_after` | `true` iff the BNDB was left modified and needs `bn save` before closing |
+| `prototype_user_type_residue` | present and `true` only when a reverted `proto set` on an AUTO function left an unclearable `has_user_type` override behind; the view is modified even though the prototype value round-tripped, so `dirty_after` is `true` too |
 
 #### Unmeasured mutations
 
