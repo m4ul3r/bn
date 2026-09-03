@@ -610,7 +610,14 @@ def _function_thunk_summary(ctx, bv, func) -> dict[str, Any]:
     # (`read_decompile._thunk_veneer_warning`) already requires
     # `"/* tailcall */" in text` to be true. A genuinely unresolved/unlifted
     # tailcall (no local target was ever positively identified) must still
-    # reach the fallback below, unaffected.
+    # reach the fallback below, unaffected. #704 round 3: suppressing
+    # `is_candidate` here turned a false positive (flagging a local forwarder
+    # as a PLT/GOT-style thunk) into a false negative (a genuine local
+    # `j_`-style veneer became invisible). Recording `target` on this path --
+    # while leaving `is_candidate` False -- keeps the fix (no unearned thunk
+    # claim) and closes the visibility gap: `evidence function` still surfaces
+    # the forwarding, without asserting a thunk/veneer verdict the tool has
+    # not established for a LOCAL destination.
     saw_local_tailcall_target = False
     for insn in llil:
         op_name = il_format._il_op_name(insn)
@@ -631,6 +638,8 @@ def _function_thunk_summary(ctx, bv, func) -> dict[str, Any]:
             callee_fn = getter(int(dest_value)) if callable(getter) else None
         if callee_fn is not None and not is_imported_function(callee_fn):
             saw_local_tailcall_target = True
+            if result["target"] is None:
+                result["target"] = target
             continue
         result.update(
             {

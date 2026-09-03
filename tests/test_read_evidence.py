@@ -2803,6 +2803,26 @@ def test_argument_confidence_arity_mismatch_note_names_true_provenance_704(monke
     assert "HLIL rendered" not in out
 
 
+def test_argument_confidence_arity_mismatch_absent_for_empty_hlil_list_704(monkeypatch):
+    """#704 round 3 follow-up: the `arguments and` guard in
+    `_argument_arity_evidence` must keep protecting a prototyped callee (3
+    declared params) whose HLIL-sourced argument list is EMPTY -- e.g. a
+    non-SSA LLIL call the mapper could not populate. An empty list means no IL
+    layer actually supplied arguments, not that the callee was called with
+    zero -- flagging `arity_mismatch` here would be a fresh false positive of
+    exactly the class this guard exists to prevent, and demoting confidence
+    would punish a prototype the tool never contradicted."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _arity_bv(monkeypatch, instance, callee_params=3, arg_texts=[])
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    assert call["argument_source"] == "hlil"
+    assert "arity_mismatch" not in call
+    assert call["arity_unknown"] is False
+    assert call["argument_confidence"] == "authoritative"
+
+
 def test_argument_confidence_indirect_call_never_authoritative_648(monkeypatch):
     """#648: an indirect call has no resolvable callee, so its arity is
     unknowable even when HLIL produced a clean-looking argument list. The
@@ -3044,6 +3064,31 @@ def test_function_evidence_does_not_flag_local_tailcall_as_thunk_673(monkeypatch
 
     result = instance._function_evidence("active", "init_array_0", context=0)
     assert result["thunk"]["is_candidate"] is False
+
+
+def test_function_evidence_local_tailcall_reports_target_without_thunk_claim_704(monkeypatch):
+    """#704 round 3 follow-up: F1 correctly stopped flagging a local tail call
+    as a thunk candidate (#673), but a bare `is_candidate: False` made a
+    genuine local `j_`-style veneer invisible -- a false positive traded for a
+    false negative. The resolved LOCAL target must still be surfaced (so
+    `evidence function` shows the forwarding) WITHOUT asserting the
+    thunk/veneer claim the tool never established for a local destination."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    helper = _FakeFunction(0x461746, "init_helper")  # no .symbol -> not imported
+    ctor = _FakeFunction(0x500000, "init_array_0")
+    ctor.basic_blocks = [_FakeBasicBlock(0x500000, 0x500004)]
+    ctor.low_level_il = [[_FakeLLILInstruction(0x500000, _FakeConstPtr(0x461746), operation="LLIL_TAILCALL")]]
+    bv = _FakeBV(
+        functions=[helper, ctor],
+        disassembly={0x500000: "b init_helper"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._function_evidence("active", "init_array_0", context=0)
+    thunk = result["thunk"]
+    assert thunk["is_candidate"] is False
+    assert thunk["target"]["function"]["name"] == "init_helper"
 
 
 def test_function_evidence_pseudo_c_fallback_does_not_flag_local_tailcall_673(monkeypatch):

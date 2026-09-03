@@ -39,6 +39,38 @@ def test_thunk_veneer_warning_names_target_and_is_quiet_for_non_thunks(monkeypat
     assert read_decompile._thunk_veneer_warning(None, None, None) is None
 
 
+def test_thunk_veneer_warning_target_less_wording_states_only_what_is_known_704(monkeypatch):
+    """#704 round 3: when `_function_thunk_summary` flagged the candidate but
+    resolved no target (the PLT-section case, or the pseudo-C `/* tailcall */`
+    fallback), the warning must not assert "PLT/GOT trampoline ... the
+    apparent self-call is the resolved target" -- no target was ever
+    resolved, so nothing was established about "the resolved target". It must
+    instead name the actual reason the candidate was flagged and say plainly
+    that the branch target was not resolved."""
+    monkeypatch.setattr(
+        read_evidence, "_function_thunk_summary",
+        lambda ctx, bv, func: {
+            "is_candidate": True,
+            "reason": "small function rendered as a pseudo-C tailcall",
+            "target": None,
+        })
+    w = read_decompile._thunk_veneer_warning(None, None, None)
+    assert "small function rendered as a pseudo-C tailcall" in w
+    assert "not resolved" in w
+    assert "the apparent self-call is the resolved target" not in w
+
+    monkeypatch.setattr(
+        read_evidence, "_function_thunk_summary",
+        lambda ctx, bv, func: {
+            "is_candidate": True,
+            "reason": "function starts in a PLT/import trampoline section",
+            "target": None,
+        })
+    w2 = read_decompile._thunk_veneer_warning(None, None, None)
+    assert "function starts in a PLT/import trampoline section" in w2
+    assert "the apparent self-call is the resolved target" not in w2
+
+
 def test_list_locals_returns_stable_ids(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

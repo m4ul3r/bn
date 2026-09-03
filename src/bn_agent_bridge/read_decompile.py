@@ -132,8 +132,16 @@ def _thunk_veneer_warning(ctx, bv, func) -> str | None:
         dest = f"{name} @ {addr}" if name and addr else (name or addr)
         return (f"thunk/veneer -> {dest}: this is a PLT/GOT trampoline (a jump to "
                 f"the real body), not a self-recursive function.")
-    return ("thunk/veneer: this is a PLT/GOT trampoline (a small jump stub), not a "
-            "real function body; the apparent self-call is the resolved target.")
+    # #704 round 3: no target was resolved here -- the candidate was flagged
+    # either because the function merely starts in a PLT/import section, or
+    # because BN's pseudo-C rendered a bare `/* tailcall */` with no branch
+    # destination this detector could follow. Asserting "PLT/GOT trampoline
+    # ... the apparent self-call is the resolved target" claimed a resolution
+    # the tool never made. State only the reason the candidate was flagged;
+    # make no claim about what the unresolved target actually is.
+    reason = summary.get("reason") or "no branch target could be resolved"
+    return (f"thunk/veneer: {reason}; the branch target was not resolved, so "
+            f"this may be a trampoline/veneer but that is not confirmed.")
 
 
 _COMMENT_LINE_RE = re.compile(
