@@ -1841,9 +1841,19 @@ class TaintEngine:
             unique_findings.append(f)
         sources_echo = [self._describe_locator(s) for s in sources]
         for f in unique_findings:
+            # #615 review F1 + "New": an unconditional finding (tainted_arg_index
+            # is None) never traced from the run's declared --source -- and
+            # neither does a DOWNSTREAM finding whose flow roots at a node the
+            # unconditional block injected (e.g. a strcpy() fed only by a gets()
+            # buffer). Both render the pre-existing "?" no-source sentinel
+            # (taint_locators.py) instead of falsely attributing --source to a
+            # flow that never traced there.
+            _from_unconditional_flow = f.pop("_unconditional_flow", False)
+            _unconditional = f.get("sink", {}).get("tainted_arg_index") is None or _from_unconditional_flow
             fm, fs = derive_flow_facts(
                 direction="forward", path=f.get("path"), sink=f.get("sink"),
-                sources=sources_echo, leaves=sub["leaves"], fn_name=str(func.name))
+                sources=[] if _unconditional else sources_echo,
+                leaves=sub["leaves"], fn_name=str(func.name))
             f["metrics"] = fm
             f["signature"] = fs
         result = {
@@ -2832,7 +2842,7 @@ class TaintEngine:
         n_params = len(list(getattr(callee_fn, "parameter_vars", []) or []))
         valid = frozenset(i for i in tainted_args if i < n_params)
         out: dict[str, Any] = {"findings": [], "reached_return": False, "leaves": [],
-                               "assumptions": [], "out_params": frozenset()}
+                               "assumptions": [], "out_params": frozenset(), "handoff_node": []}
         if not valid:
             out["reached_return"] = True
             out["assumptions"].append(f"tainted args to {callee_fn.name} fall beyond its parameters; conservative")
@@ -2862,8 +2872,17 @@ class TaintEngine:
             note = f"[{via}-resolved] " + note
         prefix.append(_instr_dict(ins, reason=note, tainted=[node_label(first_hit, why)],
                                   callee=getattr(callee_fn, "name", None)))
+        out["handoff_node"] = [n for i in sorted(valid) for n in tainted_args[i]]
         for f in sub["findings"]:
-            out["findings"].append({"sink": f["sink"], "path": prefix + f["path"]})
+            rebuilt = {"sink": f["sink"], "path": prefix + f["path"]}
+            # Round-3 blocker: a callee's OWN unconditional-flow tag (set by its
+            # own direct-sink detection, e.g. an internal gets()) must survive
+            # this rebuild -- previously it was silently dropped, so a finding
+            # correctly tagged inside the callee re-rendered as causally reached
+            # by the caller's --source once it crossed this boundary.
+            if f.get("_unconditional_flow"):
+                rebuilt["_unconditional_flow"] = True
+            out["findings"].append(rebuilt)
         out["leaves"] = list(sub["leaves"])
         # Disclose a PARTIAL arg drop: taint descended with the in-range args, but
         # any tainted arg beyond the callee's recovered arity was filtered out of
@@ -3062,6 +3081,36 @@ class TaintEngine:
             tainted.add(node)
             why[node] = {"label": label, "instr": ins, "reason": reason, "parents": list(parents)}
             return True
+
+        # #615 review "New": nodes the unconditional-sink block below injects
+        # taint into, INDEPENDENTLY of --source -- tracked so a DOWNSTREAM sink
+        # reached only via that injected taint (e.g. a strcpy() fed by a gets()
+        # buffer) is not rendered as though the run's declared --source causally
+        # reached it (it didn't; the buffer's own always-unsafe read created the
+        # taint). `_rooted_at_unconditional` walks a finding's causal chain (the
+        # same `why`-parent walk `_reconstruct_path` uses) to check this.
+        unconditional_roots: set[tuple] = set()
+
+        def _rooted_at_unconditional(node: tuple) -> bool:
+            if not unconditional_roots:
+                return False
+            cur = node
+            seen: set = set()
+            while cur is not None and cur not in seen:
+                if cur in unconditional_roots:
+                    return True
+                seen.add(cur)
+                entry = why.get(cur)
+                if entry is None:
+                    return False
+                parents = entry.get("parents") or []
+                cur = parents[0] if parents else None
+            return False
+
+        def _tag_unconditional_flow(finding: dict[str, Any], hit_nodes: list[tuple]) -> dict[str, Any]:
+            if hit_nodes and any(_rooted_at_unconditional(n) for n in hit_nodes):
+                finding["_unconditional_flow"] = True
+            return finding
 
         # #193 Part 1: recv-buffer slots registered by the seed (slot key -> info)
         # and the subset that actually correlated to a forward re-load. Both are
@@ -3290,6 +3339,75 @@ class TaintEngine:
                 if _gate not in self._enabled_sink_classes:
                     sink = None
             if sink is not None:
+                # #615/review F3: an unconditional sink is one whose arming fields
+                # are BOTH empty -- no `tainted_args` and no `len_arg` -- independent
+                # of `class`. This mirrors the catalog (`read_taint_models.py:
+                # _arg_phrase`) and validator (`taint_models.py:142-143`), which
+                # already treat that shape as always-unsafe regardless of the
+                # sink's class name; gating on `class == "unbounded_input"` left
+                # user models under other class names permanently unfireable, and
+                # let a `class: "unbounded_input"` model WITH real tainted_args
+                # double-arm (once here, once via the conditional loop below with
+                # a different dedup key). It must be reported even when no tracked
+                # taint reaches any argument, since the danger is the call itself.
+                # Fires once per resolved target (review F4: `site_taddr`
+                # distinguishes resolved-indirect candidates sharing one callsite
+                # address), deduped like every other sink below.
+                if not sink.get("tainted_args") and sink.get("len_arg") is None:
+                    usig = ((addr, "unconditional") if site_taddr is None
+                            else (addr, "unconditional", site_taddr))
+                    if usig not in recorded_sinks:
+                        recorded_sinks.add(usig)
+                        # review F5: do NOT guess arg0 as the destination -- the
+                        # same anti-pattern the len_arg/no-buf_arg branch below
+                        # already forbids (audit D2, below). Prefer the model's
+                        # declared `buf_arg`, then its `sources[].to == "*arg:N"`
+                        # (gets declares `*arg:0`), and only fall back to an
+                        # undeclared synthetic node (no real buffer taint
+                        # injected) when neither is present.
+                        _buf_idx = sink.get("buf_arg")
+                        if _buf_idx is None:
+                            _src_tos = [str(s.get("to")) for s in (model.get("sources") or [])
+                                        if str(s.get("to", "")).startswith("*arg:")]
+                            if _src_tos:
+                                _buf_idx = _try_arg_index(_src_tos[0])
+                        dest = (self._buffer_target(ssaf, params[_buf_idx])
+                                if _buf_idx is not None and _buf_idx < len(params) else None)
+                        if dest is not None:
+                            node = (dest[0], None)
+                            node_lbl = dest[1]
+                        else:
+                            _tag = _buf_idx if _buf_idx is not None else "undeclared"
+                            node = (("name", f"{mkey or name or 'unbounded_input'}_arg{_tag}@{hex(addr)}"), None)
+                            node_lbl = var_label_of(node)
+                        if taint_node(node, node_lbl, ins,
+                                      f"{mkey or name}(): unbounded read, always unsafe", []):
+                            changed = True
+                        unconditional_roots.add(node)
+                        # P3: three distinct provenance shapes -- do not claim a
+                        # buffer taint that did not happen. `dest is not None` is
+                        # the only case where a real buffer node was tainted;
+                        # a declared-but-unresolvable buf_arg (index known, target
+                        # not resolved) falls back to a synthetic
+                        # `<name>_arg{N}@<addr>` node no downstream read can match,
+                        # same as the fully-undeclared case, just worded to keep
+                        # the declared index visible for diagnosis.
+                        if dest is not None:
+                            _taint_phrase = f"taints arg{_buf_idx} "
+                        elif _buf_idx is not None:
+                            _taint_phrase = (
+                                f"declares arg{_buf_idx} as its buffer but the target "
+                                "could not be resolved, so no buffer taint was injected "
+                                "(synthetic node only) ")
+                        else:
+                            _taint_phrase = "injects no buffer taint (no declared destination) "
+                        add_assumption(
+                            f"{mkey or name}(): unconditional {sink.get('class') or '?'} sink "
+                            + _taint_phrase
+                            + f"at {hex(addr)} independently of --source (always-unsafe API; "
+                            "the finding does not require any tracked taint to reach this call)")
+                        findings.append(_tag_unconditional_flow(
+                            self._make_finding(ins, mkey or name, None, sink, [node], why), [node]))
                 # #443: a bounded-write sink (wrapped recv/read) is armed by its
                 # `len_arg` -- an attacker-controlled write length -- in addition to
                 # any explicit `tainted_args`.
@@ -3418,7 +3536,8 @@ class TaintEngine:
                                         "is path-ambiguous, so overflow-vs-bounded is deferred -- "
                                         "corroborate with `taint backward`",
                                     }
-                                findings.append(self._make_finding(ins, mkey or name, argidx, eff_sink, ht, why))
+                                findings.append(_tag_unconditional_flow(
+                                    self._make_finding(ins, mkey or name, argidx, eff_sink, ht, why), ht))
                     else:
                         # #577: the sink's OWN declared arg index is out of range
                         # of the recovered params -- disclose the under-recovered
@@ -3532,7 +3651,8 @@ class TaintEngine:
                         sig = (addr, i) if site_taddr is None else (addr, i, site_taddr)
                         if sig not in recorded_sinks:
                             recorded_sinks.add(sig)
-                            findings.append(self._make_finding(ins, mkey or name, i, eff_vsink, ht, why))
+                            findings.append(_tag_unconditional_flow(
+                                self._make_finding(ins, mkey or name, i, eff_vsink, ht, why), ht))
             return changed, propagated
 
         for _ in range(self.max_iters):
@@ -3706,7 +3826,21 @@ class TaintEngine:
                             resolved_names.append(report_name)
                         elif descend_internal:
                             d = self._descend(ins, descend_fn, tainted_args, why, depth, max_depth, via=via)
-                            findings.extend(d["findings"])
+                            # Round-3 blocker: `_descend`'s rebuild strips per-finding
+                            # taint-graph context, so a finding's provenance can only be
+                            # re-checked HERE, against the CALLER's own why-chain, using
+                            # the nodes that actually crossed into the callee -- one per
+                            # tainted argument at the call site, not just the lowest-
+                            # indexed one (a lower-indexed --source-derived arg must not
+                            # mask a higher-indexed unconditionally-injected one). If ANY
+                            # hand-off node is itself rooted at an unconditional injection
+                            # (e.g. a caller-side gets()), every finding descended through
+                            # it is equally unattributable to --source, no matter how deep
+                            # the descent went (the merge at each intervening level
+                            # re-applies this same check with its own hand-off nodes, so
+                            # multi-level descent composes).
+                            for f in d["findings"]:
+                                findings.append(_tag_unconditional_flow(f, d.get("handoff_node") or []))
                             for lf in d["leaves"]:
                                 if lf not in leaves:
                                     leaves.append(lf)
@@ -4496,9 +4630,29 @@ class TaintEngine:
 
     def _make_finding(self, ins, callee, argidx, sink, hit_nodes, why) -> dict[str, Any]:
         path = self._reconstruct_path(hit_nodes[0], why)
-        path.append(_instr_dict(ins, reason=f"tainted arg{argidx} reaches {callee}",
-                                tainted=[node_label(n, why) for n in hit_nodes],
-                                callee=callee))
+        # #615 review F1: argidx is None for an unconditional sink (no argument
+        # taint required) -- the reason must not claim an arg-taint flow that
+        # never happened.
+        reason = (f"{callee}(): unconditional sink reached (no argument taint required)"
+                  if argidx is None else f"tainted arg{argidx} reaches {callee}")
+        tainted_labels = [node_label(n, why) for n in hit_nodes]
+        # Round-3 F1 residual: an unconditional sink's hit node is taint_node()'d
+        # AT this exact call with empty parents (the call itself IS the
+        # injection site), so `_reconstruct_path` above already renders one path
+        # entry for `ins`. Appending a second entry for the same instruction
+        # below double-counts a zero-hop flow (metrics.steps == 2 for a finding
+        # with no propagation hops at all). Collapse into the existing entry
+        # instead of duplicating it; a real (non-zero-hop) finding's last
+        # reconstructed step is an earlier instruction, so this never fires for
+        # those and multi-hop paths render unchanged.
+        last = path[-1] if path else None
+        if (last is not None and last.get("il_index") == int(getattr(ins, "instr_index", -1))
+                and last.get("address") == hex(int(getattr(ins, "address", 0)))):
+            last["reason"] = reason
+            last["tainted"] = tainted_labels
+            last["callee"] = callee
+        else:
+            path.append(_instr_dict(ins, reason=reason, tainted=tainted_labels, callee=callee))
         return {
             "sink": {
                 "callee": callee,

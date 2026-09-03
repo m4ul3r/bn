@@ -64,7 +64,8 @@ def _taint_op(ctx, selector, params: dict[str, Any]):
     # `models` (before the long analysis), so a model file created/deleted
     # mid-run can't desync the reported sources from what was actually used.
     model_sources = _taint.model_overlay_sources(
-        params.get("user_models"), user_models_path=params.get("user_models_path"))
+        params.get("user_models"), user_models_path=params.get("user_models_path"),
+        user_models_via=params.get("user_models_via"))
 
     def _find_variable(fn, sel):
         var, _is_param = vars_mod._find_variable_selector(fn, sel)
@@ -122,7 +123,8 @@ def _taint_models_op(ctx, selector, params: dict[str, Any]):
         raise OperationFailure("unsupported", str(exc)) from exc
     catalog = build_catalog(models, role=params.get("role"), sink_class=params.get("class"))
     catalog["overlays"] = _taint.model_overlay_sources(
-        params.get("user_models"), user_models_path=params.get("user_models_path"))
+        params.get("user_models"), user_models_path=params.get("user_models_path"),
+        user_models_via=params.get("user_models_via"))
     catalog["items"] = ([{"role": "source", **s} for s in catalog["sources"]]
                         + [{"role": "sink", **e}
                            for lst in catalog["sinks_by_class"].values() for e in lst]

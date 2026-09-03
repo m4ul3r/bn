@@ -35,6 +35,15 @@ def test_color_env_is_pinned_regardless_of_developer_shell():
         assert var not in os.environ, f"{var} leaked into the test environment"
 
 
+def test_bn_taint_models_env_does_not_leak_into_test_environment():
+    # #615 review F6: the CLI now reads BN_TAINT_MODELS directly per invocation
+    # (dataflow.py), so a developer/CI shell that exports it must not leak into
+    # the suite -- same hermeticity class as the color vars above. Without the
+    # _hermetic_env delenv, `BN_TAINT_MODELS=/tmp/definitely-missing-models.json
+    # uv run pytest tests/test_dataflow.py -q` fails 4 unrelated tests.
+    assert "BN_TAINT_MODELS" not in os.environ
+
+
 def test_argparse_usage_text_is_never_colorized():
     """Positive control: the bug (#589) was ANSI codes in usage/help text."""
     help_text = bn.cli.build_parser().format_help()

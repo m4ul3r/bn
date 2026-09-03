@@ -227,6 +227,11 @@ def _hermetic_env(request, monkeypatch, tmp_path_factory):
     """
     for var in _COLOR_FORCING_VARS:
         monkeypatch.delenv(var, raising=False)
+    # #615 review F6: the CLI now reads BN_TAINT_MODELS directly (dataflow.py),
+    # so an ambient value in the developer/CI shell must not leak into tests --
+    # same precedent as the color vars above. A test that wants it set uses
+    # monkeypatch.setenv itself (runs after this fixture, so it still overrides).
+    monkeypatch.delenv("BN_TAINT_MODELS", raising=False)
     monkeypatch.setenv("NO_COLOR", "1")
 
     # An ambient BN_INSTANCE in the developer's/CI's shell is "same effect as

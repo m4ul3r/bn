@@ -12,6 +12,7 @@ The fixtures reproduce the verified spike function ``process``:
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import types
 from pathlib import Path
@@ -280,6 +281,22 @@ def test_model_overlay_sources_unwraps_models_envelope_and_path():
     assert len(user) == 1
     assert user[0]["count"] == 2                       # inner models, _comment excluded
     assert user[0]["path"] == "proj/models.json"
+
+
+def test_model_overlay_sources_names_the_knob_that_supplied_the_file():
+    # #669: the client now forwards a BN_TAINT_MODELS-sourced file through the
+    # same request param as --models, so the disclosure must name WHICH knob
+    # supplied it instead of always claiming `--models`.
+    by_env = te.model_overlay_sources({"app_copy": {}}, user_models_path="/tmp/env.json",
+                                      user_models_via="$BN_TAINT_MODELS")
+    user = [s for s in by_env if s["kind"] == "user"]
+    assert user[0]["via"] == "$BN_TAINT_MODELS"
+    assert user[0]["path"] == "/tmp/env.json"
+
+    # unspecified (an older client, or a direct socket caller) keeps the
+    # historical label rather than inventing a source
+    legacy = te.model_overlay_sources({"app_copy": {}})
+    assert [s for s in legacy if s["kind"] == "user"][0]["via"] == "--models"
 
 
 def test_model_overlay_sources_labels_override_by_env_presence(monkeypatch, tmp_path):
@@ -6588,3 +6605,482 @@ def test_reclassify_constant_format_sink_477(models):
     other = {"class": "overflow_len", "detail": "y"}
     assert engine._reclassify_constant_format_sink(other, "%d") == other
     assert engine._reclassify_constant_format_sink(None, "%d") is None
+
+
+def _gets_no_taint_func():
+    # dump(fd): gets(&buf) -- `buf` receives no other taint (fd is unused by the
+    # call), so the ONLY way this sink can fire is #615's unconditional
+    # `unbounded_input` emission, not the ordinary tainted-arg path.
+    buf = FVar("buf", typ="char[0x40]")
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "gets(&buf)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401070", constant=0x401070),
+               params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)]),
+    ]
+    bv = FBV({0x401070: "gets"})
+    return FFunc("dump", 0x10, FSSAFunc(instrs), params=[FVar("fd")]), bv
+
+
+def test_unbounded_input_sink_fires_unconditionally(models):
+    # #615: gets()'s model declares an empty `tainted_args` (the danger is the
+    # call itself, not a tainted operand) -- the sink must still fire exactly
+    # once per callsite, with no incoming taint required.
+    func, bv = _gets_no_taint_func()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])   # taints fd, unrelated to buf
+    gets_sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "gets"]
+    assert len(gets_sinks) == 1, result["reached_sinks"]
+    assert gets_sinks[0]["sink"]["class"] == "unbounded_input"
+    # #615 review F1: tainted_arg_index is the None/null sentinel -- no argument
+    # taint was required or claimed -- and the path/signature must not fabricate
+    # an arg-taint provenance for a flow that never traced there.
+    assert gets_sinks[0]["sink"]["tainted_arg_index"] is None
+    last_step = gets_sinks[0]["path"][-1]
+    assert "tainted arg" not in last_step["reason"]
+    assert gets_sinks[0]["signature"]["source"] == "?"
+
+    # negative control: no call to gets() at all -> no unbounded_input finding.
+    a = FVar("a"); a0 = FSSA(a, 0)
+    clean_instrs = [FInstr(0, 0x10, "MLIL_NOP", "nop", reads=[a0])]
+    clean_func = FFunc("clean", 0x10, FSSAFunc(clean_instrs), params=[a])
+    clean_engine = te.TaintEngine(FBV({}), models)
+    clean_result = clean_engine.forward(clean_func, [te.parse_locator("param:0")])
+    assert clean_result["reached_sinks"] == []
+
+
+def test_unbounded_input_sink_zero_hop_path_has_single_step(models):
+    # Round-3 F1 residual: `_make_finding` reconstructs the path from the
+    # unconditional hit node's `why` entry (one step: the call itself, since
+    # that IS the injection site with no parents) and then unconditionally
+    # appended a SECOND entry for that same call -- a zero-hop finding must
+    # have exactly one path step, not two.
+    func, bv = _gets_no_taint_func()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    gets_sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "gets"]
+    assert len(gets_sinks) == 1, result["reached_sinks"]
+    assert len(gets_sinks[0]["path"]) == 1, gets_sinks[0]["path"]
+    assert gets_sinks[0]["metrics"]["steps"] == 1
+
+
+def _gets_then_earlier_strcpy_func():
+    # #615 review F2: linear instruction order strcpy(&dst, &buf) FIRST,
+    # gets(&buf) SECOND -- stands in for a loop back-edge where the
+    # top-of-body strcpy reads a buffer gets() only fills at the bottom of the
+    # PREVIOUS iteration. A single linear pass visits strcpy before buf is
+    # tainted; only a SECOND pass (driven by changed=True from the gets()
+    # taint_node call) catches it.
+    buf = FVar("buf", typ="char[0x40]")
+    dst = FVar("dst", typ="char[0x40]")
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "strcpy(&dst, &buf)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401090", constant=0x401090),
+               params=[FExpr("MLIL_ADDRESS_OF", "&dst", src=dst),
+                       FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)]),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "gets(&buf)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401070", constant=0x401070),
+               params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)]),
+    ]
+    bv = FBV({0x401090: "strcpy", 0x401070: "gets"})
+    return FFunc("loopish", 0x10, FSSAFunc(instrs), params=[FVar("fd")]), bv
+
+
+def test_unbounded_input_taint_propagates_to_earlier_instruction_same_pass(models):
+    # #615 review F2: the unconditional-sink taint_node()'s bool return must
+    # feed `changed`, exactly like every sibling taint-introducing call in the
+    # fixpoint -- otherwise a pass whose only state change is this seed exits
+    # the fixpoint (no changed=True -> break) before a second pass can see it.
+    func, bv = _gets_then_earlier_strcpy_func()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    classes = {s["sink"]["class"] for s in result["reached_sinks"]}
+    assert "overflow_unbounded" in classes, result["reached_sinks"]  # strcpy fired on the gets()-tainted buf
+    assert result["stats"]["truncated"] is False
+
+
+def test_unconditional_sink_arms_on_shape_not_class_name(models):
+    # #615 review F3: a user model with a DIFFERENT class name but the same
+    # empty-tainted_args/no-len_arg shape must still fire unconditionally --
+    # the catalog/validator already treat this shape as always-unsafe
+    # regardless of `class`.
+    shaped = te.load_models(extra={"app_read": {
+        "sink": {"class": "overflow_unbounded", "tainted_args": []}}})
+    func, bv = _gets_no_taint_func()
+    bv2 = FBV({0x401070: "app_read"})
+    engine = te.TaintEngine(bv2, shaped)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    hits = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "app_read"]
+    assert len(hits) == 1, result["reached_sinks"]
+    assert hits[0]["sink"]["class"] == "overflow_unbounded"
+
+
+def test_unbounded_input_class_with_real_tainted_args_does_not_double_arm(models):
+    # #615 review F3 (round-2 corrected): class == "unbounded_input" is no
+    # longer sufficient by itself -- a model that ALSO declares tainted_args
+    # must arm exactly once (via the conditional path), not twice
+    # (unconditional + conditional). The buffer must be genuinely tainted by
+    # the seed so the conditional arm can actually fire -- otherwise the
+    # fixture passes trivially regardless of the fix.
+    double = te.load_models(extra={"gets2": {
+        "sink": {"class": "unbounded_input", "tainted_args": [0]}}})
+    buf = FVar("buf", typ="char[0x40]")
+    buf0 = FSSA(buf, 0)
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "gets2(&buf)", reads=[buf0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401075", constant=0x401075),
+               params=[FExpr("MLIL_VAR_SSA", "buf#0", reads=[buf0])]),
+    ]
+    bv = FBV({0x401075: "gets2"})
+    func = FFunc("dump2", 0x10, FSSAFunc(instrs), params=[buf])
+    engine = te.TaintEngine(bv, double)
+    # seed `buf` itself (the function's own param) so the CONDITIONAL arm
+    # (tainted_args=[0]) genuinely fires, not just the unconditional one.
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    hits = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "gets2"]
+    assert len(hits) == 1, result["reached_sinks"]
+
+
+def _indirect_two_unconditional_targets_func():
+    # #615 review F4 (round-2 corrected): dispatch(buf) -> [slot](buf) indirect
+    # whose value-set resolves to TWO DIFFERENTLY NAMED always-unsafe targets at
+    # different addresses -- differently named because the top-level
+    # (callee, address, tainted_arg_index) dedup would legitimately collapse two
+    # SAME-named targets regardless of this fix; only a real name difference
+    # proves the resolved-indirect dedup key (site_taddr) carries through. `buf`
+    # is read directly (not by address) and seeded so the indirect-call taint
+    # gate is satisfied and both candidates are actually resolved+applied.
+    buf = FVar("buf")
+    buf0 = FSSA(buf, 0)
+    pvs = FPVS("InSetOfValues", values=[0x900, 0x910])
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "[slot](buf#0)", reads=[buf0], writes=[],
+               dest=FExpr("MLIL_VAR_SSA", "slot#1", reads=[], possible_values=pvs),
+               params=[FExpr("MLIL_VAR_SSA", "buf#0", reads=[buf0])]),
+    ]
+    bv = FBV({0x900: "gets", 0x910: "app_gets2"})
+    return FFunc("dispatch", 0x10, FSSAFunc(instrs), params=[buf]), bv
+
+
+def test_unconditional_sink_dedup_per_resolved_indirect_target(models):
+    extra = {"app_gets2": {"sources": [{"to": "*arg:0"}],
+                           "sink": {"tainted_args": [], "class": "unbounded_input"}}}
+    shaped = te.load_models(extra=extra)
+    func, bv = _indirect_two_unconditional_targets_func()
+    engine = te.TaintEngine(bv, shaped)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    hits = {s["sink"]["callee"] for s in result["reached_sinks"]
+            if s["sink"]["callee"] in ("gets", "app_gets2")}
+    assert hits == {"gets", "app_gets2"}, result["reached_sinks"]
+
+
+def test_unconditional_sink_honors_buf_arg(models):
+    # #615 review F5 (round-2 corrected): a wrapper like app_read_line(fd, buf)
+    # has no buf_arg but DOES declare sources[].to == "*arg:1" -- the
+    # unconditional seed must taint `buf` (arg1) via that declared source, not
+    # guess arg0 (`fd`), matching the do-not-guess-arg0 rule the len_arg/no-
+    # buf_arg branch already enforces elsewhere in this file.
+    wrapped = te.load_models(extra={"app_read_line": {
+        "sources": [{"to": "*arg:1"}],
+        "sink": {"class": "unbounded_input", "tainted_args": []}}})
+    fd = FVar("fd"); buf = FVar("buf", typ="char[0x40]")
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "app_read_line(fd, &buf)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401095", constant=0x401095),
+               params=[FExpr("MLIL_VAR_SSA", "fd", reads=[]),
+                       FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)]),
+        FInstr(1, 0x14, "MLIL_CALL_SSA", "strcpy(&dst, &buf)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401090", constant=0x401090),
+               params=[FExpr("MLIL_ADDRESS_OF", "&dst", src=FVar("dst", typ="char[0x40]")),
+                       FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)]),
+    ]
+    bv = FBV({0x401095: "app_read_line", 0x401090: "strcpy"})
+    func = FFunc("h", 0x10, FSSAFunc(instrs), params=[fd])
+    engine = te.TaintEngine(bv, wrapped)
+    # seed an unrelated param (fd) -- app_read_line propagates NOTHING from it;
+    # the only way buf/strcpy fires is the unconditional buf_arg-derived seed.
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    classes = {s["sink"]["class"] for s in result["reached_sinks"]}
+    assert "overflow_unbounded" in classes, result["reached_sinks"]  # strcpy fired on buf, seeded via *arg:1
+    assert any("independently of --source" in a for a in result["assumptions"]), result["assumptions"]
+
+
+def test_unconditional_sink_downstream_finding_not_attributed_to_unrelated_source(models):
+    # #615 review "New": the unconditional block does not just report -- it
+    # taints the destination buffer, and every sink reached from that injected
+    # buffer must NOT be rendered as though the run's declared --source
+    # causally reached it. Seed an unrelated source (fd) and confirm the
+    # downstream strcpy finding's signature/source is the "?" no-source
+    # sentinel, not the seeded locator.
+    func, bv = _gets_then_earlier_strcpy_func()
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(func, [te.parse_locator("param:0")])   # taints fd, unrelated to buf/dst
+    strcpy_sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "strcpy"]
+    assert len(strcpy_sinks) == 1, result["reached_sinks"]
+    assert strcpy_sinks[0]["sink"]["tainted_arg_index"] == 1     # a REAL arg-taint finding, not the sentinel
+    assert strcpy_sinks[0]["signature"]["source"] == "?"         # but NOT attributed to param:0
+    assert "param:0" not in strcpy_sinks[0]["signature"]["rendered"]
+
+
+def test_descend_downstream_finding_not_attributed_when_handoff_is_unconditional(models):
+    # Round-3 BLOCKER: the intra-function fix above
+    # (test_unconditional_sink_downstream_finding_not_attributed_to_unrelated_source)
+    # does not survive a descent into an in-binary callee. handler(fd) calls
+    # gets(&buf) -- buf tainted unconditionally, independently of --source --
+    # then copy_it(&buf, &out), an in-binary helper whose body is
+    # `rax = src[0]; memcpy(dst, src, rax)`. `fd` (the declared --source) is
+    # never read by either call. The descended memcpy finding must render the
+    # same "?" no-source sentinel as the gets() finding, not be falsely
+    # attributed to param:0 just because it crossed a call boundary.
+    src = FVar("src"); dst = FVar("dst"); rax = FVar("rax")
+    src1 = FSSA(src, 1); rax1 = FSSA(rax, 1)
+    copy_ssa = FSSAFunc([
+        FInstr(0, 0x2004, "MLIL_SET_VAR_SSA", "rax#1 = src#1[0]", reads=[src1], writes=[rax1]),
+        FInstr(1, 0x2010, "MLIL_CALL_SSA", "0x1080(dst#1, src#1, rax#1)",
+               reads=[rax1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x1080", constant=0x1080),
+               params=[FExpr("MLIL_VAR_SSA", "dst#1", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "src#1", reads=[src1]),
+                       FExpr("MLIL_VAR_SSA", "rax#1", reads=[rax1])]),
+    ])
+    copy_it = FFunc("copy_it", 0x2000, copy_ssa, params=[src, dst])
+
+    # handler(fd): gets(&buf); copy_it(&buf, &out) -- fd is never touched.
+    buf = FVar("buf", typ="char[0x40]"); out = FVar("out", typ="char[0x10]")
+    fd = FVar("fd")
+    handler_ssa = FSSAFunc([
+        FInstr(0, 0x3008, "MLIL_CALL_SSA", "gets(&buf)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x1050", constant=0x1050),
+               params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)]),
+        FInstr(1, 0x3018, "MLIL_CALL_SSA", "0x2000(&buf, &out)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       FExpr("MLIL_ADDRESS_OF", "&out", src=out)]),
+    ])
+    handler = FFunc("handler", 0x3000, handler_ssa, params=[fd])
+
+    bv = FBV({0x1050: "gets", 0x1080: "memcpy"}, funcs={0x2000: copy_it})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(handler, [te.parse_locator("param:0")])   # taints fd, reaches nothing
+
+    gets_sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "gets"]
+    memcpy_sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(gets_sinks) == 1, result["reached_sinks"]
+    assert len(memcpy_sinks) == 1, result["reached_sinks"]
+    assert gets_sinks[0]["signature"]["source"] == "?"
+    # the blocker: a REAL arg-taint finding (memcpy's len arg is genuinely
+    # tainted, inside copy_it, by the buffer gets() filled) -- but that buffer
+    # taint never traced back to the declared --source, so the finding must
+    # still render the "?" sentinel, not param:0.
+    assert memcpy_sinks[0]["sink"]["class"] == "overflow_len"
+    assert memcpy_sinks[0]["sink"]["tainted_arg_index"] is not None
+    assert memcpy_sinks[0]["signature"]["source"] == "?"
+    assert "param:0" not in memcpy_sinks[0]["signature"]["rendered"]
+    assert result["stats"]["functions_visited"] == 2
+
+
+def test_descend_downstream_finding_composes_across_two_levels(models):
+    # Round-3 blocker fix, TWO-level version of the test above: the
+    # unconditional injection and the eventual sink are separated by two call
+    # boundaries, not one -- handler(fd) calls relay(x), which itself calls
+    # copy_it(src, dst). relay() does gets(&buf) (unconditional, independent
+    # of x) and then calls copy_it(&buf, &out); copy_it's body is
+    # `rax = src[0]; memcpy(dst, src, rax)`. fd (handler's declared --source)
+    # is passed down to relay but never read anywhere. Each `_descend` merge
+    # re-checks the finding against ITS OWN frame's handoff node
+    # (`taint_engine.py` "Round-3 blocker" comment at the `findings.extend`
+    # call site), so this must compose through both merges (relay->copy_it,
+    # then handler->relay), not just the first one.
+    src = FVar("src"); dst = FVar("dst"); rax = FVar("rax")
+    src1 = FSSA(src, 1); rax1 = FSSA(rax, 1)
+    copy_ssa = FSSAFunc([
+        FInstr(0, 0x2004, "MLIL_SET_VAR_SSA", "rax#1 = src#1[0]", reads=[src1], writes=[rax1]),
+        FInstr(1, 0x2010, "MLIL_CALL_SSA", "0x1080(dst#1, src#1, rax#1)",
+               reads=[rax1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x1080", constant=0x1080),
+               params=[FExpr("MLIL_VAR_SSA", "dst#1", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "src#1", reads=[src1]),
+                       FExpr("MLIL_VAR_SSA", "rax#1", reads=[rax1])]),
+    ])
+    copy_it = FFunc("copy_it", 0x2000, copy_ssa, params=[src, dst])
+
+    # relay(x): gets(&buf); copy_it(&buf, &out) -- x is never touched.
+    buf = FVar("buf", typ="char[0x40]"); out = FVar("out", typ="char[0x10]")
+    x = FVar("x")
+    relay_ssa = FSSAFunc([
+        FInstr(0, 0x4008, "MLIL_CALL_SSA", "gets(&buf)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x1050", constant=0x1050),
+               params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)]),
+        FInstr(1, 0x4018, "MLIL_CALL_SSA", "0x2000(&buf, &out)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf),
+                       FExpr("MLIL_ADDRESS_OF", "&out", src=out)]),
+    ])
+    relay = FFunc("relay", 0x4000, relay_ssa, params=[x])
+
+    # handler(fd): relay(fd) -- fd is passed down but relay never reads it.
+    fd = FVar("fd"); fd0 = FSSA(fd, 0)
+    handler_ssa = FSSAFunc([
+        FInstr(0, 0x3008, "MLIL_CALL_SSA", "relay(fd)", reads=[fd0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x4000", constant=0x4000),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[fd0])]),
+    ])
+    handler = FFunc("handler", 0x3000, handler_ssa, params=[fd])
+
+    bv = FBV({0x1050: "gets", 0x1080: "memcpy"}, funcs={0x2000: copy_it, 0x4000: relay})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(handler, [te.parse_locator("param:0")])   # taints fd, reaches nothing
+
+    gets_sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "gets"]
+    memcpy_sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(gets_sinks) == 1, result["reached_sinks"]
+    assert len(memcpy_sinks) == 1, result["reached_sinks"]
+    assert gets_sinks[0]["signature"]["source"] == "?"
+    # the blocker (two-level form): the memcpy finding is real (its len arg is
+    # genuinely tainted, two call boundaries down, by the buffer gets() filled
+    # in relay()) but never traces back to the declared --source, so it must
+    # still render the "?" sentinel, not param:0, even after two merges.
+    assert memcpy_sinks[0]["sink"]["class"] == "overflow_len"
+    assert memcpy_sinks[0]["sink"]["tainted_arg_index"] is not None
+    assert memcpy_sinks[0]["signature"]["source"] == "?"
+    assert "param:0" not in memcpy_sinks[0]["signature"]["rendered"]
+    assert result["stats"]["functions_visited"] == 3
+
+
+def test_descend_tags_flow_when_unconditional_arg_outranks_source_arg(models):
+    # Round-4 P2: `_descend`'s hand-off witness was a SINGLE node --
+    # `tainted_args[sorted(valid)[0]][0]` -- i.e. only the LOWEST-indexed
+    # tainted argument at the call site, and the merge site only checked that
+    # one node. When a call hands the callee BOTH a --source-derived argument
+    # at a lower index AND the unconditionally-injected buffer at a HIGHER
+    # index, the check ran against the source-derived node and the tag was
+    # never set. handler(fd): gets(&buf) (unconditional); helper(fd, &buf)
+    # where helper(a, b) does `rax = b[0]; memcpy(a, b, rax)`. fd is arg 0
+    # (--source, arms nothing) and &buf is arg 1 (unconditionally tainted by
+    # gets, and the ONLY thing that arms the memcpy finding via b's length).
+    a = FVar("a"); b = FVar("b"); rax = FVar("rax")
+    b1 = FSSA(b, 1); rax1 = FSSA(rax, 1)
+    helper_ssa = FSSAFunc([
+        FInstr(0, 0x2004, "MLIL_SET_VAR_SSA", "rax#1 = b#1[0]", reads=[b1], writes=[rax1]),
+        FInstr(1, 0x2010, "MLIL_CALL_SSA", "0x1080(a#1, b#1, rax#1)",
+               reads=[rax1], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x1080", constant=0x1080),
+               params=[FExpr("MLIL_VAR_SSA", "a#1", reads=[]),
+                       FExpr("MLIL_VAR_SSA", "b#1", reads=[b1]),
+                       FExpr("MLIL_VAR_SSA", "rax#1", reads=[rax1])]),
+    ])
+    helper = FFunc("helper", 0x2000, helper_ssa, params=[a, b])
+
+    # handler(fd): gets(&buf); helper(fd, &buf) -- fd (arg 0) precedes the
+    # unconditionally-tainted &buf (arg 1) at the call site.
+    buf = FVar("buf", typ="char[0x40]")
+    fd = FVar("fd"); fd0 = FSSA(fd, 0)
+    handler_ssa = FSSAFunc([
+        FInstr(0, 0x3008, "MLIL_CALL_SSA", "gets(&buf)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x1050", constant=0x1050),
+               params=[FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)]),
+        FInstr(1, 0x3018, "MLIL_CALL_SSA", "0x2000(fd, &buf)", reads=[fd0], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x2000", constant=0x2000),
+               params=[FExpr("MLIL_VAR_SSA", "fd#0", reads=[fd0]),
+                       FExpr("MLIL_ADDRESS_OF", "&buf", src=buf)]),
+    ])
+    handler = FFunc("handler", 0x3000, handler_ssa, params=[fd])
+
+    bv = FBV({0x1050: "gets", 0x1080: "memcpy"}, funcs={0x2000: helper})
+    engine = te.TaintEngine(bv, models)
+    result = engine.forward(handler, [te.parse_locator("param:0")])   # taints fd, reaches nothing
+
+    memcpy_sinks = [s for s in result["reached_sinks"] if s["sink"]["callee"] == "memcpy"]
+    assert len(memcpy_sinks) == 1, result["reached_sinks"]
+    assert memcpy_sinks[0]["sink"]["tainted_arg_index"] == 2   # b's length, genuinely tainted
+    # the blocker: the lower-indexed source-derived arg (fd, arg 0) must not
+    # mask the higher-indexed unconditionally-injected arg (&buf, arg 1) --
+    # the finding must still render the "?" sentinel, not be attributed to
+    # param:0 just because fd sorted first among the call's tainted args.
+    assert memcpy_sinks[0]["signature"]["source"] == "?"
+    assert "param:0" not in memcpy_sinks[0]["signature"]["rendered"]
+
+
+def _unconditional_declared_unresolvable_buf_func():
+    # app_peek's model declares buf_arg=0, but the call's actual arg0 is a
+    # bare constant (not a pointer/address-of expression) -- `_buffer_target`
+    # cannot resolve it to any real buffer, so the injection falls back to a
+    # synthetic placeholder node even though a buf_arg WAS declared.
+    instrs = [
+        FInstr(0, 0x10, "MLIL_CALL_SSA", "app_peek(0x40)", reads=[], writes=[],
+               dest=FExpr("MLIL_CONST_PTR", "0x401080", constant=0x401080),
+               params=[FExpr("MLIL_CONST", "0x40", constant=0x40)]),
+    ]
+    bv = FBV({0x401080: "app_peek"})
+    return FFunc("peek", 0x10, FSSAFunc(instrs), params=[FVar("fd")]), bv
+
+
+def test_unconditional_sink_declared_buf_arg_unresolvable_does_not_overclaim(models):
+    # P3: a DECLARED buf_arg whose target can't be resolved must not be
+    # reported as "taints arg0" -- no real buffer taint was injected, only a
+    # synthetic `<name>_arg0@<addr>` node no downstream read can match. This is
+    # a distinct shape from BOTH the declared-and-resolved case (real buffer
+    # taint, "taints argN") and the fully-undeclared case ("no declared
+    # destination").
+    shaped = te.load_models(extra={"app_peek": {
+        "sink": {"class": "unbounded_input", "tainted_args": [], "buf_arg": 0}}})
+    func, bv = _unconditional_declared_unresolvable_buf_func()
+    engine = te.TaintEngine(bv, shaped)
+    result = engine.forward(func, [te.parse_locator("param:0")])
+    hit = [a for a in result["assumptions"] if "app_peek" in a and "unconditional" in a]
+    assert len(hit) == 1, result["assumptions"]
+    assert "taints arg0" not in hit[0]
+    assert "declares arg0 as its buffer but the target could not be resolved" in hit[0]
+    assert "independently of --source" in hit[0]
+
+
+def test_model_overlay_sources_folds_duplicate_env_and_user_entry(monkeypatch, tmp_path):
+    # #669/#615 review F8: when the client forwards the SAME file the bridge
+    # already resolved from BN_TAINT_MODELS at spawn, the file must be
+    # disclosed once, not twice under different `kind`s.
+    shared = tmp_path / "shared.json"
+    shared.write_text(json.dumps({"app_copy": {"sink": {"class": "overflow_len", "tainted_args": [1]}}}))
+    monkeypatch.setenv("BN_TAINT_MODELS", str(shared))
+    monkeypatch.setattr(te._taint_models_mod, "taint_models_path", lambda: shared)
+    sources = te.model_overlay_sources({"app_copy": {}}, user_models_path=str(shared),
+                                       user_models_via="$BN_TAINT_MODELS")
+    kinds = [s["kind"] for s in sources]
+    assert kinds.count("env_override") == 1
+    assert "user" not in kinds
+
+    # a DIFFERENT file must still disclose both layers
+    other = tmp_path / "other.json"
+    other.write_text(json.dumps({"app_fmt": {"sink": {"class": "format_string", "tainted_args": [0]}}}))
+    sources2 = te.model_overlay_sources({"app_fmt": {}}, user_models_path=str(other),
+                                        user_models_via="--models")
+    kinds2 = [s["kind"] for s in sources2]
+    assert kinds2.count("env_override") == 1
+    assert kinds2.count("user") == 1
+
+
+def test_model_overlay_sources_folded_entry_keeps_model_count(monkeypatch, tmp_path):
+    # Round-3 follow-up (#707): folding the duplicate `user` entry into the
+    # `env_override` entry (F8, tested above) must not silently drop the
+    # model count the unfolded `user` entry would have carried -- a status
+    # check reading the folded entry must still learn how many models the
+    # overlay contributed, not just which file it came from.
+    shared = tmp_path / "shared.json"
+    shared.write_text(json.dumps({
+        "app_copy": {"sink": {"class": "overflow_len", "tainted_args": [1]}},
+        "app_fmt": {"sink": {"class": "format_string", "tainted_args": [0]}},
+    }))
+    monkeypatch.setenv("BN_TAINT_MODELS", str(shared))
+    monkeypatch.setattr(te._taint_models_mod, "taint_models_path", lambda: shared)
+    sources = te.model_overlay_sources({"app_copy": {}, "app_fmt": {}}, user_models_path=str(shared),
+                                       user_models_via="$BN_TAINT_MODELS")
+    folded = [s for s in sources if s["kind"] == "env_override"]
+    assert len(folded) == 1, sources
+    assert folded[0]["count"] == 2, folded[0]
+
+    # the override_default fold path (no BN_TAINT_MODELS set, but the client's
+    # --models happens to match the default override file) must carry it too.
+    monkeypatch.delenv("BN_TAINT_MODELS", raising=False)
+    sources2 = te.model_overlay_sources({"app_copy": {}}, user_models_path=str(shared),
+                                        user_models_via="--models")
+    folded2 = [s for s in sources2 if s["kind"] == "override_default"]
+    assert len(folded2) == 1, sources2
+    assert folded2[0]["count"] == 1, folded2[0]

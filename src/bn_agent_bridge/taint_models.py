@@ -195,7 +195,8 @@ def load_models(extra: dict[str, Any] | None = None) -> dict[str, Any]:
 
 
 def model_overlay_sources(extra: dict[str, Any] | None = None, *,
-                          user_models_path: str | None = None) -> list[dict[str, Any]]:
+                          user_models_path: str | None = None,
+                          user_models_via: str | None = None) -> list[dict[str, Any]]:
     """#415: the active taint-model overlay sources (most-specific last), so a
     `taint` run discloses WHICH models are in effect.
 
@@ -204,9 +205,11 @@ def model_overlay_sources(extra: dict[str, Any] | None = None, *,
     (or passing ``--models``) takes effect on the next taint command with no
     bridge restart -- this disclosure makes that visible (and lets a status check
     confirm an overlay landed). ``user_models_path`` (when known) names the
-    ``--models`` file so the disclosure points at WHICH file landed, not just a
-    count."""
+    file so the disclosure points at WHICH file landed, not just a count, and
+    ``user_models_via`` (when known) names WHICH knob supplied it -- ``--models``
+    or ``$BN_TAINT_MODELS`` -- since #669 lets the client forward either."""
     sources: list[dict[str, Any]] = [{"kind": "builtin", "path": str(_BUILTIN_MODELS)}]
+    override_path_str: str | None = None
     if taint_models_path is not None:
         try:
             override = taint_models_path()
@@ -217,11 +220,12 @@ def model_overlay_sources(extra: dict[str, Any] | None = None, *,
             # var is set, else the default ~/.cache/bn/taint_models.json -- both of
             # which load_models honors. Only claim the env var when it's actually
             # set; otherwise label the default-file override honestly (review).
+            override_path_str = str(override)
             if os.environ.get("BN_TAINT_MODELS"):
                 sources.append({"kind": "env_override", "env": "BN_TAINT_MODELS",
-                                "path": str(override)})
+                                "path": override_path_str})
             else:
-                sources.append({"kind": "override_default", "path": str(override)})
+                sources.append({"kind": "override_default", "path": override_path_str})
     if extra:
         # Count the actual models the way load_models()/_coerce_model_map does:
         # unwrap a ``{"models": {...}}`` envelope and skip ``_comment*`` doc keys,
@@ -229,10 +233,31 @@ def model_overlay_sources(extra: dict[str, Any] | None = None, *,
         # file with two inner models otherwise reported count 1).
         inner = extra.get("models") if isinstance(extra, dict) and "models" in extra else extra
         count = sum(1 for k in inner if not str(k).startswith("_comment")) if isinstance(inner, dict) else 0
-        user: dict[str, Any] = {"kind": "user", "via": "--models", "count": count}
-        if user_models_path:
-            user["path"] = str(user_models_path)
-        sources.append(user)
+        # #615 review F8: when the bridge was ALSO spawned with BN_TAINT_MODELS
+        # pointed at this SAME file, the override above already discloses it --
+        # skip the duplicate `user` entry so the same file isn't listed twice
+        # under different `kind`s (overstating the active overlay stack). A
+        # client-forwarded file that differs from the spawn-time override still
+        # discloses both layers (the common, expected case).
+        same_file_as_override = (
+            user_models_path is not None and override_path_str is not None
+            and str(Path(user_models_path).expanduser()) == str(Path(override_path_str).expanduser()))
+        if not same_file_as_override:
+            user: dict[str, Any] = {"kind": "user", "via": user_models_via or "--models",
+                                    "count": count}
+            if user_models_path:
+                user["path"] = str(user_models_path)
+            sources.append(user)
+        else:
+            # Round-3 follow-up (#707): folding into the override entry must
+            # not lose the model count the unfolded `user` entry would have
+            # carried -- attach it to the just-appended override entry
+            # (`env_override` or `override_default`, whichever matched)
+            # instead of silently dropping it.
+            for entry in reversed(sources):
+                if entry.get("kind") in ("env_override", "override_default"):
+                    entry["count"] = count
+                    break
     return sources
 
 
