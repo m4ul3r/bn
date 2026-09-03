@@ -2374,6 +2374,50 @@ def test_dispatch_error_without_residue_has_no_disclosure(monkeypatch):
     assert resp["result"] is None
 
 
+def test_dispatch_error_carries_operation_failure_metadata(monkeypatch):
+    """#625: an OperationFailure's status/requested/observed must survive
+    dispatch()'s ok:false serialization, not just its message -- a CLI client
+    needs `status` to distinguish e.g. verification_failed from unsupported."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    def _boom(op, params, target):
+        raise bridge.OperationFailure(
+            "verification_failed",
+            "rename did not stick",
+            requested={"new_name": "foo"},
+            observed={"new_name": "sub_401000"},
+        )
+
+    monkeypatch.setattr(instance, "_dispatch_on_main", _boom)
+
+    resp = instance.dispatch({"op": "__probe__", "params": {}, "target": "active"})
+
+    assert resp["ok"] is False
+    assert resp["status"] == "verification_failed"
+    assert resp["requested"] == {"new_name": "foo"}
+    assert resp["observed"] == {"new_name": "sub_401000"}
+
+
+def test_dispatch_error_without_operation_failure_has_no_metadata(monkeypatch):
+    """A plain (non-OperationFailure) error must not carry the status/
+    requested/observed keys at all -- absent, not null, so a client can key
+    off `"status" in resp`."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    def _boom(op, params, target):
+        raise RuntimeError("Function not found: foo")
+
+    monkeypatch.setattr(instance, "_dispatch_on_main", _boom)
+
+    resp = instance.dispatch({"op": "__probe__", "params": {}, "target": "active"})
+    assert resp["ok"] is False
+    assert "status" not in resp
+    assert "requested" not in resp
+    assert "observed" not in resp
+
+
 def test_serialize_error_prefixes_unexpected_exceptions(monkeypatch):
     bridge = _load_bridge(monkeypatch)
 

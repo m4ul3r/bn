@@ -29,8 +29,23 @@ except ModuleNotFoundError:  # no BN GUI runtime (tests, headless tooling): run 
         return True
 
 
-def _json_response(*, ok: bool, result: Any = None, error: str | None = None) -> dict[str, Any]:
-    return {"ok": ok, "result": result, "error": error}
+def _json_response(
+    *,
+    ok: bool,
+    result: Any = None,
+    error: str | None = None,
+    status: str | None = None,
+    requested: dict[str, Any] | None = None,
+    observed: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    response: dict[str, Any] = {"ok": ok, "result": result, "error": error}
+    if status is not None:
+        response["status"] = status
+    if requested is not None:
+        response["requested"] = requested
+    if observed is not None:
+        response["observed"] = observed
+    return response
 
 
 # Row keys per collection `kind`. Collection rows differ ON PURPOSE -- functions

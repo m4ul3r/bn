@@ -191,9 +191,9 @@ def _check_peer_credentials(connection) -> str | None:
         return None
     try:
         raw = connection.getsockopt(
-            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("iII")
         )
-        _pid, uid, _gid = struct.unpack("3i", raw)
+        _pid, uid, _gid = struct.unpack("iII", raw)
     except (OSError, struct.error, AttributeError):
         return "peer credential check failed: SO_PEERCRED unavailable; rejecting connection"
     if uid != os.getuid():
@@ -450,6 +450,25 @@ class TargetManager:
         with self._lock:
             vid = self._stable_view_id(bv)
             return vid is not None and vid in self._dirty_view_ids
+
+    def forget(self, bv) -> None:
+        """Drop *bv*'s dirty-tracking entry when the view is closed.
+
+        A committed-but-unsaved mutation marks a view dirty (`mark_dirty`); if
+        the view is closed WITHOUT saving, `clear_dirty` (save-only) never
+        fires, so the stable view_id would stay in `_dirty_view_ids` forever.
+        Unlike `_ids_by_object`/`_records`, `_dirty_view_ids` is never pruned by
+        `refresh()`, so without this discard it is the one unbounded structure
+        in `TargetManager` across many load -> mutate -> close-without-save
+        cycles (#659). This is wired only into the `bn close` path
+        (`_close_binary`); a GUI tab closed without going through that path
+        still bypasses this discard and leaks its view_id.
+
+        Same effect as `clear_dirty`; kept as a distinct name for its own
+        call sites (`_close_binary`) so the intent at each site — "closing"
+        vs. "saved" — stays clear in the code, not just the docstring.
+        """
+        self.clear_dirty(bv)
 
     def _view_name(self, bv) -> str:
         for attr in ("view_type", "name"):
@@ -1042,20 +1061,21 @@ class BinaryNinjaBridge:
             with contextlib.suppress(RuntimeError):
                 thread.join(timeout=load_join_timeout)
         with self._teardown_lock:
-            if self.socket_path.exists():
-                with contextlib.suppress(OSError):
-                    self.socket_path.unlink()
-            if self.registry_path.exists():
-                with contextlib.suppress(OSError):
-                    self.registry_path.unlink()
-            # On a clean shutdown there's no crash to diagnose, so drop the log
-            # file too rather than leave it as clutter in the instances dir. A
-            # crash skips stop() entirely (SIGKILL/segfault), so crash logs are
-            # preserved for `bn`'s empty-response diagnostic to point at.
-            log_path = self.registry_path.with_suffix(".log")
-            if log_path.exists():
-                with contextlib.suppress(OSError):
-                    log_path.unlink()
+            if self._server is not None:
+                if self.socket_path.exists():
+                    with contextlib.suppress(OSError):
+                        self.socket_path.unlink()
+                if self.registry_path.exists():
+                    with contextlib.suppress(OSError):
+                        self.registry_path.unlink()
+                # On a clean shutdown there's no crash to diagnose, so drop the log
+                # file too rather than leave it as clutter in the instances dir. A
+                # crash skips stop() entirely (SIGKILL/segfault), so crash logs are
+                # preserved for `bn`'s empty-response diagnostic to point at.
+                log_path = self.registry_path.with_suffix(".log")
+                if log_path.exists():
+                    with contextlib.suppress(OSError):
+                        log_path.unlink()
 
     def _load_worker_threads(self) -> list[threading.Thread]:
         with self._load_jobs_lock:
@@ -1215,10 +1235,16 @@ class BinaryNinjaBridge:
             # rolled_back:false / prototype_user_type_residue:true + explanation),
             # not just str(exc) -- an unattended control loop reads the response
             # and must see the view is left modified (#630 round 3).
+            status = getattr(exc, "status", None) if isinstance(exc, OperationFailure) else None
+            requested = getattr(exc, "requested", None) if isinstance(exc, OperationFailure) else None
+            observed = getattr(exc, "observed", None) if isinstance(exc, OperationFailure) else None
             return _json_response(
                 ok=False,
                 error=_serialize_error(exc),
                 result=_residue_error_disclosure(exc),
+                status=status,
+                requested=requested,
+                observed=observed,
             )
 
     @contextlib.contextmanager
@@ -1862,6 +1888,7 @@ class BinaryNinjaBridge:
         if target_bv is not None:
             closed = [_snapshot(target_bv)]
             _run_on_main_thread(lambda: target_bv.file.close())
+            self.targets.forget(target_bv)
             with _headless_views_lock:
                 _headless_views[:] = [v for v in _headless_views if v is not target_bv]
             # Refresh the registry's open-binaries list after a close (#80).
@@ -1881,6 +1908,7 @@ class BinaryNinjaBridge:
                 for bv in _headless_views:
                     closed.append(_snapshot(bv))
                     _run_on_main_thread(lambda v=bv: v.file.close())
+                    self.targets.forget(bv)
                 _headless_views.clear()
             else:
                 resolved = str(Path(path).expanduser().resolve())
@@ -1898,6 +1926,7 @@ class BinaryNinjaBridge:
                     bv = _headless_views.pop(i)
                     closed.append(_snapshot(bv))
                     _run_on_main_thread(lambda v=bv: v.file.close())
+                    self.targets.forget(bv)
 
         # Single post-lock registry refresh + return for both the --all and the
         # by-path close paths (must be OUTSIDE the lock; see the note above) (#80).
@@ -2751,6 +2780,8 @@ class BinaryNinjaBridge:
 
     def _go_rename_cancelled(self, bv, applied: list[dict[str, Any]]) -> None:
         rolled_back = self._rollback_go_renames(bv, applied)
+        if applied and not rolled_back:
+            self.targets.mark_dirty(bv)
         suffix = "" if rolled_back else " (rollback failed; the view may be partially renamed)"
         raise RuntimeError(f"request cancelled during go rename{suffix}")
 
@@ -2827,7 +2858,7 @@ class BinaryNinjaBridge:
             rolled_back = self._rollback_go_renames(bv, applied)
         committed = bool((not preview) and not failed_rows)
         success = bool(not failed_rows and (not preview or rolled_back))
-        if committed and verified_count:
+        if (committed and verified_count) or (applied and not rolled_back):
             self.targets.mark_dirty(bv)
 
         skipped_total = skipped_user_named + skipped_during_apply
@@ -4209,18 +4240,15 @@ def _preload_binary(path: str, quick: bool, prefer_bndb: bool = True):
     return bv
 
 
-def _start_bridge_command(_):  # pragma: no cover - GUI runtime
-    start_bridge()
-
-
 def start_bridge():  # pragma: no cover - GUI runtime
     global _bridge
     if ui is None:
         return
     if _bridge is not None:
         return
-    _bridge = BinaryNinjaBridge()
-    _bridge.start()
+    bridge = BinaryNinjaBridge()
+    bridge.start()
+    _bridge = bridge
 
 
 def start_headless(
@@ -4248,8 +4276,9 @@ def start_headless(
 
     ensure_private_dir(instances_dir())
 
-    _bridge = BinaryNinjaBridge(instance_id=instance_id)
-    _bridge.start()
+    bridge = BinaryNinjaBridge(instance_id=instance_id)
+    bridge.start()
+    _bridge = bridge
     bn.log_info(f"BN Agent Bridge running in headless mode (instance {instance_id})")
 
     # Open any preloaded binaries *after* the socket is live and the registry
@@ -4294,8 +4323,37 @@ def _stop_bridge():  # pragma: no cover - GUI runtime
 
 atexit.register(_stop_bridge)
 
+
+def _restart_bridge_command(_):  # pragma: no cover - GUI runtime
+    restart_bridge()
+
+
+def restart_bridge():  # pragma: no cover - GUI runtime
+    """Stop-then-start the bridge, unlike start_bridge()'s start-once no-op.
+
+    start_bridge() early-returns whenever `_bridge` is already set, so the
+    "Restart Bridge" menu command wired to it was a no-op once the bridge was
+    running (#585). This tears the live bridge down first so a fresh instance
+    always gets constructed and started.
+    """
+    global _bridge
+    if ui is None:
+        return
+    if _bridge is not None:
+        _stop_bridge()
+    try:
+        start_bridge()
+    except Exception as exc:
+        bn.log_error(f"BN Agent Bridge restart failed: {exc}")
+        return
+    if _bridge is not None:
+        bn.log_info("BN Agent Bridge restarted")
+    else:
+        bn.log_error("BN Agent Bridge restart failed: bridge did not start")
+
+
 PluginCommand.register(
     "BN Agent Bridge\\Restart Bridge",
     "Restart the bn CLI socket bridge",
-    _start_bridge_command,
+    _restart_bridge_command,
 )

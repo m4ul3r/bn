@@ -2756,3 +2756,94 @@ def test_auto_spawn_never_picks_a_hidden_instance_id(tmp_path, monkeypatch):
         transport._spawn_instance_unlocked(None, timeout=5.0)
 
     assert spawned == ["bbbb2222"]
+
+
+def test_send_request_ok_false_with_status_carries_structured_fields(tmp_path, monkeypatch):
+    instance = _make_instance(tmp_path)
+    monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None, **kw: instance)
+
+    class _FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, path):
+            pass
+
+        def sendall(self, payload):
+            self.payload = payload
+
+        def shutdown(self, how):
+            pass
+
+        def recv(self, size):
+            if not hasattr(self, "_sent"):
+                self._sent = True
+                request = json.loads(self.payload.decode("utf-8"))
+                return json.dumps({
+                    "ok": False,
+                    "error": "rename did not stick",
+                    "status": "verification_failed",
+                    "requested": {"new_name": "foo"},
+                    "observed": {"new_name": "sub_401000"},
+                    "bridge_identity": request["_bridge_identity"],
+                }).encode("utf-8")
+            return b""
+
+    monkeypatch.setattr("bn.transport.socket.socket", lambda *a, **k: _FakeSocket())
+
+    with pytest.raises(BridgeError) as exc_info:
+        send_request("symbol_rename", timeout=5.0)
+
+    assert exc_info.value.status == "verification_failed"
+    assert exc_info.value.requested == {"new_name": "foo"}
+    assert exc_info.value.observed == {"new_name": "sub_401000"}
+
+
+def test_send_request_ok_false_without_status_leaves_attrs_none(tmp_path, monkeypatch):
+    instance = _make_instance(tmp_path)
+    monkeypatch.setattr("bn.transport.choose_instance", lambda instance_id=None, **kw: instance)
+
+    class _FakeSocket:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, path):
+            pass
+
+        def sendall(self, payload):
+            self.payload = payload
+
+        def shutdown(self, how):
+            pass
+
+        def recv(self, size):
+            if not hasattr(self, "_sent"):
+                self._sent = True
+                request = json.loads(self.payload.decode("utf-8"))
+                return json.dumps({
+                    "ok": False,
+                    "error": "Unknown operation: bogus",
+                    "bridge_identity": request["_bridge_identity"],
+                }).encode("utf-8")
+            return b""
+
+    monkeypatch.setattr("bn.transport.socket.socket", lambda *a, **k: _FakeSocket())
+
+    with pytest.raises(BridgeError) as exc_info:
+        send_request("bogus", timeout=5.0)
+
+    assert exc_info.value.status is None
+    assert exc_info.value.requested is None
+    assert exc_info.value.observed is None
