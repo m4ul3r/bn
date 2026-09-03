@@ -11,7 +11,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ```bash
 uv tool install -e .          # Install CLI on PATH
 bn plugin install              # Symlink bridge into BN plugins dir
-bn skill install               # Symlink skills into ~/.claude/skills/ and, when present, ~/.codex/skills/
+bn skill install               # Symlink skills into ~/.claude/skills/, plus each other agent skill root whose home exists (~/.codex/skills/, the omp agent's skills/)
 
 uv run bn --help               # Run CLI from repo without installing
 ```
@@ -49,7 +49,7 @@ The bridge runs either as a **GUI plugin** (auto-starts when BN loads) or as a *
 
 `cli.py` is the entry point and shared infrastructure only — argparse plumbing, the `@command` decorator + `_COMMANDS` registry, target/instance resolution, the `_call` request wrapper, and `main()`. It does **not** define command handlers or text rendering anymore.
 
-- `commands/` — handler modules grouped by concern: `binary.py` (load/close/save/refresh/target info), `function.py` (list/search/info/decompile/il/disasm/xrefs/callsites), `types.py`, `mutation.py`, `misc.py` (strings/imports/sections/bundle/py exec/batch), `admin.py` (doctor/plugin/skill install/session/instance/target pins). Importing the package via `commands/__init__.py` triggers `@command` decorators that populate `_COMMANDS`. Registering the same command path twice raises at import time.
+- `commands/` — handler modules grouped by concern: `binary.py` (load/close/save/refresh/target info), `function.py` (list/search/info/decompile/il/disasm/xrefs/callsites), `types.py`, `mutation.py`, `cpp_class.py` (`class list/show`), `dataflow.py` (`dataflow defuse/callgraph/values` and the `taint forward/backward/models` surface), `tags.py` (`tag list/get/add/remove`, `tag types`, `tag type create/remove`), `misc.py` (strings/imports/sections/bundle/py exec/batch), `admin.py` (doctor/plugin/skill install/session/instance/target pins). Importing the package via `commands/__init__.py` triggers `@command` decorators that populate `_COMMANDS`. Registering the same command path twice raises at import time.
 - `formatters.py` — all text-mode rendering (`_render_*`, `_format_operation_result`). Add new text output here, not in `cli.py`.
 - `transport.py` — socket I/O, bridge discovery, multi-instance registry, auto-spawn.
 - `output.py` — token-aware rendering and artifact spillover (>10k tokens → disk).

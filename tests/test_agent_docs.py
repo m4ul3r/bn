@@ -65,13 +65,16 @@ def test_agents_md_mirrors_claude_md():
         assert os.readlink(AGENTS_MD) == "CLAUDE.md"
         assert AGENTS_MD.resolve() == CLAUDE_MD.resolve()
         return
-    assert AGENTS_MD.read_text(encoding="utf-8").strip() == "CLAUDE.md", (
+    # A bounded head keeps a drifted copy's failure to one short line instead of
+    # dumping the whole canonical document into the assertion diff.
+    head = AGENTS_MD.read_text(encoding="utf-8").strip()[:64]
+    assert head == "CLAUDE.md", (
         "AGENTS.md must be a symlink to CLAUDE.md (or its unexpanded link text on a "
         "checkout without symlink support), never a second copy -- a copy drifts"
     )
 
 
-@pytest.mark.parametrize("doc", AGENT_FACING_DOCS, ids=lambda p: p.name)
+@pytest.mark.parametrize("doc", AGENT_FACING_DOCS, ids=lambda p: str(p.relative_to(REPO)))
 def test_agent_docs_do_not_point_at_the_ghost_plugin_tree(doc: Path):
     """`plugin/bn_agent_bridge/` holds only stale bytecode; sources are in src/."""
     assert "plugin/bn_agent_bridge" not in _doc_text(doc), doc
@@ -95,23 +98,75 @@ def test_documented_pytest_invocations_resolve(line: str):
             )
 
 
+def _bullet(prefix: str) -> str:
+    """The single `prefix` bullet with its indented continuation lines folded in.
+
+    Rewrapping a bullet must not change what it claims, so a wrapped-away status
+    or module name is neither a false alarm nor a silent pass.
+    """
+    lines = _doc_text().splitlines()
+    starts = [i for i, line in enumerate(lines) if line.startswith(prefix)]
+    assert len(starts) == 1, f"expected one {prefix!r} bullet, found {len(starts)}"
+    bullet = [lines[starts[0]]]
+    for line in lines[starts[0] + 1:]:
+        if not line.startswith((" ", "\t")) or not line.strip():
+            break
+        bullet.append(line)
+    return " ".join(bullet)
+
+
 def test_exit_code_3_lists_every_failed_mutation_status():
     """Adding a failure status must not silently leave the docs understating exit 3.
 
     Scoped to the exit-code bullet itself: a status named somewhere else in the
     file (the Mutation Verification prose) does not tell an agent reading the
     exit-code contract that the status maps to 3, which was exactly #614's gap.
-    Indented continuation lines are folded in so rewrapping the bullet reports
-    what actually went missing instead of all five statuses.
     """
-    lines = _doc_text().splitlines()
-    starts = [i for i, line in enumerate(lines) if line.startswith("- Exit codes:")]
-    assert len(starts) == 1, f"expected one exit-code bullet, found {len(starts)}"
-    bullet = [lines[starts[0]]]
-    for line in lines[starts[0] + 1:]:
-        if not line.startswith((" ", "\t")) or not line.strip():
-            break
-        bullet.append(line)
-    text = " ".join(bullet)
+    text = _bullet("- Exit codes:")
     missing = sorted(s for s in FAILED_MUTATION_STATUSES if f"`{s}`" not in text)
     assert not missing, f"statuses missing from the exit-code bullet: {missing}"
+
+
+@pytest.mark.parametrize("group", ("cli", "bridge"))
+def test_test_layout_bullet_names_every_split_module(group: str):
+    """#614 replaced the monolith names with the split pattern *and* the concern
+    list; a new `test_cli_*.py` / `test_bridge_*.py` module left out of that list
+    is how the monolith names survived a rename in the first place.
+    """
+    bullet = _bullet("- Test files mirror source")
+    concerns = sorted(
+        path.stem.removeprefix(f"test_{group}_")
+        for path in (REPO / "tests").glob(f"test_{group}_*.py")
+    )
+    assert concerns, f"no tests/test_{group}_*.py modules found"
+    missing = [c for c in concerns if c not in bullet]
+    assert not missing, f"test_{group}_* concerns missing from the bullet: {missing}"
+
+
+def test_cli_layout_names_every_command_module():
+    """The CLI Layout list reads as an inventory, so a handler module absent from
+    it sends an agent adding a command to the wrong file (or to a new one).
+    """
+    modules = sorted(
+        path.name
+        for path in (REPO / "src" / "bn" / "commands").glob("*.py")
+        if path.name != "__init__.py"
+    )
+    assert modules, "no src/bn/commands/*.py modules found"
+    text = _doc_text()
+    missing = [name for name in modules if f"`{name}`" not in text]
+    assert not missing, f"command modules missing from the CLI Layout list: {missing}"
+
+
+def test_documented_python_requirement_matches_pyproject():
+    """`Requires Python >= X.Y` is the first claim an agent acts on, and a stale
+    floor sends it to install the wrong interpreter."""
+    pyproject = (REPO / "pyproject.toml").read_text(encoding="utf-8")
+    declared = re.search(r'requires-python\s*=\s*"([^"]+)"', pyproject)
+    assert declared, "requires-python is missing from pyproject.toml"
+    spec = declared.group(1).replace(" ", "")
+    floor = re.fullmatch(r">=(\d+\.\d+)", spec)
+    assert floor, f"unexpected requires-python form {spec!r}; update this guard"
+    assert f"Python >= {floor.group(1)}" in _doc_text(), (
+        f"CLAUDE.md must document Python >= {floor.group(1)} (pyproject: {spec})"
+    )
