@@ -645,6 +645,14 @@ def _render_session_start_text(value: Any) -> str:
             f"hint: bare `bn` commands from this checkout won't route to this "
             f"session; pass -i {value.get('instance_id', '<id>')}"
         )
+    if value.get("reload_capture_failed"):
+        lines.append("")
+        lines.append(
+            f"target capture error: {value.get('reload_capture_error', '<unknown>')}"
+        )
+        lines.append(
+            "hint: open targets could not be listed before the restart, so none were reloaded"
+        )
     if value.get("stopped"):
         lines.append("")
         lines.append("session stopped: no binaries loaded successfully")

@@ -531,6 +531,39 @@ def test_render_session_status_terminal_job_drops_the_poll_command():
     assert "target: s.bndb" in out
 
 
+def test_render_session_start_text_surfaces_reload_capture_failure():
+    # Follow-up to PR #703 round 3: `reload_capture_failed` was invisible in
+    # text mode -- only stderr and the exit code carried the signal. Default
+    # stdout must now show an in-band line, mirroring the
+    # `project_association_error` precedent.
+    from bn.formatters import _render_session_start_text
+    value = {
+        "instance_id": "worker-1",
+        "pid": 4242,
+        "socket_path": "/tmp/worker-1.sock",
+        "restarted": True,
+        "loaded": [],
+        "reload_capture_failed": True,
+        "reload_capture_error": "OSError: connection refused",
+    }
+    out = _render_session_start_text(value)
+    assert "target capture error: OSError: connection refused" in out
+    assert "open targets could not be listed before the restart" in out
+
+
+def test_render_session_start_text_omits_capture_error_when_absent():
+    from bn.formatters import _render_session_start_text
+    value = {
+        "instance_id": "worker-1",
+        "pid": 4242,
+        "socket_path": "/tmp/worker-1.sock",
+        "restarted": True,
+        "loaded": [],
+    }
+    out = _render_session_start_text(value)
+    assert "target capture error" not in out
+
+
 def test_resolution_note_does_not_claim_containment_for_an_exact_start():
     # Bare-decimal input is disclosed with offset +0x0 when it names the exact
     # function start. The old text said "<addr> is inside <fn> @ <addr> (+0x0);
