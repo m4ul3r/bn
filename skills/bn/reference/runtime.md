@@ -125,7 +125,8 @@ It is the discoverable spelling of `bn close -t <selector>` and delegates to the
 same implementation, so unsaved warnings, selector resolution, and the refusal to
 forward the volatile `active` literal are identical. It accepts no path and no
 `--all`, so it can never widen into closing everything; an empty selector is an
-error. Use `bn close --all` when you really do mean every loaded target.
+error. Use `bn close --all` when you really do mean every open target,
+including GUI tabs bn did not load.
 
 ```bash
 bn save                                  # saves to <filename>.bndb

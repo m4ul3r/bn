@@ -352,6 +352,13 @@ def _collect_open_views(*, strict: bool = False) -> list[Any]:
             active_context = ui.UIContext.activeContext()
             if active_context is not None:
                 contexts = [active_context]
+                # The fallback recovered a full context set, so the
+                # allContexts() failure above cost nothing -- do not refuse a
+                # destructive close over an enumeration hiccup that has
+                # already been repaired. The other note_incomplete() sites
+                # (per-tab/context queries below) have no such fallback and
+                # stay correctly fatal.
+                incomplete = False
 
         def collect_binary_view(view):
             if view is not None:
@@ -483,23 +490,27 @@ class TargetManager:
             return vid is not None and vid in self._dirty_view_ids
 
     def forget(self, bv) -> None:
-        """Drop *bv*'s dirty-tracking entry when the view is closed.
+        """Release *bv*'s record, id mapping, and dirty-tracking entry when
+        the view is closed.
 
         A committed-but-unsaved mutation marks a view dirty (`mark_dirty`); if
         the view is closed WITHOUT saving, `clear_dirty` (save-only) never
         fires, so the stable view_id would stay in `_dirty_view_ids` forever.
-        Unlike `_ids_by_object`/`_records`, `_dirty_view_ids` is never pruned by
-        `refresh()`, so without this discard it is the one unbounded structure
-        in `TargetManager` across many load -> mutate -> close-without-save
-        cycles (#659). This is wired only into the `bn close` path
-        (`_close_binary`); a GUI tab closed without going through that path
-        still bypasses this discard and leaks its view_id.
-
-        Same effect as `clear_dirty`; kept as a distinct name for its own
-        call sites (`_close_binary`) so the intent at each site — "closing"
-        vs. "saved" — stays clear in the code, not just the docstring.
+        `_ids_by_object`/`_records` now hold STRONG refs to a closed view
+        (#586), so without this eager pop a view the bridge itself closes
+        would otherwise stay pinned in memory -- whole BinaryView, analysis
+        state and all -- until some later `refresh()` prunes it; nothing
+        schedules one on a timer or a BN notification. This is wired only
+        into the `bn close` path (`_close_binary`); a GUI tab closed without
+        going through that path still bypasses this and stays pinned until
+        the next `refresh()` (#659, #613 review).
         """
-        self.clear_dirty(bv)
+        with self._lock:
+            vid = self._stable_view_id(bv)
+            if vid is not None:
+                self._dirty_view_ids.discard(vid)
+                self._records.pop(vid, None)
+                self._ids_by_object.pop(bv, None)
 
     def _view_name(self, bv) -> str:
         for attr in ("view_type", "name"):
@@ -1942,28 +1953,52 @@ class BinaryNinjaBridge:
             if not to_close:
                 raise RuntimeError(f"No loaded binary matches path: {path}")
 
+        # Dedup by BN's handle-based equality, not id(): _collect_open_views()
+        # only dedups its own walk on id(bv) (bridge.py:389-395), and BN
+        # interns no wrapper for a non-console view, so the same core view can
+        # arrive here under several distinct wrapper objects -- one per
+        # accessor (getCurrentViewFrame / getViewFrameForTab / getViewForTab).
+        # Closing/reporting it once per wrapper would run N blocking
+        # main-thread round trips for one tab (the exact contention #658 was
+        # about) and return N identical `closed` rows to the caller.
+        to_close = list(dict.fromkeys(to_close))
+
         # Close on the main thread OUTSIDE any lock (#658): a blocking
         # cross-thread round trip -- like the _headless_views_lock-held one
         # this replaces -- must never run while that lock is held, or a
         # same-thread re-acquire (via _collect_open_views()/_write_registry())
         # deadlocks (#80/#86).
         closed = []
-        for bv in to_close:
-            closed.append(_snapshot(bv))
-            _run_on_main_thread(lambda v=bv: v.file.close())
-            self.targets.forget(bv)
+        succeeded: list[Any] = []
+        try:
+            for bv in to_close:
+                closed.append(_snapshot(bv))
+                _run_on_main_thread(lambda v=bv: v.file.close())
+                self.targets.forget(bv)
+                succeeded.append(bv)
+        finally:
+            # Prune out of _headless_views only the views THIS call actually
+            # closed (#613 review): if v.file.close() raises partway through
+            # `to_close`, the not-yet-attempted (or currently failing) views
+            # are still open and must stay tracked -- pruning the whole
+            # attempted set here would falsely mark them closed. The snapshot
+            # above can hold headless-tracked views, GUI-only views, or a mix
+            # of both -- never assume all-close means only headless views
+            # existed. By handle equality, not id(): a _headless_views entry
+            # whose UI-walk twin won the dict.fromkeys() dedup above must
+            # still be pruned. Runs in `finally` so a close raising partway
+            # through the loop still reconciles every view closed before the
+            # failure -- both operations below are cheap (list filter, no
+            # blocking round trip) so running them unconditionally does not
+            # reintroduce the #658 lock-scope problem.
+            closed_views = set(succeeded)
+            with _headless_views_lock:
+                _headless_views[:] = [v for v in _headless_views if v not in closed_views]
 
-        # Prune closed views out of _headless_views as a side effect (#613):
-        # the snapshot above can hold headless-tracked views, GUI-only views,
-        # or a mix of both -- never assume all-close means only headless
-        # views existed. The lock here only mutates a list, no blocking call.
-        closed_ids = {id(bv) for bv in to_close}
-        with _headless_views_lock:
-            _headless_views[:] = [v for v in _headless_views if id(v) not in closed_ids]
-
-        # Single post-lock registry refresh + return for both the --all and the
-        # by-path close paths (must be OUTSIDE the lock; see the note above) (#80).
-        self._write_registry()
+            # Always refresh the registry (#80), even on a mid-loop failure,
+            # so already-closed views stop being advertised as open on disk
+            # instead of only doing so when the whole loop succeeds.
+            self._write_registry()
         return {"closed": closed}
 
     def _resolve_sole_target_for_close(self) -> Any:
@@ -1989,8 +2024,9 @@ class BinaryNinjaBridge:
             lines = [
                 "close_binary needs a concrete target when multiple targets "
                 f"are open ({len(targets)}): pass a target selector, a path, "
-                "or all=true to close every bn-loaded target. The volatile "
-                '"active" selector is not honored for close.',
+                "or all=true to close every open target, including GUI tabs "
+                "bn did not load. The volatile \"active\" selector is not "
+                "honored for close.",
             ]
             lines.extend(_open_target_lines(targets))
             raise RuntimeError("\n".join(lines))

@@ -77,7 +77,7 @@ def _load(args: argparse.Namespace) -> int:
 @command("close", help="Close a loaded binary", target=True,
          args=[
              arg("path", nargs="?", help="Path to close (omit to close the single open target)"),
-             arg("--all", action="store_true", help="Close all loaded binaries"),
+             arg("--all", action="store_true", help="Close all open targets, including GUI tabs bn did not load"),
          ])
 def _close(args: argparse.Namespace) -> int:
     # Only honor an explicit -t/--target. A sticky pin must not silently pick
@@ -162,8 +162,8 @@ def _close(args: argparse.Namespace) -> int:
                 raise BridgeError(
                     f"{exc}\nnote: `-t active` follows the GUI selection, "
                     "which is not honored for close: pass a concrete "
-                    "selector, a path, or --all (closes every bn-loaded "
-                    "target)."
+                    "selector, a path, or --all (closes every open target, "
+                    "including GUI tabs bn did not load)."
                 ) from None
             raise
     return _call(

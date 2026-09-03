@@ -3831,6 +3831,155 @@ def test_close_binary_by_path_prefers_match_across_sets(monkeypatch, tmp_path):
     assert bridge._headless_views == [alpha]
 
 
+def test_close_binary_all_dedups_multiple_wrappers_of_same_core_view(monkeypatch, tmp_path):
+    # #613 review (major): _collect_open_views() only dedups its own walk by
+    # id(bv) (bridge.py:389-395, untouched by this PR); BN interns no wrapper
+    # for a non-console view, so the UI walk's several accessors
+    # (getCurrentViewFrame / getViewFrameForTab / getViewForTab) hand back
+    # DISTINCT Python wrapper objects for the SAME core view. Before the fix,
+    # --all fed that raw list straight into the close loop and closed/
+    # reported the one core view once per wrapper (demonstrated executably
+    # on the patched bridge: 3 wrappers -> 3 v.file.close() round trips and 3
+    # identical `closed` rows). Model the duplication directly: three
+    # distinct _ClosableBV instances sharing one handle -- BN's real
+    # handle-address __eq__/__hash__ -- standing in for the same core view.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+
+    handle = types.SimpleNamespace(closed=False)
+    close_call_count = [0]
+    wrappers = []
+    for _ in range(3):
+        w = _ClosableBV("/proj/parse_header.elf", session_id="11", handle=handle)
+
+        def _close(handle=handle):
+            close_call_count[0] += 1
+            handle.closed = True
+
+        w.file.close = _close
+        wrappers.append(w)
+
+    monkeypatch.setattr(bridge, "_collect_open_views", lambda strict=False: list(wrappers))
+    bridge._headless_views.clear()
+
+    result = _close_on_watchdog(instance, all_=True)
+
+    assert len(result["closed"]) == 1
+    assert close_call_count[0] == 1
+    assert all(w.closed for w in wrappers)  # shared handle: closing any closes all
+
+
+def test_close_binary_all_reconciles_headless_views_and_registry_on_mid_loop_failure(monkeypatch, tmp_path):
+    # #613 review (minor): the _headless_views prune and _write_registry()
+    # used to run strictly AFTER the close loop finished. If v.file.close()
+    # raised partway through --all, the views already closed before the
+    # failure stayed listed in _headless_views and the on-disk registry kept
+    # advertising them as open. The loop must be wrapped in try/finally so a
+    # mid-loop failure still reconciles whatever it actually closed -- and
+    # must NOT also drop the other view it never got to (still genuinely
+    # open).
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    good = _ClosableBV("/proj/alpha.so", session_id="11")
+    bad = _ClosableBV("/proj/beta.so", session_id="22")
+
+    def _boom():
+        raise RuntimeError("simulated main-thread close failure")
+
+    bad.file.close = _boom
+    _register_views(bridge, good, bad)
+
+    with pytest.raises(RuntimeError, match="simulated main-thread close failure"):
+        _close_on_watchdog(instance, all_=True)
+
+    assert good.closed
+    assert not bad.closed
+    # `good` was actually closed before `bad` raised -- it must be pruned;
+    # `bad` never actually closed -- it must stay tracked as open.
+    assert bridge._headless_views == [bad]
+    registry = json.loads(instance.registry_path.read_text())
+    assert registry["binaries"] == ["/proj/beta.so"]
+
+
+def test_target_manager_forget_releases_record_without_waiting_for_refresh(monkeypatch):
+    # #613 review (minor): forget() used to only clear_dirty(), leaving a
+    # closed view's TargetRecord and _ids_by_object entry -- both STRONG refs
+    # since #586 -- pinned in memory (whole BinaryView, analysis state and
+    # all) until some later refresh() that nothing schedules for a view
+    # closed outside `bn close` (e.g. a GUI tab). forget() must drop both
+    # itself so the bridge's own close path never depends on a follow-up
+    # refresh().
+    bridge = _load_bridge(monkeypatch)
+    manager = bridge.TargetManager()
+    bv = _ClosableBV("/proj/parse_header.elf", session_id="11")
+
+    monkeypatch.setattr(bridge, "_collect_open_views", lambda strict=False: [bv])
+    targets = manager.refresh()
+    assert len(targets) == 1
+    vid = targets[0]["view_id"]
+    assert vid in manager._records
+    assert bv in manager._ids_by_object
+
+    manager.forget(bv)
+
+    assert vid not in manager._records
+    assert bv not in manager._ids_by_object
+
+
+def test_close_binary_all_succeeds_when_allcontexts_fails_but_activecontext_recovers(monkeypatch, tmp_path):
+    # #613 review (minor): a raising ui.UIContext.allContexts() used to latch
+    # note_incomplete() even though the activeContext() fallback right below
+    # it fully recovers a complete context set in the normal single-window
+    # case -- so strict=True refused every bare/--all/path close on a session
+    # that enumerated perfectly. The flag must clear when the fallback
+    # actually recovers a context set.
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    view_a = _ClosableBV("/proj/alpha.so", session_id="11")
+
+    class _Frame:
+        def __init__(self, view):
+            self._view = view
+
+        def getCurrentBinaryView(self):
+            return self._view
+
+    class _Context:
+        def getCurrentViewFrame(self):
+            return _Frame(view_a)
+
+        def getTabs(self):
+            return ["tab-0"]
+
+        def getViewFrameForTab(self, tab):
+            return _Frame(view_a)
+
+        def getViewForTab(self, tab):
+            return None
+
+    context = _Context()
+
+    def _broken_all_contexts():
+        raise RuntimeError("transient allContexts() failure")
+
+    fake_ui = types.SimpleNamespace(
+        UIContext=types.SimpleNamespace(
+            allContexts=_broken_all_contexts,
+            activeContext=lambda: context,
+        )
+    )
+    monkeypatch.setattr(bridge, "ui", fake_ui)
+    bridge._headless_views.clear()
+
+    result = _close_on_watchdog(instance, all_=True)
+
+    assert [c["path"] for c in result["closed"]] == ["/proj/alpha.so"]
+    assert view_a.closed
+
+
 def test_close_binary_bare_close_refuses_on_incomplete_view_enumeration(monkeypatch, tmp_path):
     # #613 hardening (carried from #691): _collect_open_views() swallows
     # per-tab UI exceptions so a single flaky tab never breaks `target list`.

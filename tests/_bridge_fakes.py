@@ -1335,15 +1335,34 @@ def _register_views(bridge, *bvs):
 
 
 class _ClosableBV:
-    def __init__(self, filename: str, session_id: str = "0"):
-        self.closed = False
+    """Fake BinaryView with BN's real handle-address equality semantics
+    (#586/#613 review): ``__eq__``/``__hash__`` compare the shared `handle`,
+    not object identity, and the `closed` flag lives on that handle too --
+    so several distinct wrapper instances built with the same `handle=`
+    (modeling BN's non-interning accessors handing back a fresh Python
+    wrapper per call for one core view) observe and report the same close.
+    Callers that never pass `handle=` get a private one, so identity-style
+    usage (the overwhelming majority of call sites) is unaffected."""
+
+    def __init__(self, filename: str, session_id: str = "0", handle: object | None = None):
+        self.handle = handle if handle is not None else types.SimpleNamespace(closed=False)
         self.file = types.SimpleNamespace(
             session_id=session_id,
             filename=filename,
             modified=False,
-            close=lambda: setattr(self, "closed", True),
+            close=lambda: setattr(self.handle, "closed", True),
         )
         self.view_type = types.SimpleNamespace(name="ELF")
+
+    @property
+    def closed(self) -> bool:
+        return self.handle.closed
+
+    def __eq__(self, other):
+        return isinstance(other, _ClosableBV) and other.handle is self.handle
+
+    def __hash__(self):
+        return hash(id(self.handle))
 
 
 # ---------------------------------------------------------------------------
