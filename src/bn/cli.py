@@ -297,12 +297,28 @@ def _resolve_out_path(value: str) -> Path:
     this same process, but echoed a relative path back) and the bridge-owned
     writers that do not.
 
-    ``Path.resolve()`` is non-strict by default (no existence requirement)
-    and normalizes through any symlinked cwd components. An already-absolute
-    path is returned unchanged in the common case (no symlinks/`..` to
-    collapse); `~` expansion still applies first.
+    Only RELATIVE paths are anchored. An absolute path is returned exactly
+    as given: callers deliberately pass absolute paths like
+    ``/proc/self/fd/<n>`` or ``/dev/stdout`` to hand this process a specific
+    open file descriptor (this is the bn-kernel CLI backend's own contract,
+    see skills/bn-kernel/SKILL.md), and ``Path.resolve()`` follows those
+    symlinks to a different (often deleted) path -- silently discarding the
+    fd. ``..`` normalization for relative paths is left to the kernel/OS,
+    which resolves it symlink-correctly; ``Path.cwd() / path`` here does not
+    lexically collapse it.
     """
-    return Path(value).expanduser().resolve()
+    try:
+        path = Path(value).expanduser()
+    except RuntimeError as exc:
+        # Path.expanduser() raises RuntimeError (not ArgumentTypeError/
+        # ValueError/TypeError) for an unresolvable `~user` or a missing
+        # home directory. argparse's type= machinery only converts
+        # ArgumentTypeError/TypeError/ValueError into a clean parser error;
+        # anything else escapes as a raw traceback (exit 1, empty stdout),
+        # bypassing BnArgumentParser.error()'s JSON-error-envelope contract
+        # and the documented 0/2/3 exit codes.
+        raise argparse.ArgumentTypeError(f"--out {value}: {exc}") from None
+    return path if path.is_absolute() else Path.cwd() / path
 
 
 def _common_io_options(
