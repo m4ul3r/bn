@@ -465,6 +465,31 @@ def test_render_evidence_shows_argument_confidence_and_variadic():
     assert "variadic: UNDER-RECOVERED" in out
 
 
+def test_render_evidence_function_shows_recorded_local_tailcall_target_704():
+    # #704 round 4: `_function_thunk_summary` records a resolved LOCAL branch
+    # target (`is_candidate: False`, `target` populated) so a genuine
+    # `j_`-style veneer lifted as LLIL_JUMP is not silently invisible in text
+    # output -- the target must be rendered as a plain fact, without
+    # asserting the thunk/veneer verdict the tool never established for a
+    # local destination.
+    from bn.formatters import _render_function_evidence_text
+    value = {
+        "function": {"name": "init_array_0", "address": "0x500000"},
+        "prototype": "void init_array_0()", "calling_convention": "__cdecl",
+        "thunk": {
+            "is_candidate": False, "reason": None,
+            "target": {"function": {"name": "init_helper", "address": "0x461746",
+                                     "exact_start": True}},
+        },
+        "total_calls": 0, "matched_calls": 0, "offset": 0, "limit": None,
+        "calls": [],
+    }
+    out = _render_function_evidence_text(value)
+    assert "thunk: no" in out
+    assert "candidate" not in out
+    assert "init_helper @ 0x461746" in out
+
+
 def test_render_evidence_function_notes_arity_mismatch_704():
     # #648/#704: a call demoted via `arity_mismatch` must state the reason in
     # text mode, not just print `arguments: (hlil inferred)` with no note.

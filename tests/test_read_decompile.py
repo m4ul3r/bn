@@ -23,9 +23,15 @@ read_evidence = importlib.import_module("bn_agent_bridge.read_evidence")
 def test_thunk_veneer_warning_names_target_and_is_quiet_for_non_thunks(monkeypatch):
     # #446: a PLT/GOT veneer decompiles as apparent self-recursion; the warning
     # names the real trampoline target (or a generic note) instead.
+    # #704 round 4: the mocked summary uses the shape `_function_thunk_summary`
+    # actually returns -- name/address live under `target["function"]`, not
+    # flat on `target`. The flat shape used here previously made the
+    # named-target branch dead against real data (see the round-4 tests below
+    # that drive this through the real, un-mocked producer).
     monkeypatch.setattr(read_evidence, "_function_thunk_summary",
                         lambda ctx, bv, func: {"is_candidate": True,
-                                               "target": {"name": "memcpy", "address": "0x1000"}})
+                                               "target": {"function": {"name": "memcpy", "address": "0x1000",
+                                                                        "exact_start": True}}})
     w = read_decompile._thunk_veneer_warning(None, None, None)
     assert "thunk/veneer -> memcpy @ 0x1000" in w and "self-recursive" in w
 
@@ -37,6 +43,80 @@ def test_thunk_veneer_warning_names_target_and_is_quiet_for_non_thunks(monkeypat
     monkeypatch.setattr(read_evidence, "_function_thunk_summary",
                         lambda ctx, bv, func: {"is_candidate": False})
     assert read_decompile._thunk_veneer_warning(None, None, None) is None
+
+
+def test_thunk_veneer_warning_mid_function_target_not_confirmed_704(monkeypatch):
+    """#704 round 4: a resolved target whose `exact_start` is False lands
+    mid-function, not at a trampoline entry point -- the warning must say the
+    thunk/veneer verdict is not confirmed, while still naming the resolved
+    containing function (closes round-3 follow-up 3(b))."""
+    monkeypatch.setattr(
+        read_evidence, "_function_thunk_summary",
+        lambda ctx, bv, func: {
+            "is_candidate": True,
+            "reason": "small function with llil_jump to another address",
+            "target": {"function": {"name": "big_fn", "address": "0x405000",
+                                     "exact_start": False, "offset": "0x10"}},
+        })
+    w = read_decompile._thunk_veneer_warning(None, None, None)
+    assert "big_fn @ 0x405000" in w
+    assert "not confirmed" in w
+    assert "not a self-recursive function" not in w  # the confident wording only
+
+
+def test_thunk_veneer_warning_names_resolved_exact_start_target_through_real_producer_704(monkeypatch):
+    """#704 round 4 regression: the named-target branch tested
+    `target.get("name")`/`target.get("address")` directly, but the real
+    producer's target is `ctx._normalize_code_pointer(...)`, whose name and
+    address live under `target["function"]`. That mismatch made the branch
+    dead against real data -- EVERY resolved candidate, including an import
+    veneer whose target the tool DID resolve, fell through into the
+    "not resolved" fallback. Drive the warning through the real, un-mocked
+    producer (`_function_thunk_summary`) to prove the branch fires."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    callee = _FakeFunction(0x461746, "log_write")
+    callee.symbol = _FakeSymbol("ImportedFunctionSymbol")
+    veneer = _FakeFunction(0x500000, "j_log_write")
+    veneer.basic_blocks = [_FakeBasicBlock(0x500000, 0x500004)]
+    veneer.low_level_il = [[_FakeLLILInstruction(0x500000, _FakeConstPtr(0x461746), operation="LLIL_JUMP")]]
+    bv = _FakeBV(
+        functions=[callee, veneer],
+        disassembly={0x500000: "b log_write"},
+    )
+
+    w = read_decompile._thunk_veneer_warning(instance.ctx, bv, veneer)
+
+    assert w is not None
+    assert "log_write @ 0x461746" in w
+    assert "PLT/GOT trampoline" in w
+    assert "not resolved" not in w
+    assert "not confirmed" not in w
+
+
+def test_thunk_veneer_warning_mid_function_target_through_real_producer_704(monkeypatch):
+    """#704 round 4: same regression, exercised for the `exact_start is
+    False` case through the real producer -- a branch landing inside a
+    function's body (not at its entry) must not be confirmed as a PLT/GOT
+    thunk, while still naming what the tool resolved."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    big_fn = _FakeFunction(0x405000, "big_fn")
+    big_fn.basic_blocks = [_FakeBasicBlock(0x405000, 0x405020)]
+    stub = _FakeFunction(0x500000, "stub")
+    stub.basic_blocks = [_FakeBasicBlock(0x500000, 0x500004)]
+    stub.low_level_il = [[_FakeLLILInstruction(0x500000, _FakeConstPtr(0x405010), operation="LLIL_JUMP")]]
+    bv = _FakeBV(
+        functions=[big_fn, stub],
+        disassembly={0x500000: "b 0x405010"},
+    )
+
+    w = read_decompile._thunk_veneer_warning(instance.ctx, bv, stub)
+
+    assert w is not None
+    assert "big_fn" in w
+    assert "not confirmed" in w
+    assert "not a self-recursive function" not in w
 
 
 def test_thunk_veneer_warning_target_less_wording_states_only_what_is_known_704(monkeypatch):

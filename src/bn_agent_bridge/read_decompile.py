@@ -127,9 +127,14 @@ def _thunk_veneer_warning(ctx, bv, func) -> str | None:
     if not summary.get("is_candidate"):
         return None
     target = summary.get("target") if isinstance(summary.get("target"), dict) else None
-    if target and (target.get("name") or target.get("address")):
-        name, addr = target.get("name"), target.get("address")
+    fn = target.get("function") if isinstance(target, dict) else None
+    if isinstance(fn, dict) and (fn.get("name") or fn.get("address")):
+        name, addr = fn.get("name"), fn.get("address")
         dest = f"{name} @ {addr}" if name and addr else (name or addr)
+        if fn.get("exact_start") is False:
+            return (f"thunk/veneer: the branch target lands inside {dest}, not at its "
+                    f"entry -- a mid-function destination is not a trampoline entry "
+                    f"point, so this is not confirmed as a PLT/GOT thunk.")
         return (f"thunk/veneer -> {dest}: this is a PLT/GOT trampoline (a jump to "
                 f"the real body), not a self-recursive function.")
     # #704 round 3: no target was resolved here -- the candidate was flagged

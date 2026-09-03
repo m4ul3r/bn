@@ -1507,6 +1507,9 @@ def _render_function_evidence_text(value: Any) -> str:
         lines.append(f"thunk: candidate ({thunk.get('reason', 'no reason recorded')})")
         if thunk.get("target"):
             lines.append(f"  target: {_render_target_line(thunk['target'])}")
+    elif thunk.get("target"):
+        lines.append("thunk: no (tail branch to a local function, not a trampoline)")
+        lines.append(f"  tail branch -> {_render_target_line(thunk['target'])}")
     else:
         lines.append("thunk: no")
 
