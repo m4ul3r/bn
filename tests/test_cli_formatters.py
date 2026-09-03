@@ -506,6 +506,29 @@ def test_render_callsites_no_footer_on_complete_single_page():
     assert "showing" not in out
 
 
+def test_render_callsites_empty_string_row_does_not_read_as_no_callsites():
+    # A row that renders to a literal empty string (fallback text for a raw ""
+    # item) must not be silently dropped into the "no callsites found" fallback
+    # -- that misrepresents a one-row page as a zero-result page.
+    from bn.formatters import _render_callsites_text
+    value = {"items": [""]}
+    out = _render_callsites_text(value)
+    assert out != "no callsites found"
+
+
+def test_render_callsites_string_offset_footer_renders_unknown_not_fabricated():
+    # #619: a string offset ("60") must not coerce to the same footer text as
+    # the int 60 -- _fmt_offset must disclose it as unknown instead of
+    # fabricating a specific page position the payload never stated as an int.
+    from bn.formatters import _render_callsites_text
+    value = {"items": [], "total": 47, "offset": "60", "has_more": False}
+    out = _render_callsites_text(value)
+    assert "(offset <unknown>)" in out
+    assert "(offset 60)" not in out
+
+
+
+
 def test_render_capabilities_malformed_element_renders_placeholder():
     # #619: a malformed (non-dict) list element must degrade to a placeholder
     # line, not raise inside the renderer.
@@ -597,6 +620,30 @@ def test_render_field_xrefs_offset_hex_string_renders_unknown_not_zero():
                         "field_type": "uint32_t"}, "items": []}
     out = _render_field_xrefs_text(value)
     assert "+<unknown: '0x40'>" in out
+
+
+def test_render_field_xrefs_missing_offset_key_renders_unknown_not_zero():
+    # F2: the call site must not default a missing "offset" key to 0 -- that
+    # fabricates a real offset-0 member for a struct field the payload never
+    # gave an offset for.
+    from bn.formatters import _render_field_xrefs_text
+    value = {"field": {"type_name": "Widget", "field_name": "flags",
+                        "field_type": "uint32_t"}, "items": []}
+    out = _render_field_xrefs_text(value)
+    assert "Widget.flags @ +<unknown: None>" in out
+    assert "+0x0" not in out
+
+
+def test_render_field_xrefs_non_dict_field_renders_unknown_not_zero():
+    # F2: a malformed (non-dict) "field" degrades to placeholder names, and
+    # the offset must degrade alongside them instead of impersonating +0x0.
+    from bn.formatters import _render_field_xrefs_text
+    value = {"field": "not-a-dict", "items": []}
+    out = _render_field_xrefs_text(value)
+    assert "<unknown>.<unknown> @ +<unknown: None>" in out
+    assert "+0x0" not in out
+
+
 
 
 def test_render_evidence_shows_argument_confidence_and_variadic():

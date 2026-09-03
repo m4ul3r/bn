@@ -417,7 +417,7 @@ def _render_field_xrefs_text(value: Any) -> str:
 
     field = _as_dict(value.get("field"))
     lines = [
-        f"{field.get('type_name', '<unknown>')}.{field.get('field_name', '<unknown>')} @ {_fmt_field_offset(field.get('offset', 0))}",
+        f"{field.get('type_name', '<unknown>')}.{field.get('field_name', '<unknown>')} @ {_fmt_field_offset(field.get('offset'))}",
         f"type: {field.get('field_type', '<unknown>')}",
         "",
         "code refs:",
@@ -2179,7 +2179,7 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
             if isinstance(item, dict):
                 lines.append(f"  {item.get('address', '<unknown>')}  {item.get('text', '')}".rstrip())
         blocks.append("\n".join(lines))
-    body = "\n\n".join(blocks)
+    body = "\n\n".join(block for block in blocks if block)
     # #611: a partial LAST page (offset > 0, has_more false, fewer rows than the
     # total) must still say so -- otherwise it silently reads as the complete
     # result instead of one page of a paged survey. An over-shot page (offset
@@ -2204,7 +2204,7 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
             "Use --offset/--limit to page."
         )
         body = f"{body}\n\n{footer}" if body else footer
-    if not body:
+    if not blocks and not body:
         body = "no callsites found"
     return body
 
