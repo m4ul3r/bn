@@ -527,6 +527,18 @@ def test_render_callsites_string_offset_footer_renders_unknown_not_fabricated():
     assert "(offset 60)" not in out
 
 
+def test_render_callsites_non_int_total_empty_page_does_not_assert_zero():
+    # #619 follow-up: an empty page whose `total` is not an int is not a
+    # confirmed zero-result page -- claiming "no callsites found" here is
+    # the same confidently-wrong shape the over-shot-page fix (F3) stopped
+    # fabricating for a bad offset. The total is unusable, so say so instead
+    # of asserting zero.
+    from bn.formatters import _render_callsites_text
+    value = {"items": [], "total": "47", "offset": 60}
+    out = _render_callsites_text(value)
+    assert out != "no callsites found"
+    assert "total count is not a number" in out
+    assert "(offset 60)" in out
 
 
 def test_render_capabilities_malformed_element_renders_placeholder():

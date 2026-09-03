@@ -67,10 +67,13 @@ def _fmt_field_offset(value: Any) -> str:
     return f"+<unknown: {value!r}>"
 
 
-def _as_int(value: Any, default: int = 0) -> int:
+def _int_or_default(value: Any, default: int = 0) -> int:
     """Coerce a field expected to be an int, degrading a ``None``/non-numeric
     value to ``default`` instead of raising inside ``int(...)`` or an ordering
-    comparison (#619)."""
+    comparison. Distinct from ``read_evidence._as_int``, which parses hex
+    strings and returns ``-1`` on failure -- same-named helpers with
+    different contracts are a trap, so this one names its defaulting
+    behavior explicitly (#619)."""
     if isinstance(value, bool):
         return default
     if isinstance(value, int):
@@ -2116,6 +2119,15 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value and not isinstance(total, int):
+        if total is not None:
+            # #619 follow-up: a non-int `total` on an empty page is not a
+            # confirmed zero -- it is a malformed/unusable count. Saying "no
+            # callsites found" here would assert the same confident-zero the
+            # over-shot-page fix above was written to stop fabricating.
+            return (
+                f"no callsites on this page (offset {_fmt_offset(offset)}); "
+                "total count is not a number, so a zero result cannot be confirmed"
+            )
         return "no callsites found"
 
     blocks = []
@@ -2185,7 +2197,7 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
     # result instead of one page of a paged survey. An over-shot page (offset
     # past the end) must footer too instead of hitting the empty-list early
     # return and reading as "never called" while JSON reports the real total.
-    if isinstance(total, int) and (has_more or _as_int(offset) > 0 or len(value) != total):
+    if isinstance(total, int) and (has_more or _int_or_default(offset) > 0 or len(value) != total):
         footer = f"... showing {len(value)} of {total} callsites (offset {_fmt_offset(offset)})"
         if has_more:
             # Only a mid-survey page has somewhere to page forward to -- a true
