@@ -557,6 +557,25 @@ def _slot_is_code(target: dict[str, Any]) -> bool:
     return (target.get("context") or {}).get("kind") == "code"
 
 
+def _lookahead_row_confirms_continuation(row: dict[str, Any] | None) -> bool:
+    """#706 follow-up: row `max_slots` -- read but never scanned as a slot --
+    resolves the one ambiguity the raw cap can't: a trailing run of null rows
+    inside the window reads identically whether the vtable ended there (the
+    next object's zeroed padding) or is an unresolved-relocation run inside a
+    table that keeps going past the cap (#441). A readable code/null/extern
+    row one past the cap is the same kind of entry the window itself accepts
+    as a slot, so the table demonstrably continues. Missing (the reader
+    couldn't produce it), unreadable, or a mapped-data pointer is never
+    treated as evidence of continuation -- absence of proof is not proof the
+    table goes on."""
+    if row is None or not row.get("readable"):
+        return False
+    target = row.get("target") if isinstance(row.get("target"), dict) else {}
+    status = target.get("status")
+    kind = (target.get("context") or {}).get("kind")
+    return _slot_is_code(target) or status == "null" or kind == "extern"
+
+
 def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[str, Any]:
     """Function slots of an Itanium vtable. Words [0] (offset-to-top) and [1]
     (typeinfo ptr) are header; slots start at +2*ptr_size. Reuses the
@@ -582,7 +601,11 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
             "scanned": 0,
         }
     start = vtable_addr + 2 * ptr
-    table = ctx._pointer_table_layout(bv, start, entries=max_slots, stride=ptr)
+    # #706 follow-up: read one entry PAST the cap. Row `max_slots` is a
+    # lookahead ONLY -- never a slot in its own right (the window below
+    # excludes it from both scanning and `slots`) -- consulted after the loop
+    # to resolve the trailing-null ambiguity (see the `else` branch).
+    table = ctx._pointer_table_layout(bv, start, entries=max_slots + 1, stride=ptr)
     slots: list[dict[str, Any]] = []
     # #303: the pointer-table reader (`_pointer_table_for_view`) returns the
     # canonical #275 envelope, whose rows live under `items`. This loop read the
@@ -600,15 +623,16 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
     # an unmapped word (the next sub-vtable's offset-to-top, e.g. -8) or a mapped
     # DATA pointer (the next object's typeinfo). Trailing null slots are trimmed.
     raw_entries = table.get("items") or table.get("entries") or []
+    window = raw_entries[:max_slots]
     scanned = 0
     truncated = False
-    # #584: track whether the raw scan hit `max_slots` without ever finding a
-    # genuine terminator (unreadable slot / mapped data pointer). `for...else`
+    # #584: track whether the window scan hit `max_slots` without ever finding
+    # a genuine terminator (unreadable slot / mapped data pointer). `for...else`
     # runs the `else` branch only when the loop completed without `break` --
-    # i.e. every raw entry was consumed as a valid slot, so the real vtable
-    # may continue past `max_slots` and the result is a lower bound, not the
-    # true length.
-    for i, row in enumerate(raw_entries):
+    # i.e. every entry in the window was consumed as a valid slot, so the raw
+    # scan alone can't tell whether the real vtable ends there or continues
+    # past `max_slots` (the lookahead below resolves it).
+    for i, row in enumerate(window):
         scanned = i + 1
         if not row.get("readable"):
             break
@@ -655,20 +679,28 @@ def _vtable_layout(ctx, bv, vtable_addr: int, *, max_slots: int = 64) -> dict[st
             # (typeinfo / secondary-vtable header) -- the vtable ends here.
             break
     else:
-        truncated = scanned >= max_slots > 0
+        # #706 follow-up: the window's `for...else` completion is ambiguous by
+        # itself -- a trailing null run consumed to reach `max_slots` reads
+        # identically whether it's the next object's padding (table ended) or
+        # an unresolved-reloc run inside a table that keeps going (#441). The
+        # one-entry lookahead at row `max_slots` (never scanned as a slot)
+        # resolves it directly instead of inferring from what the trim below
+        # removes: it proves the table continues (or doesn't) independent of
+        # `slots`'s final shape.
+        if scanned >= max_slots > 0:
+            lookahead = raw_entries[max_slots] if len(raw_entries) > max_slots else None
+            truncated = _lookahead_row_confirms_continuation(lookahead)
     # A vtable ends at a real or pure-virtual method, so a trailing run of null
-    # slots is the next object's zeroed offset-to-top / padding, not a slot.
-    while slots and slots[-1].get("null"):
-        slots.pop()
-    # #706 round 2: the trim above can remove exactly the slots that made
-    # `truncated` True -- a trailing null run consumed to reach `max_slots` is
-    # the next object's header, not evidence the real vtable continues past
-    # the cap (that would report a COMPLETE vtable as possibly truncated).
-    # Only honor `truncated` when the cap cut into a RETAINED slot, i.e. the
-    # last slot still present is genuinely the last raw entry scanned -- so
-    # nothing was trimmed off the boundary the cap hit.
-    if truncated and not (slots and slots[-1]["index"] == scanned - 1):
-        truncated = False
+    # slots is the next object's zeroed offset-to-top / padding, not a slot --
+    # but ONLY once the table is known to have ended (`truncated` False): when
+    # the lookahead confirmed the table continues, those same trailing nulls
+    # are interior placeholder slots the scan hasn't resolved yet, not
+    # padding, and trimming them would silently drop real (if unresolved)
+    # entries from a table that is honestly (and now unambiguously) reported
+    # as truncated.
+    if not truncated:
+        while slots and slots[-1].get("null"):
+            slots.pop()
     return {
         "address": hex(int(vtable_addr)),
         "slots": slots,

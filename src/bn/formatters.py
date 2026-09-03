@@ -1746,6 +1746,12 @@ def _render_virtual_call_text(value: Any) -> str:
     if value.get("ambiguous"):
         lines.append(f"  AMBIGUOUS: {len(cands)} provider classes implement slot "
                      f"{value.get('slot_offset', '?')}")
+    # #706 follow-up (round-2 finding 9): a reason can be attached ALONGSIDE a
+    # resolved/ambiguous candidate set (an unscanned provider's capped vtable
+    # scan might supply another candidate) -- surface it here instead of only
+    # inside the `not cands` branch above, which would silently drop it.
+    for warning in list(value.get("warnings") or []):
+        lines.append(f"  warning: {warning}")
     for c in cands:
         method = c.get("method") or "<unnamed>"
         entry = c.get("vtable_entry") or "?"

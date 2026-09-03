@@ -2432,9 +2432,25 @@ def _resolve_virtual_call(ctx, selector, at, providers=None):
         "ambiguous": len(candidates) > 1,
         "resolved": len(candidates) == 1,
     }
-    if not candidates and truncated_cap is not None:
-        result["unresolved_reason"] = (
-            f"slot {slot_index} is beyond the recovered vtable window (scan capped at "
-            f"{truncated_cap} slots) in at least one provider -- the target method may "
-            f"exist past the cap rather than being genuinely unresolvable")
+    if truncated_cap is not None:
+        if not candidates:
+            result["unresolved_reason"] = (
+                f"slot {slot_index} is beyond the recovered vtable window (scan capped at "
+                f"{truncated_cap} slots) in at least one provider -- the target method may "
+                f"exist past the cap rather than being genuinely unresolvable")
+        else:
+            # Round-2 finding 9: a candidate here only means SOME provider's
+            # vtable resolved this slot -- `truncated_cap` is set independently
+            # whenever a DIFFERENT provider's scan hit its cap before reaching
+            # `slot_index` (the `slot is None` branch above `continue`s without
+            # ever checking that provider for this slot). That provider could
+            # supply another candidate this loop never saw, so a clean-looking
+            # `resolved: true` / `ambiguous: false` must not imply every
+            # provider was actually consulted.
+            result["warnings"] = [
+                f"resolution may be incomplete: slot {slot_index} is beyond the "
+                f"recovered vtable window (scan capped at {truncated_cap} slots) in "
+                f"at least one OTHER provider that was not fully scanned for this "
+                f"slot -- it could supply an additional candidate not reflected in "
+                f"`resolved`/`ambiguous`"]
     return result
