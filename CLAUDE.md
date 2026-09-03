@@ -98,9 +98,10 @@ All mutations support `--preview` (apply → capture diffs → revert) and live 
 
 Request: `{"op": "decompile", "params": {...}, "target": "selector", "id": "uuid"}`
 Response: `{"ok": true, "result": ...}` or `{"ok": false, "error": "..."}`. On an
-`OperationFailure` the `ok: false` envelope also carries `status` (and,
-when relevant, `requested` and `observed`) describing the structured
-mutation failure; those three keys are omitted for other errors.
+`OperationFailure` the `ok: false` envelope also carries `status`, `requested`
+and `observed` describing the structured mutation failure; `requested` and
+`observed` are `{}` when the failure supplied no detail. All three keys are
+omitted entirely for other errors.
 
 ## Conventions
 
