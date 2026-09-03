@@ -280,7 +280,7 @@ def _abi_arg_register_count(bv, callee_fn) -> int | None:
     return len(regs) or None
 
 
-def _argument_arity_evidence(ctx, bv, dest_value, target,
+def _argument_arity_evidence(ctx, bv, dest_value, target, arg_source: str,
                              arguments: list[dict[str, Any]]) -> dict[str, Any]:
     """Is the callee's ARITY known, or is HLIL enumerating ABI registers? (#648)
 
@@ -308,6 +308,16 @@ def _argument_arity_evidence(ctx, bv, dest_value, target,
     prototype declares (an invented/dropped ABI-register arg -- ``arity_mismatch``,
     only checked against a non-empty rendered list; an empty list usually means no
     IL layer supplied one at all, not a real mismatch).
+
+    ``arity_mismatch`` is checked ONLY when ``arg_source == "hlil"`` (#704 round 3):
+    ``arguments`` falls back to MLIL, then LLIL, whenever the HLIL roots are an
+    ambiguous fold (``_call_arguments``); an mlil/llil-sourced list is already
+    surfaced as heuristic (never ``authoritative``) and is not even attempting to
+    describe the callee's operands the way HLIL does -- on the mapped-MLIL fallback
+    it is literally the CALLER's ABI registers (#661). Comparing THAT count against
+    the callee's declared arity and reporting the note as an "HLIL rendered N
+    argument(s)" finding would attribute a provenance the tool never established,
+    reintroducing #661's defect class in prose.
 
     Returns ``{"arity_unknown": bool, ...}``; ``arity_unknown`` is False whenever the
     callee cannot be resolved -- ``callee_unresolved`` carries that case instead.
@@ -339,8 +349,11 @@ def _argument_arity_evidence(ctx, bv, dest_value, target,
         # without claiming the whole arity is unknown. Guarded on a non-empty
         # rendered list: an empty list usually means no IL layer supplied
         # arguments at all (e.g. a non-SSA LLIL call with neither `params` nor
-        # `parameters`), not a genuine mismatch (#704 round-2 correction).
-        if not is_variadic and arguments and len(arguments) != declared_count:
+        # `parameters`), not a genuine mismatch (#704 round-2 correction). Also
+        # guarded on `arg_source == "hlil"` (#704 round-3 correction): the note
+        # this flag drives names HLIL explicitly, so only raise it when HLIL is
+        # what actually produced `arguments`.
+        if arg_source == "hlil" and not is_variadic and arguments and len(arguments) != declared_count:
             evidence["arity_mismatch"] = True
             evidence["declared_arity"] = declared_count
         return evidence
@@ -527,7 +540,7 @@ def _function_call_evidence(ctx, bv, func, *, context: int) -> list[dict[str, An
         # `authoritative`, regardless of source (#704: keyed on `callee_unresolved`,
         # not `indirect_call` -- the latter is purely a call-shape mirror of
         # `direct` and does not by itself mean the arity is unknown).
-        arity = _argument_arity_evidence(ctx, bv, dest_value, target, arguments)
+        arity = _argument_arity_evidence(ctx, bv, dest_value, target, arg_source, arguments)
         if arity.get("callee_unresolved"):
             argument_confidence = "heuristic"
         elif (arity["arity_unknown"] or arity.get("arity_mismatch")) and argument_confidence == "authoritative":

@@ -2735,6 +2735,74 @@ def test_argument_confidence_negative_control_matching_arity_stays_authoritative
     assert call["arity_unknown"] is False
 
 
+def test_argument_confidence_arity_mismatch_note_names_true_provenance_704(monkeypatch):
+    """#704 round 3: when the HLIL fold at this call's address is AMBIGUOUS (>1
+    root, none at this address), `_call_arguments` falls back to MLIL (#661).
+    On that fallback the rendered list is the CALLER's ABI registers, not the
+    callee's operands -- exactly what #661 exists to stop presenting as callee
+    arguments. `arity_mismatch` must not fire off that fallback list at all:
+    firing it (and the old note hard-coding "HLIL rendered") would attribute a
+    provenance the tool never established, reintroducing #661's defect class
+    in prose."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    callee = _FakeFunction(0x401100, "hw_get_version")
+    callee.parameter_vars = [
+        _FakeVariable(name=f"a{i}", storage=i, var_type="int64_t", identifier=i + 1)
+        for i in range(2)
+    ]
+    callee.calling_convention = types.SimpleNamespace(
+        int_arg_regs=[f"x{i}" for i in range(8)])
+    caller = _FakeFunction(0x401400, "probe_device")
+    # Two folded HLIL call roots, NEITHER at this call's address (0x401400) --
+    # an ambiguous fold (#475/#476) `_call_arguments` cannot scope to a single
+    # root, so it falls back to MLIL rather than guessing which root is ours.
+    root_a = _FakeHLILInstruction("hw_get_version(x0, x1, x2, x3)",
+                                  class_name="HighLevelILCall",
+                                  address=0x401404, expr_index=10, instr_index=10)
+    root_a.params = ["x0", "x1", "x2", "x3"]
+    root_b = _FakeHLILInstruction("other_call(y0)", class_name="HighLevelILCall",
+                                  address=0x401408, expr_index=11, instr_index=11)
+    root_b.params = ["y0"]
+    call_insn = _FakeLLILInstruction(0x401400, _FakeConstPtr(0x401100),
+                                     hlils=[root_a, root_b])
+
+    class _MappedMLIL:
+        # The mapped/coalesced MLIL form -- names the CALLER's ABI registers,
+        # not the callee's real operands (#661).
+        params = ["arg1", "arg2", "arg3", "arg4"]
+
+        def __str__(self):
+            return "call(0x401100, arg1, arg2, arg3, arg4)"
+
+    call_insn.mlil = _MappedMLIL()
+    caller.basic_blocks = [_FakeBasicBlock(0x401400, 0x401404)]
+    caller.low_level_il = [[call_insn]]
+    bv = _FakeBV(functions=[callee, caller], instruction_lengths={0x401400: 4},
+                 disassembly={0x401400: "bl hw_get_version"})
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    call = instance._function_evidence("active", "probe_device", context=0)["calls"][0]
+    # The 2-parameter callee vs. the 4-argument fallback list is precisely the
+    # shape that used to mis-render as an "HLIL" mismatch note (#704 round 3).
+    assert call["argument_source"] == "mlil"
+    assert len(call["arguments"]) == 4
+    assert "arity_mismatch" not in call
+    assert call["arity_unknown"] is False
+
+    from bn.formatters import _render_function_evidence_text
+    out = _render_function_evidence_text({
+        "function": {"name": "probe_device", "address": "0x401400"},
+        "prototype": "int32_t probe_device()", "calling_convention": "__cdecl",
+        "thunk": {"is_candidate": False},
+        "total_calls": 1, "matched_calls": 1, "offset": 0, "limit": None,
+        "calls": [call],
+    })
+    assert "arguments: (mlil" in out
+    assert "arity: MISMATCH" not in out
+    assert "HLIL rendered" not in out
+
+
 def test_argument_confidence_indirect_call_never_authoritative_648(monkeypatch):
     """#648: an indirect call has no resolvable callee, so its arity is
     unknowable even when HLIL produced a clean-looking argument list. The
