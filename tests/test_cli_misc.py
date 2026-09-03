@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import types
+from pathlib import Path
 
 import bn.cli
 import pytest
@@ -190,6 +191,44 @@ def test_bundle_function_out_path_is_bridge_owned(fake_transport, tmp_path, caps
     payload = json.loads(output)
     assert payload["artifact_path"] == str(out_path)
     assert payload["spilled"] is False
+
+
+def test_bundle_function_relative_out_resolves_to_cli_cwd(fake_transport, monkeypatch, tmp_path, capsys):
+    # #665: bundle is bridge-owned (the bridge process, not this CLI process,
+    # writes the file), so a relative --out must be resolved to an absolute
+    # path BEFORE it is threaded into the request params -- otherwise a
+    # long-lived bridge spawned from a different directory writes the
+    # artifact next to itself instead of next to the invoking shell.
+    work = tmp_path / "shell-cwd"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    expected = (work / "bundle.json").resolve()
+
+    calls = fake_transport({
+        "list_targets": {
+            "ok": True,
+            "result": [{"target_id": "123:1:7", "selector": "alpha.bndb"}],
+        },
+        "bundle_function": {
+            "ok": True,
+            "result": {
+                "ok": True,
+                "artifact_path": str(expected),
+                "format": "json",
+                "bytes": 123,
+                "sha256": "deadbeef",
+                "summary": {"kind": "object", "count": 3},
+            },
+        },
+    })
+
+    rc = bn.cli.main(["bundle", "function", "--out", "bundle.json", "sub_401000"])
+
+    assert rc == 0
+    assert calls[-1]["op"] == "bundle_function"
+    # The bug: this used to be the literal relative string "bundle.json".
+    assert calls[-1]["params"]["out_path"] == str(expected)
+    assert Path(calls[-1]["params"]["out_path"]).is_absolute()
 
 
 def test_strings_json_carries_paging_envelope(fake_transport, capsys):

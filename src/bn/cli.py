@@ -280,6 +280,31 @@ class BnArgumentParser(argparse.ArgumentParser):
         return parsed
 
 
+def _resolve_out_path(value: str) -> Path:
+    """argparse ``type=`` for ``--out``: anchor a relative path at the CLI
+    process's own cwd, before it can reach a bridge request (#665).
+
+    The bridge is a long-lived process that may have been spawned from (or
+    reattached to across sessions in) a different directory than the shell
+    invoking this CLI call. Commands like ``bundle`` thread ``--out`` into
+    the request params and let the BRIDGE write the file server-side; a
+    relative path shipped as-is silently resolves against the bridge's cwd,
+    not the caller's, so the artifact lands somewhere the caller never
+    intended (and the echoed relative ``artifact_path`` is unusable from any
+    other cwd). Resolving here -- once, centrally, before any command or
+    transport code sees the value -- fixes both the CLI-side writers in
+    output.py (which happened to write correctly already, since they run in
+    this same process, but echoed a relative path back) and the bridge-owned
+    writers that do not.
+
+    ``Path.resolve()`` is non-strict by default (no existence requirement)
+    and normalizes through any symlinked cwd components. An already-absolute
+    path is returned unchanged in the common case (no symlinks/`..` to
+    collapse); `~` expansion still applies first.
+    """
+    return Path(value).expanduser().resolve()
+
+
 def _common_io_options(
     parser: argparse.ArgumentParser,
     *,
@@ -293,9 +318,10 @@ def _common_io_options(
         help="Output format",
     )
     parser.add_argument(
-        "--out", type=Path,
+        "--out", type=_resolve_out_path,
         help="Write output to a file instead of stdout (a .json/.ndjson path "
-             "infers --format unless one is given)",
+             "infers --format unless one is given). Relative paths are resolved "
+             "against the invoking shell's cwd, not the bridge's.",
     )
 
 

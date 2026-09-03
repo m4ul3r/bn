@@ -700,6 +700,54 @@ def test_resolve_output_format_matching_explicit_json_is_silent(capsys):
     assert capsys.readouterr().err == ""
 
 
+# --- #665: --out resolves against the CLI's own cwd, not the bridge's ---
+
+
+def test_resolve_out_path_relative_anchors_at_cli_cwd(monkeypatch, tmp_path):
+    work = tmp_path / "shell-cwd"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    parser = bn.cli.build_parser()
+    ns = parser.parse_args(["function", "list", "--out", "fns.json"])
+    assert ns.out == (work / "fns.json").resolve()
+    assert ns.out.is_absolute()
+
+
+def test_resolve_out_path_absolute_is_unchanged(tmp_path):
+    abs_out = tmp_path / "nested" / "fns.json"
+    parser = bn.cli.build_parser()
+    ns = parser.parse_args(["function", "list", "--out", str(abs_out)])
+    assert ns.out == abs_out
+
+
+def test_resolve_out_path_expands_user(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    parser = bn.cli.build_parser()
+    ns = parser.parse_args(["function", "list", "--out", "~/fns.json"])
+    assert ns.out == (tmp_path / "fns.json").resolve()
+
+
+def test_relative_out_writes_and_echoes_absolute_path(fake_transport, monkeypatch, tmp_path, capsys):
+    # The dogfood scenario from #665: a relative --out must land next to the
+    # invoking shell's cwd (here, a directory the bridge never even visited)
+    # and the printed envelope's artifact_path must be usable from any cwd.
+    work = tmp_path / "shell-cwd"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    fake_transport({"list_functions": {"ok": True, "result": {
+        "kind": "functions",
+        "items": [{"address": "0x1000", "name": "f", "size": 10}],
+        "total": 1, "offset": 0, "limit": 100, "returned": 1, "has_more": False,
+    }}})
+    rc = bn.cli.main(["function", "list", "--target", "active", "--out", "fns.json"])
+    assert rc == 0
+    expected = (work / "fns.json").resolve()
+    assert expected.exists()
+    envelope = json.loads(capsys.readouterr().out)
+    assert envelope["artifact_path"] == str(expected)
+    assert envelope["artifact_path"].startswith("/")
+
+
 def test_out_json_extension_writes_valid_json_end_to_end(fake_transport, tmp_path, capsys):
     # The real footgun: `--out x.json` without --format json used to write the
     # human TEXT renderer into the .json file, breaking a downstream json.load.
