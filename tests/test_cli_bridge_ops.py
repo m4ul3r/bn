@@ -15,12 +15,17 @@ bridge loads through the same `_bridge_fakes._load_bridge` seam
 `test_op_registry.py` uses.
 
 This is a ONE-WAY subset check by design (#623 acceptance criteria): a
-bridge-only op with no CLI caller (e.g. `doctor`, which the CLI only reaches
-via `_send_request_to_instance`, or `cancel_request`, which is a hand-built
-transport payload) is fine and expected -- nothing here requires the reverse.
-Batch-manifest *inner* op names (the `{"op": ...}` entries a `bn batch` JSON
-payload carries) are also out of scope; those are validated by the bridge at
-apply time (#361-style), not by this static CLI-source sweep.
+registered op the CLI never sends is fine and expected -- nothing here
+requires the reverse. (`doctor` and `cancel_request` are NOT examples of
+that: both are in fact extracted by this module's own rules --
+`_send_request_to_instance` and the dict-literal rule below, respectively
+-- and both appear in the extraction; today the CLI-side extraction happens
+to cover the bridge's full `REGISTRY.names()`.)
+Batch-manifest *inner* op names carried inside a `bn batch` JSON payload
+are out of scope: the dict-literal rule below only fires on a hand-built
+transport *request envelope* (an `"op"` key with sibling `"id"`/`"params"`
+keys), never on an arbitrary dict that merely happens to carry an `"op"`
+key.
 """
 from __future__ import annotations
 
@@ -50,6 +55,19 @@ _OP_ARG_INDEX = {
 # it deliberately -- but a silent drop to near-zero means the extractor
 # broke (e.g. a rename of `_call`/`_mutate`), not that the CLI shrank.
 _MIN_PLAUSIBLE_OP_COUNT = 40
+
+# One op name each shape -- and ONLY that shape -- produces in today's
+# tree. The count floor above cannot detect a stale table entry on its own:
+# dropping `_mutate` still leaves 59 of 77 literals, well clear of the
+# floor, so a renamed `_mutate` would leave every mutation op string
+# unchecked and still green. Losing a sentinel names the exact broken shape.
+_SHAPE_SENTINELS = {
+    "_call": "decompile",  # commands/function.py
+    "_mutate": "set_prototype",  # commands/mutation.py
+    "send_request": "load_status",  # commands/admin.py
+    "_send_request_to_instance": "doctor",  # commands/admin.py
+    'dict literal {"id", "op", "params"}': "cancel_request",  # transport.py
+}
 
 
 def _callee_name(func: ast.expr) -> str | None:
@@ -95,18 +113,28 @@ def extract_cli_wire_ops(root: Path) -> set[str]:
     - the 2nd positional (or `op=`) argument of `_call` / `_mutate`
     - the 1st positional (or `op=`) argument of `send_request` /
       `_send_request_to_instance`
-    - `"op": "<literal>"` entries in a hand-built request dict literal
-      (today: `transport.py`'s `cancel_request` payload)
+    - `"op": "<literal>"` entries in a hand-built request *envelope* dict
+      literal -- one with sibling `"id"` and `"params"` keys, e.g.
+      `transport.py`'s `cancel_request` payload -- never an arbitrary dict
+      that merely happens to carry an `"op"` key (a batch-manifest entry, a
+      decoded response row)
     """
     ops: set[str] = set()
     for path in sorted(root.rglob("*.py")):
-        tree = ast.parse(path.read_text(), filename=str(path))
+        tree = ast.parse(path.read_bytes(), filename=str(path))
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 index = _OP_ARG_INDEX.get(_callee_name(node.func) or "")
                 if index is not None:
                     ops |= _op_arg_strings(node, index)
             elif isinstance(node, ast.Dict):
+                keys = {
+                    key.value
+                    for key in node.keys
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str)
+                }
+                if not {"id", "params"} <= keys:
+                    continue
                 for key, value in zip(node.keys, node.values):
                     if isinstance(key, ast.Constant) and key.value == "op":
                         ops |= _string_constants(value)
@@ -124,6 +152,15 @@ def test_cli_wire_ops_are_registered_on_bridge(monkeypatch):
         f"{CLI_SRC_ROOT} -- expected at least {_MIN_PLAUSIBLE_OP_COUNT}; this "
         "looks like a broken extractor (a call-shape table entry went stale), "
         "not a real shrink of the CLI"
+    )
+
+    stale = {
+        shape for shape, sentinel in _SHAPE_SENTINELS.items() if sentinel not in cli_ops
+    }
+    assert not stale, (
+        f"extractor found no literal for call shape(s) {sorted(stale)} -- "
+        "their entry in _OP_ARG_INDEX (or the dict-literal rule) went "
+        "stale, so every op string sent through them is now unchecked"
     )
 
     missing = cli_ops - bridge.REGISTRY.names()
@@ -230,3 +267,88 @@ def test_extractor_ignores_dynamic_op_variables(tmp_path):
     ops = extract_cli_wire_ops(src_dir)
 
     assert ops == set()
+
+
+def test_sentinel_catches_mutate_rename_the_count_floor_misses(tmp_path):
+    """#709 review: dropping `_mutate` alone leaves 59/77 literals in the
+    real tree -- well clear of `_MIN_PLAUSIBLE_OP_COUNT`. Reproduce that
+    shape here: a fixture tree with plenty of `_call`/`send_request`
+    literals (>= the floor) but zero `_mutate` call sites, standing in for
+    a `_mutate` rename that the extractor's table was never updated for.
+    The count floor alone would pass this; the sentinel must not.
+    """
+    src_dir = tmp_path / "bn"
+    src_dir.mkdir()
+    calls = "\n".join(f'    _call(args, "op_{i}", {{}})' for i in range(_MIN_PLAUSIBLE_OP_COUNT))
+    (src_dir / "fake_commands.py").write_text(
+        "from __future__ import annotations\n"
+        "\n"
+        "\n"
+        "def _fake_many_calls(args):\n"
+        f"{calls}\n"
+        "    # note: no _mutate(...) call site anywhere in this fixture tree,\n"
+        "    # standing in for a renamed `_mutate` the table wasn't updated for\n"
+    )
+
+    ops = extract_cli_wire_ops(src_dir)
+
+    # The count floor alone is satisfied...
+    assert len(ops) >= _MIN_PLAUSIBLE_OP_COUNT
+    # ...but the `_mutate` shape produced nothing, so its sentinel is absent,
+    # and the sentinel check catches it even though the floor did not (this
+    # fixture only exercises the `_call` shape, so the other four shapes'
+    # sentinels are also naturally absent -- the point is that `_mutate`
+    # specifically is now named, which a bare count floor cannot do).
+    assert _SHAPE_SENTINELS["_mutate"] not in ops
+    stale = {shape for shape, sentinel in _SHAPE_SENTINELS.items() if sentinel not in ops}
+    assert "_mutate" in stale
+
+
+def test_extractor_ignores_op_key_on_non_envelope_dict(tmp_path):
+    """#709 review: the dict-literal rule must only fire on a request
+    *envelope* (sibling `"id"`/`"params"` keys), never on an arbitrary dict
+    that happens to carry an `"op"` key -- e.g. a decoded response row or a
+    batch-manifest entry embedded as a literal.
+    """
+    src_dir = tmp_path / "bn"
+    src_dir.mkdir()
+    (src_dir / "fake_response.py").write_text(
+        "from __future__ import annotations\n"
+        "\n"
+        "\n"
+        "def _fake_batch_entry():\n"
+        "    return {\n"
+        '        "op": "fake_batch_only_op",\n'
+        '        "target": "alpha.so",\n'
+        "    }\n"
+    )
+
+    ops = extract_cli_wire_ops(src_dir)
+
+    assert ops == set()
+
+
+def test_extractor_parses_non_ascii_source_regardless_of_locale(tmp_path):
+    """#709 review: `ast.parse` must run on bytes, not `Path.read_text()`,
+    so extraction cannot fail depending on the process locale/encoding
+    (`Path.read_text()` used the locale encoding and raised
+    `UnicodeDecodeError` for a non-ASCII file under `LC_ALL=C
+    PYTHONUTF8=0`). Write a file with a non-ASCII string literal and
+    confirm it still parses and yields the expected op.
+    """
+    src_dir = tmp_path / "bn"
+    src_dir.mkdir()
+    (src_dir / "fake_unicode.py").write_bytes(
+        (
+            "from __future__ import annotations\n"
+            "\n"
+            "\n"
+            "def _fake_command(args):\n"
+            '    label = "\u2192 not a real op label"  # non-ASCII arrow\n'
+            '    return _call(args, "not_a_real_op", {})\n'
+        ).encode("utf-8")
+    )
+
+    ops = extract_cli_wire_ops(src_dir)
+
+    assert ops == {"not_a_real_op"}
