@@ -379,8 +379,7 @@ def _socket_path_is_confined(socket_path: Path) -> bool:
 
 
 def _registry_fields_are_well_formed(
-    raw_socket_path: object, raw_pid: object, raw_instance_id: object,
-    own_socket: Path,
+    raw_socket_path: object, raw_pid: object, raw_instance_id: object
 ) -> bool:
     """Every payload field the adopt-vs-drop decision reads, checked in one place.
 
@@ -394,19 +393,18 @@ def _registry_fields_are_well_formed(
     grammar-validated id, so anything else is corruption and is DROPPED rather
     than coerced into something plausible.
 
-    - ``socket_path`` must name a file the reader and the writer cannot
-      disagree about. An absolute value says which file it is. A relative one
-      does not: it means nothing until it is joined to a base, and the
-      caller's CWD is not the writer's -- that is how a bogus record came to
-      be believed or disbelieved depending on where the CLI happened to run,
-      and, once absoluteness was demanded instead, how ONE cache root spelled
-      two ways (relative when the bridge wrote its registry, absolute when a
-      later CLI read it) silently dropped a running bridge. So a relative
-      value is admitted only when it names THIS record's own socket -- the
-      basename is the one part of a relative path that survives a change of
-      base -- and ``_load_instance`` then anchors it to the directory the
-      registry was found in rather than to anyone's CWD. Confinement still
-      bounds the result either way.
+    - ``socket_path`` must be a path string. An absolute one names the same
+      file for everybody and is taken verbatim. A relative one names nothing
+      on its own: it needs a base, and the caller's CWD is not the writer's --
+      that is how a bogus record came to be believed or disbelieved depending
+      on where the CLI happened to run, and, once absoluteness was demanded
+      instead, how ONE cache root spelled two ways (relative when the bridge
+      wrote its registry, absolute when a later CLI read it) silently dropped
+      a running bridge. So a relative value decides nothing at all:
+      ``_load_instance`` substitutes the socket the record is entitled to by
+      construction. Judging the value further could only ever cost a live
+      bridge whose own socket is listening, which is the same over-rejection
+      again. Confinement still bounds the result.
     - ``pid`` must be a real ``int`` in the range ``os.kill`` accepts. ``int()``
       is lossy in exactly the direction that hurts: ``True``, ``"1"``, ``" 1 "``
       and ``1.9`` all become 1, and pid 1 always exists and answers EPERM. Zero
@@ -421,10 +419,7 @@ def _registry_fields_are_well_formed(
     The identity fields (``boot_id``, ``pid_start_ticks``) are validated by
     ``proc_identity``, which already refuses a wrong type there.
     """
-    if not isinstance(raw_socket_path, str) or not raw_socket_path:
-        return False
-    if (not Path(raw_socket_path).is_absolute()
-            and Path(raw_socket_path).name != own_socket.name):
+    if not isinstance(raw_socket_path, str):
         return False
     if isinstance(raw_pid, bool) or not isinstance(raw_pid, int):
         return False
@@ -457,20 +452,17 @@ def _load_instance(
         return None
 
     instance_id = payload.get("instance_id")
-    # The socket this record is allowed to own, in the directory discovery
-    # actually found the record in: `<id>.json` -> `<id>.sock` under
-    # `instances_dir()`, and the legacy fixed pair's `<plugin>.json` ->
-    # `<plugin>.sock` in the cache root. Both are exactly what
-    # ``bridge_socket_path`` would emit for that record, and unlike the CWD
-    # the reader and the writer cannot spell it differently.
-    own_socket = path.parent / f"{path.stem}.sock"
-    if not _registry_fields_are_well_formed(
-        raw_socket_path, raw_pid, instance_id, own_socket
-    ):
+    if not _registry_fields_are_well_formed(raw_socket_path, raw_pid, instance_id):
         return None
     socket_path = Path(raw_socket_path)
     if not socket_path.is_absolute():
-        socket_path = own_socket
+        # The socket this record owns by construction, in the directory
+        # discovery actually found the record in: `<name>.json` -> `<name>.sock`
+        # under `instances_dir()`, and the legacy fixed pair's `<plugin>.json`
+        # -> `<plugin>.sock` in the cache root. Both are exactly what
+        # ``bridge_socket_path`` emits for that record, and unlike the CWD the
+        # reader and the writer cannot spell it differently.
+        socket_path = path.with_name(f"{path.name.removesuffix('.json')}.sock")
     pid = raw_pid
 
     if path.parent == instances_dir() and instance_id != path.stem:

@@ -3040,26 +3040,28 @@ def test_load_instance_ignores_a_registry_socket_path_that_cannot_be_resolved(
     assert sorted(p.name for p in outside.iterdir()) == ["x.sock"]
 
 
-class _CloseCountingLog:
-    """File handle proxy that records every close() so a leak is observable."""
-
-    def __init__(self, handle, closes):
-        self._handle = handle
-        self._closes = closes
-
-    def __getattr__(self, name):
-        return getattr(self._handle, name)
-
-    def write(self, data):
-        return self._handle.write(data)
-
-    def close(self):
-        self._closes.append(self._handle)
-        self._handle.close()
+def _fds_open_on(path: Path) -> list[str]:
+    """Every fd in THIS process that names *path*, read from the fd table."""
+    target = str(path)
+    found = []
+    for entry in os.listdir("/proc/self/fd"):
+        try:
+            if os.readlink(f"/proc/self/fd/{entry}") == target:
+                found.append(entry)
+        except OSError:                    # the listing's own fd, already gone
+            continue
+    return found
 
 
+@pytest.mark.skipif(not Path("/proc/self/fd").exists(),
+                    reason="reads this process's fd table")
 def test_spawn_closes_log_on_popen_failure(tmp_path, monkeypatch):
-    """A failed Popen must not leak the parent's spawn-log write handle."""
+    """A failed Popen must not leak the parent's spawn-log write handle.
+
+    Measured where a leak actually shows -- this process's fd table, inside
+    the ``except`` block, while the traceback still holds the frame that owns
+    the handle, which is exactly how long an unclosed handle survives.
+    """
     import bn.transport as transport
 
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
@@ -3071,24 +3073,16 @@ def test_spawn_closes_log_on_popen_failure(tmp_path, monkeypatch):
 
     monkeypatch.setattr(transport.subprocess, "Popen", raising_popen)
 
-    handles: list = []
-    closes: list = []
-    real_open = open
-
-    def tracking_open(*args, **kwargs):
-        tracked = _CloseCountingLog(real_open(*args, **kwargs), closes)
-        handles.append(tracked)
-        return tracked
-
-    monkeypatch.setattr(transport, "open", tracking_open, raising=False)
-
-    with pytest.raises(FileNotFoundError):
+    log_path = instances_dir() / "leaky1.log"
+    try:
         transport._spawn_instance_unlocked("leaky1", timeout=5.0)
+    except FileNotFoundError:
+        leaked = _fds_open_on(log_path)
+    else:                                   # pragma: no cover - guard
+        pytest.fail("the spawn was supposed to fail")
 
-    assert len(handles) == 1
-    assert handles[0].name == str(instances_dir() / "leaky1.log")
-    assert closes == [handles[0]._handle]   # closed exactly once
-    assert handles[0].closed                # no leaked fd
+    assert log_path.exists()                # the log was really opened
+    assert leaked == []
 
 
 @pytest.mark.parametrize("target_exists", [True, False])
@@ -3357,18 +3351,18 @@ def _healthy_sibling(inst_dir):
     pytest.param("plain.sock", id="bare-relative-name"),
     pytest.param("./nested/plain.sock", id="explicitly-relative"),
 ])
-def test_load_instance_requires_an_absolute_socket_path_even_from_inside_the_cache(
+def test_a_relative_socket_path_never_resolves_against_the_callers_cwd(
     tmp_path, monkeypatch, raw_socket_path
 ):
-    """A relative socket_path resolves against the CWD, not against anything.
+    """The answer must not depend on the directory the CLI was run from.
 
     Confinement asks whether the path is under the cache, and ``Path("")`` is
-    ``Path(".")`` -- so a relative value inherits whatever directory the CLI
-    happens to be run from. Run from inside the cache it passes confinement and
-    the record is ADOPTED as a live bridge pointing at a directory. None of
-    these values names this record's own socket (``relpath.sock``), so none of
-    them can be anchored either, and the answer must not depend on the
-    caller's CWD.
+    ``Path(".")`` -- so a relative value used to inherit whatever directory
+    the CLI happened to be in. Run from inside the cache it passed confinement
+    and the record was ADOPTED as a live bridge pointing at a directory. Each
+    of these values exists relative to the CWD here, so only the CWD could
+    make them resolve; the record's own socket (``relpath.sock``) does not
+    exist, and that is the only thing a relative value can now mean.
     """
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     inst_dir = instances_dir()
@@ -3507,11 +3501,11 @@ def test_relative_cache_root_still_discovers_its_own_bridge(tmp_path, monkeypatc
     assert [inst.instance_id for inst in instances] == ["rel1"]
 
 
-def test_relative_socket_path_is_refused_under_an_absolute_cache_root(
+def test_a_cwd_local_socket_is_not_honoured_under_an_absolute_cache_root(
     tmp_path, monkeypatch
 ):
     """The under-rejection half: the same value must NOT be honoured when the
-    cache root is absolute, because then it can only mean "resolve against
+    cache root is absolute, because then it could only mean "resolve against
     whatever directory the caller happens to be in".
     """
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
@@ -3586,15 +3580,15 @@ def test_one_cache_root_spelled_two_ways_still_finds_its_bridge(tmp_path, monkey
     assert bridge_registry_path("mix1").exists()     # and it was not swept
 
 
-def test_a_relative_socket_path_must_name_the_records_own_socket(tmp_path, monkeypatch):
+def test_a_relative_socket_path_cannot_name_a_siblings_socket(tmp_path, monkeypatch):
     """Under a relative root, confinement was the only thing left standing.
 
-    Every relative value passed the admission point there, so a record could
-    name a SIBLING's live socket and be adopted as a live bridge of its own --
-    the same false-affirmative class this validator exists to close, reached
-    through the arm that admits the writer's own relative output. A relative
-    path's basename is the one part of it that does not depend on anyone's
-    CWD, and the record's own socket is the only thing it may name.
+    Every relative value passed straight through to confinement there, so a
+    record could name a SIBLING's live socket and be adopted as a live bridge
+    of its own -- the same false-affirmative class this validator exists to
+    close, reached through the arm that admits the writer's own relative
+    output. A relative value now names one thing only: the socket this record
+    owns by construction.
     """
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("BN_CACHE_DIR", "c")
@@ -3612,3 +3606,61 @@ def test_a_relative_socket_path_must_name_the_records_own_socket(tmp_path, monke
         sibling.server_close()
 
     assert [inst.instance_id for inst in instances] == ["good"]
+
+
+def test_a_misdescribing_relative_path_does_not_cost_a_live_bridge(tmp_path, monkeypatch):
+    """An uninterpretable value must not be allowed to condemn the record.
+
+    Anchoring already makes a relative ``socket_path`` inert -- the record's
+    own socket is used instead -- so the only thing a further rule about that
+    value could still decide is the fate of a record whose own socket IS
+    listening. Refusing it there is the over-rejection shape this field has
+    now produced twice: a running bridge invisible to `session list` and to
+    `session stop` because of how its own registry spells a path nobody can
+    interpret anyway.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("BN_CACHE_DIR", "c")
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    sibling = _healthy_sibling(inst_dir)
+    sock = inst_dir / "live1.sock"                   # the bridge really is up
+    server = _Server(str(sock), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    _plant_registry(inst_dir, "live1", pid=os.getpid(),
+                    socket_path="somewhere/else.sock", instance_id="live1",
+                    plugin_name="bn_agent_bridge")
+    try:
+        instances = list_instances()
+    finally:
+        server.shutdown()
+        server.server_close()
+        sibling.shutdown()
+        sibling.server_close()
+
+    assert sorted(inst.instance_id for inst in instances) == ["good", "live1"]
+    live = next(inst for inst in instances if inst.instance_id == "live1")
+    assert Path(live.socket_path) == sock            # its own socket, not the claim
+
+
+def test_a_dead_record_is_swept_whatever_its_relative_path_claims(tmp_path, monkeypatch):
+    """Refusing a record ahead of the liveness sweep leaves it on disk forever.
+
+    ``_load_instance`` returns before the purge, so every rule that rejects a
+    record outright also exempts it from cleanup: a dead instance whose
+    registry happens to name an odd relative path would survive every
+    `session list` and every `instance gc`, where base swept it.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("BN_CACHE_DIR", "c")
+    monkeypatch.setattr("bn.transport._process_alive", lambda pid: False)
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    _plant_registry(inst_dir, "gone", pid=os.getpid(),
+                    socket_path="somewhere/else.sock", instance_id="gone",
+                    plugin_name="bn_agent_bridge")
+
+    instances = list_instances()
+
+    assert instances == []
+    assert not (inst_dir / "gone.json").exists()
