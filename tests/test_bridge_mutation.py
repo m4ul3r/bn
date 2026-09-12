@@ -4423,3 +4423,29 @@ def test_preview_set_comment_revert_clears_the_view_624(monkeypatch):
     # readback, not a claim: the view really carries no comment now
     assert bv.get_comment_at(0x1000) == ""
     assert 0x1000 not in bv.address_comments
+
+
+def test_batch_invalid_op_rolls_back_prior_applied_op(monkeypatch):
+    """#624 AC3, on the LIVE (non-preview) batch path: when a later op fails, the
+    comment an earlier op already applied must be gone from the VIEW, not merely
+    reported as 'reverted'. The old test of this name asserted only undo events
+    and status strings, so a revert that skipped the comment store shipped green;
+    #624's dual-store/undo fixes are what make the readback below meaningful."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeCommentMutationBV()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._mutation("active", False, [
+        {"op": "set_comment", "address": "0x1000", "comment": "doomed note"},
+        {"op": "local_rename", "function": "0x2000", "variable": "v", "new_name": "w"},
+    ])
+
+    assert result["committed"] is False
+    assert result["rolled_back"] is True
+    statuses = [r["status"] for r in result["results"]]
+    assert statuses[0] == "reverted"          # applied, then undone by the sibling
+    assert statuses[1] != "verified"          # the op that actually failed
+    # readback, not a claim: the view really carries no comment now
+    assert bv.get_comment_at(0x1000) == ""
+    assert 0x1000 not in bv.address_comments

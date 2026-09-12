@@ -77,13 +77,18 @@ def test_no_op_is_both_read_and_write(bridge):
     assert set(bridge.READ_LOCKED_OPS).isdisjoint(bridge.WRITE_LOCKED_OPS)
 
 
-def test_self_managed_ops_are_unlocked(bridge):
+def test_self_managed_ops_are_unlocked(bridge, op_registry):
     """Every lock="none" op self-manages locking, so it belongs to NEITHER derived
     set. Being outside both is what keeps concurrent readers live while the op runs
     its own analysis/gate dance (#99 load, #321 refresh, #365 go_rename, #628
     mutation + function_create)."""
     assert EXPECTED_SELF_MANAGED.isdisjoint(EXPECTED_READ)
     assert EXPECTED_SELF_MANAGED.isdisjoint(EXPECTED_WRITE)
+    # Every pinned name must be a name the registry actually registers. Without
+    # this the loop below is vacuously true for a name that does not exist (an
+    # unregistered op is trivially in neither derived set), so the pin could
+    # drift to naming anything at all and still pass on its own.
+    assert EXPECTED_SELF_MANAGED <= op_registry.REGISTRY.names()
     for op_name in sorted(EXPECTED_SELF_MANAGED):
         assert op_name not in bridge.READ_LOCKED_OPS, op_name
         assert op_name not in bridge.WRITE_LOCKED_OPS, op_name

@@ -2006,6 +2006,56 @@ def test_close_read_only_view_does_not_report_unsaved_mutations(
     bridge._headless_views.clear()
 
 
+def test_close_unsaved_target_still_warns_although_the_close_prunes_dirty_ids(
+    monkeypatch, tmp_path
+):
+    """#713 AC3: `bn close` on an unsaved target must still warn -- and #713 put a
+    `_dirty_view_ids` prune INSIDE that very close path (_close_binary ->
+    _write_registry() -> targets.refresh()). The warning survives only because the
+    close snapshots `unsaved` BEFORE it forgets the view and refreshes. Nothing
+    pinned that ordering, so a later reshuffle of _close_binary would silently
+    turn a committed-but-unsaved mutation into `unsaved: false` and discard it
+    without a word."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    _hermetic_registry(instance, tmp_path)
+    bv = _ClosableBV("/proj/alpha.bndb", session_id="11")
+    _register_views(bridge, bv)
+    instance.targets.refresh()          # mint the stable view_id mark_dirty keys on
+    instance.targets.mark_dirty(bv)
+    assert instance.targets.is_dirty(bv)
+
+    manager_cls = type(instance.targets)
+    real_is_dirty, real_refresh = manager_cls.is_dirty, manager_cls.refresh
+    order: list[str] = []
+    monkeypatch.setattr(
+        manager_cls, "is_dirty",
+        lambda self, view: (order.append("read-unsaved"), real_is_dirty(self, view))[1],
+    )
+    monkeypatch.setattr(
+        manager_cls, "refresh",
+        lambda self, *, strict=False: (
+            order.append("refresh-prune"), real_refresh(self, strict=strict))[1],
+    )
+
+    result = _close_on_watchdog(instance, target="alpha.bndb")
+
+    assert result["closed"] == [
+        {"path": "/proj/alpha.bndb", "unsaved": True, "engine_modified": False}
+    ]
+    assert bv.closed
+    read_at = order.index("read-unsaved")
+    # A prune already ran while the view was still open (the selector resolve
+    # refreshes): the marker must survive it, which is what makes the
+    # `unsaved: True` above true rather than accidental.
+    assert "refresh-prune" in order[:read_at]
+    # The close's OWN prune runs only AFTER the snapshot. Swap the two and the
+    # warning silently becomes `unsaved: false`.
+    assert order[read_at + 1:] == ["refresh-prune"]
+    assert instance.targets._dirty_view_ids == set()
+    bridge._headless_views.clear()
+
+
 def test_close_binary_all_flag_closes_everything(monkeypatch, tmp_path):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
@@ -4135,15 +4185,17 @@ def test_close_binary_by_path_prefers_match_across_sets(monkeypatch, tmp_path):
 
 
 def test_close_binary_all_dedups_multiple_wrappers_of_same_core_view(monkeypatch, tmp_path):
-    # #613 review (major): _collect_open_views() only dedups its own walk by
-    # id(bv) (bridge.py:389-395, untouched by this PR); BN interns no wrapper
-    # for a non-console view, so the UI walk's several accessors
-    # (getCurrentViewFrame / getViewFrameForTab / getViewForTab) hand back
-    # DISTINCT Python wrapper objects for the SAME core view. Before the fix,
-    # --all fed that raw list straight into the close loop and closed/
-    # reported the one core view once per wrapper (demonstrated executably
-    # on the patched bridge: 3 wrappers -> 3 v.file.close() round trips and 3
-    # identical `closed` rows). Model the duplication directly: three
+    # #613 review (major): BN interns no wrapper for a non-console view, so the
+    # UI walk's several accessors (getCurrentViewFrame / getViewFrameForTab /
+    # getViewForTab) hand back DISTINCT Python wrapper objects for the SAME core
+    # view. Before the fix, --all fed that raw list straight into the close loop
+    # and closed/reported the one core view once per wrapper (demonstrated
+    # executably on the patched bridge: 3 wrappers -> 3 v.file.close() round
+    # trips and 3 identical `closed` rows). #714 since made
+    # _collect_open_views() itself dedup on BN's handle-based equality, so the
+    # walk no longer emits the duplicates -- this test pins the --all path's OWN
+    # defensive dedup, which stays because it is the destructive path and must
+    # not trust the list it is handed. Model the duplication directly: three
     # distinct _ClosableBV instances sharing one handle -- BN's real
     # handle-address __eq__/__hash__ -- standing in for the same core view.
     bridge = _load_bridge(monkeypatch)
