@@ -324,51 +324,46 @@ class _UnreadableBlock:
         raise RuntimeError("LLIL unavailable")
 
 
-def test_xrefs_import_scan_discloses_a_capped_scan(monkeypatch):
+def test_xrefs_import_scan_flags_only_a_partial_scan(monkeypatch):
     """#622: when BN reports no code refs for an import, the fallback LLIL scan is
-    budgeted. A capped scan must hand back the partial callers AND flag itself, so
-    a truncated list is never read as "no callers found"."""
+    budgeted, and ONLY a scan that stopped early may claim truncation. Both phases
+    run against the same view: under the default budget the two-caller scan is
+    complete and carries no flag or note, then the same scan under a one-function
+    budget hands back its partial caller list, flagged, so a truncated list is
+    never read as "no callers found"."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _import_scan_bv("plt_target", 0x20000, [0x1000, 0x2000])
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    complete = instance._xrefs(None, "plt_target")
+    assert complete["code_refs_scanned"] is True
+    assert complete.get("truncated") is not True
+    assert "scan_note" not in complete
+    assert complete["code_ref_count"] == 2
+    assert complete["returned"] == 2
+
     monkeypatch.setattr(bridge.read_xrefs, "SCAN_CALLS_MAX_FUNCS", 1)
-
-    result = instance._xrefs(None, "plt_target")
-
-    assert result["code_refs_scanned"] is True
-    assert result["truncated"] is True
-    assert "scan_note" in result
-    assert result["code_ref_count"] == 1          # partial, never empty
-    assert result["returned"] == 1
-    assert int(result["items"][0]["address"], 16) == 0x1010
-
-
-def test_xrefs_import_scan_is_complete_and_unflagged_under_budget(monkeypatch):
-    """The negative control: a scan that fits the budget must NOT claim
-    truncation -- the flag only ever means "the scan stopped early"."""
-    bridge = _load_bridge(monkeypatch)
-    instance = bridge.BinaryNinjaBridge()
-    bv = _import_scan_bv("plt_target", 0x20000, [0x1000, 0x2000])
-    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
-
-    result = instance._xrefs(None, "plt_target")
-
-    assert result["code_refs_scanned"] is True
-    assert result.get("truncated") is not True
-    assert "scan_note" not in result
-    assert result["code_ref_count"] == 2
+    capped = instance._xrefs(None, "plt_target")
+    assert capped["code_refs_scanned"] is True
+    assert capped["truncated"] is True
+    assert "budget" in capped["scan_note"]
+    assert capped["code_ref_count"] == 1          # partial, never empty
+    assert capped["returned"] == 1
+    assert int(capped["items"][0]["address"], 16) == 0x1010
 
 
 def test_xrefs_import_scan_flags_unreadable_llil(monkeypatch):
     """#622 review: a block whose LLIL cannot be lifted was skipped without a
     trace, so a caller list truncated by a read failure was reported as complete.
     The failure must reach the envelope: `truncated: true` plus a `scan_note`
-    naming the unreadable LLIL -- not the budget, which was never hit."""
+    naming the unreadable LLIL -- not the budget, which was never hit. The note
+    counts FUNCTIONS, not blocks: the same function with TWO unreadable blocks is
+    one truncated function, reported once."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv = _import_scan_bv("plt_target", 0x20000, [0x1000, 0x2000])
-    bv.functions[1].low_level_il = [_UnreadableBlock()]
+    bv.functions[1].low_level_il = [_UnreadableBlock(), _UnreadableBlock()]
     monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
 
     result = instance._xrefs(None, "plt_target")
@@ -376,6 +371,8 @@ def test_xrefs_import_scan_flags_unreadable_llil(monkeypatch):
     assert result["code_refs_scanned"] is True
     assert result["truncated"] is True
     assert "LLIL" in result["scan_note"]
+    assert "budget" not in result["scan_note"]    # the budget was never hit
+    assert "1 function(s)" in result["scan_note"]
     assert result["code_ref_count"] == 1          # the readable caller survives
 
 
@@ -398,21 +395,32 @@ def test_find_function_native_name_lookup_skips_the_full_walk(monkeypatch):
     assert int(instance._find_function(bv, "big_dispatch").start) == 0x401000
 
 
-def test_find_function_native_miss_still_walks_for_demangled_short_name(monkeypatch):
-    """The native index only knows BN's own spellings, so an empty native result
-    must NOT end the lookup: the mangled/demangled multi-form match (#224a) still
-    resolves through the walk."""
+def test_find_function_index_miss_still_walks_for_the_case_exact_spelling(monkeypatch):
+    """The native index is consulted first, but an EMPTY native result is not
+    authoritative -- the index does not carry the demangled spellings BN keeps
+    only on the symbol (#224a), so the walk must still run and answer the
+    exact-case query. Two functions whose demangled spellings differ only in CASE
+    expose a fallback that stops at the empty index: folding them matches BOTH and
+    raises the ambiguous-name error instead of returning the spelling the caller
+    asked for."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    fn = _FakeFunction(0x405250, "_ZN3foo3bar4recvEi")
-    sym = _FakeSymbol("FunctionSymbol")
-    sym.short_name = "foo::bar::recv"
-    sym.full_name = "foo::bar::recv(int32_t)"
-    fn.symbol = sym
-    bv = _FakeBV(functions=[fn])
-    bv.get_functions_by_name = lambda name: []       # native index knows nothing
 
-    assert int(instance._find_function(bv, "foo::bar::recv(int32_t)").start) == 0x405250
+    def _fn(start, raw, short):
+        fn = _FakeFunction(start, raw)
+        fn.symbol = _FakeSymbol("FunctionSymbol")
+        fn.symbol.short_name = short
+        return fn
+
+    bv = _FakeBV(functions=[
+        _fn(0x406000, "_ZN3pkg5ThingEv", "pkg::Thing"),
+        _fn(0x407000, "_ZN3pkg5thingEv", "pkg::thing"),
+    ])
+    queried: list[str] = []
+    bv.get_functions_by_name = lambda name: (queried.append(name), [])[1]
+
+    assert int(instance._find_function(bv, "pkg::Thing").start) == 0x406000
+    assert queried == ["pkg::Thing"], "the native index must be consulted first"
 
 
 def _suggestion_spellings(fns) -> list[str]:
@@ -462,57 +470,72 @@ def _miss_suggestions(instance, bv, query: str) -> list[str]:
     return message.split("Did you mean: ", 1)[1].split(", ")
 
 
-def test_find_function_miss_suggestion_survives_a_first_character_typo(monkeypatch):
-    """A typo in the FIRST character of the name must still suggest the intended
-    function. Prefiltering the miss corpus by the query's first character dropped
-    the intended name entirely (it no longer shares that character), so the caller
-    got no hint at all -- or, worse, an unrelated one. The hint set must equal
-    difflib over EVERY spelling, i.e. the unbounded corpus base used."""
+class _CountingFunctions(list):
+    """A view's function list that counts how many times it is enumerated."""
+
+    def __init__(self, functions):
+        super().__init__(functions)
+        self.enumerations = 0
+
+    def __iter__(self):
+        self.enumerations += 1
+        return super().__iter__()
+
+
+def test_find_function_miss_hints_are_uncapped_and_cost_one_enumeration(monkeypatch):
+    """#622(b): a miss suggests over EVERY spelling -- no cap, no prefix filter,
+    so a FIRST-character typo still finds the intended name -- and costs exactly
+    ONE `bv.functions` enumeration. Base walked the view three times per miss
+    (exact, casefold, then the suggestion corpus). The hint set must stay
+    difflib's over that full corpus, in view order, for both typo shapes."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     fns = _named_method_bv()
     bv = _FakeBV(functions=fns)
+    bv.functions = _CountingFunctions(fns)
     bv.get_functions_by_name = lambda name: []
-    typo = "uet::Session::onData"                   # first character typo'd
+    spellings = _suggestion_spellings(fns)
 
-    expected = difflib.get_close_matches(typo, _suggestion_spellings(fns), n=5, cutoff=0.5)
-    assert "net::Session::onData" in expected       # the intended name IS in range
+    for typo in ("uet::Session::onData", "net::Sessoin::onData"):
+        bv.functions.enumerations = 0
+        expected = difflib.get_close_matches(typo, spellings, n=5, cutoff=0.5)
+        assert "net::Session::onData" in expected     # in range for both typos
 
-    assert _miss_suggestions(instance, bv, typo) == expected
+        hints = _miss_suggestions(instance, bv, typo)
+
+        assert hints == expected
+        assert "net::Session::onData" in hints
+        assert not any("Zlib" in hint for hint in hints)
+        assert bv.functions.enumerations == 1, (
+            f"a miss must enumerate the view once, not "
+            f"{bv.functions.enumerations} times"
+        )
 
 
-def test_find_function_miss_suggestion_names_only_close_spellings(monkeypatch):
-    """#622 regression: the unrelated helper is outside the cutoff, so it must not be
-    offered -- and the returned set must be exactly difflib's over the full
-    corpus, not a hand-picked list."""
+def test_find_function_index_stub_does_not_shadow_the_implementation(monkeypatch):
+    """A unique native-index hit is not automatically an answer: an import stub
+    can be shadowing a same-name real body (#122/#286), and only the walk's full
+    match set lets the impl-over-stub resolver pick it. The index must be
+    consulted, and the real body returned -- never the stub."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    fns = _named_method_bv()
-    bv = _FakeBV(functions=fns)
-    bv.get_functions_by_name = lambda name: []
-    typo = "uet::Session::onData"
 
-    expected = difflib.get_close_matches(typo, _suggestion_spellings(fns), n=5, cutoff=0.5)
+    def _fn(start, type_name):
+        fn = _FakeFunction(start, "shared_entry")
+        fn.symbol = _FakeSymbol(type_name)
+        fn.symbol.short_name = "shared_entry"
+        return fn
 
-    hints = _miss_suggestions(instance, bv, typo)
-    assert hints == expected
-    assert not any("Zlib" in hint for hint in hints)
+    stub = _fn(0x400000, "ImportedFunctionSymbol")
+    body = _fn(0x401000, "FunctionSymbol")
+    bv = _FakeBV(functions=[stub, body])
+    queried: list[str] = []
+    bv.get_functions_by_name = lambda name: (queried.append(name), [stub])[1]
 
+    resolved = instance._find_function(bv, "shared_entry")
 
-def test_find_function_miss_suggestion_survives_a_middle_character_typo(monkeypatch):
-    """The regression guard: a middle-character typo always hinted the intended
-    name (the first character still matched), and must keep doing so."""
-    bridge = _load_bridge(monkeypatch)
-    instance = bridge.BinaryNinjaBridge()
-    fns = _named_method_bv()
-    bv = _FakeBV(functions=fns)
-    bv.get_functions_by_name = lambda name: []
-    typo = "net::Sessoin::onData"                   # transposed middle characters
-
-    expected = difflib.get_close_matches(typo, _suggestion_spellings(fns), n=5, cutoff=0.5)
-    assert "net::Session::onData" in expected
-
-    assert _miss_suggestions(instance, bv, typo) == expected
+    assert queried == ["shared_entry"], "the native index must be consulted first"
+    assert int(resolved.start) == 0x401000
 
 
 def test_xrefs_demangled_name_resolves_to_definition_not_veneer(monkeypatch):

@@ -134,6 +134,44 @@ def test_registry_rebuild_reflects_a_rename():
     }
 
 
+def test_class_name_classification_is_memoised_across_rebuilds(monkeypatch):
+    """#622 criterion (d), the DELIVERED half: a registry rebuild re-classifies
+    nothing, because the demangle + qualified-method split is memoised. #622's own
+    Tests section prescribes exactly this observation ("two consecutive list/show
+    calls hit cache (mock demangle counter)"): the counter wraps
+    `_split_qualified_method`, which `_classify_names` resolves at call time, so
+    it sees the real per-build classification work rather than an internal proxy.
+
+    The two spellings are unique to this test on purpose: the memo is a
+    module-level lru_cache shared by the whole file, so reusing another test's
+    names would measure a warm cache instead of this build's work."""
+    calls: list[str] = []
+    real_split = read_class._split_qualified_method
+
+    def counting_split(demangled):
+        calls.append(demangled)
+        return real_split(demangled)
+
+    monkeypatch.setattr(read_class, "_split_qualified_method", counting_split)
+    bv = _RegistryBV([
+        _Fn(0x3000, "_ZN7Memoise4ColdC1Ev", "Memoise::Cold::Cold()"),
+        _Fn(0x3100, "_ZN7Memoise4Warm5flushEi", "Memoise::Warm::flush(int)"),
+    ], [])
+
+    first = read_class._build_class_registry(None, bv)
+    assert "Memoise::Cold" in first and "Memoise::Warm" in first
+    assert calls == ["Memoise::Cold::Cold()", "Memoise::Warm::flush(int)"], (
+        "the first build must classify each function's name exactly once"
+    )
+
+    second = read_class._build_class_registry(None, bv)
+    assert second == first, "the memo must not change the registry it returns"
+    assert len(calls) == 2, (
+        f"the rebuild re-classified {len(calls) - 2} name(s): the memo is not "
+        "covering the second build"
+    )
+
+
 def test_registry_confidence_levels():
     reg = read_class._build_class_registry(None, _make_registry_bv())
     assert reg["net::Session"]["confidence"] == "rtti"   # has vtable+typeinfo

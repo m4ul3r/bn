@@ -839,7 +839,9 @@ def _scan_for_calls_to(
     is PARTIAL -- the scan stopped on ``SCAN_CALLS_MAX_FUNCS`` /
     ``SCAN_CALLS_MAX_INSNS``, or a function's LLIL could not be read -- so a
     partial (or empty) result can never be read as "no callers"; *note* then names
-    the actual reason, and is None only for a complete scan."""
+    the actual reason, and is None only for a complete scan. The unreadable count
+    is per FUNCTION: several unreadable blocks inside one function are one
+    truncated function, reported once."""
     code_refs = []
     seen: set[int] = set()
     unreadable: list[str] = []
@@ -851,7 +853,8 @@ def _scan_for_calls_to(
             truncated = True
             break
         funcs_visited += 1
-        for insn in _scan_llil_instructions(fn, unreadable):
+        unreadable_blocks: list[str] = []
+        for insn in _scan_llil_instructions(fn, unreadable_blocks):
             if insns_examined >= SCAN_CALLS_MAX_INSNS:
                 truncated = True
                 break
@@ -879,6 +882,11 @@ def _scan_for_calls_to(
                     bv, ref_addr, include_disasm=True, arch=fn_arch, assume_code=True
                 ),
             })
+        if unreadable_blocks:
+            # One entry per FUNCTION, not per failed block: the note counts the
+            # functions whose LLIL was truncated, so a function with several
+            # unreadable blocks is reported once.
+            unreadable.append(unreadable_blocks[0])
         if truncated:
             break
     code_refs.sort(key=lambda item: int(item["address"], 16))

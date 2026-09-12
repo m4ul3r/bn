@@ -223,7 +223,11 @@ def _sym_entry(sym) -> dict[str, Any] | None:
 #
 # DELIVERED: the demangle + qualified-method split is no longer recomputed per
 # call (measured on a real C++ target: 5717 splits on the first registry build,
-# 0 on the second).
+# 0 on the second), and that is now pinned by
+# `test_class_name_classification_is_memoised_across_rebuilds`: its counter wraps
+# `_split_qualified_method` and observes one split per function on the synthetic
+# view's first build, then ZERO on the rebuild -- so dropping the memo fails a
+# test instead of silently regressing.
 #
 # NOT DELIVERED: there is no per-view registry reuse. Every `class list` /
 # `class show` still enumerates the view and reads each function's live name

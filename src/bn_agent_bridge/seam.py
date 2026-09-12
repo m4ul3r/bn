@@ -54,12 +54,6 @@ _TYPE_CLASS_NAMES: dict[int, str] = {
 # one real implementation, resolution auto-picks the implementation (#122).
 _STUB_SYMBOL_TYPE_NAMES = frozenset({"ImportedFunctionSymbol", "ExternalSymbol"})
 
-# The "did you mean" corpus on a miss (#622). See
-# `BridgeContext._suggestion_corpus`: reading a function's names off a live view is
-# the expensive part of the pass, so the corpus handed to difflib is bounded by a
-# SOUND length prefilter (difflib's own cutoff) rather than by sampling -- a cap
-# silently drops the intended name.
-
 
 # Nested anonymous aggregates are expanded in the text layout and in the JSON
 # members[] tree so their inner members aren't invisible (#370.2). The depth is
@@ -132,7 +126,15 @@ class BridgeContext:
                 raise RuntimeError(f"No function found at address {hex(addr)}")
 
         text = str(identifier)
-        exact = self._find_functions_by_name(bv, text, case_sensitive=True)
+        # ONE view enumeration serves the exact match, the casefolded match and
+        # the "did you mean" corpus (#622(b)): the native index answers a unique
+        # non-stub hit without any walk, otherwise the single pass below does all
+        # three. A miss therefore costs exactly one `bv.functions` enumeration.
+        native = self._native_exact_hit(bv, text)
+        if native is not None:
+            exact, folded, corpus = [native], [], []
+        else:
+            exact, folded, corpus = self._scan_functions_by_name(bv, text)
         if len(exact) == 1:
             return exact[0]
         if len(exact) > 1:
@@ -141,7 +143,6 @@ class BridgeContext:
                 return resolved
             raise RuntimeError(_format_ambiguous_function_error(identifier, exact))
 
-        folded = self._find_functions_by_name(bv, text, case_sensitive=False)
         if len(folded) == 1:
             return folded[0]
         if len(folded) > 1:
@@ -156,9 +157,7 @@ class BridgeContext:
             if fn is not None:
                 return fn
 
-        suggestions = difflib.get_close_matches(
-            text, self._suggestion_corpus(bv, text), n=5, cutoff=0.5
-        )
+        suggestions = difflib.get_close_matches(text, corpus, n=5, cutoff=0.5)
         if suggestions:
             raise RuntimeError(
                 f"Function not found: {identifier}. Did you mean: {', '.join(suggestions)}"
@@ -238,42 +237,87 @@ class BridgeContext:
                 out.append(f)
         return out
 
-    def _suggestion_corpus(self, bv, text: str) -> list[str]:
-        """Name spellings to run difflib over for a "did you mean" hint.
+    def _scan_functions_by_name(
+        self, bv, text: str
+    ) -> tuple[list[Any], list[Any], list[str]]:
+        """ONE pass over the view -> ``(exact, folded, corpus)`` for *text*.
 
-        This is ONE lazy pass over the view, and it is deliberately UNCAPPED: it
-        collects every spelling of every function, exactly as the unbounded base
-        revision did. Sampling the corpus -- by a function/form cap, or by keeping
-        only spellings whose first character matches the query's -- silently drops
-        the name the caller meant: a typo in the FIRST character removes the
-        intended spelling from a first-character filter, so the hint is either
-        lost entirely or replaced by an unrelated name that happens to share the
-        typo (#622 review).
+        ``exact`` / ``folded`` are the case-sensitive / casefolded matches,
+        deduped by start address in view order -- the authoritative multi-form
+        match :meth:`_walk_functions_by_name` computes (the demangled short/full
+        spellings live on the symbol, not in BN's name index, #224a). ``corpus``
+        is EVERY spelling of EVERY function, in view order: the same list, in the
+        same order, that the unbounded base revision handed difflib.
 
-        What bounds the pass instead is a SOUND prefilter: a spelling is kept only
-        when ``difflib.SequenceMatcher(None, text, form).real_quick_ratio()`` is
-        at least the 0.5 cutoff the ``get_close_matches`` call downstream uses.
-        ``real_quick_ratio`` is a length-only upper bound on
-        ``SequenceMatcher.ratio``, so no candidate difflib could return at that
-        cutoff is ever dropped: the survivors are a superset of the answer in
-        unchanged relative order, which makes ``get_close_matches``'s result
-        byte-identical to one over the uncapped corpus. Reading each function's
-        name spellings off the live view is the real cost, and that stays a single
-        pass."""
+        The corpus is deliberately UNCAPPED -- no function/form cap, no
+        first-character filter, no sampling, no length prefilter -- because any
+        filter that can drop the intended spelling makes a FIRST-character typo
+        lose the "Did you mean" hint, or replace it with an unrelated name that
+        happens to share the typo (the round-1 regression). The removed length
+        prefilter was also redundant: ``difflib.get_close_matches`` already gates
+        every candidate on ``real_quick_ratio`` itself, so the prefilter only
+        re-ran that gate -- measured on 20000 synthetic spellings, 0.2231s for the
+        plain corpus vs 0.2986s for the prefiltered one (best of 5).
+
+        What IS bounded is the enumeration count, which is what made a miss
+        expensive: the base revision walked ``bv.functions`` THREE times per miss
+        -- once for the case-sensitive match, once for the casefolded one, and
+        once more to build the suggestion corpus -- while this computes all three
+        from ONE pass. Measured on a synthetic >=100-function view whose
+        ``functions`` list counts ``__iter__``: base 3 enumerations per miss, 1
+        here (#622(b)). The pass COUNT is the bound; the corpus itself stays the
+        full spelling set because no cap on it is sound."""
         corpus: list[str] = []
-        for fn in bv.functions:
-            for form in self._function_name_forms(fn):
-                if difflib.SequenceMatcher(None, text, form).real_quick_ratio() < 0.5:
-                    continue
-                corpus.append(form)
-        return corpus
+        exact: list[Any] = []
+        folded: list[Any] = []
+        seen_exact: set[int] = set()
+        seen_folded: set[int] = set()
+        needle = text.lower()
+        for fn in list(bv.functions):
+            forms = self._function_name_forms(fn)
+            corpus.extend(forms)
+            marker = int(fn.start)
+            if text in forms and marker not in seen_exact:
+                seen_exact.add(marker)
+                exact.append(fn)
+            if marker in seen_folded:
+                continue
+            if any(needle == form.lower() for form in forms):
+                seen_folded.add(marker)
+                folded.append(fn)
+        return exact, folded, corpus
 
     def _find_functions_by_name(self, bv, text: str, *, case_sensitive: bool) -> list[Any]:
         if case_sensitive:
-            native = self._native_functions_by_name(bv, text)
-            if native:
-                return native
+            hit = self._native_exact_hit(bv, text)
+            if hit is not None:
+                return [hit]
         return self._walk_functions_by_name(bv, text, case_sensitive=case_sensitive)
+
+    def _native_exact_hit(self, bv, text: str):
+        """The single function BN's own name index resolves for *text*, else None.
+
+        The index is keyed on BN's OWN spellings, while the authoritative walk
+        also matches the demangled short/full spellings BN keeps only on the
+        symbol (#224a) -- so the index can only ever return a strict SUBSET of
+        what the walk would, and a subset is never trusted when it could change
+        the answer:
+
+        * a STUB hit is not an answer -- it can be shadowing a same-name real
+          body (#122/#286), and only the walk's full set lets
+          :meth:`_resolve_impl_over_stub` pick the implementation;
+        * several candidates need that same full set so the ambiguous-name error
+          is raised instead of one candidate being silently picked.
+
+        Both fall back to the walk. The one residual trade-off, disclosed: a
+        unique NON-stub index hit is accepted without the walk, so if two REAL
+        bodies shared one spelling through different raw names, this resolves the
+        exact-spelling match where a walk-based lookup might have reported the
+        ambiguity."""
+        matches = self._native_functions_by_name(bv, text)
+        if len(matches) == 1 and _symbol_type_name(matches[0]) not in _STUB_SYMBOL_TYPE_NAMES:
+            return matches[0]
+        return None
 
     def _native_functions_by_name(self, bv, text: str) -> list[Any]:
         """Functions BN's own name index resolves for *text*, or [] when the index
@@ -320,21 +364,13 @@ class BridgeContext:
     def _walk_functions_by_name(self, bv, text: str, *, case_sensitive: bool) -> list[Any]:
         """The authoritative multi-form match: exact, or casefolded, over every
         function's spellings. Needs the walk because the demangled short/full
-        names live on the symbol, not in BN's name index (#224a)."""
-        matches = []
-        needle = text if case_sensitive else text.lower()
-        seen: set[int] = set()
-        for fn in list(bv.functions):
-            forms = self._function_name_forms(fn)
-            haystacks = forms if case_sensitive else [name.lower() for name in forms]
-            if needle not in haystacks:
-                continue
-            marker = int(fn.start)
-            if marker in seen:
-                continue
-            seen.add(marker)
-            matches.append(fn)
-        return matches
+        names live on the symbol, not in BN's name index (#224a).
+
+        Thin wrapper over :meth:`_scan_functions_by_name`, so the view is walked
+        once whether the caller wants one of the two match sets or both; the
+        result is unchanged from the per-mode walk this replaced."""
+        exact, folded, _ = self._scan_functions_by_name(bv, text)
+        return exact if case_sensitive else folded
 
     def _resolve_scope_functions(self, bv, identifiers: list[Any]) -> list[tuple[str, Any]]:
         if not identifiers:
