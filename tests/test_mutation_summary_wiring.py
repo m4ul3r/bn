@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import inspect
 import textwrap
+from pathlib import Path
 from typing import Any, Callable
 
 import pytest
@@ -20,14 +21,17 @@ def _real_commands() -> list[dict[str, Any]]:
     return cli._COMMANDS
 
 
-def _mutate_call_sites(handler: Callable[..., int]) -> list[tuple[str, bool]]:
-    """``[(op_name, has_summary_transform), ...]`` for every literal
-    ``_mutate(args, "<op>", ...)`` call site found in *handler*'s source.
+def _mutate_calls_in_source(
+    source: str, *, line_offset: int = 0, where: str = "source"
+) -> list[tuple[int, str, bool]]:
+    """``[(lineno, op_name, has_summary_transform), ...]`` for every literal
+    ``_mutate(args, "<op>", ...)`` call site in *source*; *line_offset* maps the
+    parsed fragment's line numbers back onto the file it was sliced out of.
 
-    This is how the op<->CLI-command mapping is DERIVED (#684): rather than
-    hand-listing which command drives which bridge op, statically scan each
-    registered command handler's own source for its `_mutate()` call(s) and
-    read the op name straight off the literal second argument.
+    The ONE extractor behind every population in this file -- #684's
+    per-handler walk and #720's cross-check of the handler-derived population
+    against a package-wide scan -- so no call site can be visible to one side
+    and invisible to the other.
 
     A `_mutate()` call whose op name is NOT a string literal raises instead of
     being skipped. Skipping would drop that op out of the swept population
@@ -37,13 +41,8 @@ def _mutate_call_sites(handler: Callable[..., int]) -> list[tuple[str, bool]]:
     not must make this guard fail loudly and get an extractor that understands
     it, not vanish from the sweep.
     """
-    try:
-        source = textwrap.dedent(inspect.getsource(handler))
-    except (OSError, TypeError):
-        return []
-    tree = ast.parse(source)
-    sites: list[tuple[str, bool]] = []
-    for node in ast.walk(tree):
+    calls: list[tuple[int, str, bool]] = []
+    for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.Call):
             continue
         func = node.func
@@ -55,14 +54,46 @@ def _mutate_call_sites(handler: Callable[..., int]) -> list[tuple[str, bool]]:
             (kw.value for kw in node.keywords if kw.arg == "op"), None
         )
         assert isinstance(op_arg, ast.Constant) and isinstance(op_arg.value, str), (
-            f"{getattr(handler, '__qualname__', handler)!r} calls _mutate() with a "
+            f"{where} calls _mutate() at line {node.lineno + line_offset} with a "
             "non-literal op name, so this sweep cannot tell WHICH bridge op it "
             "routes and would silently drop it from the #684 population. Pass the "
-            "op as a string literal, or teach _mutate_call_sites to resolve it."
+            "op as a string literal, or teach the extractor to resolve it."
         )
-        has_transform = any(kw.arg == "summary_transform" for kw in node.keywords)
-        sites.append((op_arg.value, has_transform))
-    return sites
+        calls.append((node.lineno + line_offset, op_arg.value,
+                      any(kw.arg == "summary_transform" for kw in node.keywords)))
+    return calls
+
+
+def _mutate_sites_in_source(
+    source: str, *, line_offset: int = 0, where: str = "source"
+) -> set[tuple[int, str]]:
+    """``{(lineno, op_name), ...}`` -- `_mutate_calls_in_source` without the
+    per-site wiring detail, the shape both #720 populations are keyed on. A
+    multiset of op names is NOT enough here: moving one call site into a helper
+    leaves the module-wide op multiset unchanged, so the cross-check has to
+    compare exact (file, lineno, op) triples."""
+    return {(lineno, op) for lineno, op, _ in _mutate_calls_in_source(
+        source, line_offset=line_offset, where=where)}
+
+
+def _mutate_call_sites(handler: Callable[..., int]) -> list[tuple[str, bool]]:
+    """``[(op_name, has_summary_transform), ...]`` for every literal
+    ``_mutate(args, "<op>", ...)`` call site found in *handler*'s OWN source.
+
+    This is how the op<->CLI-command mapping is DERIVED (#684): rather than
+    hand-listing which command drives which bridge op, statically scan each
+    registered command handler's own source for its `_mutate()` call(s) and
+    read the op name straight off the literal second argument. A site only a
+    module-level helper reaches is deliberately NOT in here -- #720's
+    `_assert_scan_accounted_for` cross-check exists to catch exactly that, since
+    otherwise the op it routes would drop out of the sweep unseen.
+    """
+    try:
+        source = textwrap.dedent(inspect.getsource(handler))
+    except (OSError, TypeError):
+        return []
+    return [(op, has_transform) for _, op, has_transform in _mutate_calls_in_source(
+        source, where=f"{getattr(handler, '__qualname__', handler)!r}")]
 
 
 def _cli_summary_wiring(commands: list[dict[str, Any]]) -> dict[str, bool]:
@@ -75,6 +106,101 @@ def _cli_summary_wiring(commands: list[dict[str, Any]]) -> dict[str, bool]:
         for op_name, has_transform in _mutate_call_sites(spec["handler"]):
             wiring[op_name] = wiring.get(op_name, True) and has_transform
     return wiring
+
+
+def _module_mutate_sites(package_root: Path) -> set[tuple[str, int, str]]:
+    """The scan half of the #720 cross-check: every literal-op `_mutate()` call
+    site in the `bn` CLI layer -- `commands/*.py` plus `cli.py`, which defines
+    `_mutate` and can grow call sites of its own -- keyed by (package-relative
+    file, absolute lineno, op name).
+
+    The region is anchored on where `bn.cli` actually lives, never on the
+    process cwd, so an unrelated checkout as cwd cannot make this read another
+    tree."""
+    files = sorted((package_root / "commands").rglob("*.py")) + [package_root / "cli.py"]
+    sites: set[tuple[str, int, str]] = set()
+    for path in files:
+        if not path.is_file():
+            # Narrowing the region is loud, not silent: any handler owning a
+            # call site the scan cannot see lands in the handler-only half of
+            # `_assert_scan_accounted_for`.
+            continue
+        relpath = path.relative_to(package_root).as_posix()
+        for lineno, op in _mutate_sites_in_source(path.read_text(), where=relpath):
+            sites.add((relpath, lineno, op))
+    return sites
+
+
+def _handler_mutate_sites(
+    commands: list[dict[str, Any]], *, package_root: Path
+) -> set[tuple[str, int, str]]:
+    """The handler-derived half of the #720 cross-check: every literal-op
+    `_mutate()` call site inside a registered handler's OWN source, keyed the
+    same way as `_module_mutate_sites` so the two populations are directly
+    comparable.
+
+    A handler registered under several command paths appears several times in
+    `_COMMANDS`, which needs no special handling: the population is a SET of
+    (file, lineno, op) triples, so one source block parsed once per
+    registration collapses onto the same triples."""
+    sites: set[tuple[str, int, str]] = set()
+    for spec in commands:
+        handler = spec["handler"]
+        try:
+            lines, start = inspect.getsourcelines(handler)
+        except (OSError, TypeError):
+            # Uninspectable handler: any site it owns then shows up as
+            # module-only below, so this cannot hide a call site.
+            continue
+        source_file = inspect.getsourcefile(handler)
+        if source_file is None:
+            continue
+        source_path = Path(source_file).resolve()
+        try:
+            relpath = source_path.relative_to(package_root).as_posix()
+        except ValueError:
+            # A handler defined outside the scanned package (e.g. a plugin)
+            # owns no site INSIDE the scanned region, so it contributes none.
+            continue
+        for lineno, op in _mutate_sites_in_source(
+            textwrap.dedent("".join(lines)), line_offset=start - 1, where=relpath
+        ):
+            sites.add((relpath, lineno, op))
+    return sites
+
+
+def _assert_scan_accounted_for(
+    handler_sites: set[tuple[str, int, str]], module_sites: set[tuple[str, int, str]]
+) -> None:
+    """#720 cross-check: the #684 population is DERIVED from each registered
+    handler's own source, so a `_mutate()` call site reached through a
+    module-level helper -- the handler delegates, the helper calls `_mutate()` --
+    is invisible to it and its op silently drops out of the sweep. `assert
+    cli_wiring` does not catch that either: the other ops are still found. So
+    compare the handler-derived population against an independent AST scan of
+    the whole CLI layer, and fail on a difference in EITHER direction: a
+    module-only site is a blind spot in the population, a handler-only site
+    means the scan region is narrower than the population it is checked
+    against."""
+    def _render(sites: set[tuple[str, int, str]]) -> str:
+        return "\n".join(f"  {relpath}:{lineno}  {op}"
+                         for relpath, lineno, op in sorted(sites)) or "  (none)"
+
+    module_only = module_sites - handler_sites
+    handler_only = handler_sites - module_sites
+    assert not module_only and not handler_only, (
+        "the #684 sweep population (derived from each registered command "
+        "handler's OWN source) does not account for every _mutate() call site in "
+        "the scanned CLI layer (#720).\n"
+        f"_mutate() call sites NO registered handler's own source contains "
+        f"({len(module_only)}) -- the helper-mediated delegation shape: a handler "
+        "calls a module-level helper that calls _mutate(), so the op it routes is "
+        "missing from the swept population and its summary wiring is never "
+        f"checked:\n{_render(module_only)}\n"
+        f"handler-owned call sites the scan region does NOT contain "
+        f"({len(handler_only)}) -- the scanned file set is narrower than the "
+        f"population checked against it, so widen the scan:\n{_render(handler_only)}"
+    )
 
 
 def _binder_populates_results(binder: Callable[..., Any]) -> bool:
@@ -159,12 +285,22 @@ def _assert_op_is_summary_safe(
     )
 
 
-def _sweep(cli_wiring: dict[str, bool], spec: Callable[[str], Any]) -> None:
+def _sweep(cli_wiring: dict[str, bool], spec: Callable[[str], Any],
+           commands: list[dict[str, Any]]) -> None:
     """The #684 sweep body, factored out so both the production guard below
     and the regression test that proves `go_rename` coverage run the SAME
     code, not a bespoke re-implementation. *spec* is `REGISTRY.spec` (or a
-    stand-in with the same signature)."""
+    stand-in with the same signature); *commands* is the `@command` registry
+    the swept population is derived from -- `_real_commands()` -- which also
+    supplies the handler-side half of the #720 cross-check that keeps a
+    helper-mediated `_mutate()` call site from dropping out of the population
+    unseen."""
     assert cli_wiring, "sanity: no _mutate() call site was found at all"
+    package_root = Path(cli.__file__).resolve().parent
+    _assert_scan_accounted_for(
+        _handler_mutate_sites(commands, package_root=package_root),
+        _module_mutate_sites(package_root),
+    )
     for op_name in sorted(cli_wiring):
         _assert_op_is_summary_safe(
             op_name, binder=spec(op_name).binder, cli_wiring=cli_wiring,
@@ -192,8 +328,9 @@ def test_every_mutating_op_has_safe_summary_wiring(monkeypatch):
     A FUTURE `lock="none"` op that reports through its own counters and
     forgets the wiring must fail HERE."""
     bridge = _load_bridge(monkeypatch)
-    cli_wiring = _cli_summary_wiring(_real_commands())
-    _sweep(cli_wiring, bridge.REGISTRY.spec)
+    commands = _real_commands()
+    cli_wiring = _cli_summary_wiring(commands)
+    _sweep(cli_wiring, bridge.REGISTRY.spec, commands)
 
 
 def test_hypothetical_counter_reporting_op_without_wiring_is_flagged():
@@ -277,9 +414,118 @@ def test_go_rename_summary_transform_removal_is_caught_by_the_sweep(monkeypatch)
     so it depends entirely on the CLI-side `summary_transform` this test
     strips."""
     bridge = _load_bridge(monkeypatch)
-    cli_wiring = dict(_cli_summary_wiring(_real_commands()))
+    commands = _real_commands()
+    cli_wiring = dict(_cli_summary_wiring(commands))
     assert "go_rename" in cli_wiring          # now inside the swept population at all
     assert cli_wiring["go_rename"] is True    # currently wired safely
     cli_wiring["go_rename"] = False           # simulate the #683 regression
     with pytest.raises(AssertionError, match="go_rename"):
-        _sweep(cli_wiring, bridge.REGISTRY.spec)
+        _sweep(cli_wiring, bridge.REGISTRY.spec, commands)
+
+
+def test_helper_mediated_mutate_call_site_is_flagged(tmp_path, monkeypatch):
+    """#720: the #684 population is DERIVED from each registered handler's OWN
+    source, so a handler that delegates to a module-level helper which calls
+    `_mutate()` drops its op out of the sweep entirely -- and invisibly, because
+    `assert cli_wiring` only notices TOTAL extractor breakage.
+
+    Proven on a scratch MIRROR of a real commands module (`commands/tags.py`):
+    byte-identical first as a control, then with its `_tag_add` `_mutate()` call
+    MOVED into an appended module-level helper and the vacated lines padded so
+    every other line number is unchanged. Both are compared through
+    `_assert_scan_accounted_for`, the same comparison the sweep runs. The
+    module-wide op multiset is identical before and after the move, so only the
+    (file, lineno, op) triples can catch it. The scratch module is never
+    imported or registered -- its handlers are found by AST -- while the
+    production population still comes from the live registry.
+    """
+    bridge = _load_bridge(monkeypatch)
+    package_root = Path(cli.__file__).resolve().parent
+    scratch_module = tmp_path / "commands" / "tags.py"
+    scratch_module.parent.mkdir(parents=True)
+    scratch_module.write_text((package_root / "commands" / "tags.py").read_text())
+
+    def _is_command_handler(node: ast.AST) -> bool:
+        if not isinstance(node, ast.FunctionDef):
+            return False
+        for decorator in node.decorator_list:
+            target = decorator.func if isinstance(decorator, ast.Call) else decorator
+            name = (target.id if isinstance(target, ast.Name)
+                    else target.attr if isinstance(target, ast.Attribute) else None)
+            if name == "command":
+                return True
+        return False
+
+    def _scratch_handler_sites() -> set[tuple[str, int, str]]:
+        """The handler-side population of the scratch mirror: every `_mutate()`
+        call site inside a `@command`-decorated function's own source, found by
+        AST rather than by importing the module."""
+        sites: set[tuple[str, int, str]] = set()
+        for path in sorted((tmp_path / "commands").rglob("*.py")):
+            relpath = path.relative_to(tmp_path).as_posix()
+            source = path.read_text()
+            lines = source.splitlines(keepends=True)
+            for node in ast.walk(ast.parse(source)):
+                if not _is_command_handler(node):
+                    continue
+                block = textwrap.dedent("".join(lines[node.lineno - 1:node.end_lineno]))
+                sites |= {(relpath, lineno, op) for lineno, op in
+                          _mutate_sites_in_source(block, line_offset=node.lineno - 1)}
+        return sites
+
+    # Control: the byte-identical mirror is fully accounted for, so what follows
+    # measures the transformation, not the mirroring.
+    control_handler_sites = _scratch_handler_sites()
+    control_module_sites = _module_mutate_sites(tmp_path)
+    _assert_scan_accounted_for(control_handler_sites, control_module_sites)
+
+    # The #720 shape: move `_tag_add`'s `_mutate()` call out of the handler into
+    # an appended module-level helper, padding the vacated lines so every other
+    # line number in the module is unchanged.
+    source = scratch_module.read_text()
+    lines = source.splitlines(keepends=True)
+    tag_add_line = next(
+        lineno for lineno, op in _mutate_sites_in_source(source) if op == "tag_add"
+    )
+    call = next(node for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id == "_mutate" and node.lineno == tag_add_line)
+    moved = "".join(lines[call.lineno - 1:call.end_lineno])
+    vacated = call.end_lineno - call.lineno + 1
+    scratch_module.write_text(
+        "".join(lines[:call.lineno - 1])
+        + "    return _tag_add_via_helper(args)\n" + "\n" * (vacated - 1)
+        + "".join(lines[call.end_lineno:])
+        + "\n\ndef _tag_add_via_helper(args):\n" + moved
+    )
+
+    handler_sites = _scratch_handler_sites()
+    module_sites = _module_mutate_sites(tmp_path)
+    # The move changes no op name and no site count, only where the site lives,
+    # so a bare op multiset comparison could not tell the two apart...
+    assert (sorted(op for _, _, op in module_sites)
+            == sorted(op for _, _, op in control_module_sites))
+    # ...and, because the vacated lines are padded, the ONLY handler site that
+    # went away is the moved one: every other line number is unchanged.
+    assert handler_sites == control_handler_sites - {("commands/tags.py", tag_add_line,
+                                                      "tag_add")}
+    module_only = module_sites - handler_sites
+    assert len(module_only) == 1, module_only
+    relpath, lineno, op = next(iter(module_only))
+    assert (relpath, op) == ("commands/tags.py", "tag_add")
+    with pytest.raises(AssertionError) as excinfo:
+        _assert_scan_accounted_for(handler_sites, module_sites)
+    assert f"{relpath}:{lineno}" in str(excinfo.value)
+    assert "tag_add" in str(excinfo.value)
+
+    # The sweep must actually RUN that comparison: hand `_sweep` the live
+    # registry minus the `tag add` registration -- the in-package call site then
+    # has no registered handler whose own source contains it -- and it has to
+    # fail naming the orphaned site.
+    commands = _real_commands()
+    unaccounted = [spec for spec in commands if spec["path"] != ("tag", "add")]
+    assert len(unaccounted) == len(commands) - 1
+    orphan = next(site for site in _module_mutate_sites(package_root) if site[2] == "tag_add")
+    with pytest.raises(AssertionError) as excinfo:
+        _sweep(_cli_summary_wiring(unaccounted), bridge.REGISTRY.spec, unaccounted)
+    assert f"{orphan[0]}:{orphan[1]}" in str(excinfo.value)
