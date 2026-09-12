@@ -595,15 +595,21 @@ class BridgeContext:
           the spelling -- the check is symmetric, so a cached NON-empty bucket that
           is missing a member is rebuilt too, not only an empty one.
 
-        The witness is case-sensitive, so it is compared against the exact bucket's
-        starts, and it is only ever a WITNESS that the group is incomplete -- never
-        the answer itself (the walk-backed rebuild supplies the COMPLETE group,
-        round-3 blocker rule).
+        BN's own index is keyed on the view's SPELLINGS and is case-sensitive, so
+        the witness is fetched once per casing the group is known by and compared
+        against the bucket that casing belongs to (:meth:`_witnessed_missing_member`)
+        -- a witness fetched in the QUERIED casing alone witnesses nothing for a
+        case-insensitive lookup whose view spells the name differently, which is the
+        round-4 blocker. It is only ever a WITNESS that the group is incomplete --
+        never the answer itself (the walk-backed rebuild supplies the COMPLETE
+        group, round-3 blocker rule).
 
         The RESIDUAL gap, stated plainly: a name change BN does not notify whose
         new spelling reaches the view only as a symbol's demangled short/full name
         -- i.e. a spelling outside BN's own name index -- is not witnessed, so a
-        cached group could stay incomplete for it."""
+        cached group could stay incomplete for it. A casing that is neither queried
+        nor already carried by a cached member is unwitnessed for the same reason:
+        BN has no case-insensitive name index to ask."""
         index, memoised = self._name_index(bv)
         exact = index.exact_matches(bv, text)
         folded = index.folded_matches(bv, text)
@@ -611,16 +617,49 @@ class BridgeContext:
         if not stale:
             stale = not self._bucket_is_live(folded, text, folded=True)
         if not stale and memoised:
-            starts = {int(fn.start) for fn in exact}
-            stale = any(
-                int(fn.start) not in starts
-                for fn in self._native_functions_by_name(bv, text)
-            )
+            stale = self._witnessed_missing_member(bv, text, exact, folded)
         if stale:
             index, _ = self._name_index(bv, refresh=True)
             exact = index.exact_matches(bv, text)
             folded = index.folded_matches(bv, text)
         return exact, folded, index.corpus
+
+    def _witnessed_missing_member(self, bv, text: str, exact: list[Any],
+                                  folded: list[Any]) -> bool:
+        """Does BN's own name index witness a same-name member the cached group LACKS?
+
+        That index is case-SENSITIVE and keyed on the view's own spellings, so the
+        casing it is asked for decides whether it can answer at all. The QUERIED
+        spelling is witnessed against the exact bucket, and every spelling the LIVE
+        folded members actually carry is witnessed against the folded bucket: both
+        buckets are then checked in a casing BN can answer for. Asking only in the
+        queried casing left a memo-served case-insensitive group with no
+        completeness check whenever the view spelled the name differently -- an
+        unnotified same-name addition was served as an incomplete group, which is
+        how a PLT veneer drops out of the xrefs caller union (#286).
+
+        Costs one native lookup per distinct casing in the group -- normally one,
+        two when the query's casing differs -- and never a ``bv.functions`` walk."""
+        exact_starts = {int(fn.start) for fn in exact}
+        if any(int(fn.start) not in exact_starts
+               for fn in self._native_functions_by_name(bv, text)):
+            return True
+        needle = text.lower()
+        spellings = {
+            form
+            for fn in folded
+            for form in self._function_name_forms(fn)
+            if form.lower() == needle
+        }
+        spellings.discard(text)         # already witnessed, against the stricter bucket
+        if not spellings:
+            return False
+        folded_starts = {int(fn.start) for fn in folded}
+        return any(
+            int(fn.start) not in folded_starts
+            for spelling in spellings
+            for fn in self._native_functions_by_name(bv, spelling)
+        )
 
     def _find_functions_by_name(self, bv, text: str, *, case_sensitive: bool) -> list[Any]:
         """The COMPLETE same-name group: every function matching *text*.

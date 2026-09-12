@@ -711,6 +711,52 @@ def test_cached_bucket_with_a_missing_member_still_rebuilds(monkeypatch):
     assert bv.functions.enumerations == 2, "the rebuilt index must be reused"
 
 
+def test_cached_folded_group_with_a_missing_member_still_rebuilds(monkeypatch):
+    """#622 review (round-4 blocker): the completeness witness must be fetched in
+    the VIEW's own casing, not the queried one. BN's name index is case-SENSITIVE,
+    so witnessing a case-insensitive lookup under the QUERIED spelling witnesses
+    nothing at all whenever the view spells the name differently -- which left
+    every memo-served folded group with no completeness check, and an unnotified
+    same-name addition served as an incomplete group (the veneer-caller drop-out
+    class, #286). The witness still only forces the walk-backed rebuild; the
+    rebuild supplies the COMPLETE group, in view order."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _named_fn(0x401000, "Alpha")
+    bv = _NotifyingBV(functions=[fn])
+    bv.functions = _CountingFunctions([fn])
+
+    def lookup(text):
+        return [
+            int(f.start)
+            for f in instance.ctx._find_functions_by_name(
+                bv, text, case_sensitive=False)
+        ]
+
+    assert lookup("alpha") == [0x401000], "the folded bucket must answer the miss"
+    assert bv.functions.enumerations == 1
+    assert lookup("alpha") == [0x401000]
+    assert bv.functions.enumerations == 1, (
+        "a warm case-insensitive lookup must not enumerate the view"
+    )
+
+    # An unnotified SAME-NAME addition, spelled the way the VIEW spells it. BN's
+    # own index resolves "Alpha" and can never be asked for "alpha", so only a
+    # witness fetched in the view's casing can see the cached group is incomplete.
+    twin = _named_fn(0x403000, "Alpha")
+    bv.functions.append(twin)
+    bv.get_functions_by_name = lambda name: [twin] if name == "Alpha" else []
+
+    assert lookup("alpha") == [0x401000, 0x403000], (
+        "an incomplete cached case-insensitive group must not be served"
+    )
+    assert bv.functions.enumerations == 2, (
+        "the completeness witness must force exactly one rebuild"
+    )
+    assert lookup("alpha") == [0x401000, 0x403000]
+    assert bv.functions.enumerations == 2, "the rebuilt index must be reused"
+
+
 def test_name_index_does_not_retain_a_closed_target(monkeypatch):
     """#622 review (blocker A): the memo must hold NOTHING that reaches the view
     back. A real BN Function strongly references its own view (``fn.view is bv``),
