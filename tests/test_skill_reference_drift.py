@@ -23,6 +23,7 @@ fail when either side drifts:
 """
 from __future__ import annotations
 
+import ast
 import importlib
 import re
 import sys
@@ -45,16 +46,37 @@ REQUIRED_INDEX_GROUPS = ("capabilities", "dataflow", "exports", "go", "tag", "ta
 
 
 @pytest.fixture(scope="module")
-def mutation_engine():
+def stub_engine():
+    """A `binaryninja` stub that CANNOT outlive the module that asked for it.
+
+    These fixtures used `sys.modules.setdefault`, which has no teardown: the
+    stub stays in `sys.modules` for the rest of the session, so a module
+    collected later that imports real symbols from the engine fails. That is not
+    hypothetical -- the same pattern at import scope deterministically broke four
+    unrelated modules in this suite. `monkeypatch.setitem` restores (and deletes
+    a key that was absent), so the stub is gone when the module finishes.
+
+    Still `setdefault` SEMANTICS: a real engine, if one is installed, is left
+    alone rather than shadowed by a stub.
+    """
+    with pytest.MonkeyPatch.context() as patch:
+        if "binaryninja" not in sys.modules:
+            try:
+                importlib.import_module("binaryninja")
+            except ImportError:
+                patch.setitem(sys.modules, "binaryninja", types.ModuleType("binaryninja"))
+        yield
+
+
+@pytest.fixture(scope="module")
+def mutation_engine(stub_engine):
     """The engine module, imported against a stub `binaryninja` (no BN needed)."""
-    sys.modules.setdefault("binaryninja", types.ModuleType("binaryninja"))
     return importlib.import_module("bn_agent_bridge.mutation_engine")
 
 
 @pytest.fixture(scope="module")
-def command_groups() -> set[str]:
+def command_groups(stub_engine) -> set[str]:
     """The live top-level groups, from the @command registry (no BN needed)."""
-    sys.modules.setdefault("binaryninja", types.ModuleType("binaryninja"))
     importlib.import_module("bn.commands")          # populates bn.cli._COMMANDS
     cli = importlib.import_module("bn.cli")
     groups = {spec["path"][0] for spec in cli._COMMANDS}
@@ -63,18 +85,55 @@ def command_groups() -> set[str]:
 
 
 @pytest.fixture(scope="module")
-def command_paths() -> set[str]:
+def command_paths(stub_engine) -> set[str]:
     """Every live command path (`"tag add"`, `"types show"`), from the registry.
 
     The index is only a map if what it advertises exists; pinning names against
     the registry is also what stops an allow-list outliving a rename (#627).
     """
-    sys.modules.setdefault("binaryninja", types.ModuleType("binaryninja"))
     importlib.import_module("bn.commands")          # populates bn.cli._COMMANDS
     cli = importlib.import_module("bn.cli")
     paths = {" ".join(spec["path"]) for spec in cli._COMMANDS}
     assert paths, "bn.commands registered no commands; the index is unchecked"
     return paths
+
+
+# The test modules in this PR's fence that stub the engine to read a registry
+# without Binary Ninja installed.
+ENGINE_STUBBING_TESTS = ("test_skill_reference_drift.py", "test_agent_docs.py")
+
+
+def test_an_engine_stub_is_installed_only_in_a_form_that_restores():
+    """`sys.modules.setdefault` has NO teardown, so a stub installed that way
+    outlives the fixture -- and, at import scope, outlives the module: the same
+    pattern deterministically broke four unrelated modules in this suite by
+    shadowing the real engine for everything collected afterwards.
+
+    Two halves, because either alone is satisfiable without the other: the
+    mechanism really does restore, and nothing here still uses the form that
+    does not. The second half is the one that goes red against the fixtures this
+    replaced.
+    """
+    probe = "bn_absent_engine_probe"
+    assert probe not in sys.modules, "pick a name nothing has imported"
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setitem(sys.modules, probe, types.ModuleType(probe))
+        assert sys.modules[probe] is not None
+    assert probe not in sys.modules, "the patched stub outlived its context"
+
+    leaking = sorted(
+        f"{name}:{node.lineno}"
+        for name in ENGINE_STUBBING_TESTS
+        for node in ast.walk(ast.parse((Path(__file__).parent / name).read_text(encoding="utf-8")))
+        if isinstance(node, ast.Call)
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "setdefault"
+        if isinstance(node.func.value, ast.Attribute) and node.func.value.attr == "modules"
+    )
+    assert not leaking, (
+        "these install a module stub with no teardown, so it outlives the test "
+        f"that asked for it and can break a module collected later: {leaking}"
+    )
 
 
 def test_skill_command_index_names_every_required_group(command_groups):
