@@ -3012,13 +3012,18 @@ def test_load_instance_ignores_a_registry_socket_path_that_cannot_be_resolved(
     discovery must still return without raising and drop the unusable
     cache-side record, exactly as it does for a socket outside the cache.
     """
-    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    cache = tmp_path / "cache"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+    bystander = outside / "x.sock"
+    bystander.write_text("", encoding="utf-8")
+    monkeypatch.setenv("BN_CACHE_DIR", str(cache))
     registry_path = instances_dir() / "nulpath.json"
     registry_path.parent.mkdir(parents=True, exist_ok=True)
     registry_path.write_text(
         json.dumps(
             _registry_payload(
-                Path("/tmp/x\x00y.sock"),
+                Path(f"{outside}/x\x00y.sock"),
                 pid=os.getpid(),
                 identity=_identity(),
                 instance_id="nulpath",
@@ -3029,6 +3034,10 @@ def test_load_instance_ignores_a_registry_socket_path_that_cannot_be_resolved(
 
     assert not any(inst.instance_id == "nulpath" for inst in list_instances())
     assert not registry_path.exists()
+    # The other half of the contract: rejecting the payload must not sweep
+    # anything the cache does not own.
+    assert bystander.exists()
+    assert sorted(p.name for p in outside.iterdir()) == ["x.sock"]
 
 
 class _CloseCountingLog:
@@ -3080,3 +3089,185 @@ def test_spawn_closes_log_on_popen_failure(tmp_path, monkeypatch):
     assert handles[0].name == str(instances_dir() / "leaky1.log")
     assert closes == [handles[0]._handle]   # closed exactly once
     assert handles[0].closed                # no leaked fd
+
+
+@pytest.mark.parametrize("target_exists", [True, False])
+def test_load_instance_never_unlinks_a_foreign_symlink_resolving_into_the_cache(
+    tmp_path, monkeypatch, target_exists
+):
+    """Confinement must bound what we UNLINK, not only what we connect to.
+
+    ``unlink`` never follows the final symlink: it deletes the directory entry
+    at ``<resolved parent>/<name>``. A registry naming an out-of-cache symlink
+    whose TARGET is in-cache therefore resolves "inside" while the stale sweep
+    deletes a path outside the cache -- exactly what #618 forbids ("never cause
+    unlink of the foreign path"). Both variants matter: a link to a dead
+    in-cache socket, and a dangling link.
+    """
+    cache = tmp_path / "cache"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+    monkeypatch.setenv("BN_CACHE_DIR", str(cache))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+
+    in_cache_target = inst_dir / "linked.sock"
+    if target_exists:
+        binder = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        binder.bind(str(in_cache_target))
+        binder.listen(1)
+        binder.close()
+    foreign_link = outside / "keep-me.sock"
+    foreign_link.symlink_to(in_cache_target)
+
+    registry_path = inst_dir / "linked.json"
+    registry_path.write_text(
+        json.dumps(
+            _registry_payload(
+                foreign_link,
+                pid=os.getpid(),
+                # A mismatched identity is what drives discovery into the
+                # destructive stale sweep; without it nothing would unlink.
+                identity=_identity(ticks_delta=1),
+                instance_id="linked",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    assert not any(inst.instance_id == "linked" for inst in list_instances())
+    # The whole point: the out-of-cache entry survives the sweep.
+    assert foreign_link.is_symlink()
+    assert not registry_path.exists()
+
+
+@pytest.mark.parametrize("bad_socket_path", [
+    pytest.param(123, id="int"),
+    pytest.param(None, id="null"),
+    pytest.param(["/tmp/x.sock"], id="list"),
+    pytest.param({"path": "/tmp/x.sock"}, id="object"),
+])
+def test_load_instance_drops_a_registry_whose_socket_path_is_not_a_string(
+    tmp_path, monkeypatch, bad_socket_path
+):
+    """A wrong-typed payload field is corruption to skip, never a CLI abort.
+
+    ``Path(123)`` raises ``TypeError``, which is not a ``ValueError``, so a
+    single hand-edited or truncated registry under the cache used to take down
+    every discovery-backed command with a raw traceback. Discovery tolerates a
+    malformed registry everywhere else; the TYPE of the malformation must not
+    decide whether the CLI survives it.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    (inst_dir / "badtype.json").write_text(
+        json.dumps({
+            "pid": os.getpid(),
+            "socket_path": bad_socket_path,
+            "instance_id": "badtype",
+            "plugin_name": "bn_agent_bridge",
+        }),
+        encoding="utf-8",
+    )
+
+    # A second, well-formed instance proves the bad record is SKIPPED rather
+    # than aborting the sweep before the rest of the directory is read.
+    good_socket = inst_dir / "good.sock"
+    server = _Server(str(good_socket), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    (inst_dir / "good.json").write_text(
+        json.dumps(
+            _registry_payload(
+                good_socket, pid=os.getpid(), identity=_identity(), instance_id="good"
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        instances = list_instances()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert [inst.instance_id for inst in instances] == ["good"]
+
+
+def test_instance_id_grammar_change_moves_both_sides(tmp_path, monkeypatch):
+    """#608: one owner means widening the grammar widens BOTH entry points.
+
+    Narrowing cannot tell the copies apart -- the CLI wrapper reaches the paths
+    grammar again through ``bridge_socket_path`` and rejects either way.
+    Widening can: a second, private regex in the CLI wrapper would keep
+    rejecting an id the single owner now accepts.
+    """
+    import re as _re
+
+    import bn.paths as paths
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(paths, "_INSTANCE_ID_RE", _re.compile(r"^[A-Za-z0-9_.+-]+$"))
+
+    assert paths.validate_instance_id("plus+id") == "plus+id"
+    assert validate_instance_id("plus+id") == "plus+id"
+
+
+@pytest.mark.parametrize("hostile", [
+    pytest.param("overlong", id="longer-than-PATH_MAX"),
+    pytest.param("escaping-symlink", id="symlink-escaping-the-registry-dir"),
+    pytest.param("surrogate", id="non-utf8-byte-sequence"),
+    pytest.param("empty", id="empty-string"),
+    pytest.param("relative", id="relative-path"),
+])
+def test_hostile_registry_socket_paths_reject_rather_than_crash(
+    tmp_path, monkeypatch, hostile
+):
+    """Confinement must REJECT a hostile socket_path, never abort discovery.
+
+    The property is "rejects cleanly", not "does not adopt": the tolerant
+    loader ignored these payloads before the confinement check existed, so
+    anything that now raises out of ``list_instances`` has converted a skipped
+    record into a dead CLI. Every input the check newly sees is exercised here,
+    and each must leave everything outside the cache alone.
+    """
+    cache = tmp_path / "cache"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+    bystander = outside / "bystander.sock"
+    bystander.write_text("", encoding="utf-8")
+    monkeypatch.setenv("BN_CACHE_DIR", str(cache))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+
+    if hostile == "overlong":
+        socket_path = f"{inst_dir}/{'L' * 9000}.sock"
+    elif hostile == "escaping-symlink":
+        link = inst_dir / "escape.sock"
+        link.symlink_to(bystander)
+        socket_path = str(link)
+    elif hostile == "surrogate":
+        # A lone surrogate is what a non-UTF-8 byte sequence becomes once JSON
+        # has decoded it; it survives into a Path and only fails at the syscall.
+        socket_path = f"{outside}/\udce9bad.sock"
+    elif hostile == "empty":
+        socket_path = ""
+    else:
+        socket_path = "relative.sock"
+
+    registry_path = inst_dir / "hostile.json"
+    registry_path.write_text(
+        json.dumps({
+            "pid": os.getpid(),
+            "socket_path": socket_path,
+            "instance_id": "hostile",
+            "plugin_name": "bn_agent_bridge",
+        }),
+        encoding="utf-8",
+    )
+
+    instances = list_instances()      # must not raise
+
+    assert not any(inst.instance_id == "hostile" for inst in instances)
+    assert bystander.exists()
+    assert sorted(p.name for p in outside.iterdir()) == ["bystander.sock"]

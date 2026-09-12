@@ -10,6 +10,7 @@ import bn.cli
 import pytest
 
 from bn_agent_bridge._shared import OperationFailure, _serialize_error, _write_json_artifact
+from bn.commands.misc import _resolved_out_format
 from bn.output import OutputWriteError, render_value, write_output_result
 from _cli_helpers import *  # noqa: F401,F403
 
@@ -471,13 +472,104 @@ def test_serialize_error_distinguishes_user_and_internal_failures(tmp_path):
     user = OperationFailure("output_write_failed", "Failed to write --out file /x: nope")
     assert _serialize_error(user) == "Failed to write --out file /x: nope"
     assert _serialize_error(TypeError("boom")) == "internal error: TypeError: boom"
-    # ...and that holds for a failure raised out of the CHANGED writer itself: the
-    # OSError guard must not swallow an unserializable payload into a user-facing
-    # OperationFailure.
+    # ...and that holds for a failure raised out of the CHANGED writer itself:
+    # the OSError guard must not swallow a genuinely unserializable payload into
+    # a user-facing OperationFailure. A non-str mapping KEY is the case no
+    # `default=` hook can rescue -- json.dumps never consults it for keys -- so
+    # it stays internal on both writers.
     with pytest.raises(TypeError) as exc:
-        _write_json_artifact(str(tmp_path / "bundle.json"), object())
+        _write_json_artifact(str(tmp_path / "bundle.json"), {(1, 2): "tuple key"})
     assert not isinstance(exc.value, OperationFailure)
     assert _serialize_error(exc.value).startswith("internal error: TypeError")
+    with pytest.raises(TypeError):
+        render_value({(1, 2): "tuple key"}, "json")
+
+
+@pytest.mark.parametrize("suffix", [".ndjson", ".json"])
+def test_write_json_artifact_renders_non_json_native_values_like_the_cli(
+        tmp_path, suffix):
+    # #670 (major): render_value passes default=_json_default, so the CLI-side
+    # --out writer renders a Path (or any exotic value) instead of dying. The
+    # bridge-side writer omitted the hook, so the SAME payload through the SAME
+    # flag came back as `internal error: TypeError` from one writer and an
+    # artifact from the other.
+    payload = {"path": Path("/x/y"), "items": [Path("/a"), 1], "total": 2}
+    out_path = tmp_path / f"bundle{suffix}"
+
+    envelope = _write_json_artifact(str(out_path), payload)
+
+    text = out_path.read_text(encoding="utf-8")
+    if suffix == ".ndjson":
+        assert text == render_value(payload, "ndjson")
+    else:
+        assert json.loads(text) == {"path": "/x/y", "items": ["/a", 1], "total": 2}
+    assert envelope["bytes"] == len(text.encode("utf-8"))
+
+
+def test_write_json_artifact_ndjson_keeps_a_payloads_own_meta_key(tmp_path):
+    # #670 (major): the trailing paging record is marked with a synthetic
+    # `_meta` key. Copying the payload's other keys into it silently DESTROYS a
+    # real `_meta` value. The bridge-owned artifact is the caller's data, so the
+    # fan-out is skipped for the one payload shape it cannot represent, rather
+    # than writing a stream that has quietly lost a field.
+    payload = {
+        "items": [{"name": "a"}, {"name": "b"}],
+        "total": 2,
+        "_meta": {"origin": "an upstream ndjson stream"},
+    }
+    out_path = tmp_path / "bundle.ndjson"
+
+    _write_json_artifact(str(out_path), payload)
+
+    lines = [line for line in out_path.read_text(encoding="utf-8").splitlines() if line]
+    assert len(lines) == 1
+    assert json.loads(lines[0]) == payload      # nothing dropped, nothing rewritten
+
+
+@pytest.mark.parametrize("explicit_format", [None, "json", "ndjson", "text"])
+@pytest.mark.parametrize("out", ["x.json", "x.ndjson", "x.txt", "x", None])
+def test_bundle_delegation_format_tracks_the_cli_resolver(
+        capsys, explicit_format, out):
+    # #670 (major): the delegation predicate re-derives cli._resolve_output_format's
+    # precedence because the real resolver PRINTS the note/warning and `_call`
+    # invokes it again. Two copies of one precedence rule drift silently, so the
+    # equivalence is pinned over every --format x --out-suffix combination.
+    args = types.SimpleNamespace(out=out, format=explicit_format or "text")
+    if explicit_format is not None:
+        args._format_explicit = True
+
+    quiet = _resolved_out_format(args)
+    loud = bn.cli._resolve_output_format(args)
+    capsys.readouterr()      # the real resolver's note/warning is a side effect
+
+    assert quiet == loud
+
+
+def test_bundle_does_not_delegate_a_suffix_the_bridge_writes_as_json(
+        fake_transport, tmp_path, capsys, monkeypatch):
+    # #670 (major): the bridge writer keys off the literal `.ndjson` suffix, the
+    # CLI off a suffix MAP. Deriving the bridge's format from the map reinstates
+    # the note/bytes contradiction the moment a second ndjson suffix is mapped:
+    # the CLI announces ndjson, delegates, and the bridge writes pretty JSON.
+    monkeypatch.setitem(bn.cli._OUT_FORMAT_BY_SUFFIX, ".jsonl", "ndjson")
+    bundle = {"function": {"name": "sub_401000"}, "warnings": []}
+    out_path = tmp_path / "bundle.jsonl"
+    calls = fake_transport({
+        "list_targets": {
+            "ok": True,
+            "result": [{"target_id": "123:1:7", "selector": "alpha.bndb"}],
+        },
+        "bundle_function": {"ok": True, "result": bundle},
+    })
+
+    rc = bn.cli.main(["bundle", "function", "--out", str(out_path), "sub_401000"])
+
+    assert rc == 0
+    assert calls[-1]["params"]["out_path"] is None     # the CLI keeps the write
+    captured = capsys.readouterr()
+    assert "inferring --format ndjson" in captured.err
+    assert json.loads(captured.out)["format"] == "ndjson"
+    assert out_path.read_text(encoding="utf-8") == render_value(bundle, "ndjson")
 
 
 def test_strings_json_carries_paging_envelope(fake_transport, capsys):

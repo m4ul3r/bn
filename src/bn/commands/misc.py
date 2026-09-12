@@ -366,6 +366,28 @@ def _go_rename(args: argparse.Namespace) -> int:
     )
 
 
+def _resolved_out_format(args: argparse.Namespace) -> str:
+    """``cli._resolve_output_format``'s decision without its stderr side effects.
+
+    The real resolver PRINTS the inference note (or the disagreement warning),
+    and ``_call`` invokes it again a few lines below, so calling it here would
+    emit the note twice. Its precedence -- an explicit ``--format`` wins,
+    otherwise a recognised ``--out`` suffix is inferred -- is mirrored instead,
+    and the two are pinned together over every ``--format`` x ``--out`` suffix
+    combination by
+    ``tests/test_cli_misc.py::test_bundle_delegation_format_tracks_the_cli_resolver``
+    so the copies cannot drift (#670).
+    """
+    out = getattr(args, "out", None)
+    fmt = getattr(args, "format", "text")
+    if out is None:
+        return fmt
+    inferred = _OUT_FORMAT_BY_SUFFIX.get(Path(str(out)).suffix.lower())
+    if inferred is None or getattr(args, "_format_explicit", False):
+        return fmt
+    return inferred
+
+
 @command("bundle", "function", help="Export a function bundle", fmt="json", target=True,
          args=[arg("identifier")])
 def _bundle_function(args: argparse.Namespace) -> int:
@@ -382,21 +404,19 @@ def _bundle_function(args: argparse.Namespace) -> int:
     # honor an explicit --format that disagrees with it -- it would write NDJSON
     # for `--format json --out x.ndjson` while this CLI prints "writing json".
     # Delegate only when the format resolved here is the one the bridge would
-    # emit for that suffix. Mirror cli.py's `_resolve_output_format` precedence
-    # (an explicit --format wins, else the suffix is inferred) rather than
-    # calling it: it PRINTS the note/warning as a side effect and `_call` calls
-    # it again below.
-    inferred = _OUT_FORMAT_BY_SUFFIX.get(Path(str(args.out)).suffix.lower()) if args.out else None
-    resolved = (
-        inferred
-        if inferred is not None and not getattr(args, "_format_explicit", False)
-        else getattr(args, "format", "text")
-    )
-    bridge_format = "ndjson" if inferred == "ndjson" else "json"
+    # actually emit for that path.
+    #
+    # `bridge_format` asks the question the BRIDGE asks (`_write_json_artifact`
+    # keys off the literal `.ndjson` suffix), not the one the CLI's suffix MAP
+    # answers. Reading it off the map instead would claim ndjson for any future
+    # ndjson-mapped suffix the bridge still writes as JSON, which is exactly the
+    # note/bytes contradiction #670 reported.
+    out_suffix = Path(str(args.out)).suffix.lower() if args.out else ""
+    bridge_format = "ndjson" if out_suffix == ".ndjson" else "json"
     bridge_writes = (
         bool(args.out)
         and not _out_path_is_process_local(args.out)
-        and resolved == bridge_format
+        and _resolved_out_format(args) == bridge_format
     )
     return _call(
         args,

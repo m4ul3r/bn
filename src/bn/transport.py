@@ -348,15 +348,26 @@ def _socket_path_is_confined(socket_path: Path) -> bool:
     entry can name any file on the host, and the loader would otherwise connect
     to it -- and, when it probes dead, unlink it through the stale sweep (#618).
     ``bridge_socket_path`` bounds what we WRITE; this bounds what we INGEST.
-    Symlinks are resolved so a link inside the cache cannot reach outside it.
+
+    Two different paths have to be inside the cache, because connect() and
+    unlink() do not act on the same one. ``connect`` follows the final symlink,
+    so the fully resolved target is what we would talk to. ``unlink`` never
+    follows it: it removes the directory ENTRY at ``<resolved parent>/<name>``.
+    Checking only the resolved target would accept an out-of-cache symlink
+    whose target happens to be in-cache, and then delete that out-of-cache link.
     Any resolution failure is treated as unconfined.
     """
     try:
-        return socket_path.resolve().is_relative_to(cache_home().resolve())
-    except (OSError, ValueError):
+        cache = cache_home().resolve()
+        if not socket_path.resolve().is_relative_to(cache):
+            return False
+        entry = socket_path.parent.resolve() / socket_path.name
+        return entry.is_relative_to(cache)
+    except (OSError, TypeError, ValueError):
         # OSError: the path cannot be stat'd. ValueError: it cannot even be
-        # interpreted as a path (an embedded NUL). Both mean "not proven
-        # confined", and a corrupt payload must not abort discovery.
+        # interpreted as a path (an embedded NUL). TypeError: an empty final
+        # component. All mean "not proven confined", and a corrupt payload must
+        # not abort discovery.
         return False
 
 
@@ -370,7 +381,12 @@ def _load_instance(
         payload = json.loads(path.read_text(encoding="utf-8"))
         socket_path = Path(payload["socket_path"])
         pid = int(payload["pid"])
-    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+    except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
+        # TypeError belongs here with the rest: `Path(12)` / `int(["x"])` on a
+        # hand-edited or truncated registry is the same class of corruption as
+        # unparseable JSON or a missing key, and discovery skips a corrupt
+        # record rather than taking every discovery-backed command down with a
+        # raw traceback (#618).
         return None
 
     instance_id = payload.get("instance_id")
