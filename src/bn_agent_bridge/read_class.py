@@ -13,6 +13,7 @@ from typing import Any
 
 from . import il_format
 from ._shared import OperationFailure, _validate_count
+from .seam import _view_memo
 
 
 def _strip_signature(name: str) -> str:
@@ -219,36 +220,43 @@ def _sym_entry(sym) -> dict[str, Any] | None:
 
 # #622 criterion (d) -- "class list / class show reuse a per-view registry (or
 # cheaper show path) rather than demangling every function on every call" -- is
-# only PARTLY delivered, and the memo below is the whole of it.
+# DELIVERED by the per-view registry memo below, and the memo that follows it
+# stays for the rebuilds that remain.
 #
-# DELIVERED: the demangle + qualified-method split is no longer recomputed per
-# call (measured on a real C++ target: 5717 splits on the first registry build,
-# 0 on the second), and that is now pinned by
-# `test_class_name_classification_is_memoised_across_rebuilds`: its counter wraps
-# `_split_qualified_method` and observes one split per function on the synthetic
-# view's first build, then ZERO on the rebuild -- so dropping the memo fails a
-# test instead of silently regressing.
+# The registry: `_scan_class_registry` is wrapped in `seam._view_memo(bv,
+# "class_registry", ...)`, so a view's registry is built ONCE, keyed on that
+# view's generation counter and dropped when BN reports any name-bearing change
+# through its own notifications (seam's `_ViewChangeState`) -- a rename or a late
+# analysis pass that adds named symbols therefore cannot be served stale, which
+# the maintainer's comment on #622 calls worse than the cost being saved. Stated
+# plainly: registry staleness is caught by BN's symbol/function notifications,
+# and a view whose notification surface is unavailable is NEVER cached (every
+# call rescans, exactly as before). `_build_class_registry` then hands out a COPY
+# of the cached registry per call (filtered by `query=`), because `_class_list`
+# writes `rec["bases"]` for its page rows and `_class_show` writes the drill-down
+# keys -- a shared record would make one command's output depend on the other's
+# call order.
 #
-# NOT DELIVERED: there is no per-view registry reuse. Every `class list` /
-# `class show` still enumerates the view and reads each function's live name
-# spellings, so end-to-end latency is unchanged -- measured in the round-1 review
-# at `class list` ~0.31-0.42s vs base ~0.33-0.42s on a ~5.8k-function C++
-# target, and ~1.56-1.60s vs base ~1.39-1.55s on a ~16k-function target. The
-# partial `class show` build that materialised only the queried class was
-# REMOVED for the same review: it measured SLOWER than the full build (median
-# 0.190s filtered vs 0.131s full), i.e. a self-inflicted pessimisation.
+# The classify memo below: it remains because it removes the per-name demangle +
+# qualified-method split from a REBUILD, not just from a repeat call -- measured
+# on a real C++ target: 5717 splits on the first registry build, 0 on the next.
+# It is pinned by `test_class_name_classification_is_memoised_across_rebuilds`:
+# its counter wraps `_split_qualified_method` and observes one split per function
+# on the synthetic view's first build, then ZERO on the rebuild -- so dropping the
+# memo fails a test instead of silently regressing.
 #
-# A per-view registry cache is deliberately NOT implemented, because no sound
-# invalidation hook exists inside this module's reach: BN exposes no view change
-# token (`BinaryView.get_modification` takes an address -- it is not a global
-# counter, and `bv.modified` does not flip for the bridge's own verified writes),
-# and BN's own analysis can add named symbols after load -- so a rename or a late
-# analysis pass would serve stale classes, which the maintainer's comment on #622
-# calls worse than the cost being saved.
+# The partial `class show` build that materialised only the queried class stays
+# REMOVED (a self-inflicted pessimisation): it measured SLOWER than the full
+# build (median 0.190s filtered vs 0.131s full) on the ~5.8k-function C++ target
+# of the round-1 review, and the registry memo now removes the rebuild that
+# measurement was chasing. The round-1 review's uncached `class list` figures
+# (~0.31-0.42s vs base ~0.33-0.42s on ~5.8k functions, ~1.56-1.60s vs base
+# ~1.39-1.55s on ~16k) no longer describe a repeat call: the second call reuses
+# the registry and enumerates nothing.
 #
-# The memo itself: every registry build classifies each function's name --
-# demangle, split the qualified method, and name the ctor/dtor/method kind. That
-# classification is a PURE function of the two name spellings
+# The classify memo itself: every registry build classifies each function's name
+# -- demangle, split the qualified method, and name the ctor/dtor/method kind.
+# That classification is a PURE function of the two name spellings
 # `il_format._display_name` consumes, so it is memoised here at the call site (the
 # demangle itself lives in `il_format`, outside this module's scope). A rename
 # changes those spellings, and therefore the key, so a stale entry for a renamed
@@ -277,13 +285,17 @@ def _classify_function(fn) -> tuple[str, str | None, str | None]:
     return _classify_names(str(short) if short else "", str(getattr(fn, "name", "") or ""))
 
 
-def _build_class_registry(ctx, bv, *, query: str | None = None) -> dict[str, dict[str, Any]]:
-    """One scan -> {class_name: ClassRecord}. Methods, RTTI symbols, confidence.
-    Per-class drill-downs (vtable layout, size, bases, instances) are added by
-    ``_class_show`` only for the requested class (too costly for every class)."""
+def _scan_class_registry(bv) -> dict[str, dict[str, Any]]:
+    """ONE pass over the view -> {class_name: ClassRecord}. Methods, RTTI symbols,
+    confidence. Per-class drill-downs (vtable layout, size, bases, instances) are
+    added by ``_class_show`` only for the requested class (too costly for every
+    class).
+
+    This is the memoised half: it reads only ``bv``, so it is cached per view on
+    the view's generation counter by :func:`_build_class_registry`. Callers must
+    never mutate what it returns -- they get their own copy."""
     rtti = _rtti_symbol_maps(bv)
     registry: dict[str, dict[str, Any]] = {}
-    needle = query.lower() if query else None
 
     for fn in bv.functions:
         demangled, cls, kind = _classify_function(fn)
@@ -329,9 +341,31 @@ def _build_class_registry(ctx, bv, *, query: str | None = None) -> dict[str, dic
         else:
             rec["confidence"] = "name-only"
 
-    if needle:
-        registry = {k: v for k, v in registry.items() if needle in k.lower()}
     return registry
+
+
+def _build_class_registry(ctx, bv, *, query: str | None = None) -> dict[str, dict[str, Any]]:
+    """The view's class registry, filtered by *query*, as a fresh COPY per call.
+
+    The scan is memoised per view (:func:`_view_memo`), keyed on the view's
+    generation counter and invalidated by BN's own symbol/function notifications
+    -- a rename changes which classes exist, so the registry is rebuilt after any
+    such change, and a view with no notification surface is never cached (every
+    call rescans, exactly as before). ``ctx`` is unused today (the scan reads only
+    ``bv``), kept for the callers' uniform ``(ctx, bv)`` seam shape.
+
+    Records are shallow-copied on the way out because the callers WRITE to them:
+    ``_class_list`` sets ``rec["bases"]`` for its page rows and ``_class_show``
+    sets the drill-down keys (``vtable`` / ``size`` / ``bases`` / ``instances`` /
+    ``notes``). Handing out the cached records would make one command's output
+    depend on the other's call order."""
+    registry = _view_memo(bv, "class_registry", lambda: _scan_class_registry(bv))
+    needle = query.lower() if query else None
+    return {
+        name: dict(rec)
+        for name, rec in registry.items()
+        if needle is None or needle in name.lower()
+    }
 
 
 # Standard-library / ABI-runtime top-level namespaces folded out by --no-stl.
@@ -1024,11 +1058,12 @@ def _recover_vtables_from_typeinfo(ctx, bv, typeinfo_addr: int) -> dict[str, Any
 
 def _class_show(ctx, selector: str | None, name: str) -> dict[str, Any]:
     bv = ctx._resolve_view(selector)
-    # #622 (d): NO per-view registry reuse and no partial "cheaper show path" --
-    # a build that skips unqueried classes measured SLOWER than the full one, so
-    # every `class show` still builds the full registry (base semantics). A miss
-    # needs it anyway, because the suggestion hint is drawn from every class name
-    # (#413).
+    # #622 (d): the per-view registry IS reused now (see `_build_class_registry`),
+    # so a repeat `class show` enumerates nothing. What stays unchanged is the
+    # removal of the partial "cheaper show path" -- a build that materialised only
+    # the queried class measured SLOWER than the full one, so it was not
+    # reimplemented. A miss needs the full registry anyway, because the suggestion
+    # hint is drawn from every class name (#413).
     registry = _build_class_registry(ctx, bv)
     matches = _resolve_class_names(registry, name)
     if not matches:

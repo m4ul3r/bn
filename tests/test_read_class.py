@@ -135,12 +135,14 @@ def test_registry_rebuild_reflects_a_rename():
 
 
 def test_class_name_classification_is_memoised_across_rebuilds(monkeypatch):
-    """#622 criterion (d), the DELIVERED half: a registry rebuild re-classifies
-    nothing, because the demangle + qualified-method split is memoised. #622's own
-    Tests section prescribes exactly this observation ("two consecutive list/show
-    calls hit cache (mock demangle counter)"): the counter wraps
-    `_split_qualified_method`, which `_classify_names` resolves at call time, so
-    it sees the real per-build classification work rather than an internal proxy.
+    """#622 criterion (d), the demangle half (the registry half is pinned by
+    `test_class_registry_is_reused_per_view_and_invalidated_by_a_change`): a
+    registry rebuild re-classifies nothing, because the demangle + qualified-method
+    split is memoised. #622's own Tests section prescribes exactly this observation
+    ("two consecutive list/show calls hit cache (mock demangle counter)"): the
+    counter wraps `_split_qualified_method`, which `_classify_names` resolves at
+    call time, so it sees the real per-build classification work rather than an
+    internal proxy.
 
     The two spellings are unique to this test on purpose: the memo is a
     module-level lru_cache shared by the whole file, so reusing another test's
@@ -169,6 +171,106 @@ def test_class_name_classification_is_memoised_across_rebuilds(monkeypatch):
     assert len(calls) == 2, (
         f"the rebuild re-classified {len(calls) - 2} name(s): the memo is not "
         "covering the second build"
+    )
+
+
+class _CountingFunctions(list):
+    """A view's function list that counts how many times it is enumerated."""
+
+    def __init__(self, functions):
+        super().__init__(functions)
+        self.enumerations = 0
+
+    def __iter__(self):
+        self.enumerations += 1
+        return super().__iter__()
+
+
+class _NotifyingRegistryBV(_RegistryBV):
+    """`_RegistryBV` plus BN's view-notification surface.
+
+    ``fire`` stands in for the core's own callbacks: it invokes ``event`` on every
+    registered notifier, synchronously, exactly as BN does inside the mutating
+    call. A test that models a change the core does NOT report simply mutates the
+    double and never calls ``fire``.
+    """
+
+    def __init__(self, functions, symbols):
+        super().__init__(functions, symbols)
+        self._notifiers: list = []
+
+    def register_notification(self, notifier):
+        self._notifiers.append(notifier)
+
+    def unregister_notification(self, notifier):
+        self._notifiers.remove(notifier)
+
+    def fire(self, event, *args):
+        for notifier in list(self._notifiers):
+            getattr(notifier, event)(self, *args)
+
+
+def _counting_registry_fns():
+    """Two synthetic C++ methods, in view order (no RTTI symbols needed)."""
+    return [
+        _Fn(0x1000, "_ZN3net7SessionC1Eh", "net::Session::Session(unsigned char)"),
+        _Fn(0x1100, "_ZN3net4Pool5allocEv", "net::Pool::alloc()"),
+    ]
+
+
+def test_class_registry_is_reused_per_view_and_invalidated_by_a_change():
+    """#622 criterion (d): the registry is built ONCE per view and reused -- a
+    repeat build, and a filtered one, enumerate nothing -- while BN's own change
+    notification forces a rebuild that reflects the rename. Records are handed out
+    as copies, because the callers write to them (`class list` sets `bases` for its
+    page rows), so a mutated record must never reappear from the cache."""
+    fns = _counting_registry_fns()
+    bv = _NotifyingRegistryBV(fns, [])
+    bv.functions = _CountingFunctions(fns)
+
+    first = read_class._build_class_registry(None, bv)
+    assert set(first) == {"net::Session", "net::Pool"}
+    assert bv.functions.enumerations == 1
+
+    again = read_class._build_class_registry(None, bv)
+    assert again == first
+    assert bv.functions.enumerations == 1, "a repeat build must not enumerate the view"
+
+    filtered = read_class._build_class_registry(None, bv, query="session")
+    assert set(filtered) == {"net::Session"}
+    assert bv.functions.enumerations == 1, "the query filter must reuse the registry"
+
+    # A returned record is private to the call: polluting it must not leak.
+    first["net::Session"]["bases"] = ["polluted"]
+    assert read_class._build_class_registry(None, bv)["net::Session"]["bases"] == []
+
+    # A rename, reported by BN's own notification, invalidates the registry.
+    renamed = bv.functions[0]
+    renamed.name = "_ZN3net9RenamedC1Ev"
+    renamed.raw_name = "_ZN3net9RenamedC1Ev"
+    renamed.symbol.short_name = "net::Renamed::Renamed()"
+    bv.fire("symbol_updated", renamed)
+
+    third = read_class._build_class_registry(None, bv)
+    assert set(third) == {"net::Renamed", "net::Pool"}
+    assert [m["demangled"] for m in third["net::Renamed"]["methods"]] == [
+        "net::Renamed::Renamed()"
+    ]
+    assert bv.functions.enumerations == 2, "the change must force exactly one rebuild"
+
+
+def test_class_registry_is_never_cached_without_notification_support():
+    """A view with no notification surface has no sound invalidation signal, so it
+    is never cached: two builds each enumerate the view."""
+    fns = _counting_registry_fns()
+    bv = _RegistryBV(fns, [])
+    bv.functions = _CountingFunctions(fns)
+
+    first = read_class._build_class_registry(None, bv)
+    second = read_class._build_class_registry(None, bv)
+    assert second == first
+    assert bv.functions.enumerations == 2, (
+        "a view that cannot report changes must rescan on every build"
     )
 
 

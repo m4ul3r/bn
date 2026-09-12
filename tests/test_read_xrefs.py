@@ -482,6 +482,172 @@ class _CountingFunctions(list):
         return super().__iter__()
 
 
+class _NotifyingBV(_FakeBV):
+    """A view double that supports BN's view notifications.
+
+    ``fire`` stands in for BN's own callbacks: it invokes ``event`` on every
+    registered notifier, synchronously, exactly as the core does inside the
+    mutating call -- which is what makes a generation bump happen-before the next
+    read. A test that models a change the core does NOT report simply mutates the
+    double and never calls ``fire``.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._notifiers: list = []
+
+    def register_notification(self, notifier):
+        self._notifiers.append(notifier)
+
+    def unregister_notification(self, notifier):
+        self._notifiers.remove(notifier)
+
+    def fire(self, event, *args):
+        for notifier in list(self._notifiers):
+            getattr(notifier, event)(self, *args)
+
+
+def _named_fn(start, name, short_name=None):
+    """A function whose spellings are its name plus a symbol short name."""
+    fn = _FakeFunction(start, name)
+    fn.symbol = _FakeSymbol("FunctionSymbol")
+    fn.symbol.short_name = short_name or name
+    return fn
+
+
+def test_name_lookup_reuses_the_per_view_index_and_a_change_invalidates_it(monkeypatch):
+    """#622(b): the per-view index is built once and reused while BN reports no
+    change (a warm lookup enumerates nothing), and BN's own change notification
+    invalidates it -- the rename is visible on the very next lookup, for exactly
+    the one enumeration the rebuild costs."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _named_fn(0x401000, "alpha")
+    other = _named_fn(0x402000, "beta")
+    bv = _NotifyingBV(functions=[fn, other])
+    bv.functions = _CountingFunctions([fn, other])
+
+    def lookup(text):
+        return [
+            int(f.start)
+            for f in instance.ctx._find_functions_by_name(
+                bv, text, case_sensitive=True)
+        ]
+
+    assert lookup("alpha") == [0x401000]
+    assert bv.functions.enumerations == 1
+    assert lookup("alpha") == [0x401000]
+    assert bv.functions.enumerations == 1, "a warm lookup must not enumerate the view"
+
+    # A rename, reported by BN's own notification.
+    fn.name = "gamma"
+    fn.raw_name = "gamma"
+    fn.symbol.short_name = "gamma"
+    bv.fire("symbol_updated", fn)
+
+    assert lookup("gamma") == [0x401000]
+    assert bv.functions.enumerations == 2, "the change must force exactly one rebuild"
+    assert lookup("alpha") == []
+    assert bv.functions.enumerations == 2, "a miss on the fresh index must not rebuild"
+    assert lookup("gamma") == [0x401000]
+    assert bv.functions.enumerations == 2
+
+
+def test_name_lookup_never_caches_a_view_without_notification_support(monkeypatch):
+    """A view with no notification surface has no sound invalidation signal, so it
+    is never cached: two identical lookups each enumerate the view, i.e. the walk
+    behaviour that predates the index."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _named_fn(0x401000, "alpha")
+
+    def lookup(bv):
+        return [
+            int(f.start)
+            for f in instance.ctx._find_functions_by_name(
+                bv, "alpha", case_sensitive=True)
+        ]
+
+    bv = _FakeBV(functions=[fn])
+    bv.functions = _CountingFunctions([fn])
+    assert lookup(bv) == [0x401000]
+    assert lookup(bv) == [0x401000]
+    assert bv.functions.enumerations == 2, (
+        "a view that cannot report changes must walk on every lookup"
+    )
+
+
+def test_name_index_drops_a_stale_bucket_after_an_unnotified_rename(monkeypatch):
+    """A change BN does NOT report leaves the generation counter untouched, so the
+    cached bucket must be re-verified against the live view: the old spelling stops
+    resolving (the stale member no longer carries it) and the new one resolves from
+    the rebuild, at the cost of that one rebuild."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _named_fn(0x401000, "alpha")
+    bv = _NotifyingBV(functions=[fn])
+    bv.functions = _CountingFunctions([fn])
+
+    def lookup(text):
+        return [
+            int(f.start)
+            for f in instance.ctx._find_functions_by_name(
+                bv, text, case_sensitive=True)
+        ]
+
+    assert lookup("alpha") == [0x401000]
+    assert bv.functions.enumerations == 1
+
+    # Renamed behind BN's back: no notification is fired.
+    fn.name = "gamma"
+    fn.raw_name = "gamma"
+    fn.symbol.short_name = "gamma"
+
+    assert lookup("alpha") == [], "the stale bucket must not answer"
+    assert bv.functions.enumerations == 2, "the live guard must rebuild exactly once"
+    assert lookup("gamma") == [0x401000]
+    assert lookup("gamma") == [0x401000]
+    assert bv.functions.enumerations == 2, "the rebuilt index must be reused"
+
+
+def test_name_index_rebuilds_when_the_native_index_witnesses_an_unknown_spelling(monkeypatch):
+    """A stale NEGATIVE is caught by BN's own name index: it witnesses that a
+    function carrying the queried spelling exists even though the cached index has
+    no bucket for it. The witness only forces a WALK-backed rebuild -- it never
+    becomes the answer -- so a spelling carried by several functions must come back
+    as the complete group even though the witness itself returned a member subset."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _named_fn(0x401000, "alpha")
+    bv = _NotifyingBV(functions=[fn])
+    bv.functions = _CountingFunctions([fn])
+
+    def lookup(text):
+        return [
+            int(f.start)
+            for f in instance.ctx._find_functions_by_name(
+                bv, text, case_sensitive=True)
+        ]
+
+    assert lookup("alpha") == [0x401000]
+    assert bv.functions.enumerations == 1
+
+    # An unnotified late addition: the first function gains the spelling "shared"
+    # and a second function carrying it appears in the view. The native index
+    # resolves the spelling, but only to the new member.
+    twin = _named_fn(0x403000, "shared")
+    fn.symbol.short_name = "shared"
+    bv.functions.append(twin)
+    bv.get_functions_by_name = lambda name: [twin] if name == "shared" else []
+
+    assert lookup("shared") == [0x401000, 0x403000], (
+        "the witness must trigger the walk-backed rebuild, not supply the answer"
+    )
+    assert bv.functions.enumerations == 2
+    assert lookup("shared") == [0x401000, 0x403000]
+    assert bv.functions.enumerations == 2
+
+
 def test_find_function_miss_hints_are_uncapped_and_cost_one_enumeration(monkeypatch):
     """#622(b): a miss suggests over EVERY spelling -- no cap, no prefix filter,
     so a FIRST-character typo still finds the intended name -- and costs exactly

@@ -808,7 +808,10 @@ def _function_evidence(ctx, selector: str | None, identifier, *, context: int = 
     }
     if decompile_deferred:
         # #622: additive honesty field -- present only when the decompile was
-        # skipped, so an unsliced read's payload is byte-for-byte unchanged.
+        # skipped, so an unsliced read's payload is byte-for-byte unchanged. The
+        # field rides the JSON envelope only: the default TEXT renderers
+        # (src/bn/formatters.py) are outside this cluster's fence and do not
+        # surface it yet.
         result["decompile_deferred"] = True
     # #626: annotate a mid-function (interior) request the same way the decompile
     # READs do (#193 Part 4). Inlined via the seam's `_containment_meta` rather
