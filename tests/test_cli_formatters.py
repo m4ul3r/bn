@@ -687,6 +687,12 @@ def test_render_field_xrefs_non_dict_field_renders_unknown_not_zero():
 # is not the shape the renderer assumed (version skew, partial bridge payload)
 # must degrade to placeholder text, not raise -- the CLI turns the raise into a
 # BridgeError that costs the agent the whole partial text view.
+#
+# Degrading must stay LOUD. Coercing a malformed container to empty renders the
+# same row a genuinely empty result does, so the caller reads a confident
+# "nothing here" and cannot tell the payload was unusable -- a wrong answer
+# nobody can detect, which is worse than the AttributeError it replaced. Every
+# test below therefore pins the DISCLOSURE, not just the absence of a raise.
 
 def test_render_field_xrefs_non_dict_item_degrades():
     from bn.formatters import _render_field_xrefs_text
@@ -694,6 +700,9 @@ def test_render_field_xrefs_non_dict_item_degrades():
              "items": [{"kind": "code", "address": "0x1"}, "bad"]}
     out = _render_field_xrefs_text(value)
     assert "0x1" in out
+    # The malformed ref is neither code nor data, so both kind filters drop it;
+    # it must still be disclosed instead of vanishing from a ref inventory.
+    assert "'bad'" in out
 
 
 def test_render_local_list_non_dict_function_degrades():
@@ -732,7 +741,9 @@ def test_render_values_non_dict_function_and_values_degrade():
     from bn.formatters import _render_values_text
     out = _render_values_text({"function": "main", "possible_values": "bad"})
     assert "<unknown> @ <unknown>" in out
-    assert "possible values: <unavailable>" in out
+    # `<unavailable>` is what an ABSENT possible_values prints: a present but
+    # malformed one must not impersonate "the analysis had no answer".
+    assert "possible values: <malformed: 'bad'>" in out
 
 
 def test_render_class_show_non_dict_members_degrade():
@@ -779,6 +790,8 @@ def test_render_taint_models_non_dict_sinks_by_class_degrades():
     out = _render_taint_models_text({"sources": [{"symbol": "gets"}],
                                      "sinks_by_class": ["bad"]})
     assert "gets" in out
+    # Dropping the whole sink section silently would read as "no sinks modeled".
+    assert "malformed sinks_by_class field" in out
 
 
 def test_render_taint_models_sink_entry_non_dict_callsite_degrades():
@@ -793,7 +806,11 @@ def test_render_taint_models_sink_entry_non_dict_callsite_degrades():
 def test_render_surface_non_dict_summary_degrades():
     from bn.formatters import _render_surface_text
     out = _render_surface_text({"summary": "bad"})
-    assert "hidden surface: 0 init section(s)" in out
+    # A clean scan with nothing to report prints all zeros; a malformed summary
+    # must not render byte-identically to it.
+    assert "hidden surface: ? init section(s)" in out
+    assert "malformed summary field" in out
+    assert out != _render_surface_text({})
 
 
 def test_render_orient_non_dict_target_and_kind_breakdown_degrade():
@@ -822,6 +839,88 @@ def test_render_imports_summary_non_dict_breakdowns_degrade():
     out = _render_imports_summary_text({"total_symbols": 2, "namespaces": ["bad"],
                                         "by_kind": ["bad"]})
     assert "total symbols: 2" in out
+    # Both breakdowns are unusable; skipping them silently reads as "no imports
+    # in any namespace", which the non-zero total contradicts.
+    assert "malformed namespaces field" in out
+    assert "malformed by_kind field" in out
+
+
+def test_render_imports_summary_uncoercible_count_renders_and_orders():
+    # The sort key coerces the count, but the column interpolated the RAW value
+    # one line later: `f"{None:>5}"` is a TypeError, so a single malformed count
+    # still cost the whole text view (#619).
+    from bn.formatters import _render_imports_summary_text
+    out = _render_imports_summary_text(
+        {"total_symbols": 7, "namespaces": {"lo": 1, "hi": 5, "broken": None}})
+    rows = [ln for ln in out.splitlines() if ln.startswith("  ")]
+    assert [r.split()[-1] for r in rows] == ["hi", "lo", "broken"]
+    assert "<unknown>" in out
+
+
+def test_render_local_list_malformed_items_alias_keeps_the_retained_alias_rows():
+    # `items` is canonical, `locals` the retained alias (#651). A truthy but
+    # malformed `items` short-circuited the alias away, so the real rows
+    # vanished behind a confident "no locals".
+    from bn.formatters import _render_local_list_text
+    out = _render_local_list_text({
+        "function": {"name": "f", "address": "0x1"},
+        "items": "bad",
+        "locals": [{"name": "count", "type": "int"}],
+    })
+    assert "count" in out
+    assert "no locals" not in out
+    assert "malformed items field" in out
+
+
+def test_render_class_list_malformed_items_alias_is_disclosed_not_zero():
+    from bn.formatters import _render_class_list_text
+    out = _render_class_list_text({"items": "bad", "classes": [{"name": "Widget"}],
+                                   "total": 1})
+    assert "Widget" in out
+    assert "classes: 0 shown of 1" not in out
+    assert "malformed items field" in out
+
+
+def test_render_orient_non_string_sample_sections_do_not_raise():
+    from bn.formatters import _render_orient_text
+    out = _render_orient_text({"strings_sample": {"items": [], "sample_sections": [1, 2]}})
+    assert "from 1, 2" in out
+
+
+def test_render_orient_non_list_strings_sample_items_is_disclosed_not_counted():
+    from bn.formatters import _render_orient_text
+    out = _render_orient_text({"strings_sample": {"items": "abc"}})
+    assert "sample 3 of 3" not in out          # 3 characters are not 3 strings
+    assert "malformed items field" in out
+
+
+def test_render_orient_non_dict_imports_summary_is_disclosed_not_dropped():
+    from bn.formatters import _render_orient_text
+    out = _render_orient_text({"imports_summary": "bad"})
+    assert "malformed imports_summary field" in out
+
+
+def test_render_grouped_leaves_distinct_malformed_leaves_each_render():
+    # Grouping malformed leaves by TYPE collapsed every distinct one behind an
+    # `(xN)` count on the first, so all but one were unreadable.
+    from bn.formatters import _render_grouped_leaves
+    out = "\n".join(_render_grouped_leaves(["alpha", "beta", "alpha"]))
+    assert "'alpha'" in out and "'beta'" in out
+    assert "(x2)" in out          # two IDENTICAL malformed leaves still collapse
+
+
+def test_render_data_symbols_non_dict_row_degrades():
+    from bn.formatters import _render_data_symbols_text
+    out = _render_data_symbols_text({"items": [{"a": "0x1", "n": "sym"}, "bad"]})
+    assert "sym" in out
+    assert "'bad'" in out
+
+
+def test_render_data_symbols_malformed_items_is_disclosed_not_none():
+    from bn.formatters import _render_data_symbols_text
+    out = _render_data_symbols_text({"items": "bad", "total": 3})
+    assert out != "none"
+    assert "malformed items field" in out
 
 
 def test_render_evidence_shows_argument_confidence_and_variadic():
