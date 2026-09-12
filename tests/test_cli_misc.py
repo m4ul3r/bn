@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import types
@@ -8,6 +9,8 @@ from pathlib import Path
 import bn.cli
 import pytest
 
+from bn_agent_bridge._shared import OperationFailure, _serialize_error, _write_json_artifact
+from bn.output import OutputWriteError, render_value, write_output_result
 from _cli_helpers import *  # noqa: F401,F403
 
 
@@ -278,6 +281,85 @@ def test_bundle_function_process_local_out_is_written_cli_side(fake_transport, c
     assert envelope["artifact_path"] == fd_path
     assert envelope["ok"] is True
     assert envelope["bytes"] == len(body)
+
+
+def test_write_json_artifact_ndjson_out_is_line_delimited(tmp_path):
+    # #670: `bundle function --out foo.ndjson` prints "note: inferring --format
+    # ndjson from the .ndjson --out path" while the bridge-owned writer hard-coded
+    # pretty single-document JSON behind an envelope claiming format json. The
+    # suffix is the only format signal the bridge side has, so the writer must
+    # honor it byte-for-byte as the CLI's own render_value("ndjson") does.
+    payload = {"alpha": 1, "nested": {"beta": [1, 2]}, "name": "sample"}
+    out_path = tmp_path / "bundle.ndjson"
+
+    envelope = _write_json_artifact(str(out_path), payload)
+
+    file_bytes = out_path.read_bytes()
+    text = file_bytes.decode("utf-8")
+    lines = [line for line in text.splitlines() if line]
+    assert len(lines) == 1
+    assert json.loads(lines[0]) == payload
+    assert text == render_value(payload, "ndjson")
+    assert envelope["format"] == "ndjson"
+    assert envelope["bytes"] == len(file_bytes)
+    assert envelope["sha256"] == hashlib.sha256(file_bytes).hexdigest()
+
+
+def test_write_json_artifact_json_out_stays_pretty_single_document(tmp_path):
+    # Regression guard for the unchanged .json path (this passes at base by
+    # design; it pins that the #670 fix did not churn it).
+    payload = {"alpha": 1, "nested": {"beta": [1, 2]}}
+    out_path = tmp_path / "bundle.json"
+
+    envelope = _write_json_artifact(str(out_path), payload)
+
+    text = out_path.read_text(encoding="utf-8")
+    assert json.loads(text) == payload
+    assert text == json.dumps(payload, indent=2, sort_keys=True)
+    assert envelope["format"] == "json"
+    assert envelope["bytes"] == len(text.encode("utf-8"))
+
+
+def test_bundle_out_error_matches_the_cli_side_writer(tmp_path):
+    # #719: the CLI-side and bridge-side --out writers must be indistinguishable
+    # to a caller. The bridge one used to leak the raw exception class name
+    # behind an `internal error:` prefix for the same user mistake.
+    payload = {"alpha": 1}
+    adir = tmp_path / "adir"
+    adir.mkdir()
+
+    with pytest.raises(OutputWriteError) as cli_exc:
+        write_output_result(payload, fmt="json", out_path=adir, stem="function-bundle")
+    with pytest.raises(OperationFailure) as bridge_exc:
+        _write_json_artifact(str(adir), payload)
+
+    assert str(bridge_exc.value) == str(cli_exc.value)
+    assert "internal error:" not in str(bridge_exc.value)
+    assert bridge_exc.value.status == "output_write_failed"
+
+
+def test_bundle_out_unwritable_path_uses_the_same_shape(tmp_path):
+    # The parent path is a regular FILE, so mkdir fails with an OSError on any
+    # uid (no chmod-based unwritability, which is a no-op when tests run as root).
+    afile = tmp_path / "afile"
+    afile.write_text("not a directory", encoding="utf-8")
+    out_path = afile / "x.json"
+
+    with pytest.raises(OperationFailure) as exc:
+        _write_json_artifact(str(out_path), {"alpha": 1})
+
+    message = str(exc.value)
+    assert message.startswith(f"Failed to write --out file {out_path}: ")
+    assert "internal error:" not in message
+    assert exc.value.status == "output_write_failed"
+
+
+def test_serialize_error_distinguishes_user_and_internal_failures():
+    # Acceptance criterion 4 of #719: a genuine bridge-internal failure must keep
+    # reporting as an internal error, not be laundered into a user-facing one.
+    user = OperationFailure("output_write_failed", "Failed to write --out file /x: nope")
+    assert _serialize_error(user) == "Failed to write --out file /x: nope"
+    assert _serialize_error(TypeError("boom")) == "internal error: TypeError: boom"
 
 
 def test_strings_json_carries_paging_envelope(fake_transport, capsys):

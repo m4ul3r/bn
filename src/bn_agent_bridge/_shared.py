@@ -422,13 +422,35 @@ def _write_json_artifact(path_text: str | None, payload: Any) -> dict[str, Any] 
         return None
 
     path = Path(path_text).expanduser()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    data = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
-    path.write_bytes(data)
+    # #670: the CLI infers --format from the --out suffix (cli.py's
+    # _OUT_FORMAT_BY_SUFFIX) and prints a note saying so, but a bridge-owned
+    # write never sees that format -- the suffix is the only signal available
+    # here. Anything but .ndjson keeps the existing pretty single-document JSON.
+    ndjson = path.suffix.lower() == ".ndjson"
+    if ndjson:
+        items = payload if isinstance(payload, list) else [payload]
+        lines = [json.dumps(item, sort_keys=True) for item in items]
+        text = "\n".join(lines) + ("\n" if lines else "")
+    else:
+        text = json.dumps(payload, indent=2, sort_keys=True)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = text.encode("utf-8")
+        path.write_bytes(data)
+    except OSError as exc:
+        # #719: a destination the caller chose but cannot write is a user error,
+        # not a bridge defect. Match the CLI-side writer's message (output.py's
+        # OutputWriteError) so the two --out writers are indistinguishable, and
+        # raise it as user-facing so `_serialize_error` does not add the
+        # `internal error:` prefix. Non-OSError failures (e.g. an unserializable
+        # payload) deliberately keep reporting as internal errors.
+        raise OperationFailure(
+            "output_write_failed", f"Failed to write --out file {path}: {exc}"
+        ) from exc
     return {
         "ok": True,
         "artifact_path": str(path),
-        "format": "json",
+        "format": "ndjson" if ndjson else "json",
         "bytes": len(data),
         "sha256": hashlib.sha256(data).hexdigest(),
         "summary": _artifact_summary(payload),
