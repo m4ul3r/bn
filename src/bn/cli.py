@@ -659,6 +659,12 @@ def _render_result(
     The spilled flag lets the caller decide whether to add a further note (e.g. a
     display-truncation warning): a spill already prints its own pipe-trap note, so
     a caller-side note would be redundant when it fires."""
+    # Serializing the bridge result parses and walks it too: `json.dumps` on a
+    # deeply nested response raises RecursionError, and a renderer meeting a
+    # field shape it cannot read raises out of `main()`, which catches only
+    # BridgeError. So the write/render steps are held to the same rule as the
+    # transforms (#101/#715) -- the malformed-result set names RecursionError
+    # precisely because of this site.
     if out_path is None and isinstance(value, dict) and isinstance(value.get("artifact_path"), str):
         artifact = dict(value)
         artifact.setdefault("ok", True)
@@ -666,11 +672,15 @@ def _render_result(
         for key, val in (provenance or {}).items():   # #653.8
             if val is not None:
                 artifact.setdefault(key, val)
-        sys.stdout.write(render_envelope(artifact, fmt))
+        sys.stdout.write(_apply_result_transform(
+            lambda payload: render_envelope(payload, fmt), artifact,
+            f"serialize the {stem} artifact envelope as {fmt}"))
         return bool(artifact.get("spilled"))
 
-    result = write_output_result(value, fmt=fmt, out_path=out_path, stem=stem,
-                                provenance=provenance)
+    result = _apply_result_transform(
+        lambda payload: write_output_result(payload, fmt=fmt, out_path=out_path,
+                                           stem=stem, provenance=provenance),
+        value, f"serialize the {stem} result as {fmt}")
     if result.spilled and result.artifact and spill_status is not None:
         # #645: NEVER put a spill envelope on stdout for a mutation. A read that
         # spills is recoverable (re-read the artifact); an atomic write whose result
@@ -679,13 +689,20 @@ def _render_result(
         # parseable status (with a pointer to the detail).
         artifact_path = result.artifact["artifact_path"]
         status_value, status_renderer = spill_status
+        # `spill_status` arrives from a caller, so its renderer is bound to the
+        # rule here rather than at the call below: this is the boundary for it.
+        status_renderer = _guarded_transform(
+            status_renderer, f"render the {stem} status line as text",
+            advice="Rerun with --format json to see the raw status.")
         if isinstance(status_value, dict):
             status_value = {**status_value, "detail_artifact_path": str(artifact_path)}
         if fmt == "text" and status_renderer is not None:
             rendered = status_renderer(status_value)
             sys.stdout.write(rendered if rendered.endswith("\n") else rendered + "\n")
         else:
-            sys.stdout.write(render_value(status_value, fmt))
+            sys.stdout.write(_apply_result_transform(
+                lambda payload: render_value(payload, fmt), status_value,
+                f"serialize the {stem} status line as {fmt}"))
         print(
             f"note: full mutation detail ({result.artifact.get('estimated_tokens')} est. "
             f"tokens) written to {artifact_path}; stdout carries the parseable status "
@@ -758,31 +775,80 @@ _MALFORMED_RESULT_ERRORS = (
 )
 
 
-def _apply_result_transform(transform: Callable[[Any], Any], result: Any, what: str) -> Any:
+def _apply_result_transform(transform: Callable[[Any], Any], result: Any, what: str,
+                            *, advice: str | None = None) -> Any:
     """Run one result transform under the malformed-result rule (#101/#715).
 
-    A mutation's compact summary is evaluated at THREE points in :func:`_call` --
-    to derive the exit code, to build what gets rendered, and to build the
-    spill-status line -- and which of them runs first depends on the result
-    (a failure short-circuits the exit code) and on the output format (only the
-    text path has a renderer). Three separate ``try`` blocks drifted apart twice:
-    each fix covered the site under test and left the next one raising a raw
-    traceback out of `main()`, which catches only :class:`BridgeError`. One
-    helper, used at every site, is the rule.
+    A mutation's compact summary is evaluated at several points in :func:`_call`
+    -- to derive the exit code, to build what gets rendered, to build the
+    spill-status line, to check for display truncation -- and which of them runs
+    first depends on the result (a failure short-circuits the exit code) and on
+    the output format (only the text path has a renderer). Separate ``try``
+    blocks drifted apart four times: each fix covered the site under test and
+    left the next one raising a raw traceback out of `main()`, which catches only
+    :class:`BridgeError`. One helper, used at every site, is the rule -- and
+    :func:`_guarded_transform` binds a transform to it at the boundary so the
+    call SITE stops mattering.
 
-    Deliberately NOT the renderer's "rerun with --format json to see the raw
-    result": these steps all run BEFORE the format is applied, so --format json
-    returns this same envelope. Advice that reproduces the error is worse than
-    none, so point at the version skew the message just diagnosed.
+    *advice* replaces the default "compare the builds" tail for a step where
+    another output format really does avoid the failure (a text renderer). The
+    default deliberately does NOT say "rerun with --format json": the parsing and
+    aggregating steps all run BEFORE the format is applied, so --format json
+    returns this same envelope, and advice that reproduces the error is worse
+    than none.
     """
     try:
         return transform(result)
     except _MALFORMED_RESULT_ERRORS as exc:
+        reason = (f"could not {what} -- the bridge response was malformed or newer "
+                  f"than this CLI")
+        tail = advice or ("so the outcome could not be determined. Compare the "
+                          "bridge and CLI builds with `bn doctor`.")
         raise BridgeError(
-            f"could not {what} -- the bridge response was malformed or newer than "
-            f"this CLI, so the outcome could not be determined. Compare the bridge "
-            f"and CLI builds with `bn doctor`. ({type(exc).__name__}: {exc})"
+            f"{reason}{'. ' if advice else ', '}{tail} ({type(exc).__name__}: {exc})"
         ) from exc
+
+
+def _guarded_transform(transform: Callable[[Any], Any] | None, what: str,
+                       *, advice: str | None = None) -> Callable[[Any], Any] | None:
+    """Bind a caller-supplied result transform to the malformed-result rule.
+
+    The BOUNDARY, not the call site. Five review rounds each found one more place
+    a transform ran outside the rule -- three `try` blocks, a handler module, the
+    truncation note -- because "these N sites are guarded" says nothing about
+    site N+1, and an aliased or attribute-dispatched call (`t = summary; t(r)`,
+    `self.summary(r)`) is invisible to any scan of call sites. Wrapping once,
+    where the transform enters this module, makes every later invocation guarded
+    whoever performs it and wherever it lives (the fan-out renderer invokes its
+    inner renderer over in ``formatters.py``).
+
+    Returns None for None so a caller can wrap unconditionally.
+    """
+    if transform is None:
+        return None
+
+    def guarded(result: Any) -> Any:
+        return _apply_result_transform(transform, result, what, advice=advice)
+
+    return guarded
+
+
+def _unwrap_result(response: Any, op: str) -> Any:
+    """The `result` an ok reply must carry.
+
+    A reply of `{"ok": true}` with no `result` key is the same version-skew class
+    as a malformed result -- and `response["result"]` raised a bare `KeyError`
+    out of `main()`, which catches only :class:`BridgeError`, for exit 1 and a
+    traceback on every output format. The documented code for a response this
+    CLI cannot read is 2.
+    """
+    if not isinstance(response, dict) or "result" not in response:
+        raise BridgeError(
+            f"the bridge reply to {op!r} carries no `result` -- the response was "
+            f"malformed or newer than this CLI, so the outcome could not be "
+            f"determined. Compare the bridge and CLI builds with `bn doctor`."
+        )
+    return response["result"]
 
 
 def _emit_result(
@@ -803,16 +869,12 @@ def _emit_result(
     json``, never a raw traceback), then writes via :func:`_render_result`. With no
     *text_renderer* the value renders as-is in every format.
     """
+    text_renderer = _guarded_transform(
+        text_renderer, f"render the {stem} result as text",
+        advice="Rerun with --format json to see the raw result.")
     fmt = _resolve_output_format(args)
     if text_renderer is not None and fmt == "text":
-        try:
-            result = text_renderer(result)
-        except _MALFORMED_RESULT_ERRORS as exc:
-            raise BridgeError(
-                f"could not render the {stem} result as text -- the bridge response was "
-                f"malformed or newer than this CLI. Rerun with --format json to see the "
-                f"raw result. ({type(exc).__name__}: {exc})"
-            ) from exc
+        result = text_renderer(result)
     _render_result(result, fmt=fmt, out_path=args.out, stem=stem)
 
 
@@ -1077,8 +1139,18 @@ def _mutation_reports_failure(result: dict[str, Any]) -> bool:
 
 
 def _mutation_exit_code(result: Any, summary: Callable[[Any], Any] | None = None) -> int:
+    summary = _guarded_transform(summary, "classify the mutation result")
     if not isinstance(result, dict):
-        return 0
+        # The MORE malformed sibling of a non-object compact summary below, and
+        # it used to return 0: a bridge that answered a mutation with a list, a
+        # string or a number had its write reported as a confirmed success to a
+        # `$?`-only consumer. Nothing about this result is classifiable, which is
+        # the documented exit 2, never 0 (#715/#716).
+        raise BridgeError(
+            f"could not classify the mutation result -- the bridge returned "
+            f"{type(result).__name__}, not an object. Compare the bridge and CLI "
+            f"builds with `bn doctor`."
+        )
     if _apply_result_transform(_mutation_reports_failure, result,
                                "classify the mutation result"):
         return 3
@@ -1094,7 +1166,7 @@ def _mutation_exit_code(result: Any, summary: Callable[[Any], Any] | None = None
         # Exit 0 is not an option when this raises -- the whole point of #715 is
         # that a result the CLI cannot classify must not read as a confirmed
         # success -- so it goes out as the documented BridgeError (exit 2).
-        compact = _apply_result_transform(summary, result, "classify the mutation result")
+        compact = summary(result)
         if not isinstance(compact, dict):
             # A registered transform that returns something else has not
             # classified anything, and "no classification" must not read as a
@@ -1104,7 +1176,20 @@ def _mutation_exit_code(result: Any, summary: Callable[[Any], Any] | None = None
                 f"back as {type(compact).__name__}, not an object. Compare the bridge "
                 f"and CLI builds with `bn doctor`."
             )
-        if compact.get("measured") is False:
+        # `measured` must be a VERDICT, not merely "not False": an envelope that
+        # carries no `measured` at all (a summary from a bridge that predates
+        # #684, or one that short-circuited an already-compact result through)
+        # said nothing about whether the write was measured, and reading silence
+        # as measured is how an unverifiable mutation exits 0.
+        measured = compact.get("measured")
+        if not isinstance(measured, bool):
+            raise BridgeError(
+                f"could not classify the mutation result -- the compact summary "
+                f"reports `measured` as {type(measured).__name__}, not a boolean, so "
+                f"whether the write was verified is unknown. Compare the bridge and "
+                f"CLI builds with `bn doctor`."
+            )
+        if measured is False:
             return 4
     return 0
 
@@ -1117,8 +1202,12 @@ def _mutate(
     stem: str,
     require_target: bool = True,
     preview: bool | None = None,
-    detail_renderer: Any = None,
-    summary_transform: Any = None,
+    # Annotated, not `Any`: these two ARE bridge-result transforms, and the
+    # guard property in tests/test_cli_mutation.py reads its population off
+    # these annotations. An unannotated transform parameter is one the property
+    # cannot see.
+    detail_renderer: Callable[[Any], str] | None = None,
+    summary_transform: Callable[[Any], Any] | None = None,
     **call_kwargs: Any,
 ) -> int:
     """:func:`_call` specialized for mutations.
@@ -1228,6 +1317,24 @@ def _call(
     spill_status_renderer: Callable[[Any], str] | None = None,
 ) -> int:
     _require_nonempty_instance(args)
+    # THE BOUNDARY (#101/#715/#716). Every transform a handler hands this call is
+    # bound to the malformed-result rule here, once, before anything can invoke
+    # it: which of these runs first depends on the result and the output format,
+    # some run in other modules (the fan-out renderer), and four earlier repairs
+    # each guarded the site under test and left the next one raising a raw
+    # traceback out of `main()`. Guarding the OBJECT retires the whole class.
+    result_exit_code = _guarded_transform(
+        result_exit_code, f"derive an exit code from the {op} result")
+    result_transform = _guarded_transform(result_transform, f"summarize the {op} result")
+    text_renderer = _guarded_transform(
+        text_renderer, f"render the {op} result as text",
+        advice="Rerun with --format json to see the raw result.")
+    truncation_note = _guarded_transform(
+        truncation_note, f"check the {op} result for display truncation")
+    spill_status = _guarded_transform(spill_status, f"summarize the {op} result")
+    spill_status_renderer = _guarded_transform(
+        spill_status_renderer, f"render the {op} status line as text",
+        advice="Rerun with --format json to see the raw status.")
     request_params = dict(params or {})
     # A long one-time op (load/refresh full analysis) raises its no-env default
     # client timeout so it isn't abandoned at the 600s read-op default on a very
@@ -1280,7 +1387,7 @@ def _call(
         spawn_missing_named=spawn_missing_named,
         **timeout_kwargs,
     )
-    result = response["result"]
+    result = _unwrap_result(response, op)
     # Auto-regex fallback (#291.3): a metacharacter query that matched nothing
     # literally is almost always meant as a pattern. Retry it once as a regex and
     # disclose the switch, instead of returning a confident literal `none`. Only
@@ -1307,7 +1414,7 @@ def _call(
             timeout=retry_timeout,
             resolved=True,
         )
-        result = response["result"]
+        result = _unwrap_result(response, op)
         # An in-band marker so a --format json consumer (which reads stdout, not
         # the stderr note below) can tell the result set came from a regex
         # fallback rather than a literal match (#291.3 review).
@@ -1342,22 +1449,11 @@ def _call(
         # Needed on its own: a FAILING mutation short-circuits to exit 3 before
         # the exit-code helper ever runs its transform, so on that path this is
         # the first place the result is parsed.
-        result = _apply_result_transform(result_transform, result, f"summarize the {op} result")
+        result = result_transform(result)
     spill_context = result
     fmt = _resolve_output_format(args)
     if text_renderer is not None and fmt == "text":
-        try:
-            result = text_renderer(result)
-        except _MALFORMED_RESULT_ERRORS as exc:
-            # A malformed/unexpected bridge result (version skew, future protocol
-            # change) must not crash a text renderer with a raw traceback -- that
-            # breaks the exit-code contract (main() only catches BridgeError).
-            # Surface a clean error pointing at --format json for the raw result (#101).
-            raise BridgeError(
-                f"could not render the {op} result as text -- the bridge response was "
-                f"malformed or newer than this CLI. Rerun with --format json to see the "
-                f"raw result. ({type(exc).__name__}: {exc})"
-            ) from exc
+        result = text_renderer(result)
     spilled = _render_result(
         result,
         fmt=fmt,
@@ -1372,8 +1468,7 @@ def _call(
             # there is no text renderer, and on the detail path `result_transform`
             # is the safe `_add_mutation_ok`, so for a failing unclassifiable
             # result this is the only step that touches the compact summary.
-            (_apply_result_transform(spill_status, spill_context, f"summarize the {op} result"),
-             spill_status_renderer)
+            (spill_status(spill_context), spill_status_renderer)
             if spill_status is not None else None
         ),
         # #653.8: stamp WHICH target/instance produced the artifact, so a stale or
@@ -1418,6 +1513,12 @@ def _fanout_call(
     aggregate is one ``{kind: fanout, instances: [...]}`` value rendered
     per-(instance,target) (text via the command's own renderer) or JSON, through
     the normal spill path."""
+    # This renderer is handed to `_render_fanout_text`, which invokes it over in
+    # `formatters.py` -- outside anything a scan of this module's call sites can
+    # see. Bind it to the malformed-result rule before it leaves (#101/#715).
+    text_renderer = _guarded_transform(
+        text_renderer, f"render the {op} result as text",
+        advice="Rerun with --format json to see the raw result.")
     fan_instances = getattr(args, "all_instances", False)
     fan_targets = getattr(args, "all_targets", False)
     # Only a -t passed on the CLI counts as explicit (applies to every instance). A
@@ -1532,7 +1633,8 @@ def _fanout_call(
             response = send_request(
                 op, params=request_params, target=target, instance_id=iid, **timeout_kwargs
             )
-            row.update({"target": target, "ok": True, "result": response["result"]})
+            row.update({"target": target, "ok": True,
+                        "result": _unwrap_result(response, op)})
         except BridgeError as exc:
             row.update({"target": tsel, "ok": False, "error": str(exc)})
         # Per-row wall-clock so an agent can see WHERE a broad survey spent its

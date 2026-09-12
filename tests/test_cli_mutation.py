@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import ast
+import inspect
 import json
+import re
+import sys
 import types
 from pathlib import Path
 
@@ -1218,73 +1221,400 @@ def test_malformed_results_field_is_a_clean_bridge_error(monkeypatch, capsys, ro
     assert "malformed or newer than this CLI" in capsys.readouterr().err
 
 
-# The parameters that carry a bridge-result transform into `_call` and
-# `_mutation_exit_code`. Calling one of these directly is what four consecutive
-# rounds of review each found one more of.
-def _CLI_SOURCES() -> list[Path]:
-    """EVERY CLI module, not just `cli.py`.
+_OUTPUT_PATHS = pytest.mark.parametrize(
+    "extra", [[], ["--verbose"], ["--summary"], ["--format", "json"],
+              ["--format", "ndjson"], ["--out"]],
+    ids=["default", "verbose", "summary", "json", "ndjson", "out"])
 
-    The first cut of this property parsed `cli.py` alone -- but the mutation
-    handlers live in `commands/`, and one of them already imports the exit-code
-    helper and a summary transform by name. A property scoped to one file is a
-    list again: it says nothing about the files where the call sites actually
-    live.
+
+def _argv_for(extra: list[str], tmp_path) -> list[str]:
+    return [*extra, str(tmp_path / "detail.json")] if extra == ["--out"] else extra
+
+
+@pytest.mark.parametrize("result", [[], [{"status": "verified"}], "committed", 7, True],
+                         ids=["empty-list", "list", "string", "int", "bool"])
+@_OUTPUT_PATHS
+def test_a_non_object_mutation_result_is_a_clean_bridge_error(monkeypatch, capsys, tmp_path,
+                                                              result, extra):
+    """The most malformed shape of all used to be the one that exited 0.
+
+    `_mutation_exit_code` opened with `if not isinstance(result, dict): return 0`,
+    so a version-skewed bridge that answered a WRITE with a list, a string or a
+    number had its unconfirmed mutation reported to a `$?`-only consumer as a
+    clean success -- the exact #715 failure mode, on a shape strictly more
+    broken than the non-object compact summary the same helper already rejects.
+    Nothing about this result is classifiable, which is the documented exit 2.
+
+    Over every output path because the exit code is decided before the format is
+    applied: a claim like that is only worth anything if it was checked on the
+    machine formats too.
     """
-    sources = sorted((REPO / "src" / "bn").rglob("*.py"))
-    assert len(sources) > 10, f"the CLI package shrank to {len(sources)} modules"
-    return sources
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": result}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["symbol", "rename", "--target", "active", "sub_401000",
+                      "player_update", *_argv_for(extra, tmp_path)])
+
+    assert rc == 2, rc
+    assert "not an object" in capsys.readouterr().err
 
 
-_RESULT_TRANSFORM_PARAMS = frozenset({
-    "result_transform", "spill_status", "summary", "summary_transform",
-})
+@pytest.mark.parametrize("compact", [{"kind": "mutation_summary"},
+                                     {"kind": "mutation_summary", "measured": None},
+                                     {"kind": "mutation_summary", "measured": "true"}],
+                         ids=["absent", "null", "string"])
+def test_a_summary_with_no_measured_verdict_is_a_clean_bridge_error(monkeypatch, capsys,
+                                                                    compact):
+    """The exit-4 test was `compact.get("measured") is False`, so SILENCE read as
+    measured and the mutation exited 0.
 
-
-def test_no_result_transform_is_invoked_outside_the_malformed_result_guard():
-    """The property, not the list.
-
-    A mutation's compact summary is invoked from several places in `cli.py`, and
-    which one runs first depends on the result and the output format. Four review
-    rounds each found the NEXT unguarded one -- an enumeration, converging on
-    nothing, because "these N sites are guarded" says nothing about site N+1.
-
-    `_apply_result_transform` is the single guarded entry point, so the invariant
-    that actually holds the line is that NOTHING ELSE calls a transform: a fifth
-    call site added next year inherits the guard or fails here, rather than
-    becoming the fifth blocker.
+    A summary that carries no `measured` -- one from a bridge predating #684, or
+    an already-compact result short-circuited through the idempotence path --
+    said nothing about whether the write was verified. "Nothing said" is the
+    unclassifiable case, which is the documented 2, and is the same rule the
+    helper already applies to a summary that is not an object at all.
     """
-    unguarded = sorted(
-        f"{node.func.id}() at {path.relative_to(REPO)}:{node.lineno}"
-        for path in _CLI_SOURCES()
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
-        if isinstance(node, ast.Call)
-        if isinstance(node.func, ast.Name)
-        if node.func.id in _RESULT_TRANSFORM_PARAMS
-    )
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": {"preview": False, "success": True,
+                                       "committed": True, "results": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    monkeypatch.setattr(bn.cli, "_mutation_summary", lambda result: compact)
+
+    rc = bn.cli.main(["symbol", "rename", "--target", "active", "sub_401000",
+                      "player_update"])
+
+    assert rc == 2, rc
+    assert "not a boolean" in capsys.readouterr().err
+
+
+@_OUTPUT_PATHS
+def test_an_ok_reply_carrying_no_result_is_a_clean_bridge_error(monkeypatch, capsys,
+                                                                tmp_path, extra):
+    """`result = response["result"]` sat outside every guard, so a reply of
+    `{"ok": true}` -- a bridge one protocol version ahead, or a reply truncated
+    on the wire -- left `main()` as a bare `KeyError` (exit 1 and a traceback) on
+    every output format. main() catches only `BridgeError`, so an unreadable
+    envelope owes the same documented 2 as an unreadable result.
+    """
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["symbol", "rename", "--target", "active", "sub_401000",
+                      "player_update", *_argv_for(extra, tmp_path)])
+
+    assert rc == 2, rc
+    assert "carries no `result`" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("extra", [["--format", "json"], ["--format", "ndjson"], ["--out"]],
+                         ids=["json", "ndjson", "out"])
+def test_a_deeply_nested_result_is_a_clean_bridge_error(monkeypatch, capsys, tmp_path, extra):
+    """`RecursionError` was added to the malformed-result set with a comment
+    claiming it covered `json.dumps` -- but the serializer was not inside the
+    rule, so a response deep enough to exhaust the encoder still left `main()`
+    as a raw `RecursionError` (exit 1) on every machine format. Depth is a
+    property of the RESPONSE, so it owes the documented 2.
+
+    Scoped to the paths that actually serialize the payload. Under `--format
+    text` this command's renderer prints known fields and never walks the deep
+    one, so there is nothing there to guard -- asserting a code for it would
+    pin a formatter's internals rather than this rule.
+    """
+    nested: dict[str, object] = {}
+    cursor = nested
+    for _ in range(100_000):
+        child: dict[str, object] = {}
+        cursor["next"] = child
+        cursor = child
+    # The premise, executed: this payload really does break the serializer. If a
+    # future encoder survives it, this fails instead of passing vacuously.
+    with pytest.raises(RecursionError):
+        json.dumps({"deep": nested})
+
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None,
+                          spawn_missing_named=False, resolved=False, **kwargs):
+        return {"ok": True, "result": {"items": [{"name": "f", "deep": nested}],
+                                       "total": 1, "offset": 0, "limit": None,
+                                       "returned": 1, "has_more": False}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["function", "list", "--target", "active", *_argv_for(extra, tmp_path)])
+
+    assert rc == 2, rc
+    err = capsys.readouterr().err
+    assert "could not serialize the functions result" in err, err
+    assert "malformed or newer than this CLI" in err, err
+
+
+# --- The transform-guard property, restated over a population it cannot miss ---
+#
+# Five review rounds each found ONE more place a caller-supplied bridge-result
+# transform ran outside the malformed-result rule: three `try` blocks, then a
+# handler module, then `truncation_note`, then an aliased call
+# (`_t = result_transform; _t(result)`). Every one of those guards asserted
+# something true about the sites its author was looking at.
+#
+# So the population is read off the SOURCE instead of listed, and the
+# requirement is moved from the call site to the BOUNDARY: `cli.py` binds each
+# transform it receives to the rule before calling it or handing it on, which
+# makes the call shape (alias, attribute dispatch, another module) irrelevant.
+_CLI = REPO / "src" / "bn" / "cli.py"
+_GUARD = "_apply_result_transform"      # the rule
+_BOUNDARY = "_guarded_transform"        # binds a transform TO the rule
+# The rule's own implementation is the one place a transform is invoked
+# directly; both halves are self-checked below rather than trusted.
+_RULE_FUNCTIONS = (_GUARD, _BOUNDARY)
+# A bridge-result transform is exactly a callable that is handed the result:
+# `Callable[[Any], ...]`. This is what makes the population derived rather than
+# remembered -- a seventh parameter is in it the moment it is annotated.
+_TRANSFORM_ANNOTATION = re.compile(r"Callable\[\[Any\]")
+
+
+def _cli_functions() -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
+    tree = ast.parse(_CLI.read_text(encoding="utf-8"))
+    functions = [node for node in ast.walk(tree)
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    assert len(functions) > 50, f"cli.py shrank to {len(functions)} functions"
+    return functions
+
+
+def _all_args(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.arg]:
+    a = fn.args
+    return [*a.posonlyargs, *a.args, *a.kwonlyargs]
+
+
+def _is_transform_annotation(annotation: ast.expr | None) -> bool:
+    return annotation is not None and bool(
+        _TRANSFORM_ANNOTATION.search(ast.unparse(annotation)))
+
+
+def _tuple_transform_positions(annotation: ast.expr | None) -> set[int]:
+    """Which slots of a `tuple[...]`-annotated parameter carry a transform.
+
+    `spill_status: tuple[Any, Callable[[Any], str] | None]` hands a renderer
+    through position 1. Position-aware on purpose: treating every unpacked name
+    as a transform made the rendered VALUE look like one, and a guard that
+    cries wolf gets loosened rather than fixed.
+    """
+    positions: set[int] = set()
+    for node in ast.walk(annotation) if annotation is not None else ():
+        if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
+                and node.value.id == "tuple" and isinstance(node.slice, ast.Tuple)):
+            positions |= {i for i, element in enumerate(node.slice.elts)
+                          if _is_transform_annotation(element)}
+    return positions
+
+
+def _transform_bindings(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[set[str], set[str]]:
+    """(names in *fn* holding a caller-supplied transform, those bound to the rule).
+
+    Aliasing is followed to a fixpoint, so `b = a; c = b; c(result)` cannot
+    launder a transform out of the population -- that exact shape kept the
+    previous, name-matching version of this property green.
+    """
+    holders = {arg.arg for arg in _all_args(fn) if _is_transform_annotation(arg.annotation)}
+    tuples = {arg.arg: _tuple_transform_positions(arg.annotation)
+              for arg in _all_args(fn) if _tuple_transform_positions(arg.annotation)}
+    guarded: set[str] = set()
+    for _ in range(len(list(ast.walk(fn))) + 1):
+        seen = (frozenset(holders), frozenset(guarded))
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Assign):
+                continue
+            value = node.value
+            names = {name.id for target in node.targets
+                     for name in ast.walk(target) if isinstance(name, ast.Name)}
+            if (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)
+                    and value.func.id == _BOUNDARY):
+                holders |= names
+                guarded |= names
+            elif isinstance(value, ast.Name) and value.id in tuples:
+                # Position-aware FIRST: a `tuple[Any, Callable[[Any], str]]`
+                # parameter also matches the plain annotation test, and treating
+                # the whole unpack as transforms made the rendered value look
+                # like one.
+                for target in node.targets:
+                    if isinstance(target, ast.Tuple):
+                        holders |= {element.id
+                                    for position in tuples[value.id]
+                                    if position < len(target.elts)
+                                    for element in [target.elts[position]]
+                                    if isinstance(element, ast.Name)}
+            elif isinstance(value, ast.Name) and value.id in holders:
+                holders |= names
+                if value.id in guarded:
+                    guarded |= names
+        if seen == (frozenset(holders), frozenset(guarded)):
+            break
+    return holders, guarded
+
+
+def _callee(node: ast.Call) -> str | None:
+    if isinstance(node.func, ast.Name):
+        return node.func.id
+    # `self.summary(result)` dispatches the same transform through an attribute;
+    # the name is what identifies it, not how it was reached.
+    return node.func.attr if isinstance(node.func, ast.Attribute) else None
+
+
+def test_the_malformed_result_rule_is_implemented_where_this_property_says_it_is():
+    """Both halves of the mechanism, checked -- otherwise the two properties
+    below could be satisfied by renaming the rule out of existence."""
+    functions = {fn.name: fn for fn in _cli_functions()}
+    rule = functions.get(_GUARD)
+    assert rule is not None, f"{_GUARD} is gone; this whole property is unchecked"
+    handlers = [handler for node in ast.walk(rule) if isinstance(node, ast.Try)
+                for handler in node.handlers]
+    assert any(isinstance(handler.type, ast.Name)
+               and handler.type.id == "_MALFORMED_RESULT_ERRORS" for handler in handlers), (
+        f"{_GUARD} no longer catches _MALFORMED_RESULT_ERRORS, so binding a "
+        "transform to it guards nothing")
+    boundary = functions.get(_BOUNDARY)
+    assert boundary is not None, f"{_BOUNDARY} is gone; nothing binds a transform to the rule"
+    assert any(_callee(node) == _GUARD for node in ast.walk(boundary)
+               if isinstance(node, ast.Call)), (
+        f"{_BOUNDARY} must delegate to {_GUARD}; otherwise it returns an "
+        "unguarded transform under a reassuring name")
+
+
+def test_no_bridge_result_transform_is_invoked_before_it_is_bound_to_the_rule():
+    """Property: in `cli.py`, a transform is CALLED only after the boundary
+    rebinding. Scoped to the module that receives every transform, and holding
+    for any call shape, because it is the object that is guarded and not the
+    site."""
+    unguarded = []
+    for fn in _cli_functions():
+        if fn.name in _RULE_FUNCTIONS:
+            continue
+        holders, guarded = _transform_bindings(fn)
+        unguarded += [
+            f"{_callee(node)}() in {fn.name}() at cli.py:{node.lineno}"
+            for node in ast.walk(fn)
+            if isinstance(node, ast.Call)
+            if _callee(node) in holders - guarded
+        ]
     assert not unguarded, (
-        "these invoke a bridge-result transform directly instead of through "
-        f"_apply_result_transform, so a malformed result escapes there: {unguarded}"
+        "these invoke a bridge-result transform that was never bound to the "
+        f"malformed-result rule, so a malformed result escapes there: {sorted(unguarded)}"
     )
 
 
-def test_the_malformed_result_guard_is_reached_from_every_transform_parameter():
-    """...and the guarded entry point must actually be wired to each of them, so
-    the property above cannot be satisfied by simply never using them."""
-    passed_through = {
-        arg.id
-        for path in _CLI_SOURCES()
-        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8")))
-        if isinstance(node, ast.Call)
-        if isinstance(node.func, ast.Name) and node.func.id == "_apply_result_transform"
-        for arg in node.args
-        if isinstance(arg, ast.Name)
-    }
-    missing = sorted({"result_transform", "spill_status", "summary"} - passed_through)
-    assert not missing, (
-        "these transform parameters never reach the malformed-result guard: "
-        f"{missing}"
+def test_no_bridge_result_transform_leaves_cli_py_unguarded():
+    """...and the other way out: a transform handed to another module is invoked
+    THERE, where no scan of `cli.py`'s call sites can see it -- the fan-out text
+    renderer already calls its `inner_renderer` directly in `formatters.py`. So
+    whatever leaves this module must already be bound to the rule. Calls to
+    `cli.py`'s own functions are exempt because the property above covers them.
+    """
+    in_module = {fn.name for fn in _cli_functions()} | {_BOUNDARY, _GUARD}
+    leaked = []
+    for fn in _cli_functions():
+        if fn.name in _RULE_FUNCTIONS:
+            continue
+        holders, guarded = _transform_bindings(fn)
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.Call) or _callee(node) in in_module:
+                continue
+            passed = [*node.args, *(keyword.value for keyword in node.keywords)]
+            leaked += [
+                f"{arg.id} -> {_callee(node)}() in {fn.name}() at cli.py:{node.lineno}"
+                for arg in passed
+                if isinstance(arg, ast.Name) and arg.id in holders - guarded
+            ]
+    assert not leaked, (
+        "these hand an unguarded bridge-result transform out of cli.py, where "
+        f"it is invoked outside the malformed-result rule: {sorted(leaked)}"
     )
 
+
+def _probe_response(op, *, params=None, target=None, timeout=30.0, instance_id=None,
+                    spawn_missing_named=False, resolved=False, **kwargs):
+    return {"ok": True, "result": {"items": [{"name": "probe"}], "total": 1,
+                                   "success": True, "committed": True,
+                                   "results": [{"status": "verified"}]}}
+
+
+def _arrange_always(monkeypatch, tmp_path) -> dict[str, object]:
+    """Sites `_call` reaches on every result."""
+    return {}
+
+
+def _arrange_piped_stdout(monkeypatch, tmp_path) -> dict[str, object]:
+    """`truncation_note` fires only when the body did not spill and stdout is a pipe."""
+    monkeypatch.setattr(bn.cli, "_stdout_is_pipe", lambda: True)
+    return {}
+
+
+def _arrange_spilled_status(monkeypatch, tmp_path) -> dict[str, object]:
+    """`spill_status_renderer` fires only on a result that SPILLED, under text."""
+    monkeypatch.setenv("BN_SPILL_TOKENS", "1")
+    return {"spill_status": lambda result: {"kind": "mutation_summary", "measured": True}}
+
+
+# The arrangement for each transform parameter's site. Checked against the live
+# signature below: a parameter with no arrangement here FAILS, because an
+# unexercised transform parameter is exactly an unguarded one.
+_TRANSFORM_ARRANGEMENTS = {
+    "result_exit_code": _arrange_always,
+    "result_transform": _arrange_always,
+    "text_renderer": _arrange_always,
+    "spill_status": _arrange_always,
+    "truncation_note": _arrange_piped_stdout,
+    "spill_status_renderer": _arrange_spilled_status,
+}
+
+
+def _call_transform_params() -> list[str]:
+    """`_call`'s transform parameters, off the live signature."""
+    params = sorted(
+        name for name, parameter in inspect.signature(bn.cli._call).parameters.items()
+        if _TRANSFORM_ANNOTATION.search(str(parameter.annotation))
+    )
+    assert len(params) >= 6, f"_call's transform parameters vanished: {params}"
+    return params
+
+
+@pytest.mark.parametrize("param", _call_transform_params())
+def test_every_transform_parameter_of_call_survives_a_malformed_result(param, monkeypatch,
+                                                                      tmp_path, capsys):
+    """The behavioural half, over the population `inspect.signature` reports.
+
+    Each parameter is handed a transform that raises on the result -- what a
+    version-skewed response does to code that parses or aggregates it -- and the
+    outcome must be the documented `BridgeError` (exit 2), never an exception
+    `main()` does not catch. The cell also asserts the transform really RAN, so
+    a parameter whose site the arrangement fails to reach cannot pass by
+    proving nothing.
+    """
+    from bn.transport import BridgeError
+
+    invoked = []
+
+    def raiser(result):
+        invoked.append(result)
+        raise ValueError("unparseable counter")
+
+    arrange = _TRANSFORM_ARRANGEMENTS.get(param)
+    assert arrange is not None, (
+        f"_call grew a transform parameter with no arrangement: {param}. Add one "
+        "-- an unexercised transform parameter is an unguarded one."
+    )
+    kwargs = arrange(monkeypatch, tmp_path)
+    kwargs[param] = raiser
+    monkeypatch.setattr(bn.cli, "send_request", _probe_response)
+    args = bn.cli.build_parser().parse_args(["function", "list", "--target", "active"])
+
+    with pytest.raises(BridgeError) as raised:
+        bn.cli._call(args, "list_functions", {}, require_target=True, stem="probe", **kwargs)
+
+    assert invoked, f"{param} was never invoked, so this cell proved nothing"
+    assert "malformed or newer than this CLI" in str(raised.value), raised.value
 
 
 def test_unclassifiable_mutation_result_advice_is_actionable(monkeypatch, capsys):

@@ -98,21 +98,53 @@ def command_paths(stub_engine) -> set[str]:
     return paths
 
 
-# The test modules in this PR's fence that stub the engine to read a registry
-# without Binary Ninja installed.
-ENGINE_STUBBING_TESTS = ("test_skill_reference_drift.py", "test_agent_docs.py")
+TESTS = Path(__file__).resolve().parent
+
+# Writing to `sys.modules` without restoring it: both shapes, because either one
+# alone escaped a guard that only knew about the other. A mutating CALL on the
+# mapping, and a direct item write. `monkeypatch.setitem(sys.modules, ...)` and
+# `MonkeyPatch.context()` pass the mapping as an ARGUMENT and put it back, so
+# they are not writes ON the mapping and are correctly invisible here.
+_SYS_MODULES_MUTATORS = frozenset({
+    "setdefault", "update", "pop", "popitem", "clear", "__setitem__", "__delitem__",
+})
+
+
+def _is_modules_mapping(node: ast.expr) -> bool:
+    """`sys.modules`, however `sys` was named (`import sys as s` still matches)."""
+    return isinstance(node, ast.Attribute) and node.attr == "modules"
+
+
+def _unrestored_sys_modules_writes(path: Path) -> list[str]:
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in _SYS_MODULES_MUTATORS
+                and _is_modules_mapping(node.func.value)):
+            yield f"{path.name}:{node.lineno} sys.modules.{node.func.attr}()"
+        targets: list[ast.expr] = []
+        if isinstance(node, (ast.Assign, ast.Delete)):
+            targets = list(node.targets)
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+            targets = [node.target]
+        for target in targets:
+            if isinstance(target, ast.Subscript) and _is_modules_mapping(target.value):
+                yield f"{path.name}:{node.lineno} sys.modules[...] assigned directly"
 
 
 def test_an_engine_stub_is_installed_only_in_a_form_that_restores():
-    """`sys.modules.setdefault` has NO teardown, so a stub installed that way
-    outlives the fixture -- and, at import scope, outlives the module: the same
-    pattern deterministically broke four unrelated modules in this suite by
-    shadowing the real engine for everything collected afterwards.
+    """A module stub that outlives the module that installed it shadows the real
+    engine for everything collected afterwards -- four unrelated modules in this
+    suite went down that way, deterministically, as a collection error.
 
     Two halves, because either alone is satisfiable without the other: the
-    mechanism really does restore, and nothing here still uses the form that
-    does not. The second half is the one that goes red against the fixtures this
-    replaced.
+    mechanism really does restore, and no test module anywhere still writes
+    `sys.modules` in a form that does not.
+
+    The population is EVERY module under `tests/`, and every write shape. The
+    previous cut named the two modules this change happened to touch and the one
+    call shape it happened to use, so a third module's stub and a plain
+    `sys.modules[name] = ...` inside one of those two both stayed green while
+    reproducing the original defect exactly.
     """
     probe = "bn_absent_engine_probe"
     assert probe not in sys.modules, "pick a name nothing has imported"
@@ -122,17 +154,13 @@ def test_an_engine_stub_is_installed_only_in_a_form_that_restores():
         assert sys.modules[probe] is not None
     assert probe not in sys.modules, "the patched stub outlived its context"
 
-    leaking = sorted(
-        f"{name}:{node.lineno}"
-        for name in ENGINE_STUBBING_TESTS
-        for node in ast.walk(ast.parse((Path(__file__).parent / name).read_text(encoding="utf-8")))
-        if isinstance(node, ast.Call)
-        if isinstance(node.func, ast.Attribute) and node.func.attr == "setdefault"
-        if isinstance(node.func.value, ast.Attribute) and node.func.value.attr == "modules"
-    )
+    modules = sorted(TESTS.rglob("*.py"))
+    assert len(modules) > 20, f"only {len(modules)} test modules found; check the glob"
+    leaking = sorted(write for path in modules
+                     for write in _unrestored_sys_modules_writes(path))
     assert not leaking, (
-        "these install a module stub with no teardown, so it outlives the test "
-        f"that asked for it and can break a module collected later: {leaking}"
+        "these write sys.modules with no teardown, so the entry outlives the "
+        f"module that asked for it and can break one collected later: {leaking}"
     )
 
 

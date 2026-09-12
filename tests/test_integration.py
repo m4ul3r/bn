@@ -840,6 +840,37 @@ class TestSessionStartTimeoutDiagnostics:
 
         assert seen["timeout"] == _CROSS_ARCH_SESSION_START_TIMEOUT, seen
 
+    def test_every_cross_arch_start_goes_through_the_lane_budget_helper(self):
+        """...and the lane must be pinned to it, not merely have one.
+
+        The test above observes the helper. Nothing stopped a NEW lane test from
+        calling the general `_session_start` directly, which puts the slow
+        cross-built probe straight back on the general budget with every test
+        green -- exactly the shape #718 was filed against. So the property is
+        over the whole lane class, not over the tests that happen to exist now.
+        """
+        import ast
+
+        tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+        lane = next((node for node in ast.walk(tree)
+                     if isinstance(node, ast.ClassDef)
+                     and node.name == "TestDisasmLinearAArch64"), None)
+        assert lane is not None, "the cross-arch lane class was renamed; update this guard"
+        helper = next((node for node in lane.body
+                       if isinstance(node, ast.FunctionDef) and node.name == "_start"), None)
+        assert helper is not None, "the lane's one budget-applying helper is gone"
+        direct = [
+            f"tests/test_integration.py:{node.lineno}"
+            for node in ast.walk(lane)
+            if isinstance(node, ast.Call)
+            if isinstance(node.func, ast.Name) and node.func.id == "_session_start"
+            if not helper.lineno <= node.lineno <= (helper.end_lineno or helper.lineno)
+        ]
+        assert not direct, (
+            "these start a session in the cross-arch lane without going through "
+            f"_start, so they run the slow probe on the general budget: {direct}"
+        )
+
     def test_timed_out_start_carries_partial_output_and_bridge_log(self, monkeypatch):
         self._hang(monkeypatch, self._HANGING_CLI)
         with pytest.raises(subprocess.TimeoutExpired) as excinfo:

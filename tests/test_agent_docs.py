@@ -168,6 +168,123 @@ def test_exit_code_bullet_documents_every_code_the_cli_can_return():
     )
 
 
+# EVERY clause of the exit-code bullet, each with a cell of its own. The
+# previous cut asserted the five code numbers, the literal `measured: false` and
+# the word `classify` -- so four clauses this contract rests on could be deleted
+# with the module still green, including #716's only documented rule (a refusal
+# is 3 whether it was raised up front or at apply). Deleting any clause below
+# reds exactly the cell that names it; adding a clause with no cell reds the
+# coverage test underneath. Both halves, because presence alone is a list again.
+_EXIT_CODE_CLAUSES = (
+    ("0-success", r"\b0 = success"),
+    ("1-cli-side-handler-error", r"\b1 = CLI-side handler error"),
+    ("2-bridge-error", r"\b2 = `BridgeError`"),
+    ("2-read-or-resolver-status", r"`FAILED_MUTATION_STATUSES` on a read/resolver call"),
+    ("2-unclassifiable-mutation", r"mutation result this CLI cannot classify"),
+    ("3-mutation-status", r"\b3 = a `_mutate`-marked call whose status is"),
+    ("3-refused-up-front-or-at-apply",
+     r"refusal is exit 3 whether it was raised up front or during apply, never 2"),
+    ("4-unmeasured",
+     r"\b4 = a `_mutate`-marked call whose compact summary reports `measured: false`"),
+    ("4-no-rows-and-no-own-summary",
+     r"no `results\[\]` rows to derive counts from AND registered no summary of its own"),
+    ("4-own-summary-stays-measured",
+     r"counts through its own registered summary \(`go rename`\) stays measured and exits 0"),
+    ("4-failure-wins-and-all-noop-is-zero",
+     r"failure still wins over 4 \(3 before 4\), and a measured all-`noop` is 0"),
+)
+
+
+@pytest.mark.parametrize("clause,pattern", _EXIT_CODE_CLAUSES,
+                         ids=[name for name, _ in _EXIT_CODE_CLAUSES])
+def test_every_clause_of_the_exit_code_bullet_is_guarded(clause: str, pattern: str):
+    """One cell per clause: this is the test that goes red when a clause is
+    deleted, which is the whole reason the bullet is worth writing."""
+    bullet = _bullet("- Exit codes:")
+    assert re.search(pattern, bullet), (
+        f"the exit-code bullet no longer states the {clause!r} clause, so the "
+        f"documented contract and the code can now disagree silently: {bullet}"
+    )
+
+
+def _exit_code_clauses(bullet: str) -> list[str]:
+    """The bullet's OWN clauses, split on its clause punctuation at paren depth 0.
+
+    Depth matters: an em dash or a sentence period inside a parenthetical
+    ("(e.g. partial `session start` failure)") is not a clause boundary, and
+    treating it as one manufactured fragments that no cell could sensibly claim.
+    """
+    body = bullet.split("- Exit codes:", 1)[1]
+    found: list[str] = []
+    buffer = ""
+    depth = 0
+    for index, char in enumerate(body):
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        if depth == 0 and (char in "—;" or (char == "." and body[index + 1:index + 2] == " ")):
+            found.append(buffer)
+            buffer = ""
+            continue
+        if depth == 0 and re.match(r"[0-4] = ", body[index:index + 4]):
+            found.append(buffer)
+            buffer = char
+            continue
+        buffer += char
+    found.append(buffer)
+    return [clause.strip(" ,") for clause in found if clause.strip(" ,")]
+
+
+def test_the_exit_code_bullet_carries_no_unguarded_clause():
+    """The other half: the enumeration above must cover the bullet.
+
+    Presence alone is satisfiable by a list that has stopped keeping up -- which
+    is exactly how the exit-4 body, the own-summary clause and #716's refusal
+    rule shipped unguarded. A clause added here without a cell of its own is a
+    claim nothing checks, so it fails until it gets one.
+    """
+    bullet = _bullet("- Exit codes:")
+    clauses = _exit_code_clauses(bullet)
+    assert len(clauses) >= 8, f"the clause split degenerated: {clauses}"
+    uncovered = [clause for clause in clauses
+                 if not any(re.search(pattern, clause) for _, pattern in _EXIT_CODE_CLAUSES)]
+    assert not uncovered, (
+        "these clauses of the exit-code bullet have no cell in "
+        f"_EXIT_CODE_CLAUSES, so deleting them would keep this module green: {uncovered}"
+    )
+
+
+def test_the_exit_code_bullet_clauses_are_what_the_cli_actually_does():
+    """...and the clauses are pinned as TEXT above, so this is the half that
+    makes them true rather than merely quoted: each behavioural claim is executed
+    against the helper the bullet describes."""
+    from bn.cli import _mutation_exit_code
+
+    verified = {"success": True, "committed": True, "results": [{"status": "verified"}]}
+    all_noop = {"success": True, "committed": True, "results": [{"status": "noop"}]}
+    unmeasured = {"success": True, "committed": True, "results": []}
+    failing_unmeasured = {"success": False, "committed": False, "results": []}
+    refused_up_front = {"success": False, "committed": False,
+                        "results": [{"status": "invalid_request"}]}
+    failed_at_apply = {"success": False, "committed": False,
+                       "results": [{"status": "verification_failed"}]}
+
+    assert _mutation_exit_code(verified, _mutation_summary) == 0
+    # "a measured all-`noop` is 0"
+    assert _mutation_exit_code(all_noop, _mutation_summary) == 0
+    # "4 = ... `measured: false`"
+    assert _mutation_exit_code(unmeasured, _mutation_summary) == 4
+    # "A failure still wins over 4 (3 before 4)"
+    assert _mutation_exit_code(failing_unmeasured, _mutation_summary) == 3
+    # "the refusal is exit 3 whether it was raised up front or during apply"
+    assert _mutation_exit_code(refused_up_front, _mutation_summary) == 3
+    assert _mutation_exit_code(failed_at_apply, _mutation_summary) == 3
+    # "an op that counts through its own registered summary stays measured and exits 0"
+    own_counters = lambda result: {"kind": "mutation_summary", "measured": True}
+    assert _mutation_exit_code(unmeasured, own_counters) == 0
+
+
 @pytest.mark.parametrize("group", ("cli", "bridge"))
 def test_test_layout_bullet_concerns_still_resolve(group: str):
     """#614's defect was the bullet naming modules a split had renamed away, so
@@ -325,13 +442,17 @@ def test_lock_model_paragraph_describes_none_ops_as_self_managing():
         f'the paragraph mentions "{claim}" without refuting it, which is worse '
         f"than not mentioning it at all: {sentence}"
     )
-    # The counterexample must sit in the refutation itself. Accepting any op name
-    # anywhere in the paragraph let an incidental later parenthetical stand in
-    # after the refuting clause and its three op names had been deleted.
-    named = [op for op in stateful if f"`{op}`" in sentence[at:at + 200]]
+    # The counterexample must sit in the refutation CLAUSE -- bounded by the
+    # clause's own terminator, not by a character count. A fixed 200-char window
+    # from the claim still reached a later incidental parenthetical, so deleting
+    # the refuting clause together with its three op names left this green: the
+    # round-4 defect at a smaller radius, which is not the same as fixed.
+    refutation = re.split(r"[;.]", sentence[at:], maxsplit=1)[0]
+    named = [op for op in stateful if f"`{op}`" in refutation]
     assert named, (
         'the refutation must name a stateful lock="none" op as its counterexample, '
-        f"so it is concrete rather than a phrase; stateful ops are {stateful}"
+        "so it is concrete rather than a phrase; the refuting clause reads "
+        f"{refutation!r} and the stateful ops are {stateful}"
     )
 
 
