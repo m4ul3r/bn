@@ -1046,3 +1046,70 @@ def test_render_trace_text_intra_out_param_reason_shows_callee():
     }
     out = _render_trace_text(value)
     assert "out-param fill not followed (via parse_input)" in out
+
+
+def test_go_rename_summary_shares_one_builder_with_the_mutation_summary(monkeypatch):
+    """#685: `go rename` reports through its own go_* counters but emits the SAME
+    compact-status schema as every other mutation, so both summaries must be
+    produced by ONE builder. They used to be separate dict literals, and the
+    copy drifted twice into defects the shared path already handled: a failure
+    row's `first_error`, and a revert that fails after every rename verified.
+    Pin the sharing (a change to the builder reaches both) and the shared rules
+    (the same OUTCOME reaches the same keys through either path)."""
+    from bn import formatters
+
+    real_builder = formatters._build_mutation_summary
+    calls: list[dict] = []
+
+    def spy(**kwargs):
+        calls.append(kwargs)
+        return real_builder(**kwargs)
+
+    monkeypatch.setattr(formatters, "_build_mutation_summary", spy)
+
+    measured = formatters._mutation_summary({
+        "success": True, "committed": True, "preview": False, "rolled_back": False,
+        "results": [{"status": "verified"}]})
+    go = formatters._go_rename_summary({
+        "kind": "go_rename", "success": True, "committed": True, "preview": False,
+        "rolled_back": False, "results": [], "go_renamed_candidates": 3,
+        "go_committed_count": 3, "go_verified_count": 3, "go_failed_count": 0,
+        "skipped_user_named": 1})
+
+    # One builder produced both -- neither path can drift from the other again.
+    assert len(calls) == 2
+    assert measured["changed_count"] == 1 and go["changed_count"] == 3
+    assert set(measured) == set(go)
+
+    # A preview whose revert failed: zero failure rows, explanation only in the
+    # top-level message. Both paths must call it dirty AND carry the error --
+    # reporting failed=0 with no error while the view is partially renamed is
+    # the defect the copy shipped once.
+    message = "preview rollback failed; the view is partially renamed"
+    mutation_stuck = formatters._mutation_summary({
+        "success": False, "committed": False, "preview": True, "rolled_back": False,
+        "message": message, "results": [{"status": "verified"}]})
+    go_stuck = formatters._go_rename_summary({
+        "kind": "go_rename", "success": False, "committed": False, "preview": True,
+        "rolled_back": False, "message": message, "results": [],
+        "go_renamed_candidates": 5, "go_committed_count": 0,
+        "go_verified_count": 5, "go_failed_count": 0, "skipped_user_named": 0})
+    for key in ("kind", "ok", "success", "committed", "preview", "measured",
+                "rolled_back", "dirty_after", "first_error"):
+        assert mutation_stuck[key] == go_stuck[key]
+    assert go_stuck["first_error"] == message
+
+    # A failure whose ONLY explanation is a results[] row: `first_error` must be
+    # read off the row on both paths, never dropped to a bare failed count.
+    reason = "rename is unsupported on this view"
+    mutation_row = formatters._mutation_summary({
+        "success": False, "committed": False, "rolled_back": True,
+        "results": [{"status": "unsupported", "message": reason}]})
+    go_row = formatters._go_rename_summary({
+        "kind": "go_rename", "success": False, "committed": False, "preview": False,
+        "rolled_back": True,
+        "results": [{"status": "unsupported", "message": reason}],
+        "go_renamed_candidates": 5, "go_verified_count": 0, "go_committed_count": 0,
+        "go_failed_count": 1, "skipped_user_named": 0})
+    assert mutation_row["failed_count"] == go_row["failed_count"] == 1
+    assert mutation_row["first_error"] == go_row["first_error"] == reason

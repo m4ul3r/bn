@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from .transport import BridgeError
 
@@ -3351,58 +3351,60 @@ def _add_mutation_ok(value: Any) -> Any:
     return {"ok": bool(value.get("success", True)) and not failed, **value}
 
 
-def _mutation_summary(value: Any) -> Any:
-    """#408: collapse a (single or batch) mutation result into a compact,
-    schema-stable status object for an unattended agent control loop -- did
-    anything change, did verification pass, was anything rolled back, what needs
-    attention -- without parsing the full results/affected_functions/diff payload.
-    The detailed result stays available without --summary."""
-    if not isinstance(value, dict):
-        return value
-    # Idempotent: `_call` evaluates `spill_status` against the ALREADY-transformed
-    # result, so on the compact path this runs on its own output. Without this
-    # guard the second pass sees no `results` and re-zeroes every count -- today
-    # only wasted work (a ~200-byte summary never crosses the spill threshold),
-    # but a spilled mutation would print an all-zero status.
-    if value.get("kind") == "mutation_summary":
-        return value
-    results = [r for r in (value.get("results") or []) if isinstance(r, dict)]
-    failed = [r for r in results if r.get("status") in FAILED_MUTATION_STATUSES]
-    verified = sum(1 for r in results if r.get("status") == "verified")
-    noop = sum(1 for r in results if r.get("status") == "noop")
-    committed = bool(value.get("committed", False))
-    rolled_back = value.get("rolled_back")
-    success = bool(value.get("success", True)) and not failed
+def _build_mutation_summary(
+    *,
+    measured: bool,
+    op_count: int,
+    reported_success: bool,
+    failure_rows: Sequence[dict[str, Any]],
+    failed: int | None,
+    changed: int | None,
+    verified: int | None,
+    noop: int | None,
+    committed: bool,
+    preview: bool,
+    rolled_back: Any,
+    message: Any,
+    proto_residue: bool = False,
+    default_error: str = "mutation failed",
+) -> dict[str, Any]:
+    """The ONE compact-status schema every mutation summary emits (#685).
+
+    The callers differ only in their INPUTS: `_mutation_summary` derives its
+    counts from `results[]`, while `go rename` reports through its own `go_*`
+    counters. Everything that must not drift between them lives here -- the key
+    set, the `ok`/`success` mirroring (#447), the `first_error` fallbacks, the
+    `dirty_after` rule and the conditional residue key (#630). This table is
+    documented in `skills/bn/reference/mutating.md`: a key change is a contract
+    change.
+    """
+    success = reported_success and not failed
+    # The failure explanation, in the one order both ops share: the first failure
+    # ROW's own message/status (an `unsupported` early return puts its only
+    # explanation in `results[0]["message"]`), then the top-level `message` (a
+    # revert that failed AFTER every op verified has no failure row at all), then
+    # a per-op default. Gating on `not success` rather than on `failed` is what
+    # keeps the last two reachable while `failed` is 0.
     first_error = None
-    if failed:
-        f0 = failed[0]
-        first_error = f0.get("message") or f0.get("status") or "mutation failed"
-    # A failure can carry its only explanation in the top-level `message` -- e.g. a
-    # preview/revert cleanup that failed AFTER every op verified, so no result row
-    # is in FAILED_MUTATION_STATUSES. Surface it so --summary never drops the error.
-    if first_error is None and not success:
-        first_error = value.get("message") or "mutation failed"
-    # An unclearable has_user_type override left behind by a reverted proto-set on
-    # an AUTO function is behaviorally meaningful residue that a control loop must
-    # see even in the compact summary (#630): it means the view is left modified.
-    proto_residue = bool(value.get("prototype_user_type_residue"))
+    if not success:
+        for row in failure_rows:
+            if isinstance(row, dict):
+                first_error = row.get("message") or row.get("status")
+                if first_error:
+                    break
+        if first_error is None:
+            first_error = message or default_error
     if proto_residue:
-        # Prefer the residue-explaining top-level message: a bare failed-row status
-        # ("rollback_failed") does not tell the loop what actually went wrong.
-        first_error = value.get("message") or first_error or (
+        # An unclearable has_user_type override left behind by a reverted
+        # proto-set on an AUTO function is behaviorally meaningful residue that a
+        # control loop must see even in the compact summary (#630): it means the
+        # view is left modified. Prefer the residue-explaining top-level message
+        # -- a bare failed-row status ("rollback_failed") does not tell the loop
+        # what actually went wrong.
+        first_error = message or first_error or (
             "prototype has_user_type override could not be cleared"
         )
-    # #684: every genuine `mutation_engine` op populates at least one
-    # `results[]` row per requested operation -- `_mutation()` refuses an
-    # empty operation list outright, so an op that reaches this GENERIC
-    # summary (no registered `summary_transform`) with an EMPTY `results[]`
-    # is never reporting a real zero-change measurement. It means the op
-    # reports through its OWN counters instead (the shape `_go_rename_summary`
-    # exists to handle) and forgot to register that escape hatch. A genuine
-    # zero-change result (e.g. a rename that matched the current name already)
-    # still comes through as a `noop` STATUS ROW inside a non-empty `results[]`
-    # -- it stays measured and distinct from the unmeasured case below.
-    unmeasured = not results
+    unmeasured = not measured
     if unmeasured:
         # Review of the first cut of this fix (#684): `dirty_after: None` is
         # FALSY under every truthiness check a control loop actually writes --
@@ -3433,24 +3435,25 @@ def _mutation_summary(value: Any) -> Any:
         "ok": success,
         "success": success,
         "committed": committed,
-        "preview": bool(value.get("preview", False)),
+        "preview": preview,
         # False when `results[]` came back empty on an op that was expected to
         # populate it. The four derived counts below are then UNKNOWN (None, not
         # a confident zero); `op_count` stays 0 (literally true -- zero rows) and
         # `dirty_after` is a deliberate fail-safe True, NOT unknown (#684).
         "measured": not unmeasured,
-        "op_count": len(results),
-        "changed_count": (None if unmeasured else verified),  # ops that changed + verified
+        "op_count": op_count,
+        "changed_count": (None if unmeasured else changed),
         "verified_count": (None if unmeasured else verified),
         "noop_count": (None if unmeasured else noop),
-        "failed_count": (None if unmeasured else len(failed)),
+        "failed_count": (None if unmeasured else failed),
         # True/False when a revert was attempted; None when none was needed.
         "rolled_back": (bool(rolled_back) if rolled_back is not None else None),
         "first_error": first_error,
         # The DB is left modified iff a live mutation actually CHANGED state
-        # (committed AND something verified -- `committed` is True even for an
-        # all-noop mutation, which leaves the DB clean), a failure's revert itself
-        # failed, or an unclearable has_user_type override was left behind (#630).
+        # (committed AND something changed -- `committed` is True even for an
+        # all-noop mutation, which leaves the DB clean), a failure's revert
+        # itself failed, or an unclearable has_user_type override was left
+        # behind (#630).
         #
         # The revert test is `rolled_back is False AND not committed`, not
         # `rolled_back is False` alone: #652 made the bridge emit `rolled_back`
@@ -3464,7 +3467,7 @@ def _mutation_summary(value: Any) -> Any:
         # fail-safe rationale above (#684 review). An agent that never reads
         # `measured` still gets the safe answer from `dirty_after` alone.
         "dirty_after": (True if unmeasured else (
-            (committed and verified > 0)
+            (committed and bool(changed))
             or (rolled_back is False and not committed)
             or proto_residue
         )),
@@ -3474,16 +3477,53 @@ def _mutation_summary(value: Any) -> Any:
     return summary
 
 
-def _first_go_rename_error(value: dict[str, Any]) -> str | None:
-    """The most specific failure explanation a go_rename result carries."""
-    for row in (value.get("results") or []):
-        if not isinstance(row, dict):
-            continue
-        message = row.get("message") or row.get("status")
-        if message:
-            return str(message)
-    message = value.get("message")
-    return str(message) if message else "go rename failed"
+def _mutation_summary(value: Any) -> Any:
+    """#408: collapse a (single or batch) mutation result into a compact,
+    schema-stable status object for an unattended agent control loop -- did
+    anything change, did verification pass, was anything rolled back, what needs
+    attention -- without parsing the full results/affected_functions/diff payload.
+    The detailed result stays available without --summary.
+
+    Derives the shared builder's inputs from `results[]` (#685)."""
+    if not isinstance(value, dict):
+        return value
+    # Idempotent: `_call` evaluates `spill_status` against the ALREADY-transformed
+    # result, so on the compact path this runs on its own output. Without this
+    # guard the second pass sees no `results` and re-zeroes every count -- today
+    # only wasted work (a ~200-byte summary never crosses the spill threshold),
+    # but a spilled mutation would print an all-zero status.
+    if value.get("kind") == "mutation_summary":
+        return value
+    results = [r for r in (value.get("results") or []) if isinstance(r, dict)]
+    failed = [r for r in results if r.get("status") in FAILED_MUTATION_STATUSES]
+    verified = sum(1 for r in results if r.get("status") == "verified")
+    noop = sum(1 for r in results if r.get("status") == "noop")
+    # #684: every genuine `mutation_engine` op populates at least one `results[]`
+    # row per requested operation -- `_mutation()` refuses an empty operation list
+    # outright -- so an op that reaches this GENERIC summary (no registered
+    # `summary_transform`) with an EMPTY `results[]` is never reporting a real
+    # zero-change measurement. It means the op reports through its OWN counters
+    # instead (the shape `_go_rename_summary` exists to handle) and forgot to
+    # register that escape hatch. A genuine zero-change result (e.g. a rename that
+    # matched the current name already) still comes through as a `noop` STATUS ROW
+    # inside a non-empty `results[]` -- it stays measured and distinct from the
+    # unmeasured case the builder fails safe on.
+    unmeasured = not results
+    return _build_mutation_summary(
+        measured=not unmeasured,
+        op_count=len(results),
+        reported_success=bool(value.get("success", True)),
+        failure_rows=failed,
+        failed=len(failed),
+        changed=verified,
+        verified=verified,
+        noop=noop,
+        committed=bool(value.get("committed", False)),
+        preview=bool(value.get("preview", False)),
+        rolled_back=value.get("rolled_back"),
+        message=value.get("message"),
+        proto_residue=bool(value.get("prototype_user_type_residue")),
+    )
 
 
 def _go_rename_summary(value: Any) -> Any:
@@ -3496,6 +3536,10 @@ def _go_rename_summary(value: Any) -> Any:
     through the generic summary therefore rendered a run that renamed 1783
     functions as `changed=0 ... dirty_after=False`, and a caller reading that
     closes without saving and silently discards every recovered name.
+
+    Derives the shared builder's inputs from those counters (#685), so the
+    compact SCHEMA -- and with it the `first_error` and `dirty_after` rules --
+    has exactly one definition.
     """
     if not isinstance(value, dict) or value.get("kind") != "go_rename":
         return _mutation_summary(value)
@@ -3507,7 +3551,6 @@ def _go_rename_summary(value: Any) -> Any:
     failed = int(value.get("go_failed_count") or 0)
     skipped = int(value.get("skipped_user_named") or 0)
     rolled_back = value.get("rolled_back")
-    success = bool(value.get("success", True)) and not failed
 
     # `changed` is what is LIVE in the view when the call returns, never the plan:
     #   committed -> what actually landed;
@@ -3525,42 +3568,38 @@ def _go_rename_summary(value: Any) -> Any:
     else:
         changed = 0
 
-    # Gate on `not success`, not on `failed`: a revert that fails AFTER every
-    # rename verified produces zero failure rows, and its only explanation is the
-    # top-level message. `_mutation_summary` has the same fallback.
-    first_error = _first_go_rename_error(value) if not success else None
-
-    return {
-        "kind": "mutation_summary",
-        "ok": success,
-        "success": success,
-        "committed": committed,
-        "preview": preview,
+    # The failure explanation (a failure row's message/status, then the top-level
+    # `message`) and `dirty_after` come from the shared builder: gating on
+    # `not success`, not on `failed`, is what keeps a revert that failed AFTER
+    # every rename verified -- zero failure rows, message only -- from reporting
+    # failed=0 with no error while the view sits partially renamed.
+    return _build_mutation_summary(
         # go_rename measures through its own counters by design (this whole
         # function is that escape hatch) -- always measured, never #684-flagged.
-        "measured": True,
+        measured=True,
         # NOT disjoint sets: the wire `skipped_user_named` FOLDS apply-time
         # "changed underneath us" skips in (bridge: skipped_total =
         # skipped_user_named + skipped_during_apply) while those same rows stay
         # inside go_renamed_candidates. Distinct functions considered =
         # candidates + scan-time-only skips -- keeping verified+noop+failed <=
         # op_count, the invariant every other mutation summary holds.
-        "op_count": candidates + skipped
-                    - int(value.get("skipped_changed_during_apply") or 0),
-        "changed_count": changed,
-        "verified_count": verified,
+        op_count=candidates + skipped
+                 - int(value.get("skipped_changed_during_apply") or 0),
+        reported_success=bool(value.get("success", True)),
+        # `results[]` holds only the FAILURE rows for this op.
+        failure_rows=value.get("results") or [],
+        failed=failed,
+        changed=changed,
+        verified=verified,
         # Already-user-named functions are deliberately left alone: no change,
         # which is what `noop` means elsewhere.
-        "noop_count": skipped,
-        "failed_count": failed,
-        "rolled_back": (bool(rolled_back) if rolled_back is not None else None),
-        "first_error": first_error,
-        # Live state exists iff renames actually landed, or a revert failed and
-        # left them behind. (`prototype_user_type_residue` is a proto-set concept
-        # and never appears on a go_rename envelope, so it is not tested here.)
-        "dirty_after": ((committed and committed_count > 0)
-                        or (rolled_back is False and not committed)),
-    }
+        noop=skipped,
+        committed=committed,
+        preview=preview,
+        rolled_back=rolled_back,
+        message=value.get("message"),
+        default_error="go rename failed",
+    )
 
 
 def _render_mutation_summary_text(value: Any) -> str:
