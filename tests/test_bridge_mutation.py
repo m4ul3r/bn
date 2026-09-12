@@ -267,6 +267,67 @@ def test_preview_drift_restore_failure_is_not_success(monkeypatch):
     assert result["rolled_back"] is False
 
 
+def test_apply_failure_and_exception_revert_settle_before_var_drift_restore(monkeypatch):
+    """#657: the apply-failure and generic-exception revert paths must settle the
+    view before reading var drift, exactly like the preview path (#581). A stale
+    read sees phantom drift and re-pins an AUTO local as USER. Observed
+    behaviourally: the settle must run BEFORE _restore_local_var_drift on both
+    paths, and be skipped when the snapshot is empty (nothing to drift-check =
+    no pointless reanalysis)."""
+    bridge = _load_bridge(monkeypatch)
+    me = bridge.mutation_engine
+
+    def drive(*, apply_exc=None, verify_exc=None, snapshots):
+        instance = bridge.BinaryNinjaBridge()
+        bv = _FakeMutationBV()
+        order: list[str] = []
+
+        def apply(bv_, op, restores=None):
+            if apply_exc is not None:
+                raise apply_exc
+            return {"op": "local_rename", "requested": {}}
+
+        def verify(bv_, result):
+            if verify_exc is not None:
+                raise verify_exc
+            return {**result, "status": "verified"}
+
+        # Record the two operations whose relative order is the contract.
+        monkeypatch.setattr(bv, "update_analysis_and_wait", lambda: order.append("settle"))
+        monkeypatch.setattr(me, "_capture_local_var_snapshots", lambda ctx, bv_, fns: snapshots)
+        monkeypatch.setattr(me, "_run_local_restores", lambda ctx, bv_, restores: True)
+        monkeypatch.setattr(
+            me, "_restore_local_var_drift", lambda ctx, bv_, snap: order.append("drift") or True
+        )
+        _mutation_with_stubs(monkeypatch, bridge, instance, bv, apply=apply, verify=verify)
+        return instance, order
+
+    snapshot = {0x1: {1: ("a", "int32_t")}}
+
+    # Apply-failure path: settle, then read drift.
+    instance, order = drive(
+        apply_exc=me.OperationFailure("unsupported", "nope", requested={}), snapshots=snapshot
+    )
+    result = instance._mutation("active", False, [{"op": "local_rename"}])
+    assert result["rolled_back"] is True
+    assert order == ["settle", "drift"]
+
+    # Generic-exception path (here: post-apply verification raises): the settle
+    # must immediately precede the drift read, and the error still propagates.
+    instance, order = drive(verify_exc=ValueError("boom"), snapshots=snapshot)
+    with pytest.raises(ValueError, match="boom"):
+        instance._mutation("active", False, [{"op": "local_rename"}])
+    assert order[-2:] == ["settle", "drift"]
+
+    # Empty snapshot -> no drift to read, so the revert path skips the
+    # reanalysis entirely (same guard as the preview path's settle).
+    instance, order = drive(
+        apply_exc=me.OperationFailure("unsupported", "nope", requested={}), snapshots={}
+    )
+    instance._mutation("active", False, [{"op": "local_rename"}])
+    assert order == ["drift"]
+
+
 def test_preview_with_successful_restore_still_succeeds(monkeypatch):
     """The restored-success coupling must not regress the normal preview path."""
     bridge = _load_bridge(monkeypatch)

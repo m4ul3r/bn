@@ -1837,6 +1837,26 @@ def _capture_local_var_snapshots(ctx, bv, functions) -> dict[int, dict[int, tupl
 
 
 
+def _settle_before_drift_restore(bv, var_before) -> None:
+    """Settle analysis before reading var drift (#581/#657).
+
+    ``revert_undo_actions`` restores provenance, but BN only re-derives an AUTO
+    variable's name/type on the next analysis pass, and the restores that ran
+    before this may have skipped their own reanalysis (they do when the failing
+    op registered none -- the blast-radius case). A stale read here would see
+    phantom drift and re-pin an AUTO local as USER, so every revert path must
+    call this immediately before ``_restore_local_var_drift``. Nothing to
+    compare (empty snapshot) means no reanalysis is needed; a failing settle is
+    logged and absorbed, never raised -- the drift read after it stays
+    best-effort."""
+    if not var_before:
+        return
+    try:
+        bv.update_analysis_and_wait()
+    except Exception as exc:
+        bn.log_error(f"BN Agent Bridge: reanalysis before var-drift check failed: {exc!r}")
+
+
 def _restore_local_var_drift(ctx, bv, snapshots) -> bool:
     """Put any local whose (name, type) drifted from *snapshots* back, then
     reanalyze. Covers BN's name/type propagation onto aliased siblings that
@@ -2193,6 +2213,7 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
         # non-journaled local/prototype changes applied.
         undo_ok = _revert_undo_safely(ctx, bv, state)
         restore_ok = _run_local_restores(ctx, bv, restores)
+        _settle_before_drift_restore(bv, var_before)
         drift_ok = _restore_local_var_drift(ctx, bv, var_before)
         # #630: an already-applied set_prototype on an AUTO function leaves an
         # unclearable has_user_type override after revert. That is real residue,
@@ -2278,18 +2299,7 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
             # Targeted/prototype restores first, then mop up BN's propagation
             # onto aliased siblings; all must succeed for a clean revert.
             restore_ok = _run_local_restores(ctx, bv, restores)
-            # Settle analysis before reading var drift (#581). revert_undo_actions
-            # restores provenance, but BN only re-derives an AUTO variable's
-            # name/type on the next pass; _run_local_restores skips reanalysis
-            # when it had no restores (the blast-radius case), so a stale read
-            # here would see phantom drift and re-pin an AUTO local as USER.
-            if var_before:
-                try:
-                    bv.update_analysis_and_wait()
-                except Exception as exc:
-                    bn.log_error(
-                        f"BN Agent Bridge: reanalysis before var-drift check failed: {exc!r}"
-                    )
+            _settle_before_drift_restore(bv, var_before)
             drift_ok = _restore_local_var_drift(ctx, bv, var_before)
             # #630: a proto set on a function that had NO prior user type pins
             # has_user_type, and neither BN's undo nor set_auto_type clears the
@@ -2387,6 +2397,7 @@ def _mutation(ctx, selector: str | None, preview: bool, operations: list[dict[st
     except Exception as exc:
         undo_ok = _revert_undo_safely(ctx, bv, state)
         restore_ok = _run_local_restores(ctx, bv, restores)
+        _settle_before_drift_restore(bv, var_before)
         drift_ok = _restore_local_var_drift(ctx, bv, var_before)
         # #630 round 2: even when the value revert succeeds, an already-applied
         # set_prototype on an AUTO function leaves an unclearable has_user_type
