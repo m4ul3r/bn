@@ -3279,6 +3279,7 @@ def test_hostile_registry_socket_paths_reject_rather_than_crash(
     pytest.param("-Infinity", id="negative-infinity"),
     pytest.param("0", id="zero-is-our-own-process-group"),
     pytest.param("-1", id="negative-is-a-process-group"),
+    pytest.param("true", id="a-json-boolean-is-not-pid-1"),
 ])
 def test_load_instance_drops_a_registry_whose_pid_is_not_a_process_id(
     tmp_path, monkeypatch, raw_pid
@@ -3287,10 +3288,14 @@ def test_load_instance_drops_a_registry_whose_pid_is_not_a_process_id(
 
     ``os.kill`` takes a C ``int``: anything wider raises ``OverflowError``,
     which is neither an ``OSError`` nor a ``ValueError``, so one corrupt
-    registry took every discovery-backed command down with a traceback. Zero
-    and negative values are worse than a crash -- they address a process GROUP,
-    so ``os.kill(0, 0)`` reports OUR OWN group as the bridge's live owner and
-    the bogus record is adopted. Both are rejected before the probe.
+    registry took every discovery-backed command down with a traceback.
+
+    The values that do NOT crash are the more dangerous half, because they make
+    a record that should have been discarded look ALIVE. Zero and negatives
+    address a process GROUP, so ``os.kill(0, 0)`` reports our own group as the
+    bridge's owner; and a JSON ``true`` is an ``int`` in Python, so it becomes
+    pid 1, which always exists and answers ``EPERM``. All are rejected before
+    the probe.
     """
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     inst_dir = instances_dir()

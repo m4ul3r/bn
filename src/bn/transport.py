@@ -387,7 +387,8 @@ def _load_instance(
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         socket_path = Path(payload["socket_path"])
-        pid = int(payload["pid"])
+        raw_pid = payload["pid"]
+        pid = int(raw_pid)
     except (OSError, TypeError, ValueError, OverflowError, KeyError, json.JSONDecodeError):
         # TypeError and OverflowError belong here with the rest: `Path(12)`,
         # `int(["x"])` and `int(Infinity)` on a hand-edited or truncated
@@ -395,13 +396,16 @@ def _load_instance(
         # missing key, and discovery skips a corrupt record rather than taking
         # every discovery-backed command down with a raw traceback (#618).
         return None
-    if not 0 < pid <= _PID_MAX:
-        # A registry is data, so its pid is range-checked BEFORE it reaches a
+    if isinstance(raw_pid, bool) or not 0 < pid <= _PID_MAX:
+        # A registry is data, so its pid is validated BEFORE it reaches a
         # syscall. Wider than a C int and `os.kill` raises OverflowError --
-        # not an OSError, so `_process_alive` would not catch it. Zero or
-        # negative is worse than a crash: those address a process GROUP, so
-        # `os.kill(0, 0)` succeeds against OUR OWN group and the bogus record
-        # is adopted as a live bridge (#618).
+        # not an OSError, so `_process_alive` would not catch it.
+        #
+        # The values that do NOT crash are the dangerous ones, because they
+        # make a record that should have been discarded look ALIVE: zero and
+        # negatives address a process GROUP, so `os.kill(0, 0)` succeeds
+        # against OUR OWN group; and a JSON `true` is an `int` in Python, so it
+        # would become pid 1, which always exists and answers EPERM (#618).
         return None
 
     instance_id = payload.get("instance_id")
