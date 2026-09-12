@@ -1370,10 +1370,16 @@ _BOUNDARY = "_guarded_transform"        # binds a transform TO the rule
 # The rule's own implementation is the one place a transform is invoked
 # directly; both halves are self-checked below rather than trusted.
 _RULE_FUNCTIONS = (_GUARD, _BOUNDARY)
-# A bridge-result transform is exactly a callable that is handed the result:
-# `Callable[[Any], ...]`. This is what makes the population derived rather than
-# remembered -- a seventh parameter is in it the moment it is annotated.
+# A bridge-result transform is a callable that is handed the result. Three
+# independent ways in, because each one alone was escaped: the ANNOTATION
+# (`Callable[[Any], ...]`), the USE (a parameter this function calls), and the
+# NAME. Round 6 escaped the annotation discriminator with a transform parameter
+# typed `Any` -- the exact shape two of this module's own parameters had before
+# this change -- so a population defined by annotation alone is a list with a
+# type checker in front of it.
 _TRANSFORM_ANNOTATION = re.compile(r"Callable\[\[Any\]")
+_TRANSFORM_NAME = re.compile(
+    r"(?:^|_)(?:transform|renderer|note|summary|formatter|hook|exit_code|status)$")
 
 
 def _cli_functions() -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
@@ -1411,14 +1417,31 @@ def _tuple_transform_positions(annotation: ast.expr | None) -> set[int]:
     return positions
 
 
+def _called_parameters(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    """Parameters this function invokes DIRECTLY -- whatever their annotation.
+
+    `param(x)` only: `param.method(x)` calls a method OF the parameter and says
+    nothing about the parameter being a transform, so seeding on it would flag
+    every `parser.add_argument` in the module.
+    """
+    params = {arg.arg for arg in _all_args(fn)}
+    return {node.func.id for node in ast.walk(fn)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id in params}
+
+
 def _transform_bindings(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[set[str], set[str]]:
     """(names in *fn* holding a caller-supplied transform, those bound to the rule).
 
-    Aliasing is followed to a fixpoint, so `b = a; c = b; c(result)` cannot
-    launder a transform out of the population -- that exact shape kept the
-    previous, name-matching version of this property green.
+    Aliasing and CONTAINMENT are followed to a fixpoint: `b = a`, `b = (a, x)`,
+    `b = {"k": a}`, `b = partial(a)` all keep the transform in the population,
+    so `slots["k"](result)` cannot launder it out -- successive rounds escaped
+    this property through a plain alias, then through a dict.
     """
-    holders = {arg.arg for arg in _all_args(fn) if _is_transform_annotation(arg.annotation)}
+    holders = {arg.arg for arg in _all_args(fn)
+               if _is_transform_annotation(arg.annotation)
+               or _TRANSFORM_NAME.search(arg.arg)}
+    holders |= _called_parameters(fn)
     tuples = {arg.arg: _tuple_transform_positions(arg.annotation)
               for arg in _all_args(fn) if _tuple_transform_positions(arg.annotation)}
     guarded: set[str] = set()
@@ -1434,7 +1457,8 @@ def _transform_bindings(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[set
                     and value.func.id == _BOUNDARY):
                 holders |= names
                 guarded |= names
-            elif isinstance(value, ast.Name) and value.id in tuples:
+                continue
+            if isinstance(value, ast.Name) and value.id in tuples:
                 # Position-aware FIRST: a `tuple[Any, Callable[[Any], str]]`
                 # parameter also matches the plain annotation test, and treating
                 # the whole unpack as transforms made the rendered value look
@@ -1446,21 +1470,38 @@ def _transform_bindings(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> tuple[set
                                     if position < len(target.elts)
                                     for element in [target.elts[position]]
                                     if isinstance(element, ast.Name)}
-            elif isinstance(value, ast.Name) and value.id in holders:
+                continue
+            # Containment: every holder mentioned in the value expression other
+            # than as the thing being CALLED (`x = t(result)` is the transform's
+            # OUTPUT, not the transform) keeps its taint in the target.
+            called = {inner.func.id for inner in ast.walk(value)
+                      if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Name)}
+            carried = {inner.id for inner in ast.walk(value)
+                       if isinstance(inner, ast.Name)} & holders - called
+            if carried:
                 holders |= names
-                if value.id in guarded:
+                if carried <= guarded:
                     guarded |= names
         if seen == (frozenset(holders), frozenset(guarded)):
             break
     return holders, guarded
 
 
-def _callee(node: ast.Call) -> str | None:
-    if isinstance(node.func, ast.Name):
-        return node.func.id
-    # `self.summary(result)` dispatches the same transform through an attribute;
-    # the name is what identifies it, not how it was reached.
-    return node.func.attr if isinstance(node.func, ast.Attribute) else None
+def _callee_names(node: ast.Call) -> set[str]:
+    """Every name that identifies what a call invokes.
+
+    `f(x)`, `obj.f(x)`, `slots["f"](x)`, `registry.slots["f"](x)`: the callee is
+    reached by a chain of attributes, subscripts and calls, and each step roots
+    in a name. Round 5 escaped this property through an alias, round 6 through a
+    dict lookup -- so it collects every name in the callee expression and stops
+    asking what shape the dispatch took.
+    """
+    return ({name.id for name in ast.walk(node.func) if isinstance(name, ast.Name)}
+            | {attr.attr for attr in ast.walk(node.func) if isinstance(attr, ast.Attribute)})
+
+
+def _callee(node: ast.Call) -> str:
+    return ast.unparse(node.func)
 
 
 def test_the_malformed_result_rule_is_implemented_where_this_property_says_it_is():
@@ -1477,7 +1518,7 @@ def test_the_malformed_result_rule_is_implemented_where_this_property_says_it_is
         "transform to it guards nothing")
     boundary = functions.get(_BOUNDARY)
     assert boundary is not None, f"{_BOUNDARY} is gone; nothing binds a transform to the rule"
-    assert any(_callee(node) == _GUARD for node in ast.walk(boundary)
+    assert any(_callee_names(node) & {_GUARD} for node in ast.walk(boundary)
                if isinstance(node, ast.Call)), (
         f"{_BOUNDARY} must delegate to {_GUARD}; otherwise it returns an "
         "unguarded transform under a reassuring name")
@@ -1486,8 +1527,8 @@ def test_the_malformed_result_rule_is_implemented_where_this_property_says_it_is
 def test_no_bridge_result_transform_is_invoked_before_it_is_bound_to_the_rule():
     """Property: in `cli.py`, a transform is CALLED only after the boundary
     rebinding. Scoped to the module that receives every transform, and holding
-    for any call shape, because it is the object that is guarded and not the
-    site."""
+    for any call shape -- name, attribute, dict lookup -- because it is the
+    OBJECT that is guarded and not the site."""
     unguarded = []
     for fn in _cli_functions():
         if fn.name in _RULE_FUNCTIONS:
@@ -1497,11 +1538,35 @@ def test_no_bridge_result_transform_is_invoked_before_it_is_bound_to_the_rule():
             f"{_callee(node)}() in {fn.name}() at cli.py:{node.lineno}"
             for node in ast.walk(fn)
             if isinstance(node, ast.Call)
-            if _callee(node) in holders - guarded
+            if _callee_names(node) & (holders - guarded)
         ]
     assert not unguarded, (
         "these invoke a bridge-result transform that was never bound to the "
         f"malformed-result rule, so a malformed result escapes there: {sorted(unguarded)}"
+    )
+
+
+def test_no_bridge_reply_is_indexed_for_its_result_outside_the_unwrap_helper():
+    """The same lesson one level up: `_unwrap_result` was applied to the reads
+    its author was looking at, and the fan-out planner's fourth read still
+    indexed the reply raw, so `{"ok": true}` with no `result` left `main()` as a
+    bare `KeyError`. The property is that NO `["result"]` read survives anywhere
+    in `cli.py` outside the helper -- a fifth read added later inherits the rule
+    or fails here.
+    """
+    unwrap = next((fn for fn in _cli_functions() if fn.name == "_unwrap_result"), None)
+    assert unwrap is not None, "_unwrap_result is gone; nothing checks the envelope"
+    raw = [
+        f"{ast.unparse(node)} at cli.py:{node.lineno}"
+        for node in ast.walk(ast.parse(_CLI.read_text(encoding="utf-8")))
+        if isinstance(node, ast.Subscript)
+        if isinstance(node.slice, ast.Constant) and node.slice.value == "result"
+        if isinstance(node.ctx, ast.Load)
+        if not unwrap.lineno <= node.lineno <= (unwrap.end_lineno or unwrap.lineno)
+    ]
+    assert not raw, (
+        "these read a bridge reply's `result` without the envelope check, so a "
+        f"reply that carries none leaves main() as a raw KeyError: {raw}"
     )
 
 
@@ -1519,7 +1584,7 @@ def test_no_bridge_result_transform_leaves_cli_py_unguarded():
             continue
         holders, guarded = _transform_bindings(fn)
         for node in ast.walk(fn):
-            if not isinstance(node, ast.Call) or _callee(node) in in_module:
+            if not isinstance(node, ast.Call) or _callee_names(node) & in_module:
                 continue
             passed = [*node.args, *(keyword.value for keyword in node.keywords)]
             leaked += [
@@ -1571,11 +1636,19 @@ _TRANSFORM_ARRANGEMENTS = {
 
 
 def _call_transform_params() -> list[str]:
-    """`_call`'s transform parameters, off the live signature."""
-    params = sorted(
-        name for name, parameter in inspect.signature(bn.cli._call).parameters.items()
-        if _TRANSFORM_ANNOTATION.search(str(parameter.annotation))
-    )
+    """`_call`'s transform parameters -- the same three-way population the AST
+    properties use, intersected with the live signature.
+
+    Annotation alone was escaped by a transform parameter typed `Any`, so a
+    parameter that `_call` INVOKES, or that is named like a transform, is in
+    this parametrization too and fails until it has an arrangement.
+    """
+    call = next((fn for fn in _cli_functions() if fn.name == "_call"), None)
+    assert call is not None, "_call is gone; this whole property is unchecked"
+    shaped = {arg.arg for arg in _all_args(call)
+              if _is_transform_annotation(arg.annotation)
+              or _TRANSFORM_NAME.search(arg.arg)} | _called_parameters(call)
+    params = sorted(shaped & set(inspect.signature(bn.cli._call).parameters))
     assert len(params) >= 6, f"_call's transform parameters vanished: {params}"
     return params
 

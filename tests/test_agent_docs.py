@@ -168,30 +168,42 @@ def test_exit_code_bullet_documents_every_code_the_cli_can_return():
     )
 
 
-# EVERY clause of the exit-code bullet, each with a cell of its own. The
-# previous cut asserted the five code numbers, the literal `measured: false` and
-# the word `classify` -- so four clauses this contract rests on could be deleted
-# with the module still green, including #716's only documented rule (a refusal
-# is 3 whether it was raised up front or at apply). Deleting any clause below
-# reds exactly the cell that names it; adding a clause with no cell reds the
-# coverage test underneath. Both halves, because presence alone is a list again.
+# EVERY clause of the exit-code bullet, each with a cell of its own. An earlier
+# cut asserted the five code numbers, the literal `measured: false` and the word
+# `classify`, so four clauses this contract rests on could be deleted with the
+# module still green -- including #716's only documented rule. Deleting any
+# clause below reds exactly the cell that names it.
+#
+# Each pattern spans its WHOLE clause, not a distinctive prefix, because the
+# coverage half underneath measures the characters these patterns claim: a
+# prefix leaves the rest of its own clause unclaimed, which is where a second
+# claim can be smuggled in beside a guarded one.
 _EXIT_CODE_CLAUSES = (
     ("0-success", r"\b0 = success"),
-    ("1-cli-side-handler-error", r"\b1 = CLI-side handler error"),
-    ("2-bridge-error", r"\b2 = `BridgeError`"),
-    ("2-read-or-resolver-status", r"`FAILED_MUTATION_STATUSES` on a read/resolver call"),
-    ("2-unclassifiable-mutation", r"mutation result this CLI cannot classify"),
-    ("3-mutation-status", r"\b3 = a `_mutate`-marked call whose status is"),
+    ("1-cli-side-handler-error",
+     r"\b1 = CLI-side handler error \(e\.g\. partial `session start` failure\)"),
+    ("2-bridge-error",
+     r"\b2 = `BridgeError` \(transport failures and bridge-side errors,"),
+    ("2-read-or-resolver-status",
+     r"including a status in `FAILED_MUTATION_STATUSES` on a read/resolver call,"),
+    ("2-unclassifiable-mutation",
+     r"and a mutation result this CLI cannot classify — malformed or newer than the CLI\)"),
+    ("3-mutation-status",
+     r"\b3 = a `_mutate`-marked call whose status is `verification_failed`, `unsupported`, "
+     r"`invalid_request`, `rollback_failed`, or `internal_error`"),
     ("3-refused-up-front-or-at-apply",
-     r"refusal is exit 3 whether it was raised up front or during apply, never 2"),
+     r"— the refusal is exit 3 whether it was raised up front or during apply, "
+     r"never 2 for a mutation —"),
     ("4-unmeasured",
-     r"\b4 = a `_mutate`-marked call whose compact summary reports `measured: false`"),
+     r"\b4 = a `_mutate`-marked call whose compact summary reports `measured: false`, i\.e\."),
     ("4-no-rows-and-no-own-summary",
-     r"no `results\[\]` rows to derive counts from AND registered no summary of its own"),
+     r"the op returned no `results\[\]` rows to derive counts from AND registered no "
+     r"summary of its own to count with, so the outcome could not be verified \(#715\);"),
     ("4-own-summary-stays-measured",
-     r"counts through its own registered summary \(`go rename`\) stays measured and exits 0"),
+     r"an op that counts through its own registered summary \(`go rename`\) stays "
+     r"measured and exits 0\."),
     ("4-failure-wins-and-all-noop-is-zero",
-     r"failure still wins over 4 \(3 before 4\), and a measured all-`noop` is 0"),
+     r"A failure still wins over 4 \(3 before 4\), and a measured all-`noop` is 0"),
 )
 
 
@@ -207,51 +219,46 @@ def test_every_clause_of_the_exit_code_bullet_is_guarded(clause: str, pattern: s
     )
 
 
-def _exit_code_clauses(bullet: str) -> list[str]:
-    """The bullet's OWN clauses, split on its clause punctuation at paren depth 0.
-
-    Depth matters: an em dash or a sentence period inside a parenthetical
-    ("(e.g. partial `session start` failure)") is not a clause boundary, and
-    treating it as one manufactured fragments that no cell could sensibly claim.
-    """
-    body = bullet.split("- Exit codes:", 1)[1]
-    found: list[str] = []
-    buffer = ""
-    depth = 0
-    for index, char in enumerate(body):
-        if char == "(":
-            depth += 1
-        elif char == ")":
-            depth = max(0, depth - 1)
-        if depth == 0 and (char in "—;" or (char == "." and body[index + 1:index + 2] == " ")):
-            found.append(buffer)
-            buffer = ""
-            continue
-        if depth == 0 and re.match(r"[0-4] = ", body[index:index + 4]):
-            found.append(buffer)
-            buffer = char
-            continue
-        buffer += char
-    found.append(buffer)
-    return [clause.strip(" ,") for clause in found if clause.strip(" ,")]
+# A word an added claim would be made of. Backticks and brackets count as part
+# of one token so `results[]` is one word, not three.
+_CLAIM_WORD = re.compile(r"[A-Za-z`][A-Za-z`_\[\]]{2,}")
 
 
 def test_the_exit_code_bullet_carries_no_unguarded_clause():
-    """The other half: the enumeration above must cover the bullet.
+    """The other half: the cells above must account for the WHOLE bullet.
 
-    Presence alone is satisfiable by a list that has stopped keeping up -- which
+    Presence alone is satisfiable by a list that has stopped keeping up, which
     is exactly how the exit-4 body, the own-summary clause and #716's refusal
-    rule shipped unguarded. A clause added here without a cell of its own is a
-    claim nothing checks, so it fails until it gets one.
+    rule shipped unguarded. The first cut of this half split the bullet on its
+    clause punctuation -- and a claim smuggled INSIDE a parenthetical, or
+    comma-joined to a guarded clause, is not a clause boundary, so it stayed
+    invisible. So this measures CHARACTERS instead of clauses: every span the
+    cells match is claimed, and any run of prose left unclaimed is a claim
+    nothing guards, wherever in the bullet it was put.
     """
     bullet = _bullet("- Exit codes:")
-    clauses = _exit_code_clauses(bullet)
-    assert len(clauses) >= 8, f"the clause split degenerated: {clauses}"
-    uncovered = [clause for clause in clauses
-                 if not any(re.search(pattern, clause) for _, pattern in _EXIT_CODE_CLAUSES)]
-    assert not uncovered, (
-        "these clauses of the exit-code bullet have no cell in "
-        f"_EXIT_CODE_CLAUSES, so deleting them would keep this module green: {uncovered}"
+    claimed = bytearray(len(bullet))
+    for _, pattern in _EXIT_CODE_CLAUSES:
+        for match in re.finditer(pattern, bullet):
+            claimed[match.start():match.end()] = b"\x01" * (match.end() - match.start())
+    unclaimed: list[str] = []
+    run: list[str] = []
+    for index, char in enumerate(bullet):
+        if claimed[index]:
+            if run:
+                unclaimed.append("".join(run))
+                run = []
+        else:
+            run.append(char)
+    if run:
+        unclaimed.append("".join(run))
+    # The bullet's own label ("- Exit codes:") is the only unclaimed prose, and
+    # it is two words; three words is a claim.
+    prose = [text.strip() for text in unclaimed if len(_CLAIM_WORD.findall(text)) >= 3]
+    assert not prose, (
+        "these runs of the exit-code bullet are claimed by no cell in "
+        f"_EXIT_CODE_CLAUSES, so they could be changed or deleted with this "
+        f"module green: {prose}"
     )
 
 
@@ -432,28 +439,34 @@ def test_lock_model_paragraph_describes_none_ops_as_self_managing():
     # parenthetical after the refuting clause had been deleted, which left the
     # paragraph silent on the false reading it exists to correct.
     claim = "touches no BN state"
-    at = sentence.find(claim)
-    assert at != -1, (
+    mentions = [match.start() for match in re.finditer(re.escape(claim), sentence)]
+    assert mentions, (
         f'the paragraph must explicitly refute the "{claim}" reading of '
         f'`lock="none"`, which is the claim this guard exists to keep true: {sentence}'
     )
-    lead = sentence[:at]
-    assert "not" in lead.rsplit('`lock="none"`', 1)[-1], (
-        f'the paragraph mentions "{claim}" without refuting it, which is worse '
-        f"than not mentioning it at all: {sentence}"
-    )
-    # The counterexample must sit in the refutation CLAUSE -- bounded by the
-    # clause's own terminator, not by a character count. A fixed 200-char window
-    # from the claim still reached a later incidental parenthetical, so deleting
-    # the refuting clause together with its three op names left this green: the
-    # round-4 defect at a smaller radius, which is not the same as fixed.
-    refutation = re.split(r"[;.]", sentence[at:], maxsplit=1)[0]
-    named = [op for op in stateful if f"`{op}`" in refutation]
-    assert named, (
-        'the refutation must name a stateful lock="none" op as its counterexample, '
-        "so it is concrete rather than a phrase; the refuting clause reads "
-        f"{refutation!r} and the stateful ops are {stateful}"
-    )
+    # EVERY mention, not the first: a paragraph that refutes the reading once and
+    # then repeats it as fact still teaches the falsehood. And the negation is
+    # matched as a WORD -- `"not" in lead` was satisfied by "as a general note",
+    # so the paragraph could be rewritten to ASSERT the false reading and stay
+    # green.
+    for at in mentions:
+        lead = sentence[:at].rsplit('`lock="none"`', 1)[-1]
+        assert re.search(r"\b(?:not|never)\b", lead), (
+            f'the paragraph mentions "{claim}" at offset {at} without refuting it, '
+            f"which is worse than not mentioning it at all: {sentence}"
+        )
+        # The counterexample must sit in the refutation CLAUSE -- bounded by the
+        # clause's own terminator, not by a character count. A fixed 200-char
+        # window from the claim still reached a later incidental parenthetical,
+        # so deleting the refuting clause together with its three op names left
+        # this green: the round-4 defect at a smaller radius, not fixed.
+        refutation = re.split(r"[;.]", sentence[at:], maxsplit=1)[0]
+        named = [op for op in stateful if f"`{op}`" in refutation]
+        assert named, (
+            'the refutation must name a stateful lock="none" op as its '
+            "counterexample, so it is concrete rather than a phrase; the refuting "
+            f"clause reads {refutation!r} and the stateful ops are {stateful}"
+        )
 
 
 def test_documented_python_requirement_matches_pyproject():

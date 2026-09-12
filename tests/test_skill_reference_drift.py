@@ -40,9 +40,22 @@ SKILL = REFERENCE.parent / "SKILL.md"
 COMMAND_INDEX_HEADING = "## Command index"
 
 # Top-level command groups an agent must be able to discover from the skill's
-# Command index. Each is also asserted to exist in the live `_COMMANDS`
-# registry, so the allow-list cannot outlive a command rename (#627).
-REQUIRED_INDEX_GROUPS = ("capabilities", "dataflow", "exports", "go", "tag", "taint")
+# Command index, mapped to the index LINE each must be discoverable from. Each
+# group is also asserted to exist in the live `_COMMANDS` registry, so the
+# allow-list cannot outlive a command rename (#627).
+#
+# The placement is the point: asking only whether a group appears SOMEWHERE in
+# the index let the whole read-side entry for `tag` and `go` be deleted while
+# their mutate-side entries kept the guard green -- and an agent that cannot
+# find `tag list` on the Read line does not run it.
+REQUIRED_INDEX_GROUPS = {
+    "capabilities": ("Discover",),
+    "dataflow": ("Read",),
+    "exports": ("Read",),
+    "taint": ("Read",),
+    "tag": ("Read", "Mutate"),
+    "go": ("Read", "Mutate"),
+}
 
 
 @pytest.fixture(scope="module")
@@ -100,35 +113,73 @@ def command_paths(stub_engine) -> set[str]:
 
 TESTS = Path(__file__).resolve().parent
 
-# Writing to `sys.modules` without restoring it: both shapes, because either one
-# alone escaped a guard that only knew about the other. A mutating CALL on the
-# mapping, and a direct item write. `monkeypatch.setitem(sys.modules, ...)` and
-# `MonkeyPatch.context()` pass the mapping as an ARGUMENT and put it back, so
-# they are not writes ON the mapping and are correctly invisible here.
+# Writing to `sys.modules` without restoring it. Both write shapes AND every
+# route to the mapping, because each narrower cut was escaped by the next one:
+# first only `setdefault`, then only `sys.modules` spelled literally, while
+# `m = sys.modules; m[name] = stub`, `from sys import modules`,
+# `vars(sys)["modules"]` and `getattr(sys, "modules")` all reach the same dict.
+# `monkeypatch.setitem(sys.modules, ...)` and `MonkeyPatch.context()` pass the
+# mapping as an ARGUMENT and put it back, so they are not writes ON it and are
+# correctly invisible here.
 _SYS_MODULES_MUTATORS = frozenset({
     "setdefault", "update", "pop", "popitem", "clear", "__setitem__", "__delitem__",
 })
 
 
-def _is_modules_mapping(node: ast.expr) -> bool:
-    """`sys.modules`, however `sys` was named (`import sys as s` still matches)."""
-    return isinstance(node, ast.Attribute) and node.attr == "modules"
+def _modules_mapping_aliases(tree: ast.Module) -> set[str]:
+    """Local names bound to the module table anywhere in *tree*."""
+    aliases: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module == "sys":
+            aliases |= {alias.asname or alias.name
+                        for alias in node.names if alias.name == "modules"}
+    for _ in range(4):                       # `a = sys.modules; b = a; c = b`
+        grew = False
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign) or not _is_modules_mapping(node.value, aliases):
+                continue
+            for target in node.targets:
+                for name in ast.walk(target):
+                    if isinstance(name, ast.Name) and name.id not in aliases:
+                        aliases.add(name.id)
+                        grew = True
+        if not grew:
+            break
+    return aliases
+
+
+def _is_modules_mapping(node: ast.expr, aliases: frozenset[str] | set[str] = frozenset()) -> bool:
+    """Every expression that evaluates to the interpreter's module table."""
+    if isinstance(node, ast.Attribute) and node.attr == "modules":
+        return True                                   # sys.modules, s.modules
+    if isinstance(node, ast.Name) and node.id in aliases:
+        return True                                   # m = sys.modules
+    if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name) and node.value.func.id == "vars"
+            and isinstance(node.slice, ast.Constant) and node.slice.value == "modules"):
+        return True                                   # vars(sys)["modules"]
+    return (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "getattr" and len(node.args) >= 2
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value == "modules")       # getattr(sys, "modules")
 
 
 def _unrestored_sys_modules_writes(path: Path) -> list[str]:
-    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    aliases = _modules_mapping_aliases(tree)
+    for node in ast.walk(tree):
         if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr in _SYS_MODULES_MUTATORS
-                and _is_modules_mapping(node.func.value)):
-            yield f"{path.name}:{node.lineno} sys.modules.{node.func.attr}()"
+                and _is_modules_mapping(node.func.value, aliases)):
+            yield f"{path.name}:{node.lineno} the module table .{node.func.attr}()"
         targets: list[ast.expr] = []
         if isinstance(node, (ast.Assign, ast.Delete)):
             targets = list(node.targets)
         elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
             targets = [node.target]
         for target in targets:
-            if isinstance(target, ast.Subscript) and _is_modules_mapping(target.value):
-                yield f"{path.name}:{node.lineno} sys.modules[...] assigned directly"
+            if isinstance(target, ast.Subscript) and _is_modules_mapping(target.value, aliases):
+                yield f"{path.name}:{node.lineno} the module table written by subscript"
 
 
 def test_an_engine_stub_is_installed_only_in_a_form_that_restores():
@@ -172,15 +223,27 @@ def test_skill_command_index_names_every_required_group(command_groups):
     `bn taint forward`.
 
     Scoped to the index section (the Reference block names files, not groups),
-    and paired with the registry so the requirement fails if a group is renamed
-    away rather than pinning a name that no longer exists.
+    per index LINE (a read-side entry deleted while the mutate-side one remains
+    is still a group an agent cannot find where it looks), and paired with the
+    registry so the requirement fails if a group is renamed away rather than
+    pinning a name that no longer exists.
     """
-    text = SKILL.read_text(encoding="utf-8")
-    assert COMMAND_INDEX_HEADING in text, f"{COMMAND_INDEX_HEADING!r} is gone from SKILL.md"
-    index = text.split(COMMAND_INDEX_HEADING, 1)[1].split("\n## ", 1)[0]
-    missing = [group for group in REQUIRED_INDEX_GROUPS
-               if not re.search(rf"`{group}\b", index)]
-    assert not missing, f"groups missing from the SKILL.md Command index: {missing}"
+    index = _index_section()
+    lines = {}
+    for line in index.splitlines():
+        heading = _INDEX_LINE.match(line)
+        if heading:
+            lines[heading.group("group").strip()] = line
+    missing = sorted(
+        f"{group} under **{where}**"
+        for group, placements in REQUIRED_INDEX_GROUPS.items()
+        for where in placements
+        if where not in lines or not re.search(rf"`{group}\b", lines[where])
+    )
+    assert not missing, (
+        f"the SKILL.md Command index does not advertise these where an agent "
+        f"looks for them: {missing}; index lines are {sorted(lines)}"
+    )
     renamed = sorted(set(REQUIRED_INDEX_GROUPS) - command_groups)
     assert not renamed, f"the index requires groups the CLI registry does not have: {renamed}"
 

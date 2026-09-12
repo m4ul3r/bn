@@ -840,35 +840,65 @@ class TestSessionStartTimeoutDiagnostics:
 
         assert seen["timeout"] == _CROSS_ARCH_SESSION_START_TIMEOUT, seen
 
-    def test_every_cross_arch_start_goes_through_the_lane_budget_helper(self):
+    def test_every_cross_arch_session_start_asks_for_the_lane_budget(self):
         """...and the lane must be pinned to it, not merely have one.
 
-        The test above observes the helper. Nothing stopped a NEW lane test from
-        calling the general `_session_start` directly, which puts the slow
+        The test above observes today's helper. Nothing stopped a NEW lane test
+        from calling the general `_session_start`, which puts the slow
         cross-built probe straight back on the general budget with every test
-        green -- exactly the shape #718 was filed against. So the property is
-        over the whole lane class, not over the tests that happen to exist now.
+        green -- the shape #718 was filed against. The first cut of this
+        property named ONE class and matched one call shape, so a second
+        cross-arch class, or a start routed through a module-level helper, both
+        escaped it.
+
+        So: the population is every class that CROSS-COMPILES (what makes a
+        start slow is the cross-built probe, not the class's name), the call
+        shape is any expression naming `_session_start`, and reachability
+        follows module-level helpers the class calls.
         """
         import ast
 
         tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
-        lane = next((node for node in ast.walk(tree)
-                     if isinstance(node, ast.ClassDef)
-                     and node.name == "TestDisasmLinearAArch64"), None)
-        assert lane is not None, "the cross-arch lane class was renamed; update this guard"
-        helper = next((node for node in lane.body
-                       if isinstance(node, ast.FunctionDef) and node.name == "_start"), None)
-        assert helper is not None, "the lane's one budget-applying helper is gone"
-        direct = [
-            f"tests/test_integration.py:{node.lineno}"
-            for node in ast.walk(lane)
-            if isinstance(node, ast.Call)
-            if isinstance(node.func, ast.Name) and node.func.id == "_session_start"
-            if not helper.lineno <= node.lineno <= (helper.end_lineno or helper.lineno)
-        ]
-        assert not direct, (
-            "these start a session in the cross-arch lane without going through "
-            f"_start, so they run the slow probe on the general budget: {direct}"
+        helpers = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+
+        def cross_compiles(node: ast.AST) -> bool:
+            """Does this class reach for a cross toolchain? That -- not the class
+            name -- is what makes its `session start` slow enough to need the
+            bigger budget."""
+            return any(isinstance(argument, ast.Constant)
+                       and isinstance(argument.value, str) and "-linux-gnu-" in argument.value
+                       for call in ast.walk(node) if isinstance(call, ast.Call)
+                       for argument in call.args)
+
+        lanes = [node for node in tree.body
+                 if isinstance(node, ast.ClassDef) and cross_compiles(node)]
+        assert lanes, "no cross-compiling lane class found; update this guard"
+
+        def names_of(call: ast.Call) -> set[str]:
+            return ({name.id for name in ast.walk(call.func) if isinstance(name, ast.Name)}
+                    | {attr.attr for attr in ast.walk(call.func) if isinstance(attr, ast.Attribute)})
+
+        def unbudgeted(node: ast.AST, seen: frozenset[str]) -> list[str]:
+            found: list[str] = []
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call):
+                    continue
+                reached = names_of(call)
+                if "_session_start" in reached:
+                    budget = next((keyword.value for keyword in call.keywords
+                                   if keyword.arg == "timeout"), None)
+                    if not (isinstance(budget, ast.Name)
+                            and budget.id == "_CROSS_ARCH_SESSION_START_TIMEOUT"):
+                        found.append(f"tests/test_integration.py:{call.lineno}")
+                for name in (reached & set(helpers)) - seen:
+                    found += unbudgeted(helpers[name], seen | {name})
+            return found
+
+        offenders = sorted({site for lane in lanes for site in unbudgeted(lane, frozenset())})
+        assert not offenders, (
+            "these start a session in a cross-compiling lane without asking for "
+            f"_CROSS_ARCH_SESSION_START_TIMEOUT, so the slow probe runs on the "
+            f"general budget: {offenders}"
         )
 
     def test_timed_out_start_carries_partial_output_and_bridge_log(self, monkeypatch):

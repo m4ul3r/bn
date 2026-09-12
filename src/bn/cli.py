@@ -1543,7 +1543,7 @@ def _fanout_call(
 
     def _instance_target_ids(iid: Any) -> list[Any]:
         tresp = send_request("list_targets", params={}, instance_id=iid, **timeout_kwargs)
-        titems = tresp["result"]
+        titems = _unwrap_result(tresp, "list_targets")
         # Production list_targets always replies with a bare list (see
         # _implicit_target's identical guard) -- a wrong-typed result (an int,
         # a string, ...) must not reach `for t in titems` below as a raw
