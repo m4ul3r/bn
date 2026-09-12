@@ -3271,3 +3271,55 @@ def test_hostile_registry_socket_paths_reject_rather_than_crash(
     assert not any(inst.instance_id == "hostile" for inst in instances)
     assert bystander.exists()
     assert sorted(p.name for p in outside.iterdir()) == ["bystander.sock"]
+
+
+@pytest.mark.parametrize("raw_pid", [
+    pytest.param("10000000000000000000000000000000000000000", id="wider-than-a-C-int"),
+    pytest.param("Infinity", id="infinity"),
+    pytest.param("-Infinity", id="negative-infinity"),
+    pytest.param("0", id="zero-is-our-own-process-group"),
+    pytest.param("-1", id="negative-is-a-process-group"),
+])
+def test_load_instance_drops_a_registry_whose_pid_is_not_a_process_id(
+    tmp_path, monkeypatch, raw_pid
+):
+    """An untrusted pid must never reach a syscall unchecked.
+
+    ``os.kill`` takes a C ``int``: anything wider raises ``OverflowError``,
+    which is neither an ``OSError`` nor a ``ValueError``, so one corrupt
+    registry took every discovery-backed command down with a traceback. Zero
+    and negative values are worse than a crash -- they address a process GROUP,
+    so ``os.kill(0, 0)`` reports OUR OWN group as the bridge's live owner and
+    the bogus record is adopted. Both are rejected before the probe.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    hostile_socket = inst_dir / "badpid.sock"
+    hostile_socket.write_text("", encoding="utf-8")
+    (inst_dir / "badpid.json").write_text(
+        '{"pid": ' + raw_pid + ', "socket_path": "' + str(hostile_socket) + '",'
+        ' "instance_id": "badpid", "plugin_name": "bn_agent_bridge"}',
+        encoding="utf-8",
+    )
+
+    # A well-formed sibling proves the bad record is SKIPPED, not fatal.
+    good_socket = inst_dir / "good.sock"
+    server = _Server(str(good_socket), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    (inst_dir / "good.json").write_text(
+        json.dumps(
+            _registry_payload(
+                good_socket, pid=os.getpid(), identity=_identity(), instance_id="good"
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        instances = list_instances()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert [inst.instance_id for inst in instances] == ["good"]

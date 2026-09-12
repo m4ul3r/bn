@@ -147,6 +147,13 @@ def _format_instance_choices(instances: list[BridgeInstance]) -> str:
     return "\n".join(lines)
 
 
+# The widest value the kernel's pid_t (a C `int`) can carry. Beyond it
+# ``os.kill`` raises OverflowError -- not an OSError -- before any syscall
+# happens, so `_process_alive` cannot absorb it. Registry content is checked
+# against this before it is ever probed; see `_load_instance`.
+_PID_MAX = 2**31 - 1
+
+
 def _process_alive(pid: int) -> bool:
     """Best-effort check that ``pid`` still names a running process."""
     try:
@@ -381,12 +388,20 @@ def _load_instance(
         payload = json.loads(path.read_text(encoding="utf-8"))
         socket_path = Path(payload["socket_path"])
         pid = int(payload["pid"])
-    except (OSError, TypeError, ValueError, KeyError, json.JSONDecodeError):
-        # TypeError belongs here with the rest: `Path(12)` / `int(["x"])` on a
-        # hand-edited or truncated registry is the same class of corruption as
-        # unparseable JSON or a missing key, and discovery skips a corrupt
-        # record rather than taking every discovery-backed command down with a
-        # raw traceback (#618).
+    except (OSError, TypeError, ValueError, OverflowError, KeyError, json.JSONDecodeError):
+        # TypeError and OverflowError belong here with the rest: `Path(12)`,
+        # `int(["x"])` and `int(Infinity)` on a hand-edited or truncated
+        # registry are the same class of corruption as unparseable JSON or a
+        # missing key, and discovery skips a corrupt record rather than taking
+        # every discovery-backed command down with a raw traceback (#618).
+        return None
+    if not 0 < pid <= _PID_MAX:
+        # A registry is data, so its pid is range-checked BEFORE it reaches a
+        # syscall. Wider than a C int and `os.kill` raises OverflowError --
+        # not an OSError, so `_process_alive` would not catch it. Zero or
+        # negative is worse than a crash: those address a process GROUP, so
+        # `os.kill(0, 0)` succeeds against OUR OWN group and the bogus record
+        # is adopted as a live bridge (#618).
         return None
 
     instance_id = payload.get("instance_id")
