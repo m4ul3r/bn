@@ -435,12 +435,16 @@ def test_find_function_reports_ambiguity_the_native_index_cannot_see(monkeypatch
 
 
 def test_find_function_index_miss_still_walks_for_the_case_exact_spelling(monkeypatch):
-    """An EMPTY result from BN's own name index is not authoritative -- the index
-    does not carry the demangled spellings BN keeps only on the symbol (#224a), so
-    the walk must answer the exact-case query. Two functions whose demangled
-    spellings differ only in CASE expose a fallback that stops at the empty index:
-    folding them matches BOTH and raises the ambiguous-name error instead of
-    returning the spelling the caller asked for."""
+    """INVARIANT GUARD -- green at the base revision by construction (base always
+    walked), so it is not regression evidence for this PR; it is what fails if any
+    later change lets an EMPTY result from BN's own name index end the lookup.
+
+    That result is never authoritative: the index does not carry the demangled
+    spellings BN keeps only on the symbol (#224a), so the walk must answer the
+    exact-case query. Two functions whose demangled spellings differ only in CASE
+    expose a fallback that stops at the empty index: folding them matches BOTH and
+    raises the ambiguous-name error instead of returning the spelling the caller
+    asked for."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
 
@@ -832,6 +836,51 @@ def test_an_addition_in_an_unwitnessable_casing_still_invalidates_the_group(monk
     assert bv.functions.enumerations == 2, "the rebuilt index must be reused"
 
 
+def test_a_vanished_cached_start_invalidates_the_group(monkeypatch):
+    """#622 review (round-6 major): the count witness is blind to a change that
+    PRESERVES the count -- an unnotified ADDITION paired with a REMOVAL. When the
+    removed function was in the cached group, the start the index recorded stops
+    resolving, and that is proof the view changed: no spelling, no casing and no
+    count difference needed.
+
+    Without it the group is quietly served as the surviving members, which reads
+    as a complete same-name group -- the exact shape that drops a veneer from the
+    xrefs caller union (#286). Here nothing else can catch it: the count is
+    unchanged and BN's name index is not answering at all."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    first = _named_fn(0x401000, "alpha")
+    second = _named_fn(0x402000, "alpha")
+    bv = _NotifyingBV(functions=[first, second])
+    bv.functions = _CountingFunctions([first, second])
+
+    def lookup(text):
+        return [
+            int(f.start)
+            for f in instance.ctx._find_functions_by_name(
+                bv, text, case_sensitive=True)
+        ]
+
+    assert lookup("alpha") == [0x401000, 0x402000]
+    assert bv.functions.enumerations == 1
+    assert lookup("alpha") == [0x401000, 0x402000]
+    assert bv.functions.enumerations == 1, "the group must be memo-served"
+
+    # Unnotified, and COUNT-PRESERVING: one group member goes away, another
+    # same-name function appears. BN's name index answers nothing here, so the
+    # vanished start is the only remaining evidence.
+    bv.functions.remove(second)
+    bv.functions.append(_named_fn(0x403000, "alpha"))
+    assert len(bv.functions) == 2, "the count must be unchanged for this to bite"
+
+    assert lookup("alpha") == [0x401000, 0x403000], (
+        "a cached start the view no longer has must invalidate, not shrink, the group"
+    )
+    assert bv.functions.enumerations == 2, "exactly one rebuild"
+    assert lookup("alpha") == [0x401000, 0x403000]
+    assert bv.functions.enumerations == 2, "the rebuilt index must be reused"
+
+
 def test_an_empty_cached_group_is_still_rechecked_against_the_view(monkeypatch):
     """#622 review (round-5 major): an EMPTY cached bucket has no member whose
     casing could be asked for, so a case-insensitive lookup has nothing to witness
@@ -1019,7 +1068,11 @@ def test_find_function_miss_hints_are_bounded_and_the_budget_is_disclosed(monkey
 
 
 def test_find_function_stub_does_not_shadow_the_implementation(monkeypatch):
-    """An import stub can shadow a same-name real body (#122/#286), and only the
+    """INVARIANT GUARD -- green at base by construction (base always walked), so
+    it is not regression evidence for this PR; it fails if any later change lets a
+    unique native-index hit answer a single identifier.
+
+    An import stub can shadow a same-name real body (#122/#286), and only the
     walk's full match set lets the impl-over-stub resolver pick the body. BN's own
     name index resolving just the stub must never become the answer -- the real
     body is returned."""
@@ -1635,12 +1688,16 @@ def test_xrefs_no_stub_union_for_plain_function(monkeypatch):
 
 
 def test_xrefs_keeps_stub_callers_when_the_native_index_answers_a_subset(monkeypatch):
-    """The same-name group callers need EVERY member, but BN's own name index can
+    """INVARIANT GUARD for the round-3 review BLOCKER -- green at base by
+    construction (base always walked), and proven non-vacuous by mutation: making
+    the group lookup answer from the native index turns it RED.
+
+    The same-name group callers need EVERY member, but BN's own name index can
     only ever return a strict SUBSET of the authoritative walk -- it does not carry
     the demangled short/full spellings BN keeps only on the symbol (#224a). With an
     index that resolves just the real body, `xrefs <name>` must STILL union the
     veneer's callers: answering from the subset silently drops them and reads a hot
-    function as zero-caller with no flag (round-3 review BLOCKER)."""
+    function as zero-caller with no flag."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     bv, caller, stub, impl = _impl_stub_bv(stub_ref_addrs=[0x500010])
@@ -1652,7 +1709,10 @@ def test_xrefs_keeps_stub_callers_when_the_native_index_answers_a_subset(monkeyp
 
 
 def test_same_name_stub_union_survives_a_subset_native_index(monkeypatch):
-    """The group lookup is walk-backed even when the native index answers: it must
+    """INVARIANT GUARD, sibling of the test above -- green at base by construction
+    and proven non-vacuous by the same mutation.
+
+    The group lookup is walk-backed even when the native index answers: it must
     return the COMPLETE same-name group (both members, view order) so the stub union
     sees the veneer, and the stub set must be derived from that full group rather
     than from the index's subset."""

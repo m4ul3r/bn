@@ -289,10 +289,10 @@ class _NameIndex:
     would be retained for the process lifetime. Only ints and strings are stored,
     so the entry dies with the view.
 
-    ``count`` is the number of functions the view held when the index was built
-    (None when the view could not report one). It is the only staleness signal
-    that is independent of SPELLING and of CASE, which is what makes it the
-    witness of last resort for a change BN did not notify: BN's own name index is
+    ``count`` is how many functions the view held when the index was built, taken
+    from the very list the build walked. It is the one staleness signal that is
+    independent of SPELLING and of CASE, which is what makes it the witness of
+    last resort for a change BN did not notify: BN's own name index is
     case-sensitive, so an addition spelled in a casing nothing asked for cannot be
     witnessed by name (:meth:`BridgeContext._witnessed_missing_member`).
     """
@@ -303,7 +303,7 @@ class _NameIndex:
         self.exact: dict[str, list[int]] = {}
         self.folded: dict[str, list[int]] = {}
         self.corpus: list[str] = []
-        self.count: int | None = None
+        self.count: int = 0
 
     @staticmethod
     def _starts(mapping: dict[str, list[int]], key: str) -> list[int]:
@@ -322,27 +322,36 @@ class _NameIndex:
         return out
 
     @staticmethod
-    def _resolve(bv, starts: list[int]) -> list[Any]:
-        """The LIVE functions at *starts*, in view order, as a NEW list per call.
+    def _resolve(bv, starts: list[int]) -> tuple[list[Any], int]:
+        """``(live functions at *starts* in view order, how many did not resolve)``.
 
         Resolution happens here, at lookup time, rather than being stored: a
         Function would pin the view (see the class docstring). On real BN
         ``get_function_at`` is a map lookup, not a ``bv.functions`` walk, and a
-        start the view no longer has resolves to None and is skipped."""
+        start the view no longer has resolves to None.
+
+        The unresolved COUNT is returned rather than swallowed: a start this index
+        recorded that the view no longer has is proof the view changed after the
+        index was built, which is exactly what the staleness guards look for. A
+        list built by silently dropping it would be an incomplete group that looks
+        complete."""
         get_at = getattr(bv, "get_function_at", None)
         if not callable(get_at):
-            return []
+            return [], len(starts)
         out: list[Any] = []
+        missing = 0
         for start in starts:
             fn = get_at(start)
-            if fn is not None:
+            if fn is None:
+                missing += 1
+            else:
                 out.append(fn)
-        return out
+        return out, missing
 
-    def exact_matches(self, bv, text: str) -> list[Any]:
+    def exact_matches(self, bv, text: str) -> tuple[list[Any], int]:
         return self._resolve(bv, self._starts(self.exact, text))
 
-    def folded_matches(self, bv, text: str) -> list[Any]:
+    def folded_matches(self, bv, text: str) -> tuple[list[Any], int]:
         return self._resolve(bv, self._starts(self.folded, text.lower()))
 
 
@@ -626,45 +635,61 @@ class BridgeContext:
         work: the base revision walked ``bv.functions`` THREE times per miss
         (case-sensitive match, casefolded match, suggestion corpus) and the
         round-3 single-pass version still walked once per miss, so every lookup
-        paid a full view enumeration. A WARM view needs NO enumeration at all --
-        the index above is built once per view generation and reused, and a lookup
-        costs one dict lookup plus the guards below (a count read, the bucket's
-        member re-validation, and one native-index witness lookup per casing),
-        none of which enumerates ``bv.functions``. Measured on a synthetic
-        >=100-function view whose ``functions`` list counts ``__iter__``: base 3
-        enumerations per miss, 1 for round-3, 0 warm here (#622(b)).
+        paid a full view enumeration. A WARM view needs none of that -- the index
+        above is built once per view generation and reused, and a lookup costs one
+        dict lookup plus the guards below: a ``get_function_at`` map lookup per
+        cached member, one ``len(bv.functions)``, the members' spelling re-read,
+        and one native-index lookup per casing. None of those constructs a
+        ``Function`` per view function or reads any name off one, which is what
+        the walk costs; stated exactly, ``len(bv.functions)`` is one core
+        list-and-count call (see :meth:`_function_count_changed`), so "no
+        enumeration" means no Python-level pass and no per-function name reads,
+        not zero core calls. Measured on a synthetic >=100-function view whose
+        ``functions`` list counts ``__iter__``: base 3 enumerations per miss, 1
+        for round-3, 0 warm here (#622(b)).
 
         Invalidation is BN's own notification counter: every mutation path that
         could be exercised -- a direct ``fn.name`` write, undo, redo, the bridge's
         rename op, a reverted ``bn rename --preview`` and ``bn refresh`` -- fires a
         handled ``symbol_*``/``function_*`` event, so a read that follows one never
-        serves the pre-change index. Three live guards cover a change BN does not
-        notify, on every lookup served by the memo (an index built by this call IS
-        the walk, so no witness can contradict it) and each costing at most ONE
-        extra rebuild -- never a loop:
+        serves the pre-change index. That counter is the invalidation signal; the
+        guards below are cheap CORROBORATION for a change BN did not notify at
+        all, run on every lookup served by the memo (an index built by this call
+        IS the walk, so no witness can contradict it) and each costing at most ONE
+        rebuild per lookup -- never a loop:
 
+        * no cached start may have VANISHED: a start this index recorded that the
+          view no longer resolves is proof the view changed, and it needs no
+          spelling, no casing and no count difference to see it;
         * the view must still hold as many functions as when the index was built
-          (:meth:`_function_count_changed`) -- the one guard that needs no
-          spelling and no casing, so it is what catches an unnotified ADDITION or
-          REMOVAL BN's case-sensitive name index cannot be asked about;
+          (:meth:`_function_count_changed`) -- the one guard that is independent
+          of spelling AND casing, so it catches an unnotified ADDITION or REMOVAL
+          BN's case-sensitive name index cannot be asked about;
         * every cached member must still carry the queried spelling; and
         * the cached group must not LACK a member BN's own name index witnesses for
           the spelling -- the check is symmetric, so a cached NON-empty bucket that
           is missing a member is rebuilt too, not only an empty one.
 
         BN's own index is keyed on the view's SPELLINGS and is case-sensitive, so
-        that third witness is fetched once per casing the group is known by and
+        that last witness is fetched once per casing the group is known by and
         compared against the bucket that casing belongs to
         (:meth:`_witnessed_missing_member`). It is only ever a WITNESS that the
         group is incomplete -- never the answer itself (the walk-backed rebuild
         supplies the COMPLETE group, round-3 blocker rule).
 
-        The RESIDUAL gap, stated plainly: an unnotified RENAME leaves the count
-        unchanged, so if its new spelling reaches the view only as a symbol's
-        demangled short/full name (outside BN's own name index), or differs from
-        the query only in casing while no cached member carries that casing, it is
-        unwitnessed and a cached group could stay incomplete for it. Only a walk
-        could close that, and BN has no case-insensitive name index to ask."""
+        The RESIDUAL gap, stated in full: a change BN does not notify escapes all
+        four guards only when it leaves the function COUNT unchanged, leaves every
+        cached start resolvable, and carries a spelling BN's case-sensitive index
+        cannot be asked for (a casing nothing queried and no cached member holds,
+        or a demangled short/full name the index does not carry, #224a). Two
+        shapes qualify: an unnotified RENAME, and an unnotified ADDITION paired
+        with a REMOVAL outside the queried group. Both then serve a group that is
+        missing a member. Closing that needs a membership re-read of every
+        function on every warm lookup -- i.e. the walk this index exists to
+        remove -- so it is disclosed rather than paid for. A standing disagreement
+        between BN's name index and ``bv.functions`` degrades the warm path to one
+        rebuild per lookup, which is the BASE cost and the safe direction: a group
+        a witness calls incomplete is never served."""
         if not callable(getattr(bv, "get_function_at", None)):
             # The index stores START ADDRESSES and resolves them at lookup time
             # (the retention contract above), so a view that cannot resolve an
@@ -672,9 +697,15 @@ class BridgeContext:
             # resolution would otherwise produce.
             return self._walk_scan(bv, text)
         index, memoised = self._name_index(bv)
-        exact = index.exact_matches(bv, text)
-        folded = index.folded_matches(bv, text)
-        stale = memoised and self._function_count_changed(bv, index)
+        exact, exact_gone = index.exact_matches(bv, text)
+        folded, folded_gone = index.folded_matches(bv, text)
+        stale = memoised and (
+            # A start this index recorded that the view no longer has is PROOF of
+            # an unnotified change -- cheaper and stronger than any witness,
+            # because it needs no spelling, no casing and no count difference.
+            bool(exact_gone or folded_gone)
+            or self._function_count_changed(bv, index)
+        )
         if not stale:
             stale = not self._bucket_is_live(exact, text, folded=False)
         if not stale:
@@ -683,8 +714,8 @@ class BridgeContext:
             stale = self._witnessed_missing_member(bv, text, exact, folded)
         if stale:
             index, _ = self._name_index(bv, refresh=True)
-            exact = index.exact_matches(bv, text)
-            folded = index.folded_matches(bv, text)
+            exact, _ = index.exact_matches(bv, text)
+            folded, _ = index.folded_matches(bv, text)
         return exact, folded, index.corpus
 
     def _walk_scan(self, bv, text: str) -> tuple[list[Any], list[Any], list[str]]:
@@ -718,18 +749,22 @@ class BridgeContext:
         """Does the view hold a different number of functions than when *index*
         was built?
 
-        The only staleness signal that depends on neither a spelling nor a casing,
+        The one staleness signal that depends on neither a spelling nor a casing,
         which is what makes it the witness of last resort: BN's name index is
         case-sensitive, so an unnotified addition spelled in a casing nothing
         queried -- and that no cached member carries -- cannot be witnessed by name
-        at all, but it does change the count. On real BN this reads
-        ``len(bv.functions)``: one core list call, without the per-function
-        ``Function`` construction and four name reads the index build pays, so it
-        costs a small fraction of the walk it keeps from being needed. A view that
-        cannot report a count has no count witness (the name witnesses still
-        apply)."""
-        if index.count is None:
-            return False
+        at all, but it does change the count.
+
+        Cost, exactly: on the installed BN API ``bv.functions`` is a
+        ``FunctionList`` built by ONE core ``BNGetAnalysisFunctionList`` call that
+        also yields the count, and ``len()`` reads that count -- so this is one
+        core call plus the core's own array allocation, with none of the
+        per-function ``Function`` construction or the four name reads per function
+        the index build pays. It is a fraction of the walk it keeps from being
+        needed, not free, and it is O(n) inside the core.
+
+        A view whose ``functions`` cannot report a length (a double, never a real
+        BinaryView) has no count witness; the other three guards still apply."""
         try:
             live = len(bv.functions)
         except (AttributeError, TypeError):

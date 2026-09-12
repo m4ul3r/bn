@@ -262,6 +262,14 @@ def test_class_registry_is_reused_per_view_and_invalidated_by_a_change():
         for m in read_class._build_class_registry(None, bv)["net::Session"]["methods"]
     ] == methods_before
 
+    # ... and so is each method ENTRY: mutating one in place must not reach the
+    # memo either, or the poisoned entry is served to every later call.
+    first["net::Session"]["methods"][0]["demangled"] = "polluted-in-place"
+    assert [
+        m["demangled"]
+        for m in read_class._build_class_registry(None, bv)["net::Session"]["methods"]
+    ] == methods_before
+
     # A rename, reported by BN's own notification, invalidates the registry.
     renamed = bv.functions[0]
     renamed.name = "_ZN3net9RenamedC1Ev"
