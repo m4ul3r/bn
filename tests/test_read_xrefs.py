@@ -426,6 +426,43 @@ def test_xrefs_import_scan_flags_a_function_with_no_llil(monkeypatch):
     assert "2 function(s)" in blind["scan_note"]
 
 
+class _HostileIL:
+    """An IL container whose iteration raises AND whose ``basic_blocks`` access
+    raises -- a read failure no enumeration of known shapes anticipated."""
+
+    def __iter__(self):
+        raise RuntimeError("LLIL unavailable")
+
+    @property
+    def basic_blocks(self):
+        raise RuntimeError("LLIL unavailable")
+
+
+def test_xrefs_import_scan_discloses_an_unanticipated_read_failure(monkeypatch):
+    """#622 review (round-3 blocker, class not instance): the scan's completeness
+    disclosure must be a CHOKE POINT, not a list of the read failures someone
+    thought of. Two shapes slipped through silently once already; this is a shape
+    neither of those fixes enumerated -- an IL object that raises on iteration AND
+    on the ``basic_blocks`` fallback -- and it must be recorded, not escape as an
+    exception out of the whole xrefs op (nor, worse, as a flagless empty scan).
+
+    A function whose IL read fails in any way has not been examined, so the
+    envelope says so."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _import_scan_bv("plt_target", 0x20000, [0x1000, 0x2000])
+    bv.functions[1].low_level_il = _HostileIL()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._xrefs(None, "plt_target")
+
+    assert result["truncated"] is True
+    assert "LLIL" in result["scan_note"]
+    assert "1 function(s)" in result["scan_note"]
+    assert result["code_ref_count"] == 1          # the readable caller survives
+
+
+
 def test_find_function_exact_hit_walks_once_and_then_never_again(monkeypatch):
     """#622(b) for the SINGLE-identifier path: an exact name hit pays the one
     index build and every later hit enumerates nothing.

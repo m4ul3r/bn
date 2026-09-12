@@ -824,29 +824,40 @@ def _scan_llil_instructions(fn, unreadable: list[str] | None = None):
 
     A function whose LLIL cannot be read is skipped, and -- when *unreadable* is
     given -- recorded there, so the caller can report its scan as partial instead
-    of presenting the truncated caller list as complete. All three read failures
-    count, not just a failed block: BN documents ``low_level_il`` as None when
-    "an error occurs while loading the IL", and an IL container that can neither
-    be iterated nor offer ``basic_blocks`` yields nothing either. In every case
-    the function's body never entered the scan, so claiming a complete scan over
-    it is a false negative -- and since the envelope's missing ``truncated`` now
-    ASSERTS completeness, silence there is worse than the unflagged base.
+    of presenting the truncated caller list as complete. Since the envelope's
+    missing ``truncated`` now ASSERTS completeness, an unrecorded read failure is
+    worse than the unflagged base revision: it turns "we did not look" into "we
+    looked and there is nothing".
 
-    A function whose LLIL iterates to zero blocks is NOT a failure: an empty
-    body is read successfully and has no callers to contribute."""
-    il = getattr(fn, "low_level_il", None)
-    if il is None:
-        il = getattr(fn, "llil", None)
-    if il is None:
+    That disclosure is a CHOKE POINT, not a list of known failures. Acquiring the
+    blocks happens inside ONE guard whose every failure -- ``low_level_il`` None
+    (BN documents that as "an error occurs while loading the IL"), either IL
+    attribute raising instead of answering, a container that cannot be iterated,
+    a ``basic_blocks`` fallback that is empty or itself raises, anything else --
+    lands on ``blocks is None`` and is recorded. Per-block iteration has the same
+    shape: a bare ``except`` records and moves on. So a read failure BN grows
+    later is disclosed by default; nothing has to be enumerated here again.
+
+    The ONE case that yields nothing and is NOT a failure: a successfully read IL
+    with zero blocks. An empty body is read, not unread, so flagging it would fire
+    the honesty flag constantly and train readers to ignore it."""
+    blocks: list | None = None
+    try:
+        il = getattr(fn, "low_level_il", None)
+        if il is None:
+            il = getattr(fn, "llil", None)
+        if il is not None:
+            try:
+                blocks = list(il)
+            except Exception:
+                # The container itself is unreadable; its basic_blocks are the
+                # documented fallback, and an EMPTY fallback read nothing at all.
+                blocks = list(getattr(il, "basic_blocks", None) or []) or None
+    except Exception:
+        blocks = None
+    if blocks is None:
         _note_unreadable(fn, unreadable)
         return
-    try:
-        blocks = list(il)
-    except Exception:
-        blocks = list(getattr(il, "basic_blocks", []) or [])
-        if not blocks:
-            _note_unreadable(fn, unreadable)
-            return
     for block in blocks:
         try:
             yield from block
