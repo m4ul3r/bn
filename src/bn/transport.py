@@ -353,7 +353,10 @@ def _socket_path_is_confined(socket_path: Path) -> bool:
     """
     try:
         return socket_path.resolve().is_relative_to(cache_home().resolve())
-    except OSError:
+    except (OSError, ValueError):
+        # OSError: the path cannot be stat'd. ValueError: it cannot even be
+        # interpreted as a path (an embedded NUL). Both mean "not proven
+        # confined", and a corrupt payload must not abort discovery.
         return False
 
 

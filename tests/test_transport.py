@@ -3000,6 +3000,37 @@ def test_registry_socket_under_cache_still_loads_and_purges(tmp_path, monkeypatc
         stale_socket.unlink(missing_ok=True)
 
 
+def test_load_instance_ignores_a_registry_socket_path_that_cannot_be_resolved(
+    tmp_path, monkeypatch
+):
+    """An unresolvable socket_path is corruption to skip, never a CLI abort.
+
+    ``Path.resolve()`` raises ValueError -- not OSError -- on an embedded NUL, so
+    the confinement check must treat it as unconfined instead of letting it
+    escape ``_load_instance``/``list_instances``. The owner here is live and its
+    identity PROVEN: that is the payload the tolerant loader used to ignore, so
+    discovery must still return without raising and drop the unusable
+    cache-side record, exactly as it does for a socket outside the cache.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    registry_path = instances_dir() / "nulpath.json"
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    registry_path.write_text(
+        json.dumps(
+            _registry_payload(
+                Path("/tmp/x\x00y.sock"),
+                pid=os.getpid(),
+                identity=_identity(),
+                instance_id="nulpath",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    assert not any(inst.instance_id == "nulpath" for inst in list_instances())
+    assert not registry_path.exists()
+
+
 class _CloseCountingLog:
     """File handle proxy that records every close() so a leak is observable."""
 
