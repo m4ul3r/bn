@@ -1012,7 +1012,7 @@ def _resolve_target(
     return target
 
 
-def _mutation_exit_code(result: Any) -> int:
+def _mutation_exit_code(result: Any, summary: Callable[[Any], Any] | None = None) -> int:
     if not isinstance(result, dict):
         return 0
     results = list(result.get("results") or [])
@@ -1020,6 +1020,18 @@ def _mutation_exit_code(result: Any) -> int:
         return 3
     if result.get("success") is False:
         return 3
+    # #715: a successful mutation the compact summary could not MEASURE (no
+    # `results[]` rows to derive counts from, #684) is "applied but
+    # unverifiable", not a confirmed success -- a $?-only consumer must not read
+    # it as one. 4 is deliberately distinct from a failure's 3 (the write did
+    # land) and from 0 (an all-noop or verified run, both measured). *summary* is
+    # the transform this call actually renders/spills with, so an op that
+    # measures through its own counters (`_go_rename_summary` reports
+    # `measured: true` by design) is not mislabelled by a generic recompute.
+    if summary is not None:
+        compact = summary(result)
+        if isinstance(compact, dict) and compact.get("measured") is False:
+            return 4
     return 0
 
 
@@ -1085,7 +1097,14 @@ def _mutate(
         # status line stays shared so #645's default is identical everywhere.
         text_renderer=(_render_mutation_summary_text if compact
                        else (detail_renderer or _render_mutation_text)),
-        result_exit_code=_mutation_exit_code,
+        # #715: the exit code is computed on the ORIGINAL result, before any
+        # transform runs, so it cannot see the `measured` flag `_mutation_summary`
+        # derives. Hand it the same transform this call renders/spills with (an
+        # op with its own measurement escape hatch supplies that instead) so an
+        # unmeasured success maps to exit 4 rather than reading as a clean 0.
+        result_exit_code=lambda result: _mutation_exit_code(
+            result, summary_transform or _mutation_summary,
+        ),
         # A mutation whose result does not report through `results[]` supplies its
         # own compact transform; everything else shares `_mutation_summary`.
         result_transform=((summary_transform or _mutation_summary) if compact

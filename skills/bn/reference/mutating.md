@@ -34,7 +34,7 @@ Per-op statuses:
 - `noop` — already in the requested state.
 - `unsupported` — operation not supported on this object.
 - `verification_failed` — readback disagrees; the whole mutation/batch is reverted, and JSON also returns the requested vs observed state.
-- `invalid_request` — the op was refused **during apply** (bad field *value*, an ambiguous target, conflicting options); the whole mutation/batch is reverted and this status shows up in a per-op `results[]` row, exit 3. A manifest that instead fails the **up-front shape check** (an unknown op kind, or a missing required field) never reaches apply — nothing is touched, so there is nothing to revert — and surfaces as a bridge/request error with no `results[]` envelope at all, exit 2.
+- `invalid_request` — the request was refused: a bad field *value*, a missing required field, an ambiguous target, conflicting options. Whether the refusal is raised up front (the pre-apply shape check that validates every op before any is applied) or during apply, it is a mutation failure: exit 3 on any mutation command, with the whole mutation/batch reverted when anything had been applied. An unknown op kind is `unsupported` and likewise exit 3. The up-front/apply-time distinction does **not** change the exit code — a status in `FAILED_MUTATION_STATUSES` on a mutation call is exit 3 (#625/#716); only the same status escaping a read/resolver op is exit 2. The single exit-2 case on this path is a manifest the CLI rejects before sending anything (unparseable JSON, a manifest that is not an object with an `"ops"` list), which never reaches the bridge and has no `status`.
 - `rollback_failed` — an operation failed and the automatic revert of that failure also failed; the view may be left in a mixed state.
 - `internal_error` — an unexpected exception during apply; treated like a failure and reverted.
 
@@ -59,10 +59,12 @@ in a write-heavy session (a `proto set` cost ~7 KB; a 115-op previewed batch cos
 | the compact status as JSON | `--format json --summary` (alias `--quiet`) |
 | full detail written to a file | `--out detail.json` (stdout keeps a small envelope) |
 
-`--format` picks the medium; `--verbose`/`--summary` pick the detail level. Exit
-codes are unchanged in every combination (0 ok / 2 bridge or request error / 3
-mutation status `verification_failed`, `unsupported`, `invalid_request`,
-`rollback_failed`, or `internal_error`).
+`--format` picks the medium; `--verbose`/`--summary` pick the detail level. No
+combination changes the exit code (each computes it from the same full result):
+0 ok / 2 bridge or request error / 3 a mutation status `verification_failed`,
+`unsupported`, `invalid_request`, `rollback_failed`, or `internal_error` / 4 an
+unmeasured success (`measured: false` — applied but unverifiable; see
+"Unmeasured mutations").
 
 ### Compact status keys
 
@@ -103,9 +105,14 @@ falsy under every truthiness check a control loop actually writes (`jq 'if
 close()`), so it would read identically to a confirmed clean no-op and a naive
 consumer would discard real work. Check `measured` (or just read `dirty_after`,
 which fails safe on its own) before trusting a `0`-looking status line as a
-confirmed no-op. The exit code does **not** change for an unmeasured result —
-it is still `0` on success — so a script that only checks `$?` will not notice;
-read the summary object.
+confirmed no-op.
+
+An unmeasured success also changes the exit code: it is **`4`** ("applied but
+unverifiable"), so a script that only checks `$?` sees that the write could not be
+confirmed instead of reading it as a clean success. `4` is distinct from `3` (a
+failure — a status in `FAILED_MUTATION_STATUSES`, which still wins if both apply)
+and from `0` (a verified or measured all-`noop` run). It is not a new failure
+mode: the mutation did apply, so read the view back and `bn save` before closing.
 
 **A mutation result never spills.** A read that spills is recoverable (re-read the
 artifact); an atomic write whose result is unparseable is not — the agent's model of
@@ -235,8 +242,9 @@ for `struct_name`) on the `struct_field_*` ops, `source_path` on `types_declare`
 Rules:
 
 - The manifest must be a dict with an `"ops"` key (not a bare list).
-- **Every op is validated before ANY is applied.** A guessed op name or field name is
-  a clean `invalid_request` naming the op *index* — with a "did you mean" hint — so a
+- **Every op is validated before ANY is applied.** A missing required field or a bad
+  field *value* is a clean `invalid_request` naming the op *index* — with a "did you
+  mean" hint — and an unrecognized op kind is `unsupported`; either way exit 3, and a
   typo in op 13 no longer rolls back 12 good ops.
 - **One write per key.** Every op is verified against the batch's END state, so a
   manifest that writes the same key twice (two `set_comment`s on one address, a

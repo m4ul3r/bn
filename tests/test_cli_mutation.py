@@ -553,7 +553,7 @@ def test_mutation_result_never_spills_to_an_envelope_645(fake_transport, capsys,
 
 
 def test_symbol_rename_builds_preview_payload(fake_transport):
-    calls = fake_transport({"rename_symbol": {"ok": True, "result": {"preview": True}}})
+    calls = fake_transport({"rename_symbol": {"ok": True, "result": {"preview": True, "results": [{"status": "verified"}]}}})
 
     rc = bn.cli.main(
         [
@@ -621,7 +621,7 @@ def test_symbol_rename_uses_implicit_target_when_single_target_is_open(fake_tran
                     }
                 ],
             },
-            "rename_symbol": {"ok": True, "result": {"preview": True}},
+            "rename_symbol": {"ok": True, "result": {"preview": True, "results": [{"status": "verified"}]}},
         }
     )
 
@@ -734,7 +734,7 @@ def test_function_create_text_output_renders_verified_summary(fake_transport, ca
 
 def test_function_create_forwards_preview_flag(fake_transport):
     calls = fake_transport(
-        {"function_create": {"ok": True, "result": {"preview": True, "success": True, "committed": False, "results": []}}}
+        {"function_create": {"ok": True, "result": {"preview": True, "success": True, "committed": False, "results": [{"status": "verified"}]}}}
     )
 
     rc = bn.cli.main(["function", "create", "--target", "123:1:7", "--preview", "0x401000"])
@@ -1044,6 +1044,63 @@ def test_symbol_rename_noop_still_succeeds(monkeypatch):
     assert rc == 0
 
 
+def test_unmeasured_mutation_success_exits_four(monkeypatch, capsys):
+    """#715: a successful mutation whose result carries no `results[]` rows is
+    `measured: false` in its compact summary, so the outcome could not be
+    verified. That is neither a failure (exit 3) nor a confirmed success (exit
+    0): it is exit 4 "applied but unverifiable", so a script that only checks
+    `$?` cannot read it as a clean success."""
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        assert op == "rename_symbol"
+        return {
+            "ok": True,
+            "result": {
+                "preview": False,
+                "success": True,
+                "committed": True,
+                "rolled_back": False,
+                # No `results[]`: the op measures through its own counters.
+            },
+        }
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["symbol", "rename", "--target", "active", "sub_401000", "player_update"])
+
+    assert rc == 4
+    # The exit code agrees with the status line the same call printed.
+    assert "warning: unmeasured" in capsys.readouterr().out
+
+
+def test_unmeasured_mutation_still_exits_four_in_verbose_mode(monkeypatch):
+    """The exit code must not depend on the detail level: `--verbose` still
+    renders the full payload, but an unverifiable write is exit 4 either way."""
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": {"preview": False, "success": True, "committed": True}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["symbol", "rename", "--target", "active", "--verbose",
+                      "sub_401000", "player_update"])
+
+    assert rc == 4
+
+
+def test_unmeasured_mutation_failure_still_exits_three(monkeypatch):
+    """Ordering: an unmeasured envelope that also reports failure is a failure
+    (exit 3), not "applied but unverifiable" (exit 4)."""
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": False, "result": {"preview": False, "success": False,
+                                        "committed": False,
+                                        "message": "revert failed after apply"}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["symbol", "rename", "--target", "active", "sub_401000", "player_update"])
+
+    assert rc == 3
+
+
 def test_operation_failure_status_maps_to_exit_3_for_mutation(monkeypatch, capsys):
     """#625: an OperationFailure that escapes a genuine mutation call (routed
     through `_mutate`) with a status in FAILED_MUTATION_STATUSES maps to exit
@@ -1120,7 +1177,7 @@ def test_batch_apply_stdin_forwards_preview_flag(monkeypatch, fake_transport):
         io.StringIO('{"ops": [{"op": "set_comment", "address": "0x1000", "comment": "x"}]}'),
     )
     calls = fake_transport(
-        {"batch_apply": {"ok": True, "result": {"preview": True, "success": True, "committed": False, "results": []}}}
+        {"batch_apply": {"ok": True, "result": {"preview": True, "success": True, "committed": False, "results": [{"status": "verified"}]}}}
     )
 
     rc = bn.cli.main(["batch", "apply", "--preview", "-"])
@@ -1130,7 +1187,7 @@ def test_batch_apply_stdin_forwards_preview_flag(monkeypatch, fake_transport):
 
 
 def test_rename_alias_maps_to_symbol_rename(fake_transport):
-    calls = fake_transport({"rename_symbol": {"ok": True, "result": {"preview": True}}})
+    calls = fake_transport({"rename_symbol": {"ok": True, "result": {"preview": True, "results": [{"status": "verified"}]}}})
 
     rc = bn.cli.main(["rename", "--target", "123:1:7", "--preview", "sub_401000", "player_update"])
 

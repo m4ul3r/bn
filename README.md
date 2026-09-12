@@ -348,6 +348,8 @@ Mutation results now distinguish:
 
 When verification fails, JSON output also includes `requested` and `observed` state for the failed op.
 
+Any status above other than `verified`/`noop` puts a mutation at exit code `3`. An operation that reports through its own counters instead of populating `results[]` cannot be measured at all: its compact summary sets `measured: false`, a fail-safe `dirty_after: true` and a `first_error` explaining that the counts are unknown, and the CLI exits `4` ("applied but unverifiable") — distinct from `3` (a failure) and from `0`, so a script that only checks `$?` cannot read an unconfirmed write as a clean success. A measured all-`noop` is still `0`.
+
 `bn types declare` now uses Binary Ninja's source parser when available. When you pass `--file`, the CLI also forwards the source path so relative includes resolve the same way they would during header import in the GUI.
 
 If a declaration only parses functions or extern variables and introduces no named types to persist, `types declare` returns a verified no-op instead of failing with `No named types found in declaration`.
