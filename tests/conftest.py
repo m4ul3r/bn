@@ -141,6 +141,12 @@ def _invalidate_stale_bndb_sidecars(binaries: list[Path]) -> None:
     gone between the `stat()` and the `unlink()`, so the disappearances that
     race is allowed to produce (`FileNotFoundError`) are treated as "already
     invalidated" rather than escaping as a fixture-build flake.
+
+    Any OTHER `OSError` is the opposite case and must not be swallowed: a stale
+    database the build cannot remove is exactly the one the lane would go on to
+    load, so it becomes a `FixtureBuildError` -- the type every caller of
+    `build_integration_fixtures` documents and catches -- rather than a raw
+    errno escaping past them.
     """
     for binary in binaries:
         sidecar = Path(str(binary) + ".bndb")
@@ -149,7 +155,17 @@ def _invalidate_stale_bndb_sidecars(binaries: list[Path]) -> None:
         except FileNotFoundError:
             continue
         if sidecar_mtime < binary.stat().st_mtime:
-            sidecar.unlink(missing_ok=True)
+            try:
+                sidecar.unlink(missing_ok=True)
+            except OSError as exc:
+                raise FixtureBuildError(
+                    f"a saved analysis database older than the fixture it caches "
+                    f"could not be removed, so the real-BN tests would analyse the "
+                    f"stale database instead of the freshly built program. Remove "
+                    f"it by hand and run: make -C tests/fixtures clean\n"
+                    f"  database: {sidecar}\n"
+                    f"  error: {exc}"
+                ) from exc
 
 
 def build_integration_fixtures(

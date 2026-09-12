@@ -40,6 +40,16 @@ def _mutate_calls_in_source(
     tree today passes the op positionally as a literal; a future one that does
     not must make this guard fail loudly and get an extractor that understands
     it, not vanish from the sweep.
+
+    The callee is matched by NAME, with any receiver (`_mutate(...)` and
+    `<anything>._mutate(...)` alike), deliberately. Since #720 the scan covers
+    the whole package, and the delegating helper this guard exists to catch
+    usually reaches the CLI's `_mutate` as an attribute (`cli._mutate(...)`);
+    pinning the receiver to the bare name would make that helper invisible and
+    reopen the exact blind spot. The cost is that an unrelated callee sharing
+    the name is a false positive -- but a false positive fails LOUDLY and names
+    its file:line, which is the right failure direction for a guard whose whole
+    purpose is that nothing drops out of the population unseen.
     """
     calls: list[tuple[int, str, bool]] = []
     for node in ast.walk(ast.parse(source)):
@@ -199,10 +209,13 @@ def _assert_scan_accounted_for(
         "handler's OWN source) does not account for every _mutate() call site in "
         "the bn package (#720).\n"
         f"_mutate() call sites NO registered handler's own source contains "
-        f"({len(module_only)}) -- the helper-mediated delegation shape: a handler "
-        "calls a module-level helper that calls _mutate(), so the op it routes is "
-        "missing from the swept population and its summary wiring is never "
-        f"checked:\n{_render(module_only)}\n"
+        f"({len(module_only)}) -- usually the helper-mediated delegation shape: a "
+        "handler calls a module-level helper that calls _mutate(), so the op it "
+        "routes is missing from the swept population and its summary wiring is "
+        "never checked. The other possibility is an unrelated callee that merely "
+        "SHARES the name -- see `_mutate_calls_in_source` on why the receiver is "
+        "deliberately not pinned; rename that callee rather than narrowing the "
+        f"scan:\n{_render(module_only)}\n"
         f"handler-owned call sites the scan region does NOT contain "
         f"({len(handler_only)}) -- the scanned file set is narrower than the "
         f"population checked against it, so widen the scan:\n{_render(handler_only)}"
