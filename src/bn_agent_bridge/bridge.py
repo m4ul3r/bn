@@ -1436,6 +1436,14 @@ class BinaryNinjaBridge:
             "plugin_build_id": PLUGIN_BUILD_ID,
             # Whole-package fingerprint of the code this process loaded (#161).
             "engine_build_id": ENGINE_BUILD_ID,
+            # Which Binary Ninja this process is actually driving. Nothing else
+            # in the tool's output names it: a major-version jump (5.x -> 6.x)
+            # changes analysis and IL semantics, so "the same command behaved
+            # differently" is unanswerable from `bn doctor` without this. Read
+            # live from the loaded module, not from the install directory, so it
+            # describes the running engine rather than whatever is on disk now.
+            "bn_version": bn.core_version(),
+            "bn_build_id": str(bn.core_build_id()),
             "pid": os.getpid(),
             "socket_path": str(self.socket_path),
             "targets": self.targets.refresh(),

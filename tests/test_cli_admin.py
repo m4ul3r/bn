@@ -673,6 +673,47 @@ def test_doctor_text_marks_healthy_instance_ok(monkeypatch, tmp_path, capsys):
     assert "status=error" not in output
 
 
+def test_doctor_names_engine_version(monkeypatch, tmp_path, capsys):
+    """`bn doctor` must name the Binary Ninja build the bridge is driving, in both
+    text and JSON. Nothing else in the tool's output does, so after a BN major
+    upgrade there is no way to tell which engine produced a given result -- the
+    same command can decode/analyze differently across majors."""
+    install_dir = tmp_path / "install"
+    source_dir = tmp_path / "source"
+    install_dir.mkdir()
+    source_dir.mkdir()
+    (install_dir / "bridge.py").write_text("print('b')\n", encoding="utf-8")
+    (source_dir / "bridge.py").write_text("print('b')\n", encoding="utf-8")
+
+    fake_instance = type("FakeInstance", (), {
+        "pid": 7, "socket_path": tmp_path / "bridge.sock",
+        "plugin_version": bn.cli.VERSION, "started_at": "2026-03-09T00:00:00+00:00",
+        "instance_id": "engine",
+    })()
+    monkeypatch.setattr(bn.cli, "list_instances", lambda: [fake_instance])
+    monkeypatch.setattr(bn.cli, "plugin_install_dir", lambda: install_dir)
+    monkeypatch.setattr(bn.cli, "plugin_source_dir", lambda: source_dir)
+    monkeypatch.setattr(
+        bn.cli, "_send_request_to_instance",
+        lambda instance, op, params=None, target=None: {
+            "ok": True,
+            "result": {
+                "plugin_version": bn.cli.VERSION, "plugin_build_id": "b",
+                "bn_version": "6.1.10638-dev", "bn_build_id": "256112377",
+                "targets": [],
+            },
+        },
+    )
+
+    assert bn.cli.main(["doctor"]) == 0
+    assert "binary ninja: 6.1.10638-dev (build 256112377)" in capsys.readouterr().out
+
+    assert bn.cli.main(["doctor", "--format", "json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    assert data["instances"][0]["bn_version"] == "6.1.10638-dev"
+    assert data["instances"][0]["bn_build_id"] == "256112377"
+
+
 def test_doctor_json_carries_reachable_and_status(monkeypatch, tmp_path, capsys):
     """doctor --format json must carry the same health signal the text mode shows
     (reachable / status), so a scripted JSON health check can read it directly

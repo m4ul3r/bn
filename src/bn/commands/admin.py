@@ -157,6 +157,10 @@ def _doctor(args: argparse.Namespace) -> int:
         loaded_version = ping.get("plugin_version") if isinstance(ping, dict) else None
         loaded_build_id = ping.get("plugin_build_id") if isinstance(ping, dict) else None
         loaded_engine_id = ping.get("engine_build_id") if isinstance(ping, dict) else None
+        # Engine (Binary Ninja) identity of the process behind this instance --
+        # the only place the tool ever names the BN version it is driving.
+        bn_version = ping.get("bn_version") if isinstance(ping, dict) else None
+        bn_build_id = ping.get("bn_build_id") if isinstance(ping, dict) else None
         # Health signal in the JSON itself, matching what the text renderer
         # prints (status=ok/error). Without these a scripted JSON health check
         # could not tell a reachable instance from an unreachable one -- it had
@@ -171,6 +175,8 @@ def _doctor(args: argparse.Namespace) -> int:
                 "socket_path": str(instance.socket_path),
                 "plugin_version": instance.plugin_version,
                 "plugin_build_id": loaded_build_id,
+                "bn_version": bn_version,
+                "bn_build_id": bn_build_id,
                 "installed_plugin_build_id": install_build_id,
                 "source_plugin_build_id": source_build_id,
                 "stale_plugin_version": (

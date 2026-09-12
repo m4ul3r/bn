@@ -286,7 +286,7 @@ Run `bn doctor` only when something is wrong — commands fail unexpectedly, tar
 bn doctor
 ```
 
-It checks CLI version, plugin staleness (`stale_plugin_version`, `stale_plugin_code`), and instance connectivity. Don't run it as part of normal workflow. Exit code is reachability-only: nonzero if any probed instance is unreachable, zero otherwise (staleness fields are informational and never affect the exit code; zero registered instances is not a failure).
+It checks CLI version, plugin staleness (`stale_plugin_version`, `stale_plugin_code`), the Binary Ninja engine each bridge is driving (`binary ninja: <core version> (build <id>)`, so a BN major upgrade is visible rather than inferred), and instance connectivity. Don't run it as part of normal workflow. Exit code is reachability-only: nonzero if any probed instance is unreachable, zero otherwise (staleness fields are informational and never affect the exit code; zero registered instances is not a failure).
 
 ## 10. Known quirks
 

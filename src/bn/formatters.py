@@ -3134,6 +3134,14 @@ def _render_doctor_text(value: Any) -> str:
         build_id = item.get("plugin_build_id")
         if build_id:
             lines.append(f"  build: {build_id}")
+        # Name the engine the bridge is actually driving: with two BN majors in
+        # play (5.x vs 6.x) the same command can behave differently, and nothing
+        # else in doctor output distinguishes them.
+        bn_version = item.get("bn_version")
+        if bn_version:
+            bn_build = item.get("bn_build_id")
+            suffix = f" (build {bn_build})" if bn_build else ""
+            lines.append(f"  binary ninja: {bn_version}{suffix}")
         if item.get("stale_plugin_version"):
             lines.append("  stale: loaded plugin version differs from CLI version")
         if item.get("stale_plugin_code"):
