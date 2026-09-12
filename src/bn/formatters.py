@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import re
 from typing import Any, Callable, Sequence
@@ -82,34 +83,57 @@ def _skew_note(*fields: str) -> str:
             "container -- any rows it held are NOT shown (use --format json)")
 
 
-def _aliased_list(value: dict[str, Any], *keys: str) -> tuple[list[Any], list[str]]:
-    """The first alias key holding a non-empty list, plus every alias that is
-    present as a truthy value of some other shape.
+def _discloses(*, lists: tuple[str, ...] = (), dicts: tuple[str, ...] = ()):
+    """Declare the container fields a text renderer coerces, so a malformed one
+    is DISCLOSED instead of rendering as an empty one.
+
+    ``_as_dict``/``_as_list`` stop the AttributeError a skewed payload used to
+    raise, but the coerced ``{}``/``[]`` then renders byte-identically to a
+    genuinely EMPTY result -- the caller reads a confident "nothing here" from
+    data the renderer could not use, which is worse than the crash it replaced:
+    a forward-taint view prints "NO modeled sink reached", a security all-clear,
+    from an unusable payload. Declaring the keys once per renderer covers EVERY
+    return path, including the early ones a per-branch line misses, and keeps
+    the rule in one place as the renderers grow (#619)."""
+    def decorate(fn: Callable[..., str]) -> Callable[..., str]:
+        @functools.wraps(fn)
+        def rendered(value: Any, *args: Any, **kwargs: Any) -> str:
+            out = fn(value, *args, **kwargs)
+            if not isinstance(value, dict) or not isinstance(out, str):
+                return out
+            skewed = sorted(
+                [k for k in lists if value.get(k) and not isinstance(value.get(k), list)]
+                + [k for k in dicts if value.get(k) and not isinstance(value.get(k), dict)])
+            if not skewed:
+                return out
+            return out + ("\n" if out else "") + _skew_note(*skewed)
+        return rendered
+    return decorate
+
+
+def _aliased_list(value: dict[str, Any], *keys: str) -> list[Any]:
+    """The first alias key that actually holds a non-empty list.
 
     ``value.get("items") or value.get("locals")`` short-circuits on a truthy
     MALFORMED canonical key, so the retained alias holding the real rows is
     never consulted and the renderer reports a confident empty listing. Testing
-    each alias independently keeps the alias reachable and hands the skew back
-    for the caller to disclose (#619)."""
-    rows: list[Any] = []
-    skewed: list[str] = []
+    each alias independently keeps the alias reachable; the skew itself is
+    disclosed by the renderer's ``@_discloses`` declaration (#619)."""
     for key in keys:
         raw = value.get(key)
-        if isinstance(raw, list):
-            if raw and not rows:
-                rows = raw
-        elif raw:
-            skewed.append(key)
-    return rows, skewed
+        if isinstance(raw, list) and raw:
+            return raw
+    return []
 
 
 def _fmt_count(value: Any) -> str:
     """Render a keyed-aggregate count for a right-aligned column, disclosing an
     uncoercible one instead of raising inside the format spec: ``f"{None:>5}"``
     is a TypeError, so one malformed count in a breakdown costs the whole text
-    view. Mirrors ``_fmt_offset`` -- only a real int renders as a number (#619)."""
+    view. The placeholder stays one character wide so a degraded row cannot skew
+    the column it sits in, and no real count renders as ``?`` (#619)."""
     if isinstance(value, bool) or not isinstance(value, int):
-        return "<unknown>"
+        return "?"
     return str(value)
 
 
@@ -307,6 +331,7 @@ def _render_disasm_linear_text(value: Any) -> str:
     return body
 
 
+@_discloses(lists=("items",))
 def _render_capabilities_text(value: Any) -> str:
     """Render the #276 capability index as a grouped, scannable catalog: each
     top-level group, its commands with one-line help, and the prefer-when /
@@ -338,6 +363,7 @@ def _render_capabilities_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+@_discloses(lists=("locals", "parameters"), dicts=("function",))
 def _render_function_info_text(value: Any, verbose: bool = False, demangle: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -437,12 +463,13 @@ def _render_proto_text(value: Any) -> str:
     return note + prototype
 
 
+@_discloses(lists=("items", "locals"), dicts=("function",))
 def _render_local_list_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     function = _as_dict(value.get("function"))
     # #651: `items` is the canonical container; `locals` is the retained alias.
-    all_items, skewed = _aliased_list(value, "items", "locals")
+    all_items = _aliased_list(value, "items", "locals")
     # A malformed (non-dict) element cannot say whether it is a parameter, so it
     # is counted as neither -- disclosing it separately keeps both counts honest
     # instead of raising or folding it into a group it may not belong to (#619).
@@ -467,9 +494,7 @@ def _render_local_list_text(value: Any) -> str:
         lines.extend(["", f"malformed entries ({len(malformed)}):"])
         for item in malformed:
             lines.append(f"  {item!r}")
-    if skewed:
-        lines.extend(["", _skew_note(*skewed)])
-    if not params and not locals_only and not malformed and not skewed:
+    if not params and not locals_only and not malformed:
         lines.extend(["", "no locals"])
     return _resolution_note(value) + "\n".join(lines)
 
@@ -486,6 +511,7 @@ def _render_type_info_text(value: Any) -> str:
     return _render_fallback_text(value)
 
 
+@_discloses(lists=("items",), dicts=("field",))
 def _render_field_xrefs_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -498,8 +524,7 @@ def _render_field_xrefs_text(value: Any) -> str:
         "code refs:",
     ]
     # #275: refs come as a unified `items` list, each tagged with its `kind`.
-    items_raw = value.get("items")
-    items = _as_list(items_raw)
+    items = _as_list(value.get("items"))
     code_refs = [it for it in items if isinstance(it, dict) and it.get("kind") == "code"]
     data_refs = [it for it in items if isinstance(it, dict) and it.get("kind") == "data"]
     # A non-dict ref carries no `kind`, so both filters above drop it. Disclose
@@ -534,8 +559,6 @@ def _render_field_xrefs_text(value: Any) -> str:
         lines.extend(["", f"malformed refs ({len(malformed_refs)}):"])
         for ref in malformed_refs:
             lines.append(f"- {ref!r}")
-    elif items_raw and not items:
-        lines.extend(["", _skew_note("items")])
 
     # #532: field xrefs now page like every other xref path. Surface the paging
     # metadata whenever the page isn't the whole ref set -- either more pages remain
@@ -658,14 +681,15 @@ def _render_refresh_text(value: Any) -> str:
     return _render_fallback_text(value)
 
 
+@_discloses(lists=("notes", "targets"))
 def _render_load_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     suffix = "  [not analyzed]" if value.get("analyzed") is False else ""
     lines = [f"loaded: {value.get('path', '<unknown>')}{suffix}"]
-    for note in value.get("notes") or []:
+    for note in _as_list(value.get("notes")):
         lines.append(f"note: {note}")
-    targets = list(value.get("targets") or [])
+    targets = _as_list(value.get("targets"))
     if targets:
         lines.append("")
         lines.append("targets:")
@@ -677,10 +701,11 @@ def _render_load_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+@_discloses(lists=("closed",))
 def _render_close_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    closed = list(value.get("closed") or [])
+    closed = _as_list(value.get("closed"))
     if not closed:
         return "no binaries closed"
 
@@ -722,6 +747,7 @@ def _render_save_text(value: Any) -> str:
     return line
 
 
+@_discloses(lists=("loaded", "project_roots"))
 def _render_session_start_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -730,7 +756,7 @@ def _render_session_start_text(value: Any) -> str:
         f"pid: {value.get('pid', '<unknown>')}",
         f"socket: {value.get('socket_path', '<unknown>')}",
     ]
-    loaded = list(value.get("loaded") or [])
+    loaded = _as_list(value.get("loaded"))
     if loaded:
         lines.append("")
         lines.append("loaded:")
@@ -759,7 +785,7 @@ def _render_session_start_text(value: Any) -> str:
                     lines.append(f"  note: {note}")
             else:
                 lines.append(f"- {_render_fallback_text(item)}")
-    project_roots = list(value.get("project_roots") or [])
+    project_roots = _as_list(value.get("project_roots"))
     if project_roots:
         lines.append("")
         lines.append(f"projects: {', '.join(str(root) for root in project_roots)}")
@@ -785,10 +811,11 @@ def _render_session_start_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+@_discloses(lists=("items",))
 def _render_session_status_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    items = list(value.get("items") or [])
+    items = _as_list(value.get("items"))
     if not items:
         return "no load jobs"
     lines = []
@@ -828,10 +855,11 @@ def _render_session_stop_text(value: Any) -> str:
     return line
 
 
+@_discloses(lists=("items", "instances"))
 def _render_session_list_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    instances = list(value.get("items") or value.get("instances") or [])
+    instances = _aliased_list(value, "items", "instances")
     if not instances:
         return "no sessions"
     lines = []
@@ -866,14 +894,18 @@ def _render_session_list_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+@_discloses(lists=("items",))
 def _render_instance_find_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    items = list(value.get("items") or [])
+    items = _as_list(value.get("items"))
     if not items:
         return f"no instance has a binary matching {value.get('query')!r}"
     lines = []
     for item in items:
+        if not isinstance(item, dict):
+            lines.append(f"{item!r}")
+            continue
         selector = str(item.get("selector") or item.get("instance_id") or "<unknown>")
         lines.append(f"{selector}  (instance {item.get('instance_id')})")
         lines.append(f"  {item.get('binary')}")
@@ -1130,6 +1162,7 @@ def _render_name_address_list_text(value: Any) -> str:
     return body
 
 
+@_discloses(lists=("results",))
 def _render_go_rename_text(value: Any) -> str:
     """Render `go rename` (#217): a compact summary (verified / failed / skipped
     counts) with the preview/rollback banner and a capped FAILED list -- never a
@@ -1389,12 +1422,13 @@ def _xref_buckets(value: dict[str, Any]) -> tuple[list[Any], list[Any], int, int
     return code_refs, data_refs, total_code, total_data
 
 
+@_discloses(lists=("items",))
 def _render_xrefs_any_text(value: Any) -> str:
     """Render the multi-symbol sink-sweep (`xrefs --any`): one line per symbol,
     present (with counts) or absent (#218)."""
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    syms = list(value.get("items") or [])  # #275: was `symbols`
+    syms = _as_list(value.get("items"))  # #275: was `symbols`
     lines = [f"xrefs --any: {value.get('present', 0)}/{value.get('count', len(syms))} symbol(s) present"]
     for s in syms:
         if not isinstance(s, dict):
@@ -1627,6 +1661,7 @@ def _render_target_line(target: Any) -> str:
     return base
 
 
+@_discloses(lists=("calls",))
 def _render_function_evidence_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -1647,7 +1682,7 @@ def _render_function_evidence_text(value: Any) -> str:
     else:
         lines.append("thunk: no")
 
-    calls = list(value.get("calls") or [])
+    calls = _as_list(value.get("calls"))
     lines.append("")
     # #471: show the slice window when the call set was paged/windowed.
     total_calls = value.get("total_calls")
@@ -1768,6 +1803,8 @@ def _render_resolved_arg(resolved: Any) -> str:
     return ""
 
 
+@_discloses(lists=("warnings", "init_sections", "candidate_tables",
+                   "missing_function_candidates"), dicts=("summary",))
 def _render_surface_text(value: Any) -> str:
     """#503: render the hidden code surface -- init/ctor pointers, candidate vtable/
     dispatch tables, and data-referenced code BN did not functionize."""
@@ -1784,8 +1821,6 @@ def _render_surface_text(value: Any) -> str:
         f"{s.get('candidate_tables', miss)} candidate table(s), "
         f"{s.get('missing_function_candidates', miss)} missing-function candidate(s)"
     ]
-    if summary_skewed:
-        lines.append(_skew_note("summary"))
     for w in _as_list(value.get("warnings")):
         lines.append(f"warning: {w}")
 
@@ -1850,6 +1885,7 @@ def _render_surface_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+@_discloses(lists=("items", "warnings"))
 def _render_call_descriptors_text(value: Any) -> str:
     """#469: one line per callsite of a registration API -- the declared descriptor
     field values (constants + resolved callback symbols), with unknown/computed
@@ -1859,9 +1895,9 @@ def _render_call_descriptors_text(value: Any) -> str:
     callee = value.get("callee", "<unknown>")
     lines = [f"descriptors passed to {callee} (arg {value.get('arg_index', '?')}): "
              f"{value.get('total', 0)} callsite(s)"]
-    for warning in list(value.get("warnings") or []):
+    for warning in _as_list(value.get("warnings")):
         lines.append(f"warning: {warning}")
-    for row in list(value.get("items") or []):
+    for row in _as_list(value.get("items")):
         if not isinstance(row, dict):
             lines.append(_render_fallback_text(row))
             continue
@@ -1893,6 +1929,7 @@ def _render_call_descriptors_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+@_discloses(lists=("candidates", "warnings"))
 def _render_virtual_call_text(value: Any) -> str:
     """#466: resolve an imported virtual call to provider vtable method(s)."""
     if not isinstance(value, dict):
@@ -1940,17 +1977,18 @@ def _render_virtual_call_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+@_discloses(lists=("items", "warnings", "ptr_fields"))
 def _render_record_table_text(value: Any) -> str:
     """#455: render a mixed-record dispatch table -- one block per record, each
     field labeled fn / data / scalar / null so a scalar isn't read as a bad slot."""
     lines = [
         f"record table @ {value.get('address', '<unknown>')}  "
         f"record-size: {value.get('record_size', '?')}  "
-        f"ptr-fields: {', '.join(value.get('ptr_fields') or []) or '(none)'}"
+        f"ptr-fields: {', '.join(str(p) for p in _as_list(value.get('ptr_fields'))) or '(none)'}"
     ]
-    for warning in list(value.get("warnings") or []):
+    for warning in _as_list(value.get("warnings")):
         lines.append(f"warning: {warning}")
-    for row in list(value.get("items") or []):
+    for row in _as_list(value.get("items")):
         if not isinstance(row, dict):
             lines.append(_render_fallback_text(row))
             continue
@@ -1991,6 +2029,7 @@ def _render_record_table_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+@_discloses(lists=("items", "warnings"))
 def _render_pointer_table_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -2004,10 +2043,10 @@ def _render_pointer_table_text(value: Any) -> str:
     suffix = _context_suffix(value.get("context"))
     if suffix:
         lines.append(f"context{suffix}")
-    for warning in list(value.get("warnings") or []):
+    for warning in _as_list(value.get("warnings")):
         lines.append(f"warning: {warning}")
     lines.append("")
-    for item in list(value.get("items") or []):  # #275: was `entries`
+    for item in _as_list(value.get("items")):  # #275: was `entries`
         if not isinstance(item, dict):
             lines.append(_render_fallback_text(item))
             continue
@@ -2020,6 +2059,7 @@ def _render_pointer_table_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+@_discloses(lists=("items", "hints", "rtti_symbols"))
 def _render_message_lens_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -2030,7 +2070,7 @@ def _render_message_lens_text(value: Any) -> str:
         header += f"; showing first {shown}, increase --limit for the rest"
     header += ")"
     lines = [header]
-    for match in list(value.get("items") or []):  # #275: was `matches`
+    for match in _as_list(value.get("items")):  # #275: was `matches`
         if not isinstance(match, dict):
             lines.append(_render_fallback_text(match))
             continue
@@ -2059,7 +2099,7 @@ def _render_message_lens_text(value: Any) -> str:
                     for warning in list(table.get("warnings") or [])[:2]:
                         lines.append(f"      warning: {warning}")
     # Resolved RTTI data symbols (the real vtable/typeinfo the lens targets, #194)
-    for sym in list(value.get("rtti_symbols") or []):
+    for sym in _as_list(value.get("rtti_symbols")):
         if not isinstance(sym, dict):
             continue
         xr = sym.get("xrefs") if isinstance(sym.get("xrefs"), dict) else {}
@@ -2074,14 +2114,15 @@ def _render_message_lens_text(value: Any) -> str:
             # pre-#275 `entries` key always read 0, so a resolved RTTI vtable
             # window falsely rendered "(0 slots)" in text while the JSON carried
             # the real slots. (entries fallback for any legacy producer.)
-            slot_count = len(list(tw.get("items") or tw.get("entries") or []))
+            slot_count = len(_as_list(tw.get("items") or tw.get("entries")))
             lines.append(f"    vtable window @ {tw.get('address', '?')} "
                          f"({slot_count} slots)")
-    for hint in list(value.get("hints") or []):
+    for hint in _as_list(value.get("hints")):
         lines.append(f"hint: {hint}")
     return "\n".join(lines)
 
 
+@_discloses(lists=("instances",))
 def _render_fanout_text(value: Any, inner_renderer: Callable[[Any], str] | None = None) -> str:
     """Render an --all-instances fan-out (#169 L1): a header per instance, then
     that instance's result rendered by the command's own text renderer (or a
@@ -2089,7 +2130,7 @@ def _render_fanout_text(value: Any, inner_renderer: Callable[[Any], str] | None 
     resolved. Failures are per-instance rows, not a hard failure."""
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    rows = value.get("instances") or []
+    rows = _as_list(value.get("instances"))
     ok = sum(1 for r in rows if isinstance(r, dict) and r.get("ok"))
     lines = [f"fan-out: {value.get('command', '?')} — {len(rows)} result(s) "
              f"({ok} ok, {len(rows) - ok} failed)"]
@@ -2132,6 +2173,7 @@ def _render_fanout_text(value: Any, inner_renderer: Callable[[Any], str] | None 
     return "\n".join(lines)
 
 
+@_discloses(dicts=("target", "imports_summary", "sections", "strings_sample"))
 def _render_orient_text(value: Any) -> str:
     """Render the orientation digest (#169 L2) as a compact triage card: analysis
     state up front (so an empty strings/function set from a --quick view isn't
@@ -2148,23 +2190,23 @@ def _render_orient_text(value: Any) -> str:
     fc = value.get("function_count")
     if fc is not None:
         lines.append(f"  functions: {fc}")
-    imp_raw = value.get("imports_summary")
-    imp = _as_dict(imp_raw)
+    imp = _as_dict(value.get("imports_summary"))
     total = imp.get("total_symbols", imp.get("total"))
-    by_kind = _as_dict(imp.get("by_kind"))
+    by_kind_raw = imp.get("by_kind")
+    by_kind = _as_dict(by_kind_raw)
     kinds = ", ".join(f"{k}={v}" for k, v in list(by_kind.items())[:6])
     lines.append(f"  imports: {total if total is not None else '?'}" + (f" ({kinds})" if kinds else ""))
-    if imp_raw and not imp:
-        # Dropping the line entirely read as "this target has no imports".
-        lines.append("  " + _skew_note("imports_summary"))
-    secs_raw = value.get("sections")
-    secs = _as_dict(secs_raw)
+    if by_kind_raw and not by_kind:
+        # A malformed breakdown NESTED in a well-formed imports_summary is out of
+        # the decorator's reach, and omitting it reads as "no breakdown reported".
+        lines.append("  " + _skew_note("by_kind"))
+    secs = _as_dict(value.get("sections"))
     sec_items = secs.get("items")
     if isinstance(sec_items, list):
         names = " ".join(str(s.get("name", "?")) for s in sec_items[:12] if isinstance(s, dict))
         lines.append(f"  sections: {secs.get('total', len(sec_items))}  {names}")
-    elif (secs_raw and not secs) or sec_items:
-        lines.append("  " + _skew_note("sections"))
+    elif sec_items:
+        lines.append("  " + _skew_note("items"))
     ea = value.get("existing_annotations")
     if isinstance(ea, dict):
         # #561: disclose annotations already present so an agent doesn't over-credit
@@ -2180,12 +2222,9 @@ def _render_orient_text(value: Any) -> str:
             )
             if ea.get("provenance_hint"):
                 lines.append(f"  ! {ea['provenance_hint']}")
-    ss_raw = value.get("strings_sample")
-    ss = _as_dict(ss_raw)
+    ss = _as_dict(value.get("strings_sample"))
     if ss.get("unavailable"):
         lines.append(f"  strings: unavailable — {ss['unavailable']}")
-    elif ss_raw and not ss:
-        lines.append("  " + _skew_note("strings_sample"))
     else:
         items_raw = ss.get("items")
         items = _as_list(items_raw)
@@ -2210,10 +2249,11 @@ def _render_orient_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+@_discloses(lists=("items",))
 def _render_init_arrays_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    sections = list(value.get("items") or [])  # #275: was `sections`
+    sections = _as_list(value.get("items"))  # #275: was `sections`
     if not sections:
         # #448: on a `.so` you'd expect constructors, so a bare "none" reads like a
         # possible miss. State the authoritative reason so an empty result is
@@ -2246,6 +2286,7 @@ def _render_init_arrays_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+@_discloses(lists=("items",))
 def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) -> str:
     # callsites returns the {items,total,...} envelope (#131 / item 11). Keep the
     # paging metadata (#454: callsites now pages bridge-side like xrefs) so a
@@ -2265,7 +2306,7 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
         caller_total = value.get("caller_total")
         scan_truncated = bool(value.get("scan_truncated"))
         has_more = bool(value.get("has_more"))
-        value = value.get("items") or []
+        value = _as_list(value.get("items"))
     if not isinstance(value, list):
         return _render_fallback_text(value)
     if not value and not isinstance(total, int):
@@ -2371,6 +2412,7 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
     return body
 
 
+@_discloses(lists=("instructions",), dicts=("function",))
 def _render_structured_il_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -2392,6 +2434,8 @@ def _render_structured_il_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+@_discloses(lists=("phi_sources", "uses", "other_versions"),
+            dicts=("function", "variable"))
 def _render_defuse_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -2420,12 +2464,13 @@ def _render_defuse_text(value: Any) -> str:
             lines.append(f"  {u!r}")
             continue
         lines.append(f"  {u.get('address')}  {u.get('op')}  {u.get('text', '')}".rstrip())
-    others = value.get("other_versions") or []
+    others = _as_list(value.get("other_versions"))
     if others:
         lines.append(f"other versions of {var.get('name', '?')}: {others}")
     return "\n".join(lines)
 
 
+@_discloses(lists=("callees", "callers"), dicts=("function",))
 def _render_callgraph_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -2462,6 +2507,7 @@ def _render_callgraph_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+@_discloses(dicts=("function",))
 def _render_values_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -2735,6 +2781,8 @@ def _render_forward_diagnostics(diag: dict[str, Any]) -> list[str]:
     return out
 
 
+@_discloses(lists=("sources", "reached_sinks", "leaves", "assumptions",
+                   "sinks", "slices", "sink_status"), dicts=("function",))
 def _render_taint_text(value: Any, full: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -2871,6 +2919,7 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
     return "\n".join(lines)
 
 
+@_discloses(lists=("sources", "propagators", "overlays"), dicts=("sinks_by_class",))
 def _render_taint_models_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -2890,13 +2939,14 @@ def _render_taint_models_text(value: Any) -> str:
                 continue
             p = " [present]" if s.get("present") else (" [absent]" if "present" in s else "")
             lines.append(f"  {s.get('symbol', '<unknown>')}  ->  {s.get('to', '')}{p}")
-    sbc_raw = value.get("sinks_by_class")
-    sbc = _as_dict(sbc_raw)
+    sbc = _as_dict(value.get("sinks_by_class"))
     if sbc:
         lines.append("")
-        # A class whose entry list is malformed is still one sink row to disclose,
-        # so it counts once and renders its raw value rather than being dropped.
-        classes = {cls: (lst if isinstance(lst, list) else [lst]) for cls, lst in sbc.items()}
+        # A class whose entry list is malformed contributes NO sink rows: this
+        # inventory is read as ground truth, so counting a row that may not
+        # exist is worse than disclosing the class as unusable.
+        classes = {cls: lst for cls, lst in sbc.items() if isinstance(lst, list)}
+        skewed = sorted(f"sinks_by_class[{cls}]" for cls in sbc if cls not in classes)
         total = sum(len(entries) for entries in classes.values())
         lines.append(f"sinks ({total} in {len(classes)} class(es)); NOT findings:")
         for cls, entries in classes.items():
@@ -2906,9 +2956,8 @@ def _render_taint_models_text(value: Any) -> str:
                     lines.append(f"    {e!r}")
                     continue
                 lines.extend(_render_taint_sink_entry(e))
-    elif sbc_raw:
-        # Skipping the section silently reads as "no sinks are modeled here".
-        lines.extend(["", _skew_note("sinks_by_class")])
+        if skewed:
+            lines.append("  " + _skew_note(*skewed))
     props = _as_list(value.get("propagators"))
     if props:
         lines.append("")
@@ -3014,6 +3063,7 @@ def _render_type_list_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+@_discloses(lists=("needed_libraries",), dicts=("namespaces", "by_kind"))
 def _render_imports_summary_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -3032,24 +3082,18 @@ def _render_imports_summary_text(value: Any) -> str:
             lines.append(f"  {lib}")
     # Skip the breakdown sections entirely when empty (e.g. a 0-import target),
     # rather than printing dangling "by namespace:"/"by kind:" headers.
-    namespaces_raw = value.get("namespaces")
-    namespaces = _as_dict(namespaces_raw)
+    namespaces = _as_dict(value.get("namespaces"))
     if namespaces:
         lines.append("")
         lines.append("by namespace:")
         for ns, count in sorted(namespaces.items(), key=lambda x: -_int_or_default(x[1])):
             lines.append(f"  {_fmt_count(count):>5}  {ns if ns else '(unnamed)'}")
-    elif namespaces_raw:
-        lines.extend(["", _skew_note("namespaces")])
-    by_kind_raw = value.get("by_kind")
-    by_kind = _as_dict(by_kind_raw)
+    by_kind = _as_dict(value.get("by_kind"))
     if by_kind:
         lines.append("")
         lines.append("by kind:")
         for kind, count in sorted(by_kind.items(), key=lambda x: -_int_or_default(x[1])):
             lines.append(f"  {_fmt_count(count):>5}  {kind}")
-    elif by_kind_raw:
-        lines.extend(["", _skew_note("by_kind")])
     return "\n".join(lines)
 
 
@@ -3123,6 +3167,7 @@ def _render_sections_rows(value: Any) -> str:
     return "\n".join(lines)
 
 
+@_discloses(lists=("warnings", "blocks"), dicts=("function",))
 def _render_cfg_text(value: Any) -> str:
     """Render the cfg result: a function header, then each block's rendered
     lines and outgoing edges. Block `start` / edge `to` are IL instruction
@@ -3152,6 +3197,7 @@ def _render_cfg_text(value: Any) -> str:
     return "\n".join(parts)
 
 
+@_discloses(lists=("items",))
 def _render_data_vars_text(value: Any) -> str:
     """Render the data_vars window: one row per typed data variable, with the
     decoded scalar (`= v`), pointer target (`-> p sym` / `-> p "str"`), and
@@ -3192,16 +3238,15 @@ def _render_data_vars_text(value: Any) -> str:
     return body
 
 
+@_discloses(lists=("items",))
 def _render_data_symbols_text(value: Any) -> str:
     """Render the data_symbols listing, with a paging footer when the caller
     asked for a bounded page (`--limit`/`--offset`) and more remain."""
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    syms_raw = value.get("items")  # #275: was `syms`
-    syms = _as_list(syms_raw)
+    syms = _as_list(value.get("items"))  # #275: was `syms`
     if not syms:
-        # A malformed listing must not render the "none" a real empty one does.
-        return _skew_note("items") if syms_raw else "none"
+        return "none"
     body = "\n".join(
         f"{sym.get('a', '?')}  {sym.get('n', '')}" if isinstance(sym, dict) else f"  {sym!r}"
         for sym in syms)
@@ -3212,6 +3257,7 @@ def _render_data_symbols_text(value: Any) -> str:
     return body
 
 
+@_discloses(lists=("writable_executable_items",))
 def _render_sections_text(value: Any) -> str:
     """Render sections: the paged {items, total, ...} envelope (with a footer),
     or a bare list for back-compat / internal callers (#122). Prefixes a W+X
@@ -3221,7 +3267,7 @@ def _render_sections_text(value: Any) -> str:
     if isinstance(value, dict) and value.get("wx_verdict"):
         verdict = value["wx_verdict"]
         if verdict == "wx_sections_present":
-            names = value.get("writable_executable_items") or []
+            names = _as_list(value.get("writable_executable_items"))
             line = f"w+x: {len(names)} section(s): {', '.join(names)}"
         elif verdict == "no_wx_sections_observed":
             line = "w+x: none observed"
@@ -3271,6 +3317,7 @@ def _render_read_text(value: Any) -> str:
     return "\n".join(lines)
 
 
+@_discloses(lists=("instances",))
 def _render_doctor_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -3284,7 +3331,7 @@ def _render_doctor_text(value: Any) -> str:
         "",
         "instances:",
     ]
-    instances = list(value.get("instances") or [])
+    instances = _as_list(value.get("instances"))
     if not instances:
         lines.append("- none")
         return "\n".join(lines)
@@ -3808,6 +3855,7 @@ def _render_mutation_summary_text(value: Any) -> str:
     return line
 
 
+@_discloses(lists=("results", "affected_functions"))
 def _render_mutation_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -3905,6 +3953,7 @@ def _render_mutation_text(value: Any) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+@_discloses(lists=("warnings",))
 def _render_py_exec_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -3919,7 +3968,7 @@ def _render_py_exec_text(value: Any) -> str:
         body = result if isinstance(result, str) else json.dumps(result, indent=2, sort_keys=True)
         parts.append("result:\n" + body)
 
-    warnings = list(value.get("warnings") or [])
+    warnings = _as_list(value.get("warnings"))
     if warnings:
         parts.append("warnings:\n" + "\n".join(f"- {warning}" for warning in warnings))
 
@@ -3959,7 +4008,6 @@ _TRACE_REASON_LABELS: dict[str, str] = {
     # parameter: an undefined local or a global. Don't claim "function
     # parameter" — that misleads provenance/attacker-source slices.
     "undefined_or_global": "undefined / no reaching definition",
-    # Legacy combined reason (still accepted on input): stay neutral.
     "function_parameter_or_global": "function parameter, global, or undefined",
     "memory_load": "memory load",
     "field_load": "field load",
@@ -3975,6 +4023,7 @@ _TRACE_REASON_LABELS: dict[str, str] = {
 }
 
 
+@_discloses(lists=("trace", "hints", "assumptions"), dicts=("arg_label",))
 def _render_trace_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -3982,8 +4031,8 @@ def _render_trace_text(value: Any) -> str:
     fn_addr = value.get("function_address", "<unknown>")
     target_addr = value.get("target_address", "<unknown>")
     arg_index = value.get("arg_index", 0)
-    trace = list(value.get("trace") or [])
-    hints = [h for h in (value.get("hints") or []) if h]
+    trace = _as_list(value.get("trace"))
+    hints = [h for h in _as_list(value.get("hints")) if h]
 
     # arg[N] of <callee> (reg) -- the callee resolved for this callsite plus
     # the calling-convention register (#662): the value being sliced is the
@@ -4011,7 +4060,7 @@ def _render_trace_text(value: Any) -> str:
         # so `assumptions` cannot actually be non-empty here today. Kept as
         # pure renderer robustness against a future producer relaxing that
         # invariant, not because this path is currently reachable.
-        assumptions = [a for a in (value.get("assumptions") or []) if a]
+        assumptions = [a for a in _as_list(value.get("assumptions")) if a]
         if assumptions:
             body += f"\n\ncaveats ({len(assumptions)}):\n" + \
                 "\n".join(f"  - {a}" for a in assumptions)
@@ -4067,7 +4116,7 @@ def _render_trace_text(value: Any) -> str:
                 lines.append(f"  {il_text}")
 
     lines.extend(_render_trace_frontiers(value.get("frontiers")))
-    assumptions = [a for a in (value.get("assumptions") or []) if a]
+    assumptions = [a for a in _as_list(value.get("assumptions")) if a]
     if assumptions:
         lines.append("")
         lines.append(f"caveats ({len(assumptions)}):")
@@ -4124,6 +4173,7 @@ def _class_inputs_note(value: Any) -> str:
     )
 
 
+@_discloses(lists=("items", "classes"))
 def _render_class_list_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
@@ -4134,7 +4184,7 @@ def _render_class_list_text(value: Any) -> str:
         art = value.get("artifact_count") or 0
         tail = f" ({art} non-class RTTI/type artifact{'s' if art != 1 else ''})" if art else ""
         return f"classes: {n}{tail}{_class_inputs_note(value)}"
-    rows, skewed = _aliased_list(value, "items", "classes")
+    rows = _aliased_list(value, "items", "classes")
     total = value.get("total", len(rows))
     header = f"classes: {len(rows)} shown of {total}"
     # Surface what was folded out so the count is self-documenting (#205/#309).
@@ -4155,8 +4205,6 @@ def _render_class_list_text(value: Any) -> str:
         header += " (hidden: " + ", ".join(hidden_parts) + ")"
     header += _class_inputs_note(value)
     lines = [header]
-    if skewed:
-        lines.append(_skew_note(*skewed))
     for rec in rows:
         if not isinstance(rec, dict):
             lines.append(_render_fallback_text(rec))
@@ -4198,6 +4246,7 @@ def _vtable_slot_label(s: dict[str, Any]) -> str:
     return "<unnamed>"
 
 
+@_discloses(lists=("matches",))
 def _render_class_show_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)

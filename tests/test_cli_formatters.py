@@ -819,6 +819,10 @@ def test_render_orient_non_dict_target_and_kind_breakdown_degrade():
                                "imports_summary": {"total": 3, "by_kind": ["bad"]}})
     assert "orientation: <target>" in out
     assert "imports: 3" in out
+    # A malformed breakdown NESTED inside a well-formed imports_summary renders
+    # the same line the breakdown simply being absent does, so it needs the same
+    # disclosure the top-level fields get.
+    assert "malformed by_kind field" in out
 
 
 def test_render_cfg_non_dict_nested_fields_degrade():
@@ -841,20 +845,19 @@ def test_render_imports_summary_non_dict_breakdowns_degrade():
     assert "total symbols: 2" in out
     # Both breakdowns are unusable; skipping them silently reads as "no imports
     # in any namespace", which the non-zero total contradicts.
-    assert "malformed namespaces field" in out
-    assert "malformed by_kind field" in out
+    assert "malformed by_kind, namespaces fields" in out
 
 
 def test_render_imports_summary_uncoercible_count_renders_and_orders():
     # The sort key coerces the count, but the column interpolated the RAW value
     # one line later: `f"{None:>5}"` is a TypeError, so a single malformed count
-    # still cost the whole text view (#619).
+    # still cost the whole text view (#619). The placeholder also has to fit the
+    # right-aligned column, or one bad row skews the whole table.
     from bn.formatters import _render_imports_summary_text
     out = _render_imports_summary_text(
         {"total_symbols": 7, "namespaces": {"lo": 1, "hi": 5, "broken": None}})
-    rows = [ln for ln in out.splitlines() if ln.startswith("  ")]
-    assert [r.split()[-1] for r in rows] == ["hi", "lo", "broken"]
-    assert "<unknown>" in out
+    assert [ln for ln in out.splitlines() if ln.startswith("  ")] == [
+        "      5  hi", "      1  lo", "      ?  broken"]
 
 
 def test_render_local_list_malformed_items_alias_keeps_the_retained_alias_rows():
@@ -916,11 +919,177 @@ def test_render_data_symbols_non_dict_row_degrades():
     assert "'bad'" in out
 
 
-def test_render_data_symbols_malformed_items_is_disclosed_not_none():
-    from bn.formatters import _render_data_symbols_text
-    out = _render_data_symbols_text({"items": "bad", "total": 3})
-    assert out != "none"
-    assert "malformed items field" in out
+def test_the_disclosure_reaches_an_early_return_path():
+    # The whole point of declaring the coerced keys per renderer instead of
+    # appending a line per branch: several renderers bail out BEFORE their
+    # normal tail -- "none", "no instance has a binary matching ...", the
+    # no-possible-values return -- and a per-branch line misses exactly those.
+    from bn.formatters import (_render_data_symbols_text,
+                               _render_instance_find_text, _render_values_text)
+    listing = _render_data_symbols_text({"items": "bad", "total": 3})
+    assert listing != "none" and "malformed items field" in listing
+
+    found = _render_instance_find_text({"query": "q", "items": "bad"})
+    assert found.startswith("no instance has a binary matching")
+    assert "malformed items field" in found
+
+    # Here the field that bails out (an absent possible_values) is NOT the field
+    # that is malformed, so only a wrapper around every return path discloses it.
+    values = _render_values_text({"function": "bad"})
+    assert "possible values: <unavailable>" in values
+    assert "malformed function field" in values
+
+
+# Every container field a text renderer coerces, with the empty value it is
+# coerced TO. `_as_dict`/`_as_list` stop the AttributeError a malformed payload
+# used to raise (#101/#619), but a coerced `{}`/`[]` renders byte-identically to
+# a genuinely empty result -- so the caller reads a confident "nothing here"
+# from data the renderer could not use. That is strictly worse than the crash:
+# a forward-taint view prints "no taint reached any sink or frontier", a
+# security all-clear, where base raised. This table is the contract; a new
+# coercion site that forgets its disclosure fails the two tests below.
+COERCED_CONTAINER_FIELDS: tuple[tuple[str, str, object], ...] = (
+    ("_render_capabilities_text", "items", []),
+    ("_render_function_info_text", "function", {}),
+    ("_render_function_info_text", "locals", []),
+    ("_render_function_info_text", "parameters", []),
+    ("_render_local_list_text", "function", {}),
+    ("_render_local_list_text", "items", []),
+    ("_render_local_list_text", "locals", []),
+    ("_render_field_xrefs_text", "field", {}),
+    ("_render_field_xrefs_text", "items", []),
+    ("_render_instance_find_text", "items", []),
+    ("_render_go_rename_text", "results", []),
+    ("_render_surface_text", "summary", {}),
+    ("_render_surface_text", "warnings", []),
+    ("_render_surface_text", "init_sections", []),
+    ("_render_surface_text", "candidate_tables", []),
+    ("_render_surface_text", "missing_function_candidates", []),
+    ("_render_virtual_call_text", "candidates", []),
+    ("_render_virtual_call_text", "warnings", []),
+    ("_render_message_lens_text", "rtti_symbols", []),
+    ("_render_orient_text", "target", {}),
+    ("_render_orient_text", "imports_summary", {}),
+    ("_render_orient_text", "sections", {}),
+    ("_render_orient_text", "strings_sample", {}),
+    ("_render_structured_il_text", "function", {}),
+    ("_render_structured_il_text", "instructions", []),
+    ("_render_defuse_text", "function", {}),
+    ("_render_defuse_text", "variable", {}),
+    ("_render_defuse_text", "phi_sources", []),
+    ("_render_defuse_text", "uses", []),
+    ("_render_callgraph_text", "function", {}),
+    ("_render_callgraph_text", "callees", []),
+    ("_render_callgraph_text", "callers", []),
+    ("_render_values_text", "function", {}),
+    ("_render_values_text", "possible_values", {}),
+    ("_render_taint_text", "function", {}),
+    ("_render_taint_text", "sources", []),
+    ("_render_taint_text", "reached_sinks", []),
+    ("_render_taint_text", "leaves", []),
+    ("_render_taint_text", "assumptions", []),
+    ("_render_taint_text", "sinks", []),
+    ("_render_taint_text", "slices", []),
+    ("_render_taint_text", "sink_status", []),
+    ("_render_taint_models_text", "sources", []),
+    ("_render_taint_models_text", "sinks_by_class", {}),
+    ("_render_taint_models_text", "propagators", []),
+    ("_render_taint_models_text", "overlays", []),
+    ("_render_imports_summary_text", "needed_libraries", []),
+    ("_render_imports_summary_text", "namespaces", {}),
+    ("_render_imports_summary_text", "by_kind", {}),
+    ("_render_cfg_text", "function", {}),
+    ("_render_cfg_text", "warnings", []),
+    ("_render_cfg_text", "blocks", []),
+    ("_render_data_vars_text", "items", []),
+    ("_render_data_symbols_text", "items", []),
+    ("_render_mutation_text", "results", []),
+    ("_render_mutation_text", "affected_functions", []),
+    ("_render_trace_text", "arg_label", {}),
+    ("_render_class_list_text", "items", []),
+    ("_render_class_list_text", "classes", []),
+    ("_render_class_show_text", "matches", []),
+    ("_render_trace_text", "trace", []),
+    ("_render_trace_text", "hints", []),
+    ("_render_trace_text", "assumptions", []),
+    ("_render_defuse_text", "other_versions", []),
+    ("_render_load_text", "notes", []),
+    ("_render_load_text", "targets", []),
+    ("_render_close_text", "closed", []),
+    ("_render_session_start_text", "loaded", []),
+    ("_render_session_start_text", "project_roots", []),
+    ("_render_session_status_text", "items", []),
+    ("_render_session_list_text", "items", []),
+    ("_render_session_list_text", "instances", []),
+    ("_render_xrefs_any_text", "items", []),
+    ("_render_function_evidence_text", "calls", []),
+    ("_render_call_descriptors_text", "items", []),
+    ("_render_call_descriptors_text", "warnings", []),
+    ("_render_record_table_text", "items", []),
+    ("_render_record_table_text", "warnings", []),
+    ("_render_record_table_text", "ptr_fields", []),
+    ("_render_pointer_table_text", "items", []),
+    ("_render_pointer_table_text", "warnings", []),
+    ("_render_message_lens_text", "items", []),
+    ("_render_message_lens_text", "hints", []),
+    ("_render_fanout_text", "instances", []),
+    ("_render_init_arrays_text", "items", []),
+    ("_render_callsites_text", "items", []),
+    ("_render_sections_text", "writable_executable_items", []),
+    ("_render_doctor_text", "instances", []),
+    ("_render_py_exec_text", "warnings", []),
+)
+
+
+def test_a_malformed_container_is_never_rendered_as_an_empty_one():
+    from bn import formatters
+
+    def render(name, payload):
+        try:
+            return getattr(formatters, name)(payload)
+        except Exception as exc:                       # a raise is the old bug
+            return f"RAISED {type(exc).__name__}: {exc}"
+
+    silent = []
+    for name, field, empty in COERCED_CONTAINER_FIELDS:
+        out = render(name, {field: "bad"})
+        if ("malformed" not in out
+                or out == render(name, {field: empty})
+                or out == render(name, {})):
+            silent.append(f"{name}({field}) -> {out.splitlines()[:1]}")
+    assert not silent, f"malformed container not disclosed: {silent}"
+
+
+def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
+    # The mirror of the test above, and the more dangerous failure: crying
+    # "malformed" at a genuinely empty result would teach a caller to distrust
+    # correct output.
+    from bn import formatters
+    noisy = []
+    for name, field, empty in COERCED_CONTAINER_FIELDS:
+        render = getattr(formatters, name)
+        for payload in ({}, {field: empty}, {field: None}):
+            if "malformed" in render(payload):
+                noisy.append(f"{name}({field}) on {payload!r}")
+    assert not noisy, f"disclosure fired on well-formed data: {noisy}"
+
+
+def test_render_instance_find_non_dict_item_degrades():
+    from bn.formatters import _render_instance_find_text
+    out = _render_instance_find_text({"query": "q", "items": [
+        {"selector": "s", "instance_id": "i", "binary": "b"}, "bad"]})
+    assert "s  (instance i)" in out
+    assert "'bad'" in out
+
+
+def test_render_taint_models_malformed_class_entries_are_not_counted_as_sinks():
+    # Wrapping a malformed entry list as a one-element list made a `None` count
+    # as one modeled sink -- a fabricated row in an inventory an auditor reads
+    # as ground truth.
+    from bn.formatters import _render_taint_models_text
+    out = _render_taint_models_text({"sinks_by_class": {"unbounded_input": None}})
+    assert "sinks (0 in 0 class(es))" in out
+    assert "malformed sinks_by_class[unbounded_input] field" in out
 
 
 def test_render_evidence_shows_argument_confidence_and_variadic():
