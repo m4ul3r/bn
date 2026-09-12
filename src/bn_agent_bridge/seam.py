@@ -54,12 +54,11 @@ _TYPE_CLASS_NAMES: dict[int, str] = {
 # one real implementation, resolution auto-picks the implementation (#122).
 _STUB_SYMBOL_TYPE_NAMES = frozenset({"ImportedFunctionSymbol", "ExternalSymbol"})
 
-# Bounds for the "did you mean" corpus on a miss (#622). See
+# The "did you mean" corpus on a miss (#622). See
 # `BridgeContext._suggestion_corpus`: reading a function's names off a live view is
-# the expensive part, so the function cap is the latency bound and the form cap
-# bounds the corpus handed to difflib.
-SUGGESTION_MAX_FUNCS = 5000
-SUGGESTION_MAX_FORMS = 2000
+# the expensive part of the pass, so the corpus handed to difflib is bounded by a
+# SOUND length prefilter (difflib's own cutoff) rather than by sampling -- a cap
+# silently drops the intended name.
 
 
 # Nested anonymous aggregates are expanded in the text layout and in the JSON
@@ -242,24 +241,31 @@ class BridgeContext:
     def _suggestion_corpus(self, bv, text: str) -> list[str]:
         """Name spellings to run difflib over for a "did you mean" hint.
 
-        Bounded (#622): collecting every spelling of every function turned a miss
-        into a third full enumeration of the view. The pass stops at
-        ``SUGGESTION_MAX_FORMS`` collected spellings and visits at most
-        ``SUGGESTION_MAX_FUNCS`` functions, and it only collects spellings whose
-        first character matches the query's (case-insensitively) -- which is where
-        a close difflib match lives, and what keeps the corpus relevant instead of
-        an arbitrary prefix of the function list."""
-        prefix = text[:1].lower()
+        This is ONE lazy pass over the view, and it is deliberately UNCAPPED: it
+        collects every spelling of every function, exactly as the unbounded base
+        revision did. Sampling the corpus -- by a function/form cap, or by keeping
+        only spellings whose first character matches the query's -- silently drops
+        the name the caller meant: a typo in the FIRST character removes the
+        intended spelling from a first-character filter, so the hint is either
+        lost entirely or replaced by an unrelated name that happens to share the
+        typo (#622 review).
+
+        What bounds the pass instead is a SOUND prefilter: a spelling is kept only
+        when ``difflib.SequenceMatcher(None, text, form).real_quick_ratio()`` is
+        at least the 0.5 cutoff the ``get_close_matches`` call downstream uses.
+        ``real_quick_ratio`` is a length-only upper bound on
+        ``SequenceMatcher.ratio``, so no candidate difflib could return at that
+        cutoff is ever dropped: the survivors are a superset of the answer in
+        unchanged relative order, which makes ``get_close_matches``'s result
+        byte-identical to one over the uncapped corpus. Reading each function's
+        name spellings off the live view is the real cost, and that stays a single
+        pass."""
         corpus: list[str] = []
-        for index, fn in enumerate(bv.functions):
-            if index >= SUGGESTION_MAX_FUNCS:
-                break
+        for fn in bv.functions:
             for form in self._function_name_forms(fn):
-                if form[:1].lower() != prefix:
+                if difflib.SequenceMatcher(None, text, form).real_quick_ratio() < 0.5:
                     continue
                 corpus.append(form)
-                if len(corpus) >= SUGGESTION_MAX_FORMS:
-                    return corpus
         return corpus
 
     def _find_functions_by_name(self, bv, text: str, *, case_sensitive: bool) -> list[Any]:

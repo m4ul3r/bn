@@ -762,7 +762,7 @@ def _xrefs_import_symbol(ctx, bv, identifier: str, *, offset: int = 0, limit: in
     result["import_name"] = str(identifier)
 
     if not result.get("code_refs"):
-        manual, scan_truncated = _scan_for_calls_to(ctx, bv, sym_address)
+        manual, scan_truncated, scan_note = _scan_for_calls_to(ctx, bv, sym_address)
         if manual or scan_truncated:
             # Rebuild the envelope so the manually-discovered code refs land in
             # both the deprecated `code_refs` and the canonical `items` page.
@@ -772,14 +772,12 @@ def _xrefs_import_symbol(ctx, bv, identifier: str, *, offset: int = 0, limit: in
                 "code_refs_scanned": True,
             }
             if scan_truncated:
-                # A capped scan is PARTIAL: without this flag an agent reads the
+                # A PARTIAL scan -- stopped at its budget, or with LLIL that could
+                # not be read -- must be flagged: without this an agent reads the
                 # short (or empty) caller list as "no callers found" (#622).
+                # `scan_note` names which of the two actually happened.
                 extra["truncated"] = True
-                extra["scan_note"] = (
-                    "call scan stopped at its budget "
-                    f"({SCAN_CALLS_MAX_FUNCS} functions / {SCAN_CALLS_MAX_INSNS} "
-                    "LLIL instructions examined); the caller list may be incomplete"
-                )
+                extra["scan_note"] = scan_note
             result = _xref_envelope(
                 sym_address, result["target_context"], manual, result["data_refs"],
                 offset=offset, limit=limit,
@@ -800,7 +798,7 @@ SCAN_CALLS_MAX_FUNCS = 256
 SCAN_CALLS_MAX_INSNS = 200_000
 
 
-def _scan_llil_instructions(fn):
+def _scan_llil_instructions(fn, unreadable: list[str] | None = None):
     """LLIL instructions of *fn*, yielded lazily block by block.
 
     ``il_format._iter_llil_instructions`` materialises a whole function's
@@ -808,7 +806,11 @@ def _scan_llil_instructions(fn):
     WORK, not merely the count examined after the fact, so this yields straight
     from the blocks: lifting a pathological function whole is exactly the
     unbounded cost the budget exists to prevent. Iteration order is irrelevant
-    here -- the collected refs are sorted by address before they are returned."""
+    here -- the collected refs are sorted by address before they are returned.
+
+    A block whose LLIL cannot be read is skipped, and -- when *unreadable* is
+    given -- recorded there, so the caller can report its scan as partial instead
+    of presenting the truncated caller list as complete."""
     il = getattr(fn, "low_level_il", None)
     if il is None:
         il = getattr(fn, "llil", None)
@@ -822,19 +824,25 @@ def _scan_llil_instructions(fn):
         try:
             yield from block
         except Exception:
+            if unreadable is not None:
+                unreadable.append(str(getattr(fn, "name", "") or ""))
             continue
 
 
-def _scan_for_calls_to(ctx, bv, target_address: int) -> tuple[list[dict[str, Any]], bool]:
+def _scan_for_calls_to(
+    ctx, bv, target_address: int
+) -> tuple[list[dict[str, Any]], bool, str | None]:
     """Callers of *target_address* recovered from function LLIL, for the import
     addresses BN itself reports no ``code_refs`` for.
 
-    Returns ``(code_refs, truncated)``; *truncated* is True when the scan stopped
-    on ``SCAN_CALLS_MAX_FUNCS`` / ``SCAN_CALLS_MAX_INSNS`` rather than running out
-    of functions, so a partial (or empty) result can never be read as "no
-    callers"."""
+    Returns ``(code_refs, truncated, note)``. *truncated* is True when the result
+    is PARTIAL -- the scan stopped on ``SCAN_CALLS_MAX_FUNCS`` /
+    ``SCAN_CALLS_MAX_INSNS``, or a function's LLIL could not be read -- so a
+    partial (or empty) result can never be read as "no callers"; *note* then names
+    the actual reason, and is None only for a complete scan."""
     code_refs = []
     seen: set[int] = set()
+    unreadable: list[str] = []
     funcs_visited = 0
     insns_examined = 0
     truncated = False
@@ -843,7 +851,7 @@ def _scan_for_calls_to(ctx, bv, target_address: int) -> tuple[list[dict[str, Any
             truncated = True
             break
         funcs_visited += 1
-        for insn in _scan_llil_instructions(fn):
+        for insn in _scan_llil_instructions(fn, unreadable):
             if insns_examined >= SCAN_CALLS_MAX_INSNS:
                 truncated = True
                 break
@@ -874,7 +882,26 @@ def _scan_for_calls_to(ctx, bv, target_address: int) -> tuple[list[dict[str, Any
         if truncated:
             break
     code_refs.sort(key=lambda item: int(item["address"], 16))
-    return code_refs, truncated
+    note = None
+    if truncated:
+        note = (
+            "call scan stopped at its budget "
+            f"({SCAN_CALLS_MAX_FUNCS} functions / {SCAN_CALLS_MAX_INSNS} "
+            "LLIL instructions examined); the caller list may be incomplete"
+        )
+    if unreadable:
+        # An unreadable block truncates the scan just as a budget does: the
+        # caller list below it is missing, so it must be disclosed rather than
+        # reported as a complete (possibly empty) result.
+        first = unreadable[0]
+        where = f" (first: {first})" if first else ""
+        reason = (
+            f"LLIL could not be read for {len(unreadable)} function(s){where}; "
+            "the caller list may be incomplete"
+        )
+        note = f"{note}; {reason}" if note else reason
+        truncated = True
+    return code_refs, truncated, note
 
 
 def _resolve_type_field(ctx, bv, field_spec: str):

@@ -1149,9 +1149,10 @@ def test_scan_for_calls_to_finds_llil_calls(monkeypatch):
     bv = _FakeBV(functions=[fn])
     monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
 
-    refs, truncated = instance._scan_for_calls_to(bv, 0x20000)
+    refs, truncated, note = instance._scan_for_calls_to(bv, 0x20000)
 
     assert truncated is False          # complete under budget -> NOT flagged (#622)
+    assert note is None                # ...and carries no partial-scan note either
     assert len(refs) == 2
     addresses = [int(r["address"], 16) for r in refs]
     assert 0x10010 in addresses
@@ -1170,7 +1171,7 @@ def test_scan_for_calls_to_deduplicates_same_address(monkeypatch):
     bv = _FakeBV(functions=[fn])
     monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
 
-    refs, _truncated = instance._scan_for_calls_to(bv, 0x20000)
+    refs, _truncated, _note = instance._scan_for_calls_to(bv, 0x20000)
 
     assert len(refs) == 1
 
@@ -1193,9 +1194,10 @@ def test_scan_for_calls_to_stops_at_function_budget_and_reports_it(monkeypatch):
     monkeypatch.setattr(instance, "_resolve_view", lambda selector: bv)
     monkeypatch.setattr(bridge.read_xrefs, "SCAN_CALLS_MAX_FUNCS", 1)
 
-    refs, truncated = instance._scan_for_calls_to(bv, 0x20000)
+    refs, truncated, note = instance._scan_for_calls_to(bv, 0x20000)
 
     assert truncated is True
+    assert note and "budget" in note          # names the actual reason (#622 review)
     assert [int(r["address"], 16) for r in refs] == [0x1010]   # partial, not all
 
 
@@ -1214,9 +1216,10 @@ def test_scan_for_calls_to_stops_at_instruction_budget_and_reports_it(monkeypatc
     monkeypatch.setattr(bridge.read_xrefs, "SCAN_CALLS_MAX_FUNCS", 100)
     monkeypatch.setattr(bridge.read_xrefs, "SCAN_CALLS_MAX_INSNS", 1)
 
-    refs, truncated = instance._scan_for_calls_to(bv, 0x20000)
+    refs, truncated, note = instance._scan_for_calls_to(bv, 0x20000)
 
     assert truncated is True
+    assert note and "budget" in note
     assert [int(r["address"], 16) for r in refs] == [0x1010]   # 1 of 2 examined
 
 

@@ -217,14 +217,38 @@ def _sym_entry(sym) -> dict[str, Any] | None:
     }
 
 
-# #622: every registry build classifies each function's name -- demangle, split
-# the qualified method, and name the ctor/dtor/method kind. That classification is
-# a PURE function of the two name spellings `il_format._display_name` consumes, so
-# it is memoised here at the call site (the demangle itself lives in `il_format`,
-# outside this module's scope). A rename changes those spellings, and therefore
-# the key, so a stale entry for a renamed function is unreachable -- which is why
-# no view-keyed registry cache (and no invalidation hook BN cannot provide) is
-# needed.
+# #622 criterion (d) -- "class list / class show reuse a per-view registry (or
+# cheaper show path) rather than demangling every function on every call" -- is
+# only PARTLY delivered, and the memo below is the whole of it.
+#
+# DELIVERED: the demangle + qualified-method split is no longer recomputed per
+# call (measured on a real C++ target: 5717 splits on the first registry build,
+# 0 on the second).
+#
+# NOT DELIVERED: there is no per-view registry reuse. Every `class list` /
+# `class show` still enumerates the view and reads each function's live name
+# spellings, so end-to-end latency is unchanged -- measured in the round-1 review
+# at `class list` ~0.31-0.42s vs base ~0.33-0.42s on a ~5.8k-function C++
+# target, and ~1.56-1.60s vs base ~1.39-1.55s on a ~16k-function target. The
+# partial `class show` build that materialised only the queried class was
+# REMOVED for the same review: it measured SLOWER than the full build (median
+# 0.190s filtered vs 0.131s full), i.e. a self-inflicted pessimisation.
+#
+# A per-view registry cache is deliberately NOT implemented, because no sound
+# invalidation hook exists inside this module's reach: BN exposes no view change
+# token (`BinaryView.get_modification` takes an address -- it is not a global
+# counter, and `bv.modified` does not flip for the bridge's own verified writes),
+# and BN's own analysis can add named symbols after load -- so a rename or a late
+# analysis pass would serve stale classes, which the maintainer's comment on #622
+# calls worse than the cost being saved.
+#
+# The memo itself: every registry build classifies each function's name --
+# demangle, split the qualified method, and name the ctor/dtor/method kind. That
+# classification is a PURE function of the two name spellings
+# `il_format._display_name` consumes, so it is memoised here at the call site (the
+# demangle itself lives in `il_format`, outside this module's scope). A rename
+# changes those spellings, and therefore the key, so a stale entry for a renamed
+# function is unreachable -- no invalidation hook is needed for the memo.
 _CLASSIFY_CACHE_MAX = 65536
 
 
@@ -249,29 +273,17 @@ def _classify_function(fn) -> tuple[str, str | None, str | None]:
     return _classify_names(str(short) if short else "", str(getattr(fn, "name", "") or ""))
 
 
-def _build_class_registry(ctx, bv, *, query: str | None = None,
-                          name_filter: str | None = None) -> dict[str, dict[str, Any]]:
+def _build_class_registry(ctx, bv, *, query: str | None = None) -> dict[str, dict[str, Any]]:
     """One scan -> {class_name: ClassRecord}. Methods, RTTI symbols, confidence.
     Per-class drill-downs (vtable layout, size, bases, instances) are added by
-    ``_class_show`` only for the requested class (too costly for every class).
-
-    ``name_filter`` (#622) keeps only the classes a ``class show <name>`` query can
-    resolve to -- the exact name, or any class sharing its top-level leaf, exactly
-    what ``_resolve_class_names`` accepts -- so a drill-down does not materialise a
-    record for every class in a large C++ target. A miss still needs the full
-    registry for the suggestion hint."""
+    ``_class_show`` only for the requested class (too costly for every class)."""
     rtti = _rtti_symbol_maps(bv)
     registry: dict[str, dict[str, Any]] = {}
     needle = query.lower() if query else None
-    name_filter = name_filter or None
-    leaf = _query_leaf(name_filter) if name_filter else None
-
-    def wanted(cls: str) -> bool:
-        return cls == name_filter or _query_leaf(cls) == leaf
 
     for fn in bv.functions:
         demangled, cls, kind = _classify_function(fn)
-        if cls is None or (name_filter is not None and not wanted(cls)):
+        if cls is None:
             continue
         rec = registry.get(cls)
         if rec is None:
@@ -295,8 +307,6 @@ def _build_class_registry(ctx, bv, *, query: str | None = None,
 
     # Ensure RTTI-only classes (no demangled methods clustered) still appear.
     for cls in rtti:
-        if name_filter is not None and not wanted(cls):
-            continue
         registry.setdefault(cls, {
             "name": cls, "methods": [], "vtable": None, "typeinfo": None,
             "typeinfo_name": None, "size": None, "bases": [], "instances": [],
@@ -1010,14 +1020,14 @@ def _recover_vtables_from_typeinfo(ctx, bv, typeinfo_addr: int) -> dict[str, Any
 
 def _class_show(ctx, selector: str | None, name: str) -> dict[str, Any]:
     bv = ctx._resolve_view(selector)
-    # #622: a concrete-name drill-down only needs the classes that name can
-    # resolve to, so the walk does not build a record for every class on the
-    # target. A miss still builds the full registry, because the suggestion hint
-    # is drawn from every class name (#413).
-    registry = _build_class_registry(ctx, bv, name_filter=name)
+    # #622 (d): NO per-view registry reuse and no partial "cheaper show path" --
+    # a build that skips unqueried classes measured SLOWER than the full one, so
+    # every `class show` still builds the full registry (base semantics). A miss
+    # needs it anyway, because the suggestion hint is drawn from every class name
+    # (#413).
+    registry = _build_class_registry(ctx, bv)
     matches = _resolve_class_names(registry, name)
     if not matches:
-        registry = _build_class_registry(ctx, bv)
         raise OperationFailure(
             "unknown_class",
             f"No class named {name!r}.{_class_name_suggestions(registry, name)} "

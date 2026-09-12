@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import importlib
+import difflib
 import importlib.util
 import io
 import json
@@ -317,6 +317,13 @@ def _import_scan_bv(name: str, address: int, caller_starts: list[int]):
     return _FakeBV(functions=callers, symbols=[sym])
 
 
+class _UnreadableBlock:
+    """A basic block whose LLIL iteration raises, i.e. a read failure."""
+
+    def __iter__(self):
+        raise RuntimeError("LLIL unavailable")
+
+
 def test_xrefs_import_scan_discloses_a_capped_scan(monkeypatch):
     """#622: when BN reports no code refs for an import, the fallback LLIL scan is
     budgeted. A capped scan must hand back the partial callers AND flag itself, so
@@ -351,6 +358,25 @@ def test_xrefs_import_scan_is_complete_and_unflagged_under_budget(monkeypatch):
     assert result.get("truncated") is not True
     assert "scan_note" not in result
     assert result["code_ref_count"] == 2
+
+
+def test_xrefs_import_scan_flags_unreadable_llil(monkeypatch):
+    """#622 review: a block whose LLIL cannot be lifted was skipped without a
+    trace, so a caller list truncated by a read failure was reported as complete.
+    The failure must reach the envelope: `truncated: true` plus a `scan_note`
+    naming the unreadable LLIL -- not the budget, which was never hit."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _import_scan_bv("plt_target", 0x20000, [0x1000, 0x2000])
+    bv.functions[1].low_level_il = [_UnreadableBlock()]
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._xrefs(None, "plt_target")
+
+    assert result["code_refs_scanned"] is True
+    assert result["truncated"] is True
+    assert "LLIL" in result["scan_note"]
+    assert result["code_ref_count"] == 1          # the readable caller survives
 
 
 def test_find_function_native_name_lookup_skips_the_full_walk(monkeypatch):
@@ -389,33 +415,104 @@ def test_find_function_native_miss_still_walks_for_demangled_short_name(monkeypa
     assert int(instance._find_function(bv, "foo::bar::recv(int32_t)").start) == 0x405250
 
 
-def test_find_function_miss_suggestions_stop_at_the_corpus_cap(monkeypatch):
-    """#622: the miss path used to walk every function a third time to build the
-    difflib corpus. The corpus pass is now capped, so a typo'd name on a large view
-    cannot turn into another full enumeration -- while still suggesting the name
-    the caller meant."""
+def _suggestion_spellings(fns) -> list[str]:
+    """Every spelling of *fns* in the order the miss corpus collects them: the
+    function's own name/raw_name plus the symbol's demangled short/full name,
+    de-duplicated per function. Recomputed here (not imported from the seam) so
+    the expectation below is independent of the code under test."""
+    out: list[str] = []
+    for fn in fns:
+        sym = getattr(fn, "symbol", None)
+        forms: list[str] = []
+        for value in (
+            getattr(fn, "name", None),
+            getattr(fn, "raw_name", None),
+            getattr(sym, "short_name", None),
+            getattr(sym, "full_name", None),
+        ):
+            if value and str(value) not in forms:
+                forms.append(str(value))
+        out.extend(forms)
+    return out
+
+
+def _named_method_bv():
+    """A synthetic C++-style view: one intended method whose demangled name lives
+    only on the symbol (#224a), plus an unrelated helper. Synthetic names only."""
+    def _fn(start, raw, short, full):
+        fn = _FakeFunction(start, raw)
+        fn.symbol = _FakeSymbol("FunctionSymbol")
+        fn.symbol.short_name = short
+        fn.symbol.full_name = full
+        return fn
+
+    return [
+        _fn(0x401000, "_ZN3net7Session6onDataEi",
+            "net::Session::onData", "net::Session::onData(int32_t)"),
+        _fn(0x402000, "_ZN3net12ZlibChecksumEj",
+            "net::ZlibChecksum", "net::ZlibChecksum(uint32_t)"),
+    ]
+
+
+def _miss_suggestions(instance, bv, query: str) -> list[str]:
+    with pytest.raises(RuntimeError) as exc_info:
+        instance._find_function(bv, query)
+    message = str(exc_info.value)
+    assert "Did you mean: " in message, message
+    return message.split("Did you mean: ", 1)[1].split(", ")
+
+
+def test_find_function_miss_suggestion_survives_a_first_character_typo(monkeypatch):
+    """A typo in the FIRST character of the name must still suggest the intended
+    function. Prefiltering the miss corpus by the query's first character dropped
+    the intended name entirely (it no longer shares that character), so the caller
+    got no hint at all -- or, worse, an unrelated one. The hint set must equal
+    difflib over EVERY spelling, i.e. the unbounded corpus base used."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    seam = importlib.import_module("bn_agent_bridge.seam")
-    fns = [_FakeFunction(0x400000 + i * 0x100, f"player_{i:04d}") for i in range(40)]
+    fns = _named_method_bv()
     bv = _FakeBV(functions=fns)
-    monkeypatch.setattr(seam, "SUGGESTION_MAX_FORMS", 3)
-    # Isolate the corpus pass from the two authoritative name walks.
-    monkeypatch.setattr(instance, "_find_functions_by_name", lambda *a, **k: [])
-    seen: list = []
-    real_forms = seam.BridgeContext._function_name_forms
-    monkeypatch.setattr(
-        seam.BridgeContext, "_function_name_forms",
-        staticmethod(lambda fn: (seen.append(int(fn.start)), real_forms(fn))[1]),
-    )
+    bv.get_functions_by_name = lambda name: []
+    typo = "uet::Session::onData"                   # first character typo'd
 
-    with pytest.raises(RuntimeError) as exc_info:
-        instance._find_function(bv, "player_0001x")
+    expected = difflib.get_close_matches(typo, _suggestion_spellings(fns), n=5, cutoff=0.5)
+    assert "net::Session::onData" in expected       # the intended name IS in range
 
-    message = str(exc_info.value)
-    assert "Did you mean" in message
-    assert "player_0001" in message                 # the corpus still holds the match
-    assert len(seen) <= 3                           # capped, not a full walk
+    assert _miss_suggestions(instance, bv, typo) == expected
+
+
+def test_find_function_miss_suggestion_names_only_close_spellings(monkeypatch):
+    """#622 regression: the unrelated helper is outside the cutoff, so it must not be
+    offered -- and the returned set must be exactly difflib's over the full
+    corpus, not a hand-picked list."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fns = _named_method_bv()
+    bv = _FakeBV(functions=fns)
+    bv.get_functions_by_name = lambda name: []
+    typo = "uet::Session::onData"
+
+    expected = difflib.get_close_matches(typo, _suggestion_spellings(fns), n=5, cutoff=0.5)
+
+    hints = _miss_suggestions(instance, bv, typo)
+    assert hints == expected
+    assert not any("Zlib" in hint for hint in hints)
+
+
+def test_find_function_miss_suggestion_survives_a_middle_character_typo(monkeypatch):
+    """The regression guard: a middle-character typo always hinted the intended
+    name (the first character still matched), and must keep doing so."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fns = _named_method_bv()
+    bv = _FakeBV(functions=fns)
+    bv.get_functions_by_name = lambda name: []
+    typo = "net::Sessoin::onData"                   # transposed middle characters
+
+    expected = difflib.get_close_matches(typo, _suggestion_spellings(fns), n=5, cutoff=0.5)
+    assert "net::Session::onData" in expected
+
+    assert _miss_suggestions(instance, bv, typo) == expected
 
 
 def test_xrefs_demangled_name_resolves_to_definition_not_veneer(monkeypatch):

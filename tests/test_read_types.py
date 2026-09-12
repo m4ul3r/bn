@@ -705,22 +705,42 @@ def test_struct_show_follows_a_typedef_chain(monkeypatch):
     assert "0x0000: int32_t hp" in entry["layout"]
 
 
-def test_struct_show_typedef_to_non_struct_still_raises(monkeypatch):
-    """A type that resolves to a scalar is genuinely not struct-like: the error
-    path must survive the typedef follow (and not hang on a self-referential
-    alias) while naming the type it could not resolve to a struct."""
+def test_struct_show_distinguishes_scalar_from_an_unfollowable_alias(monkeypatch):
+    """Two different failures must not share one misleading message: an alias
+    that WAS followed to a scalar is genuinely not struct-like, while an alias
+    whose chain cannot be followed at all (self-referential here, and the same
+    path covers a raised target()) must say so and name the reason (#674 review:
+    the previous assertion pinned both to 'not a struct-like type')."""
     bridge = _load_bridge(monkeypatch)
     ctx = bridge.BinaryNinjaBridge().ctx
     scalar = _FakeType("int32_t", type_class="IntegerTypeClass")
+    broken = _TypedefRef("RaisingAlias", None)
+
+    def _raise(bv):
+        raise RuntimeError("symbol resolution failed")
+
+    broken.target = _raise
     loop = _TypedefRef("SelfAlias", None)
     loop._target = loop                      # pathological self-referential typedef
-    bv = _FakeBV(types_={"TileCount": scalar, "SelfAlias": loop})
+    bv = _FakeBV(types_={"TileCount": scalar, "SelfAlias": loop, "RaisingAlias": broken})
     monkeypatch.setattr(ctx, "_resolve_view", lambda selector: bv)
 
+    # (i) a followed scalar keeps the original, accurate message.
     with pytest.raises(RuntimeError, match=r"not a struct-like type: TileCount"):
         bridge.read_types._type_info(ctx, None, "TileCount", require_struct=True)
-    with pytest.raises(RuntimeError, match=r"not a struct-like type: SelfAlias"):
+
+    # (ii) an unresolvable chain reports the alias AND why, distinctly.
+    with pytest.raises(RuntimeError) as cycle:
         bridge.read_types._type_info(ctx, None, "SelfAlias", require_struct=True)
+    assert "SelfAlias" in str(cycle.value)
+    assert "not a struct-like type" not in str(cycle.value)
+    assert "cyclic" in str(cycle.value)
+
+    with pytest.raises(RuntimeError) as raised:
+        bridge.read_types._type_info(ctx, None, "RaisingAlias", require_struct=True)
+    assert "RaisingAlias" in str(raised.value)
+    assert "not a struct-like type" not in str(raised.value)
+    assert "resolve" in str(raised.value).lower()
 
 
 def _nested_anonymous_aggregate(levels: int):
