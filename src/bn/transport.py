@@ -379,7 +379,8 @@ def _socket_path_is_confined(socket_path: Path) -> bool:
 
 
 def _registry_fields_are_well_formed(
-    raw_socket_path: object, raw_pid: object, raw_instance_id: object
+    raw_socket_path: object, raw_pid: object, raw_instance_id: object,
+    own_socket: Path,
 ) -> bool:
     """Every payload field the adopt-vs-drop decision reads, checked in one place.
 
@@ -393,17 +394,19 @@ def _registry_fields_are_well_formed(
     grammar-validated id, so anything else is corruption and is DROPPED rather
     than coerced into something plausible.
 
-    - ``socket_path`` must be a path string whose meaning does not depend on
-      who is asking. It is required to be absolute whenever the cache root is,
-      because a relative value would then resolve against the caller's CWD --
-      run the CLI from inside the cache and a bogus record was believed. A
-      relative value is admitted ONLY when the cache root is itself relative:
-      that is a supported answer to ``socket_too_long_message`` (the AF_UNIX
-      107-byte limit is real), the writer legitimately emits a relative path
-      there, and discovery only located this registry by resolving a relative
-      ``instances_dir()`` against the same base -- so the base is fixed by
-      construction rather than chosen by the caller. Confinement still bounds
-      the result either way.
+    - ``socket_path`` must name a file the reader and the writer cannot
+      disagree about. An absolute value says which file it is. A relative one
+      does not: it means nothing until it is joined to a base, and the
+      caller's CWD is not the writer's -- that is how a bogus record came to
+      be believed or disbelieved depending on where the CLI happened to run,
+      and, once absoluteness was demanded instead, how ONE cache root spelled
+      two ways (relative when the bridge wrote its registry, absolute when a
+      later CLI read it) silently dropped a running bridge. So a relative
+      value is admitted only when it names THIS record's own socket -- the
+      basename is the one part of a relative path that survives a change of
+      base -- and ``_load_instance`` then anchors it to the directory the
+      registry was found in rather than to anyone's CWD. Confinement still
+      bounds the result either way.
     - ``pid`` must be a real ``int`` in the range ``os.kill`` accepts. ``int()``
       is lossy in exactly the direction that hurts: ``True``, ``"1"``, ``" 1 "``
       and ``1.9`` all become 1, and pid 1 always exists and answers EPERM. Zero
@@ -420,7 +423,8 @@ def _registry_fields_are_well_formed(
     """
     if not isinstance(raw_socket_path, str) or not raw_socket_path:
         return False
-    if not Path(raw_socket_path).is_absolute() and instances_dir().is_absolute():
+    if (not Path(raw_socket_path).is_absolute()
+            and Path(raw_socket_path).name != own_socket.name):
         return False
     if isinstance(raw_pid, bool) or not isinstance(raw_pid, int):
         return False
@@ -453,9 +457,20 @@ def _load_instance(
         return None
 
     instance_id = payload.get("instance_id")
-    if not _registry_fields_are_well_formed(raw_socket_path, raw_pid, instance_id):
+    # The socket this record is allowed to own, in the directory discovery
+    # actually found the record in: `<id>.json` -> `<id>.sock` under
+    # `instances_dir()`, and the legacy fixed pair's `<plugin>.json` ->
+    # `<plugin>.sock` in the cache root. Both are exactly what
+    # ``bridge_socket_path`` would emit for that record, and unlike the CWD
+    # the reader and the writer cannot spell it differently.
+    own_socket = path.parent / f"{path.stem}.sock"
+    if not _registry_fields_are_well_formed(
+        raw_socket_path, raw_pid, instance_id, own_socket
+    ):
         return None
     socket_path = Path(raw_socket_path)
+    if not socket_path.is_absolute():
+        socket_path = own_socket
     pid = raw_pid
 
     if path.parent == instances_dir() and instance_id != path.stem:
@@ -1166,8 +1181,11 @@ def _spawn_instance_unlocked(
         )
     finally:
         # The child inherits the fd across a successful Popen; close the parent's
-        # copy either way, or a failed spawn leaks the write handle for the
-        # lifetime of the CLI process (#618).
+        # copy either way. Without this the write handle on a failed spawn lives
+        # exactly as long as the traceback that holds the frame owning it: the
+        # measured window is the exception propagating out of here, but anything
+        # that keeps that traceback alive -- a stored exception, a debugger, a
+        # caller that formats it later -- keeps the fd alive with it (#618).
         log_file.close()
 
     reg_path = bridge_registry_path(instance_id)

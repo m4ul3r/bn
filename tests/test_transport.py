@@ -3365,10 +3365,10 @@ def test_load_instance_requires_an_absolute_socket_path_even_from_inside_the_cac
     Confinement asks whether the path is under the cache, and ``Path("")`` is
     ``Path(".")`` -- so a relative value inherits whatever directory the CLI
     happens to be run from. Run from inside the cache it passes confinement and
-    the record is ADOPTED as a live bridge pointing at a directory. The only
-    legitimate writer emits ``str(bridge_socket_path(...))``, which is always
-    absolute, so a non-absolute value is corruption and the answer must not
-    depend on the caller's CWD.
+    the record is ADOPTED as a live bridge pointing at a directory. None of
+    these values names this record's own socket (``relpath.sock``), so none of
+    them can be anchored either, and the answer must not depend on the
+    caller's CWD.
     """
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     inst_dir = instances_dir()
@@ -3473,10 +3473,10 @@ def test_legacy_fixed_registry_validates_its_instance_id(
 def test_relative_cache_root_still_discovers_its_own_bridge(tmp_path, monkeypatch):
     """The over-rejection half: a relative cache root is a supported setup.
 
-    ``socket_too_long_message`` tells the user to point BN_CACHE_DIR at a
-    shorter directory, and a relative root is how that is done against the
-    real AF_UNIX 107-byte limit. The authoritative writer then emits
-    ``str(bridge_socket_path(id))``, which is relative -- so requiring an
+    ``cache_home()`` does not force its env override absolute, so a relative
+    BN_CACHE_DIR is an input the CLI accepts and the AF_UNIX 107-byte limit
+    gives users a reason to shorten the root. The authoritative writer then
+    emits a relative ``str(bridge_socket_path(id))`` -- so requiring an
     absolute socket_path silently drops a LIVE bridge, leaving `session list`
     empty and `session stop` with no handle on a running process.
     """
@@ -3525,6 +3525,86 @@ def test_relative_socket_path_is_refused_under_an_absolute_cache_root(
     _plant_registry(inst_dir, "cwdrel", pid=os.getpid(), socket_path="cwd.sock",
                     instance_id="cwdrel", plugin_name="bn_agent_bridge")
     sibling = _healthy_sibling(inst_dir)
+    try:
+        instances = list_instances()
+    finally:
+        sibling.shutdown()
+        sibling.server_close()
+
+    assert [inst.instance_id for inst in instances] == ["good"]
+
+
+def test_one_cache_root_spelled_two_ways_still_finds_its_bridge(tmp_path, monkeypatch):
+    """Two spellings of ONE cache root must not disagree about a live bridge.
+
+    The writer ran with a relative cache root and emitted the relative
+    ``str(bridge_socket_path(id))`` it always emits there; a later CLI names
+    the SAME directory absolutely. Nothing about the instance changed -- only
+    how the reader spells its own root -- yet asking whether the VALUE is
+    absolute dropped the record ahead of the ``include_unreachable`` arm, so
+    `session list` was empty, `session stop` had no handle, and nothing swept
+    the record either: a running bridge orphaned by a spelling. Base kept the
+    lifecycle handle here, so this is a regression against base, and the
+    reader's CWD must not enter into it.
+    """
+    from bn.paths import bridge_socket_path
+    from bn.transport import find_lifecycle_instance
+
+    writer_cwd = tmp_path / "w"
+    (writer_cwd / "other").mkdir(parents=True)
+    monkeypatch.chdir(writer_cwd)
+    monkeypatch.setenv("BN_CACHE_DIR", "c")          # the WRITER's spelling
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+
+    sock = bridge_socket_path("mix1")
+    assert not sock.is_absolute()                    # what the writer emits here
+    server = _Server(str(sock), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    bridge_registry_path("mix1").write_text(
+        json.dumps(
+            _registry_payload(sock, pid=os.getpid(), identity=_identity(),
+                              instance_id="mix1")
+        ),
+        encoding="utf-8",
+    )
+
+    # The reader: same directory, absolute spelling, and a DIFFERENT CWD, so
+    # nothing it concludes may depend on where it happens to be run from.
+    monkeypatch.setenv("BN_CACHE_DIR", str(writer_cwd / "c"))
+    monkeypatch.chdir(writer_cwd / "other")
+    assert instances_dir().is_absolute()
+    try:
+        instances = list_instances()
+        lifecycle = find_lifecycle_instance("mix1")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert [inst.instance_id for inst in instances] == ["mix1"]
+    assert lifecycle is not None and lifecycle.instance_id == "mix1"
+    assert bridge_registry_path("mix1").exists()     # and it was not swept
+
+
+def test_a_relative_socket_path_must_name_the_records_own_socket(tmp_path, monkeypatch):
+    """Under a relative root, confinement was the only thing left standing.
+
+    Every relative value passed the admission point there, so a record could
+    name a SIBLING's live socket and be adopted as a live bridge of its own --
+    the same false-affirmative class this validator exists to close, reached
+    through the arm that admits the writer's own relative output. A relative
+    path's basename is the one part of it that does not depend on anyone's
+    CWD, and the record's own socket is the only thing it may name.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("BN_CACHE_DIR", "c")
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    sibling = _healthy_sibling(inst_dir)             # a real listening good.sock
+    stolen = str(inst_dir / "good.sock")
+    assert not Path(stolen).is_absolute()            # relative, in-cache, live
+    _plant_registry(inst_dir, "thief", pid=os.getpid(), socket_path=stolen,
+                    instance_id="thief", plugin_name="bn_agent_bridge")
     try:
         instances = list_instances()
     finally:
