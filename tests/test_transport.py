@@ -3664,3 +3664,93 @@ def test_a_dead_record_is_swept_whatever_its_relative_path_claims(tmp_path, monk
 
     assert instances == []
     assert not (inst_dir / "gone.json").exists()
+
+
+def test_a_symlinked_instances_dir_does_not_cost_a_live_bridge(tmp_path, monkeypatch):
+    """Confinement must measure the cache the user actually laid out.
+
+    ``resolve()`` follows symlinks, so a cache whose ``instances/`` is a link
+    -- a tmpfs, a bigger disk, a per-project directory -- put every socket the
+    bridge writes "outside the cache". That arm does not merely skip the
+    record, it PURGES the registry: the bridge keeps listening while
+    `session list` shows nothing and `session stop` has lost its only handle
+    on the process. Base listed it and kept the record.
+
+    The widened boundary must not become a hole, so the same cache also holds
+    a record naming a socket outside BOTH roots: that one is still refused,
+    and the file it names is still not touched.
+    """
+    from bn.paths import bridge_socket_path
+
+    cache = tmp_path / "cache"
+    linked = tmp_path / "elsewhere"
+    outside = tmp_path / "outside"
+    linked.mkdir(parents=True)
+    outside.mkdir(parents=True)
+    cache.mkdir(parents=True)
+    (cache / "instances").symlink_to(linked)     # the user's own layout
+    monkeypatch.setenv("BN_CACHE_DIR", str(cache))
+    bystander = outside / "bystander.sock"
+    bystander.write_text("", encoding="utf-8")
+
+    sock = bridge_socket_path("sym1")
+    server = _Server(str(sock), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    bridge_registry_path("sym1").write_text(
+        json.dumps(
+            _registry_payload(sock, pid=os.getpid(), identity=_identity(),
+                              instance_id="sym1")
+        ),
+        encoding="utf-8",
+    )
+    _plant_registry(instances_dir(), "foreign", pid=os.getpid(),
+                    socket_path=str(bystander), instance_id="foreign",
+                    plugin_name="bn_agent_bridge")
+    try:
+        instances = list_instances()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert [inst.instance_id for inst in instances] == ["sym1"]
+    assert bridge_registry_path("sym1").exists()          # and not purged
+    assert bystander.exists()                             # nothing outside touched
+    assert sorted(p.name for p in outside.iterdir()) == ["bystander.sock"]
+
+
+def test_an_all_dot_instance_id_keeps_its_live_registry(tmp_path, monkeypatch):
+    """``Path.stem`` does not round-trip every id the grammar accepts.
+
+    ``validate_instance_id`` accepts ``...``; its registry is ``....json``,
+    and ``Path("....json").stem`` is the WHOLE name, because pathlib reads a
+    leading dot run as part of the name rather than as a suffix separator. The
+    filename check therefore derived a different identity than the writer
+    wrote and deleted a LIVE bridge's record as foreign -- the destructive
+    form of the same wrong-reason check this PR keeps finding. Both sides now
+    derive the id the one way that round-trips: strip the exact ``.json``.
+    """
+    from bn.paths import bridge_socket_path
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    assert Path(str(bridge_registry_path("..."))).stem != "..."   # the trap
+
+    sock = bridge_socket_path("...")
+    server = _Server(str(sock), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    bridge_registry_path("...").write_text(
+        json.dumps(
+            _registry_payload(sock, pid=os.getpid(), identity=_identity(),
+                              instance_id="...")
+        ),
+        encoding="utf-8",
+    )
+    try:
+        instances = list_instances()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert [inst.instance_id for inst in instances] == ["..."]
+    assert bridge_registry_path("...").exists()

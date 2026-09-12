@@ -348,7 +348,7 @@ def _socket_is_live(socket_path: Path, timeout: float = 0.2) -> bool:
         return False
 
 
-def _socket_path_is_confined(socket_path: Path) -> bool:
+def _socket_path_is_confined(socket_path: Path, registry_dir: Path) -> bool:
     """Whether a registry's ``socket_path`` lives under this user's bn cache.
 
     A registry is data, not a path we constructed: a corrupted or hand-edited
@@ -363,13 +363,24 @@ def _socket_path_is_confined(socket_path: Path) -> bool:
     Checking only the resolved target would accept an out-of-cache symlink
     whose target happens to be in-cache, and then delete that out-of-cache link.
     Any resolution failure is treated as unconfined.
+
+    The boundary is the cache AS THE USER LAID IT OUT, which is why the
+    directory the record was found in counts as well. ``resolve()`` follows
+    symlinks, so measuring against ``cache_home()`` alone puts every socket
+    under a symlinked ``instances/`` -- a tmpfs, a bigger disk -- outside the
+    cache, and the arm below does not merely skip such a record, it purges it:
+    a listening bridge loses its registry and with it the only handle
+    ``session stop`` has. Discovery reached this record by walking that
+    directory, and an actor able to retarget it can already plant registries
+    in the cache, so trusting it grants nothing and refusing it costs a live
+    bridge.
     """
     try:
-        cache = cache_home().resolve()
-        if not socket_path.resolve().is_relative_to(cache):
-            return False
+        roots = (cache_home().resolve(), registry_dir.resolve())
+        target = socket_path.resolve()
         entry = socket_path.parent.resolve() / socket_path.name
-        return entry.is_relative_to(cache)
+        return any(target.is_relative_to(root) and entry.is_relative_to(root)
+                   for root in roots)
     except (OSError, TypeError, ValueError):
         # OSError: the path cannot be stat'd. ValueError: it cannot even be
         # interpreted as a path (an embedded NUL). TypeError: an empty final
@@ -454,6 +465,12 @@ def _load_instance(
     instance_id = payload.get("instance_id")
     if not _registry_fields_are_well_formed(raw_socket_path, raw_pid, instance_id):
         return None
+    # What the FILENAME says this record is, derived the one way that
+    # round-trips every id the grammar accepts: ``Path.stem`` reads a leading
+    # dot run as part of the name, so ``....json`` -- the registry of the legal
+    # id ``...`` -- stems to the whole name, and the record then reads as
+    # foreign and is deleted while its bridge is still listening.
+    own_id = path.name.removesuffix(".json")
     socket_path = Path(raw_socket_path)
     if not socket_path.is_absolute():
         # The socket this record owns by construction, in the directory
@@ -462,10 +479,10 @@ def _load_instance(
         # -> `<plugin>.sock` in the cache root. Both are exactly what
         # ``bridge_socket_path`` emits for that record, and unlike the CWD the
         # reader and the writer cannot spell it differently.
-        socket_path = path.with_name(f"{path.name.removesuffix('.json')}.sock")
+        socket_path = path.with_name(f"{own_id}.sock")
     pid = raw_pid
 
-    if path.parent == instances_dir() and instance_id != path.stem:
+    if path.parent == instances_dir() and instance_id != own_id:
         # The registry filename is the caller's explicit selector. Never trust a
         # payload that claims a different identity, and never unlink the socket
         # named by that foreign payload.
@@ -473,7 +490,7 @@ def _load_instance(
             path.unlink()
         return None
 
-    if not _socket_path_is_confined(socket_path):
+    if not _socket_path_is_confined(socket_path, path.parent):
         # The payload points at a socket outside the cache: never connect to it
         # and never let the stale sweep unlink it. Drop only the registry file
         # that lives under our cache (#618).
