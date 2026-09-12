@@ -1741,6 +1741,50 @@ def test_validate_instance_id_rejects_traversal_and_separators(bad):
         validate_instance_id(bad)
 
 
+# --- #608: one owner for the instance-id grammar ----------------------------
+# The grammar lives only in bn.paths; transport.validate_instance_id is a
+# ValueError -> BridgeError wrapper that also keeps the socket-length budget
+# check. These guards fail if the wrapper drifts in what it accepts, in the
+# exception type it raises, or in the message it reports.
+
+_INSTANCE_ID_GRAMMAR = [
+    ("abc123", True),
+    ("goal-v1", True),
+    ("my_inst.2", True),
+    ("A.B-C_9", True),
+    ("default", True),
+    ("../evil", False),
+    ("../../tmp/evil", False),
+    ("/abs/path", False),
+    ("a/b", False),
+    ("a\\b", False),
+    (".", False),
+    ("..", False),
+    ("", False),
+    ("has space", False),
+    ("weird;id", False),
+]
+
+
+@pytest.mark.parametrize("instance_id, accepted", _INSTANCE_ID_GRAMMAR)
+def test_instance_id_grammar_agrees_between_paths_and_transport(instance_id, accepted, tmp_path, monkeypatch):
+    from bn.paths import validate_instance_id as paths_validate
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    if accepted:
+        assert paths_validate(instance_id) == instance_id
+        assert validate_instance_id(instance_id) == instance_id
+        return
+    # Value side: ValueError. CLI side: BridgeError (a RuntimeError, so these
+    # two `pytest.raises` cannot both be satisfied by one type).
+    with pytest.raises(ValueError, match="Invalid instance id|non-empty") as paths_exc:
+        paths_validate(instance_id)
+    with pytest.raises(BridgeError) as transport_exc:
+        validate_instance_id(instance_id)
+    # Wrapper fidelity: the CLI-facing message is the canonical one, verbatim.
+    assert str(transport_exc.value) == str(paths_exc.value)
+
+
 def test_spawn_instance_rejects_traversal_id_before_any_fs(tmp_path, monkeypatch):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     # Must raise before spawning anything; no files outside instances_dir().
@@ -2847,3 +2891,161 @@ def test_send_request_ok_false_without_status_leaves_attrs_none(tmp_path, monkey
     assert exc_info.value.status is None
     assert exc_info.value.requested is None
     assert exc_info.value.observed is None
+
+# ---------------------------------------------------------------------------
+# #618 — registry socket confinement + spawn log-fd hygiene
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("socket_is_live", [True, False])
+def test_load_instance_rejects_socket_outside_cache(tmp_path, monkeypatch, socket_is_live):
+    """A registry is DATA: its socket_path must stay under this user's cache.
+
+    Ids are basename-validated when paths are constructed; the payload is not.
+    Whatever an out-of-tree registry claims, we must never adopt its socket and
+    never let the stale sweep unlink it -- only the registry file under the
+    cache is dropped. Both facets matter: a live foreign socket must not be
+    connected to, and a dead foreign file must survive our cleanup.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    foreign_socket = tmp_path.parent / f"{tmp_path.name}-outside.sock"
+    server = None
+    if socket_is_live:
+        server = _Server(str(foreign_socket), _Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    else:
+        stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        stale.bind(str(foreign_socket))
+        stale.listen(1)
+        stale.close()
+
+    registry_path = inst_dir / "outsider.json"
+    registry_path.write_text(
+        json.dumps(
+            _registry_payload(
+                foreign_socket,
+                pid=os.getpid(),
+                identity=_identity(ticks_delta=1),
+                instance_id="outsider",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        assert not any(inst.instance_id == "outsider" for inst in list_instances())
+        assert foreign_socket.exists()      # never unlinked
+        assert not registry_path.exists()   # the cache-side record is dropped
+    finally:
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+        else:
+            foreign_socket.unlink(missing_ok=True)
+
+
+def test_registry_socket_under_cache_still_loads_and_purges(tmp_path, monkeypatch):
+    """#618 control: in-cache sockets are untouched by the confinement check.
+
+    The legacy fixed pair (cache_home()/bn_agent_bridge.json ->
+    cache_home()/bn-fixed.sock) must keep resolving, and a dead in-cache socket
+    must still be swept together with its registry.
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+
+    fixed_socket = tmp_path / "bn-fixed.sock"
+    server = _Server(str(fixed_socket), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    fixed_registry = bridge_registry_path()
+    fixed_registry.write_text(
+        json.dumps(
+            _registry_payload(
+                fixed_socket, pid=os.getpid(), identity=_identity(), instance_id=None
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    stale_socket = inst_dir / "stale1.sock"
+    stale_binder = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    stale_binder.bind(str(stale_socket))
+    stale_binder.listen(1)
+    stale_binder.close()
+    stale_registry = inst_dir / "stale1.json"
+    stale_registry.write_text(
+        json.dumps(
+            _registry_payload(
+                stale_socket,
+                pid=os.getpid(),
+                identity=_identity(ticks_delta=1),
+                instance_id="stale1",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        instances = list_instances()
+        assert any(inst.registry_path == fixed_registry for inst in instances)
+        assert not any(inst.instance_id == "stale1" for inst in instances)
+        assert not stale_registry.exists()
+        assert not stale_socket.exists()
+    finally:
+        server.shutdown()
+        server.server_close()
+        stale_socket.unlink(missing_ok=True)
+
+
+class _CloseCountingLog:
+    """File handle proxy that records every close() so a leak is observable."""
+
+    def __init__(self, handle, closes):
+        self._handle = handle
+        self._closes = closes
+
+    def __getattr__(self, name):
+        return getattr(self._handle, name)
+
+    def write(self, data):
+        return self._handle.write(data)
+
+    def close(self):
+        self._closes.append(self._handle)
+        self._handle.close()
+
+
+def test_spawn_closes_log_on_popen_failure(tmp_path, monkeypatch):
+    """A failed Popen must not leak the parent's spawn-log write handle."""
+    import bn.transport as transport
+
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(transport, "list_instances", lambda **kwargs: [])
+    monkeypatch.setattr(transport, "_find_bn_agent", lambda: ["bn-agent"])
+
+    def raising_popen(*args, **kwargs):
+        raise FileNotFoundError("bn-agent: not found")
+
+    monkeypatch.setattr(transport.subprocess, "Popen", raising_popen)
+
+    handles: list = []
+    closes: list = []
+    real_open = open
+
+    def tracking_open(*args, **kwargs):
+        tracked = _CloseCountingLog(real_open(*args, **kwargs), closes)
+        handles.append(tracked)
+        return tracked
+
+    monkeypatch.setattr(transport, "open", tracking_open, raising=False)
+
+    with pytest.raises(FileNotFoundError):
+        transport._spawn_instance_unlocked("leaky1", timeout=5.0)
+
+    assert len(handles) == 1
+    assert handles[0].name == str(instances_dir() / "leaky1.log")
+    assert closes == [handles[0]._handle]   # closed exactly once
+    assert handles[0].closed                # no leaked fd

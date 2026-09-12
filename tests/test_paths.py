@@ -113,6 +113,18 @@ def test_validate_instance_id_rejects_an_unfittable_id_before_spawning(monkeypat
     assert "too long" in str(exc.value) and "limit" in str(exc.value)
 
 
+def test_validate_instance_id_maps_the_path_boundary_error(monkeypatch):
+    # #608: the wrapper must keep delegating the socket-length budget to the
+    # path helper -- ValueError at the boundary, BridgeError for the CLI, with
+    # the same message, so the two sides cannot drift.
+    with _cache_dir_of_length(monkeypatch, _paths.socket_path_budget() + 1):
+        with pytest.raises(ValueError, match="too long") as paths_exc:
+            _paths.bridge_socket_path("i")
+        with pytest.raises(BridgeError, match="too long") as transport_exc:
+            validate_instance_id("i")
+    assert str(transport_exc.value) == str(paths_exc.value)
+
+
 def test_validate_instance_id_still_accepts_a_normal_id(monkeypatch, tmp_path):
     monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
     assert validate_instance_id("phase2-probe") == "phase2-probe"

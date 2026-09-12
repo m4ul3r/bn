@@ -6,7 +6,6 @@ import fcntl
 import json
 import math
 import os
-import re
 import secrets
 import socket
 import struct
@@ -19,8 +18,8 @@ from pathlib import Path
 from typing import Any
 
 from .paths import (
-    bridge_registry_path, bridge_socket_path, ensure_private_dir, instances_dir,
-    project_root,
+    bridge_registry_path, bridge_socket_path, cache_home, ensure_private_dir,
+    instances_dir, project_root, validate_instance_id as _paths_validate_instance_id,
 )
 from .proc_identity import PinUnavailable, identity_verdict, pin_process
 
@@ -113,40 +112,28 @@ def instance_selector(instance: BridgeInstance) -> str:
     return instance.instance_id or "default"
 
 
-# A bridge instance id is joined directly into filesystem paths
-# (instances_dir()/<id>.{json,sock,log}). Path semantics make an unvalidated id
-# a traversal primitive: "../evil" escapes instances_dir() and "/abs" replaces
-# it entirely, spawning a bridge whose files land outside the cache tree --
-# never listed by list_instances() (which only globs instances_dir()/*.json) and
-# impossible to stop normally (#84). Restrict ids to a strict basename grammar.
-_INSTANCE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
-
-
 def validate_instance_id(instance_id: str) -> str:
-    """Reject any instance id that isn't a safe path basename.
+    """CLI-facing wrapper over the canonical instance-id grammar in ``.paths``.
 
-    Accepts letters, digits, '_', '-', '.'; rejects empty strings, '.'/'..',
-    and anything containing a path separator or other character (which also
-    rules out absolute paths and traversal). Raises BridgeError before any
-    filesystem activity. Returns the id unchanged when valid.
+    The grammar and its message live in ``paths.validate_instance_id``, the one
+    chokepoint both the CLI and the bridge route through (#608); this function
+    only translates its ``ValueError`` into the ``BridgeError`` the CLI and
+    ``cli.py``'s re-export expect. Raises before any filesystem activity.
     """
-    if not isinstance(instance_id, str) or not instance_id:
-        raise BridgeError("Instance id must be a non-empty string")
-    if instance_id in (".", "..") or not _INSTANCE_ID_RE.fullmatch(instance_id):
-        raise BridgeError(
-            f"Invalid instance id: {instance_id!r}. Use only letters, digits, "
-            "'_', '-', and '.' (no path separators, no '.'/'..', no absolute paths)."
-        )
+    try:
+        validated = _paths_validate_instance_id(instance_id)
+    except ValueError as exc:
+        raise BridgeError(str(exc)) from exc
     # An id whose socket path cannot fit in sockaddr_un.sun_path must fail HERE,
     # in the CLI and before anything is spawned, rather than as a bare
     # `OSError: AF_UNIX path too long` from bind() inside the bridge -- by which
     # point the caller has already committed to the id and the real cause (a
     # byte count) is nowhere in the message.
     try:
-        bridge_socket_path(instance_id)
+        bridge_socket_path(validated)
     except ValueError as exc:
         raise BridgeError(str(exc)) from exc
-    return instance_id
+    return validated
 
 
 def _format_instance_choices(instances: list[BridgeInstance]) -> str:
@@ -354,6 +341,22 @@ def _socket_is_live(socket_path: Path, timeout: float = 0.2) -> bool:
         return False
 
 
+def _socket_path_is_confined(socket_path: Path) -> bool:
+    """Whether a registry's ``socket_path`` lives under this user's bn cache.
+
+    A registry is data, not a path we constructed: a corrupted or hand-edited
+    entry can name any file on the host, and the loader would otherwise connect
+    to it -- and, when it probes dead, unlink it through the stale sweep (#618).
+    ``bridge_socket_path`` bounds what we WRITE; this bounds what we INGEST.
+    Symlinks are resolved so a link inside the cache cannot reach outside it.
+    Any resolution failure is treated as unconfined.
+    """
+    try:
+        return socket_path.resolve().is_relative_to(cache_home().resolve())
+    except OSError:
+        return False
+
+
 def _load_instance(
     path: Path,
     *,
@@ -374,6 +377,13 @@ def _load_instance(
         # named by that foreign payload.
         with contextlib.suppress(OSError):
             path.unlink()
+        return None
+
+    if not _socket_path_is_confined(socket_path):
+        # The payload points at a socket outside the cache: never connect to it
+        # and never let the stale sweep unlink it. Drop only the registry file
+        # that lives under our cache (#618).
+        _purge_stale_registry(path)
         return None
 
     process_state = _process_state(pid)
@@ -1059,14 +1069,19 @@ def _spawn_instance_unlocked(
     log_file = open(log_path, "w")  # noqa: SIM115
 
     cmd = _find_bn_agent() + ["--instance-id", instance_id]
-    proc = subprocess.Popen(
-        cmd,
-        start_new_session=True,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
-    )
-    log_file.close()
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            start_new_session=True,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+    finally:
+        # The child inherits the fd across a successful Popen; close the parent's
+        # copy either way, or a failed spawn leaks the write handle for the
+        # lifetime of the CLI process (#618).
+        log_file.close()
 
     reg_path = bridge_registry_path(instance_id)
     while time.monotonic() < deadline:
