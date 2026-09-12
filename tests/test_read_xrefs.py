@@ -305,6 +305,119 @@ def test_xrefs_falls_back_to_import_symbol_when_function_not_found(monkeypatch):
     assert result["address"] == "0x20000"
 
 
+def _import_scan_bv(name: str, address: int, caller_starts: list[int]):
+    fake_bn = sys.modules["binaryninja"]
+    sym = fake_bn.Symbol(fake_bn.SymbolType.ImportedFunctionSymbol, address, name)
+    sym.short_name = name
+    callers = []
+    for index, start in enumerate(caller_starts):
+        fn = _FakeFunction(start, f"caller_{index}")
+        fn.low_level_il = [[_FakeLLILInstruction(start + 0x10, _FakeConstPtr(address))]]
+        callers.append(fn)
+    return _FakeBV(functions=callers, symbols=[sym])
+
+
+def test_xrefs_import_scan_discloses_a_capped_scan(monkeypatch):
+    """#622: when BN reports no code refs for an import, the fallback LLIL scan is
+    budgeted. A capped scan must hand back the partial callers AND flag itself, so
+    a truncated list is never read as "no callers found"."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _import_scan_bv("plt_target", 0x20000, [0x1000, 0x2000])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    monkeypatch.setattr(bridge.read_xrefs, "SCAN_CALLS_MAX_FUNCS", 1)
+
+    result = instance._xrefs(None, "plt_target")
+
+    assert result["code_refs_scanned"] is True
+    assert result["truncated"] is True
+    assert "scan_note" in result
+    assert result["code_ref_count"] == 1          # partial, never empty
+    assert result["returned"] == 1
+    assert int(result["items"][0]["address"], 16) == 0x1010
+
+
+def test_xrefs_import_scan_is_complete_and_unflagged_under_budget(monkeypatch):
+    """The negative control: a scan that fits the budget must NOT claim
+    truncation -- the flag only ever means "the scan stopped early"."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _import_scan_bv("plt_target", 0x20000, [0x1000, 0x2000])
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._xrefs(None, "plt_target")
+
+    assert result["code_refs_scanned"] is True
+    assert result.get("truncated") is not True
+    assert "scan_note" not in result
+    assert result["code_ref_count"] == 2
+
+
+def test_find_function_native_name_lookup_skips_the_full_walk(monkeypatch):
+    """#622: an exact name hit uses BN's own name index instead of enumerating
+    every function. A view whose enumeration is a landmine proves the walk never
+    happened (and that the native hit is real, not an incidental match)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x401000, "big_dispatch")
+    bv = _FakeBV(functions=[fn])
+
+    class _NoEnumerate(list):
+        def __iter__(self):
+            raise AssertionError("full bv.functions enumeration on an exact-name hit")
+
+    bv.functions = _NoEnumerate([fn])
+    bv.get_functions_by_name = lambda name: [fn] if name == "big_dispatch" else []
+
+    assert int(instance._find_function(bv, "big_dispatch").start) == 0x401000
+
+
+def test_find_function_native_miss_still_walks_for_demangled_short_name(monkeypatch):
+    """The native index only knows BN's own spellings, so an empty native result
+    must NOT end the lookup: the mangled/demangled multi-form match (#224a) still
+    resolves through the walk."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _FakeFunction(0x405250, "_ZN3foo3bar4recvEi")
+    sym = _FakeSymbol("FunctionSymbol")
+    sym.short_name = "foo::bar::recv"
+    sym.full_name = "foo::bar::recv(int32_t)"
+    fn.symbol = sym
+    bv = _FakeBV(functions=[fn])
+    bv.get_functions_by_name = lambda name: []       # native index knows nothing
+
+    assert int(instance._find_function(bv, "foo::bar::recv(int32_t)").start) == 0x405250
+
+
+def test_find_function_miss_suggestions_stop_at_the_corpus_cap(monkeypatch):
+    """#622: the miss path used to walk every function a third time to build the
+    difflib corpus. The corpus pass is now capped, so a typo'd name on a large view
+    cannot turn into another full enumeration -- while still suggesting the name
+    the caller meant."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    seam = importlib.import_module("bn_agent_bridge.seam")
+    fns = [_FakeFunction(0x400000 + i * 0x100, f"player_{i:04d}") for i in range(40)]
+    bv = _FakeBV(functions=fns)
+    monkeypatch.setattr(seam, "SUGGESTION_MAX_FORMS", 3)
+    # Isolate the corpus pass from the two authoritative name walks.
+    monkeypatch.setattr(instance, "_find_functions_by_name", lambda *a, **k: [])
+    seen: list = []
+    real_forms = seam.BridgeContext._function_name_forms
+    monkeypatch.setattr(
+        seam.BridgeContext, "_function_name_forms",
+        staticmethod(lambda fn: (seen.append(int(fn.start)), real_forms(fn))[1]),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        instance._find_function(bv, "player_0001x")
+
+    message = str(exc_info.value)
+    assert "Did you mean" in message
+    assert "player_0001" in message                 # the corpus still holds the match
+    assert len(seen) <= 3                           # capped, not a full walk
+
+
 def test_xrefs_demangled_name_resolves_to_definition_not_veneer(monkeypatch):
     """A demangled C++ name matches an import veneer (PLT stub) via short_name,
     but the same symbol is also DEFINED in this module. xrefs must resolve to the

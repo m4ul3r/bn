@@ -762,25 +762,92 @@ def _xrefs_import_symbol(ctx, bv, identifier: str, *, offset: int = 0, limit: in
     result["import_name"] = str(identifier)
 
     if not result.get("code_refs"):
-        manual = _scan_for_calls_to(ctx, bv, sym_address)
-        if manual:
+        manual, scan_truncated = _scan_for_calls_to(ctx, bv, sym_address)
+        if manual or scan_truncated:
             # Rebuild the envelope so the manually-discovered code refs land in
             # both the deprecated `code_refs` and the canonical `items` page.
+            extra: dict[str, Any] = {
+                "import_resolved": True,
+                "import_name": str(identifier),
+                "code_refs_scanned": True,
+            }
+            if scan_truncated:
+                # A capped scan is PARTIAL: without this flag an agent reads the
+                # short (or empty) caller list as "no callers found" (#622).
+                extra["truncated"] = True
+                extra["scan_note"] = (
+                    "call scan stopped at its budget "
+                    f"({SCAN_CALLS_MAX_FUNCS} functions / {SCAN_CALLS_MAX_INSNS} "
+                    "LLIL instructions examined); the caller list may be incomplete"
+                )
             result = _xref_envelope(
                 sym_address, result["target_context"], manual, result["data_refs"],
                 offset=offset, limit=limit,
-                extra={"import_resolved": True, "import_name": str(identifier),
-                       "code_refs_scanned": True},
+                extra=extra,
             )
 
     return result
 
 
-def _scan_for_calls_to(ctx, bv, target_address: int) -> list[dict[str, Any]]:
+# #622: the import-xref fallback below walks function LLIL only when BN reports NO
+# code refs for an import address. Both dimensions are bounded (functions visited,
+# LLIL instructions examined) so the walk cannot pin the shared read lock on a
+# large target; a scan that stops on either budget returns its partial caller set
+# with `truncated` + `scan_note` on the envelope. BN lifts LLIL on demand, which
+# makes the cost per FUNCTION rather than per instruction, so the function cap is
+# the effective latency bound and the instruction cap guards a few huge functions.
+SCAN_CALLS_MAX_FUNCS = 256
+SCAN_CALLS_MAX_INSNS = 200_000
+
+
+def _scan_llil_instructions(fn):
+    """LLIL instructions of *fn*, yielded lazily block by block.
+
+    ``il_format._iter_llil_instructions`` materialises a whole function's
+    instruction list (and sorts it). The scan's instruction budget must bound the
+    WORK, not merely the count examined after the fact, so this yields straight
+    from the blocks: lifting a pathological function whole is exactly the
+    unbounded cost the budget exists to prevent. Iteration order is irrelevant
+    here -- the collected refs are sorted by address before they are returned."""
+    il = getattr(fn, "low_level_il", None)
+    if il is None:
+        il = getattr(fn, "llil", None)
+    if il is None:
+        return
+    try:
+        blocks = list(il)
+    except Exception:
+        blocks = list(getattr(il, "basic_blocks", []) or [])
+    for block in blocks:
+        try:
+            yield from block
+        except Exception:
+            continue
+
+
+def _scan_for_calls_to(ctx, bv, target_address: int) -> tuple[list[dict[str, Any]], bool]:
+    """Callers of *target_address* recovered from function LLIL, for the import
+    addresses BN itself reports no ``code_refs`` for.
+
+    Returns ``(code_refs, truncated)``; *truncated* is True when the scan stopped
+    on ``SCAN_CALLS_MAX_FUNCS`` / ``SCAN_CALLS_MAX_INSNS`` rather than running out
+    of functions, so a partial (or empty) result can never be read as "no
+    callers"."""
     code_refs = []
     seen: set[int] = set()
+    funcs_visited = 0
+    insns_examined = 0
+    truncated = False
     for fn in list(bv.functions):
-        for insn in il_format._iter_llil_instructions(fn):
+        if funcs_visited >= SCAN_CALLS_MAX_FUNCS:
+            truncated = True
+            break
+        funcs_visited += 1
+        for insn in _scan_llil_instructions(fn):
+            if insns_examined >= SCAN_CALLS_MAX_INSNS:
+                truncated = True
+                break
+            insns_examined += 1
             op_name = il_format._il_op_name(insn)
             if op_name not in {"LLIL_CALL", "LLIL_CALL_STACK_ADJUST", "LLIL_TAILCALL"}:
                 continue
@@ -804,8 +871,10 @@ def _scan_for_calls_to(ctx, bv, target_address: int) -> list[dict[str, Any]]:
                     bv, ref_addr, include_disasm=True, arch=fn_arch, assume_code=True
                 ),
             })
+        if truncated:
+            break
     code_refs.sort(key=lambda item: int(item["address"], 16))
-    return code_refs
+    return code_refs, truncated
 
 
 def _resolve_type_field(ctx, bv, field_spec: str):

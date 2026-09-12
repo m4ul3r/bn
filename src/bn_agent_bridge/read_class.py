@@ -7,6 +7,7 @@ module never imports ``bridge`` or ``mutation_engine``."""
 from __future__ import annotations
 
 import difflib
+import functools
 import re
 from typing import Any
 
@@ -216,18 +217,61 @@ def _sym_entry(sym) -> dict[str, Any] | None:
     }
 
 
-def _build_class_registry(ctx, bv, *, query: str | None = None) -> dict[str, dict[str, Any]]:
+# #622: every registry build classifies each function's name -- demangle, split
+# the qualified method, and name the ctor/dtor/method kind. That classification is
+# a PURE function of the two name spellings `il_format._display_name` consumes, so
+# it is memoised here at the call site (the demangle itself lives in `il_format`,
+# outside this module's scope). A rename changes those spellings, and therefore
+# the key, so a stale entry for a renamed function is unreachable -- which is why
+# no view-keyed registry cache (and no invalidation hook BN cannot provide) is
+# needed.
+_CLASSIFY_CACHE_MAX = 65536
+
+
+@functools.lru_cache(maxsize=_CLASSIFY_CACHE_MAX)
+def _classify_names(short_name: str, name: str) -> tuple[str, str | None, str | None]:
+    """``(demangled, class, kind)`` for a function's name spellings.
+
+    ``short_name`` is the symbol's demangled short name when BN has one (its
+    ``fn.name`` stays mangled for C++), else "". ``kind`` is
+    ``ctor``/``dtor``/``method``, or None for a name with no scope qualifier --
+    exactly ``_split_qualified_method`` + ``_method_kind`` over
+    ``il_format._display_name``."""
+    demangled = short_name or name
+    cls, method = _split_qualified_method(demangled)
+    return demangled, cls, (None if cls is None else _method_kind(cls, method))
+
+
+def _classify_function(fn) -> tuple[str, str | None, str | None]:
+    """Memoised :func:`_classify_names` for *fn*, read off the live object."""
+    sym = getattr(fn, "symbol", None)
+    short = getattr(sym, "short_name", None) if sym is not None else None
+    return _classify_names(str(short) if short else "", str(getattr(fn, "name", "") or ""))
+
+
+def _build_class_registry(ctx, bv, *, query: str | None = None,
+                          name_filter: str | None = None) -> dict[str, dict[str, Any]]:
     """One scan -> {class_name: ClassRecord}. Methods, RTTI symbols, confidence.
     Per-class drill-downs (vtable layout, size, bases, instances) are added by
-    ``_class_show`` only for the requested class (too costly for every class)."""
+    ``_class_show`` only for the requested class (too costly for every class).
+
+    ``name_filter`` (#622) keeps only the classes a ``class show <name>`` query can
+    resolve to -- the exact name, or any class sharing its top-level leaf, exactly
+    what ``_resolve_class_names`` accepts -- so a drill-down does not materialise a
+    record for every class in a large C++ target. A miss still needs the full
+    registry for the suggestion hint."""
     rtti = _rtti_symbol_maps(bv)
     registry: dict[str, dict[str, Any]] = {}
     needle = query.lower() if query else None
+    name_filter = name_filter or None
+    leaf = _query_leaf(name_filter) if name_filter else None
+
+    def wanted(cls: str) -> bool:
+        return cls == name_filter or _query_leaf(cls) == leaf
 
     for fn in bv.functions:
-        demangled = il_format._display_name(fn)
-        cls, method = _split_qualified_method(demangled)
-        if cls is None:
+        demangled, cls, kind = _classify_function(fn)
+        if cls is None or (name_filter is not None and not wanted(cls)):
             continue
         rec = registry.get(cls)
         if rec is None:
@@ -246,11 +290,13 @@ def _build_class_registry(ctx, bv, *, query: str | None = None) -> dict[str, dic
             "address": hex(int(getattr(fn, "start", 0))),
             "mangled": str(getattr(fn, "name", "")),
             "demangled": demangled,
-            "kind": _method_kind(cls, method),
+            "kind": kind,
         })
 
     # Ensure RTTI-only classes (no demangled methods clustered) still appear.
     for cls in rtti:
+        if name_filter is not None and not wanted(cls):
+            continue
         registry.setdefault(cls, {
             "name": cls, "methods": [], "vtable": None, "typeinfo": None,
             "typeinfo_name": None, "size": None, "bases": [], "instances": [],
@@ -422,7 +468,7 @@ def _class_lens_inputs(ctx, bv) -> dict[str, int]:
     demangled = 0
     for fn in (getattr(bv, "functions", None) or []):
         try:
-            cls, _method = _split_qualified_method(il_format._display_name(fn))
+            _demangled, cls, _kind = _classify_function(fn)
         except Exception:
             continue
         if cls is not None:
@@ -964,9 +1010,14 @@ def _recover_vtables_from_typeinfo(ctx, bv, typeinfo_addr: int) -> dict[str, Any
 
 def _class_show(ctx, selector: str | None, name: str) -> dict[str, Any]:
     bv = ctx._resolve_view(selector)
-    registry = _build_class_registry(ctx, bv)
+    # #622: a concrete-name drill-down only needs the classes that name can
+    # resolve to, so the walk does not build a record for every class on the
+    # target. A miss still builds the full registry, because the suggestion hint
+    # is drawn from every class name (#413).
+    registry = _build_class_registry(ctx, bv, name_filter=name)
     matches = _resolve_class_names(registry, name)
     if not matches:
+        registry = _build_class_registry(ctx, bv)
         raise OperationFailure(
             "unknown_class",
             f"No class named {name!r}.{_class_name_suggestions(registry, name)} "

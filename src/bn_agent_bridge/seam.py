@@ -54,6 +54,14 @@ _TYPE_CLASS_NAMES: dict[int, str] = {
 # one real implementation, resolution auto-picks the implementation (#122).
 _STUB_SYMBOL_TYPE_NAMES = frozenset({"ImportedFunctionSymbol", "ExternalSymbol"})
 
+# Bounds for the "did you mean" corpus on a miss (#622). See
+# `BridgeContext._suggestion_corpus`: reading a function's names off a live view is
+# the expensive part, so the function cap is the latency bound and the form cap
+# bounds the corpus handed to difflib.
+SUGGESTION_MAX_FUNCS = 5000
+SUGGESTION_MAX_FORMS = 2000
+
+
 # Nested anonymous aggregates are expanded in the text layout and in the JSON
 # members[] tree so their inner members aren't invisible (#370.2). The depth is
 # capped only to bound recursion on a pathological (even self-referential)
@@ -149,10 +157,9 @@ class BridgeContext:
             if fn is not None:
                 return fn
 
-        available: list[str] = []
-        for fn in list(bv.functions):
-            available.extend(self._function_name_forms(fn))
-        suggestions = difflib.get_close_matches(text, available, n=5, cutoff=0.5)
+        suggestions = difflib.get_close_matches(
+            text, self._suggestion_corpus(bv, text), n=5, cutoff=0.5
+        )
         if suggestions:
             raise RuntimeError(
                 f"Function not found: {identifier}. Did you mean: {', '.join(suggestions)}"
@@ -212,7 +219,11 @@ class BridgeContext:
         mangled name as ``fn.name`` -- the symbol's demangled ``short_name`` /
         ``full_name``. Lets ``foo::bar::recv`` resolve a function whose
         ``fn.name`` is the mangled ``_ZN3foo3bar4recvEi`` (#224a), uniformly
-        across xrefs / callsites / decompile (all route through here)."""
+        across xrefs / callsites / decompile (all route through here).
+
+        Deliberately NOT memoised: reading the four names off a live BinaryView
+        costs far more than the de-duplication this does, so a cache keyed on the
+        read values measured *slower* than re-reading them (#622)."""
         forms: list[str] = []
         for v in (getattr(fn, "name", None), getattr(fn, "raw_name", None)):
             if v:
@@ -228,7 +239,82 @@ class BridgeContext:
                 out.append(f)
         return out
 
+    def _suggestion_corpus(self, bv, text: str) -> list[str]:
+        """Name spellings to run difflib over for a "did you mean" hint.
+
+        Bounded (#622): collecting every spelling of every function turned a miss
+        into a third full enumeration of the view. The pass stops at
+        ``SUGGESTION_MAX_FORMS`` collected spellings and visits at most
+        ``SUGGESTION_MAX_FUNCS`` functions, and it only collects spellings whose
+        first character matches the query's (case-insensitively) -- which is where
+        a close difflib match lives, and what keeps the corpus relevant instead of
+        an arbitrary prefix of the function list."""
+        prefix = text[:1].lower()
+        corpus: list[str] = []
+        for index, fn in enumerate(bv.functions):
+            if index >= SUGGESTION_MAX_FUNCS:
+                break
+            for form in self._function_name_forms(fn):
+                if form[:1].lower() != prefix:
+                    continue
+                corpus.append(form)
+                if len(corpus) >= SUGGESTION_MAX_FORMS:
+                    return corpus
+        return corpus
+
     def _find_functions_by_name(self, bv, text: str, *, case_sensitive: bool) -> list[Any]:
+        if case_sensitive:
+            native = self._native_functions_by_name(bv, text)
+            if native:
+                return native
+        return self._walk_functions_by_name(bv, text, case_sensitive=case_sensitive)
+
+    def _native_functions_by_name(self, bv, text: str) -> list[Any]:
+        """Functions BN's own name index resolves for *text*, or [] when the index
+        cannot answer and the caller must walk.
+
+        BN keeps a name index (``get_functions_by_name`` + the symbol name
+        lookups), so an exact-name hit on a large view is answered without
+        enumerating every function (#622). Two guards keep this honest:
+        ``getattr`` because not every BinaryView-shaped test double implements the
+        index, and a re-check of every candidate against the full spelling set
+        ``_function_name_forms`` produces -- a native candidate only counts if the
+        authoritative walk would have matched it too. An empty result is NOT
+        authoritative (the index does not carry the demangled spellings BN keeps
+        only on the symbol, #224a) and falls back to the walk."""
+        candidates: list[Any] = []
+        getter = getattr(bv, "get_functions_by_name", None)
+        if callable(getter):
+            candidates.extend(getter(text) or [])
+        symbol_lookups = []
+        for attr in ("get_symbols_by_name", "get_symbol_by_raw_name"):
+            lookup = getattr(bv, attr, None)
+            if callable(lookup):
+                symbol_lookups.append(lookup(text))
+        for found in symbol_lookups:
+            for symbol in (found if isinstance(found, (list, tuple)) else [found]):
+                if symbol is None:
+                    continue
+                get_at = getattr(bv, "get_function_at", None)
+                fn = get_at(int(getattr(symbol, "address", 0))) if callable(get_at) else None
+                if fn is not None:
+                    candidates.append(fn)
+        matches: list[Any] = []
+        seen: set[int] = set()
+        for fn in candidates:
+            if text not in self._function_name_forms(fn):
+                continue
+            marker = int(getattr(fn, "start", 0))
+            if marker in seen:
+                continue
+            seen.add(marker)
+            matches.append(fn)
+        return matches
+
+    def _walk_functions_by_name(self, bv, text: str, *, case_sensitive: bool) -> list[Any]:
+        """The authoritative multi-form match: exact, or casefolded, over every
+        function's spellings. Needs the walk because the demangled short/full
+        names live on the symbol, not in BN's name index (#224a)."""
         matches = []
         needle = text if case_sensitive else text.lower()
         seen: set[int] = set()

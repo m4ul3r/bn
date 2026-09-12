@@ -105,6 +105,57 @@ def test_registry_clusters_methods():
     assert kinds["net::Session::onData(int)"] == "method"
 
 
+def test_registry_reuses_the_name_classification_and_still_sees_a_rename(monkeypatch):
+    """#622: the demangle / qualified-method split is a pure function of the
+    function's name spellings, so it is memoised -- a second `class list`/`show`
+    must not re-split every function's name. The memo is keyed on those spellings,
+    so a rename inside the session is visible on the very next call: no stale
+    entry is reachable, and no invalidation hook is needed."""
+    bv = _make_registry_bv()
+    splits: list = []
+    real_split = read_class._split_qualified_method
+    monkeypatch.setattr(read_class, "_split_qualified_method",
+                        lambda name: (splits.append(name), real_split(name))[1])
+    read_class._classify_names.cache_clear()
+
+    first = read_class._build_class_registry(None, bv)
+    cold = len(splits)
+    assert cold == len(bv.functions)          # one classification per function
+
+    second = read_class._build_class_registry(None, bv)
+    assert sorted(second) == sorted(first)    # same registry...
+    assert len(splits) == cold                # ...without re-splitting the names
+
+    renamed = bv.functions[0]
+    renamed.name = "_ZN3net9RenamedC1Ev"
+    renamed.raw_name = "_ZN3net9RenamedC1Ev"
+    renamed.symbol.short_name = "net::Renamed::Renamed()"
+    third = read_class._build_class_registry(None, bv)
+    assert "net::Renamed" in third
+    assert third["net::Renamed"]["methods"][0]["kind"] == "ctor"
+    assert "net::Session::Session(unsigned char)" not in {
+        m["demangled"] for m in third["net::Session"]["methods"]
+    }
+
+
+def test_class_show_materialises_only_the_queried_class():
+    """#622: `class show <name>` filters the registry as it walks instead of
+    building every class's record; the name resolution (exact, then leaf) sees the
+    same set it would from a full build."""
+    bv = _make_registry_bv()
+    filtered = read_class._build_class_registry(None, bv, name_filter="net::Session")
+    assert sorted(filtered) == ["net::Session"]
+    assert [m["kind"] for m in filtered["net::Session"]["methods"]] == ["ctor", "dtor", "method"]
+    # A bare leaf query resolves the same class through the filtered build.
+    assert sorted(read_class._build_class_registry(None, bv, name_filter="Session")) == ["net::Session"]
+    assert sorted(read_class._build_class_registry(None, bv, name_filter="Pool")) == ["net::Pool"]
+    # An RTTI-only class (no demangled methods) is filtered on the same rule, not
+    # dropped wholesale with the function walk.
+    bv = _make_registry_bv()
+    bv._symbols.append(_Sym("_ZTVN3net4OnlyE", "vtable for net::Only", 0x9300))
+    assert sorted(read_class._build_class_registry(None, bv, name_filter="net::Only")) == ["net::Only"]
+
+
 def test_registry_confidence_levels():
     reg = read_class._build_class_registry(None, _make_registry_bv())
     assert reg["net::Session"]["confidence"] == "rtti"   # has vtable+typeinfo
