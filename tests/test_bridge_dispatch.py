@@ -186,6 +186,207 @@ def test_refresh_resolves_target_under_write_gate(monkeypatch):
     assert gate_held_at_resolve["v"] is True  # gate acquired before the target was resolved
 
 
+def test_mutation_reanalysis_runs_under_gate_not_exclusive_lock(monkeypatch):
+    """#628: a mutation op is @op lock="none" and self-manages locking -- the write
+    gate serializes writers for the WHOLE op, while the exclusive target lock covers
+    only the phases that mutate or snapshot BN state. The post-apply
+    update_analysis_and_wait() runs under the gate ONLY, so concurrent reads stay
+    live instead of starving for the whole reanalysis (parity with #99/#321/#365)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+    lock = instance._target_lock
+    states: dict = {}
+
+    def apply(bv_, op, restores=None):
+        states["apply_writer"] = lock._writer
+        states["apply_gate"] = instance._write_gate.locked()
+        return {"op": "rename_symbol", "requested": {}}
+
+    _mutation_with_stubs(
+        monkeypatch, bridge, instance, bv,
+        apply=apply,
+        verify=lambda bv_, result: {**result, "status": "verified"},
+    )
+    original = bv.update_analysis_and_wait
+
+    def analyze():
+        states["reanalysis_writer"] = lock._writer
+        states["reanalysis_gate"] = instance._write_gate.locked()
+        original()
+
+    bv.update_analysis_and_wait = analyze
+
+    response = instance.dispatch(
+        {"op": "rename_symbol", "params": {"identifier": "f", "new_name": "g"}, "target": "active"}
+    )
+
+    assert response["ok"] is True
+    assert states["apply_writer"] is True        # apply phase holds the exclusive lock
+    assert states["apply_gate"] is True          # ...and is serialized as a writer
+    assert states["reanalysis_writer"] is False  # reanalysis is NOT exclusive
+    assert states["reanalysis_gate"] is True     # ...but the write gate is still held
+    assert lock._writer is False                 # both released at the end
+    assert instance._write_gate.locked() is False
+
+
+def test_mutation_reanalysis_leaves_concurrent_reads_live(monkeypatch):
+    """#628 (the issue's actual complaint): while a mutation's post-apply
+    reanalysis is still running, a read op must be able to take the target read
+    lock and FINISH. With the exclusive lock held through the reanalysis that read
+    blocks until the mutation is completely done -- doctor / target info /
+    function list starving on a large target."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+    reanalyzing = threading.Event()
+    release = threading.Event()
+    read_finished = threading.Event()
+    outcome: dict = {}
+
+    _mutation_with_stubs(
+        monkeypatch, bridge, instance, bv,
+        apply=lambda bv_, op, restores=None: {"op": "rename_symbol", "requested": {}},
+        verify=lambda bv_, result: {**result, "status": "verified"},
+    )
+    original = bv.update_analysis_and_wait
+
+    def analyze():
+        reanalyzing.set()
+        assert release.wait(timeout=5.0), "test driver never released the reanalysis"
+        original()
+
+    bv.update_analysis_and_wait = analyze
+
+    def run_mutation():
+        outcome["response"] = instance.dispatch(
+            {"op": "rename_symbol", "params": {"identifier": "f", "new_name": "g"}, "target": "active"}
+        )
+
+    writer = threading.Thread(target=run_mutation, daemon=True)
+    writer.start()
+    try:
+        assert reanalyzing.wait(timeout=5.0)  # the mutation is parked in reanalysis
+
+        def reader():
+            with instance._target_lock.read():
+                read_finished.set()
+
+        reader_thread = threading.Thread(target=reader, daemon=True)
+        reader_thread.start()
+
+        # The read completes while the reanalysis is STILL running (only released
+        # below); were the exclusive lock still held it would block instead.
+        assert read_finished.wait(timeout=5.0) is True
+        assert release.is_set() is False
+        assert instance._write_gate.locked() is True  # writers still serialized
+    finally:
+        release.set()
+        writer.join(timeout=5.0)
+
+    assert outcome["response"]["ok"] is True
+    assert instance._target_lock._writer is False
+    assert instance._write_gate.locked() is False
+
+
+def test_mutation_write_gate_serializes_a_second_writer_during_reanalysis(monkeypatch):
+    """#628: relaxing the exclusive lock must NOT allow two writers on one view.
+    The write gate is held for the whole op -- including the relaxed reanalysis --
+    so a second mutation cannot reach its apply phase until the first finishes."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+    reanalyzing = threading.Event()
+    release = threading.Event()
+    entered_second = threading.Event()
+    calls = {"n": 0}
+
+    def apply(bv_, op, restores=None):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            entered_second.set()
+        return {"op": str(op.get("op") or "rename_symbol"), "requested": {}}
+
+    _mutation_with_stubs(
+        monkeypatch, bridge, instance, bv,
+        apply=apply,
+        verify=lambda bv_, result: {**result, "status": "verified"},
+    )
+    original = bv.update_analysis_and_wait
+    waits = {"n": 0}
+
+    def analyze():
+        waits["n"] += 1
+        if waits["n"] == 1:
+            reanalyzing.set()
+            assert release.wait(timeout=5.0), "test driver never released the reanalysis"
+        original()
+
+    bv.update_analysis_and_wait = analyze
+
+    def run(op, params):
+        return instance.dispatch({"op": op, "params": params, "target": "active"})
+
+    first = threading.Thread(
+        target=run, args=("rename_symbol", {"identifier": "f", "new_name": "g"}), daemon=True
+    )
+    second = threading.Thread(
+        target=run, args=("set_comment", {"comment": "x", "address": "0x1000"}), daemon=True
+    )
+    first.start()
+    assert reanalyzing.wait(timeout=5.0)
+    try:
+        second.start()
+        assert entered_second.wait(timeout=0.3) is False  # no second writer enters
+        assert calls["n"] == 1
+        assert instance._write_gate.locked() is True
+    finally:
+        release.set()
+        first.join(timeout=5.0)
+
+    second.join(timeout=5.0)
+    assert entered_second.is_set() is True  # it runs as soon as the gate is released
+    assert calls["n"] == 2
+
+
+def test_mutation_rollback_settle_still_runs_under_exclusive_lock(monkeypatch):
+    """#628: the revert/settle paths are deliberately CARVED OUT of the relaxation --
+    a reader must never observe a half-reverted view. On a preview/rollback the
+    post-apply reanalysis is relaxed, but the drift-restore settle that follows is
+    still exclusive."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeMutationBV()
+    lock = instance._target_lock
+    seen: list = []
+
+    _mutation_with_stubs(
+        monkeypatch, bridge, instance, bv,
+        apply=lambda bv_, op, restores=None: {"op": "local_rename", "requested": {}},
+        verify=lambda bv_, result: {**result, "status": "verified"},
+    )
+    # A non-empty var snapshot makes the pre-drift settle reanalyze on the
+    # preview/rollback path.
+    monkeypatch.setattr(
+        bridge.mutation_engine, "_capture_local_var_snapshots",
+        lambda ctx, bv_, fns: {0x1000: {}},
+    )
+    original = bv.update_analysis_and_wait
+
+    def analyze():
+        seen.append(lock._writer)
+        original()
+
+    bv.update_analysis_and_wait = analyze
+
+    result = instance._mutation("active", True, [{"op": "local_rename"}])
+
+    assert result["preview"] is True
+    assert len(seen) == 2
+    assert seen[0] is False  # post-apply reanalysis: relaxed (gate only)
+    assert seen[1] is True   # drift-restore settle: exclusive, carved out
+
+
 def test_target_info_surfaces_analysis_progress(monkeypatch):
     """#321: target info exposes pollable analysis phase/counts so a large-target
     analysis can be watched instead of guessing whether the bridge is wedged."""

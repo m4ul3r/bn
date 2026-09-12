@@ -97,203 +97,229 @@ def _remove_created_function(ctx, bv, addr: int) -> bool:
     return bv.get_function_at(addr) is None
 
 
-def _function_create(ctx, selector: str | None, address, preview: bool):
-    bv = ctx._resolve_view(selector)
-    # #479: on a --quick-loaded view the initial analysis never ran, so the
-    # update_analysis_and_wait() below would run the full (multi-minute) analysis
-    # while holding the exclusive write lock -- wedging the instance so even a
-    # later `target info` blocks. Refuse fast and point at `bn refresh` (which is
-    # built to run that analysis once) instead of starting it under the lock. Also
-    # protects --preview, whose whole promise is a bounded, revertible probe.
-    require_analysis(bv, "Creating a function")
-    addr = _parse_address(address)
-    requested = {"op": "function_create", "address": hex(addr)}
+def _function_create(ctx, selector: str | None, address, preview: bool, *, exclusive=None):
+    """Create a function at *address*, verify it, and revert if asked or failed.
 
-    existing = bv.get_function_at(addr)
-    if existing is not None:
-        return {
-            "preview": preview,
-            "success": True,
-            "committed": False,
-            "message": "A function already starts at this address.",
-            "results": [
-                {
-                    "op": "function_create",
-                    "status": "noop",
-                    "address": hex(addr),
-                    "function": str(existing.name),
-                    "message": "A function already starts at this address.",
-                    "requested": requested,
-                }
-            ],
-            "affected_functions": [],
-            "affected_types": [],
-        }
+    #628 lock split: ``exclusive`` is the caller's EXCLUSIVE target-lock scope -- a
+    context-manager FACTORY (``bridge._function_create`` passes
+    ``self._target_lock.write``). The caller holds the bridge write GATE for the
+    whole call, which serializes writers; the exclusive lock is taken here only
+    around the phases that mutate or snapshot BN state. The post-create
+    ``update_analysis_and_wait()`` deliberately runs OUTSIDE it, under the gate
+    alone, so concurrent reads stay live instead of starving for a multi-minute
+    reanalysis -- parity with load_binary (#99), refresh (#321), go_rename (#365)
+    and the #628 mutation engine. The revert's own reanalysis
+    (``_remove_created_function``) stays exclusive on purpose: a reader must never
+    observe a half-reverted view. ``exclusive=None`` means "no exclusive scope" (a
+    no-op), so direct engine calls and tests keep working.
+    """
+    exclusive_scope = exclusive if exclusive is not None else contextlib.nullcontext
+    with exclusive_scope():
+        bv = ctx._resolve_view(selector)
+        # #479: on a --quick-loaded view the initial analysis never ran, so the
+        # update_analysis_and_wait() below would run the full (multi-minute) analysis
+        # as a side effect of a mutation -- a stall the caller never asked for, and
+        # before #628 one that also held the exclusive write lock so even a later
+        # `target info` blocked. Refuse fast and point at `bn refresh` (which is built
+        # to run that analysis once) instead. Also protects --preview, whose whole
+        # promise is a bounded, revertible probe. #628 only shortens the exclusive
+        # window the reanalysis runs in; this refusal is unchanged.
+        require_analysis(bv, "Creating a function")
+        addr = _parse_address(address)
+        requested = {"op": "function_create", "address": hex(addr)}
 
-    # Refuse to create junk functions: the address must be mapped and live
-    # inside an executable region. Auto-analysis skips exactly these handler
-    # entry points (reachable only via data/function-pointer tables), so we
-    # still create them on request -- but only where code can actually run.
-    if len(bytes(bv.read(addr, 1))) == 0:
-        raise RuntimeError(
-            f"Cannot create function: address 0x{addr:x} is not mapped"
-        )
-    if not read_misc._is_executable_address(ctx, bv, addr):
-        raise RuntimeError(
-            f"Cannot create function: address 0x{addr:x} is not inside an executable segment"
-        )
+        existing = bv.get_function_at(addr)
+        if existing is not None:
+            return {
+                "preview": preview,
+                "success": True,
+                "committed": False,
+                "message": "A function already starts at this address.",
+                "results": [
+                    {
+                        "op": "function_create",
+                        "status": "noop",
+                        "address": hex(addr),
+                        "function": str(existing.name),
+                        "message": "A function already starts at this address.",
+                        "requested": requested,
+                    }
+                ],
+                "affected_functions": [],
+                "affected_types": [],
+            }
 
-    state = bv.begin_undo_actions()
+        # Refuse to create junk functions: the address must be mapped and live
+        # inside an executable region. Auto-analysis skips exactly these handler
+        # entry points (reachable only via data/function-pointer tables), so we
+        # still create them on request -- but only where code can actually run.
+        if len(bytes(bv.read(addr, 1))) == 0:
+            raise RuntimeError(
+                f"Cannot create function: address 0x{addr:x} is not mapped"
+            )
+        if not read_misc._is_executable_address(ctx, bv, addr):
+            raise RuntimeError(
+                f"Cannot create function: address 0x{addr:x} is not inside an executable segment"
+            )
+
+        state = bv.begin_undo_actions()
     try:
-        # create_user_function (FORCED), not add_function (an advisory auto hint):
-        # auto-analysis declines exactly the addresses it already skipped -- the
-        # data-table / missed-handler entries this op exists to recover -- so
-        # add_function returned verification_failed on its own documented use-case
-        # (#360). The forced path also bypasses any prior remove_user_function
-        # "no function here" suppression, so a preview's cleanup can't sabotage a
-        # later live create.
-        bv.create_user_function(addr)
+        with exclusive_scope():
+            # create_user_function (FORCED), not add_function (an advisory auto hint):
+            # auto-analysis declines exactly the addresses it already skipped -- the
+            # data-table / missed-handler entries this op exists to recover -- so
+            # add_function returned verification_failed on its own documented use-case
+            # (#360). The forced path also bypasses any prior remove_user_function
+            # "no function here" suppression, so a preview's cleanup can't sabotage a
+            # later live create.
+            bv.create_user_function(addr)
+
+        # #628: the reanalysis after the create is the long pole on a large
+        # target -- run it under the write gate only (still held by the caller,
+        # so no second writer can start) so concurrent reads stay live.
         bv.update_analysis_and_wait()
-        created = bv.get_function_at(addr)
-        if created is None:
-            reverted = mutation_engine._revert_undo_safely(ctx, bv, state)
-            return {
-                "preview": preview,
-                "success": False,
-                "committed": False,
-                "rolled_back": reverted,
-                "message": (
-                    "Rolled back because no function was created at the address."
-                    if reverted
-                    else "No function was created at the address AND the rollback failed; "
-                    "the view may be left partially modified."
-                ),
-                "results": [
-                    {
-                        "op": "function_create",
-                        "status": "verification_failed",
-                        "address": hex(addr),
-                        "message": f"No function starts at 0x{addr:x} after analysis.",
-                        "requested": requested,
-                        "observed": {"address": hex(addr), "function": None},
-                    }
-                ],
-                "affected_functions": [],
-                "affected_types": [],
-            }
+        with exclusive_scope():
+            created = bv.get_function_at(addr)
+            if created is None:
+                reverted = mutation_engine._revert_undo_safely(ctx, bv, state)
+                return {
+                    "preview": preview,
+                    "success": False,
+                    "committed": False,
+                    "rolled_back": reverted,
+                    "message": (
+                        "Rolled back because no function was created at the address."
+                        if reverted
+                        else "No function was created at the address AND the rollback failed; "
+                        "the view may be left partially modified."
+                    ),
+                    "results": [
+                        {
+                            "op": "function_create",
+                            "status": "verification_failed",
+                            "address": hex(addr),
+                            "message": f"No function starts at 0x{addr:x} after analysis.",
+                            "requested": requested,
+                            "observed": {"address": hex(addr), "function": None},
+                        }
+                    ],
+                    "affected_functions": [],
+                    "affected_types": [],
+                }
 
-        guard_reason = mutation_engine._function_looks_like_code(bv, created, addr)
-        if guard_reason is not None:
-            # The forced create landed a junk function on non-code; revert the
-            # journal and explicitly remove the created function (creation is not
-            # reliably undone), then fail honestly instead of reporting the
-            # fabricated function verified (#386).
-            mutation_engine._revert_undo_safely(ctx, bv, state)
-            removed = _remove_created_function(ctx, bv, addr)
-            return {
-                "preview": preview,
-                "success": False,
-                "committed": False,
-                "rolled_back": removed,
-                "message": mutation_engine._function_create_guard_message(addr, guard_reason),
-                "results": [
-                    {
-                        "op": "function_create",
-                        "status": "verification_failed",
-                        "address": hex(addr),
-                        "message": mutation_engine._function_create_guard_message(addr, guard_reason),
-                        "requested": requested,
-                        "observed": {"address": hex(addr), "function": str(created.name)},
-                    }
-                ],
-                "affected_functions": [],
-                "affected_types": [],
-            }
+            guard_reason = mutation_engine._function_looks_like_code(bv, created, addr)
+            if guard_reason is not None:
+                # The forced create landed a junk function on non-code; revert the
+                # journal and explicitly remove the created function (creation is not
+                # reliably undone), then fail honestly instead of reporting the
+                # fabricated function verified (#386).
+                mutation_engine._revert_undo_safely(ctx, bv, state)
+                removed = _remove_created_function(ctx, bv, addr)
+                return {
+                    "preview": preview,
+                    "success": False,
+                    "committed": False,
+                    "rolled_back": removed,
+                    "message": mutation_engine._function_create_guard_message(addr, guard_reason),
+                    "results": [
+                        {
+                            "op": "function_create",
+                            "status": "verification_failed",
+                            "address": hex(addr),
+                            "message": mutation_engine._function_create_guard_message(addr, guard_reason),
+                            "requested": requested,
+                            "observed": {"address": hex(addr), "function": str(created.name)},
+                        }
+                    ],
+                    "affected_functions": [],
+                    "affected_types": [],
+                }
 
-        function_name = str(created.name)
-        op_status = "verified"
-        if preview:
-            # Function creation isn't reliably undone by revert_undo_actions
-            # (the same non-journaled class as create_user_var / set_user_type),
-            # so after reverting the journal explicitly remove the created
-            # function and read back that it is gone -- never claim a revert we
-            # did not verify (#117).
-            bv.revert_undo_actions(state)
-            reverted = _remove_created_function(ctx, bv, addr)
-            committed = False
-            success = reverted
-            if reverted:
-                message = "Preview verified and reverted."
+            function_name = str(created.name)
+            op_status = "verified"
+            if preview:
+                # Function creation isn't reliably undone by revert_undo_actions
+                # (the same non-journaled class as create_user_var / set_user_type),
+                # so after reverting the journal explicitly remove the created
+                # function and read back that it is gone -- never claim a revert we
+                # did not verify (#117).
+                bv.revert_undo_actions(state)
+                reverted = _remove_created_function(ctx, bv, addr)
+                committed = False
+                success = reverted
+                if reverted:
+                    message = "Preview verified and reverted."
+                else:
+                    # The function was created+verified, but removing it on revert
+                    # failed -- it may still be in the view. Mark the op the way the
+                    # batch engine marks a failed rollback so the text renderer
+                    # routes it to 'failed:' instead of '[verified]' and the per-op
+                    # status stops contradicting success:false (#117).
+                    message = (
+                        "Preview verified, but removing the created function on "
+                        "revert failed; the view may be left modified."
+                    )
+                    op_status = "rollback_failed"
+                    # The fabricated function is still LIVE in the view, but BN's
+                    # bv.file.modified never flips True for our create -- so without
+                    # this mark `bn close` computes unsaved=false and never warns
+                    # about the leftover. Mark dirty so close still warns, even though
+                    # the op itself reports failure. A clean preview revert (the
+                    # branch above) intentionally does NOT dirty the view (#545). Same
+                    # guarded helper the committed #519 path uses.
+                    try:
+                        ctx.targets.mark_dirty(bv)
+                    except Exception:
+                        pass
             else:
-                # The function was created+verified, but removing it on revert
-                # failed -- it may still be in the view. Mark the op the way the
-                # batch engine marks a failed rollback so the text renderer
-                # routes it to 'failed:' instead of '[verified]' and the per-op
-                # status stops contradicting success:false (#117).
-                message = (
-                    "Preview verified, but removing the created function on "
-                    "revert failed; the view may be left modified."
-                )
-                op_status = "rollback_failed"
-                # The fabricated function is still LIVE in the view, but BN's
-                # bv.file.modified never flips True for our create -- so without
-                # this mark `bn close` computes unsaved=false and never warns
-                # about the leftover. Mark dirty so close still warns, even though
-                # the op itself reports failure. A clean preview revert (the
-                # branch above) intentionally does NOT dirty the view (#545). Same
-                # guarded helper the committed #519 path uses.
+                bv.commit_undo_actions(state)
+                reverted = None
+                committed = True
+                success = True
+                message = "Function created and verified in the live Binary Ninja session."
+                # This standalone path bypasses the generic _mutation() shim that
+                # marks the view dirty, and BN's bv.file.modified does NOT flip True
+                # after our verified mutation -- so without this, `bn close` computes
+                # unsaved=false and silently drops the created function (#519). Mark
+                # dirty only on a committed, verified (non-preview) create; preview
+                # reverts and the noop / guard-rejected paths return earlier.
                 try:
                     ctx.targets.mark_dirty(bv)
                 except Exception:
                     pass
-        else:
-            bv.commit_undo_actions(state)
-            reverted = None
-            committed = True
-            success = True
-            message = "Function created and verified in the live Binary Ninja session."
-            # This standalone path bypasses the generic _mutation() shim that
-            # marks the view dirty, and BN's bv.file.modified does NOT flip True
-            # after our verified mutation -- so without this, `bn close` computes
-            # unsaved=false and silently drops the created function (#519). Mark
-            # dirty only on a committed, verified (non-preview) create; preview
-            # reverts and the noop / guard-rejected paths return earlier.
-            try:
-                ctx.targets.mark_dirty(bv)
-            except Exception:
-                pass
-        result = {
-            "preview": preview,
-            "success": success,
-            "committed": committed,
-            "message": message,
-            "results": [
-                {
-                    "op": "function_create",
-                    "status": op_status,
-                    "address": hex(addr),
-                    "function": function_name,
-                    "requested": requested,
-                }
-            ],
-            "affected_functions": [
-                {
-                    "address": hex(addr),
-                    "before_name": None,
-                    "after_name": function_name,
-                    "changed": True,
-                }
-            ],
-            "affected_types": [],
-        }
-        if preview:
-            result["rolled_back"] = reverted
-        return result
+            result = {
+                "preview": preview,
+                "success": success,
+                "committed": committed,
+                "message": message,
+                "results": [
+                    {
+                        "op": "function_create",
+                        "status": op_status,
+                        "address": hex(addr),
+                        "function": function_name,
+                        "requested": requested,
+                    }
+                ],
+                "affected_functions": [
+                    {
+                        "address": hex(addr),
+                        "before_name": None,
+                        "after_name": function_name,
+                        "changed": True,
+                    }
+                ],
+                "affected_types": [],
+            }
+            if preview:
+                result["rolled_back"] = reverted
+            return result
     except Exception as exc:
-        # revert_undo_actions does not reliably remove a just-created function, so
-        # also explicitly drop any function left at the address (#117).
-        undo_ok = mutation_engine._revert_undo_safely(ctx, bv, state)
-        removed = _remove_created_function(ctx, bv, addr)
+        with exclusive_scope():
+            # revert_undo_actions does not reliably remove a just-created function, so
+            # also explicitly drop any function left at the address (#117).
+            undo_ok = mutation_engine._revert_undo_safely(ctx, bv, state)
+            removed = _remove_created_function(ctx, bv, addr)
         if not (undo_ok and removed):
             raise RuntimeError(
                 f"{exc} (additionally, rollback failed; the view may be left partially modified)"

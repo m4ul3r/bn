@@ -59,6 +59,74 @@ def test_function_create_preview_reverts_without_committing(monkeypatch):
     assert not _has_event(bv, "commit")
 
 
+def test_function_create_reanalysis_runs_under_gate_not_exclusive_lock(monkeypatch):
+    """#628: function_create self-manages locking. The create itself is exclusive,
+    but the post-create update_analysis_and_wait() runs under the write gate ONLY
+    (so concurrent reads stay live), and the readback/commit phase is exclusive
+    again. Same protocol as the batch mutation engine."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    lock = instance._target_lock
+    bv = _FakeFunctionCreateBV(
+        segments={0x1000: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x55\x48\x89\xe5"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    states: dict = {}
+    create = bv.create_user_function
+
+    def create_user_function(addr):
+        states["create_writer"] = lock._writer
+        states["create_gate"] = instance._write_gate.locked()
+        return create(addr)
+
+    bv.create_user_function = create_user_function
+    original = bv.update_analysis_and_wait
+    waits: list = []
+
+    def analyze():
+        waits.append((lock._writer, instance._write_gate.locked()))
+        original()
+
+    bv.update_analysis_and_wait = analyze
+
+    result = instance._function_create(None, "0x1000", False)
+
+    assert result["committed"] is True
+    assert states["create_writer"] is True   # create phase holds the exclusive lock
+    assert states["create_gate"] is True     # ...and is serialized as a writer
+    assert waits == [(False, True)]          # post-create reanalysis: gate only
+    assert lock._writer is False             # both released at the end
+    assert instance._write_gate.locked() is False
+
+
+def test_function_create_preview_revert_settle_still_runs_under_exclusive_lock(monkeypatch):
+    """#628: on a --preview the post-create reanalysis is relaxed, but the revert's
+    own reanalysis (removing the created function, a non-journaled creation) stays
+    under the exclusive lock -- a reader must never observe a half-reverted view."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    lock = instance._target_lock
+    bv = _FakeFunctionCreateBV(
+        segments={0x1000: _FakeSegment(readable=True, executable=True)},
+        memory={0x1000: b"\x55\x48\x89\xe5"},
+    )
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    original = bv.update_analysis_and_wait
+    waits: list = []
+
+    def analyze():
+        waits.append((lock._writer, instance._write_gate.locked()))
+        original()
+
+    bv.update_analysis_and_wait = analyze
+
+    result = instance._function_create(None, "0x1000", True)
+
+    assert result["rolled_back"] is True
+    assert waits == [(False, True), (True, True)]
+
+
 def test_function_create_existing_function_is_noop(monkeypatch):
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()

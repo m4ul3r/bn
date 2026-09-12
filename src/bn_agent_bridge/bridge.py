@@ -3037,7 +3037,15 @@ class BinaryNinjaBridge:
         return read_misc._is_executable_address(self.ctx, *a, **k)
 
     def _function_create(self, *a, **k):
-        return create_comments._function_create(self.ctx, *a, **k)
+        # #628: same self-managed lock split as _mutation -- the op is
+        # @op lock="none", so the write gate here serializes writers for the whole
+        # call while create_comments._function_create holds the exclusive target
+        # lock only around the create/readback/revert phases, NOT around the
+        # post-create update_analysis_and_wait(). See _mutation.
+        with self._write_gate:
+            return create_comments._function_create(
+                self.ctx, *a, exclusive=self._target_lock.write, **k
+            )
 
     def _get_comment(self, *a, **k):
         return create_comments._get_comment(self.ctx, *a, **k)
@@ -3334,58 +3342,76 @@ class BinaryNinjaBridge:
         return mutation_engine._run_local_restores(self.ctx, *a, **k)
 
     def _mutation(self, *a, **k):
-        try:
-            result = mutation_engine._mutation(self.ctx, *a, **k)
-        except Exception as exc:
-            # #630 round 2: a post-apply exception path restores the prototype
-            # VALUE but cannot clear the has_user_type override an applied
-            # set_prototype pinned. That residue leaves the view modified even
-            # though _mutation raised (returns no result), so mark the view dirty
-            # here -- otherwise `close` reads bv.file.modified == false and reports
-            # no unsaved state. The original exception still propagates intact.
-            if getattr(exc, "prototype_user_type_residue", False):
+        # #628: mutation ops are @op lock="none" -- they reanalyze inside their
+        # own body, so holding the exclusive target lock for the whole op starved
+        # every concurrent read for the length of update_analysis_and_wait(). Lock
+        # split instead (mirroring load_binary #99 / refresh #321 / go_rename
+        # #365):
+        #   * this write GATE serializes writers for the WHOLE call, so no second
+        #     writer (mutation, py_exec, close, save, refresh, go_rename) can
+        #     interleave with this one;
+        #   * the exclusive TARGET lock is threaded into the engine, which holds it
+        #     only around the phases that mutate or snapshot BN state (resolve,
+        #     gates, snapshots, apply, and the post-analysis verify/commit) and
+        #     NOT around the post-apply reanalysis, which runs under the gate
+        #     alone so concurrent reads stay live.
+        # Revert/settle stays exclusive on purpose: a reader must never observe a
+        # half-reverted view. The #479 quick-load refusal is unchanged.
+        with self._write_gate:
+            try:
+                result = mutation_engine._mutation(
+                    self.ctx, *a, exclusive=self._target_lock.write, **k
+                )
+            except Exception as exc:
+                # #630 round 2: a post-apply exception path restores the prototype
+                # VALUE but cannot clear the has_user_type override an applied
+                # set_prototype pinned. That residue leaves the view modified even
+                # though _mutation raised (returns no result), so mark the view dirty
+                # here -- otherwise `close` reads bv.file.modified == false and reports
+                # no unsaved state. The original exception still propagates intact.
+                if getattr(exc, "prototype_user_type_residue", False):
+                    try:
+                        selector = a[0] if a else k.get("selector")
+                        self.targets.mark_dirty(self.targets.resolve(selector))
+                    except Exception:
+                        pass
+                raise
+            # A committed (non-preview) write that actually changed state leaves the
+            # view dirty until saved -- mark it so `close` can warn. A pure no-op
+            # (every op already in the requested state) changes nothing, so it does
+            # not dirty the view. (L15)
+            committed_change = (
+                isinstance(result, dict)
+                and result.get("committed")
+                and not result.get("preview")
+                and any(
+                    isinstance(r, dict) and r.get("status") == "verified"
+                    for r in (result.get("results") or [])
+                )
+            )
+            # A FAILED rollback (preview or live) can leave partial state live in the
+            # view while committed is False, so the committed check above never fires.
+            # bv.file.modified does not flip for these writes, so mark dirty here or
+            # `bn close` computes unsaved=false and silently discards the leftover
+            # renames/types/locals (#606). Identity check, not falsy: a clean result
+            # with no rolled_back key (rolled_back is None) must be unchanged, and a
+            # clean rollback (rolled_back True) leaves the view as before.
+            rollback_left_state = isinstance(result, dict) and result.get("rolled_back") is False
+            # An unclearable has_user_type override (a proto set on an AUTO function
+            # that had to be reverted) leaves the view modified even though the
+            # prototype value round-tripped. It now also flips rolled_back to False,
+            # but key on the residue field explicitly too so `bn close` never silently
+            # discards it (#630).
+            residue_left_state = isinstance(result, dict) and bool(
+                result.get("prototype_user_type_residue")
+            )
+            if committed_change or rollback_left_state or residue_left_state:
                 try:
                     selector = a[0] if a else k.get("selector")
                     self.targets.mark_dirty(self.targets.resolve(selector))
                 except Exception:
                     pass
-            raise
-        # A committed (non-preview) write that actually changed state leaves the
-        # view dirty until saved -- mark it so `close` can warn. A pure no-op
-        # (every op already in the requested state) changes nothing, so it does
-        # not dirty the view. (L15)
-        committed_change = (
-            isinstance(result, dict)
-            and result.get("committed")
-            and not result.get("preview")
-            and any(
-                isinstance(r, dict) and r.get("status") == "verified"
-                for r in (result.get("results") or [])
-            )
-        )
-        # A FAILED rollback (preview or live) can leave partial state live in the
-        # view while committed is False, so the committed check above never fires.
-        # bv.file.modified does not flip for these writes, so mark dirty here or
-        # `bn close` computes unsaved=false and silently discards the leftover
-        # renames/types/locals (#606). Identity check, not falsy: a clean result
-        # with no rolled_back key (rolled_back is None) must be unchanged, and a
-        # clean rollback (rolled_back True) leaves the view as before.
-        rollback_left_state = isinstance(result, dict) and result.get("rolled_back") is False
-        # An unclearable has_user_type override (a proto set on an AUTO function
-        # that had to be reverted) leaves the view modified even though the
-        # prototype value round-tripped. It now also flips rolled_back to False,
-        # but key on the residue field explicitly too so `bn close` never silently
-        # discards it (#630).
-        residue_left_state = isinstance(result, dict) and bool(
-            result.get("prototype_user_type_residue")
-        )
-        if committed_change or rollback_left_state or residue_left_state:
-            try:
-                selector = a[0] if a else k.get("selector")
-                self.targets.mark_dirty(self.targets.resolve(selector))
-            except Exception:
-                pass
-        return result
+            return result
 
     def _op_rename_symbol(self, *a, **k):
         return mutation_engine._op_rename_symbol(self.ctx, *a, **k)
@@ -3971,7 +3997,18 @@ def _bind_read(bridge, params, target):
     return bridge._read(target, params["address"], int(params["length"]))
 
 
-@op("function_create", lock="write")
+# #628: function_create and every single-mutation binder below (rename/proto/
+# comment/local/struct/type/tag, plus batch_apply) reanalyze inside their own
+# body -- bridge._function_create / bridge._mutation call
+# bv.update_analysis_and_wait() -- so they are lock="none" and self-manage
+# locking (see BinaryNinjaBridge._mutation): the write gate serializes writers
+# for the WHOLE op, while the exclusive target lock covers only the
+# BN-mutating/snapshotting phases. Holding the exclusive lock through that
+# reanalysis starved every concurrent read (doctor / target info / function
+# list) for minutes on a large target -- the same residual pattern #99 (load),
+# #321 (refresh) and #365 (go_rename) already fixed. The true short writers
+# (py_exec, close_binary, save_database) stay lock="write".
+@op("function_create", lock="none")
 def _bind_function_create(bridge, params, target):
     return bridge._function_create(target, params["address"], _validate_bool(params.get("preview"), label="preview", default=False))
 
@@ -4000,7 +4037,7 @@ def _bind_py_exec(bridge, params, target):
 # operation (e.g. a `set_comment` request with `params={"op":"delete_comment"}`
 # must still run set_comment). Only `batch_apply` legitimately trusts
 # manifest-supplied ops; these fixed-op endpoints must not.
-@op("rename_symbol", lock="write")
+@op("rename_symbol", lock="none")
 def _bind_rename_symbol(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "rename_symbol"}])
 
@@ -4050,79 +4087,79 @@ def _bind_list_tags(bridge, params, target):
     )
 
 
-@op("tag_add", lock="write")
+@op("tag_add", lock="none")
 def _bind_tag_add(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "tag_add"}])
 
 
-@op("tag_remove", lock="write")
+@op("tag_remove", lock="none")
 def _bind_tag_remove(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "tag_remove"}])
 
 
-@op("tag_type_create", lock="write")
+@op("tag_type_create", lock="none")
 def _bind_tag_type_create(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "tag_type_create"}])
 
 
-@op("tag_type_remove", lock="write")
+@op("tag_type_remove", lock="none")
 def _bind_tag_type_remove(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "tag_type_remove"}])
 
 
-@op("set_comment", lock="write")
+@op("set_comment", lock="none")
 def _bind_set_comment(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "set_comment"}])
 
 
-@op("delete_comment", lock="write")
+@op("delete_comment", lock="none")
 def _bind_delete_comment(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "delete_comment"}])
 
 
-@op("set_prototype", lock="write")
+@op("set_prototype", lock="none")
 def _bind_set_prototype(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "set_prototype"}])
 
 
-@op("local_rename", lock="write")
+@op("local_rename", lock="none")
 def _bind_local_rename(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "local_rename"}])
 
 
-@op("local_retype", lock="write")
+@op("local_retype", lock="none")
 def _bind_local_retype(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "local_retype"}])
 
 
-@op("data_retype", lock="write")
+@op("data_retype", lock="none")
 def _bind_data_retype(bridge, params, target):
     # #649: typing a recovered data variable had no verified mutation path at all
     # (py exec only -- no --preview, no readback, no batch atomicity).
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "data_retype"}])
 
 
-@op("struct_field_set", lock="write")
+@op("struct_field_set", lock="none")
 def _bind_struct_field_set(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "struct_field_set"}])
 
 
-@op("struct_field_rename", lock="write")
+@op("struct_field_rename", lock="none")
 def _bind_struct_field_rename(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "struct_field_rename"}])
 
 
-@op("struct_field_delete", lock="write")
+@op("struct_field_delete", lock="none")
 def _bind_struct_field_delete(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "struct_field_delete"}])
 
 
-@op("types_declare", lock="write")
+@op("types_declare", lock="none")
 def _bind_types_declare(bridge, params, target):
     return bridge._mutation(target, _validate_bool(params.get("preview"), label="preview", default=False), [{**params, "op": "types_declare"}])
 
 
-@op("batch_apply", lock="write")
+@op("batch_apply", lock="none")
 def _bind_batch_apply(bridge, params, target):
     manifest = dict(params)
     preview = _validate_bool(manifest.get("preview"), label="preview", default=False)
@@ -4160,6 +4197,9 @@ def _bind_batch_apply(bridge, params, target):
 # does its OWN fine-grained locking (exclusive only around the BN open and the
 # publish, NOT around the multi-minute update_analysis_and_wait), so doctor/
 # target reads stay responsive during a large load (#99). See _load_binary.
+# The #628 mutation ops are unlocked for the same reason: they hold the write
+# gate for the whole op but the exclusive lock only around the BN-mutating and
+# snapshotting phases, never around the post-apply reanalysis.
 READ_LOCKED_OPS = frozenset(REGISTRY.read_locked_ops())
 WRITE_LOCKED_OPS = frozenset(REGISTRY.write_locked_ops())
 
