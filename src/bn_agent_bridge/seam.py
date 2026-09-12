@@ -149,7 +149,11 @@ class _ViewChangeState(_NotificationBase):
 
 
 # Keyed weakly by the view: the state (and every memo it holds) dies with the
-# view's Python wrapper, so a closed target's index is never retained.
+# view's Python wrapper, so a closed target's index is never retained. That holds
+# only because NO memo value references the view: the name index stores start
+# addresses and spelling strings and resolves them through ``bv.get_function_at``
+# at lookup time, because a stored Function would reach the view back through
+# ``fn.view`` and pin this weak key (see :class:`_NameIndex`).
 _VIEW_STATES: "weakref.WeakKeyDictionary[Any, _ViewChangeState]" = weakref.WeakKeyDictionary()
 _VIEW_STATE_LOCK = threading.Lock()
 
@@ -163,6 +167,11 @@ def _view_state(bv) -> _ViewChangeState | None:
     registration that raises. Registration is attempted inside the try and the
     state is stored ONLY on success, so a half-registered state can never be
     handed out.
+
+    The state is a :class:`_ViewChangeState`, which holds only its own counter,
+    memo slots and lock -- no reference to the view -- and (see
+    :func:`_view_memo_entry`) no memo value may hold one either, so the weak entry
+    really is released when the target closes.
     """
     if bn is None or bv is None:
         return None
@@ -189,25 +198,42 @@ def _view_memo(bv, slot: str, build):
     """Memoise ``build()`` for *bv*'s CURRENT generation, or call it and cache
     nothing when *bv* has no sound invalidation signal (:func:`_view_state`).
 
+    The memoised value alone; :func:`_view_memo_entry` holds the machinery, the
+    "built by an earlier call" flag the staleness guards need, and the invariant
+    every memo value must satisfy.
+    """
+    return _view_memo_entry(bv, slot, build)[0]
+
+
+def _view_memo_entry(bv, slot: str, build) -> tuple[Any, bool]:
+    """``(value, served_from_memo)`` behind :func:`_view_memo`.
+
     The value is tagged with the generation it was built at and is only stored if
     that generation still stands after the build -- a change landing mid-build can
     never be tagged fresh, so the next read rebuilds. ``build()`` itself runs
     OUTSIDE the lock: it enumerates the view, and holding the state lock across
     that would serialise unrelated readers for no benefit.
+
+    ``served_from_memo`` is True only for a value built by an EARLIER call, i.e.
+    one a change BN did not notify may have overtaken; a value built by THIS call
+    is current by construction. Every memo value must be free of view-derived
+    objects: the state is keyed weakly by the view, so a value that reaches the
+    view back -- a Function reaches it through ``fn.view`` -- would pin that key
+    and retain a closed target for the process lifetime.
     """
     state = _view_state(bv)
     if state is None:
-        return build()
+        return build(), False
     with state.lock:
         generation = state.generation
         cached = state.values.get(slot)
     if cached is not None and cached[0] == generation:
-        return cached[1]
+        return cached[1], True
     value = build()
     with state.lock:
         if state.generation == generation:
             state.values[slot] = (generation, value)
-    return value
+    return value, False
 
 
 def _view_memo_clear(bv, slot: str) -> None:
@@ -226,43 +252,69 @@ def _view_memo_clear(bv, slot: str) -> None:
 
 
 class _NameIndex:
-    """Every function's spellings -> the functions carrying them, from ONE pass.
+    """Every function's spellings -> the START ADDRESSES carrying them, from ONE pass.
 
-    ``exact``/``folded`` map a spelling (as-is / casefolded) to its bucket, in
-    view order; ``corpus`` is every spelling of every function in view order, for
-    the "did you mean" hint. Buckets are handed out as NEW lists (:meth:`_bucket`)
-    so a caller can never alias -- and therefore never mutate -- the cached index.
+    ``exact``/``folded`` map a spelling (as-is / casefolded) to its bucket of
+    ``int(fn.start)`` addresses, in view order; ``corpus`` is every spelling of
+    every function in view order, for the "did you mean" hint. Buckets are handed
+    out as NEW lists (:meth:`_starts`), resolved back to LIVE functions at lookup
+    time (:meth:`_resolve`).
+
+    That indirection is the retention contract, not a style choice: a Function, a
+    BinaryView, or anything else that reaches the view back MUST NOT be stored
+    here. On real BN a Function strongly references its own view (``fn.view is
+    bv``), so a bucket of Functions would keep the view alive through the
+    ``WeakKeyDictionary`` value keyed on it, and a closed target's spelling corpus
+    would be retained for the process lifetime. Only ints and strings are stored,
+    so the entry dies with the view.
     """
 
     __slots__ = ("exact", "folded", "corpus")
 
     def __init__(self):
-        self.exact: dict[str, list[Any]] = {}
-        self.folded: dict[str, list[Any]] = {}
+        self.exact: dict[str, list[int]] = {}
+        self.folded: dict[str, list[int]] = {}
         self.corpus: list[str] = []
 
     @staticmethod
-    def _bucket(mapping: dict[str, list[Any]], key: str) -> list[Any]:
-        """The bucket for *key*, deduped by start address in view order, as a NEW
-        list (the walk's semantics)."""
+    def _starts(mapping: dict[str, list[int]], key: str) -> list[int]:
+        """The start addresses for *key*, deduped by address in view order, as a
+        NEW list (the walk's semantics)."""
         bucket = mapping.get(key)
         if not bucket:
             return []
-        out: list[Any] = []
+        out: list[int] = []
         seen: set[int] = set()
-        for fn in bucket:
-            marker = int(fn.start)
-            if marker in seen:
+        for start in bucket:
+            if start in seen:
                 continue
-            seen.add(marker)
-            out.append(fn)
+            seen.add(start)
+            out.append(start)
         return out
 
-    def exact_matches(self, text: str) -> list[Any]:
-        return self._bucket(self.exact, text)
+    @staticmethod
+    def _resolve(bv, starts: list[int]) -> list[Any]:
+        """The LIVE functions at *starts*, in view order, as a NEW list per call.
 
-    def folded_matches(self, text: str) -> list[Any]:
-        return self._bucket(self.folded, text.lower())
+        Resolution happens here, at lookup time, rather than being stored: a
+        Function would pin the view (see the class docstring). On real BN
+        ``get_function_at`` is a map lookup, not a ``bv.functions`` walk, and a
+        start the view no longer has resolves to None and is skipped."""
+        get_at = getattr(bv, "get_function_at", None)
+        if not callable(get_at):
+            return []
+        out: list[Any] = []
+        for start in starts:
+            fn = get_at(start)
+            if fn is not None:
+                out.append(fn)
+        return out
+
+    def exact_matches(self, bv, text: str) -> list[Any]:
+        return self._resolve(bv, self._starts(self.exact, text))
+
+    def folded_matches(self, bv, text: str) -> list[Any]:
+        return self._resolve(bv, self._starts(self.folded, text.lower()))
 
 
 class BridgeContext:
@@ -441,29 +493,40 @@ class BridgeContext:
         """ONE pass over ``list(bv.functions)`` -> the per-view :class:`_NameIndex`.
 
         Exactly the pass :meth:`_scan_functions_by_name` used to run inline: every
-        form of every function goes into the corpus verbatim and into the exact /
-        folded buckets, in view order."""
+        form of every function goes into the corpus verbatim, and the function's
+        START ADDRESS into the exact / folded buckets, in view order. Only the
+        address is kept -- never the Function, which would reach the view back
+        through ``fn.view`` and keep a closed target's index alive."""
         index = _NameIndex()
         for fn in list(bv.functions):
+            start = int(fn.start)
             forms = self._function_name_forms(fn)
             index.corpus.extend(forms)
             for form in forms:
-                index.exact.setdefault(form, []).append(fn)
-                index.folded.setdefault(form.lower(), []).append(fn)
+                index.exact.setdefault(form, []).append(start)
+                index.folded.setdefault(form.lower(), []).append(start)
         return index
 
-    def _name_index(self, bv, *, refresh: bool = False) -> _NameIndex:
-        """The per-view name index: built once per view generation, reused after.
+    def _name_index(self, bv, *, refresh: bool = False) -> tuple[_NameIndex, bool]:
+        """``(index, memoised)`` for the per-view name index.
 
-        The index is PER VIEW and dies with the view's Python wrapper (a weak key),
-        and it is rebuilt whenever BN reports ANY name-bearing change -- a rename
-        makes a bucket stale, so over-invalidating is the safe direction. A view
-        whose notification surface is unavailable is NEVER cached (every lookup
-        walks, i.e. the behaviour before the index existed). ``refresh=True`` drops
-        the memo slot first, for the live staleness guards."""
+        The index is built once per view generation and reused after; ``memoised``
+        is True only when it was built by an EARLIER call, so a change BN did not
+        notify may have overtaken it -- a value built by this call IS the walk and
+        cannot be stale.
+
+        The index is PER VIEW and dies with the view's Python wrapper (a weak
+        key): it holds only start addresses and spelling strings, so no memo value
+        references the view (a stored Function would, through ``fn.view``) and the
+        entry is released when the target closes. It is rebuilt whenever BN
+        reports ANY name-bearing change -- a rename makes a bucket stale, so
+        over-invalidating is the safe direction. A view whose notification surface
+        is unavailable is NEVER cached (every lookup walks, i.e. the behaviour
+        before the index existed). ``refresh=True`` drops the memo slot first, for
+        the live staleness guards."""
         if refresh:
             _view_memo_clear(bv, "name_index")
-        return _view_memo(bv, "name_index", lambda: self._build_name_index(bv))
+        return _view_memo_entry(bv, "name_index", lambda: self._build_name_index(bv))
 
     def _bucket_is_live(self, bucket: list[Any], text: str, *, folded: bool) -> bool:
         """Does every member of a cached *bucket* still carry the queried spelling?
@@ -510,30 +573,53 @@ class BridgeContext:
         match, suggestion corpus) and the round-3 single-pass version still walked
         once per miss, so every lookup paid a full view enumeration. A WARM view
         now needs NO enumeration at all -- the index above is built once per view
-        generation and reused, and a miss costs one dict lookup. Measured on a
+        generation and reused, and a miss costs one dict lookup plus the guards
+        below (the bucket's member re-validation and one native-index witness
+        lookup), neither of which enumerates ``bv.functions``. Measured on a
         synthetic >=100-function view whose ``functions`` list counts
         ``__iter__``: base 3 enumerations per miss, 1 for round-3, 0 warm here
         (#622(b)). The pass COUNT is the bound; the corpus itself stays the full
         spelling set because no cap on it is sound.
 
-        Two live guards keep even a change BN does not notify from serving a stale
-        answer, each costing at most ONE extra rebuild per lookup (never a loop):
-        a hit's buckets must still be live for the queried spelling, and a
-        case-sensitive miss must not be contradicted by BN's own name index -- that
-        index is a witness that the spelling exists, never the answer itself (the
-        walk-backed rebuild supplies the COMPLETE group, round-3 blocker rule)."""
-        index = self._name_index(bv)
-        exact = index.exact_matches(text)
-        folded = index.folded_matches(text)
+        Invalidation is BN's own notification counter: every mutation path that
+        could be exercised -- a direct ``fn.name`` write, undo, redo, the bridge's
+        rename op, a reverted ``bn rename --preview`` and ``bn refresh`` -- fires a
+        handled ``symbol_*``/``function_*`` event, so a read that follows one never
+        serves the pre-change index. Two live guards cover a change BN does not
+        notify, on every lookup served by the memo (an index built by this call IS
+        the walk, so no witness can contradict it) and each costing at most ONE
+        extra rebuild -- never a loop:
+
+        * every cached member must still carry the queried spelling, and
+        * the cached group must not LACK a member BN's own name index witnesses for
+          the spelling -- the check is symmetric, so a cached NON-empty bucket that
+          is missing a member is rebuilt too, not only an empty one.
+
+        The witness is case-sensitive, so it is compared against the exact bucket's
+        starts, and it is only ever a WITNESS that the group is incomplete -- never
+        the answer itself (the walk-backed rebuild supplies the COMPLETE group,
+        round-3 blocker rule).
+
+        The RESIDUAL gap, stated plainly: a name change BN does not notify whose
+        new spelling reaches the view only as a symbol's demangled short/full name
+        -- i.e. a spelling outside BN's own name index -- is not witnessed, so a
+        cached group could stay incomplete for it."""
+        index, memoised = self._name_index(bv)
+        exact = index.exact_matches(bv, text)
+        folded = index.folded_matches(bv, text)
         stale = not self._bucket_is_live(exact, text, folded=False)
         if not stale:
             stale = not self._bucket_is_live(folded, text, folded=True)
-        if not stale and not exact:
-            stale = bool(self._native_functions_by_name(bv, text))
+        if not stale and memoised:
+            starts = {int(fn.start) for fn in exact}
+            stale = any(
+                int(fn.start) not in starts
+                for fn in self._native_functions_by_name(bv, text)
+            )
         if stale:
-            index = self._name_index(bv, refresh=True)
-            exact = index.exact_matches(text)
-            folded = index.folded_matches(text)
+            index, _ = self._name_index(bv, refresh=True)
+            exact = index.exact_matches(bv, text)
+            folded = index.folded_matches(bv, text)
         return exact, folded, index.corpus
 
     def _find_functions_by_name(self, bv, text: str, *, case_sensitive: bool) -> list[Any]:

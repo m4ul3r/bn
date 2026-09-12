@@ -106,9 +106,15 @@ def test_registry_clusters_methods():
 
 
 def test_registry_rebuild_reflects_a_rename():
-    """#622 criterion (d): the registry is rebuilt per call and reads the live
-    name spellings, so a rename inside the session is visible on the very next
-    call -- no per-view registry cache exists that could serve a stale class."""
+    """#622 criterion (d): the registry reads the live name spellings on every
+    build, so a rename inside the session is visible on the very next call.
+
+    What this pins is the SAFE FALLBACK, not the cache: this double has NO
+    notification surface, so the registry is never cached (`_view_memo` gets no
+    state => no memo), and the rebuild that reflects the rename is never a cache
+    hit. The cache itself -- reuse while BN reports no change, invalidated by BN's
+    own notifications -- is pinned by
+    `test_class_registry_is_reused_per_view_and_invalidated_by_a_change`."""
     bv = _make_registry_bv()
     first = read_class._build_class_registry(None, bv)
     assert "net::Session" in first
@@ -260,8 +266,12 @@ def test_class_registry_is_reused_per_view_and_invalidated_by_a_change():
 
 
 def test_class_registry_is_never_cached_without_notification_support():
-    """A view with no notification surface has no sound invalidation signal, so it
-    is never cached: two builds each enumerate the view."""
+    """NEGATIVE CONTROL for the safe-fallback rule -- this passes at the base by
+    construction, so it is NOT regression evidence for the cache itself: a view
+    with no notification surface has no sound invalidation signal, so it is never
+    cached and two builds each enumerate the view. The cache -- reuse while BN
+    reports no change, invalidation by BN's own notification -- is pinned by
+    `test_class_registry_is_reused_per_view_and_invalidated_by_a_change`."""
     fns = _counting_registry_fns()
     bv = _RegistryBV(fns, [])
     bv.functions = _CountingFunctions(fns)

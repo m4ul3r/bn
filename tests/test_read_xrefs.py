@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import gc
 import importlib.util
 import io
 import json
@@ -482,7 +483,24 @@ class _CountingFunctions(list):
         return super().__iter__()
 
 
-class _NotifyingBV(_FakeBV):
+class _MapLookupBV(_FakeBV):
+    """A view double whose ``get_function_at`` is a MAP lookup, as real BN's is.
+
+    ``BinaryView.get_function_at`` is a map lookup in the core; the base double
+    instead scans ``self.functions``, which is the ``_CountingFunctions`` list the
+    tests wrap -- so a lookup that resolves a cached bucket would be counted as a
+    full walk. Iterating the plain list storage keeps ``enumerations`` meaning
+    exactly "a full ``bv.functions`` walk".
+    """
+
+    def get_function_at(self, address: int):
+        for fn in list.__iter__(self.functions):
+            if int(fn.start) == int(address):
+                return fn
+        return None
+
+
+class _NotifyingBV(_MapLookupBV):
     """A view double that supports BN's view notifications.
 
     ``fire`` stands in for BN's own callbacks: it invokes ``event`` on every
@@ -554,9 +572,13 @@ def test_name_lookup_reuses_the_per_view_index_and_a_change_invalidates_it(monke
 
 
 def test_name_lookup_never_caches_a_view_without_notification_support(monkeypatch):
-    """A view with no notification surface has no sound invalidation signal, so it
-    is never cached: two identical lookups each enumerate the view, i.e. the walk
-    behaviour that predates the index."""
+    """NEGATIVE CONTROL for the safe-fallback rule -- this passes at the base by
+    construction, so it is NOT regression evidence for the cache itself: a view
+    with no notification surface has no sound invalidation signal, so it is never
+    cached and two identical lookups each enumerate the view, i.e. the walk
+    behaviour that predates the index. The cache -- reuse while BN reports no
+    change, invalidation by BN's own notification -- is pinned by
+    `test_name_lookup_reuses_the_per_view_index_and_a_change_invalidates_it`."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     fn = _named_fn(0x401000, "alpha")
@@ -568,7 +590,7 @@ def test_name_lookup_never_caches_a_view_without_notification_support(monkeypatc
                 bv, "alpha", case_sensitive=True)
         ]
 
-    bv = _FakeBV(functions=[fn])
+    bv = _MapLookupBV(functions=[fn])
     bv.functions = _CountingFunctions([fn])
     assert lookup(bv) == [0x401000]
     assert lookup(bv) == [0x401000]
@@ -646,6 +668,85 @@ def test_name_index_rebuilds_when_the_native_index_witnesses_an_unknown_spelling
     assert bv.functions.enumerations == 2
     assert lookup("shared") == [0x401000, 0x403000]
     assert bv.functions.enumerations == 2
+
+
+def test_cached_bucket_with_a_missing_member_still_rebuilds(monkeypatch):
+    """#622 review (blocker B): the completeness check is SYMMETRIC. A cached
+    NON-empty bucket that lacks a member BN's own name index witnesses for the
+    queried spelling must be rebuilt, so an unnotified same-name addition cannot be
+    served as an incomplete group (which is how a veneer caller silently drops out
+    of the xrefs union). The witness NEVER supplies the answer -- the walk-backed
+    rebuild returns the COMPLETE group, in view order."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _named_fn(0x401000, "alpha")
+    bv = _NotifyingBV(functions=[fn])
+    bv.functions = _CountingFunctions([fn])
+
+    def lookup(text):
+        return [
+            int(f.start)
+            for f in instance.ctx._find_functions_by_name(
+                bv, text, case_sensitive=True)
+        ]
+
+    assert lookup("alpha") == [0x401000]
+    assert bv.functions.enumerations == 1
+
+    # An unnotified SAME-NAME addition: a second function carrying the spelling
+    # appears in the view, no notification fires, and BN's own name index resolves
+    # the spelling -- to the new member only. The cached bucket is NON-empty, so
+    # only the symmetric check can notice that the group is incomplete.
+    twin = _named_fn(0x403000, "alpha")
+    bv.functions.append(twin)
+    bv.get_functions_by_name = lambda name: [twin] if name == "alpha" else []
+
+    assert lookup("alpha") == [0x401000, 0x403000], (
+        "an incomplete cached same-name group must not be served"
+    )
+    assert bv.functions.enumerations == 2, (
+        "the completeness witness must force exactly one rebuild"
+    )
+    assert lookup("alpha") == [0x401000, 0x403000]
+    assert bv.functions.enumerations == 2, "the rebuilt index must be reused"
+
+
+def test_name_index_does_not_retain_a_closed_target(monkeypatch):
+    """#622 review (blocker A): the memo must hold NOTHING that reaches the view
+    back. A real BN Function strongly references its own view (``fn.view is bv``),
+    so a bucket of Functions would keep the ``WeakKeyDictionary`` weak key alive and
+    retain a closed target's full spelling corpus for the process lifetime. With
+    the buckets holding start addresses only -- resolved through
+    ``bv.get_function_at`` at lookup time -- dropping the view drops the index."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+
+    def warm_and_release():
+        fns = [_named_fn(0x401000, "alpha"), _named_fn(0x402000, "beta")]
+        bv = _NotifyingBV(functions=fns)
+        bv.functions = _CountingFunctions(fns)
+        for fn in fns:
+            fn.view = bv  # exactly as a real BN Function does
+
+        def lookup(text):
+            return [
+                int(f.start)
+                for f in instance.ctx._find_functions_by_name(
+                    bv, text, case_sensitive=True)
+            ]
+
+        assert lookup("alpha") == [0x401000]
+        assert bv.functions.enumerations == 1
+        assert lookup("alpha") == [0x401000]
+        assert bv.functions.enumerations == 1, "the index must really be warm"
+        return weakref.ref(bv)
+
+    ref = warm_and_release()
+    gc.collect()
+    assert ref() is None, (
+        "the cached name index retained the closed target: no memo value may "
+        "reference the view it is keyed on"
+    )
 
 
 def test_find_function_miss_hints_are_uncapped_and_cost_one_enumeration(monkeypatch):
