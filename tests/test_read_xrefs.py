@@ -377,6 +377,55 @@ def test_xrefs_import_scan_flags_unreadable_llil(monkeypatch):
     assert result["code_ref_count"] == 1          # the readable caller survives
 
 
+class _UnIterableIL:
+    """An IL container whose iteration raises and which exposes no basic blocks,
+    i.e. a function whose LLIL cannot be read at all."""
+
+    def __iter__(self):
+        raise RuntimeError("LLIL unavailable")
+
+
+def test_xrefs_import_scan_flags_a_function_with_no_llil(monkeypatch):
+    """#622 review (round-3 blocker): a function BN could not lift at all --
+    ``low_level_il`` is None (BN documents that as "an error occurred while
+    loading the IL"), or an IL container that cannot be iterated and offers no
+    basic blocks -- was skipped WITHOUT a trace, so its body never entered the
+    scan while the envelope still reported a complete one.
+
+    That is worse than the base revision it replaced: base asserted nothing about
+    completeness, whereas the absence of ``truncated`` now positively claims the
+    caller list is whole. With every scanned function unlifted the answer was a
+    clean, flagless "no callers" -- the exact false negative the budget
+    disclosure exists to prevent."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _import_scan_bv("plt_target", 0x20000, [0x1000, 0x2000])
+    bv.functions[1].low_level_il = None          # BN never lifted this one
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    partial = instance._xrefs(None, "plt_target")
+    assert partial["code_refs_scanned"] is True
+    assert partial["truncated"] is True
+    assert "LLIL" in partial["scan_note"]
+    assert "budget" not in partial["scan_note"]   # the budget was never hit
+    assert "1 function(s)" in partial["scan_note"]
+    assert partial["code_ref_count"] == 1         # the readable caller survives
+
+    # An IL object that cannot be iterated and has no basic_blocks fallback is
+    # the same failure by another route, and must disclose the same way.
+    bv.functions[1].low_level_il = _UnIterableIL()
+    assert instance._xrefs(None, "plt_target")["truncated"] is True
+
+    # Nothing readable at all: the answer is EMPTY, which is precisely when the
+    # flag has to be there -- an unflagged empty caller list reads as "no callers".
+    for fn in bv.functions:
+        fn.low_level_il = None
+    blind = instance._xrefs(None, "plt_target")
+    assert blind["code_ref_count"] == 0
+    assert blind["truncated"] is True, "an empty scan of unlifted functions is not 'no callers'"
+    assert "2 function(s)" in blind["scan_note"]
+
+
 def test_find_function_exact_hit_walks_once_and_then_never_again(monkeypatch):
     """#622(b) for the SINGLE-identifier path: an exact name hit pays the one
     index build and every later hit enumerates nothing.

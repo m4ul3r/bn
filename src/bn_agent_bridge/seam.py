@@ -677,19 +677,31 @@ class BridgeContext:
         group is incomplete -- never the answer itself (the walk-backed rebuild
         supplies the COMPLETE group, round-3 blocker rule).
 
-        The RESIDUAL gap, stated in full: a change BN does not notify escapes all
-        four guards only when it leaves the function COUNT unchanged, leaves every
-        cached start resolvable, and carries a spelling BN's case-sensitive index
-        cannot be asked for (a casing nothing queried and no cached member holds,
-        or a demangled short/full name the index does not carry, #224a). Two
-        shapes qualify: an unnotified RENAME, and an unnotified ADDITION paired
-        with a REMOVAL outside the queried group. Both then serve a group that is
-        missing a member. Closing that needs a membership re-read of every
-        function on every warm lookup -- i.e. the walk this index exists to
-        remove -- so it is disclosed rather than paid for. A standing disagreement
-        between BN's name index and ``bv.functions`` degrades the warm path to one
-        rebuild per lookup, which is the BASE cost and the safe direction: a group
-        a witness calls incomplete is never served."""
+        The RESIDUAL gap. A change BN does not notify escapes all four guards
+        exactly when all three of these hold: it leaves the function COUNT
+        unchanged; every start cached for THE QUERIED spelling still resolves (the
+        vanished-start guard reads the queried buckets, not the whole index); and
+        the spelling it introduces is one BN's case-sensitive index cannot be
+        asked for -- a casing nothing queried and no cached member holds, or a
+        demangled short/full name the index does not carry (#224a). That
+        CONDITION is the boundary; the shapes known to meet it are an unnotified
+        rename, an unnotified addition paired with a removal outside the queried
+        buckets, and an unnotified late symbol attachment that gives an existing
+        function the queried spelling (no rename, no addition, no removal). Any
+        other change meeting the condition escapes too -- the list is the shapes
+        seen, not a proof that no fourth exists.
+
+        What a reader gets in that case: a group missing a member, and -- because
+        the same index backs the suggestion corpus -- a "Did you mean" list built
+        from the same stale spellings, so it can still name a removed function and
+        omit an added one. Closing any of it needs a membership re-read of every
+        function on every warm lookup, i.e. the walk this index exists to remove,
+        so it is disclosed rather than paid for.
+
+        A standing disagreement between BN's name index and ``bv.functions``
+        degrades the warm path to one rebuild per lookup, which is the BASE cost
+        and the safe direction: a group a witness calls incomplete is never
+        served."""
         if not callable(getattr(bv, "get_function_at", None)):
             # The index stores START ADDRESSES and resolves them at lookup time
             # (the retention contract above), so a view that cannot resolve an
