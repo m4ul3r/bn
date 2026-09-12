@@ -122,6 +122,28 @@ def _run_fixture_make(env: dict[str, str], out_dir: Path) -> subprocess.Complete
     )
 
 
+def _invalidate_stale_bndb_sidecars(binaries: list[Path]) -> None:
+    """Drop any `<binary>.bndb` whose mtime predates the binary it caches.
+
+    The bridge resolves an adjacent `<binary>.bndb` in preference to the binary
+    itself (`bn_agent_bridge.bridge._resolve_bndb_sidecar`), so a sidecar left
+    behind by an earlier build of a since-changed fixture is analysed instead of
+    the freshly compiled program -- surfacing as an assertion about the *old*
+    program's call graph, indistinguishable from a read-path regression (#717).
+
+    Mtime is the whole test, and only strictly-older sidecars go: a `.bndb`
+    newer than its binary is the legitimate saved analysis. `make -C
+    tests/fixtures clean` removes them too; this catches the long-lived checkout
+    that never ran it.
+    """
+    for binary in binaries:
+        sidecar = Path(str(binary) + ".bndb")
+        if not sidecar.exists():
+            continue
+        if sidecar.stat().st_mtime < binary.stat().st_mtime:
+            sidecar.unlink()
+
+
 def build_integration_fixtures(
     *,
     make_env: dict[str, str] | None = None,
@@ -178,7 +200,9 @@ def build_integration_fixtures(
             f"  stdout: {proc.stdout.strip()}\n"
             f"  stderr: {proc.stderr.strip()}"
         )
-    return [out_dir / n for n in REQUIRED_INTEGRATION_FIXTURES]
+    built = [out_dir / n for n in REQUIRED_INTEGRATION_FIXTURES]
+    _invalidate_stale_bndb_sidecars(built)
+    return built
 
 
 def _decode(stream: str | bytes | None) -> str:
