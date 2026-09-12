@@ -947,35 +947,41 @@ def _coercion_sites(source: str | None = None):
     Derived, never hand-listed. The first attempt at this guard was a table of
     the renderers' own `@_discloses(lists=..., dicts=...)` declarations, which is
     a restatement of the implementation: a declaration list and a table of that
-    same list agreeing with each other proves nothing, and it read as 89 rows of
-    coverage while re-stating the declarations it was meant to check.
+    same list agreeing with each other proves nothing.
 
-    `source` parses a module given as TEXT instead, so the set of shapes this
-    recognises can itself be enumerated and asserted rather than merely claimed.
+    `source` parses a module given as TEXT instead, so both what this recognises
+    and what it is BLIND to can be asserted as data rather than claimed in prose.
+    Every round of this PR that described the guard's reach in prose described it
+    wrongly; `_GUARD_CATCHES` and `_GUARD_BLIND` below are the actual statement.
 
-    The bypass half recognises a payload lookup (`.get(k)` with a literal OR a
-    variable key, and `[k]` subscript) that reaches a container coercion either
-    directly or through ONE local alias, in every one of these spellings:
+    Scope is every function, method, lambda and module-level statement -- not
+    just top-level `def`s -- because "inside a class" and "at module level" were
+    two of the evasions review found. A payload lookup is `.get(k)` with a
+    literal or variable key, or a `[k]` subscript, reached directly or through
+    one local alias. Five rules then fire on it:
 
-      * `<lookup> or []` / `or {}` / `or ()`          -- the pre-#619 idiom
-      * `_as_dict(<lookup>)`                          -- the raw coercer
-      * `<any>.get(k, [])` / `.get(k, {})`            -- a defaulted lookup
-      * `<lookup> if isinstance(...) else []` / `{}`  -- the ternary
-      * `<x> if isinstance(<x>, list|dict|tuple) else None` -- the ternary whose
-        default is `None`, which the recording helpers read as ABSENT, so it
-        buries a malformed value exactly as completely as `[]` does
-      * `if isinstance(<lookup>, list|dict|tuple): ... else: <name> = []`, its
-        `= None` variant, and its negated `if not isinstance(...)` rebind -- the
-        STATEMENT spelling of that same ternary
+      R1 `_as_dict(<lookup>)` / `_as_list(<lookup>)` -- the raw coercers.
+      R2 `<lookup> or []` / `{}` / `()` / `set()` / a module-level empty constant.
+      R3 `.get/.pop/.setdefault(k, <empty container>)` -- a defaulted lookup.
+      R4 the `isinstance` ternary in BOTH orientations, defaulting to an empty
+         container, or to `None` when the test decides the shape of the value
+         being bound (`None` is what the helpers read as ABSENT, so it buries a
+         malformed value exactly as completely as `[]` does).
+      R5 the STATEMENT family: a name bound BOTH from an expression containing a
+         payload lookup AND to an empty container -- which covers if/else, the
+         negated rebind, pre-initialise-then-assign, `try/except TypeError`, a
+         walrus, an annotated assign and tuple unpacking without enumerating any
+         of them -- plus the same rebind to `None` when a container-shape test on
+         that same expression is what gates it.
 
-    What it still does NOT see -- stated in full, because an UNDER-stated limit
-    is what let the `else None` ternary sit live at two named-field sites while
-    the docstring admitted only two holes: two alias hops through two variables;
-    a lookup crossing a function boundary; a walrus binding; a `try/except
-    TypeError` coercion; a default taken from a module-level constant; a
-    `functools.partial` or other deferred call; and any coercion written at
-    module level rather than inside a function. Those are why the ENUMERATED
-    differential below RUNS the renderers instead of reading them."""
+    R5 deliberately does NOT require the assigned name to come from a BARE
+    lookup: `rows = list(v.get(k))` inside the shape branch is the spelling a
+    maintainer adding a defensive copy would reach for, and requiring bareness is
+    how the round-6 version of this rule stayed blind to it.
+
+    The remaining blind spots are asserted, not described -- see `_GUARD_BLIND`.
+    They are why the ENUMERATED differential below RUNS the renderers instead of
+    reading them, and why no claim of completeness is made here."""
     import ast
     import inspect
 
@@ -984,7 +990,7 @@ def _coercion_sites(source: str | None = None):
     tree = ast.parse(source if source is not None else inspect.getsource(formatters))
     RECORDERS = ("_field_list", "_field_dict")
     COERCERS = ("_as_list", "_as_dict")
-    CONTAINERS = ("list", "dict", "tuple", "set")
+    CONTAINERS = ("list", "dict", "tuple", "set", "frozenset")
 
     def is_lookup(node):
         """A read of a NAMED field off some mapping, by `.get(k)` or `[k]`.
@@ -1001,17 +1007,47 @@ def _coercion_sites(source: str | None = None):
         return isinstance(key, ast.Name) or (
             isinstance(key, ast.Constant) and isinstance(key.value, str))
 
-    def empty_container(node):
-        return ((isinstance(node, ast.List) and not node.elts)
-                or (isinstance(node, ast.Dict) and not node.keys)
-                or (isinstance(node, ast.Tuple) and not node.elts))
+    def bound_names(target):
+        if isinstance(target, ast.Name):
+            return [target.id]
+        if isinstance(target, (ast.Tuple, ast.List)):
+            return [n for e in target.elts for n in bound_names(e)]
+        if isinstance(target, ast.Starred):
+            return bound_names(target.value)
+        return []                       # a subscript/attribute store rebinds nothing
 
-    def coerced_default(node):
-        """A default that renders as "no container". `None` counts: the recording
-        helpers read an explicit null as ABSENT, so defaulting a malformed value
-        to `None` hides it exactly as thoroughly as defaulting it to `[]`."""
-        return empty_container(node) or (
-            isinstance(node, ast.Constant) and node.value is None)
+    def bindings(node):
+        """(names, value) pairs this statement binds, distributing a tuple assign
+        element-wise so `rows, n = [], 0` is seen as binding `rows` to `[]`."""
+        if isinstance(node, ast.Assign):
+            pairs = []
+            for target in node.targets:
+                if (isinstance(target, (ast.Tuple, ast.List))
+                        and isinstance(node.value, (ast.Tuple, ast.List))
+                        and len(target.elts) == len(node.value.elts)):
+                    pairs += [(bound_names(t), v)
+                              for t, v in zip(target.elts, node.value.elts)]
+                else:
+                    pairs.append((bound_names(target), node.value))
+            return pairs
+        if isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+            return [(bound_names(node.target), node.value)] if node.value else []
+        return []
+
+    empty_consts = set()
+
+    def empty_container(node):
+        if isinstance(node, (ast.List, ast.Tuple, ast.Set)) and not node.elts:
+            return True
+        if isinstance(node, ast.Dict) and not node.keys:
+            return True
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in CONTAINERS and not node.args and not node.keywords):
+            return True                  # `list()`, `set()`, `dict()`
+        return isinstance(node, ast.Name) and node.id in empty_consts
+
+    def is_none(node):
+        return isinstance(node, ast.Constant) and node.value is None
 
     def container_isinstance(node):
         """The expression whose CONTAINER shape `node` tests, else None. Accepts
@@ -1027,77 +1063,105 @@ def _coercion_sites(source: str | None = None):
             return None
         return node.args[0]
 
+    # A module-level `_EMPTY = []` is as good a coercion default as the literal.
+    for stmt in tree.body:
+        for names, val in bindings(stmt):
+            if empty_container(val):
+                empty_consts |= set(names)
+
+    def scope_nodes(scope):
+        """Every node belonging to this scope, not descending into a nested
+        function/class -- those are separate scopes with their own aliases."""
+        out, stack = [], list(ast.iter_child_nodes(scope))
+        while stack:
+            node = stack.pop()
+            out.append(node)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
+                                 ast.ClassDef, ast.Lambda)):
+                continue
+            stack.extend(ast.iter_child_nodes(node))
+        return out
+
+    scopes = [("<module>", tree)]
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            scopes.append((node.name, node))
+        elif isinstance(node, ast.Lambda):
+            scopes.append(("<lambda>", node))
+
     sites, raw = [], []
-    for fn in tree.body:
-        if not isinstance(fn, ast.FunctionDef):
-            continue
+    for fn_name, scope in scopes:
         # The recording helpers ARE the choke point: they necessarily test the
         # shape of a lookup and fall back, which is the very shape being hunted
         # everywhere else. Scanning them would report the fix as the defect.
-        if fn.name in RECORDERS + COERCERS:
+        if fn_name in RECORDERS + COERCERS:
             continue
-        # Locals bound straight from a payload lookup: one alias hop is the
-        # evasion review demonstrated, so resolve it rather than trust the shape.
-        aliases = {
-            t.id
-            for node in ast.walk(fn) if isinstance(node, ast.Assign)
-            for t in node.targets
-            if isinstance(t, ast.Name) and is_lookup(node.value)
-        }
+        nodes = scope_nodes(scope)
+        aliases = {n for node in nodes for names, val in bindings(node)
+                   if is_lookup(val) for n in names}
 
         def suspect(node):
             return is_lookup(node) or (isinstance(node, ast.Name) and node.id in aliases)
 
-        for node in ast.walk(fn):
+        def suspect_within(node):
+            return any(suspect(n) for n in ast.walk(node))
+
+        lookup_bound: dict[str, list] = {}
+        container_default: set[str] = set()
+        none_default: set[str] = set()
+        for node in nodes:
+            for names, val in bindings(node):
+                if suspect_within(val):
+                    for n in names:
+                        lookup_bound.setdefault(n, []).append(val)
+                if empty_container(val):
+                    container_default |= set(names)
+                elif is_none(val):
+                    none_default |= set(names)
+
+        for node in nodes:
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
                 if node.func.id in RECORDERS:
                     base = node.args[0] if node.args else None
                     top = isinstance(base, ast.Name) and base.id == "value"
                     keys = [a.value for a in node.args[1:] if isinstance(a, ast.Constant)]
                     kind = "list" if node.func.id == "_field_list" else "dict"
-                    sites.append((fn.name, tuple(keys), kind, top))
-                elif node.func.id in COERCERS and node.args and suspect(node.args[0]):
-                    raw.append((fn.name, ast.unparse(node)))
-            # `<lookup> or []` / `or {}` -- the pre-#619 idiom, any key shape.
-            if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+                    sites.append((fn_name, tuple(keys), kind, top))
+                elif node.func.id in COERCERS and node.args and suspect_within(node.args[0]):
+                    raw.append((fn_name, "R1 " + ast.unparse(node)))          # R1
+            if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):  # R2
                 if empty_container(node.values[-1]):
                     for c in node.values[:-1]:
-                        if suspect(c):
-                            raw.append((fn.name, ast.unparse(node)))
-            # `x if isinstance(x, list) else []`, and the `else None` spelling.
-            # An empty-container default is a container tell on its own; `None`
-            # is one only when the test decides the SHAPE of the very value being
-            # bound, which is what separates a container coercion from a guard on
-            # the SOURCE (`fn.get("name") if isinstance(fn, dict) else None`).
-            if isinstance(node, ast.IfExp) and suspect(node.body):
-                tested = container_isinstance(node.test)
-                shape_tested = (tested is not None
-                                and ast.dump(tested) == ast.dump(node.body))
-                if empty_container(node.orelse) or (
-                        shape_tested and coerced_default(node.orelse)):
-                    raw.append((fn.name, ast.unparse(node)))
-            # The STATEMENT form of that ternary: a container-shape test on a
-            # payload lookup, with a branch binding an empty container/None to a
-            # name that is ALSO bound straight from a lookup. That last clause is
-            # what keeps it a coercion check rather than an "isinstance plus an
-            # accumulator" check -- `lines = []` inside a shape branch is not a
-            # coerced field, and reporting it would train the guard to be ignored.
-            if isinstance(node, ast.If):
-                tested = container_isinstance(node.test)
-                if tested is not None and suspect(tested):
-                    for stmt in list(node.body) + list(node.orelse):
-                        for sub in ast.walk(stmt):
-                            if not (isinstance(sub, ast.Assign) and coerced_default(sub.value)):
-                                continue
-                            if any(isinstance(t, ast.Name) and t.id in aliases
-                                   for t in sub.targets):
-                                raw.append((fn.name, f"if {ast.unparse(node.test)}: ... "
-                                                     f"{ast.unparse(sub)}"))
-            # `.get(k, [])` / `.get(k, {})` -- a defaulted lookup coerces too.
+                        if suspect_within(c):
+                            raw.append((fn_name, "R2 " + ast.unparse(node)))
             if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "get" and len(node.args) == 2
-                    and empty_container(node.args[1])):
-                raw.append((fn.name, ast.unparse(node)))
+                    and node.func.attr in ("get", "pop", "setdefault")
+                    and len(node.args) == 2 and empty_container(node.args[1])):
+                raw.append((fn_name, "R3 " + ast.unparse(node)))              # R3
+            if isinstance(node, ast.IfExp):                                   # R4
+                tested = container_isinstance(node.test)
+                for real, default in ((node.body, node.orelse), (node.orelse, node.body)):
+                    if not suspect_within(real):
+                        continue
+                    # The tested expression must BE the value being bound, not
+                    # merely appear inside it: `fn.get("name") if isinstance(fn,
+                    # dict) else None` guards the SOURCE and binds a string, and
+                    # reporting that would make the guard fire on correct code.
+                    shaped = tested is not None and ast.dump(tested) == ast.dump(real)
+                    if empty_container(default) or (shaped and is_none(default)):
+                        raw.append((fn_name, "R4 " + ast.unparse(node)))
+                        break
+
+        for name in sorted(set(lookup_bound) & container_default):            # R5
+            raw.append((fn_name, f"R5 {name!r} is bound from a payload lookup and "
+                                 f"also to an empty container"))
+        shape_tests = [container_isinstance(n.test)
+                       for n in nodes if isinstance(n, (ast.If, ast.IfExp))]
+        shape_tests = [t for t in shape_tests if t is not None and suspect(t)]
+        for name in sorted(set(lookup_bound) & none_default):
+            if any(ast.dump(t) in ast.dump(v)
+                   for t in shape_tests for v in lookup_bound[name]):
+                raw.append((fn_name, f"R5 {name!r} is shape-tested and defaulted to None"))
     return sites, raw
 
 
@@ -1105,7 +1169,7 @@ def test_no_payload_container_is_coerced_outside_the_recording_helpers():
     """THE load-bearing assertion. `_field_list`/`_field_dict` disclose by
     construction, so "every _field_* call discloses" is close to a tautology.
     What actually makes the choke point a choke point is that nothing coerces a
-    payload container any other way: the two earlier attempts at this fix each
+    payload container any other way: the earlier attempts at this fix each
     enumerated the sites they could see and left the rest silent, and a single
     `x.get("k") or []` -- or `_as_list(vt["slots"])`, which is how a live blocker
     hid from the first version of this check -- puts the defect straight back."""
@@ -1116,37 +1180,85 @@ def test_no_payload_container_is_coerced_outside_the_recording_helpers():
         f"malformed value there renders as empty with no disclosure: {raw[:6]}")
 
 
-# Every spelling the guard claims to see, one probe module each. Enumerated as
-# DATA so the claim is ASSERTED rather than described: round 5 evaded the guard
-# with two of these (the `else None` ternary, live at two real sites, and the
-# statement form) while its docstring still called the class closed.
+# Every spelling the guard sees, one probe module each, enumerated as DATA so the
+# claim is ASSERTED rather than described. Rounds 5 and 6 each evaded the guard
+# with a shape its prose had called covered; the table is the answer to that.
 _GUARD_CATCHES = {
-    "or-empty-list": 'rows = value.get("k") or []\n    return str(rows)',
-    "or-empty-dict": 'rows = value.get("k") or {}\n    return str(rows)',
-    "or-empty-tuple": 'rows = value.get("k") or ()\n    return str(rows)',
-    "or-empty-subscript": 'rows = value["k"] or []\n    return str(rows)',
-    "raw-coercer-on-get": 'return str(_as_dict(value.get("k")))',
-    "raw-coercer-on-subscript": 'return str(_as_dict(value["k"]))',
-    "raw-coercer-variable-key": 'return str(_as_dict(value.get(key)))',
-    "raw-coercer-one-alias-hop": 'raw = value.get("k")\n    return str(_as_dict(raw))',
-    "defaulted-get-list": 'return str(value.get("k", []))',
-    "defaulted-get-dict": 'return str(value.get("k", {}))',
-    "ternary-else-empty": ('rows = value.get("k") if isinstance(value, dict) else []\n'
-                           '    return str(rows)'),
-    "ternary-else-none": ('rows = value.get("k") if isinstance(value.get("k"), list)'
-                          ' else None\n    return str(rows)'),
-    "ternary-else-none-alias": ('raw = value.get("k")\n'
-                                '    rows = raw if isinstance(raw, dict) else None\n'
-                                '    return str(rows)'),
-    "statement-if-else-empty": ('if isinstance(value.get("k"), list):\n'
-                                '        rows = value.get("k")\n'
-                                '    else:\n        rows = []\n    return str(rows)'),
-    "statement-if-else-none": ('if isinstance(value.get("k"), dict):\n'
-                               '        rows = value.get("k")\n'
-                               '    else:\n        rows = None\n    return str(rows)'),
-    "statement-negated-rebind": ('rows = value.get("k")\n'
-                                 '    if not isinstance(rows, list):\n        rows = []\n'
-                                 '    return str(rows)'),
+    "R1-coercer-on-get": 'return str(_as_dict(value.get("k")))',
+    "R1-coercer-on-subscript": 'return str(_as_dict(value["k"]))',
+    "R1-coercer-variable-key": 'return str(_as_dict(value.get(key)))',
+    "R1-coercer-one-alias-hop": 'raw = value.get("k")\n    return str(_as_dict(raw))',
+    "R1-coercer-list-name-still-guarded": 'return str(_as_list(value.get("k")))',
+    "R2-or-empty-list": 'rows = value.get("k") or []\n    return str(rows)',
+    "R2-or-empty-dict": 'rows = value.get("k") or {}\n    return str(rows)',
+    "R2-or-empty-tuple": 'rows = value.get("k") or ()\n    return str(rows)',
+    "R2-or-empty-set-call": 'rows = value.get("k") or set()\n    return str(rows)',
+    "R2-or-empty-subscript": 'rows = value["k"] or []\n    return str(rows)',
+    "R2-and-or-idiom": ('rows = isinstance(value.get("k"), list) and value.get("k") or []\n'
+                        '    return str(rows)'),
+    "R3-defaulted-get": 'return str(value.get("k", []))',
+    "R3-defaulted-get-dict": 'return str(value.get("k", {}))',
+    "R3-defaulted-get-call": 'return str(value.get("k", list()))',
+    "R3-defaulted-pop": 'return str(value.pop("k", []))',
+    "R3-defaulted-setdefault": 'return str(value.setdefault("k", []))',
+    "R4-ternary-else-empty": ('rows = value.get("k") if isinstance(value, dict) else []\n'
+                              '    return str(rows)'),
+    "R4-ternary-else-none": ('rows = value.get("k") if isinstance(value.get("k"), list)'
+                             ' else None\n    return str(rows)'),
+    "R4-ternary-else-none-alias": ('raw = value.get("k")\n'
+                                   '    rows = raw if isinstance(raw, dict) else None\n'
+                                   '    return str(rows)'),
+    "R4-ternary-inverted": ('rows = [] if not isinstance(value.get("k"), list)'
+                            ' else value.get("k")\n    return str(rows)'),
+    "R4-ternary-comprehension-body": ('rows = [r for r in value.get("k")]'
+                                      ' if isinstance(value.get("k"), list) else []\n'
+                                      '    return str(rows)'),
+    "R5-if-else-empty": ('if isinstance(value.get("k"), list):\n'
+                         '        rows = value.get("k")\n'
+                         '    else:\n        rows = []\n    return str(rows)'),
+    "R5-if-else-none": ('if isinstance(value.get("k"), dict):\n'
+                        '        rows = value.get("k")\n'
+                        '    else:\n        rows = None\n    return str(rows)'),
+    "R5-negated-rebind": ('rows = value.get("k")\n'
+                          '    if not isinstance(rows, list):\n        rows = []\n'
+                          '    return str(rows)'),
+    "R5-defensive-copy-branch": ('if isinstance(value.get("k"), list):\n'
+                                 '        rows = list(value.get("k"))\n'
+                                 '    else:\n        rows = []\n    return str(rows)'),
+    "R5-pre-initialise-then-assign": ('rows = []\n'
+                                      '    if isinstance(value.get("k"), list):\n'
+                                      '        rows = value.get("k")\n    return str(rows)'),
+    "R5-pre-initialise-none": ('rows = None\n'
+                               '    if isinstance(value.get("k"), list):\n'
+                               '        rows = value.get("k")\n    return str(rows)'),
+    "R5-annotated-rebind": ('rows = value.get("k")\n'
+                            '    if not isinstance(rows, list):\n        rows: list = []\n'
+                            '    return str(rows)'),
+    "R5-try-except": ('try:\n        rows = list(value.get("k"))\n'
+                      '    except TypeError:\n        rows = []\n    return str(rows)'),
+    "R5-walrus": ('if not isinstance(rows := value.get("k"), list):\n        rows = []\n'
+                  '    return str(rows)'),
+    "R5-tuple-unpack": ('rows, n = value.get("k"), 1\n'
+                        '    if not isinstance(rows, list):\n        rows, n = [], 1\n'
+                        '    return str(rows)'),
+    "R5-module-level-constant-default": None,       # needs its own module text
+    "scope-inside-a-class": None,
+    "scope-async-def": None,
+    "scope-module-level": None,
+}
+
+_GUARD_CATCH_MODULES = {
+    "R5-module-level-constant-default":
+        '_EMPTY = []\n\n\ndef _render_probe(value):\n'
+        '    rows = value.get("k") or _EMPTY\n    return str(rows)\n',
+    "scope-inside-a-class":
+        'class Renderer:\n    def render(self, value):\n'
+        '        rows = value.get("k") or []\n        return str(rows)\n',
+    "scope-async-def":
+        'async def _render_probe(value):\n    rows = value.get("k") or []\n'
+        '    return str(rows)\n',
+    "scope-module-level":
+        '_PAYLOAD = {}\n_ROWS = _PAYLOAD.get("k") or []\n',
 }
 
 # The mirror: shapes that must NOT be reported, or the guard degenerates into
@@ -1160,20 +1272,40 @@ _GUARD_IGNORES = {
                             '        if not isinstance(s, dict):\n            continue\n'
                             '        out.append(s)\n    return str(out)'),
     "presence-test": ('rows = _field_list(value, "k")\n'
-                      '    if rows or "k" in value:\n        return str(len(rows))\n'
-                      '    return ""'),
+                      '    if rows or _field_present(value, "k"):\n'
+                      '        return str(len(rows))\n    return ""'),
     "index-into-a-list": 'rows = _field_list(value, "k")\n    return str(rows[-1:])',
     "accumulator-inside-a-shape-branch": ('if isinstance(value.get("k"), list):\n'
                                           '        lines = []\n'
                                           '        lines.append("x")\n'
                                           '        return str(lines)\n'
                                           '    return ""'),
+    "scalar-defaulted-to-none-in-a-shape-branch":
+        ('addr = None\n    holder = _field_dict(value, "k")\n'
+         '    if isinstance(value.get("k"), dict):\n        addr = holder.get("a")\n'
+         '    return str(addr)'),
+}
+
+# The blind spots, asserted rather than listed in prose. Every round of this PR
+# that DESCRIBED the guard's limits described them wrongly -- either claiming a
+# shape was covered when it was not, or calling the list complete when it was
+# not. A shape here is one the guard provably cannot see; if a future change
+# happens to cover one, this test fails and the claim gets updated with it.
+_GUARD_BLIND = {
+    "two-alias-hops": ('a = value.get("k")\n    b = a\n    rows = b or []\n'
+                       '    return str(rows)'),
+    "lookup-across-a-function-boundary": ('rows = _grab(value) or []\n    return str(rows)'),
+    "deferred-call": ('import functools\n'
+                      '    f = functools.partial(value.get, "k")\n'
+                      '    rows = f() or []\n    return str(rows)'),
 }
 
 
 @pytest.mark.parametrize("name,body", sorted(_GUARD_CATCHES.items()))
 def test_the_coercion_guard_sees_every_form_it_claims_to_see(name, body):
-    _, raw = _coercion_sites(f"def _render_probe(value, key='k'):\n    {body}\n")
+    text = (_GUARD_CATCH_MODULES[name] if body is None
+            else f"def _render_probe(value, key='k'):\n    {body}\n")
+    _, raw = _coercion_sites(text)
     assert raw, f"the guard is blind to the {name} spelling of a container coercion"
 
 
@@ -1181,6 +1313,17 @@ def test_the_coercion_guard_sees_every_form_it_claims_to_see(name, body):
 def test_the_coercion_guard_does_not_fire_on_a_recorded_read(name, body):
     _, raw = _coercion_sites(f"def _render_probe(value, key='k'):\n    {body}\n")
     assert not raw, f"the guard mis-reports {name} as a bypass: {raw}"
+
+
+@pytest.mark.parametrize("name,body", sorted(_GUARD_BLIND.items()))
+def test_the_coercion_guards_blind_spots_are_the_ones_it_declares(name, body):
+    """The guard is a structural proxy, not a proof. Pinning what it CANNOT see
+    keeps its docstring honest -- an under-stated limit is what let two live
+    bypasses sit behind a "the class is closed" claim for two rounds."""
+    _, raw = _coercion_sites(f"def _render_probe(value, key='k'):\n    {body}\n")
+    assert not raw, (
+        f"the guard now SEES {name}; that is good news, but it is declared as a "
+        f"blind spot -- move it to _GUARD_CATCHES so the claim matches: {raw}")
 
 
 # Malformed payloads for a field whose well-formed shape is a list / a dict.
@@ -1191,50 +1334,80 @@ _MALFORMED = {
     "list": ("bad", {"a": 1}, 0, "", False, {}),
     "dict": ("bad", ["bad"], 0, "", False, []),
 }
+_WELL_FORMED = {"list": [{"name": "x", "address": "0x1"}], "dict": {"name": "x"}}
 
 
-def test_a_malformed_container_either_discloses_or_renders_exactly_as_absent():
-    """The ENUMERATED positive differential, over every top-level recorded field
-    the AST can find rather than a hand-picked table of examples (the 89-row
-    table this replaced ran real renders, but only at the positions its author
-    typed out).
-
-    Under the choke point the property needs no expected-output table at all: if
-    the renderer READ the field, the recorder fired and the disclosure is in the
-    output; so a rendering byte-identical to the ABSENT one proves the value was
-    never consumed, and a rendering that is the raw-payload fallback echoes the
-    bogus value verbatim. Anything else is a malformed container being reported
-    as a result -- the confident empty, which is the one reading with no honest
-    interpretation."""
+def _top_level_render_sites():
+    """(renderer, key, kind) for every top-level recorded field the AST reports,
+    with the renderer resolved. The differential's population, derived."""
     from bn import formatters
 
     sites, _ = _coercion_sites()
     assert sites, "AST walk found no coercion sites at all -- the guard is blind"
-    checked, silent = 0, []
+    out = []
     for fn_name, keys, kind, top in sites:
         render = getattr(formatters, fn_name, None)
         if not top or render is None or not fn_name.startswith("_render"):
             continue
+        for key in keys:
+            out.append((fn_name, render, key, kind))
+    return out
+
+
+def test_a_malformed_container_is_disclosed_wherever_it_is_read():
+    """The ENUMERATED positive differential, over every top-level recorded field
+    the AST can find rather than a hand-picked table (the 89-row table this
+    replaced ran real renders, but only at the positions its author typed out).
+
+    Under the choke point the property needs no expected-output table: if the
+    renderer READ the field, the recorder fired and the disclosure is in the
+    output. So for a field the renderer demonstrably CONSUMES -- proven by a
+    well-formed value changing the rendering -- a malformed one must disclose.
+    Accepting "renders identically to absent" for a consumed field would be
+    circular with the AST guard, which is exactly the reasoning that let earlier
+    rounds call this class closed.
+
+    A RAISE is a failure too: soft-degrading is the whole point of #619, so a
+    renderer that survives an absent field and dies on a malformed one has
+    regressed to the crash this replaced."""
+    from bn import formatters
+
+    checked, silent, raised = 0, [], []
+    for fn_name, render, key, kind in _top_level_render_sites():
         try:
             absent = render({})
         except Exception:                          # unrelated shape requirement
             continue
-        for key in keys:
-            for bogus in _MALFORMED[kind]:
-                try:
-                    out = render({key: bogus})
-                except Exception:
-                    continue
-                checked += 1
-                # Three honest outcomes: disclosed; provably never consumed
-                # (byte-identical to absent); or the payload echoed verbatim by
-                # the raw fallback, which hides nothing at all.
-                if ("malformed" in out or out == absent
-                        or out == formatters._render_fallback_text({key: bogus})):
-                    continue
+        echoes = formatters._render_fallback_text          # the raw-payload dump
+        try:
+            well_formed = render({key: _WELL_FORMED[kind]})
+        except Exception:
+            well_formed = absent
+        # A renderer that falls through to the raw payload dump "changes output"
+        # for any value at all, which is not evidence that it CONSUMED the field.
+        consumed = (well_formed != absent
+                    and well_formed != echoes({key: _WELL_FORMED[kind]}))
+        for bogus in _MALFORMED[kind]:
+            try:
+                out = render({key: bogus})
+            except Exception as exc:
+                raised.append(f"{fn_name}({key}={bogus!r}) raised {type(exc).__name__} "
+                              f"where the absent payload rendered cleanly")
+                continue
+            checked += 1
+            # Disclosed, or echoed verbatim by the raw fallback -- which hides
+            # nothing at all, so there is nothing to disclose.
+            if "malformed" in out or out == echoes({key: bogus}):
+                continue
+            if consumed:
+                silent.append(f"{fn_name}({key}={bogus!r}) is a field this renderer "
+                              f"demonstrably consumes, and the malformed value is "
+                              f"not disclosed")
+            elif out != absent:
                 silent.append(f"{fn_name}({key}={bogus!r}) renders as a result with "
                               f"no disclosure and differs from the absent rendering")
-    assert checked >= 200, f"differential ran on only {checked} cases -- not enumerated"
+    assert not raised, raised[:8]
+    assert checked >= 520, f"differential ran on only {checked} cases -- not enumerated"
     assert not silent, silent[:8]
 
 
@@ -1243,31 +1416,22 @@ def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
     at a genuinely empty result would teach a caller to ignore the signal, which
     destroys it while appearing to fix it. Every top-level coerced field, with
     the value absent, empty, or an explicit null."""
-    from bn import formatters
-
-    sites, _ = _coercion_sites()
-    assert sites, "AST walk found no coercion sites at all -- the mirror is blind"
     noisy, checked = [], 0
-    for fn_name, keys, kind, top in sites:
-        render = getattr(formatters, fn_name, None)
-        if not top or render is None or not fn_name.startswith("_render"):
-            continue
+    for fn_name, render, key, kind in _top_level_render_sites():
         empty: object = [] if kind == "list" else {}
-        for key in keys:
-            for payload in ({}, {key: empty}, {key: None}):
-                try:
-                    out = render(payload)
-                except (AttributeError, TypeError, KeyError, IndexError, ValueError):
-                    # The renderer's own shape requirement, not a disclosure bug.
-                    # Narrowed from a bare `except Exception` so anything else --
-                    # including a raise the recorder itself introduces -- fails
-                    # here instead of being swallowed, and `checked` bounds how
-                    # vacuous the remainder is allowed to become.
-                    continue
-                checked += 1
-                if "malformed" in out:
-                    noisy.append(f"{fn_name}({key}) on {payload!r}")
-    assert checked >= 100, f"mirror ran on only {checked} payloads -- not enumerated"
+        for payload in ({}, {key: empty}, {key: None}):
+            try:
+                out = render(payload)
+            except (AttributeError, TypeError, KeyError, IndexError, ValueError):
+                # The renderer's own shape requirement, not a disclosure bug.
+                # Narrowed from a bare `except Exception` so anything else fails
+                # here instead of being swallowed, and `checked` bounds how
+                # vacuous the remainder is allowed to become.
+                continue
+            checked += 1
+            if "malformed" in out:
+                noisy.append(f"{fn_name}({key}) on {payload!r}")
+    assert checked >= 260, f"mirror ran on only {checked} payloads -- not enumerated"
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
 
 
@@ -1534,6 +1698,51 @@ def test_orient_skewed_section_listing_is_a_superset_of_the_empty_one():
     assert "malformed items field" in skewed
     assert skewed.startswith(empty)
     assert "sections" not in absent                  # absent claims nothing
+
+
+def test_an_explicit_null_listing_claims_nothing_and_renders_no_count_row():
+    # The other half of the same row, and the trap the superset fix fell into:
+    # the renderer must use the CHOKE POINT's definition of PRESENT. Spelling it
+    # `"items" in secs` disagreed with `_field_list` about an explicit null and
+    # printed a confident `sections: 0` -- and, with a sibling total, printed
+    # that total -- for a payload that had claimed nothing at all.
+    from bn.formatters import _render_orient_text
+    nulled = _render_orient_text({"sections": {"items": None}})
+    assert "sections" not in nulled
+    assert "malformed" not in nulled
+    assert nulled == _render_orient_text({})
+    # A null alongside a total is the loudest version: the total must not be
+    # rendered as if a listing had come back.
+    assert "sections" not in _render_orient_text({"sections": {"items": None, "total": 7}})
+
+
+def test_the_class_count_only_envelope_still_discloses_a_falsy_wrong_listing():
+    # #484's count-only branch decided on the raw containers' truth and returned
+    # BEFORE the recorded read ran, so a falsy wrong-shaped listing rendered the
+    # count line byte-identically to the listing simply being absent. Reading
+    # through the choke point first leaves the branch alone and still discloses.
+    from bn.formatters import _render_class_list_text
+    bare = _render_class_list_text({"count": 3})
+    assert bare == "classes: 3"
+    for bogus in ({}, 0, "", False):
+        out = _render_class_list_text({"count": 3, "items": bogus})
+        assert out.startswith("classes: 3"), bogus     # superset of the bare row
+        assert "malformed items field" in out, bogus
+    # A genuinely empty listing is a real count-only envelope and stays quiet.
+    assert _render_class_list_text({"count": 3, "items": []}) == bare
+
+
+def test_class_show_renders_a_declared_but_unnamed_base_instead_of_dropping_it():
+    # An element filter on the base list turned "has an unnamed base" into "has
+    # no such base" in a hierarchy view -- a silent drop, in the direction that
+    # understates what the payload declared.
+    from bn.formatters import _render_class_show_text
+    rec = {"name": "Widget", "confidence": "rtti"}
+    assert "base: ?, A" in _render_class_show_text({**rec, "bases": [{}, {"name": "A"}]})
+    assert "base: ?" in _render_class_show_text({**rec, "bases": [{}]})
+    assert "base: ?" in _render_class_show_text({**rec, "bases": [None]})
+    # A genuinely empty base list still means "no bases", so no clause at all.
+    assert "base:" not in _render_class_show_text({**rec, "bases": []})
 
 
 def test_render_evidence_shows_argument_confidence_and_variadic():
@@ -1911,27 +2120,29 @@ def test_go_rename_summary_shares_one_builder_with_the_mutation_summary(monkeypa
     from bn import formatters
 
     real_builder = formatters._build_mutation_summary
-    calls: list[dict] = []
-
-    def spy(**kwargs):
-        calls.append(kwargs)
-        return real_builder(**kwargs)
-
-    monkeypatch.setattr(formatters, "_build_mutation_summary", spy)
-
-    measured = formatters._mutation_summary({
+    measured_payload = {
         "success": True, "committed": True, "preview": False, "rolled_back": False,
-        "results": [{"status": "verified"}]})
-    go = formatters._go_rename_summary({
+        "results": [{"status": "verified"}]}
+    go_payload = {
         "kind": "go_rename", "success": True, "committed": True, "preview": False,
         "rolled_back": False, "results": [], "go_renamed_candidates": 3,
         "go_committed_count": 3, "go_verified_count": 3, "go_failed_count": 0,
-        "skipped_user_named": 1})
+        "skipped_user_named": 1}
 
-    # One builder produced both -- neither path can drift from the other again.
-    assert len(calls) == 2
+    measured = formatters._mutation_summary(dict(measured_payload))
+    go = formatters._go_rename_summary(dict(go_payload))
     assert measured["changed_count"] == 1 and go["changed_count"] == 3
     assert set(measured) == set(go)
+
+    # One builder produced both, proven by CONSUMER-OBSERVABLE output: a change
+    # made in the builder has to appear in both summaries. A call count would
+    # only say each path called something; this says neither has a literal of
+    # its own that a builder change would leave behind.
+    monkeypatch.setattr(formatters, "_build_mutation_summary",
+                        lambda **kw: {**real_builder(**kw), "reached_via_builder": True})
+    assert formatters._mutation_summary(dict(measured_payload))["reached_via_builder"]
+    assert formatters._go_rename_summary(dict(go_payload))["reached_via_builder"]
+    monkeypatch.setattr(formatters, "_build_mutation_summary", real_builder)
 
     # A preview whose revert failed: zero failure rows, explanation only in the
     # top-level message. Both paths must call it dirty AND carry the error --
@@ -1965,3 +2176,89 @@ def test_go_rename_summary_shares_one_builder_with_the_mutation_summary(monkeypa
         "go_failed_count": 1, "skipped_user_named": 0})
     assert mutation_row["failed_count"] == go_row["failed_count"] == 1
     assert mutation_row["first_error"] == go_row["first_error"] == reason
+
+
+def test_the_compact_summary_ok_key_mirrors_success_on_every_outcome():
+    """#447: `.ok` exists so one `jq '.ok'` works across reads AND mutations. It
+    is only worth having if it TRACKS the outcome -- a hardcoded true is strictly
+    worse than the null it replaced, because a failed or rolled-back mutation
+    would then report success to the control loop that was told to trust it.
+
+    Enumerated over the outcome space rather than one example: the previous cover
+    was a single `assert out["ok"] is True`, which a literal `True` satisfies,
+    and the same literal survived the whole mocked suite."""
+    import itertools
+
+    from bn import formatters
+
+    seen = set()
+    for reported, committed, preview, rolled_back, failures in itertools.product(
+            (True, False), (True, False), (True, False), (True, False, None), (0, 1)):
+        rows = ([{"status": "failed", "message": "boom"}] if failures
+                else [{"status": "verified"}])
+        base = {"success": reported, "committed": committed, "preview": preview,
+                "rolled_back": rolled_back, "results": rows}
+        generic = formatters._mutation_summary(dict(base))
+        go = formatters._go_rename_summary({
+            **base, "kind": "go_rename", "results": rows,
+            "go_renamed_candidates": 2, "go_committed_count": 2,
+            "go_verified_count": 2, "go_failed_count": failures,
+            "skipped_user_named": 0})
+        for name, summary in (("mutation", generic), ("go rename", go)):
+            assert summary["ok"] is summary["success"], (
+                f"{name} summary reported ok={summary['ok']!r} for "
+                f"success={summary['success']!r} on {base!r}")
+            seen.add(summary["ok"])
+    # Without this the mirror is satisfiable by a constant: the population has to
+    # actually produce BOTH outcomes for the assertion above to have bitten.
+    assert seen == {True, False}, f"the outcome population only produced ok={seen}"
+
+
+def test_no_renderer_mutates_a_container_it_read_through_the_choke_point():
+    """The recording helpers hand back the payload's OWN list, so a renderer that
+    appended to one would silently edit the caller's result -- and the JSON path
+    would then emit rows the text path invented. No defensive copy is taken (that
+    would allocate on all ~190 reads to defend against nothing), so the no-mutate
+    rule is asserted instead, over every name in the module bound from a helper
+    rather than over the handful anyone happened to look at."""
+    import ast
+    import inspect
+
+    from bn import formatters
+
+    tree = ast.parse(inspect.getsource(formatters))
+    MUTATORS = ("append", "extend", "insert", "sort", "reverse", "pop", "clear",
+                "remove", "update", "setdefault", "popitem")
+    RECORDERS = ("_field_list", "_field_dict")
+    offenders, watched = [], set()
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        held = {t.id
+                for node in ast.walk(fn) if isinstance(node, ast.Assign)
+                for t in node.targets
+                if isinstance(t, ast.Name) and isinstance(node.value, ast.Call)
+                and isinstance(node.value.func, ast.Name)
+                and node.value.func.id in RECORDERS}
+        watched |= held
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in MUTATORS
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in held):
+                offenders.append(f"{fn.name}: {ast.unparse(node)}")
+            if isinstance(node, (ast.AugAssign, ast.Delete)):
+                targets = [node.target] if isinstance(node, ast.AugAssign) else node.targets
+                for t in targets:
+                    name = t.value if isinstance(t, ast.Subscript) else t
+                    if isinstance(name, ast.Name) and name.id in held:
+                        offenders.append(f"{fn.name}: {ast.unparse(node)}")
+            if isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if (isinstance(t, ast.Subscript) and isinstance(t.value, ast.Name)
+                            and t.value.id in held):
+                        offenders.append(f"{fn.name}: {ast.unparse(node)}")
+    assert watched, "no name is bound from a recording helper -- the scan is blind"
+    assert not offenders, (
+        "a renderer mutates a container it read through the recording helpers, "
+        f"which is the CALLER's object, not a copy: {offenders[:6]}")

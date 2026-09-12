@@ -99,13 +99,18 @@ def _field_list(source: Any, *keys: str) -> list[Any]:
     """``source[key]`` as a list, recording the skew when the key is PRESENT but
     holds something that is neither ``None`` nor a list, at ANY depth.
 
-    Three states, kept distinct here so no caller has to re-derive them: ABSENT
-    (key missing, or an explicit null -- nothing was claimed), PRESENT-AND-EMPTY
-    (a real result: we looked and found none), and PRESENT-BUT-WRONG-SHAPE (a
-    skew to disclose). Testing the raw value for TRUTH instead of presence
-    collapsed the third into the first for every FALSY wrong shape -- ``0``,
-    ``""``, ``False``, a ``{}`` where a list belongs -- which rendered a payload
-    the renderer could not use as a confident empty result (#619).
+    Three states, and the return value alone cannot carry all three -- it is a
+    list, so ABSENT and PRESENT-AND-EMPTY both arrive as ``[]``. A renderer that
+    must tell them apart asks ``_field_present``; it must never re-derive the
+    answer from the raw payload, because a second definition of PRESENT drifts
+    from this one (a round-6 repair did exactly that, and fabricated a count row
+    for an explicit null). ABSENT is a missing key OR an explicit null -- nothing
+    was claimed. PRESENT-AND-EMPTY is a real result: we looked and found none.
+    PRESENT-BUT-WRONG-SHAPE is a skew to disclose. Testing the raw value for
+    TRUTH instead of presence collapsed the third into the first for every FALSY
+    wrong shape -- ``0``, ``""``, ``False``, a ``{}`` where a list belongs --
+    which rendered a payload the renderer could not use as a confident empty
+    result (#619).
 
     Extra ``keys`` are retained aliases (#651): the first that actually holds a
     non-empty list wins. ``source.get("items") or source.get("locals")`` instead
@@ -139,6 +144,20 @@ def _field_dict(source: Any, key: str) -> dict[str, Any]:
     if raw is not None:
         _record_skew(key)
     return {}
+
+
+def _field_present(source: Any, key: str) -> bool:
+    """Whether ``source[key]`` CLAIMED anything: the key is there and is not an
+    explicit null.
+
+    The single definition of PRESENT, so a renderer that has to tell "we looked
+    and found none" from "nothing was said" cannot drift from what
+    ``_field_list``/``_field_dict`` mean by it. Both read an explicit null as
+    ABSENT; a renderer that spelled the same test as ``key in source`` disagreed
+    with them about null and printed a confident zero for a payload that claimed
+    nothing (#619)."""
+    src = _as_dict(source)
+    return key in src and src[key] is not None
 
 
 def _discloses(fn: Callable[..., str]) -> Callable[..., str]:
@@ -1421,8 +1440,13 @@ def _group_refs_by_caller(refs: list[Any]) -> list[dict[str, Any]]:
             continue
         # Through the choke point, so a malformed `caller_function` discloses
         # itself rather than silently grouping the ref as if it had no
-        # containing function. A PRESENT but empty dict still takes the function
-        # branch, exactly as it did before the coercion moved here (#619).
+        # containing function. The second test asks a different question from
+        # `_field_present` -- "did it hold a usable dict?", not "did it claim
+        # anything?" -- so a PRESENT but empty dict still takes the function
+        # branch as it did before, while a malformed one keeps grouping by its
+        # own label. Using presence here instead would merge refs with DIFFERENT
+        # malformed callers into one group and lose their separate contexts,
+        # which is the collapsing this grouping exists to prevent (#619).
         caller = _field_dict(ref, "caller_function")
         key: tuple
         if caller or isinstance(ref.get("caller_function"), dict):
@@ -2275,8 +2299,11 @@ def _render_orient_text(value: Any) -> str:
     sec_items = _field_list(secs, "items")
     # Present-and-empty and present-but-malformed both render the count row, so
     # the malformed rendering is a strict SUPERSET of the empty one (the note is
-    # appended by the decorator); only a genuinely ABSENT listing omits it.
-    if sec_items or "items" in secs:
+    # appended by the decorator); a genuinely ABSENT listing omits it. PRESENT is
+    # asked of the choke point, never re-derived: spelling it `"items" in secs`
+    # disagreed with the helper about an explicit null and printed a confident
+    # `sections: 0` for a payload that had claimed nothing (#619).
+    if sec_items or _field_present(secs, "items"):
         names = " ".join(str(s.get("name", "?")) for s in sec_items[:12] if isinstance(s, dict))
         lines.append(f"  sections: {secs.get('total', len(sec_items))}  {names}")
     ea = value.get("existing_annotations")
@@ -4251,14 +4278,20 @@ def _class_inputs_note(value: Any) -> str:
 def _render_class_list_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    # #484 count-only: a bare count envelope (no items), with the non-class artifact
-    # (#481) share broken out so the domain-class count is honest.
+    # The recorded read happens BEFORE the count-only branch, never after it.
+    # #484 count-only is a bare count envelope (no items), with the non-class
+    # artifact (#481) share broken out so the domain-class count is honest --
+    # but deciding that on the raw containers' truth returned before the choke
+    # point ran, so a FALSY wrong-shaped listing (`{}`, `0`, `""`, `False`)
+    # rendered the count line as if the listing had simply been absent, with no
+    # disclosure. Reading first leaves the branch condition alone and still
+    # makes the skew reach the note (#619).
+    rows = _field_list(value, "items", "classes")
     if "count" in value and not value.get("items") and not value.get("classes"):
         n = value.get("count", 0)
         art = value.get("artifact_count") or 0
         tail = f" ({art} non-class RTTI/type artifact{'s' if art != 1 else ''})" if art else ""
         return f"classes: {n}{tail}{_class_inputs_note(value)}"
-    rows = _field_list(value, "items", "classes")
     total = value.get("total", len(rows))
     header = f"classes: {len(rows)} shown of {total}"
     # Surface what was folded out so the count is self-documenting (#205/#309).
@@ -4348,8 +4381,11 @@ def _render_one_class(rec: Any) -> str:
     # degrade to, and every read below already treats it as "no vtable".
     vt = _field_dict(rec, "vtable")
     vt_addr = vt.get("address")
-    bases = ", ".join((b.get("name") or "?") if isinstance(b, dict) else str(b)
-                      for b in _field_list(rec, "bases") if b)
+    # No element filter: a declared but EMPTY base entry is a base the payload
+    # claimed, so it renders as `?` the way base rendered it. Dropping it turned
+    # "has an unnamed base" into "has no such base" in a hierarchy view (#619).
+    bases = ", ".join((b.get("name") or "?") if isinstance(b, dict) else (str(b) if b else "?")
+                      for b in _field_list(rec, "bases"))
     head = f"class {rec.get('name', '<unknown>')}"
     bits = []
     if size_s:
