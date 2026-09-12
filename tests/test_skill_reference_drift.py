@@ -89,11 +89,31 @@ def _index_section() -> str:
     return text.split(COMMAND_INDEX_HEADING, 1)[1].split("\n## ", 1)[0]
 
 
+# One index entry, whole: a fully backticked command whose last word may carry
+# `/`-separated alternatives. Matched with `fullmatch` against the WHOLE entry,
+# never searched for inside it -- a `re.findall` over the line silently drops
+# every entry it cannot read, which is the same "advertised but undocumented"
+# hole this guard exists to close.
+_INDEX_ENTRY = re.compile(r"`([a-z][a-z ]*(?:/[a-z]+)*)`")
+
+# ```bash blocks are how this reference presents a command an agent can run.
+_BASH_BLOCK = re.compile(r"```bash\n(.*?)```", re.S)
+
+
 def _expand(entry: str) -> list[str]:
     """`struct field set/rename/delete` -> the three full command strings."""
     words = entry.split()
     prefix, last = words[:-1], words[-1]
     return [" ".join([*prefix, alt]) for alt in last.split("/")]
+
+
+def _index_entries(line: str) -> list[str]:
+    """Every comma-separated entry between the index line's em dash and its
+    `->` pointer. Returns them RAW so the caller can reject what it cannot read
+    rather than skipping it."""
+    assert "—" in line and "→" in line, f"unrecognised index line shape: {line}"
+    body = line.split("—", 1)[1].split("→", 1)[0]
+    return [entry.strip() for entry in body.split(",") if entry.strip()]
 
 
 def test_skill_mutate_index_entries_are_documented_where_the_index_points():
@@ -103,23 +123,32 @@ def test_skill_mutate_index_entries_are_documented_where_the_index_points():
     whose reference file never mentioned it, which sends an agent that followed
     the pointer to a file with no entry and no flags for the command it came for.
 
-    `bn <command>` (not a bare backticked mention) is the bar on purpose: a
-    passing reference to a command name in prose about something else is not
-    documentation an agent can run.
+    Two things this guard must not do, because both restore the defect while
+    staying green: skip an entry it cannot parse (so an entry that grows a
+    parenthetical, a capital or a stray space stops being checked), and accept a
+    passing mention in prose as documentation. So EVERY entry must parse, and
+    the bar is a runnable `bn <command>` line inside a ```bash block.
     """
     mutate_lines = [line for line in _index_section().splitlines()
                     if line.startswith("- **Mutate**")]
     assert len(mutate_lines) == 1, f"expected exactly one Mutate index line, got {len(mutate_lines)}"
     line = mutate_lines[0]
     assert "reference/mutating.md" in line, "the Mutate line must name the reference it points at"
-    commands = [full for entry in re.findall(r"`([a-z][a-z ]*(?:/[a-z]+)*)`", line)
-                for full in _expand(entry)]
-    assert len(commands) >= 10, f"the Mutate line parsed to too few commands: {commands}"
-    text = MUTATING.read_text(encoding="utf-8")
-    missing = [cmd for cmd in commands if f"bn {cmd}" not in text]
+    entries = _index_entries(line)
+    assert len(entries) >= 10, f"the Mutate line parsed to too few entries: {entries}"
+    unreadable = [entry for entry in entries if not _INDEX_ENTRY.fullmatch(entry)]
+    assert not unreadable, (
+        "these Mutate index entries are not a plain backticked command, so this "
+        f"guard cannot check them and must not pretend it did: {unreadable}"
+    )
+    commands = [full for entry in entries
+                for full in _expand(_INDEX_ENTRY.fullmatch(entry).group(1))]
+    runnable = "\n".join(_BASH_BLOCK.findall(MUTATING.read_text(encoding="utf-8")))
+    missing = [cmd for cmd in commands
+               if not re.search(rf"^\s*bn {re.escape(cmd)}\b", runnable, re.M)]
     assert not missing, (
         "the SKILL.md Mutate index points at reference/mutating.md for commands "
-        f"that file never documents: {missing}"
+        f"that file never shows as a runnable command: {missing}"
     )
 
 

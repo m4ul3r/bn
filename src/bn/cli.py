@@ -741,6 +741,19 @@ def _render_result(
     return False
 
 
+# What a malformed or version-skewed bridge result does to code that parses,
+# aggregates or renders it. `main()` catches only `BridgeError`, so anything
+# escaping one of those steps leaves as a raw traceback and a process exit the
+# documented 0/1/2/3/4 contract does not list (#101). `ArithmeticError` is in
+# the set because these steps also AGGREGATE wire numbers and JSON bounds no
+# numeric literal: `1e999` round-trips through `json` as `float("inf")`, and
+# `int(inf)` raises `OverflowError`. `BridgeError` is deliberately absent --
+# code that raises one already says exactly what it means.
+_MALFORMED_RESULT_ERRORS = (
+    AttributeError, TypeError, KeyError, IndexError, ValueError, ArithmeticError,
+)
+
+
 def _emit_result(
     args: argparse.Namespace,
     result: Any,
@@ -763,7 +776,7 @@ def _emit_result(
     if text_renderer is not None and fmt == "text":
         try:
             result = text_renderer(result)
-        except (AttributeError, TypeError, KeyError, IndexError, ValueError) as exc:
+        except _MALFORMED_RESULT_ERRORS as exc:
             raise BridgeError(
                 f"could not render the {stem} result as text -- the bridge response was "
                 f"malformed or newer than this CLI. Rerun with --format json to see the "
@@ -1031,8 +1044,7 @@ def _mutation_exit_code(result: Any, summary: Callable[[Any], Any] | None = None
     if summary is not None:
         try:
             compact = summary(result)
-        except (AttributeError, TypeError, KeyError, IndexError, ValueError,
-                ArithmeticError) as exc:
+        except _MALFORMED_RESULT_ERRORS as exc:
             # Deriving the exit code RUNS the transform, and `_call` computes the
             # exit code before the renderer's malformed-result guard (#101), so
             # this is now the first place a version-skewed result is parsed. It
@@ -1041,13 +1053,6 @@ def _mutation_exit_code(result: Any, summary: Callable[[Any], Any] | None = None
             # which catches only BridgeError. Exit 0 is not an option -- the
             # whole point of #715 is that a result the CLI cannot classify must
             # not read as a confirmed success.
-            #
-            # `ArithmeticError` is here and not in the renderer guard because
-            # this call AGGREGATES wire numbers rather than formatting them:
-            # JSON bounds no numeric literal, so `1e999` decodes to `float(inf)`
-            # and `int(inf)` raises `OverflowError`. `BridgeError` is
-            # deliberately absent -- a transform that raises one already means
-            # exactly what it says, and must pass through unwrapped.
             raise BridgeError(
                 f"could not classify the mutation result -- the bridge response was "
                 f"malformed or newer than this CLI. Rerun with --format json to see the "
@@ -1288,13 +1293,25 @@ def _call(
     _maybe_regex_hint(args, result, regex_hint_query)
     _maybe_offset_hint(args, result, offset_hint_identifier)
     if result_transform is not None:
-        result = result_transform(result)
+        try:
+            result = result_transform(result)
+        except _MALFORMED_RESULT_ERRORS as exc:
+            # Same contract as the renderer guard below, and needed on its own:
+            # a FAILING mutation short-circuits to exit 3 before the exit-code
+            # helper ever runs its transform, so this is the first place that
+            # result is parsed -- and it was crashing out with a raw traceback
+            # after the exit code had already been decided.
+            raise BridgeError(
+                f"could not summarize the {op} result -- the bridge response was "
+                f"malformed or newer than this CLI. Rerun with --format json to see the "
+                f"raw result. ({type(exc).__name__}: {exc})"
+            ) from exc
     spill_context = result
     fmt = _resolve_output_format(args)
     if text_renderer is not None and fmt == "text":
         try:
             result = text_renderer(result)
-        except (AttributeError, TypeError, KeyError, IndexError, ValueError) as exc:
+        except _MALFORMED_RESULT_ERRORS as exc:
             # A malformed/unexpected bridge result (version skew, future protocol
             # change) must not crash a text renderer with a raw traceback -- that
             # breaks the exit-code contract (main() only catches BridgeError).

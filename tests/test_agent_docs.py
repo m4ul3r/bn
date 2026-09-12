@@ -200,20 +200,23 @@ def test_cli_layout_names_every_top_level_module():
     pointer to the page-aggregation helper and re-implemented paging in the
     handler.
 
-    Only a line that *introduces* a module counts: its leading backticked token,
-    which is how the `- ` list items and the section's lead sentence (`cli.py`)
-    name theirs. The body also mentions modules in passing -- the `version.py`
-    bullet compares itself to `paths.py`, and the symlink sentence below the list
-    names `version.py` again -- so anything looser lets a module leave the
-    inventory with the guard still green. One directory glob, and any deliberate
-    omission named in `CLI_LAYOUT_INTERNAL_MODULES`.
+    Only an INVENTORY ENTRY counts: a `- ` list item, or the section's lead
+    sentence (which is how `cli.py` is introduced). Two looser readings both
+    let a module leave the inventory with the guard still green, so neither is
+    used: "named anywhere in the section" is satisfied by the `version.py`
+    bullet's aside about `paths.py` and by the symlink sentence below the list,
+    and "leading backticked token of any line" is satisfied by replacing a
+    bullet with a bare prose mention that documents nothing. One directory glob,
+    and any deliberate omission named in `CLI_LAYOUT_INTERNAL_MODULES`.
     """
-    section = _claude_md_section(CLI_LAYOUT_HEADING)
+    lines = _claude_md_section(CLI_LAYOUT_HEADING).splitlines()
+    lead = next((line for line in lines if line.strip()), "")
+    entries = [line for line in lines if line.startswith("- ")]
+    assert entries, f"the {CLI_LAYOUT_HEADING} section has no `- ` inventory entries"
     introduced = {
         match.group(1)
-        for line in section.splitlines()
-        if not line.startswith((" ", "\t"))
-        if (match := re.match(r"(?:- )?`([^`]+)`", line.strip()))
+        for line in [lead, *entries]
+        if (match := re.match(r"(?:- )?`([^`]+)`", line))
     }
     modules = sorted(
         path.name

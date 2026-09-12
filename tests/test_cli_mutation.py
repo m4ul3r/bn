@@ -1154,6 +1154,27 @@ def test_unclassifiable_mutation_result_covers_overflowed_wire_numbers(monkeypat
     assert "malformed or newer than this CLI" in capsys.readouterr().err
 
 
+def test_unclassifiable_failing_mutation_result_is_still_a_clean_exit(monkeypatch, capsys):
+    """A FAILING result short-circuits to exit 3 before the summary transform is
+    ever run, so the exit-code guard never sees it -- and `_call` then renders
+    with that same transform. Both paths must survive an unparseable result: the
+    process must leave with a documented code and a documented message, never a
+    traceback (exit 1) after the exit code was already decided.
+    """
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": {"kind": "go_rename", "preview": False,
+                                       "success": False, "committed": False,
+                                       "go_renamed_candidates": "many",
+                                       "results": [{"status": "verification_failed"}]}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["go", "rename", "--target", "active"])
+
+    assert rc in (2, 3), rc
+    assert "malformed or newer than this CLI" in capsys.readouterr().err
+
+
 def test_unclassifiable_mutation_result_is_a_clean_bridge_error(monkeypatch, capsys):
     """The #715 exit code is derived by RUNNING the compact-summary transform,
     and `_call` computes it before the renderer's malformed-result guard (#101).
