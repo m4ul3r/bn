@@ -1048,15 +1048,21 @@ def _mutation_exit_code(result: Any, summary: Callable[[Any], Any] | None = None
             # Deriving the exit code RUNS the transform, and `_call` computes the
             # exit code before the renderer's malformed-result guard (#101), so
             # this is now the first place a version-skewed result is parsed. It
-            # must fail the same documented way: a clean BridgeError (exit 2)
-            # pointing at --format json, never a raw traceback out of `main()`,
-            # which catches only BridgeError. Exit 0 is not an option -- the
-            # whole point of #715 is that a result the CLI cannot classify must
-            # not read as a confirmed success.
+            # must fail the documented way: a clean BridgeError (exit 2), never a
+            # raw traceback out of `main()`, which catches only BridgeError.
+            # Exit 0 is not an option -- the whole point of #715 is that a result
+            # the CLI cannot classify must not read as a confirmed success.
+            #
+            # Deliberately NOT the renderer guard's "rerun with --format json to
+            # see the raw result": that guard runs after this one, so on this
+            # path --format json returns this same error envelope. Advice that
+            # reproduces the error is worse than none; point at the version skew
+            # the message just diagnosed.
             raise BridgeError(
                 f"could not classify the mutation result -- the bridge response was "
-                f"malformed or newer than this CLI. Rerun with --format json to see the "
-                f"raw result. ({type(exc).__name__}: {exc})"
+                f"malformed or newer than this CLI, so the outcome could not be "
+                f"determined. Compare the bridge and CLI builds with `bn doctor`. "
+                f"({type(exc).__name__}: {exc})"
             ) from exc
         if isinstance(compact, dict) and compact.get("measured") is False:
             return 4
@@ -1296,15 +1302,18 @@ def _call(
         try:
             result = result_transform(result)
         except _MALFORMED_RESULT_ERRORS as exc:
-            # Same contract as the renderer guard below, and needed on its own:
-            # a FAILING mutation short-circuits to exit 3 before the exit-code
-            # helper ever runs its transform, so this is the first place that
-            # result is parsed -- and it was crashing out with a raw traceback
-            # after the exit code had already been decided.
+            # Needed on its own: a FAILING mutation short-circuits to exit 3
+            # before the exit-code helper ever runs its transform, so this is
+            # the first place that result is parsed -- and it was crashing out
+            # with a raw traceback after the exit code had already been decided.
+            # Like the classification guard, and unlike the renderer guard
+            # below, this runs BEFORE the format is applied, so --format json
+            # would return this same envelope: do not advertise it.
             raise BridgeError(
                 f"could not summarize the {op} result -- the bridge response was "
-                f"malformed or newer than this CLI. Rerun with --format json to see the "
-                f"raw result. ({type(exc).__name__}: {exc})"
+                f"malformed or newer than this CLI, so the outcome could not be "
+                f"determined. Compare the bridge and CLI builds with `bn doctor`. "
+                f"({type(exc).__name__}: {exc})"
             ) from exc
     spill_context = result
     fmt = _resolve_output_format(args)

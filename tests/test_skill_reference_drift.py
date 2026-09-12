@@ -89,15 +89,21 @@ def _index_section() -> str:
     return text.split(COMMAND_INDEX_HEADING, 1)[1].split("\n## ", 1)[0]
 
 
-# One index entry, whole: a fully backticked command whose last word may carry
-# `/`-separated alternatives. Matched with `fullmatch` against the WHOLE entry,
-# never searched for inside it -- a `re.findall` over the line silently drops
-# every entry it cannot read, which is the same "advertised but undocumented"
-# hole this guard exists to close.
-_INDEX_ENTRY = re.compile(r"`([a-z][a-z ]*(?:/[a-z]+)*)`")
+# One index entry, WHOLE: a backticked command whose last word may carry
+# `/`-separated alternatives and an optional `[subcommand]` marker, plus an
+# optional parenthetical gloss. Matched with `fullmatch` against the whole
+# entry, never searched for inside it -- a `re.findall` over the line silently
+# drops every entry it cannot read, which is the same "advertised but
+# undocumented" hole this guard exists to close.
+_INDEX_ENTRY = re.compile(
+    r"`(?P<cmd>[a-z][a-z ]*(?:/[a-z]+)*)(?: \[[a-z]+\])?`(?: \([^)]*\))?"
+)
 
-# ```bash blocks are how this reference presents a command an agent can run.
+# ```bash blocks are how every reference presents a command an agent can run.
 _BASH_BLOCK = re.compile(r"```bash\n(.*?)```", re.S)
+
+# The index line's own pointer: `- **<Group>** … → **`reference/<file>.md`**`.
+_INDEX_REFERENCE = re.compile(r"`(reference/[a-z_]+\.md)`")
 
 
 def _expand(entry: str) -> list[str]:
@@ -116,12 +122,21 @@ def _index_entries(line: str) -> list[str]:
     return [entry.strip() for entry in body.split(",") if entry.strip()]
 
 
-def test_skill_mutate_index_entries_are_documented_where_the_index_points():
-    """#627: naming a group in the index is only half the map -- the line ends
-    in `-> reference/mutating.md`, so every command it advertises must actually
-    be documented there. The first cut of the widened index added a mutation
-    whose reference file never mentioned it, which sends an agent that followed
-    the pointer to a file with no entry and no flags for the command it came for.
+def _index_lines() -> list[str]:
+    lines = [line for line in _index_section().splitlines() if line.startswith("- **")]
+    assert len(lines) >= 4, f"the Command index lost its group lines: {lines}"
+    return lines
+
+
+@pytest.mark.parametrize("line", _index_lines(), ids=lambda line: line.split("**")[1])
+def test_skill_index_entries_are_documented_where_the_index_points(line):
+    """#627: naming a group in the index is only half the map -- each line ends
+    in `-> reference/<file>.md`, so every command it advertises must actually be
+    documented in THAT file. The first cut of the widened index advertised a
+    mutation whose reference never mentioned it, and pointed the read line at a
+    reference that catalogued one of its commands in a different file; both send
+    an agent that followed the pointer to a file with no entry for the command
+    it came for.
 
     Two things this guard must not do, because both restore the defect while
     staying green: skip an entry it cannot parse (so an entry that grows a
@@ -129,26 +144,24 @@ def test_skill_mutate_index_entries_are_documented_where_the_index_points():
     passing mention in prose as documentation. So EVERY entry must parse, and
     the bar is a runnable `bn <command>` line inside a ```bash block.
     """
-    mutate_lines = [line for line in _index_section().splitlines()
-                    if line.startswith("- **Mutate**")]
-    assert len(mutate_lines) == 1, f"expected exactly one Mutate index line, got {len(mutate_lines)}"
-    line = mutate_lines[0]
-    assert "reference/mutating.md" in line, "the Mutate line must name the reference it points at"
+    reference = _INDEX_REFERENCE.search(line)
+    assert reference, f"index line names no reference file: {line}"
     entries = _index_entries(line)
-    assert len(entries) >= 10, f"the Mutate line parsed to too few entries: {entries}"
+    assert entries, f"index line advertises nothing: {line}"
     unreadable = [entry for entry in entries if not _INDEX_ENTRY.fullmatch(entry)]
     assert not unreadable, (
-        "these Mutate index entries are not a plain backticked command, so this "
-        f"guard cannot check them and must not pretend it did: {unreadable}"
+        "these index entries are not a plain backticked command, so this guard "
+        f"cannot check them and must not pretend it did: {unreadable}"
     )
     commands = [full for entry in entries
-                for full in _expand(_INDEX_ENTRY.fullmatch(entry).group(1))]
-    runnable = "\n".join(_BASH_BLOCK.findall(MUTATING.read_text(encoding="utf-8")))
+                for full in _expand(_INDEX_ENTRY.fullmatch(entry).group("cmd"))]
+    text = (REFERENCE.parent / reference.group(1)).read_text(encoding="utf-8")
+    runnable = "\n".join(_BASH_BLOCK.findall(text))
     missing = [cmd for cmd in commands
                if not re.search(rf"^\s*bn {re.escape(cmd)}\b", runnable, re.M)]
     assert not missing, (
-        "the SKILL.md Mutate index points at reference/mutating.md for commands "
-        f"that file never shows as a runnable command: {missing}"
+        f"the SKILL.md index points at {reference.group(1)} for commands that "
+        f"file never shows as a runnable command: {missing}"
     )
 
 

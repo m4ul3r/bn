@@ -5,6 +5,7 @@ Read-command catalog for the `bn` skill. Open when surveying/decompiling. See `.
 
 ```bash
 bn target info
+bn target list [--format json]                       # open targets + their selectors; `selector` is what -t takes
 bn function list [--count] [--min-address 0x401000 --max-address 0x40ffff]
 bn function list [--sort {address|size|name}] [--reverse] [--min-size 64] [--demangle]
 bn function list [--named | --unnamed]               # meaningful names vs BN's auto sub_* (import thunks in neither)

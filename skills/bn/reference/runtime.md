@@ -66,6 +66,7 @@ bn -i <id> session status [<job-id>]     # queued/running/complete/failed
 bn session list [-i <id>]                # all running instances, or filter one
 bn session stop <id>                     # aliases: --instance-id <id>, -i <id>
 bn close [<path>] [-t <sel>] [--all]     # close one or explicitly --all
+bn refresh                               # promote a --quick view to full analysis (see "Quick-load" below)
 bn target close <sel>                    # close exactly that target (alias for `close -t <sel>`)
 bn exports [list]                         # public exported symbols
 bn help [family]                          # concise index; advertises capabilities

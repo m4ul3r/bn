@@ -1175,14 +1175,41 @@ def test_unclassifiable_failing_mutation_result_is_still_a_clean_exit(monkeypatc
     assert "malformed or newer than this CLI" in capsys.readouterr().err
 
 
+def test_unclassifiable_mutation_result_advice_is_actionable(monkeypatch, capsys):
+    """The classification guard runs BEFORE rendering, so `--format json` on the
+    same call returns this same error envelope and never the raw result. The
+    message must therefore not send the reader there -- following advice that
+    returns the identical error is how a version-skew report turns into a
+    "the CLI is broken" bug.
+    """
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": {"kind": "go_rename", "preview": False,
+                                       "success": True, "committed": True,
+                                       "go_renamed_candidates": "many",
+                                       "results": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["go", "rename", "--target", "active", "--format", "json"])
+    captured = capsys.readouterr()
+
+    # The advertised escape hatch really is closed on this path ...
+    assert rc == 2
+    assert json.loads(captured.out).get("ok") is False
+    assert "go_renamed_candidates" not in captured.out
+    # ... so the message must not advertise it.
+    assert "--format json" not in captured.err, captured.err
+    assert "bn doctor" in captured.err, captured.err
+
+
 def test_unclassifiable_mutation_result_is_a_clean_bridge_error(monkeypatch, capsys):
     """The #715 exit code is derived by RUNNING the compact-summary transform,
     and `_call` computes it before the renderer's malformed-result guard (#101).
     A version-skewed bridge result whose own counters are not numeric therefore
     reaches that transform first: it must still come out as the documented
-    `BridgeError`/exit 2 pointing at `--format json`, never as a raw traceback
-    out of `main()` (which only catches `BridgeError`) and a process exit the
-    exit-code contract does not list.
+    `BridgeError`/exit 2, never as a raw traceback out of `main()` (which only
+    catches `BridgeError`) and a process exit the exit-code contract does not
+    list. What the message may advise is pinned separately.
     """
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         return {"ok": True, "result": {"kind": "go_rename", "preview": False,
@@ -1198,7 +1225,6 @@ def test_unclassifiable_mutation_result_is_a_clean_bridge_error(monkeypatch, cap
     assert rc == 2
     err = capsys.readouterr().err
     assert "malformed or newer than this CLI" in err, err
-    assert "--format json" in err, err
 
 
 def test_unclassifiable_mutation_result_is_a_clean_bridge_error_when_compact(monkeypatch, capsys):
