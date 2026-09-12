@@ -393,9 +393,17 @@ def _registry_fields_are_well_formed(
     grammar-validated id, so anything else is corruption and is DROPPED rather
     than coerced into something plausible.
 
-    - ``socket_path`` must be an absolute path string. Coercion is what made a
-      relative or empty value resolve against the process CWD, so whether a
-      bogus record was believed depended on where the CLI was run from.
+    - ``socket_path`` must be a path string whose meaning does not depend on
+      who is asking. It is required to be absolute whenever the cache root is,
+      because a relative value would then resolve against the caller's CWD --
+      run the CLI from inside the cache and a bogus record was believed. A
+      relative value is admitted ONLY when the cache root is itself relative:
+      that is a supported answer to ``socket_too_long_message`` (the AF_UNIX
+      107-byte limit is real), the writer legitimately emits a relative path
+      there, and discovery only located this registry by resolving a relative
+      ``instances_dir()`` against the same base -- so the base is fixed by
+      construction rather than chosen by the caller. Confinement still bounds
+      the result either way.
     - ``pid`` must be a real ``int`` in the range ``os.kill`` accepts. ``int()``
       is lossy in exactly the direction that hurts: ``True``, ``"1"``, ``" 1 "``
       and ``1.9`` all become 1, and pid 1 always exists and answers EPERM. Zero
@@ -410,7 +418,9 @@ def _registry_fields_are_well_formed(
     The identity fields (``boot_id``, ``pid_start_ticks``) are validated by
     ``proc_identity``, which already refuses a wrong type there.
     """
-    if not isinstance(raw_socket_path, str) or not Path(raw_socket_path).is_absolute():
+    if not isinstance(raw_socket_path, str) or not raw_socket_path:
+        return False
+    if not Path(raw_socket_path).is_absolute() and instances_dir().is_absolute():
         return False
     if isinstance(raw_pid, bool) or not isinstance(raw_pid, int):
         return False

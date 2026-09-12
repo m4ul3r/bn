@@ -3468,3 +3468,67 @@ def test_legacy_fixed_registry_validates_its_instance_id(
         sibling.server_close()
 
     assert [inst.instance_id for inst in instances] == ["good"]
+
+
+def test_relative_cache_root_still_discovers_its_own_bridge(tmp_path, monkeypatch):
+    """The over-rejection half: a relative cache root is a supported setup.
+
+    ``socket_too_long_message`` tells the user to point BN_CACHE_DIR at a
+    shorter directory, and a relative root is how that is done against the
+    real AF_UNIX 107-byte limit. The authoritative writer then emits
+    ``str(bridge_socket_path(id))``, which is relative -- so requiring an
+    absolute socket_path silently drops a LIVE bridge, leaving `session list`
+    empty and `session stop` with no handle on a running process.
+    """
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("BN_CACHE_DIR", "c")
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    assert not inst_dir.is_absolute()          # the configuration under test
+
+    from bn.paths import bridge_socket_path
+
+    sock = bridge_socket_path("rel1")
+    server = _Server(str(sock), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    bridge_registry_path("rel1").write_text(
+        json.dumps(
+            _registry_payload(sock, pid=os.getpid(), identity=_identity(),
+                              instance_id="rel1")
+        ),
+        encoding="utf-8",
+    )
+    try:
+        instances = list_instances()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert [inst.instance_id for inst in instances] == ["rel1"]
+
+
+def test_relative_socket_path_is_refused_under_an_absolute_cache_root(
+    tmp_path, monkeypatch
+):
+    """The under-rejection half: the same value must NOT be honoured when the
+    cache root is absolute, because then it can only mean "resolve against
+    whatever directory the caller happens to be in".
+    """
+    monkeypatch.setenv("BN_CACHE_DIR", str(tmp_path))
+    inst_dir = instances_dir()
+    inst_dir.mkdir(parents=True, exist_ok=True)
+    assert inst_dir.is_absolute()
+    # The value is relative, and made to exist relative to the CWD so the
+    # record would be adopted rather than dropped on the missing-socket arm.
+    monkeypatch.chdir(inst_dir)
+    (inst_dir / "cwd.sock").write_text("", encoding="utf-8")
+    _plant_registry(inst_dir, "cwdrel", pid=os.getpid(), socket_path="cwd.sock",
+                    instance_id="cwdrel", plugin_name="bn_agent_bridge")
+    sibling = _healthy_sibling(inst_dir)
+    try:
+        instances = list_instances()
+    finally:
+        sibling.shutdown()
+        sibling.server_close()
+
+    assert [inst.instance_id for inst in instances] == ["good"]
