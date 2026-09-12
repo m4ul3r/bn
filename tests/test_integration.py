@@ -52,8 +52,15 @@ def _bn(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _session_start(*binaries: str, timeout: float = 30.0) -> dict:
+def _session_start(*binaries: str, timeout: float = 120.0) -> dict:
     # session start defaults to text output; this helper parses JSON.
+    # The budget must cover bridge spawn + BN import + FULL analysis of every
+    # fixture passed in, not just the socket round trip. A static cross-built
+    # fixture (e.g. the -static aarch64 probe) is ~1.1k functions and takes ~25s
+    # of analysis on a 6-core laptop before the ~5s bridge startup is added, so a
+    # 30s ceiling failed the aarch64 linear-decode tests on slower hardware while
+    # the same assertions passed by hand. Analysis cost scales with the fixture
+    # and the host, so keep this generous rather than tuned to one machine.
     cmd = [*_BN_CLI, "session", "start", "--format", "json"]
     cmd.extend(str(b) for b in binaries)
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=_env())
@@ -271,9 +278,14 @@ class TestProtoSetUnnamedParams:
             fn = self._first_fn(inst_id)  # a fresh-analysis function is AUTO
             res = _bn("--instance", inst_id, "proto", "set", fn,
                       f"void {fn}(int32_t, char**, char**)", "--preview", "--format", "json")
-            # A refusal is a BridgeError -> CLI exit 2, specifically (not merely
-            # nonzero): the preflight raised before any mutation (#630 round 3).
-            assert res.returncode == 2, (res.returncode, res.stdout, res.stderr)
+            # A refusal is a structured OperationFailure(status="unsupported")
+            # escaping a `_mutate`-marked call, so it lands at exit 3 (#625/#701:
+            # a FAILED_MUTATION_STATUSES status on a genuine mutation call). It is
+            # NOT exit 2 -- that is reserved for a read/resolver op sharing the
+            # status string. `status` is surfaced in the --format json envelope.
+            assert res.returncode == 3, (res.returncode, res.stdout, res.stderr)
+            payload = json.loads(res.stdout)
+            assert payload["status"] == "unsupported", payload
             assert "has_user_type" in (res.stdout + res.stderr), (res.stdout, res.stderr)
             # Pristine, checked against a source that ACTUALLY reflects has_user_type:
             # `function info` never emits the flag, so asserting on its output is
