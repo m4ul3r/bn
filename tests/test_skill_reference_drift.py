@@ -83,6 +83,46 @@ def test_skill_command_index_names_every_required_group(command_groups):
     assert not renamed, f"the index requires groups the CLI registry does not have: {renamed}"
 
 
+def _index_section() -> str:
+    text = SKILL.read_text(encoding="utf-8")
+    assert COMMAND_INDEX_HEADING in text, f"{COMMAND_INDEX_HEADING!r} is gone from SKILL.md"
+    return text.split(COMMAND_INDEX_HEADING, 1)[1].split("\n## ", 1)[0]
+
+
+def _expand(entry: str) -> list[str]:
+    """`struct field set/rename/delete` -> the three full command strings."""
+    words = entry.split()
+    prefix, last = words[:-1], words[-1]
+    return [" ".join([*prefix, alt]) for alt in last.split("/")]
+
+
+def test_skill_mutate_index_entries_are_documented_where_the_index_points():
+    """#627: naming a group in the index is only half the map -- the line ends
+    in `-> reference/mutating.md`, so every command it advertises must actually
+    be documented there. The first cut of the widened index added a mutation
+    whose reference file never mentioned it, which sends an agent that followed
+    the pointer to a file with no entry and no flags for the command it came for.
+
+    `bn <command>` (not a bare backticked mention) is the bar on purpose: a
+    passing reference to a command name in prose about something else is not
+    documentation an agent can run.
+    """
+    mutate_lines = [line for line in _index_section().splitlines()
+                    if line.startswith("- **Mutate**")]
+    assert len(mutate_lines) == 1, f"expected exactly one Mutate index line, got {len(mutate_lines)}"
+    line = mutate_lines[0]
+    assert "reference/mutating.md" in line, "the Mutate line must name the reference it points at"
+    commands = [full for entry in re.findall(r"`([a-z][a-z ]*(?:/[a-z]+)*)`", line)
+                for full in _expand(entry)]
+    assert len(commands) >= 10, f"the Mutate line parsed to too few commands: {commands}"
+    text = MUTATING.read_text(encoding="utf-8")
+    missing = [cmd for cmd in commands if f"bn {cmd}" not in text]
+    assert not missing, (
+        "the SKILL.md Mutate index points at reference/mutating.md for commands "
+        f"that file never documents: {missing}"
+    )
+
+
 def test_mutating_reference_documents_every_batch_op(mutation_engine):
     """#650: `mutation_engine.REQUIRED_FIELDS` defines 16 batch ops; `mutating.md`
     used to name TWO. Every op AND every required field name must be documented --

@@ -1101,6 +1101,80 @@ def test_unmeasured_mutation_failure_still_exits_three(monkeypatch):
     assert rc == 3
 
 
+def test_op_with_its_own_summary_is_measured_and_exits_zero(monkeypatch, capsys):
+    """#715: "no `results[]` rows" is NOT the exit-4 rule -- `measured: false`
+    is. `go rename` reports its work through its own counters and registers a
+    compact summary that counts them, so an empty `results[]` (that array holds
+    only its FAILURE rows) is a fully measured clean run: exit 0.
+
+    The exit code must therefore be derived with the transform THIS call renders
+    with, not with a generic recompute; a recompute would see no rows, call the
+    run unmeasured and exit 4 on a successful bulk rename.
+    """
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        assert op == "go_rename"
+        return {"ok": True, "result": {"kind": "go_rename", "preview": False,
+                                       "success": True, "committed": True,
+                                       "rolled_back": False,
+                                       "go_renamed_candidates": 1783,
+                                       "go_committed_count": 1783,
+                                       "go_verified_count": 1783,
+                                       "go_failed_count": 0,
+                                       "skipped_user_named": 4,
+                                       "results": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["go", "rename", "--target", "active"])
+
+    assert rc == 0
+    # The exit code agrees with the status line: this run WAS measured.
+    assert "warning: unmeasured" not in capsys.readouterr().out
+
+
+def test_unclassifiable_mutation_result_is_a_clean_bridge_error(monkeypatch, capsys):
+    """The #715 exit code is derived by RUNNING the compact-summary transform,
+    and `_call` computes it before the renderer's malformed-result guard (#101).
+    A version-skewed bridge result whose own counters are not numeric therefore
+    reaches that transform first: it must still come out as the documented
+    `BridgeError`/exit 2 pointing at `--format json`, never as a raw traceback
+    out of `main()` (which only catches `BridgeError`) and a process exit the
+    exit-code contract does not list.
+    """
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": {"kind": "go_rename", "preview": False,
+                                       "success": True, "committed": True,
+                                       # a counter this CLI cannot parse
+                                       "go_renamed_candidates": "many",
+                                       "results": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["go", "rename", "--target", "active", "--verbose"])
+
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "malformed or newer than this CLI" in err, err
+    assert "--format json" in err, err
+
+
+def test_unclassifiable_mutation_result_is_a_clean_bridge_error_when_compact(monkeypatch, capsys):
+    """Same guarantee on the compact default path, where the transform is also
+    the renderer input: one rule for every detail level."""
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": {"kind": "go_rename", "preview": False,
+                                       "success": True, "committed": True,
+                                       "go_renamed_candidates": "many",
+                                       "results": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["go", "rename", "--target", "active"])
+
+    assert rc == 2
+    assert "malformed or newer than this CLI" in capsys.readouterr().err
+
+
 def test_operation_failure_status_maps_to_exit_3_for_mutation(monkeypatch, capsys):
     """#625: an OperationFailure that escapes a genuine mutation call (routed
     through `_mutate`) with a status in FAILED_MUTATION_STATUSES maps to exit

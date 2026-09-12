@@ -87,8 +87,11 @@ def _bridge_log_excerpts(started_at: float) -> list[str]:
 
     A timed-out `session start` reports no instance id -- the CLI only prints one
     on success -- but the spawn creates ``<instances_dir>/<id>.log`` before it
-    does anything else, so any log newer than the attempt is that attempt's. An
-    empty list is itself a diagnosis: the CLI hung before spawning a bridge.
+    does anything else, so any log newer than the attempt is that attempt's.
+    That holds because conftest's autouse ``_hermetic_env`` pins ``BN_CACHE_DIR``
+    per test (#589): this instances dir belongs to one test, so "newer than the
+    attempt" cannot pick up a concurrent unrelated bridge. An empty list is
+    itself a diagnosis: the CLI hung before spawning a bridge.
     """
     try:
         paths = sorted(instances_dir().glob("*.log"))
@@ -723,6 +726,18 @@ class TestDisasmLinearAArch64:
         return out
 
     @staticmethod
+    def _start(binary: Path) -> dict:
+        """The ONE place this lane's `session start` budget lives (#718).
+
+        Every start here analyses the ~1.1k-function `-static` cross-built probe,
+        which measures ~25s warm, so it must run on the larger lane budget rather
+        than the general default. Spread across the individual tests that budget
+        was one forgettable kwarg per callsite; here dropping it is a visible
+        change to a helper whose only job is to apply it.
+        """
+        return _session_start(str(binary), timeout=_CROSS_ARCH_SESSION_START_TIMEOUT)
+
+    @staticmethod
     def _func_start(inst_id: str, name: str) -> int:
         listing = _bn("--instance", inst_id, "function", "list", "--format", "json")
         assert listing.returncode == 0, listing.stderr
@@ -733,7 +748,7 @@ class TestDisasmLinearAArch64:
 
     def test_aarch64_odd_linear_start_not_thumb_masked(self, tmp_path):
         binary = self._build_aarch64(tmp_path)
-        info = _session_start(str(binary), timeout=_CROSS_ARCH_SESSION_START_TIMEOUT)
+        info = self._start(binary)
         inst_id = info["instance_id"]
         try:
             start = self._func_start(inst_id, "add")
@@ -754,7 +769,7 @@ class TestDisasmLinearAArch64:
         # --mode arm|thumb is only meaningful for classic 32-bit ARM/Thumb. On a
         # real aarch64 target it must be rejected with the ACTUAL arch named.
         binary = self._build_aarch64(tmp_path)
-        info = _session_start(str(binary), timeout=_CROSS_ARCH_SESSION_START_TIMEOUT)
+        info = self._start(binary)
         inst_id = info["instance_id"]
         try:
             res = _bn("--instance", inst_id, "disasm", "add", "--linear", "2",
@@ -805,6 +820,25 @@ class TestSessionStartTimeoutDiagnostics:
         """
         assert _SESSION_START_TIMEOUT > 30.0
         assert _CROSS_ARCH_SESSION_START_TIMEOUT > _SESSION_START_TIMEOUT
+
+    def test_cross_arch_lane_actually_starts_on_its_own_budget(self, monkeypatch):
+        """...and the lane must USE it. Asserting only the two constants left the
+        delivered behaviour unguarded: dropping the budget from the lane's start
+        silently put the slow cross-built probe back on the general default with
+        every test still green. Observe the budget the lane's start really asks
+        for, so that regression is RED.
+        """
+        seen: dict[str, float] = {}
+
+        def record(*binaries: str, timeout: float = _SESSION_START_TIMEOUT) -> dict:
+            seen["timeout"] = timeout
+            return {"instance_id": "stand-in"}
+
+        monkeypatch.setattr(sys.modules[__name__], "_session_start", record)
+
+        TestDisasmLinearAArch64._start(Path("stand-in-probe"))
+
+        assert seen["timeout"] == _CROSS_ARCH_SESSION_START_TIMEOUT, seen
 
     def test_timed_out_start_carries_partial_output_and_bridge_log(self, monkeypatch):
         self._hang(monkeypatch, self._HANGING_CLI)

@@ -34,7 +34,7 @@ Per-op statuses:
 - `noop` — already in the requested state.
 - `unsupported` — operation not supported on this object.
 - `verification_failed` — readback disagrees; the whole mutation/batch is reverted, and JSON also returns the requested vs observed state.
-- `invalid_request` — the request was refused: a bad field *value*, a missing required field, an ambiguous target, conflicting options. Whether the refusal is raised up front (the pre-apply shape check that validates every op before any is applied) or during apply, it is a mutation failure: exit 3 on any mutation command, with the whole mutation/batch reverted when anything had been applied. An unknown op kind is `unsupported` and likewise exit 3. The up-front/apply-time distinction does **not** change the exit code — a status in `FAILED_MUTATION_STATUSES` on a mutation call is exit 3 (#625/#716); only the same status escaping a read/resolver op is exit 2. The single exit-2 case on this path is a manifest the CLI rejects before sending anything (unparseable JSON, a manifest that is not an object with an `"ops"` list), which never reaches the bridge and has no `status`.
+- `invalid_request` — the request was refused: a bad field *value*, a missing required field, an ambiguous target, conflicting options. Whether the refusal is raised up front (the pre-apply shape check that validates every op before any is applied) or during apply, it is a mutation failure: exit 3 on any mutation command, with the whole mutation/batch reverted when anything had been applied. An unknown op kind is `unsupported` and likewise exit 3. The up-front/apply-time distinction does **not** change the exit code — a status in `FAILED_MUTATION_STATUSES` on a mutation call is exit 3 (#625/#716); only the same status escaping a read/resolver op is exit 2. Exit 2 still covers everything on this path that is *not* one of those statuses: a manifest the CLI rejects before sending anything (unparseable JSON, a manifest that is not an object with an `"ops"` list), a transport failure, a bridge error carrying some other status or none, and a response this CLI cannot parse.
 - `rollback_failed` — an operation failed and the automatic revert of that failure also failed; the view may be left in a mixed state.
 - `internal_error` — an unexpected exception during apply; treated like a failure and reverted.
 
@@ -61,7 +61,8 @@ in a write-heavy session (a `proto set` cost ~7 KB; a 115-op previewed batch cos
 
 `--format` picks the medium; `--verbose`/`--summary` pick the detail level. No
 combination changes the exit code (each computes it from the same full result):
-0 ok / 2 bridge or request error / 3 a mutation status `verification_failed`,
+0 ok / 1 a CLI-side handler error / 2 bridge or request error (including a
+response this CLI cannot parse) / 3 a mutation status `verification_failed`,
 `unsupported`, `invalid_request`, `rollback_failed`, or `internal_error` / 4 an
 unmeasured success (`measured: false` — applied but unverifiable; see
 "Unmeasured mutations").
@@ -88,7 +89,13 @@ true:
 
 #### Unmeasured mutations
 
-A small number of bespoke ops (identified statically by `test_mutation_summary_wiring.py`) report success through their own counters instead of populating `results[]`. When that happens the compact summary cannot derive real counts, and says so:
+Every shipped mutation is measurable one of two ways: it populates `results[]`,
+or — like `go rename`, the one op that reports through its own counters — it
+registers a compact summary that counts those counters instead.
+`test_mutation_summary_wiring.py` statically enforces that pairing for every
+`_mutate`-routed op, so you should never see this. When *neither* holds (a
+bridge older or newer than this CLI, or a wiring regression that slipped the
+sweep), the compact summary cannot derive real counts, and says so:
 
 ```
 mutation: committed  changed=None  verified=None  noop=None  failed=None  dirty_after=True
@@ -107,12 +114,15 @@ consumer would discard real work. Check `measured` (or just read `dirty_after`,
 which fails safe on its own) before trusting a `0`-looking status line as a
 confirmed no-op.
 
-An unmeasured success also changes the exit code: it is **`4`** ("applied but
-unverifiable"), so a script that only checks `$?` sees that the write could not be
-confirmed instead of reading it as a clean success. `4` is distinct from `3` (a
-failure — a status in `FAILED_MUTATION_STATUSES`, which still wins if both apply)
-and from `0` (a verified or measured all-`noop` run). It is not a new failure
-mode: the mutation did apply, so read the view back and `bn save` before closing.
+An unmeasured **live** success also changes the exit code: it is **`4`**
+("applied but unverifiable"), so a script that only checks `$?` sees that the
+write could not be confirmed instead of reading it as a clean success. `4` is
+distinct from `3` (a failure — a status in `FAILED_MUTATION_STATUSES`, which
+still wins if both apply) and from `0` (a verified or measured all-`noop` run).
+It is not a new failure mode: the mutation did apply, so read the view back and
+`bn save` before closing. The rule is keyed on `measured: false`, not on the
+kind of call, so an unmeasured `--preview` is `4` as well — there the write was
+reverted, and what could not be confirmed is what *would* have landed.
 
 **A mutation result never spills.** A read that spills is recoverable (re-read the
 artifact); an atomic write whose result is unparseable is not — the agent's model of
@@ -171,6 +181,26 @@ Tags are the "remember this spot" annotation path — a **bookmark is just
 type must exist (`tag type create`, a mutation) before `tag add` can use it, and
 each call takes exactly one location: an address (positional or `--address`) or
 `--function`, never both. Reads (`bn tag list/get/types`) are in `reading.md`.
+
+### Go names — apply what `.gopclntab` recovered
+
+```bash
+bn go functions --summary                          # read side: what would be renamed
+bn go rename [--preview]                           # apply; no positional args
+```
+
+`bn go rename` is the bulk mutation that writes the names `bn go functions`
+recovered from `.gopclntab` into the database. It renames **auto-named
+`sub_*`/`nullsub_*` functions only** — an already-named function is left alone
+and counted as a `noop` — so it is idempotent and safe to re-run. It takes the
+standard mutation flags (`--preview`, `--summary`, `--verbose`, `--format`,
+`--out`) and nothing else.
+
+It is the one mutation whose bridge result reports the work through its **own
+counters** rather than a `results[]` row per rename (that array carries only the
+failure rows), so it registers its own compact summary to count them. The status
+line and exit codes are therefore the same as every other mutation — including
+`measured: true` on success, so a clean run is exit `0`, not the unmeasured `4`.
 
 ### Data variables — bind a recovered type to an address
 

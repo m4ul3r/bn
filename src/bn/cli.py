@@ -316,7 +316,7 @@ def _resolve_out_path(value: str) -> Path:
         # ArgumentTypeError/TypeError/ValueError into a clean parser error;
         # anything else escapes as a raw traceback (exit 1, empty stdout),
         # bypassing BnArgumentParser.error()'s JSON-error-envelope contract
-        # and the documented 0/2/3 exit codes.
+        # and the documented 0/1/2/3/4 exit codes.
         raise argparse.ArgumentTypeError(f"--out {value}: {exc}") from None
     return path if path.is_absolute() else Path.cwd() / path
 
@@ -1029,7 +1029,22 @@ def _mutation_exit_code(result: Any, summary: Callable[[Any], Any] | None = None
     # measures through its own counters (`_go_rename_summary` reports
     # `measured: true` by design) is not mislabelled by a generic recompute.
     if summary is not None:
-        compact = summary(result)
+        try:
+            compact = summary(result)
+        except (AttributeError, TypeError, KeyError, IndexError, ValueError) as exc:
+            # Deriving the exit code RUNS the transform, and `_call` computes the
+            # exit code before the renderer's malformed-result guard (#101), so
+            # this is now the first place a version-skewed result is parsed. It
+            # must fail the same documented way: a clean BridgeError (exit 2)
+            # pointing at --format json, never a raw traceback out of `main()`,
+            # which catches only BridgeError. Exit 0 is not an option -- the
+            # whole point of #715 is that a result the CLI cannot classify must
+            # not read as a confirmed success.
+            raise BridgeError(
+                f"could not classify the mutation result -- the bridge response was "
+                f"malformed or newer than this CLI. Rerun with --format json to see the "
+                f"raw result. ({type(exc).__name__}: {exc})"
+            ) from exc
         if isinstance(compact, dict) and compact.get("measured") is False:
             return 4
     return 0
