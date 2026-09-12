@@ -1130,6 +1130,39 @@ def test_xrefs_no_stub_union_for_plain_function(monkeypatch):
     assert "stub_callers_via" not in result
 
 
+def test_xrefs_keeps_stub_callers_when_the_native_index_answers_a_subset(monkeypatch):
+    """The same-name group callers need EVERY member, but BN's own name index can
+    only ever return a strict SUBSET of the authoritative walk -- it does not carry
+    the demangled short/full spellings BN keeps only on the symbol (#224a). With an
+    index that resolves just the real body, `xrefs <name>` must STILL union the
+    veneer's callers: answering from the subset silently drops them and reads a hot
+    function as zero-caller with no flag (round-3 review BLOCKER)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, caller, stub, impl = _impl_stub_bv(stub_ref_addrs=[0x500010])
+    bv.get_functions_by_name = lambda name: [impl]      # subset: the veneer is absent
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+    result = instance._xrefs(None, "get_param")
+    assert result["code_ref_count"] == 1
+    assert "0x40f1a0" in result.get("stub_callers_via", [])
+
+
+def test_same_name_stub_union_survives_a_subset_native_index(monkeypatch):
+    """The group lookup is walk-backed even when the native index answers: it must
+    return the COMPLETE same-name group (both members, view order) so the stub union
+    sees the veneer, and the stub set must be derived from that full group rather
+    than from the index's subset."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv, caller, stub, impl = _impl_stub_bv()
+    bv.get_functions_by_name = lambda name: [impl]
+    assert [
+        int(f.start)
+        for f in instance.ctx._find_functions_by_name(bv, "get_param", case_sensitive=True)
+    ] == [0x40f1a0, 0x5c40]
+    assert [int(f.start) for f in instance.ctx._same_name_stub_functions(bv, impl)] == [0x40f1a0]
+
+
 # ===================================================================
 # #286 (callsites half): callsites see through a same-name PLT stub
 # ===================================================================

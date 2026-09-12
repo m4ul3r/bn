@@ -288,14 +288,31 @@ class BridgeContext:
         return exact, folded, corpus
 
     def _find_functions_by_name(self, bv, text: str, *, case_sensitive: bool) -> list[Any]:
-        if case_sensitive:
-            hit = self._native_exact_hit(bv, text)
-            if hit is not None:
-                return [hit]
+        """The COMPLETE same-name group: every function matching *text*.
+
+        Always walk-backed -- it never consults :meth:`_native_exact_hit`. Its
+        callers need the whole group, and BN's own name index can only ever return
+        a strict SUBSET of the walk: it does not carry the demangled short/full
+        spellings BN keeps only on the symbol (#224a). Answering from that subset
+        silently drops a same-name member, which is how `xrefs <name>` once read a
+        hot function as zero-caller -- the veneer carrying its call traffic was
+        missing from the index, so the stub union had nothing to union
+        (#286/#220/#201). The group callers: :meth:`_same_name_stub_functions`
+        (the sole input to the xrefs/callsites PLT-veneer caller union), the xrefs
+        name-collection path and ``read_xrefs._xrefs_import_symbol``'s body
+        lookup, and :meth:`_resolve_rename_target` (which must raise on a genuine
+        ambiguity rather than miss a member). Only :meth:`_find_function` --
+        single-identifier resolution, where the unique-non-stub-hit trade-off is
+        weighed -- may take the native shortcut."""
         return self._walk_functions_by_name(bv, text, case_sensitive=case_sensitive)
 
     def _native_exact_hit(self, bv, text: str):
         """The single function BN's own name index resolves for *text*, else None.
+
+        Consulted ONLY by :meth:`_find_function`'s single-identifier resolution.
+        The GROUP lookup :meth:`_find_functions_by_name` never uses it: its callers
+        need every same-name member, for which this index is only ever a strict
+        subset (#224a).
 
         The index is keyed on BN's OWN spellings, while the authoritative walk
         also matches the demangled short/full spellings BN keeps only on the
