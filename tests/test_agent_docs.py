@@ -225,6 +225,56 @@ def test_cli_layout_names_every_top_level_module():
     assert not missing, f"top-level modules missing from the CLI Layout list: {missing}"
 
 
+# The lock class is declared at the `@op` decorator, so the declarations are the
+# ground truth for what `lock="none"` actually covers.
+_NONE_LOCK_OP = re.compile(r'@op\(\s*"([^"]+)"\s*,\s*lock="none"')
+
+# The two `none` ops that really are pure signals: they set an event and must
+# stay deliverable while a write op holds the lock. Everything else declared
+# `none` runs real work on the view and takes whatever lock it needs itself.
+SIGNAL_ONLY_NONE_OPS = frozenset({"shutdown", "cancel_request"})
+
+LOCK_MODEL_SENTENCE_PREFIX = "`op_registry.py` is the single source of truth"
+
+
+def test_lock_model_paragraph_describes_none_ops_as_self_managing():
+    """The lock-model paragraph used to read `none` ops as "only for ops that
+    touch no BN state (e.g. `shutdown`)". That was already false -- `load_binary`
+    and `go_rename` are declared `none` and both mutate the view -- and it is the
+    single sentence an agent adding an op reads before choosing its lock class.
+    Believing it, the agent either write-locks an op that must not be
+    write-locked, or leaves a genuinely stateful op taking no lock at all.
+
+    `none` means the DISPATCHER holds no lock; the op body self-manages. The
+    guard is grounded in the declarations so it cannot outlive a re-classing:
+    the moment every `none` op really is a pure signal, the premise assertion
+    fails and this test must be rewritten rather than quietly kept.
+    """
+    bridge = (REPO / "src" / "bn_agent_bridge" / "bridge.py").read_text(encoding="utf-8")
+    none_ops = set(_NONE_LOCK_OP.findall(bridge))
+    assert none_ops, 'no lock="none" op declarations found; this guard is unchecked'
+    stateful = sorted(none_ops - SIGNAL_ONLY_NONE_OPS)
+    assert stateful, (
+        'every lock="none" op is now a pure signal, so the "touches no BN state" '
+        "reading would be true again -- rewrite this guard instead of deleting it"
+    )
+    sentence = next(
+        (line for line in _doc_text().splitlines()
+         if line.startswith(LOCK_MODEL_SENTENCE_PREFIX)),
+        None,
+    )
+    assert sentence, f"the lock-model paragraph ({LOCK_MODEL_SENTENCE_PREFIX}...) is gone"
+    assert "self-manage" in sentence, (
+        "the lock-model paragraph must say `none` ops self-manage locking; "
+        f"it reads: {sentence}"
+    )
+    named = [op for op in stateful if f"`{op}`" in sentence]
+    assert named, (
+        'the paragraph must name at least one stateful lock="none" op, so the '
+        f"self-management claim is concrete rather than a phrase: {stateful}"
+    )
+
+
 def test_documented_python_requirement_matches_pyproject():
     """`Requires Python >= X.Y` is the first claim an agent acts on, and a stale
     floor sends it to install the wrong interpreter."""

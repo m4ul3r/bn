@@ -1031,7 +1031,8 @@ def _mutation_exit_code(result: Any, summary: Callable[[Any], Any] | None = None
     if summary is not None:
         try:
             compact = summary(result)
-        except (AttributeError, TypeError, KeyError, IndexError, ValueError) as exc:
+        except (AttributeError, TypeError, KeyError, IndexError, ValueError,
+                ArithmeticError) as exc:
             # Deriving the exit code RUNS the transform, and `_call` computes the
             # exit code before the renderer's malformed-result guard (#101), so
             # this is now the first place a version-skewed result is parsed. It
@@ -1040,6 +1041,13 @@ def _mutation_exit_code(result: Any, summary: Callable[[Any], Any] | None = None
             # which catches only BridgeError. Exit 0 is not an option -- the
             # whole point of #715 is that a result the CLI cannot classify must
             # not read as a confirmed success.
+            #
+            # `ArithmeticError` is here and not in the renderer guard because
+            # this call AGGREGATES wire numbers rather than formatting them:
+            # JSON bounds no numeric literal, so `1e999` decodes to `float(inf)`
+            # and `int(inf)` raises `OverflowError`. `BridgeError` is
+            # deliberately absent -- a transform that raises one already means
+            # exactly what it says, and must pass through unwrapped.
             raise BridgeError(
                 f"could not classify the mutation result -- the bridge response was "
                 f"malformed or newer than this CLI. Rerun with --format json to see the "

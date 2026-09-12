@@ -1132,6 +1132,28 @@ def test_op_with_its_own_summary_is_measured_and_exits_zero(monkeypatch, capsys)
     assert "warning: unmeasured" not in capsys.readouterr().out
 
 
+def test_unclassifiable_mutation_result_covers_overflowed_wire_numbers(monkeypatch, capsys):
+    """The transform this guard wraps AGGREGATES wire numbers, so its failure
+    surface includes arithmetic, not just parsing. JSON has no bound on a numeric
+    literal: `1e999` decodes to `float("inf")`, and `int(inf)` raises
+    `OverflowError` -- an `ArithmeticError`, outside the exception set a text
+    renderer can throw. It must still be the documented exit 2, not a traceback.
+    """
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": {"kind": "go_rename", "preview": False,
+                                       "success": True, "committed": True,
+                                       # what `1e999` on the wire decodes to
+                                       "go_renamed_candidates": float("inf"),
+                                       "results": []}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["go", "rename", "--target", "active"])
+
+    assert rc == 2
+    assert "malformed or newer than this CLI" in capsys.readouterr().err
+
+
 def test_unclassifiable_mutation_result_is_a_clean_bridge_error(monkeypatch, capsys):
     """The #715 exit code is derived by RUNNING the compact-summary transform,
     and `_call` computes it before the renderer's malformed-result guard (#101).
