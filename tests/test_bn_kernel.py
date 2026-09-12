@@ -1985,8 +1985,16 @@ time.sleep(30)
     monkeypatch.setenv("BN_BIN", str(_fake_bn(tmp_path, script)))
     session = bn_kernel.Session(instance="worker", timeout=5, backend="cli")
 
+    # The budget must cover the child's interpreter startup: it is a
+    # `#!/usr/bin/env python3` script, so reaching the write means exec, env
+    # resolution, CPython boot, and two imports. At 0.05s that had not happened
+    # on a loaded host (it failed once in a full-suite run, then passed 5/5
+    # idle), so `marker.exists()` below raced the deadline instead of testing
+    # anything. 2s still proves the CLI tears down a child that would otherwise
+    # sleep 30s -- the propagation of a caller's own shorter timeout is pinned
+    # separately by test_assert_target_accepts_shorter_caller_timeout.
     with pytest.raises(bn_kernel.BnError, match="timed out"):
-        _run(session.assert_target("sample.bndb", timeout=0.05))
+        _run(session.assert_target("sample.bndb", timeout=2.0))
 
     assert marker.exists()
     pid = int(marker.read_text())
