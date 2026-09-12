@@ -1357,7 +1357,10 @@ def _render_paged_list_text(
     still hand over a plain list keep working (#122)."""
     if not isinstance(value, dict) or page_key not in value:
         return item_renderer(value)  # back-compat / fallback for a bare list
-    items = value.get(page_key) or []
+    # The page key is a runtime argument, so this one site stands in for six
+    # listing renderers -- and a raw `or []` here was invisible to the coercion
+    # guard precisely because the key is not a literal (#619).
+    items = _field_list(value, page_key)
     body = item_renderer(items)
     footer = _paging_footer(value, items)
     if footer is None:
@@ -1691,7 +1694,7 @@ def _render_target_line(target: Any) -> str:
                 base += " (not start)"
     else:
         addr = normalized or raw or "<unknown>"
-        context = target.get("context") if isinstance(target.get("context"), dict) else {}
+        context = _field_dict(target, "context")
         symbol = context.get("symbol")
         string = context.get("string")
         sections = context.get("sections")
@@ -1732,13 +1735,13 @@ def _render_target_line(target: Any) -> str:
 def _render_function_evidence_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    function = value.get("function") if isinstance(value.get("function"), dict) else {}
+    function = _field_dict(value, "function")
     lines = [
         f"{function.get('name', '<unknown>')} @ {function.get('address', '<unknown>')}",
         f"prototype: {value.get('prototype', '<unknown>')}",
         f"calling convention: {value.get('calling_convention', '<unknown>')}",
     ]
-    thunk = value.get("thunk") if isinstance(value.get("thunk"), dict) else {}
+    thunk = _field_dict(value, "thunk")
     if thunk.get("is_candidate"):
         lines.append(f"thunk: candidate ({thunk.get('reason', 'no reason recorded')})")
         if thunk.get("target"):
@@ -2139,13 +2142,13 @@ def _render_message_lens_text(value: Any) -> str:
         if not isinstance(match, dict):
             lines.append(_render_fallback_text(match))
             continue
-        type_string = match.get("type_string") if isinstance(match.get("type_string"), dict) else {}
+        type_string = _field_dict(match, "type_string")
         lines.append("")
         lines.append(f"{type_string.get('address', '<unknown>')}  {json.dumps(type_string.get('value', ''), ensure_ascii=True)}")
         suffix = _context_suffix(type_string.get("context"))
         if suffix:
             lines.append(f"  context{suffix}")
-        xrefs = match.get("xrefs") if isinstance(match.get("xrefs"), dict) else {}
+        xrefs = _field_dict(match, "xrefs")
         code_count = len(_field_list(xrefs, "code_refs"))
         data_count = len(_field_list(xrefs, "data_refs"))
         lines.append(f"  xrefs: {code_count} code, {data_count} data")
@@ -2167,7 +2170,7 @@ def _render_message_lens_text(value: Any) -> str:
     for sym in _field_list(value, "rtti_symbols"):
         if not isinstance(sym, dict):
             continue
-        xr = sym.get("xrefs") if isinstance(sym.get("xrefs"), dict) else {}
+        xr = _field_dict(sym, "xrefs")
         cc = len(_field_list(xr, "code_refs"))
         dc = len(_field_list(xr, "data_refs"))
         lines.append("")
@@ -2257,21 +2260,14 @@ def _render_orient_text(value: Any) -> str:
         lines.append(f"  functions: {fc}")
     imp = _field_dict(value, "imports_summary")
     total = imp.get("total_symbols", imp.get("total"))
-    by_kind_raw = imp.get("by_kind")
-    by_kind = _as_dict(by_kind_raw)
+    by_kind = _field_dict(imp, "by_kind")
     kinds = ", ".join(f"{k}={v}" for k, v in list(by_kind.items())[:6])
     lines.append(f"  imports: {total if total is not None else '?'}" + (f" ({kinds})" if kinds else ""))
-    if by_kind_raw and not by_kind:
-        # A malformed breakdown NESTED in a well-formed imports_summary is out of
-        # the decorator's reach, and omitting it reads as "no breakdown reported".
-        lines.append("  " + _skew_note("by_kind"))
     secs = _field_dict(value, "sections")
-    sec_items = secs.get("items")
-    if isinstance(sec_items, list):
+    sec_items = _field_list(secs, "items")
+    if sec_items or isinstance(secs.get("items"), list):
         names = " ".join(str(s.get("name", "?")) for s in sec_items[:12] if isinstance(s, dict))
         lines.append(f"  sections: {secs.get('total', len(sec_items))}  {names}")
-    elif sec_items:
-        lines.append("  " + _skew_note("items"))
     ea = value.get("existing_annotations")
     if isinstance(ea, dict):
         # #561: disclose annotations already present so an agent doesn't over-credit
@@ -2291,8 +2287,7 @@ def _render_orient_text(value: Any) -> str:
     if ss.get("unavailable"):
         lines.append(f"  strings: unavailable — {ss['unavailable']}")
     else:
-        items_raw = ss.get("items")
-        items = _as_list(items_raw)
+        items = _field_list(ss, "items")
         # Disclose the min-length filter so orient's total reconciles with the
         # `bn strings` total (which uses a lower default) (#357).
         mn = value.get("strings_min_length")
@@ -2303,10 +2298,6 @@ def _render_orient_text(value: Any) -> str:
         from_where = f"; from {', '.join(str(d) for d in drawn)}" if drawn else ""
         lines.append(
             f"  strings ({filt}sample {len(items)} of {ss.get('total', len(items))}{from_where}):")
-        if items_raw and not items:
-            # A truthy non-list is iterated element by element -- for a string,
-            # one bogus row per CHARACTER, which fabricates the sample count.
-            lines.append("  " + _skew_note("items"))
         for s in items[:15]:
             if isinstance(s, dict):
                 # `or ''` (not just the .get default) guards an explicit value:None.
@@ -2337,7 +2328,7 @@ def _render_init_arrays_text(value: Any) -> str:
         )
         if section.get("truncated"):
             lines.append(f"  showing first {section.get('shown_entries', '?')} entries")
-        table = section.get("table") if isinstance(section.get("table"), dict) else {}
+        table = _field_dict(section, "table")
         for warning in _field_list(table, "warnings"):
             lines.append(f"  warning: {warning}")
         for item in _field_list(table, "items"):  # #275: embedded table is canonical too
@@ -2392,8 +2383,8 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
             blocks.append(_render_fallback_text(row))
             continue
 
-        callee = row.get("callee") if isinstance(row.get("callee"), dict) else {}
-        containing = row.get("containing_function") if isinstance(row.get("containing_function"), dict) else {}
+        callee = _field_dict(row, "callee")
+        containing = _field_dict(row, "containing_function")
         call_addr = row.get("call_addr", "<unknown>")
         caller_static = row.get("caller_static", "<unknown>")
         call_index = row.get("call_index")
@@ -2433,7 +2424,7 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
                 f"or `bn disasm {containing.get('name', '<caller>')} --linear`"
             )
 
-        call_instruction = row.get("call_instruction") if isinstance(row.get("call_instruction"), dict) else {}
+        call_instruction = _field_dict(row, "call_instruction")
         previous = _field_list(row, "previous_instructions")
         next_instructions = _field_list(row, "next_instructions")
         lines.append("context:")
@@ -2578,12 +2569,12 @@ def _render_values_text(value: Any) -> str:
     fn = _field_dict(value, "function")
     lines = [f"{fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}"]
     lines.append(f"at {value.get('at')}: {value.get('expression', '<no instruction at address>')}")
-    pvs_raw = value.get("possible_values")
-    pvs = _as_dict(pvs_raw)
+    pvs = _field_dict(value, "possible_values")
     if not pvs:
         # `<unavailable>` is what an ABSENT field prints: a present but malformed
         # one must not impersonate "the analysis had no answer" (#619).
-        lines.append(f"possible values: <malformed: {pvs_raw!r}>" if pvs_raw
+        lines.append(f"possible values: <malformed: {value['possible_values']!r}>"
+                     if value.get("possible_values")
                      else "possible values: <unavailable>")
         return "\n".join(lines)
     summary = pvs.get("type", "?")
@@ -2637,7 +2628,7 @@ def _render_leaf_line(leaf: Any) -> str:
             f"  arg_under_recovered @ {leaf.get('address')}"
             f"  -> {cal.get('name', '?')} @ {cal.get('address', '?')}"
             f"  (recovered {leaf.get('recovered_params', '?')} param(s); "
-            f"dropped arg(s) {leaf.get('dropped_args', [])})"
+            f"dropped arg(s) {_field_list(leaf, 'dropped_args')})"
             + (f"  -- {leaf.get('note')}" if leaf.get("note") else "")
         )
     return (
@@ -3007,9 +2998,10 @@ def _render_taint_models_text(value: Any) -> str:
         lines.append("")
         # A class whose entry list is malformed contributes NO sink rows: this
         # inventory is read as ground truth, so counting a row that may not
-        # exist is worse than disclosing the class as unusable.
-        classes = {cls: lst for cls, lst in sbc.items() if isinstance(lst, list)}
-        skewed = sorted(f"sinks_by_class[{cls}]" for cls in sbc if cls not in classes)
+        # exist is worse than disclosing the class as unusable. The per-class
+        # skew is recorded by key, so the render's own note names it.
+        classes = {cls: _field_list(sbc, cls) for cls in sbc}
+        classes = {cls: rows for cls, rows in classes.items() if rows}
         total = sum(len(entries) for entries in classes.values())
         lines.append(f"sinks ({total} in {len(classes)} class(es)); NOT findings:")
         for cls, entries in classes.items():
@@ -3019,8 +3011,6 @@ def _render_taint_models_text(value: Any) -> str:
                     lines.append(f"    {e!r}")
                     continue
                 lines.extend(_render_taint_sink_entry(e))
-        if skewed:
-            lines.append("  " + _skew_note(*skewed))
     props = _field_list(value, "propagators")
     if props:
         lines.append("")
@@ -3406,7 +3396,7 @@ def _render_doctor_text(value: Any) -> str:
         if not isinstance(item, dict):
             lines.append("- " + _render_fallback_text(item))
             continue
-        doctor = item.get("doctor") if isinstance(item.get("doctor"), dict) else {}
+        doctor = _field_dict(item, "doctor")
         # Prefer the status the JSON carries (L16) so text and JSON can't drift;
         # fall back to deriving it for any caller that built the dict the old way.
         status = item.get("status") or ("ok" if doctor and not doctor.get("error") else "error")
@@ -4302,7 +4292,7 @@ def _vtable_slot_label(s: dict[str, Any]) -> str:
     named external (cross-module) slot, `<null>`, or `<unnamed>` (#441)."""
     if s.get("pure_virtual"):
         return "__cxa_pure_virtual"
-    method = s.get("method") if isinstance(s.get("method"), dict) else {}
+    method = _field_dict(s, "method")
     slot_name = method.get("display_name") or method.get("name")
     if slot_name:
         return slot_name
@@ -4358,8 +4348,12 @@ def _render_one_class(rec: Any) -> str:
             continue
         if m.get("kind") in ("ctor", "dtor"):
             lines.append(f"  {m.get('kind'):<6} {m.get('address', '?')}  {m.get('demangled', '')}")
-    if vt and vt.get("slots"):
-        for s in _as_list(vt["slots"]):
+    # A malformed slot container must fall through to the explanation below, not
+    # to a class card that shows a vtable address and then nothing at all -- that
+    # rendered strictly LESS than the genuinely-empty case (#619).
+    vt_slots = _field_list(vt, "slots") if vt else []
+    if vt_slots:
+        for s in vt_slots:
             if not isinstance(s, dict):
                 lines.append(f"  vtable {s!r}")
                 continue
@@ -4374,7 +4368,7 @@ def _render_one_class(rec: Any) -> str:
                      "(defined in another module, or applied at load time via relocations)")
     if vt and vt.get("truncated"):
         lines.append(
-            f"  vtable: showing {len(_field_list(vt, 'slots'))} slots; scan capped at {vt.get('max_slots')} -- "
+            f"  vtable: showing {len(vt_slots)} slots; scan capped at {vt.get('max_slots')} -- "
             "more may exist (raise the cap or inspect the table directly)"
         )
     # #412: secondary (multiple-inheritance) vtables -- shown compactly so a simple
@@ -4403,7 +4397,7 @@ def _render_one_class(rec: Any) -> str:
         lines.append(f"  methods ({len(member_methods)}):")
         for m in member_methods:
             lines.append(f"    {m.get('address', '?')}  {m.get('demangled', '')}")
-    inst = rec.get("instances") if isinstance(rec.get("instances"), dict) else {}
+    inst = _field_dict(rec, "instances")
     parts = []
     for site in _field_list(inst, "construction_sites"):
         if not isinstance(site, dict):

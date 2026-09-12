@@ -820,9 +820,9 @@ def test_render_orient_non_dict_target_and_kind_breakdown_degrade():
     assert "orientation: <target>" in out
     assert "imports: 3" in out
     # A malformed breakdown NESTED inside a well-formed imports_summary renders
-    # the same line the breakdown simply being absent does, so it needs the same
-    # disclosure the top-level fields get.
-    assert "malformed by_kind field" in out
+    # the same line the breakdown simply being absent does, so it is recorded at
+    # the same choke point and named in the same note as the top-level skew.
+    assert "malformed by_kind, target fields" in out
 
 
 def test_render_cfg_non_dict_nested_fields_degrade():
@@ -941,49 +941,92 @@ def test_the_disclosure_reaches_an_early_return_path():
 
 
 def _coercion_sites():
-    """Every named-field container coercion in the formatter module, read out of
-    the module's own AST.
+    """Every named-field container coercion in the formatter module, and every
+    coercion that BYPASSES the recording helpers, read out of the module's AST.
 
     Derived, never hand-listed. The first attempt at this guard was a table of
     the renderers' own `@_discloses(lists=..., dicts=...)` declarations, which is
     a restatement of the implementation: a declaration list and a table of that
     same list agreeing with each other proves nothing, and it read as 89 rows of
-    coverage while checking nothing the code does."""
+    coverage while checking nothing the code does.
+
+    The bypass half recognises a payload lookup (`.get(k)` with a literal OR a
+    variable key, and `[k]` subscript) that reaches a container coercion either
+    directly or through ONE local alias -- the shapes review actually used to
+    evade the first version of this check, plus the subscript shape that hid a
+    live blocker. It is not a proof over arbitrary indirection; two hops through
+    two variables, or a lookup crossing a function boundary, would still pass,
+    which is why the realistic-payload tests below exist alongside it."""
     import ast
     import inspect
 
     from bn import formatters
 
     tree = ast.parse(inspect.getsource(formatters))
+    RECORDERS = ("_field_list", "_field_dict")
+    COERCERS = ("_as_list", "_as_dict")
+
+    def is_lookup(node):
+        """A read of a NAMED field off some mapping, by `.get(k)` or `[k]`.
+
+        A subscript counts only when the key is a string literal or a variable:
+        `rows[-1]` is an index into a list, which carries no field name to
+        disclose and whose element-level coercion is already rendered inline."""
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get" and node.args):
+            return True
+        if not isinstance(node, ast.Subscript):
+            return False
+        key = node.slice
+        return isinstance(key, ast.Name) or (
+            isinstance(key, ast.Constant) and isinstance(key.value, str))
+
+    def empty_container(node):
+        return ((isinstance(node, ast.List) and not node.elts)
+                or (isinstance(node, ast.Dict) and not node.keys)
+                or (isinstance(node, ast.Tuple) and not node.elts))
+
     sites, raw = [], []
     for fn in tree.body:
         if not isinstance(fn, ast.FunctionDef):
             continue
+        # Locals bound straight from a payload lookup: one alias hop is the
+        # evasion review demonstrated, so resolve it rather than trust the shape.
+        aliases = {
+            t.id
+            for node in ast.walk(fn) if isinstance(node, ast.Assign)
+            for t in node.targets
+            if isinstance(t, ast.Name) and is_lookup(node.value)
+        }
+
+        def suspect(node):
+            return is_lookup(node) or (isinstance(node, ast.Name) and node.id in aliases)
+
         for node in ast.walk(fn):
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-                if node.func.id in ("_field_list", "_field_dict"):
+                if node.func.id in RECORDERS:
                     base = node.args[0] if node.args else None
                     top = isinstance(base, ast.Name) and base.id == "value"
-                    keys = [a.value for a in node.args[1:]
-                            if isinstance(a, ast.Constant)]
+                    keys = [a.value for a in node.args[1:] if isinstance(a, ast.Constant)]
                     kind = "list" if node.func.id == "_field_list" else "dict"
                     sites.append((fn.name, tuple(keys), kind, top))
-                # A coercion that bypasses the recording helpers cannot disclose.
-                if node.func.id in ("_as_list", "_as_dict") and node.args:
-                    a = node.args[0]
-                    if (isinstance(a, ast.Call) and isinstance(a.func, ast.Attribute)
-                            and a.func.attr == "get"):
-                        raw.append((fn.name, ast.unparse(node)))
-            # `x.get("k") or []` / `or {}` -- the pre-#619 raw coercion idiom.
+                elif node.func.id in COERCERS and node.args and suspect(node.args[0]):
+                    raw.append((fn.name, ast.unparse(node)))
+            # `<lookup> or []` / `or {}` -- the pre-#619 idiom, any key shape.
             if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
-                last = node.values[-1]
-                if ((isinstance(last, ast.List) and not last.elts)
-                        or (isinstance(last, ast.Dict) and not last.keys)):
+                if empty_container(node.values[-1]):
                     for c in node.values[:-1]:
-                        if (isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
-                                and c.func.attr == "get" and c.args
-                                and isinstance(c.args[0], ast.Constant)):
+                        if suspect(c):
                             raw.append((fn.name, ast.unparse(node)))
+            # `x if isinstance(x, list) else []` over a payload lookup/alias.
+            if isinstance(node, ast.IfExp) and empty_container(node.orelse):
+                if suspect(node.body):
+                    raw.append((fn.name, ast.unparse(node)))
+            # `.get(k, [])` / `.get(k, {})` -- a defaulted lookup coerces too.
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "get" and len(node.args) == 2
+                    and empty_container(node.args[1])):
+                raw.append((fn.name, ast.unparse(node)))
     return sites, raw
 
 
@@ -993,7 +1036,8 @@ def test_no_payload_container_is_coerced_outside_the_recording_helpers():
     What actually makes the choke point a choke point is that nothing coerces a
     payload container any other way: the two earlier attempts at this fix each
     enumerated the sites they could see and left the rest silent, and a single
-    `x.get("k") or []` added later puts the defect straight back."""
+    `x.get("k") or []` -- or `_as_list(vt["slots"])`, which is how a live blocker
+    hid from the first version of this check -- puts the defect straight back."""
     sites, raw = _coercion_sites()
     assert sites, "AST walk found no coercion sites at all -- the guard is blind"
     assert not raw, (
@@ -1065,6 +1109,22 @@ def test_a_truncated_taint_run_with_a_skewed_stats_field_says_so():
     skewed = _render_taint_text({**payload, "stats": "bad"})
     assert "malformed stats field" in skewed
     assert skewed != _render_taint_text(payload)
+
+
+def test_class_show_skewed_primary_vtable_slots_say_more_than_the_empty_case():
+    # This one was introduced BY this PR: converting `for s in vt["slots"]` to a
+    # bare coercion turned base's loud failure into a class card that printed a
+    # vtable address and then nothing at all -- strictly LESS than the
+    # genuinely-empty case, which at least explains why no slots resolved. A
+    # subscript lookup also hid it from the first version of the coercion guard.
+    from bn.formatters import _render_class_show_text
+    base = {"name": "Widget", "confidence": "rtti", "vtable": {"address": "0x10"}}
+    skewed = _render_class_show_text({**base, "vtable": {"address": "0x10", "slots": "bad"}})
+    empty = _render_class_show_text({**base, "vtable": {"address": "0x10", "slots": []}})
+    assert "no slots resolved here" in skewed        # the empty case's explanation
+    assert "malformed slots field" in skewed         # plus what the empty case cannot say
+    assert all(line in skewed for line in empty.splitlines())
+    assert skewed != empty
 
 
 def test_class_show_discloses_a_skewed_method_list_on_both_paths():
@@ -1182,13 +1242,18 @@ def test_render_instance_find_non_dict_item_degrades():
 
 
 def test_render_taint_models_malformed_class_entries_are_not_counted_as_sinks():
-    # Wrapping a malformed entry list as a one-element list made a `None` count
-    # as one modeled sink -- a fabricated row in an inventory an auditor reads
-    # as ground truth.
+    # Wrapping a malformed entry list as a one-element list made it count as one
+    # modeled sink -- a fabricated row in an inventory an auditor reads as ground
+    # truth. An explicit null is an ABSENT list, so it is not a skew to disclose;
+    # a truthy wrong-shaped one is.
     from bn.formatters import _render_taint_models_text
-    out = _render_taint_models_text({"sinks_by_class": {"unbounded_input": None}})
-    assert "sinks (0 in 0 class(es))" in out
-    assert "malformed sinks_by_class[unbounded_input] field" in out
+    nulled = _render_taint_models_text({"sinks_by_class": {"unbounded_input": None}})
+    assert "sinks (0 in 0 class(es))" in nulled
+    assert "malformed" not in nulled
+
+    skewed = _render_taint_models_text({"sinks_by_class": {"unbounded_input": "gets"}})
+    assert "sinks (0 in 0 class(es))" in skewed
+    assert "malformed unbounded_input field" in skewed
 
 
 def test_render_evidence_shows_argument_confidence_and_variadic():
