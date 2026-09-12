@@ -405,14 +405,15 @@ def _collect_open_views(*, strict: bool = False) -> list[Any]:
             for tab in tabs:
                 collect_from_tab(context, tab)
 
-        unique: list[Any] = []
-        seen: set[int] = set()
-        for bv in found:
-            marker = id(bv)
-            if marker not in seen:
-                seen.add(marker)
-                unique.append(bv)
-        return unique, incomplete
+        # Dedup by BN's handle-based equality, not id(bv) (#714). BN interns a
+        # wrapper only for the scripting console's current view, so one core
+        # view reaches this walk as several DISTINCT wrapper objects -- one per
+        # accessor (getCurrentViewFrame / getViewFrameForTab / getViewForTab) --
+        # and an id()-keyed dedup lets every duplicate through. Every consumer
+        # then pays for it: refresh() builds a full TargetRecord (session_id,
+        # filename, view name -- three core reads) per duplicate before
+        # discarding the extras.
+        return list(dict.fromkeys(found)), incomplete
 
     views, incomplete = _run_on_main_thread(collect)
     if incomplete and strict:
@@ -430,10 +431,13 @@ def _collect_open_views(*, strict: bool = False) -> list[Any]:
     # load (#86 Problem A). Merge in any tracked headless views the UI walk
     # missed so every loaded target is visible and resolvable.
     with _headless_views_lock:
-        seen_ids = {id(bv) for bv in views}
+        # Handle equality again (#714): a `bn load`-tracked wrapper for a view
+        # the UI walk already reported IS the same core view, however many
+        # Python objects stand in for it.
+        seen = set(views)
         for bv in _headless_views:
-            if id(bv) not in seen_ids:
-                seen_ids.add(id(bv))
+            if bv not in seen:
+                seen.add(bv)
                 views.append(bv)
     return views
 
@@ -518,14 +522,13 @@ class TargetManager:
 
         Release timing, stated exactly: this is wired ONLY into the `bn close`
         path (`_close_binary`). A tab the USER closes in the GUI never reaches
-        it, and the two structures then age out differently -- `_records` and
-        `_ids_by_object` (and with them the strong view ref) are reclaimed by
-        the next `refresh()`, which prunes to the current open-view set, but
-        `_dirty_view_ids` is NOT pruned by `refresh()` at all, so that view's
-        stable view_id leaks for the process lifetime. `_dirty_view_ids` holds
-        only short id strings, so the leak is bounded in size, not in count
-        (#659). `refresh()` still bounds every structure that pins a
-        BinaryView (#586, #613 review).
+        it, but it does not have to: the next `refresh()` prunes every
+        structure here back to the current open-view set -- `_records` and
+        `_ids_by_object` (and with them the strong view ref), and
+        `_dirty_view_ids` against those same live record ids (#713), so a
+        closed view's stable view_id does not leak for the process lifetime
+        (#659). `refresh()` bounds every structure that pins a BinaryView
+        (#586, #613 review) or a stable view_id (#713).
         """
         with self._lock:
             vid = self._stable_view_id(bv)
@@ -668,6 +671,14 @@ class TargetManager:
                 )
 
             self._records = alive
+            # Prune dirty markers for views that left the open set WITHOUT
+            # going through forget() -- a GUI tab the user closed never reaches
+            # the `bn close` path, so without this its stable view_id (and its
+            # "unsaved" answer) would leak for the process lifetime (#713).
+            # `alive` is the current open set, rebuilt from handle-keyed strong
+            # refs (#586), so a view that is STILL open and still unsaved keeps
+            # its marker across any number of refreshes (#606).
+            self._dirty_view_ids &= set(alive)
             active = focused
             if active is None and len(self._records) == 1:
                 active = next(iter(self._records.values())).view
@@ -1986,14 +1997,13 @@ class BinaryNinjaBridge:
             if not to_close:
                 raise RuntimeError(f"No loaded binary matches path: {path}")
 
-        # Dedup by BN's handle-based equality, not id(): _collect_open_views()
-        # only dedups its own walk on `id(bv)`, and BN
-        # interns no wrapper for a non-console view, so the same core view can
-        # arrive here under several distinct wrapper objects -- one per
-        # accessor (getCurrentViewFrame / getViewFrameForTab / getViewForTab).
-        # Closing/reporting it once per wrapper would run N blocking
-        # main-thread round trips for one tab (the exact contention #658 was
-        # about) and return N identical `closed` rows to the caller.
+        # Dedup by BN's handle-based equality, not id(). _collect_open_views()
+        # already collapses wrappers per core view (#714), but this is the
+        # destructive path: it stays defensive about the list it is handed
+        # rather than trusting the walk. Closing/reporting one core view once
+        # per wrapper would run N blocking main-thread round trips for one tab
+        # (the exact contention #658 was about) and return N identical `closed`
+        # rows to the caller.
         to_close = list(dict.fromkeys(to_close))
 
         # Close on the main thread OUTSIDE any lock (#658): a blocking

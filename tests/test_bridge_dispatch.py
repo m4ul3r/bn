@@ -2863,6 +2863,108 @@ def test_target_manager_resolves_view_across_fresh_wrapper_instances(monkeypatch
 
 
 # ---------------------------------------------------------------------------
+# TargetManager.refresh(): prune _dirty_view_ids (#713)
+# ---------------------------------------------------------------------------
+
+
+def test_target_manager_refresh_prunes_dirty_id_of_a_view_the_user_closed(monkeypatch):
+    """#713: a GUI tab the USER closes never reaches `forget()` -- that is wired
+    only into `bn close` -- so `refresh()` must prune `_dirty_view_ids` against
+    the live records or the closed view's stable view_id (and its "unsaved"
+    answer) leaks for the process lifetime. The view is handed back as a FRESH
+    wrapper per walk, like BN does for any tab the scripting console is not
+    interning (#586), so nothing here can pass on object identity."""
+    bridge = _load_bridge(monkeypatch)
+    manager = bridge.TargetManager()
+    handle = object()  # stand-in for the shared core view handle
+    open_files = ["/proj/alpha.bndb"]
+
+    def fresh_collect(*, strict: bool = False):
+        return [
+            _NonInterningBV(handle, filename, session_id="11")
+            for filename in open_files
+        ]
+
+    monkeypatch.setattr(bridge, "_collect_open_views", fresh_collect)
+
+    view_id = manager.refresh()[0]["view_id"]
+    manager.mark_dirty(_NonInterningBV(handle, "/proj/alpha.bndb", session_id="11"))
+    assert manager._dirty_view_ids == {view_id}
+
+    # The user closes the tab: it leaves the open set WITHOUT `_close_binary`,
+    # so `forget()` never fires for it.
+    open_files.clear()
+
+    assert manager.refresh() == []
+    assert manager._dirty_view_ids == set()
+
+
+def test_target_manager_refresh_keeps_dirty_marker_for_a_still_open_view(monkeypatch):
+    """The #606 contract the prune must not break: a view that is STILL open and
+    still unsaved keeps its dirty marker across any number of `refresh()` calls
+    (#713), and `is_dirty` keeps answering True for every fresh wrapper of that
+    core view."""
+    bridge = _load_bridge(monkeypatch)
+    manager = bridge.TargetManager()
+    handle = object()
+
+    def fresh_collect(*, strict: bool = False):
+        return [_NonInterningBV(handle, "/proj/alpha.bndb", session_id="11")]
+
+    monkeypatch.setattr(bridge, "_collect_open_views", fresh_collect)
+
+    view_id = manager.refresh()[0]["view_id"]
+    manager.mark_dirty(_NonInterningBV(handle, "/proj/alpha.bndb", session_id="11"))
+
+    for _ in range(3):
+        targets = manager.refresh()
+        assert targets[0]["view_id"] == view_id
+        assert manager._dirty_view_ids == {view_id}
+        assert (
+            manager.is_dirty(_NonInterningBV(handle, "/proj/alpha.bndb", session_id="11"))
+            is True
+        )
+
+
+def test_target_manager_refresh_does_not_let_a_stale_dirty_id_mark_a_later_view(monkeypatch):
+    """#713: the marker must not outlive its view. If a later view is assigned
+    the stable id the user-closed tab leaked, that view must not be born dirty.
+    The id counter is monotonic today, so the reuse the issue names is forced
+    here rather than waited for -- the guarantee under test is that no path may
+    resurrect a dead view's marker, whatever hands the id out."""
+    bridge = _load_bridge(monkeypatch)
+    manager = bridge.TargetManager()
+    handle = object()
+    open_files = ["/proj/alpha.bndb"]
+
+    def fresh_collect(*, strict: bool = False):
+        return [
+            _NonInterningBV(handle, filename, session_id="11")
+            for filename in open_files
+        ]
+
+    monkeypatch.setattr(bridge, "_collect_open_views", fresh_collect)
+
+    leaked = manager.refresh()[0]["view_id"]
+    manager.mark_dirty(_NonInterningBV(handle, "/proj/alpha.bndb", session_id="11"))
+
+    open_files.clear()  # user closes the tab; forget() never fires
+    manager.refresh()
+
+    manager._next_id = int(leaked)  # hand the leaked id to a different view
+    open_files.append("/proj/beta.bndb")
+
+    targets = manager.refresh()
+
+    assert targets[0]["view_id"] == leaked
+    assert (
+        manager.is_dirty(_NonInterningBV(handle, "/proj/beta.bndb", session_id="11"))
+        is False
+    )
+    assert manager._dirty_view_ids == set()
+
+
+# ---------------------------------------------------------------------------
 # Registry write atomicity
 # ---------------------------------------------------------------------------
 
@@ -4078,8 +4180,9 @@ def test_close_binary_all_dedups_wrappers_minted_by_the_real_gui_walk(monkeypatc
     # accessors (getCurrentViewFrame / getViewFrameForTab / getViewForTab) each
     # mint a BRAND NEW wrapper for the same core handle, which is what BN does
     # for any view the scripting console is not currently interning (#586).
-    # _collect_open_views()'s own dedup is `id(bv)` (bridge.py), so it cannot
-    # collapse them -- the close path must.
+    # _collect_open_views() dedups by BN handle equality (#714), so the three
+    # wrappers collapse to the one core view before the close path ever sees
+    # them -- and the close path keeps its own defensive dedup behind that.
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     _hermetic_registry(instance, tmp_path)
@@ -4128,20 +4231,145 @@ def test_close_binary_all_dedups_wrappers_minted_by_the_real_gui_walk(monkeypatc
     ))
     bridge._headless_views.clear()
 
-    # The walk itself really does hand back one wrapper per accessor: this is
-    # the duplication the close path has to absorb, not a hypothetical.
+    # #714: the walk itself now collapses them by BN handle equality, so the
+    # duplication never reaches the close path -- one entry per core view.
     raw = bridge._collect_open_views()
-    assert len(raw) == 3
-    assert len({id(v) for v in raw}) == 3   # three distinct Python objects
+    assert len(raw) == 1
     assert len(set(raw)) == 1               # one core view by handle equality
 
-    # `target list` already collapses them (records are keyed by stable id)...
+    # `target list` builds one record per core view...
     assert len(instance.targets.refresh()) == 1
     # ...and so must the destructive close: one round trip, one reported row.
     result = _close_on_watchdog(instance, all_=True)
     assert len(result["closed"]) == 1
     assert close_call_count[0] == 1
     assert handle.closed
+
+
+def test_collect_open_views_and_refresh_read_each_core_view_once(monkeypatch):
+    """#714: BN interns no wrapper for a non-console tab, so one core view
+    arrives from the UI walk under several distinct wrappers. Deduping by
+    handle equality at the source means the walk returns one entry per core
+    view -- and `refresh()` therefore performs ONE set of core reads
+    (session_id / filename / view name) per core view instead of building a
+    full TargetRecord per duplicate and throwing the extras away. The read
+    count is the assertion: the row count alone collapses either way."""
+    bridge = _load_bridge(monkeypatch)
+    handle = object()  # one shared core handle; must be hashable like BN's
+    reads = {"session_id": 0, "filename": 0, "view_name": 0}
+
+    class _CountingFile:
+        @property
+        def session_id(self):
+            reads["session_id"] += 1
+            return "11"
+
+        @property
+        def filename(self):
+            reads["filename"] += 1
+            return "/proj/parse_header.elf"
+
+    class _CountingView:
+        """A fresh wrapper per accessor (BN interns nothing here) for one shared
+        core handle, counting every core read the bridge performs."""
+
+        def __init__(self):
+            self.handle = handle
+            self.file = _CountingFile()
+
+        @property
+        def view_type(self):
+            reads["view_name"] += 1
+            return types.SimpleNamespace(name="ELF")
+
+        def __eq__(self, other):
+            return isinstance(other, _CountingView) and other.handle is self.handle
+
+        def __hash__(self):
+            return hash(self.handle)
+
+    class _Frame:
+        def getCurrentBinaryView(self):
+            return _CountingView()
+
+    class _TabView:
+        def getData(self):
+            return _CountingView()
+
+    class _Context:
+        def getCurrentViewFrame(self):
+            return _Frame()
+
+        def getTabs(self):
+            return ["tab-0"]
+
+        def getViewFrameForTab(self, tab):
+            return _Frame()
+
+        def getViewForTab(self, tab):
+            return _TabView()
+
+    monkeypatch.setattr(bridge, "ui", types.SimpleNamespace(
+        UIContext=types.SimpleNamespace(
+            allContexts=lambda: [_Context()],
+            activeContext=lambda: None,
+        )
+    ))
+    bridge._headless_views.clear()
+
+    views = bridge._collect_open_views()
+
+    reads.update(session_id=0, filename=0, view_name=0)
+    targets = bridge.TargetManager().refresh()
+
+    # The measured quantity: ONE set of core reads for the one core view. The
+    # row count alone collapses either way, so it cannot show the duplicate
+    # TargetRecords the old walk made refresh() build.
+    assert reads == {"session_id": 1, "filename": 1, "view_name": 1}
+    assert len(views) == 1
+    assert len(set(views)) == 1
+    assert len(targets) == 1
+
+
+def test_collect_open_views_merges_headless_views_by_handle_equality(monkeypatch):
+    """#714: the headless merge dedups by handle equality too, so a GUI tab and
+    a `bn load`-tracked wrapper for the same core view are reported once. Two
+    genuinely different core views must still both survive (#86 Problem A)."""
+    bridge = _load_bridge(monkeypatch)
+    gui_handle = types.SimpleNamespace(closed=False)
+    headless_handle = types.SimpleNamespace(closed=False)
+
+    class _Frame:
+        def getCurrentBinaryView(self):
+            return _ClosableBV("/proj/gui.so", session_id="11", handle=gui_handle)
+
+    class _Context:
+        def getCurrentViewFrame(self):
+            return _Frame()
+
+        def getTabs(self):
+            return []
+
+    monkeypatch.setattr(bridge, "ui", types.SimpleNamespace(
+        UIContext=types.SimpleNamespace(
+            allContexts=lambda: [_Context()],
+            activeContext=lambda: None,
+        )
+    ))
+    bridge._headless_views.clear()
+    # A DISTINCT wrapper for the identical core view the walk just reported,
+    # plus a genuinely different core view only `bn load` knows about.
+    bridge._headless_views.extend([
+        _ClosableBV("/proj/gui.so", session_id="11", handle=gui_handle),
+        _ClosableBV("/proj/loaded.bndb", session_id="22", handle=headless_handle),
+    ])
+
+    views = bridge._collect_open_views()
+
+    assert len(views) == 2
+    assert len(set(views)) == 2
+    assert {v.file.filename for v in views} == {"/proj/gui.so", "/proj/loaded.bndb"}
+    bridge._headless_views.clear()
 
 
 def test_close_binary_registry_failure_does_not_mask_the_close_failure(monkeypatch, tmp_path):
