@@ -175,6 +175,47 @@ def test_cli_layout_names_every_command_module():
     assert not missing, f"command modules missing from the CLI Layout list: {missing}"
 
 
+CLI_LAYOUT_HEADING = "### CLI Layout (`src/bn/`)"
+
+# Top-level modules no agent reaches for by name: the package initializer and
+# the `python -m bn` entry point. Named explicitly so a *new* module fails the
+# guard until it is listed (or deliberately added here), never silently omitted.
+CLI_LAYOUT_INTERNAL_MODULES = frozenset({"__init__.py", "__main__.py"})
+
+
+def _claude_md_section(heading: str) -> str:
+    """One `### ` section body, from `heading` to the next `### ` heading."""
+    lines = _doc_text().splitlines()
+    assert heading in lines, f"{heading!r} heading is missing from CLAUDE.md"
+    body = lines[lines.index(heading) + 1:]
+    for index, line in enumerate(body):
+        if line.startswith("### "):
+            return "\n".join(body[:index])
+    return "\n".join(body)
+
+
+def test_cli_layout_names_every_top_level_module():
+    """#721: `client.py`, `proc_identity.py` and `version.py` were missing from
+    the CLI Layout inventory, so an agent adding a paged read command had no
+    pointer to the page-aggregation helper and re-implemented paging in the
+    handler.
+
+    Scoped to the section, not the file: CLAUDE.md names `version.py` again in
+    the symlink sentence, so a whole-file `in text` check passes vacuously for
+    exactly the module the ticket is about. One directory glob, and any
+    deliberate omission named in `CLI_LAYOUT_INTERNAL_MODULES`.
+    """
+    section = _claude_md_section(CLI_LAYOUT_HEADING)
+    modules = sorted(
+        path.name
+        for path in (REPO / "src" / "bn").glob("*.py")
+        if path.name not in CLI_LAYOUT_INTERNAL_MODULES
+    )
+    assert modules, "no src/bn/*.py modules found"
+    missing = [name for name in modules if f"`{name}`" not in section]
+    assert not missing, f"top-level modules missing from the CLI Layout list: {missing}"
+
+
 def test_documented_python_requirement_matches_pyproject():
     """`Requires Python >= X.Y` is the first claim an agent acts on, and a stale
     floor sends it to install the wrong interpreter."""

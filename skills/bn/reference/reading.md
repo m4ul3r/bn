@@ -30,6 +30,12 @@ bn evidence message <type-string> [--limit N]        # protobuf/RTTI type-name -
 bn evidence init [--limit N]                         # .init_array/.ctors constructor-pointer summary
 bn evidence surface                                  # hidden code surface: init/ctor + vtable/dispatch tables + data-referenced code BN missed
 bn trace <fn> <addr> [--arg N] [--interprocedural]   # backward SSA slice: trace where a call argument originates
+bn dataflow defuse <fn> --var <name|local_id|name#version>   # SSA def site + use sites of one variable
+bn dataflow callgraph <fn> [--direction {callees|callers|both}]   # resolved edges; indirect targets via value-set
+bn dataflow values <fn> --at 0x401234                # value-set (possible values) at an instruction
+bn taint models [--role {source|sink|propagator}] [--class overflow_len] [--present]   # known sources/sinks; --present needs a target
+bn taint forward -f <fn> --source param:0 [--sink-class recv_overflow]   # untrusted data source→sink across calls (methodology → the `bn-vr` skill)
+bn taint backward -f <fn> --sink arg:memcpy:2         # slice a sink's args back to their origin (`bounded: true` = provably bounded)
 bn proto get <fn>
 bn local list <fn>
 bn read 0x... --length N [--encoding {hex|bytes}]   # address is positional; --address 0x... is an accepted alias
@@ -41,7 +47,12 @@ bn class list [--all] [--no-stl] [--query <substr>]   # C++ classes from demangl
 bn class show <Name>                                  # one class: methods, vtable, size, bases, instances
 bn strings [--query <q>] [--regex] [--min-length 5] [--section .rodata] [--no-crt]
 bn imports
+bn exports [--count]                                 # public exported symbols (contrast `imports`)
+bn go functions [--summary | --count]                # recover Go names from .gopclntab (then `bn go rename`, a mutation)
 bn sections [--query <q>]
+bn tag list [--type Bookmarks --query <substr>]      # tags at all scopes; `--type Bookmarks` is the bookmarks tag
+bn tag get 0x401000 | --function <fn>                # tags at one address, or the whole-function tags
+bn tag types                                         # tag types (built-in + custom)
 bn comment list [--query <q>] [--scope {all|address|function}]   # `all` (default) includes function docs
 bn comment get   --address 0x... | --function <fn>
 ```

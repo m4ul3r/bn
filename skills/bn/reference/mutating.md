@@ -155,6 +155,23 @@ bn comment delete --function player_update
 
 `comment set/get/delete` take the address either positionally (`bn comment set 0x401000 "..."`) or via `--address`; `--function` attaches a function-level comment instead. Exactly one of address / `--function` is required. The **comment text is a positional argument** — `bn comment set --address 0x.. "text"`; there is **no `--comment` flag** (the natural `--comment "text"` fails with an argparse error).
 
+### Tags
+
+```bash
+bn tag add 0x401000 --type Important --data "len unchecked" [--preview]
+bn tag add --function player_update --type Bookmarks --data "entry point"
+bn tag remove --id <tag-id>                        # ids come from `bn tag list --format json`
+bn tag remove 0x401000 --type Important
+bn tag type create my_sink --icon <glyph>
+bn tag type remove my_sink
+```
+
+Tags are the "remember this spot" annotation path — a **bookmark is just
+`--type Bookmarks`** — and they run the standard preview→verify loop. A custom
+type must exist (`tag type create`, a mutation) before `tag add` can use it, and
+each call takes exactly one location: an address (positional or `--address`) or
+`--function`, never both. Reads (`bn tag list/get/types`) are in `reading.md`.
+
 ### Data variables — bind a recovered type to an address
 
 ```bash

@@ -34,6 +34,14 @@ import pytest
 REFERENCE = Path(__file__).resolve().parent.parent / "skills" / "bn" / "reference"
 READING = REFERENCE / "reading.md"
 MUTATING = REFERENCE / "mutating.md"
+SKILL = REFERENCE.parent / "SKILL.md"
+
+COMMAND_INDEX_HEADING = "## Command index"
+
+# Top-level command groups an agent must be able to discover from the skill's
+# Command index. Each is also asserted to exist in the live `_COMMANDS`
+# registry, so the allow-list cannot outlive a command rename (#627).
+REQUIRED_INDEX_GROUPS = ("capabilities", "dataflow", "exports", "go", "tag", "taint")
 
 
 @pytest.fixture(scope="module")
@@ -41,6 +49,38 @@ def mutation_engine():
     """The engine module, imported against a stub `binaryninja` (no BN needed)."""
     sys.modules.setdefault("binaryninja", types.ModuleType("binaryninja"))
     return importlib.import_module("bn_agent_bridge.mutation_engine")
+
+
+@pytest.fixture(scope="module")
+def command_groups() -> set[str]:
+    """The live top-level groups, from the @command registry (no BN needed)."""
+    sys.modules.setdefault("binaryninja", types.ModuleType("binaryninja"))
+    importlib.import_module("bn.commands")          # populates bn.cli._COMMANDS
+    cli = importlib.import_module("bn.cli")
+    groups = {spec["path"][0] for spec in cli._COMMANDS}
+    assert groups, "bn.commands registered no commands; the allow-list is unchecked"
+    return groups
+
+
+def test_skill_command_index_names_every_required_group(command_groups):
+    """#627: `skills/bn/SKILL.md` is the first thing an agent reads, and its
+    Command index silently omitted `tag`, `taint`, `dataflow`, `exports`, `go`
+    and `capabilities` -- so an agent told to bookmark findings and run
+    source->sink analysis never reached `bn tag add --type Bookmarks` or
+    `bn taint forward`.
+
+    Scoped to the index section (the Reference block names files, not groups),
+    and paired with the registry so the requirement fails if a group is renamed
+    away rather than pinning a name that no longer exists.
+    """
+    text = SKILL.read_text(encoding="utf-8")
+    assert COMMAND_INDEX_HEADING in text, f"{COMMAND_INDEX_HEADING!r} is gone from SKILL.md"
+    index = text.split(COMMAND_INDEX_HEADING, 1)[1].split("\n## ", 1)[0]
+    missing = [group for group in REQUIRED_INDEX_GROUPS
+               if not re.search(rf"`{group}\b", index)]
+    assert not missing, f"groups missing from the SKILL.md Command index: {missing}"
+    renamed = sorted(set(REQUIRED_INDEX_GROUPS) - command_groups)
+    assert not renamed, f"the index requires groups the CLI registry does not have: {renamed}"
 
 
 def test_mutating_reference_documents_every_batch_op(mutation_engine):

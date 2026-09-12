@@ -69,6 +69,7 @@ bn close [<path>] [-t <sel>] [--all]     # close one or explicitly --all
 bn target close <sel>                    # close exactly that target (alias for `close -t <sel>`)
 bn exports [list]                         # public exported symbols
 bn help [family]                          # concise index; advertises capabilities
+bn capabilities --format json             # machine-readable full index, derived from the command registry
 bn instance gc                            # reap dead instance cache residue
 ```
 
