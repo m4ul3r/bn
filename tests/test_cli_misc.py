@@ -726,7 +726,7 @@ def test_batch_apply_reads_manifest_from_stdin(monkeypatch, fake_transport, caps
     )
     monkeypatch.setattr("sys.stdin", io.StringIO(manifest))
 
-    calls = fake_transport({"batch_apply": {"ok": True, "result": {"preview": False, "success": True, "results": []}}})
+    calls = fake_transport({"batch_apply": {"ok": True, "result": {"preview": False, "success": True, "results": [{"status": "verified"}]}}})
 
     rc = bn.cli.main(["batch", "apply", "-"])
 
@@ -783,7 +783,7 @@ def test_batch_apply_accepts_target_flag(monkeypatch, fake_transport):
     # supplies the manifest target when the manifest itself omits one.
     import io
     monkeypatch.setattr("sys.stdin", io.StringIO('{"ops": [{"op": "set_comment", "address": "0x1", "comment": "c"}]}'))
-    calls = fake_transport({"batch_apply": {"ok": True, "result": {"success": True, "results": []}}})
+    calls = fake_transport({"batch_apply": {"ok": True, "result": {"success": True, "results": [{"status": "verified"}]}}})
     rc = bn.cli.main(["batch", "apply", "-", "-t", "foo.bndb", "-i", "inst"])
     assert rc == 0
     assert calls[-1]["params"].get("target") == "foo.bndb"
@@ -795,7 +795,7 @@ def test_batch_apply_cli_target_overrides_manifest(monkeypatch, fake_transport):
     # example but passes a correct -t must not be sabotaged by the in-payload value.
     import io
     monkeypatch.setattr("sys.stdin", io.StringIO('{"target": "active", "ops": []}'))
-    calls = fake_transport({"batch_apply": {"ok": True, "result": {"success": True, "results": []}}})
+    calls = fake_transport({"batch_apply": {"ok": True, "result": {"success": True, "results": [{"status": "verified"}]}}})
     rc = bn.cli.main(["batch", "apply", "-", "-t", "fromflag", "-i", "inst"])
     assert rc == 0
     assert calls[-1]["params"].get("target") == "fromflag"
@@ -805,7 +805,7 @@ def test_batch_apply_manifest_target_used_when_no_flag(monkeypatch, fake_transpo
     # Without -t, the manifest "target" is still honored.
     import io
     monkeypatch.setattr("sys.stdin", io.StringIO('{"target": "explicit", "ops": []}'))
-    calls = fake_transport({"batch_apply": {"ok": True, "result": {"success": True, "results": []}}})
+    calls = fake_transport({"batch_apply": {"ok": True, "result": {"success": True, "results": [{"status": "verified"}]}}})
     rc = bn.cli.main(["batch", "apply", "-", "-i", "inst"])
     assert rc == 0
     assert calls[-1]["params"].get("target") == "explicit"
@@ -1331,7 +1331,7 @@ def test_batch_apply_drops_instance_id_target(monkeypatch):
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         captured["params"] = params
         captured["instance_id"] = instance_id
-        return {"ok": True, "result": {"results": [], "status": "verified"}}
+        return {"ok": True, "result": {"results": [{"status": "verified"}], "status": "verified"}}
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
     import io
     manifest = '{"target": "my_inst", "ops": []}'
