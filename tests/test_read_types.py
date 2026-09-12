@@ -636,3 +636,168 @@ def test_render_type_layout_expands_anonymous_aggregate(monkeypatch):
     inner_members = by_name["u"].get("members")
     assert isinstance(inner_members, list)
     assert {m.get("name") for m in inner_members} == {"iv", "fv"}
+
+
+# ---------------------------------------------------------------------------
+# typedef aliases and nesting depth (#674)
+# ---------------------------------------------------------------------------
+
+
+class _TypedefRef(_FakeType):
+    """A BN NamedTypeReference: the alias carries no members of its own and
+    resolves to the registered underlying type through `.target(bv)`."""
+
+    def __init__(self, decl, target):
+        super().__init__(decl, type_class="NamedTypeReferenceClass")
+        self._target = target
+
+    def target(self, bv):
+        return self._target
+
+
+def _registered(type_obj, name):
+    type_obj.registered_name = types.SimpleNamespace(name=name)
+    return type_obj
+
+
+def test_struct_show_follows_typedef_to_underlying_struct(monkeypatch):
+    """`struct show <typedef>` reported "Type is not a struct-like type: <alias>"
+    because the alias itself has no members, while the underlying registered
+    struct does. It must follow the typedef and render that body (layout and
+    JSON members[]), while `types show` keeps reporting the alias (#674)."""
+    bridge = _load_bridge(monkeypatch)
+    ctx = bridge.BinaryNinjaBridge().ctx
+    body = _registered(
+        _FakeType("struct", width=0x10, members=[_FakeMember(0x0, "data", "uint8_t[16]")]),
+        "_AnonymousBody",
+    )
+    alias = _TypedefRef("struct _AnonymousBody", body)
+    bv = _FakeBV(types_={"AliasName": alias, "_AnonymousBody": body})
+    monkeypatch.setattr(ctx, "_resolve_view", lambda selector: bv)
+
+    entry = bridge.read_types._type_info(ctx, None, "AliasName", require_struct=True)
+    assert entry["name"] == "_AnonymousBody"
+    assert "0x0000: uint8_t[16] data" in entry["layout"]
+    assert [m.get("name") for m in entry["members"]] == ["data"]
+
+    # `types show` is unrestricted and still reports the alias entry unchanged.
+    plain = bridge.read_types._type_info(ctx, None, "AliasName")
+    assert plain["name"] == "AliasName"
+    assert "members" not in plain
+
+
+def test_struct_show_follows_a_typedef_chain(monkeypatch):
+    """A typedef of a typedef resolves through every hop to the struct body
+    (BN's `.target()` may itself hand back another NamedTypeReference)."""
+    bridge = _load_bridge(monkeypatch)
+    ctx = bridge.BinaryNinjaBridge().ctx
+    body = _registered(
+        _FakeType("struct", width=0x4, members=[_FakeMember(0x0, "hp", "int32_t")]),
+        "_Body",
+    )
+    mid = _TypedefRef("struct _Body", body)
+    outer = _TypedefRef("MidAlias", mid)
+    bv = _FakeBV(types_={"OuterAlias": outer, "MidAlias": mid, "_Body": body})
+    monkeypatch.setattr(ctx, "_resolve_view", lambda selector: bv)
+
+    entry = bridge.read_types._type_info(ctx, None, "OuterAlias", require_struct=True)
+    assert entry["name"] == "_Body"
+    assert "0x0000: int32_t hp" in entry["layout"]
+
+
+def test_struct_show_typedef_to_non_struct_still_raises(monkeypatch):
+    """A type that resolves to a scalar is genuinely not struct-like: the error
+    path must survive the typedef follow (and not hang on a self-referential
+    alias) while naming the type it could not resolve to a struct."""
+    bridge = _load_bridge(monkeypatch)
+    ctx = bridge.BinaryNinjaBridge().ctx
+    scalar = _FakeType("int32_t", type_class="IntegerTypeClass")
+    loop = _TypedefRef("SelfAlias", None)
+    loop._target = loop                      # pathological self-referential typedef
+    bv = _FakeBV(types_={"TileCount": scalar, "SelfAlias": loop})
+    monkeypatch.setattr(ctx, "_resolve_view", lambda selector: bv)
+
+    with pytest.raises(RuntimeError, match=r"not a struct-like type: TileCount"):
+        bridge.read_types._type_info(ctx, None, "TileCount", require_struct=True)
+    with pytest.raises(RuntimeError, match=r"not a struct-like type: SelfAlias"):
+        bridge.read_types._type_info(ctx, None, "SelfAlias", require_struct=True)
+
+
+def _nested_anonymous_aggregate(levels: int):
+    """An anonymous struct nested *levels* deep: the outermost type holds member
+    `nested1`, whose own type holds `nested2`, ... down to a scalar `leaf` at the
+    innermost depth."""
+    current = _FakeType("struct", width=1, members=[_FakeMember(0x0, "leaf", "uint8_t")])
+    for level in range(levels, 0, -1):
+        current = _FakeType("struct", width=1, members=[_FakeMember(0x0, f"nested{level}", current)])
+    return current
+
+
+def _flagged_json_depth(entry):
+    """Depth (0 = top-level member) of the first JSON member entry flagged
+    `truncated: true` on the single-child path, or None when nothing is cut."""
+    depth = 0
+    nodes = entry.get("members")
+    while nodes:
+        node = nodes[0]
+        if node.get("truncated"):
+            return depth
+        nodes = node.get("members")
+        depth += 1
+    return None
+
+
+def test_deeply_nested_layout_renders_past_level_five(monkeypatch):
+    """A 10-level anonymous aggregate used to stop expanding after level 5 with
+    no marker, so the inner structs read as empty. Both renderers must reach the
+    innermost members (#674)."""
+    bridge = _load_bridge(monkeypatch)
+    ctx = bridge.BinaryNinjaBridge().ctx
+    deep = _nested_anonymous_aggregate(10)
+
+    text = ctx._render_type_layout(deep)
+    assert "nested1" in text and "nested10" in text
+    assert "0x0000: uint8_t leaf" in text
+
+    entry = ctx._type_entry("Deep", deep)
+    assert _flagged_json_depth(entry) is None
+    node = entry
+    for level in range(1, 11):
+        children = {m.get("name"): m for m in node["members"]}
+        assert f"nested{level}" in children, (level, children)
+        node = children[f"nested{level}"]
+    assert [m.get("name") for m in node["members"]] == ["leaf"]
+
+
+def test_nested_layout_truncation_is_disclosed(monkeypatch):
+    """Past the nesting cap the cut must be disclosed, not silent: a text marker
+    line and a `truncated: true` JSON flag on the entry whose children were cut,
+    both agreeing on the depth (#674)."""
+    bridge = _load_bridge(monkeypatch)
+    ctx = bridge.BinaryNinjaBridge().ctx
+    deep = _nested_anonymous_aggregate(40)
+
+    text = ctx._render_type_layout(deep)
+    marker = [line for line in text.splitlines() if "truncated at depth" in line]
+    assert marker, text
+    assert "leaf" not in text                      # the cut is real
+    assert "nested1" in text                       # ...but the outer levels stay
+
+    entry = ctx._type_entry("Deep", deep)
+    flagged = _flagged_json_depth(entry)
+    assert flagged is not None
+    declared = int(marker[0].split("truncated at depth", 1)[1].split(":", 1)[0].strip())
+    assert declared == flagged + 1
+
+
+def test_self_referential_anonymous_aggregate_still_terminates(monkeypatch):
+    """The cap must also bound a pathological aggregate that nests into itself:
+    rendering terminates and discloses the cut instead of recursing forever."""
+    bridge = _load_bridge(monkeypatch)
+    ctx = bridge.BinaryNinjaBridge().ctx
+    cycle = _FakeType("struct", width=8, members=[], type_class="StructureTypeClass")
+    cycle.members.append(_FakeMember(0x0, "self", cycle))
+
+    text = ctx._render_type_layout(cycle)
+    assert "truncated at depth" in text
+    assert _flagged_json_depth(ctx._type_entry("Cycle", cycle)) is not None

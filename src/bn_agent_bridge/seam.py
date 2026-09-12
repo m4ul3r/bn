@@ -54,6 +54,16 @@ _TYPE_CLASS_NAMES: dict[int, str] = {
 # one real implementation, resolution auto-picks the implementation (#122).
 _STUB_SYMBOL_TYPE_NAMES = frozenset({"ImportedFunctionSymbol", "ExternalSymbol"})
 
+# Nested anonymous aggregates are expanded in the text layout and in the JSON
+# members[] tree so their inner members aren't invisible (#370.2). The depth is
+# capped only to bound recursion on a pathological (even self-referential)
+# aggregate -- deep nesting is real, so the cap is generous -- and hitting it is
+# DISCLOSED, never silent: the text layout renders an explicit
+# "... truncated at depth N" line and the JSON entry whose children were cut
+# carries "truncated": true, so a capped subtree is never read as an empty
+# struct (#674).
+_MAX_NESTED_LAYOUT_DEPTH = 32
+
 
 class BridgeContext:
     """Resolution / ABI / address-context seam over a ``TargetManager``."""
@@ -1004,10 +1014,14 @@ class BridgeContext:
                     offset = 0
                 member_type = getattr(member, "type", None)
                 lines.append(f"{pad}0x{offset:04x}: {member_type if member_type is not None else '<unknown>'} {name}")
-                if depth < 4 and self._is_anonymous_aggregate(member_type):
-                    itc = str(getattr(getattr(member_type, "type_class", None), "name", "") or "")
-                    self._append_member_lines(
-                        lines, member_type.members, "Enum" in itc, depth=depth + 1)
+                if self._is_anonymous_aggregate(member_type):
+                    if depth < _MAX_NESTED_LAYOUT_DEPTH:
+                        itc = str(getattr(getattr(member_type, "type_class", None), "name", "") or "")
+                        self._append_member_lines(
+                            lines, member_type.members, "Enum" in itc, depth=depth + 1)
+                    else:
+                        lines.append(
+                            f"{pad}  ... truncated at depth {depth + 1}: further nested members omitted")
 
     def _member_entries(self, type_obj, depth: int = 0) -> list[dict] | None:
         """Structured members[] for the JSON readback, recursing into anonymous
@@ -1031,10 +1045,13 @@ class BridgeContext:
                 entry["type"] = str(mtype)
             if value is not None and offset is None:
                 entry["value"] = int(value) if isinstance(value, int) else str(value)
-            if depth < 4 and self._is_anonymous_aggregate(mtype):
-                inner = self._member_entries(mtype, depth + 1)
-                if inner:
-                    entry["members"] = inner
+            if self._is_anonymous_aggregate(mtype):
+                if depth < _MAX_NESTED_LAYOUT_DEPTH:
+                    inner = self._member_entries(mtype, depth + 1)
+                    if inner:
+                        entry["members"] = inner
+                else:
+                    entry["truncated"] = True
             out.append(entry)
         return out
 
