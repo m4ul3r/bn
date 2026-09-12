@@ -940,138 +940,237 @@ def test_the_disclosure_reaches_an_early_return_path():
     assert "malformed function field" in values
 
 
-# Every container field a text renderer coerces, with the empty value it is
-# coerced TO. `_as_dict`/`_as_list` stop the AttributeError a malformed payload
-# used to raise (#101/#619), but a coerced `{}`/`[]` renders byte-identically to
-# a genuinely empty result -- so the caller reads a confident "nothing here"
-# from data the renderer could not use. That is strictly worse than the crash:
-# a forward-taint view prints "no taint reached any sink or frontier", a
-# security all-clear, where base raised. This table is the contract; a new
-# coercion site that forgets its disclosure fails the two tests below.
-COERCED_CONTAINER_FIELDS: tuple[tuple[str, str, object], ...] = (
-    ("_render_capabilities_text", "items", []),
-    ("_render_function_info_text", "function", {}),
-    ("_render_function_info_text", "locals", []),
-    ("_render_function_info_text", "parameters", []),
-    ("_render_local_list_text", "function", {}),
-    ("_render_local_list_text", "items", []),
-    ("_render_local_list_text", "locals", []),
-    ("_render_field_xrefs_text", "field", {}),
-    ("_render_field_xrefs_text", "items", []),
-    ("_render_instance_find_text", "items", []),
-    ("_render_go_rename_text", "results", []),
-    ("_render_surface_text", "summary", {}),
-    ("_render_surface_text", "warnings", []),
-    ("_render_surface_text", "init_sections", []),
-    ("_render_surface_text", "candidate_tables", []),
-    ("_render_surface_text", "missing_function_candidates", []),
-    ("_render_virtual_call_text", "candidates", []),
-    ("_render_virtual_call_text", "warnings", []),
-    ("_render_message_lens_text", "rtti_symbols", []),
-    ("_render_orient_text", "target", {}),
-    ("_render_orient_text", "imports_summary", {}),
-    ("_render_orient_text", "sections", {}),
-    ("_render_orient_text", "strings_sample", {}),
-    ("_render_structured_il_text", "function", {}),
-    ("_render_structured_il_text", "instructions", []),
-    ("_render_defuse_text", "function", {}),
-    ("_render_defuse_text", "variable", {}),
-    ("_render_defuse_text", "phi_sources", []),
-    ("_render_defuse_text", "uses", []),
-    ("_render_callgraph_text", "function", {}),
-    ("_render_callgraph_text", "callees", []),
-    ("_render_callgraph_text", "callers", []),
-    ("_render_values_text", "function", {}),
-    ("_render_values_text", "possible_values", {}),
-    ("_render_taint_text", "function", {}),
-    ("_render_taint_text", "sources", []),
-    ("_render_taint_text", "reached_sinks", []),
-    ("_render_taint_text", "leaves", []),
-    ("_render_taint_text", "assumptions", []),
-    ("_render_taint_text", "sinks", []),
-    ("_render_taint_text", "slices", []),
-    ("_render_taint_text", "sink_status", []),
-    ("_render_taint_models_text", "sources", []),
-    ("_render_taint_models_text", "sinks_by_class", {}),
-    ("_render_taint_models_text", "propagators", []),
-    ("_render_taint_models_text", "overlays", []),
-    ("_render_imports_summary_text", "needed_libraries", []),
-    ("_render_imports_summary_text", "namespaces", {}),
-    ("_render_imports_summary_text", "by_kind", {}),
-    ("_render_cfg_text", "function", {}),
-    ("_render_cfg_text", "warnings", []),
-    ("_render_cfg_text", "blocks", []),
-    ("_render_data_vars_text", "items", []),
-    ("_render_data_symbols_text", "items", []),
-    ("_render_mutation_text", "results", []),
-    ("_render_mutation_text", "affected_functions", []),
-    ("_render_trace_text", "arg_label", {}),
-    ("_render_class_list_text", "items", []),
-    ("_render_class_list_text", "classes", []),
-    ("_render_class_show_text", "matches", []),
-    ("_render_trace_text", "trace", []),
-    ("_render_trace_text", "hints", []),
-    ("_render_trace_text", "assumptions", []),
-    ("_render_defuse_text", "other_versions", []),
-    ("_render_load_text", "notes", []),
-    ("_render_load_text", "targets", []),
-    ("_render_close_text", "closed", []),
-    ("_render_session_start_text", "loaded", []),
-    ("_render_session_start_text", "project_roots", []),
-    ("_render_session_status_text", "items", []),
-    ("_render_session_list_text", "items", []),
-    ("_render_session_list_text", "instances", []),
-    ("_render_xrefs_any_text", "items", []),
-    ("_render_function_evidence_text", "calls", []),
-    ("_render_call_descriptors_text", "items", []),
-    ("_render_call_descriptors_text", "warnings", []),
-    ("_render_record_table_text", "items", []),
-    ("_render_record_table_text", "warnings", []),
-    ("_render_record_table_text", "ptr_fields", []),
-    ("_render_pointer_table_text", "items", []),
-    ("_render_pointer_table_text", "warnings", []),
-    ("_render_message_lens_text", "items", []),
-    ("_render_message_lens_text", "hints", []),
-    ("_render_fanout_text", "instances", []),
-    ("_render_init_arrays_text", "items", []),
-    ("_render_callsites_text", "items", []),
-    ("_render_sections_text", "writable_executable_items", []),
-    ("_render_doctor_text", "instances", []),
-    ("_render_py_exec_text", "warnings", []),
-)
+def _coercion_sites():
+    """Every named-field container coercion in the formatter module, read out of
+    the module's own AST.
 
+    Derived, never hand-listed. The first attempt at this guard was a table of
+    the renderers' own `@_discloses(lists=..., dicts=...)` declarations, which is
+    a restatement of the implementation: a declaration list and a table of that
+    same list agreeing with each other proves nothing, and it read as 89 rows of
+    coverage while checking nothing the code does."""
+    import ast
+    import inspect
 
-def test_a_malformed_container_is_never_rendered_as_an_empty_one():
     from bn import formatters
 
-    def render(name, payload):
-        try:
-            return getattr(formatters, name)(payload)
-        except Exception as exc:                       # a raise is the old bug
-            return f"RAISED {type(exc).__name__}: {exc}"
+    tree = ast.parse(inspect.getsource(formatters))
+    sites, raw = [], []
+    for fn in tree.body:
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        for node in ast.walk(fn):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                if node.func.id in ("_field_list", "_field_dict"):
+                    base = node.args[0] if node.args else None
+                    top = isinstance(base, ast.Name) and base.id == "value"
+                    keys = [a.value for a in node.args[1:]
+                            if isinstance(a, ast.Constant)]
+                    kind = "list" if node.func.id == "_field_list" else "dict"
+                    sites.append((fn.name, tuple(keys), kind, top))
+                # A coercion that bypasses the recording helpers cannot disclose.
+                if node.func.id in ("_as_list", "_as_dict") and node.args:
+                    a = node.args[0]
+                    if (isinstance(a, ast.Call) and isinstance(a.func, ast.Attribute)
+                            and a.func.attr == "get"):
+                        raw.append((fn.name, ast.unparse(node)))
+            # `x.get("k") or []` / `or {}` -- the pre-#619 raw coercion idiom.
+            if isinstance(node, ast.BoolOp) and isinstance(node.op, ast.Or):
+                last = node.values[-1]
+                if ((isinstance(last, ast.List) and not last.elts)
+                        or (isinstance(last, ast.Dict) and not last.keys)):
+                    for c in node.values[:-1]:
+                        if (isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                                and c.func.attr == "get" and c.args
+                                and isinstance(c.args[0], ast.Constant)):
+                            raw.append((fn.name, ast.unparse(node)))
+    return sites, raw
 
-    silent = []
-    for name, field, empty in COERCED_CONTAINER_FIELDS:
-        out = render(name, {field: "bad"})
-        if ("malformed" not in out
-                or out == render(name, {field: empty})
-                or out == render(name, {})):
-            silent.append(f"{name}({field}) -> {out.splitlines()[:1]}")
-    assert not silent, f"malformed container not disclosed: {silent}"
+
+def test_no_payload_container_is_coerced_outside_the_recording_helpers():
+    """THE load-bearing assertion. `_field_list`/`_field_dict` disclose by
+    construction, so "every _field_* call discloses" is close to a tautology.
+    What actually makes the choke point a choke point is that nothing coerces a
+    payload container any other way: the two earlier attempts at this fix each
+    enumerated the sites they could see and left the rest silent, and a single
+    `x.get("k") or []` added later puts the defect straight back."""
+    sites, raw = _coercion_sites()
+    assert sites, "AST walk found no coercion sites at all -- the guard is blind"
+    assert not raw, (
+        f"{len(raw)} container coercion(s) bypass the recording helpers, so a "
+        f"malformed value there renders as empty with no disclosure: {raw[:6]}")
 
 
 def test_the_malformed_disclosure_never_fires_on_a_well_formed_payload():
-    # The mirror of the test above, and the more dangerous failure: crying
-    # "malformed" at a genuinely empty result would teach a caller to distrust
-    # correct output.
+    """The mirror property, and the more dangerous direction: crying "malformed"
+    at a genuinely empty result would teach a caller to ignore the signal, which
+    destroys it while appearing to fix it. Every top-level coerced field, with
+    the value absent, empty, or an explicit null."""
     from bn import formatters
+
+    sites, _ = _coercion_sites()
     noisy = []
-    for name, field, empty in COERCED_CONTAINER_FIELDS:
-        render = getattr(formatters, name)
-        for payload in ({}, {field: empty}, {field: None}):
-            if "malformed" in render(payload):
-                noisy.append(f"{name}({field}) on {payload!r}")
+    for fn_name, keys, kind, top in sites:
+        render = getattr(formatters, fn_name, None)
+        if not top or render is None or not fn_name.startswith("_render"):
+            continue
+        empty: object = [] if kind == "list" else {}
+        for key in keys:
+            for payload in ({}, {key: empty}, {key: None}):
+                try:
+                    out = render(payload)
+                except Exception:                  # unrelated shape requirement
+                    continue
+                if "malformed" in out:
+                    noisy.append(f"{fn_name}({key}) on {payload!r}")
     assert not noisy, f"disclosure fired on well-formed data: {noisy}"
+
+
+def test_well_formed_realistic_payloads_carry_no_disclosure():
+    # The mirror again, on data shaped like reality rather than one key at a
+    # time: an empty listing, a 0-import target, a zero-class result and a taint
+    # run with nothing to report are all CORRECT empty answers.
+    from bn import formatters
+    clean = [
+        formatters._render_imports_summary_text(
+            {"total_symbols": 0, "needed_libraries": [], "namespaces": {}, "by_kind": {}}),
+        formatters._render_class_list_text({"items": [], "total": 0}),
+        formatters._render_local_list_text(
+            {"function": {"name": "f", "address": "0x1"}, "items": []}),
+        formatters._render_taint_text(
+            {"function": {"name": "f", "address": "0x1"}, "direction": "forward",
+             "sources": [{"address": "0x2"}], "reached_sinks": [], "leaves": [],
+             "stats": {"functions_visited": 3}}),
+        formatters._render_surface_text(
+            {"summary": {"init_sections": 0, "candidate_tables": 0,
+                         "missing_function_candidates": 0}}),
+        formatters._render_cfg_text(
+            {"function": {"name": "f", "address": "0x1"}, "view": "mlil",
+             "blocks": [{"start": "0x1", "insns": [{"a": "0x1", "t": "nop"}], "edges": []}]}),
+        formatters._render_class_show_text(
+            {"name": "Widget", "bases": [], "methods": [], "confidence": "rtti"}),
+    ]
+    assert not [out for out in clean if "malformed" in out]
+
+
+def test_a_truncated_taint_run_with_a_skewed_stats_field_says_so():
+    # The worst case in this class: `stats` is coerced inside the verdict helper
+    # the renderer hands its WHOLE payload to, so a declaration on the renderer
+    # never saw it. A truncated run whose stats arrive skewed silently loses the
+    # "truncated @depth" clause and the visited-function count, and an
+    # INCOMPLETE analysis then reads byte-identically to a complete one.
+    from bn.formatters import _render_taint_text
+    payload = {"function": {"name": "f", "address": "0x1"}, "direction": "forward",
+               "sources": [{"address": "0x2"}], "reached_sinks": [], "leaves": []}
+    skewed = _render_taint_text({**payload, "stats": "bad"})
+    assert "malformed stats field" in skewed
+    assert skewed != _render_taint_text(payload)
+
+
+def test_class_show_discloses_a_skewed_method_list_on_both_paths():
+    # `methods`/`bases` are coerced in the single-class helper, which the
+    # renderer calls with its own payload on the non-ambiguous path and with a
+    # match ROW on the ambiguous one. A class whose method list arrives skewed
+    # must not render as a class that simply has no methods.
+    from bn.formatters import _render_class_show_text
+    direct = _render_class_show_text(
+        {"name": "Widget", "confidence": "rtti", "methods": "bad", "bases": "bad"})
+    assert "class Widget" in direct
+    assert "malformed bases, methods fields" in direct
+    assert direct != _render_class_show_text(
+        {"name": "Widget", "confidence": "rtti", "methods": [], "bases": []})
+
+    ambiguous = _render_class_show_text(
+        {"ambiguous": True, "query": "W",
+         "matches": [{"name": "Widget", "confidence": "rtti", "methods": "bad"}]})
+    assert "malformed methods field" in ambiguous
+
+
+def test_class_show_ambiguous_count_is_the_rows_rendered_not_the_raw_field():
+    # A skewed `matches` counted one match per CHARACTER of the string: invented
+    # data in the one line a reader uses to judge how ambiguous the query was.
+    from bn.formatters import _render_class_show_text
+    out = _render_class_show_text({"ambiguous": True, "query": "W", "matches": "bad"})
+    assert "0 matches" in out
+    assert "3 matches" not in out
+    assert "malformed matches field" in out
+
+
+def test_class_show_discloses_a_skewed_secondary_vtable_slot_list():
+    from bn.formatters import _render_class_show_text
+    out = _render_class_show_text(
+        {"name": "Widget", "confidence": "rtti",
+         "secondary_vtables": [{"address": "0x10", "slots": "bad"}]})
+    assert "malformed slots field" in out
+
+
+def test_cfg_discloses_skewed_per_block_containers():
+    # Nested one level below the renderer's own payload: per-block `insns` and
+    # `edges`. Base raised here; a coerced [] renders a block that looks empty.
+    from bn.formatters import _render_cfg_text
+    out = _render_cfg_text({"function": {"name": "f", "address": "0x1"},
+                            "view": "mlil",
+                            "blocks": [{"start": "0x1", "insns": "bad", "edges": "bad"}]})
+    assert "block 0x1" in out
+    assert "malformed edges, insns fields" in out
+
+
+def test_callgraph_discloses_a_skewed_per_callee_resolution_list():
+    from bn.formatters import _render_callgraph_text
+    out = _render_callgraph_text({
+        "function": {"name": "f", "address": "0x1"},
+        "callees": [{"call_addr": "0x5", "direct": False, "dest_expr": "rax",
+                     "resolved": "bad"}]})
+    assert "UNRESOLVED" in out          # an unusable list is not "no targets"
+    assert "malformed resolved field" in out
+
+
+def test_structured_il_discloses_skewed_per_instruction_var_lists():
+    from bn.formatters import _render_structured_il_text
+    out = _render_structured_il_text({
+        "function": {"name": "f", "address": "0x1"}, "view": "mlil",
+        "instructions": [{"il_index": 0, "address": "0x1", "op": "MLIL_SET_VAR",
+                          "text": "x = 1", "vars_read": "bad", "vars_written": "bad"}]})
+    assert "MLIL_SET_VAR" in out
+    assert "malformed vars_read, vars_written fields" in out
+
+
+def test_class_list_discloses_a_skewed_per_row_base_list():
+    from bn.formatters import _render_class_list_text
+    out = _render_class_list_text({"items": [{"name": "Widget", "bases": "bad"}], "total": 1})
+    assert "Widget" in out
+    assert "malformed bases field" in out
+
+
+def test_orient_discloses_a_skewed_sample_attribution_list():
+    # A round-1 major fixed the RAISE here by coercing the list; coercing it
+    # silently traded the crash for a silent drop, which is the trade this whole
+    # change exists to refuse.
+    from bn.formatters import _render_orient_text
+    out = _render_orient_text({"strings_sample": {"items": [], "sample_sections": "bad"}})
+    assert "malformed sample_sections field" in out
+
+
+def test_xref_renderers_disclose_skewed_ref_containers():
+    from bn.formatters import _render_xrefs_text
+    out = _render_xrefs_text({"symbol": "gets", "code_refs": "bad", "data_refs": "bad"})
+    assert "malformed code_refs, data_refs fields" in out
+
+
+def test_mutation_renderer_discloses_a_skewed_affected_types_list():
+    from bn.formatters import _render_mutation_text
+    out = _render_mutation_text({"success": True, "committed": True,
+                                 "results": [{"op": "types_declare", "status": "verified"}],
+                                 "affected_types": "bad"})
+    assert "malformed affected_types field" in out
+
+
+def test_taint_sink_entry_discloses_a_skewed_callsite_list():
+    from bn.formatters import _render_taint_models_text
+    out = _render_taint_models_text({"sinks_by_class": {"unbounded_input": [
+        {"symbol": "gets", "callsites": "bad"}]}})
+    assert "gets" in out
+    assert "malformed callsites field" in out
 
 
 def test_render_instance_find_non_dict_item_degrades():
