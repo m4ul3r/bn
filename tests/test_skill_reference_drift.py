@@ -124,7 +124,7 @@ _INDEX_ENTRY = re.compile(
 _INDEX_LINE = re.compile(r"\s*[-*+] +\*\*(?P<group>[^*]+)\*\*")
 
 # ```bash blocks are how every reference presents a command an agent can run.
-_BASH_BLOCK = re.compile(r"```bash\n(.*?)```", re.S)
+_BASH_BLOCK = re.compile(r"```(?:bash|sh|shell|console)\n(.*?)```", re.S)
 
 # A runnable invocation: a line whose first word is `bn`.
 _RUNNABLE = re.compile(r"^[ \t]*bn +(?P<rest>[a-z].*)$", re.M)
@@ -163,8 +163,7 @@ def _documented_commands(text: str, command_paths: set[str]) -> set[str]:
 
     Each `bn ...` line resolves to its longest registered command path, so a
     match is exact rather than a prefix: `bn types show <name>` documents
-    `types show` and NOT `types`, which a `startswith`-style check would have
-    let stand in for it.
+    `types show` and NOT `types`, which a prefix check would let stand in for it.
     """
     documented: set[str] = set()
     for match in _RUNNABLE.finditer("\n".join(_BASH_BLOCK.findall(text))):
@@ -177,9 +176,25 @@ def _documented_commands(text: str, command_paths: set[str]) -> set[str]:
     return documented
 
 
+# The groups the Command index must carry. Pinned as a SET, not a floor: a floor
+# is satisfied by "still at least four lines", which is exactly how a line that
+# stopped matching disappeared unnoticed. `_INDEX_LINE` refusing what it cannot
+# read covers the other half -- nothing silently leaves the sweep.
+EXPECTED_INDEX_GROUPS = frozenset({"Read", "Mutate", "Discover", "Session", "Escape hatch"})
+
+
 def _index_lines() -> list[str]:
     lines = [line for line in _index_section().splitlines() if line.strip()]
-    assert len(lines) >= 4, f"the Command index lost its group lines: {lines}"
+    unreadable = [line for line in lines if not _INDEX_LINE.match(line)]
+    assert not unreadable, (
+        "every line in the Command index must be a readable `- **Group** ...` "
+        f"entry, or this guard silently stops checking it: {unreadable}"
+    )
+    groups = {_INDEX_LINE.match(line).group("group").strip() for line in lines}
+    assert groups == EXPECTED_INDEX_GROUPS, (
+        f"the Command index groups changed: expected {sorted(EXPECTED_INDEX_GROUPS)}, "
+        f"parsed {sorted(groups)}"
+    )
     return lines
 
 

@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import ast
 import json
 import types
+from pathlib import Path
 
 import bn.cli
 import pytest
 
 from _cli_helpers import *  # noqa: F401,F403
+
+REPO = Path(__file__).resolve().parents[1]
 
 
 def test_mutation_summary_transform_compacts_result():
@@ -1086,7 +1090,7 @@ def test_unmeasured_mutation_still_exits_four_in_verbose_mode(monkeypatch):
     assert rc == 4
 
 
-def test_unmeasured_mutation_failure_still_exits_three(monkeypatch):
+def test_invariant_guard_unmeasured_mutation_failure_still_exits_three(monkeypatch):
     """Ordering: an unmeasured envelope that also reports failure is a failure
     (exit 3), not "applied but unverifiable" (exit 4)."""
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
@@ -1101,7 +1105,7 @@ def test_unmeasured_mutation_failure_still_exits_three(monkeypatch):
     assert rc == 3
 
 
-def test_op_with_its_own_summary_is_measured_and_exits_zero(monkeypatch, capsys):
+def test_invariant_guard_op_with_its_own_summary_is_measured_and_exits_zero(monkeypatch, capsys):
     """#715: "no `results[]` rows" is NOT the exit-4 rule -- `measured: false`
     is. `go rename` reports its work through its own counters and registers a
     compact summary that counts them, so an empty `results[]` (that array holds
@@ -1157,9 +1161,10 @@ def test_unclassifiable_mutation_result_covers_overflowed_wire_numbers(monkeypat
 @pytest.mark.parametrize("counter", ["many", float("inf")],
                          ids=["unparseable", "non-finite"])
 @pytest.mark.parametrize("extra", [[], ["--verbose"], ["--summary"],
-                                   ["--format", "json"], ["--format", "ndjson"]],
-                         ids=["default", "verbose", "summary", "json", "ndjson"])
-def test_unclassifiable_failing_mutation_result_is_still_a_clean_exit(monkeypatch, capsys, extra, counter):
+                                   ["--format", "json"], ["--format", "ndjson"],
+                                   ["--out"]],
+                         ids=["default", "verbose", "summary", "json", "ndjson", "out"])
+def test_unclassifiable_failing_mutation_result_is_still_a_clean_exit(monkeypatch, capsys, tmp_path, extra, counter):
     """A FAILING result short-circuits to exit 3 before the summary transform is
     ever run, so the exit-code guard never sees it -- and `_call` then feeds that
     same transform to the renderer AND to the spill-status builder. Every one of
@@ -1167,9 +1172,12 @@ def test_unclassifiable_failing_mutation_result_is_still_a_clean_exit(monkeypatc
     must leave with a documented code and a documented message, never a traceback
     (exit 1) after the exit code was already decided.
 
-    Parametrized over the formats on purpose: the first cut of this test covered
-    only the default, which was the single variant the guard already handled, so
-    it stayed green while three machine formats still crashed.
+    Parametrized over every output path, and asserting the exact code, on
+    purpose: the first cut covered only the default format and accepted `2 or 3`,
+    so it stayed green while three machine formats still crashed. The answer is
+    2 and not 3 because a result the CLI cannot read cannot be reported as a
+    verified failure either -- "I could not classify this" outranks a status
+    parsed out of a response that does not parse.
     """
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         return {"ok": True, "result": {"kind": "go_rename", "preview": False,
@@ -1178,10 +1186,11 @@ def test_unclassifiable_failing_mutation_result_is_still_a_clean_exit(monkeypatc
                                        "results": [{"status": "verification_failed"}]}}
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+    argv = [*extra, str(tmp_path / "detail.json")] if extra == ["--out"] else extra
 
-    rc = bn.cli.main(["go", "rename", "--target", "active", *extra])
+    rc = bn.cli.main(["go", "rename", "--target", "active", *argv])
 
-    assert rc in (2, 3), rc
+    assert rc == 2, rc
     assert "malformed or newer than this CLI" in capsys.readouterr().err
 
 
@@ -1207,6 +1216,61 @@ def test_malformed_results_field_is_a_clean_bridge_error(monkeypatch, capsys, ro
 
     assert rc == 2, rc
     assert "malformed or newer than this CLI" in capsys.readouterr().err
+
+
+# The parameters that carry a bridge-result transform into `_call` and
+# `_mutation_exit_code`. Calling one of these directly is what four consecutive
+# rounds of review each found one more of.
+_RESULT_TRANSFORM_PARAMS = frozenset({
+    "result_transform", "spill_status", "summary", "summary_transform",
+})
+
+
+def test_no_result_transform_is_invoked_outside_the_malformed_result_guard():
+    """The property, not the list.
+
+    A mutation's compact summary is invoked from several places in `cli.py`, and
+    which one runs first depends on the result and the output format. Four review
+    rounds each found the NEXT unguarded one -- an enumeration, converging on
+    nothing, because "these N sites are guarded" says nothing about site N+1.
+
+    `_apply_result_transform` is the single guarded entry point, so the invariant
+    that actually holds the line is that NOTHING ELSE calls a transform: a fifth
+    call site added next year inherits the guard or fails here, rather than
+    becoming the fifth blocker.
+    """
+    tree = ast.parse((REPO / "src" / "bn" / "cli.py").read_text(encoding="utf-8"))
+    unguarded = sorted(
+        f"{node.func.id}() at cli.py:{node.lineno}"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        if isinstance(node.func, ast.Name)
+        if node.func.id in _RESULT_TRANSFORM_PARAMS
+    )
+    assert not unguarded, (
+        "these invoke a bridge-result transform directly instead of through "
+        f"_apply_result_transform, so a malformed result escapes there: {unguarded}"
+    )
+
+
+def test_the_malformed_result_guard_is_reached_from_every_transform_parameter():
+    """...and the guarded entry point must actually be wired to each of them, so
+    the property above cannot be satisfied by simply never using them."""
+    tree = ast.parse((REPO / "src" / "bn" / "cli.py").read_text(encoding="utf-8"))
+    passed_through = {
+        arg.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        if isinstance(node.func, ast.Name) and node.func.id == "_apply_result_transform"
+        for arg in node.args
+        if isinstance(arg, ast.Name)
+    }
+    missing = sorted({"result_transform", "spill_status", "summary"} - passed_through)
+    assert not missing, (
+        "these transform parameters never reach the malformed-result guard: "
+        f"{missing}"
+    )
+
 
 
 def test_unclassifiable_mutation_result_advice_is_actionable(monkeypatch, capsys):
@@ -1236,7 +1300,7 @@ def test_unclassifiable_mutation_result_advice_is_actionable(monkeypatch, capsys
     assert "bn doctor" in captured.err, captured.err
 
 
-def test_unclassifiable_mutation_result_is_a_clean_bridge_error(monkeypatch, capsys):
+def test_invariant_guard_unclassifiable_mutation_result_is_a_clean_bridge_error(monkeypatch, capsys):
     """The #715 exit code is derived by RUNNING the compact-summary transform,
     and `_call` computes it before the renderer's malformed-result guard (#101).
     A version-skewed bridge result whose own counters are not numeric therefore

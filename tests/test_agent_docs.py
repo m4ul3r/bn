@@ -12,11 +12,16 @@ from __future__ import annotations
 
 import os
 import re
+import sys
+import types
 from pathlib import Path
 
 import pytest
 
-from bn.formatters import FAILED_MUTATION_STATUSES
+sys.modules.setdefault("binaryninja", types.ModuleType("binaryninja"))
+
+import bn.cli as cli
+from bn.formatters import FAILED_MUTATION_STATUSES, _mutation_summary
 
 REPO = Path(__file__).resolve().parents[1]
 CLAUDE_MD = REPO / "CLAUDE.md"
@@ -127,6 +132,39 @@ def test_exit_code_3_lists_every_failed_mutation_status():
     text = _bullet("- Exit codes:")
     missing = sorted(s for s in FAILED_MUTATION_STATUSES if f"`{s}`" not in text)
     assert not missing, f"statuses missing from the exit-code bullet: {missing}"
+
+
+def test_exit_code_bullet_documents_every_code_the_cli_can_return():
+    """#715 widened the contract from 0/1/2/3 to 0/1/2/3/4 and added the
+    unclassifiable-result case to exit 2. Both new clauses arrived UNGUARDED:
+    deleting either left this module green, in the very PR whose purpose is
+    making the docs provably match the code -- the same shape as the defect #721
+    exists to fix.
+
+    Each claim is tied to something executable rather than pinned as prose: the
+    `measured` key really is what the compact summary emits for a result with no
+    rows to count, and the CLI really does have a malformed-result rule that
+    turns an unreadable response into a `BridgeError`.
+    """
+    bullet = _bullet("- Exit codes:")
+    missing = [code for code in ("0", "1", "2", "3", "4")
+               if not re.search(rf"(?:^|[ ,]){code} = ", bullet)]
+    assert not missing, f"exit codes missing from the exit-code bullet: {missing}"
+
+    # exit 4's stated subject: the summary key an unmeasurable result really sets.
+    unmeasured = _mutation_summary({"success": True, "committed": True})
+    assert unmeasured["measured"] is False, unmeasured
+    assert "`measured: false`" in bullet.lower(), (
+        "the exit-4 clause must name the `measured: false` summary key it is "
+        f"keyed on, not merely the number: {bullet}"
+    )
+
+    # exit 2's stated subject: the malformed-result rule really exists.
+    assert cli._MALFORMED_RESULT_ERRORS, "the CLI has no malformed-result rule to document"
+    assert "classify" in bullet, (
+        "the exit-2 clause must say a result this CLI cannot classify is 2, "
+        f"which is what the malformed-result rule does: {bullet}"
+    )
 
 
 @pytest.mark.parametrize("group", ("cli", "bridge"))
