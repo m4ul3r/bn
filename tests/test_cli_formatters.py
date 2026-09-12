@@ -682,6 +682,146 @@ def test_render_field_xrefs_non_dict_field_renders_unknown_not_zero():
     assert "+0x0" not in out
 
 
+# --- #619: finish _as_dict adoption / soft-degrade malformed list elements ----
+# Same class as the #101 function-info fix: a nested field or list element that
+# is not the shape the renderer assumed (version skew, partial bridge payload)
+# must degrade to placeholder text, not raise -- the CLI turns the raise into a
+# BridgeError that costs the agent the whole partial text view.
+
+def test_render_field_xrefs_non_dict_item_degrades():
+    from bn.formatters import _render_field_xrefs_text
+    value = {"field": {"type_name": "T", "field_name": "n", "offset": 0},
+             "items": [{"kind": "code", "address": "0x1"}, "bad"]}
+    out = _render_field_xrefs_text(value)
+    assert "0x1" in out
+
+
+def test_render_local_list_non_dict_function_degrades():
+    from bn.formatters import _render_local_list_text
+    out = _render_local_list_text({"function": "main", "items": []})
+    assert "<unknown> @ <unknown>" in out
+
+
+def test_render_local_list_non_dict_element_renders_placeholder():
+    from bn.formatters import _render_local_list_text
+    out = _render_local_list_text({
+        "function": {"name": "f", "address": "0x1"},
+        "items": [{"name": "count", "type": "int"}, "bad"],
+    })
+    assert "count" in out
+    assert "'bad'" in out
+
+
+def test_render_function_info_verbose_non_dict_local_element_degrades():
+    from bn.formatters import _render_function_info_text
+    out = _render_function_info_text(
+        {"function": {"name": "f"}, "parameters": ["bad"]}, verbose=True)
+    assert "'bad'" in out
+
+
+def test_render_defuse_non_dict_nested_fields_degrade():
+    from bn.formatters import _render_defuse_text
+    out = _render_defuse_text({"function": "main", "variable": "v",
+                               "is_phi": True, "phi_sources": ["bad"],
+                               "uses": ["bad"]})
+    assert "<unknown> @ <unknown>" in out
+    assert "'bad'" in out
+
+
+def test_render_values_non_dict_function_and_values_degrade():
+    from bn.formatters import _render_values_text
+    out = _render_values_text({"function": "main", "possible_values": "bad"})
+    assert "<unknown> @ <unknown>" in out
+    assert "possible values: <unavailable>" in out
+
+
+def test_render_class_show_non_dict_members_degrade():
+    from bn.formatters import _render_class_show_text
+    out = _render_class_show_text({
+        "name": "Widget", "bases": ["bad"],
+        "methods": ["bad"],
+        "vtable": {"address": "0x1", "slots": ["bad"]},
+        "instances": {"construction_sites": ["bad"], "stored_globals": ["bad"]},
+    })
+    assert "class Widget" in out
+    assert "'bad'" in out
+
+
+def test_render_class_list_dict_base_rows_render_names():
+    # "bases" arrives as name-dicts (what class show already renders); the list
+    # renderer must not blow up joining them as strings.
+    from bn.formatters import _render_class_list_text
+    out = _render_class_list_text(
+        {"items": [{"name": "Widget", "bases": [{"name": "Base"}]}]})
+    assert "Base" in out
+
+
+def test_render_taint_non_dict_nested_fields_degrade():
+    from bn.formatters import _render_taint_text
+    out = _render_taint_text({"function": "main", "direction": "forward",
+                              "reached_sinks": ["bad"], "leaves": ["bad"],
+                              "by_source": {"0x1": "bad"}})
+    assert "forward taint in <unknown> @ <unknown>" in out
+    assert "'bad'" in out
+
+
+def test_render_taint_backward_non_dict_slices_degrade():
+    from bn.formatters import _render_taint_text
+    out = _render_taint_text({"function": {"name": "f", "address": "0x1"},
+                              "direction": "backward", "slices": ["bad"],
+                              "sink_status": ["bad"]})
+    assert "backward taint in f @ 0x1" in out
+    assert "'bad'" in out
+
+
+def test_render_taint_models_non_dict_sinks_by_class_degrades():
+    from bn.formatters import _render_taint_models_text
+    out = _render_taint_models_text({"sources": [{"symbol": "gets"}],
+                                     "sinks_by_class": ["bad"]})
+    assert "gets" in out
+
+
+def test_render_taint_models_sink_entry_non_dict_callsite_degrades():
+    from bn.formatters import _render_taint_models_text
+    value = {"sinks_by_class": {"unbounded_input": [
+        {"symbol": "gets", "callsites": ["bad"]}]}}
+    out = _render_taint_models_text(value)
+    assert "gets" in out
+    assert "'bad'" in out
+
+
+def test_render_surface_non_dict_summary_degrades():
+    from bn.formatters import _render_surface_text
+    out = _render_surface_text({"summary": "bad"})
+    assert "hidden surface: 0 init section(s)" in out
+
+
+def test_render_orient_non_dict_target_and_kind_breakdown_degrade():
+    from bn.formatters import _render_orient_text
+    out = _render_orient_text({"target": "bad",
+                               "imports_summary": {"total": 3, "by_kind": ["bad"]}})
+    assert "orientation: <target>" in out
+    assert "imports: 3" in out
+
+
+def test_render_cfg_non_dict_nested_fields_degrade():
+    from bn.formatters import _render_cfg_text
+    out = _render_cfg_text({"function": "bad", "blocks": ["bad"]})
+    assert "? @ ? (?)" in out
+    assert "'bad'" in out
+
+
+def test_render_data_vars_non_dict_row_degrades():
+    from bn.formatters import _render_data_vars_text
+    out = _render_data_vars_text({"items": ["bad"], "total": 1})
+    assert "'bad'" in out
+
+
+def test_render_imports_summary_non_dict_breakdowns_degrade():
+    from bn.formatters import _render_imports_summary_text
+    out = _render_imports_summary_text({"total_symbols": 2, "namespaces": ["bad"],
+                                        "by_kind": ["bad"]})
+    assert "total symbols: 2" in out
 
 
 def test_render_evidence_shows_argument_confidence_and_variadic():

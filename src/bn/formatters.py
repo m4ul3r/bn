@@ -58,6 +58,16 @@ def _as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _as_list(value: Any) -> list[Any]:
+    """Coerce a nested field to a list for safe iteration.
+
+    Mirrors ``_as_dict``: a renderer that does ``value.get("items") or []`` still
+    iterates a truthy NON-list (a string from a malformed or future bridge result)
+    element by element -- for a string that is one bogus row per CHARACTER. This
+    returns ``[]`` for anything that isn't a list (#619)."""
+    return value if isinstance(value, list) else []
+
+
 def _fmt_field_offset(value: Any) -> str:
     """Render a struct-field offset, disclosing an uncoercible one instead of
     fabricating ``+0x0`` -- a zero is a real, common offset, so a degraded row
@@ -258,7 +268,7 @@ def _render_capabilities_text(value: Any) -> str:
     see-also routing hints where a command overlaps a neighbor."""
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    items = value.get("items") or []
+    items = _as_list(value.get("items"))
     lines: list[str] = []
     current_group: str | None = None
     for item in items:
@@ -299,7 +309,7 @@ def _render_function_info_text(value: Any, verbose: bool = False, demangle: bool
         f"xrefs: {value.get('xref_count', 0)}",
     ]
 
-    locals_only = list(value.get("locals") or [])
+    locals_only = _as_list(value.get("locals"))
     if locals_only:
         lines.append(f"locals: {len(locals_only)} variables")
 
@@ -317,16 +327,22 @@ def _render_function_info_text(value: Any, verbose: bool = False, demangle: bool
             f"dataflow through them is not tracked{suffix}")
 
     if verbose:
-        parameters = list(value.get("parameters") or [])
+        parameters = _as_list(value.get("parameters"))
         if parameters:
             lines.append("")
             lines.append("parameters:")
             for item in parameters:
+                if not isinstance(item, dict):
+                    lines.append(f"  {item!r}")
+                    continue
                 lines.append(_format_local_entry(item))
         lines.append("")
         if locals_only:
             lines.append("locals:")
             for item in locals_only:
+                if not isinstance(item, dict):
+                    lines.append(f"  {item!r}")
+                    continue
                 lines.append(_format_local_entry(item))
         else:
             lines.append("locals: none")
@@ -379,11 +395,16 @@ def _render_proto_text(value: Any) -> str:
 def _render_local_list_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    function = value.get("function") or {}
+    function = _as_dict(value.get("function"))
     # #651: `items` is the canonical container; `locals` is the retained alias.
-    all_items = list(value.get("items") or value.get("locals") or [])
-    params = [item for item in all_items if item.get("is_parameter")]
-    locals_only = [item for item in all_items if not item.get("is_parameter")]
+    all_items = _as_list(value.get("items") or value.get("locals"))
+    # A malformed (non-dict) element cannot say whether it is a parameter, so it
+    # is counted as neither -- disclosing it separately keeps both counts honest
+    # instead of raising or folding it into a group it may not belong to (#619).
+    params = [item for item in all_items if isinstance(item, dict) and item.get("is_parameter")]
+    locals_only = [item for item in all_items
+                   if isinstance(item, dict) and not item.get("is_parameter")]
+    malformed = [item for item in all_items if not isinstance(item, dict)]
 
     header = f"{function.get('name', '<unknown>')} @ {function.get('address', '<unknown>')}"
     header += f" ({len(params)} params, {len(locals_only)} locals)"
@@ -397,7 +418,11 @@ def _render_local_list_text(value: Any) -> str:
         lines.extend(["", "locals:"])
         for item in locals_only:
             lines.append(_format_local_entry(item))
-    if not params and not locals_only:
+    if malformed:
+        lines.extend(["", f"malformed entries ({len(malformed)}):"])
+        for item in malformed:
+            lines.append(f"  {item!r}")
+    if not params and not locals_only and not malformed:
         lines.extend(["", "no locals"])
     return _resolution_note(value) + "\n".join(lines)
 
@@ -426,9 +451,9 @@ def _render_field_xrefs_text(value: Any) -> str:
         "code refs:",
     ]
     # #275: refs come as a unified `items` list, each tagged with its `kind`.
-    items = list(value.get("items") or [])
-    code_refs = [it for it in items if it.get("kind") == "code"]
-    data_refs = [it for it in items if it.get("kind") == "data"]
+    items = _as_list(value.get("items"))
+    code_refs = [it for it in items if isinstance(it, dict) and it.get("kind") == "code"]
+    data_refs = [it for it in items if isinstance(it, dict) and it.get("kind") == "data"]
     if code_refs:
         for ref in code_refs:
             details = [ref.get("address", "<unknown>")]
@@ -1690,16 +1715,16 @@ def _render_surface_text(value: Any) -> str:
     dispatch tables, and data-referenced code BN did not functionize."""
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    s = value.get("summary") or {}
+    s = _as_dict(value.get("summary"))
     lines = [
         f"hidden surface: {s.get('init_sections', 0)} init section(s), "
         f"{s.get('candidate_tables', 0)} candidate table(s), "
         f"{s.get('missing_function_candidates', 0)} missing-function candidate(s)"
     ]
-    for w in list(value.get("warnings") or []):
+    for w in _as_list(value.get("warnings")):
         lines.append(f"warning: {w}")
 
-    init = list(value.get("init_sections") or [])
+    init = _as_list(value.get("init_sections"))
     if init:
         lines.append("")
         lines.append("init / ctor sections (pre-main code):")
@@ -1711,7 +1736,7 @@ def _render_surface_text(value: Any) -> str:
                 f"entries={sec.get('total_entries', '?')}  "
                 f"fn={sec.get('resolved_functions', 0)}  missing={sec.get('missing_functions', 0)}")
 
-    tables = list(value.get("candidate_tables") or [])
+    tables = _as_list(value.get("candidate_tables"))
     if tables:
         lines.append("")
         lines.append("candidate vtable / dispatch tables (runs of pointers-to-code):")
@@ -1723,7 +1748,7 @@ def _render_surface_text(value: Any) -> str:
                 f"entries={t.get('entries', '?')}  fn={t.get('resolved_functions', 0)}  "
                 f"missing={t.get('missing_functions', 0)}")
 
-    cands = list(value.get("missing_function_candidates") or [])
+    cands = _as_list(value.get("missing_function_candidates"))
     if cands:
         code_likely = [c for c in cands if isinstance(c, dict) and c.get("code_likely")]
         lines.append("")
@@ -1812,7 +1837,7 @@ def _render_virtual_call_text(value: Any) -> str:
             f"vtable slot {value.get('slot_offset', '?')} (index {value.get('slot_index', '?')}), "
             f"object from {factory}")
     lines = [head]
-    cands = list(value.get("candidates") or [])
+    cands = _as_list(value.get("candidates"))
     if not cands:
         # #531: an unresolved slot (e.g. an unaligned offset that can't map to a slot
         # index) carries a concrete reason -- surface it instead of the generic hint.
@@ -1833,6 +1858,9 @@ def _render_virtual_call_text(value: Any) -> str:
     for warning in list(value.get("warnings") or []):
         lines.append(f"  warning: {warning}")
     for c in cands:
+        if not isinstance(c, dict):
+            lines.append(f"  {c!r}")
+            continue
         method = c.get("method") or "<unnamed>"
         entry = c.get("vtable_entry") or "?"
         # #533: include the concrete jump target (method_address) -- the pointer's
@@ -2046,7 +2074,7 @@ def _render_orient_text(value: Any) -> str:
     strings sample."""
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    target = value.get("target") or {}
+    target = _as_dict(value.get("target"))
     name = target.get("basename") or target.get("filename") or target.get("name") or "<target>"
     state = value.get("analysis_state") or ("full" if value.get("analyzed") else "?")
     lines = [f"orientation: {name}  [analysis: {state}]"]
@@ -2058,7 +2086,7 @@ def _render_orient_text(value: Any) -> str:
     imp = value.get("imports_summary") or {}
     if isinstance(imp, dict):
         total = imp.get("total_symbols", imp.get("total"))
-        by_kind = imp.get("by_kind") or {}
+        by_kind = _as_dict(imp.get("by_kind"))
         kinds = ", ".join(f"{k}={v}" for k, v in list(by_kind.items())[:6])
         lines.append(f"  imports: {total if total is not None else '?'}" + (f" ({kinds})" if kinds else ""))
     secs = value.get("sections") or {}
@@ -2270,14 +2298,14 @@ def _render_structured_il_text(value: Any) -> str:
     fn = _as_dict(value.get("function"))
     form = "ssa" if value.get("ssa") else "non-ssa"
     lines = [f"{fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}  ({value.get('view', 'mlil')} {form})"]
-    for ins in list(value.get("instructions") or []):
+    for ins in _as_list(value.get("instructions")):
         # A malformed list element (non-dict) must render as fallback text, not
         # crash the whole listing with an AttributeError (#101).
         if not isinstance(ins, dict):
             lines.append(f"  {ins}")
             continue
-        reads = ",".join(_as_dict(v).get("ssa", _as_dict(v).get("name", "?")) for v in (ins.get("vars_read") or []))
-        writes = ",".join(_as_dict(v).get("ssa", _as_dict(v).get("name", "?")) for v in (ins.get("vars_written") or []))
+        reads = ",".join(_as_dict(v).get("ssa", _as_dict(v).get("name", "?")) for v in _as_list(ins.get("vars_read")))
+        writes = ",".join(_as_dict(v).get("ssa", _as_dict(v).get("name", "?")) for v in _as_list(ins.get("vars_written")))
         head = f"  [{ins.get('il_index')}] {ins.get('address')}  {ins.get('op')}  {ins.get('text', '')}".rstrip()
         lines.append(head)
         if reads or writes:
@@ -2288,23 +2316,30 @@ def _render_structured_il_text(value: Any) -> str:
 def _render_defuse_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    fn = value.get("function") or {}
-    var = value.get("variable") or {}
+    fn = _as_dict(value.get("function"))
+    var = _as_dict(value.get("variable"))
     lines = [
         f"{fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}",
         f"variable: {var.get('ssa', var.get('name', '?'))}  ({var.get('type', '?')})",
     ]
     definition = value.get("definition")
-    if definition:
+    if isinstance(definition, dict) and definition:
         lines.append(f"def: {definition.get('address')}  {definition.get('op')}  {definition.get('text', '')}".rstrip())
+    elif definition:
+        lines.append(f"def: {definition!r}")
     else:
         lines.append("def: <none (parameter/entry/aliased)>")
     if value.get("is_phi"):
-        srcs = ", ".join(s.get("ssa", s.get("name", "?")) for s in (value.get("phi_sources") or []))
+        srcs = ", ".join(
+            (s.get("ssa", s.get("name", "?")) if isinstance(s, dict) else repr(s))
+            for s in _as_list(value.get("phi_sources")))
         lines.append(f"phi sources: {srcs}")
-    uses = list(value.get("uses") or [])
+    uses = _as_list(value.get("uses"))
     lines.append(f"uses ({len(uses)}):")
     for u in uses:
+        if not isinstance(u, dict):
+            lines.append(f"  {u!r}")
+            continue
         lines.append(f"  {u.get('address')}  {u.get('op')}  {u.get('text', '')}".rstrip())
     others = value.get("other_versions") or []
     if others:
@@ -2318,7 +2353,7 @@ def _render_callgraph_text(value: Any) -> str:
     fn = _as_dict(value.get("function"))
     lines = [f"{fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}"]
     if "callees" in value:
-        callees = list(value.get("callees") or [])
+        callees = _as_list(value.get("callees"))
         lines.append(f"callees ({len(callees)}):")
         for c in callees:
             if not isinstance(c, dict):
@@ -2328,7 +2363,7 @@ def _render_callgraph_text(value: Any) -> str:
                 tgt = _as_dict(c.get("target"))
                 lines.append(f"  {c.get('call_addr')}  direct -> {tgt.get('name', '<unknown>')} @ {tgt.get('address')}")
             else:
-                resolved = c.get("resolved") or []
+                resolved = _as_list(c.get("resolved"))
                 if resolved:
                     tgts = ", ".join(f"{_as_dict(r).get('name', '?')}@{_as_dict(r).get('address')}" for r in resolved)
                     suffix = f"resolved: {tgts}"
@@ -2336,7 +2371,7 @@ def _render_callgraph_text(value: Any) -> str:
                     suffix = f"UNRESOLVED ({c.get('resolution_detail', 'indirect')})"
                 lines.append(f"  {c.get('call_addr')}  indirect [{c.get('dest_expr', '')}]  {suffix}")
     if "callers" in value:
-        callers = list(value.get("callers") or [])
+        callers = _as_list(value.get("callers"))
         lines.append(f"callers ({len(callers)}):")
         for c in callers:
             if not isinstance(c, dict):
@@ -2351,10 +2386,10 @@ def _render_callgraph_text(value: Any) -> str:
 def _render_values_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    fn = value.get("function") or {}
+    fn = _as_dict(value.get("function"))
     lines = [f"{fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}"]
     lines.append(f"at {value.get('at')}: {value.get('expression', '<no instruction at address>')}")
-    pvs = value.get("possible_values")
+    pvs = _as_dict(value.get("possible_values"))
     if not pvs:
         lines.append("possible values: <unavailable>")
         return "\n".join(lines)
@@ -2372,11 +2407,13 @@ def _render_values_text(value: Any) -> str:
     return "\n".join(lines)
 
 
-def _render_leaf_line(leaf: dict[str, Any]) -> str:
+def _render_leaf_line(leaf: Any) -> str:
     """One text line for a single unresolved-frontier leaf."""
+    if not isinstance(leaf, dict):
+        return f"  {leaf!r}"
     kind = leaf.get("kind")
     if kind == "unmodeled_callee":
-        cal = leaf.get("callee") or {}
+        cal = _as_dict(leaf.get("callee"))
         args = leaf.get("tainted_args") or []
         return (
             f"  unmodeled_callee @ {leaf.get('address')}"
@@ -2402,7 +2439,7 @@ def _render_leaf_line(leaf: dict[str, Any]) -> str:
         meta = ("  " + " ".join(bits)) if bits else ""
         return f"  field_load_unresolved @ {leaf.get('address')}{meta}"
     if kind == "arg_under_recovered":
-        cal = leaf.get("callee") or {}
+        cal = _as_dict(leaf.get("callee"))
         return (
             f"  arg_under_recovered @ {leaf.get('address')}"
             f"  -> {cal.get('name', '?')} @ {cal.get('address', '?')}"
@@ -2416,20 +2453,25 @@ def _render_leaf_line(leaf: dict[str, Any]) -> str:
     )
 
 
-def _leaf_group_key(leaf: dict[str, Any]) -> tuple:
+def _leaf_group_key(leaf: Any) -> tuple:
     """Collapse near-identical frontier leaves: one group per callee for
     unmodeled calls, per (base, offset) for field loads, per kind otherwise."""
+    if not isinstance(leaf, dict):
+        # Group malformed leaves by type; a type key can't collide with a real
+        # `kind` string, and each renders as a repr instead of collapsing into
+        # a `(xN)` count of rows that only look alike because both are broken.
+        return (type(leaf),)
     kind = leaf.get("kind")
     if kind == "unmodeled_callee":
-        return (kind, (leaf.get("callee") or {}).get("name", "?"))
+        return (kind, _as_dict(leaf.get("callee")).get("name", "?"))
     if kind == "field_load_unresolved":
         return (kind, leaf.get("base"), leaf.get("offset"))
     if kind == "arg_under_recovered":
-        return (kind, (leaf.get("callee") or {}).get("name", "?"))
+        return (kind, _as_dict(leaf.get("callee")).get("name", "?"))
     return (kind,)
 
 
-def _render_grouped_leaves(leaves: list[dict[str, Any]], *, top_n: int = 12) -> list[str]:
+def _render_grouped_leaves(leaves: list[Any], *, top_n: int = 12) -> list[str]:
     """Render unresolved leaves grouped by kind/callee with counts and a top-N
     cap (full detail stays in --format json) so real binaries don't flood the
     text output with a wall of near-identical leaves (#160)."""
@@ -2511,14 +2553,15 @@ def _taint_truncation_note(stats: dict[str, Any]) -> str:
 
 def _taint_forward_verdict(value: dict[str, Any]) -> str:
     """One-line verdict for a forward-taint result, derived from existing fields."""
-    findings = value.get("reached_sinks") or []
-    leaves = value.get("leaves") or []
-    stats = value.get("stats") or {}
+    findings = _as_list(value.get("reached_sinks"))
+    leaves = _as_list(value.get("leaves"))
+    stats = _as_dict(value.get("stats"))
     fns = stats.get("functions_visited")
     fns_part = f" · taint crossed {fns} fn(s)" if fns else ""
     trunc = _taint_truncation_note(stats)
     if findings:
-        classes = ", ".join(sorted({(f.get("sink") or {}).get("class") or "?" for f in findings}))
+        sinks = [_as_dict(_as_dict(f).get("sink")) for f in findings]
+        classes = ", ".join(sorted({s.get("class") or "?" for s in sinks}))
         return f"verdict: {len(findings)} sink(s) reached ({classes}){fns_part}{trunc}"
     if leaves:
         return (f"verdict: NO modeled sink reached — {len(leaves)} tainted frontier(s) "
@@ -2538,7 +2581,7 @@ def _taint_via_trail(value: dict[str, Any], finding: dict[str, Any]) -> str | No
     """Compact callee trail for a sink, parsed from its path-step reasons:
     `<analyzed fn> → <callee> → … → <sink callee>`. None if no callees parse."""
     chain: list[str] = []
-    fn = (value.get("function") or {}).get("name")
+    fn = _as_dict(value.get("function")).get("name")
     if fn:
         chain.append(str(fn))
     for step in finding.get("path") or []:
@@ -2558,11 +2601,11 @@ def _taint_via_trail(value: dict[str, Any], finding: dict[str, Any]) -> str | No
 def _render_flow_line(f: dict[str, Any]) -> str:
     """One compact line for a forward finding: sink + address + arg + grouping
     signature + structural metrics. The full SSA path is shown only under --full."""
-    sink = f.get("sink") or {}
+    sink = _as_dict(f.get("sink"))
     ai = sink.get("tainted_arg_index")
     arg = f" (arg {ai})" if ai is not None else ""
-    m = f.get("metrics") or {}
-    sig = (f.get("signature") or {}).get("rendered", "")
+    m = _as_dict(f.get("metrics"))
+    sig = _as_dict(f.get("signature")).get("rendered", "")
     unresolved = "y" if m.get("traverses_unresolved") else "n"
     facts = f"{{steps={m.get('steps', '?')} fns={m.get('fns_spanned', '?')} unresolved={unresolved}}}"
     head = f"[{sink.get('class') or '?'}] {sink.get('callee', '?')} @ {sink.get('address')}{arg}"
@@ -2576,8 +2619,8 @@ def _render_forward_diagnostics(diag: dict[str, Any]) -> list[str]:
     vulnerability verdict."""
     if not isinstance(diag, dict):
         return []
-    fr = diag.get("frontier") or {}
-    lu = diag.get("last_use") or {}
+    fr = _as_dict(diag.get("frontier"))
+    lu = _as_dict(diag.get("last_use"))
     out = ["diagnostics:"]
     out.append(
         f"  seed: matched {diag.get('source_callsites', 0)} source callsite(s), "
@@ -2611,14 +2654,14 @@ def _render_forward_diagnostics(diag: dict[str, Any]) -> list[str]:
 def _render_taint_text(value: Any, full: bool = False) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    fn = value.get("function") or {}
+    fn = _as_dict(value.get("function"))
     direction = value.get("direction", "forward")
     lines = [f"{direction} taint in {fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}"]
 
     if direction == "forward":
-        srcs = value.get("sources") or []
+        srcs = _as_list(value.get("sources"))
         lines.append("sources: " + (", ".join(_describe_loc(s) for s in srcs) or "<none>"))
-        findings = list(value.get("reached_sinks") or [])
+        findings = _as_list(value.get("reached_sinks"))
         lines.append(_taint_forward_verdict(value))
         if not findings and value.get("diagnostics"):
             lines.extend(_render_forward_diagnostics(value["diagnostics"]))
@@ -2630,9 +2673,12 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
                 # findings are already unique per (callee,address,arg), so distinct sink
                 # call-sites always render on their own line -- never folded behind a
                 # count. --full appends the sink detail, via: trail, and full SSA path.
+                if not isinstance(f, dict):
+                    lines.append(f"  {f!r}")
+                    continue
                 lines.append(_render_flow_line(f))
                 if full:
-                    _detail = (f.get("sink") or {}).get('detail') or ''
+                    _detail = _as_dict(f.get("sink")).get('detail') or ''
                     if _detail:
                         lines.append(f"      -- {_detail}")
                     _via = _taint_via_trail(value, f)
@@ -2640,14 +2686,17 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
                         lines.append(f"    {_via}")
                     lines.extend(_render_taint_path(f.get("path") or []))
     else:
-        sinks = value.get("sinks") or []
+        sinks = _as_list(value.get("sinks"))
         lines.append("sinks: " + (", ".join(_describe_loc(s) for s in sinks) or "<none>"))
-        slices = list(value.get("slices") or [])
+        slices = _as_list(value.get("slices"))
         for sl in slices:
-            sink = sl.get("sink") or {}
-            origin = sl.get("origin") or {}
-            m = sl.get("metrics") or {}
-            sig = (sl.get("signature") or {}).get("rendered", "")
+            if not isinstance(sl, dict):
+                lines.append(f"  {sl!r}")
+                continue
+            sink = _as_dict(sl.get("sink"))
+            origin = _as_dict(sl.get("origin"))
+            m = _as_dict(sl.get("metrics"))
+            sig = _as_dict(sl.get("signature")).get("rendered", "")
             n = sl.get("reached_via_call_sites", 1)
             xn = f"  (x{n} callsites)" if n and n > 1 else ""
             unresolved = "y" if m.get("traverses_unresolved") else "n"
@@ -2679,11 +2728,13 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
                 for step in sl.get("slice") or []:
                     if isinstance(step, dict):
                         lines.append(f"  {step.get('address')}  {step.get('op')}  {step.get('il_text', '')}".rstrip())
-        status = value.get("sink_status") or []
+        status = _as_list(value.get("sink_status"))
         # A constant-length sink is "provably bounded" -- a SUCCESS, not a failed
-        # seed -- so report it apart from genuinely-unseeded sinks (#310).
-        bounded = [s for s in status if s.get("bounded")]
-        unseeded = [s for s in status if not s.get("seeded", True) and not s.get("bounded")]
+        # seed -- so report it apart from genuinely-unseeded sinks (#310). A
+        # malformed (non-dict) status row is neither.
+        bounded = [s for s in status if isinstance(s, dict) and s.get("bounded")]
+        unseeded = [s for s in status
+                    if isinstance(s, dict) and not s.get("seeded", True) and not s.get("bounded")]
         if bounded:
             lines.append("")
             lines.append(f"provably bounded ({len(bounded)}):")
@@ -2700,24 +2751,27 @@ def _render_taint_text(value: Any, full: bool = False) -> str:
         lines.append("")
         lines.append(f"PER-SOURCE ({len(by_source)} call site(s)):")
         for addr, br in by_source.items():
-            bsinks = br.get("reached_sinks") or []
-            bleaves = br.get("leaves") or []
+            if not isinstance(br, dict):
+                lines.append(f"  {addr}: {br!r}")
+                continue
+            bsinks = [s for s in _as_list(br.get("reached_sinks")) if isinstance(s, dict)]
+            bleaves = _as_list(br.get("leaves"))
             if bsinks:
                 desc = ", ".join(
-                    f"{(s.get('sink') or {}).get('class', '?')} {(s.get('sink') or {}).get('callee', '?')}"
+                    f"{_as_dict(s.get('sink')).get('class', '?')} {_as_dict(s.get('sink')).get('callee', '?')}"
                     for s in bsinks)
             else:
                 desc = "no sinks"
-            nfront = sum(1 for l in bleaves if l.get("kind") == "unmodeled_callee")
+            nfront = sum(1 for l in bleaves if isinstance(l, dict) and l.get("kind") == "unmodeled_callee")
             if bleaves:
                 desc += f"; {len(bleaves)} leaf(s)" + (f" ({nfront} frontier)" if nfront else "")
             lines.append(f"  {addr}: {desc}")
 
-    leaves = list(value.get("leaves") or [])
+    leaves = _as_list(value.get("leaves"))
     if leaves:
         lines.append("")
         lines.extend(_render_grouped_leaves(leaves))
-    assumptions = list(value.get("assumptions") or [])
+    assumptions = _as_list(value.get("assumptions"))
     if assumptions:
         lines.append("")
         lines.append(f"caveats ({len(assumptions)}):")
@@ -2743,7 +2797,7 @@ def _render_taint_models_text(value: Any) -> str:
     if note:
         lines.append("NOTE: " + str(note))
         lines.append("")
-    srcs = value.get("sources") or []
+    srcs = _as_list(value.get("sources"))
     if srcs:
         lines.append(f"sources ({len(srcs)}):")
         for s in srcs:
@@ -2752,19 +2806,22 @@ def _render_taint_models_text(value: Any) -> str:
                 continue
             p = " [present]" if s.get("present") else (" [absent]" if "present" in s else "")
             lines.append(f"  {s.get('symbol', '<unknown>')}  ->  {s.get('to', '')}{p}")
-    sbc = value.get("sinks_by_class") or {}
+    sbc = _as_dict(value.get("sinks_by_class"))
     if sbc:
         lines.append("")
-        total = sum(len(v) for v in sbc.values())
-        lines.append(f"sinks ({total} in {len(sbc)} class(es)); NOT findings:")
-        for cls, lst in sbc.items():
+        # A class whose entry list is malformed is still one sink row to disclose,
+        # so it counts once and renders its raw value rather than being dropped.
+        classes = {cls: (lst if isinstance(lst, list) else [lst]) for cls, lst in sbc.items()}
+        total = sum(len(entries) for entries in classes.values())
+        lines.append(f"sinks ({total} in {len(classes)} class(es)); NOT findings:")
+        for cls, entries in classes.items():
             lines.append(f"  [{cls}]")
-            for e in lst:
+            for e in entries:
                 if not isinstance(e, dict):
                     lines.append(f"    {e!r}")
                     continue
                 lines.extend(_render_taint_sink_entry(e))
-    props = value.get("propagators") or []
+    props = _as_list(value.get("propagators"))
     if props:
         lines.append("")
         lines.append(f"propagators ({len(props)}):")
@@ -2773,7 +2830,7 @@ def _render_taint_models_text(value: Any) -> str:
                 lines.append(f"  {p!r}")
                 continue
             lines.append(f"  {p.get('symbol', '<unknown>')}  {p.get('from_to', '')}")
-    ov = value.get("overlays") or []
+    ov = _as_list(value.get("overlays"))
     if ov:
         lines.append("")
         lines.append("overlays: " + ", ".join(_as_dict(o).get("path", _as_dict(o).get("kind", "?")) for o in ov))
@@ -2795,7 +2852,10 @@ def _render_taint_sink_entry(e: dict[str, Any]) -> list[str]:
         cs = ""
     desc = f"  -- {e['model_description']}" if e.get("model_description") else ""
     out = [f"    {e.get('symbol', '<unknown>')} (arg {e.get('tainted_args')}){p}{cs}{desc}"]
-    for c in (e.get("callsites") or []):
+    for c in _as_list(e.get("callsites")):
+        if not isinstance(c, dict):
+            out.append(f"      {c!r}")
+            continue
         fn = c.get("function") or "?"
         kind = c.get("kind")
         tag = f" [{kind}]" if kind and kind != "app_caller" else ""
@@ -2876,7 +2936,7 @@ def _render_imports_summary_text(value: Any) -> str:
     excluded = value.get("self_defined_excluded")
     if isinstance(excluded, int) and excluded > 0:
         lines.append(f"self-defined excluded: {excluded}")
-    needed = value.get("needed_libraries") or []
+    needed = _as_list(value.get("needed_libraries"))
     if needed:
         lines.append("")
         lines.append("needed libraries (DT_NEEDED):")
@@ -2884,17 +2944,17 @@ def _render_imports_summary_text(value: Any) -> str:
             lines.append(f"  {lib}")
     # Skip the breakdown sections entirely when empty (e.g. a 0-import target),
     # rather than printing dangling "by namespace:"/"by kind:" headers.
-    namespaces = value.get("namespaces") or {}
+    namespaces = _as_dict(value.get("namespaces"))
     if namespaces:
         lines.append("")
         lines.append("by namespace:")
-        for ns, count in sorted(namespaces.items(), key=lambda x: -x[1]):
+        for ns, count in sorted(namespaces.items(), key=lambda x: -_int_or_default(x[1])):
             lines.append(f"  {count:>5}  {ns if ns else '(unnamed)'}")
-    by_kind = value.get("by_kind") or {}
+    by_kind = _as_dict(value.get("by_kind"))
     if by_kind:
         lines.append("")
         lines.append("by kind:")
-        for kind, count in sorted(by_kind.items(), key=lambda x: -x[1]):
+        for kind, count in sorted(by_kind.items(), key=lambda x: -_int_or_default(x[1])):
             lines.append(f"  {count:>5}  {kind}")
     return "\n".join(lines)
 
@@ -2975,16 +3035,25 @@ def _render_cfg_text(value: Any) -> str:
     indexes at IL levels (the identity contract), so they are echoed verbatim."""
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    func = value.get("function") or {}
+    func = _as_dict(value.get("function"))
     parts = [f"{func.get('name', '?')} @ {func.get('address', '?')} ({value.get('view', '?')})"]
-    for warning in value.get("warnings") or []:
+    for warning in _as_list(value.get("warnings")):
         parts.append(f"// {warning}")
-    for block in value.get("blocks") or []:
+    for block in _as_list(value.get("blocks")):
         parts.append("")
+        if not isinstance(block, dict):
+            parts.append(f"block {block!r}")
+            continue
         parts.append(f"block {block.get('start', '?')}")
-        for insn in block.get("insns") or []:
+        for insn in _as_list(block.get("insns")):
+            if not isinstance(insn, dict):
+                parts.append(f"  {insn!r}")
+                continue
             parts.append(f"  {insn.get('a', '?')}  {insn.get('t', '')}")
-        for edge in block.get("edges") or []:
+        for edge in _as_list(block.get("edges")):
+            if not isinstance(edge, dict):
+                parts.append(f"  -> {edge!r}")
+                continue
             parts.append(f"  -> {edge.get('to', '?')} [{edge.get('k', '?')}]")
     return "\n".join(parts)
 
@@ -2995,9 +3064,12 @@ def _render_data_vars_text(value: Any) -> str:
     section, plus a resume hint when the row cap truncated the window."""
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    rows = value.get("items") or []  # #275: was `vars`
+    rows = _as_list(value.get("items"))  # #275: was `vars`
     lines = []
     for row in rows:
+        if not isinstance(row, dict):
+            lines.append(f"  {row!r}")
+            continue
         cells = [str(row.get("a", "?")), str(row.get("t", "?")), f"w={row.get('w', '?')}"]
         if row.get("n"):
             cells.append(str(row["n"]))
@@ -3016,7 +3088,7 @@ def _render_data_vars_text(value: Any) -> str:
     body = "\n".join(lines) if lines else "none"
     if value.get("has_more"):
         hint = ""
-        last = rows[-1].get("a") if rows else None
+        last = _as_dict(rows[-1]).get("a") if rows else None
         if isinstance(last, str):
             try:
                 hint = f"; resume with --start {hex(int(last, 16) + 1)}"
@@ -3162,7 +3234,7 @@ def _render_doctor_text(value: Any) -> str:
 
 def _format_operation_result(item: dict[str, Any]) -> str:
     op = item.get("op", "<unknown>")
-    requested = item.get("requested") or {}
+    requested = _as_dict(item.get("requested"))
 
     def _get(key: str, default: str = "<unknown>") -> str:
         return item.get(key) or requested.get(key, default)
@@ -3200,7 +3272,7 @@ def _format_operation_result(item: dict[str, Any]) -> str:
         # Name the type(s) defined, not a bare count -- "which type?" is the first
         # thing an agent needs. Parser bookkeeping (parsed functions/variables) is
         # internal noise and moves out of the default line.
-        names = list((item.get("defined_types") or {}).keys())
+        names = list(_as_dict(item.get("defined_types")).keys())
         if names:
             return f"types_declare {', '.join(names)}"
         return f"types_declare {item.get('count', 0)} types"
@@ -3820,7 +3892,7 @@ def _render_trace_text(value: Any) -> str:
     # CALLER's operand at the callsite, not a named callee parameter, so the
     # header no longer prints a parameter name (which suggested a seed that
     # was never what was traced).
-    arg_lbl = value.get("arg_label") or {}
+    arg_lbl = _as_dict(value.get("arg_label"))
     arg_desc = f"arg[{arg_index}]"
     if arg_lbl.get("callee"):
         arg_desc += f" of {arg_lbl['callee']}"
@@ -3964,7 +4036,7 @@ def _render_class_list_text(value: Any) -> str:
         art = value.get("artifact_count") or 0
         tail = f" ({art} non-class RTTI/type artifact{'s' if art != 1 else ''})" if art else ""
         return f"classes: {n}{tail}{_class_inputs_note(value)}"
-    rows = list(value.get("items") or value.get("classes") or [])
+    rows = _as_list(value.get("items") or value.get("classes"))
     total = value.get("total", len(rows))
     header = f"classes: {len(rows)} shown of {total}"
     # Surface what was folded out so the count is self-documenting (#205/#309).
@@ -3992,7 +4064,10 @@ def _render_class_list_text(value: Any) -> str:
         vt = "vtable" if rec.get("has_vtable") else "no-vtable"
         size = rec.get("size")
         size_s = size.get("value") if isinstance(size, dict) else size
-        bases = ", ".join(b for b in (rec.get("bases") or []) if b)
+        # `bases` arrives as name-dicts (what class show renders) or bare strings;
+        # joining a dict crashed the whole listing (#619).
+        bases = ", ".join((b.get("name") or "?") if isinstance(b, dict) else str(b)
+                          for b in _as_list(rec.get("bases")) if b)
         base_s = f"  : {bases}" if bases else ""
         # #481: mark a non-class RTTI/type-signature artifact (rtti confidence but no
         # methods and no vtable) so it doesn't read as a domain class.
@@ -4042,7 +4117,8 @@ def _render_one_class(rec: Any) -> str:
     size_s = size.get("value") if isinstance(size, dict) else None
     vt = rec.get("vtable") if isinstance(rec.get("vtable"), dict) else None
     vt_addr = vt.get("address") if vt else None
-    bases = ", ".join(b.get("name") or "?" for b in (rec.get("bases") or []))
+    bases = ", ".join((b.get("name") or "?") if isinstance(b, dict) else str(b)
+                      for b in _as_list(rec.get("bases")) if b)
     head = f"class {rec.get('name', '<unknown>')}"
     bits = []
     if size_s:
@@ -4054,12 +4130,18 @@ def _render_one_class(rec: Any) -> str:
     if bits:
         head += "  (" + ", ".join(bits) + ")"
     lines = [head, f"  [{rec.get('confidence', '?')}]"]
-    methods = rec.get("methods") or []
+    methods = _as_list(rec.get("methods"))
     for m in methods:
+        if not isinstance(m, dict):
+            lines.append(f"  method {m!r}")
+            continue
         if m.get("kind") in ("ctor", "dtor"):
-            lines.append(f"  {m['kind']:<6} {m.get('address', '?')}  {m.get('demangled', '')}")
+            lines.append(f"  {m.get('kind'):<6} {m.get('address', '?')}  {m.get('demangled', '')}")
     if vt and vt.get("slots"):
-        for s in vt["slots"]:
+        for s in _as_list(vt["slots"]):
+            if not isinstance(s, dict):
+                lines.append(f"  vtable {s!r}")
+                continue
             lines.append(f"  vtable [{s.get('index')}] {s.get('address', '?')}  {_vtable_slot_label(s)}")
     elif vt_addr:
         # A vtable symbol exists but no slots resolved. Either the vtable is
@@ -4071,39 +4153,48 @@ def _render_one_class(rec: Any) -> str:
                      "(defined in another module, or applied at load time via relocations)")
     if vt and vt.get("truncated"):
         lines.append(
-            f"  vtable: showing {len(vt.get('slots') or [])} slots; scan capped at {vt.get('max_slots')} -- "
+            f"  vtable: showing {len(_as_list(vt.get('slots')))} slots; scan capped at {vt.get('max_slots')} -- "
             "more may exist (raise the cap or inspect the table directly)"
         )
     # #412: secondary (multiple-inheritance) vtables -- shown compactly so a simple
     # single-inheritance class isn't cluttered (there are none to show there).
-    for sec in rec.get("secondary_vtables") or []:
+    for sec in _as_list(rec.get("secondary_vtables")):
         if not isinstance(sec, dict):
             continue
         ott = sec.get("offset_to_top")
         ott_s = f" (offset-to-top {ott})" if ott is not None else ""
         lines.append(f"  secondary vtable @ {sec.get('address', '?')}{ott_s}:")
-        for s in sec.get("slots") or []:
+        for s in _as_list(sec.get("slots")):
+            if not isinstance(s, dict):
+                lines.append(f"    {s!r}")
+                continue
             lines.append(f"    [{s.get('index')}] {s.get('address', '?')}  {_vtable_slot_label(s)}")
         if sec.get("truncated"):
             lines.append(
-                f"    vtable: showing {len(sec.get('slots') or [])} slots; scan capped at {sec.get('max_slots')} -- "
+                f"    vtable: showing {len(_as_list(sec.get('slots')))} slots; scan capped at {sec.get('max_slots')} -- "
                 "more may exist (raise the cap or inspect the table directly)"
             )
     # Non-virtual member functions (kind=method). Virtual ones already appear as
     # vtable slots above; listing the symbol-side methods makes `class show`
     # useful for classes whose vtable is empty or absent (e.g. Controller).
-    member_methods = [m for m in methods if m.get("kind") == "method"]
+    member_methods = [m for m in methods if isinstance(m, dict) and m.get("kind") == "method"]
     if member_methods:
         lines.append(f"  methods ({len(member_methods)}):")
         for m in member_methods:
             lines.append(f"    {m.get('address', '?')}  {m.get('demangled', '')}")
     inst = rec.get("instances") if isinstance(rec.get("instances"), dict) else {}
     parts = []
-    for site in inst.get("construction_sites") or []:
+    for site in _as_list(inst.get("construction_sites")):
+        if not isinstance(site, dict):
+            parts.append(repr(site))
+            continue
         sz = f" (size {site['size']})" if site.get("size") else ""
         fn = f" (in {site['function']})" if site.get("function") else ""
         parts.append(f"{site.get('kind', '?')} @ {site.get('address', '?')}{sz}{fn}")
-    for g in inst.get("stored_globals") or []:
+    for g in _as_list(inst.get("stored_globals")):
+        if not isinstance(g, dict):
+            parts.append(f"stored -> {g!r}")
+            continue
         parts.append(f"stored -> {g.get('symbol') or '?'} @ {g.get('address', '?')}")
     if parts:
         lines.append("  instances: " + " ; ".join(parts))
