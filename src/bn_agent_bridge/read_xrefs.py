@@ -10,8 +10,10 @@ Outbound calls resolve through:
   * ``ctx`` -- resolution / address-context / type helpers relocated to the seam
     (``_resolve_view``, ``_find_function``, ``_functions_containing``,
     ``_address_context``, ``_find_type``);
-  * ``il_format`` -- the state-free IL helpers used by the call scan
-    (``_iter_llil_instructions``, ``_il_op_name``, ``_llil_constant_value``);
+  * ``il_format`` -- the state-free IL / function helpers (``_il_op_name``,
+    ``_llil_constant_value``, ``_function_size``); the budgeted call scan walks
+    LLIL blocks itself rather than through ``_iter_llil_instructions``, which
+    materialises a whole function's instructions (see ``_scan_for_calls_to``);
   * ``_shared`` -- module-free helpers (``_parse_address``).
 
 Import direction is one-way: this module imports ``il_format`` and ``_shared``

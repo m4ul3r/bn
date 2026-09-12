@@ -377,33 +377,70 @@ def test_xrefs_import_scan_flags_unreadable_llil(monkeypatch):
     assert result["code_ref_count"] == 1          # the readable caller survives
 
 
-def test_find_function_native_name_lookup_skips_the_full_walk(monkeypatch):
-    """#622: an exact name hit uses BN's own name index instead of enumerating
-    every function. A view whose enumeration is a landmine proves the walk never
-    happened (and that the native hit is real, not an incidental match)."""
+def test_find_function_exact_hit_walks_once_and_then_never_again(monkeypatch):
+    """#622(b) for the SINGLE-identifier path: an exact name hit pays the one
+    index build and every later hit enumerates nothing.
+
+    BN's own name index deliberately does NOT answer here even though it could:
+    it is a strict subset of the walk (#224a), and a unique non-stub hit from it
+    suppressed the ambiguous-identifier error for two real bodies sharing a
+    spelling (#122, pinned by
+    `test_find_function_reports_ambiguity_the_native_index_cannot_see`). The
+    per-view index delivers the same zero-enumeration hit soundly, from the
+    second lookup on."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
-    fn = _FakeFunction(0x401000, "big_dispatch")
-    bv = _FakeBV(functions=[fn])
-
-    class _NoEnumerate(list):
-        def __iter__(self):
-            raise AssertionError("full bv.functions enumeration on an exact-name hit")
-
-    bv.functions = _NoEnumerate([fn])
+    fn = _named_fn(0x401000, "big_dispatch")
+    bv = _NotifyingBV(functions=[fn])
+    bv.functions = _CountingFunctions([fn])
     bv.get_functions_by_name = lambda name: [fn] if name == "big_dispatch" else []
 
     assert int(instance._find_function(bv, "big_dispatch").start) == 0x401000
+    assert bv.functions.enumerations == 1, "the cold hit builds the index once"
+    for _ in range(3):
+        assert int(instance._find_function(bv, "big_dispatch").start) == 0x401000
+    assert bv.functions.enumerations == 1, (
+        "a warm exact hit must not enumerate the view again"
+    )
+
+
+def test_find_function_reports_ambiguity_the_native_index_cannot_see(monkeypatch):
+    """#122: two REAL bodies sharing one spelling must raise the ambiguous-name
+    error, never be auto-picked.
+
+    BN's own name index is a strict SUBSET of the walk -- it does not carry the
+    demangled short/full spellings BN keeps only on the symbol (#224a) -- so a
+    unique non-stub hit from it is NO evidence that the spelling is unique. Here a
+    C body is literally named `handle` while a C++ body carries `handle` only as
+    its demangled short name, exactly the mixed-language shape of a real target;
+    the index resolves only the C body. Accepting that hit resolved a genuine
+    two-implementation ambiguity silently.
+
+    REGRESSION test: this passes at the base revision (which always walked) and
+    fails only on the revisions that let the native index answer -- it pins
+    behaviour that must be RESTORED, so being green on base is the point, not
+    missing evidence."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    c_body = _named_fn(0x401000, "handle")
+    cpp_body = _named_fn(0x402000, "_Z6handlev", short_name="handle")
+    bv = _FakeBV(functions=[c_body, cpp_body])
+    bv.get_functions_by_name = lambda name: [c_body] if name == "handle" else []
+
+    with pytest.raises(RuntimeError) as exc_info:
+        instance._find_function(bv, "handle")
+    message = str(exc_info.value)
+    assert "Ambiguous function identifier" in message, message
+    assert "0x00401000" in message and "0x00402000" in message, message
 
 
 def test_find_function_index_miss_still_walks_for_the_case_exact_spelling(monkeypatch):
-    """The native index is consulted first, but an EMPTY native result is not
-    authoritative -- the index does not carry the demangled spellings BN keeps
-    only on the symbol (#224a), so the walk must still run and answer the
-    exact-case query. Two functions whose demangled spellings differ only in CASE
-    expose a fallback that stops at the empty index: folding them matches BOTH and
-    raises the ambiguous-name error instead of returning the spelling the caller
-    asked for."""
+    """An EMPTY result from BN's own name index is not authoritative -- the index
+    does not carry the demangled spellings BN keeps only on the symbol (#224a), so
+    the walk must answer the exact-case query. Two functions whose demangled
+    spellings differ only in CASE expose a fallback that stops at the empty index:
+    folding them matches BOTH and raises the ambiguous-name error instead of
+    returning the spelling the caller asked for."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
 
@@ -417,11 +454,9 @@ def test_find_function_index_miss_still_walks_for_the_case_exact_spelling(monkey
         _fn(0x406000, "_ZN3pkg5ThingEv", "pkg::Thing"),
         _fn(0x407000, "_ZN3pkg5thingEv", "pkg::thing"),
     ])
-    queried: list[str] = []
-    bv.get_functions_by_name = lambda name: (queried.append(name), [])[1]
+    bv.get_functions_by_name = lambda name: []
 
     assert int(instance._find_function(bv, "pkg::Thing").start) == 0x406000
-    assert queried == ["pkg::Thing"], "the native index must be consulted first"
 
 
 def _suggestion_spellings(fns) -> list[str]:
@@ -757,6 +792,117 @@ def test_cached_folded_group_with_a_missing_member_still_rebuilds(monkeypatch):
     assert bv.functions.enumerations == 2, "the rebuilt index must be reused"
 
 
+def test_an_addition_in_an_unwitnessable_casing_still_invalidates_the_group(monkeypatch):
+    """#622 review (round-5 major): BN's own name index is case-SENSITIVE, so a
+    same-name addition spelled in a casing NOTHING asked for and NO cached member
+    carries cannot be witnessed by name at all -- the queried casing witnesses
+    only itself, and the cached members' casings witness only theirs.
+
+    The view's function COUNT is the case-independent witness of last resort: the
+    addition changes it, so the cached group is rebuilt once and comes back
+    COMPLETE rather than serving one of two same-name members."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _named_fn(0x401000, "alpha")
+    bv = _NotifyingBV(functions=[fn])
+    bv.functions = _CountingFunctions([fn])
+
+    def lookup(text):
+        return [
+            int(f.start)
+            for f in instance.ctx._find_functions_by_name(
+                bv, text, case_sensitive=False)
+        ]
+
+    assert lookup("alpha") == [0x401000]
+    assert bv.functions.enumerations == 1
+    assert lookup("alpha") == [0x401000]
+    assert bv.functions.enumerations == 1, "the memo must really be serving it"
+
+    # A THIRD casing: not the queried "alpha", not the cached member's "alpha".
+    twin = _named_fn(0x403000, "ALPHA")
+    bv.functions.append(twin)
+    bv.get_functions_by_name = lambda name: [twin] if name == "ALPHA" else []
+
+    assert lookup("alpha") == [0x401000, 0x403000], (
+        "an addition no name witness can see must still invalidate the group"
+    )
+    assert bv.functions.enumerations == 2, "exactly one rebuild"
+    assert lookup("alpha") == [0x401000, 0x403000]
+    assert bv.functions.enumerations == 2, "the rebuilt index must be reused"
+
+
+def test_an_empty_cached_group_is_still_rechecked_against_the_view(monkeypatch):
+    """#622 review (round-5 major): an EMPTY cached bucket has no member whose
+    casing could be asked for, so a case-insensitive lookup has nothing to witness
+    with -- BN's index can only be asked for the queried casing, and the view
+    spells the name differently. The count witness covers exactly that: the
+    unnotified addition changes the view's function count, so the empty group is
+    rebuilt instead of being served as "no such function"."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    unrelated = _named_fn(0x401000, "zeta")
+    bv = _NotifyingBV(functions=[unrelated])
+    bv.functions = _CountingFunctions([unrelated])
+
+    def lookup(text):
+        return [
+            int(f.start)
+            for f in instance.ctx._find_functions_by_name(
+                bv, text, case_sensitive=False)
+        ]
+
+    assert lookup("alpha") == []
+    assert bv.functions.enumerations == 1
+    assert lookup("alpha") == []
+    assert bv.functions.enumerations == 1, "the empty group must be memo-served"
+
+    twin = _named_fn(0x403000, "Alpha")
+    bv.functions.append(twin)
+    bv.get_functions_by_name = lambda name: [twin] if name == "Alpha" else []
+
+    assert lookup("alpha") == [0x403000], (
+        "an empty cached group with no witness must be rechecked, not served"
+    )
+    assert bv.functions.enumerations == 2, "exactly one rebuild"
+    assert lookup("alpha") == [0x403000]
+    assert bv.functions.enumerations == 2, "the rebuilt index must be reused"
+
+
+def test_name_lookup_walks_a_view_that_cannot_resolve_a_start_address(monkeypatch):
+    """The index stores start ADDRESSES and resolves them at lookup time (storing
+    a Function would pin its view), so it can only answer a view that maps an
+    address back to a function. A view without ``get_function_at`` must therefore
+    be WALKED -- answering it from the index yields the empty group resolution
+    produces, i.e. a silent "not found" for a function the view has.
+
+    REGRESSION test: green at the base revision (which always walked); it fails
+    only while the index path answers such a view from an unresolvable bucket."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    fn = _named_fn(0x401000, "alpha")
+
+    class _NoResolveBV(_NotifyingBV):
+        get_function_at = None          # a BinaryView-shaped double without it
+
+    bv = _NoResolveBV(functions=[fn])
+    bv.functions = _CountingFunctions([fn])
+
+    def lookup(text, *, case_sensitive):
+        return [
+            int(f.start)
+            for f in instance.ctx._find_functions_by_name(
+                bv, text, case_sensitive=case_sensitive)
+        ]
+
+    assert lookup("alpha", case_sensitive=True) == [0x401000]
+    assert lookup("ALPHA", case_sensitive=False) == [0x401000]
+    assert bv.functions.enumerations == 2, (
+        "a view the index cannot serve must walk on every lookup"
+    )
+
+
+
 def test_name_index_does_not_retain_a_closed_target(monkeypatch):
     """#622 review (blocker A): the memo must hold NOTHING that reaches the view
     back. A real BN Function strongly references its own view (``fn.view is bv``),
@@ -795,12 +941,14 @@ def test_name_index_does_not_retain_a_closed_target(monkeypatch):
     )
 
 
-def test_find_function_miss_hints_are_uncapped_and_cost_one_enumeration(monkeypatch):
-    """#622(b): a miss suggests over EVERY spelling -- no cap, no prefix filter,
-    so a FIRST-character typo still finds the intended name -- and costs exactly
-    ONE `bv.functions` enumeration. Base walked the view three times per miss
-    (exact, casefold, then the suggestion corpus). The hint set must stay
-    difflib's over that full corpus, in view order, for both typo shapes."""
+def test_find_function_miss_hints_are_unfiltered_and_cost_one_enumeration(monkeypatch):
+    """#622(b): a miss suggests over every spelling within the budget -- no prefix
+    filter, no sampling, no length prefilter, so a FIRST-character typo still finds
+    the intended name -- and costs exactly ONE `bv.functions` enumeration. Base
+    walked the view three times per miss (exact, casefold, then the suggestion
+    corpus). The hint set must stay difflib's over that corpus, in view order, for
+    both typo shapes. (The budget itself is pinned by
+    `test_find_function_miss_hints_are_bounded_and_the_budget_is_disclosed`.)"""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
     fns = _named_method_bv()
@@ -825,11 +973,56 @@ def test_find_function_miss_hints_are_uncapped_and_cost_one_enumeration(monkeypa
         )
 
 
-def test_find_function_index_stub_does_not_shadow_the_implementation(monkeypatch):
-    """A unique native-index hit is not automatically an answer: an import stub
-    can be shadowing a same-name real body (#122/#286), and only the walk's full
-    match set lets the impl-over-stub resolver pick it. The index must be
-    consulted, and the real body returned -- never the stub."""
+def test_find_function_miss_hints_are_bounded_and_the_budget_is_disclosed(monkeypatch):
+    """#622(b) as a LATENCY bound: the hint search is O(all spellings) -- difflib
+    gates every candidate it is handed -- so the number of candidates is capped,
+    and the cap is DISCLOSED in the message instead of silently changing the hint
+    ("prefer bounded latency + honest truncation over silent incompleteness").
+
+    The budget is exercised through a patched constant rather than a 20k-function
+    view, so what is pinned is the behaviour (at most `SUGGESTION_CORPUS_MAX`
+    candidates, and the message naming how many of how many spellings were
+    searched), not the constant's value."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    seam = sys.modules[type(instance.ctx).__module__]
+    fns = [_named_fn(0x401000 + i * 0x100, f"handler_{i:03d}") for i in range(8)]
+    bv = _NotifyingBV(functions=fns)
+    bv.functions = _CountingFunctions(fns)
+    bv.get_functions_by_name = lambda name: []
+
+    searched: list[int] = []
+    real_matcher = difflib.get_close_matches
+
+    def _spy(word, possibilities, **kwargs):
+        searched.append(len(possibilities))
+        return real_matcher(word, possibilities, **kwargs)
+
+    monkeypatch.setattr(seam, "SUGGESTION_CORPUS_MAX", 3)
+    monkeypatch.setattr(seam.difflib, "get_close_matches", _spy)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        instance._find_function(bv, "handler_00X")
+    message = str(exc_info.value)
+
+    assert searched == [3], (
+        f"the hint search must see at most the budget, saw {searched}"
+    )
+    assert "the first 3 of 8 spellings" in message, message
+    assert "suggestion budget" in message, message
+    # Under the budget the message is unchanged -- no note, nothing to disclose.
+    monkeypatch.setattr(seam, "SUGGESTION_CORPUS_MAX", 8)
+    with pytest.raises(RuntimeError) as exc_info:
+        instance._find_function(bv, "handler_00X")
+    assert "suggestion budget" not in str(exc_info.value), str(exc_info.value)
+    assert searched == [3, 8]
+
+
+def test_find_function_stub_does_not_shadow_the_implementation(monkeypatch):
+    """An import stub can shadow a same-name real body (#122/#286), and only the
+    walk's full match set lets the impl-over-stub resolver pick the body. BN's own
+    name index resolving just the stub must never become the answer -- the real
+    body is returned."""
     bridge = _load_bridge(monkeypatch)
     instance = bridge.BinaryNinjaBridge()
 
@@ -842,12 +1035,10 @@ def test_find_function_index_stub_does_not_shadow_the_implementation(monkeypatch
     stub = _fn(0x400000, "ImportedFunctionSymbol")
     body = _fn(0x401000, "FunctionSymbol")
     bv = _FakeBV(functions=[stub, body])
-    queried: list[str] = []
-    bv.get_functions_by_name = lambda name: (queried.append(name), [stub])[1]
+    bv.get_functions_by_name = lambda name: [stub]
 
     resolved = instance._find_function(bv, "shared_entry")
 
-    assert queried == ["shared_entry"], "the native index must be consulted first"
     assert int(resolved.start) == 0x401000
 
 

@@ -354,15 +354,23 @@ def _build_class_registry(ctx, bv, *, query: str | None = None) -> dict[str, dic
     call rescans, exactly as before). ``ctx`` is unused today (the scan reads only
     ``bv``), kept for the callers' uniform ``(ctx, bv)`` seam shape.
 
-    Records are shallow-copied on the way out because the callers WRITE to them:
+    Records are copied on the way out because the callers WRITE to them:
     ``_class_list`` sets ``rec["bases"]`` for its page rows and ``_class_show``
     sets the drill-down keys (``vtable`` / ``size`` / ``bases`` / ``instances`` /
     ``notes``). Handing out the cached records would make one command's output
-    depend on the other's call order."""
+    depend on the other's call order. The record's own LISTS are copied too, so a
+    caller that appends to ``methods`` (or to a drill-down list) grows its own
+    copy instead of poisoning the memo for every later call; the method entries
+    themselves are flat value dicts, read and never written in place."""
     registry = _view_memo(bv, "class_registry", lambda: _scan_class_registry(bv))
     needle = query.lower() if query else None
     return {
-        name: dict(rec)
+        name: {
+            **rec,
+            "methods": list(rec["methods"]),
+            "bases": list(rec["bases"]),
+            "instances": list(rec["instances"]),
+        }
         for name, rec in registry.items()
         if needle is None or needle in name.lower()
     }

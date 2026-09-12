@@ -106,15 +106,16 @@ def test_registry_clusters_methods():
 
 
 def test_registry_rebuild_reflects_a_rename():
-    """#622 criterion (d): the registry reads the live name spellings on every
-    build, so a rename inside the session is visible on the very next call.
+    """NEGATIVE CONTROL for #622 criterion (d) -- it passes at the base revision
+    by construction, so it is NOT regression evidence for the cache: the registry
+    reads the live name spellings on every build, so a rename inside the session
+    is visible on the very next call.
 
-    What this pins is the SAFE FALLBACK, not the cache: this double has NO
-    notification surface, so the registry is never cached (`_view_memo` gets no
-    state => no memo), and the rebuild that reflects the rename is never a cache
-    hit. The cache itself -- reuse while BN reports no change, invalidated by BN's
-    own notifications -- is pinned by
-    `test_class_registry_is_reused_per_view_and_invalidated_by_a_change`."""
+    What it pins is the SAFE FALLBACK: this double has NO notification surface, so
+    the registry is never cached (`_view_memo` gets no state => no memo), and the
+    rebuild that reflects the rename is never a cache hit. The cache itself --
+    reuse while BN reports no change, invalidated by BN's own notifications -- is
+    pinned by `test_class_registry_is_reused_per_view_and_invalidated_by_a_change`."""
     bv = _make_registry_bv()
     first = read_class._build_class_registry(None, bv)
     assert "net::Session" in first
@@ -249,6 +250,17 @@ def test_class_registry_is_reused_per_view_and_invalidated_by_a_change():
     # A returned record is private to the call: polluting it must not leak.
     first["net::Session"]["bases"] = ["polluted"]
     assert read_class._build_class_registry(None, bv)["net::Session"]["bases"] == []
+
+    # #622 review: the record's own LISTS are private too. A caller that APPENDS
+    # to `methods` (rather than replacing a key) must grow its own copy -- the
+    # memo's interior state may never be reachable from a handed-out record, or
+    # one command's mutation leaks into every later call on that view.
+    methods_before = [m["demangled"] for m in first["net::Session"]["methods"]]
+    first["net::Session"]["methods"].append({"demangled": "polluted"})
+    assert [
+        m["demangled"]
+        for m in read_class._build_class_registry(None, bv)["net::Session"]["methods"]
+    ] == methods_before
 
     # A rename, reported by BN's own notification, invalidates the registry.
     renamed = bv.functions[0]
