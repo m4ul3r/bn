@@ -428,8 +428,28 @@ def _write_json_artifact(path_text: str | None, payload: Any) -> dict[str, Any] 
     # here. Anything but .ndjson keeps the existing pretty single-document JSON.
     ndjson = path.suffix.lower() == ".ndjson"
     if ndjson:
-        items = payload if isinstance(payload, list) else [payload]
-        lines = [json.dumps(item, sort_keys=True) for item in items]
+        # Emit exactly what the CLI-side writer would (output.py's render_value):
+        # one record per element for a list; for a paged dict (a list under
+        # `items`/`functions`) one record per element plus a trailing `_meta`
+        # record carrying the rest of the mapping; a single record otherwise. The
+        # two --out writers must stay interchangeable for ANY payload, so the
+        # same dict that `--format ndjson` fans out on stdout cannot collapse to
+        # one line here.
+        records = [payload]
+        if isinstance(payload, list):
+            records = payload
+        elif isinstance(payload, dict):
+            for page_key in ("items", "functions"):
+                page = payload.get(page_key)
+                if isinstance(page, list):
+                    meta = {
+                        k: v for k, v in payload.items()
+                        if k not in ("items", "functions")
+                    }
+                    meta["_meta"] = True
+                    records = [*page, meta]
+                    break
+        lines = [json.dumps(item, sort_keys=True) for item in records]
         text = "\n".join(lines) + ("\n" if lines else "")
     else:
         text = json.dumps(payload, indent=2, sort_keys=True)

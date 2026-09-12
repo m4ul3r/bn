@@ -6,8 +6,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from ..cli import (_call, _effective_limit, _int_or_hex, _mutate, _mutation_exit_code,
-                   _non_negative_int, _out_path_is_process_local, _pick,
+from ..cli import (_OUT_FORMAT_BY_SUFFIX, _call, _effective_limit, _int_or_hex, _mutate,
+                   _mutation_exit_code, _non_negative_int, _out_path_is_process_local, _pick,
                    _positive_int, arg, command, mutex, mutation_output_args,
                    preview_arg)
 from ..formatters import (
@@ -377,7 +377,27 @@ def _bundle_function(args: argparse.Namespace) -> int:
     # into its own fd <n> and the caller would read zero bytes behind an
     # ok/bytes/sha256 envelope. Write those in THIS process instead: with
     # `out_path=None` the bridge returns the bundle itself.
-    bridge_writes = bool(args.out) and not _out_path_is_process_local(args.out)
+    #
+    # #670: the bridge-side writer sees only the `--out` SUFFIX, so it cannot
+    # honor an explicit --format that disagrees with it -- it would write NDJSON
+    # for `--format json --out x.ndjson` while this CLI prints "writing json".
+    # Delegate only when the format resolved here is the one the bridge would
+    # emit for that suffix. Mirror cli.py's `_resolve_output_format` precedence
+    # (an explicit --format wins, else the suffix is inferred) rather than
+    # calling it: it PRINTS the note/warning as a side effect and `_call` calls
+    # it again below.
+    inferred = _OUT_FORMAT_BY_SUFFIX.get(Path(str(args.out)).suffix.lower()) if args.out else None
+    resolved = (
+        inferred
+        if inferred is not None and not getattr(args, "_format_explicit", False)
+        else getattr(args, "format", "text")
+    )
+    bridge_format = "ndjson" if inferred == "ndjson" else "json"
+    bridge_writes = (
+        bool(args.out)
+        and not _out_path_is_process_local(args.out)
+        and resolved == bridge_format
+    )
     return _call(
         args,
         "bundle_function",
