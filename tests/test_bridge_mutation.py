@@ -4345,3 +4345,81 @@ def test_batch_validation_covers_every_op_before_the_first_apply_650(monkeypatch
         instance._mutation("active", False, ops)
     assert "operation 12" in exc.value.message
     assert all(bv.get_comment_at(0x1000 + i * 4) == "" for i in range(12))
+
+
+# ===========================================================================
+# #624 -- the comment fake must be undo-honest. `_FakeCommentMutationBV` used
+# to keep a SECOND dict for `get_comment_at`/`set_comment_at` while the
+# inherited `address_comments` read `_comments`, and the undo journal snapshotted
+# only function provenance -- so a "reverted" comment survived in the store the
+# snapshot/list paths read, and a rollback test could stay green with the view
+# state wrong.
+# ===========================================================================
+
+def test_fake_comment_store_is_unified_624():
+    """Real BN exposes ONE global address-comment store: what `set_comment_at`
+    writes is what `get_comment_at` reads and what `address_comments` hands back.
+    A second dict on the subclass broke that, so an apply landed in a store the
+    snapshot/list paths never saw."""
+    bv = _FakeCommentMutationBV()
+
+    bv.set_comment_at(0x1000, "x")
+    assert bv.get_comment_at(0x1000) == "x"
+    assert bv.address_comments[0x1000] == "x"
+
+    # An empty/None comment REMOVES the key (real BN semantics), in both views.
+    bv.set_comment_at(0x1000, "")
+    assert bv.get_comment_at(0x1000) == ""
+    assert 0x1000 not in bv.address_comments
+
+
+def test_fake_mutation_undo_restores_address_comments_624():
+    """Real BN journals global address comments, so a reverted transaction drops
+    the comment it applied; a commit keeps it. The fake journal used to carry
+    only function provenance, so a revert left the comment behind."""
+    bv = _FakeCommentMutationBV()
+    state = bv.begin_undo_actions()
+    bv.set_comment_at(0x1000, "x")
+    bv.revert_undo_actions(state)
+    assert bv.get_comment_at(0x1000) == ""
+    assert bv.address_comments == {}
+
+    bv = _FakeCommentMutationBV()
+    state = bv.begin_undo_actions()
+    bv.set_comment_at(0x1000, "x")
+    bv.commit_undo_actions(state)
+    assert bv.get_comment_at(0x1000) == "x"
+
+    # Nested transactions keep the existing stack semantics: reverting the inner
+    # transaction restores the comment state at ITS begin, the outer one at its
+    # own, and closing the outer drops any snapshot left nested inside it.
+    bv = _FakeCommentMutationBV()
+    outer = bv.begin_undo_actions()
+    bv.set_comment_at(0x1000, "outer")
+    inner = bv.begin_undo_actions()
+    bv.set_comment_at(0x1000, "inner")
+    bv.revert_undo_actions(inner)
+    assert bv.get_comment_at(0x1000) == "outer"
+    bv.revert_undo_actions(outer)
+    assert bv.get_comment_at(0x1000) == ""
+
+
+def test_preview_set_comment_revert_clears_the_view_624(monkeypatch):
+    """A preview's promise is that the view is left unmodified. For a comment op
+    the revert must really clear the address comment it applied -- the rollback
+    tests only asserted undo events and status strings, so a revert that skipped
+    the comment store shipped green (#173's rollback contract, #624)."""
+    bridge = _load_bridge(monkeypatch)
+    instance = bridge.BinaryNinjaBridge()
+    bv = _FakeCommentMutationBV()
+    monkeypatch.setattr(instance.ctx, "_resolve_view", lambda selector: bv)
+
+    result = instance._mutation("active", True, [
+        {"op": "set_comment", "address": "0x1000", "comment": "reverted note"}])
+
+    assert result["preview"] is True and result["committed"] is False
+    assert result["rolled_back"] is True
+    assert result["results"][0]["status"] == "verified"   # it DID land, then reverted
+    # readback, not a claim: the view really carries no comment now
+    assert bv.get_comment_at(0x1000) == ""
+    assert 0x1000 not in bv.address_comments
