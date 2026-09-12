@@ -200,19 +200,28 @@ def test_cli_layout_names_every_top_level_module():
     pointer to the page-aggregation helper and re-implemented paging in the
     handler.
 
-    Scoped to the section, not the file: CLAUDE.md names `version.py` again in
-    the symlink sentence, so a whole-file `in text` check passes vacuously for
-    exactly the module the ticket is about. One directory glob, and any
-    deliberate omission named in `CLI_LAYOUT_INTERNAL_MODULES`.
+    Only a line that *introduces* a module counts: its leading backticked token,
+    which is how the `- ` list items and the section's lead sentence (`cli.py`)
+    name theirs. The body also mentions modules in passing -- the `version.py`
+    bullet compares itself to `paths.py`, and the symlink sentence below the list
+    names `version.py` again -- so anything looser lets a module leave the
+    inventory with the guard still green. One directory glob, and any deliberate
+    omission named in `CLI_LAYOUT_INTERNAL_MODULES`.
     """
     section = _claude_md_section(CLI_LAYOUT_HEADING)
+    introduced = {
+        match.group(1)
+        for line in section.splitlines()
+        if not line.startswith((" ", "\t"))
+        if (match := re.match(r"(?:- )?`([^`]+)`", line.strip()))
+    }
     modules = sorted(
         path.name
         for path in (REPO / "src" / "bn").glob("*.py")
         if path.name not in CLI_LAYOUT_INTERNAL_MODULES
     )
     assert modules, "no src/bn/*.py modules found"
-    missing = [name for name in modules if f"`{name}`" not in section]
+    missing = [name for name in modules if name not in introduced]
     assert not missing, f"top-level modules missing from the CLI Layout list: {missing}"
 
 
