@@ -1034,26 +1034,35 @@ def _coercion_sites(source: str | None = None):
             return [(bound_names(node.target), node.value)] if node.value else []
         return []
 
-    empty_consts = set()
+    empty_consts: set[str] = set()
 
-    def empty_container(node):
+    def literal_empty(node):
+        """An empty container written out, with no name indirection."""
         if isinstance(node, (ast.List, ast.Tuple, ast.Set)) and not node.elts:
             return True
         if isinstance(node, ast.Dict) and not node.keys:
             return True
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                and node.func.id in CONTAINERS and not node.args and not node.keywords):
-            return True                  # `list()`, `set()`, `dict()`
-        return isinstance(node, ast.Name) and node.id in empty_consts
+        return (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                and node.func.id in CONTAINERS and not node.args and not node.keywords)
+
+    def empty_container(node):
+        """...or a NAME bound to one, at module or function scope. A default
+        taken from `_EMPTY = []` coerces exactly as the literal does."""
+        return literal_empty(node) or (isinstance(node, ast.Name)
+                                       and node.id in empty_consts)
 
     def is_none(node):
         return isinstance(node, ast.Constant) and node.value is None
 
-    def container_isinstance(node):
-        """The expression whose CONTAINER shape `node` tests, else None. Accepts
-        the negated form, so `if not isinstance(x, list)` is seen as well."""
+    def container_isinstance(node, negated=None):
+        """The expression whose CONTAINER shape `node` tests, else None.
+        `negated=True` asks only for the `not isinstance(...)` spelling, which is
+        what distinguishes a SKIP from a dispatch."""
+        neg = False
         if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
-            node = node.operand
+            node, neg = node.operand, True
+        if negated is not None and neg is not negated:
+            return None
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
                 and node.func.id == "isinstance" and len(node.args) == 2):
             return None
@@ -1064,10 +1073,9 @@ def _coercion_sites(source: str | None = None):
         return node.args[0]
 
     # A module-level `_EMPTY = []` is as good a coercion default as the literal.
-    for stmt in tree.body:
-        for names, val in bindings(stmt):
-            if empty_container(val):
-                empty_consts |= set(names)
+    module_empties = {n for stmt in tree.body for names, val in bindings(stmt)
+                      if literal_empty(val) for n in names}
+    empty_consts = module_empties
 
     def scope_nodes(scope):
         """Every node belonging to this scope, not descending into a nested
@@ -1088,6 +1096,8 @@ def _coercion_sites(source: str | None = None):
             scopes.append((node.name, node))
         elif isinstance(node, ast.Lambda):
             scopes.append(("<lambda>", node))
+        elif isinstance(node, ast.ClassDef):
+            scopes.append((f"class {node.name}", node))
 
     sites, raw = [], []
     for fn_name, scope in scopes:
@@ -1097,11 +1107,24 @@ def _coercion_sites(source: str | None = None):
         if fn_name in RECORDERS + COERCERS:
             continue
         nodes = scope_nodes(scope)
+        # A FUNCTION-LOCAL `_empty = []` defaults exactly as a module-level one.
+        local_empties = {n for node in nodes for names, val in bindings(node)
+                         if literal_empty(val) for n in names}
+        empty_consts = module_empties | local_empties
         aliases = {n for node in nodes for names, val in bindings(node)
                    if is_lookup(val) for n in names}
+        # `g = value.get` then `g("k")`: a bound-method alias is still a lookup.
+        getters = {n for node in nodes for names, val in bindings(node)
+                   if isinstance(val, ast.Attribute) and val.attr == "get" for n in names}
+
+        def is_lookup_here(node):
+            if is_lookup(node):
+                return True
+            return (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id in getters and bool(node.args))
 
         def suspect(node):
-            return is_lookup(node) or (isinstance(node, ast.Name) and node.id in aliases)
+            return is_lookup_here(node) or (isinstance(node, ast.Name) and node.id in aliases)
 
         def suspect_within(node):
             return any(suspect(n) for n in ast.walk(node))
@@ -1148,9 +1171,39 @@ def _coercion_sites(source: str | None = None):
                     # dict) else None` guards the SOURCE and binds a string, and
                     # reporting that would make the guard fire on correct code.
                     shaped = tested is not None and ast.dump(tested) == ast.dump(real)
-                    if empty_container(default) or (shaped and is_none(default)):
+                    # ...unless the test is itself a LOOKUP that the chosen branch
+                    # re-reads, which is a container coercion whatever the default
+                    # is: `len(v.get(k)) if isinstance(v.get(k), list) else 0`.
+                    reread = (tested is not None and is_lookup_here(tested)
+                              and any(ast.dump(tested) == ast.dump(n) for n in ast.walk(real)))
+                    if empty_container(default) or (shaped and is_none(default)) or reread:
                         raw.append((fn_name, "R4 " + ast.unparse(node)))
                         break
+            if isinstance(node, ast.If):                                      # R6
+                # The SKIP form: a wrong shape silently leaves the function or
+                # the loop. Only the NEGATED spelling -- `if isinstance(x, list):
+                # ... return` is a dispatch, not a skip -- and not when the exit
+                # hands back the raw payload echo, which discloses everything.
+                tested = container_isinstance(node.test, negated=True)
+                if tested is not None and suspect(tested):
+                    exits = [s for s in node.body
+                             if isinstance(s, (ast.Return, ast.Continue, ast.Break))]
+                    echoes = any(isinstance(s, ast.Return) and isinstance(s.value, ast.Call)
+                                 and isinstance(s.value.func, ast.Name)
+                                 and "fallback" in s.value.func.id for s in node.body)
+                    if exits and not echoes:
+                        raw.append((fn_name, "R6 skip on " + ast.unparse(node.test)))
+            if isinstance(node, ast.Match) and suspect_within(node.subject):  # R7
+                if any(isinstance(c.pattern, (ast.MatchValue, ast.MatchSequence,
+                                              ast.MatchMapping)) for c in node.cases):
+                    raw.append((fn_name, "R7 match on " + ast.unparse(node.subject)))
+            if isinstance(node, ast.comprehension):                           # R8
+                for cond in node.ifs:
+                    tested = container_isinstance(cond)
+                    if (tested is not None and suspect(tested)
+                            and any(ast.dump(tested) == ast.dump(n)
+                                    for n in ast.walk(node.iter))):
+                        raw.append((fn_name, "R8 comprehension filter " + ast.unparse(cond)))
 
         for name in sorted(set(lookup_bound) & container_default):            # R5
             raw.append((fn_name, f"R5 {name!r} is bound from a payload lookup and "
@@ -1159,9 +1212,13 @@ def _coercion_sites(source: str | None = None):
                        for n in nodes if isinstance(n, (ast.If, ast.IfExp))]
         shape_tests = [t for t in shape_tests if t is not None and suspect(t)]
         for name in sorted(set(lookup_bound) & none_default):
-            if any(ast.dump(t) in ast.dump(v)
+            # EXACT match, never a substring of the dump: a scalar read out of a
+            # container inside a container-shape branch is correct code, and
+            # reporting it would train a maintainer to switch the guard off.
+            if any(ast.dump(t) == ast.dump(v)
                    for t in shape_tests for v in lookup_bound[name]):
                 raw.append((fn_name, f"R5 {name!r} is shape-tested and defaulted to None"))
+        empty_consts = module_empties
     return sites, raw
 
 
@@ -1180,10 +1237,122 @@ def test_no_payload_container_is_coerced_outside_the_recording_helpers():
         f"malformed value there renders as empty with no disclosure: {raw[:6]}")
 
 
+def _container_key_decisions():
+    """Every place the module DECIDES something about a container field, split
+    into the ones that delegate to the choke point and the ones that re-derive
+    the answer from the raw payload.
+
+    A container key is one the module itself reads through `_field_list` /
+    `_field_dict` somewhere. Two returns: `membership` is a raw `"k" in mapping`
+    test on such a key, and `before_read` is a branch that tests a container key
+    raw EARLIER in the same function than that key's recorded read."""
+    import ast
+    import inspect
+
+    from bn import formatters
+
+    tree = ast.parse(inspect.getsource(formatters))
+    RECORDERS = ("_field_list", "_field_dict")
+    HELPERS = RECORDERS + ("_field_present", "_field_declared")
+    container_keys = {
+        a.value
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        and n.func.id in RECORDERS
+        for a in n.args[1:]
+        if isinstance(a, ast.Constant) and isinstance(a.value, str)}
+
+    def raw_key(node):
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "get" and node.args
+                and isinstance(node.args[0], ast.Constant)):
+            return node.args[0].value
+        if (isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant)
+                and isinstance(node.slice.value, str)):
+            return node.slice.value
+        if (isinstance(node, ast.Compare) and len(node.ops) == 1
+                and isinstance(node.ops[0], (ast.In, ast.NotIn))
+                and isinstance(node.left, ast.Constant)):
+            return node.left.value
+        return None
+
+    membership, before_read = [], []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if fn.name in HELPERS:
+            continue
+        first_read: dict[str, int] = {}
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id in RECORDERS):
+                for a in node.args[1:]:
+                    if isinstance(a, ast.Constant) and isinstance(a.value, str):
+                        first_read[a.value] = min(first_read.get(a.value, 1 << 30),
+                                                  node.lineno)
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.Compare) and len(node.ops) == 1
+                    and isinstance(node.ops[0], (ast.In, ast.NotIn))
+                    and isinstance(node.left, ast.Constant)
+                    and node.left.value in container_keys):
+                membership.append((fn.name, ast.unparse(node)))
+            tests = ([node.test] if isinstance(node, (ast.If, ast.IfExp))
+                     else node.ifs if isinstance(node, ast.comprehension) else [])
+            for test in tests:
+                for sub in ast.walk(test):
+                    key = raw_key(sub)
+                    if key in first_read and getattr(sub, "lineno", 1 << 30) < first_read[key]:
+                        before_read.append((fn.name, ast.unparse(sub)))
+    assert container_keys, "no container key found -- the scan is blind"
+    return membership, before_read
+
+
+def test_exactly_the_choke_point_decides_what_present_means():
+    """The count-the-deciders property, and the one this PR has failed FIVE
+    rounds running -- every time by growing a SECOND place that answers a
+    question the choke point already answers, which then drifts from it.
+
+    Two questions exist and they are different: `_field_present` (did the payload
+    CLAIM anything -- an explicit null did not) and `_field_declared` (does the
+    envelope carry the key at all -- null counts, which is how you tell a paged
+    envelope from a bare list). Both live in the choke point. A renderer that
+    spells either one itself is a second definition, and it is a finding even
+    while it still agrees: round 6's blocker was `"items" in secs` agreeing with
+    nothing about an explicit null, written in the same commit as the helper.
+
+    The second half is ordering: a renderer may branch on a container key only
+    AFTER that key's recorded read, because a branch that returns or skips first
+    means the skew was never recorded and a malformed value renders as a
+    confident result. That is precisely how the class-listing count-only
+    envelope stayed silent on a falsy wrong-shaped listing."""
+    membership, before_read = _container_key_decisions()
+    assert not membership, (
+        f"{len(membership)} raw `key in mapping` test(s) on a container key -- a "
+        f"second definition of PRESENT that will drift from the helpers' one; "
+        f"call _field_declared or _field_present instead: {membership[:6]}")
+    assert not before_read, (
+        f"{len(before_read)} branch(es) decide on a container key BEFORE its "
+        f"recorded read, so a malformed value there never reaches the "
+        f"disclosure: {before_read[:6]}")
+
+
 # Every spelling the guard sees, one probe module each, enumerated as DATA so the
 # claim is ASSERTED rather than described. Rounds 5 and 6 each evaded the guard
 # with a shape its prose had called covered; the table is the answer to that.
 _GUARD_CATCHES = {
+    "R2-bound-method-alias": 'g = value.get\n    rows = g("k") or []\n    return str(rows)',
+    "R2-function-local-empty-constant": ('_EMPTY = []\n    rows = value.get("k") or _EMPTY\n'
+                                         '    return str(rows)'),
+    "R4-len-guarded-ternary": ('n = len(value.get("k")) if isinstance(value.get("k"), list)'
+                               ' else 0\n    return str(n)'),
+    "R6-skip-form-return": ('rows = value.get("k")\n'
+                            '    if not isinstance(rows, list):\n        return ""\n'
+                            '    return str(rows)'),
+    "R7-match-statement": ('match value.get("k"):\n        case []:\n            rows = []\n'
+                           '        case _:\n            rows = []\n    return str(rows)'),
+    "R8-comprehension-shape-filter": ('rows = [r for r in value.get("k")'
+                                      ' if isinstance(value.get("k"), list)]\n'
+                                      '    return str(rows)'),
     "R1-coercer-on-get": 'return str(_as_dict(value.get("k")))',
     "R1-coercer-on-subscript": 'return str(_as_dict(value["k"]))',
     "R1-coercer-variable-key": 'return str(_as_dict(value.get(key)))',

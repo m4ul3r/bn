@@ -146,18 +146,28 @@ def _field_dict(source: Any, key: str) -> dict[str, Any]:
     return {}
 
 
+# Two questions a renderer can ask about a container field, and they are NOT the
+# same one. Both live here so a call site names which it means instead of
+# spelling its own test: the whole defect class this module keeps re-growing is
+# a SECOND place deciding a question the choke point already decides, which then
+# drifts. A renderer that spelled PRESENT as ``key in source`` disagreed with the
+# helpers about an explicit null and printed a confident zero for a payload that
+# had claimed nothing (#619).
 def _field_present(source: Any, key: str) -> bool:
-    """Whether ``source[key]`` CLAIMED anything: the key is there and is not an
-    explicit null.
-
-    The single definition of PRESENT, so a renderer that has to tell "we looked
-    and found none" from "nothing was said" cannot drift from what
-    ``_field_list``/``_field_dict`` mean by it. Both read an explicit null as
-    ABSENT; a renderer that spelled the same test as ``key in source`` disagreed
-    with them about null and printed a confident zero for a payload that claimed
-    nothing (#619)."""
+    """Did ``source[key]`` CLAIM anything? The key is there AND is not an
+    explicit null -- the same reading ``_field_list``/``_field_dict`` use, so
+    "we looked and found none" is distinguishable from "nothing was said"."""
     src = _as_dict(source)
     return key in src and src[key] is not None
+
+
+def _field_declared(source: Any, key: str) -> bool:
+    """Does the ENVELOPE carry ``key`` at all, null included? A different
+    question: it decides which SHAPE of payload arrived (a paged envelope versus
+    a bare list, a callgraph with a callees section versus one without), not
+    whether that field has contents. Null counts here and does not count for
+    ``_field_present`` -- that is the distinction, stated once (#619)."""
+    return key in _as_dict(source)
 
 
 def _discloses(fn: Callable[..., str]) -> Callable[..., str]:
@@ -319,8 +329,14 @@ def _resolution_note(value: Any) -> str:
     """
     if not isinstance(value, dict):
         return ""
-    resolved_from = value.get("resolved_from")
-    if not isinstance(resolved_from, dict):
+    # Through the choke point: a malformed resolution envelope used to drop this
+    # whole note in silence, so a function-scoped read answered for a DIFFERENT
+    # address than the caller asked for with the disclosure this docstring calls
+    # load-bearing simply gone. An unusable envelope still yields no note -- it
+    # states nothing it cannot support -- but the skew now reaches the render's
+    # disclosure instead of disappearing (#619).
+    resolved_from = _field_dict(value, "resolved_from")
+    if not resolved_from:
         return ""
     function = _field_dict(value, "function")
     name = function.get("name", "?")
@@ -370,8 +386,8 @@ def _disasm_linear_steer_note(value: Any, *, sliced: bool) -> str:
     """
     if not sliced or not isinstance(value, dict):
         return ""
-    resolved_from = value.get("resolved_from")
-    if not isinstance(resolved_from, dict) or _is_exact_start(resolved_from):
+    resolved_from = _field_dict(value, "resolved_from")
+    if not resolved_from or _is_exact_start(resolved_from):
         return ""
     addr = resolved_from.get("requested_address", "?")
     return (
@@ -673,7 +689,7 @@ def _render_comment_text(value: Any) -> str:
 def _render_comment_list_text(value: Any) -> str:
     # Paged envelope ({items,total,...}) -> render the page + the shared footer;
     # a bare list falls through to the per-item body below (back-compat) (#131).
-    if isinstance(value, dict) and "items" in value:
+    if _field_declared(value, "items"):
         return _render_paged_list_text(value, "items", _render_comment_list_text)
     if not isinstance(value, list):
         return _render_fallback_text(value)
@@ -733,7 +749,7 @@ def _render_tag_row(t: dict) -> str:
 
 @_discloses
 def _render_tag_list_text(value: Any) -> str:
-    if isinstance(value, dict) and "items" in value:
+    if _field_declared(value, "items"):
         return _render_paged_list_text(value, "items", _render_tag_list_text)
     if not isinstance(value, list):
         return _render_fallback_text(value)
@@ -1080,7 +1096,7 @@ def _render_target_summary(value: dict[str, Any]) -> str:
     segments = value.get("segments")
     if isinstance(segments, list) and segments:
         lines.append("\tsegments:")
-        for seg in segments:
+        for seg in (s for s in segments if isinstance(s, dict)):
             perms = "".join(
                 flag if seg.get(name) else "-"
                 for name, flag in (("readable", "r"), ("writable", "w"), ("executable", "x"))
@@ -1095,8 +1111,13 @@ def _render_target_summary(value: dict[str, Any]) -> str:
 def _render_target_list_text(value: Any) -> str:
     # Accept both the {kind, items} envelope (#358) and a bare list (older
     # callers / raw socket clients).
-    if isinstance(value, dict):
-        items = value.get("items")
+    if _field_declared(value, "items"):
+        # Called for its RECORDING side effect, not its value: a malformed
+        # listing must reach the disclosure, but this renderer then echoes the
+        # raw payload below, which is strictly MORE information than a note --
+        # so the echo keeps the raw value and the skew is recorded anyway (#619).
+        _field_list(value, "items")
+        items = _as_dict(value)["items"]
     else:
         items = value
     if not isinstance(items, list):
@@ -1167,9 +1188,12 @@ def _render_instance_gc_text(value: Any) -> str:
     """Render the `instance gc` cache-cleanup summary."""
     if not isinstance(value, dict):
         return _render_fallback_text(value)
-    logs = value.get("logs_removed", 0)
-    socks = value.get("sockets_removed", 0)
-    regs = value.get("registries_purged", 0)
+    # Counts are summed, so a non-numeric one raised a TypeError and cost the
+    # whole text view -- the same crash #619 replaced everywhere else, still live
+    # here because these fields are scalars rather than containers.
+    logs = _int_or_default(value.get("logs_removed"))
+    socks = _int_or_default(value.get("sockets_removed"))
+    regs = _int_or_default(value.get("registries_purged"))
     live = value.get("live_instances", 0)
     reaped = logs + socks + regs
     if reaped == 0:
@@ -1251,7 +1275,7 @@ def _render_go_rename_text(value: Any) -> str:
     if not isinstance(value, dict):
         return _render_fallback_text(value)
     skipped = value.get("skipped_user_named", 0)
-    targeted = value.get("go_renamed_candidates", 0)
+    targeted = _int_or_default(value.get("go_renamed_candidates"))
     if not targeted:
         return ("go rename: nothing to do — no auto-named (sub_*) Go functions to rename "
                 f"({value.get('defined_count', 0)} defined at pcln addresses, "
@@ -1378,7 +1402,7 @@ def _render_paged_list_text(
     appends the shared paging footer. Falls back to rendering *value* as a bare
     list when it isn't an envelope, so internal callers or older bridges that
     still hand over a plain list keep working (#122)."""
-    if not isinstance(value, dict) or page_key not in value:
+    if not _field_declared(value, page_key):
         return item_renderer(value)  # back-compat / fallback for a bare list
     # The page key is a runtime argument, so this one site stands in for six
     # listing renderers -- and a raw `or []` here was invisible to the coercion
@@ -1427,7 +1451,7 @@ def _render_function_list_text(value: Any, *, demangle: bool = False) -> str:
     an older bridge that emits only the latter (#223). ``demangle`` shows the
     demangled display_name (#196). A quick-loaded (partial) listing is prefixed
     with a warning so the page isn't mistaken for the whole binary (#437)."""
-    page_key = "items" if isinstance(value, dict) and "items" in value else "functions"
+    page_key = "items" if _field_declared(value, "items") else "functions"
     return _quick_partial_prefix(value) + _render_paged_list_text(
         value, page_key, lambda items: _render_name_address_rows(items, demangle=demangle))
 
@@ -1774,13 +1798,17 @@ def _render_function_evidence_text(value: Any) -> str:
         f"calling convention: {value.get('calling_convention', '<unknown>')}",
     ]
     thunk = _field_dict(value, "thunk")
+    # The target envelope goes through the choke point too: a malformed one used
+    # to vanish from the card because the raw truth test never told anyone the
+    # payload was unusable (#619).
+    thunk_target = _field_dict(thunk, "target")
     if thunk.get("is_candidate"):
         lines.append(f"thunk: candidate ({thunk.get('reason', 'no reason recorded')})")
-        if thunk.get("target"):
-            lines.append(f"  target: {_render_target_line(thunk['target'])}")
-    elif thunk.get("target"):
+        if thunk_target:
+            lines.append(f"  target: {_render_target_line(thunk_target)}")
+    elif thunk_target:
         lines.append("thunk: no (tail branch to a local function, not a trampoline)")
-        lines.append(f"  tail branch -> {_render_target_line(thunk['target'])}")
+        lines.append(f"  tail branch -> {_render_target_line(thunk_target)}")
     else:
         lines.append("thunk: no")
 
@@ -1811,13 +1839,12 @@ def _render_function_evidence_text(value: Any) -> str:
         operation = call.get("operation", "<unknown>")
         direct = "direct" if call.get("direct") else "indirect"
         lines.append(f"- {call_addr}  {operation}  {direct}")
-        target = call.get("target")
+        target = _field_dict(call, "target")
         if target:
             lines.append(f"  target: {_render_target_line(target)}")
-        if call.get("call_instruction"):
-            instr = call["call_instruction"]
-            if isinstance(instr, dict):
-                lines.append(f"  instruction: {instr.get('address', call_addr)}  {instr.get('text', '')}".rstrip())
+        instr = _field_dict(call, "call_instruction")
+        if instr:
+            lines.append(f"  instruction: {instr.get('address', call_addr)}  {instr.get('text', '')}".rstrip())
         if call.get("hlil_statement"):
             lines.append(f"  hlil: {call['hlil_statement']}")
         elif call.get("hlil_statement_reason"):
@@ -2234,12 +2261,15 @@ def _render_fanout_text(value: Any, inner_renderer: Callable[[Any], str] | None 
     ok = sum(1 for r in rows if isinstance(r, dict) and r.get("ok"))
     lines = [f"fan-out: {value.get('command', '?')} — {len(rows)} result(s) "
              f"({ok} ok, {len(rows) - ok} failed)"]
-    expanded = value.get("auto_expanded_instances")
+    # Through the choke point: a non-iterable here used to raise (an int) or
+    # render one bogus entry per CHARACTER (a string), and both cost the whole
+    # fan-out view instead of one line (#619).
+    expanded = _field_list(value, "auto_expanded_instances")
     if expanded:
         # #368: be explicit that a multi-target instance was surveyed in full, so
         # extra rows for one instance read as complete coverage, not a duplicate.
         lines.append(f"  (surveyed all targets of multi-target instance(s): {', '.join(map(str, expanded))})")
-    slow = value.get("slow_rows")
+    slow = _field_list(value, "slow_rows")
     if slow:
         # #417: show where a broad survey spent its time so a long fan-out reads as
         # progress (which instance was slow), not a wedge.
@@ -2392,7 +2422,7 @@ def _render_callsites_text(value: Any, *, prefer_caller_static: bool = False) ->
     caller_total = None
     scan_truncated = False
     has_more = False
-    if isinstance(value, dict) and "items" in value:
+    if _field_declared(value, "items"):
         total = value.get("total")
         offset = value.get("offset")
         lower_bound = value.get("total_lower_bound")
@@ -2569,7 +2599,11 @@ def _render_callgraph_text(value: Any) -> str:
         return _render_fallback_text(value)
     fn = _field_dict(value, "function")
     lines = [f"{fn.get('name', '<unknown>')} @ {fn.get('address', '<unknown>')}"]
-    if "callees" in value:
+    # PRESENT, not merely declared: an explicit null CLAIMED nothing about the
+    # callees, so asserting `callees (0):` from it is the same confident zero
+    # this change exists to refuse. A present-and-empty list still prints the
+    # row -- that is a real "we looked and found none" (#619).
+    if _field_present(value, "callees"):
         callees = _field_list(value, "callees")
         lines.append(f"callees ({len(callees)}):")
         for c in callees:
@@ -2587,7 +2621,7 @@ def _render_callgraph_text(value: Any) -> str:
                 else:
                     suffix = f"UNRESOLVED ({c.get('resolution_detail', 'indirect')})"
                 lines.append(f"  {c.get('call_addr')}  indirect [{c.get('dest_expr', '')}]  {suffix}")
-    if "callers" in value:
+    if _field_present(value, "callers"):
         callers = _field_list(value, "callers")
         lines.append(f"callers ({len(callers)}):")
         for c in callers:
@@ -3138,7 +3172,7 @@ def _describe_loc(loc: Any) -> str:
 def _render_type_list_text(value: Any) -> str:
     # Paged envelope ({items,total,...}) -> render the page + the shared footer;
     # a bare list falls through to the per-item body below (back-compat) (#131).
-    if isinstance(value, dict) and "items" in value:
+    if _field_declared(value, "items"):
         return _render_paged_list_text(value, "items", _render_type_list_text)
     if not isinstance(value, list):
         return _render_fallback_text(value)
@@ -3611,8 +3645,11 @@ def _types_affected_lines(value: dict[str, Any]) -> list[str]:
 def _blast_radius_line(value: dict[str, Any]) -> str | None:
     """One line of blast radius for a type op: how many functions reference the
     type and how many actually reflowed, with a few names (reflowed first)."""
-    summary = value.get("affected_summary")
-    if not isinstance(summary, dict):
+    # Through the choke point: a malformed summary dropped this entire line with
+    # no note. An empty one yields no line either way (`referenced` is 0), so
+    # only the silence changes (#619).
+    summary = _field_dict(value, "affected_summary")
+    if not summary:
         return None
     referenced = int(summary.get("referenced") or 0)
     reflowed = int(summary.get("reflowed") or 0)
