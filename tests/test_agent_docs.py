@@ -12,15 +12,15 @@ from __future__ import annotations
 
 import os
 import re
-import sys
-import types
 from pathlib import Path
 
 import pytest
 
-sys.modules.setdefault("binaryninja", types.ModuleType("binaryninja"))
-
-import bn.cli as cli
+# NB: no module-level `binaryninja` stub here. Injecting one at import time
+# poisons `sys.modules` for every module collected AFTER this one, and the
+# bridge's taint modules import real symbols from it -- under a randomized
+# collection order that turned into a suite-wide collection error. These two
+# imports are CLI-side and need no engine.
 from bn.formatters import FAILED_MUTATION_STATUSES, _mutation_summary
 
 REPO = Path(__file__).resolve().parents[1]
@@ -160,7 +160,8 @@ def test_exit_code_bullet_documents_every_code_the_cli_can_return():
     )
 
     # exit 2's stated subject: the malformed-result rule really exists.
-    assert cli._MALFORMED_RESULT_ERRORS, "the CLI has no malformed-result rule to document"
+    from bn.cli import _MALFORMED_RESULT_ERRORS
+    assert _MALFORMED_RESULT_ERRORS, "the CLI has no malformed-result rule to document"
     assert "classify" in bullet, (
         "the exit-2 clause must say a result this CLI cannot classify is 2, "
         f"which is what the malformed-result rule does: {bullet}"
