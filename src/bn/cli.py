@@ -1052,13 +1052,31 @@ def _resolve_target(
     return target
 
 
+def _mutation_reports_failure(result: dict[str, Any]) -> bool:
+    """Whether *result* reports a failed mutation.
+
+    This PARSES the bridge response -- it iterates `results[]` and looks each
+    row's status up in a set -- so it is held to the same rule as the compact
+    summary: a field this CLI cannot read raises, and the caller turns that into
+    the documented `BridgeError`. Returning "not a failure" for a shape we could
+    not read would let an unreadable response continue as a success.
+    """
+    rows = result.get("results")
+    if rows is not None and not isinstance(rows, list):
+        raise TypeError(f"results must be a list, got {type(rows).__name__}")
+    for item in rows or []:
+        if not isinstance(item, dict):
+            raise TypeError(f"results rows must be objects, got {type(item).__name__}")
+        if item.get("status") in FAILED_MUTATION_STATUSES:
+            return True
+    return result.get("success") is False
+
+
 def _mutation_exit_code(result: Any, summary: Callable[[Any], Any] | None = None) -> int:
     if not isinstance(result, dict):
         return 0
-    results = list(result.get("results") or [])
-    if any(isinstance(item, dict) and item.get("status") in FAILED_MUTATION_STATUSES for item in results):
-        return 3
-    if result.get("success") is False:
+    if _apply_result_transform(_mutation_reports_failure, result,
+                               "classify the mutation result"):
         return 3
     # #715: a successful mutation the compact summary could not MEASURE (no
     # `results[]` rows to derive counts from, #684) is "applied but

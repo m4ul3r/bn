@@ -1185,6 +1185,30 @@ def test_unclassifiable_failing_mutation_result_is_still_a_clean_exit(monkeypatc
     assert "malformed or newer than this CLI" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("rows", [5, True, "verified", {"a": 1},
+                                  [{"status": ["verification_failed"]}]],
+                         ids=["int", "bool", "string", "mapping", "unhashable-status"])
+def test_malformed_results_field_is_a_clean_bridge_error(monkeypatch, capsys, rows):
+    """The exit-code helper reads `results[]` BEFORE it runs any transform, and
+    that preamble parses the bridge response too: it iterates the field and looks
+    each row's `status` up in a set. A `results` that is not a list of dicts with
+    hashable statuses is a malformed response, so it owes the same documented
+    exit 2 -- not a `TypeError` out of `main()`, and not the exit 4 an
+    iterable-but-meaningless shape used to fall through to, which would report an
+    unreadable response as a real (if unmeasured) mutation.
+    """
+    def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
+        return {"ok": True, "result": {"preview": False, "success": True,
+                                       "committed": True, "results": rows}}
+
+    monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
+
+    rc = bn.cli.main(["symbol", "rename", "--target", "active", "sub_401000", "player_update"])
+
+    assert rc == 2, rc
+    assert "malformed or newer than this CLI" in capsys.readouterr().err
+
+
 def test_unclassifiable_mutation_result_advice_is_actionable(monkeypatch, capsys):
     """The classification guard runs BEFORE rendering, so `--format json` on the
     same call returns this same error envelope and never the raw result. The

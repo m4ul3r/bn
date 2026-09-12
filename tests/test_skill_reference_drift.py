@@ -62,6 +62,21 @@ def command_groups() -> set[str]:
     return groups
 
 
+@pytest.fixture(scope="module")
+def command_paths() -> set[str]:
+    """Every live command path (`"tag add"`, `"types show"`), from the registry.
+
+    The index is only a map if what it advertises exists; pinning names against
+    the registry is also what stops an allow-list outliving a rename (#627).
+    """
+    sys.modules.setdefault("binaryninja", types.ModuleType("binaryninja"))
+    importlib.import_module("bn.commands")          # populates bn.cli._COMMANDS
+    cli = importlib.import_module("bn.cli")
+    paths = {" ".join(spec["path"]) for spec in cli._COMMANDS}
+    assert paths, "bn.commands registered no commands; the index is unchecked"
+    return paths
+
+
 def test_skill_command_index_names_every_required_group(command_groups):
     """#627: `skills/bn/SKILL.md` is the first thing an agent reads, and its
     Command index silently omitted `tag`, `taint`, `dataflow`, `exports`, `go`
@@ -84,9 +99,12 @@ def test_skill_command_index_names_every_required_group(command_groups):
 
 
 def _index_section() -> str:
+    """The Command index body, WITHOUT the remainder of its heading line."""
     text = SKILL.read_text(encoding="utf-8")
     assert COMMAND_INDEX_HEADING in text, f"{COMMAND_INDEX_HEADING!r} is gone from SKILL.md"
-    return text.split(COMMAND_INDEX_HEADING, 1)[1].split("\n## ", 1)[0]
+    after = text.split(COMMAND_INDEX_HEADING, 1)[1]
+    body = after.split("\n", 1)[1] if "\n" in after else ""
+    return body.split("\n## ", 1)[0]
 
 
 # One index entry, WHOLE: a backticked command whose last word may carry
@@ -96,21 +114,39 @@ def _index_section() -> str:
 # drops every entry it cannot read, which is the same "advertised but
 # undocumented" hole this guard exists to close.
 _INDEX_ENTRY = re.compile(
-    r"`(?P<cmd>[a-z][a-z ]*(?:/[a-z]+)*)(?: \[[a-z]+\])?`(?: \([^)]*\))?"
+    r"`(?P<cmd>[a-z][a-z ]*(?:/[a-z]+)*)(?: \[(?P<optional>[a-z]+)\])?`(?: \([^)]*\))?"
 )
+
+# Any list item introducing a group, whatever the marker or indentation. The
+# index guard must REFUSE a line it cannot read rather than drop it from the
+# sweep: a `- ` -> `* ` marker swap renders identically in Markdown and used to
+# take a whole line's commands out of the check silently.
+_INDEX_LINE = re.compile(r"\s*[-*+] +\*\*(?P<group>[^*]+)\*\*")
 
 # ```bash blocks are how every reference presents a command an agent can run.
 _BASH_BLOCK = re.compile(r"```bash\n(.*?)```", re.S)
+
+# A runnable invocation: a line whose first word is `bn`.
+_RUNNABLE = re.compile(r"^[ \t]*bn +(?P<rest>[a-z].*)$", re.M)
 
 # The index line's own pointer: `- **<Group>** … → **`reference/<file>.md`**`.
 _INDEX_REFERENCE = re.compile(r"`(reference/[a-z_]+\.md)`")
 
 
-def _expand(entry: str) -> list[str]:
-    """`struct field set/rename/delete` -> the three full command strings."""
-    words = entry.split()
+def _expand(entry: re.Match[str]) -> list[str]:
+    """`struct field set/rename/delete` -> the three full command strings.
+
+    An `[optional]` subcommand yields BOTH forms: `types [show]` advertises
+    `types` and `types show`, and both have to be real and documented. Parsing
+    the marker and then discarding it is how `tag [frobnicate]` passed on the
+    strength of `bn tag` alone.
+    """
+    words = entry.group("cmd").split()
     prefix, last = words[:-1], words[-1]
-    return [" ".join([*prefix, alt]) for alt in last.split("/")]
+    commands = [" ".join([*prefix, alt]) for alt in last.split("/")]
+    if entry.group("optional"):
+        commands += [f"{cmd} {entry.group('optional')}" for cmd in commands]
+    return commands
 
 
 def _index_entries(line: str) -> list[str]:
@@ -122,14 +158,34 @@ def _index_entries(line: str) -> list[str]:
     return [entry.strip() for entry in body.split(",") if entry.strip()]
 
 
+def _documented_commands(text: str, command_paths: set[str]) -> set[str]:
+    """The command paths a reference actually SHOWS as runnable.
+
+    Each `bn ...` line resolves to its longest registered command path, so a
+    match is exact rather than a prefix: `bn types show <name>` documents
+    `types show` and NOT `types`, which a `startswith`-style check would have
+    let stand in for it.
+    """
+    documented: set[str] = set()
+    for match in _RUNNABLE.finditer("\n".join(_BASH_BLOCK.findall(text))):
+        words = match.group("rest").split()
+        for size in range(min(3, len(words)), 0, -1):
+            candidate = " ".join(words[:size])
+            if candidate in command_paths:
+                documented.add(candidate)
+                break
+    return documented
+
+
 def _index_lines() -> list[str]:
-    lines = [line for line in _index_section().splitlines() if line.startswith("- **")]
+    lines = [line for line in _index_section().splitlines() if line.strip()]
     assert len(lines) >= 4, f"the Command index lost its group lines: {lines}"
     return lines
 
 
-@pytest.mark.parametrize("line", _index_lines(), ids=lambda line: line.split("**")[1])
-def test_skill_index_entries_are_documented_where_the_index_points(line):
+@pytest.mark.parametrize("line", _index_lines(),
+                         ids=lambda line: line.strip()[:24])
+def test_skill_index_entries_are_documented_where_the_index_points(line, command_paths):
     """#627: naming a group in the index is only half the map -- each line ends
     in `-> reference/<file>.md`, so every command it advertises must actually be
     documented in THAT file. The first cut of the widened index advertised a
@@ -138,12 +194,20 @@ def test_skill_index_entries_are_documented_where_the_index_points(line):
     an agent that followed the pointer to a file with no entry for the command
     it came for.
 
-    Two things this guard must not do, because both restore the defect while
-    staying green: skip an entry it cannot parse (so an entry that grows a
-    parenthetical, a capital or a stray space stops being checked), and accept a
-    passing mention in prose as documentation. So EVERY entry must parse, and
-    the bar is a runnable `bn <command>` line inside a ```bash block.
+    Three things this guard must not do, because each restores the defect while
+    staying green, and each was caught doing it: DROP a line it does not
+    recognise (a `- ` -> `* ` marker swap renders identically and took a whole
+    line out of the sweep), SKIP an entry it cannot parse, and accept a passing
+    mention in prose as documentation. So every line in the section must be a
+    readable index line, every entry must parse, every advertised command must
+    exist in the live `@command` registry, and the documentation bar is a
+    runnable `bn <command>` line inside a ```bash block, resolved to its exact
+    command path rather than matched as a prefix.
     """
+    assert _INDEX_LINE.match(line), (
+        "every line in the Command index must be a readable `- **Group** ...` "
+        f"entry, or this guard silently stops checking it: {line!r}"
+    )
     reference = _INDEX_REFERENCE.search(line)
     assert reference, f"index line names no reference file: {line}"
     entries = _index_entries(line)
@@ -154,11 +218,15 @@ def test_skill_index_entries_are_documented_where_the_index_points(line):
         f"cannot check them and must not pretend it did: {unreadable}"
     )
     commands = [full for entry in entries
-                for full in _expand(_INDEX_ENTRY.fullmatch(entry).group("cmd"))]
+                for full in _expand(_INDEX_ENTRY.fullmatch(entry))]
+    unregistered = sorted(set(commands) - command_paths)
+    assert not unregistered, (
+        f"the SKILL.md index advertises commands the CLI registry does not have: "
+        f"{unregistered}"
+    )
     text = (REFERENCE.parent / reference.group(1)).read_text(encoding="utf-8")
-    runnable = "\n".join(_BASH_BLOCK.findall(text))
-    missing = [cmd for cmd in commands
-               if not re.search(rf"^\s*bn {re.escape(cmd)}\b", runnable, re.M)]
+    documented = _documented_commands(text, command_paths)
+    missing = [cmd for cmd in commands if cmd not in documented]
     assert not missing, (
         f"the SKILL.md index points at {reference.group(1)} for commands that "
         f"file never shows as a runnable command: {missing}"
