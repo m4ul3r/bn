@@ -754,6 +754,33 @@ _MALFORMED_RESULT_ERRORS = (
 )
 
 
+def _apply_result_transform(transform: Callable[[Any], Any], result: Any, what: str) -> Any:
+    """Run one result transform under the malformed-result rule (#101/#715).
+
+    A mutation's compact summary is evaluated at THREE points in :func:`_call` --
+    to derive the exit code, to build what gets rendered, and to build the
+    spill-status line -- and which of them runs first depends on the result
+    (a failure short-circuits the exit code) and on the output format (only the
+    text path has a renderer). Three separate ``try`` blocks drifted apart twice:
+    each fix covered the site under test and left the next one raising a raw
+    traceback out of `main()`, which catches only :class:`BridgeError`. One
+    helper, used at every site, is the rule.
+
+    Deliberately NOT the renderer's "rerun with --format json to see the raw
+    result": these steps all run BEFORE the format is applied, so --format json
+    returns this same envelope. Advice that reproduces the error is worse than
+    none, so point at the version skew the message just diagnosed.
+    """
+    try:
+        return transform(result)
+    except _MALFORMED_RESULT_ERRORS as exc:
+        raise BridgeError(
+            f"could not {what} -- the bridge response was malformed or newer than "
+            f"this CLI, so the outcome could not be determined. Compare the bridge "
+            f"and CLI builds with `bn doctor`. ({type(exc).__name__}: {exc})"
+        ) from exc
+
+
 def _emit_result(
     args: argparse.Namespace,
     result: Any,
@@ -1042,28 +1069,10 @@ def _mutation_exit_code(result: Any, summary: Callable[[Any], Any] | None = None
     # measures through its own counters (`_go_rename_summary` reports
     # `measured: true` by design) is not mislabelled by a generic recompute.
     if summary is not None:
-        try:
-            compact = summary(result)
-        except _MALFORMED_RESULT_ERRORS as exc:
-            # Deriving the exit code RUNS the transform, and `_call` computes the
-            # exit code before the renderer's malformed-result guard (#101), so
-            # this is now the first place a version-skewed result is parsed. It
-            # must fail the documented way: a clean BridgeError (exit 2), never a
-            # raw traceback out of `main()`, which catches only BridgeError.
-            # Exit 0 is not an option -- the whole point of #715 is that a result
-            # the CLI cannot classify must not read as a confirmed success.
-            #
-            # Deliberately NOT the renderer guard's "rerun with --format json to
-            # see the raw result": that guard runs after this one, so on this
-            # path --format json returns this same error envelope. Advice that
-            # reproduces the error is worse than none; point at the version skew
-            # the message just diagnosed.
-            raise BridgeError(
-                f"could not classify the mutation result -- the bridge response was "
-                f"malformed or newer than this CLI, so the outcome could not be "
-                f"determined. Compare the bridge and CLI builds with `bn doctor`. "
-                f"({type(exc).__name__}: {exc})"
-            ) from exc
+        # Exit 0 is not an option when this raises -- the whole point of #715 is
+        # that a result the CLI cannot classify must not read as a confirmed
+        # success -- so it goes out as the documented BridgeError (exit 2).
+        compact = _apply_result_transform(summary, result, "classify the mutation result")
         if isinstance(compact, dict) and compact.get("measured") is False:
             return 4
     return 0
@@ -1299,22 +1308,10 @@ def _call(
     _maybe_regex_hint(args, result, regex_hint_query)
     _maybe_offset_hint(args, result, offset_hint_identifier)
     if result_transform is not None:
-        try:
-            result = result_transform(result)
-        except _MALFORMED_RESULT_ERRORS as exc:
-            # Needed on its own: a FAILING mutation short-circuits to exit 3
-            # before the exit-code helper ever runs its transform, so this is
-            # the first place that result is parsed -- and it was crashing out
-            # with a raw traceback after the exit code had already been decided.
-            # Like the classification guard, and unlike the renderer guard
-            # below, this runs BEFORE the format is applied, so --format json
-            # would return this same envelope: do not advertise it.
-            raise BridgeError(
-                f"could not summarize the {op} result -- the bridge response was "
-                f"malformed or newer than this CLI, so the outcome could not be "
-                f"determined. Compare the bridge and CLI builds with `bn doctor`. "
-                f"({type(exc).__name__}: {exc})"
-            ) from exc
+        # Needed on its own: a FAILING mutation short-circuits to exit 3 before
+        # the exit-code helper ever runs its transform, so on that path this is
+        # the first place the result is parsed.
+        result = _apply_result_transform(result_transform, result, f"summarize the {op} result")
     spill_context = result
     fmt = _resolve_output_format(args)
     if text_renderer is not None and fmt == "text":
@@ -1340,7 +1337,12 @@ def _call(
         # #645: a mutation supplies a compact status to print INSTEAD of a spill
         # envelope, so an atomic write's outcome is always parseable on stdout.
         spill_status=(
-            (spill_status(spill_context), spill_status_renderer)
+            # ... and this is the LAST place it is parsed: under a machine format
+            # there is no text renderer, and on the detail path `result_transform`
+            # is the safe `_add_mutation_ok`, so for a failing unclassifiable
+            # result this is the only step that touches the compact summary.
+            (_apply_result_transform(spill_status, spill_context, f"summarize the {op} result"),
+             spill_status_renderer)
             if spill_status is not None else None
         ),
         # #653.8: stamp WHICH target/instance produced the artifact, so a stale or

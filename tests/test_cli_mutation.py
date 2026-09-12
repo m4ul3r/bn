@@ -1154,22 +1154,32 @@ def test_unclassifiable_mutation_result_covers_overflowed_wire_numbers(monkeypat
     assert "malformed or newer than this CLI" in capsys.readouterr().err
 
 
-def test_unclassifiable_failing_mutation_result_is_still_a_clean_exit(monkeypatch, capsys):
+@pytest.mark.parametrize("counter", ["many", float("inf")],
+                         ids=["unparseable", "non-finite"])
+@pytest.mark.parametrize("extra", [[], ["--verbose"], ["--summary"],
+                                   ["--format", "json"], ["--format", "ndjson"]],
+                         ids=["default", "verbose", "summary", "json", "ndjson"])
+def test_unclassifiable_failing_mutation_result_is_still_a_clean_exit(monkeypatch, capsys, extra, counter):
     """A FAILING result short-circuits to exit 3 before the summary transform is
-    ever run, so the exit-code guard never sees it -- and `_call` then renders
-    with that same transform. Both paths must survive an unparseable result: the
-    process must leave with a documented code and a documented message, never a
-    traceback (exit 1) after the exit code was already decided.
+    ever run, so the exit-code guard never sees it -- and `_call` then feeds that
+    same transform to the renderer AND to the spill-status builder. Every one of
+    those steps must survive an unparseable result on every format: the process
+    must leave with a documented code and a documented message, never a traceback
+    (exit 1) after the exit code was already decided.
+
+    Parametrized over the formats on purpose: the first cut of this test covered
+    only the default, which was the single variant the guard already handled, so
+    it stayed green while three machine formats still crashed.
     """
     def fake_send_request(op, *, params=None, target=None, timeout=30.0, instance_id=None, spawn_missing_named=False):
         return {"ok": True, "result": {"kind": "go_rename", "preview": False,
                                        "success": False, "committed": False,
-                                       "go_renamed_candidates": "many",
+                                       "go_renamed_candidates": counter,
                                        "results": [{"status": "verification_failed"}]}}
 
     monkeypatch.setattr(bn.cli, "send_request", fake_send_request)
 
-    rc = bn.cli.main(["go", "rename", "--target", "active"])
+    rc = bn.cli.main(["go", "rename", "--target", "active", *extra])
 
     assert rc in (2, 3), rc
     assert "malformed or newer than this CLI" in capsys.readouterr().err
