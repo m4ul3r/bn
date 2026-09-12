@@ -110,16 +110,22 @@ def _cli_summary_wiring(commands: list[dict[str, Any]]) -> dict[str, bool]:
 
 def _module_mutate_sites(package_root: Path) -> set[tuple[str, int, str]]:
     """The scan half of the #720 cross-check: every literal-op `_mutate()` call
-    site in the `bn` CLI layer -- `commands/*.py` plus `cli.py`, which defines
-    `_mutate` and can grow call sites of its own -- keyed by (package-relative
-    file, absolute lineno, op name).
+    site ANYWHERE in the `bn` package -- the CLI layer (`bn.cli`, which defines
+    `_mutate`, plus `bn.commands`) and anything else that may grow a call site
+    -- keyed by (package-relative file, absolute lineno, op name).
+
+    The region is the WHOLE package, never just `commands/` + `cli.py`: a
+    handler that delegates to a module-level helper in a sibling module (e.g.
+    `bn/<helper>.py`) moves its site outside the narrower region, so BOTH halves
+    of the comparison shrink together and the op drops out of the sweep with the
+    cross-check silent. Scanning everything `bn` owns keeps the two populations
+    comparable wherever a call site lands.
 
     The region is anchored on where `bn.cli` actually lives, never on the
     process cwd, so an unrelated checkout as cwd cannot make this read another
     tree."""
-    files = sorted((package_root / "commands").rglob("*.py")) + [package_root / "cli.py"]
     sites: set[tuple[str, int, str]] = set()
-    for path in files:
+    for path in sorted(package_root.rglob("*.py")):
         if not path.is_file():
             # Narrowing the region is loud, not silent: any handler owning a
             # call site the scan cannot see lands in the handler-only half of
@@ -178,7 +184,7 @@ def _assert_scan_accounted_for(
     is invisible to it and its op silently drops out of the sweep. `assert
     cli_wiring` does not catch that either: the other ops are still found. So
     compare the handler-derived population against an independent AST scan of
-    the whole CLI layer, and fail on a difference in EITHER direction: a
+    the whole `bn` package, and fail on a difference in EITHER direction: a
     module-only site is a blind spot in the population, a handler-only site
     means the scan region is narrower than the population it is checked
     against."""
@@ -191,7 +197,7 @@ def _assert_scan_accounted_for(
     assert not module_only and not handler_only, (
         "the #684 sweep population (derived from each registered command "
         "handler's OWN source) does not account for every _mutate() call site in "
-        "the scanned CLI layer (#720).\n"
+        "the bn package (#720).\n"
         f"_mutate() call sites NO registered handler's own source contains "
         f"({len(module_only)}) -- the helper-mediated delegation shape: a handler "
         "calls a module-level helper that calls _mutate(), so the op it routes is "
@@ -438,6 +444,13 @@ def test_helper_mediated_mutate_call_site_is_flagged(tmp_path, monkeypatch):
     (file, lineno, op) triples can catch it. The scratch module is never
     imported or registered -- its handlers are found by AST -- while the
     production population still comes from the live registry.
+
+    The move is then repeated with the helper OUTSIDE `commands/` -- a sibling
+    module at the scratch package root. That is the region the original
+    commands/+cli.py scan did not cover, so under it the site was invisible to
+    both halves and the cross-check stayed silent while the op dropped out of
+    the population; the scan now covers the whole package and names the sibling
+    module's file:line.
     """
     bridge = _load_bridge(monkeypatch)
     package_root = Path(cli.__file__).resolve().parent
@@ -513,6 +526,39 @@ def test_helper_mediated_mutate_call_site_is_flagged(tmp_path, monkeypatch):
     assert len(module_only) == 1, module_only
     relpath, lineno, op = next(iter(module_only))
     assert (relpath, op) == ("commands/tags.py", "tag_add")
+    with pytest.raises(AssertionError) as excinfo:
+        _assert_scan_accounted_for(handler_sites, module_sites)
+    assert f"{relpath}:{lineno}" in str(excinfo.value)
+    assert "tag_add" in str(excinfo.value)
+
+    # Same transformation, helper OUTSIDE `commands/`: rewrite the mirror
+    # WITHOUT the helper the move above appended (same delegated body, same
+    # padding, so still byte-comparable), and land that helper in a sibling
+    # module at the scratch package root instead. A scan restricted to
+    # `commands/` + `cli.py` sees neither the handler site (moved away) nor the
+    # sibling one (outside the region), so both populations shrink together and
+    # the cross-check stays silent -- the #720 hole the whole-package region
+    # closes.
+    sibling_module = tmp_path / "mutation_helpers.py"
+    scratch_module.write_text(
+        "".join(lines[:call.lineno - 1])
+        + "    return _tag_add_via_helper(args)\n" + "\n" * (vacated - 1)
+        + "".join(lines[call.end_lineno:])
+    )
+    sibling_module.write_text(
+        "\n\ndef _tag_add_via_helper(args):\n" + moved
+    )
+
+    handler_sites = _scratch_handler_sites()
+    module_sites = _module_mutate_sites(tmp_path)
+    assert (sorted(op for _, _, op in module_sites)
+            == sorted(op for _, _, op in control_module_sites))
+    assert handler_sites == control_handler_sites - {("commands/tags.py", tag_add_line,
+                                                      "tag_add")}
+    module_only = module_sites - handler_sites
+    assert len(module_only) == 1, module_only
+    relpath, lineno, op = next(iter(module_only))
+    assert (relpath, op) == ("mutation_helpers.py", "tag_add")
     with pytest.raises(AssertionError) as excinfo:
         _assert_scan_accounted_for(handler_sites, module_sites)
     assert f"{relpath}:{lineno}" in str(excinfo.value)
