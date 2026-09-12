@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from bn.paths import instances_dir
+
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 HELLO_BINARY = FIXTURES_DIR / "hello_x86_64"
 ADD_BINARY = FIXTURES_DIR / "add_x86_64"
@@ -52,18 +54,100 @@ def _bn(*args: str, timeout: float = 60.0) -> subprocess.CompletedProcess[str]:
     )
 
 
-def _session_start(*binaries: str, timeout: float = 120.0) -> dict:
+# `session start` is a superprocess: bridge spawn + BN import + FULL analysis of
+# every fixture passed in, not just the socket round trip. These budgets are
+# ceilings on that whole pipeline, sized from the SLOWEST fixture rather than
+# tuned to one machine.
+#
+# Measured on a 6-core laptop, warm: ~5s of bridge startup plus ~25s of analysis
+# for the -static aarch64 probe (~1.1k functions). #718 was filed while this
+# default was 30s -- a 5s margin over the measurement itself -- so a cold BN
+# cache or a loaded host manufactured `subprocess.TimeoutExpired` failures that
+# were indistinguishable from a genuine hang. The cross-arch lane is the one
+# that analyses that probe, so it gets the larger, explicitly named budget.
+_SESSION_START_TIMEOUT = 120.0
+_CROSS_ARCH_SESSION_START_TIMEOUT = 300.0
+
+# How much of a bridge log to attach to a timeout: the crash output that matters
+# is at the end, and the tail cannot be allowed to swamp the failure report.
+_LOG_EXCERPT_CHARS = 4000
+
+
+def _decode(stream: str | bytes | None) -> str:
+    """Partial output arrives as bytes even in text mode on the timeout path."""
+    if stream is None:
+        return ""
+    if isinstance(stream, bytes):
+        return stream.decode("utf-8", "replace")
+    return stream
+
+
+def _bridge_log_excerpts(started_at: float) -> list[str]:
+    """Excerpt every bridge log written since *started_at* (#718).
+
+    A timed-out `session start` reports no instance id -- the CLI only prints one
+    on success -- but the spawn creates ``<instances_dir>/<id>.log`` before it
+    does anything else, so any log newer than the attempt is that attempt's. An
+    empty list is itself a diagnosis: the CLI hung before spawning a bridge.
+    """
+    try:
+        paths = sorted(instances_dir().glob("*.log"))
+    except OSError:
+        return []
+    excerpts = []
+    for path in paths:
+        try:
+            if path.stat().st_mtime < started_at:
+                continue  # a log from an earlier instance in this cache dir
+            text = path.read_text(errors="replace")
+        except OSError as exc:
+            excerpts.append(f"--- {path.name}: unreadable ({exc}) ---")
+            continue
+        excerpts.append(f"--- {path.name} (tail) ---\n{text[-_LOG_EXCERPT_CHARS:]}")
+    return excerpts
+
+
+class _SessionStartTimeout(subprocess.TimeoutExpired):
+    """A timed-out `session start`, carrying how far the start got (#718).
+
+    A bare `TimeoutExpired` renders as ``Command [...] timed out after N
+    seconds`` and nothing else -- Python 3.14 drops the captured output from
+    ``__str__`` entirely -- which is exactly how a genuine hang (#80/#86
+    deadlocks, #658 spawn-lock waits) looks. Attach the partial bridge
+    stdout/stderr and the bridge log, so slow and wedged stay distinguishable.
+    Still a `subprocess.TimeoutExpired`, so nothing can catch it as a pass.
+    """
+
+    def __init__(self, exc: subprocess.TimeoutExpired, log_excerpts: list[str]) -> None:
+        super().__init__(exc.cmd, exc.timeout, output=exc.stdout, stderr=exc.stderr)
+        self.log_excerpts = log_excerpts
+
+    def __str__(self) -> str:
+        if self.log_excerpts:
+            log = "bridge log:\n" + "\n".join(self.log_excerpts)
+        else:
+            log = (
+                "bridge log: none was written before the timeout -- the CLI hung "
+                "before (or while) spawning a bridge process"
+            )
+        return (
+            f"Command {self.cmd!r} timed out after {self.timeout} seconds\n"
+            f"stdout:\n{_decode(self.output)}\n"
+            f"stderr:\n{_decode(self.stderr)}\n"
+            f"{log}"
+        )
+
+
+def _session_start(*binaries: str, timeout: float = _SESSION_START_TIMEOUT) -> dict:
     # session start defaults to text output; this helper parses JSON.
-    # The budget must cover bridge spawn + BN import + FULL analysis of every
-    # fixture passed in, not just the socket round trip. A static cross-built
-    # fixture (e.g. the -static aarch64 probe) is ~1.1k functions and takes ~25s
-    # of analysis on a 6-core laptop before the ~5s bridge startup is added, so a
-    # 30s ceiling failed the aarch64 linear-decode tests on slower hardware while
-    # the same assertions passed by hand. Analysis cost scales with the fixture
-    # and the host, so keep this generous rather than tuned to one machine.
     cmd = [*_BN_CLI, "session", "start", "--format", "json"]
     cmd.extend(str(b) for b in binaries)
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=_env())
+    started_at = time.time()
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=_env())
+    except subprocess.TimeoutExpired as exc:
+        # #718: a timeout must never surface as a bare `-9` with no evidence.
+        raise _SessionStartTimeout(exc, _bridge_log_excerpts(started_at)) from exc
     assert result.returncode == 0, f"session start failed: {result.stderr}"
     return json.loads(result.stdout)
 
@@ -649,7 +733,7 @@ class TestDisasmLinearAArch64:
 
     def test_aarch64_odd_linear_start_not_thumb_masked(self, tmp_path):
         binary = self._build_aarch64(tmp_path)
-        info = _session_start(str(binary))
+        info = _session_start(str(binary), timeout=_CROSS_ARCH_SESSION_START_TIMEOUT)
         inst_id = info["instance_id"]
         try:
             start = self._func_start(inst_id, "add")
@@ -670,7 +754,7 @@ class TestDisasmLinearAArch64:
         # --mode arm|thumb is only meaningful for classic 32-bit ARM/Thumb. On a
         # real aarch64 target it must be rejected with the ACTUAL arch named.
         binary = self._build_aarch64(tmp_path)
-        info = _session_start(str(binary))
+        info = _session_start(str(binary), timeout=_CROSS_ARCH_SESSION_START_TIMEOUT)
         inst_id = info["instance_id"]
         try:
             res = _bn("--instance", inst_id, "disasm", "add", "--linear", "2",
@@ -679,6 +763,67 @@ class TestDisasmLinearAArch64:
             assert "aarch64" in (res.stdout + res.stderr).lower(), (res.stdout, res.stderr)
         finally:
             _session_stop(inst_id)
+
+
+class TestSessionStartTimeoutDiagnostics:
+    """#718: `session start` must not race its own measurement, and a timeout
+    must carry the evidence of how far the start got.
+
+    The failure path is driven with a stand-in CLI (a hanging interpreter, not a
+    BN target) so the diagnostics can be asserted exactly, without spending
+    minutes of real analysis on a deliberate hang.
+    """
+
+    # Stand-in for the `bn` console script: writes the per-instance log
+    # breadcrumb the real spawn creates, emits a line on each stream, then hangs
+    # without ever printing the JSON `_session_start` parses. The three markers
+    # are assembled at run time on purpose: a bare `TimeoutExpired` prints the
+    # command, and a literal marker in this source would let that repr satisfy
+    # the assertions below without a single byte of real output.
+    _HANGING_CLI = (
+        "import os, pathlib, sys, time\n"
+        "logs = pathlib.Path(os.environ['BN_CACHE_DIR']) / 'instances'\n"
+        "logs.mkdir(parents=True, exist_ok=True)\n"
+        "tag = 'before' + '-hang'\n"
+        "(logs / 'stand-in.log').write_text('bridge-log' + '-line')\n"
+        "print('partial-stdout-' + tag, flush=True)\n"
+        "print('partial-stderr-' + tag, file=sys.stderr, flush=True)\n"
+        "time.sleep(60)\n"
+    )
+
+    @staticmethod
+    def _hang(monkeypatch, program: str) -> None:
+        monkeypatch.setattr(sys.modules[__name__], "_BN_CLI", [sys.executable, "-c", program])
+
+    def test_cross_arch_lane_budget_clears_the_warm_cost(self):
+        """The cross-arch lane must not run on a budget that IS the measurement.
+
+        One aarch64 `session start` measures ~25s warm (a ~1.1k-function -static
+        probe). #718 was filed against a 30s ceiling -- all the margin was the
+        measurement's own noise -- so the lane's budget must clear that ceiling
+        and be larger than the general default, not equal to it.
+        """
+        assert _SESSION_START_TIMEOUT > 30.0
+        assert _CROSS_ARCH_SESSION_START_TIMEOUT > _SESSION_START_TIMEOUT
+
+    def test_timed_out_start_carries_partial_output_and_bridge_log(self, monkeypatch):
+        self._hang(monkeypatch, self._HANGING_CLI)
+        with pytest.raises(subprocess.TimeoutExpired) as excinfo:
+            _session_start("stand-in-probe", timeout=2.0)
+        message = str(excinfo.value)
+        assert "partial-stdout-before-hang" in message, message
+        assert "partial-stderr-before-hang" in message, message
+        assert "bridge-log-line" in message, message
+
+    def test_timed_out_start_without_output_or_log_still_fails_loudly(self, monkeypatch):
+        # A real hang: no partial output, no bridge log. It must still fail, and
+        # say so, rather than degrade into a silent (or empty-message) pass.
+        self._hang(monkeypatch, "import time; time.sleep(60)\n")
+        with pytest.raises(subprocess.TimeoutExpired) as excinfo:
+            _session_start(timeout=2.0)
+        message = str(excinfo.value)
+        assert "timed out after 2.0 seconds" in message, message
+        assert "bridge log: none" in message, message
 
 
 class TestFunctionCreatePreviewHonesty:
